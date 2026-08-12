@@ -20,7 +20,7 @@ import {
 } from "../domain/types.ts";
 import { diffDigest, git } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
-import type { ProviderRegistry } from "../runtime/provider.ts";
+import type { InvocationRequest, InvocationResult, ProviderRegistry } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import {
@@ -498,14 +498,21 @@ export class BlindReviewGate {
     return allow(ReasonCode.OK, { diffs, binaryArtifacts });
   }
 
-  private async singleReview(
+  private reviewInvocation(
     request: BlindReviewRequest,
-    diffs: Array<{ identity: string; diff: string; files: string[] }>,
     reviewer: ReviewerBinding,
-  ): Promise<Decision<ReviewOutcome>> {
-    const adapter = this.providers.require(reviewer.preference.provider);
-    const result = await adapter.invoke({
-      prompt: this.buildPrompt(request, diffs),
+    prompt: string,
+    correlationId: string,
+  ): IsolatedInvocationRequest {
+    const denyReadPaths = new Set<string>([process.cwd()]);
+    const databasePath = this.db.raw.name;
+    if (databasePath && databasePath !== ":memory:") denyReadPaths.add(databasePath);
+    for (const repository of request.snapshot.repositories) {
+      const checkout = this.repositories.byIdentity(repository.identity)?.checkoutPath;
+      if (checkout) denyReadPaths.add(checkout);
+    }
+    return {
+      prompt,
       systemPrompt: REVIEWER_SYSTEM_PROMPT,
       workdir: reviewer.workdir,
       timeoutMs: REVIEW_TIMEOUT_MS,
@@ -513,9 +520,48 @@ export class BlindReviewGate {
       effort: reviewer.preference.effort ?? undefined,
       responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
       readOnly: true,
-      correlationId: `${request.runId}:${reviewer.sessionId}`,
+      correlationId,
       externalSessionId: reviewer.externalSessionId,
+      isolation: {
+        packetRoot: reviewer.workdir,
+        denyReadPaths: [...denyReadPaths],
+        emptyEnvironment: true,
+        network: "deny",
+        tools: "none",
+      },
+    };
+  }
+
+  private assertIsolationAttested(
+    runId: string,
+    reviewer: ReviewerBinding,
+    result: InvocationResult,
+  ): Decision<void> {
+    if ((result as IsolationAttestedResult).isolationAttested === true) {
+      return allow(ReasonCode.OK, undefined);
+    }
+    return deny(ReasonCode.ISOLATION_LOST, "reviewer adapter did not attest packet-only isolation", {
+      runId,
+      provider: reviewer.preference.provider,
+      reviewerSessionId: reviewer.sessionId,
+      packetRoot: reviewer.workdir,
     });
+  }
+
+  private async singleReview(
+    request: BlindReviewRequest,
+    diffs: Array<{ identity: string; diff: string; files: string[] }>,
+    reviewer: ReviewerBinding,
+  ): Promise<Decision<ReviewOutcome>> {
+    const adapter = this.providers.require(reviewer.preference.provider);
+    const result = await adapter.invoke(this.reviewInvocation(
+      request,
+      reviewer,
+      this.buildPrompt(request, diffs),
+      `${request.runId}:${reviewer.sessionId}`,
+    ));
+    const isolation = this.assertIsolationAttested(request.runId, reviewer, result);
+    if (!isolation.allowed) return isolation as Decision<ReviewOutcome>;
 
     // CP-HI-08 — a timed-out or errored invocation is missing evidence, even if whatever
     // it managed to emit happens to parse as a PASS.
@@ -579,18 +625,14 @@ export class BlindReviewGate {
           budget: CHUNK_THRESHOLD_CHARS,
         });
       }
-      const result = await adapter.invoke({
+      const result = await adapter.invoke(this.reviewInvocation(
+        request,
+        reviewer,
         prompt,
-        systemPrompt: REVIEWER_SYSTEM_PROMPT,
-        workdir: reviewer.workdir,
-        timeoutMs: REVIEW_TIMEOUT_MS,
-        model: reviewer.preference.model,
-        effort: reviewer.preference.effort ?? undefined,
-        responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
-        readOnly: true,
-        correlationId: `${request.runId}:${reviewer.sessionId}:chunk${index + 1}`,
-        externalSessionId: reviewer.externalSessionId,
-      });
+        `${request.runId}:${reviewer.sessionId}:chunk${index + 1}`,
+      ));
+      const isolation = this.assertIsolationAttested(request.runId, reviewer, result);
+      if (!isolation.allowed) return isolation as Decision<ReviewOutcome>;
       const parsed = result.ok ? parseVerdict(result.json ?? result.text) : null;
       if (!parsed) {
         // A chunk that did not produce a usable verdict is an omission, not a pass.
@@ -632,18 +674,19 @@ export class BlindReviewGate {
       });
     }
 
-    const finalResult = await this.providers.require(finalReviewer.value.preference.provider).invoke({
-      prompt: finalPrompt,
-      systemPrompt: REVIEWER_SYSTEM_PROMPT,
-      workdir: finalReviewer.value.workdir,
-      timeoutMs: REVIEW_TIMEOUT_MS,
-      model: finalReviewer.value.preference.model,
-      effort: finalReviewer.value.preference.effort ?? undefined,
-      responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
-      readOnly: true,
-      correlationId: `${request.runId}:${finalReviewer.value.sessionId}:final`,
-      externalSessionId: finalReviewer.value.externalSessionId,
-    });
+    const finalResult = await this.providers.require(finalReviewer.value.preference.provider).invoke(
+      this.reviewInvocation(
+        request,
+        finalReviewer.value,
+        finalPrompt,
+        `${request.runId}:${finalReviewer.value.sessionId}:final`,
+      ),
+    );
+    const finalIsolation = this.assertIsolationAttested(request.runId, finalReviewer.value, finalResult);
+    if (!finalIsolation.allowed) {
+      this.disposeReviewer(finalReviewer.value, "final reviewer did not attest isolation");
+      return finalIsolation as Decision<ReviewOutcome>;
+    }
 
     if (!finalResult.ok) {
       this.disposeReviewer(finalReviewer.value, "final review did not complete");
@@ -1032,6 +1075,17 @@ interface ReviewerBinding {
   roleKey: string;
   workdir: string;
 }
+
+type ReviewerIsolation = {
+  packetRoot: string;
+  denyReadPaths: readonly string[];
+  emptyEnvironment: true;
+  network: "deny";
+  tools: "none";
+};
+
+type IsolatedInvocationRequest = InvocationRequest & { isolation: ReviewerIsolation };
+type IsolationAttestedResult = InvocationResult & { isolationAttested?: boolean };
 
 interface ReviewOutcome {
   verdict: RawVerdict;

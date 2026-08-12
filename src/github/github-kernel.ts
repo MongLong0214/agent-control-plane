@@ -167,18 +167,20 @@ export class GitHubKernel {
 
   /**
    * CP-HI-01 — every external write this kernel performs goes through the guard, and the
-   * grant is consumed immediately before the API call. Without this the guard would be a
-   * decision function nobody consults on the paths that actually mutate GitHub.
+   * API call is performed inside the guard's fenced authorisation lifecycle. Without this
+   * the guard would be a decision function nobody consults on the paths that actually
+   * mutate GitHub.
    *
    * The caller's identity is used when it has one; daemon-initiated operations
    * (gate publish, tag, projection) are authorised as the run's pinned owner.
    */
-  private mediate(
+  private async mediate<T>(
     operation: WriteOperation,
     runId: string,
     repositoryIdentity: string,
     caller?: { ownerSessionId: string; ownerBindingGeneration: number },
-  ): Decision<string> {
+    effect?: () => T | Promise<T>,
+  ): Promise<Decision<T>> {
     const run = this.runs.get(runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
 
@@ -191,7 +193,10 @@ export class GitHubKernel {
       });
     }
 
-    const granted = this.guard.evaluate({
+    if (!effect) {
+      return deny(ReasonCode.INTERNAL_ERROR, "GitHub write has no fenced effect", { operation, runId });
+    }
+    return this.guard.authorize({
       operation,
       repositoryIdentity,
       runId,
@@ -199,15 +204,7 @@ export class GitHubKernel {
       bindingGeneration: generation,
       claimedClassification: "MANAGED",
       actor: "github-kernel",
-    });
-    if (!granted.allowed) return granted as Decision<string>;
-    return allow(ReasonCode.OK, granted.value.grantId);
-  }
-
-  /** Burns the grant. Called immediately before the side effect. */
-  private commitGrant(grantId: string): Decision<void> {
-    const consumed = this.guard.consume(grantId);
-    return consumed.allowed ? allow(ReasonCode.OK, undefined) : (consumed as Decision<void>);
+    }, () => effect());
   }
 
   private api(): GitHubClient {
@@ -233,9 +230,6 @@ export class GitHubKernel {
     // needs — otherwise two runs can open competing PRs from the same branch (§24.3).
     const claimed = this.assertClaim(input.runId, input.repositoryIdentity, input.head);
     if (!claimed.allowed) return claimed as Decision<{ pullNumber: number; url: string }>;
-
-    const grant = this.mediate(WriteOperation.GITHUB_PR, input.runId, input.repositoryIdentity, input);
-    if (!grant.allowed) return grant as Decision<{ pullNumber: number; url: string }>;
 
     const candidate = this.candidateRepository(input.runId, input.repositoryIdentity);
     if (!candidate.allowed) return candidate as Decision<{ pullNumber: number; url: string }>;
@@ -392,18 +386,65 @@ export class GitHubKernel {
         requestDigest,
       });
       if (!reserved.allowed) return reserved as Decision<{ pullNumber: number; url: string }>;
-      const consumed = this.commitGrant(grant.value);
-      if (!consumed.allowed) {
-        this.releaseReservation(idempotencyKey, requestDigest);
-        return consumed as Decision<{ pullNumber: number; url: string }>;
+      const created = await this.mediate(
+        WriteOperation.GITHUB_PR,
+        input.runId,
+        input.repositoryIdentity,
+        input,
+        () => this.api().request<PullRequest>("POST", `/repos/${owner}/${repo}/pulls`, {
+          title: input.title,
+          body: prBody,
+          head: input.head,
+          base: input.base,
+        }),
+      );
+      if (!created.allowed) {
+        if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
+        return created as Decision<{ pullNumber: number; url: string }>;
       }
+      const pull = created.value;
+      return this.finishPreparedPr({
+        pull,
+        createdByUs,
+        input,
+        candidate: candidate.value,
+        linkedIssues,
+        idempotencyKey,
+        requestDigest,
+        request,
+        owner,
+        repo,
+      });
     }
-    const pull = open[0] ?? (await this.api().request<PullRequest>("POST", `/repos/${owner}/${repo}/pulls`, {
-      title: input.title,
-      body: prBody,
-      head: input.head,
-      base: input.base,
-    }));
+    const pull = open[0]!;
+
+    return this.finishPreparedPr({
+      pull,
+      createdByUs,
+      input,
+      candidate: candidate.value,
+      linkedIssues,
+      idempotencyKey,
+      requestDigest,
+      request,
+      owner,
+      repo,
+    });
+  }
+
+  private async finishPreparedPr(input: {
+    pull: PullRequest;
+    createdByUs: boolean;
+    input: PrepareInput;
+    candidate: { candidateHead: string; baseHead: string; baseBranch: string };
+    linkedIssues: number[];
+    idempotencyKey: string;
+    requestDigest: string;
+    request: Record<string, unknown>;
+    owner: string;
+    repo: string;
+  }): Promise<Decision<{ pullNumber: number; url: string }>> {
+    const { pull, createdByUs, linkedIssues, idempotencyKey, requestDigest, request, owner, repo } = input;
 
     // §16.2 — command success is not evidence; re-read and compare.
     const reread = await this.api().request<PullRequest>(
@@ -411,17 +452,17 @@ export class GitHubKernel {
       `/repos/${owner}/${repo}/pulls/${pull.number}`,
     );
     if (
-      reread.head.sha !== input.exactHeadSha ||
-      reread.head.ref !== input.head ||
-      reread.base.ref !== input.base ||
-      reread.base.sha !== candidate.value.baseHead
+      reread.head.sha !== input.input.exactHeadSha ||
+      reread.head.ref !== input.input.head ||
+      reread.base.ref !== input.input.base ||
+      reread.base.sha !== input.candidate.baseHead
     ) {
       return deny(ReasonCode.MERGE_HEAD_STALE, "pull request head does not match the candidate head", {
-        expected: input.exactHeadSha,
+        expected: input.input.exactHeadSha,
         observed: { head: reread.head, base: reread.base },
       });
     }
-    if (input.requireLinkage && !this.hasPrLinkage(reread.body, linkedIssues)) {
+    if (input.input.requireLinkage && !this.hasPrLinkage(reread.body, linkedIssues)) {
       return deny(ReasonCode.PR_LINKAGE_MISSING, "GitHub did not persist the required PR issue linkage", {
         pullNumber: reread.number,
         linkedIssues,
@@ -443,8 +484,8 @@ export class GitHubKernel {
       this.writeReceipt({
         idempotencyKey,
         operation: "pr_prepare",
-        runId: input.runId,
-        repositoryIdentity: input.repositoryIdentity,
+        runId: input.input.runId,
+        repositoryIdentity: input.input.repositoryIdentity,
         resourceType: "pull_request",
         resourceIdentity: `${owner}/${repo}#${reread.number}`,
         preexisting: true,
@@ -483,9 +524,6 @@ export class GitHubKernel {
     const slug = this.slug(repositoryIdentity);
     if (!slug.allowed) return slug as Decision<{ checkRunId: number }>;
     const { owner, repo } = slug.value;
-
-    const grant = this.mediate(WriteOperation.GITHUB_CHECK_RUN, payload.runId, repositoryIdentity);
-    if (!grant.allowed) return grant as Decision<{ checkRunId: number }>;
 
     const payloadDigest = digestOf(payload);
     const idempotencyKey = `gate_publish:${repositoryIdentity}:${payload.exactHead}:${payloadDigest}`;
@@ -555,30 +593,34 @@ export class GitHubKernel {
     });
     if (!reserved.allowed) return reserved as Decision<{ checkRunId: number }>;
 
-    const consumed = this.commitGrant(grant.value);
-    if (!consumed.allowed) {
-      this.releaseReservation(idempotencyKey, payloadDigest);
-      return consumed as Decision<{ checkRunId: number }>;
+    const created = await this.mediate(
+      WriteOperation.GITHUB_CHECK_RUN,
+      payload.runId,
+      repositoryIdentity,
+      undefined,
+      () => this.api().request<CheckRun>("POST", `/repos/${owner}/${repo}/check-runs`, {
+        name: GATE_CHECK_NAME,
+        head_sha: payload.exactHead,
+        status: "completed",
+        conclusion: "success",
+        completed_at: this.clock.nowIso(),
+        output: {
+          title: "Agent Control Plane production gate",
+          summary: `payloadDigest=${payloadDigest}`,
+          text: JSON.stringify(payload, null, 2),
+        },
+      }),
+    );
+    if (!created.allowed) {
+      if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, payloadDigest);
+      return created as Decision<{ checkRunId: number }>;
     }
-
-    const created = await this.api().request<CheckRun>("POST", `/repos/${owner}/${repo}/check-runs`, {
-      name: GATE_CHECK_NAME,
-      head_sha: payload.exactHead,
-      status: "completed",
-      conclusion: "success",
-      completed_at: this.clock.nowIso(),
-      output: {
-        title: "Agent Control Plane production gate",
-        summary: `payloadDigest=${payloadDigest}`,
-        text: JSON.stringify(payload, null, 2),
-      },
-    });
 
     // GitHub's POST acknowledgement is not proof that the expected check exists. Re-read
     // the commit's checks and bind the exact id, head, creator and payload projection.
     let reread: CheckRun | undefined;
     try {
-      reread = await this.api().request<CheckRun>("GET", `/repos/${owner}/${repo}/check-runs/${created.id}`);
+      reread = await this.api().request<CheckRun>("GET", `/repos/${owner}/${repo}/check-runs/${created.value.id}`);
     } catch {
       // Some GitHub-compatible providers do not expose the singular endpoint. Their
       // commit-scoped listing still proves the exact id and every bound field.
@@ -586,7 +628,7 @@ export class GitHubKernel {
         "GET",
         `/repos/${owner}/${repo}/commits/${payload.exactHead}/check-runs?check_name=${GATE_CHECK_NAME}`,
       );
-      reread = (checks.check_runs ?? []).find((check) => check.id === created.id);
+      reread = (checks.check_runs ?? []).find((check) => check.id === created.value.id);
     }
     const creator = this.credentials.creatorIdentity();
     const observedDigest = /payloadDigest=(sha256:[0-9a-f]{64})/.exec(reread?.output?.summary ?? "")?.[1];
@@ -601,7 +643,7 @@ export class GitHubKernel {
       observedDigest !== payloadDigest
     ) {
       return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "published gate did not survive GitHub re-read", {
-        checkRunId: created.id,
+        checkRunId: created.value.id,
         observed: reread
           ? { head: reread.head_sha, status: reread.status, conclusion: reread.conclusion, creator: reread.app?.slug }
           : null,
@@ -612,7 +654,7 @@ export class GitHubKernel {
       requestDigest: payloadDigest,
       preexisting: false,
       afterStateDigest: payloadDigest,
-      response: { checkRunId: created.id, payload, payloadDigest },
+      response: { checkRunId: created.value.id, payload, payloadDigest },
       reread: true,
     });
     if (!finalized.allowed) return finalized as Decision<{ checkRunId: number }>;
@@ -624,11 +666,11 @@ export class GitHubKernel {
         repositoryIdentity,
         exactHead: payload.exactHead,
         payloadDigest,
-        checkRunId: created.id,
+        checkRunId: created.value.id,
         creatorIdentity: this.credentials.creatorIdentity(),
       },
     });
-    return allow(ReasonCode.OK, { checkRunId: created.id });
+    return allow(ReasonCode.OK, { checkRunId: created.value.id });
   }
 
   /**
@@ -1230,16 +1272,6 @@ export class GitHubKernel {
     const evaluation = await this.mergeEvaluate(input);
     if (!evaluation.allowed) return evaluation as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
-    const grant = this.mediate(
-      WriteOperation.PROGRAMMATIC_MERGE,
-      input.runId,
-      input.repositoryIdentity,
-      input,
-    );
-    if (!grant.allowed) return grant as Decision<{ mergeCommitSha: string; replayed: boolean }>;
-    const consumed = this.commitGrant(grant.value);
-    if (!consumed.allowed) return consumed as Decision<{ mergeCommitSha: string; replayed: boolean }>;
-
     const slug = this.slug(input.repositoryIdentity);
     if (!slug.allowed) return slug as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     const { owner, repo } = slug.value;
@@ -1287,12 +1319,22 @@ export class GitHubKernel {
     // GitHub fences the irreversible write on the exact head. Its REST API has no base
     // predicate, so the late base reread and first-parent proof below make that residual
     // race explicit rather than treating the preflight as an atomic guarantee.
-    const merged = await this.api().request<{ sha: string; merged: boolean }>(
-      "PUT",
-      `/repos/${owner}/${repo}/pulls/${input.pullNumber}/merge`,
-      { sha: input.exactHeadSha, merge_method: method },
+    const merged = await this.mediate(
+      WriteOperation.PROGRAMMATIC_MERGE,
+      input.runId,
+      input.repositoryIdentity,
+      input,
+      () => this.api().request<{ sha: string; merged: boolean }>(
+        "PUT",
+        `/repos/${owner}/${repo}/pulls/${input.pullNumber}/merge`,
+        { sha: input.exactHeadSha, merge_method: method },
+      ),
     );
-    if (!merged.merged) {
+    if (!merged.allowed) {
+      if (merged.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
+      return merged as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    }
+    if (!merged.value.merged) {
       // GitHub explicitly reports no mutation, so this is not an ambiguous outcome and
       // the pre-write reservation may be released for a corrected retry.
       this.releaseReservation(idempotencyKey, requestDigest);
@@ -1310,7 +1352,7 @@ export class GitHubKernel {
         pullNumber: input.pullNumber,
       });
     }
-    if (!merged.sha) {
+    if (!merged.value.sha) {
       return deny(ReasonCode.EVIDENCE_MISSING, "GitHub reported a merge with no commit sha", {
         pullNumber: input.pullNumber,
       });
@@ -1323,7 +1365,7 @@ export class GitHubKernel {
         repositoryIdentity: input.repositoryIdentity,
         pullNumber: input.pullNumber,
         exactHead: input.exactHeadSha,
-        mergeCommitSha: merged.sha,
+        mergeCommitSha: merged.value.sha,
         method,
       },
     });
@@ -1336,7 +1378,7 @@ export class GitHubKernel {
     // The merge happened; now prove it landed on the base the evidence was bound to. A
     // mismatch is reported, never smoothed over: the merge commit exists and the run's
     // evidence no longer describes it (§24.6).
-    const onBase = await this.assertMergedOntoBase(owner, repo, merged.sha, input.expectedBaseSha, method);
+    const onBase = await this.assertMergedOntoBase(owner, repo, merged.value.sha, input.expectedBaseSha, method);
     if (!onBase.allowed) {
       if (typeof mergeRepositoryId === "string") this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId as string, "FAILED");
       this.audit.record({
@@ -1345,12 +1387,12 @@ export class GitHubKernel {
         reasonCode: ReasonCode.MERGE_BASE_STALE,
         evidence: {
           repositoryIdentity: input.repositoryIdentity,
-          mergeCommitSha: merged.sha,
+          mergeCommitSha: merged.value.sha,
           expectedBase: input.expectedBaseSha,
           detail: (onBase as Extract<Decision<void>, { allowed: false }>).message,
         },
       });
-      this.rollbackPrepare(input.runId, input.repositoryIdentity, merged.sha, "halt");
+      this.rollbackPrepare(input.runId, input.repositoryIdentity, merged.value.sha, "halt");
       return onBase as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
 
@@ -1358,9 +1400,9 @@ export class GitHubKernel {
       idempotencyKey,
       requestDigest,
       preexisting: false,
-      afterStateDigest: sha256(merged.sha),
+      afterStateDigest: sha256(merged.value.sha),
       response: {
-        mergeCommitSha: merged.sha,
+        mergeCommitSha: merged.value.sha,
         sourceBranch: preflight.head.ref,
         targetBranch: preflight.base.ref,
         expectedBaseSha: input.expectedBaseSha,
@@ -1377,7 +1419,7 @@ export class GitHubKernel {
     // API success is only a pending merge: dependents remain blocked until the exact
     // merge commit has passed the pinned post-merge checks.
     if (typeof mergeRepositoryId === "string") this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId as string, "PENDING");
-    return allow(ReasonCode.OK, { mergeCommitSha: merged.sha, replayed: false });
+    return allow(ReasonCode.OK, { mergeCommitSha: merged.value.sha, replayed: false });
   }
 
   /**
@@ -1678,15 +1720,17 @@ export class GitHubKernel {
       });
     }
 
-    const grant = this.mediate(WriteOperation.GITHUB_RELEASE, runId, repositoryIdentity, caller);
-    if (!grant.allowed) return grant as Decision<{ tag: string; sha: string }>;
-    const consumed = this.commitGrant(grant.value);
-    if (!consumed.allowed) return consumed as Decision<{ tag: string; sha: string }>;
-
-    await this.api().request("POST", `/repos/${owner}/${repo}/git/refs`, {
-      ref: `refs/tags/${tag}`,
-      sha: commitSha,
-    });
+    const tagged = await this.mediate(
+      WriteOperation.GITHUB_RELEASE,
+      runId,
+      repositoryIdentity,
+      caller,
+      () => this.api().request("POST", `/repos/${owner}/${repo}/git/refs`, {
+        ref: `refs/tags/${tag}`,
+        sha: commitSha,
+      }),
+    );
+    if (!tagged.allowed) return tagged as Decision<{ tag: string; sha: string }>;
 
     const reread = await this.api().request<{ object: { sha: string } }>(
       "GET",
@@ -1701,10 +1745,25 @@ export class GitHubKernel {
     }
 
     if (profile.value.releaseBranchCleanup === "delete") {
-      await this.api().request(
-        "DELETE",
-        `/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(merge.sourceBranch)}`,
+      const sourceBranch = merge.sourceBranch;
+      if (!sourceBranch) {
+        return deny(ReasonCode.RELEASE_TAG_COMMIT_NOT_ACCEPTED, "accepted release merge has no source branch", {
+          runId,
+          repositoryIdentity,
+          commitSha,
+        });
+      }
+      const deleted = await this.mediate(
+        WriteOperation.GITHUB_RELEASE,
+        runId,
+        repositoryIdentity,
+        caller,
+        () => this.api().request(
+          "DELETE",
+          `/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(sourceBranch)}`,
+        ),
       );
+      if (!deleted.allowed) return deleted as Decision<{ tag: string; sha: string }>;
     }
 
     this.writeReceipt({
@@ -1830,11 +1889,6 @@ export class GitHubKernel {
     if (!slug.allowed) return slug as Decision<{ created: number; updated: number }>;
     const { owner, repo } = slug.value;
 
-    const grant = this.mediate(WriteOperation.GITHUB_ISSUE, runId, repositoryIdentity, caller);
-    if (!grant.allowed) return grant as Decision<{ created: number; updated: number }>;
-    const consumed = this.commitGrant(grant.value);
-    if (!consumed.allowed) return consumed as Decision<{ created: number; updated: number }>;
-
     const existing = await this.api().request<Array<{ number: number; body: string | null }>>(
       "GET",
       `/repos/${owner}/${repo}/issues?state=all&per_page=100`,
@@ -1851,18 +1905,32 @@ export class GitHubKernel {
       const body = `<!-- acp-ticket:${ticket.id} -->\n${ticket.body}`;
       const number = byMarker.get(ticket.id);
       if (number) {
-        await this.api().request("PATCH", `/repos/${owner}/${repo}/issues/${number}`, {
-          title: ticket.title,
-          body,
-          labels: ticket.labels ?? [],
-        });
+        const patched = await this.mediate(
+          WriteOperation.GITHUB_ISSUE,
+          runId,
+          repositoryIdentity,
+          caller,
+          () => this.api().request("PATCH", `/repos/${owner}/${repo}/issues/${number}`, {
+            title: ticket.title,
+            body,
+            labels: ticket.labels ?? [],
+          }),
+        );
+        if (!patched.allowed) return patched as Decision<{ created: number; updated: number }>;
         updated += 1;
       } else {
-        await this.api().request("POST", `/repos/${owner}/${repo}/issues`, {
-          title: ticket.title,
-          body,
-          labels: ticket.labels ?? [],
-        });
+        const createdIssue = await this.mediate(
+          WriteOperation.GITHUB_ISSUE,
+          runId,
+          repositoryIdentity,
+          caller,
+          () => this.api().request("POST", `/repos/${owner}/${repo}/issues`, {
+            title: ticket.title,
+            body,
+            labels: ticket.labels ?? [],
+          }),
+        );
+        if (!createdIssue.allowed) return createdIssue as Decision<{ created: number; updated: number }>;
         created += 1;
       }
     }

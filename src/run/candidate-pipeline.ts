@@ -6,6 +6,7 @@ import { commandsForMode } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
+import type { Db } from "../db/database.ts";
 import { ArtifactKind, RunState } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
@@ -24,6 +25,7 @@ import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
+import type { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 
 export interface SubmitResultInput {
   runId: string;
@@ -62,6 +64,7 @@ export type PipelineOutcome =
  */
 export class CandidatePipeline {
   constructor(
+    private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly artifacts: ArtifactStore,
@@ -76,11 +79,10 @@ export class CandidatePipeline {
     private readonly bindings: BindingRegistry,
     private readonly outbox: Outbox,
     private readonly telemetry: Telemetry,
+    private readonly guard: ManagedWriteGuard,
   ) {}
 
   #continuity: { evaluate?(reason: string): Promise<unknown> } | null = null;
-  /** Single-process fence for the asynchronous verify → review → publish sequence. */
-  readonly #submissions = new Set<string>();
 
   attach(ports: { continuity?: { evaluate?(reason: string): Promise<unknown> } }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
@@ -133,20 +135,17 @@ export class CandidatePipeline {
   }
 
   async submitResult(input: SubmitResultInput): Promise<Decision<PipelineOutcome>> {
-    if (this.#submissions.has(input.runId)) {
-      return deny(ReasonCode.CONFLICT, "a candidate submission is already being evaluated for this run", {
-        runId: input.runId,
-      });
-    }
-    this.#submissions.add(input.runId);
+    const attemptId = `attempt_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+    const acquired = this.acquireAttempt(input, attemptId);
+    if (!acquired.allowed) return acquired as Decision<PipelineOutcome>;
     try {
-      return await this.submitResultOnce(input);
+      return await this.submitResultOnce(input, attemptId);
     } finally {
-      this.#submissions.delete(input.runId);
+      this.releaseAttempt(input.runId, attemptId);
     }
   }
 
-  private async submitResultOnce(input: SubmitResultInput): Promise<Decision<PipelineOutcome>> {
+  private async submitResultOnce(input: SubmitResultInput, attemptId: string): Promise<Decision<PipelineOutcome>> {
     const owner = this.runs.assertOwner(
       input.runId,
       input.ownerSessionId,
@@ -166,6 +165,8 @@ export class CandidatePipeline {
     if (!frozen.allowed) return frozen as Decision<PipelineOutcome>;
     const snapshot = frozen.value;
     const snapshotDigest = candidateSnapshotDigest(snapshot);
+    const boundAttempt = this.bindAttemptCandidate(input.runId, attemptId, snapshotDigest);
+    if (!boundAttempt.allowed) return boundAttempt as Decision<PipelineOutcome>;
 
     const commands = this.resolveCommands(
       run.pinnedManifestDigest,
@@ -289,37 +290,110 @@ export class CandidatePipeline {
     // decides on a current mode rather than one that predates a provider outage (§15.6).
     if (this.#continuity?.evaluate) await this.#continuity.evaluate("pre-completion");
 
-    // And again before the packet: the review is also asynchronous.
-    const stillFreshAfterReview = await this.assertStillFresh(snapshot);
-    if (!stillFreshAfterReview.allowed) {
-      return allow(ReasonCode.OK, {
-        stage: "CANDIDATE_STALE",
-        reasonCode: stillFreshAfterReview.reasonCode,
-        snapshotDigest,
-      });
-    }
+    const sourceReadLease = this.guard.acquireSourceReadLease(
+      input.runId,
+      snapshot.repositories.map((repository) => repository.identity),
+    );
+    if (!sourceReadLease.allowed) return sourceReadLease as Decision<PipelineOutcome>;
+    try {
+      // And again before the packet: the review is also asynchronous. Managed source
+      // writes cannot slip between this observation and production-ready publication.
+      const stillFreshAfterReview = await this.assertStillFresh(snapshot);
+      if (!stillFreshAfterReview.allowed) {
+        return allow(ReasonCode.OK, {
+          stage: "CANDIDATE_STALE",
+          reasonCode: stillFreshAfterReview.reasonCode,
+          snapshotDigest,
+        });
+      }
 
-    const built = this.ceo.buildPacket({
-      runId: input.runId,
-      candidateSnapshotDigest: snapshotDigest,
-      approval: {
+      const built = this.ceo.buildPacket({
         runId: input.runId,
         candidateSnapshotDigest: snapshotDigest,
-        resultSummary: input.resultSummary,
-        recommendation: input.recommendation,
-        residualRisk: input.residualRisk ?? [],
-        approvedBySessionId: input.ownerSessionId,
-        approvedByGeneration: input.ownerBindingGeneration,
-        approvedAt: this.clock.nowIso(),
-      },
-    });
-    if (!built.allowed) return built as Decision<PipelineOutcome>;
+        sourceReadLeaseId: sourceReadLease.value.leaseId,
+        approval: {
+          runId: input.runId,
+          candidateSnapshotDigest: snapshotDigest,
+          resultSummary: input.resultSummary,
+          recommendation: input.recommendation,
+          residualRisk: input.residualRisk ?? [],
+          approvedBySessionId: input.ownerSessionId,
+          approvedByGeneration: input.ownerBindingGeneration,
+          approvedAt: this.clock.nowIso(),
+        },
+      } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string });
+      if (!built.allowed) return built as Decision<PipelineOutcome>;
 
-    return allow(ReasonCode.OK, {
-      stage: "COMPLETED_REVIEW",
-      packet: built.value,
-      snapshotDigest,
+      return allow(ReasonCode.OK, {
+        stage: "COMPLETED_REVIEW",
+        packet: built.value,
+        snapshotDigest,
+      });
+    } finally {
+      sourceReadLease.value.release();
+    }
+  }
+
+  /** Durable, per-run fence for the whole asynchronous verification/review attempt. */
+  private acquireAttempt(input: SubmitResultInput, attemptId: string): Decision<void> {
+    return this.db.tx(() => {
+      const inserted = this.db.run(
+        `INSERT INTO candidate_pipeline_attempts
+           (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, released_at)
+         VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, NULL)
+         ON CONFLICT(run_id) DO UPDATE SET
+           attempt_id = excluded.attempt_id,
+           owner_session_id = excluded.owner_session_id,
+           owner_binding_generation = excluded.owner_binding_generation,
+           candidate_digest = NULL,
+           state = 'RUNNING',
+           started_at = excluded.started_at,
+           released_at = NULL
+         WHERE candidate_pipeline_attempts.state = 'RELEASED'`,
+        [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, this.clock.nowIso()],
+      );
+      if (inserted.changes === 1) return allow(ReasonCode.OK, undefined);
+      const current = this.db.get<{
+        attempt_id: string;
+        owner_session_id: string;
+        owner_binding_generation: number;
+        candidate_digest: string | null;
+        state: string;
+      }>(
+        `SELECT attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state
+           FROM candidate_pipeline_attempts WHERE run_id = ?`,
+        [input.runId],
+      );
+      return deny(ReasonCode.CONFLICT, "a durable candidate submission attempt already owns this run", {
+        runId: input.runId,
+        current,
+      });
     });
+  }
+
+  private bindAttemptCandidate(runId: string, attemptId: string, candidateDigest: string): Decision<void> {
+    const updated = this.db.run(
+      `UPDATE candidate_pipeline_attempts
+          SET candidate_digest = ?
+        WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING'`,
+      [candidateDigest, runId, attemptId],
+    );
+    return updated.changes === 1
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.CONFLICT, "candidate submission attempt lease was replaced before snapshot binding", {
+          runId,
+          attemptId,
+          candidateDigest,
+        });
+  }
+
+  private releaseAttempt(runId: string, attemptId: string): void {
+    this.db.run(
+      `UPDATE candidate_pipeline_attempts
+          SET state = 'RELEASED', released_at = ?
+        WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING'`,
+      [this.clock.nowIso(), runId, attemptId],
+    );
   }
 
   /**
@@ -398,3 +472,4 @@ export class CandidatePipeline {
     return verifySnapshotFreshness(snapshot, probes);
   }
 }
+import { randomUUID } from "node:crypto";

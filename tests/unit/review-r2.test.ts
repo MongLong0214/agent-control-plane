@@ -4,6 +4,7 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import { __testing } from "../../src/review/blind-review.ts";
+import { CandidatePipeline } from "../../src/run/candidate-pipeline.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
@@ -216,7 +217,7 @@ describe("round-2 blind-review regressions", () => {
     expect(coverage.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
   });
 
-  it("#130 serializes concurrent candidate submissions for one run", async () => {
+  it("#130 serializes concurrent candidate submissions across a reconstructed pipeline", async () => {
     const setup = await prepareReviewedInputs();
     setup.harness.cp.verification.verify = async () => allow(ReasonCode.OK, setup.verification);
     setup.harness.scripted.script({
@@ -232,7 +233,25 @@ describe("round-2 blind-review regressions", () => {
       recommendation: "merge",
     };
     const first = setup.harness.cp.pipeline.submitResult(input);
-    const second = await setup.harness.cp.pipeline.submitResult(input);
+    const restarted = new CandidatePipeline(
+      setup.harness.cp.db,
+      setup.harness.cp.clock,
+      setup.harness.cp.audit,
+      setup.harness.cp.artifacts,
+      setup.harness.cp.runs,
+      setup.harness.cp.tasks,
+      setup.harness.cp.projects,
+      setup.harness.cp.repositories,
+      setup.harness.cp.verification,
+      setup.harness.cp.review,
+      setup.harness.cp.review.controlPlaneInvoker(),
+      setup.harness.cp.ceo,
+      setup.harness.cp.bindings,
+      setup.harness.cp.outbox,
+      setup.harness.cp.telemetry,
+      setup.harness.cp.guard,
+    );
+    const second = await restarted.submitResult(input);
     expect(second.allowed).toBe(false);
     expect(second.reasonCode).toBe(ReasonCode.CONFLICT);
     await first;
@@ -244,6 +263,31 @@ describe("round-2 blind-review regressions", () => {
     expect(result.allowed).toBe(true);
     expect(setup.harness.scripted.invocations[0]?.workdir).not.toBe(setup.harness.repoPath);
     expect(result.allowed && result.value.inputManifest.withheld).toContain("daemon state");
+  });
+
+  it("#132 rejects a reviewer adapter that does not attest its requested isolation", async () => {
+    const setup = await prepareReviewedInputs();
+    const originalInvoke = setup.harness.scripted.invoke.bind(setup.harness.scripted);
+    setup.harness.scripted.invoke = async (request) => ({
+      ...(await originalInvoke(request)),
+      isolationAttested: false,
+    });
+
+    const result = await directReview(setup);
+    const invocation = setup.harness.scripted.invocations[0] as unknown as {
+      workdir: string;
+      isolation?: { packetRoot: string; emptyEnvironment: boolean; network: string; tools: string; denyReadPaths: string[] };
+    };
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
+    expect(invocation.isolation).toEqual(expect.objectContaining({
+      packetRoot: invocation.workdir,
+      emptyEnvironment: true,
+      network: "deny",
+      tools: "none",
+    }));
+    expect(invocation.isolation?.denyReadPaths).toContain(setup.harness.repoPath);
   });
 
   it("#133 rejects a PASS response that omits required evidence fields", () => {
