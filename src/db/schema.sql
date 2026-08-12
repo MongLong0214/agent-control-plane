@@ -383,7 +383,8 @@ CREATE TABLE IF NOT EXISTS capacity_snapshots (
   reset_at             TEXT,
   capabilities_json    TEXT NOT NULL,
   sensor_health        TEXT NOT NULL CHECK (sensor_health IN ('HEALTHY','STALE','ERROR')),
-  runtime_health       TEXT NOT NULL CHECK (runtime_health IN ('HEALTHY','DEGRADED','UNAVAILABLE')),
+  -- UNKNOWN is recorded, not smoothed away: an unprobed runtime is not a routable one.
+  runtime_health       TEXT NOT NULL CHECK (runtime_health IN ('HEALTHY','DEGRADED','UNAVAILABLE','UNKNOWN')),
   allocation_admission TEXT NOT NULL CHECK (allocation_admission IN ('OPEN','CONSERVE','SUSPENDED')),
   observed_at          TEXT NOT NULL,
   source               TEXT NOT NULL,
@@ -566,7 +567,10 @@ CREATE TABLE IF NOT EXISTS continuity_state (
   id           INTEGER PRIMARY KEY CHECK (id = 1),
   mode         TEXT NOT NULL CHECK (mode IN ('NORMAL','DEGRADED','SURVIVAL')),
   reason_code  TEXT,
-  changed_at   TEXT NOT NULL
+  changed_at   TEXT NOT NULL,
+  -- When coverage was last actually computed. A completion decision must not lean on a
+  -- mode that was true an hour ago (§15.6): the stored mode is only as good as its age.
+  evaluated_at TEXT
 );
 
 INSERT OR IGNORE INTO continuity_state (id, mode, changed_at)

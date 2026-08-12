@@ -17,7 +17,7 @@ const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
  * migration: it silently keeps an older table whose CHECK constraints are weaker, so a
  * deployment could start with hard invariants missing (§40 Maintainability).
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * SQLite handle plus the transaction discipline required by PRD §30.3.

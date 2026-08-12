@@ -370,6 +370,7 @@ describe("one safe project run, end to end", () => {
     const frozen = await harness.cp.pipeline.freeze(runId);
     expect(frozen.allowed).toBe(true);
 
+    await harness.cp.continuity.evaluate("test");
     const stale = harness.cp.ceo.buildPacket({
       runId,
       candidateSnapshotDigest: oldDigest,
@@ -400,6 +401,9 @@ describe("one safe project run, end to end", () => {
     // nothing to corroborate it must not be accepted.
     harness.cp.db.run(`DELETE FROM verification_results WHERE run_id = ?`, [runId]);
 
+    // The pipeline evaluates coverage immediately before completing; a direct gate call
+    // must do the same or the gate refuses on a stale continuity mode.
+    await harness.cp.continuity.evaluate("test");
     const decision = harness.cp.ceo.buildPacket({
       runId,
       candidateSnapshotDigest: digest,
@@ -481,6 +485,9 @@ describe("one safe project run, end to end", () => {
       digest,
     );
 
+    // The pipeline evaluates coverage immediately before completing; a direct gate call
+    // must do the same or the gate refuses on a stale continuity mode.
+    await harness.cp.continuity.evaluate("test");
     const decision = harness.cp.ceo.buildPacket({
       runId,
       candidateSnapshotDigest: digest,

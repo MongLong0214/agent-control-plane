@@ -68,6 +68,22 @@ const PREFERENCE: Readonly<Record<string, readonly string[]>> = {
  * which roles can be staffed at all?" — and only then does anything move.
  */
 export class ContinuityKernel {
+  #readiness: { checkSession(sessionId: string): Promise<Decision<void>> } | null = null;
+  #buzz: { connect(sessionId: string, purpose: string): Promise<Decision<string>> } | null = null;
+
+  /**
+   * §15.7 requires the new session to be READY *before* the switch. Without a readiness
+   * probe and a route, a failover would hand the role to an id nothing can reach, and the
+   * next fenced message would have nowhere to go. Missing ports therefore fail closed.
+   */
+  attach(ports: {
+    readiness?: { checkSession(sessionId: string): Promise<Decision<void>> };
+    buzz?: { connect(sessionId: string, purpose: string): Promise<Decision<string>> };
+  }): void {
+    if (ports.readiness) this.#readiness = ports.readiness;
+    if (ports.buzz) this.#buzz = ports.buzz;
+  }
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -86,18 +102,28 @@ export class ContinuityKernel {
     return row?.mode ?? ContinuityMode.NORMAL;
   }
 
+  /** How long ago coverage was actually computed, in ms; Infinity if never. */
+  modeAgeMs(): number {
+    const row = this.db.get<{ evaluated_at: string | null }>(
+      `SELECT evaluated_at FROM continuity_state WHERE id = 1`,
+    );
+    if (!row?.evaluated_at) return Number.POSITIVE_INFINITY;
+    const at = new Date(row.evaluated_at).getTime();
+    if (!Number.isFinite(at)) return Number.POSITIVE_INFINITY;
+    return Math.max(0, new Date(this.clock.nowIso()).getTime() - at);
+  }
+
   /** §15.3 — computed before any failover, never after. */
   computeCoveragePlan(): RoleCoveragePlan {
     const requiredRoles = this.requiredRoles();
     const capacities = this.capacity.all();
     const byProvider = new Map(capacities.map((c) => [c.provider, c]));
 
-    const usable = (provider: string): ProviderCapacity | null => {
+    const usable = (provider: string, capability: string): ProviderCapacity | null => {
       const capacity = byProvider.get(provider);
       if (!capacity) return null;
-      if (capacity.allocationAdmission === "SUSPENDED") return null;
-      if (capacity.runtimeHealth === "UNAVAILABLE") return null;
-      return capacity;
+      // Same routability rule the monitor applies: an unknown bucket is not routable.
+      return this.capacity.isRoutableFor(capacity, capability) ? capacity : null;
     };
 
     const assignments: RoleCoveragePlan["assignments"] = [];
@@ -106,23 +132,25 @@ export class ContinuityKernel {
     // provider outage cannot take a producer and its reviewer at once.
     const usedByGroup = new Map<string, Set<string>>();
 
+    // The §15.1 order first, then any other registered provider that can serve the
+    // capability. Coverage must reflect the providers this deployment actually has, not a
+    // hardcoded roster: an unlisted provider is a fallback, not an absence of coverage.
+    const registered = this.providers.list().map((a) => a.provider);
+    const candidatesFor = (capability: string): string[] => {
+      const ranked = (PREFERENCE[capability] ?? []).filter((p) => byProvider.has(p) || registered.includes(p));
+      // §14.5 — an optional provider never becomes coverage on its own. It is a
+      // candidate only where the preference table names it explicitly.
+      const rest = registered.filter((p) => !ranked.includes(p) && !OPTIONAL_PROVIDERS.has(p));
+      return [...ranked, ...rest];
+    };
+
     for (const role of requiredRoles) {
-      const preferred = PREFERENCE[role.capability] ?? [];
+      const preferred = candidatesFor(role.capability);
       const taken = usedByGroup.get(role.isolationGroup) ?? new Set<string>();
 
       const candidate =
-        preferred.find((p) => {
-          const capacity = usable(p);
-          return (
-            capacity !== null &&
-            capacity.buckets.some((b) => b.capabilities.includes(role.capability)) &&
-            !taken.has(p)
-          );
-        }) ??
-        preferred.find((p) => {
-          const capacity = usable(p);
-          return capacity !== null && capacity.buckets.some((b) => b.capabilities.includes(role.capability));
-        }) ??
+        preferred.find((p) => usable(p, role.capability) !== null && !taken.has(p)) ??
+        preferred.find((p) => usable(p, role.capability) !== null) ??
         null;
 
       if (!candidate) {
@@ -150,7 +178,9 @@ export class ContinuityKernel {
     const requiredProvidersDown = [...byProvider.values()].filter(
       (c) =>
         !OPTIONAL_PROVIDERS.has(c.provider) &&
-        (c.allocationAdmission === "SUSPENDED" || c.runtimeHealth === "UNAVAILABLE"),
+        (c.allocationAdmission === "SUSPENDED" ||
+          c.runtimeHealth === "UNAVAILABLE" ||
+          c.runtimeHealth === "UNKNOWN"),
     );
 
     const mode: ContinuityMode =
@@ -195,6 +225,10 @@ export class ContinuityKernel {
     await this.capacity.refresh(RefreshTrigger.CONTINUITY_EVALUATION);
     const plan = this.computeCoveragePlan();
     const previous = this.mode();
+
+    // Record *when* coverage was computed, so a completion decision can tell a current
+    // mode from a stale one.
+    this.db.run(`UPDATE continuity_state SET evaluated_at = ? WHERE id = 1`, [this.clock.nowIso()]);
 
     if (plan.mode !== previous) {
       this.db.run(`UPDATE continuity_state SET mode = ?, reason_code = ?, changed_at = ? WHERE id = 1`, [
@@ -279,6 +313,30 @@ export class ContinuityKernel {
     });
     this.sessions.transition(session.sessionId, SessionLifecycle.READY, "continuity failover");
 
+    // Give the role a route before it becomes the role.
+    if (this.#buzz) {
+      const connected = await this.#buzz.connect(session.sessionId, `continuity:${role}`);
+      if (!connected.allowed) {
+        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "buzz connect failed");
+        return connected as Decision<{ provider: string; generation: number }>;
+      }
+      this.sessions.setBuzzAddress(session.sessionId, connected.value);
+    }
+
+    if (!this.#readiness) {
+      this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, "no readiness probe");
+      return deny(
+        ReasonCode.SESSION_NOT_READY,
+        "no readiness probe is attached; a failover cannot be shown to have produced a routable session",
+        { roleKey, provider: assignment.provider },
+      );
+    }
+    const ready = await this.#readiness.checkSession(session.sessionId);
+    if (!ready.allowed) {
+      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "readiness failed");
+      return ready as Decision<{ provider: string; generation: number }>;
+    }
+
     const switched = this.bindings.switchTo({
       roleKey,
       role,
@@ -353,12 +411,22 @@ export class ContinuityKernel {
   }
 
   /** §15.6 — SURVIVAL: state is preserved, diagnostics run, completion is forbidden. */
-  assertCompletionAllowed(runId: string): Decision<void> {
+  assertCompletionAllowed(runId: string, maxAgeMs = 5 * 60 * 1000): Decision<void> {
     if (this.mode() === ContinuityMode.SURVIVAL) {
       return deny(
         ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
         "production-ready completion is not permitted in SURVIVAL",
         { runId },
+      );
+    }
+    // §15.6 — a NORMAL that was computed before both providers failed is not evidence of
+    // anything. Completion requires a *current* evaluation, so the caller must refresh.
+    const ageMs = this.modeAgeMs();
+    if (ageMs > maxAgeMs) {
+      return deny(
+        ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
+        "continuity mode is stale; re-evaluate coverage before completing",
+        { runId, ageMs, maxAgeMs },
       );
     }
     return allow(ReasonCode.OK, undefined);

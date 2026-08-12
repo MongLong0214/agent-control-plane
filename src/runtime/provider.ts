@@ -72,7 +72,12 @@ export interface CapacityBucket {
 export interface CapacityReading {
   provider: string;
   sensorHealth: "HEALTHY" | "STALE" | "ERROR";
-  runtimeHealth: "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
+  /**
+   * Whether the provider's runtime actually runs. UNKNOWN is a first-class value: a quota
+   * file says nothing about the CLI, and an unprobed provider must not be routed to
+   * (§14.3 — routing has no UNKNOWN state, so UNKNOWN suspends rather than passes).
+   */
+  runtimeHealth: "HEALTHY" | "DEGRADED" | "UNAVAILABLE" | "UNKNOWN";
   observedAt: string;
   buckets: CapacityBucket[];
   source: string;

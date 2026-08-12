@@ -129,8 +129,12 @@ export class ProductionGate {
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
 
-    if (this.#continuity?.mode() === ContinuityMode.SURVIVAL) {
-      // §15.6 — SURVIVAL forbids production-ready completion outright.
+    // §15.6 — SURVIVAL forbids completion, and a mode that has not been re-evaluated
+    // recently is not evidence that we are not in SURVIVAL.
+    if (this.#continuity?.assertCompletionAllowed) {
+      const allowed = this.#continuity.assertCompletionAllowed(input.runId);
+      if (!allowed.allowed) return allowed as Decision<ProductionReadyPacket>;
+    } else if (this.#continuity?.mode() === ContinuityMode.SURVIVAL) {
       return deny(
         ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
         "continuity is in SURVIVAL; production-ready completion is not permitted",

@@ -206,8 +206,17 @@ export class ControlPlane {
       capacity: { refreshForDispatch: () => this.capacity.refreshForDispatch() },
       continuity: { mode: () => this.continuity.mode() },
     });
-    this.ceo.attach({ continuity: { mode: () => this.continuity.mode() } });
+    this.ceo.attach({
+      continuity: {
+        mode: () => this.continuity.mode(),
+        assertCompletionAllowed: (runId) => this.continuity.assertCompletionAllowed(runId),
+      },
+    });
+    this.pipeline.attach({
+      continuity: { evaluate: (reason) => this.continuity.evaluate(reason) },
+    });
     this.cto.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
+    this.continuity.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
   }
 
   private defaultAdapters(): ProviderAdapter[] {

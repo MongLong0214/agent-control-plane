@@ -55,7 +55,7 @@ const DENIED_TOOLS = [
  * STALE — never a guess. §14.3 is explicit that routing has no UNKNOWN quota, so a
  * failed sensor suspends new allocation rather than inventing a number.
  */
-const readCapacityFile = (
+export const readCapacityFile = (
   provider: string,
   file: string,
   clock: Clock,
@@ -72,7 +72,7 @@ const readCapacityFile = (
     return {
       ...base,
       sensorHealth: "ERROR",
-      runtimeHealth: "HEALTHY",
+      runtimeHealth: "UNKNOWN",
       error: "capacity file not present",
     };
   }
@@ -83,8 +83,22 @@ const readCapacityFile = (
       runtimeHealth?: CapacityReading["runtimeHealth"];
       buckets?: CapacityReading["buckets"];
     };
-    const observedAt = parsed.observedAt ?? base.observedAt;
-    const ageMs = new Date(clock.nowIso()).getTime() - new Date(observedAt).getTime();
+    // A file with no timestamp is not evidence of freshness; substituting "now" would
+    // make a static file fresh forever (§14.3).
+    if (!parsed.observedAt) {
+      return { ...base, sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", error: "no observedAt" };
+    }
+    const observedAt = parsed.observedAt;
+    const observedMs = new Date(observedAt).getTime();
+    if (!Number.isFinite(observedMs)) {
+      return {
+        ...base,
+        sensorHealth: "ERROR",
+        runtimeHealth: "UNKNOWN",
+        error: `unparsable observedAt: ${observedAt}`,
+      };
+    }
+    const ageMs = new Date(clock.nowIso()).getTime() - observedMs;
     const buckets = (parsed.buckets ?? []).map((bucket) => ({
       id: String(bucket.id),
       remainingPercent:
@@ -94,20 +108,22 @@ const readCapacityFile = (
     }));
 
     if (buckets.length === 0) {
-      return { ...base, sensorHealth: "ERROR", runtimeHealth: "HEALTHY", error: "no buckets" };
+      return { ...base, sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", error: "no buckets" };
     }
     return {
       ...base,
       observedAt,
       buckets,
       sensorHealth: ageMs > freshnessMs ? "STALE" : "HEALTHY",
-      runtimeHealth: parsed.runtimeHealth ?? "HEALTHY",
+      // A quota file says nothing about whether the CLI runs. When the file does not
+      // state runtime health, it is unknown and must be probed, not assumed.
+      runtimeHealth: parsed.runtimeHealth ?? "UNKNOWN",
     };
   } catch (err) {
     return {
       ...base,
       sensorHealth: "ERROR",
-      runtimeHealth: "HEALTHY",
+      runtimeHealth: "UNKNOWN",
       error: (err as Error).message,
     };
   }
@@ -262,13 +278,27 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   }
 
   async probeCapacity(): Promise<CapacityReading> {
-    const reading = readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs);
-    if (reading.sensorHealth === "ERROR") {
-      return { ...reading, runtimeHealth: await this.probeRuntime() };
-    }
-    return reading;
+    return resolveRuntimeHealth(
+      readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs),
+      () => this.probeRuntime(),
+    );
   }
 }
+
+/**
+ * A quota file cannot vouch for the runtime. When the sensor failed, or the file did not
+ * state runtime health, the CLI is probed — otherwise a fresh quota file would mask an
+ * unavailable provider.
+ */
+const resolveRuntimeHealth = async (
+  reading: CapacityReading,
+  probe: () => Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">,
+): Promise<CapacityReading> => {
+  if (reading.sensorHealth === "ERROR" || reading.runtimeHealth === "UNKNOWN") {
+    return { ...reading, runtimeHealth: await probe() };
+  }
+  return reading;
+};
 
 /**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-5.6 Sol at xhigh
@@ -360,11 +390,10 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   async probeCapacity(): Promise<CapacityReading> {
-    const reading = readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs);
-    if (reading.sensorHealth === "ERROR") {
-      return { ...reading, runtimeHealth: await this.probeRuntime() };
-    }
-    return reading;
+    return resolveRuntimeHealth(
+      readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs),
+      () => this.probeRuntime(),
+    );
   }
 }
 

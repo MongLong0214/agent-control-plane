@@ -7,12 +7,20 @@ import type { CapacityReading, ProviderRegistry } from "../runtime/provider.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 
 export type AllocationAdmission = "OPEN" | "CONSERVE" | "SUSPENDED";
+
+/** §14.3 — a bucket is routable only when its remaining quota is a usable number. */
+const isRoutableBucket = (
+  bucket: { remainingPercent: number | null },
+  exhaustedPercent: number,
+): boolean => typeof bucket.remainingPercent === "number" && bucket.remainingPercent > exhaustedPercent;
 export type AdvisoryCapacityState = "HEALTHY" | "CONSERVE" | "CRITICAL" | "EXHAUSTED";
 
 export interface ProviderCapacity extends CapacityReading {
   allocationAdmission: AllocationAdmission;
   advisoryState: AdvisoryCapacityState;
   ageMs: number;
+  /** Buckets whose remaining quota is unknown. §14.3 forbids routing against these. */
+  unknownBuckets: string[];
 }
 
 /** PRD §14.2 — the six points at which a refresh is mandatory. */
@@ -55,6 +63,7 @@ const DEFAULTS = {
  */
 export class CapacityMonitor {
   readonly #options: Required<CapacityOptions>;
+
 
   constructor(
     private readonly db: Db,
@@ -177,13 +186,29 @@ export class CapacityMonitor {
       .filter((c): c is ProviderCapacity => c !== null);
   }
 
-  /** Providers whose buckets advertise a capability and can still be allocated. */
+  /**
+   * Providers that can actually serve a capability right now.
+   *
+   * §14.3 — a bucket whose remaining quota is unknown is not routable. Checking only the
+   * capability string would route against `remainingPercent: null` whenever some *other*
+   * bucket happened to carry a number.
+   */
   providersFor(capability: string): ProviderCapacity[] {
     return this.all().filter(
       (c) =>
         c.allocationAdmission !== "SUSPENDED" &&
         c.runtimeHealth !== "UNAVAILABLE" &&
-        c.buckets.some((b) => b.capabilities.includes(capability)),
+        c.runtimeHealth !== "UNKNOWN" &&
+        c.buckets.some((b) => isRoutableBucket(b, this.#options.exhaustedPercent) && b.capabilities.includes(capability)),
+    );
+  }
+
+  /** Exposed so the coverage planner applies the same routability rule. */
+  isRoutableFor(capacity: ProviderCapacity, capability: string): boolean {
+    if (capacity.allocationAdmission === "SUSPENDED") return false;
+    if (capacity.runtimeHealth === "UNAVAILABLE" || capacity.runtimeHealth === "UNKNOWN") return false;
+    return capacity.buckets.some(
+      (b) => isRoutableBucket(b, this.#options.exhaustedPercent) && b.capabilities.includes(capability),
     );
   }
 
@@ -210,22 +235,53 @@ export class CapacityMonitor {
     return Math.max(0.05, Math.min(0.9, weighted / (weighted + headroom)));
   }
 
-  private enrich(reading: CapacityReading): ProviderCapacity {
-    const ageMs = Math.max(
-      0,
-      new Date(this.clock.nowIso()).getTime() - new Date(reading.observedAt).getTime(),
-    );
+  private enrich(input: CapacityReading): ProviderCapacity {
+    const observed = new Date(input.observedAt).getTime();
+    // An unparsable timestamp is not freshness evidence. NaN arithmetic would otherwise
+    // classify it HEALTHY, so it is treated as a sensor error.
+    if (!Number.isFinite(observed)) {
+      const errored: CapacityReading = {
+        ...input,
+        sensorHealth: "ERROR",
+        error: input.error ?? "capacity reading has no usable observedAt",
+      };
+      return {
+        ...errored,
+        allocationAdmission: "SUSPENDED",
+        advisoryState: "EXHAUSTED",
+        ageMs: Number.POSITIVE_INFINITY,
+        unknownBuckets: errored.buckets.map((b) => b.id),
+      };
+    }
+    const ageMs = Math.max(0, new Date(this.clock.nowIso()).getTime() - observed);
+    // The monitor decides staleness from the age it can see, so an adapter cannot label a
+    // week-old file HEALTHY.
+    const reading: CapacityReading = {
+      ...input,
+      sensorHealth:
+        input.sensorHealth === "ERROR"
+          ? "ERROR"
+          : ageMs > this.#options.freshnessMs
+            ? "STALE"
+            : input.sensorHealth,
+    };
     const remaining = reading.buckets
       .map((b) => b.remainingPercent)
       .filter((p): p is number => typeof p === "number");
     const lowest = remaining.length > 0 ? Math.min(...remaining) : null;
+    const unknownBuckets = reading.buckets
+      .filter((b) => typeof b.remainingPercent !== "number")
+      .map((b) => b.id);
 
     const admission = ((): AllocationAdmission => {
       if (reading.sensorHealth === "ERROR") return "SUSPENDED";
-      if (reading.runtimeHealth === "UNAVAILABLE") return "SUSPENDED";
+      // An unprobed runtime is not a routable one.
+      if (reading.runtimeHealth === "UNAVAILABLE" || reading.runtimeHealth === "UNKNOWN") return "SUSPENDED";
       // A stale reading remains usable only inside the grace window (§14.3).
       if (reading.sensorHealth === "STALE" && ageMs > this.#options.staleGraceMs) return "SUSPENDED";
       if (lowest === null) return "SUSPENDED";
+      // Every bucket unknown is the same as no reading at all.
+      if (unknownBuckets.length === reading.buckets.length) return "SUSPENDED";
       if (lowest <= this.#options.exhaustedPercent) return "SUSPENDED";
       if (lowest <= this.#options.conservePercent) return "CONSERVE";
       return "OPEN";
@@ -239,7 +295,7 @@ export class CapacityMonitor {
       return "HEALTHY";
     })();
 
-    return { ...reading, allocationAdmission: admission, advisoryState, ageMs };
+    return { ...reading, allocationAdmission: admission, advisoryState, ageMs, unknownBuckets };
   }
 
   private persist(reading: CapacityReading): void {

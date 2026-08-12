@@ -66,6 +66,10 @@ export interface CapacityGate {
 
 export interface ContinuityGate {
   mode(): ContinuityMode;
+  /** Refuses completion in SURVIVAL *and* when the stored mode is stale (§15.6). */
+  assertCompletionAllowed?(runId: string): Decision<void>;
+  /** Re-computes coverage. Callers in an async context must do this before completing. */
+  evaluate?(reason: string): Promise<unknown>;
 }
 
 export class RunEngine {

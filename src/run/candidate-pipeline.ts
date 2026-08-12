@@ -76,6 +76,12 @@ export class CandidatePipeline {
     private readonly telemetry: Telemetry,
   ) {}
 
+  #continuity: { evaluate?(reason: string): Promise<unknown> } | null = null;
+
+  attach(ports: { continuity?: { evaluate?(reason: string): Promise<unknown> } }): void {
+    if (ports.continuity) this.#continuity = ports.continuity;
+  }
+
   /** Freeze the candidate across every repository participating in the run (§16.2). */
   async freeze(runId: string): Promise<Decision<CandidateSnapshot>> {
     const run = this.runs.get(runId);
@@ -253,6 +259,10 @@ export class CandidatePipeline {
         ...(packet ? { review: packet } : {}),
       });
     }
+
+    // Coverage is re-evaluated here, in async context, so the gate's completion check
+    // decides on a current mode rather than one that predates a provider outage (§15.6).
+    if (this.#continuity?.evaluate) await this.#continuity.evaluate("pre-completion");
 
     // And again before the packet: the review is also asynchronous.
     const stillFreshAfterReview = await this.assertStillFresh(snapshot);

@@ -170,7 +170,9 @@ const dispatch = async (
         const payload = required(args.slice(2).join(" "), "json");
         mkdirSync(cp.config.capacityDir, { recursive: true });
         const parsed = JSON.parse(payload) as Record<string, unknown>;
-        const body = { observedAt: cp.clock.nowIso(), runtimeHealth: "HEALTHY", ...parsed };
+        // The owner publishes quota, not runtime health: an unstated runtime is probed
+        // by the adapter, never assumed healthy.
+        const body = { observedAt: cp.clock.nowIso(), runtimeHealth: "UNKNOWN", ...parsed };
         writeFileSync(join(cp.config.capacityDir, `${provider}.json`), JSON.stringify(body, null, 2), {
           mode: 0o600,
         });
