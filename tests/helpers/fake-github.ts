@@ -34,6 +34,10 @@ export class FakeGitHub implements GitHubClient {
   issues: Array<{ number: number; body: string | null; title: string }> = [];
   /** branch -> commits it contains, for the hotfix propagation compare. */
   contains = new Map<string, Set<string>>();
+  /** sha -> its parents, so the kernel's post-merge base proof has something to read. */
+  commitParents = new Map<string, string[]>();
+  /** When set, the next merge records this sha as the merge commit's first parent. */
+  driftBaseTo: string | null = null;
   readonly calls: Array<{ method: string; path: string; body?: unknown }> = [];
   mergeCount = 0;
   #nextId = 100;
@@ -87,6 +91,9 @@ export class FakeGitHub implements GitHubClient {
       pull.merged = true;
       pull.state = "closed";
       const mergeSha = `merge${this.mergeCount}`.padEnd(40, "0");
+      const firstParent = this.driftBaseTo ?? pull.base.sha;
+      this.driftBaseTo = null;
+      this.commitParents.set(mergeSha, [firstParent, pull.head.sha]);
       this.markContains(pull.base.ref, mergeSha);
       return { merged: true, sha: mergeSha } as unknown as T;
     }
@@ -114,6 +121,12 @@ export class FakeGitHub implements GitHubClient {
         (c) => c.head_sha === sha && (!name || c.name === decodeURIComponent(name)),
       );
       return { check_runs: runs } as unknown as T;
+    }
+
+    if (method === "GET" && /\/commits\/[^/]+$/.test(path)) {
+      const sha = /\/commits\/([^/]+)$/.exec(path)![1]!;
+      const parents = this.commitParents.get(sha) ?? [];
+      return { sha, parents: parents.map((p) => ({ sha: p })) } as unknown as T;
     }
 
     // --- refs and tags -----------------------------------------------------

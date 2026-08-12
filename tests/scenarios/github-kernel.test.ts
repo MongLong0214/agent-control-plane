@@ -3,7 +3,11 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
-import { GATE_CHECK_NAME, type GatePayload } from "../../src/github/github-kernel.ts";
+import {
+  GATE_CHECK_NAME,
+  NO_HUMAN_GATE_DIGEST,
+  type GatePayload,
+} from "../../src/github/github-kernel.ts";
 import { classifyBranch, validateBranchContract } from "../../src/github/branch-contract.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
@@ -11,7 +15,7 @@ import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
   type Harness,
-  applyPassingChange,
+  driveToReviewedCandidate,
   makeHarness,
   registerFixtureProject,
 } from "../helpers/harness.ts";
@@ -30,8 +34,6 @@ const CONTRACT: TaskContract = {
   references: [],
 };
 
-const HEAD = "a".repeat(40);
-const BASE = "b".repeat(40);
 const PROFILE = {
   longLived: ["main", "dev"],
   defaultBranch: "dev",
@@ -41,6 +43,11 @@ const PROFILE = {
   releaseBranchCleanup: "keep" as const,
 };
 
+/** The check the fixture project declares as its post-merge requirement (§24.7). */
+const CI_WORKFLOWS = [
+  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null },
+];
+
 interface Fixture {
   harness: Harness;
   github: FakeGitHub;
@@ -48,59 +55,75 @@ interface Fixture {
   identity: string;
   ownerSessionId: string;
   ownerBindingGeneration: number;
+  caller: { ownerSessionId: string; ownerBindingGeneration: number };
+  head: string;
+  base: string;
+  workBranch: string;
+  payload: GatePayload;
 }
 
+/**
+ * A real run driven to production-ready, so the gate payload names evidence that exists.
+ * The kernel refuses to publish a gate for digests it cannot resolve, which means these
+ * scenarios cannot be set up with placeholder digests.
+ */
 const setup = async (): Promise<Fixture> => {
   const github = new FakeGitHub();
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
 
-  const { projectId, repositoryId, identity } = await registerFixtureProject(harness);
-  const created = harness.cp.runs.create({
-    projectId,
-    executionMode: ExecutionMode.STANDARD,
-    contract: CONTRACT,
-    repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+  const driven = await driveToReviewedCandidate(harness, {
+    workBranch: "feature/F1-thing",
+    manifestOverrides: { ciWorkflows: CI_WORKFLOWS },
   });
-  if (!created.allowed) throw new Error(created.message);
-  const dispatched = await harness.cp.runs.dispatch(created.value.runId);
-  if (!dispatched.allowed) throw new Error(dispatched.message);
 
-  github.setBranch("dev", BASE);
+  // GitHub's view of the repository matches the frozen candidate.
+  github.setBranch("dev", driven.baseHead);
   github.setBranch("main", "c".repeat(40));
-  github.setBranch("feature/F1-thing", HEAD);
-  github.setBranch("task/T1-thing", HEAD);
+  github.setBranch(driven.workBranch, driven.candidateHead);
 
-  // The kernel requires a live claim on the repository before it will act.
-  harness.cp.claims.acquire({
-    runId: created.value.runId,
-    ownerSessionId: dispatched.value.ownerSessionId!,
-    ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
-    ownerRoleKey: dispatched.value.ownerRoleKey!,
-    repositoryIdentity: identity,
-    branch: "task/T1-thing",
+  // The kernel requires a live claim on the branch it is about to write.
+  const claimed = harness.cp.claims.acquire({
+    runId: driven.runId,
+    ownerSessionId: driven.ownerSessionId,
+    ownerBindingGeneration: driven.ownerBindingGeneration,
+    ownerRoleKey: harness.cp.runs.require(driven.runId).ownerRoleKey!,
+    repositoryIdentity: driven.identity,
+    branch: driven.workBranch,
   });
+  if (!claimed.allowed) throw new Error(claimed.message);
 
   return {
     harness,
     github,
-    runId: created.value.runId,
-    identity,
-    ownerSessionId: dispatched.value.ownerSessionId!,
-    ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+    runId: driven.runId,
+    identity: driven.identity,
+    ownerSessionId: driven.ownerSessionId,
+    ownerBindingGeneration: driven.ownerBindingGeneration,
+    caller: {
+      ownerSessionId: driven.ownerSessionId,
+      ownerBindingGeneration: driven.ownerBindingGeneration,
+    },
+    head: driven.candidateHead,
+    base: driven.baseHead,
+    workBranch: driven.workBranch,
+    payload: {
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      contractDigest: driven.contractDigest,
+      verificationDigest: driven.verificationDigest,
+      blindReviewDigest: driven.blindReviewDigest,
+      humanGateDigest: NO_HUMAN_GATE_DIGEST,
+      bindingGeneration: driven.ownerBindingGeneration,
+      exactHead: driven.candidateHead,
+      timestamp: "2026-08-12T00:00:00.000Z",
+    },
   };
 };
 
-const gatePayload = (fixture: Fixture, head = HEAD): GatePayload => ({
-  runId: fixture.runId,
-  candidateSnapshotDigest: "sha256:" + "1".repeat(64),
-  contractDigest: "sha256:" + "2".repeat(64),
-  verificationDigest: "sha256:" + "3".repeat(64),
-  blindReviewDigest: "sha256:" + "4".repeat(64),
-  humanGateDigest: "sha256:" + "5".repeat(64),
-  bindingGeneration: fixture.ownerBindingGeneration,
+const gatePayload = (fixture: Fixture, head = fixture.head): GatePayload => ({
+  ...fixture.payload,
   exactHead: head,
-  timestamp: "2026-08-12T00:00:00.000Z",
 });
 
 describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
@@ -169,13 +192,13 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
     const refused = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "main",
       title: "wrong target",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION);
@@ -187,7 +210,7 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
     const refused = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "ok",
       body: "",
@@ -204,7 +227,7 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
     const refused = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "ok",
       body: "",
@@ -212,7 +235,7 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
       linkedIssues: [],
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
   });
@@ -226,18 +249,18 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
 
   it("CP-S35: a same-named check from an untrusted creator or with an unknown payload is refused", async () => {
     // The candidate forges a check with the gate's exact name.
-    fixture.github.forgeGate(HEAD, `payloadDigest=sha256:${"9".repeat(64)}`, "candidate-ci");
+    fixture.github.forgeGate(fixture.head, `payloadDigest=sha256:${"9".repeat(64)}`, "candidate-ci");
 
     const prepared = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "candidate",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     if (!prepared.allowed) throw new Error(prepared.message);
 
@@ -245,8 +268,8 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
       pullNumber: prepared.value.pullNumber,
-      exactHeadSha: HEAD,
-      expectedBaseSha: BASE,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
       mergeStrategy: "merge_commit",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -259,35 +282,36 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
   });
 
   it("CP-S35: a gate whose payload the daemon did record, but under a different head, is refused", async () => {
-    const published = await fixture.harness.cp.github.gatePublish(
-      gatePayload(fixture, "e".repeat(40)),
-      fixture.identity,
-    );
+    const published = await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
     expect(published.allowed).toBe(true);
-
-    // Re-point the recorded payload's check at a different head.
-    const check = fixture.github.checkRuns.find((c) => c.name === GATE_CHECK_NAME)!;
-    check.head_sha = HEAD;
 
     const prepared = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "candidate",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     if (!prepared.allowed) throw new Error(prepared.message);
+
+    // The branch moves and the published check is re-pointed at the new head. The gate is
+    // now attached to a commit its own payload does not describe.
+    const movedHead = "e".repeat(40);
+    const check = fixture.github.checkRuns.find((c) => c.name === GATE_CHECK_NAME)!;
+    check.head_sha = movedHead;
+    const pull = fixture.github.pulls.find((p) => p.number === prepared.value.pullNumber)!;
+    pull.head.sha = movedHead;
 
     const refused = await fixture.harness.cp.github.mergeEvaluate({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
       pullNumber: prepared.value.pullNumber,
-      exactHeadSha: HEAD,
-      expectedBaseSha: BASE,
+      exactHeadSha: movedHead,
+      expectedBaseSha: fixture.base,
       mergeStrategy: "merge_commit",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -300,13 +324,13 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
     const prepared = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "candidate",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     if (!prepared.allowed) throw new Error(prepared.message);
 
@@ -314,8 +338,8 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
       pullNumber: prepared.value.pullNumber,
-      exactHeadSha: HEAD,
-      expectedBaseSha: BASE,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
       mergeStrategy: "merge_commit",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -343,13 +367,13 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     const pr = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "candidate",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     if (!pr.allowed) throw new Error(pr.message);
     return pr.value.pullNumber;
@@ -370,13 +394,13 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     const staleHead = await fixture.harness.cp.github.mergeEvaluate({
       ...base,
       exactHeadSha: "f".repeat(40),
-      expectedBaseSha: BASE,
+      expectedBaseSha: fixture.base,
     });
     expect(staleHead.reasonCode).toBe(ReasonCode.MERGE_HEAD_STALE);
 
     const staleBase = await fixture.harness.cp.github.mergeEvaluate({
       ...base,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
       expectedBaseSha: "0".repeat(40),
     });
     expect(staleBase.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
@@ -390,8 +414,8 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
       pullNumber,
-      exactHeadSha: HEAD,
-      expectedBaseSha: BASE,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
       mergeStrategy: "merge_commit" as const,
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -420,8 +444,8 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
       pullNumber,
-      exactHeadSha: HEAD,
-      expectedBaseSha: BASE,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
       mergeStrategy: "merge_commit",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -472,6 +496,7 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
       fixture.identity,
       "1.0.0",
       "1".repeat(40),
+      fixture.caller,
     );
     expect(notMerged.allowed).toBe(false);
     expect(notMerged.reasonCode).toBe(ReasonCode.RELEASE_TAG_COMMIT_NOT_ACCEPTED);
@@ -481,6 +506,7 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
       fixture.identity,
       "release-one",
       "1".repeat(40),
+      fixture.caller,
     );
     expect(badSemver.reasonCode).toBe(ReasonCode.RELEASE_TAG_SEMVER_MISMATCH);
 
@@ -490,21 +516,21 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
     const pr = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "candidate",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     if (!pr.allowed) throw new Error(pr.message);
     const merged = await fixture.harness.cp.github.mergeExecute({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
       pullNumber: pr.value.pullNumber,
-      exactHeadSha: HEAD,
-      expectedBaseSha: BASE,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
       mergeStrategy: "merge_commit",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -516,6 +542,7 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
       fixture.identity,
       "1.0.0",
       merged.value.mergeCommitSha,
+      fixture.caller,
     );
     expect(tagged.allowed).toBe(true);
 
@@ -525,6 +552,7 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
       fixture.identity,
       "1.0.0",
       merged.value.mergeCommitSha,
+      fixture.caller,
     );
     expect(replay.reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
 
@@ -535,6 +563,7 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
       fixture.identity,
       "1.0.0",
       "z".repeat(40),
+      fixture.caller,
     );
     expect(moved.allowed).toBe(false);
     expect([ReasonCode.RELEASE_TAG_DUPLICATE, ReasonCode.RELEASE_TAG_COMMIT_NOT_ACCEPTED]).toContain(
@@ -574,12 +603,15 @@ describe("issue projection", () => {
     const fixture = await setup();
     const tickets = [{ id: "T001", title: "first", body: "do the thing" }];
 
-    const first = await fixture.harness.cp.github.issueProject(fixture.runId, fixture.identity, tickets);
+    const first = await fixture.harness.cp.github.issueProject(fixture.runId, fixture.identity, tickets, fixture.caller);
     expect(first.allowed && first.value).toEqual({ created: 1, updated: 0 });
 
-    const second = await fixture.harness.cp.github.issueProject(fixture.runId, fixture.identity, [
-      { id: "T001", title: "first, retitled", body: "do the thing" },
-    ]);
+    const second = await fixture.harness.cp.github.issueProject(
+      fixture.runId,
+      fixture.identity,
+      [{ id: "T001", title: "first, retitled", body: "do the thing" }],
+      fixture.caller,
+    );
     expect(second.allowed && second.value).toEqual({ created: 0, updated: 1 });
     expect(fixture.github.issues).toHaveLength(1);
     expect(fixture.github.issues[0]?.title).toBe("first, retitled");
@@ -595,13 +627,13 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
     const pr = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "candidate",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     if (!pr.allowed) throw new Error(pr.message);
 
@@ -616,8 +648,8 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
       pullNumber: pr.value.pullNumber,
-      exactHeadSha: HEAD,
-      expectedBaseSha: BASE,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
       mergeStrategy: "merge_commit",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -633,13 +665,13 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
     const pr = await fixture.harness.cp.github.prPrepare({
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
-      head: "feature/F1-thing",
+      head: fixture.workBranch,
       base: "dev",
       title: "candidate",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: HEAD,
+      exactHeadSha: fixture.head,
     });
     if (!pr.allowed) throw new Error(pr.message);
 
@@ -647,8 +679,8 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
       runId: fixture.runId,
       repositoryIdentity: fixture.identity,
       pullNumber: pr.value.pullNumber,
-      exactHeadSha: HEAD,
-      expectedBaseSha: BASE,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
       mergeStrategy: "merge_commit",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -688,7 +720,7 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
         blindReviewDigest: "sha256:" + "4".repeat(64),
         humanGateDigest: "sha256:" + "5".repeat(64),
         bindingGeneration: 1,
-        exactHead: HEAD,
+        exactHead: "a".repeat(40),
         timestamp: "2026-08-12T00:00:00.000Z",
       },
       identity,
@@ -710,8 +742,9 @@ describe("trusted CI evidence (CP-S29)", () => {
     }),
   ];
 
+  // The fixture already applied the candidate change and froze it; re-freezing returns the
+  // same content-addressed snapshot.
   const frozen = async (fixture: Fixture) => {
-    applyPassingChange(fixture.harness.repoPath);
     const snapshot = await fixture.harness.cp.pipeline.freeze(fixture.runId);
     if (!snapshot.allowed) throw new Error(snapshot.message);
     return snapshot.value;

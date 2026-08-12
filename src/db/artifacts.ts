@@ -25,7 +25,7 @@ export interface StoredArtifact<T = unknown> {
  * written only through `putEvidence` and only by the engine that owns them (CP-HI-04,
  * CP-HI-08).
  */
-const EVIDENCE_PRODUCERS: Readonly<Record<string, string>> = {
+export const EVIDENCE_PRODUCERS: Readonly<Record<string, string>> = {
   VERIFICATION: "verification-engine",
   BLIND_REVIEW: "blind-review-gate",
   PRODUCTION_READY_PACKET: "production-gate",

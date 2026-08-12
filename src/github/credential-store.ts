@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -16,8 +17,9 @@ export interface TrustedCredential {
  * It lives outside every project repository, in a directory only the daemon user can
  * read, and it is never placed in the environment of a CTO, worker, reviewer,
  * verification subprocess, Repo Factory, Buzz or Telegram adapter. The only way to use
- * it is `withToken`, which hands the value to a callback and never returns it — so a
- * caller cannot accidentally log it or pass it onward.
+ * it is `run`, which spawns one short-lived child process with the token in that child's
+ * environment. No caller ever receives the value, so it cannot be logged, returned or
+ * forwarded — a callback that "only uses" the token is not offered.
  */
 export class TrustedCredentialStore {
   readonly #path: string;
@@ -49,13 +51,76 @@ export class TrustedCredentialStore {
   }
 
   /**
-   * Runs `fn` with the token. The token is not returned, stored on `this` beyond the
-   * process, or exposed to any other surface.
+   * Runs one child process with the credential in its environment, under the variable
+   * name the tool expects. The token is never handed to JavaScript callers, so there is
+   * no surface on which it can be logged, returned or forwarded (CP-HI-05).
+   *
+   * `env` is the *complete* environment of the child apart from the injected token: the
+   * daemon's own environment is not inherited, so nothing else leaks either.
    */
-  async withToken<T>(fn: (token: string) => Promise<T>): Promise<Decision<T>> {
+  async run(options: {
+    file: string;
+    args: readonly string[];
+    tokenEnvVar: string;
+    env: Readonly<Record<string, string>>;
+    input?: string;
+    timeoutMs?: number;
+    maxOutputBytes?: number;
+  }): Promise<Decision<{ stdout: string; stderr: string; exitCode: number | null }>> {
     const loaded = this.load();
-    if (!loaded.allowed) return loaded as Decision<T>;
-    return allow(ReasonCode.OK, await fn(loaded.value.token));
+    if (!loaded.allowed)
+      return loaded as Decision<{ stdout: string; stderr: string; exitCode: number | null }>;
+
+    const limit = options.maxOutputBytes ?? 32 * 1024 * 1024;
+    const result = await new Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; spawnError: string | null }>(
+      (resolve) => {
+        const child = spawn(options.file, [...options.args], {
+          env: { ...options.env, [options.tokenEnvVar]: loaded.value.token },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        let timedOut = false;
+        let spawnError: string | null = null;
+        child.stdout.on("data", (b: Buffer) => {
+          if (stdout.length < limit) stdout += b.toString("utf8");
+        });
+        child.stderr.on("data", (b: Buffer) => {
+          if (stderr.length < limit) stderr += b.toString("utf8");
+        });
+        const timer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGKILL");
+        }, options.timeoutMs ?? 120_000);
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          spawnError = err.message;
+          resolve({ stdout, stderr, exitCode: null, timedOut, spawnError });
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ stdout, stderr, exitCode: code, timedOut, spawnError });
+        });
+        // The body must be written *and* stdin closed, or a tool reading from `-` waits
+        // forever. Doing it here is the reason this class owns the spawn.
+        if (options.input !== undefined) child.stdin.end(options.input);
+        else child.stdin.end();
+      },
+    );
+
+    if (result.spawnError) {
+      return deny(ReasonCode.PROBE_FAILED, `could not start ${options.file}: ${result.spawnError}`, {
+        file: options.file,
+      });
+    }
+    if (result.timedOut) {
+      return deny(ReasonCode.PROBE_FAILED, `${options.file} timed out`, { file: options.file });
+    }
+    return allow(ReasonCode.OK, {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+    });
   }
 
   /** Permission audit for the doctor: the secret directory must not be world-readable. */
