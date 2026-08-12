@@ -39,12 +39,37 @@ export const Role = {
 } as const;
 export type Role = (typeof Role)[keyof typeof Role];
 
+/**
+ * CP-HI-04 classification. Exhaustive by construction: adding a role to `Role` fails to
+ * compile until it is classified, so a new role cannot quietly default to "not a producer".
+ *
+ * `QUALITY` is the blind reviewer itself. `AUTHORITY` is the CEO endpoint. Everything that
+ * contributes to the candidate — including a *non-blind* adversarial reviewer, which §4
+ * lists in the producer set — is `PRODUCER`.
+ */
+export const ROLE_CLASS: Readonly<Record<Role, "PRODUCER" | "QUALITY" | "AUTHORITY">> = {
+  [Role.PRIMARY_CTO]: "PRODUCER",
+  [Role.BOOTSTRAP_CTO]: "PRODUCER",
+  [Role.WORKER]: "PRODUCER",
+  [Role.OPTIONAL_ADVERSARIAL_REVIEWER]: "PRODUCER",
+  [Role.BLIND_REVIEWER]: "QUALITY",
+  [Role.CEO]: "AUTHORITY",
+};
+
 /** PRD §4 CP-HI-04 — the producer set a blind reviewer must not belong to. */
-export const PRODUCER_ROLES: readonly Role[] = [
-  Role.PRIMARY_CTO,
-  Role.BOOTSTRAP_CTO,
-  Role.WORKER,
-];
+export const PRODUCER_ROLES: readonly Role[] = (Object.keys(ROLE_CLASS) as Role[]).filter(
+  (role) => ROLE_CLASS[role] === "PRODUCER",
+);
+
+/** Scope each role requires. A role bound without its scope is not addressable. */
+export const ROLE_SCOPE: Readonly<Record<Role, "none" | "project" | "run" | "task">> = {
+  [Role.CEO]: "none",
+  [Role.PRIMARY_CTO]: "project",
+  [Role.BOOTSTRAP_CTO]: "run",
+  [Role.BLIND_REVIEWER]: "run",
+  [Role.OPTIONAL_ADVERSARIAL_REVIEWER]: "run",
+  [Role.WORKER]: "task",
+};
 
 export const ExecutionMode = {
   SIMPLE: "SIMPLE",

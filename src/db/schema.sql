@@ -443,7 +443,12 @@ CREATE TABLE IF NOT EXISTS outbox (
   expires_at         TEXT NOT NULL,
   created_at         TEXT NOT NULL,
   status             TEXT NOT NULL
-                       CHECK (status IN ('PENDING','SENT','ACKED','REJECTED','EXPIRED','RETARGETED')),
+                       CHECK (status IN ('PENDING','IN_FLIGHT','SENT','ACKED','REJECTED',
+                                         'EXPIRED','RETARGETED')),
+  -- §34.1 — a delivery loop *claims* a message rather than merely selecting it, so two
+  -- overlapping loops cannot both send the same envelope.
+  claim_token        TEXT,
+  claimed_at         TEXT,
   attempts           INTEGER NOT NULL DEFAULT 0,
   last_error         TEXT,
   sent_at            TEXT,

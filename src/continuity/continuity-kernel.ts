@@ -287,6 +287,9 @@ export class ContinuityKernel {
       runId: scope.runId ?? null,
       mode: assignment.reason === "preferred" ? "PREFERRED" : "FALLBACK",
       reason: `continuity failover: ${reason}`,
+      // A failover of a role that still owns live work is a takeover: the runs move to the
+      // new generation in the same transaction rather than being orphaned.
+      takeover: true,
     });
     if (!switched.allowed) {
       this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, "failover rejected");

@@ -159,16 +159,24 @@ export class BuzzAdapter {
       const session = this.sessions.get(message.targetSessionId);
       const channel = session?.buzzAddress;
       if (!channel) {
-        this.outbox.markAttemptFailed(message.messageId, "target session has no buzz address");
+        this.outbox.markAttemptFailed(
+          message.messageId,
+          message.claimToken,
+          "target session has no buzz address",
+        );
         failed.push(message.messageId);
         continue;
       }
       try {
         await this.transport.send(channel, render(message));
-        this.outbox.markSent(message.messageId);
-        delivered.push(message.messageId);
+        // Completing the delivery is a compare-and-set on the claim: if the claim was
+        // reclaimed or the message retargeted while we were sending, this fails and the
+        // message stays eligible rather than being marked sent to a revoked session.
+        const completed = this.outbox.markSent(message.messageId, message.claimToken);
+        if (completed.allowed) delivered.push(message.messageId);
+        else failed.push(message.messageId);
       } catch (err) {
-        this.outbox.markAttemptFailed(message.messageId, (err as Error).message);
+        this.outbox.markAttemptFailed(message.messageId, message.claimToken, (err as Error).message);
         failed.push(message.messageId);
       }
     }

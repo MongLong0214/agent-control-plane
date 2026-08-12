@@ -9,6 +9,8 @@ import { ArtifactStore } from "../../src/db/artifacts.ts";
 import { AuditLog } from "../../src/db/audit.ts";
 import { Db } from "../../src/db/database.ts";
 import { Outbox } from "../../src/outbox/outbox.ts";
+import { BindingRegistry } from "../../src/session/binding-registry.ts";
+import { SessionRegistry } from "../../src/session/session-registry.ts";
 import { Telemetry } from "../../src/telemetry/telemetry.ts";
 import type { Role } from "../../src/domain/types.ts";
 
@@ -20,6 +22,8 @@ export interface CoreHarness {
   audit: AuditLog;
   artifacts: ArtifactStore;
   outbox: Outbox;
+  sessions: SessionRegistry;
+  bindings: BindingRegistry;
   telemetry: Telemetry;
 }
 
@@ -27,12 +31,16 @@ export const makeCore = (): CoreHarness => {
   const db = makeDb();
   const clock = new ManualClock();
   const audit = new AuditLog(db, clock);
+  const outbox = new Outbox(db, clock, audit);
+  const sessions = new SessionRegistry(db, clock, audit);
   return {
     db,
     clock,
     audit,
     artifacts: new ArtifactStore(db, clock),
-    outbox: new Outbox(db, clock, audit),
+    outbox,
+    sessions,
+    bindings: new BindingRegistry(db, clock, audit, sessions, outbox),
     telemetry: new Telemetry(db, clock),
   };
 };

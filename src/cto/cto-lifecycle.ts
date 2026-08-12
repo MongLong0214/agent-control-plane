@@ -321,6 +321,8 @@ export class CtoLifecycle {
         ],
       );
 
+      // §10.3 — a takeover: the switch repoints every run the dead generation owned inside
+      // the same transaction, so no run is left pinned to a revoked generation.
       const switched = this.bindings.switchTo({
         roleKey,
         role: Role.PRIMARY_CTO,
@@ -328,15 +330,12 @@ export class CtoLifecycle {
         projectId,
         mode: "FALLBACK",
         reason: `recovery takeover: ${reason}`,
+        takeover: true,
       });
       if (!switched.allowed) return switched;
 
       if (current) {
         this.sessions.transition(current.sessionId, SessionLifecycle.ERROR, "recovery takeover");
-        // §10.3 — every run the dead generation owned is repointed at the acting CTO.
-        for (const run of this.runs.activeRunsOwnedBy(current.sessionId)) {
-          this.runs.reassignOwner(run.runId, switched.value, `recovery takeover: ${reason}`);
-        }
       }
 
       this.audit.record({

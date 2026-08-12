@@ -1,6 +1,8 @@
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
+import { randomUUID } from "node:crypto";
+
 import { newMessageId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -26,7 +28,7 @@ export interface EnqueueInput {
 export interface OutboxMessage extends FencedEnvelope {
   kind: MessageKind;
   payload: unknown;
-  status: "PENDING" | "SENT" | "ACKED" | "REJECTED" | "EXPIRED" | "RETARGETED";
+  status: "PENDING" | "IN_FLIGHT" | "SENT" | "ACKED" | "REJECTED" | "EXPIRED" | "RETARGETED";
   idempotencyKey: string;
   attempts: number;
   createdAt: string;
@@ -108,14 +110,19 @@ export class Outbox {
   }
 
   /**
-   * Messages that are still deliverable right now: pending, unexpired, and addressed
-   * to the generation that is currently ACTIVE for their role key.
+   * Atomically claims deliverable messages (§34.1).
+   *
+   * A read-only SELECT would let two overlapping delivery loops pick the same envelope and
+   * both send it. Claiming stamps a token and moves the row to IN_FLIGHT inside one
+   * transaction, so a second loop sees nothing to take.
    */
-  claimDeliverable(limit = 50): OutboxMessage[] {
-    const now = this.clock.nowIso();
-    this.expireOverdue();
-    return this.db
-      .all<RawOutbox>(
+  claimDeliverable(limit = 50): Array<OutboxMessage & { claimToken: string }> {
+    return this.db.tx(() => {
+      const now = this.clock.nowIso();
+      this.expireOverdue();
+      this.reclaimStaleLeases();
+
+      const rows = this.db.all<RawOutbox>(
         `SELECT o.* FROM outbox o
            JOIN assignments a ON a.role_key = o.role_key AND a.status = 'ACTIVE'
           WHERE o.status = 'PENDING'
@@ -124,22 +131,61 @@ export class Outbox {
           ORDER BY o.created_at
           LIMIT ?`,
         [now, limit],
-      )
-      .map(hydrate);
+      );
+
+      const claimed: Array<OutboxMessage & { claimToken: string }> = [];
+      for (const row of rows) {
+        const token = `clm_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+        const updated = this.db.run(
+          `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = ?, claimed_at = ?
+            WHERE message_id = ? AND status = 'PENDING'`,
+          [token, now, row.message_id],
+        );
+        // Compare-and-set: another loop may have taken it between the select and here.
+        if (updated.changes === 1) claimed.push({ ...hydrate(row), claimToken: token });
+      }
+      return claimed;
+    });
   }
 
-  markSent(messageId: string): void {
-    this.db.run(
-      `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = attempts + 1 WHERE message_id = ?`,
-      [this.clock.nowIso(), messageId],
-    );
+  /** A claim whose holder died must return to PENDING rather than stay stuck IN_FLIGHT. */
+  reclaimStaleLeases(leaseMs = 5 * 60 * 1000): number {
+    return this.db.run(
+      `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL
+        WHERE status = 'IN_FLIGHT' AND claimed_at <= ?`,
+      [new Date(new Date(this.clock.nowIso()).getTime() - leaseMs).toISOString()],
+    ).changes;
   }
 
-  markAttemptFailed(messageId: string, error: string): void {
-    this.db.run(
-      `UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE message_id = ?`,
-      [error.slice(0, 500), messageId],
-    );
+  /** Only the holder of the current claim may complete a delivery. */
+  markSent(messageId: string, claimToken: string): Decision<void> {
+    const changes = this.db.run(
+      `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = attempts + 1,
+                         claim_token = NULL, claimed_at = NULL
+        WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?`,
+      [this.clock.nowIso(), messageId, claimToken],
+    ).changes;
+    if (changes !== 1) {
+      return deny(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, "claim is no longer held", {
+        messageId,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  markAttemptFailed(messageId: string, claimToken: string, error: string): Decision<void> {
+    const changes = this.db.run(
+      `UPDATE outbox SET status = 'PENDING', attempts = attempts + 1, last_error = ?,
+                         claim_token = NULL, claimed_at = NULL
+        WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?`,
+      [error.slice(0, 500), messageId, claimToken],
+    ).changes;
+    if (changes !== 1) {
+      return deny(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, "claim is no longer held", {
+        messageId,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /**
@@ -147,8 +193,56 @@ export class Outbox {
    * audit-only and does not change state (§15.7, §34.4).
    */
   acknowledge(messageId: string, fromSessionId: string, generation: number): Decision<void> {
+    return this.db.tx(() => this.acknowledgeInTx(messageId, fromSessionId, generation));
+  }
+
+  private acknowledgeInTx(
+    messageId: string,
+    fromSessionId: string,
+    generation: number,
+  ): Decision<void> {
     const row = this.db.get<RawOutbox>(`SELECT * FROM outbox WHERE message_id = ?`, [messageId]);
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown message", { messageId });
+
+    // §15.7 / §34.4 — matching the stored envelope is not enough. A late ACK from a
+    // generation that has since been revoked is audit-only, as is an ACK for a message
+    // that has expired or was already rejected.
+    const current = this.db.get<{ binding_generation: number }>(
+      `SELECT binding_generation FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+      [row.role_key],
+    );
+    const staleGeneration = !current || current.binding_generation !== generation;
+    const ineligible =
+      row.status === "REJECTED" ||
+      row.status === "EXPIRED" ||
+      row.status === "ACKED" ||
+      row.expires_at <= this.clock.nowIso();
+
+    if (staleGeneration || ineligible) {
+      this.audit.record({
+        kind: "OUTBOX_ACK_REJECTED",
+        reasonCode:
+          row.status === "EXPIRED" || row.expires_at <= this.clock.nowIso()
+            ? ReasonCode.OUTBOX_EXPIRED
+            : ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+        runId: row.run_id,
+        sessionId: fromSessionId,
+        roleKey: row.role_key,
+        evidence: {
+          messageId,
+          status: row.status,
+          ackGeneration: generation,
+          currentGeneration: current?.binding_generation ?? null,
+        },
+      });
+      return deny(
+        ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+        staleGeneration
+          ? "ack came from a generation that is no longer active"
+          : `message is ${row.status} and cannot be acknowledged`,
+        { messageId, status: row.status, ackGeneration: generation },
+      );
+    }
 
     if (row.target_session_id !== fromSessionId || row.binding_generation !== generation) {
       this.audit.record({

@@ -4,12 +4,24 @@ import { newAssignmentId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { PRODUCER_ROLES, type Role, type RoleBinding, SessionLifecycle } from "../domain/types.ts";
+import {
+  PRODUCER_ROLES,
+  ROLE_SCOPE,
+  type Role,
+  type RoleBinding,
+  SessionLifecycle,
+  roleKeyFor,
+} from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { SessionRegistry } from "./session-registry.ts";
 
 export interface BindInput {
-  roleKey: string;
+  /**
+   * Optional. The key is *derived* from the role and its scope; supplying one that does
+   * not match is refused, because a mismatched key routes traffic to a session whose
+   * role-based checks say something different.
+   */
+  roleKey?: string;
   role: Role;
   sessionId: string;
   projectId?: string | null;
@@ -37,8 +49,75 @@ export class BindingRegistry {
     private readonly outbox: Outbox,
   ) {}
 
+  /**
+   * Derives the canonical role key and rejects a caller-supplied key or scope that does
+   * not match it. Without this, `bind({roleKey: 'PRIMARY_CTO:P', role: 'CEO'})` would be
+   * persisted: key consumers would treat the session as project P's CTO while role-based
+   * checks saw a CEO.
+   */
+  private resolveRoleKey(input: BindInput): Decision<string> {
+    const scope = ROLE_SCOPE[input.role];
+    const required: Record<typeof scope, string | null | undefined> = {
+      none: null,
+      project: input.projectId,
+      run: input.runId,
+      task: input.taskId,
+    };
+    if (scope !== "none" && !required[scope]) {
+      return deny(ReasonCode.INVALID_ARGUMENT, `role ${input.role} requires a ${scope} scope`, {
+        role: input.role,
+        scope,
+      });
+    }
+    // Extraneous scope is refused too: a WORKER carrying a projectId is addressable two
+    // ways, and the two ways can disagree.
+    const supplied = { project: input.projectId, run: input.runId, task: input.taskId };
+    for (const [name, value] of Object.entries(supplied)) {
+      if (!value) continue;
+      if (name === scope) continue;
+      // A run-scoped role may legitimately record its project for reporting.
+      if (scope === "run" && name === "project") continue;
+      if (scope === "task" && (name === "run" || name === "project")) continue;
+      return deny(ReasonCode.INVALID_ARGUMENT, `role ${input.role} must not carry a ${name} scope`, {
+        role: input.role,
+        scope,
+        extraneous: name,
+      });
+    }
+
+    const derived = roleKeyFor(input.role, {
+      projectId: input.projectId ?? null,
+      runId: input.runId ?? null,
+      taskId: input.taskId ?? null,
+    });
+    if (input.roleKey && input.roleKey !== derived) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "supplied role key does not match role and scope", {
+        supplied: input.roleKey,
+        derived,
+      });
+    }
+
+    // A role key's semantic role must not change across generations.
+    const previous = this.db.get<{ role: Role }>(
+      `SELECT role FROM assignments WHERE role_key = ? ORDER BY binding_generation DESC LIMIT 1`,
+      [derived],
+    );
+    if (previous && previous.role !== input.role) {
+      return deny(ReasonCode.CONFLICT, "role key already belongs to a different role", {
+        roleKey: derived,
+        existingRole: previous.role,
+        requestedRole: input.role,
+      });
+    }
+
+    return allow(ReasonCode.OK, derived);
+  }
+
   bind(input: BindInput): Decision<RoleBinding> {
     return this.db.tx(() => {
+      const key = this.resolveRoleKey(input);
+      if (!key.allowed) return key as Decision<RoleBinding>;
+      const roleKey = key.value;
       const session = this.sessions.get(input.sessionId);
       if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId: input.sessionId });
       if (
@@ -51,9 +130,9 @@ export class BindingRegistry {
         });
       }
 
-      if (this.active(input.roleKey)) {
+      if (this.active(roleKey)) {
         return deny(ReasonCode.BINDING_ALREADY_ACTIVE, "role key already has an active binding", {
-          roleKey: input.roleKey,
+          roleKey,
         });
       }
 
@@ -63,14 +142,14 @@ export class BindingRegistry {
         if (!independence.allowed) return independence as Decision<RoleBinding>;
       }
 
-      const generation = this.nextGeneration(input.roleKey);
+      const generation = this.nextGeneration(roleKey);
       const assignmentId = newAssignmentId();
       this.db.run(
         `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id,
                                   session_id, session_incarnation, binding_generation, mode, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
         [
-          assignmentId, input.roleKey, input.role, input.projectId ?? null, input.runId ?? null,
+          assignmentId, roleKey, input.role, input.projectId ?? null, input.runId ?? null,
           input.taskId ?? null, input.sessionId, session.incarnation, generation,
           input.mode ?? "PREFERRED", this.clock.nowIso(),
         ],
@@ -78,13 +157,13 @@ export class BindingRegistry {
 
       this.audit.record({
         kind: "BINDING_CREATED",
-        roleKey: input.roleKey,
+        roleKey,
         sessionId: input.sessionId,
         projectId: input.projectId ?? null,
         runId: input.runId ?? null,
         evidence: { role: input.role, generation, mode: input.mode ?? "PREFERRED" },
       });
-      return allow(ReasonCode.OK, this.require(input.roleKey));
+      return allow(ReasonCode.OK, this.require(roleKey));
     });
   }
 
@@ -93,9 +172,34 @@ export class BindingRegistry {
    * fencing the outbox all happen in one transaction; a crash between them would leave
    * messages addressed to a revoked generation.
    */
-  switchTo(input: BindInput & { reason: string }): Decision<RoleBinding> {
+  switchTo(input: BindInput & { reason: string; takeover?: boolean }): Decision<RoleBinding> {
     return this.db.tx(() => {
-      const current = this.active(input.roleKey);
+      const key = this.resolveRoleKey(input);
+      if (!key.allowed) return key as Decision<RoleBinding>;
+      const roleKey = key.value;
+      const current = this.active(roleKey);
+
+      // A plain switch must not orphan work. If the outgoing binding still owns live runs,
+      // those runs would be pinned to a revoked generation: the old session is refused
+      // because its generation is gone, and the new one because the run still names the
+      // old tuple. Either drain first, or ask for an explicit takeover.
+      if (current) {
+        const orphaned = this.db.all<{ run_id: string }>(
+          `SELECT run_id FROM runs
+            WHERE owner_session_id = ? AND owner_binding_generation = ?
+              AND state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW',
+                            'REVISION_REQUIRED','AWAITING_HUMAN')`,
+          [current.sessionId, current.bindingGeneration],
+        );
+        if (orphaned.length > 0 && !input.takeover) {
+          return deny(
+            ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS,
+            "the outgoing binding still owns live runs; drain them or request a takeover",
+            { roleKey, runs: orphaned.map((r) => r.run_id) },
+          );
+        }
+      }
+
       const session = this.sessions.get(input.sessionId);
       if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId: input.sessionId });
       if (
@@ -119,21 +223,38 @@ export class BindingRegistry {
         );
       }
 
-      const generation = this.nextGeneration(input.roleKey);
+      const generation = this.nextGeneration(roleKey);
       this.db.run(
         `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id,
                                   session_id, session_incarnation, binding_generation, mode, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
         [
-          newAssignmentId(), input.roleKey, input.role, input.projectId ?? null, input.runId ?? null,
+          newAssignmentId(), roleKey, input.role, input.projectId ?? null, input.runId ?? null,
           input.taskId ?? null, input.sessionId, session.incarnation, generation,
           input.mode ?? "PREFERRED", this.clock.nowIso(),
         ],
       );
 
+      // A takeover repoints the live runs in the *same* transaction, so a crash cannot
+      // leave a run pinned to a revoked generation.
+      let repointed = 0;
+      if (current && input.takeover) {
+        repointed = this.db.run(
+          `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
+                           owner_session_incarnation = ?, owner_role_key = ?
+            WHERE owner_session_id = ? AND owner_binding_generation = ?
+              AND state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW',
+                            'REVISION_REQUIRED','AWAITING_HUMAN')`,
+          [
+            input.sessionId, generation, session.incarnation, roleKey,
+            current.sessionId, current.bindingGeneration,
+          ],
+        ).changes;
+      }
+
       const fence = current
         ? this.outbox.retargetOrReject(
-            input.roleKey,
+            roleKey,
             current.bindingGeneration,
             generation,
             input.sessionId,
@@ -142,7 +263,7 @@ export class BindingRegistry {
 
       this.audit.record({
         kind: "BINDING_SWITCHED",
-        roleKey: input.roleKey,
+        roleKey,
         sessionId: input.sessionId,
         runId: input.runId ?? null,
         projectId: input.projectId ?? null,
@@ -153,10 +274,12 @@ export class BindingRegistry {
           toGeneration: generation,
           retargeted: fence.retargeted.length,
           rejected: fence.rejected.length,
+          runsRepointed: repointed,
+          takeover: Boolean(input.takeover),
         },
       });
 
-      return allow(ReasonCode.OK, this.require(input.roleKey));
+      return allow(ReasonCode.OK, this.require(roleKey));
     });
   }
 
@@ -280,6 +403,35 @@ export class BindingRegistry {
    * primary CTO and its blind reviewer.
    */
   assertFinalCeoIndependence(runId: string, ceoSessionId: string): Decision<void> {
+    // A normal primary CTO binding is project-scoped with run_id NULL, so byRun alone
+    // never sees it — and that is exactly the session most likely to be the run's CTO.
+    const run = this.db.get<{ project_id: string | null; owner_session_id: string | null }>(
+      `SELECT project_id, owner_session_id FROM runs WHERE run_id = ?`,
+      [runId],
+    );
+    if (run?.owner_session_id === ceoSessionId) {
+      return deny(
+        ReasonCode.FINAL_CEO_SESSION_NOT_INDEPENDENT,
+        "final CEO session is the run's pinned owner",
+        { runId, ceoSessionId },
+      );
+    }
+
+    const projectCto = run?.project_id
+      ? this.db.get<{ session_id: string }>(
+          `SELECT session_id FROM assignments
+            WHERE project_id = ? AND role IN ('PRIMARY_CTO','BOOTSTRAP_CTO') AND session_id = ?`,
+          [run.project_id, ceoSessionId],
+        )
+      : undefined;
+    if (projectCto) {
+      return deny(
+        ReasonCode.FINAL_CEO_SESSION_NOT_INDEPENDENT,
+        "final CEO session has held the project's CTO role",
+        { runId, ceoSessionId, projectId: run?.project_id ?? null },
+      );
+    }
+
     const conflicting = this.byRun(runId).filter(
       (b) =>
         (b.role === "PRIMARY_CTO" || b.role === "BOOTSTRAP_CTO" || b.role === "BLIND_REVIEWER") &&
