@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { basename, isAbsolute } from "node:path";
+import { closeSync, fstatSync, openSync, statSync, type Stats } from "node:fs";
+import { basename, dirname, isAbsolute } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
@@ -82,6 +83,13 @@ export interface GuardRequest {
   targetPath?: string | null;
   /** Normalized remote identity, required for every remote operation. */
   repositoryIdentity?: string | null;
+  /**
+   * The branch this operation mutates. GIT_BRANCH must always name one because the
+   * checkout branch says nothing about the branch the command will change.
+   */
+  targetBranch?: string | null;
+  /** The worktree this operation mutates when it cannot be recovered from the path. */
+  targetWorktreeId?: string | null;
   /** Managed run identity claimed by the caller. */
   runId?: string | null;
   sessionId?: string | null;
@@ -96,12 +104,23 @@ export interface GuardGrant {
   classification: "DIRECT" | "MANAGED";
   operation: GuardOperation;
   runId: string | null;
+  sessionId: string | null;
   roleKey: string | null;
   bindingGeneration: number | null;
   repositoryIdentity: string | null;
   resolvedPath: string | null;
+  targetBranch: string | null;
+  targetWorktreeId: string | null;
   issuedAt: string;
   expiresAt: string;
+}
+
+/** The effect is invoked only after the grant has been revalidated and fenced. */
+export type GuardEffect<T> = (context: { readonly grant: GuardGrant }) => T | Promise<T>;
+
+export interface ManagedWriteGuardOptions {
+  /** Explicit independent-artifact roots. An empty list permits no DIRECT mutations. */
+  directWriteRoots?: readonly string[];
 }
 
 interface RunAuthRow {
@@ -116,13 +135,42 @@ interface RunAuthRow {
 interface ParticipantRow {
   identity: string;
   checkout_path: string;
-  work_branch: string | null;
-  worktree_id: string | null;
+}
+
+interface TargetResource {
+  branch: string | null;
+  worktreeId: string | null;
+  relativePath: string | null;
+}
+
+interface HeldGrant {
+  facts: Readonly<GuardGrant>;
+  request: Readonly<GuardRequest>;
+}
+
+interface ClaimRow {
+  claim_id: string;
+  expires_at: string;
+}
+
+interface NodeIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface FilesystemFence {
+  requestedPath: string;
+  requestedParent: string;
+  resolvedPath: string;
+  parentFd: number;
+  parent: NodeIdentity;
+  toplevel: string | null;
+  toplevelFd: number | null;
+  toplevelIdentity: NodeIdentity | null;
 }
 
 /** A grant is short-lived and single use; see `consume`. */
 const CLAIM_LEASE_EXTENSION_MS = 5 * 60 * 1000;
-
 const GRANT_TTL_MS = 60_000;
 
 /**
@@ -131,33 +179,35 @@ const GRANT_TTL_MS = 60_000;
  * The guard inspects the operation and the resolved target itself. Hermes' own
  * DIRECT/MANAGED judgement arrives as `claimedClassification`, is written to the audit
  * record, and never influences the decision.
- *
- * Authorisation is deliberately two-phase. `evaluate` decides; `consume` re-decides
- * immediately before the side effect and burns the grant. A decision that is merely
- * *held* is worthless, because a binding can be revoked or a run can leave ACTIVE in the
- * window between deciding and writing (§15.7).
  */
 export class ManagedWriteGuard {
-  readonly #grants = new Map<
-    string,
-    { grant: GuardGrant; request: GuardRequest; consumed: boolean }
-  >();
+  readonly #grants = new Map<string, HeldGrant>();
+  readonly #inFlight = new Map<string, HeldGrant>();
+  readonly #directWriteRoots: readonly string[];
 
   constructor(
     private readonly db: Db,
     private readonly probe: WorkspaceProbe,
     private readonly audit: AuditLog,
     private readonly clock: Clock,
-  ) {}
+    options: ManagedWriteGuardOptions = {},
+  ) {
+    const roots = options.directWriteRoots ?? [];
+    if (roots.some((root) => !isAbsolute(root))) {
+      throw new Error("direct write roots must be absolute paths");
+    }
+    this.#directWriteRoots = Object.freeze([...new Set(roots.map((root) => this.probe.canonical(root)))]);
+  }
 
   evaluate(request: GuardRequest): Decision<GuardGrant> {
     const decision = this.decide(request);
-    if (decision.allowed && decision.value.classification === "MANAGED") {
-      this.#grants.set(decision.value.grantId, { grant: decision.value, request, consumed: false });
-    }
+    const exposed = decision.allowed
+      ? this.holdOrExpose(request, decision)
+      : decision;
+
     this.audit.record({
       kind: "MANAGED_WRITE_GUARD",
-      reasonCode: decision.reasonCode,
+      reasonCode: exposed.reasonCode,
       runId: request.runId ?? null,
       sessionId: request.sessionId ?? null,
       actor: request.actor ?? null,
@@ -165,111 +215,84 @@ export class ManagedWriteGuard {
         operation: request.operation,
         targetPath: request.targetPath ?? null,
         repositoryIdentity: request.repositoryIdentity ?? null,
+        targetBranch: request.targetBranch ?? null,
+        targetWorktreeId: request.targetWorktreeId ?? null,
         claimedClassification: request.claimedClassification ?? null,
-        allowed: decision.allowed,
-        grantId: decision.allowed ? decision.value.grantId : null,
-        ...decision.evidence,
+        allowed: exposed.allowed,
+        grantId: exposed.allowed ? exposed.value.grantId : null,
+        ...exposed.evidence,
       },
     });
-    return decision;
+    return exposed;
   }
 
   /**
-   * Re-validates a grant and burns it. The caller must invoke this immediately before the
-   * write; a grant that is expired, already used, or no longer authorised is refused.
+   * Legacy two-phase API. New side-effecting adapters should use `authorize`, which keeps
+   * the grant in-flight until the effect has settled.
    */
   consume(grantId: string): Decision<GuardGrant> {
-    const held = this.#grants.get(grantId);
-    if (!held) {
-      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "unknown or already-expired grant", {
-        grantId,
-      });
+    const active = this.activate(grantId);
+    if (!active.allowed) return active as Decision<GuardGrant>;
+
+    this.auditConsumed(active.value.facts);
+    return allow(ReasonCode.WRITE_ALLOWED, this.publicGrant(active.value.facts));
+  }
+
+  /**
+   * Performs the side effect inside the authorisation lifecycle. Both authority and the
+   * filesystem identity are checked immediately before and after the effect, so a racing
+   * revocation or ancestor replacement is a refusal rather than a successful write.
+   */
+  async authorize<T>(request: GuardRequest, effect: GuardEffect<T>): Promise<Decision<T>> {
+    const granted = this.evaluate(request);
+    if (!granted.allowed) return granted as Decision<T>;
+
+    const active = this.activate(granted.value.grantId);
+    if (!active.allowed) return active as Decision<T>;
+
+    const held = active.value;
+    const prepared = this.captureFilesystemFence(held);
+    if (!prepared.allowed) {
+      this.recordRevocation(held, granted.value.grantId, prepared, "before effect");
+      return prepared as Decision<T>;
     }
-    if (held.consumed) {
-      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "grant has already been consumed", {
-        grantId,
-      });
+
+    const fence = prepared.value;
+    this.#inFlight.set(held.facts.grantId, held);
+    const immediatelyBeforeEffect = this.verifyFilesystemFence(held, fence);
+    if (!immediatelyBeforeEffect.allowed) {
+      this.#inFlight.delete(held.facts.grantId);
+      this.releaseFilesystemFence(fence);
+      this.recordRevocation(held, held.facts.grantId, immediatelyBeforeEffect, "before effect");
+      return immediatelyBeforeEffect as Decision<T>;
     }
-    if (this.clock.nowIso() >= held.grant.expiresAt) {
-      this.#grants.delete(grantId);
-      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "grant expired before the write", {
-        grantId,
-        expiresAt: held.grant.expiresAt,
+
+    let result: T | undefined;
+    let effectError: unknown;
+    let settled: Decision<void>;
+    try {
+      result = await effect({ grant: this.publicGrant(held.facts) });
+    } catch (error) {
+      effectError = error;
+    } finally {
+      settled = this.settle(held, fence);
+      this.#inFlight.delete(held.facts.grantId);
+      this.releaseFilesystemFence(fence);
+    }
+
+    if (!settled.allowed) {
+      this.recordRevocation(held, held.facts.grantId, settled, "after effect");
+      return settled as Decision<T>;
+    }
+    if (effectError) {
+      return deny(ReasonCode.INTERNAL_ERROR, "authorised write effect failed", {
+        grantId: held.facts.grantId,
+        operation: held.facts.operation,
       });
     }
 
-    // The authority may have moved since the grant was issued.
-    const fresh = this.decide(held.request);
-    if (!fresh.allowed) {
-      this.#grants.delete(grantId);
-      this.audit.record({
-        kind: "MANAGED_WRITE_GUARD_REVOKED",
-        reasonCode: fresh.reasonCode,
-        runId: held.request.runId ?? null,
-        sessionId: held.request.sessionId ?? null,
-        evidence: { grantId, ...fresh.evidence },
-      });
-      return fresh;
-    }
-    if (fresh.value.bindingGeneration !== held.grant.bindingGeneration) {
-      this.#grants.delete(grantId);
-      return deny(
-        ReasonCode.WRITE_BINDING_GENERATION_STALE,
-        "binding generation changed between authorisation and write",
-        {
-          grantId,
-          authorised: held.grant.bindingGeneration,
-          current: fresh.value.bindingGeneration,
-        },
-      );
-    }
-
-    // §23.2 — the *write* needs a claim this run holds, not merely the absence of someone
-    // else's. A claim is what makes the window between this decision and the write safe:
-    // while it is held, the unique claim indexes stop another run from taking the same
-    // branch, worktree or path.
-    if (held.grant.repositoryIdentity && held.grant.runId) {
-      const lease = this.ownClaim(held.grant.runId, held.grant.repositoryIdentity);
-      if (!lease) {
-        this.#grants.delete(grantId);
-        this.audit.record({
-          kind: "MANAGED_WRITE_GUARD_REVOKED",
-          reasonCode: ReasonCode.WRITE_PATH_NOT_CLAIMED,
-          runId: held.grant.runId,
-          evidence: {
-            grantId,
-            repositoryIdentity: held.grant.repositoryIdentity,
-            reason: "no live claim on the repository at write time",
-          },
-        });
-        return deny(
-          ReasonCode.WRITE_PATH_NOT_CLAIMED,
-          "the run holds no live claim on this repository, so the write cannot be fenced",
-          { grantId, runId: held.grant.runId, repositoryIdentity: held.grant.repositoryIdentity },
-        );
-      }
-      // Extend the lease so it cannot lapse while the write is in flight.
-      this.db.run(
-        `UPDATE resource_claims SET expires_at = ? WHERE claim_id = ? AND status = 'HELD'`,
-        [isoPlus(this.clock.nowIso(), CLAIM_LEASE_EXTENSION_MS), lease],
-      );
-    }
-
-    held.consumed = true;
-    this.#grants.delete(grantId);
-    this.audit.record({
-      kind: "MANAGED_WRITE_GUARD_CONSUMED",
-      reasonCode: ReasonCode.WRITE_ALLOWED,
-      runId: held.grant.runId,
-      roleKey: held.grant.roleKey,
-      evidence: {
-        grantId,
-        operation: held.grant.operation,
-        repositoryIdentity: held.grant.repositoryIdentity,
-        resolvedPath: held.grant.resolvedPath,
-      },
-    });
-    return allow(ReasonCode.WRITE_ALLOWED, held.grant);
+    this.auditConsumed(held.facts);
+    return allow(ReasonCode.WRITE_ALLOWED, result as T);
   }
 
   /** Drops grants past their expiry. Called by the watchdog and on each evaluate. */
@@ -277,7 +300,7 @@ export class ManagedWriteGuard {
     const now = this.clock.nowIso();
     let dropped = 0;
     for (const [id, held] of this.#grants) {
-      if (now >= held.grant.expiresAt) {
+      if (now >= held.facts.expiresAt) {
         this.#grants.delete(id);
         dropped += 1;
       }
@@ -286,6 +309,372 @@ export class ManagedWriteGuard {
   }
 
   // -------------------------------------------------------------------------
+
+  private holdOrExpose(request: GuardRequest, decision: Decision<GuardGrant>): Decision<GuardGrant> {
+    if (!decision.allowed) return decision;
+    if (READ_OPERATIONS.has(decision.value.operation)) {
+      return allow(decision.reasonCode, this.publicGrant(decision.value), decision.evidence);
+    }
+
+    const facts = this.freezeGrant(decision.value);
+    const snapshot = Object.freeze({
+      operation: facts.operation,
+      targetPath: request.targetPath ?? null,
+      repositoryIdentity: facts.repositoryIdentity,
+      targetBranch: facts.targetBranch,
+      targetWorktreeId: facts.targetWorktreeId,
+      runId: facts.runId,
+      sessionId: facts.sessionId,
+      bindingGeneration: facts.bindingGeneration,
+      claimedClassification: request.claimedClassification ?? null,
+      actor: request.actor ?? null,
+    });
+    this.#grants.set(facts.grantId, { facts, request: snapshot });
+    return allow(decision.reasonCode, this.publicGrant(facts), decision.evidence);
+  }
+
+  private activate(grantId: string): Decision<HeldGrant> {
+    const held = this.#grants.get(grantId);
+    if (!held) {
+      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "unknown or already-expired grant", { grantId });
+    }
+    if (this.clock.nowIso() >= held.facts.expiresAt) {
+      this.#grants.delete(grantId);
+      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "grant expired before the write", {
+        grantId,
+        expiresAt: held.facts.expiresAt,
+      });
+    }
+
+    const revalidated = this.revalidate(held);
+    if (!revalidated.allowed) {
+      this.#grants.delete(grantId);
+      this.recordRevocation(held, grantId, revalidated, "before effect");
+      return revalidated as Decision<HeldGrant>;
+    }
+    this.#grants.delete(grantId);
+    return allow(ReasonCode.WRITE_ALLOWED, held);
+  }
+
+  private settle(held: HeldGrant, fence: FilesystemFence | null): Decision<void> {
+    if (this.#inFlight.get(held.facts.grantId) !== held) {
+      return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "in-flight write authorisation was not retained", {
+        grantId: held.facts.grantId,
+      });
+    }
+    const filesystem = this.verifyFilesystemFence(held, fence);
+    if (!filesystem.allowed) return filesystem;
+    return this.revalidate(held);
+  }
+
+  private revalidate(held: HeldGrant): Decision<void> {
+    const fresh = this.decide(held.request);
+    if (!fresh.allowed) return fresh as Decision<void>;
+    if (!this.sameAuthorisationFacts(held.facts, fresh.value)) {
+      return deny(
+        ReasonCode.WRITE_BINDING_GENERATION_STALE,
+        "authorisation facts changed between evaluation and the write",
+        {
+          grantId: held.facts.grantId,
+          authorised: this.authorisationFacts(held.facts),
+          current: this.authorisationFacts(fresh.value),
+        },
+      );
+    }
+    return this.renewRequiredClaims(held.facts);
+  }
+
+  private sameAuthorisationFacts(left: GuardGrant, right: GuardGrant): boolean {
+    const a = this.authorisationFacts(left);
+    const b = this.authorisationFacts(right);
+    return Object.entries(a).every(([key, value]) => b[key] === value);
+  }
+
+  private authorisationFacts(grant: GuardGrant): Record<string, string | number | null> {
+    return {
+      runId: grant.runId,
+      sessionId: grant.sessionId,
+      roleKey: grant.roleKey,
+      bindingGeneration: grant.bindingGeneration,
+      operation: grant.operation,
+      repositoryIdentity: grant.repositoryIdentity,
+      resolvedPath: grant.resolvedPath,
+      targetBranch: grant.targetBranch,
+      targetWorktreeId: grant.targetWorktreeId,
+    };
+  }
+
+  private renewRequiredClaims(grant: GuardGrant): Decision<void> {
+    if (!grant.repositoryIdentity || !grant.runId) return allow(ReasonCode.OK, undefined);
+
+    return this.db.tx(() => {
+      const rows = this.requiredClaims(grant);
+      if (!rows.allowed) return rows as Decision<void>;
+      const required = rows.value;
+      if (required.length === 0) {
+        return deny(
+          ReasonCode.WRITE_PATH_NOT_CLAIMED,
+          "the run holds no live claim on this repository, so the write cannot be fenced",
+          { grantId: grant.grantId, runId: grant.runId, repositoryIdentity: grant.repositoryIdentity },
+        );
+      }
+
+      const deadline = isoPlus(this.clock.nowIso(), CLAIM_LEASE_EXTENSION_MS);
+      for (const claim of required) {
+        const updated = this.db.run(
+          `UPDATE resource_claims
+              SET expires_at = CASE WHEN expires_at > ? THEN expires_at ELSE ? END
+            WHERE claim_id = ? AND status = 'HELD' AND expires_at > ?`,
+          [deadline, deadline, claim.claim_id, this.clock.nowIso()],
+        );
+        if (updated.changes !== 1) {
+          return deny(
+            ReasonCode.WRITE_PATH_NOT_CLAIMED,
+            "a required claim changed while the write was being fenced",
+            { grantId: grant.grantId, claimId: claim.claim_id },
+          );
+        }
+      }
+      return allow(ReasonCode.OK, undefined);
+    });
+  }
+
+  private requiredClaims(grant: GuardGrant): Decision<ClaimRow[]> {
+    const common = [grant.runId, grant.repositoryIdentity, this.clock.nowIso()];
+    const query = (where: string, params: unknown[]): ClaimRow[] =>
+      this.db.all<ClaimRow>(
+        `SELECT c.claim_id, c.expires_at FROM resource_claims c
+           JOIN runs r ON r.run_id = c.run_id
+          WHERE c.run_id = ? AND c.repository_identity = ? AND c.status = 'HELD'
+            AND c.expires_at > ? AND c.owner_binding_generation = r.owner_binding_generation
+            AND ${where}`,
+        [...common, ...params],
+      );
+
+    const required: ClaimRow[] = [];
+    if (grant.targetBranch) {
+      const branch = query("c.branch = ?", [grant.targetBranch]);
+      if (branch.length === 0) return this.claimMissing(grant, "branch", grant.targetBranch);
+      required.push(...branch);
+    }
+    if (grant.targetWorktreeId) {
+      const worktree = query("c.worktree_id = ?", [grant.targetWorktreeId]);
+      if (worktree.length === 0) return this.claimMissing(grant, "worktree", grant.targetWorktreeId);
+      required.push(...worktree);
+    }
+    if (required.length === 0 && grant.resolvedPath) {
+      const relative = this.relativePath(grant);
+      if (!relative) return this.claimMissing(grant, "path", grant.resolvedPath);
+      const path = query("c.declared_path = ? OR c.declared_path = '.'", [relative]);
+      if (path.length === 0) return this.claimMissing(grant, "path", relative);
+      required.push(...path);
+    }
+    if (required.length === 0) {
+      // A path-free remote operation has repository identity as its only target fact.
+      const repository = query("1 = 1", []);
+      const identity = grant.repositoryIdentity;
+      if (repository.length === 0 || !identity) return this.claimMissing(grant, "repository", identity ?? "");
+      required.push(repository[0]!);
+    }
+
+    return allow(
+      ReasonCode.OK,
+      [...new Map(required.map((claim) => [claim.claim_id, claim])).values()],
+    );
+  }
+
+  private claimMissing(
+    grant: GuardGrant,
+    resource: "branch" | "worktree" | "path" | "repository",
+    value: string,
+  ): Decision<ClaimRow[]> {
+    return deny(
+      ReasonCode.WRITE_PATH_NOT_CLAIMED,
+      `the run holds no live claim covering the target ${resource}`,
+      {
+        grantId: grant.grantId,
+        runId: grant.runId,
+        repositoryIdentity: grant.repositoryIdentity,
+        [resource]: value,
+      },
+    );
+  }
+
+  private relativePath(grant: GuardGrant): string | null {
+    if (!grant.resolvedPath || !grant.repositoryIdentity) return null;
+    const repository = this.db.get<{ checkout_path: string }>(
+      `SELECT checkout_path FROM repositories WHERE identity = ?`,
+      [grant.repositoryIdentity],
+    );
+    if (!repository) return null;
+    const checkout = this.probe.canonical(repository.checkout_path);
+    return isWithin(checkout, grant.resolvedPath)
+      ? grant.resolvedPath.slice(checkout.length + 1)
+      : null;
+  }
+
+  private captureFilesystemFence(held: HeldGrant): Decision<FilesystemFence | null> {
+    const operation = held.facts.operation as WriteOperation;
+    if (READ_OPERATIONS.has(operation) || OPERATION_CLASS[operation] !== "FILESYSTEM") {
+      return allow(ReasonCode.OK, null);
+    }
+    if (!held.request.targetPath || !held.facts.resolvedPath) {
+      return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "filesystem grant lost its target path", {
+        grantId: held.facts.grantId,
+      });
+    }
+
+    let parentFd: number | null = null;
+    let toplevelFd: number | null = null;
+    try {
+      const requestedParent = dirname(held.request.targetPath);
+      const canonicalParent = this.probe.canonical(requestedParent);
+      parentFd = openSync(canonicalParent, "r");
+      const parentStat = fstatSync(parentFd);
+      if (!parentStat.isDirectory()) {
+        closeSync(parentFd);
+        return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "write parent is not a directory", {
+          grantId: held.facts.grantId,
+          parent: canonicalParent,
+        });
+      }
+
+      let toplevelIdentity: NodeIdentity | null = null;
+      const probed = this.probe.probeWorktree(held.facts.resolvedPath);
+      if (probed.status === "ERROR") {
+        closeSync(parentFd);
+        return deny(ReasonCode.PROBE_FAILED, "could not determine the worktree for the write fence", {
+          grantId: held.facts.grantId,
+          reason: probed.reason,
+        });
+      }
+      const toplevel = probed.status === "INSIDE" ? this.probe.canonical(probed.toplevel) : null;
+      if (toplevel) {
+        toplevelFd = openSync(toplevel, "r");
+        toplevelIdentity = this.nodeIdentity(fstatSync(toplevelFd));
+      }
+
+      return allow(ReasonCode.OK, {
+        requestedPath: held.request.targetPath,
+        requestedParent,
+        resolvedPath: held.facts.resolvedPath,
+        parentFd,
+        parent: this.nodeIdentity(parentStat),
+        toplevel,
+        toplevelFd,
+        toplevelIdentity,
+      });
+    } catch (error) {
+      if (toplevelFd != null) closeSync(toplevelFd);
+      if (parentFd != null) closeSync(parentFd);
+      return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "could not hold a stable filesystem fence", {
+        grantId: held.facts.grantId,
+        reason: error instanceof Error ? error.message : "unknown filesystem error",
+      });
+    }
+  }
+
+  private verifyFilesystemFence(held: HeldGrant, fence: FilesystemFence | null): Decision<void> {
+    if (!fence) return allow(ReasonCode.OK, undefined);
+    try {
+      if (!this.sameNode(this.nodeIdentity(fstatSync(fence.parentFd)), fence.parent)) {
+        return this.fenceLost(held, "the held parent directory changed");
+      }
+      if (!this.sameNode(this.nodeIdentity(statSync(fence.requestedParent)), fence.parent)) {
+        return this.fenceLost(held, "the path to the parent directory changed");
+      }
+      if (this.probe.canonical(fence.requestedPath) !== fence.resolvedPath) {
+        return this.fenceLost(held, "the canonical target changed during the effect");
+      }
+      if (fence.toplevel && fence.toplevelFd != null && fence.toplevelIdentity) {
+        if (!this.sameNode(this.nodeIdentity(fstatSync(fence.toplevelFd)), fence.toplevelIdentity)) {
+          return this.fenceLost(held, "the held git worktree changed");
+        }
+        const probed = this.probe.probeWorktree(fence.resolvedPath);
+        if (
+          probed.status !== "INSIDE" ||
+          this.probe.canonical(probed.toplevel) !== fence.toplevel ||
+          !this.sameNode(this.nodeIdentity(statSync(fence.toplevel)), fence.toplevelIdentity)
+        ) {
+          return this.fenceLost(held, "the git worktree identity changed during the effect");
+        }
+      }
+      return allow(ReasonCode.OK, undefined);
+    } catch (error) {
+      return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "could not reverify the filesystem fence", {
+        grantId: held.facts.grantId,
+        reason: error instanceof Error ? error.message : "unknown filesystem error",
+      });
+    }
+  }
+
+  private releaseFilesystemFence(fence: FilesystemFence | null): void {
+    if (!fence) return;
+    if (fence.toplevelFd != null) closeSync(fence.toplevelFd);
+    closeSync(fence.parentFd);
+  }
+
+  private fenceLost(held: HeldGrant, message: string): Decision<void> {
+    return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, message, {
+      grantId: held.facts.grantId,
+      targetPath: held.facts.resolvedPath,
+      repositoryIdentity: held.facts.repositoryIdentity,
+    });
+  }
+
+  private nodeIdentity(stat: Stats): NodeIdentity {
+    return { dev: stat.dev, ino: stat.ino };
+  }
+
+  private sameNode(left: NodeIdentity, right: NodeIdentity): boolean {
+    return left.dev === right.dev && left.ino === right.ino;
+  }
+
+  private auditConsumed(grant: GuardGrant): void {
+    this.audit.record({
+      kind: "MANAGED_WRITE_GUARD_CONSUMED",
+      reasonCode: ReasonCode.WRITE_ALLOWED,
+      runId: grant.runId,
+      sessionId: grant.sessionId,
+      roleKey: grant.roleKey,
+      evidence: {
+        grantId: grant.grantId,
+        operation: grant.operation,
+        repositoryIdentity: grant.repositoryIdentity,
+        resolvedPath: grant.resolvedPath,
+        targetBranch: grant.targetBranch,
+        targetWorktreeId: grant.targetWorktreeId,
+      },
+    });
+  }
+
+  private recordRevocation(
+    held: HeldGrant,
+    grantId: string,
+    decision: Decision<unknown>,
+    phase: "before effect" | "after effect",
+  ): void {
+    this.audit.record({
+      kind: "MANAGED_WRITE_GUARD_REVOKED",
+      reasonCode: decision.reasonCode,
+      runId: held.facts.runId,
+      sessionId: held.facts.sessionId,
+      roleKey: held.facts.roleKey,
+      evidence: {
+        grantId,
+        phase,
+        ...decision.evidence,
+      },
+    });
+  }
+
+  private freezeGrant(grant: GuardGrant): Readonly<GuardGrant> {
+    return Object.freeze({ ...grant });
+  }
+
+  private publicGrant(grant: GuardGrant): GuardGrant {
+    return Object.freeze({ ...grant });
+  }
 
   private decide(request: GuardRequest): Decision<GuardGrant> {
     this.expireGrants();
@@ -297,25 +686,33 @@ export class ManagedWriteGuard {
 
     const operation = request.operation as WriteOperation;
     const operationClass = OPERATION_CLASS[operation];
+    if (!operationClass) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "unknown guard operation", { operation: request.operation });
+    }
 
     // --- argument validation, per operation class --------------------------
     if (request.targetPath != null && !isAbsolute(request.targetPath)) {
-      // A relative path would be resolved against the daemon's cwd, not the cwd the tool
-      // actually writes in, so the guard could authorise a different file than the one
-      // mutated.
       return deny(
         ReasonCode.INVALID_ARGUMENT,
         "target path must be absolute; a relative path cannot be authorised reliably",
         { operation, targetPath: request.targetPath },
       );
     }
+    if (request.targetBranch !== undefined && request.targetBranch !== null && !request.targetBranch.trim()) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "target branch must not be empty", { operation });
+    }
+    if (
+      request.targetWorktreeId !== undefined &&
+      request.targetWorktreeId !== null &&
+      !request.targetWorktreeId.trim()
+    ) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "target worktree id must not be empty", { operation });
+    }
     if (operationClass === "FILESYSTEM" && !request.targetPath) {
       return deny(ReasonCode.INVALID_ARGUMENT, `${operation} requires a target path`, { operation });
     }
     if (operationClass === "REMOTE" && !request.repositoryIdentity) {
-      return deny(ReasonCode.INVALID_ARGUMENT, `${operation} requires a repository identity`, {
-        operation,
-      });
+      return deny(ReasonCode.INVALID_ARGUMENT, `${operation} requires a repository identity`, { operation });
     }
     if (operationClass === "GIT_LOCAL" && !request.targetPath && !request.repositoryIdentity) {
       return deny(
@@ -323,6 +720,11 @@ export class ManagedWriteGuard {
         `${operation} requires a target path or a repository identity`,
         { operation },
       );
+    }
+    if (operation === WriteOperation.GIT_BRANCH && !request.targetBranch) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "GIT_BRANCH requires the branch it will mutate", {
+        operation,
+      });
     }
 
     // --- resolve the filesystem context ------------------------------------
@@ -343,14 +745,6 @@ export class ManagedWriteGuard {
     }
 
     const registered = resolvedPath ? this.registeredContaining(resolvedPath) : null;
-
-    // A filesystem write is project-natured when it lands in a git work tree *or* inside a
-    // registered checkout. Git detection alone is not the classifier: a registered
-    // repository whose git metadata is unreadable is still a managed project.
-    //
-    // Contract writes are managed wherever they sit on disk — CP-HI-01 lists manifest and
-    // verification-contract changes outright, so a new project directory is no exemption.
-    // A run id also settles it: a caller asserting managed context is held to it.
     const contractWrite =
       operation === WriteOperation.MANIFEST_CHANGE ||
       operation === WriteOperation.VERIFICATION_CONTRACT_CHANGE;
@@ -362,9 +756,16 @@ export class ManagedWriteGuard {
       registered !== null;
 
     if (!projectNatured) {
-      // §6.1 — independent artifacts outside any managed repository remain DIRECT.
+      if (!resolvedPath || !this.isDirectArtifactPath(resolvedPath)) {
+        return deny(
+          ReasonCode.DIRECT_WRITE_ROOT_REQUIRED,
+          "DIRECT mutation needs an explicitly configured independent-artifact root",
+          { operation, resolvedPath, directWriteRoots: this.#directWriteRoots },
+        );
+      }
       return this.direct(request, ReasonCode.DIRECT_READ_ONLY_ALLOWED, resolvedPath, null, {
         projectNatured: false,
+        directWriteRoot: this.#directWriteRoots.find((root) => isWithin(root, resolvedPath)) ?? null,
       });
     }
 
@@ -382,9 +783,7 @@ export class ManagedWriteGuard {
       [request.runId],
     );
     if (!run) {
-      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "run does not exist", {
-        runId: request.runId,
-      });
+      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "run does not exist", { runId: request.runId });
     }
     if (run.state !== RunState.ACTIVE) {
       return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, `run is ${run.state}, not ACTIVE`, {
@@ -396,17 +795,20 @@ export class ManagedWriteGuard {
     const identity = this.authorizeSession(run, request);
     if (!identity.allowed) return identity as Decision<GuardGrant>;
 
-    const target = this.authorizeTarget({
-      run,
+    const target = this.authorizeTarget({ run, request, operation, resolvedPath, toplevel });
+    if (!target.allowed) return target as Decision<GuardGrant>;
+
+    const resources = this.authorizeResources({
       request,
       operation,
       operationClass,
+      participant: target.value,
       resolvedPath,
       toplevel,
     });
-    if (!target.allowed) return target as Decision<GuardGrant>;
+    if (!resources.allowed) return resources as Decision<GuardGrant>;
 
-    const conflict = this.claimConflict(run.run_id, target.value, resolvedPath, toplevel);
+    const conflict = this.claimConflict(run.run_id, target.value, resources.value);
     if (conflict) return conflict as Decision<GuardGrant>;
 
     const issuedAt = this.clock.nowIso();
@@ -414,13 +816,16 @@ export class ManagedWriteGuard {
       ReasonCode.WRITE_ALLOWED,
       {
         grantId: `grant_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-        classification: "MANAGED" as const,
+        classification: "MANAGED",
         operation,
         runId: run.run_id,
+        sessionId: request.sessionId,
         roleKey: identity.value.roleKey,
         bindingGeneration: identity.value.generation,
         repositoryIdentity: target.value.identity,
         resolvedPath,
+        targetBranch: resources.value.branch,
+        targetWorktreeId: resources.value.worktreeId,
         issuedAt,
         expiresAt: isoPlus(issuedAt, GRANT_TTL_MS),
       },
@@ -440,13 +845,16 @@ export class ManagedWriteGuard {
       reasonCode,
       {
         grantId: `direct_${randomUUID().replace(/-/g, "").slice(0, 20)}`,
-        classification: "DIRECT" as const,
+        classification: "DIRECT",
         operation: request.operation,
         runId: null,
+        sessionId: null,
         roleKey: null,
         bindingGeneration: null,
         repositoryIdentity,
         resolvedPath,
+        targetBranch: null,
+        targetWorktreeId: null,
         issuedAt,
         expiresAt: isoPlus(issuedAt, GRANT_TTL_MS),
       },
@@ -469,9 +877,6 @@ export class ManagedWriteGuard {
       });
     }
 
-    // §23.2 — a revoked owner generation is a hard reject, and it must fence *every*
-    // writer on the run, not only the owner itself. A worker whose own binding is still
-    // ACTIVE has no authority once the run's owner generation has been revoked.
     const ownerCurrent = this.db.get<{ binding_generation: number }>(
       `SELECT binding_generation FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
       [run.owner_role_key],
@@ -508,7 +913,7 @@ export class ManagedWriteGuard {
       );
     }
 
-    const matching = bindings.find((b) => b.binding_generation === request.bindingGeneration);
+    const matching = bindings.find((binding) => binding.binding_generation === request.bindingGeneration);
     if (!matching) {
       return deny(
         ReasonCode.WRITE_BINDING_GENERATION_STALE,
@@ -516,7 +921,7 @@ export class ManagedWriteGuard {
         {
           runId: run.run_id,
           claimed: request.bindingGeneration,
-          known: bindings.map((b) => b.binding_generation),
+          known: bindings.map((binding) => binding.binding_generation),
         },
       );
     }
@@ -528,7 +933,6 @@ export class ManagedWriteGuard {
       });
     }
     if (!WRITER_ROLES.has(matching.role)) {
-      // A reviewer that can edit the candidate is not an independent reviewer.
       return deny(
         ReasonCode.REVIEWER_SESSION_IS_PRODUCER,
         `role ${matching.role} may not perform project writes`,
@@ -555,35 +959,26 @@ export class ManagedWriteGuard {
     });
   }
 
-  /**
-   * Binds the operation to exactly one repository participating in the run.
-   *
-   * A filesystem target is matched against the *git toplevel*, not against any enclosing
-   * participant checkout, so a nested or vendored repository cannot be written under its
-   * parent's authority. A remote operation always validates its own repository identity,
-   * even when a path was also supplied.
-   */
+  /** Binds the operation to exactly one repository participating in the run. */
   private authorizeTarget(input: {
     run: RunAuthRow;
     request: GuardRequest;
     operation: WriteOperation;
-    operationClass: OperationClass;
     resolvedPath: string | null;
     toplevel: string | null;
   }): Decision<ParticipantRow> {
     const participants = this.db
-      .all<ParticipantRow>(
+      .all<ParticipantRow & { work_branch: string | null; worktree_id: string | null }>(
         `SELECT r.identity, r.checkout_path, rr.work_branch, rr.worktree_id
            FROM run_repositories rr JOIN repositories r ON r.repository_id = rr.repository_id
           WHERE rr.run_id = ?`,
         [input.run.run_id],
       )
-      .map((p) => ({ ...p, checkout_path: this.probe.canonical(p.checkout_path) }));
+      .map(({ identity, checkout_path }) => ({ identity, checkout_path: this.probe.canonical(checkout_path) }));
 
     const byIdentity = input.request.repositoryIdentity
-      ? (participants.find((p) => p.identity === input.request.repositoryIdentity) ?? null)
+      ? (participants.find((participant) => participant.identity === input.request.repositoryIdentity) ?? null)
       : null;
-
     if (input.request.repositoryIdentity && !byIdentity) {
       return deny(
         ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
@@ -591,13 +986,12 @@ export class ManagedWriteGuard {
         {
           runId: input.run.run_id,
           identity: input.request.repositoryIdentity,
-          participants: participants.map((p) => p.identity),
+          participants: participants.map((participant) => participant.identity),
         },
       );
     }
 
     if (!input.resolvedPath) {
-      // Remote or git operation identified purely by repository.
       if (!byIdentity) {
         return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "no repository target resolved", {
           runId: input.run.run_id,
@@ -607,11 +1001,9 @@ export class ManagedWriteGuard {
       return allow(ReasonCode.OK, byIdentity);
     }
 
-    // The authoritative local repository is the work tree the path actually belongs to.
     const owner = input.toplevel
-      ? (participants.find((p) => p.checkout_path === input.toplevel) ?? null)
-      : (participants.find((p) => isWithin(p.checkout_path, input.resolvedPath!)) ?? null);
-
+      ? (participants.find((participant) => participant.checkout_path === input.toplevel) ?? null)
+      : (participants.find((participant) => isWithin(participant.checkout_path, input.resolvedPath!)) ?? null);
     if (!owner) {
       return deny(
         ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
@@ -622,12 +1014,10 @@ export class ManagedWriteGuard {
           runId: input.run.run_id,
           resolvedPath: input.resolvedPath,
           worktree: input.toplevel,
-          participants: participants.map((p) => p.checkout_path),
+          participants: participants.map((participant) => participant.checkout_path),
         },
       );
     }
-
-    // Both were supplied: they must agree, or the declared target is not what is written.
     if (byIdentity && byIdentity.identity !== owner.identity) {
       return deny(
         ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
@@ -640,19 +1030,79 @@ export class ManagedWriteGuard {
         },
       );
     }
-
     return allow(ReasonCode.OK, owner);
   }
 
-  /**
-   * §23.2 hard rejects. A write is refused when another run currently holds the worktree,
-   * the branch, or the exact declared path this operation would touch.
-   */
+  private authorizeResources(input: {
+    request: GuardRequest;
+    operation: WriteOperation;
+    operationClass: OperationClass;
+    participant: ParticipantRow;
+    resolvedPath: string | null;
+    toplevel: string | null;
+  }): Decision<TargetResource> {
+    const checkout = input.toplevel ?? input.participant.checkout_path;
+    const canReadLocalBranch = input.operationClass !== "REMOTE";
+    const observedBranch = canReadLocalBranch ? this.probe.currentBranch(checkout) : null;
+    const branchMustBeDeclared = input.operation === WriteOperation.GIT_BRANCH;
+    if (branchMustBeDeclared && !input.request.targetBranch) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "GIT_BRANCH requires targetBranch", {
+        operation: input.operation,
+      });
+    }
+    if (
+      input.request.targetBranch &&
+      canReadLocalBranch &&
+      input.operation !== WriteOperation.GIT_BRANCH &&
+      observedBranch !== input.request.targetBranch
+    ) {
+      return deny(
+        ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
+        "declared branch does not match the branch Git reports for the target work tree",
+        {
+          declaredBranch: input.request.targetBranch,
+          observedBranch,
+          checkout,
+        },
+      );
+    }
+
+    const branch = input.request.targetBranch ?? observedBranch;
+    const actualWorktree = input.toplevel ? basename(input.toplevel) : null;
+    if (input.request.targetWorktreeId && input.toplevel && input.request.targetWorktreeId !== actualWorktree) {
+      return deny(
+        ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
+        "declared worktree does not match the resolved target work tree",
+        {
+          declaredWorktreeId: input.request.targetWorktreeId,
+          observedWorktreeId: actualWorktree,
+          toplevel: input.toplevel,
+        },
+      );
+    }
+
+    const needsWorktree = this.hasHeldWorktreeClaim(input.participant.identity);
+    const worktreeId = input.request.targetWorktreeId ?? (needsWorktree ? actualWorktree : null);
+    if (needsWorktree && !worktreeId) {
+      return deny(
+        ReasonCode.CLAIM_WORKTREE_CONFLICT,
+        "a worktree is claimed and the target worktree cannot be determined",
+        { repositoryIdentity: input.participant.identity },
+      );
+    }
+
+    const relativePath =
+      input.resolvedPath && isWithin(input.participant.checkout_path, input.resolvedPath)
+        ? input.resolvedPath.slice(input.participant.checkout_path.length + 1)
+        : null;
+    return allow(ReasonCode.OK, { branch, worktreeId, relativePath });
+  }
+
+  /** §23.2 hard rejects against the resource this operation actually names or reaches. */
   private claimConflict(
     runId: string,
     participant: ParticipantRow,
-    resolvedPath: string | null,
-    toplevel: string | null,
+    resource: TargetResource,
   ): Decision<never> | null {
     const held = this.db.all<{
       claim_id: string;
@@ -668,25 +1118,10 @@ export class ManagedWriteGuard {
     );
     if (held.length === 0) return null;
 
-    const relative =
-      resolvedPath && isWithin(participant.checkout_path, resolvedPath)
-        ? resolvedPath.slice(participant.checkout_path.length + 1)
-        : null;
-
-    // Which branch and worktree this write actually touches. The run's own declaration is
-    // authoritative when it made one; otherwise fall back to what the checkout says, so a
-    // run that simply never declared a branch cannot slip past another run's claim.
-    const checkout = toplevel ?? participant.checkout_path;
-    const branchTouched = participant.work_branch ?? this.probe.currentBranch(checkout);
-    // Managed verification worktrees are created under a root and named by their id, so a
-    // resolved toplevel's basename is the worktree id when the write lands in one.
-    const worktreeTouched = participant.worktree_id ?? (toplevel ? basename(toplevel) : null);
-
-    // CP-HI-08 — if another run holds a branch or worktree claim on this repository and we
-    // cannot establish which branch or worktree this operation touches, we cannot show the
-    // operation is safe. Skipping the check would be a silent downgrade.
     const undeterminable = held.filter(
-      (c) => (c.branch !== null && branchTouched === null) || (c.worktree_id !== null && worktreeTouched === null),
+      (claim) =>
+        (claim.branch !== null && resource.branch === null) ||
+        (claim.worktree_id !== null && resource.worktreeId === null),
     );
     if (undeterminable.length > 0) {
       return deny(
@@ -694,33 +1129,33 @@ export class ManagedWriteGuard {
         "another run holds a branch or worktree claim and the touched resource cannot be determined",
         {
           repositoryIdentity: participant.identity,
-          heldBy: undeterminable.map((c) => c.run_id),
-          branchTouched,
-          worktreeTouched,
+          heldBy: undeterminable.map((claim) => claim.run_id),
+          branchTouched: resource.branch,
+          worktreeTouched: resource.worktreeId,
         },
       );
     }
 
     for (const claim of held) {
-      if (claim.worktree_id && worktreeTouched && claim.worktree_id === worktreeTouched) {
+      if (claim.worktree_id && resource.worktreeId === claim.worktree_id) {
         return deny(ReasonCode.CLAIM_WORKTREE_CONFLICT, "worktree is claimed by another run", {
           worktreeId: claim.worktree_id,
           heldBy: claim.run_id,
           claimId: claim.claim_id,
-          source: participant.worktree_id ? "run declaration" : "resolved work tree",
+          source: "resolved target work tree",
         });
       }
-      if (claim.branch && branchTouched && claim.branch === branchTouched) {
+      if (claim.branch && resource.branch === claim.branch) {
         return deny(ReasonCode.CLAIM_BRANCH_CONFLICT, "branch is claimed by another run", {
           branch: claim.branch,
           heldBy: claim.run_id,
           claimId: claim.claim_id,
-          source: participant.work_branch ? "run declaration" : "checked-out branch",
+          source: "declared or Git-resolved target branch",
         });
       }
-      if (relative && claim.declared_path === relative) {
+      if (resource.relativePath && claim.declared_path === resource.relativePath) {
         return deny(ReasonCode.WRITE_PATH_NOT_CLAIMED, "exact path is claimed by another run", {
-          path: relative,
+          path: resource.relativePath,
           heldBy: claim.run_id,
           claimId: claim.claim_id,
         });
@@ -729,17 +1164,16 @@ export class ManagedWriteGuard {
     return null;
   }
 
-  /** A claim this run currently holds on the repository, if any. */
-  private ownClaim(runId: string, repositoryIdentity: string): string | null {
-    const row = this.db.get<{ claim_id: string }>(
-      `SELECT c.claim_id FROM resource_claims c
-         JOIN runs r ON r.run_id = c.run_id
-        WHERE c.run_id = ? AND c.repository_identity = ? AND c.status = 'HELD'
-          AND c.expires_at > ? AND c.owner_binding_generation = r.owner_binding_generation
-        ORDER BY c.expires_at DESC`,
-      [runId, repositoryIdentity, this.clock.nowIso()],
+  private hasHeldWorktreeClaim(repositoryIdentity: string): boolean {
+    return !!this.db.get<{ claim_id: string }>(
+      `SELECT claim_id FROM resource_claims
+        WHERE repository_identity = ? AND status = 'HELD' AND worktree_id IS NOT NULL AND expires_at > ?`,
+      [repositoryIdentity, this.clock.nowIso()],
     );
-    return row?.claim_id ?? null;
+  }
+
+  private isDirectArtifactPath(resolvedPath: string): boolean {
+    return this.#directWriteRoots.some((root) => isWithin(root, resolvedPath));
   }
 
   /** Registered checkouts are managed regardless of what the git probe can see. */
@@ -748,8 +1182,8 @@ export class ManagedWriteGuard {
       `SELECT identity, checkout_path FROM repositories`,
     );
     const match = rows
-      .map((r) => ({ ...r, checkout_path: this.probe.canonical(r.checkout_path) }))
-      .filter((r) => isWithin(r.checkout_path, resolvedPath))
+      .map((row) => ({ ...row, checkout_path: this.probe.canonical(row.checkout_path) }))
+      .filter((row) => isWithin(row.checkout_path, resolvedPath))
       .sort((a, b) => b.checkout_path.length - a.checkout_path.length)[0];
     return match?.identity ?? null;
   }

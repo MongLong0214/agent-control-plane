@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { symlinkSync } from "node:fs";
 
 import { isoPlus } from "../../src/core/clock.ts";
@@ -54,6 +54,30 @@ const otherRun = (
                        contract_digest, created_at)
      VALUES ('run_other', ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'other', 'sha256:c', ?)`,
     [projectId, clock.nowIso()],
+  );
+};
+
+const ownBranchClaim = (
+  db: ReturnType<typeof makeCore>["db"],
+  clock: ReturnType<typeof makeCore>["clock"],
+  seeded: ReturnType<typeof seedRun>,
+  branch = "dev",
+) => {
+  db.run(
+    `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                  owner_session_id, owner_binding_generation, acquired_at,
+                                  expires_at, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'HELD')`,
+    [
+      `branch_${seeded.runId.slice(-8)}_${branch.replaceAll("/", "_")}`,
+      seeded.identity,
+      branch,
+      seeded.runId,
+      seeded.sessionId,
+      seeded.generation,
+      clock.nowIso(),
+      isoPlus(clock.nowIso(), 3_600_000),
+    ],
   );
 };
 
@@ -152,13 +176,18 @@ describe("guard enforces the §23.2 claim rejects, not only exact paths", () => 
   it("a worktree held by another run blocks the write", () => {
     const { guard, db, clock, seeded, repo } = setup();
     otherRun(db, clock, seeded.projectId);
-    db.run(`UPDATE run_repositories SET worktree_id = 'wt-shared' WHERE run_id = ?`, [seeded.runId]);
     db.run(
       `INSERT INTO resource_claims (claim_id, repository_identity, worktree_id, run_id,
                                     owner_session_id, owner_binding_generation, acquired_at,
                                     expires_at, status)
-       VALUES ('cw', ?, 'wt-shared', 'run_other', ?, 1, ?, ?, 'HELD')`,
-      [seeded.identity, seeded.sessionId, clock.nowIso(), isoPlus(clock.nowIso(), 3_600_000)],
+       VALUES ('cw', ?, ?, 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [
+        seeded.identity,
+        basename(repo),
+        seeded.sessionId,
+        clock.nowIso(),
+        isoPlus(clock.nowIso(), 3_600_000),
+      ],
     );
 
     const decision = guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") }));
@@ -169,12 +198,11 @@ describe("guard enforces the §23.2 claim rejects, not only exact paths", () => 
   it("a branch held by another run blocks the write", () => {
     const { guard, db, clock, seeded, repo } = setup();
     otherRun(db, clock, seeded.projectId);
-    db.run(`UPDATE run_repositories SET work_branch = 'task/T1-x' WHERE run_id = ?`, [seeded.runId]);
     db.run(
       `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
                                     owner_session_id, owner_binding_generation, acquired_at,
                                     expires_at, status)
-       VALUES ('cb', ?, 'task/T1-x', 'run_other', ?, 1, ?, ?, 'HELD')`,
+       VALUES ('cb', ?, 'dev', 'run_other', ?, 1, ?, ?, 'HELD')`,
       [seeded.identity, seeded.sessionId, clock.nowIso(), isoPlus(clock.nowIso(), 3_600_000)],
     );
 
@@ -214,7 +242,9 @@ describe("guard enforces the §23.2 claim rejects, not only exact paths", () => 
     });
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.CLAIM_BRANCH_CONFLICT);
-    expect(decision.allowed === false && decision.evidence["source"]).toBe("checked-out branch");
+    expect(decision.allowed === false && decision.evidence["source"]).toBe(
+      "declared or Git-resolved target branch",
+    );
   });
 
   it("a different branch in the same repository is not a conflict", () => {
@@ -252,12 +282,11 @@ describe("guard enforces the §23.2 claim rejects, not only exact paths", () => 
   it("an expired lease does not block anyone", () => {
     const { guard, db, clock, seeded, repo } = setup();
     otherRun(db, clock, seeded.projectId);
-    db.run(`UPDATE run_repositories SET work_branch = 'task/T1-x' WHERE run_id = ?`, [seeded.runId]);
     db.run(
       `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
                                     owner_session_id, owner_binding_generation, acquired_at,
                                     expires_at, status)
-       VALUES ('cb', ?, 'task/T1-x', 'run_other', ?, 1, ?, ?, 'HELD')`,
+       VALUES ('cb', ?, 'dev', 'run_other', ?, 1, ?, ?, 'HELD')`,
       [seeded.identity, seeded.sessionId, clock.nowIso(), clock.nowIso()],
     );
     expect(guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") })).allowed).toBe(
@@ -328,7 +357,8 @@ describe("guard grants are fenced, short-lived and single use", () => {
   });
 
   it("a grant can be consumed exactly once", () => {
-    const { guard, seeded, repo } = setup();
+    const { guard, db, clock, seeded, repo } = setup();
+    ownBranchClaim(db, clock, seeded);
     const decision = guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") }));
     if (!decision.allowed) throw new Error(decision.message);
 
@@ -398,12 +428,13 @@ describe("the write itself must be fenced by a claim (§23.2, G6)", () => {
 
   it("extends the claim lease so it cannot lapse mid-write", () => {
     const { guard, db, seeded, repo, clock } = setup();
+    ownBranchClaim(db, clock, seeded);
     const before = db.get<{ expires_at: string }>(
-      `SELECT expires_at FROM resource_claims WHERE run_id = ?`,
+      `SELECT expires_at FROM resource_claims WHERE run_id = ? AND branch = 'dev'`,
       [seeded.runId],
     )!.expires_at;
     // The lease is close to expiry when the write is authorised.
-    db.run(`UPDATE resource_claims SET expires_at = ? WHERE run_id = ?`, [
+    db.run(`UPDATE resource_claims SET expires_at = ? WHERE run_id = ? AND branch = 'dev'`, [
       isoPlus(clock.nowIso(), 2_000),
       seeded.runId,
     ]);
@@ -413,7 +444,7 @@ describe("the write itself must be fenced by a claim (§23.2, G6)", () => {
     expect(guard.consume(decision.value.grantId).allowed).toBe(true);
 
     const after = db.get<{ expires_at: string }>(
-      `SELECT expires_at FROM resource_claims WHERE run_id = ?`,
+      `SELECT expires_at FROM resource_claims WHERE run_id = ? AND branch = 'dev'`,
       [seeded.runId],
     )!.expires_at;
     expect(new Date(after).getTime()).toBeGreaterThan(new Date(clock.nowIso()).getTime() + 60_000);
