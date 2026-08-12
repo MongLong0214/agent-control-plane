@@ -24,6 +24,8 @@ export const WriteOperation = {
   GITHUB_ISSUE: "GITHUB_ISSUE",
   GITHUB_RELEASE: "GITHUB_RELEASE",
   GITHUB_RULESET: "GITHUB_RULESET",
+  /** Check-run write. The production gate is published this way (§24.4). */
+  GITHUB_CHECK_RUN: "GITHUB_CHECK_RUN",
   MANIFEST_CHANGE: "MANIFEST_CHANGE",
   VERIFICATION_CONTRACT_CHANGE: "VERIFICATION_CONTRACT_CHANGE",
   PROGRAMMATIC_MERGE: "PROGRAMMATIC_MERGE",
@@ -59,6 +61,7 @@ const OPERATION_CLASS: Readonly<Record<WriteOperation, OperationClass>> = {
   [WriteOperation.GITHUB_ISSUE]: "REMOTE",
   [WriteOperation.GITHUB_RELEASE]: "REMOTE",
   [WriteOperation.GITHUB_RULESET]: "REMOTE",
+  [WriteOperation.GITHUB_CHECK_RUN]: "REMOTE",
   [WriteOperation.PROGRAMMATIC_MERGE]: "REMOTE",
 };
 
@@ -308,11 +311,22 @@ export class ManagedWriteGuard {
 
     const registered = resolvedPath ? this.registeredContaining(resolvedPath) : null;
 
-    // A filesystem write is project-natured when it lands in a git work tree *or* inside
-    // a registered checkout. Git detection alone is not the classifier: a registered
+    // A filesystem write is project-natured when it lands in a git work tree *or* inside a
+    // registered checkout. Git detection alone is not the classifier: a registered
     // repository whose git metadata is unreadable is still a managed project.
+    //
+    // Contract writes are managed wherever they sit on disk — CP-HI-01 lists manifest and
+    // verification-contract changes outright, so a new project directory is no exemption.
+    // A run id also settles it: a caller asserting managed context is held to it.
+    const contractWrite =
+      operation === WriteOperation.MANIFEST_CHANGE ||
+      operation === WriteOperation.VERIFICATION_CONTRACT_CHANGE;
     const projectNatured =
-      operationClass !== "FILESYSTEM" || toplevel !== null || registered !== null;
+      operationClass !== "FILESYSTEM" ||
+      contractWrite ||
+      request.runId != null ||
+      toplevel !== null ||
+      registered !== null;
 
     if (!projectNatured) {
       // §6.1 — independent artifacts outside any managed repository remain DIRECT.
@@ -416,9 +430,25 @@ export class ManagedWriteGuard {
     run: RunAuthRow,
     request: GuardRequest,
   ): Decision<{ roleKey: string; role: string; generation: number }> {
-    if (!run.owner_session_id) {
+    if (!run.owner_session_id || run.owner_binding_generation == null || !run.owner_role_key) {
       return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "run has no pinned owner binding", {
         runId: run.run_id,
+      });
+    }
+
+    // §23.2 — a revoked owner generation is a hard reject, and it must fence *every*
+    // writer on the run, not only the owner itself. A worker whose own binding is still
+    // ACTIVE has no authority once the run's owner generation has been revoked.
+    const ownerCurrent = this.db.get<{ binding_generation: number }>(
+      `SELECT binding_generation FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+      [run.owner_role_key],
+    );
+    if (!ownerCurrent || ownerCurrent.binding_generation !== run.owner_binding_generation) {
+      return deny(ReasonCode.RUN_OWNER_REVOKED, "the run's pinned owner generation is revoked", {
+        runId: run.run_id,
+        ownerRoleKey: run.owner_role_key,
+        pinned: run.owner_binding_generation,
+        current: ownerCurrent?.binding_generation ?? null,
       });
     }
 
@@ -618,6 +648,25 @@ export class ManagedWriteGuard {
     // Managed verification worktrees are created under a root and named by their id, so a
     // resolved toplevel's basename is the worktree id when the write lands in one.
     const worktreeTouched = participant.worktree_id ?? (toplevel ? basename(toplevel) : null);
+
+    // CP-HI-08 — if another run holds a branch or worktree claim on this repository and we
+    // cannot establish which branch or worktree this operation touches, we cannot show the
+    // operation is safe. Skipping the check would be a silent downgrade.
+    const undeterminable = held.filter(
+      (c) => (c.branch !== null && branchTouched === null) || (c.worktree_id !== null && worktreeTouched === null),
+    );
+    if (undeterminable.length > 0) {
+      return deny(
+        ReasonCode.CLAIM_BRANCH_CONFLICT,
+        "another run holds a branch or worktree claim and the touched resource cannot be determined",
+        {
+          repositoryIdentity: participant.identity,
+          heldBy: undeterminable.map((c) => c.run_id),
+          branchTouched,
+          worktreeTouched,
+        },
+      );
+    }
 
     for (const claim of held) {
       if (claim.worktree_id && worktreeTouched && claim.worktree_id === worktreeTouched) {

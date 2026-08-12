@@ -3,8 +3,50 @@
     {
       "key": "guard",
       "verdict": "BLOCK",
+      "findings": 7,
+      "seconds": 616
+    },
+    {
+      "key": "verify",
+      "verdict": "BLOCK",
+      "findings": 14,
+      "seconds": 899
+    },
+    {
+      "key": "review",
+      "verdict": "BLOCK",
       "findings": 9,
-      "seconds": 509
+      "seconds": 519
+    },
+    {
+      "key": "binding",
+      "verdict": "BLOCK",
+      "findings": 10,
+      "seconds": 921
+    },
+    {
+      "key": "continuity",
+      "verdict": "BLOCK",
+      "findings": 12,
+      "seconds": 892
+    },
+    {
+      "key": "github",
+      "verdict": "BLOCK",
+      "findings": 18,
+      "seconds": 706
+    },
+    {
+      "key": "runtime",
+      "verdict": "BLOCK",
+      "findings": 19,
+      "seconds": 773
+    },
+    {
+      "key": "ops",
+      "verdict": "BLOCK",
+      "findings": 24,
+      "seconds": 831
     }
   ]
 }

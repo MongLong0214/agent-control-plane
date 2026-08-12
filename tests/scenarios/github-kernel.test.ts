@@ -587,6 +587,118 @@ describe("issue projection", () => {
   });
 });
 
+describe("the kernel is on the guard's write path (CP-HI-01)", () => {
+  it("a revoked owner generation stops the merge at the guard, not at GitHub", async () => {
+    const fixture = await setup();
+    const published = await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
+    if (!published.allowed) throw new Error(published.message);
+    const pr = await fixture.harness.cp.github.prPrepare({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      head: "feature/F1-thing",
+      base: "dev",
+      title: "candidate",
+      body: "",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+      exactHeadSha: HEAD,
+    });
+    if (!pr.allowed) throw new Error(pr.message);
+
+    // Revoke the owner binding: the merge must be refused by the guard even though the
+    // gate, the branch contract and the exact head are all still satisfied.
+    fixture.harness.cp.db.run(
+      `UPDATE assignments SET status = 'REVOKED' WHERE role_key = ?`,
+      [fixture.harness.cp.runs.require(fixture.runId).ownerRoleKey],
+    );
+
+    const refused = await fixture.harness.cp.github.mergeExecute({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      pullNumber: pr.value.pullNumber,
+      exactHeadSha: HEAD,
+      expectedBaseSha: BASE,
+      mergeStrategy: "merge_commit",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+    });
+    expect(refused.allowed).toBe(false);
+    expect(fixture.github.mergeCount).toBe(0);
+  });
+
+  it("a successful merge leaves a consumed guard grant, proving mediation", async () => {
+    const fixture = await setup();
+    const published = await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
+    if (!published.allowed) throw new Error(published.message);
+    const pr = await fixture.harness.cp.github.prPrepare({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      head: "feature/F1-thing",
+      base: "dev",
+      title: "candidate",
+      body: "",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+      exactHeadSha: HEAD,
+    });
+    if (!pr.allowed) throw new Error(pr.message);
+
+    const merged = await fixture.harness.cp.github.mergeExecute({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      pullNumber: pr.value.pullNumber,
+      exactHeadSha: HEAD,
+      expectedBaseSha: BASE,
+      mergeStrategy: "merge_commit",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+    });
+    expect(merged.allowed).toBe(true);
+
+    // Every remote write the kernel performed burned a guard grant: the guard is on the
+    // path, not merely available to be called.
+    const consumed = fixture.harness.cp.audit
+      .byKind("MANAGED_WRITE_GUARD_CONSUMED")
+      .map((e) => e.evidence["operation"]);
+    expect(consumed).toContain("PROGRAMMATIC_MERGE");
+    expect(consumed).toContain("GITHUB_PR");
+    expect(consumed).toContain("GITHUB_CHECK_RUN");
+  });
+
+  it("a gate publish for a run with no pinned owner is refused", async () => {
+    const github = new FakeGitHub();
+    const harness = makeHarness({ githubClient: github });
+    harness.cp.credentials.install({ token: "t", creatorIdentity: "acp-trusted-app" });
+    const { projectId, repositoryId, identity } = await registerFixtureProject(harness);
+    const created = harness.cp.runs.create({
+      projectId,
+      executionMode: ExecutionMode.SIMPLE,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    // Never dispatched, so no owner is pinned.
+
+    const refused = await harness.cp.github.gatePublish(
+      {
+        runId: created.value.runId,
+        candidateSnapshotDigest: "sha256:" + "1".repeat(64),
+        contractDigest: "sha256:" + "2".repeat(64),
+        verificationDigest: "sha256:" + "3".repeat(64),
+        blindReviewDigest: "sha256:" + "4".repeat(64),
+        humanGateDigest: "sha256:" + "5".repeat(64),
+        bindingGeneration: 1,
+        exactHead: HEAD,
+        timestamp: "2026-08-12T00:00:00.000Z",
+      },
+      identity,
+    );
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_NOT_PINNED);
+    expect(github.checkRuns).toHaveLength(0);
+  });
+});
+
 describe("trusted CI evidence (CP-S29)", () => {
   const commands = [
     parseVerificationCommand({

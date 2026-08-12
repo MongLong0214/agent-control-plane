@@ -25,6 +25,12 @@ export interface InvocationRequest {
   maxBudgetUsd?: number;
   /** Stable id so an interrupted invocation can be correlated in provider logs. */
   correlationId: string;
+  /**
+   * External session id the control plane constituted for this role. Where the runtime
+   * supports it, the invocation must *be* that session — otherwise the session the
+   * independence check was performed against is not the session that produced the verdict.
+   */
+  externalSessionId?: string;
 }
 
 export interface InvocationResult {
@@ -36,6 +42,8 @@ export interface InvocationResult {
   durationMs: number;
   exitCode: number | null;
   error: string | null;
+  /** Session identity the provider reports for this invocation, when it reports one. */
+  providerSessionId: string | null;
 }
 
 export interface SessionSpec {

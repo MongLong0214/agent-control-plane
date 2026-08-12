@@ -206,6 +206,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       "--model",
       request.model ?? this.defaultModels.cto,
     ];
+    // Make the invocation *be* the constituted session, so the identity the independence
+    // check was performed against is the identity that produces the answer.
+    if (request.externalSessionId) args.push("--session-id", request.externalSessionId);
     if (request.readOnly) {
       // §18.3 — a blind reviewer judges exactly the inputs it was given. Granting it
       // repository tools invites it to go exploring, which both changes what it saw and
@@ -244,6 +247,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       durationMs: Date.now() - started,
       exitCode: result.exitCode,
       error: result.timedOut ? "timeout" : result.exitCode === 0 ? null : result.stderr.slice(0, 2000),
+      providerSessionId:
+        typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null,
     };
   }
 
@@ -341,6 +346,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       durationMs: Date.now() - started,
       exitCode: result.exitCode,
       error: result.timedOut ? "timeout" : result.exitCode === 0 ? null : result.stderr.slice(0, 2000),
+      providerSessionId: /session[_ ]id[:=]\s*([0-9a-f-]{16,})/i.exec(result.stdout)?.[1] ?? null,
     };
   }
 

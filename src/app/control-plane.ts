@@ -176,7 +176,8 @@ export class ControlPlane {
     this.credentials = new TrustedCredentialStore(config.secretsDir);
     this.github = new GitHubKernel(
       this.db, this.clock, this.audit, this.artifacts, this.credentials,
-      this.repositories, this.runs, this.projects, config.githubClient,
+      this.repositories, this.runs, this.projects, this.guard,
+      ...(config.githubClient ? [config.githubClient] : []),
     );
     this.verification.attachCi(this.github.ciEvidenceSource());
 

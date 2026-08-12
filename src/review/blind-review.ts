@@ -13,7 +13,7 @@ import {
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
-import { diffText } from "../git/git.ts";
+import { diffDigest, diffText } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -44,6 +44,11 @@ export interface ReviewPacket {
   reviewerRoleBindingGeneration: number;
   reviewerSessionId: string;
   reviewerSessionIncarnation: string;
+  /**
+   * Session the provider itself reports for the invocation that produced this verdict.
+   * Without it, an independence check proves only that a synthetic id was not a producer.
+   */
+  reviewerProviderSessionId: string | null;
   provider: string;
   model: string;
   effort: string | null;
@@ -79,7 +84,6 @@ export interface BlindReviewRequest {
   contract: TaskContract;
   contractDigest: string;
   verification: VerificationReport;
-  projectContext?: string;
 }
 
 const VERDICT_SCHEMA = {
@@ -178,16 +182,21 @@ export class BlindReviewGate {
     const expected = snapshotCoverageTargets(request.snapshot);
     const reviewer = await this.constituteReviewer(request.runId);
     if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
-    const { sessionId, incarnation, generation, preference, roleKey } = reviewer.value;
+    const { sessionId, incarnation, externalSessionId, generation, preference, roleKey } =
+      reviewer.value;
 
     try {
-      const diffs = await this.collectDiffs(request.snapshot);
+      const collected = await this.collectDiffs(request.snapshot);
+      if (!collected.allowed) return collected as Decision<ReviewPacket>;
+      const { diffs, unreviewable } = collected.value;
+
       const totalChars = diffs.reduce((n, d) => n + d.diff.length, 0);
       const chunked = totalChars > CHUNK_THRESHOLD_CHARS;
+      const reviewer = { sessionId, externalSessionId };
 
       const outcome = chunked
-        ? await this.chunkedReview(request, diffs, preference, sessionId)
-        : await this.singleReview(request, diffs, preference, sessionId);
+        ? await this.chunkedReview(request, diffs, preference, reviewer)
+        : await this.singleReview(request, diffs, preference, reviewer);
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
 
@@ -199,7 +208,12 @@ export class BlindReviewGate {
         generation,
         preference,
         chunked,
-        raw: outcome.value,
+        raw: {
+          ...outcome.value.verdict,
+          // Anything with no reviewable text is an omission, never a silent pass.
+          omittedItems: [...outcome.value.verdict.omittedItems, ...unreviewable],
+        },
+        providerSessionId: outcome.value.providerSessionId,
         expected,
       });
 
@@ -284,10 +298,14 @@ export class BlindReviewGate {
    * independence is required even when the provider family is reused; if no isolated
    * reviewer can be constituted the gate is not lowered — the caller waits.
    */
-  private async constituteReviewer(runId: string): Promise<
+  private async constituteReviewer(
+    runId: string,
+    purpose: "blind-review" | "blind-review-final" = "blind-review",
+  ): Promise<
     Decision<{
       sessionId: string;
       incarnation: string;
+      externalSessionId: string;
       generation: number;
       preference: ReviewerPreference;
       roleKey: string;
@@ -312,7 +330,7 @@ export class BlindReviewGate {
         model: preference.model,
         effort: preference.effort,
         workdir: process.cwd(),
-        purpose: "blind-review",
+        purpose,
       });
       const session = this.sessions.create({
         provider: adapter.provider,
@@ -323,13 +341,24 @@ export class BlindReviewGate {
       });
       this.sessions.transition(session.sessionId, SessionLifecycle.READY, "reviewer ready");
 
-      const bound = this.bindings.bind({
-        roleKey,
-        role: Role.BLIND_REVIEWER,
-        sessionId: session.sessionId,
-        runId,
-        mode: preference === this.preferences.preferred ? "PREFERRED" : "FALLBACK",
-      });
+      // A second reviewer for the same run replaces the first generation rather than
+      // colliding with it: §18.5's final reviewer is a distinct, fresh session.
+      const bound = this.bindings.active(roleKey)
+        ? this.bindings.switchTo({
+            roleKey,
+            role: Role.BLIND_REVIEWER,
+            sessionId: session.sessionId,
+            runId,
+            mode: preference === this.preferences.preferred ? "PREFERRED" : "FALLBACK",
+            reason: `constituting ${purpose}`,
+          })
+        : this.bindings.bind({
+            roleKey,
+            role: Role.BLIND_REVIEWER,
+            sessionId: session.sessionId,
+            runId,
+            mode: preference === this.preferences.preferred ? "PREFERRED" : "FALLBACK",
+          });
       if (!bound.allowed) {
         this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, "binding refused");
         attempts.push({ preference, reason: bound.reasonCode });
@@ -339,6 +368,7 @@ export class BlindReviewGate {
       return allow(ReasonCode.OK, {
         sessionId: session.sessionId,
         incarnation: session.incarnation,
+        externalSessionId: handle.externalSessionId,
         generation: bound.value.bindingGeneration,
         preference,
         roleKey,
@@ -352,26 +382,64 @@ export class BlindReviewGate {
     );
   }
 
+  /**
+   * Collects the real diff for every repository in the candidate.
+   *
+   * Fails closed rather than substituting an empty string: a reviewer handed no diff can
+   * still echo the touched paths back and return PASS, and the packet would then claim
+   * `diff: true` for content nobody saw (CP-HI-08). Binary changes have no reviewable
+   * text, so they are declared as omissions instead of being silently dropped.
+   */
   private async collectDiffs(
     snapshot: CandidateSnapshot,
-  ): Promise<Array<{ identity: string; diff: string; files: string[] }>> {
-    const out: Array<{ identity: string; diff: string; files: string[] }> = [];
+  ): Promise<
+    Decision<{
+      diffs: Array<{ identity: string; diff: string; files: string[] }>;
+      unreviewable: string[];
+    }>
+  > {
+    const diffs: Array<{ identity: string; diff: string; files: string[] }> = [];
+    const unreviewable: string[] = [];
+
     for (const repo of snapshot.repositories) {
       const record = this.repositories.byIdentity(repo.identity);
-      const diff = record
-        ? await diffText(record.checkoutPath, repo.baseHead, repo.candidateHead)
-        : "";
-      out.push({ identity: repo.identity, diff, files: repo.touchedPaths });
+      if (!record) {
+        return deny(
+          ReasonCode.EVIDENCE_MISSING,
+          "a repository in the candidate has no local binding, so its diff cannot be produced",
+          { identity: repo.identity },
+        );
+      }
+
+      const diff = await diffText(record.checkoutPath, repo.baseHead, repo.candidateHead);
+      // The diff must be the one the frozen candidate describes.
+      const observedDigest = await diffDigest(record.checkoutPath, repo.baseHead, repo.candidateHead);
+      if (observedDigest !== repo.diffDigest) {
+        return deny(ReasonCode.EVIDENCE_STALE, "diff no longer matches the frozen candidate", {
+          identity: repo.identity,
+          expected: repo.diffDigest,
+          observed: observedDigest,
+        });
+      }
+
+      for (const path of repo.touchedPaths) {
+        if (new RegExp(`^Binary files .*${escapeRegExp(path)}`, "m").test(diff)) {
+          unreviewable.push(`${repo.identity}:${path} (binary, no reviewable text)`);
+        }
+      }
+
+      diffs.push({ identity: repo.identity, diff, files: repo.touchedPaths });
     }
-    return out;
+
+    return allow(ReasonCode.OK, { diffs, unreviewable });
   }
 
   private async singleReview(
     request: BlindReviewRequest,
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
     preference: ReviewerPreference,
-    sessionId: string,
-  ): Promise<Decision<RawVerdict>> {
+    reviewer: { sessionId: string; externalSessionId: string },
+  ): Promise<Decision<{ verdict: RawVerdict; providerSessionId: string | null }>> {
     const adapter = this.providers.require(preference.provider);
     const result = await adapter.invoke({
       prompt: this.buildPrompt(request, diffs),
@@ -382,8 +450,20 @@ export class BlindReviewGate {
       effort: preference.effort ?? undefined,
       responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
       readOnly: true,
-      correlationId: `${request.runId}:${sessionId}`,
+      correlationId: `${request.runId}:${reviewer.sessionId}`,
+      externalSessionId: reviewer.externalSessionId,
     });
+
+    // CP-HI-08 — a timed-out or errored invocation is missing evidence, even if whatever
+    // it managed to emit happens to parse as a PASS.
+    if (!result.ok) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "reviewer invocation did not complete", {
+        runId: request.runId,
+        provider: preference.provider,
+        exitCode: result.exitCode,
+        error: result.error,
+      });
+    }
 
     const parsed = parseVerdict(result.json ?? result.text);
     if (!parsed) {
@@ -394,7 +474,7 @@ export class BlindReviewGate {
         raw: result.text.slice(0, 500),
       });
     }
-    return allow(ReasonCode.OK, parsed);
+    return allow(ReasonCode.OK, { verdict: parsed, providerSessionId: result.providerSessionId });
   }
 
   /**
@@ -405,8 +485,8 @@ export class BlindReviewGate {
     request: BlindReviewRequest,
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
     preference: ReviewerPreference,
-    sessionId: string,
-  ): Promise<Decision<RawVerdict>> {
+    reviewer: { sessionId: string; externalSessionId: string },
+  ): Promise<Decision<{ verdict: RawVerdict; providerSessionId: string | null }>> {
     const adapter = this.providers.require(preference.provider);
     const chunks = splitDiffs(diffs, CHUNK_THRESHOLD_CHARS);
     const covered = new Set<string>();
@@ -424,10 +504,12 @@ export class BlindReviewGate {
         effort: preference.effort ?? undefined,
         responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
         readOnly: true,
-        correlationId: `${request.runId}:${sessionId}:chunk${index + 1}`,
+        correlationId: `${request.runId}:${reviewer.sessionId}:chunk${index + 1}`,
+        externalSessionId: reviewer.externalSessionId,
       });
-      const parsed = parseVerdict(result.json ?? result.text);
+      const parsed = result.ok ? parseVerdict(result.json ?? result.text) : null;
       if (!parsed) {
+        // A chunk that did not produce a usable verdict is an omission, not a pass.
         omitted.push(...chunk.flatMap((c) => c.files.map((f) => `${c.identity}:${f}`)));
         continue;
       }
@@ -442,12 +524,84 @@ export class BlindReviewGate {
     const unseen = expected.filter((key) => !covered.has(key) && !covered.has(key.split(":").slice(1).join(":")));
     omitted.push(...unseen);
 
-    return allow(ReasonCode.OK, {
+    const reduced: RawVerdict = {
       verdict: worst,
       coveredFiles: [...covered],
       omittedItems: [...new Set(omitted)],
       findings: dedupeFindings(findings),
+    };
+
+    // §18.5 — the reduced result is not the verdict. A *final fresh reviewer* judges it,
+    // and only that judgement is authoritative.
+    const finalReviewer = await this.constituteReviewer(request.runId, "blind-review-final");
+    if (!finalReviewer.allowed) return finalReviewer as Decision<never>;
+
+    const finalResult = await this.providers.require(finalReviewer.value.preference.provider).invoke({
+      prompt: this.buildFinalPrompt(request, reduced, chunks.length),
+      systemPrompt: REVIEWER_SYSTEM_PROMPT,
+      workdir: process.cwd(),
+      timeoutMs: REVIEW_TIMEOUT_MS,
+      model: finalReviewer.value.preference.model,
+      effort: finalReviewer.value.preference.effort ?? undefined,
+      responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
+      readOnly: true,
+      correlationId: `${request.runId}:${finalReviewer.value.sessionId}:final`,
+      externalSessionId: finalReviewer.value.externalSessionId,
     });
+
+    if (!finalResult.ok) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer did not complete", {
+        runId: request.runId,
+        exitCode: finalResult.exitCode,
+        error: finalResult.error,
+      });
+    }
+    const finalVerdict = parseVerdict(finalResult.json ?? finalResult.text);
+    if (!finalVerdict) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer returned no usable verdict", {
+        runId: request.runId,
+        raw: finalResult.text.slice(0, 500),
+      });
+    }
+
+    return allow(ReasonCode.OK, {
+      verdict: {
+        // The final reviewer may not erase coverage gaps the reducer established.
+        verdict: worseVerdict(finalVerdict.verdict, reduced.omittedItems.length > 0 ? "REVISE" : "PASS"),
+        coveredFiles: [...new Set([...reduced.coveredFiles, ...finalVerdict.coveredFiles])],
+        omittedItems: [...new Set([...reduced.omittedItems, ...finalVerdict.omittedItems])],
+        findings: dedupeFindings([...reduced.findings, ...finalVerdict.findings]),
+      },
+      providerSessionId: finalResult.providerSessionId,
+    });
+  }
+
+  /** Input for §18.5's final reviewer: the reduced coverage and findings, nothing else. */
+  private buildFinalPrompt(
+    request: BlindReviewRequest,
+    reduced: RawVerdict,
+    chunkCount: number,
+  ): string {
+    return [
+      `# Final review over a reduced ${chunkCount}-chunk result`,
+      "",
+      "Earlier reviewers examined this candidate in chunks. You are judging their reduced",
+      "output, not re-reading the diff. Decide the authoritative verdict.",
+      "",
+      "## Task contract",
+      `Goal: ${request.contract.goal}`,
+      "Acceptance criteria:",
+      ...request.contract.acceptance.map((a) => `- ${a}`),
+      "",
+      "## Reduced coverage and findings",
+      "```json",
+      JSON.stringify(reduced, null, 2),
+      "```",
+      "",
+      "## Required response",
+      "Return a single JSON object matching the schema, and nothing else.",
+      "You may not return PASS while omittedItems is non-empty.",
+    ].join("\n");
   }
 
   private buildPrompt(
@@ -502,7 +656,6 @@ export class BlindReviewGate {
       ),
       "```",
       "",
-      request.projectContext ? `## Project context\n${request.projectContext}\n` : "",
       "## Actual diff",
     ];
 
@@ -552,6 +705,7 @@ export class BlindReviewGate {
     preference: ReviewerPreference;
     chunked: boolean;
     raw: RawVerdict;
+    providerSessionId: string | null;
     expected: Array<{ identity: string; path: string }>;
   }): ReviewPacket {
     return {
@@ -561,6 +715,7 @@ export class BlindReviewGate {
       reviewerRoleBindingGeneration: input.generation,
       reviewerSessionId: input.sessionId,
       reviewerSessionIncarnation: input.incarnation,
+      reviewerProviderSessionId: input.providerSessionId,
       provider: input.preference.provider,
       model: input.preference.model,
       effort: input.preference.effort,
@@ -569,7 +724,7 @@ export class BlindReviewGate {
         snapshotManifest: true,
         diff: true,
         verificationEvidence: true,
-        projectContext: Boolean(input.request.projectContext),
+        projectContext: false,
         // §18.3 — the reviewer is blind to how the candidate was produced.
         withheld: [
           "worker reasoning",
@@ -598,6 +753,11 @@ export class BlindReviewGate {
     expected: Array<{ identity: string; path: string }>,
   ): ReviewPacket {
     if (packet.verdict !== "PASS") return packet;
+
+    // §18.4 — PASS requires omittedItems=0. Normalising here, before the artifact is
+    // persisted and before the audit and telemetry records are written, is what keeps a
+    // packet with omissions from ever being *recorded* as a pass.
+    if (packet.omittedItems.length > 0) return { ...packet, verdict: "REVISE" };
 
     const covered = new Set(packet.coveredFiles.map(normalizeCoverageKey));
     const missing = expected
@@ -664,6 +824,8 @@ const asStringArray = (value: unknown): string[] =>
   Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 
 const normalizeCoverageKey = (key: string): string => key.replace(/^\.\//, "").trim();
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const worseVerdict = (a: ReviewVerdict, b: ReviewVerdict): ReviewVerdict => {
   const rank = { PASS: 0, REVISE: 1, BLOCK: 2 } as const;

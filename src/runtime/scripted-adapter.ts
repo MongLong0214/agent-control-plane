@@ -93,6 +93,7 @@ export class ScriptedAdapter implements ProviderAdapter {
         durationMs: 0,
         exitCode: 1,
         error: `no scripted response matched prompt: ${request.prompt.slice(0, 200)}`,
+        providerSessionId: request.externalSessionId ?? null,
       };
     }
     const response = this.#responses[index]!;
@@ -108,6 +109,7 @@ export class ScriptedAdapter implements ProviderAdapter {
       durationMs: response.delayMs ?? 1,
       exitCode: response.ok === false ? 1 : 0,
       error: response.ok === false ? "scripted failure" : null,
+      providerSessionId: request.externalSessionId ?? null,
     };
   }
 

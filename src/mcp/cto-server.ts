@@ -234,13 +234,12 @@ export const createCtoServer = (cp: ControlPlane): McpServer => {
     "result_submit",
     {
       description:
-        "Submit the candidate for judgement. The control plane freezes it, verifies it, and then invokes the mandatory blind review automatically.",
+        "Submit the candidate for judgement. The control plane freezes it, verifies it, and then invokes the mandatory blind review automatically. There is deliberately no field for reviewer context: §18.3 keeps producer-supplied material away from the reviewer.",
       inputSchema: {
         ...identity,
         resultSummary: z.string(),
         recommendation: z.string(),
         residualRisk: z.array(z.string()).default([]),
-        projectContext: z.string().optional(),
         runScopedCommands: z.array(z.record(z.unknown())).default([]),
       },
     },
@@ -256,7 +255,6 @@ export const createCtoServer = (cp: ControlPlane): McpServer => {
             recommendation: args.recommendation,
             residualRisk: args.residualRisk,
             ...(commands.length > 0 ? { runScopedCommands: commands } : {}),
-            ...(args.projectContext !== undefined ? { projectContext: args.projectContext } : {}),
           }),
         );
       }),

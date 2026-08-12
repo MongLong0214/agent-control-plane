@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
 
 /**
@@ -97,19 +97,36 @@ export function canonical(path: string): string {
   const abs = isAbsolute(path) ? path : resolve(path);
   const missing: string[] = [];
   let cursor = abs;
-  for (;;) {
+  for (let hops = 0; hops < 64; hops += 1) {
+    // A *dangling* symlink is the dangerous case: existsSync follows the link and reports
+    // false, so the path would be classified by its own location while the eventual write
+    // lands wherever the link points. lstat sees the link itself.
+    const link = readLinkIfSymlink(cursor);
+    if (link !== null) {
+      cursor = isAbsolute(link) ? link : resolve(dirname(cursor), link);
+      continue;
+    }
     if (existsSync(cursor)) {
       const head = realpathSync(cursor);
       return missing.length > 0 ? resolve(head, ...missing.reverse()) : head;
     }
     const parent = dirname(cursor);
-    if (parent === cursor) return abs;
+    if (parent === cursor) return missing.length > 0 ? resolve(cursor, ...missing.reverse()) : cursor;
     // basename, not an offset slice: at the filesystem root the parent already ends in
     // the separator, and slicing would drop the component's first character.
     missing.push(basename(cursor));
     cursor = parent;
   }
+  return abs;
 }
+
+const readLinkIfSymlink = (path: string): string | null => {
+  try {
+    return lstatSync(path).isSymbolicLink() ? readlinkSync(path) : null;
+  } catch {
+    return null;
+  }
+};
 
 /** True when `child` is `parent` itself or lives beneath it. */
 export const isWithin = (parent: string, child: string): boolean => {

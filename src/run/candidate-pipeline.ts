@@ -17,6 +17,7 @@ import {
   type CandidateSnapshot,
   buildCandidateSnapshot,
   candidateSnapshotDigest,
+  verifySnapshotFreshness,
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
@@ -35,13 +36,20 @@ export interface SubmitResultInput {
    * project manifest (§17.5); otherwise the pinned contract's commands win.
    */
   runScopedCommands?: readonly VerificationCommand[];
-  projectContext?: string;
 }
 
 export type PipelineOutcome =
   | { stage: "COMPLETED_REVIEW"; packet: ProductionReadyPacket; snapshotDigest: string }
   | { stage: "REVISION_REQUIRED"; reasonCode: string; snapshotDigest: string; review?: ReviewPacket }
-  | { stage: "VERIFICATION_FAILED"; reasonCode: string; snapshotDigest: string; report: VerificationReport };
+  | { stage: "VERIFICATION_FAILED"; reasonCode: string; snapshotDigest: string; report: VerificationReport }
+  /**
+   * §18.7 — assurance could not be constituted. Editing the candidate cannot fix a lost
+   * reviewer isolation or a dead provider, so this is *not* a revision request: the run
+   * waits, and continuity decides.
+   */
+  | { stage: "REVIEW_UNAVAILABLE"; reasonCode: string; snapshotDigest: string }
+  /** The source moved while the candidate was being judged; all its evidence is stale. */
+  | { stage: "CANDIDATE_STALE"; reasonCode: string; snapshotDigest: string };
 
 /**
  * The candidate completion path (PRD §§16–19).
@@ -135,7 +143,11 @@ export class CandidatePipeline {
     const snapshot = frozen.value;
     const snapshotDigest = candidateSnapshotDigest(snapshot);
 
-    const commands = this.resolveCommands(run.projectId, run.executionMode, input.runScopedCommands);
+    const commands = this.resolveCommands(
+      run.pinnedManifestDigest,
+      run.executionMode,
+      input.runScopedCommands,
+    );
     const verified = await this.verification.verify({
       runId: input.runId,
       snapshot,
@@ -174,6 +186,17 @@ export class CandidatePipeline {
       });
     }
 
+    // CP-HI-06 / §16.2 — verification ran against a detached head, but the source may have
+    // moved while it ran. Re-check before spending a review on it.
+    const stillFreshAfterVerify = await this.assertStillFresh(snapshot);
+    if (!stillFreshAfterVerify.allowed) {
+      return allow(ReasonCode.OK, {
+        stage: "CANDIDATE_STALE",
+        reasonCode: stillFreshAfterVerify.reasonCode,
+        snapshotDigest,
+      });
+    }
+
     const contract = this.artifacts.latest<TaskContract>(input.runId, ArtifactKind.TASK_CONTRACT);
     if (!contract) {
       return deny(ReasonCode.EVIDENCE_MISSING, "run has no task contract artifact", {
@@ -190,10 +213,31 @@ export class CandidatePipeline {
       contract: contract.content,
       contractDigest: run.contractDigest,
       verification: verified.value,
-      ...(input.projectContext !== undefined ? { projectContext: input.projectContext } : {}),
     });
 
     if (!reviewed.allowed) {
+      // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
+      // or a provider that never answered is an assurance failure the candidate cannot
+      // repair, so the gate is neither lowered nor handed to the CTO to "fix".
+      const isVerdict =
+        reviewed.reasonCode === ReasonCode.REVIEW_REVISE ||
+        reviewed.reasonCode === ReasonCode.REVIEW_BLOCK ||
+        reviewed.reasonCode === ReasonCode.REVIEW_OMITTED_ITEMS_PRESENT;
+
+      if (!isVerdict) {
+        this.audit.record({
+          kind: "BLIND_REVIEW_UNAVAILABLE",
+          runId: input.runId,
+          reasonCode: reviewed.reasonCode,
+          evidence: { candidateSnapshotDigest: snapshotDigest, ...reviewed.evidence },
+        });
+        return allow(ReasonCode.OK, {
+          stage: "REVIEW_UNAVAILABLE",
+          reasonCode: reviewed.reasonCode,
+          snapshotDigest,
+        });
+      }
+
       this.returnToCto(input.runId, reviewed.reasonCode, {
         stage: "blind-review",
         candidateSnapshotDigest: snapshotDigest,
@@ -205,6 +249,16 @@ export class CandidatePipeline {
         reasonCode: reviewed.reasonCode,
         snapshotDigest,
         ...(packet ? { review: packet } : {}),
+      });
+    }
+
+    // And again before the packet: the review is also asynchronous.
+    const stillFreshAfterReview = await this.assertStillFresh(snapshot);
+    if (!stillFreshAfterReview.allowed) {
+      return allow(ReasonCode.OK, {
+        stage: "CANDIDATE_STALE",
+        reasonCode: stillFreshAfterReview.reasonCode,
+        snapshotDigest,
       });
     }
 
@@ -278,15 +332,31 @@ export class CandidatePipeline {
    * active manifest may use run-scoped commands the CTO proposed, validated against the
    * same argv/sandbox contract and never persisted as a default.
    */
+  /**
+   * CP-HI-03 — commands come from the manifest this run pinned at dispatch admission, not
+   * from whatever is active now. A concurrent CONTRACT_CHANGE must not change the bar a
+   * run in flight is judged against.
+   */
   private resolveCommands(
-    projectId: string | null,
+    pinnedManifestDigest: string | null,
     mode: "SIMPLE" | "STANDARD" | "GUARDED",
     runScoped: readonly VerificationCommand[] | undefined,
   ): VerificationCommand[] {
-    if (projectId) {
-      const active = this.projects.activeManifest(projectId);
-      if (active) return commandsForMode(active.manifest, mode);
+    if (pinnedManifestDigest) {
+      const pinned = this.projects.manifest(pinnedManifestDigest);
+      if (pinned) return commandsForMode(pinned, mode);
     }
     return [...(runScoped ?? [])];
+  }
+
+  /** Re-reads every frozen repository and reports drift (§16.2). */
+  private async assertStillFresh(snapshot: CandidateSnapshot): Promise<Decision<CandidateSnapshot>> {
+    const probes = snapshot.repositories
+      .map((repo) => ({
+        identity: repo.identity,
+        checkoutPath: this.repositories.byIdentity(repo.identity)?.checkoutPath ?? "",
+      }))
+      .filter((p) => p.checkoutPath);
+    return verifySnapshotFreshness(snapshot, probes);
   }
 }

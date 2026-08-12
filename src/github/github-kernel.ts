@@ -15,6 +15,7 @@ import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { CiCheck, CiEvidenceSource } from "../verify/verification-engine.ts";
+import { WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
 
@@ -146,8 +147,54 @@ export class GitHubKernel {
     private readonly repositories: RepositoryRegistry,
     private readonly runs: RunEngine,
     private readonly projects: ProjectRegistry,
+    private readonly guard: ManagedWriteGuard,
     private readonly client?: GitHubClient,
   ) {}
+
+  /**
+   * CP-HI-01 — every external write this kernel performs goes through the guard, and the
+   * grant is consumed immediately before the API call. Without this the guard would be a
+   * decision function nobody consults on the paths that actually mutate GitHub.
+   *
+   * The caller's identity is used when it has one; daemon-initiated operations
+   * (gate publish, tag, projection) are authorised as the run's pinned owner.
+   */
+  private mediate(
+    operation: WriteOperation,
+    runId: string,
+    repositoryIdentity: string,
+    caller?: { ownerSessionId: string; ownerBindingGeneration: number },
+  ): Decision<string> {
+    const run = this.runs.get(runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+
+    const sessionId = caller?.ownerSessionId ?? run.ownerSessionId;
+    const generation = caller?.ownerBindingGeneration ?? run.ownerBindingGeneration;
+    if (!sessionId || generation == null) {
+      return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "run has no pinned owner to authorise against", {
+        runId,
+        operation,
+      });
+    }
+
+    const granted = this.guard.evaluate({
+      operation,
+      repositoryIdentity,
+      runId,
+      sessionId,
+      bindingGeneration: generation,
+      claimedClassification: "MANAGED",
+      actor: "github-kernel",
+    });
+    if (!granted.allowed) return granted as Decision<string>;
+    return allow(ReasonCode.OK, granted.value.grantId);
+  }
+
+  /** Burns the grant. Called immediately before the side effect. */
+  private commitGrant(grantId: string): Decision<void> {
+    const consumed = this.guard.consume(grantId);
+    return consumed.allowed ? allow(ReasonCode.OK, undefined) : (consumed as Decision<void>);
+  }
 
   private api(): GitHubClient {
     return this.client ?? new GhCliClient(this.credentials);
@@ -167,6 +214,9 @@ export class GitHubKernel {
   async prPrepare(input: PrepareInput): Promise<Decision<{ pullNumber: number; url: string }>> {
     const authority = this.assertAuthority(input.runId, input.repositoryIdentity, input);
     if (!authority.allowed) return authority as Decision<{ pullNumber: number; url: string }>;
+
+    const grant = this.mediate(WriteOperation.GITHUB_PR, input.runId, input.repositoryIdentity, input);
+    if (!grant.allowed) return grant as Decision<{ pullNumber: number; url: string }>;
 
     const profile = this.branchProfile(input.runId);
     const contract = validateBranchContract({
@@ -194,6 +244,9 @@ export class GitHubKernel {
       const cached = JSON.parse(existing.response_json) as { pullNumber: number; url: string };
       return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, cached, { replayed: true });
     }
+
+    const consumed = this.commitGrant(grant.value);
+    if (!consumed.allowed) return consumed as Decision<{ pullNumber: number; url: string }>;
 
     const open = await this.api().request<PullRequest[]>(
       "GET",
@@ -259,6 +312,9 @@ export class GitHubKernel {
     if (!slug.allowed) return slug as Decision<{ checkRunId: number }>;
     const { owner, repo } = slug.value;
 
+    const grant = this.mediate(WriteOperation.GITHUB_CHECK_RUN, payload.runId, repositoryIdentity);
+    if (!grant.allowed) return grant as Decision<{ checkRunId: number }>;
+
     const payloadDigest = digestOf(payload);
     const idempotencyKey = `gate_publish:${repositoryIdentity}:${payload.exactHead}:${payloadDigest}`;
     const existing = this.receipt(idempotencyKey);
@@ -269,6 +325,9 @@ export class GitHubKernel {
         { replayed: true },
       );
     }
+
+    const consumed = this.commitGrant(grant.value);
+    if (!consumed.allowed) return consumed as Decision<{ checkRunId: number }>;
 
     const created = await this.api().request<CheckRun>("POST", `/repos/${owner}/${repo}/check-runs`, {
       name: GATE_CHECK_NAME,
@@ -501,6 +560,16 @@ export class GitHubKernel {
     const evaluation = await this.mergeEvaluate(input);
     if (!evaluation.allowed) return evaluation as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
+    const grant = this.mediate(
+      WriteOperation.PROGRAMMATIC_MERGE,
+      input.runId,
+      input.repositoryIdentity,
+      input,
+    );
+    if (!grant.allowed) return grant as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    const consumed = this.commitGrant(grant.value);
+    if (!consumed.allowed) return consumed as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+
     const slug = this.slug(input.repositoryIdentity);
     if (!slug.allowed) return slug as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     const { owner, repo } = slug.value;
@@ -669,6 +738,11 @@ export class GitHubKernel {
       });
     }
 
+    const grant = this.mediate(WriteOperation.GITHUB_RELEASE, runId, repositoryIdentity);
+    if (!grant.allowed) return grant as Decision<{ tag: string; sha: string }>;
+    const consumed = this.commitGrant(grant.value);
+    if (!consumed.allowed) return consumed as Decision<{ tag: string; sha: string }>;
+
     await this.api().request("POST", `/repos/${owner}/${repo}/git/refs`, {
       ref: `refs/tags/${tag}`,
       sha: commitSha,
@@ -801,6 +875,11 @@ export class GitHubKernel {
     const slug = this.slug(repositoryIdentity);
     if (!slug.allowed) return slug as Decision<{ created: number; updated: number }>;
     const { owner, repo } = slug.value;
+
+    const grant = this.mediate(WriteOperation.GITHUB_ISSUE, runId, repositoryIdentity);
+    if (!grant.allowed) return grant as Decision<{ created: number; updated: number }>;
+    const consumed = this.commitGrant(grant.value);
+    if (!consumed.allowed) return consumed as Decision<{ created: number; updated: number }>;
 
     const existing = await this.api().request<Array<{ number: number; body: string | null }>>(
       "GET",
