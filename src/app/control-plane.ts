@@ -200,9 +200,9 @@ export class ControlPlane {
     );
 
     this.pipeline = new CandidatePipeline(
-      this.clock, this.audit, this.artifacts, this.runs, this.tasks, this.projects,
+      this.db, this.clock, this.audit, this.artifacts, this.runs, this.tasks, this.projects,
       this.repositories, this.verification, this.review, this.review.controlPlaneInvoker(), this.ceo, this.bindings, this.outbox,
-      this.telemetry,
+      this.telemetry, this.guard,
     );
 
     this.credentials = new TrustedCredentialStore(config.secretsDir);

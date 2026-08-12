@@ -304,6 +304,29 @@ describe("round-two GitHub hardening", () => {
     expect(fixture.github.checkRuns.filter((check) => check.name === "acp-production-gate")).toHaveLength(1);
   });
 
+  it("#97: refuses a GitHub write when the run owner is revoked during its fenced request", async () => {
+    const fixture = await ready();
+    const original = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async (method, path, body) => {
+      if (method === "POST" && /\/pulls$/.test(path)) {
+        fixture.harness.cp.db.run(`UPDATE assignments SET status = 'REVOKED' WHERE role_key = ?`, [
+          fixture.harness.cp.runs.require(fixture.driven.runId).ownerRoleKey,
+        ]);
+      }
+      return original(method, path, body);
+    };
+
+    const result = await fixture.harness.cp.github.prPrepare(fixture.input);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
+    expect(fixture.github.pulls).toHaveLength(1);
+    const receipt = fixture.harness.cp.db.get<{ verified: number }>(
+      `SELECT verified FROM github_receipts WHERE operation = 'pr_prepare'`,
+    );
+    expect(receipt?.verified).toBe(0);
+  });
+
   it("#199: required issue numbers are emitted as GitHub-recognised PR linkage, not merely accepted", async () => {
     const fixture = await ready();
     const result = await fixture.harness.cp.github.prPrepare({

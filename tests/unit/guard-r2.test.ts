@@ -77,6 +77,22 @@ describe("round-two managed-write regressions", () => {
     expect(decision.reasonCode).toBe(ReasonCode.WRITE_EFFECT_FENCE_LOST);
   });
 
+  it("#131 blocks a managed source mutation while final publication holds its source-read lease", () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
+    addBranchClaim(core.db, core.clock, seeded, "claim_dev", "dev");
+    const lease = guard.acquireSourceReadLease(seeded.runId, [seeded.identity]);
+    if (!lease.allowed) throw new Error(lease.message);
+
+    const decision = guard.evaluate(managedRequest(seeded, join(repo, "src", "app.ts")));
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.SOURCE_READ_LEASE_CONFLICT);
+    lease.value.release();
+  });
+
   it("#98 snapshots every authority fact instead of trusting a caller-mutated request or grant", () => {
     const core = makeCore();
     const repo = makeRepo();

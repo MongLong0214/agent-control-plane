@@ -66,6 +66,18 @@ const OPERATION_CLASS: Readonly<Record<WriteOperation, OperationClass>> = {
   [WriteOperation.PROGRAMMATIC_MERGE]: "REMOTE",
 };
 
+/** Source mutations must not race a final candidate freshness read (§16.2). */
+const SOURCE_MUTATIONS: ReadonlySet<WriteOperation> = new Set([
+  WriteOperation.FILE_MUTATION,
+  WriteOperation.GIT_COMMIT,
+  WriteOperation.GIT_BRANCH,
+  WriteOperation.GIT_TAG,
+  WriteOperation.GITHUB_RELEASE,
+  WriteOperation.MANIFEST_CHANGE,
+  WriteOperation.VERIFICATION_CONTRACT_CHANGE,
+  WriteOperation.PROGRAMMATIC_MERGE,
+]);
+
 /**
  * Roles that may produce a candidate. CP-HI-04 puts the blind reviewer outside the
  * producer set, so a reviewer session holding a binding on the run must not be able to
@@ -169,6 +181,12 @@ interface FilesystemFence {
   toplevelIdentity: NodeIdentity | null;
 }
 
+interface SourceReadLease {
+  leaseId: string;
+  runId: string;
+  repositoryIdentities: readonly string[];
+}
+
 /** A grant is short-lived and single use; see `consume`. */
 const CLAIM_LEASE_EXTENSION_MS = 5 * 60 * 1000;
 const GRANT_TTL_MS = 60_000;
@@ -183,6 +201,8 @@ const GRANT_TTL_MS = 60_000;
 export class ManagedWriteGuard {
   readonly #grants = new Map<string, HeldGrant>();
   readonly #inFlight = new Map<string, HeldGrant>();
+  readonly #sourceReadLeases = new Map<string, SourceReadLease>();
+  readonly #sourceReadLeasesByRepository = new Map<string, Set<string>>();
   readonly #directWriteRoots: readonly string[];
 
   constructor(
@@ -282,17 +302,90 @@ export class ManagedWriteGuard {
 
     if (!settled.allowed) {
       this.recordRevocation(held, held.facts.grantId, settled, "after effect");
-      return settled as Decision<T>;
+      return deny(settled.reasonCode, settled.message, { ...settled.evidence, effectInvoked: true });
     }
     if (effectError) {
       return deny(ReasonCode.INTERNAL_ERROR, "authorised write effect failed", {
         grantId: held.facts.grantId,
         operation: held.facts.operation,
+        effectInvoked: true,
       });
     }
 
     this.auditConsumed(held.facts);
     return allow(ReasonCode.WRITE_ALLOWED, result as T);
+  }
+
+  /**
+   * Holds the participating source identities stable from the final freshness read
+   * through packet publication. Source writes consult this lease before a grant exists.
+   */
+  acquireSourceReadLease(
+    runId: string,
+    repositoryIdentities: readonly string[],
+  ): Decision<{ leaseId: string; release(): void }> {
+    const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run for source-read lease", { runId });
+    if (run.state !== RunState.ACTIVE) {
+      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "source-read lease requires an ACTIVE run", {
+        runId,
+        state: run.state,
+      });
+    }
+
+    const identities = [...new Set(repositoryIdentities)];
+    if (identities.length === 0) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "source-read lease requires at least one repository", { runId });
+    }
+    const participating = new Set(
+      this.db.all<{ identity: string }>(
+        `SELECT r.identity FROM run_repositories rr
+           JOIN repositories r ON r.repository_id = rr.repository_id
+          WHERE rr.run_id = ?`,
+        [runId],
+      ).map((row) => row.identity),
+    );
+    const outsideScope = identities.filter((identity) => !participating.has(identity));
+    if (outsideScope.length > 0) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "source-read lease includes a repository outside the run", {
+        runId,
+        outsideScope,
+      });
+    }
+
+    const leaseId = `source_read_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+    const lease: SourceReadLease = Object.freeze({
+      leaseId,
+      runId,
+      repositoryIdentities: Object.freeze(identities),
+    });
+    this.#sourceReadLeases.set(leaseId, lease);
+    for (const identity of identities) {
+      const held = this.#sourceReadLeasesByRepository.get(identity) ?? new Set<string>();
+      held.add(leaseId);
+      this.#sourceReadLeasesByRepository.set(identity, held);
+    }
+
+    let released = false;
+    return allow(ReasonCode.OK, Object.freeze({
+      leaseId,
+      release: () => {
+        if (released) return;
+        released = true;
+        this.releaseSourceReadLease(lease);
+      },
+    }));
+  }
+
+  assertSourceReadLease(runId: string, leaseId: string): Decision<void> {
+    const lease = this.#sourceReadLeases.get(leaseId);
+    if (!lease || lease.runId !== runId) {
+      return deny(ReasonCode.SOURCE_READ_LEASE_NOT_HELD, "source-read lease is not held by this run", {
+        runId,
+        leaseId,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /** Drops grants past their expiry. Called by the watchdog and on each evaluate. */
@@ -331,6 +424,37 @@ export class ManagedWriteGuard {
     });
     this.#grants.set(facts.grantId, { facts, request: snapshot });
     return allow(decision.reasonCode, this.publicGrant(facts), decision.evidence);
+  }
+
+  private releaseSourceReadLease(lease: SourceReadLease): void {
+    if (this.#sourceReadLeases.get(lease.leaseId) !== lease) return;
+    this.#sourceReadLeases.delete(lease.leaseId);
+    for (const identity of lease.repositoryIdentities) {
+      const held = this.#sourceReadLeasesByRepository.get(identity);
+      if (!held) continue;
+      held.delete(lease.leaseId);
+      if (held.size === 0) this.#sourceReadLeasesByRepository.delete(identity);
+    }
+  }
+
+  private sourceReadLeaseConflict(operation: WriteOperation, repositoryIdentity: string): Decision<never> | null {
+    if (!SOURCE_MUTATIONS.has(operation)) return null;
+    const leaseIds = this.#sourceReadLeasesByRepository.get(repositoryIdentity);
+    if (!leaseIds || leaseIds.size === 0) return null;
+    const leases = [...leaseIds]
+      .map((leaseId) => this.#sourceReadLeases.get(leaseId))
+      .filter((lease): lease is SourceReadLease => lease !== undefined);
+    if (leases.length === 0) return null;
+    return deny(
+      ReasonCode.SOURCE_READ_LEASE_CONFLICT,
+      "a final candidate source-read lease prevents source mutation",
+      {
+        operation,
+        repositoryIdentity,
+        leaseIds: leases.map((lease) => lease.leaseId),
+        leaseRunIds: leases.map((lease) => lease.runId),
+      },
+    );
   }
 
   private activate(grantId: string): Decision<HeldGrant> {
@@ -807,6 +931,9 @@ export class ManagedWriteGuard {
       toplevel,
     });
     if (!resources.allowed) return resources as Decision<GuardGrant>;
+
+    const sourceReadLease = this.sourceReadLeaseConflict(operation, target.value.identity);
+    if (sourceReadLease) return sourceReadLease as Decision<GuardGrant>;
 
     const conflict = this.claimConflict(run.run_id, target.value, resources.value);
     if (conflict) return conflict as Decision<GuardGrant>;
