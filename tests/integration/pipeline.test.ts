@@ -356,6 +356,149 @@ describe("one safe project run, end to end", () => {
     expect(outcome.value.review?.omittedItems).toContain(`${identity}:src/app.js`);
   });
 
+  it("the gate refuses a candidate that is no longer the run's current one", async () => {
+    const harness = makeHarness();
+    const { runId, run, outcome } = await drive(harness);
+    if (!outcome.allowed || outcome.value.stage !== "COMPLETED_REVIEW") {
+      throw new Error("setup did not reach a packet");
+    }
+    const oldDigest = outcome.value.snapshotDigest;
+
+    // A new commit promotes a new candidate; the old evidence is no longer current.
+    writeFiles(harness.repoPath, { "src/app.js": "module.exports = () => 2; // later\n" });
+    commitAll(harness.repoPath, "move the candidate on");
+    const frozen = await harness.cp.pipeline.freeze(runId);
+    expect(frozen.allowed).toBe(true);
+
+    const stale = harness.cp.ceo.buildPacket({
+      runId,
+      candidateSnapshotDigest: oldDigest,
+      approval: {
+        runId,
+        candidateSnapshotDigest: oldDigest,
+        resultSummary: "stale",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: run.ownerSessionId!,
+        approvedByGeneration: run.ownerBindingGeneration!,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    expect(stale.allowed).toBe(false);
+    expect(stale.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+  });
+
+  it("the gate refuses a verification report that no result rows corroborate", async () => {
+    const harness = makeHarness();
+    const { runId, run, outcome } = await drive(harness);
+    if (!outcome.allowed || outcome.value.stage !== "COMPLETED_REVIEW") {
+      throw new Error("setup did not reach a packet");
+    }
+    const digest = outcome.value.snapshotDigest;
+
+    // The report artifact is immutable, so remove the rows behind it instead: a PASS with
+    // nothing to corroborate it must not be accepted.
+    harness.cp.db.run(`DELETE FROM verification_results WHERE run_id = ?`, [runId]);
+
+    const decision = harness.cp.ceo.buildPacket({
+      runId,
+      candidateSnapshotDigest: digest,
+      approval: {
+        runId,
+        candidateSnapshotDigest: digest,
+        resultSummary: "uncorroborated",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: run.ownerSessionId!,
+        approvedByGeneration: run.ownerBindingGeneration!,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+  });
+
+  it("the gate refuses a review packet naming a reviewer that never held the binding", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId, identity } = await registerFixtureProject(harness);
+    bindCeo(harness);
+    const created = harness.cp.runs.create({
+      projectId,
+      executionMode: ExecutionMode.SIMPLE,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+    if (!dispatched.allowed) throw new Error(dispatched.message);
+    const runId = created.value.runId;
+
+    applyPassingChange(harness.repoPath);
+    const frozen = await harness.cp.pipeline.freeze(runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
+    const digest = candidateSnapshotDigest(frozen.value);
+
+    const verified = await harness.cp.verification.verify({
+      runId,
+      snapshot: frozen.value,
+      commands: harness.cp.projects.activeManifest(projectId)!.manifest.verificationCommands,
+      contractDigest: frozen.value.contractDigest,
+    });
+    expect(verified.allowed).toBe(true);
+
+    // A well-formed review packet from the right producer, but naming a session that was
+    // never bound as this run's blind reviewer.
+    harness.cp.artifacts.putEvidence(
+      "blind-review-gate",
+      runId,
+      "BLIND_REVIEW",
+      {
+        runId,
+        candidateSnapshotDigest: digest,
+        contractDigest: frozen.value.contractDigest,
+        reviewerRoleBindingGeneration: 1,
+        reviewerSessionId: "ses_never_bound",
+        reviewerSessionIncarnation: "inc-x",
+        provider: "scripted",
+        model: "scripted-reviewer",
+        effort: null,
+        inputManifest: {
+          contract: true,
+          snapshotManifest: true,
+          diff: true,
+          verificationEvidence: true,
+          projectContext: false,
+          withheld: [],
+        },
+        coveredRepositories: [identity],
+        coveredFiles: [`${identity}:src/app.js`],
+        omittedItems: [],
+        verdict: "PASS",
+        findings: [],
+        chunked: false,
+        createdAt: harness.clock.nowIso(),
+      },
+      digest,
+    );
+
+    const decision = harness.cp.ceo.buildPacket({
+      runId,
+      candidateSnapshotDigest: digest,
+      approval: {
+        runId,
+        candidateSnapshotDigest: digest,
+        resultSummary: "forged reviewer",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: dispatched.value.ownerSessionId!,
+        approvedByGeneration: dispatched.value.ownerBindingGeneration!,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.REVIEWER_NOT_INDEPENDENT);
+  });
+
   it("task graph rejects cycles and honours dependency order", async () => {
     const harness = makeHarness();
     const { projectId, repositoryId } = await registerFixtureProject(harness);

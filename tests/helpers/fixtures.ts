@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { newAssignmentId, newRepositoryId, newRunId, newSessionId } from "../../src/core/ids.ts";
+import { ArtifactStore } from "../../src/db/artifacts.ts";
 import { AuditLog } from "../../src/db/audit.ts";
 import { Db } from "../../src/db/database.ts";
 import { Outbox } from "../../src/outbox/outbox.ts";
@@ -17,6 +18,7 @@ export interface CoreHarness {
   db: Db;
   clock: ManualClock;
   audit: AuditLog;
+  artifacts: ArtifactStore;
   outbox: Outbox;
   telemetry: Telemetry;
 }
@@ -25,7 +27,14 @@ export const makeCore = (): CoreHarness => {
   const db = makeDb();
   const clock = new ManualClock();
   const audit = new AuditLog(db, clock);
-  return { db, clock, audit, outbox: new Outbox(db, clock, audit), telemetry: new Telemetry(db, clock) };
+  return {
+    db,
+    clock,
+    audit,
+    artifacts: new ArtifactStore(db, clock),
+    outbox: new Outbox(db, clock, audit),
+    telemetry: new Telemetry(db, clock),
+  };
 };
 
 let tempRoots: string[] = [];

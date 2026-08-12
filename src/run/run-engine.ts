@@ -414,6 +414,46 @@ export class RunEngine {
     });
   }
 
+  /**
+   * Promotes a freshly frozen candidate in one transaction: records it as the run's
+   * current candidate and supersedes every artifact bound to an earlier one.
+   *
+   * A caller-managed, per-kind staleness update could be forgotten or interrupted, and
+   * evidence for a superseded candidate would keep reading as current — the CP-HI-06
+   * failure this closes.
+   */
+  promoteCandidate(runId: string, candidateSnapshotDigest: string): void {
+    this.db.tx(() => {
+      this.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [
+        candidateSnapshotDigest,
+        runId,
+      ]);
+      this.db.run(
+        `UPDATE run_artifacts SET superseded = 1
+          WHERE run_id = ?
+            AND candidate_snapshot_digest IS NOT NULL
+            AND candidate_snapshot_digest <> ?
+            AND superseded = 0`,
+        [runId, candidateSnapshotDigest],
+      );
+      this.audit.record({
+        kind: "CANDIDATE_PROMOTED",
+        runId,
+        evidence: { candidateSnapshotDigest },
+      });
+    });
+  }
+
+  /** The candidate every evidence read for this run must agree with. */
+  currentCandidate(runId: string): string | null {
+    return (
+      this.db.get<{ current_candidate_digest: string | null }>(
+        `SELECT current_candidate_digest FROM runs WHERE run_id = ?`,
+        [runId],
+      )?.current_candidate_digest ?? null
+    );
+  }
+
   pinManifest(runId: string, digest: string): void {
     this.db.run(`UPDATE runs SET pinned_manifest_digest = ? WHERE run_id = ?`, [digest, runId]);
   }
@@ -511,6 +551,7 @@ interface RawRun {
   goal: string;
   contract_digest: string;
   pinned_manifest_digest: string | null;
+  current_candidate_digest: string | null;
   owner_session_id: string | null;
   owner_binding_generation: number | null;
   owner_session_incarnation: string | null;

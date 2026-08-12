@@ -145,6 +145,18 @@ BEGIN
   SELECT RAISE(ABORT, 'BINDING_GENERATION_NOT_MONOTONIC');
 END;
 
+-- INSERT-only monotonicity is not enough: lowering binding_generation, or moving a low
+-- generation into another role's history via role_key, would reactivate stale authority.
+CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable
+BEFORE UPDATE OF binding_generation, role_key, session_id, session_incarnation ON assignments
+WHEN NEW.binding_generation <> OLD.binding_generation
+  OR NEW.role_key <> OLD.role_key
+  OR NEW.session_id <> OLD.session_id
+  OR NEW.session_incarnation <> OLD.session_incarnation
+BEGIN
+  SELECT RAISE(ABORT, 'BINDING_IDENTITY_IMMUTABLE');
+END;
+
 CREATE INDEX IF NOT EXISTS assignments_session ON assignments(session_id, status);
 CREATE INDEX IF NOT EXISTS assignments_run ON assignments(run_id);
 
@@ -170,6 +182,10 @@ CREATE TABLE IF NOT EXISTS runs (
   owner_binding_generation  INTEGER,
   owner_session_incarnation TEXT,
   owner_role_key            TEXT,
+  -- The candidate every read of this run's evidence must agree with. Freezing a new
+  -- candidate moves this pointer and supersedes prior evidence in one transaction, so a
+  -- crash cannot leave stale evidence looking current (CP-HI-06).
+  current_candidate_digest  TEXT,
   human_gate_required       INTEGER NOT NULL DEFAULT 0 CHECK (human_gate_required IN (0,1)),
   revision_count            INTEGER NOT NULL DEFAULT 0,
   created_at                TEXT NOT NULL,
@@ -279,6 +295,9 @@ CREATE TABLE IF NOT EXISTS run_artifacts (
   digest                   TEXT NOT NULL,
   candidate_snapshot_digest TEXT,
   content_json             TEXT NOT NULL,
+  -- Which trusted component wrote this. Evidence kinds may only be written by the engine
+  -- that owns them, so a forged JSON blob cannot pass as verification or review output.
+  produced_by              TEXT NOT NULL DEFAULT 'unspecified',
   created_at               TEXT NOT NULL,
   superseded               INTEGER NOT NULL DEFAULT 0 CHECK (superseded IN (0,1)),
   -- §30.2 #7 — verification and review artifacts must carry the exact candidate digest.
@@ -287,8 +306,17 @@ CREATE TABLE IF NOT EXISTS run_artifacts (
   UNIQUE (run_id, kind, digest)
 );
 
+-- Evidence must not be editable, re-bindable to a different candidate, or deletable.
+-- Omitting candidate_snapshot_digest here would let a passing result be re-pointed at a
+-- newer candidate, which is precisely the CP-HI-06 bypass this trigger exists to prevent.
 CREATE TRIGGER IF NOT EXISTS run_artifacts_content_immutable
-BEFORE UPDATE OF content_json, digest, kind ON run_artifacts
+BEFORE UPDATE OF content_json, digest, kind, candidate_snapshot_digest, produced_by ON run_artifacts
+BEGIN
+  SELECT RAISE(ABORT, 'ARTIFACT_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS run_artifacts_no_delete
+BEFORE DELETE ON run_artifacts
 BEGIN
   SELECT RAISE(ABORT, 'ARTIFACT_IMMUTABLE');
 END;
@@ -492,6 +520,14 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 CREATE TRIGGER IF NOT EXISTS audit_events_append_only
 BEFORE UPDATE ON audit_events
+BEGIN
+  SELECT RAISE(ABORT, 'AUDIT_APPEND_ONLY');
+END;
+
+-- Append-only means no deletes either: erasing a denial or a takeover record would
+-- destroy exactly the evidence §40 requires for explainability.
+CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+BEFORE DELETE ON audit_events
 BEGIN
   SELECT RAISE(ABORT, 'AUDIT_APPEND_ONLY');
 END;

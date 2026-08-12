@@ -171,6 +171,72 @@ describe("guard enforces the §23.2 claim rejects, not only exact paths", () => 
     expect(decision.reasonCode).toBe(ReasonCode.CLAIM_BRANCH_CONFLICT);
   });
 
+  it("a branch claim still blocks when the writing run declared no branch of its own", () => {
+    // The run has no work_branch, so the guard falls back to the branch the checkout is
+    // actually on. Without that fallback a run could bypass the claim simply by never
+    // declaring one.
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const guard = new ManagedWriteGuard(
+      core.db,
+      fakeWorkspaceProbe([repo], { branches: { [repo]: "task/T1-x" } }),
+      core.audit,
+      core.clock,
+    );
+    otherRun(core.db, core.clock, seeded.projectId);
+    core.db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('cb2', ?, 'task/T1-x', 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [seeded.identity, seeded.sessionId, core.clock.nowIso(), isoPlus(core.clock.nowIso(), 3_600_000)],
+    );
+
+    const decision = guard.evaluate({
+      operation: WriteOperation.FILE_MUTATION,
+      targetPath: join(repo, "src/app.ts"),
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CLAIM_BRANCH_CONFLICT);
+    expect(decision.allowed === false && decision.evidence["source"]).toBe("checked-out branch");
+  });
+
+  it("a different branch in the same repository is not a conflict", () => {
+    // §23.3 — claims are short coordination leases, not repository ownership. Two runs on
+    // different branches of one repository must both be able to work.
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const guard = new ManagedWriteGuard(
+      core.db,
+      fakeWorkspaceProbe([repo], { branches: { [repo]: "task/T2-mine" } }),
+      core.audit,
+      core.clock,
+    );
+    otherRun(core.db, core.clock, seeded.projectId);
+    core.db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('cb3', ?, 'task/T1-theirs', 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [seeded.identity, seeded.sessionId, core.clock.nowIso(), isoPlus(core.clock.nowIso(), 3_600_000)],
+    );
+
+    expect(
+      guard.evaluate({
+        operation: WriteOperation.FILE_MUTATION,
+        targetPath: join(repo, "src/app.ts"),
+        runId: seeded.runId,
+        sessionId: seeded.sessionId,
+        bindingGeneration: seeded.generation,
+      }).allowed,
+    ).toBe(true);
+  });
+
   it("an expired lease does not block anyone", () => {
     const { guard, db, clock, seeded, repo } = setup();
     otherRun(db, clock, seeded.projectId);

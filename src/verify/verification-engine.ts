@@ -325,7 +325,7 @@ export class VerificationEngine {
   }
 
   private persist(runId: string, snapshotDigest: string, report: VerificationReport): void {
-    this.artifacts.put(runId, ArtifactKind.VERIFICATION, report, snapshotDigest);
+    this.artifacts.putEvidence("verification-engine", runId, ArtifactKind.VERIFICATION, report, snapshotDigest);
     this.audit.record({
       kind: "VERIFICATION_COMPLETED",
       runId,

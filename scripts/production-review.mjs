@@ -268,16 +268,17 @@ const run = (key, area) =>
 const requested = process.argv.slice(2);
 const keys = requested.length > 0 ? requested : Object.keys(AREAS);
 
-const results = [];
-// Sequential: xhigh reasoning across nine areas in parallel would spike the same quota
-// bucket the control plane is supposed to protect.
 for (const key of keys) {
   if (!AREAS[key]) {
     console.error(`unknown area: ${key}`);
     process.exit(2);
   }
-  results.push(await run(key, AREAS[key]));
 }
+
+// Areas are independent — disjoint file sets, no shared state — so they run concurrently.
+// Each is its own `codex exec` process; the only shared resource is provider quota, which
+// the caller decides to spend.
+const results = await Promise.all(keys.map((key) => run(key, AREAS[key])));
 
 writeFileSync(join(outDir, "summary.json"), JSON.stringify({ results }, null, 2));
 const blocked = results.filter((r) => r.verdict !== "PASS");

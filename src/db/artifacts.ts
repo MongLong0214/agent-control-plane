@@ -13,9 +13,23 @@ export interface StoredArtifact<T = unknown> {
   digest: string;
   candidateSnapshotDigest: string | null;
   content: T;
+  /** Trusted component that wrote this artifact; part of the evidence, not decoration. */
+  producedBy: string;
   createdAt: string;
   superseded: boolean;
 }
+
+/**
+ * Components permitted to write each evidence kind. Passing an arbitrary JSON blob as a
+ * verification or review result would let any caller mint a PASS, so those kinds are
+ * written only through `putEvidence` and only by the engine that owns them (CP-HI-04,
+ * CP-HI-08).
+ */
+const EVIDENCE_PRODUCERS: Readonly<Record<string, string>> = {
+  VERIFICATION: "verification-engine",
+  BLIND_REVIEW: "blind-review-gate",
+  PRODUCTION_READY_PACKET: "production-gate",
+};
 
 /** Artifact kinds that must be bound to an exact candidate (§30.2 #7, CP-HI-06). */
 const SNAPSHOT_BOUND: ReadonlySet<string> = new Set([
@@ -35,11 +49,55 @@ export class ArtifactStore {
     private readonly clock: Clock,
   ) {}
 
+  /** Non-evidence artifacts: contracts, plans, snapshots, handoffs, receipts. */
   put<T>(
     runId: string,
     kind: ArtifactKind,
     content: T,
     candidateSnapshotDigest?: string | null,
+  ): StoredArtifact<T> {
+    if (kind in EVIDENCE_PRODUCERS) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        `${kind} is evidence and must be written through putEvidence by ${EVIDENCE_PRODUCERS[kind]}`,
+        { runId, kind },
+      );
+    }
+    return this.write(runId, kind, content, candidateSnapshotDigest ?? null, "service");
+  }
+
+  /**
+   * Writes an evidence artifact on behalf of the component that owns that kind. The
+   * producer is recorded and checked, so the gate can distinguish engine output from a
+   * blob some other caller assembled.
+   */
+  putEvidence<T>(
+    producer: string,
+    runId: string,
+    kind: ArtifactKind,
+    content: T,
+    candidateSnapshotDigest: string,
+  ): StoredArtifact<T> {
+    const expected = EVIDENCE_PRODUCERS[kind];
+    if (!expected) {
+      fail(ReasonCode.INVALID_ARGUMENT, `${kind} is not an evidence kind`, { runId, kind });
+    }
+    if (expected !== producer) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        `${producer} may not write ${kind}; only ${expected} may`,
+        { runId, kind, producer },
+      );
+    }
+    return this.write(runId, kind, content, candidateSnapshotDigest, producer);
+  }
+
+  private write<T>(
+    runId: string,
+    kind: ArtifactKind,
+    content: T,
+    candidateSnapshotDigest: string | null,
+    producedBy: string,
   ): StoredArtifact<T> {
     if (SNAPSHOT_BOUND.has(kind) && !candidateSnapshotDigest) {
       fail(
@@ -62,13 +120,14 @@ export class ArtifactStore {
       digest,
       candidateSnapshotDigest: candidateSnapshotDigest ?? null,
       content,
+      producedBy,
       createdAt: this.clock.nowIso(),
       superseded: false,
     };
     this.db.run(
       `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
-                                  content_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                                  content_json, produced_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         artifact.artifactId,
         runId,
@@ -76,6 +135,7 @@ export class ArtifactStore {
         digest,
         artifact.candidateSnapshotDigest,
         JSON.stringify(content),
+        producedBy,
         artifact.createdAt,
       ],
     );
@@ -152,6 +212,7 @@ interface RawArtifact {
   digest: string;
   candidate_snapshot_digest: string | null;
   content_json: string;
+  produced_by: string;
   created_at: string;
   superseded: number;
 }
@@ -163,6 +224,7 @@ const hydrate = <T>(row: RawArtifact): StoredArtifact<T> => ({
   digest: row.digest,
   candidateSnapshotDigest: row.candidate_snapshot_digest,
   content: JSON.parse(row.content_json) as T,
+  producedBy: row.produced_by,
   createdAt: row.created_at,
   superseded: row.superseded === 1,
 });

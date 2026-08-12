@@ -155,6 +155,17 @@ export class ProductionGate {
     const completeness = this.tasks.completeness(input.runId);
     if (!completeness.allowed) return completeness as Decision<ProductionReadyPacket>;
 
+    // The candidate must be the one the run is actually on. Anything else is evidence for
+    // a superseded candidate, whatever its own digest says (CP-HI-06).
+    const current = this.runs.currentCandidate(input.runId);
+    if (current !== input.candidateSnapshotDigest) {
+      return deny(ReasonCode.EVIDENCE_STALE, "candidate is not the run's current candidate", {
+        runId: input.runId,
+        supplied: input.candidateSnapshotDigest,
+        current,
+      });
+    }
+
     const verificationArtifact = this.artifacts.latestForSnapshot<VerificationReport>(
       input.runId,
       ArtifactKind.VERIFICATION,
@@ -167,6 +178,21 @@ export class ProductionGate {
         status: verificationArtifact?.content.status ?? null,
       });
     }
+    if (verificationArtifact.producedBy !== "verification-engine") {
+      return deny(ReasonCode.EVIDENCE_MISSING, "verification artifact was not written by the engine", {
+        runId: input.runId,
+        producedBy: verificationArtifact.producedBy,
+      });
+    }
+
+    // The JSON report alone is not the evidence: it must agree with the normalized
+    // per-command rows the engine wrote. A hand-assembled PASS blob has no rows behind it.
+    const corroboration = this.corroborateVerification(
+      input.runId,
+      input.candidateSnapshotDigest,
+      verificationArtifact.content,
+    );
+    if (!corroboration.allowed) return corroboration as Decision<ProductionReadyPacket>;
 
     const reviewArtifact = this.artifacts.latestForSnapshot<ReviewPacket>(
       input.runId,
@@ -179,6 +205,18 @@ export class ProductionGate {
         candidateSnapshotDigest: input.candidateSnapshotDigest,
       });
     }
+    if (reviewArtifact.producedBy !== "blind-review-gate") {
+      return deny(ReasonCode.REVIEW_REQUIRED, "review artifact was not written by the review gate", {
+        runId: input.runId,
+        producedBy: reviewArtifact.producedBy,
+      });
+    }
+
+    // CP-HI-04 — the reviewer named in the packet must be a session that really held the
+    // BLIND_REVIEWER binding for this run at that generation, and must not be a producer.
+    const provenance = this.reviewerProvenance(input.runId, reviewArtifact.content);
+    if (!provenance.allowed) return provenance as Decision<ProductionReadyPacket>;
+
     if (reviewArtifact.content.verdict !== "PASS") {
       return deny(ReasonCode.REVIEW_REQUIRED, "blind review has not passed", {
         verdict: reviewArtifact.content.verdict,
@@ -245,7 +283,8 @@ export class ProductionGate {
     };
 
     this.artifacts.put(input.runId, ArtifactKind.APPROVAL, input.approval, input.candidateSnapshotDigest);
-    this.artifacts.put(
+    this.artifacts.putEvidence(
+      "production-gate",
       input.runId,
       ArtifactKind.PRODUCTION_READY_PACKET,
       packet,
@@ -342,6 +381,68 @@ export class ProductionGate {
     });
 
     return allow(ReasonCode.OK, { state: target });
+  }
+
+  /**
+   * §17.6/§17.7 — the report must match the rows. Every required command needs a PASS row
+   * for this exact candidate, and no row for it may be anything other than PASS.
+   */
+  private corroborateVerification(
+    runId: string,
+    candidateSnapshotDigest: string,
+    report: VerificationReport,
+  ): Decision<void> {
+    const rows = this.db.all<{ command_id: string; source: string; status: string }>(
+      `SELECT command_id, source, status FROM verification_results
+        WHERE run_id = ? AND candidate_snapshot_digest = ?`,
+      [runId, candidateSnapshotDigest],
+    );
+    if (rows.length === 0) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "no verification result rows for this candidate", {
+        runId,
+        candidateSnapshotDigest,
+      });
+    }
+    const failing = rows.filter((r) => r.status !== "PASS");
+    if (failing.length > 0) {
+      return deny(ReasonCode.VERIFICATION_COMMAND_FAILED, "verification rows contradict the report", {
+        runId,
+        failing,
+      });
+    }
+    const reported = new Set(report.results.map((r) => `${r.commandId}:${r.source}`));
+    const observed = new Set(rows.map((r) => `${r.command_id}:${r.source}`));
+    const missing = [...reported].filter((k) => !observed.has(k));
+    if (missing.length > 0 || rows.length < report.expectedInputs) {
+      return deny(ReasonCode.VERIFICATION_INCOMPLETE, "verification report is not fully corroborated", {
+        runId,
+        missing,
+        rows: rows.length,
+        expectedInputs: report.expectedInputs,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /** The reviewer identity in the packet must match a real binding, and be independent. */
+  private reviewerProvenance(runId: string, packet: ReviewPacket): Decision<void> {
+    const binding = this.db.get<{ session_id: string; binding_generation: number }>(
+      `SELECT session_id, binding_generation FROM assignments
+        WHERE run_id = ? AND role = 'BLIND_REVIEWER' AND session_id = ? AND binding_generation = ?`,
+      [runId, packet.reviewerSessionId, packet.reviewerRoleBindingGeneration],
+    );
+    if (!binding) {
+      return deny(
+        ReasonCode.REVIEWER_NOT_INDEPENDENT,
+        "packet names a reviewer that never held the blind reviewer binding for this run",
+        {
+          runId,
+          reviewerSessionId: packet.reviewerSessionId,
+          generation: packet.reviewerRoleBindingGeneration,
+        },
+      );
+    }
+    return this.bindings.assertReviewerIndependence(runId, packet.reviewerSessionId);
   }
 
   /** §21 — an owner decision recorded against a specific run and gate item. */

@@ -19,6 +19,12 @@ export interface WorkspaceProbe {
   probeWorktree(path: string): WorktreeProbe;
   /** Resolve symlinks as far as the path exists; the guard compares canonical paths. */
   canonical(path: string): string;
+  /**
+   * Branch currently checked out in the work tree, or null if it cannot be determined
+   * (detached HEAD, unreadable repository). The guard needs this to compare a write
+   * against another run's branch claim when the writing run declared no branch of its own.
+   */
+  currentBranch(toplevel: string): string | null;
 }
 
 export const realWorkspaceProbe: WorkspaceProbe = {
@@ -61,6 +67,18 @@ export const realWorkspaceProbe: WorkspaceProbe = {
     }
   },
   canonical,
+  currentBranch(toplevel: string): string | null {
+    try {
+      const out = execFileSync("git", ["-C", toplevel, "rev-parse", "--abbrev-ref", "HEAD"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: gitProbeEnv(),
+      }).trim();
+      return out === "HEAD" || out.length === 0 ? null : out;
+    } catch {
+      return null;
+    }
+  },
 };
 
 const gitProbeEnv = (): NodeJS.ProcessEnv => ({
@@ -102,7 +120,7 @@ export const isWithin = (parent: string, child: string): boolean => {
 /** In-memory probe for tests: the given roots are work trees, everything else is outside. */
 export const fakeWorkspaceProbe = (
   worktrees: readonly string[],
-  options: { errorFor?: readonly string[] } = {},
+  options: { errorFor?: readonly string[]; branches?: Readonly<Record<string, string>> } = {},
 ): WorkspaceProbe => {
   const roots = [...worktrees].map((w) => resolve(w)).sort((a, b) => b.length - a.length);
   const errors = (options.errorFor ?? []).map((p) => resolve(p));
@@ -116,5 +134,6 @@ export const fakeWorkspaceProbe = (
       return toplevel ? { status: "INSIDE", toplevel } : { status: "OUTSIDE" };
     },
     canonical: (path: string) => resolve(path),
+    currentBranch: (toplevel: string) => options.branches?.[resolve(toplevel)] ?? null,
   };
 };

@@ -12,6 +12,14 @@ export type SqliteDatabase = Database.Database;
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
 /**
+ * Version of the shape in schema.sql. Bump this whenever a constraint, trigger or column
+ * changes, and add the corresponding migration. `CREATE TABLE IF NOT EXISTS` is not a
+ * migration: it silently keeps an older table whose CHECK constraints are weaker, so a
+ * deployment could start with hard invariants missing (§40 Maintainability).
+ */
+export const SCHEMA_VERSION = 1;
+
+/**
  * SQLite handle plus the transaction discipline required by PRD §30.3.
  *
  * Every section listed there — binding failover, run owner takeover, gate publish
@@ -32,6 +40,43 @@ export class Db {
       this.raw.pragma("journal_mode = WAL");
       this.raw.pragma("synchronous = FULL");
     }
+    this.applySchema();
+  }
+
+  /**
+   * Applies the schema exactly once and pins the version. Anything unexpected fails
+   * closed rather than running against a database whose constraints are unknown.
+   */
+  private applySchema(): void {
+    const version = Number(this.raw.pragma("user_version", { simple: true }));
+    const alreadyPopulated =
+      this.raw
+        .prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'runs'`)
+        .get() as { n: number };
+
+    if (version === 0 && alreadyPopulated.n > 0) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        "database predates schema versioning; its constraints cannot be verified",
+        { expected: SCHEMA_VERSION, found: version, action: "recreate or migrate the database" },
+      );
+    }
+    if (version === 0) {
+      this.raw.exec(readFileSync(schemaPath, "utf8"));
+      this.raw.pragma(`user_version = ${SCHEMA_VERSION}`);
+      return;
+    }
+    if (version !== SCHEMA_VERSION) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        version < SCHEMA_VERSION
+          ? "database schema is older than this build and no migration is defined"
+          : "database schema is newer than this build",
+        { expected: SCHEMA_VERSION, found: version },
+      );
+    }
+    // Same version: re-running the idempotent DDL adds nothing, but it does verify the
+    // file still parses against this SQLite build.
     this.raw.exec(readFileSync(schemaPath, "utf8"));
   }
 
@@ -41,11 +86,11 @@ export class Db {
    * silent second BEGIN would commit the outer work early.
    */
   tx<T>(fn: () => T): T {
-    if (this.#depth > 0) return fn();
+    if (this.#depth > 0) return this.guardSync(fn());
     this.raw.exec("BEGIN IMMEDIATE");
     this.#depth += 1;
     try {
-      const out = fn();
+      const out = this.guardSync(fn());
       this.raw.exec("COMMIT");
       return out;
     } catch (err) {
@@ -58,6 +103,25 @@ export class Db {
     } finally {
       this.#depth -= 1;
     }
+  }
+
+  /**
+   * A transaction body must be synchronous. An async callback would return a pending
+   * promise, COMMIT would run before the work finished, and writes after the first await
+   * would land outside the transaction with no way to roll them back — silently voiding
+   * every §30.3 atomicity guarantee.
+   */
+  private guardSync<T>(out: T): T {
+    if (out && typeof (out as { then?: unknown }).then === "function") {
+      this.raw.exec("ROLLBACK");
+      this.#depth = 0;
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        "transaction callback returned a promise; transaction bodies must be synchronous",
+        {},
+      );
+    }
+    return out;
   }
 
   get inTransaction(): boolean {
@@ -96,6 +160,7 @@ export class Db {
 const TRIGGER_CODES: Record<string, ReasonCode> = {
   SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,
   BINDING_GENERATION_NOT_MONOTONIC: ReasonCode.BINDING_GENERATION_STALE,
+  BINDING_IDENTITY_IMMUTABLE: ReasonCode.BINDING_GENERATION_STALE,
   ARTIFACT_IMMUTABLE: ReasonCode.CONFLICT,
   MANIFEST_IMMUTABLE: ReasonCode.CONFLICT,
   AUDIT_APPEND_ONLY: ReasonCode.CONFLICT,

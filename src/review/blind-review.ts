@@ -218,7 +218,7 @@ export class BlindReviewGate {
       }
 
       const validated = this.validateCoverage(packet, expected);
-      this.artifacts.put(request.runId, ArtifactKind.BLIND_REVIEW, validated, snapshotDigest);
+      this.artifacts.putEvidence("blind-review-gate", request.runId, ArtifactKind.BLIND_REVIEW, validated, snapshotDigest);
 
       this.audit.record({
         kind: "BLIND_REVIEW_COMPLETED",

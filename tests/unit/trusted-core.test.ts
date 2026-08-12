@@ -385,9 +385,26 @@ describe("outbox fencing (PRD §15.7, §27.5)", () => {
   });
 
   it("CP-S50: only messages matching the currently active generation are deliverable", () => {
-    const { outbox, db, seeded } = enqueue();
+    const { outbox, db, seeded, clock } = enqueue();
     expect(outbox.claimDeliverable()).toHaveLength(1);
-    db.run(`UPDATE assignments SET binding_generation = 2 WHERE role_key = ?`, [seeded.roleKey]);
+
+    // Move the generation the way production does: revoke, then bind the successor.
+    // Updating binding_generation in place is refused by the schema, precisely so a stale
+    // generation cannot be reactivated.
+    db.run(`UPDATE assignments SET status = 'REVOKED' WHERE role_key = ?`, [seeded.roleKey]);
+    db.run(
+      `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, session_id,
+                                session_incarnation, binding_generation, mode, status, created_at)
+       VALUES (?, ?, 'PRIMARY_CTO', ?, ?, ?, 'inc-1', 2, 'PREFERRED', 'ACTIVE', ?)`,
+      [
+        newAssignmentId(),
+        seeded.roleKey,
+        seeded.projectId,
+        seeded.runId,
+        seeded.sessionId,
+        clock.nowIso(),
+      ],
+    );
     expect(outbox.claimDeliverable()).toHaveLength(0);
   });
 

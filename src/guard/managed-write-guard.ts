@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { basename, isAbsolute } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
@@ -359,7 +359,7 @@ export class ManagedWriteGuard {
     });
     if (!target.allowed) return target as Decision<GuardGrant>;
 
-    const conflict = this.claimConflict(run.run_id, target.value, resolvedPath);
+    const conflict = this.claimConflict(run.run_id, target.value, resolvedPath, toplevel);
     if (conflict) return conflict as Decision<GuardGrant>;
 
     const issuedAt = this.clock.nowIso();
@@ -589,6 +589,7 @@ export class ManagedWriteGuard {
     runId: string,
     participant: ParticipantRow,
     resolvedPath: string | null,
+    toplevel: string | null,
   ): Decision<never> | null {
     const held = this.db.all<{
       claim_id: string;
@@ -609,19 +610,30 @@ export class ManagedWriteGuard {
         ? resolvedPath.slice(participant.checkout_path.length + 1)
         : null;
 
+    // Which branch and worktree this write actually touches. The run's own declaration is
+    // authoritative when it made one; otherwise fall back to what the checkout says, so a
+    // run that simply never declared a branch cannot slip past another run's claim.
+    const branchTouched =
+      participant.work_branch ?? (toplevel ? this.probe.currentBranch(toplevel) : null);
+    // Managed verification worktrees are created under a root and named by their id, so a
+    // resolved toplevel's basename is the worktree id when the write lands in one.
+    const worktreeTouched = participant.worktree_id ?? (toplevel ? basename(toplevel) : null);
+
     for (const claim of held) {
-      if (claim.worktree_id && participant.worktree_id && claim.worktree_id === participant.worktree_id) {
+      if (claim.worktree_id && worktreeTouched && claim.worktree_id === worktreeTouched) {
         return deny(ReasonCode.CLAIM_WORKTREE_CONFLICT, "worktree is claimed by another run", {
           worktreeId: claim.worktree_id,
           heldBy: claim.run_id,
           claimId: claim.claim_id,
+          source: participant.worktree_id ? "run declaration" : "resolved work tree",
         });
       }
-      if (claim.branch && participant.work_branch && claim.branch === participant.work_branch) {
+      if (claim.branch && branchTouched && claim.branch === branchTouched) {
         return deny(ReasonCode.CLAIM_BRANCH_CONFLICT, "branch is claimed by another run", {
           branch: claim.branch,
           heldBy: claim.run_id,
           claimId: claim.claim_id,
+          source: participant.work_branch ? "run declaration" : "checked-out branch",
         });
       }
       if (relative && claim.declared_path === relative) {

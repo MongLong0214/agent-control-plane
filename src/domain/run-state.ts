@@ -34,15 +34,21 @@ const TRANSITIONS: Readonly<Record<RunState, readonly RunState[]>> = {
   [RunState.CANCELLED]: [],
 };
 
-export const TERMINAL_RUN_STATES: readonly RunState[] = [
+// `readonly` is compile-time only. The normative §29 machine must not be reshapeable at
+// runtime: pushing a target onto a returned array would make an illegal completion legal.
+Object.freeze(TRANSITIONS);
+for (const targets of Object.values(TRANSITIONS)) Object.freeze(targets);
+
+export const TERMINAL_RUN_STATES: readonly RunState[] = Object.freeze([
   RunState.COMPLETED,
   RunState.FAILED,
   RunState.CANCELLED,
-];
+]);
 
 export const isTerminal = (state: RunState): boolean => TERMINAL_RUN_STATES.includes(state);
 
-export const legalTargets = (from: RunState): readonly RunState[] => TRANSITIONS[from];
+/** Returns a copy: callers must not be able to reach the table itself. */
+export const legalTargets = (from: RunState): readonly RunState[] => [...TRANSITIONS[from]];
 
 export const canTransition = (from: RunState, to: RunState): Decision<RunState> => {
   if (from === to) {

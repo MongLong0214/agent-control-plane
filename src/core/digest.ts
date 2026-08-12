@@ -12,10 +12,27 @@ export const canonicalJson = (value: unknown): string => {
       if (!Number.isFinite(node)) throw new TypeError("non-finite number in canonical json");
       return JSON.stringify(node);
     }
-    if (typeof node === "boolean" || typeof node === "string") return JSON.stringify(node);
-    if (typeof node === "bigint") return JSON.stringify(node.toString());
+    if (typeof node === "boolean") return JSON.stringify(node);
+    if (typeof node === "string") {
+      // Integration §8.3 requires normalized newlines: a checkout that differs only by
+      // line ending must not produce a different digest and so a false drift.
+      return JSON.stringify(node.replace(/\r\n/g, "\n").replace(/\r/g, "\n"));
+    }
+    // bigint would encode identically to the string form, making the encoding
+    // non-injective — 1n and "1" must not share a digest.
+    if (typeof node === "bigint") {
+      throw new TypeError("bigint is not canonically encodable; convert it explicitly");
+    }
     if (Array.isArray(node)) return `[${node.map((item) => encode(item ?? null)).join(",")}]`;
     if (typeof node === "object") {
+      // A Date, Map, Set or class instance has no own enumerable entries, so it would
+      // silently encode as {} and collide with every other such value.
+      const proto = Object.getPrototypeOf(node) as unknown;
+      if (proto !== Object.prototype && proto !== null) {
+        throw new TypeError(
+          `only plain objects are canonically encodable; got ${(node as object).constructor?.name ?? "unknown"}`,
+        );
+      }
       const entries = Object.entries(node as Record<string, unknown>)
         .filter(([, v]) => v !== undefined)
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));

@@ -96,6 +96,9 @@ export class CandidatePipeline {
     );
 
     this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, candidateSnapshotDigest(snapshot));
+    // One transaction records the new candidate and stales everything bound to an older
+    // one, so no window exists in which superseded evidence still reads as current.
+    this.runs.promoteCandidate(runId, candidateSnapshotDigest(snapshot));
     this.audit.record({
       kind: "CANDIDATE_FROZEN",
       runId,
@@ -131,11 +134,6 @@ export class CandidatePipeline {
     if (!frozen.allowed) return frozen as Decision<PipelineOutcome>;
     const snapshot = frozen.value;
     const snapshotDigest = candidateSnapshotDigest(snapshot);
-
-    // Evidence bound to a superseded candidate stops being current the moment a new
-    // one is frozen (§34.4).
-    this.artifacts.supersedeForOtherSnapshots(input.runId, ArtifactKind.VERIFICATION, snapshotDigest);
-    this.artifacts.supersedeForOtherSnapshots(input.runId, ArtifactKind.BLIND_REVIEW, snapshotDigest);
 
     const commands = this.resolveCommands(run.projectId, run.executionMode, input.runScopedCommands);
     const verified = await this.verification.verify({
