@@ -44,6 +44,25 @@ export interface ReadinessProbe {
   checkSession(sessionId: string): Promise<Decision<void>>;
 }
 
+/** The receipt an incoming runtime presents after receiving a handoff envelope. */
+export interface HandoffAcknowledgement {
+  sessionId: string;
+  sessionIncarnation: string;
+  bindingGeneration: number;
+  messageId: string;
+  payloadDigest: string;
+  /** Session-scoped secret; never persisted in the handoff, audit, or outbox payload. */
+  sessionSecret: string;
+}
+
+/**
+ * Session authentication belongs to the session registry. Keeping this as a narrow port
+ * stops a lifecycle caller from treating knowledge of an id as possession of a session.
+ */
+export interface HandoffAuthentication {
+  verifyHandoffAcknowledgement(input: HandoffAcknowledgement): Decision<void>;
+}
+
 export interface CtoPreference {
   provider: string;
   model: string;
@@ -62,6 +81,7 @@ export class CtoLifecycle {
   #buzz: BuzzConnector | null = null;
   #readiness: ReadinessProbe | null = null;
   #ownerAuthority: OwnerAuthorityPort | null = null;
+  #handoffAuthentication: HandoffAuthentication | null = null;
 
   constructor(
     private readonly db: Db,
@@ -80,10 +100,12 @@ export class CtoLifecycle {
     buzz?: BuzzConnector;
     readiness?: ReadinessProbe;
     ownerAuthority?: OwnerAuthorityPort;
+    handoffAuthentication?: HandoffAuthentication;
   }): void {
     if (ports.buzz) this.#buzz = ports.buzz;
     if (ports.readiness) this.#readiness = ports.readiness;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
+    if (ports.handoffAuthentication) this.#handoffAuthentication = ports.handoffAuthentication;
   }
 
   /**
@@ -202,16 +224,6 @@ export class CtoLifecycle {
       );
     }
 
-    // Zero active runs now is not zero active runs at ack time. DRAINING is the barrier:
-    // dispatch admission refuses to hand a new run to a draining CTO, so the count cannot
-    // climb back up between prepare and ack (§10.1).
-    const draining = this.sessions.transition(
-      current.sessionId,
-      SessionLifecycle.DRAINING,
-      "switchover prepared",
-    );
-    if (!draining.allowed) return draining as Decision<{ handoffId: string; incomingSessionId: string }>;
-
     const missing = missingHandoffFields(handoff);
     if (missing.length > 0) {
       return deny(ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, "handoff package is incomplete", {
@@ -224,25 +236,65 @@ export class CtoLifecycle {
     if (!incoming.allowed) return incoming as Decision<{ handoffId: string; incomingSessionId: string }>;
 
     const handoffId = `hof_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
-    this.db.run(
-      `INSERT INTO handoffs (handoff_id, project_id, kind, from_session_id, from_generation,
-                             to_session_id, package_json, digest, status, created_at)
-       VALUES (?, ?, 'HANDOFF', ?, ?, ?, ?, ?, 'PENDING', ?)`,
-      [
-        handoffId, projectId, current.sessionId, current.bindingGeneration, incoming.value,
-        JSON.stringify(handoff), digestOf(handoff), this.clock.nowIso(),
-      ],
-    );
+    const prepared = this.db.tx(() => {
+      // Spawn is asynchronous, so repeat the authority and active-run checks at the
+      // moment the drain barrier is persisted. A replacement can never revoke a run that
+      // appeared while its incoming session was being readied.
+      const fresh = this.bindings.active(roleKey);
+      if (
+        !fresh ||
+        fresh.sessionId !== current.sessionId ||
+        fresh.bindingGeneration !== current.bindingGeneration
+      ) {
+        return deny<{ handoffId: string; incomingSessionId: string }>(
+          ReasonCode.WRITE_BINDING_GENERATION_STALE,
+          "the primary CTO binding changed while the replacement was being prepared",
+          { projectId, expectedGeneration: current.bindingGeneration, current: fresh?.bindingGeneration ?? null },
+        );
+      }
+      const stillActive = this.runs.activeRunsOwnedBy(current.sessionId);
+      if (stillActive.length > 0) {
+        return deny<{ handoffId: string; incomingSessionId: string }>(
+          ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS,
+          "the outgoing CTO acquired active runs while the replacement was being prepared",
+          { projectId, activeRuns: stillActive.map((run) => run.runId) },
+        );
+      }
 
-    this.outbox.enqueue({
-      idempotencyKey: `handoff:${handoffId}`,
-      roleKey,
-      bindingGeneration: current.bindingGeneration,
-      targetSessionId: incoming.value,
-      runId: null,
-      kind: MessageKind.HANDOFF_PACKAGE,
-      payload: { handoffId, projectId, handoff },
+      // DRAINING, the durable handoff, and the message that authorizes its recipient are
+      // one transition. A failed transaction rolls the owner back to its prior lifecycle.
+      const draining = this.sessions.transition(
+        current.sessionId,
+        SessionLifecycle.DRAINING,
+        "switchover prepared",
+      );
+      if (!draining.allowed) {
+        return draining as Decision<{ handoffId: string; incomingSessionId: string }>;
+      }
+      this.db.run(
+        `INSERT INTO handoffs (handoff_id, project_id, kind, from_session_id, from_generation,
+                               to_session_id, package_json, digest, status, created_at)
+         VALUES (?, ?, 'HANDOFF', ?, ?, ?, ?, ?, 'PENDING', ?)`,
+        [
+          handoffId, projectId, current.sessionId, current.bindingGeneration, incoming.value,
+          JSON.stringify(handoff), digestOf(handoff), this.clock.nowIso(),
+        ],
+      );
+      this.outbox.enqueue({
+        idempotencyKey: `handoff:${handoffId}`,
+        roleKey,
+        bindingGeneration: current.bindingGeneration,
+        targetSessionId: incoming.value,
+        runId: null,
+        kind: MessageKind.HANDOFF_PACKAGE,
+        payload: { handoffId, projectId, handoff },
+      });
+      return allow(ReasonCode.OK, { handoffId, incomingSessionId: incoming.value });
     });
+    if (!prepared.allowed) {
+      await this.stopUnusedSession(incoming.value, "switchover preparation refused");
+      return prepared;
+    }
 
     this.audit.record({
       kind: "HANDOFF_SUBMITTED",
@@ -251,27 +303,73 @@ export class CtoLifecycle {
       roleKey,
       evidence: { handoffId, incomingSessionId: incoming.value, digest: digestOf(handoff) },
     });
-    return allow(ReasonCode.OK, { handoffId, incomingSessionId: incoming.value });
+    return prepared;
   }
 
   /**
    * §10.1 — HANDOFF_ACK, then the atomic binding generation switch. Until the ack
    * arrives the old binding is still the authority.
    */
-  acknowledgeHandoff(handoffId: string, ackBySessionId: string): Decision<RoleBinding> {
+  acknowledgeHandoff(
+    handoffId: string,
+    acknowledgement: HandoffAcknowledgement | string,
+  ): Decision<RoleBinding> {
     return this.db.tx(() => {
       const row = this.db.get<RawHandoff>(`SELECT * FROM handoffs WHERE handoff_id = ?`, [handoffId]);
       if (!row) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId });
       if (row.status !== "PENDING") {
         return deny(ReasonCode.CONFLICT, `handoff is already ${row.status}`, { handoffId });
       }
-      if (row.to_session_id !== ackBySessionId) {
+
+      // A session id is an address, not a credential. Legacy callers that only provide
+      // it are deliberately refused instead of silently retaining the pre-hardening
+      // authentication model.
+      if (typeof acknowledgement === "string") {
+        return deny(ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED, "handoff ack requires a session-authenticated envelope", {
+          handoffId,
+        });
+      }
+      if (row.to_session_id !== acknowledgement.sessionId) {
         return deny(ReasonCode.HANDOFF_ACK_REQUIRED, "ack must come from the incoming session", {
           handoffId,
           expected: row.to_session_id,
-          got: ackBySessionId,
+          got: acknowledgement.sessionId,
         });
       }
+
+      const incoming = this.sessions.get(row.to_session_id);
+      const envelope = this.outbox.byIdempotencyKey(`handoff:${handoffId}`);
+      if (
+        !incoming ||
+        acknowledgement.sessionIncarnation !== incoming.incarnation ||
+        acknowledgement.bindingGeneration !== row.from_generation ||
+        !envelope ||
+        envelope.kind !== MessageKind.HANDOFF_PACKAGE ||
+        envelope.targetSessionId !== row.to_session_id ||
+        envelope.bindingGeneration !== row.from_generation ||
+        acknowledgement.messageId !== envelope.messageId ||
+        acknowledgement.payloadDigest !== envelope.payloadDigest ||
+        envelope.status !== "SENT"
+      ) {
+        return deny(
+          ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED,
+          "handoff ack does not match a delivered, current handoff envelope",
+          {
+            handoffId,
+            messageId: acknowledgement.messageId,
+            delivered: envelope?.status === "SENT",
+          },
+        );
+      }
+      if (!this.#handoffAuthentication) {
+        return deny(
+          ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED,
+          "handoff session authentication is not configured",
+          { handoffId },
+        );
+      }
+      const authenticated = this.#handoffAuthentication.verifyHandoffAcknowledgement(acknowledgement);
+      if (!authenticated.allowed) return authenticated as Decision<RoleBinding>;
 
       // The authority that prepared the handoff must still be the authority. If the
       // binding moved (failover, recovery takeover) this ack is for a generation that no
@@ -305,14 +403,14 @@ export class CtoLifecycle {
 
       this.db.run(
         `UPDATE handoffs SET status = 'ACKED', acked_at = ?, ack_by_session_id = ? WHERE handoff_id = ?`,
-        [this.clock.nowIso(), ackBySessionId, handoffId],
+        [this.clock.nowIso(), acknowledgement.sessionId, handoffId],
       );
 
       const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: row.project_id });
       const switched = this.bindings.switchTo({
         roleKey,
         role: Role.PRIMARY_CTO,
-        sessionId: ackBySessionId,
+        sessionId: acknowledgement.sessionId,
         projectId: row.project_id,
         mode: "PREFERRED",
         reason: `handoff ${handoffId} acknowledged`,
@@ -326,7 +424,7 @@ export class CtoLifecycle {
       this.audit.record({
         kind: "HANDOFF_ACK",
         projectId: row.project_id,
-        sessionId: ackBySessionId,
+        sessionId: acknowledgement.sessionId,
         roleKey,
         evidence: {
           handoffId,
@@ -354,11 +452,11 @@ export class CtoLifecycle {
 
     if (current) {
       const session = this.sessions.get(current.sessionId);
-      if (session?.lifecycle === SessionLifecycle.READY) {
+      if (!session || !isUnavailable(session.lifecycle)) {
         return deny(
           ReasonCode.RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER,
-          "the bound CTO session is READY; use a normal replacement instead",
-          { projectId, sessionId: current.sessionId },
+          "the bound CTO has no durable unavailable/error evidence; use a normal replacement instead",
+          { projectId, sessionId: current.sessionId, lifecycle: session?.lifecycle ?? null },
         );
       }
     }
@@ -367,7 +465,28 @@ export class CtoLifecycle {
     const incoming = await this.spawn(projectId, "acting-cto-recovery");
     if (!incoming.allowed) return incoming as Decision<RoleBinding>;
 
-    return this.db.tx(() => {
+    const takeover = this.db.tx(() => {
+      // `spawn` awaits provider work. Do not let a session that recovered, or a binding
+      // that moved in that interval, be displaced by a stale emergency decision.
+      const currentNow = this.bindings.active(roleKey);
+      if (
+        (current &&
+          (!currentNow ||
+            currentNow.sessionId !== current.sessionId ||
+            currentNow.bindingGeneration !== current.bindingGeneration ||
+            !isUnavailable(this.sessions.get(current.sessionId)?.lifecycle))) ||
+        (!current && currentNow)
+      ) {
+        return deny<RoleBinding>(
+          ReasonCode.WRITE_BINDING_GENERATION_STALE,
+          "the owner binding or its unavailable evidence changed during recovery preparation",
+          {
+            projectId,
+            expectedGeneration: current?.bindingGeneration ?? null,
+            currentGeneration: currentNow?.bindingGeneration ?? null,
+          },
+        );
+      }
       const handoffId = `hof_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
       this.db.run(
         `INSERT INTO handoffs (handoff_id, project_id, kind, from_session_id, from_generation,
@@ -413,6 +532,10 @@ export class CtoLifecycle {
       });
       return switched;
     });
+    if (!takeover.allowed) {
+      await this.stopUnusedSession(incoming.value, "recovery takeover refused");
+    }
+    return takeover;
   }
 
   /** §10.4 — capacity-driven suspend. Owner approval is mandatory. */
@@ -438,13 +561,17 @@ export class CtoLifecycle {
       }
     }
 
-    const suspended = this.projects.setSuspended(projectId, true, ownerApproved);
-    if (!suspended.allowed) return suspended;
-
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const current = this.bindings.active(roleKey);
-    if (current) {
-      // Checkpoint before the binding disappears, so a resume is not a cold start.
+    const session = current ? this.sessions.require(current.sessionId) : null;
+    const prepared = this.db.tx(() => {
+      const suspended = this.projects.setSuspended(projectId, true, ownerApproved);
+      if (!suspended.allowed) return suspended;
+      if (!current || !session) return allow(ReasonCode.OK, undefined);
+
+      // The recovery package captures ownership before active runs are checkpointed. It
+      // remains durable when provider cleanup later fails, so suspension can be retried
+      // without pretending that those executions vanished.
       const recovery = this.buildRecoveryPackage(projectId, `suspend: ${reason}`);
       this.db.run(
         `INSERT INTO handoffs (handoff_id, project_id, kind, from_session_id, from_generation,
@@ -456,18 +583,72 @@ export class CtoLifecycle {
           digestOf(recovery), this.clock.nowIso(),
         ],
       );
-      this.bindings.revoke(roleKey, `project suspended: ${reason}`);
-      this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, "project suspended");
-      await this.providers
-        .require(this.sessions.require(current.sessionId).provider)
-        .stopSession({
+      for (const run of this.runs.activeRunsOwnedBy(current.sessionId)) {
+        if (run.state === RunState.ACTIVE) {
+          const checkpointed = this.runs.transition(run.runId, RunState.BLOCKED, "project capacity suspended");
+          if (!checkpointed.allowed) return checkpointed as Decision<void>;
+        }
+      }
+      if (session.lifecycle === SessionLifecycle.READY) {
+        const draining = this.sessions.transition(current.sessionId, SessionLifecycle.DRAINING, "project suspended");
+        if (!draining.allowed) return draining as Decision<void>;
+      }
+      return allow(ReasonCode.OK, undefined);
+    });
+    if (!prepared.allowed) return prepared;
+
+    if (current && session && session.lifecycle !== SessionLifecycle.STOPPED) {
+      try {
+        await this.providers.require(session.provider).stopSession({
           externalSessionId: current.sessionId,
-          provider: this.sessions.require(current.sessionId).provider,
-          model: this.sessions.require(current.sessionId).model,
-          effort: null,
-          pid: null,
-        })
-        .catch(() => undefined);
+          provider: session.provider,
+          model: session.model,
+          effort: session.effort,
+          pid: session.osPid,
+        });
+      } catch (error) {
+        this.db.tx(() => {
+          const latest = this.sessions.require(current.sessionId);
+          if (latest.lifecycle === SessionLifecycle.READY || latest.lifecycle === SessionLifecycle.DRAINING) {
+            this.sessions.transition(current.sessionId, SessionLifecycle.ERROR, "provider stop failed");
+          }
+          this.projects.setAvailability(projectId, "UNAVAILABLE", "provider stop failed during suspension");
+          this.audit.record({
+            kind: "PROJECT_SUSPEND_RUNTIME_STOP_FAILED",
+            reasonCode: ReasonCode.SESSION_STOP_FAILED,
+            projectId,
+            sessionId: current.sessionId,
+            evidence: { reason, error: error instanceof Error ? error.message : String(error) },
+          });
+        });
+        return deny(ReasonCode.SESSION_STOP_FAILED, "CTO runtime stop failed; cleanup remains pending", {
+          projectId,
+          sessionId: current.sessionId,
+        });
+      }
+
+      const completed = this.db.tx(() => {
+        const fresh = this.bindings.active(roleKey);
+        if (
+          !fresh ||
+          fresh.sessionId !== current.sessionId ||
+          fresh.bindingGeneration !== current.bindingGeneration
+        ) {
+          return deny<void>(
+            ReasonCode.WRITE_BINDING_GENERATION_STALE,
+            "the CTO binding changed while runtime shutdown was in progress",
+            {
+              projectId,
+              expectedGeneration: current.bindingGeneration,
+              currentGeneration: fresh?.bindingGeneration ?? null,
+            },
+          );
+        }
+        const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, "project suspended");
+        if (!stopped.allowed) return stopped as Decision<void>;
+        return this.bindings.revoke(roleKey, `project suspended: ${reason}`);
+      });
+      if (!completed.allowed) return completed;
     }
 
     this.audit.record({
@@ -588,7 +769,34 @@ export class CtoLifecycle {
 
     return allow(ReasonCode.OK, session.sessionId);
   }
+
+  /** A replacement that never became authoritative must not remain a live orphan. */
+  private async stopUnusedSession(sessionId: string, reason: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
+    try {
+      await this.providers.require(session.provider).stopSession({
+        externalSessionId: sessionId,
+        provider: session.provider,
+        model: session.model,
+        effort: session.effort,
+        pid: session.osPid,
+      });
+      this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
+    } catch (error) {
+      this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);
+      this.audit.record({
+        kind: "CTO_UNUSED_SESSION_STOP_FAILED",
+        reasonCode: ReasonCode.SESSION_STOP_FAILED,
+        sessionId,
+        evidence: { reason, error: error instanceof Error ? error.message : String(error) },
+      });
+    }
+  }
 }
+
+const isUnavailable = (lifecycle: SessionLifecycle | undefined): boolean =>
+  lifecycle === SessionLifecycle.ERROR || lifecycle === SessionLifecycle.STOPPED;
 
 export const missingHandoffFields = (handoff: HandoffPackage): string[] => {
   const missing: string[] = [];

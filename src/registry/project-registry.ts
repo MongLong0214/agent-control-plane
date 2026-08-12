@@ -110,59 +110,63 @@ export class ProjectRegistry {
     const project = this.get(projectId);
     if (!project) return deny(ReasonCode.NOT_FOUND, "unknown project", { projectId });
 
-    if (
-      project.activeManifestDigest &&
-      via.runKind !== "CONTRACT_CHANGE" &&
-      via.runKind !== "PROJECT_BOOTSTRAP"
-    ) {
+    if (via.runKind !== "CONTRACT_CHANGE" && via.runKind !== "PROJECT_BOOTSTRAP") {
       return deny(
         ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
-        "replacing an active manifest requires a CONTRACT_CHANGE run",
+        "manifest activation requires a CONTRACT_CHANGE or PROJECT_BOOTSTRAP run",
         { projectId, current: project.activeManifestDigest, viaRunKind: via.runKind },
       );
     }
 
-    // A run *kind* is a label, not a proof. Replacing a live contract requires a real
-    // CONTRACT_CHANGE run for this project that actually completed (Integration §10.4).
-    if (project.activeManifestDigest && via.runKind === "CONTRACT_CHANGE") {
-      const run = via.runId
-        ? this.db.get<{ kind: string; state: string; project_id: string | null }>(
-            `SELECT kind, state, project_id FROM runs WHERE run_id = ?`,
-            [via.runId],
-          )
-        : null;
-      if (
-        !run ||
-        run.project_id !== projectId ||
-        run.kind !== "CONTRACT_CHANGE" ||
-        run.state !== "COMPLETED"
-      ) {
-        return deny(
-          ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
-          "a contract change must be carried by a completed CONTRACT_CHANGE run for this project",
-          {
-            projectId,
-            runId: via.runId,
-            observed: run ? { kind: run.kind, state: run.state, projectId: run.project_id } : null,
-          },
-        );
-      }
-    }
-
     const stored = this.storeManifest(manifest);
     if (!stored.allowed) return stored;
+    if (project.activeManifestDigest === stored.value) return stored;
 
-    this.db.run(`UPDATE projects SET active_manifest_digest = ? WHERE project_id = ?`, [
-      stored.value,
-      projectId,
-    ]);
-    this.audit.record({
-      kind: "PROJECT_MANIFEST_ACTIVATED",
-      projectId,
-      runId: via.runId,
-      evidence: { from: project.activeManifestDigest, to: stored.value, viaRunKind: via.runKind },
+    return this.db.tx(() => {
+      const fresh = this.get(projectId);
+      if (!fresh) return deny(ReasonCode.NOT_FOUND, "unknown project", { projectId });
+      if (fresh.activeManifestDigest === stored.value) return stored;
+
+      // A run label and a terminal state are not authorization for an arbitrary new
+      // contract. The production gate must issue an immutable grant that names this
+      // project, run kind, candidate, and exact manifest digest.
+      const grant = this.activationGrant(projectId, stored.value, via);
+      if (!grant.allowed) return grant;
+      if (this.activationGrantConsumed(grant.value.artifactDigest)) {
+        return deny(
+          ReasonCode.MANIFEST_ACTIVATION_GRANT_CONSUMED,
+          "manifest activation grant has already been consumed",
+          { projectId, runId: via.runId, activationGrantDigest: grant.value.artifactDigest },
+        );
+      }
+
+      this.db.run(`UPDATE projects SET active_manifest_digest = ? WHERE project_id = ?`, [
+        stored.value,
+        projectId,
+      ]);
+      // Repository bindings are local evidence of the formerly active contract. A new
+      // project digest invalidates that evidence until each checkout is re-read and a
+      // managed operation acknowledges the resulting head.
+      this.db.run(
+        `UPDATE repositories
+            SET active_manifest_digest = ?, drift_state = 'DRIFTED'
+          WHERE project_id = ?`,
+        [stored.value, projectId],
+      );
+      this.audit.record({
+        kind: "PROJECT_MANIFEST_ACTIVATED",
+        projectId,
+        runId: via.runId,
+        evidence: {
+          from: fresh.activeManifestDigest,
+          to: stored.value,
+          viaRunKind: via.runKind,
+          activationGrantDigest: grant.value.artifactDigest,
+          candidateSnapshotDigest: grant.value.candidateSnapshotDigest,
+        },
+      });
+      return stored;
     });
-    return stored;
   }
 
   get(projectId: string): ProjectRecord | null {
@@ -213,6 +217,92 @@ export class ProjectRegistry {
     return allow(ReasonCode.OK, undefined);
   }
 
+  private activationGrant(
+    projectId: string,
+    manifestDigestValue: string,
+    via: { runKind: string; runId: string | null },
+  ): Decision<{ artifactDigest: string; candidateSnapshotDigest: string }> {
+    const run = via.runId
+      ? this.db.get<{
+          kind: string;
+          state: string;
+          project_id: string | null;
+          current_candidate_digest: string | null;
+        }>(
+          `SELECT kind, state, project_id, current_candidate_digest FROM runs WHERE run_id = ?`,
+          [via.runId],
+        )
+      : null;
+    if (
+      !run ||
+      run.project_id !== projectId ||
+      run.kind !== via.runKind ||
+      run.state !== "COMPLETED" ||
+      !run.current_candidate_digest
+    ) {
+      return deny(
+        ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
+        "manifest activation requires a completed dedicated run with a current candidate",
+        {
+          projectId,
+          runId: via.runId,
+          observed: run
+            ? {
+                kind: run.kind,
+                state: run.state,
+                projectId: run.project_id,
+                currentCandidateDigest: run.current_candidate_digest,
+              }
+            : null,
+        },
+      );
+    }
+
+    const grants = this.db.all<RawActivationGrant>(
+      `SELECT digest, candidate_snapshot_digest, content_json FROM run_artifacts
+        WHERE run_id = ? AND kind = 'APPROVAL' AND produced_by = 'production-gate'
+          AND superseded = 0
+        ORDER BY created_at DESC, rowid DESC`,
+      [via.runId],
+    );
+    const grant = grants.find((row) => {
+      const content = parseActivationGrant(row.content_json);
+      return (
+        content?.projectId === projectId &&
+        content.runId === via.runId &&
+        content.runKind === via.runKind &&
+        content.manifestDigest === manifestDigestValue &&
+        content.candidateSnapshotDigest === run.current_candidate_digest &&
+        row.candidate_snapshot_digest === run.current_candidate_digest
+      );
+    });
+    if (!grant) {
+      return deny(
+        ReasonCode.MANIFEST_ACTIVATION_EVIDENCE_MISSING,
+        "no production-gate activation grant proves this exact manifest and candidate",
+        { projectId, runId: via.runId, runKind: via.runKind, manifestDigest: manifestDigestValue },
+      );
+    }
+    return allow(ReasonCode.OK, {
+      artifactDigest: grant.digest,
+      candidateSnapshotDigest: run.current_candidate_digest,
+    });
+  }
+
+  private activationGrantConsumed(artifactDigest: string): boolean {
+    return this.db
+      .all<{ evidence_json: string }>(
+        `SELECT evidence_json FROM audit_events WHERE kind = 'PROJECT_MANIFEST_ACTIVATED'`,
+      )
+      .some((row) => {
+        try {
+          return (JSON.parse(row.evidence_json) as { activationGrantDigest?: unknown }).activationGrantDigest === artifactDigest;
+        } catch {
+          return false;
+        }
+      });
+  }
+
   private hydrate(row: RawProject): ProjectRecord {
     const bound = this.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM assignments
@@ -239,3 +329,37 @@ interface RawProject {
   suspended: number;
   created_at: string;
 }
+
+interface RawActivationGrant {
+  digest: string;
+  candidate_snapshot_digest: string | null;
+  content_json: string;
+}
+
+interface ActivationGrant {
+  schema: "acp.manifest-activation-grant.v1";
+  projectId: string;
+  runId: string;
+  runKind: "CONTRACT_CHANGE" | "PROJECT_BOOTSTRAP";
+  manifestDigest: string;
+  candidateSnapshotDigest: string;
+}
+
+const parseActivationGrant = (content: string): ActivationGrant | null => {
+  try {
+    const value = JSON.parse(content) as Partial<ActivationGrant>;
+    if (
+      value.schema !== "acp.manifest-activation-grant.v1" ||
+      typeof value.projectId !== "string" ||
+      typeof value.runId !== "string" ||
+      (value.runKind !== "CONTRACT_CHANGE" && value.runKind !== "PROJECT_BOOTSTRAP") ||
+      typeof value.manifestDigest !== "string" ||
+      typeof value.candidateSnapshotDigest !== "string"
+    ) {
+      return null;
+    }
+    return value as ActivationGrant;
+  } catch {
+    return null;
+  }
+};
