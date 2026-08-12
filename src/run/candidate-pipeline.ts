@@ -29,6 +29,8 @@ import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
 import type { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 
+const ATTEMPT_LEASE_TTL_MS = 30 * 60 * 1000;
+
 export interface SubmitResultInput {
   runId: string;
   ownerSessionId: string;
@@ -137,6 +139,19 @@ export class CandidatePipeline {
   }
 
   async submitResult(input: SubmitResultInput): Promise<Decision<PipelineOutcome>> {
+    // A caller that cannot prove the run owner must not be able to reserve the run's
+    // durable submission fence, even briefly. This check is repeated after acquisition
+    // to cover a state/ownership change between the two database operations.
+    const owner = this.runs.assertOwner(
+      input.runId,
+      input.ownerSessionId,
+      input.ownerBindingGeneration,
+    );
+    if (!owner.allowed) return owner as Decision<PipelineOutcome>;
+    if (owner.value.state !== RunState.ACTIVE) {
+      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${owner.value.state}`, { runId: input.runId });
+    }
+
     const attemptId = `attempt_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     const acquired = this.acquireAttempt(input, attemptId);
     if (!acquired.allowed) return acquired as Decision<PipelineOutcome>;
@@ -339,6 +354,8 @@ export class CandidatePipeline {
   /** Durable, per-run fence for the whole asynchronous verification/review attempt. */
   private acquireAttempt(input: SubmitResultInput, attemptId: string): Decision<void> {
     return this.db.tx(() => {
+      const now = this.clock.nowIso();
+      const staleBefore = new Date(this.clock.now().getTime() - ATTEMPT_LEASE_TTL_MS).toISOString();
       const inserted = this.db.run(
         `INSERT INTO candidate_pipeline_attempts
            (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, released_at)
@@ -351,8 +368,10 @@ export class CandidatePipeline {
            state = 'RUNNING',
            started_at = excluded.started_at,
            released_at = NULL
-         WHERE candidate_pipeline_attempts.state = 'RELEASED'`,
-        [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, this.clock.nowIso()],
+         WHERE candidate_pipeline_attempts.state = 'RELEASED'
+            OR (candidate_pipeline_attempts.state = 'RUNNING'
+                AND candidate_pipeline_attempts.started_at < ?)`,
+        [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, now, staleBefore],
       );
       if (inserted.changes === 1) return allow(ReasonCode.OK, undefined);
       const current = this.db.get<{

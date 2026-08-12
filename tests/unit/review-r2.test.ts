@@ -1,10 +1,14 @@
 import { afterAll, describe, expect, it } from "vitest";
+import { join } from "node:path";
 
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
-import { __testing } from "../../src/review/blind-review.ts";
+import { BlindReviewGate, __testing } from "../../src/review/blind-review.ts";
 import { CandidatePipeline } from "../../src/run/candidate-pipeline.ts";
+import { canonical } from "../../src/guard/workspace-probe.ts";
+import { ClaudeCliAdapter, CodexCliAdapter, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
+import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
@@ -17,6 +21,7 @@ import {
   registerFixtureProject,
   reviewerPass,
 } from "../helpers/harness.ts";
+import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -123,6 +128,40 @@ const directReview = async (setup: Awaited<ReturnType<typeof prepareReviewedInpu
     verification: setup.verification,
   });
 };
+
+const invokeGate = (
+  gate: BlindReviewGate,
+  setup: Awaited<ReturnType<typeof prepareReviewedInputs>>,
+) => gate.controlPlaneInvoker()({
+  runId: setup.run.runId,
+  projectId: setup.projectId,
+  executionMode: setup.run.executionMode,
+  snapshot: setup.snapshot,
+  contract: CONTRACT,
+  contractDigest: setup.run.contractDigest,
+  verification: setup.verification,
+});
+
+class HealthyProbeClaudeAdapter extends ClaudeCliAdapter {
+  override async probeRuntime(): Promise<"HEALTHY"> {
+    return "HEALTHY";
+  }
+
+  override async invoke(request: InvocationRequest): Promise<InvocationResult> {
+    return {
+      ok: false,
+      text: "",
+      json: null,
+      provider: this.provider,
+      model: request.model ?? this.defaultModels.reviewer,
+      durationMs: 0,
+      exitCode: 1,
+      error: "model did not answer",
+      providerSessionId: request.externalSessionId ?? null,
+      isolationAttested: request.isolation !== undefined,
+    };
+  }
+}
 
 describe("round-2 blind-review regressions", () => {
   it("#125 rejects a caller-fabricated PASS verification report", async () => {
@@ -257,6 +296,139 @@ describe("round-2 blind-review regressions", () => {
     await first;
   });
 
+  it("#333 skips a preferred adapter that cannot attest reviewer isolation", async () => {
+    const setup = await prepareReviewedInputs();
+    const preferred = new CodexCliAdapter({
+      clock: setup.harness.clock,
+      capacityFile: join(setup.harness.root, "gpt-capacity.json"),
+      binary: "codex-not-used-by-reviewer-capability-test",
+    });
+    let probes = 0;
+    preferred.probeRuntime = async () => {
+      probes += 1;
+      return "HEALTHY";
+    };
+    const fallback = new TestProductionAdapter(setup.harness.clock, "claude");
+    fallback.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    setup.harness.cp.providers.register(preferred);
+    setup.harness.cp.providers.register(fallback);
+
+    const gate = new BlindReviewGate(
+      setup.harness.cp.clock,
+      setup.harness.cp.db,
+      setup.harness.cp.audit,
+      setup.harness.cp.artifacts,
+      setup.harness.cp.evidenceWriters.BLIND_REVIEW,
+      setup.harness.cp.sessions,
+      setup.harness.cp.bindings,
+      setup.harness.cp.providers,
+      setup.harness.cp.repositories,
+      setup.harness.cp.telemetry,
+      {
+        preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
+        fallbacks: [{ provider: "claude", model: "opus", effort: null }],
+      },
+    );
+    const result = await invokeGate(gate, setup);
+
+    expect(result.allowed).toBe(true);
+    expect(result.reasonCode).toBe(ReasonCode.REVIEW_PASS);
+    expect(result.allowed && result.value.provider).toBe("claude");
+    expect(probes).toBe(0);
+  });
+
+  it("#334 uses a packet-local reviewer home and reports answer failure separately", async () => {
+    const setup = await prepareReviewedInputs();
+    const claude = new HealthyProbeClaudeAdapter({
+      clock: setup.harness.clock,
+      capacityFile: join(setup.harness.root, "claude-capacity.json"),
+      binary: "/bin/false",
+    });
+    const environment = reviewerEnvironment("/packet-root", "/provider-home");
+    expect(environment.HOME).toBe("/packet-root");
+    expect(environment.PATH).toContain("/usr/bin");
+    expect(environment.CLAUDE_CONFIG_DIR).toBe("/provider-home");
+    expect(claude.supportsReviewerIsolation).toBe(true);
+    setup.harness.cp.providers.register(claude);
+    const gate = new BlindReviewGate(
+      setup.harness.cp.clock,
+      setup.harness.cp.db,
+      setup.harness.cp.audit,
+      setup.harness.cp.artifacts,
+      setup.harness.cp.evidenceWriters.BLIND_REVIEW,
+      setup.harness.cp.sessions,
+      setup.harness.cp.bindings,
+      setup.harness.cp.providers,
+      setup.harness.cp.repositories,
+      setup.harness.cp.telemetry,
+      {
+        preferred: { provider: "claude", model: "opus", effort: null },
+        fallbacks: [],
+      },
+    );
+
+    const result = await invokeGate(gate, setup);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+  });
+
+  it("#335 reclaims an aged crashed submission lease", async () => {
+    const setup = await prepareReviewedInputs();
+    setup.harness.cp.verification.verify = async () => allow(ReasonCode.OK, setup.verification);
+    setup.harness.scripted.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    const startedAt = new Date(setup.harness.clock.now().getTime() - 31 * 60 * 1000).toISOString();
+    setup.harness.cp.db.run(
+      `INSERT INTO candidate_pipeline_attempts
+         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, released_at)
+       VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, NULL)`,
+      [setup.run.runId, "attempt_crashed", "session-crashed", 1, startedAt],
+    );
+
+    const result = await setup.harness.cp.pipeline.submitResult({
+      runId: setup.run.runId,
+      ownerSessionId: setup.run.ownerSessionId!,
+      ownerBindingGeneration: setup.run.ownerBindingGeneration!,
+      resultSummary: "done",
+      recommendation: "merge",
+    });
+
+    expect(result.allowed).toBe(true);
+    expect(result.reasonCode).toBe(ReasonCode.OK);
+  });
+
+  it("#344 validates the owner before reserving the submission lease", async () => {
+    const setup = await prepareReviewedInputs();
+    setup.harness.cp.verification.verify = async () => allow(ReasonCode.OK, setup.verification);
+    setup.harness.scripted.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    const input = {
+      runId: setup.run.runId,
+      ownerSessionId: setup.run.ownerSessionId!,
+      ownerBindingGeneration: setup.run.ownerBindingGeneration!,
+      resultSummary: "done",
+      recommendation: "merge",
+    };
+
+    const bogus = setup.harness.cp.pipeline.submitResult({ ...input, ownerSessionId: "not-the-owner" });
+    const valid = setup.harness.cp.pipeline.submitResult(input);
+    const rejected = await bogus;
+    const accepted = await valid;
+
+    expect(rejected.allowed).toBe(false);
+    expect(rejected.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
+    expect(accepted.allowed).toBe(true);
+    expect(accepted.reasonCode).toBe(ReasonCode.OK);
+  });
+
   it("#132 gives the reviewer an empty packet-only working directory", async () => {
     const setup = await prepareReviewedInputs();
     const result = await directReview(setup);
@@ -287,7 +459,7 @@ describe("round-2 blind-review regressions", () => {
       network: "deny",
       tools: "none",
     }));
-    expect(invocation.isolation?.denyReadPaths).toContain(setup.harness.repoPath);
+    expect(invocation.isolation?.denyReadPaths).toContain(canonical(setup.harness.repoPath));
   });
 
   it("#133 rejects a PASS response that omits required evidence fields", () => {
@@ -312,8 +484,10 @@ describe("round-2 blind-review regressions", () => {
       diff: `diff --git a/large.ts b/large.ts\n${"x".repeat(1_000)}`,
       files: ["large.ts"],
     }], 100);
-    expect(chunks.flat().every((part) => part.diff.length <= 100)).toBe(true);
-    expect(chunks.flat().every((part) => part.files[0] === "large.ts")).toBe(true);
+    const parts = chunks.flat();
+    expect(parts.length).toBeGreaterThan(1);
+    expect(parts.every((part) => part.diff.length <= 100)).toBe(true);
+    expect(parts.every((part) => part.files[0] === "large.ts")).toBe(true);
   });
 
   it("#136 supplies a digest-bound git binary patch instead of permanently omitting it", async () => {
@@ -419,6 +593,5 @@ describe("round-2 blind-review regressions", () => {
     expect(result.value.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
     expect(evaluations).toBe(1);
     expect(setup.harness.cp.audit.byKind("REVISION_RETURNED_TO_CTO")).toHaveLength(0);
-    console.log("DEBUG", JSON.stringify(setup.harness.cp.audit.byKind("BLIND_REVIEW_UNAVAILABLE")));
   });
 });
