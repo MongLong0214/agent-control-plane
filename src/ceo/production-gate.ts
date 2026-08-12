@@ -97,7 +97,15 @@ export interface SourceReadLeasePort {
     runId: string,
     repositoryIdentities: readonly string[],
   ): Decision<{ leaseId: string; release(): void }>;
-  assertSourceReadLease(runId: string, leaseId: string): Decision<void>;
+  /**
+   * The lease must cover the repositories this packet is about to publish, not merely exist
+   * for the run — a lease over one repository authorised a packet spanning two before #341.
+   */
+  assertSourceReadLease(
+    runId: string,
+    leaseId: string,
+    repositoryIdentities: readonly string[],
+  ): Decision<void>;
 }
 
 /** PRD §19.3 — the only three automatic Hermes notifications. */
@@ -224,7 +232,11 @@ export class ProductionGate {
     if (acquired && !acquired.allowed) return acquired as Decision<ProductionReadyPacket>;
     const sourceReadLeaseId = input.sourceReadLeaseId ?? acquired!.value.leaseId;
     const releaseSourceReadLease = acquired?.allowed ? acquired.value.release : null;
-    const checkLease = (): Decision<void> => sourceLeases.assertSourceReadLease(input.runId, sourceReadLeaseId);
+    // The identities the packet actually covers: a caller-supplied lease is only good for
+    // these, and every re-check through publication asks the same question.
+    const leasedIdentities = snapshot.value.repositories.map((repository) => repository.identity);
+    const checkLease = (): Decision<void> =>
+      sourceLeases.assertSourceReadLease(input.runId, sourceReadLeaseId, leasedIdentities);
     const held = checkLease();
     if (!held.allowed) {
       releaseSourceReadLease?.();

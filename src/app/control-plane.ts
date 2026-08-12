@@ -270,7 +270,9 @@ export class ControlPlane {
         isDraining: (projectId) => this.cto.isDraining(projectId),
         plannedProvider: (projectId) => this.cto.plannedProvider(projectId),
       },
-      capacity: { refreshForDispatch: () => this.capacity.refreshForDispatch() },
+      // The target has to survive the port: dropping it here is what made every dispatch
+      // ask "is any provider healthy?" instead of "is the one this run will use healthy?".
+      capacity: { refreshForDispatch: (target) => this.capacity.refreshForDispatch(target) },
       continuity: { mode: () => this.continuity.mode() },
     });
     this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? []);

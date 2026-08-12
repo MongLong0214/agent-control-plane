@@ -194,6 +194,13 @@ interface SourceReadLease {
 /** A grant is short-lived and single use; see `consume`. */
 const CLAIM_LEASE_EXTENSION_MS = 5 * 60 * 1000;
 const GRANT_TTL_MS = 60_000;
+
+/** The states in which a gate may hold a source freeze; see `acquireSourceReadLease`. */
+const LEASEABLE_RUN_STATES: ReadonlySet<string> = new Set<string>([
+  RunState.ACTIVE,
+  RunState.READY_FOR_CEO_REVIEW,
+  RunState.AWAITING_HUMAN,
+]);
 const SOURCE_READ_LEASE_TTL_MS = 60_000;
 const NO_FOLLOW_READ = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 
@@ -381,8 +388,13 @@ export class ManagedWriteGuard {
 
     const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run for source-read lease", { runId });
-    if (run.state !== RunState.ACTIVE) {
-      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "source-read lease requires an ACTIVE run", {
+    // A freeze is legitimate exactly while a gate is deciding on this run's candidate: the
+    // pipeline holds one across verification → review → packet (ACTIVE), and the CEO gate
+    // holds one across its own re-read and confirmation (READY_FOR_CEO_REVIEW, and
+    // AWAITING_HUMAN while an owner clears a gate item). A run that is queued, revising or
+    // terminal has no candidate to publish, so freezing source in its name is refused.
+    if (!LEASEABLE_RUN_STATES.has(run.state)) {
+      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "source-read lease requires a run that is deciding on a candidate", {
         runId,
         state: run.state,
       });
@@ -489,8 +501,10 @@ export class ManagedWriteGuard {
       });
     }
     const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
-    if (!run || run.state !== RunState.ACTIVE) {
-      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "source-read lease requires an ACTIVE run", {
+    // Same window as acquisition: a freeze stays valid while the run is deciding on its
+    // candidate, which includes the CEO-review states the gate re-reads evidence in.
+    if (!run || !LEASEABLE_RUN_STATES.has(run.state)) {
+      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "source-read lease requires a run that is deciding on a candidate", {
         runId,
         state: run?.state ?? null,
       });
