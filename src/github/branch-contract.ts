@@ -37,6 +37,11 @@ export interface BranchContractInput {
   declaredParent?: string | null;
   /** Active release branches, needed for fix lineage and hotfix propagation. */
   activeReleases?: readonly string[];
+  /**
+   * Immutable source line recorded when the candidate was frozen. A PR target is
+   * mutable, so it cannot prove where a branch was cut from.
+   */
+  sourceBase?: string | null;
 }
 
 interface RuleContext extends BranchContractInput {
@@ -80,6 +85,14 @@ const RULES: Readonly<Record<BranchClass, (ctx: RuleContext) => Decision<BranchF
 
   // fix/* stays in the lineage it came from: dev, or an active release.
   fix: (ctx) => {
+    if (!ctx.declaredParent) {
+      return ctx.refuse("fix branches must declare the lineage they were cut from");
+    }
+    if (ctx.base !== ctx.declaredParent) {
+      return ctx.refuse("fix branch target does not match its declared lineage", {
+        declaredParent: ctx.declaredParent,
+      });
+    }
     if (ctx.base_.class === "dev") return allow(ReasonCode.OK, ctx.head_);
     if (ctx.base_.class === "release") {
       return ctx.releases.includes(ctx.base)
@@ -136,7 +149,17 @@ export const validateBranchContract = (input: BranchContractInput): Decision<Bra
       ...extra,
     });
 
-  return RULES[head_.class]({ ...input, head_, base_, releases, refuse });
+  const rule = RULES[head_.class]({ ...input, head_, base_, releases, refuse });
+  if (!rule.allowed) return rule;
+
+  const requiredBase = requiredBaseFor(input.head, input.profile, input.declaredParent);
+  if (requiredBase && input.sourceBase !== undefined && input.sourceBase !== requiredBase) {
+    return refuse("branch was not frozen from the required source lineage", {
+      sourceBase: input.sourceBase,
+      requiredBase,
+    });
+  }
+  return rule;
 };
 
 /** Integration §9.2 — the base a branch of this class must have been cut from. */
