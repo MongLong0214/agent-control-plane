@@ -13,11 +13,11 @@ const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
 /**
  * Version of the shape in schema.sql. Bump this whenever a constraint, trigger or column
- * changes, and add the corresponding migration. `CREATE TABLE IF NOT EXISTS` is not a
- * migration: it silently keeps an older table whose CHECK constraints are weaker, so a
- * deployment could start with hard invariants missing (§40 Maintainability).
+ * changes. There is no ordered migration path: `CREATE TABLE IF NOT EXISTS` would silently
+ * preserve an older table whose constraints are weaker, so version mismatch is refused
+ * instead of pretending that a deployed database was migrated (§40 Maintainability).
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /**
  * SQLite handle plus the transaction discipline required by PRD §30.3.
@@ -200,6 +200,7 @@ const isAsyncTransactionError = (err: unknown): err is AsyncTransactionError =>
 const TRIGGER_CODES: Record<string, ReasonCode> = {
   SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,
   SESSION_BUZZ_ACTOR_IMMUTABLE: ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE,
+  OUTBOX_REQUEST_FINGERPRINT_IMMUTABLE: ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH,
   BINDING_GENERATION_NOT_MONOTONIC: ReasonCode.BINDING_GENERATION_STALE,
   BINDING_IDENTITY_IMMUTABLE: ReasonCode.BINDING_GENERATION_STALE,
   BINDING_REVOKED_TERMINAL: ReasonCode.BINDING_REVOKED,
