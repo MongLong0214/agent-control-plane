@@ -17,7 +17,7 @@ const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
  * migration: it silently keeps an older table whose CHECK constraints are weaker, so a
  * deployment could start with hard invariants missing (§40 Maintainability).
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /**
  * SQLite handle plus the transaction discipline required by PRD §30.3.
@@ -207,6 +207,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   EVIDENCE_CANDIDATE_MISMATCH: ReasonCode.SNAPSHOT_DIGEST_MISMATCH,
   ARTIFACT_IMMUTABLE: ReasonCode.CONFLICT,
   GITHUB_RECEIPT_IMMUTABLE: ReasonCode.CONFLICT,
+  GITHUB_RECEIPT_PROTOCOL_VIOLATION: ReasonCode.GITHUB_RECEIPT_PROTOCOL_VIOLATION,
   MANIFEST_IMMUTABLE: ReasonCode.CONFLICT,
   AUDIT_APPEND_ONLY: ReasonCode.CONFLICT,
 };
