@@ -4,7 +4,8 @@ import { z } from "zod";
 import type { ControlPlane } from "../app/control-plane.ts";
 import { deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { ExecutionMode, RunKind, RunPriority } from "../domain/types.ts";
+import type { ExecutionMode, RunPriority } from "../domain/types.ts";
+import { RunKind } from "../domain/types.ts";
 import { guarded, ok, respond } from "./shared.ts";
 
 const contractSchema = z.object({

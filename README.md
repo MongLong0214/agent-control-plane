@@ -126,6 +126,20 @@ fetch them. A project therefore needs one of:
   control plane accept the result only at the exact candidate head from an approved
   workflow digest.
 
+## Persistence
+
+21 tables: the eleven PRD §30.1 names plus ten additions, each justified inline in
+[`src/db/schema.sql`](src/db/schema.sql) by the independent lifecycle, integrity constraint
+or query it exists for — §40 requires exactly that justification. `tasks` and
+`task_dependencies` are separate from `task_executions` because a task node outlives its
+attempts and the DAG is queried in both directions; `verification_results` exists because
+the completeness gate *counts* rows and a JSON blob cannot be counted or uniquely
+constrained; `handoffs` is project-scoped and a replacement happens precisely when the run
+count is zero, so it cannot live in `run_artifacts`.
+
+Event sourcing, an audit hash chain, a generic policy DSL, distributed consensus and a
+cloud database are all deliberately absent (§30.4).
+
 ## Provider capacity
 
 Neither shipped CLI exposes a quota interface, so the adapters read a structured local

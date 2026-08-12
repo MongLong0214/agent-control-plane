@@ -20,7 +20,7 @@ import { IngressGuard, asUntrustedData } from "../../src/ingress/ingress-guard.t
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
-import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import {
   type Harness,
   bindCeo,

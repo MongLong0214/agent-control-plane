@@ -7,7 +7,7 @@ period cannot be satisfied by a build, and are marked as such rather than glosse
 |---|---|---|---|
 | 1 | CP-S01–CP-S59 all PASS | **Met** | Every scenario id maps to an executable test; `pnpm trace` reports 59/59 covered and the suite passes. See `evidence/traceability.md`. |
 | 2 | DB constraint and transactional failover tests PASS | **Met** | `tests/unit/trusted-core.test.ts` trips each §30.2 constraint; `switchTo` activate/revoke/outbox-fence runs in one transaction and is asserted in CP-S10 and CP-S23. |
-| 3 | One real end-to-end run in each of SIMPLE, STANDARD, GUARDED | **Partly met** | STANDARD ran end to end against a real project with a real reviewer (`evidence/e2e-real-project.json`). SIMPLE and GUARDED are exercised by the scenario suite — including the GUARDED human gate — but not yet as real runs with live model sessions. |
+| 3 | One real end-to-end run in each of SIMPLE, STANDARD, GUARDED | **Partly met** | STANDARD ran end to end in 166s against a real project with a real CTO session, real sandboxed verification and a real independent reviewer — see `evidence/e2e-real-project.json`. SIMPLE and GUARDED are exercised by the scenario suite, including the GUARDED human gate, but not yet as real runs with live model sessions. |
 | 4 | One multi-repository run with an explicit merge order | **Partly met** | Multi-repository freezing and staleness are proven with two real repositories (CP-S25), and `run_repositories.merge_order` plus per-repo merge state are implemented. A full two-repository merge sequence has not been executed. |
 | 5 | Zero role/session independence violations under GPT-down and Claude-down continuity | **Met** | CP-S19–CP-S22, CP-S24, CP-S34. Distinct sessions are asserted, and a failover the coverage plan cannot staff is refused rather than downgraded. |
 | 6 | Repo Factory bootstrap → primary CTO activation → doctor | **Met on the control-plane side** | Activation runs from a fixture `repo-factory.result.v2` through registration, binding, handoff ACK and doctor (CP-S52). The producing side is a separate deliverable and does not exist yet. |
@@ -15,6 +15,33 @@ period cannot be satisfied by a build, and are marked as such rather than glosse
 | 8 | Recorded observation window and duration for the zero counts | **Not met** | Follows item 7. |
 | 9 | Zero owner interrupts for routine technical revision during dogfood | **Not met** | Follows item 7. CP-S33 and CP-S53 prove routine revision and churn do not notify upward. |
 | 10 | Every P0 requirement linked to a scenario and evidence | **Met** | 22/22 requirements covered, 0 gaps, generated from the PRD tables rather than hand-maintained. |
+
+## What the real end-to-end run produced
+
+One run, `run_05f4d4ae2b624ecb92c51a87`, against a local clone of this repository
+registered by hand. Full record in `evidence/e2e-real-project.json`.
+
+- Project registered with activity `INACTIVE`; dispatch provisioned a primary CTO and it
+  became `ACTIVE`, derived from the binding rather than stored.
+- A DIRECT-labelled write to `src/core/reason-codes.ts` was refused with
+  `WRITE_REQUIRES_MANAGED_RUN` before any run existed.
+- A real Claude session, bound as `PRIMARY_CTO`, returned a parsed lean plan in 49s.
+- Verification ran the project's real contract check inside a seatbelt-confined disposable
+  worktree at exact head `e0a990d8…`: 1 expected input, 1 observed, `PASS`.
+- A **fresh** Claude session, bound as `BLIND_REVIEWER` at generation 1 and confirmed not
+  to be in the run's producer set, returned `PASS` with 1 file covered, 0 omissions and 1
+  non-blocking finding. The packet records what was withheld from it.
+- The CEO decision came from a third distinct session and moved the run to `COMPLETED`.
+- The doctor then reported `DEGRADED` with exactly one finding,
+  `CTO_BUZZ_NOT_CONNECTED` — correct, since Buzz is not configured here.
+
+The first attempt at this run **failed**, and that is the more interesting evidence: the
+independent reviewer returned `REVISE` with two findings that were both correct. It caught
+a machine-specific `node_modules` symlink that had entered the candidate diff (scope creep
+that would have broken any other checkout) and a mismatch between the contract's stated
+acceptance criterion and the verification evidence actually supplied. Both were real
+defects in the setup, both were fixed, and the re-run passed under a fresh reviewer — the
+`REVISE → revise → fresh re-review` loop executed for real rather than simulated.
 
 ## Environmental boundaries found while building
 

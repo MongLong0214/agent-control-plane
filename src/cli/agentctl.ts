@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
 import { isAcpError } from "../core/errors.ts";
-import { RunState } from "../domain/types.ts";
+import type { RunState } from "../domain/types.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
 
 /**
