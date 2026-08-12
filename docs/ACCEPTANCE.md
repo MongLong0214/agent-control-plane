@@ -75,6 +75,41 @@ dependency-free command, an install command declared with a network allowlist, o
 `TRUSTED_CI` evidence. This repository uses the first for local verification
 (`scripts/verify-reason-codes.mjs`) and the third for its typecheck.
 
+## Operating requirements the hardening pass introduced
+
+These are configuration facts an operator has to satisfy; the code fails closed without
+them rather than assuming a permissive default.
+
+- **Owner identities must be configured.** `ControlPlaneConfig.ownerIdentities` lists the
+  channel/actor pairs that may act as the owner. With none configured, an owner decision, an
+  owner-approved project suspension and an owner-authorised repair are all refused with
+  `INGRESS_ACTOR_NOT_ALLOWLISTED` / `REPAIR_REQUIRES_OWNER`. A deployment with no owner
+  cannot satisfy a human gate — deliberately, because §21 makes the owner the one authority
+  the runtime may not synthesise.
+- **A managed write needs a live claim.** Burning a guard grant requires the run to hold a
+  `HELD`, unexpired claim on that repository under the run's current owner generation; the
+  claim's lease is extended at that moment. A worker that writes without claiming is refused
+  with `WRITE_PATH_NOT_CLAIMED`.
+- **Post-merge verification needs declared checks.** `postMergeVerify` uses the pinned
+  manifest's `ciWorkflows` / `postMergeCommands`; a caller-supplied name that the manifest
+  does not declare, or an empty declared set, is refused with
+  `POST_MERGE_CHECKS_NOT_DECLARED` instead of passing every commit.
+- **Bootstrap activation is two-phase.** The first `activate` opens a `PENDING` handoff and
+  returns `BOOTSTRAP_ACTIVATION_INCOMPLETE` with `pendingHandoffId`; the incoming CTO calls
+  `acknowledgeActivationHandoff`, and a re-run of `activate` then completes. A bootstrap run
+  cannot be confirmed by the CEO without a stored activation result.
+- **Ingress signatures cover the envelope.** A signing client must use
+  `ingressSignature(secret, request)` from `src/ingress/ingress-guard.ts`; the guard derives
+  the signed bytes from channel, actor, conversation, nonce and payload rather than trusting
+  a caller-supplied body.
+
+## Known unresolved findings
+
+The independent review's BLOCKER findings are all closed with regression tests. Its MAJOR
+findings are tracked as GitHub issues rather than silently deferred; see the
+`review-major` label on the repository. Nothing in that set is required for the Hard
+Invariants, and each issue records the area, the file and the reviewer's reasoning.
+
 ## What would close items 7–9
 
 Run three real projects through the control plane for as long as it takes to accumulate 30
