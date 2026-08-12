@@ -166,6 +166,7 @@ const run = (key, area) =>
       "--no-subagents",
       "--max-turns", "120",
       "--cwd", repoRoot,
+      "--leader-socket", join(outDir, `${key}.leader.sock`),
     ];
     const child = execFile(
       "grok",
@@ -177,10 +178,18 @@ const run = (key, area) =>
         let verdict = "ERROR";
         let findings = 0;
         try {
-          // The CLI prints one JSON envelope; the structured answer is its `result`.
+          // The CLI prints one JSON envelope whose answer is `text` (measured, not assumed:
+          // `result` does not exist on it). With --json-schema that text *is* the JSON report,
+          // but the field also carries narration, so the report is the last JSON object in it.
           const envelope = JSON.parse(stdout.slice(stdout.indexOf("{")));
-          const report =
-            typeof envelope.result === "string" ? JSON.parse(envelope.result) : envelope.result;
+          const answer = typeof envelope.text === "string" ? envelope.text : "";
+          const opening = answer.lastIndexOf("{\"verdict\"");
+          const report = JSON.parse(opening >= 0 ? answer.slice(opening) : answer);
+          if (envelope.stopReason && envelope.stopReason !== "end_turn") {
+            // A cancelled run has partial narration and no verdict; treating it as a review
+            // would let an interrupted reviewer read as a clean one.
+            throw new Error(`grok stopped with ${envelope.stopReason}`);
+          }
           writeFileSync(join(outDir, `${key}.json`), JSON.stringify(report, null, 2));
           verdict = report.verdict ?? "ERROR";
           findings = (report.findings ?? []).length;
@@ -211,8 +220,11 @@ for (const key of keys) {
   }
 }
 
-// Areas are independent — disjoint file sets, no shared state — so they run concurrently.
-const results = await Promise.all(keys.map((key) => run(key, AREAS[key])));
+// Sequential on purpose. Concurrent `grok` processes contend over the leader socket and
+// cancel each other — measured, and a cancelled review is worse than a slow one because its
+// partial output looks like a verdict.
+const results = [];
+for (const key of keys) results.push(await run(key, AREAS[key]));
 writeFileSync(join(outDir, "summary.json"), JSON.stringify({ reviewer: "grok", results }, null, 2));
 const blocked = results.filter((r) => r.verdict !== "PASS");
 console.log(`\n${results.length} areas reviewed by grok; ${blocked.length} not PASS`);

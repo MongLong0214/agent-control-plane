@@ -228,21 +228,44 @@ Items 4 and 5 of the original list — the guard's check-to-act window and revie
 by binding history rather than process sandboxing — are what #97 and #132 are about, and both
 are still open.
 
-## Independent review status — **BLOCK**, 47 findings open
+## Independent review status — **BLOCK**, 112 issues open
 
-Two rounds of independent review by GPT-5.6 Sol (nine areas, read-only sandbox, reasoning
-effort `xhigh`, no shared context between rounds). Both are recorded under
-`evidence/review/` — round 1 in `evidence/review-round1/`, round 2 in `evidence/review/`.
-**No third round has been run**; there is no `round:r3` label and no `evidence/review-round3/`.
+Four independent passes have now been run, by two different model families, and the newest two
+found defects the first two did not. That is the point of using more than one lineage: a shared
+blind spot is exactly what a second round from the same reviewer cannot catch.
+
+1. **GPT-5.6 Sol, round 1** — nine areas, read-only sandbox, effort `xhigh` (`evidence/review-round1/`).
+2. **GPT-5.6 Sol, round 2** — same shape, fresh context, against the hardened code (`evidence/review/`).
+3. **Test-integrity audit** — every one of the 436 tests read with one question: *would this still
+   pass if the enforcement it names were deleted?* 26 would. Eight closed issues were **reopened**,
+   because the regression test they were closed against proves nothing (label `test-integrity`).
+4. **Edge-case audit** — the concurrency and lifecycle mechanisms the delegate waves added, read
+   for the interleavings their own tests do not cover. 15 defects, 6 of them blocker-class
+   (label `edge-case`).
+5. **Grok audit of the integrator's own trade-offs** — the nine decisions on issue #247 where a
+   fail-closed choice was deliberately relaxed. Verdict: **5 holes, 4 sound** (label `grok-audit`).
+   It confirmed one decision by measurement rather than reading, and it caught the two worst
+   defects in the whole set: a memory bound whose evidence claims an observation that does not
+   exist, and an evidence capability the MCP surface can reach because the integrator's own
+   justification for exposing it was false.
+
+**No third Sol round has been run**; there is no `round:r3` label and no `evidence/review-round3/`.
+The final gate is a Grok review of all nine areas (`node scripts/grok-review.mjs`), which has not
+been run against a settled tree yet.
 
 | Round | Verdict | BLOCKER | MAJOR | Closed | Open |
 |---|---|---|---|---|---|
 | 1 | BLOCK in all 9 areas | 57 | 66 (+1 minor) | 57 / 52 / 1 | 0 / 14 / 0 |
 | 2 | BLOCK in all 9 areas | 63 | 64 (+1 minor) | 46 / 49 / 0 | 17 / 15 / 1 |
 
-252 findings, 205 closed, 47 open — reconciled by `node scripts/ssot-report.mjs`, which
-reports 0 missing. Total open issues: **56** (47 findings, 2 `acceptance`, 4 `prerequisite`,
-2 `epic`, 1 `design-decision`).
+252 review findings, 205 closed, 47 open — reconciled by `node scripts/ssot-report.mjs`,
+which reports 0 missing. On top of those: 26 `test-integrity`, 16 `edge-case` and 6 `grok-audit`
+issues, of which 8 are reopened closures. **112 issues open in total.**
+
+The eight reopened ones matter more than their count suggests. Each had been closed against a
+named regression test, which is this project's own bar — and the audit showed the test would pass
+with the enforcement removed. The fixes may well be right; what was missing was any way to notice
+if they stopped being right. A closed issue with no evidence is not closed, so they are open.
 
 ### How the 205 got closed
 
