@@ -556,14 +556,36 @@ export class Outbox {
     ).changes;
   }
 
+  /**
+   * A message must be fenced by a live binding, and its target must be a session that is
+   * legitimately addressable under that binding.
+   *
+   * Usually the target *is* the holder. A handoff package is the exception §10.1 requires:
+   * the outgoing binding stays in force until the ACK, so the package is addressed to the
+   * incoming session, which by definition does not hold the binding yet. That case is
+   * admitted only when a pending handoff from this exact generation names this session as
+   * its recipient — the fence is still the outgoing binding, so a superseded generation
+   * cannot send, and a session that is not READY cannot receive.
+   */
   private isCurrentTarget(roleKey: string, bindingGeneration: number, sessionId: string): boolean {
+    const holder = this.db.get(
+      `SELECT 1 FROM assignments a
+        JOIN sessions s ON s.session_id = a.session_id
+        WHERE a.role_key = ? AND a.binding_generation = ? AND a.session_id = ?
+          AND a.status = 'ACTIVE' AND s.lifecycle IN ('READY','DRAINING')`,
+      [roleKey, bindingGeneration, sessionId],
+    );
+    if (holder) return true;
+
     return Boolean(
       this.db.get(
-        `SELECT 1 FROM assignments a
-          JOIN sessions s ON s.session_id = a.session_id
-          WHERE a.role_key = ? AND a.binding_generation = ? AND a.session_id = ?
-            AND a.status = 'ACTIVE' AND s.lifecycle IN ('READY','DRAINING')`,
-        [roleKey, bindingGeneration, sessionId],
+        `SELECT 1 FROM handoffs h
+          JOIN sessions s ON s.session_id = h.to_session_id
+          JOIN assignments a ON a.role_key = ? AND a.binding_generation = ?
+                            AND a.session_id = h.from_session_id AND a.status = 'ACTIVE'
+          WHERE h.to_session_id = ? AND h.status = 'PENDING' AND h.from_generation = ?
+            AND s.lifecycle = 'READY'`,
+        [roleKey, bindingGeneration, sessionId, bindingGeneration],
       ),
     );
   }
