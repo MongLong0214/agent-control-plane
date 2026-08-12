@@ -1,4 +1,5 @@
 import type { Clock } from "../core/clock.ts";
+import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode } from "../contracts/manifest.ts";
@@ -11,7 +12,7 @@ import type { Outbox } from "../outbox/outbox.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
-import type { BlindReviewGate, ReviewPacket } from "../review/blind-review.ts";
+import type { BlindReviewGate, BlindReviewInvoker, ReviewPacket } from "../review/blind-review.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
@@ -70,6 +71,7 @@ export class CandidatePipeline {
     private readonly repositories: RepositoryRegistry,
     private readonly verification: VerificationEngine,
     private readonly review: BlindReviewGate,
+    private readonly invokeReview: BlindReviewInvoker,
     private readonly ceo: ProductionGate,
     private readonly bindings: BindingRegistry,
     private readonly outbox: Outbox,
@@ -77,6 +79,8 @@ export class CandidatePipeline {
   ) {}
 
   #continuity: { evaluate?(reason: string): Promise<unknown> } | null = null;
+  /** Single-process fence for the asynchronous verify → review → publish sequence. */
+  readonly #submissions = new Set<string>();
 
   attach(ports: { continuity?: { evaluate?(reason: string): Promise<unknown> } }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
@@ -129,6 +133,20 @@ export class CandidatePipeline {
   }
 
   async submitResult(input: SubmitResultInput): Promise<Decision<PipelineOutcome>> {
+    if (this.#submissions.has(input.runId)) {
+      return deny(ReasonCode.CONFLICT, "a candidate submission is already being evaluated for this run", {
+        runId: input.runId,
+      });
+    }
+    this.#submissions.add(input.runId);
+    try {
+      return await this.submitResultOnce(input);
+    } finally {
+      this.#submissions.delete(input.runId);
+    }
+  }
+
+  private async submitResultOnce(input: SubmitResultInput): Promise<Decision<PipelineOutcome>> {
     const owner = this.runs.assertOwner(
       input.runId,
       input.ownerSessionId,
@@ -205,15 +223,19 @@ export class CandidatePipeline {
       });
     }
 
-    const contract = this.artifacts.latest<TaskContract>(input.runId, ArtifactKind.TASK_CONTRACT);
-    if (!contract) {
-      return deny(ReasonCode.EVIDENCE_MISSING, "run has no task contract artifact", {
+    const contract = this.artifacts
+      .list<TaskContract>(input.runId, ArtifactKind.TASK_CONTRACT)
+      .find((artifact) => !artifact.superseded && artifact.digest === run.contractDigest);
+    if (!contract || digestOf(contract.content) !== run.contractDigest) {
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run's pinned task contract is not retrievable by digest", {
         runId: input.runId,
+        expected: run.contractDigest,
+        found: contract?.digest ?? null,
       });
     }
 
     // §18.2 — automatic, immediately after verification passes.
-    const reviewed = await this.review.review({
+    const reviewed = await this.invokeReview({
       runId: input.runId,
       projectId: run.projectId,
       executionMode: run.executionMode,
@@ -224,6 +246,9 @@ export class CandidatePipeline {
     });
 
     if (!reviewed.allowed) {
+      // §18.7 is an assurance decision too. Re-evaluate continuity before deciding
+      // whether a provider/isolation failure waits or moves the system into SURVIVAL.
+      if (this.#continuity?.evaluate) await this.#continuity.evaluate("blind-review-unavailable");
       // §18.7 — only a reviewer *verdict* enters the CTO revision loop. A lost isolation
       // or a provider that never answered is an assurance failure the candidate cannot
       // repair, so the gate is neither lowered nor handed to the CTO to "fix".

@@ -307,7 +307,7 @@ export const driveToReviewedCandidate = async (
   if (!verified.allowed) throw new Error(`${verified.reasonCode}: ${verified.message}`);
 
   harness.scripted.script({ match: /Candidate review/, text: reviewerPass([`${identity}:src/app.js`]) });
-  const reviewed = await harness.cp.review.review({
+  const reviewed = await harness.cp.review.controlPlaneInvoker()({
     runId,
     projectId,
     executionMode: run.executionMode,
