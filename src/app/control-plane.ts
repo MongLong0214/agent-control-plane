@@ -62,6 +62,12 @@ export interface ControlPlaneConfig {
   allowNonProductionAdapters?: boolean;
   clock?: Clock;
   workspaceProbe?: WorkspaceProbe;
+  /**
+   * Explicit roots for independent artifacts. Leaving this empty (the production default)
+   * denies every DIRECT mutation, so repository bootstrap cannot be misclassified before
+   * Git metadata exists.
+   */
+  directWriteRoots?: readonly string[];
   githubClient?: GitHubClient;
 }
 
@@ -159,6 +165,7 @@ export class ControlPlane {
       config.workspaceProbe ?? realWorkspaceProbe,
       this.audit,
       this.clock,
+      { directWriteRoots: config.directWriteRoots },
     );
     this.tasks = new TaskGraph(this.db, this.clock, this.audit, this.telemetry);
     this.runs = new RunEngine(
