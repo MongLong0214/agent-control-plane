@@ -2,6 +2,7 @@ import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import type { OwnerAuthorityPort } from "./owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
@@ -99,6 +100,7 @@ export const HUMAN_GATE_TRIGGERS: readonly string[] = [
 
 export class ProductionGate {
   #continuity: ContinuityGate | null = null;
+  #ownerAuthority: OwnerAuthorityPort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -112,8 +114,12 @@ export class ProductionGate {
     private readonly telemetry: Telemetry,
   ) {}
 
-  attach(ports: { continuity?: ContinuityGate }): void {
+  attach(ports: {
+    continuity?: ContinuityGate;
+    ownerAuthority?: OwnerAuthorityPort;
+  }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
+    if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
   }
 
   /**
@@ -341,6 +347,11 @@ export class ProductionGate {
       });
     }
 
+    // The decision is an exercise of the CEO role, so the session must currently hold it.
+    // Independence alone would let any unknown id decide (CP-HI-07).
+    const holds = this.assertCurrentCeo(input.ceoSessionId);
+    if (!holds.allowed) return holds as Decision<{ state: RunState }>;
+
     // CP-HI-04 second clause — the deciding CEO session cannot also be this run's CTO
     // or blind reviewer.
     const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
@@ -449,13 +460,48 @@ export class ProductionGate {
     return this.bindings.assertReviewerIndependence(runId, packet.reviewerSessionId);
   }
 
-  /** §21 — an owner decision recorded against a specific run and gate item. */
+  /**
+   * §21 — an owner decision recorded against a specific run and gate item.
+   *
+   * The owner is an identity the deployment allowlisted, verified here. Without that,
+   * "the owner approved" would be a claim any caller could make, and a human gate would
+   * be satisfiable by the very candidate it exists to gate.
+   */
+  private assertCurrentCeo(sessionId: string): Decision<void> {
+    const binding = this.bindings.active(roleKeyFor(Role.CEO));
+    if (!binding) {
+      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no session currently holds the CEO role", {
+        sessionId,
+      });
+    }
+    if (binding.sessionId !== sessionId) {
+      return deny(
+        ReasonCode.GATE_AUTHORITY_DENIED,
+        "only the session currently bound to the CEO role may decide",
+        { sessionId, current: binding.sessionId, generation: binding.bindingGeneration },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
   recordOwnerDecision(input: {
     runId: string;
     item: string;
     approved: boolean;
     note: string;
+    owner: { channel: string; actor: string };
   }): Decision<void> {
+    const authorised = this.#ownerAuthority?.isAllowedActor(input.owner.channel, input.owner.actor);
+    if (!authorised) {
+      return deny(
+        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+        this.#ownerAuthority
+          ? "actor is not an allowlisted owner identity"
+          : "no owner authority is configured, so an owner decision cannot be attributed",
+        { runId: input.runId, channel: input.owner.channel, actor: input.owner.actor },
+      );
+    }
+
     this.artifacts.put(input.runId, ArtifactKind.APPROVAL, {
       kind: "OWNER_DECISION",
       item: input.item,
@@ -466,7 +512,7 @@ export class ProductionGate {
     this.audit.record({
       kind: "OWNER_DECISION",
       runId: input.runId,
-      actor: "owner",
+      actor: `${input.owner.channel}:${input.owner.actor}`,
       evidence: { item: input.item, approved: input.approved },
     });
     return allow(ReasonCode.OK, undefined);
@@ -531,6 +577,8 @@ export class ProductionGate {
   resolveEscalation(runId: string, resolution: string, byCeoSession: string): Decision<void> {
     const run = this.runs.get(runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    const holds = this.assertCurrentCeo(byCeoSession);
+    if (!holds.allowed) return holds as Decision<void>;
     this.audit.record({
       kind: "CEO_DECISION",
       runId,

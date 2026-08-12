@@ -5,6 +5,7 @@ import { ExecutionMode, RunState, SessionLifecycle, roleKeyFor, Role } from "../
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { cleanupTempDirs, makeRepo } from "../helpers/fixtures.ts";
 import {
+  TEST_OWNER,
   type Harness,
   bindCeo,
   fixtureManifest,
@@ -263,6 +264,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       item: "public release",
       approved: true,
       note: "approved by owner",
+      owner: TEST_OWNER,
     });
     expect(harness.cp.ceo.humanGateStatus(created.value.runId).satisfied).toBe(true);
 
@@ -279,7 +281,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_REQUIRED);
 
-    const suspended = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis");
+    const suspended = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
     expect(suspended.allowed).toBe(true);
     expect(harness.cp.projects.require(projectId).suspended).toBe(true);
     expect(harness.cp.projects.require(projectId).activity).toBe("INACTIVE");
@@ -310,9 +312,39 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN);
 
-    const allowed = harness.cp.projects.activateManifest(projectId, revised, {
+    // A CONTRACT_CHANGE *label* is not enough: the change must be carried by a real
+    // contract-change run for this project that completed.
+    const unbacked = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",
       runId: null,
+    });
+    expect(unbacked.allowed).toBe(false);
+    expect(unbacked.reasonCode).toBe(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN);
+
+    const change = harness.cp.runs.create({
+      projectId,
+      kind: "CONTRACT_CHANGE",
+      executionMode: ExecutionMode.GUARDED,
+      contract: { ...CONTRACT, goal: "revise the project contract" },
+    });
+    if (!change.allowed) throw new Error(change.message);
+    harness.cp.runs.transition(change.value.runId, RunState.ACTIVE, "contract change started");
+    harness.cp.runs.transition(
+      change.value.runId,
+      RunState.READY_FOR_CEO_REVIEW,
+      "contract change ready",
+    );
+    harness.cp.runs.transition(change.value.runId, RunState.COMPLETED, "contract change confirmed");
+
+    const unknownRun = harness.cp.projects.activateManifest(projectId, revised, {
+      runKind: "CONTRACT_CHANGE",
+      runId: "run_does_not_exist",
+    });
+    expect(unknownRun.allowed).toBe(false);
+
+    const allowed = harness.cp.projects.activateManifest(projectId, revised, {
+      runKind: "CONTRACT_CHANGE",
+      runId: change.value.runId,
     });
     expect(allowed.allowed).toBe(true);
   });

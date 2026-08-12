@@ -27,6 +27,7 @@ import { Telemetry } from "../telemetry/telemetry.ts";
 import { VerificationEngine } from "../verify/verification-engine.ts";
 import { WorktreeManager } from "../verify/worktree.ts";
 import { GitHubKernel, type GitHubClient } from "../github/github-kernel.ts";
+import { OwnerAuthority, type OwnerIdentity } from "../ceo/owner-authority.ts";
 import { TrustedCredentialStore } from "../github/credential-store.ts";
 import { Doctor } from "../doctor/doctor.ts";
 import { Watchdog } from "../doctor/watchdog.ts";
@@ -35,6 +36,12 @@ import { BootstrapActivation } from "../bootstrap/activation.ts";
 
 export interface ControlPlaneConfig {
   databasePath: string;
+  /**
+   * Identities that may act as the owner (§21). Empty means this deployment has no owner
+   * identity, so no human gate can be satisfied — an explicit absence, never an implicit
+   * grant.
+   */
+  ownerIdentities?: readonly OwnerIdentity[];
   /** Root under which disposable verification worktrees are created. */
   worktreeRoot: string;
   /** Directory holding the structured local capacity files, one per provider. */
@@ -93,6 +100,7 @@ export class ControlPlane {
   readonly review: BlindReviewGate;
   readonly capacity: CapacityMonitor;
   readonly continuity: ContinuityKernel;
+  readonly ownerAuthority: OwnerAuthority;
   readonly cto: CtoLifecycle;
   readonly ceo: ProductionGate;
   readonly pipeline: CandidatePipeline;
@@ -206,7 +214,10 @@ export class ControlPlane {
       capacity: { refreshForDispatch: () => this.capacity.refreshForDispatch() },
       continuity: { mode: () => this.continuity.mode() },
     });
+    this.ownerAuthority = new OwnerAuthority(config.ownerIdentities ?? []);
+    this.cto.attach({ ownerAuthority: this.ownerAuthority });
     this.ceo.attach({
+      ownerAuthority: this.ownerAuthority,
       continuity: {
         mode: () => this.continuity.mode(),
         assertCompletionAllowed: (runId) => this.continuity.assertCompletionAllowed(runId),

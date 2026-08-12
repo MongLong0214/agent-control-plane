@@ -317,7 +317,7 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
         repositoryId: repository.value.repositoryId,
       });
       if (!verifyExecution.allowed) throw new Error(verifyExecution.message);
-      cp.tasks.finishExecution(verifyExecution.value.executionId, { status: "SUCCEEDED" });
+      cp.tasks.finishExecution(verifyExecution.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:task-report" });
 
       // --- the full candidate path: freeze, verify, review, packet ----------
       const outcome = await cp.pipeline.submitResult({

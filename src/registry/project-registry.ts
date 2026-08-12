@@ -122,6 +122,33 @@ export class ProjectRegistry {
       );
     }
 
+    // A run *kind* is a label, not a proof. Replacing a live contract requires a real
+    // CONTRACT_CHANGE run for this project that actually completed (Integration §10.4).
+    if (project.activeManifestDigest && via.runKind === "CONTRACT_CHANGE") {
+      const run = via.runId
+        ? this.db.get<{ kind: string; state: string; project_id: string | null }>(
+            `SELECT kind, state, project_id FROM runs WHERE run_id = ?`,
+            [via.runId],
+          )
+        : null;
+      if (
+        !run ||
+        run.project_id !== projectId ||
+        run.kind !== "CONTRACT_CHANGE" ||
+        run.state !== "COMPLETED"
+      ) {
+        return deny(
+          ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN,
+          "a contract change must be carried by a completed CONTRACT_CHANGE run for this project",
+          {
+            projectId,
+            runId: via.runId,
+            observed: run ? { kind: run.kind, state: run.state, projectId: run.project_id } : null,
+          },
+        );
+      }
+    }
+
     const stored = this.storeManifest(manifest);
     if (!stored.allowed) return stored;
 

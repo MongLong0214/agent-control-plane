@@ -4,7 +4,7 @@ import { newTaskId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { type FailureClass, type TaskCategory, TaskState } from "../domain/types.ts";
+import { type FailureClass, RunState, type TaskCategory, TaskState } from "../domain/types.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 
 export interface TaskSpec {
@@ -68,6 +68,17 @@ export interface ExecutionRecord {
  * requirement for a node to report progress, and no per-second heartbeat (§31.4); a
  * long job may record a low-frequency activity lease instead.
  */
+/**
+ * States in which the graph is sealed. A packet has been produced or the run is over, so
+ * a new pending task could only invalidate a completeness claim already made (§34.3).
+ */
+const CLOSED_TO_NEW_TASKS: ReadonlySet<RunState> = new Set([
+  RunState.READY_FOR_CEO_REVIEW,
+  RunState.COMPLETED,
+  RunState.FAILED,
+  RunState.CANCELLED,
+]);
+
 export class TaskGraph {
   constructor(
     private readonly db: Db,
@@ -76,9 +87,24 @@ export class TaskGraph {
     private readonly telemetry: Telemetry,
   ) {}
 
+  /**
+   * A graph may only be created or extended while the run is still doing work. Adding a
+   * pending task to a run that has already produced a packet would make the packet's
+   * completeness claim false after the fact (§34.3, CP-HI-08).
+   */
   submit(runId: string, specs: readonly TaskSpec[]): Decision<TaskRecord[]> {
     if (specs.length === 0) {
       return deny(ReasonCode.INVALID_ARGUMENT, "task submission is empty", { runId });
+    }
+
+    const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    if (CLOSED_TO_NEW_TASKS.has(run.state as RunState)) {
+      return deny(
+        ReasonCode.RUN_TRANSITION_ILLEGAL,
+        `run is ${run.state}; its work is already sealed against new tasks`,
+        { runId, state: run.state },
+      );
     }
 
     const keys = new Set(specs.map((s) => s.key));
@@ -177,6 +203,14 @@ export class TaskGraph {
     return this.db.tx(() => {
       const task = this.get(input.taskId);
       if (!task) return deny(ReasonCode.NOT_FOUND, "unknown task", { taskId: input.taskId });
+      // An authorised owner of one run must not be able to drive another run's task.
+      if (task.runId !== input.runId) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "task belongs to another run", {
+          taskId: input.taskId,
+          taskRunId: task.runId,
+          requestedRunId: input.runId,
+        });
+      }
       if (task.state !== TaskState.READY && task.state !== TaskState.FAILED) {
         return deny(
           ReasonCode.TASK_DEPENDENCY_UNSATISFIED,
@@ -230,10 +264,34 @@ export class TaskGraph {
       resultDigest?: string | null;
       failureClass?: FailureClass | null;
     },
+    /** When given, the execution must belong to this run (§25.2). */
+    expectedRunId?: string,
   ): Decision<ExecutionRecord> {
     return this.db.tx(() => {
       const execution = this.execution(executionId);
       if (!execution) return deny(ReasonCode.NOT_FOUND, "unknown execution", { executionId });
+      if (expectedRunId !== undefined && execution.runId !== expectedRunId) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "execution belongs to another run", {
+          executionId,
+          executionRunId: execution.runId,
+          requestedRunId: expectedRunId,
+        });
+      }
+      if (execution.status !== "RUNNING") {
+        return deny(ReasonCode.CONFLICT, `execution is already ${execution.status}`, {
+          executionId,
+          status: execution.status,
+        });
+      }
+      // §25.2 — a success receipt names what it produced. Without a digest there is
+      // nothing to bind the claim to, so it is not a success.
+      if (outcome.status === "SUCCEEDED" && !outcome.resultDigest) {
+        return deny(
+          ReasonCode.EVIDENCE_MISSING,
+          "a SUCCEEDED execution must carry a result digest",
+          { executionId },
+        );
+      }
 
       const now = this.clock.nowIso();
       this.db.run(

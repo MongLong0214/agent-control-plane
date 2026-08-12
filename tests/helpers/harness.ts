@@ -6,8 +6,12 @@ import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/cont
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
+import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts";
+
+/** The single allowlisted owner identity of the fixture deployment. */
+export const TEST_OWNER = { channel: "cli", actor: "test-owner" } as const;
 
 export interface Harness {
   cp: ControlPlane;
@@ -22,7 +26,9 @@ export interface Harness {
  * verification command. Only the model runtime is scripted — the database, the sandbox,
  * git and every gate are the production implementations.
  */
-export const makeHarness = (options: { githubClient?: GitHubClient } = {}): Harness => {
+export const makeHarness = (
+  options: { githubClient?: GitHubClient; ownerIdentities?: readonly OwnerIdentity[] } = {},
+): Harness => {
   const root = tempDir("acp-harness-");
   const clock = new ManualClock("2026-08-12T00:00:00.000Z");
   const scripted = new ScriptedAdapter(clock);
@@ -44,6 +50,8 @@ console.log('verification ok');`,
     clock,
     adapters: [scripted],
     allowNonProductionAdapters: true,
+    // §21 — the fixture deployment has exactly one owner identity.
+    ownerIdentities: options.ownerIdentities ?? [TEST_OWNER],
     ctoPreference: { provider: "scripted", model: "scripted-cto", effort: null },
     reviewer: {
       preferred: { provider: "scripted", model: "scripted-reviewer", effort: "xhigh" },

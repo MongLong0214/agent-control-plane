@@ -4,6 +4,7 @@ import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import type { OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
@@ -60,6 +61,7 @@ export interface CtoPreference {
 export class CtoLifecycle {
   #buzz: BuzzConnector | null = null;
   #readiness: ReadinessProbe | null = null;
+  #ownerAuthority: OwnerAuthorityPort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -74,9 +76,14 @@ export class CtoLifecycle {
     private readonly preference: CtoPreference,
   ) {}
 
-  attach(ports: { buzz?: BuzzConnector; readiness?: ReadinessProbe }): void {
+  attach(ports: {
+    buzz?: BuzzConnector;
+    readiness?: ReadinessProbe;
+    ownerAuthority?: OwnerAuthorityPort;
+  }): void {
     if (ports.buzz) this.#buzz = ports.buzz;
     if (ports.readiness) this.#readiness = ports.readiness;
+    if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
   }
 
   /**
@@ -183,6 +190,16 @@ export class CtoLifecycle {
       );
     }
 
+    // Zero active runs now is not zero active runs at ack time. DRAINING is the barrier:
+    // dispatch admission refuses to hand a new run to a draining CTO, so the count cannot
+    // climb back up between prepare and ack (§10.1).
+    const draining = this.sessions.transition(
+      current.sessionId,
+      SessionLifecycle.DRAINING,
+      "switchover prepared",
+    );
+    if (!draining.allowed) return draining as Decision<{ handoffId: string; incomingSessionId: string }>;
+
     const missing = missingHandoffFields(handoff);
     if (missing.length > 0) {
       return deny(ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, "handoff package is incomplete", {
@@ -242,6 +259,36 @@ export class CtoLifecycle {
           expected: row.to_session_id,
           got: ackBySessionId,
         });
+      }
+
+      // The authority that prepared the handoff must still be the authority. If the
+      // binding moved (failover, recovery takeover) this ack is for a generation that no
+      // longer exists, and switching on it would strand whatever the new owner is doing.
+      const roleKeyForAck = roleKeyFor(Role.PRIMARY_CTO, { projectId: row.project_id });
+      const currentBinding = this.bindings.active(roleKeyForAck);
+      if (!currentBinding || currentBinding.bindingGeneration !== row.from_generation) {
+        return deny(
+          ReasonCode.WRITE_BINDING_GENERATION_STALE,
+          "the binding moved since this handoff was prepared",
+          {
+            handoffId,
+            preparedFrom: row.from_generation,
+            current: currentBinding?.bindingGeneration ?? null,
+          },
+        );
+      }
+
+      // Re-check the barrier: a run dispatched after prepare would be handed to a session
+      // that is about to be stopped.
+      if (row.from_session_id) {
+        const stillActive = this.runs.activeRunsOwnedBy(row.from_session_id);
+        if (stillActive.length > 0) {
+          return deny(
+            ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS,
+            "the outgoing CTO acquired active runs after the switchover was prepared",
+            { handoffId, activeRuns: stillActive.map((r) => r.runId) },
+          );
+        }
       }
 
       this.db.run(
@@ -357,7 +404,28 @@ export class CtoLifecycle {
   }
 
   /** §10.4 — capacity-driven suspend. Owner approval is mandatory. */
-  async suspendProject(projectId: string, ownerApproved: boolean, reason: string): Promise<Decision<void>> {
+  async suspendProject(
+    projectId: string,
+    ownerApproved: boolean,
+    reason: string,
+    owner?: { channel: string; actor: string },
+  ): Promise<Decision<void>> {
+    // §14.6 — suspension is an owner decision. A bare boolean is a claim, not an
+    // authorisation, so an allowlisted owner identity has to carry it.
+    if (ownerApproved) {
+      const authorised =
+        owner && this.#ownerAuthority?.isAllowedActor(owner.channel, owner.actor) === true;
+      if (!authorised) {
+        return deny(
+          ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+          this.#ownerAuthority
+            ? "owner approval must come from an allowlisted owner identity"
+            : "no owner authority is configured, so an owner approval cannot be attributed",
+          { projectId, channel: owner?.channel ?? null, actor: owner?.actor ?? null },
+        );
+      }
+    }
+
     const suspended = this.projects.setSuspended(projectId, true, ownerApproved);
     if (!suspended.allowed) return suspended;
 

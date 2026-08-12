@@ -88,7 +88,7 @@ const drive = async (
     repositoryId,
   });
   if (!secondExecution.allowed) throw new Error(secondExecution.message);
-  harness.cp.tasks.finishExecution(secondExecution.value.executionId, { status: "SUCCEEDED" });
+  harness.cp.tasks.finishExecution(secondExecution.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:task-report" });
 
   harness.scripted.script({
     match: /Candidate review/,

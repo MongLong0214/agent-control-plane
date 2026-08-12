@@ -271,9 +271,9 @@ describe("parallel execution (CP-S12)", () => {
     // The dependent task stays blocked until both parents succeed.
     expect(harness.cp.tasks.ready(created.value.runId)).toHaveLength(0);
     if (!first.allowed || !second.allowed) return;
-    harness.cp.tasks.finishExecution(first.value.executionId, { status: "SUCCEEDED" });
+    harness.cp.tasks.finishExecution(first.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:task-report" });
     expect(harness.cp.tasks.ready(created.value.runId)).toHaveLength(0);
-    harness.cp.tasks.finishExecution(second.value.executionId, { status: "SUCCEEDED" });
+    harness.cp.tasks.finishExecution(second.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:task-report" });
     expect(harness.cp.tasks.ready(created.value.runId).map((t) => t.title)).toEqual(["integrate"]);
 
     const providers = harness.cp.tasks

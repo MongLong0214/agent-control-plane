@@ -390,7 +390,7 @@ describe("CEO notification policy (CP-S53, CP-S54)", () => {
         repositoryId,
       });
       if (execution.allowed) {
-        harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED" });
+        harness.cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:task-report" });
       }
     }
 

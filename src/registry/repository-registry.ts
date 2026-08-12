@@ -55,8 +55,18 @@ export class RepositoryRegistry {
     }
 
     const observedRemote = await remoteUrl(root);
-    const identity =
-      input.identity ?? (observedRemote ? normalizeRemoteIdentity(observedRemote) : `local:${root}`);
+    const observedIdentity = observedRemote ? normalizeRemoteIdentity(observedRemote) : null;
+    // A declared identity may *name* a checkout that has no remote, but it may never
+    // contradict one that does: evidence would then describe a different repository from
+    // the one being read and tested (CP-HI-06).
+    if (input.identity && observedIdentity && input.identity !== observedIdentity) {
+      return deny(
+        ReasonCode.REPOSITORY_IDENTITY_MISMATCH,
+        "declared repository identity does not match the checkout's remote",
+        { declared: input.identity, observed: observedIdentity, path: canonical(root) },
+      );
+    }
+    const identity = input.identity ?? observedIdentity ?? `local:${root}`;
 
     const existing = this.byIdentity(identity);
     if (existing && existing.registration === "REGISTERED") {

@@ -458,8 +458,32 @@ export class RunEngine {
     );
   }
 
-  pinManifest(runId: string, digest: string): void {
+  /**
+   * CP-HI-03 — the dispatch-time pin is what judges the candidate, so it is written once.
+   * A later "correction" would silently change the contract a run is measured against.
+   */
+  pinManifest(runId: string, digest: string): Decision<void> {
+    const row = this.db.get<{ pinned_manifest_digest: string | null; state: string }>(
+      `SELECT pinned_manifest_digest, state FROM runs WHERE run_id = ?`,
+      [runId],
+    );
+    if (!row) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    if (row.pinned_manifest_digest === digest) return allow(ReasonCode.OK, undefined);
+    if (row.pinned_manifest_digest) {
+      return deny(
+        ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+        "a run's pinned manifest is immutable once set",
+        { runId, pinned: row.pinned_manifest_digest, requested: digest },
+      );
+    }
+    if (row.state !== RunState.QUEUED && row.state !== RunState.ACTIVE) {
+      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${row.state}; too late to pin`, {
+        runId,
+        state: row.state,
+      });
+    }
     this.db.run(`UPDATE runs SET pinned_manifest_digest = ? WHERE run_id = ?`, [digest, runId]);
+    return allow(ReasonCode.OK, undefined);
   }
 
   get(runId: string): RunRow | null {

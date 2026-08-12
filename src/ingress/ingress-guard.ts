@@ -46,6 +46,15 @@ export class IngressGuard {
     private readonly policies: Readonly<Record<string, IngressPolicy>>,
   ) {}
 
+  /**
+   * Whether an actor is allowlisted on a channel. The owner authority checks (§21) reuse
+   * this so "the owner said so" means an identity the deployment configured, not a
+   * caller-supplied claim.
+   */
+  isAllowedActor(channel: string, actor: string): boolean {
+    return this.policies[channel]?.allowedActors.includes(actor) ?? false;
+  }
+
   admit(request: IngressRequest): Decision<{ payload: unknown; untrusted: true }> {
     const policy = this.policies[request.channel];
     if (!policy) {

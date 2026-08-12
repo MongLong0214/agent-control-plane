@@ -219,9 +219,24 @@ export const createHermesServer = (cp: ControlPlane): McpServer => {
         item: z.string(),
         approved: z.boolean(),
         note: z.string().default(""),
+        // The MCP peer is Hermes, not the owner: the owner identity is named explicitly
+        // and must be one the deployment allowlisted (§21).
+        ownerChannel: z.string(),
+        ownerActor: z.string(),
       },
     },
-    async (args) => guarded(() => respond(cp.ceo.recordOwnerDecision(args))),
+    async (args) =>
+      guarded(() =>
+        respond(
+          cp.ceo.recordOwnerDecision({
+            runId: args.runId,
+            item: args.item,
+            approved: args.approved,
+            note: args.note,
+            owner: { channel: args.ownerChannel, actor: args.ownerActor },
+          }),
+        ),
+      ),
   );
 
   server.registerTool(

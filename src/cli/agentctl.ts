@@ -128,11 +128,15 @@ const dispatch = async (
 
     owner: async () => {
       if (args[0] !== "approve") return fail(`unknown owner subcommand: ${args[0] ?? ""}`);
+      // The local operator acts on the "cli" channel; the actor is their OS user, which
+      // the deployment must have allowlisted as an owner identity (§21).
+      const actor = process.env["ACP_OWNER_ACTOR"] ?? process.env["USER"] ?? "";
       const decision = cp.ceo.recordOwnerDecision({
         runId: required(args[1], "runId"),
         item: required(args[2], "item"),
         approved: true,
         note: args.slice(3).join(" "),
+        owner: { channel: "cli", actor },
       });
       print(decision);
       return decision.allowed ? 0 : 1;
