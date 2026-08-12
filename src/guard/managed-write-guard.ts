@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, fstatSync, openSync, statSync, type Stats } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, openSync, statSync, type Stats } from "node:fs";
 import { basename, dirname, isAbsolute } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
@@ -179,17 +179,29 @@ interface FilesystemFence {
   toplevel: string | null;
   toplevelFd: number | null;
   toplevelIdentity: NodeIdentity | null;
+  targetFd: number | null;
+  targetIdentity: NodeIdentity | null;
+  targetExisted: boolean;
 }
 
 interface SourceReadLease {
   leaseId: string;
   runId: string;
   repositoryIdentities: readonly string[];
+  expiresAt: string;
 }
 
 /** A grant is short-lived and single use; see `consume`. */
 const CLAIM_LEASE_EXTENSION_MS = 5 * 60 * 1000;
 const GRANT_TTL_MS = 60_000;
+const SOURCE_READ_LEASE_TTL_MS = 60_000;
+const NO_FOLLOW_READ = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+
+const isMissingPath = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  (error as { code?: unknown }).code === "ENOENT";
 
 /**
  * CP-HI-01 Managed Write Guard.
@@ -201,6 +213,7 @@ const GRANT_TTL_MS = 60_000;
 export class ManagedWriteGuard {
   readonly #grants = new Map<string, HeldGrant>();
   readonly #inFlight = new Map<string, HeldGrant>();
+  readonly #inFlightByTarget = new Map<string, string>();
   readonly #sourceReadLeases = new Map<string, SourceReadLease>();
   readonly #sourceReadLeasesByRepository = new Map<string, Set<string>>();
   readonly #directWriteRoots: readonly string[];
@@ -271,6 +284,24 @@ export class ManagedWriteGuard {
     if (!active.allowed) return active as Decision<T>;
 
     const held = active.value;
+    const targetKey = this.inFlightTargetKey(held.facts);
+    if (targetKey) {
+      const existingGrantId = this.#inFlightByTarget.get(targetKey);
+      if (existingGrantId) {
+        const collision = deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "the target already has an in-flight managed write",
+          {
+            grantId: held.facts.grantId,
+            operation: held.facts.operation,
+            repositoryIdentity: held.facts.repositoryIdentity,
+            resolvedPath: held.facts.resolvedPath,
+          },
+        );
+        this.recordRevocation(held, held.facts.grantId, collision, "before effect");
+        return collision as Decision<T>;
+      }
+    }
     const prepared = this.captureFilesystemFence(held);
     if (!prepared.allowed) {
       this.recordRevocation(held, granted.value.grantId, prepared, "before effect");
@@ -279,9 +310,10 @@ export class ManagedWriteGuard {
 
     const fence = prepared.value;
     this.#inFlight.set(held.facts.grantId, held);
+    if (targetKey) this.#inFlightByTarget.set(targetKey, held.facts.grantId);
     const immediatelyBeforeEffect = this.verifyFilesystemFence(held, fence);
     if (!immediatelyBeforeEffect.allowed) {
-      this.#inFlight.delete(held.facts.grantId);
+      this.clearInFlight(held.facts.grantId, targetKey);
       this.releaseFilesystemFence(fence);
       this.recordRevocation(held, held.facts.grantId, immediatelyBeforeEffect, "before effect");
       return immediatelyBeforeEffect as Decision<T>;
@@ -296,7 +328,7 @@ export class ManagedWriteGuard {
       effectError = error;
     } finally {
       settled = this.settle(held, fence);
-      this.#inFlight.delete(held.facts.grantId);
+      this.clearInFlight(held.facts.grantId, targetKey);
       this.releaseFilesystemFence(fence);
     }
 
@@ -330,6 +362,9 @@ export class ManagedWriteGuard {
         dropped += 1;
       }
     }
+    for (const lease of [...this.#sourceReadLeases.values()]) {
+      if (now >= lease.expiresAt) this.releaseSourceReadLease(lease, "expired");
+    }
     return dropped;
   }
 
@@ -342,15 +377,53 @@ export class ManagedWriteGuard {
     runId: string,
     repositoryIdentities: readonly string[],
   ): Decision<{ leaseId: string; release(): void }> {
+    this.expireGrants();
+
+    const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run for source-read lease", { runId });
+    if (run.state !== RunState.ACTIVE) {
+      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "source-read lease requires an ACTIVE run", {
+        runId,
+        state: run.state,
+      });
+    }
+
     const identities = [...new Set(repositoryIdentities)];
-    if (!runId || identities.length === 0 || identities.some((identity) => !identity)) {
-      return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "source-read lease requires a run and repository identities", {
+    if (identities.length === 0 || identities.some((identity) => !identity.trim())) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "source-read lease requires at least one repository", {
         runId,
         repositoryIdentities,
       });
     }
+
+    const participating = new Set(
+      this.db
+        .all<{ identity: string }>(
+          `SELECT r.identity FROM run_repositories rr
+             JOIN repositories r ON r.repository_id = rr.repository_id
+            WHERE rr.run_id = ?`,
+          [runId],
+        )
+        .map((row) => row.identity),
+    );
+    const outsideScope = identities.filter((identity) => !participating.has(identity));
+    if (outsideScope.length > 0) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "source-read lease includes a repository outside the run", {
+        runId,
+        outsideScope,
+      });
+    }
+
+    const requested = new Set(identities);
+    const now = this.clock.nowIso();
     const conflicting = [...this.#grants.values(), ...this.#inFlight.values()].find(
-      (held) => held.facts.repositoryIdentity !== null && identities.includes(held.facts.repositoryIdentity),
+      (held) =>
+        SOURCE_MUTATIONS.has(held.facts.operation as WriteOperation) &&
+        // An effect already running cannot be cancelled when its admission TTL ends;
+        // keep its source fenced until settle, while abandoned grants expire normally.
+        (this.#inFlight.has(held.facts.grantId) || now < held.facts.expiresAt) &&
+        held.facts.repositoryIdentity !== null &&
+        requested.has(held.facts.repositoryIdentity),
     );
     if (conflicting) {
       return deny(ReasonCode.SOURCE_READ_LEASE_HELD, "a managed source write is already authorised", {
@@ -360,7 +433,12 @@ export class ManagedWriteGuard {
       });
     }
     const leaseId = `source_read_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-    const lease: SourceReadLease = { leaseId, runId, repositoryIdentities: identities };
+    const lease: SourceReadLease = Object.freeze({
+      leaseId,
+      runId,
+      repositoryIdentities: Object.freeze(identities),
+      expiresAt: isoPlus(now, SOURCE_READ_LEASE_TTL_MS),
+    });
     this.#sourceReadLeases.set(leaseId, lease);
     // Indexed by repository as well, so `decide` can answer "is this identity frozen?"
     // without walking every live lease on the write path.
@@ -369,23 +447,60 @@ export class ManagedWriteGuard {
       held.add(leaseId);
       this.#sourceReadLeasesByRepository.set(identity, held);
     }
+    this.audit.record({
+      kind: "SOURCE_READ_LEASE_ACQUIRED",
+      reasonCode: ReasonCode.OK,
+      runId,
+      evidence: {
+        operationId: leaseId,
+        repositories: identities,
+        expiresAt: lease.expiresAt,
+      },
+    });
     let released = false;
-    return allow(ReasonCode.OK, {
+    return allow(ReasonCode.OK, Object.freeze({
       leaseId,
       release: () => {
         if (released) return;
         released = true;
         this.releaseSourceReadLease(lease);
       },
-    });
+    }));
   }
 
-  assertSourceReadLease(runId: string, leaseId: string): Decision<void> {
+  assertSourceReadLease(
+    runId: string,
+    leaseId: string,
+    repositoryIdentities: readonly string[],
+  ): Decision<void> {
+    this.expireGrants();
     const lease = this.#sourceReadLeases.get(leaseId);
     if (!lease || lease.runId !== runId) {
       return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "source-read lease is not held for this run", {
         runId,
         leaseId,
+      });
+    }
+    const required = [...new Set(repositoryIdentities)];
+    if (required.length === 0 || required.some((identity) => !identity.trim())) {
+      return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "source-read lease requires repository coverage", {
+        runId,
+        leaseId,
+      });
+    }
+    const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
+    if (!run || run.state !== RunState.ACTIVE) {
+      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "source-read lease requires an ACTIVE run", {
+        runId,
+        state: run?.state ?? null,
+      });
+    }
+    const uncovered = required.filter((identity) => !lease.repositoryIdentities.includes(identity));
+    if (uncovered.length > 0) {
+      return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "source-read lease does not cover every required repository", {
+        runId,
+        leaseId,
+        uncovered,
       });
     }
     return allow(ReasonCode.OK, undefined);
@@ -416,7 +531,7 @@ export class ManagedWriteGuard {
     return allow(decision.reasonCode, this.publicGrant(facts), decision.evidence);
   }
 
-  private releaseSourceReadLease(lease: SourceReadLease): void {
+  private releaseSourceReadLease(lease: SourceReadLease, action: "released" | "expired" = "released"): void {
     if (this.#sourceReadLeases.get(lease.leaseId) !== lease) return;
     this.#sourceReadLeases.delete(lease.leaseId);
     for (const identity of lease.repositoryIdentities) {
@@ -425,6 +540,17 @@ export class ManagedWriteGuard {
       held.delete(lease.leaseId);
       if (held.size === 0) this.#sourceReadLeasesByRepository.delete(identity);
     }
+    this.audit.record({
+      kind: "SOURCE_READ_LEASE_RELEASED",
+      reasonCode: ReasonCode.OK,
+      runId: lease.runId,
+      evidence: {
+        action,
+        operationId: lease.leaseId,
+        repositories: lease.repositoryIdentities,
+        expiresAt: lease.expiresAt,
+      },
+    });
   }
 
   private sourceReadLeaseConflict(operation: WriteOperation, repositoryIdentity: string): Decision<never> | null {
@@ -476,7 +602,7 @@ export class ManagedWriteGuard {
         grantId: held.facts.grantId,
       });
     }
-    const filesystem = this.verifyFilesystemFence(held, fence);
+    const filesystem = this.verifyFilesystemFence(held, fence, "after effect");
     if (!filesystem.allowed) return filesystem;
     return this.revalidate(held);
   }
@@ -640,9 +766,10 @@ export class ManagedWriteGuard {
 
     let parentFd: number | null = null;
     let toplevelFd: number | null = null;
+    let targetFd: number | null = null;
     try {
       const requestedParent = dirname(held.request.targetPath);
-      const canonicalParent = this.probe.canonical(requestedParent);
+      const canonicalParent = this.nearestExistingDirectory(requestedParent);
       parentFd = openSync(canonicalParent, "r");
       const parentStat = fstatSync(parentFd);
       if (!parentStat.isDirectory()) {
@@ -668,17 +795,31 @@ export class ManagedWriteGuard {
         toplevelIdentity = this.nodeIdentity(fstatSync(toplevelFd));
       }
 
+      let targetIdentity: NodeIdentity | null = null;
+      let targetExisted = false;
+      try {
+        targetFd = openSync(held.facts.resolvedPath, NO_FOLLOW_READ);
+        targetIdentity = this.nodeIdentity(fstatSync(targetFd));
+        targetExisted = true;
+      } catch (error) {
+        if (!isMissingPath(error)) throw error;
+      }
+
       return allow(ReasonCode.OK, {
         requestedPath: held.request.targetPath,
-        requestedParent,
+        requestedParent: canonicalParent,
         resolvedPath: held.facts.resolvedPath,
         parentFd,
         parent: this.nodeIdentity(parentStat),
         toplevel,
         toplevelFd,
         toplevelIdentity,
+        targetFd,
+        targetIdentity,
+        targetExisted,
       });
     } catch (error) {
+      if (targetFd != null) closeSync(targetFd);
       if (toplevelFd != null) closeSync(toplevelFd);
       if (parentFd != null) closeSync(parentFd);
       return deny(ReasonCode.WRITE_EFFECT_FENCE_LOST, "could not hold a stable filesystem fence", {
@@ -688,7 +829,11 @@ export class ManagedWriteGuard {
     }
   }
 
-  private verifyFilesystemFence(held: HeldGrant, fence: FilesystemFence | null): Decision<void> {
+  private verifyFilesystemFence(
+    held: HeldGrant,
+    fence: FilesystemFence | null,
+    phase: "before effect" | "after effect" = "before effect",
+  ): Decision<void> {
     if (!fence) return allow(ReasonCode.OK, undefined);
     try {
       if (!this.sameNode(this.nodeIdentity(fstatSync(fence.parentFd)), fence.parent)) {
@@ -699,6 +844,35 @@ export class ManagedWriteGuard {
       }
       if (this.probe.canonical(fence.requestedPath) !== fence.resolvedPath) {
         return this.fenceLost(held, "the canonical target changed during the effect");
+      }
+      if (fence.targetExisted && fence.targetFd != null && fence.targetIdentity) {
+        if (!this.sameNode(this.nodeIdentity(fstatSync(fence.targetFd)), fence.targetIdentity)) {
+          return this.fenceLost(held, "the held target inode changed");
+        }
+        let currentTargetFd: number | null = null;
+        try {
+          currentTargetFd = openSync(fence.resolvedPath, NO_FOLLOW_READ);
+          if (!this.sameNode(this.nodeIdentity(fstatSync(currentTargetFd)), fence.targetIdentity)) {
+            return this.fenceLost(held, "the target inode changed during the effect");
+          }
+        } catch (error) {
+          if (isMissingPath(error)) return this.fenceLost(held, "the fenced target was removed");
+          throw error;
+        } finally {
+          if (currentTargetFd != null) closeSync(currentTargetFd);
+        }
+      } else {
+        let currentTargetFd: number | null = null;
+        try {
+          currentTargetFd = openSync(fence.resolvedPath, NO_FOLLOW_READ);
+          if (phase === "before effect") {
+            return this.fenceLost(held, "a target appeared before the filesystem effect");
+          }
+        } catch (error) {
+          if (!isMissingPath(error)) throw error;
+        } finally {
+          if (currentTargetFd != null) closeSync(currentTargetFd);
+        }
       }
       if (fence.toplevel && fence.toplevelFd != null && fence.toplevelIdentity) {
         if (!this.sameNode(this.nodeIdentity(fstatSync(fence.toplevelFd)), fence.toplevelIdentity)) {
@@ -724,8 +898,37 @@ export class ManagedWriteGuard {
 
   private releaseFilesystemFence(fence: FilesystemFence | null): void {
     if (!fence) return;
+    if (fence.targetFd != null) closeSync(fence.targetFd);
     if (fence.toplevelFd != null) closeSync(fence.toplevelFd);
     closeSync(fence.parentFd);
+  }
+
+  private nearestExistingDirectory(path: string): string {
+    let cursor = this.probe.canonical(path);
+    for (let hops = 0; hops < 64; hops += 1) {
+      try {
+        if (statSync(cursor).isDirectory()) return cursor;
+        cursor = dirname(cursor);
+      } catch (error) {
+        if (!isMissingPath(error)) throw error;
+        const parent = dirname(cursor);
+        if (parent === cursor) throw error;
+        cursor = parent;
+      }
+    }
+    throw new Error("could not find an existing directory for the filesystem fence");
+  }
+
+  private inFlightTargetKey(grant: GuardGrant): string | null {
+    if (!grant.repositoryIdentity || !grant.resolvedPath) return null;
+    return JSON.stringify([grant.repositoryIdentity, grant.resolvedPath]);
+  }
+
+  private clearInFlight(grantId: string, targetKey: string | null): void {
+    this.#inFlight.delete(grantId);
+    if (targetKey && this.#inFlightByTarget.get(targetKey) === grantId) {
+      this.#inFlightByTarget.delete(targetKey);
+    }
   }
 
   private fenceLost(held: HeldGrant, message: string): Decision<void> {

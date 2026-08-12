@@ -337,12 +337,7 @@ describe("guard grants are fenced, short-lived and single use", () => {
 
     const consumed = guard.consume(decision.value.grantId);
     expect(consumed.allowed).toBe(false);
-    expect([
-      ReasonCode.RUN_OWNER_REVOKED,
-      ReasonCode.BINDING_REVOKED,
-      ReasonCode.WRITE_BINDING_GENERATION_STALE,
-      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
-    ]).toContain(consumed.reasonCode);
+    expect(consumed.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
   });
 
   it("a grant is refused once the run leaves ACTIVE", () => {
