@@ -91,7 +91,8 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       // the code, history and verification command are the real ones.
       execFileSync("git", ["clone", "--local", "--quiet", REAL_PROJECT, checkout]);
       symlinkSync(join(REAL_PROJECT, "node_modules"), join(checkout, "node_modules"), "dir");
-      gitSync(checkout, ["checkout", "-q", "-b", "main"]);
+      // The clone already sits on the project's real default branch.
+      expect(gitSync(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
 
       const cp = new ControlPlane({
         databasePath: join(root, "state.sqlite"),
@@ -218,7 +219,9 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
         readOnly: true,
         correlationId: `${runId}:plan`,
       });
-      expect(planning.ok).toBe(true);
+      if (!planning.ok) {
+        throw new Error(`CTO planning invocation failed: ${planning.error ?? "unknown"}`);
+      }
       evidence["ctoPlan"] = {
         provider: planning.provider,
         model: planning.model,

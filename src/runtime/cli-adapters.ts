@@ -194,13 +194,19 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     if (request.readOnly) {
       // Plan mode plus a read-only tool allowlist: the reviewer receives the diff in
       // its prompt and has no reason, and now no ability, to mutate the candidate.
-      args.push("--permission-mode", "plan", "--allowedTools", "Read", "Grep", "Glob");
+      // The allowlist goes in as one comma-separated value — the flag is variadic, so
+      // separate arguments would swallow the prompt that follows.
+      args.push("--permission-mode", "plan", "--allowedTools", "Read,Grep,Glob");
     }
     if (request.systemPrompt) args.push("--append-system-prompt", request.systemPrompt);
 
-    const result = await runCli(this.#binary, [...args, request.prompt], {
+    // The prompt goes over stdin rather than as a positional argument: several of the
+    // CLI's options are variadic, and a trailing positional is liable to be swallowed by
+    // whichever flag precedes it.
+    const result = await runCli(this.#binary, args, {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
+      stdin: request.prompt,
     });
 
     const envelope = safeParse(result.stdout);

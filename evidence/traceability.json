@@ -1,0 +1,1308 @@
+{
+  "generatedFrom": [
+    "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
+    "docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md"
+  ],
+  "summary": {
+    "requirements": 22,
+    "requirementsCovered": 22,
+    "requirementsWithGaps": 0,
+    "scenarios": 59,
+    "scenariosCovered": 59,
+    "scenariosMissing": [],
+    "repoFactoryScenariosTouched": 4
+  },
+  "requirements": [
+    {
+      "id": "CP-001",
+      "text": "Hermes가 DIRECT/MANAGED를 자율 분류하되 Tool-level Managed Write Guard가 강제한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S01",
+        "CP-S02",
+        "CP-S03"
+      ],
+      "evidenceSource": "Managed Write Guard Decision + Run Record",
+      "coveredScenarios": [
+        "CP-S01",
+        "CP-S02",
+        "CP-S03"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-002",
+      "text": "Project·Repository·Session·Binding의 권위를 분리한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S04",
+        "CP-S05"
+      ],
+      "evidenceSource": "Manifest/Registry Authority Validation",
+      "coveredScenarios": [
+        "CP-S04",
+        "CP-S05"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-003",
+      "text": "Project당 Active Primary CTO 최대 1개, Activity와 Availability를 분리한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S06"
+      ],
+      "evidenceSource": "Unique Active Primary CTO Constraint",
+      "coveredScenarios": [
+        "CP-S06"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-004",
+      "text": "CTO Create·Drain·Handoff·Replace·Suspend·Recovery를 지원한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S07",
+        "CP-S08",
+        "CP-S09",
+        "CP-S10"
+      ],
+      "evidenceSource": "Session Lifecycle + Handoff Records",
+      "coveredScenarios": [
+        "CP-S07",
+        "CP-S08",
+        "CP-S09",
+        "CP-S10"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-005",
+      "text": "Run Owner를 Dispatch 시 Pin하고 Binding Generation으로 Fence한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S11"
+      ],
+      "evidenceSource": "Owner Binding Fence + Recovery Receipt",
+      "coveredScenarios": [
+        "CP-S11"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-006",
+      "text": "CTO 자율 아래 여러 Run/Task의 병렬 실행을 허용한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S12"
+      ],
+      "evidenceSource": "Parallel Run/Task Execution Evidence",
+      "coveredScenarios": [
+        "CP-S12"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-007",
+      "text": "Global Resource Claim으로 명백한 Cross-CTO Conflict를 방지한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S13",
+        "CP-S14",
+        "CP-S15"
+      ],
+      "evidenceSource": "Resource Claim Decision Records",
+      "coveredScenarios": [
+        "CP-S13",
+        "CP-S14",
+        "CP-S15"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-008",
+      "text": "Provider Usage를 Multi-bucket으로 수집하고 Sensor/Runtime/Admission을 분리한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S16",
+        "CP-S17",
+        "CP-S18"
+      ],
+      "evidenceSource": "Capacity Bucket Snapshots + Routing Record",
+      "coveredScenarios": [
+        "CP-S16",
+        "CP-S17",
+        "CP-S18"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-009",
+      "text": "Failover 전 RoleCoveragePlan을 계산한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S19",
+        "CP-S20",
+        "CP-S21",
+        "CP-S22"
+      ],
+      "evidenceSource": "RoleCoveragePlan",
+      "coveredScenarios": [
+        "CP-S19",
+        "CP-S20",
+        "CP-S21",
+        "CP-S22"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-010",
+      "text": "Failover와 Message Fencing을 Atomic하게 수행한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S23",
+        "CP-S24"
+      ],
+      "evidenceSource": "Binding Transaction + Stale Message Audit",
+      "coveredScenarios": [
+        "CP-S23",
+        "CP-S24"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-011",
+      "text": "Candidate Snapshot이 모든 Touched Repository를 완전하게 표현한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S25",
+        "CP-S26"
+      ],
+      "evidenceSource": "CandidateSnapshot Manifest",
+      "coveredScenarios": [
+        "CP-S25",
+        "CP-S26"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-012",
+      "text": "Verification은 공통 argv Schema와 Isolated Sandbox를 사용한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S27",
+        "CP-S28",
+        "CP-S29"
+      ],
+      "evidenceSource": "Sandbox + Verification Result",
+      "coveredScenarios": [
+        "CP-S27",
+        "CP-S28",
+        "CP-S29"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-013",
+      "text": "모든 Execution Mode에 Automatic Independent Blind Review가 필수다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S30",
+        "CP-S33"
+      ],
+      "evidenceSource": "Automatic Blind Review Artifact",
+      "coveredScenarios": [
+        "CP-S30",
+        "CP-S33"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-014",
+      "text": "Blind Review Coverage와 Producer Session Independence를 증명한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S31",
+        "CP-S32",
+        "CP-S34"
+      ],
+      "evidenceSource": "Session Independence + Coverage Manifest",
+      "coveredScenarios": [
+        "CP-S31",
+        "CP-S32",
+        "CP-S34"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-015",
+      "text": "`agentcpd`만 Trusted GitHub Gate·Programmatic Merge Credential을 소유한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S35"
+      ],
+      "evidenceSource": "Trusted Gate Creator/Payload Evidence",
+      "coveredScenarios": [
+        "CP-S35"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-016",
+      "text": "GitHub Integration Kernel이 PR·Merge·Post-merge·Tag·Rollback·Issue Projection을 소유한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S36",
+        "CP-S37",
+        "CP-S38",
+        "CP-S39",
+        "CP-S40",
+        "CP-S41",
+        "CP-S42"
+      ],
+      "evidenceSource": "PR/Merge/Post-merge/Tag Receipts",
+      "coveredScenarios": [
+        "CP-S36",
+        "CP-S37",
+        "CP-S38",
+        "CP-S39",
+        "CP-S40",
+        "CP-S41",
+        "CP-S42"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-017",
+      "text": "Doctor는 Runtime Receipt와 Watchdog Stall Evidence를 사용한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S43",
+        "CP-S44",
+        "CP-S45",
+        "CP-S46",
+        "CP-S47"
+      ],
+      "evidenceSource": "Doctor Finding + Watchdog Trigger",
+      "coveredScenarios": [
+        "CP-S43",
+        "CP-S44",
+        "CP-S45",
+        "CP-S46",
+        "CP-S47"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-018",
+      "text": "Buzz·Telegram·MCP는 Authentication·Replay 방어를 가진다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S48",
+        "CP-S49",
+        "CP-S50",
+        "CP-S51"
+      ],
+      "evidenceSource": "Ingress Auth/Replay/Injection Results",
+      "coveredScenarios": [
+        "CP-S48",
+        "CP-S49",
+        "CP-S50",
+        "CP-S51"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-019",
+      "text": "RepoFactoryResult와 ACP Activation Result를 분리한다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S52"
+      ],
+      "evidenceSource": "Bootstrap Result Separation Validation",
+      "coveredScenarios": [
+        "CP-S52"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-020",
+      "text": "CEO는 Final Candidate·True Escalation·Critical Failure만 자동 보고받는다.",
+      "blocking": "P0",
+      "scenarios": [
+        "CP-S53",
+        "CP-S54",
+        "CP-S55"
+      ],
+      "evidenceSource": "CEO Notification/Escalation Audit",
+      "coveredScenarios": [
+        "CP-S53",
+        "CP-S54",
+        "CP-S55"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-021",
+      "text": "Telemetry는 Decision-grade·Redacted이며 Full Trace가 아니다.",
+      "blocking": "P1",
+      "scenarios": [
+        "CP-S56",
+        "CP-S57"
+      ],
+      "evidenceSource": "Redacted B-lite Telemetry Records",
+      "coveredScenarios": [
+        "CP-S56",
+        "CP-S57"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-022",
+      "text": "Daemon은 Supervised·Single-instance·Restart Reconcile을 지원한다.",
+      "blocking": "P1",
+      "scenarios": [
+        "CP-S58",
+        "CP-S59"
+      ],
+      "evidenceSource": "Supervisor + Restart Reconciliation Evidence",
+      "coveredScenarios": [
+        "CP-S58",
+        "CP-S59"
+      ],
+      "missingScenarios": [],
+      "status": "COVERED"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "CP-S01",
+      "description": "Read-only Repo 분석은 DIRECT 유지.",
+      "tests": [
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S01: read-only repository analysis stays DIRECT"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S02",
+      "description": "DIRECT Repo Mutation 시도 → Managed Run 부재로 거부.",
+      "tests": [
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S02: a DIRECT-labelled mutation inside a repo is denied without a managed run"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S03",
+      "description": "실행 요청 후 Managed Promotion·Run 생성·Write 진행.",
+      "tests": [
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S03: the same mutation passes with a valid run identity"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S04",
+      "description": "Absolute Path가 있는 Committed Manifest 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "registry authority (CP-S04, CP-S05, CP-S26)"
+        },
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S04: a manifest carrying an absolute path is refused at registration"
+        },
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S04 / RF-S05: rejects absolute paths and session identifiers"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S05",
+      "description": "Local Checkout Path는 Repository Registry에만 존재.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "registry authority (CP-S04, CP-S05, CP-S26)"
+        },
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S05: the absolute checkout path exists only in the repository registry"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S06",
+      "description": "Project에 Active Primary CTO 2개 생성 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S06: a project cannot hold two active primary CTO bindings"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S07",
+      "description": "CTO 없는 Project Run → Fresh Opus 자동 Binding.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CTO lifecycle (CP-S07 – CP-S11)"
+        },
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S07: a run against a CTO-less project provisions a fresh CTO and turns it ACTIVE"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S08",
+      "description": "Active Run 중 Replace Request → DRAINING, Switchover 대기.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S08 / CP-S09: a replacement drains the CTO and new runs stay QUEUED"
+        },
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S08: switchover is refused while the outgoing CTO still owns active runs"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S09",
+      "description": "Replacement 중 New Run QUEUED.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S08 / CP-S09: a replacement drains the CTO and new runs stay QUEUED"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S10",
+      "description": "New CTO Handoff ACK 전 Old Binding 유지.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S10: the old binding stays in force until HANDOFF_ACK, then switches atomically"
+        },
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S10: an ack from the wrong session cannot switch the binding"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S11",
+      "description": "Dead Owner Recovery Takeover·Late Result Reject.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CTO lifecycle (CP-S07 – CP-S11)"
+        },
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S11: recovery takeover repoints the run and makes late results audit-only"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S12",
+      "description": "Independent Task를 여러 Provider로 Fan-out.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "parallel execution (CP-S12)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S12: independent tasks fan out across providers under one run"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S13",
+      "description": "Same Worktree Writer Conflict 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "resource claims (CP-S13, CP-S14, CP-S15)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S13: two runs cannot hold the same worktree"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S14",
+      "description": "다른 CTO의 Exact Path Claim Overlap 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "resource claims (CP-S13, CP-S14, CP-S15)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S14: exact declared path overlap between runs is a hard reject"
+        },
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S14: rejects an exact path already claimed by another run"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S15",
+      "description": "Semantic Conflict는 Warning 후 CTO 판단.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "resource claims (CP-S13, CP-S14, CP-S15)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S15: a semantic (same-directory) overlap is advisory, not a reject"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S16",
+      "description": "GPT/Claude Usage의 여러 Window를 Bucket으로 Normalization.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "provider capacity (CP-S16, CP-S17, CP-S18)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S16: several usage windows are normalized into separate buckets"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S17",
+      "description": "Probe Failure → New Allocation Suspend, Existing Critical Runtime 별도 Probe.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "provider capacity (CP-S16, CP-S17, CP-S18)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S17: a failed probe suspends new allocation and still probes runtime health"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S17: dispatch is refused rather than routed against an unknown quota"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S18",
+      "description": "GPT Disposable Capacity Healthy → Mechanical Task에 Luna Max 선택.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "provider capacity (CP-S16, CP-S17, CP-S18)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S18: a healthy disposable bucket is what makes Luna Max routable"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S19",
+      "description": "GPT Exhausted, Claude Full Coverage 가능 → DEGRADED/FULL_COVERAGE.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "role continuity (CP-S19 – CP-S24)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S19: GPT exhausted with Claude able to cover everything is DEGRADED / FULL_COVERAGE"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S20",
+      "description": "GPT Exhausted, Claude 일부만 Coverage → Suspend Recommendation.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S20: partial coverage yields a wait-or-pause action rather than a silent pass"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S21",
+      "description": "Claude Exhausted → Distinct GPT Acting CTO/Reviewer/CEO.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S21: with Claude down, distinct GPT sessions cover CEO, CTO and reviewer"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S22",
+      "description": "GPT+Claude 불가 → SURVIVAL, Production Completion 금지.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S22: with both providers unavailable the mode is SURVIVAL and completion is refused"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S23",
+      "description": "Old Generation Late Message → State 불변.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S23: a message addressed to a revoked generation is never delivered"
+        },
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S23: an ack from a superseded generation is audit-only"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S24",
+      "description": "Provider 복구가 In-flight Owner/Reviewer를 즉시 교체하지 않음.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "role continuity (CP-S19 – CP-S24)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S24: a recovered provider does not seize an in-flight run owner"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S25",
+      "description": "2-Repo Snapshot Freeze 후 1 Repo Head 변경 → 전체 Evidence Stale.",
+      "tests": [
+        {
+          "file": "ests/integration/pipeline.test.ts",
+          "title": "CP-S25: a repository change after freezing invalidates the whole candidate"
+        },
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S25: freezes every repository and goes stale when one head moves"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S26",
+      "description": "Unregistered Repo Temporary Binding, Active Project 자동 등록 없음.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "registry authority (CP-S04, CP-S05, CP-S26)"
+        },
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S26: an unregistered repository gets a run-scoped binding and no active project"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S27",
+      "description": "Candidate Test가 Authority Secret 접근 실패.",
+      "tests": [
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S27: a candidate command cannot read authority secrets from the environment"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S28",
+      "description": "Timeout Child Process Group Kill.",
+      "tests": [
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S28: kills the whole process group on timeout"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S29",
+      "description": "Old Head Trusted CI Result 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "trusted CI evidence (CP-S29)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S29: a CI result for a different head is refused, not counted"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S29: an unapproved workflow digest or untrusted creator is also refused"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S29: a CI result at the exact head from an approved workflow is accepted"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S30",
+      "description": "SIMPLE도 Sol xhigh 자동 Review.",
+      "tests": [
+        {
+          "file": "ests/integration/pipeline.test.ts",
+          "title": "registers a project manually and drives contract → verification → blind review → packet"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S31",
+      "description": "같은 Worker Session Reviewer Binding 거부.",
+      "tests": [
+        {
+          "file": "ests/integration/pipeline.test.ts",
+          "title": "CP-S31: a producer session cannot be bound as the run"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S32",
+      "description": "Large Diff에서 File 1개 Coverage 누락 → PASS 불가.",
+      "tests": [
+        {
+          "file": "ests/integration/pipeline.test.ts",
+          "title": "CP-S32: a review that misses a touched file cannot pass"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S33",
+      "description": "REVISE는 CTO로만 돌아가고 CEO 알림 없음.",
+      "tests": [
+        {
+          "file": "ests/integration/pipeline.test.ts",
+          "title": "CP-S33: a REVISE verdict returns to the CTO and does not notify the CEO"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S34",
+      "description": "Fallback Isolation 불가 → Wait/SURVIVAL, Gate 약화 없음.",
+      "tests": [
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "CP-S34: a failover the coverage plan cannot staff is refused, not downgraded"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S35",
+      "description": "Candidate가 동일 Check Name 생성 → Trusted Creator/Payload 불일치로 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "production gate provenance (CP-S35, CP-S37)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S35: a same-named check from an untrusted creator or with an unknown payload is refused"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S35: a gate whose payload the daemon did record, but under a different head, is refused"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S36",
+      "description": "Branch Contract 위반 Target → PR Prepare 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "branch contract (CP-S36, RF-S10, RF-S11)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S36: pr_prepare refuses a contract-violating target before any external write"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S37",
+      "description": "Feature/Release Target에 Gate 없는 Merge 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "production gate provenance (CP-S35, CP-S37)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S37: a merge with no gate at all is refused, whatever the target branch is"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S38",
+      "description": "Stale Base/Head Merge 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "merge execution (CP-S38, CP-S39, CP-S40)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S38: a stale head or base is refused"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S39",
+      "description": "Valid Exact-head Merge 1회, Replay Receipt 반환.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "merge execution (CP-S38, CP-S39, CP-S40)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S39: a valid merge happens exactly once and a replay returns the original receipt"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S40",
+      "description": "Post-merge Failure → Dependent 차단·Rollback/Repair.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "merge execution (CP-S38, CP-S39, CP-S40)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S40: a failed post-merge check blocks dependent merges and a rollback plan is prepared"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S41",
+      "description": "Wrong Commit/Duplicate Release Tag 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "release and hotfix (CP-S41, CP-S42)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S41: a tag on a commit the kernel never merged, and a duplicate tag, are both refused"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S42",
+      "description": "Active Release에 Hotfix 누락 → Propagation Incomplete.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "release and hotfix (CP-S41, CP-S42)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "CP-S42: a hotfix missing from an active release reports propagation incomplete"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S43",
+      "description": "Receipt/Runtime Mismatch로 Dead Worker 감지.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "doctor (CP-S43 – CP-S45)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S43: a running receipt with a dead worker process is detected"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S44",
+      "description": "Orphan Worktree 감지, 자동 삭제 없음.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S44: an orphan worktree is reported and not deleted"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S45",
+      "description": "CPU/RAM Pressure → Deterministic DEGRADED.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "doctor (CP-S43 – CP-S45)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S45: aggregation from findings to status is deterministic"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S46",
+      "description": "Deadline 이후 Event 없음 → Watchdog Scoped Doctor.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "watchdog (CP-S46)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S46: nothing happening past the deadline triggers a scoped doctor"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S47",
+      "description": "Repair는 Explicit Contract·Authorization 필요.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "repair (CP-S47)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S47: repair needs an allowlisted operation and the right authorization"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S48",
+      "description": "Non-allowlisted Telegram User 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "ingress (CP-S48 – CP-S51)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S48: a non-allowlisted user or chat is refused"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S48: an update without the webhook secret is refused"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S49",
+      "description": "Replayed Buzz/MCP Message Idempotent Ignore.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S49: a replayed update is idempotently ignored"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S49: a Buzz message with an invalid HMAC is refused, and a valid one admitted once"
+        },
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S49: suppresses a replayed enqueue by idempotency key"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S50",
+      "description": "Old Binding Generation Dispatch 거부.",
+      "tests": [
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S50: only messages matching the currently active generation are deliverable"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S51",
+      "description": "Crawled Prompt Injection이 Run/Write/Secret에 영향 없음.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "ingress (CP-S48 – CP-S51)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S51: forwarded and crawled content is admitted as data and cannot change authority"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S52",
+      "description": "RepoFactoryResult만으로 Bootstrap Completion 불가.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "Repo Factory boundary (CP-S52)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S52: a factory result that claims activation facts is rejected"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S52: only the ACP activation result supplies CTO, Buzz and doctor facts"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S53",
+      "description": "Routine Worker/Test/Review Churn은 CEO 자동 알림 없음.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CEO notification policy (CP-S53, CP-S54)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S53: routine worker, task and review churn produces no CEO notification"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S54",
+      "description": "True CTO Escalation이 Buzz에 표시되고 Hermes가 종결.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CEO notification policy (CP-S53, CP-S54)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S54: a true escalation notifies the CEO and Hermes can close it"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S55",
+      "description": "Owner Decision → AWAITING_HUMAN → 정상 Resume.",
+      "tests": [
+        {
+          "file": "ests/scenarios/registry-cto.test.ts",
+          "title": "CP-S55: an owner decision moves the run through AWAITING_HUMAN and back"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S56",
+      "description": "Task Start/Finish Receipt로 Doctor/Telemetry 충족, Per-second Reporting 없음.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "telemetry (CP-S56, CP-S57)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S56: start and finish receipts are enough; nothing requires per-second reporting"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S57",
+      "description": "Missing Telemetry는 Missing으로 표시.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "telemetry (CP-S56, CP-S57)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S57: telemetry that was never collected reports MISSING rather than a default"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S58",
+      "description": "Daemon Crash/Restart 후 Duplicate Dispatch 없이 Reconcile.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "daemon (CP-S58, CP-S59)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S58: restart reconciles without dispatching the same run twice"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S58: a queued run is resumed exactly once across a restart"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S58: an execution left RUNNING across a restart is abandoned, not left dangling"
+        }
+      ],
+      "status": "COVERED"
+    },
+    {
+      "id": "CP-S59",
+      "description": "Crash Loop Backoff.",
+      "tests": [
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "daemon (CP-S58, CP-S59)"
+        },
+        {
+          "file": "ests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "CP-S59: a second instance refuses to start and the backoff grows"
+        }
+      ],
+      "status": "COVERED"
+    }
+  ],
+  "repoFactoryScenariosTouched": [
+    {
+      "id": "RF-S05",
+      "description": "Absolute Path·Session ID·Provider·Channel ID가 있는 Manifest를 거부한다.",
+      "tests": [
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "CP-S04 / RF-S05: rejects absolute paths and session identifiers"
+        }
+      ]
+    },
+    {
+      "id": "RF-S07",
+      "description": "Shell String/Pipeline은 거부되고 argv Command는 통과한다.",
+      "tests": [
+        {
+          "file": "ests/unit/trusted-core.test.ts",
+          "title": "RF-S07: accepts argv and rejects shell pipelines"
+        }
+      ]
+    },
+    {
+      "id": "RF-S10",
+      "description": "잘못된 Base의 Feature Branch 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "branch contract (CP-S36, RF-S10, RF-S11)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "RF-S10: a feature branch targeting anything but dev is refused"
+        }
+      ]
+    },
+    {
+      "id": "RF-S11",
+      "description": "선언하지 않은 Parent로 가는 Task PR 거부.",
+      "tests": [
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "branch contract (CP-S36, RF-S10, RF-S11)"
+        },
+        {
+          "file": "ests/scenarios/github-kernel.test.ts",
+          "title": "RF-S11: a task branch may only target its declared parent"
+        }
+      ]
+    }
+  ]
+}

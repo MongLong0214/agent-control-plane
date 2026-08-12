@@ -5,9 +5,16 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import { GATE_CHECK_NAME, type GatePayload } from "../../src/github/github-kernel.ts";
 import { classifyBranch, validateBranchContract } from "../../src/github/branch-contract.ts";
+import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
+import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
-import { type Harness, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import {
+  type Harness,
+  applyPassingChange,
+  makeHarness,
+  registerFixtureProject,
+} from "../helpers/harness.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 
 afterAll(cleanupTempDirs);
@@ -577,6 +584,127 @@ describe("issue projection", () => {
     expect(fixture.github.issues).toHaveLength(1);
     expect(fixture.github.issues[0]?.title).toBe("first, retitled");
     expect(fixture.github.issues[0]?.body).toContain("<!-- acp-ticket:T001 -->");
+  });
+});
+
+describe("trusted CI evidence (CP-S29)", () => {
+  const commands = [
+    parseVerificationCommand({
+      id: "project-ci",
+      argv: ["node", "verify.js"],
+      repositoryRole: "primary",
+      evidenceMode: "TRUSTED_CI",
+      timeoutSeconds: 60,
+    }),
+  ];
+
+  const frozen = async (fixture: Fixture) => {
+    applyPassingChange(fixture.harness.repoPath);
+    const snapshot = await fixture.harness.cp.pipeline.freeze(fixture.runId);
+    if (!snapshot.allowed) throw new Error(snapshot.message);
+    return snapshot.value;
+  };
+
+  it("CP-S29: a CI result for a different head is refused, not counted", async () => {
+    const fixture = await setup();
+    const snapshot = await frozen(fixture);
+    const repo = snapshot.repositories[0]!;
+
+    fixture.harness.cp.verification.attachCi({
+      // The check reports success, but against a head that is not the candidate's.
+      fetch: async () => [
+        {
+          commandId: "project-ci",
+          repositoryIdentity: repo.identity,
+          head: "0".repeat(40),
+          conclusion: "success",
+          workflowDigest: "sha256:approved",
+          creatorIdentity: "github-actions",
+          completedAt: "2026-08-12T00:00:00.000Z",
+          nonVacuous: true,
+        },
+      ],
+      approvedWorkflowDigests: async () => ["sha256:approved"],
+      trustedCreators: async () => ["github-actions"],
+    });
+
+    const verified = await fixture.harness.cp.verification.verify({
+      runId: fixture.runId,
+      snapshot,
+      commands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(verified.allowed).toBe(false);
+
+    const report = fixture.harness.cp.verification.latestReport(
+      fixture.runId,
+      candidateSnapshotDigest(snapshot),
+    )!;
+    expect(report.results[0]?.reasonCode).toBe(ReasonCode.VERIFICATION_CI_HEAD_MISMATCH);
+    expect(report.status).not.toBe("PASS");
+  });
+
+  it("CP-S29: an unapproved workflow digest or untrusted creator is also refused", async () => {
+    const fixture = await setup();
+    const snapshot = await frozen(fixture);
+    const repo = snapshot.repositories[0]!;
+    const base = {
+      commandId: "project-ci",
+      repositoryIdentity: repo.identity,
+      head: repo.candidateHead,
+      conclusion: "success" as const,
+      completedAt: "2026-08-12T00:00:00.000Z",
+      nonVacuous: true,
+    };
+
+    fixture.harness.cp.verification.attachCi({
+      fetch: async () => [{ ...base, workflowDigest: "sha256:candidate-edited", creatorIdentity: "github-actions" }],
+      approvedWorkflowDigests: async () => ["sha256:approved"],
+      trustedCreators: async () => ["github-actions"],
+    });
+    const edited = await fixture.harness.cp.verification.verify({
+      runId: fixture.runId,
+      snapshot,
+      commands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(edited.allowed).toBe(false);
+    expect(
+      fixture.harness.cp.verification.latestReport(fixture.runId, candidateSnapshotDigest(snapshot))!
+        .results[0]?.reasonCode,
+    ).toBe(ReasonCode.VERIFICATION_CI_WORKFLOW_DIGEST_MISMATCH);
+  });
+
+  it("CP-S29: a CI result at the exact head from an approved workflow is accepted", async () => {
+    const fixture = await setup();
+    const snapshot = await frozen(fixture);
+    const repo = snapshot.repositories[0]!;
+
+    fixture.harness.cp.verification.attachCi({
+      fetch: async () => [
+        {
+          commandId: "project-ci",
+          repositoryIdentity: repo.identity,
+          head: repo.candidateHead,
+          conclusion: "success",
+          workflowDigest: "sha256:approved",
+          creatorIdentity: "github-actions",
+          completedAt: "2026-08-12T00:00:00.000Z",
+          nonVacuous: true,
+        },
+      ],
+      approvedWorkflowDigests: async () => ["sha256:approved"],
+      trustedCreators: async () => ["github-actions"],
+    });
+
+    const verified = await fixture.harness.cp.verification.verify({
+      runId: fixture.runId,
+      snapshot,
+      commands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(verified.allowed).toBe(true);
+    expect(verified.allowed && verified.value.status).toBe("PASS");
   });
 });
 
