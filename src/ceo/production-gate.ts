@@ -1,6 +1,8 @@
+import { execFileSync } from "node:child_process";
+
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { OwnerAuthorityPort } from "./owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -9,7 +11,6 @@ import type { Db } from "../db/database.ts";
 import {
   ArtifactKind,
   type CeoDecision,
-  ContinuityMode,
   RunState,
   Role,
   RunKind,
@@ -24,6 +25,11 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationReport } from "../verify/verification-engine.ts";
 import type { ContinuityGate } from "../run/run-engine.ts";
+import {
+  candidateSnapshotDigest,
+  candidateSnapshotSchema,
+  type CandidateSnapshot,
+} from "../snapshot/candidate-snapshot.ts";
 
 /** PRD §19.1 — what Hermes receives by default. */
 export interface ProductionReadyPacket {
@@ -136,18 +142,8 @@ export class ProductionGate {
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
 
-    // §15.6 — SURVIVAL forbids completion, and a mode that has not been re-evaluated
-    // recently is not evidence that we are not in SURVIVAL.
-    if (this.#continuity?.assertCompletionAllowed) {
-      const allowed = this.#continuity.assertCompletionAllowed(input.runId);
-      if (!allowed.allowed) return allowed as Decision<ProductionReadyPacket>;
-    } else if (this.#continuity?.mode() === ContinuityMode.SURVIVAL) {
-      return deny(
-        ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
-        "continuity is in SURVIVAL; production-ready completion is not permitted",
-        { runId: input.runId },
-      );
-    }
+    const continuity = this.assertCompletionAllowed(input.runId);
+    if (!continuity.allowed) return continuity as Decision<ProductionReadyPacket>;
 
     if (input.approval.candidateSnapshotDigest !== input.candidateSnapshotDigest) {
       return deny(ReasonCode.EVIDENCE_STALE, "CTO approval is bound to a different candidate", {
@@ -176,6 +172,9 @@ export class ProductionGate {
         current,
       });
     }
+
+    const snapshot = this.requireCandidateSnapshot(input.runId, input.candidateSnapshotDigest);
+    if (!snapshot.allowed) return snapshot as Decision<ProductionReadyPacket>;
 
     const verificationArtifact = this.artifacts.latestForSnapshot<VerificationReport>(
       input.runId,
@@ -246,12 +245,6 @@ export class ProductionGate {
       });
     }
 
-    // Look the snapshot up by the candidate digest it is bound to, not by the artifact
-    // content digest — the two differ because the candidate digest deliberately
-    // excludes `createdAt` so re-freezing identical content is stable.
-    const snapshotArtifact = this.artifacts.latestForSnapshot<{
-      repositories: Array<Record<string, unknown>>;
-    }>(input.runId, ArtifactKind.CANDIDATE_SNAPSHOT, input.candidateSnapshotDigest);
     const humanGate = this.humanGateStatus(input.runId);
 
     const packet: ProductionReadyPacket = {
@@ -282,41 +275,95 @@ export class ProductionGate {
         findings: reviewArtifact.content.findings.length,
       },
       knownResidualRisk: input.approval.residualRisk,
-      changedRepositories: (snapshotArtifact?.content.repositories ?? []).map((repo) => ({
-        identity: String(repo["identity"]),
-        baseHead: String(repo["baseHead"]),
-        candidateHead: String(repo["candidateHead"]),
-        files: Array.isArray(repo["touchedPaths"]) ? repo["touchedPaths"].length : 0,
+      changedRepositories: snapshot.value.repositories.map((repo) => ({
+        identity: repo.identity,
+        baseHead: repo.baseHead,
+        candidateHead: repo.candidateHead,
+        files: repo.touchedPaths.length,
       })),
       ctoRecommendation: input.approval.recommendation,
       humanGate,
       createdAt: this.clock.nowIso(),
     };
 
-    this.artifacts.put(input.runId, ArtifactKind.APPROVAL, input.approval, input.candidateSnapshotDigest);
-    this.artifacts.putEvidence(
-      "production-gate",
-      input.runId,
-      ArtifactKind.PRODUCTION_READY_PACKET,
-      packet,
-      input.candidateSnapshotDigest,
-    );
+    const ceo = this.bindings.active(roleKeyFor(Role.CEO));
+    if (!ceo) {
+      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive the production packet", {
+        runId: input.runId,
+      });
+    }
 
-    const transition = this.runs.transition(
-      input.runId,
-      RunState.READY_FOR_CEO_REVIEW,
-      "production-ready packet assembled",
-      { candidateSnapshotDigest: input.candidateSnapshotDigest },
-    );
-    if (!transition.allowed) return transition as Decision<ProductionReadyPacket>;
+    // §30.3 — publication means all four durable facts exist together: CTO approval,
+    // immutable packet, READY transition, and a fenced notification intent. A denied
+    // transition is thrown through the transaction so an earlier artifact cannot escape.
+    try {
+      return this.db.tx(() => {
+        const currentCeo = this.bindings.active(roleKeyFor(Role.CEO));
+        if (
+          !currentCeo ||
+          currentCeo.sessionId !== ceo.sessionId ||
+          currentCeo.bindingGeneration !== ceo.bindingGeneration
+        ) {
+          throw acpError(ReasonCode.GATE_AUTHORITY_DENIED, "CEO binding changed before notification", {
+            runId: input.runId,
+          });
+        }
 
-    this.notify(NotificationKind.READY_FOR_CEO_REVIEW, input.runId, {
-      goal: run.goal,
-      candidateSnapshotDigest: input.candidateSnapshotDigest,
-      humanGate,
-    });
+        this.artifacts.put(input.runId, ArtifactKind.APPROVAL, input.approval, input.candidateSnapshotDigest);
+        this.artifacts.putEvidence(
+          "production-gate",
+          input.runId,
+          ArtifactKind.PRODUCTION_READY_PACKET,
+          packet,
+          input.candidateSnapshotDigest,
+        );
 
-    return allow(ReasonCode.OK, packet);
+        const transition = this.runs.transition(
+          input.runId,
+          RunState.READY_FOR_CEO_REVIEW,
+          "production-ready packet assembled",
+          { candidateSnapshotDigest: input.candidateSnapshotDigest },
+        );
+        if (!transition.allowed) {
+          throw acpError(transition.reasonCode, transition.message, transition.evidence);
+        }
+
+        this.outbox.enqueue({
+          idempotencyKey: `notify:${NotificationKind.READY_FOR_CEO_REVIEW}:${input.runId}:${digestOf({
+            goal: run.goal,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            humanGate,
+          })}`,
+          roleKey: ceo.roleKey,
+          bindingGeneration: ceo.bindingGeneration,
+          targetSessionId: ceo.sessionId,
+          runId: input.runId,
+          kind: MessageKind.CEO_NOTIFICATION,
+          payload: {
+            notification: NotificationKind.READY_FOR_CEO_REVIEW,
+            runId: input.runId,
+            goal: run.goal,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            humanGate,
+          },
+        });
+        this.audit.record({
+          kind: "CEO_NOTIFICATION",
+          runId: input.runId,
+          roleKey: ceo.roleKey,
+          evidence: {
+            notification: NotificationKind.READY_FOR_CEO_REVIEW,
+            goal: run.goal,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            humanGate,
+          },
+        });
+        return allow(ReasonCode.OK, packet);
+      });
+    } catch (error) {
+      if (isAcpError(error)) return deny(error.reasonCode, error.message, error.evidence);
+      throw error;
+    }
   }
 
   /**
@@ -351,6 +398,11 @@ export class ProductionGate {
       });
     }
 
+    if (input.decision === "CONFIRM") {
+      const continuity = this.assertCompletionAllowed(input.runId);
+      if (!continuity.allowed) return continuity as Decision<{ state: RunState }>;
+    }
+
     // The decision is an exercise of the CEO role, so the session must currently hold it.
     // Independence alone would let any unknown id decide (CP-HI-07).
     const holds = this.assertCurrentCeo(input.ceoSessionId);
@@ -374,12 +426,26 @@ export class ProductionGate {
     // there must be one before the CEO can confirm it.
     if (input.decision === "CONFIRM" && run.kind === RunKind.PROJECT_BOOTSTRAP) {
       const activation = this.artifacts.latest(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT);
-      if (!activation) {
+      const activationCheck = activation ? this.validateBootstrapActivation(input.runId, activation.content) : null;
+      if (!activation || !activationCheck?.allowed) {
         return deny(
           ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
-          "a bootstrap run cannot be confirmed without an activation result",
-          { runId: input.runId },
+          "a bootstrap run cannot be confirmed without a complete activation result",
+          { runId: input.runId, ...(activationCheck?.evidence ?? {}) },
         );
+      }
+    }
+
+    if (input.decision === "CONFIRM" && !isBootstrap) {
+      const freshness = this.revalidateCandidateFreshness(input.runId, input.candidateSnapshotDigest);
+      if (!freshness.allowed) {
+        const invalidated = this.runs.invalidateCandidate(
+          input.runId,
+          "candidate freshness failed at CEO confirmation",
+          freshness.evidence,
+        );
+        if (!invalidated.allowed) return invalidated as Decision<{ state: RunState }>;
+        return freshness as Decision<{ state: RunState }>;
       }
     }
 
@@ -428,8 +494,16 @@ export class ProductionGate {
     candidateSnapshotDigest: string,
     report: VerificationReport,
   ): Decision<void> {
-    const rows = this.db.all<{ command_id: string; source: string; status: string }>(
-      `SELECT command_id, source, status FROM verification_results
+    const rows = this.db.all<{
+      command_id: string;
+      repository_identity: string;
+      source: string;
+      exact_head: string;
+      status: string;
+      output_digest: string;
+    }>(
+      `SELECT command_id, repository_identity, source, exact_head, status, output_digest
+         FROM verification_results
         WHERE run_id = ? AND candidate_snapshot_digest = ?`,
       [runId, candidateSnapshotDigest],
     );
@@ -446,18 +520,296 @@ export class ProductionGate {
         failing,
       });
     }
-    const reported = new Set(report.results.map((r) => `${r.commandId}:${r.source}`));
-    const observed = new Set(rows.map((r) => `${r.command_id}:${r.source}`));
-    const missing = [...reported].filter((k) => !observed.has(k));
-    if (missing.length > 0 || rows.length < report.expectedInputs) {
+    const reportRows = report.results.map((result) => ({
+      commandId: result.commandId,
+      repositoryIdentity: result.repositoryIdentity,
+      source: result.source,
+      exactHead: result.exactHead,
+      status: result.status,
+      outputDigest: result.outputDigest,
+    }));
+    const key = (row: {
+      commandId: string;
+      repositoryIdentity: string;
+      source: string;
+      exactHead: string;
+      status: string;
+      outputDigest: string;
+    }): string =>
+      [row.commandId, row.repositoryIdentity, row.source, row.exactHead, row.status, row.outputDigest]
+        .map((field) => JSON.stringify(field))
+        .join("|");
+    const reported = reportRows.map(key);
+    const observed = rows.map((row) =>
+      key({
+        commandId: row.command_id,
+        repositoryIdentity: row.repository_identity,
+        source: row.source,
+        exactHead: row.exact_head,
+        status: row.status,
+        outputDigest: row.output_digest,
+      }),
+    );
+    const reportedSet = new Set(reported);
+    const observedSet = new Set(observed);
+    const missing = reported.filter((entry) => !observedSet.has(entry));
+    const extra = observed.filter((entry) => !reportedSet.has(entry));
+    if (
+      report.expectedInputs !== report.observedInputs ||
+      report.expectedInputs !== reportRows.length ||
+      reportRows.length !== rows.length ||
+      reportedSet.size !== reportRows.length ||
+      observedSet.size !== rows.length ||
+      missing.length > 0 ||
+      extra.length > 0
+    ) {
       return deny(ReasonCode.VERIFICATION_INCOMPLETE, "verification report is not fully corroborated", {
         runId,
         missing,
+        extra,
         rows: rows.length,
+        reportRows: reportRows.length,
         expectedInputs: report.expectedInputs,
+        observedInputs: report.observedInputs,
       });
     }
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /** A completion is not safe when the continuity evaluator has not been wired. */
+  private assertCompletionAllowed(runId: string): Decision<void> {
+    if (!this.#continuity?.assertCompletionAllowed) {
+      return deny(
+        ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
+        "completion requires a current continuity evaluation",
+        { runId },
+      );
+    }
+    return this.#continuity.assertCompletionAllowed(runId);
+  }
+
+  /** Require the stored, self-consistent snapshot that every packet claims to summarize. */
+  private requireCandidateSnapshot(
+    runId: string,
+    digest: string,
+  ): Decision<CandidateSnapshot> {
+    const artifact = this.artifacts.latestForSnapshot<unknown>(
+      runId,
+      ArtifactKind.CANDIDATE_SNAPSHOT,
+      digest,
+    );
+    if (!artifact) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "candidate snapshot artifact is missing", { runId, digest });
+    }
+    const parsed = candidateSnapshotSchema.safeParse(artifact.content);
+    if (!parsed.success) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "candidate snapshot has an invalid schema", {
+        runId,
+        digest,
+      });
+    }
+    const snapshot = parsed.data;
+    if (
+      artifact.candidateSnapshotDigest !== digest ||
+      snapshot.runId !== runId ||
+      candidateSnapshotDigest(snapshot) !== digest
+    ) {
+      return deny(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "candidate snapshot binding does not match its content", {
+        runId,
+        expectedDigest: digest,
+        artifactDigest: artifact.candidateSnapshotDigest,
+        contentDigest: candidateSnapshotDigest(snapshot),
+        snapshotRunId: snapshot.runId,
+      });
+    }
+
+    const participants = this.runs.repositoriesOf(runId);
+    const byIdentity = new Map(snapshot.repositories.map((repository) => [repository.identity, repository]));
+    if (byIdentity.size !== snapshot.repositories.length || participants.length !== byIdentity.size) {
+      return deny(ReasonCode.COVERAGE_INCOMPLETE, "candidate snapshot does not cover every run repository", {
+        runId,
+        participants: participants.map((repository) => repository.identity),
+        snapshotRepositories: snapshot.repositories.map((repository) => repository.identity),
+      });
+    }
+    const mismatch = participants.find((participant) => {
+      const frozen = byIdentity.get(participant.identity);
+      return (
+        !frozen ||
+        frozen.repositoryRole !== participant.repositoryRole ||
+        frozen.baseBranch !== participant.baseBranch ||
+        frozen.manifestDigest !== participant.activeManifestDigest
+      );
+    });
+    if (mismatch) {
+      return deny(ReasonCode.COVERAGE_INCOMPLETE, "candidate snapshot repository coverage is inconsistent", {
+        runId,
+        repository: mismatch.identity,
+      });
+    }
+    return allow(ReasonCode.OK, snapshot);
+  }
+
+  /** Re-read the complete frozen tuple directly before the irrevocable CEO confirmation. */
+  private revalidateCandidateFreshness(runId: string, digest: string): Decision<void> {
+    const snapshot = this.requireCandidateSnapshot(runId, digest);
+    if (!snapshot.allowed) return snapshot as Decision<void>;
+    const participants = new Map(
+      this.runs.repositoriesOf(runId).map((repository) => [repository.identity, repository]),
+    );
+    const drift: Array<Record<string, unknown>> = [];
+
+    for (const frozen of snapshot.value.repositories) {
+      const participant = participants.get(frozen.identity);
+      if (!participant) {
+        drift.push({ identity: frozen.identity, reason: "repository no longer participates in run" });
+        continue;
+      }
+      const git = (args: string[]): string | null => {
+        try {
+          return execFileSync("git", ["-C", participant.checkoutPath, ...args], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+          }).trim();
+        } catch {
+          return null;
+        }
+      };
+      const head = git(["rev-parse", "HEAD"]);
+      const tree = git(["rev-parse", `${frozen.candidateHead}^{tree}`]);
+      const base = git(["rev-parse", frozen.baseBranch]);
+      const status = git(["status", "--porcelain", "--untracked-files=all"]);
+      if (head !== frozen.candidateHead) {
+        drift.push({ identity: frozen.identity, expectedHead: frozen.candidateHead, observedHead: head });
+      }
+      if (`git-tree:${tree}` !== frozen.treeDigest) {
+        drift.push({ identity: frozen.identity, expectedTree: frozen.treeDigest, observedTree: tree });
+      }
+      if (base !== frozen.baseHead) {
+        drift.push({ identity: frozen.identity, expectedBaseHead: frozen.baseHead, observedBaseHead: base });
+      }
+      if (participant.activeManifestDigest !== frozen.manifestDigest) {
+        drift.push({
+          identity: frozen.identity,
+          expectedManifestDigest: frozen.manifestDigest,
+          observedManifestDigest: participant.activeManifestDigest,
+        });
+      }
+      if (status !== "") {
+        drift.push({ identity: frozen.identity, reason: "working tree has uncommitted changes" });
+      }
+    }
+
+    return drift.length === 0
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.SNAPSHOT_STALE, "candidate snapshot is no longer fresh at CEO confirmation", {
+          runId,
+          candidateSnapshotDigest: digest,
+          drift,
+        });
+  }
+
+  /** Facts in a bootstrap result are cross-checked against durable control-plane state. */
+  private validateBootstrapActivation(runId: string, value: unknown): Decision<void> {
+    if (!isRecord(value)) {
+      return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE, "activation result has no valid schema", { runId });
+    }
+    const projectRegistration = isRecord(value["projectRegistration"])
+      ? value["projectRegistration"]
+      : null;
+    const primary = isRecord(value["primaryCtoBinding"]) ? value["primaryCtoBinding"] : null;
+    const buzz = isRecord(value["buzz"]) ? value["buzz"] : null;
+    const handoffAck = isRecord(value["handoffAck"]) ? value["handoffAck"] : null;
+    const doctor = isRecord(value["doctor"]) ? value["doctor"] : null;
+    const projectId = typeof value["projectId"] === "string" ? value["projectId"] : null;
+    const incomplete: string[] = [];
+
+    if (
+      value["schema"] !== "agent-control-plane.bootstrap-activation.v1" ||
+      value["runId"] !== runId ||
+      !projectId ||
+      !projectRegistration ||
+      projectRegistration["registered"] !== true ||
+      typeof projectRegistration["activeManifestDigest"] !== "string" ||
+      !Array.isArray(value["localBindings"]) ||
+      value["localBindings"].length === 0 ||
+      !isRecord(value["blindReview"]) ||
+      value["blindReview"]["verdict"] !== "PASS" ||
+      !primary ||
+      typeof primary["roleKey"] !== "string" ||
+      typeof primary["sessionId"] !== "string" ||
+      typeof primary["bindingGeneration"] !== "number" ||
+      !buzz ||
+      buzz["connected"] !== true ||
+      !handoffAck ||
+      typeof handoffAck["handoffId"] !== "string" ||
+      typeof handoffAck["ackedAt"] !== "string" ||
+      !doctor ||
+      (doctor["status"] !== "HEALTHY" && doctor["status"] !== "DEGRADED") ||
+      value["activity"] !== "ACTIVE"
+    ) {
+      incomplete.push("activationResult");
+    }
+
+    if (projectId && projectRegistration && typeof projectRegistration["activeManifestDigest"] === "string") {
+      const project = this.db.get<{ active_manifest_digest: string }>(
+        `SELECT active_manifest_digest FROM projects WHERE project_id = ?`,
+        [projectId],
+      );
+      if (!project || project.active_manifest_digest !== projectRegistration["activeManifestDigest"]) {
+        incomplete.push("projectManifestBinding");
+      }
+    }
+    if (projectId && primary) {
+      const binding = this.db.get<{ session_id: string; binding_generation: number }>(
+        `SELECT session_id, binding_generation FROM assignments
+          WHERE role_key = ? AND project_id = ? AND status = 'ACTIVE'`,
+        [primary["roleKey"], projectId],
+      );
+      if (
+        !binding ||
+        binding.session_id !== primary["sessionId"] ||
+        binding.binding_generation !== primary["bindingGeneration"]
+      ) {
+        incomplete.push("primaryCtoBinding");
+      }
+    }
+    if (primary) {
+      const session = this.db.get<{ buzz_address: string | null }>(
+        `SELECT buzz_address FROM sessions WHERE session_id = ?`,
+        [primary["sessionId"]],
+      );
+      if (!session?.buzz_address) incomplete.push("buzzBinding");
+    }
+    if (projectId && handoffAck) {
+      const handoff = this.db.get<{ status: string; acked_at: string | null }>(
+        `SELECT status, acked_at FROM handoffs WHERE handoff_id = ? AND project_id = ? AND kind = 'BOOTSTRAP'`,
+        [handoffAck["handoffId"], projectId],
+      );
+      if (handoff?.status !== "ACKED" || handoff.acked_at !== handoffAck["ackedAt"]) {
+        incomplete.push("handoffAckBinding");
+      }
+    }
+    const blindReview = isRecord(value["blindReview"]) ? value["blindReview"] : null;
+    const review = blindReview
+      ? this.artifacts
+          .list<{ verdict?: string }>(runId, ArtifactKind.BLIND_REVIEW)
+          .find((artifact) => artifact.digest === blindReview["digest"] && artifact.content.verdict === "PASS")
+      : null;
+    if (!review) incomplete.push("blindReviewBinding");
+
+    return incomplete.length === 0
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE, "activation result is incomplete or unbound", {
+          runId,
+          incomplete,
+        });
+  }
+
+  private humanGateDefinition(runId: string): { items: string[]; digest: string } {
+    const contract = this.artifacts.latest<{ humanGate?: string[] }>(runId, ArtifactKind.TASK_CONTRACT);
+    const items = contract?.content.humanGate ?? [];
+    return { items, digest: digestOf(items) };
   }
 
   /** The reviewer identity in the packet must match a real binding, and be independent. */
@@ -522,37 +874,107 @@ export class ProductionGate {
         { runId: input.runId, channel: input.owner.channel, actor: input.owner.actor },
       );
     }
+    const run = this.runs.get(input.runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
+    const gate = this.humanGateDefinition(input.runId);
 
-    this.artifacts.put(input.runId, ArtifactKind.APPROVAL, {
-      kind: "OWNER_DECISION",
-      item: input.item,
-      approved: input.approved,
-      note: input.note,
-      at: this.clock.nowIso(),
-    });
-    this.audit.record({
-      kind: "OWNER_DECISION",
-      runId: input.runId,
-      actor: `${input.owner.channel}:${input.owner.actor}`,
-      evidence: { item: input.item, approved: input.approved },
-    });
-    return allow(ReasonCode.OK, undefined);
+    try {
+      return this.db.tx(() => {
+      const fresh = this.runs.require(input.runId);
+      const candidateSnapshotDigest = this.runs.currentCandidate(input.runId);
+      this.artifacts.put(input.runId, ArtifactKind.APPROVAL, {
+        kind: "OWNER_DECISION",
+        item: input.item,
+        approved: input.approved,
+        note: input.note,
+        at: this.clock.nowIso(),
+        humanGateDigest: gate.digest,
+        candidateSnapshotDigest,
+      }, candidateSnapshotDigest);
+      this.audit.record({
+        kind: "OWNER_DECISION",
+        runId: input.runId,
+        actor: `${input.owner.channel}:${input.owner.actor}`,
+        evidence: { item: input.item, approved: input.approved, candidateSnapshotDigest, humanGateDigest: gate.digest },
+      });
+
+      const status = this.humanGateStatus(input.runId);
+      if (fresh.state !== RunState.AWAITING_HUMAN || !status.satisfied) {
+        return allow(ReasonCode.OK, undefined);
+      }
+
+      const binding = fresh.ownerRoleKey ? this.bindings.active(fresh.ownerRoleKey) : null;
+      if (
+        !binding ||
+        binding.sessionId !== fresh.ownerSessionId ||
+        binding.bindingGeneration !== fresh.ownerBindingGeneration
+      ) {
+        throw acpError(ReasonCode.RUN_OWNER_NOT_PINNED, "cannot resume without the current run owner", {
+          runId: input.runId,
+          roleKey: fresh.ownerRoleKey,
+        });
+      }
+      const transition = this.runs.transition(
+        input.runId,
+        RunState.ACTIVE,
+        "required owner decisions recorded",
+        { candidateSnapshotDigest, humanGateDigest: gate.digest },
+      );
+      if (!transition.allowed) {
+        throw acpError(transition.reasonCode, transition.message, transition.evidence);
+      }
+      this.outbox.enqueue({
+        idempotencyKey: `owner-decision-resume:${input.runId}:${candidateSnapshotDigest ?? "none"}:${gate.digest}`,
+        roleKey: binding.roleKey,
+        bindingGeneration: binding.bindingGeneration,
+        targetSessionId: binding.sessionId,
+        runId: input.runId,
+        kind: MessageKind.RUN_DISPATCH,
+        payload: {
+          runId: input.runId,
+          reason: "OWNER_DECISION_RECORDED",
+          candidateSnapshotDigest,
+          humanGate: status,
+        },
+      });
+        return allow(ReasonCode.OK, undefined);
+      });
+    } catch (error) {
+      if (isAcpError(error)) return deny(error.reasonCode, error.message, error.evidence);
+      throw error;
+    }
   }
 
   humanGateStatus(runId: string): { required: boolean; items: string[]; satisfied: boolean } {
-    const contract = this.artifacts.latest<{ humanGate: string[] }>(
-      runId,
-      ArtifactKind.TASK_CONTRACT,
-    );
-    const items = contract?.content.humanGate ?? [];
+    const gate = this.humanGateDefinition(runId);
+    const { items } = gate;
     if (items.length === 0) return { required: false, items: [], satisfied: true };
 
-    const approvals = this.artifacts
-      .list<{ kind?: string; item?: string; approved?: boolean }>(runId, ArtifactKind.APPROVAL)
-      .filter((a) => a.content.kind === "OWNER_DECISION" && a.content.approved === true)
-      .map((a) => a.content.item);
+    const currentCandidate = this.runs.currentCandidate(runId);
+    const latestDecision = new Map<string, boolean>();
+    for (const artifact of this.artifacts.list<{
+      kind?: string;
+      item?: string;
+      approved?: boolean;
+      humanGateDigest?: string;
+      candidateSnapshotDigest?: string | null;
+    }>(runId, ArtifactKind.APPROVAL)) {
+      const decision = artifact.content;
+      if (
+        decision.kind !== "OWNER_DECISION" ||
+        !decision.item ||
+        typeof decision.approved !== "boolean" ||
+        decision.humanGateDigest !== gate.digest ||
+        (decision.candidateSnapshotDigest != null && decision.candidateSnapshotDigest !== currentCandidate)
+      ) {
+        continue;
+      }
+      // ArtifactStore.list is durable creation order (then rowid), so assignment makes
+      // a later explicit rejection revoke an earlier approval for the same gate item.
+      latestDecision.set(decision.item, decision.approved);
+    }
 
-    return { required: true, items, satisfied: items.every((item) => approvals.includes(item)) };
+    return { required: true, items, satisfied: items.every((item) => latestDecision.get(item) === true) };
   }
 
   /**
@@ -575,13 +997,14 @@ export class ProductionGate {
       },
     });
 
-    this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, {
+    const notified = this.notify(NotificationKind.TRUE_ESCALATION, escalation.runId, {
       question: escalation.question,
       options: escalation.options,
       recommendation: escalation.ctoRecommendation,
       whyItMatters: escalation.whyItMatters,
       blocksCriticalPath: escalation.blocksCriticalPath,
     });
+    if (!notified.allowed) return notified as Decision<{ state: RunState }>;
 
     if (!escalation.blocksCriticalPath) return allow(ReasonCode.OK, { state: run.state });
 
@@ -630,15 +1053,27 @@ export class ProductionGate {
    * §19.3 — routine worker, test and review churn never reaches Hermes. Only the three
    * documented notification kinds are emitted, and this is the only emitter.
    */
-  notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): void {
+  notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): Decision<void> {
     const ceo = this.bindings.active(roleKeyFor(Role.CEO));
+    if (!ceo) {
+      this.audit.record({
+        kind: "CEO_NOTIFICATION_BLOCKED",
+        runId,
+        reasonCode: ReasonCode.GATE_AUTHORITY_DENIED,
+        roleKey: "CEO",
+        evidence: { notification: kind, ...payload },
+      });
+      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive notification", {
+        runId,
+        notification: kind,
+      });
+    }
     this.audit.record({
       kind: "CEO_NOTIFICATION",
       runId,
-      roleKey: ceo?.roleKey ?? "CEO",
+      roleKey: ceo.roleKey,
       evidence: { notification: kind, ...payload },
     });
-    if (!ceo) return;
     this.outbox.enqueue({
       idempotencyKey: `notify:${kind}:${runId}:${digestOf(payload)}`,
       roleKey: ceo.roleKey,
@@ -648,6 +1083,7 @@ export class ProductionGate {
       kind: MessageKind.CEO_NOTIFICATION,
       payload: { notification: kind, runId, ...payload },
     });
+    return allow(ReasonCode.OK, undefined);
   }
 
   packet(runId: string, candidateSnapshotDigest: string): ProductionReadyPacket | null {
@@ -667,3 +1103,6 @@ export class ProductionGate {
       .map((a) => ({ kind: a.kind, digest: a.digest, createdAt: a.createdAt }));
   }
 }
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);

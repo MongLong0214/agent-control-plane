@@ -277,6 +277,37 @@ export class TaskGraph {
           requestedRunId: expectedRunId,
         });
       }
+      const owner = this.db.get<{ owner_binding_generation: number | null }>(
+        `SELECT owner_binding_generation FROM runs WHERE run_id = ?`,
+        [execution.runId],
+      );
+      if (!owner || owner.owner_binding_generation !== execution.ownerBindingGeneration) {
+        // A takeover invalidates an in-flight execution, even if the old process gets to
+        // report after the replacement has started. Preserve the receipt attempt for
+        // forensic audit but never let it advance the task state (§10.3, §15.7).
+        this.audit.record({
+          kind: "TASK_EXECUTION_LATE_RESULT_IGNORED",
+          runId: execution.runId,
+          sessionId: execution.workerSessionId,
+          reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+          evidence: {
+            executionId,
+            taskId: execution.taskId,
+            executionGeneration: execution.ownerBindingGeneration,
+            currentGeneration: owner?.owner_binding_generation ?? null,
+            attemptedStatus: outcome.status,
+          },
+        });
+        return deny(
+          ReasonCode.BINDING_GENERATION_STALE,
+          "execution belongs to a superseded owner generation",
+          {
+            executionId,
+            executionGeneration: execution.ownerBindingGeneration,
+            currentGeneration: owner?.owner_binding_generation ?? null,
+          },
+        );
+      }
       if (execution.status !== "RUNNING") {
         return deny(ReasonCode.CONFLICT, `execution is already ${execution.status}`, {
           executionId,
@@ -409,6 +440,36 @@ export class TaskGraph {
     );
     if (changes > 0) this.audit.record({ kind: "TASK_GRAPH_CANCELLED", runId, evidence: { reason, changes } });
     return changes;
+  }
+
+  /** A replacement owner must start a fresh attempt; old work is never adoptable. */
+  abandonStaleExecutions(runId: string, currentGeneration: number, reason: string): number {
+    const now = this.clock.nowIso();
+    const stale = this.db.all<{ task_id: string; execution_id: string }>(
+      `SELECT task_id, execution_id FROM task_executions
+        WHERE run_id = ? AND status = 'RUNNING' AND owner_binding_generation <> ?`,
+      [runId, currentGeneration],
+    );
+    if (stale.length === 0) return 0;
+
+    this.db.run(
+      `UPDATE task_executions SET status = 'ABANDONED', ended_at = ?
+        WHERE run_id = ? AND status = 'RUNNING' AND owner_binding_generation <> ?`,
+      [now, runId, currentGeneration],
+    );
+    for (const task of stale) {
+      this.db.run(
+        `UPDATE tasks SET state = 'READY', updated_at = ? WHERE task_id = ? AND state = 'RUNNING'`,
+        [now, task.task_id],
+      );
+    }
+    this.audit.record({
+      kind: "TASK_EXECUTIONS_ABANDONED_FOR_TAKEOVER",
+      runId,
+      reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+      evidence: { reason, currentGeneration, executions: stale.map((row) => row.execution_id) },
+    });
+    return stale.length;
   }
 
   get(taskId: string): TaskRecord | null {
