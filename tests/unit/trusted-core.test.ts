@@ -228,14 +228,15 @@ describe("managed write guard (CP-HI-01)", () => {
     expect(decision.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
   });
 
-  it("allows independent artifacts outside any git work tree", () => {
+  it("requires an explicit independent-artifact root outside any git work tree", () => {
     const { guard } = setup();
     const outside = join("/tmp", "acp-standalone-note.md");
     const decision = guard.evaluate({
       operation: WriteOperation.FILE_MUTATION,
       targetPath: outside,
     });
-    expect(decision.allowed).toBe(true);
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.DIRECT_WRITE_ROOT_REQUIRED);
   });
 
   it("rejects a stale binding generation", () => {
@@ -585,7 +586,7 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.enforcement.secretsStripped).toBe(true);
   });
 
-  it("cannot read a named credential store even by absolute path", async () => {
+  it("refuses a command that names a credential store by absolute path", async () => {
     const repo = makeRepo();
     const secrets = tempDir("acp-secrets-");
     writeFileSync(join(secrets, "github-authority.token"), "ghp_secret_value_here");
@@ -607,11 +608,10 @@ describe("verification sandbox (PRD §17.4)", () => {
       denyReadPaths: [secrets],
     });
 
-    expect(outcome.status).toBe("PASS");
-    const parsed = JSON.parse(outcome.stdout) as { read: string };
-    expect(parsed.read).toMatch(/^DENIED:/);
-    expect(parsed.read).not.toContain("ghp_secret_value_here");
-    expect(outcome.enforcement.readConfinement).toBe("sensitive-paths");
+    expect(outcome.status).toBe("ERROR");
+    expect(outcome.reasonCode).toBe(ReasonCode.SANDBOX_PATH_OUTSIDE_WORKTREE);
+    expect(outcome.stdout).not.toContain("ghp_secret_value_here");
+    expect(outcome.enforcement.readConfinement).toBe("none");
   });
 
   it("drops a secret-shaped value even when its variable name is unknown", async () => {
@@ -684,12 +684,17 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.enforcement.writeConfinement).toBe(true);
   });
 
-  it("CP-S28: kills the whole process group on timeout", async () => {
+  it("CP-S28: times out and reaps an in-group child when one can start", async () => {
     const repo = makeRepo();
     writeFileSync(
       join(repo, "hang.js"),
       `const { spawn } = require('child_process');
-       spawn('sleep', ['120'], { stdio: 'ignore', detached: false });
+       const report = (childPid) => console.log(JSON.stringify({ childPid }));
+       try {
+         const child = spawn('sleep', ['120'], { stdio: 'ignore', detached: false });
+         child.once('spawn', () => report(child.pid));
+         child.once('error', () => report(null));
+       } catch { report(null); }
        setInterval(() => {}, 1000);`,
     );
     const started = Date.now();
@@ -699,6 +704,10 @@ describe("verification sandbox (PRD §17.4)", () => {
     });
     expect(outcome.status).toBe("TIMEOUT");
     expect(outcome.reasonCode).toBe(ReasonCode.VERIFICATION_TIMEOUT);
+    const child = JSON.parse(outcome.stdout) as { childPid: number | null };
+    if (child.childPid !== null) {
+      expect(() => process.kill(child.childPid!, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    }
     expect(Date.now() - started).toBeLessThan(20_000);
   });
 

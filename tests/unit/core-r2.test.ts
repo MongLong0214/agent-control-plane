@@ -210,16 +210,16 @@ describe("round-2 database and evidence regressions", () => {
     expect(canonicalJson(new Array(2))).toBe("[null,null]");
   });
 
-  it("#74 rejects private bulk content and redacts secret collections before durable storage", () => {
-    const { artifacts, runId } = candidateRun();
+  it("#74 rejects private bulk content and credential-bearing evidence before durable storage", () => {
+    const { artifacts, db, runId } = candidateRun();
     expect(
       thrown(() => artifacts.put(runId, ArtifactKind.PLAN, { prompt: "full private instruction" })),
     ).toMatchObject({ reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
 
-    const stored = artifacts.put(runId, ArtifactKind.PLAN, {
-      requestHeaders: { "X-Service-Key": "arbitrary-password" },
-    });
-    expect(stored.content).toEqual({ requestHeaders: "[redacted-collection]" });
+    expect(
+      thrown(() => artifacts.put(runId, ArtifactKind.PLAN, { requestHeaders: { serviceKey: "arbitrary-password" } })),
+    ).toMatchObject({ reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+    expect(db.get<{ n: number }>("SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ?", [runId])?.n).toBe(1);
   });
 
   it("#75 redacts arbitrary secrets stored under requestHeaders before audit serialization", () => {
