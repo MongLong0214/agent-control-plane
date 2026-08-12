@@ -1,9 +1,16 @@
+import { z } from "zod";
+
 import type { Clock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
+import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
 import { newArtifactId } from "../core/ids.ts";
 import { fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ArtifactKind } from "../domain/types.ts";
+import {
+  candidateSnapshotDigest as digestCandidateSnapshot,
+  candidateSnapshotSchema,
+} from "../snapshot/candidate-snapshot.ts";
+import { prohibitedDurableField, redact } from "./audit.ts";
 import type { Db } from "./database.ts";
 
 export interface StoredArtifact<T = unknown> {
@@ -106,10 +113,26 @@ export class ArtifactStore {
         { runId, kind },
       );
     }
-    const digest = digestOf(content);
+    this.validateContent(runId, kind, content, candidateSnapshotDigest);
+    const prohibited = prohibitedDurableField(content);
+    if (prohibited) {
+      fail(
+        ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
+        `${kind} contains prohibited private bulk content`,
+        { runId, kind, field: prohibited },
+      );
+    }
+
+    // Redact before both hashing and serializing. A returned digest is therefore a
+    // digest of exactly the durable representation, never a secret-bearing input.
+    const durableContent = redact(content) as T;
+    const digest = SNAPSHOT_BOUND.has(kind)
+      ? digestOf({ candidateSnapshotDigest, content: durableContent })
+      : digestOf(durableContent);
     const existing = this.db.get<RawArtifact>(
-      `SELECT * FROM run_artifacts WHERE run_id = ? AND kind = ? AND digest = ?`,
-      [runId, kind, digest],
+      `SELECT * FROM run_artifacts
+        WHERE run_id = ? AND kind = ? AND digest = ? AND candidate_snapshot_digest IS ?`,
+      [runId, kind, digest, candidateSnapshotDigest],
     );
     if (existing) return hydrate<T>(existing);
 
@@ -119,7 +142,7 @@ export class ArtifactStore {
       kind,
       digest,
       candidateSnapshotDigest: candidateSnapshotDigest ?? null,
-      content,
+      content: durableContent,
       producedBy,
       createdAt: this.clock.nowIso(),
       superseded: false,
@@ -134,12 +157,92 @@ export class ArtifactStore {
         kind,
         digest,
         artifact.candidateSnapshotDigest,
-        JSON.stringify(content),
+        canonicalJson(durableContent),
         producedBy,
         artifact.createdAt,
       ],
     );
     return artifact;
+  }
+
+  private validateContent(
+    runId: string,
+    kind: ArtifactKind,
+    content: unknown,
+    candidateSnapshotDigest: string | null,
+  ): void {
+    if (kind === "CANDIDATE_SNAPSHOT") {
+      const parsed = candidateSnapshotSchema.safeParse(content);
+      const snapshotContent = parsed.data ?? fail(
+        ReasonCode.INVALID_ARGUMENT,
+        "candidate snapshot is malformed or belongs to another run",
+        { runId, kind },
+      );
+      if (snapshotContent.runId !== runId) {
+        fail(ReasonCode.INVALID_ARGUMENT, "candidate snapshot is malformed or belongs to another run", {
+          runId,
+          kind,
+        });
+      }
+      if (!candidateSnapshotDigest || !isDigest(candidateSnapshotDigest)) {
+        fail(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "candidate snapshot requires a sha256 digest", {
+          runId,
+          kind,
+          candidateSnapshotDigest,
+        });
+      }
+      if (digestCandidateSnapshot(snapshotContent) !== candidateSnapshotDigest) {
+        fail(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, "candidate snapshot digest does not address its content", {
+          runId,
+          candidateSnapshotDigest,
+        });
+      }
+      return;
+    }
+
+    if (!SNAPSHOT_BOUND.has(kind)) return;
+    if (!candidateSnapshotDigest || !isDigest(candidateSnapshotDigest)) {
+      fail(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, `${kind} requires a sha256 candidate digest`, {
+        runId,
+        kind,
+        candidateSnapshotDigest,
+      });
+    }
+
+    const schema = EVIDENCE_SCHEMAS[kind as keyof typeof EVIDENCE_SCHEMAS];
+    const parsed = schema.safeParse(content);
+    const evidenceContent = parsed.data ?? fail(
+      ReasonCode.INVALID_ARGUMENT,
+      `${kind} has an invalid evidence envelope`,
+      { runId, kind },
+    );
+    if (evidenceContent.runId !== runId) {
+      fail(ReasonCode.INVALID_ARGUMENT, `${kind} has an invalid evidence envelope`, {
+        runId,
+        kind,
+      });
+    }
+    if (evidenceContent.candidateSnapshotDigest !== candidateSnapshotDigest) {
+      fail(ReasonCode.SNAPSHOT_DIGEST_MISMATCH, `${kind} content is bound to another candidate`, {
+        runId,
+        kind,
+        contentCandidateSnapshotDigest: evidenceContent.candidateSnapshotDigest,
+        candidateSnapshotDigest,
+      });
+    }
+
+    const snapshot = this.db.get<{ artifact_id: string }>(
+      `SELECT artifact_id FROM run_artifacts
+        WHERE run_id = ? AND kind = 'CANDIDATE_SNAPSHOT' AND candidate_snapshot_digest = ?`,
+      [runId, candidateSnapshotDigest],
+    );
+    if (!snapshot) {
+      fail(ReasonCode.EVIDENCE_MISSING, "evidence names no stored candidate snapshot for this run", {
+        runId,
+        kind,
+        candidateSnapshotDigest,
+      });
+    }
   }
 
   latest<T>(runId: string, kind: ArtifactKind): StoredArtifact<T> | null {
@@ -228,3 +331,74 @@ const hydrate = <T>(row: RawArtifact): StoredArtifact<T> => ({
   createdAt: row.created_at,
   superseded: row.superseded === 1,
 });
+
+const DIGEST_SCHEMA = z.string().regex(/^sha256:[0-9a-f]{64}$/);
+
+const verificationEvidenceSchema = z
+  .object({
+    runId: z.string().min(1),
+    candidateSnapshotDigest: DIGEST_SCHEMA,
+    contractDigest: z.string().min(1),
+    expectedInputs: z.number().int().nonnegative(),
+    observedInputs: z.number().int().nonnegative(),
+    results: z.array(z.object({}).passthrough()),
+    status: z.enum(["PASS", "FAIL", "INCOMPLETE"]),
+    reasonCode: z.string().min(1),
+    gaps: z.array(z.string()),
+  })
+  .strict();
+
+const blindReviewEvidenceSchema = z
+  .object({
+    runId: z.string().min(1),
+    candidateSnapshotDigest: DIGEST_SCHEMA,
+    contractDigest: z.string().min(1),
+    reviewerRoleBindingGeneration: z.number().int().positive(),
+    reviewerSessionId: z.string().min(1),
+    reviewerSessionIncarnation: z.string().min(1),
+    reviewerProviderSessionId: z.string().nullable(),
+    provider: z.string().min(1),
+    model: z.string().min(1),
+    effort: z.string().nullable(),
+    inputManifest: z
+      .object({
+        contract: z.boolean(),
+        snapshotManifest: z.boolean(),
+        diff: z.boolean(),
+        verificationEvidence: z.boolean(),
+        projectContext: z.boolean(),
+        withheld: z.array(z.string()),
+      })
+      .strict(),
+    coveredRepositories: z.array(z.string()),
+    coveredFiles: z.array(z.string()),
+    omittedItems: z.array(z.string()),
+    verdict: z.enum(["PASS", "REVISE", "BLOCK"]),
+    findings: z.array(z.object({}).passthrough()),
+    chunked: z.boolean(),
+    createdAt: z.string().min(1),
+  })
+  .strict();
+
+const productionReadyEvidenceSchema = z
+  .object({
+    runId: z.string().min(1),
+    projectId: z.string().nullable(),
+    goal: z.string(),
+    resultSummary: z.string(),
+    candidateSnapshotDigest: DIGEST_SCHEMA,
+    verification: z.object({}).passthrough(),
+    blindReview: z.object({}).passthrough(),
+    knownResidualRisk: z.array(z.string()),
+    changedRepositories: z.array(z.object({}).passthrough()),
+    ctoRecommendation: z.string(),
+    humanGate: z.object({}).passthrough(),
+    createdAt: z.string().min(1),
+  })
+  .strict();
+
+const EVIDENCE_SCHEMAS = {
+  VERIFICATION: verificationEvidenceSchema,
+  BLIND_REVIEW: blindReviewEvidenceSchema,
+  PRODUCTION_READY_PACKET: productionReadyEvidenceSchema,
+} as const;

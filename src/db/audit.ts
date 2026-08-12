@@ -111,14 +111,15 @@ const hydrate = (row: RawAuditRow): AuditRow => ({
  * environment/header collections as secret-bearing wholesale.
  */
 const SECRET_KEY =
-  /(token|secret|password|passwd|credential|api[-_]?key|authorization|auth|private[-_]?key|nsec|session[-_]?key|cookie|signature)/i;
+  /(token|secret|password|passwd|credential|api[-_]?key|authorization|auth|private[-_]?key|nsec|session[-_]?key|cookie|signature|access[-_]?key|service[-_]?key|client[-_]?key|signing[-_]?key|key$)/i;
 
 /** Collections whose values are credentials often enough that per-key rules miss them. */
-const SECRET_COLLECTION_KEY = /^(env|environment|headers|http_?headers|secrets|credentials)$/i;
+const SECRET_COLLECTION_KEY =
+  /(?:^|[_-])(env|environment|headers|http_?headers|request_?headers|response_?headers|cookies|secrets|credentials)(?:$|[_-])/i;
 
 /** Content §31.5 forbids storing at all, whatever the surrounding key is called. */
 const BULK_KEY =
-  /^(prompt|prompts|system_?prompt|transcript|chat_?transcript|chain_?of_?thought|reasoning|messages|conversation|raw_?output|full_?output)$/i;
+  /(?:^|[_-])(prompt|prompts|system_?prompt|transcript|chat_?transcript|chain_?of_?thought|reasoning|messages|conversation|raw_?output|full_?output)(?:$|[_-])/i;
 
 /** Credential shapes recognisable in a value regardless of its key. */
 const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
@@ -151,12 +152,52 @@ export const redact = (value: unknown, depth = 0): unknown => {
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      if (SECRET_KEY.test(k)) out[k] = "[redacted]";
-      else if (SECRET_COLLECTION_KEY.test(k)) out[k] = "[redacted-collection]";
-      else if (BULK_KEY.test(k)) out[k] = "[not-stored]";
+      if (isSecretKey(k)) out[k] = "[redacted]";
+      else if (isSecretCollectionKey(k)) out[k] = "[redacted-collection]";
+      else if (isBulkContentKey(k)) out[k] = "[not-stored]";
       else out[k] = redact(v, depth + 1);
     }
     return out;
   }
   return value;
+};
+
+/** Field-name checks share one normal form so `requestHeaders` cannot evade `headers`. */
+const normalizedKey = (key: string): string => key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+
+const isSecretKey = (key: string): boolean => {
+  const normalized = normalizedKey(key);
+  return SECRET_KEY.test(key) || /(token|secret|password|credential|authorization|apikey|accesskey|servicekey|clientkey|signingkey|privatekey|sessionkey|cookie|signature|key)$/.test(normalized);
+};
+
+const isSecretCollectionKey = (key: string): boolean => {
+  const normalized = normalizedKey(key);
+  return SECRET_COLLECTION_KEY.test(key) || /(env|environment|headers|cookies|secrets|credentials)$/.test(normalized);
+};
+
+const isBulkContentKey = (key: string): boolean => {
+  const normalized = normalizedKey(key);
+  return BULK_KEY.test(key) || /(?:prompt|transcript|chainofthought|reasoning|messages|conversation|rawoutput|fulloutput)$/.test(normalized);
+};
+
+/**
+ * Full prompts, transcripts, and reasoning must be rejected at any durable boundary;
+ * replacing them with a marker is suitable for audit explainability, not an artifact
+ * whose digest would otherwise purport to address the original private payload.
+ */
+export const prohibitedDurableField = (value: unknown, depth = 0): string | null => {
+  if (depth > 8 || !value || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = prohibitedDurableField(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    if (isBulkContentKey(key)) return key;
+    const found = prohibitedDurableField(nested, depth + 1);
+    if (found) return found;
+  }
+  return null;
 };

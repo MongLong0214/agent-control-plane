@@ -17,7 +17,7 @@ const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
  * migration: it silently keeps an older table whose CHECK constraints are weaker, so a
  * deployment could start with hard invariants missing (§40 Maintainability).
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * SQLite handle plus the transaction discipline required by PRD §30.3.
@@ -30,6 +30,7 @@ export const SCHEMA_VERSION = 3;
 export class Db {
   readonly raw: SqliteDatabase;
   #depth = 0;
+  #poisoned = false;
 
   constructor(filename: string) {
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
@@ -86,6 +87,7 @@ export class Db {
    * silent second BEGIN would commit the outer work early.
    */
   tx<T>(fn: () => T): T {
+    this.assertUsable();
     if (this.#depth > 0) return this.guardSync(fn());
     this.raw.exec("BEGIN IMMEDIATE");
     this.#depth += 1;
@@ -99,6 +101,7 @@ export class Db {
       } catch {
         /* rollback of an already-aborted tx is not itself an error */
       }
+      if (isAsyncTransactionError(err)) this.poison();
       throw translate(err);
     } finally {
       this.#depth -= 1;
@@ -113,13 +116,10 @@ export class Db {
    */
   private guardSync<T>(out: T): T {
     if (out && typeof (out as { then?: unknown }).then === "function") {
-      this.raw.exec("ROLLBACK");
-      this.#depth = 0;
-      throw acpError(
-        ReasonCode.INTERNAL_ERROR,
-        "transaction callback returned a promise; transaction bodies must be synchronous",
-        {},
-      );
+      // The callback cannot be cancelled. Consume its rejection and poison the handle after
+      // the owner rolls back, so code after its first await cannot escape into autocommit.
+      void Promise.resolve(out).catch(() => undefined);
+      throw asyncTransactionError();
     }
     return out;
   }
@@ -129,18 +129,22 @@ export class Db {
   }
 
   exec(sql: string): void {
+    this.assertUsable();
     this.raw.exec(sql);
   }
 
   all<T>(sql: string, params: unknown[] = []): T[] {
+    this.assertUsable();
     return this.raw.prepare(sql).all(...(params as never[])) as T[];
   }
 
   get<T>(sql: string, params: unknown[] = []): T | undefined {
+    this.assertUsable();
     return this.raw.prepare(sql).get(...(params as never[])) as T | undefined;
   }
 
   run(sql: string, params: unknown[] = []): Database.RunResult {
+    this.assertUsable();
     try {
       return this.raw.prepare(sql).run(...(params as never[]));
     } catch (err) {
@@ -149,9 +153,45 @@ export class Db {
   }
 
   close(): void {
-    this.raw.close();
+    if (this.raw.open) this.raw.close();
+  }
+
+  private assertUsable(): void {
+    if (!this.#poisoned) return;
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "database handle was poisoned by an asynchronous transaction callback",
+      {},
+    );
+  }
+
+  private poison(): void {
+    this.#poisoned = true;
+    if (this.raw.open) this.raw.close();
   }
 }
+
+const ASYNC_TRANSACTION = Symbol("async-transaction");
+
+type AsyncTransactionError = Error & { [ASYNC_TRANSACTION]: true };
+
+const asyncTransactionError = (): AsyncTransactionError =>
+  Object.assign(
+    acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "transaction callback returned a promise; transaction bodies must be synchronous",
+      {},
+    ),
+    { [ASYNC_TRANSACTION]: true as const },
+  );
+
+const isAsyncTransactionError = (err: unknown): err is AsyncTransactionError =>
+  Boolean(
+    err &&
+      typeof err === "object" &&
+      ASYNC_TRANSACTION in err &&
+      (err as { [ASYNC_TRANSACTION]?: unknown })[ASYNC_TRANSACTION] === true,
+  );
 
 /**
  * Turn the DB-level guard rails into the same reason codes the service layer uses,
@@ -161,7 +201,12 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,
   BINDING_GENERATION_NOT_MONOTONIC: ReasonCode.BINDING_GENERATION_STALE,
   BINDING_IDENTITY_IMMUTABLE: ReasonCode.BINDING_GENERATION_STALE,
+  BINDING_REVOKED_TERMINAL: ReasonCode.BINDING_REVOKED,
+  PINNED_MANIFEST_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+  RUN_STATE_TRANSITION_ILLEGAL: ReasonCode.RUN_TRANSITION_ILLEGAL,
+  EVIDENCE_CANDIDATE_MISMATCH: ReasonCode.SNAPSHOT_DIGEST_MISMATCH,
   ARTIFACT_IMMUTABLE: ReasonCode.CONFLICT,
+  GITHUB_RECEIPT_IMMUTABLE: ReasonCode.CONFLICT,
   MANIFEST_IMMUTABLE: ReasonCode.CONFLICT,
   AUDIT_APPEND_ONLY: ReasonCode.CONFLICT,
 };
@@ -192,6 +237,11 @@ export const translate = (err: unknown): unknown => {
   }
   for (const [pattern, code, message] of INDEX_CODES) {
     if (pattern.test(msg)) return acpError(code, message, { sqlite: msg });
+  }
+  if (msg.includes("FOREIGN KEY constraint failed")) {
+    return acpError(ReasonCode.RUN_OWNER_REVOKED, "foreign-key authority tuple is invalid", {
+      sqlite: msg,
+    });
   }
   return err;
 };

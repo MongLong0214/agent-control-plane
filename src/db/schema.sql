@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS repositories (
 
 CREATE INDEX IF NOT EXISTS repositories_project ON repositories(project_id);
 
+-- A checkout is a machine-local identity binding, not an alias that two repository
+-- identities may claim. Sharing it would let write guards disagree about provenance.
+CREATE UNIQUE INDEX IF NOT EXISTS repositories_checkout_path ON repositories(checkout_path);
+
 -- ---------------------------------------------------------------------------
 -- sessions  (PRD §9.3, §5.5, §5.6)
 --   A runtime session, not an organisational identity. BUSY is derived from owned
@@ -88,6 +92,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   lifecycle      TEXT NOT NULL
                    CHECK (lifecycle IN ('STARTING','READY','DRAINING','STOPPED','ERROR')),
   buzz_address   TEXT,
+  -- Never retain the session secret itself. The digest is enough to bind a local
+  -- handshake while keeping credentials out of durable state (§31.5).
+  session_secret_digest TEXT,
   os_pid         INTEGER,
   workdir        TEXT,
   created_at     TEXT NOT NULL,
@@ -148,14 +155,60 @@ END;
 -- INSERT-only monotonicity is not enough: lowering binding_generation, or moving a low
 -- generation into another role's history via role_key, would reactivate stale authority.
 CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable
-BEFORE UPDATE OF binding_generation, role_key, session_id, session_incarnation ON assignments
+BEFORE UPDATE OF binding_generation, role_key, session_id, session_incarnation,
+                 role, project_id, run_id, task_id ON assignments
 WHEN NEW.binding_generation <> OLD.binding_generation
   OR NEW.role_key <> OLD.role_key
   OR NEW.session_id <> OLD.session_id
   OR NEW.session_incarnation <> OLD.session_incarnation
+  OR NEW.role <> OLD.role
+  OR NEW.project_id IS NOT OLD.project_id
+  OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.task_id IS NOT OLD.task_id
 BEGIN
   SELECT RAISE(ABORT, 'BINDING_IDENTITY_IMMUTABLE');
 END;
+
+-- Revocation advances a fencing generation. Re-activating an old row would make stale
+-- authority current again after every newer generation has been revoked.
+CREATE TRIGGER IF NOT EXISTS assignments_revocation_terminal
+BEFORE UPDATE OF status ON assignments
+WHEN OLD.status = 'REVOKED' AND NEW.status <> 'REVOKED'
+BEGIN
+  SELECT RAISE(ABORT, 'BINDING_REVOKED_TERMINAL');
+END;
+
+-- Defence in depth over the monotonic insertion trigger: an ACTIVE row is always the
+-- newest generation for its logical role endpoint.
+CREATE TRIGGER IF NOT EXISTS assignments_active_generation_current
+BEFORE UPDATE OF status ON assignments
+WHEN NEW.status = 'ACTIVE'
+ AND NEW.binding_generation < COALESCE(
+   (SELECT MAX(binding_generation)
+      FROM assignments
+     WHERE role_key = NEW.role_key AND assignment_id <> NEW.assignment_id),
+   0
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'BINDING_REVOKED_TERMINAL');
+END;
+
+CREATE TRIGGER IF NOT EXISTS assignments_active_generation_insert_guard
+BEFORE INSERT ON assignments
+WHEN EXISTS (
+  SELECT 1 FROM assignments
+   WHERE role_key = NEW.role_key
+     AND status = 'ACTIVE'
+     AND binding_generation < NEW.binding_generation
+)
+BEGIN
+  SELECT RAISE(ABORT, 'BINDING_REVOKED_TERMINAL');
+END;
+
+-- A run owner pin has to identify one actual role binding, not a mix of fields from
+-- different rows. The unique parent key is immutable under the trigger above.
+CREATE UNIQUE INDEX IF NOT EXISTS assignments_owner_tuple
+  ON assignments(role_key, binding_generation, session_id, session_incarnation);
 
 CREATE INDEX IF NOT EXISTS assignments_session ON assignments(session_id, status);
 CREATE INDEX IF NOT EXISTS assignments_run ON assignments(run_id);
@@ -194,12 +247,43 @@ CREATE TABLE IF NOT EXISTS runs (
   state_reason              TEXT,
   -- owner pinning is all-or-nothing
   CHECK ((owner_session_id IS NULL) = (owner_binding_generation IS NULL)),
-  CHECK ((owner_session_id IS NULL) = (owner_session_incarnation IS NULL))
+  CHECK ((owner_session_id IS NULL) = (owner_session_incarnation IS NULL)),
+  CHECK ((owner_session_id IS NULL) = (owner_role_key IS NULL)),
+  FOREIGN KEY (owner_role_key, owner_binding_generation, owner_session_id, owner_session_incarnation)
+    REFERENCES assignments(role_key, binding_generation, session_id, session_incarnation)
+    DEFERRABLE INITIALLY DEFERRED
 );
 
 CREATE INDEX IF NOT EXISTS runs_state ON runs(state);
 CREATE INDEX IF NOT EXISTS runs_owner ON runs(owner_session_id, state);
 CREATE INDEX IF NOT EXISTS runs_project ON runs(project_id, state);
+
+-- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
+-- while this guard rejects topology bypasses even from a raw SQLite caller.
+CREATE TRIGGER IF NOT EXISTS runs_state_transition_guard
+BEFORE UPDATE OF state ON runs
+WHEN NEW.state <> OLD.state
+ AND NOT (
+   (OLD.state = 'QUEUED' AND NEW.state IN ('ACTIVE','CANCELLED')) OR
+   (OLD.state = 'ACTIVE' AND NEW.state IN ('BLOCKED','READY_FOR_CEO_REVIEW','FAILED','CANCELLED','AWAITING_HUMAN')) OR
+   (OLD.state = 'BLOCKED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED','AWAITING_HUMAN')) OR
+   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
+   (OLD.state = 'REVISION_REQUIRED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED')) OR
+   (OLD.state = 'AWAITING_HUMAN' AND NEW.state IN ('ACTIVE','CANCELLED','FAILED'))
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
+END;
+
+-- CP-HI-03 — dispatch/pinning may fill an empty pin once; no later operation may
+-- rewrite, clear, or replace the contract that the run will be judged against.
+CREATE TRIGGER IF NOT EXISTS runs_pinned_manifest_immutable
+BEFORE UPDATE OF pinned_manifest_digest ON runs
+WHEN NEW.pinned_manifest_digest IS NOT OLD.pinned_manifest_digest
+ AND NOT (OLD.pinned_manifest_digest IS NULL AND NEW.pinned_manifest_digest IS NOT NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'PINNED_MANIFEST_IMMUTABLE');
+END;
 
 -- ---------------------------------------------------------------------------
 -- run_repositories
@@ -303,14 +387,48 @@ CREATE TABLE IF NOT EXISTS run_artifacts (
   -- §30.2 #7 — verification and review artifacts must carry the exact candidate digest.
   CHECK (kind NOT IN ('VERIFICATION','BLIND_REVIEW','PRODUCTION_READY_PACKET')
          OR candidate_snapshot_digest IS NOT NULL),
-  UNIQUE (run_id, kind, digest)
+  CHECK ((kind <> 'VERIFICATION' OR produced_by = 'verification-engine')
+    AND (kind <> 'BLIND_REVIEW' OR produced_by = 'blind-review-gate')
+    AND (kind <> 'PRODUCTION_READY_PACKET' OR produced_by = 'production-gate')),
+  UNIQUE (run_id, kind, digest, candidate_snapshot_digest)
 );
 
--- Evidence must not be editable, re-bindable to a different candidate, or deletable.
--- Omitting candidate_snapshot_digest here would let a passing result be re-pointed at a
--- newer candidate, which is precisely the CP-HI-06 bypass this trigger exists to prevent.
+-- A raw insert must not make evidence appear bound merely by filling a metadata column.
+-- SQLite can verify the evidence envelope's declared candidate and that the run owns a
+-- snapshot with that binding; ArtifactStore additionally validates the snapshot schema
+-- and canonical digest before this point.
+CREATE TRIGGER IF NOT EXISTS run_artifacts_evidence_candidate_guard
+BEFORE INSERT ON run_artifacts
+WHEN NEW.kind IN ('VERIFICATION','BLIND_REVIEW','PRODUCTION_READY_PACKET')
+ AND (
+   json_valid(NEW.content_json) = 0
+   OR json_extract(NEW.content_json, '$.candidateSnapshotDigest') IS NOT NEW.candidate_snapshot_digest
+   OR NOT EXISTS (
+     SELECT 1 FROM run_artifacts snapshot
+      WHERE snapshot.run_id = NEW.run_id
+        AND snapshot.kind = 'CANDIDATE_SNAPSHOT'
+        AND snapshot.candidate_snapshot_digest = NEW.candidate_snapshot_digest
+   )
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'EVIDENCE_CANDIDATE_MISMATCH');
+END;
+
+-- Evidence is append-only except for one one-way staleness mark. Every metadata field,
+-- including row identity and timestamp, participates in authority and must stay fixed.
 CREATE TRIGGER IF NOT EXISTS run_artifacts_content_immutable
-BEFORE UPDATE OF content_json, digest, kind, candidate_snapshot_digest, produced_by ON run_artifacts
+BEFORE UPDATE ON run_artifacts
+WHEN NOT (
+  OLD.superseded = 0 AND NEW.superseded = 1
+  AND NEW.artifact_id IS OLD.artifact_id
+  AND NEW.run_id IS OLD.run_id
+  AND NEW.kind IS OLD.kind
+  AND NEW.digest IS OLD.digest
+  AND NEW.candidate_snapshot_digest IS OLD.candidate_snapshot_digest
+  AND NEW.content_json IS OLD.content_json
+  AND NEW.produced_by IS OLD.produced_by
+  AND NEW.created_at IS OLD.created_at
+)
 BEGIN
   SELECT RAISE(ABORT, 'ARTIFACT_IMMUTABLE');
 END;
@@ -441,6 +559,11 @@ CREATE TABLE IF NOT EXISTS outbox (
   kind               TEXT NOT NULL,
   payload_json       TEXT NOT NULL,
   payload_digest     TEXT NOT NULL,
+  -- A retry/recovery path must bind its request and policy explicitly rather than infer
+  -- either from a mutable payload after an outage.
+  request_fingerprint TEXT,
+  retry_max_attempts  INTEGER NOT NULL DEFAULT 5 CHECK (retry_max_attempts >= 0),
+  retry_backoff_ms    INTEGER NOT NULL DEFAULT 1000 CHECK (retry_backoff_ms >= 0),
   expires_at         TEXT NOT NULL,
   created_at         TEXT NOT NULL,
   status             TEXT NOT NULL
@@ -490,7 +613,9 @@ CREATE TABLE IF NOT EXISTS github_receipts (
                         CHECK (operation IN ('pr_prepare','gate_publish','merge_execute',
                                              'post_merge_verify','release_tag','rollback_prepare',
                                              'issue_project')),
-  run_id              TEXT REFERENCES runs(run_id) ON DELETE SET NULL,
+  -- Receipts outlive their run. Keeping the opaque historical run id avoids a mutable
+  -- ON DELETE SET NULL update on an otherwise append-only receipt.
+  run_id              TEXT,
   repository_identity TEXT NOT NULL,
   resource_type       TEXT NOT NULL,
   resource_identity   TEXT NOT NULL,
@@ -501,10 +626,25 @@ CREATE TABLE IF NOT EXISTS github_receipts (
   response_json       TEXT NOT NULL,
   created_at          TEXT NOT NULL,
   reread_at           TEXT,
-  verified            INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0,1))
+  verified            INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0,1)),
+  status              TEXT NOT NULL DEFAULT 'APPLIED' CHECK (status IN ('PENDING','APPLIED'))
 );
 
 CREATE INDEX IF NOT EXISTS github_receipts_run ON github_receipts(run_id, operation);
+
+-- An external-write receipt is the replay marker. Rewriting or deleting it would turn a
+-- completed side effect into an apparently new operation.
+CREATE TRIGGER IF NOT EXISTS github_receipts_immutable
+BEFORE UPDATE ON github_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'GITHUB_RECEIPT_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS github_receipts_no_delete
+BEFORE DELETE ON github_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'GITHUB_RECEIPT_IMMUTABLE');
+END;
 
 -- ---------------------------------------------------------------------------
 -- audit_events  (PRD §30.1)

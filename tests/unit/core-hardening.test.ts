@@ -13,7 +13,12 @@ import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { redact } from "../../src/db/audit.ts";
 import { legalTargets } from "../../src/domain/run-state.ts";
 import { ArtifactKind, RunState } from "../../src/domain/types.ts";
-import { cleanupTempDirs, makeCore, makeRepo, seedRun, tempDir } from "../helpers/fixtures.ts";
+import {
+  CANDIDATE_SNAPSHOT_SCHEMA_ID,
+  candidateSnapshotDigest,
+  type CandidateSnapshot,
+} from "../../src/snapshot/candidate-snapshot.ts";
+import { cleanupTempDirs, makeCore, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -24,51 +29,86 @@ afterAll(cleanupTempDirs);
 describe("evidence can only be written by the engine that owns it", () => {
   const setup = () => {
     const core = makeCore();
-    const repo = makeRepo();
-    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
-    return { ...core, seeded };
+    const runId = "run_artifact";
+    core.db.run(
+      `INSERT INTO runs (run_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+       VALUES (?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'fixture goal', 'sha256:contract', ?)`,
+      [runId, core.clock.nowIso()],
+    );
+    const snapshot: CandidateSnapshot = {
+      schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
+      runId,
+      contractDigest: "sha256:contract",
+      repositories: [{
+        identity: "github:acme/fixture",
+        repositoryRole: "primary",
+        baseBranch: "main",
+        baseHead: "a".repeat(40),
+        candidateHead: "b".repeat(40),
+        treeDigest: "git-tree:fixture",
+        diffDigest: "sha256:fixture",
+        worktreeId: null,
+        manifestDigest: null,
+        touchedPaths: ["src/app.ts"],
+      }],
+      createdAt: core.clock.nowIso(),
+    };
+    const digest = candidateSnapshotDigest(snapshot);
+    core.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
+    const verification = {
+      runId,
+      candidateSnapshotDigest: digest,
+      contractDigest: "sha256:contract",
+      expectedInputs: 1,
+      observedInputs: 1,
+      results: [],
+      status: "PASS" as const,
+      reasonCode: "OK",
+      gaps: [],
+    };
+    return { ...core, runId, digest, verification };
   };
 
   it("a general caller cannot mint a verification or review artifact", () => {
-    const { artifacts, seeded } = setup();
+    const { artifacts, runId, digest } = setup();
     expect(() =>
-      artifacts.put(seeded.runId, ArtifactKind.VERIFICATION, { status: "PASS" }, "sha256:x"),
+      artifacts.put(runId, ArtifactKind.VERIFICATION, { status: "PASS" }, digest),
     ).toThrowError(/must be written through putEvidence/);
     expect(() =>
-      artifacts.put(seeded.runId, ArtifactKind.BLIND_REVIEW, { verdict: "PASS" }, "sha256:x"),
+      artifacts.put(runId, ArtifactKind.BLIND_REVIEW, { verdict: "PASS" }, digest),
     ).toThrowError(/must be written through putEvidence/);
   });
 
   it("putEvidence refuses a producer that does not own the kind", () => {
-    const { artifacts, seeded } = setup();
+    const { artifacts, runId, digest, verification } = setup();
     expect(() =>
       artifacts.putEvidence(
         "blind-review-gate",
-        seeded.runId,
+        runId,
         ArtifactKind.VERIFICATION,
         { status: "PASS" },
-        "sha256:x",
+        digest,
       ),
     ).toThrowError(/may not write VERIFICATION/);
 
     const written = artifacts.putEvidence(
       "verification-engine",
-      seeded.runId,
+      runId,
       ArtifactKind.VERIFICATION,
-      { status: "PASS" },
-      "sha256:x",
+      verification,
+      digest,
     );
     expect(written.producedBy).toBe("verification-engine");
   });
 
   it("evidence cannot be rebound to another candidate, edited or deleted", () => {
-    const { db, artifacts, seeded } = setup();
+    const { db, artifacts, runId, digest, verification } = setup();
     artifacts.putEvidence(
       "verification-engine",
-      seeded.runId,
+      runId,
       ArtifactKind.VERIFICATION,
-      { status: "PASS" },
-      "sha256:candidate-a",
+      verification,
+      digest,
     );
 
     expect(() =>
@@ -92,18 +132,22 @@ describe("append-only really means append-only", () => {
 describe("binding identity is immutable once written", () => {
   it("generation, role key, session and incarnation cannot be updated in place", () => {
     const { db, clock } = makeCore();
-    const repo = makeRepo();
-    const seeded = seedRun({ db, clock, repoPath: repo });
+    const now = clock.nowIso();
+    db.run(`INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+            VALUES ('session_1', 'inc-1', 'test', 'test', 'READY', ?, ?)`, [now, now]);
+    db.run(`INSERT INTO assignments (assignment_id, role_key, role, session_id, session_incarnation,
+                                     binding_generation, mode, status, created_at)
+            VALUES ('assignment_1', 'CEO', 'CEO', 'session_1', 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`, [now]);
 
     // Lowering the generation would reactivate stale authority.
     expect(() =>
-      db.run(`UPDATE assignments SET binding_generation = 1 WHERE role_key = ?`, [seeded.roleKey]),
+      db.run(`UPDATE assignments SET binding_generation = 1 WHERE role_key = 'CEO'`),
     ).not.toThrow(); // already 1: a no-op update is fine
     expect(() =>
-      db.run(`UPDATE assignments SET binding_generation = 5 WHERE role_key = ?`, [seeded.roleKey]),
+      db.run(`UPDATE assignments SET binding_generation = 5 WHERE role_key = 'CEO'`),
     ).toThrowError(/BINDING_IDENTITY_IMMUTABLE/);
     expect(() =>
-      db.run(`UPDATE assignments SET role_key = 'CEO' WHERE role_key = ?`, [seeded.roleKey]),
+      db.run(`UPDATE assignments SET role_key = 'OTHER' WHERE role_key = 'CEO'`),
     ).toThrowError(/BINDING_IDENTITY_IMMUTABLE/);
   });
 });
@@ -118,21 +162,25 @@ describe("transactions must be synchronous", () => {
 
   it("a synchronous body still commits and rolls back normally", () => {
     const { db, clock } = makeCore();
-    const repo = makeRepo();
-    const seeded = seedRun({ db, clock, repoPath: repo });
+    const runId = "run_transaction";
+    db.run(
+      `INSERT INTO runs (run_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+       VALUES (?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'initial', 'sha256:contract', ?)`,
+      [runId, clock.nowIso()],
+    );
 
-    db.tx(() => db.run(`UPDATE runs SET goal = 'committed' WHERE run_id = ?`, [seeded.runId]));
-    expect(db.get<{ goal: string }>(`SELECT goal FROM runs WHERE run_id = ?`, [seeded.runId])?.goal).toBe(
+    db.tx(() => db.run(`UPDATE runs SET goal = 'committed' WHERE run_id = ?`, [runId]));
+    expect(db.get<{ goal: string }>(`SELECT goal FROM runs WHERE run_id = ?`, [runId])?.goal).toBe(
       "committed",
     );
 
     expect(() =>
       db.tx(() => {
-        db.run(`UPDATE runs SET goal = 'rolled back' WHERE run_id = ?`, [seeded.runId]);
+        db.run(`UPDATE runs SET goal = 'rolled back' WHERE run_id = ?`, [runId]);
         throw new Error("boom");
       }),
     ).toThrowError("boom");
-    expect(db.get<{ goal: string }>(`SELECT goal FROM runs WHERE run_id = ?`, [seeded.runId])?.goal).toBe(
+    expect(db.get<{ goal: string }>(`SELECT goal FROM runs WHERE run_id = ?`, [runId])?.goal).toBe(
       "committed",
     );
   });

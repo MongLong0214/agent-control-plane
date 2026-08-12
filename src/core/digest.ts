@@ -23,7 +23,9 @@ export const canonicalJson = (value: unknown): string => {
     if (typeof node === "bigint") {
       throw new TypeError("bigint is not canonically encodable; convert it explicitly");
     }
-    if (Array.isArray(node)) return `[${node.map((item) => encode(item ?? null)).join(",")}]`;
+    // Array#map preserves holes, whereas JSON arrays serialize every hole as null. Index
+    // through the declared length so `[ , ]` and `[]` cannot share an artifact digest.
+    if (Array.isArray(node)) return `[${Array.from(node, (item) => encode(item ?? null)).join(",")}]`;
     if (typeof node === "object") {
       // A Date, Map, Set or class instance has no own enumerable entries, so it would
       // silently encode as {} and collide with every other such value.
