@@ -113,6 +113,19 @@ confinement mechanism is unavailable the command is **not run** — the result i
 with `SANDBOX_NETWORK_DENIED`, never a pass. See
 [ADR-0004](docs/adr/ADR-0004-verification-sandbox-isolation.md).
 
+**A consequence worth planning for:** a fresh worktree contains only committed files, so
+it has no `node_modules`, no `.venv`, no build cache — and with `network: "deny"` it cannot
+fetch them. A project therefore needs one of:
+
+- a verification command that needs no installed dependencies (this repo's
+  `scripts/verify-reason-codes.mjs` is one — it checks the reason-code contract with
+  nothing but Node),
+- an install step declared as its own command with `network: "allowlist"` ahead of the
+  build in the profile's command order, or
+- `evidenceMode: "TRUSTED_CI"`, letting CI do the dependency-heavy work and having the
+  control plane accept the result only at the exact candidate head from an approved
+  workflow digest.
+
 ## Provider capacity
 
 Neither shipped CLI exposes a quota interface, so the adapters read a structured local

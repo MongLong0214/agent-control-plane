@@ -4,7 +4,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunState, TaskState } from "../../src/domain/types.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import {
   type Harness,
   applyFailingChange,
@@ -162,6 +162,55 @@ describe("one safe project run, end to end", () => {
     expect(notifications).toHaveLength(0);
 
     expect(harness.cp.runs.require(runId).state).toBe(RunState.ACTIVE);
+  });
+
+  it("REVISE → CTO revision → a fresh review on the new candidate passes", async () => {
+    const harness = makeHarness();
+    const { runId, run, identity, outcome } = await drive(harness, { reviewerVerdict: "REVISE" });
+
+    if (!outcome.allowed || outcome.value.stage !== "REVISION_REQUIRED") {
+      throw new Error(`unexpected stage: ${outcome.allowed ? outcome.value.stage : outcome.message}`);
+    }
+    const revisedFrom = outcome.value.snapshotDigest;
+    const firstReviewer = harness.cp.review.latestPacket(runId, revisedFrom)?.reviewerSessionId;
+    expect(firstReviewer).toBeTruthy();
+
+    // The CTO revises. A new commit means a new candidate, so the previous review is no
+    // longer current evidence.
+    writeFiles(harness.repoPath, { "src/app.js": "module.exports = () => 2; // addressed review\n" });
+    commitAll(harness.repoPath, "address the review finding");
+
+    harness.scripted.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${identity}:src/app.js`]),
+    });
+
+    const second = await harness.cp.pipeline.submitResult({
+      runId,
+      ownerSessionId: run.ownerSessionId!,
+      ownerBindingGeneration: run.ownerBindingGeneration!,
+      resultSummary: "review finding addressed",
+      recommendation: "merge",
+    });
+    if (!second.allowed || second.value.stage !== "COMPLETED_REVIEW") {
+      throw new Error(`unexpected stage: ${second.allowed ? second.value.stage : second.message}`);
+    }
+
+    // A different candidate, judged by a different reviewer session, with the old review
+    // marked superseded.
+    expect(second.value.snapshotDigest).not.toBe(revisedFrom);
+    const secondReviewer = harness.cp.review.latestPacket(runId, second.value.snapshotDigest)!;
+    expect(secondReviewer.reviewerSessionId).not.toBe(firstReviewer);
+    expect(secondReviewer.candidateSnapshotDigest).toBe(second.value.snapshotDigest);
+
+    const stale = harness.cp.artifacts
+      .list(runId, "BLIND_REVIEW")
+      .filter((a) => a.candidateSnapshotDigest === revisedFrom);
+    expect(stale.every((a) => a.superseded)).toBe(true);
+
+    // Two reviews happened, and only the second one produced a packet.
+    expect(harness.cp.audit.byKind("BLIND_REVIEW_COMPLETED")).toHaveLength(2);
+    expect(second.value.packet.blindReview.verdict).toBe("PASS");
   });
 
   it("failed verification → repair → re-verification produces fresh evidence", async () => {
