@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve, sep } from "node:path";
 
 /**
@@ -23,6 +23,9 @@ export const realWorkspaceProbe: WorkspaceProbe = {
       if (parent === start) return null;
       start = parent;
     }
+    // `git -C` needs a directory. When the target is an existing file, asking git about
+    // the file itself fails and the path would be misread as outside any repository.
+    if (!statSync(start).isDirectory()) start = dirname(start);
     try {
       const out = execFileSync("git", ["-C", start, "rev-parse", "--show-toplevel"], {
         encoding: "utf8",

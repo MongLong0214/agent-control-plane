@@ -243,6 +243,13 @@ export class CapacityMonitor {
   }
 
   private persist(reading: CapacityReading): void {
+    // A reading is one atomic observation. Re-observing at the same instant must
+    // replace the whole bucket set — leaving a bucket behind from a previous
+    // observation would let a shrunken or failed sensor read as healthy.
+    this.db.run(`DELETE FROM capacity_snapshots WHERE provider = ? AND observed_at = ?`, [
+      reading.provider,
+      reading.observedAt,
+    ]);
     for (const bucket of reading.buckets) {
       this.db.run(
         `INSERT OR REPLACE INTO capacity_snapshots

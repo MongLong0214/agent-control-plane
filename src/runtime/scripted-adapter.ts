@@ -30,7 +30,7 @@ export interface ScriptedResponse {
  * provider quota, not as a stand-in for a real model on a production path.
  */
 export class ScriptedAdapter implements ProviderAdapter {
-  readonly provider = "scripted";
+  readonly provider: string;
   readonly isProduction = false;
   readonly defaultModels = { cto: "scripted-cto", reviewer: "scripted-reviewer", worker: "scripted-worker", ceo: "scripted-ceo" } as const;
 
@@ -39,7 +39,16 @@ export class ScriptedAdapter implements ProviderAdapter {
   #capacity: CapacityReading | null = null;
   #runtime: "HEALTHY" | "DEGRADED" | "UNAVAILABLE" = "HEALTHY";
 
-  constructor(private readonly clock: Clock) {}
+  /**
+   * `provider` is overridable so a scenario can model two distinct providers (fan-out,
+   * continuity failover) without either becoming production-eligible.
+   */
+  constructor(
+    private readonly clock: Clock,
+    provider = "scripted",
+  ) {
+    this.provider = provider;
+  }
 
   script(...responses: ScriptedResponse[]): this {
     this.#responses.push(...responses);
@@ -107,22 +116,21 @@ export class ScriptedAdapter implements ProviderAdapter {
   }
 
   async probeCapacity(): Promise<CapacityReading> {
-    return (
-      this.#capacity ?? {
-        provider: this.provider,
-        sensorHealth: "HEALTHY",
-        runtimeHealth: this.#runtime,
-        observedAt: this.clock.nowIso(),
-        source: "scripted",
-        buckets: [
-          {
-            id: "scripted-bucket",
-            remainingPercent: 100,
-            resetAt: null,
-            capabilities: ["ceo", "blind-review", "cto", "worker"],
-          },
-        ],
-      }
-    );
+    if (this.#capacity) return this.#capacity;
+    return {
+      provider: this.provider,
+      sensorHealth: "HEALTHY",
+      runtimeHealth: this.#runtime,
+      observedAt: this.clock.nowIso(),
+      source: "scripted",
+      buckets: [
+        {
+          id: "scripted-bucket",
+          remainingPercent: 100,
+          resetAt: null,
+          capabilities: ["ceo", "blind-review", "cto", "worker", "luna-worker"],
+        },
+      ],
+    };
   }
 }
