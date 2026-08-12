@@ -301,10 +301,18 @@ describe("round-2 registry regressions", () => {
 
   it("#156 and #227 retain the accepted head after repeated observations of an out-of-band move", async () => {
     const harness = makeHarness();
-    const { repositoryId } = await registerFixtureProject(harness);
+    const { repositoryId, identity } = await registerFixtureProject(harness);
     const accepted = harness.cp.repositories.byId(repositoryId)!.lastObservedHead;
     writeFiles(harness.repoPath, { "README.md": "# changed outside ACP\n" });
     commitAll(harness.repoPath, "out-of-band move");
+
+    const diagnostic = harness.cp.repositories.observed(identity);
+    expect(diagnostic).toMatchObject({
+      baselineHead: accepted,
+      drift: "DRIFTED",
+    });
+    expect(diagnostic.currentHead).not.toBe(accepted);
+    expect(harness.cp.repositories.byId(repositoryId)!.lastObservedHead).toBe(accepted);
 
     const first = await harness.cp.repositories.observe(repositoryId);
     const second = await harness.cp.repositories.observe(repositoryId);

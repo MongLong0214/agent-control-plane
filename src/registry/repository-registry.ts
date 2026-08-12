@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
@@ -243,7 +244,9 @@ export class RepositoryRegistry {
     const observedHead = await tryRevParse(record.checkoutPath, "HEAD");
     const clean = observedHead ? await isClean(record.checkoutPath) : false;
     const driftState: RepositoryRecord["driftState"] =
-      observedHead === null
+      record.driftState === "DRIFTED"
+        ? "DRIFTED"
+        : observedHead === null
         ? "UNKNOWN"
         : observedHead === record.lastObservedHead && clean
           ? "IN_SYNC"
@@ -257,6 +260,32 @@ export class RepositoryRegistry {
       clean,
       driftState,
     };
+  }
+
+  /**
+   * Read-only, synchronous diagnostic view used by Doctor. A passive probe must never
+   * accept a new baseline: only `acknowledgeHead` records owner-authorised acceptance.
+   */
+  observed(identity: string): {
+    baselineHead: string | null;
+    currentHead: string | null;
+    drift: "CLEAN" | "DRIFTED" | "UNKNOWN";
+  } {
+    const record = this.byIdentity(identity);
+    if (!record) {
+      return { baselineHead: null, currentHead: null, drift: "UNKNOWN" };
+    }
+
+    const currentHead = gitHead(record.checkoutPath);
+    const clean = currentHead !== null && gitClean(record.checkoutPath);
+    const drift =
+      record.driftState === "DRIFTED" ||
+      currentHead === null
+        ? currentHead === null ? "UNKNOWN" : "DRIFTED"
+        : currentHead === record.lastObservedHead && clean
+          ? "CLEAN"
+          : "DRIFTED";
+    return { baselineHead: record.lastObservedHead, currentHead, drift };
   }
 
   /** Accept the current head as the new baseline after a legitimate managed change. */
@@ -383,3 +412,26 @@ const hydrate = (row: RawRepository): RepositoryRecord => ({
   temporaryForRun: row.temporary_for_run,
   createdAt: row.created_at,
 });
+
+const gitHead = (checkoutPath: string): string | null => {
+  try {
+    const head = execFileSync("git", ["-C", checkoutPath, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return head || null;
+  } catch {
+    return null;
+  }
+};
+
+const gitClean = (checkoutPath: string): boolean => {
+  try {
+    return execFileSync("git", ["-C", checkoutPath, "status", "--porcelain"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim().length === 0;
+  } catch {
+    return false;
+  }
+};
