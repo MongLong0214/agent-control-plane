@@ -61,7 +61,7 @@ the executable test suite for each scenario id, not by assertion.
 | CP-S25 | COVERED | ests/integration/pipeline.test.ts › CP-S25: a repository change after freezing invalidates the whole candidate<br>ests/unit/trusted-core.test.ts › CP-S25: freezes every repository and goes stale when one head moves |
 | CP-S26 | COVERED | ests/scenarios/registry-cto.test.ts › registry authority (CP-S04, CP-S05, CP-S26)<br>ests/scenarios/registry-cto.test.ts › CP-S26: an unregistered repository gets a run-scoped binding and no active project |
 | CP-S27 | COVERED | ests/unit/trusted-core.test.ts › CP-S27: a candidate command cannot read authority secrets from the environment |
-| CP-S28 | COVERED | ests/unit/trusted-core.test.ts › CP-S28: kills the whole process group on timeout |
+| CP-S28 | COVERED | ests/unit/trusted-core.test.ts › CP-S28: times out and reaps an in-group child when one can start |
 | CP-S29 | COVERED | ests/scenarios/github-kernel.test.ts › trusted CI evidence (CP-S29)<br>ests/scenarios/github-kernel.test.ts › CP-S29: a CI result for a different head is refused, not counted<br>ests/scenarios/github-kernel.test.ts › CP-S29: an unapproved workflow digest or untrusted creator is also refused<br>ests/scenarios/github-kernel.test.ts › CP-S29: a CI result at the exact head from an approved workflow is accepted |
 | CP-S30 | COVERED | ests/integration/pipeline.test.ts › registers a project manually and drives contract → verification → blind review → packet |
 | CP-S31 | COVERED | ests/integration/pipeline.test.ts › CP-S31: a producer session cannot be bound as the run |

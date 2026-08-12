@@ -784,7 +784,7 @@
       "tests": [
         {
           "file": "ests/unit/trusted-core.test.ts",
-          "title": "CP-S28: kills the whole process group on timeout"
+          "title": "CP-S28: times out and reaps an in-group child when one can start"
         }
       ],
       "status": "COVERED"

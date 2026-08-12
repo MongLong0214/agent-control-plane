@@ -242,11 +242,25 @@ const SECRET_VALUE_SHAPES: readonly RegExp[] = [
 const authorityEnvironment = (name: string): boolean => AUTHORITY_ENV.some((pattern) => pattern.test(name));
 const looksLikeCredential = (value: string): boolean => SECRET_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
 
-/** Constructed, never inherited: agent CLIs do not receive daemon authority. */
+/**
+ * Constructed, never inherited: an agent CLI receives no daemon authority.
+ *
+ * What it *does* receive is its own provider identity. An agent session exists in order to
+ * authenticate to its provider, and both shipped CLIs read that from the real `HOME`
+ * (`~/.claude`, `~/.codex`); pointing HOME at an empty scratch directory does not contain
+ * the agent, it stops it from being an agent at all. The daemon's authority is withheld by
+ * refusing every authority-shaped variable and every credential-shaped value below, and by
+ * confining writes to the scratch and work directories — not by blinding the provider to
+ * its own login.
+ */
 export const runtimeEnvironment = (allowlist: readonly string[], scratch: string): NodeJS.ProcessEnv => {
   const environment: NodeJS.ProcessEnv = {
     PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
-    HOME: scratch,
+    HOME: process.env["HOME"] ?? scratch,
+    // Both CLIs resolve their own login through the invoking user's keychain, and neither
+    // finds it without USER. Measured, not assumed: with HOME alone `claude --print`
+    // answers "Not logged in"; with USER added it authenticates.
+    ...(process.env["USER"] ? { USER: process.env["USER"] } : {}),
     TMPDIR: scratch,
     LANG: "C.UTF-8",
     LC_ALL: "C",
