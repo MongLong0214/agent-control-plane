@@ -13,6 +13,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
+import { isClean, tryRevParse } from "../git/git.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -83,8 +84,12 @@ export class Doctor {
     private readonly worktrees: { orphans(repo: string, live: ReadonlySet<string>): Promise<string[]> },
   ) {}
 
-  async run(scope: DoctorScope = "system", target?: string): Promise<DoctorReport> {
-    const findings: Finding[] = [];
+  async run(
+    scope: DoctorScope = "system",
+    target?: string,
+    supplementalFindings: readonly Finding[] = [],
+  ): Promise<DoctorReport> {
+    const findings: Finding[] = [...supplementalFindings];
 
     if (scope === "system" || scope === "cto" || scope === "project") {
       findings.push(...this.checkBindings(target ?? null));
@@ -275,10 +280,50 @@ export class Doctor {
           FROM task_executions WHERE status = 'RUNNING'`);
 
     for (const execution of running) {
-      const sessionAlive = execution.worker_session_id
-        ? this.sessions.get(execution.worker_session_id)?.lifecycle
+      const session = execution.worker_session_id ? this.sessions.get(execution.worker_session_id) : null;
+      const sessionAlive = session?.lifecycle ?? null;
+      const pid = execution.worker_process_id;
+      const hasSessionIdentity = execution.worker_session_id !== null;
+      const hasValidSessionIdentity = hasSessionIdentity && session !== null;
+      const hasProcessIdentity = pid !== null;
+      const hasValidProcessIdentity =
+        hasProcessIdentity &&
+        Number.isInteger(pid) &&
+        pid > 0;
+      const processAlive = hasValidProcessIdentity
+        ? isProcessAlive(pid!)
         : null;
-      const processAlive = execution.worker_process_id ? isProcessAlive(execution.worker_process_id) : null;
+
+      if (!hasSessionIdentity && !hasProcessIdentity) {
+        findings.push({
+          code: "WORKER_IDENTITY_MISSING",
+          severity: "ERROR",
+          scope: `run:${execution.run_id}`,
+          blocking: true,
+          confidence: "HIGH",
+          observedEvidence: { executionId: execution.execution_id, startedAt: execution.started_at },
+          recommendedAction: "supply a live worker session or a positive worker process id before opening a receipt",
+        });
+        continue;
+      }
+
+      if (!hasValidSessionIdentity && !hasValidProcessIdentity) {
+        findings.push({
+          code: "WORKER_IDENTITY_UNVERIFIABLE",
+          severity: "ERROR",
+          scope: `run:${execution.run_id}`,
+          blocking: true,
+          confidence: "HIGH",
+          observedEvidence: {
+            executionId: execution.execution_id,
+            workerSessionId: execution.worker_session_id,
+            workerProcessId: execution.worker_process_id,
+            startedAt: execution.started_at,
+          },
+          recommendedAction: "replace the receipt with one backed by a known session or a positive process id",
+        });
+        continue;
+      }
 
       if (processAlive === false || sessionAlive === SessionLifecycle.STOPPED || sessionAlive === SessionLifecycle.ERROR) {
         findings.push({
@@ -467,8 +512,15 @@ export class Doctor {
   private async checkRepositories(): Promise<Finding[]> {
     const findings: Finding[] = [];
     for (const repository of this.repositories.list()) {
-      const observed = await this.repositories.observe(repository.repositoryId);
-      if (observed?.driftState === "DRIFTED") {
+      // `lastObservedHead` is the acknowledged baseline. A diagnostic must not call the
+      // registry's mutating observation API because that would acknowledge an owner
+      // change merely by looking at it (§25, §33.5).
+      const head = await tryRevParse(repository.checkoutPath, "HEAD");
+      const clean = head ? await isClean(repository.checkoutPath) : false;
+      const driftState =
+        head === null ? "UNKNOWN" : head === repository.lastObservedHead && clean ? "IN_SYNC" : "DRIFTED";
+
+      if (driftState === "DRIFTED") {
         findings.push({
           code: "REPOSITORY_DRIFT",
           severity: "WARN",
@@ -476,13 +528,15 @@ export class Doctor {
           blocking: false,
           confidence: "MEDIUM",
           observedEvidence: {
-            lastObservedHead: observed.lastObservedHead,
-            checkoutPath: observed.checkoutPath,
+            acknowledgedHead: repository.lastObservedHead,
+            observedHead: head,
+            clean,
+            checkoutPath: repository.checkoutPath,
           },
           recommendedAction: "reconcile the checkout, or treat pending candidates as stale",
         });
       }
-      if (observed?.driftState === "UNKNOWN") {
+      if (driftState === "UNKNOWN") {
         findings.push({
           code: "REPOSITORY_UNREADABLE",
           severity: "ERROR",
@@ -509,7 +563,24 @@ export class Doctor {
         .filter(Boolean),
     );
     for (const repository of this.repositories.list()) {
-      const orphans = await this.worktrees.orphans(repository.checkoutPath, live).catch(() => []);
+      let orphans: string[];
+      try {
+        orphans = await this.worktrees.orphans(repository.checkoutPath, live);
+      } catch (err) {
+        findings.push({
+          code: "WORKTREE_PROBE_FAILED",
+          severity: "ERROR",
+          scope: `repository:${repository.identity}`,
+          blocking: true,
+          confidence: "HIGH",
+          observedEvidence: {
+            checkoutPath: repository.checkoutPath,
+            error: safeErrorMessage(err),
+          },
+          recommendedAction: "restore worktree inspection before trusting repository isolation",
+        });
+        continue;
+      }
       if (orphans.length > 0) {
         findings.push({
           code: "ORPHAN_WORKTREE",
@@ -573,12 +644,18 @@ const statusReason = (status: DoctorStatus): ReasonCode =>
         : ReasonCode.DOCTOR_ERROR;
 
 const isProcessAlive = (pid: number): boolean => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch {
     return false;
   }
+};
+
+const safeErrorMessage = (err: unknown): string => {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.replace(/[\r\n\t]/g, " ").slice(0, 500);
 };
 
 const loadAverage = async (): Promise<number[]> => {

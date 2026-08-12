@@ -8,6 +8,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind } from "../domain/types.ts";
+import { isClean, tryRevParse } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { WorktreeManager } from "../verify/worktree.ts";
 
@@ -154,91 +155,38 @@ export class RepairService {
       }
     }
 
-    const handlers: Record<string, () => Promise<{ changes: number; evidence: unknown }>> = {
-      expire_stale_claims: async () => {
-        const overdue = this.claims.overdue();
-        if (request.dryRun) return { changes: overdue.length, evidence: overdue.map((c) => c.claimId) };
-        return { changes: this.claims.expireOverdue(), evidence: overdue.map((c) => c.claimId) };
-      },
-      abandon_dead_executions: async () => {
-        const running = this.db.all<{ execution_id: string; worker_process_id: number | null }>(
-          `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING'`,
-        );
-        const dead = running.filter((r) => r.worker_process_id != null && !alive(r.worker_process_id));
-        if (request.dryRun) return { changes: dead.length, evidence: dead.map((d) => d.execution_id) };
-        let changes = 0;
-        for (const execution of dead) {
-          changes += this.db.run(
-            `UPDATE task_executions SET status = 'ABANDONED', ended_at = ?, failure_class = 'infrastructure'
-              WHERE execution_id = ?`,
-            [this.clock.nowIso(), execution.execution_id],
-          ).changes;
-        }
-        return { changes, evidence: dead.map((d) => d.execution_id) };
-      },
-      retry_outbox: async () => {
-        const pending = this.db.all<{ message_id: string }>(
-          `SELECT message_id FROM outbox WHERE status = 'PENDING' AND attempts > 0`,
-        );
-        if (request.dryRun) return { changes: pending.length, evidence: pending.map((p) => p.message_id) };
-        const changes = this.db.run(
-          `UPDATE outbox SET attempts = 0, last_error = NULL WHERE status = 'PENDING' AND attempts > 0`,
-        ).changes;
-        return { changes, evidence: pending.map((p) => p.message_id) };
-      },
-      prune_orphan_worktrees: async () => {
-        const live = new Set(
-          this.db
-            .all<{ worktree_id: string | null }>(
-              `SELECT worktree_id FROM task_executions WHERE status = 'RUNNING' AND worktree_id IS NOT NULL`,
-            )
-            .map((r) => r.worktree_id!),
-        );
-        let changes = 0;
-        const pruned: string[] = [];
-        for (const repository of this.repositories.list()) {
-          const orphans = await this.worktrees.orphans(repository.checkoutPath, live).catch(() => []);
-          for (const orphan of orphans) {
-            pruned.push(orphan);
-            if (!request.dryRun) {
-              await this.worktrees.destroy(repository.checkoutPath, orphan);
-              changes += 1;
-            }
-          }
-        }
-        return { changes: request.dryRun ? pruned.length : changes, evidence: pruned };
-      },
-      clear_repository_drift: async () => {
-        const identity = request.parameters["identity"];
-        const repository = identity ? this.repositories.byIdentity(identity) : null;
-        if (!repository) return { changes: 0, evidence: { identity, found: false } };
-        const observed = await this.repositories.observe(repository.repositoryId);
-        if (request.dryRun || !observed?.lastObservedHead) {
-          return { changes: observed?.driftState === "DRIFTED" ? 1 : 0, evidence: observed };
-        }
-        this.repositories.acknowledgeHead(repository.repositoryId, observed.lastObservedHead);
-        return { changes: 1, evidence: { head: observed.lastObservedHead } };
-      },
-    };
+    const plan = await this.plan(operation, request);
+    if (plan.preconditions.some((precondition) => !precondition.satisfied)) {
+      this.audit.record({
+        kind: "REPAIR_REFUSED",
+        reasonCode: ReasonCode.REPAIR_PRECONDITION_UNMET,
+        runId: request.runId ?? null,
+        actor: request.authorizedBy,
+        evidence: { operationId: operation.id, preconditions: plan.preconditions },
+      });
+      return deny(ReasonCode.REPAIR_PRECONDITION_UNMET, "repair preconditions are not satisfied", {
+        operationId: operation.id,
+        preconditions: plan.preconditions,
+      });
+    }
 
-    const preconditions = operation.preconditions.map((precondition) => ({
-      precondition,
-      satisfied: true,
-      evidence: "checked by the operation handler",
-    }));
-
-    const outcome = await handlers[operation.id]!();
+    const outcome = await plan.perform(request.dryRun);
 
     const receipt: RepairReceipt = {
       operationId: operation.id,
       parameters: request.parameters,
       dryRun: request.dryRun,
       authorizedBy: request.authorizedBy,
-      preconditionsChecked: preconditions,
+      preconditionsChecked: plan.preconditions,
       effect: operation.expectedEffect,
       changes: outcome.changes,
       performedAt: this.clock.nowIso(),
-      digest: digestOf({ operation: operation.id, parameters: request.parameters, evidence: outcome.evidence }),
+      digest: digestOf({
+        operation: operation.id,
+        parameters: request.parameters,
+        preconditions: plan.preconditions,
+        evidence: outcome.evidence,
+      }),
     };
 
     if (request.runId) {
@@ -252,19 +200,194 @@ export class RepairService {
         operationId: operation.id,
         risk: operation.risk,
         changes: outcome.changes,
+        preconditions: plan.preconditions,
         target: outcome.evidence,
       },
     });
 
     return allow(ReasonCode.OK, receipt);
   }
+
+  private async plan(operation: RepairOperation, request: RepairRequest): Promise<RepairPlan> {
+    switch (operation.id) {
+      case "expire_stale_claims": {
+        const overdue = this.claims.overdue();
+        const preconditions = [checked(
+          operation.preconditions[0]!,
+          overdue.length > 0,
+          { overdueClaimIds: overdue.map((claim) => claim.claimId) },
+        )];
+        return {
+          preconditions,
+          perform: async (dryRun) => ({
+            changes: dryRun ? overdue.length : this.claims.expireOverdue(),
+            evidence: { overdueClaimIds: overdue.map((claim) => claim.claimId) },
+          }),
+        };
+      }
+      case "abandon_dead_executions": {
+        const running = this.db.all<{ execution_id: string; worker_process_id: number | null }>(
+          `SELECT execution_id, worker_process_id FROM task_executions WHERE status = 'RUNNING'`,
+        );
+        const dead = running.filter(
+          (execution) =>
+            execution.worker_process_id !== null &&
+            Number.isInteger(execution.worker_process_id) &&
+            execution.worker_process_id > 0 &&
+            !alive(execution.worker_process_id),
+        );
+        const evidence = {
+          running: running.map((execution) => ({
+            executionId: execution.execution_id,
+            workerProcessId: execution.worker_process_id,
+          })),
+          deadExecutionIds: dead.map((execution) => execution.execution_id),
+        };
+        return {
+          preconditions: [
+            checked(operation.preconditions[0]!, dead.length > 0, evidence),
+            checked(operation.preconditions[1]!, dead.length > 0, evidence),
+          ],
+          perform: async (dryRun) => {
+            if (dryRun) return { changes: dead.length, evidence };
+            let changes = 0;
+            for (const execution of dead) {
+              changes += this.db.run(
+                `UPDATE task_executions SET status = 'ABANDONED', ended_at = ?, failure_class = 'infrastructure'
+                  WHERE execution_id = ? AND status = 'RUNNING'`,
+                [this.clock.nowIso(), execution.execution_id],
+              ).changes;
+            }
+            return { changes, evidence };
+          },
+        };
+      }
+      case "retry_outbox": {
+        const pending = this.db.all<{ message_id: string; expires_at: string }>(
+          `SELECT message_id, expires_at FROM outbox WHERE status = 'PENDING' AND attempts > 0`,
+        );
+        const now = this.clock.nowIso();
+        const eligible = pending.filter((message) => message.expires_at > now);
+        const evidence = {
+          pending: pending.map((message) => ({ messageId: message.message_id, expiresAt: message.expires_at })),
+          eligibleMessageIds: eligible.map((message) => message.message_id),
+        };
+        return {
+          preconditions: [checked(operation.preconditions[0]!, eligible.length > 0, evidence)],
+          perform: async (dryRun) => {
+            if (dryRun) return { changes: eligible.length, evidence };
+            let changes = 0;
+            for (const message of eligible) {
+              changes += this.db.run(
+                `UPDATE outbox SET attempts = 0, last_error = NULL
+                  WHERE message_id = ? AND status = 'PENDING' AND expires_at > ?`,
+                [message.message_id, now],
+              ).changes;
+            }
+            return { changes, evidence };
+          },
+        };
+      }
+      case "prune_orphan_worktrees": {
+        const live = new Set(
+          this.db
+            .all<{ worktree_id: string | null }>(
+              `SELECT worktree_id FROM task_executions WHERE status = 'RUNNING' AND worktree_id IS NOT NULL`,
+            )
+            .map((row) => row.worktree_id!)
+            .filter(Boolean),
+        );
+        const candidates: Array<{ checkoutPath: string; worktreeId: string }> = [];
+        const probeFailures: Array<{ identity: string; error: string }> = [];
+        for (const repository of this.repositories.list()) {
+          try {
+            const orphans = await this.worktrees.orphans(repository.checkoutPath, live);
+            candidates.push(...orphans.map((worktreeId) => ({ checkoutPath: repository.checkoutPath, worktreeId })));
+          } catch (err) {
+            probeFailures.push({ identity: repository.identity, error: safeErrorMessage(err) });
+          }
+        }
+        const evidence = { liveWorktreeIds: [...live], candidates, probeFailures };
+        return {
+          preconditions: [checked(
+            operation.preconditions[0]!,
+            probeFailures.length === 0 && candidates.length > 0,
+            evidence,
+          )],
+          perform: async (dryRun) => {
+            if (dryRun) return { changes: candidates.length, evidence };
+            let changes = 0;
+            for (const candidate of candidates) {
+              await this.worktrees.destroy(candidate.checkoutPath, candidate.worktreeId);
+              changes += 1;
+            }
+            return { changes, evidence };
+          },
+        };
+      }
+      case "clear_repository_drift": {
+        const identity = request.parameters["identity"];
+        const repository = identity ? this.repositories.byIdentity(identity) : null;
+        let head: string | null = null;
+        let clean = false;
+        let probeError: string | null = null;
+        if (repository) {
+          try {
+            head = await tryRevParse(repository.checkoutPath, "HEAD");
+            clean = head !== null && await isClean(repository.checkoutPath);
+          } catch (err) {
+            probeError = safeErrorMessage(err);
+          }
+        }
+        const evidence = {
+          identity: identity ?? null,
+          found: repository !== null,
+          checkoutPath: repository?.checkoutPath ?? null,
+          observedHead: head,
+          clean,
+          probeError,
+        };
+        return {
+          preconditions: [checked(
+            operation.preconditions[0]!,
+            repository !== null && head !== null && clean && probeError === null,
+            evidence,
+          )],
+          perform: async (dryRun) => {
+            const changes = repository && head && repository.driftState !== "IN_SYNC" ? 1 : 0;
+            if (!dryRun && repository && head) this.repositories.acknowledgeHead(repository.repositoryId, head);
+            return { changes, evidence };
+          },
+        };
+      }
+      default:
+        throw new Error(`missing repair plan for ${operation.id}`);
+    }
+  }
 }
 
+interface RepairPlan {
+  preconditions: RepairReceipt["preconditionsChecked"];
+  perform(dryRun: boolean): Promise<{ changes: number; evidence: unknown }>;
+}
+
+const checked = (precondition: string, satisfied: boolean, evidence: unknown): RepairReceipt["preconditionsChecked"][number] => ({
+  precondition,
+  satisfied,
+  evidence,
+});
+
 const alive = (pid: number): boolean => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch {
     return false;
   }
+};
+
+const safeErrorMessage = (err: unknown): string => {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.replace(/[\r\n\t]/g, " ").slice(0, 500);
 };
