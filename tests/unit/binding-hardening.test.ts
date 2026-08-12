@@ -168,11 +168,14 @@ describe("outbox delivery is claimed, not merely selected", () => {
     expect(outbox.markSent(claimed.messageId, claimed.claimToken).allowed).toBe(true);
   });
 
-  it("a failed attempt returns the message to the queue", () => {
+  it("fails closed when retry-policy storage is unavailable", () => {
     const { outbox } = enqueued();
     const claimed = outbox.claimDeliverable()[0]!;
-    expect(outbox.markAttemptFailed(claimed.messageId, claimed.claimToken, "boom").allowed).toBe(true);
-    expect(outbox.claimDeliverable()).toHaveLength(1);
+    const failed = outbox.markAttemptFailed(claimed.messageId, claimed.claimToken, "boom");
+    expect(failed.allowed).toBe(false);
+    expect(failed.reasonCode).toBe(ReasonCode.OUTBOX_RETRY_POLICY_UNAVAILABLE);
+    expect(outbox.get(claimed.messageId)?.status).toBe("REJECTED");
+    expect(outbox.claimDeliverable()).toHaveLength(0);
   });
 
   it("an abandoned lease is reclaimed rather than stuck", () => {

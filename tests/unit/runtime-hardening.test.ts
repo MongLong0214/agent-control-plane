@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 
+import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs, gitSync, makeRepo } from "../helpers/fixtures.ts";
@@ -13,7 +14,7 @@ import {
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
+import type { HandoffAcknowledgement, HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -26,6 +27,30 @@ const CONTRACT: TaskContract = {
   priority: "NORMAL",
   humanGate: [],
   references: [],
+};
+
+const authenticateHandoffsForTest = (harness: Harness): void => {
+  harness.cp.cto.attach({
+    handoffAuthentication: { verifyHandoffAcknowledgement: () => allow(ReasonCode.OK, undefined) },
+  });
+};
+
+const deliveredAck = (
+  harness: Harness,
+  handoffId: string,
+  incomingSessionId: string,
+): HandoffAcknowledgement => {
+  const message = harness.cp.outbox.byIdempotencyKey(`handoff:${handoffId}`);
+  if (!message) throw new Error("handoff message was not persisted");
+  harness.cp.db.run(`UPDATE outbox SET status = 'SENT' WHERE message_id = ?`, [message.messageId]);
+  return {
+    sessionId: incomingSessionId,
+    sessionIncarnation: harness.cp.sessions.require(incomingSessionId).incarnation,
+    bindingGeneration: message.bindingGeneration,
+    messageId: message.messageId,
+    payloadDigest: message.payloadDigest,
+    sessionSecret: "test-session-secret",
+  };
 };
 
 const activeRun = async (harness: Harness, projectId = "fixture-project") => {
@@ -403,18 +428,21 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
 
   it("refuses the ack when the binding moved after the handoff was prepared", async () => {
     const harness = makeHarness();
+    authenticateHandoffsForTest(harness);
     const { projectId } = await registerFixtureProject(harness);
     await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
     const prepared = await harness.cp.cto.prepareSwitchover(projectId, handoff);
     if (!prepared.allowed) throw new Error(prepared.message);
 
     // An emergency takeover moves the binding while the handoff is still pending.
+    const outgoing = harness.cp.bindings.activePrimaryCto(projectId)!;
+    harness.cp.sessions.transition(outgoing.sessionId, SessionLifecycle.ERROR, "outgoing session became unavailable");
     const taken = await harness.cp.cto.recoveryTakeover(projectId, "outgoing session died");
     if (!taken.allowed) throw new Error(taken.message);
 
     const refused = harness.cp.cto.acknowledgeHandoff(
       prepared.value.handoffId,
-      prepared.value.incomingSessionId,
+      deliveredAck(harness, prepared.value.handoffId, prepared.value.incomingSessionId),
     );
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.WRITE_BINDING_GENERATION_STALE);
@@ -422,6 +450,7 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
 
   it("refuses the ack when the outgoing CTO picked up an active run after prepare", async () => {
     const harness = makeHarness();
+    authenticateHandoffsForTest(harness);
     const { projectId, repositoryId } = await registerFixtureProject(harness);
     await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
     const outgoing = harness.cp.bindings.activePrimaryCto(projectId)!;
@@ -452,7 +481,7 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
 
     const refused = harness.cp.cto.acknowledgeHandoff(
       prepared.value.handoffId,
-      prepared.value.incomingSessionId,
+      deliveredAck(harness, prepared.value.handoffId, prepared.value.incomingSessionId),
     );
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS);
@@ -462,6 +491,7 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
 
   it("completes the switchover when the barrier held", async () => {
     const harness = makeHarness();
+    authenticateHandoffsForTest(harness);
     const { projectId } = await registerFixtureProject(harness);
     await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
     const outgoing = harness.cp.bindings.activePrimaryCto(projectId)!;
@@ -470,7 +500,7 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
 
     const acked = harness.cp.cto.acknowledgeHandoff(
       prepared.value.handoffId,
-      prepared.value.incomingSessionId,
+      deliveredAck(harness, prepared.value.handoffId, prepared.value.incomingSessionId),
     );
     expect(acked.allowed).toBe(true);
     if (!acked.allowed) return;

@@ -93,7 +93,6 @@ describe("round-2 outbox fencing", () => {
 
   it("#173 denies a different request that reuses an idempotency key", () => {
     const { core, seeded } = seededCore();
-    core.db.exec(`ALTER TABLE outbox ADD COLUMN request_fingerprint TEXT;`);
     const first = enqueue(core, seeded, "outbox:collision");
     expect(first.allowed).toBe(true);
     const collision = core.outbox.enqueue({

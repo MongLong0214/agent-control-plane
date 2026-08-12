@@ -180,13 +180,13 @@ describe("#50 / #172 — only READY sessions can become active bindings", () => 
 });
 
 describe("binding fencing mechanisms", () => {
-  it("refuses session authentication until secret storage is migrated", () => {
+  it("issues an opaque session secret when secret storage is available", () => {
     const core = makeCore();
     const session = core.sessions.create({ provider: "scripted", model: "test", sessionId: "ses_no_secret_store" });
-    expect(session.sessionSecret).toBeNull();
+    expect(session.sessionSecret).toMatch(/^[A-Za-z0-9_-]{43}$/);
     const refused = core.sessions.verifySecret(session.sessionId, "forged");
     expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE);
+    expect(refused.reasonCode).toBe(ReasonCode.SESSION_SECRET_INVALID);
   });
 
   it("refuses a switch whose expected current generation is stale", () => {
@@ -208,7 +208,6 @@ describe("binding fencing mechanisms", () => {
 
   it("authenticates the session secret and current binding generation in one call", () => {
     const core = makeCore();
-    core.db.exec(`ALTER TABLE sessions ADD COLUMN session_secret_hash TEXT`);
     const incumbent = readySession(core, "ses_secret_one");
     expect(incumbent.sessionSecret).not.toBeNull();
     expect(
