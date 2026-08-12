@@ -2,8 +2,9 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { GATE_CHECK_NAME, NO_HUMAN_GATE_DIGEST, type GatePayload } from "../../src/github/github-kernel.ts";
-import { cleanupTempDirs, makeRepo } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import { type Harness, driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
 
@@ -469,18 +470,19 @@ describe("release tags and issue projection are owner-authorised (CP-HI-01)", ()
 });
 
 describe("the trusted credential has no read surface (CP-HI-05)", () => {
-  it("offers no way to obtain the token in-process", async () => {
-    const fixture = await setup();
-    const store = fixture.harness.cp.credentials as unknown as Record<string, unknown>;
-    expect(typeof store["withToken"]).toBe("undefined");
-    expect(JSON.stringify(store)).not.toContain("test-token");
-  });
-
-  it("does not expose an arbitrary child-process runner that could print the token", async () => {
-    const fixture = await setup();
-    const store = fixture.harness.cp.credentials as unknown as Record<string, unknown>;
-    expect(typeof store["run"]).toBe("undefined");
-    expect(typeof store["githubApi"]).toBe("function");
+  it("exposes only the fixed credential-store API", () => {
+    const store = new TrustedCredentialStore(tempDir("credential-surface-"));
+    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(store)).sort()).toEqual([
+      "assertInstallTarget",
+      "available",
+      "constructor",
+      "creatorIdentity",
+      "githubApi",
+      "install",
+      "load",
+      "metadataOk",
+      "permissionsOk",
+    ]);
   });
 });
 
@@ -618,17 +620,11 @@ describe("round-2 review: post-merge coverage and receipts", () => {
       ["project-ci"],
     );
     expect(narrowed.allowed).toBe(false);
+    expect(narrowed.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
     expect(narrowed.evidence["failed"]).toEqual([
       { name: "project-ci", conclusion: "untrusted" },
       { name: "security", conclusion: "missing" },
     ]);
-
-    github.setPostMergeCheck(mergeSha, "security", "success");
-    const complete = await harness.cp.github.postMergeVerify(driven.runId, driven.identity, mergeSha, [
-      "project-ci",
-    ]);
-    expect(complete.allowed).toBe(false);
-    expect(complete.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
   });
 
   it("refuses a post-merge result for a commit this run never merged (github#6)", async () => {

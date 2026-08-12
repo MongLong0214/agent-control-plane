@@ -321,20 +321,29 @@ export class GitHubKernel {
           this.hasPrRunMarker(pull.body, input.runId) &&
           (!input.requireLinkage || this.hasPrLinkage(pull.body, linkedIssues)),
         );
-        if (matches.length !== 1) {
+        if (matches.length > 1) {
           return deny(ReasonCode.RESOURCE_COLLISION, "PR operation is pending reconciliation", { idempotencyKey });
         }
-        const value = { pullNumber: matches[0]!.number, url: matches[0]!.html_url };
-        const finalized = this.finalizeReservedReceipt({
-          idempotencyKey,
-          requestDigest,
-          preexisting: false,
-          afterStateDigest: digestOf({ head: matches[0]!.head.sha, base: matches[0]!.base.sha }),
-          response: { ...value, intent: request },
-          reread: true,
-        });
-        if (!finalized.allowed) return finalized as Decision<{ pullNumber: number; url: string }>;
-        return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, value, { replayed: true });
+        if (matches.length === 1) {
+          const value = { pullNumber: matches[0]!.number, url: matches[0]!.html_url };
+          const finalized = this.finalizeReservedReceipt({
+            idempotencyKey,
+            requestDigest,
+            preexisting: false,
+            afterStateDigest: digestOf({ head: matches[0]!.head.sha, base: matches[0]!.base.sha }),
+            response: { ...value, intent: request },
+            reread: true,
+          });
+          if (!finalized.allowed) return finalized as Decision<{ pullNumber: number; url: string }>;
+          return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, value, { replayed: true });
+        }
+        if (open.length > 0) {
+          return deny(ReasonCode.RESOURCE_COLLISION, "PR operation is pending reconciliation", { idempotencyKey });
+        }
+        // An empty branch-pair query proves the reserved POST was never applied, so this
+        // stale receipt may be reclaimed before the new attempt reserves it again.
+        this.releaseReservation(idempotencyKey, requestDigest);
+        return this.prPrepare(input);
       }
       const reread = await this.api().request<PullRequest>(
         "GET",
@@ -543,7 +552,10 @@ export class GitHubKernel {
           "GET",
           `/repos/${owner}/${repo}/commits/${payload.exactHead}/check-runs?check_name=${GATE_CHECK_NAME}`,
         );
-        const matches = (checks.check_runs ?? []).filter((check) =>
+        const observed = (checks.check_runs ?? []).filter((check) =>
+          check.name === GATE_CHECK_NAME && check.head_sha === payload.exactHead,
+        );
+        const matches = observed.filter((check) =>
           check.name === GATE_CHECK_NAME &&
           check.head_sha === payload.exactHead &&
           check.status === "completed" &&
@@ -551,22 +563,28 @@ export class GitHubKernel {
           check.app?.slug === creator &&
           /payloadDigest=(sha256:[0-9a-f]{64})/.exec(check.output?.summary ?? "")?.[1] === payloadDigest,
         );
-        if (matches.length !== 1) {
+        if (matches.length === 1) {
+          const finalized = this.finalizeReservedReceipt({
+            idempotencyKey,
+            requestDigest: payloadDigest,
+            preexisting: false,
+            afterStateDigest: payloadDigest,
+            response: { checkRunId: matches[0]!.id, payload, payloadDigest },
+            reread: true,
+          });
+          if (!finalized.allowed) return finalized as Decision<{ checkRunId: number }>;
+          return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, { checkRunId: matches[0]!.id }, { replayed: true });
+        }
+        if (observed.length > 0) {
           return deny(ReasonCode.RESOURCE_COLLISION, "pending gate publication cannot be reconciled unambiguously", {
             idempotencyKey,
             matchingChecks: matches.map((check) => check.id),
           });
         }
-        const finalized = this.finalizeReservedReceipt({
-          idempotencyKey,
-          requestDigest: payloadDigest,
-          preexisting: false,
-          afterStateDigest: payloadDigest,
-          response: { checkRunId: matches[0]!.id, payload, payloadDigest },
-          reread: true,
-        });
-        if (!finalized.allowed) return finalized as Decision<{ checkRunId: number }>;
-        return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, { checkRunId: matches[0]!.id }, { replayed: true });
+        // No check with this name and head exists, so the reserved POST demonstrably did
+        // not happen and the next attempt can safely claim a fresh reservation.
+        this.releaseReservation(idempotencyKey, payloadDigest);
+        return this.gatePublish(payload, repositoryIdentity);
       }
       const replay = await this.verifyGate(repositoryIdentity, payload.exactHead, payload.runId);
       if (!replay.allowed || digestOf(replay.value) !== payloadDigest) {
@@ -615,12 +633,27 @@ export class GitHubKernel {
       if (created.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, payloadDigest);
       return created as Decision<{ checkRunId: number }>;
     }
+    const createdCheck = created.value as unknown;
+    if (
+      !createdCheck ||
+      typeof createdCheck !== "object" ||
+      !("id" in createdCheck) ||
+      typeof createdCheck.id !== "number"
+    ) {
+      // A blank acknowledgement can follow an applied POST, so the receipt must remain
+      // PENDING until a future reconciliation can prove whether the check exists.
+      return deny(ReasonCode.EVIDENCE_MISSING, "GitHub returned no usable gate publication acknowledgement", {
+        repositoryIdentity,
+        exactHead: payload.exactHead,
+      });
+    }
+    const checkRunId = createdCheck.id;
 
     // GitHub's POST acknowledgement is not proof that the expected check exists. Re-read
     // the commit's checks and bind the exact id, head, creator and payload projection.
     let reread: CheckRun | undefined;
     try {
-      reread = await this.api().request<CheckRun>("GET", `/repos/${owner}/${repo}/check-runs/${created.value.id}`);
+      reread = await this.api().request<CheckRun>("GET", `/repos/${owner}/${repo}/check-runs/${checkRunId}`);
     } catch {
       // Some GitHub-compatible providers do not expose the singular endpoint. Their
       // commit-scoped listing still proves the exact id and every bound field.
@@ -628,7 +661,7 @@ export class GitHubKernel {
         "GET",
         `/repos/${owner}/${repo}/commits/${payload.exactHead}/check-runs?check_name=${GATE_CHECK_NAME}`,
       );
-      reread = (checks.check_runs ?? []).find((check) => check.id === created.value.id);
+      reread = (checks.check_runs ?? []).find((check) => check.id === checkRunId);
     }
     const creator = this.credentials.creatorIdentity();
     const observedDigest = /payloadDigest=(sha256:[0-9a-f]{64})/.exec(reread?.output?.summary ?? "")?.[1];
@@ -643,7 +676,7 @@ export class GitHubKernel {
       observedDigest !== payloadDigest
     ) {
       return deny(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID, "published gate did not survive GitHub re-read", {
-        checkRunId: created.value.id,
+        checkRunId,
         observed: reread
           ? { head: reread.head_sha, status: reread.status, conclusion: reread.conclusion, creator: reread.app?.slug }
           : null,
@@ -654,7 +687,7 @@ export class GitHubKernel {
       requestDigest: payloadDigest,
       preexisting: false,
       afterStateDigest: payloadDigest,
-      response: { checkRunId: created.value.id, payload, payloadDigest },
+      response: { checkRunId, payload, payloadDigest },
       reread: true,
     });
     if (!finalized.allowed) return finalized as Decision<{ checkRunId: number }>;
@@ -666,11 +699,11 @@ export class GitHubKernel {
         repositoryIdentity,
         exactHead: payload.exactHead,
         payloadDigest,
-        checkRunId: created.value.id,
+        checkRunId,
         creatorIdentity: this.credentials.creatorIdentity(),
       },
     });
-    return allow(ReasonCode.OK, { checkRunId: created.value.id });
+    return allow(ReasonCode.OK, { checkRunId });
   }
 
   /**
@@ -1211,41 +1244,47 @@ export class GitHubKernel {
           "GET",
           `/repos/${slug.value.owner}/${slug.value.repo}/pulls/${input.pullNumber}`,
         );
-        if (!pull.merged || !pull.merge_commit_sha || pull.head.sha !== input.exactHeadSha) {
+        if (!pull.merged) {
+          // The pull is still open, so the reserved PUT did not merge it and may be
+          // retried after reclaiming the stale crash-era reservation.
+          this.releaseReservation(idempotencyKey, requestDigest);
+          return this.mergeExecute(input);
+        } else if (!pull.merge_commit_sha || pull.head.sha !== input.exactHeadSha) {
           return deny(ReasonCode.RESOURCE_COLLISION, "merge operation is pending reconciliation", { idempotencyKey });
-        }
-        const method = input.mergeStrategy === "squash" ? "squash" : "merge";
-        const onBase = await this.assertMergedOntoBase(
-          slug.value.owner,
-          slug.value.repo,
-          pull.merge_commit_sha,
-          input.expectedBaseSha,
-          method,
-        );
-        if (!onBase.allowed) return onBase as Decision<{ mergeCommitSha: string; replayed: boolean }>;
-        const finalized = this.finalizeReservedReceipt({
-          idempotencyKey,
-          requestDigest,
-          preexisting: false,
-          afterStateDigest: sha256(pull.merge_commit_sha),
-          response: {
-            mergeCommitSha: pull.merge_commit_sha,
-            sourceBranch: pull.head.ref,
-            targetBranch: pull.base.ref,
-            expectedBaseSha: input.expectedBaseSha,
-            baseVerification: {
-              preflight: "exact-base-reread",
-              residualRace: "base-may-move-between-preflight-and-merge",
-              proof: "merge-commit-first-parent",
+        } else {
+          const method = input.mergeStrategy === "squash" ? "squash" : "merge";
+          const onBase = await this.assertMergedOntoBase(
+            slug.value.owner,
+            slug.value.repo,
+            pull.merge_commit_sha,
+            input.expectedBaseSha,
+            method,
+          );
+          if (!onBase.allowed) return onBase as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+          const finalized = this.finalizeReservedReceipt({
+            idempotencyKey,
+            requestDigest,
+            preexisting: false,
+            afterStateDigest: sha256(pull.merge_commit_sha),
+            response: {
+              mergeCommitSha: pull.merge_commit_sha,
+              sourceBranch: pull.head.ref,
+              targetBranch: pull.base.ref,
+              expectedBaseSha: input.expectedBaseSha,
+              baseVerification: {
+                preflight: "exact-base-reread",
+                residualRace: "base-may-move-between-preflight-and-merge",
+                proof: "merge-commit-first-parent",
+              },
             },
-          },
-          reread: true,
-        });
-        if (!finalized.allowed) return finalized as Decision<{ mergeCommitSha: string; replayed: boolean }>;
-        return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, {
-          mergeCommitSha: pull.merge_commit_sha,
-          replayed: true,
-        });
+            reread: true,
+          });
+          if (!finalized.allowed) return finalized as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+          return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, {
+            mergeCommitSha: pull.merge_commit_sha,
+            replayed: true,
+          });
+        }
       }
       const slug = this.slug(input.repositoryIdentity);
       if (!slug.allowed) return slug as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -1334,7 +1373,20 @@ export class GitHubKernel {
       if (merged.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
       return merged as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
-    if (!merged.value.merged) {
+    const mergeResponse = merged.value as unknown;
+    if (
+      !mergeResponse ||
+      typeof mergeResponse !== "object" ||
+      !("merged" in mergeResponse) ||
+      typeof mergeResponse.merged !== "boolean"
+    ) {
+      // A blank acknowledgement can follow an applied PUT, so retain the receipt until a
+      // reconciliation can establish whether the merge occurred.
+      return deny(ReasonCode.EVIDENCE_MISSING, "GitHub returned no usable merge acknowledgement", {
+        pullNumber: input.pullNumber,
+      });
+    }
+    if (!mergeResponse.merged) {
       // GitHub explicitly reports no mutation, so this is not an ambiguous outcome and
       // the pre-write reservation may be released for a corrected retry.
       this.releaseReservation(idempotencyKey, requestDigest);
@@ -1352,11 +1404,12 @@ export class GitHubKernel {
         pullNumber: input.pullNumber,
       });
     }
-    if (!merged.value.sha) {
+    if (!("sha" in mergeResponse) || typeof mergeResponse.sha !== "string" || !mergeResponse.sha) {
       return deny(ReasonCode.EVIDENCE_MISSING, "GitHub reported a merge with no commit sha", {
         pullNumber: input.pullNumber,
       });
     }
+    const mergeCommitSha = mergeResponse.sha;
 
     this.audit.record({
       kind: "MERGE_EXECUTED",
@@ -1365,7 +1418,7 @@ export class GitHubKernel {
         repositoryIdentity: input.repositoryIdentity,
         pullNumber: input.pullNumber,
         exactHead: input.exactHeadSha,
-        mergeCommitSha: merged.value.sha,
+        mergeCommitSha,
         method,
       },
     });
@@ -1378,7 +1431,7 @@ export class GitHubKernel {
     // The merge happened; now prove it landed on the base the evidence was bound to. A
     // mismatch is reported, never smoothed over: the merge commit exists and the run's
     // evidence no longer describes it (§24.6).
-    const onBase = await this.assertMergedOntoBase(owner, repo, merged.value.sha, input.expectedBaseSha, method);
+    const onBase = await this.assertMergedOntoBase(owner, repo, mergeCommitSha, input.expectedBaseSha, method);
     if (!onBase.allowed) {
       if (typeof mergeRepositoryId === "string") this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId as string, "FAILED");
       this.audit.record({
@@ -1387,12 +1440,12 @@ export class GitHubKernel {
         reasonCode: ReasonCode.MERGE_BASE_STALE,
         evidence: {
           repositoryIdentity: input.repositoryIdentity,
-          mergeCommitSha: merged.value.sha,
+          mergeCommitSha,
           expectedBase: input.expectedBaseSha,
           detail: (onBase as Extract<Decision<void>, { allowed: false }>).message,
         },
       });
-      this.rollbackPrepare(input.runId, input.repositoryIdentity, merged.value.sha, "halt");
+      this.rollbackPrepare(input.runId, input.repositoryIdentity, mergeCommitSha, "halt");
       return onBase as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
 
@@ -1400,9 +1453,9 @@ export class GitHubKernel {
       idempotencyKey,
       requestDigest,
       preexisting: false,
-      afterStateDigest: sha256(merged.value.sha),
+      afterStateDigest: sha256(mergeCommitSha),
       response: {
-        mergeCommitSha: merged.value.sha,
+        mergeCommitSha,
         sourceBranch: preflight.head.ref,
         targetBranch: preflight.base.ref,
         expectedBaseSha: input.expectedBaseSha,
@@ -1419,7 +1472,7 @@ export class GitHubKernel {
     // API success is only a pending merge: dependents remain blocked until the exact
     // merge commit has passed the pinned post-merge checks.
     if (typeof mergeRepositoryId === "string") this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId as string, "PENDING");
-    return allow(ReasonCode.OK, { mergeCommitSha: merged.value.sha, replayed: false });
+    return allow(ReasonCode.OK, { mergeCommitSha, replayed: false });
   }
 
   /**

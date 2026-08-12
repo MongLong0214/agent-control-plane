@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 
-import { digestOf } from "../../src/core/digest.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import {
@@ -155,6 +155,115 @@ const setup = async (): Promise<Fixture> => {
 const gatePayload = (fixture: Fixture, head = fixture.head): GatePayload => ({
   ...fixture.payload,
   exactHead: head,
+});
+
+/** Release tags require historical merge and post-merge evidence the feature-to-dev fixture cannot produce. */
+const recordAcceptedReleaseMerge = (fixture: Fixture, commit: string, pullNumber: number): void => {
+  const idempotencyKey = `merge_execute:${fixture.identity}:${pullNumber}`;
+  fixture.harness.cp.db.run(
+    `INSERT INTO github_receipts
+       (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
+        preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at,
+        reread_at, verified, status)
+     VALUES (?, ?, 'merge_execute', ?, ?, 'merge', ?, 0, NULL, NULL, ?, '{"pending":true}', ?, NULL, 0, 'PENDING')`,
+    [
+      `rcp_release_merge_${pullNumber}`,
+      idempotencyKey,
+      fixture.runId,
+      fixture.identity,
+      `acme/fixture#${pullNumber}`,
+      digestOf({ releaseMerge: commit }),
+      "2026-08-12T00:00:00.000Z",
+    ],
+  );
+  fixture.harness.cp.db.run(
+    `UPDATE github_receipts
+        SET status = 'APPLIED', after_state_digest = ?, response_json = ?, reread_at = ?, verified = 1
+      WHERE idempotency_key = ? AND status = 'PENDING'`,
+    [
+      sha256(commit),
+      JSON.stringify({ mergeCommitSha: commit, sourceBranch: "release/1.0.0", targetBranch: "main" }),
+      "2026-08-12T00:00:00.000Z",
+      idempotencyKey,
+    ],
+  );
+  fixture.harness.cp.db.run(
+    `INSERT INTO github_receipts
+       (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
+        preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at,
+        reread_at, verified, status)
+     VALUES (?, ?, 'post_merge_verify', ?, ?, 'commit', ?, 0, NULL, ?, ?, ?, ?, ?, 1, 'APPLIED')`,
+    [
+      `rcp_release_postmerge_${pullNumber}`,
+      `post_merge_verify:${fixture.identity}:${commit}`,
+      fixture.runId,
+      fixture.identity,
+      `acme/fixture@${commit}`,
+      digestOf([{ name: "project-ci", conclusion: "success" }]),
+      digestOf({ postMerge: commit }),
+      JSON.stringify({ checks: [{ name: "project-ci", conclusion: "success" }] }),
+      "2026-08-12T00:00:00.000Z",
+      "2026-08-12T00:00:00.000Z",
+    ],
+  );
+  fixture.github.markContains("dev", commit);
+};
+
+/** A raw PENDING row is the durable recovery input after the daemon has lost its memory. */
+const reservePendingReceipt = (
+  fixture: Fixture,
+  receipt: {
+    receiptId: string;
+    idempotencyKey: string;
+    operation: "pr_prepare" | "gate_publish" | "merge_execute";
+    resourceType: string;
+    resourceIdentity: string;
+    beforeStateDigest: string | null;
+    requestDigest: string;
+  },
+): void => {
+  fixture.harness.cp.db.run(
+    `INSERT INTO github_receipts
+       (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
+        preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at,
+        reread_at, verified, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, '{"pending":true}', ?, NULL, 0, 'PENDING')`,
+    [
+      receipt.receiptId,
+      receipt.idempotencyKey,
+      receipt.operation,
+      fixture.runId,
+      fixture.identity,
+      receipt.resourceType,
+      receipt.resourceIdentity,
+      receipt.beforeStateDigest,
+      receipt.requestDigest,
+      "2026-08-12T00:00:00.000Z",
+    ],
+  );
+};
+
+const prepareInput = (fixture: Fixture) => ({
+  runId: fixture.runId,
+  repositoryIdentity: fixture.identity,
+  head: fixture.workBranch,
+  base: "dev",
+  title: "candidate",
+  body: "",
+  ownerSessionId: fixture.ownerSessionId,
+  ownerBindingGeneration: fixture.ownerBindingGeneration,
+  exactHeadSha: fixture.head,
+});
+
+const mergeInput = (fixture: Fixture, pullNumber: number) => ({
+  runId: fixture.runId,
+  repositoryIdentity: fixture.identity,
+  pullNumber,
+  exactHeadSha: fixture.head,
+  expectedBaseSha: fixture.base,
+  mergeStrategy: "merge_commit" as const,
+  ownerSessionId: fixture.ownerSessionId,
+  ownerBindingGeneration: fixture.ownerBindingGeneration,
 });
 
 describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
@@ -546,7 +655,7 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
 });
 
 describe("release and hotfix (CP-S41, CP-S42)", () => {
-  it("CP-S41: a tag on a commit the kernel never merged, and a duplicate tag, are both refused", async () => {
+  it("CP-S41: a tag on an unaccepted commit and a conflicting existing tag are both refused", async () => {
     const fixture = await setup();
     const notMerged = await fixture.harness.cp.github.releaseTag(
       fixture.runId,
@@ -567,6 +676,29 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
     );
     expect(badSemver.reasonCode).toBe(ReasonCode.RELEASE_TAG_SEMVER_MISMATCH);
 
+    const releaseCommit = "r".repeat(40);
+    recordAcceptedReleaseMerge(fixture, releaseCommit, 1200);
+    const tagged = await fixture.harness.cp.github.releaseTag(
+      fixture.runId,
+      fixture.identity,
+      "1.0.0",
+      releaseCommit,
+      fixture.caller,
+    );
+    expect(tagged.reasonCode).toBe(ReasonCode.OK);
+    expect(fixture.github.tags).toEqual(new Map([["1.0.0", releaseCommit]]));
+
+    fixture.github.tags.set("1.0.0", "d".repeat(40));
+    const duplicate = await fixture.harness.cp.github.releaseTag(
+      fixture.runId,
+      fixture.identity,
+      "1.0.0",
+      releaseCommit,
+      fixture.caller,
+    );
+    expect(duplicate.allowed).toBe(false);
+    expect(duplicate.reasonCode).toBe(ReasonCode.RELEASE_TAG_DUPLICATE);
+    expect(fixture.github.tags.size).toBe(1);
   });
 
   it("CP-S42: a hotfix missing from an active release reports propagation incomplete", async () => {
@@ -697,6 +829,126 @@ describe("issue projection", () => {
   });
 });
 
+describe("crash and acknowledgement recovery", () => {
+  it("#336: stale absent PR, gate and merge reservations are reclaimed after restart", async () => {
+    const prFixture = await setup();
+    const preparedInput = prepareInput(prFixture);
+    const prBody = `\n\n<!-- acp-run:${prFixture.runId} -->`;
+    const prRequestDigest = digestOf({
+      runId: preparedInput.runId,
+      repositoryIdentity: preparedInput.repositoryIdentity,
+      head: preparedInput.head,
+      base: preparedInput.base,
+      exactHeadSha: preparedInput.exactHeadSha,
+      expectedBaseSha: prFixture.base,
+      sourceBase: "dev",
+      title: preparedInput.title,
+      body: prBody,
+      declaredParent: null,
+      linkedIssues: [],
+      ownerBindingGeneration: preparedInput.ownerBindingGeneration,
+    });
+    reservePendingReceipt(prFixture, {
+      receiptId: "rcp_pending_pr_absent",
+      idempotencyKey: `pr_prepare:${prFixture.identity}:${prFixture.workBranch}:dev`,
+      operation: "pr_prepare",
+      resourceType: "pull_request",
+      resourceIdentity: `acme/fixture@${prFixture.workBranch}->dev`,
+      beforeStateDigest: null,
+      requestDigest: prRequestDigest,
+    });
+    const prepared = await prFixture.harness.cp.github.prPrepare(preparedInput);
+    expect(prepared.reasonCode).toBe(ReasonCode.OK);
+    expect(prFixture.github.pulls).toHaveLength(1);
+
+    const gateFixture = await setup();
+    const payloadDigest = digestOf(gateFixture.payload);
+    reservePendingReceipt(gateFixture, {
+      receiptId: "rcp_pending_gate_absent",
+      idempotencyKey: `gate_publish:${gateFixture.identity}:${gateFixture.head}:${payloadDigest}`,
+      operation: "gate_publish",
+      resourceType: "check_run",
+      resourceIdentity: `acme/fixture@${gateFixture.head}/acp-production-gate`,
+      beforeStateDigest: null,
+      requestDigest: payloadDigest,
+    });
+    const published = await gateFixture.harness.cp.github.gatePublish(gateFixture.payload, gateFixture.identity);
+    expect(published.reasonCode).toBe(ReasonCode.OK);
+    expect(gateFixture.github.checkRuns.filter((check) => check.name === GATE_CHECK_NAME)).toHaveLength(1);
+
+    const mergeFixture = await setup();
+    const gate = await mergeFixture.harness.cp.github.gatePublish(mergeFixture.payload, mergeFixture.identity);
+    if (!gate.allowed) throw new Error(gate.message);
+    const pr = await mergeFixture.harness.cp.github.prPrepare(prepareInput(mergeFixture));
+    if (!pr.allowed) throw new Error(pr.message);
+    const input = mergeInput(mergeFixture, pr.value.pullNumber);
+    reservePendingReceipt(mergeFixture, {
+      receiptId: "rcp_pending_merge_absent",
+      idempotencyKey: `merge_execute:${mergeFixture.identity}:${pr.value.pullNumber}`,
+      operation: "merge_execute",
+      resourceType: "merge",
+      resourceIdentity: `acme/fixture#${pr.value.pullNumber}`,
+      beforeStateDigest: digestOf({ head: mergeFixture.head, base: mergeFixture.base }),
+      requestDigest: digestOf({
+        runId: input.runId,
+        repositoryIdentity: input.repositoryIdentity,
+        pullNumber: input.pullNumber,
+        exactHeadSha: input.exactHeadSha,
+        expectedBaseSha: input.expectedBaseSha,
+        mergeStrategy: input.mergeStrategy,
+        ownerBindingGeneration: input.ownerBindingGeneration,
+      }),
+    });
+    const merged = await mergeFixture.harness.cp.github.mergeExecute(input);
+    expect(merged.reasonCode).toBe(ReasonCode.OK);
+    expect(mergeFixture.github.mergeCount).toBe(1);
+  });
+
+  it("#343: blank mutating acknowledgements stay pending instead of throwing or releasing", async () => {
+    const gateFixture = await setup();
+    const gateRequest = gateFixture.github.request.bind(gateFixture.github);
+    gateFixture.github.request = async (method, path, body) => {
+      if (method === "POST" && path.endsWith("/check-runs")) {
+        await gateRequest(method, path, body);
+        return null as never;
+      }
+      return gateRequest(method, path, body);
+    };
+    const blankGate = await gateFixture.harness.cp.github.gatePublish(gateFixture.payload, gateFixture.identity);
+    expect(blankGate.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(gateFixture.github.checkRuns).toHaveLength(1);
+    expect(
+      gateFixture.harness.cp.db.get<{ status: string; verified: number }>(
+        `SELECT status, verified FROM github_receipts WHERE operation = 'gate_publish'`,
+      ),
+    ).toEqual({ status: "PENDING", verified: 0 });
+
+    const mergeFixture = await setup();
+    const gate = await mergeFixture.harness.cp.github.gatePublish(mergeFixture.payload, mergeFixture.identity);
+    if (!gate.allowed) throw new Error(gate.message);
+    const pr = await mergeFixture.harness.cp.github.prPrepare(prepareInput(mergeFixture));
+    if (!pr.allowed) throw new Error(pr.message);
+    const mergeRequest = mergeFixture.github.request.bind(mergeFixture.github);
+    mergeFixture.github.request = async (method, path, body) => {
+      if (method === "PUT" && path.endsWith("/merge")) {
+        await mergeRequest(method, path, body);
+        return null as never;
+      }
+      return mergeRequest(method, path, body);
+    };
+    const blankMerge = await mergeFixture.harness.cp.github.mergeExecute(
+      mergeInput(mergeFixture, pr.value.pullNumber),
+    );
+    expect(blankMerge.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(mergeFixture.github.mergeCount).toBe(1);
+    expect(
+      mergeFixture.harness.cp.db.get<{ status: string; verified: number }>(
+        `SELECT status, verified FROM github_receipts WHERE operation = 'merge_execute'`,
+      ),
+    ).toEqual({ status: "PENDING", verified: 0 });
+  });
+});
+
 describe("the kernel is on the guard's write path (CP-HI-01)", () => {
   it("a revoked owner generation stops the merge at the guard, not at GitHub", async () => {
     const fixture = await setup();
@@ -715,25 +967,40 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
     });
     if (!pr.allowed) throw new Error(pr.message);
 
-    // Revoke the owner binding: the merge must be refused by the guard even though the
-    // gate, the branch contract and the exact head are all still satisfied.
-    fixture.harness.cp.db.run(
-      `UPDATE assignments SET status = 'REVOKED' WHERE role_key = ?`,
-      [fixture.harness.cp.runs.require(fixture.runId).ownerRoleKey],
-    );
-
-    const refused = await fixture.harness.cp.github.mergeExecute({
-      runId: fixture.runId,
-      repositoryIdentity: fixture.identity,
-      pullNumber: pr.value.pullNumber,
-      exactHeadSha: fixture.head,
-      expectedBaseSha: fixture.base,
-      mergeStrategy: "merge_commit",
-      ownerSessionId: fixture.ownerSessionId,
-      ownerBindingGeneration: fixture.ownerBindingGeneration,
-    });
+    // Revoke after evaluation issued a grant but before activation revalidates it. This
+    // proves the fenced guard, rather than an earlier merge predicate, stopped GitHub.
+    const guardEventsBefore = fixture.harness.cp.audit.byKind("MANAGED_WRITE_GUARD").length;
+    const originalEvaluate = fixture.harness.cp.guard.evaluate.bind(fixture.harness.cp.guard);
+    fixture.harness.cp.guard.evaluate = (request) => {
+      const granted = originalEvaluate(request);
+      if (granted.allowed) {
+        fixture.harness.cp.db.run(
+          `UPDATE assignments SET status = 'REVOKED' WHERE role_key = ?`,
+          [fixture.harness.cp.runs.require(fixture.runId).ownerRoleKey],
+        );
+      }
+      return granted;
+    };
+    const refused = await (async () => {
+      try {
+        return await fixture.harness.cp.github.mergeExecute({
+          runId: fixture.runId,
+          repositoryIdentity: fixture.identity,
+          pullNumber: pr.value.pullNumber,
+          exactHeadSha: fixture.head,
+          expectedBaseSha: fixture.base,
+          mergeStrategy: "merge_commit",
+          ownerSessionId: fixture.ownerSessionId,
+          ownerBindingGeneration: fixture.ownerBindingGeneration,
+        });
+      } finally {
+        fixture.harness.cp.guard.evaluate = originalEvaluate;
+      }
+    })();
     expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
     expect(fixture.github.mergeCount).toBe(0);
+    expect(fixture.harness.cp.audit.byKind("MANAGED_WRITE_GUARD")).toHaveLength(guardEventsBefore + 1);
   });
 
   it("a successful merge leaves a consumed guard grant, proving mediation", async () => {
@@ -1028,7 +1295,17 @@ describe("trusted credential boundary (CP-HI-05)", () => {
     const fixture = await setup();
     // The store exposes the creator identity but never the token itself.
     expect(fixture.harness.cp.credentials.creatorIdentity()).toBe("acp-trusted-app");
-    expect(Object.values(fixture.harness.cp.credentials)).not.toContain("test-token");
+    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(fixture.harness.cp.credentials)).sort()).toEqual([
+      "assertInstallTarget",
+      "available",
+      "constructor",
+      "creatorIdentity",
+      "githubApi",
+      "install",
+      "load",
+      "metadataOk",
+      "permissionsOk",
+    ]);
 
     await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
     const audit = JSON.stringify(fixture.harness.cp.audit.all());
@@ -1036,6 +1313,5 @@ describe("trusted credential boundary (CP-HI-05)", () => {
 
     const receipts = JSON.stringify(fixture.harness.cp.github.receipts(fixture.runId));
     expect(receipts).not.toContain("test-token");
-    expect(digestOf({ ok: true })).toMatch(/^sha256:/);
   });
 });

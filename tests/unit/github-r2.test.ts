@@ -157,10 +157,20 @@ const acceptedReleaseMerge = (fixture: Fixture, commit: string): void => {
 };
 
 describe("round-two GitHub hardening", () => {
-  it("#77: exposes no arbitrary executable runner that could print the authority environment", () => {
+  it("#77: exposes only the fixed credential-store API", () => {
     const store = new TrustedCredentialStore(tempDir("credential-boundary-"));
     store.install({ token: "never-exposed", creatorIdentity: "acp" });
-    expect(typeof (store as unknown as Record<string, unknown>)["run"]).toBe("undefined");
+    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(store)).sort()).toEqual([
+      "assertInstallTarget",
+      "available",
+      "constructor",
+      "creatorIdentity",
+      "githubApi",
+      "install",
+      "load",
+      "metadataOk",
+      "permissionsOk",
+    ]);
   });
 
   it("#191: rejects cached credentials after their token file becomes group-readable", async () => {
