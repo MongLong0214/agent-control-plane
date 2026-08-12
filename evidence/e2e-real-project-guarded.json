@@ -1,0 +1,274 @@
+{
+  "registration": {
+    "projectId": "agent-control-plane",
+    "activeManifestDigest": "sha256:905a5dd1724e0b086562cc693a5e5b3065532a70875a055d132c80403d307ae9",
+    "identity": "github:MongLong0214/agent-control-plane",
+    "activityBeforeCto": "INACTIVE"
+  },
+  "directWriteRefused": "WRITE_REQUIRES_MANAGED_RUN",
+  "dispatch": {
+    "runId": "run_818cfdb2af0d47858a5df121",
+    "ownerSessionId": "ses_cto_7bcc89915dec40a1bd1f",
+    "ownerBindingGeneration": 1,
+    "pinnedManifestDigest": "sha256:905a5dd1724e0b086562cc693a5e5b3065532a70875a055d132c80403d307ae9",
+    "activityAfterCto": "ACTIVE"
+  },
+  "ctoPlan": {
+    "provider": "claude",
+    "model": "sonnet",
+    "durationMs": 61434,
+    "parsed": true
+  },
+  "humanGateRefusedNonOwner": "INGRESS_ACTOR_NOT_ALLOWLISTED",
+  "ownerDecision": {
+    "owner": {
+      "channel": "cli",
+      "actor": "isaac"
+    },
+    "items": [
+      "owner approval before a guarded change is published"
+    ]
+  },
+  "verification": {
+    "status": "PASS",
+    "expectedInputs": 1,
+    "observedInputs": 1,
+    "commands": [
+      {
+        "commandId": "reason-codes",
+        "source": "local",
+        "status": "PASS",
+        "exactHead": "e2c10c78bda9b9ccc12e24e5b3d5e1a9fc50b27e"
+      }
+    ],
+    "digest": "sha256:53908415566c096ad0010d09f3a2be558f69f22ff3cb9881e4c9ee55f60d9517"
+  },
+  "blindReview": {
+    "verdict": "PASS",
+    "provider": "claude",
+    "model": "sonnet",
+    "reviewerSessionId": "ses_review_e7557cd31a234415b72c",
+    "reviewerGeneration": 1,
+    "coveredFiles": [
+      "github:MongLong0214/agent-control-plane:src/core/reason-codes.ts"
+    ],
+    "omittedItems": [],
+    "findings": 0,
+    "withheld": [
+      "worker reasoning",
+      "CTO reasoning",
+      "chat history",
+      "producer self-assessment",
+      "previous verdicts",
+      "daemon state",
+      "trusted credentials",
+      "candidate checkout paths"
+    ]
+  },
+  "candidateSnapshotDigest": "sha256:7c77b15f2deca2f7fab661058c44d85142738c470268dda1b31beb00b347b513",
+  "ceoConfirm": {
+    "state": "COMPLETED",
+    "sessionId": "ses_5763fe8d0954448bb5d869b8"
+  },
+  "doctor": {
+    "scope": "project",
+    "target": "agent-control-plane",
+    "status": "DEGRADED",
+    "findings": [
+      {
+        "code": "CTO_BUZZ_NOT_CONNECTED",
+        "severity": "WARN",
+        "scope": "project:agent-control-plane",
+        "blocking": false,
+        "confidence": "MEDIUM",
+        "observedEvidence": {
+          "sessionId": "ses_cto_7bcc89915dec40a1bd1f"
+        },
+        "recommendedAction": "reconnect the CTO session to Buzz"
+      }
+    ],
+    "ranAt": "2026-08-12T21:34:09.172Z"
+  },
+  "telemetry": {
+    "run": [
+      {
+        "metricId": 10,
+        "at": "2026-08-12T21:34:09.171Z",
+        "scope": "run",
+        "name": "outcome",
+        "runId": "run_818cfdb2af0d47858a5df121",
+        "taskId": null,
+        "value": 129248,
+        "text": "COMPLETED",
+        "dims": {
+          "mode": "GUARDED",
+          "priority": "NORMAL",
+          "revisionCount": 0,
+          "kind": "STANDARD_WORK"
+        }
+      }
+    ],
+    "task": [
+      {
+        "metricId": 4,
+        "at": "2026-08-12T21:33:01.541Z",
+        "scope": "task",
+        "name": "execution",
+        "runId": "run_818cfdb2af0d47858a5df121",
+        "taskId": "task_4d423c5feaf2471e917d593b",
+        "value": 113,
+        "text": "SUCCEEDED",
+        "dims": {
+          "category": "implementation",
+          "provider": "claude",
+          "model": "sonnet",
+          "attempt": 1,
+          "failureClass": null
+        }
+      },
+      {
+        "metricId": 5,
+        "at": "2026-08-12T21:33:01.542Z",
+        "scope": "task",
+        "name": "execution",
+        "runId": "run_818cfdb2af0d47858a5df121",
+        "taskId": "task_45c5b0d92bd8446faa76aa51",
+        "value": 1,
+        "text": "SUCCEEDED",
+        "dims": {
+          "category": "test",
+          "provider": "claude",
+          "model": "sonnet",
+          "attempt": 1,
+          "failureClass": null
+        }
+      }
+    ],
+    "quality": [
+      {
+        "metricId": 6,
+        "at": "2026-08-12T21:33:02.033Z",
+        "scope": "quality",
+        "name": "verification",
+        "runId": "run_818cfdb2af0d47858a5df121",
+        "taskId": null,
+        "value": null,
+        "text": "PASS",
+        "dims": {
+          "expected": 1,
+          "observed": 1,
+          "gaps": 0
+        }
+      },
+      {
+        "metricId": 7,
+        "at": "2026-08-12T21:34:09.053Z",
+        "scope": "quality",
+        "name": "blind_review",
+        "runId": "run_818cfdb2af0d47858a5df121",
+        "taskId": null,
+        "value": null,
+        "text": "PASS",
+        "dims": {
+          "provider": "claude",
+          "model": "sonnet",
+          "chunked": false,
+          "findingCategories": []
+        }
+      },
+      {
+        "metricId": 11,
+        "at": "2026-08-12T21:34:09.172Z",
+        "scope": "quality",
+        "name": "ceo_outcome",
+        "runId": "run_818cfdb2af0d47858a5df121",
+        "taskId": null,
+        "value": null,
+        "text": "CONFIRM",
+        "dims": {}
+      }
+    ]
+  },
+  "auditTrail": [
+    {
+      "kind": "RUN_CREATED",
+      "reasonCode": null
+    },
+    {
+      "kind": "PRIMARY_CTO_ACTIVATED",
+      "reasonCode": null
+    },
+    {
+      "kind": "DISPATCHED",
+      "reasonCode": null
+    },
+    {
+      "kind": "TASK_GRAPH_SUBMITTED",
+      "reasonCode": null
+    },
+    {
+      "kind": "CLAIM_ACQUIRED",
+      "reasonCode": null
+    },
+    {
+      "kind": "TASK_EXECUTION_STARTED",
+      "reasonCode": null
+    },
+    {
+      "kind": "TASK_EXECUTION_FINISHED",
+      "reasonCode": null
+    },
+    {
+      "kind": "TASK_EXECUTION_STARTED",
+      "reasonCode": null
+    },
+    {
+      "kind": "TASK_EXECUTION_FINISHED",
+      "reasonCode": null
+    },
+    {
+      "kind": "OWNER_DECISION",
+      "reasonCode": null
+    },
+    {
+      "kind": "CANDIDATE_PROMOTED",
+      "reasonCode": null
+    },
+    {
+      "kind": "CANDIDATE_FROZEN",
+      "reasonCode": null
+    },
+    {
+      "kind": "VERIFICATION_COMPLETED",
+      "reasonCode": "OK"
+    },
+    {
+      "kind": "BINDING_CREATED",
+      "reasonCode": null
+    },
+    {
+      "kind": "BLIND_REVIEW_COMPLETED",
+      "reasonCode": "REVIEW_PASS"
+    },
+    {
+      "kind": "RUN_TRANSITION",
+      "reasonCode": null
+    },
+    {
+      "kind": "CEO_NOTIFICATION",
+      "reasonCode": null
+    },
+    {
+      "kind": "CLAIM_RELEASED",
+      "reasonCode": null
+    },
+    {
+      "kind": "RUN_TRANSITION",
+      "reasonCode": null
+    },
+    {
+      "kind": "CEO_DECISION",
+      "reasonCode": null
+    }
+  ]
+}

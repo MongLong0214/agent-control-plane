@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import { ControlPlane } from "../../src/app/control-plane.ts";
+import { ControlPlane, readOwnerIdentities } from "../../src/app/control-plane.ts";
 import { systemClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
@@ -31,6 +31,18 @@ const ENABLED = process.env["ACP_E2E"] === "1";
 const REAL_PROJECT = resolve(process.env["ACP_E2E_PROJECT"] ?? process.cwd());
 const REVIEWER_MODEL = process.env["ACP_E2E_MODEL"] ?? "sonnet";
 
+/**
+ * §42 #3 wants one real run per execution mode. The flow is the same one: §12.1 keeps
+ * contract, snapshot, verification and blind review mandatory in SIMPLE and makes only the
+ * plan document optional, so the mode is a parameter rather than a second copy of the run.
+ * GUARDED additionally carries a human gate, and a real owner decision has to satisfy it.
+ */
+const MODE = (process.env["ACP_E2E_MODE"] ?? "STANDARD") as "SIMPLE" | "STANDARD" | "GUARDED";
+const EVIDENCE_FILE =
+  MODE === "STANDARD" ? "e2e-real-project.json" : `e2e-real-project-${MODE.toLowerCase()}.json`;
+/** The identity this deployment allowlists in `~/.agent-control-plane/owner-identities`. */
+const OWNER = { channel: "cli", actor: process.env["USER"] ?? "" } as const;
+
 const CONTRACT: TaskContract = {
   goal: "Add a documented helper that reports the reason-code catalogue size",
   why: "Operators need a machine-readable count of the stable reason codes when auditing denials",
@@ -45,7 +57,9 @@ const CONTRACT: TaskContract = {
     "nothing outside src/core/reason-codes.ts is modified",
   ],
   priority: "NORMAL",
-  humanGate: [],
+  // A GUARDED run is exactly the one that must not complete on machine evidence alone
+  // (§12.3, §21), so the gate is real and an allowlisted owner has to clear it.
+  humanGate: MODE === "GUARDED" ? ["owner approval before a guarded change is published"] : [],
   references: ["PRD §40 Explainability"],
 };
 
@@ -96,7 +110,7 @@ const manifestFor = (projectId: string): ProjectManifest => ({
 
 describe.runIf(ENABLED)("E2E: real project, real verification, real blind review", () => {
   it(
-    "drives User → Hermes → ACP → Primary CTO → workers → verification → fresh blind review → packet → confirm",
+    `drives ${MODE}: User → Hermes → ACP → Primary CTO → workers → verification → fresh blind review → packet → confirm`,
     async () => {
       const root = tempDir("acp-e2e-");
       const checkout = join(root, "project");
@@ -131,6 +145,12 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
             capacityFile: join(root, "capacity", "claude.json"),
           }),
         ],
+        // The host's own declaration authorises the owner, not a list this test invented:
+        // an empty or absent file means the deployment has no owner and the gate cannot be
+        // cleared, which is the safe reading of §21.
+        ownerIdentities: readOwnerIdentities(
+          join(process.env["HOME"] ?? "", ".agent-control-plane", "owner-identities"),
+        ),
         ctoPreference: { provider: "claude", model: REVIEWER_MODEL, effort: null },
         reviewer: {
           preferred: { provider: "claude", model: REVIEWER_MODEL, effort: null },
@@ -203,7 +223,7 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       // --- run creation and dispatch --------------------------------------
       const created = cp.runs.create({
         projectId,
-        executionMode: ExecutionMode.STANDARD,
+        executionMode: ExecutionMode[MODE],
         contract: CONTRACT,
         repositories: [
           { repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: "main" },
@@ -327,6 +347,34 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       cp.tasks.finishExecution(verifyExecution.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:task-report" });
 
       // --- the full candidate path: freeze, verify, review, packet ----------
+      // A GUARDED run must not complete on machine evidence alone (§12.3, §21). The gate is
+      // cleared by a real decision from the identity this host allowlists, recorded before
+      // the packet is published so the packet states a gate that is genuinely satisfied —
+      // and an identity that is not the owner is refused, which is what makes it a gate.
+      if (MODE === "GUARDED") {
+        const impostor = cp.ceo.recordOwnerDecision({
+          runId,
+          item: CONTRACT.humanGate[0]!,
+          approved: true,
+          note: "not the owner",
+          owner: { channel: "cli", actor: "someone-else" },
+        });
+        expect(impostor.allowed).toBe(false);
+        evidence["humanGateRefusedNonOwner"] = impostor.reasonCode;
+
+        for (const item of CONTRACT.humanGate) {
+          const decided = cp.ceo.recordOwnerDecision({
+            runId,
+            item,
+            approved: true,
+            note: "reviewed the contract and the declared scope before publication",
+            owner: OWNER,
+          });
+          expect(decided.allowed).toBe(true);
+        }
+        evidence["ownerDecision"] = { owner: OWNER, items: CONTRACT.humanGate };
+      }
+
       const outcome = await cp.pipeline.submitResult({
         runId,
         ownerSessionId: run.ownerSessionId!,
@@ -403,7 +451,7 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
 
       mkdirSync(join(REAL_PROJECT, "evidence"), { recursive: true });
       writeFileSync(
-        join(REAL_PROJECT, "evidence", "e2e-real-project.json"),
+        join(REAL_PROJECT, "evidence", EVIDENCE_FILE),
         JSON.stringify(evidence, null, 2),
       );
 

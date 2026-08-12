@@ -82,7 +82,12 @@ export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): C
   ownerIdentities: readOwnerIdentities(join(root, "owner-identities")),
 });
 
-const readOwnerIdentities = (file: string): OwnerIdentity[] => {
+/**
+ * Reads the deployment's declared owner identities, one `channel:actor` per line. Exported
+ * so an acceptance run can authorise against the host's real declaration rather than a
+ * list the test invented for itself (§21, §42 #3).
+ */
+export const readOwnerIdentities = (file: string): OwnerIdentity[] => {
   if (!existsSync(file)) return [];
   return readFileSync(file, "utf8")
     .split("\n")
