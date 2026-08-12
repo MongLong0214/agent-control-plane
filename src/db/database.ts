@@ -1,0 +1,134 @@
+import Database from "better-sqlite3";
+import { readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { acpError, isAcpError } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
+
+export type SqliteDatabase = Database.Database;
+
+const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
+
+/**
+ * SQLite handle plus the transaction discipline required by PRD §30.3.
+ *
+ * Every section listed there — binding failover, run owner takeover, gate publish
+ * record, merge receipt, claim acquire/release, state transition + outbox enqueue —
+ * goes through `tx()`, which uses BEGIN IMMEDIATE so two writers cannot interleave
+ * a read-then-write race.
+ */
+export class Db {
+  readonly raw: SqliteDatabase;
+  #depth = 0;
+
+  constructor(filename: string) {
+    if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
+    this.raw = new Database(filename);
+    this.raw.pragma("foreign_keys = ON");
+    this.raw.pragma("busy_timeout = 10000");
+    if (filename !== ":memory:") {
+      this.raw.pragma("journal_mode = WAL");
+      this.raw.pragma("synchronous = FULL");
+    }
+    this.raw.exec(readFileSync(schemaPath, "utf8"));
+  }
+
+  /**
+   * Runs `fn` inside a single write transaction. Nested calls join the outer
+   * transaction rather than opening a second one — SQLite has no real nesting and a
+   * silent second BEGIN would commit the outer work early.
+   */
+  tx<T>(fn: () => T): T {
+    if (this.#depth > 0) return fn();
+    this.raw.exec("BEGIN IMMEDIATE");
+    this.#depth += 1;
+    try {
+      const out = fn();
+      this.raw.exec("COMMIT");
+      return out;
+    } catch (err) {
+      try {
+        this.raw.exec("ROLLBACK");
+      } catch {
+        /* rollback of an already-aborted tx is not itself an error */
+      }
+      throw translate(err);
+    } finally {
+      this.#depth -= 1;
+    }
+  }
+
+  get inTransaction(): boolean {
+    return this.#depth > 0;
+  }
+
+  exec(sql: string): void {
+    this.raw.exec(sql);
+  }
+
+  all<T>(sql: string, params: unknown[] = []): T[] {
+    return this.raw.prepare(sql).all(...(params as never[])) as T[];
+  }
+
+  get<T>(sql: string, params: unknown[] = []): T | undefined {
+    return this.raw.prepare(sql).get(...(params as never[])) as T | undefined;
+  }
+
+  run(sql: string, params: unknown[] = []): Database.RunResult {
+    try {
+      return this.raw.prepare(sql).run(...(params as never[]));
+    } catch (err) {
+      throw translate(err);
+    }
+  }
+
+  close(): void {
+    this.raw.close();
+  }
+}
+
+/**
+ * Turn the DB-level guard rails into the same reason codes the service layer uses,
+ * so a constraint violation is never reported as an opaque SQLITE_CONSTRAINT.
+ */
+const TRIGGER_CODES: Record<string, ReasonCode> = {
+  SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,
+  BINDING_GENERATION_NOT_MONOTONIC: ReasonCode.BINDING_GENERATION_STALE,
+  ARTIFACT_IMMUTABLE: ReasonCode.CONFLICT,
+  MANIFEST_IMMUTABLE: ReasonCode.CONFLICT,
+  AUDIT_APPEND_ONLY: ReasonCode.CONFLICT,
+};
+
+/**
+ * SQLite reports a partial-index violation by column list, not by index name, so the
+ * patterns below match the columns each guard rail is built on.
+ */
+const INDEX_CODES: Array<[RegExp, ReasonCode, string]> = [
+  [/assignments\.project_id/, ReasonCode.PRIMARY_CTO_ALREADY_BOUND, "project already has an active primary CTO binding"],
+  [/assignments\.role_key/, ReasonCode.BINDING_ALREADY_ACTIVE, "role key already has an active binding"],
+  [/resource_claims\.worktree_id/, ReasonCode.CLAIM_WORKTREE_CONFLICT, "worktree already claimed by another holder"],
+  [/resource_claims\.branch/, ReasonCode.CLAIM_BRANCH_CONFLICT, "branch already claimed by another holder"],
+  [/resource_claims\.declared_path/, ReasonCode.CLAIM_PATH_CONFLICT, "declared write path already claimed by another holder"],
+  [/outbox\.idempotency_key/, ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, "outbox idempotency key already used"],
+  [/github_receipts\.idempotency_key/, ReasonCode.MERGE_IDEMPOTENT_REPLAY, "github operation already executed"],
+  [/capacity_snapshots\./, ReasonCode.CONFLICT, "duplicate capacity snapshot"],
+  [/verification_results\./, ReasonCode.CONFLICT, "duplicate verification result for this candidate"],
+  [/task_executions\./, ReasonCode.CONFLICT, "duplicate task execution attempt"],
+  [/manifests\./, ReasonCode.CONFLICT, "manifest digest already stored"],
+];
+
+export const translate = (err: unknown): unknown => {
+  if (!(err instanceof Error) || isAcpError(err)) return err;
+  const msg = err.message;
+  for (const [key, code] of Object.entries(TRIGGER_CODES)) {
+    if (msg.includes(key)) return acpError(code, msg, { sqlite: key });
+  }
+  for (const [pattern, code, message] of INDEX_CODES) {
+    if (pattern.test(msg)) return acpError(code, message, { sqlite: msg });
+  }
+  return err;
+};
+
+export const openDb = (filename: string): Db => new Db(filename);
