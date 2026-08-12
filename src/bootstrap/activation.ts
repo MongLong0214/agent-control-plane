@@ -17,6 +17,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
+import { tryRevParse } from "../git/git.ts";
 import type { RepoFactoryResult } from "./repo-factory-result.ts";
 import { parseRepoFactoryResult } from "./repo-factory-result.ts";
 
@@ -47,6 +48,17 @@ export interface ActivationInput {
   localBindings: ReadonlyArray<{ identity: string; checkoutPath: string; repositoryRole: string }>;
   projectName: string;
   handoff: HandoffPackage;
+}
+
+interface ApprovedBootstrapPlan {
+  bootstrapOperationId: string;
+  requestDigest: string;
+  projectManifestDigest: string;
+  githubOperations: ReadonlyArray<{
+    operationId: string;
+    resourceType: string;
+    resourceIdentity: string;
+  }>;
 }
 
 /**
@@ -161,6 +173,14 @@ export class BootstrapActivation {
       );
     }
 
+    if (result.runId !== input.runId) {
+      return deny(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "Repo Factory result belongs to a different bootstrap run",
+        { activatingRunId: input.runId, resultRunId: result.runId },
+      );
+    }
+
     // Integration §19.5 — the applied manifest must be the approved one.
     const approvedDigest = manifestDigest(input.approvedManifest);
     if (result.projectManifestDigest !== approvedDigest) {
@@ -170,6 +190,9 @@ export class BootstrapActivation {
         { applied: result.projectManifestDigest, approved: approvedDigest },
       );
     }
+
+    const provenance = await this.validateFactoryProvenance(input, result, approvedDigest);
+    if (!provenance.allowed) return provenance as Decision<ACPBootstrapActivationResult>;
 
     // Everything that can be refused is refused *before* the first mutation. Registering a
     // project, binding a primary CTO and then denying would leave a half-activated
@@ -278,7 +301,11 @@ export class BootstrapActivation {
       input.handoff,
     );
     if (!handoff.allowed) return handoff as Decision<ACPBootstrapActivationResult>;
-    const handoffAck = this.acknowledgedActivationHandoff(input.runId, primaryCtoBinding.sessionId);
+    const handoffAck = this.acknowledgedActivationHandoff(
+      input.runId,
+      handoff.value.handoffId,
+      primaryCtoBinding.sessionId,
+    );
 
     // 10. Doctor.
     const report = await this.doctor.run("project", projectId);
@@ -315,8 +342,9 @@ export class BootstrapActivation {
 
     // §26.3 — the factory result is stored as evidence; only this activation result can
     // complete the run.
+    // The factory's durable output may be retained for a retry, but a final activation
+    // result is not evidence until every completion predicate is actually true.
     this.artifacts.put(input.runId, ArtifactKind.REPO_FACTORY_RESULT, result);
-    this.artifacts.put(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT, activation);
 
     const incomplete = this.incompleteness(activation, report);
     if (incomplete.length > 0) {
@@ -334,6 +362,8 @@ export class BootstrapActivation {
         activation,
       });
     }
+
+    this.artifacts.put(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT, activation);
 
     this.audit.record({
       kind: "BOOTSTRAP_ACTIVATED",
@@ -360,13 +390,6 @@ export class BootstrapActivation {
     toSessionId: string,
     handoff: HandoffPackage,
   ): Decision<{ handoffId: string }> {
-    const existing = this.db.get<{ handoff_id: string }>(
-      `SELECT handoff_id FROM handoffs
-        WHERE project_id = ? AND kind = 'BOOTSTRAP' AND to_session_id = ?`,
-      [projectId, toSessionId],
-    );
-    if (existing) return allow(ReasonCode.OK, { handoffId: existing.handoff_id });
-
     const missing = missingHandoffFields(handoff);
     if (missing.length > 0) {
       return deny(ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, "activation handoff is incomplete", {
@@ -375,13 +398,56 @@ export class BootstrapActivation {
       });
     }
 
-    const handoffId = `hof_${digestOf({ runId, toSessionId }).slice(7, 27)}`;
+    const handoffDigest = digestOf(handoff);
+    const recorded = this.artifacts.latest<{
+      handoffId: string;
+      projectId: string;
+      toSessionId: string;
+      handoff: HandoffPackage;
+    }>(runId, ArtifactKind.HANDOFF);
+    if (recorded) {
+      const recordedDigest = digestOf(recorded.content.handoff);
+      if (
+        recorded.content.projectId !== projectId ||
+        recorded.content.toSessionId !== toSessionId ||
+        recordedDigest !== handoffDigest
+      ) {
+        return deny(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "bootstrap handoff retry changed its bound package", {
+          runId,
+          expected: {
+            projectId: recorded.content.projectId,
+            toSessionId: recorded.content.toSessionId,
+            digest: recordedDigest,
+          },
+          received: { projectId, toSessionId, digest: handoffDigest },
+        });
+      }
+      const row = this.db.get<{ project_id: string; to_session_id: string; digest: string; kind: string }>(
+        `SELECT project_id, to_session_id, digest, kind FROM handoffs WHERE handoff_id = ?`,
+        [recorded.content.handoffId],
+      );
+      if (
+        !row ||
+        row.kind !== "BOOTSTRAP" ||
+        row.project_id !== projectId ||
+        row.to_session_id !== toSessionId ||
+        row.digest !== handoffDigest
+      ) {
+        return deny(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT, "bootstrap handoff record no longer matches its run artifact", {
+          runId,
+          handoffId: recorded.content.handoffId,
+        });
+      }
+      return allow(ReasonCode.OK, { handoffId: recorded.content.handoffId });
+    }
+
+    const handoffId = `hof_${digestOf({ runId, toSessionId, handoffDigest }).slice(7, 27)}`;
     this.db.run(
       `INSERT INTO handoffs (handoff_id, project_id, kind, from_session_id, from_generation,
                              to_session_id, package_json, digest, status, created_at)
        VALUES (?, ?, 'BOOTSTRAP', NULL, 0, ?, ?, ?, 'PENDING', ?)`,
       [
-        handoffId, projectId, toSessionId, JSON.stringify(handoff), digestOf(handoff),
+        handoffId, projectId, toSessionId, JSON.stringify(handoff), handoffDigest,
         this.clock.nowIso(),
       ],
     );
@@ -414,11 +480,14 @@ export class BootstrapActivation {
 
   /** The ack, as recorded by the incoming session itself. */
   acknowledgeActivationHandoff(handoffId: string, ackBySessionId: string): Decision<void> {
-    const row = this.db.get<{ to_session_id: string; status: string }>(
-      `SELECT to_session_id, status FROM handoffs WHERE handoff_id = ?`,
+    const row = this.db.get<{ to_session_id: string; status: string; kind: string }>(
+      `SELECT to_session_id, status, kind FROM handoffs WHERE handoff_id = ?`,
       [handoffId],
     );
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId });
+    if (row.kind !== "BOOTSTRAP") {
+      return deny(ReasonCode.INVALID_ARGUMENT, "handoff is not a bootstrap activation handoff", { handoffId });
+    }
     if (row.to_session_id !== ackBySessionId) {
       return deny(ReasonCode.HANDOFF_ACK_REQUIRED, "ack must come from the incoming session", {
         handoffId,
@@ -442,15 +511,211 @@ export class BootstrapActivation {
 
   private acknowledgedActivationHandoff(
     runId: string,
+    handoffId: string,
     toSessionId: string,
   ): { handoffId: string; ackedAt: string } | null {
     const row = this.db.get<{ handoff_id: string; acked_at: string | null }>(
       `SELECT handoff_id, acked_at FROM handoffs
-        WHERE kind = 'BOOTSTRAP' AND to_session_id = ? AND status = 'ACKED'`,
-      [toSessionId],
+        WHERE handoff_id = ? AND kind = 'BOOTSTRAP' AND to_session_id = ? AND status = 'ACKED'`,
+      [handoffId, toSessionId],
     );
-    void runId;
+    const artifact = this.artifacts.latest<{ handoffId: string }>(runId, ArtifactKind.HANDOFF);
+    if (artifact?.content.handoffId !== handoffId) return null;
     return row?.acked_at ? { handoffId: row.handoff_id, ackedAt: row.acked_at } : null;
+  }
+
+  /**
+   * Integration §13 — every result fact must trace to the approved plan, this run, and
+   * the exact checked-out repository head before activation writes begin.
+   */
+  private async validateFactoryProvenance(
+    input: ActivationInput,
+    result: RepoFactoryResult,
+    approvedManifestDigest: string,
+  ): Promise<Decision<void>> {
+    const planArtifact = this.artifacts.latest<Partial<ApprovedBootstrapPlan>>(
+      input.runId,
+      ArtifactKind.PLAN,
+    );
+    const plan = planArtifact?.content;
+    if (
+      !planArtifact ||
+      !plan ||
+      typeof plan.bootstrapOperationId !== "string" ||
+      typeof plan.requestDigest !== "string" ||
+      typeof plan.projectManifestDigest !== "string" ||
+      !Array.isArray(plan.githubOperations) ||
+      plan.githubOperations.some(
+        (operation) =>
+          !operation ||
+          typeof operation.operationId !== "string" ||
+          typeof operation.resourceType !== "string" ||
+          typeof operation.resourceIdentity !== "string",
+      )
+    ) {
+      return deny(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "activation requires a durable approved bootstrap plan with operation provenance",
+        {
+          runId: input.runId,
+          missing: ["planDigest", "bootstrapOperationId", "requestDigest", "githubOperations"],
+        },
+      );
+    }
+    if (
+      planArtifact.digest !== result.planDigest ||
+      plan.bootstrapOperationId !== result.bootstrapOperationId ||
+      plan.projectManifestDigest !== approvedManifestDigest
+    ) {
+      return deny(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "Repo Factory result does not match the approved bootstrap plan",
+        {
+          approvedPlanDigest: planArtifact.digest,
+          resultPlanDigest: result.planDigest,
+          approvedBootstrapOperationId: plan.bootstrapOperationId,
+          resultBootstrapOperationId: result.bootstrapOperationId,
+          approvedManifestDigest: plan.projectManifestDigest,
+          resultManifestDigest: result.projectManifestDigest,
+        },
+      );
+    }
+
+    const expectedRepositories = input.approvedManifest.repositories.map((repository) => ({
+      role: repository.role,
+      identity: repository.remote,
+    }));
+    const resultRepositories = result.repositories.map((repository) => ({
+      role: repository.role,
+      identity: repository.identity,
+    }));
+    if (
+      expectedRepositories.length !== resultRepositories.length ||
+      expectedRepositories.some((expected) =>
+        !resultRepositories.some(
+          (actual) => actual.role === expected.role && actual.identity === expected.identity,
+        ),
+      )
+    ) {
+      return deny(
+        ReasonCode.COVERAGE_INCOMPLETE,
+        "Repo Factory result does not cover the approved repository contract",
+        { expectedRepositories, resultRepositories },
+      );
+    }
+
+    const duplicateRepositories = new Set<string>();
+    for (const repository of result.repositories) {
+      const key = `${repository.role}:${repository.identity}`;
+      if (duplicateRepositories.has(key)) {
+        return deny(ReasonCode.COVERAGE_INCOMPLETE, "Repo Factory result repeats a repository", {
+          repository,
+        });
+      }
+      duplicateRepositories.add(key);
+    }
+
+    const heads = new Map<string, string>();
+    for (const repository of result.repositories) {
+      const local = input.localBindings.find(
+        (binding) => binding.identity === repository.identity && binding.repositoryRole === repository.role,
+      );
+      if (!local) {
+        return deny(ReasonCode.COVERAGE_INCOMPLETE, "activation has no local binding for factory repository", {
+          repository,
+        });
+      }
+      const head = await tryRevParse(local.checkoutPath, "HEAD");
+      if (!head) {
+        return deny(ReasonCode.EVIDENCE_MISSING, "local bootstrap repository has no exact HEAD", {
+          repository: repository.identity,
+          checkoutPath: local.checkoutPath,
+        });
+      }
+      heads.set(repository.identity, head);
+    }
+
+    const badReceipts = result.externalWriteReceipts.filter(
+      (receipt) =>
+        receipt.bootstrapOperationId !== result.bootstrapOperationId ||
+        receipt.requestDigest !== plan.requestDigest,
+    );
+    if (badReceipts.length > 0) {
+      return deny(
+        ReasonCode.BOOTSTRAP_CONTRACT_DRIFT,
+        "external-write receipt provenance does not match the approved bootstrap plan",
+        { receipts: badReceipts.map((receipt) => receipt.operationId) },
+      );
+    }
+    const plannedOperations = plan.githubOperations;
+    const unmatchedReceipts = result.externalWriteReceipts.filter(
+      (receipt) =>
+        !plannedOperations.some(
+          (operation) =>
+            operation.operationId === receipt.operationId &&
+            operation.resourceType === receipt.resourceType &&
+            operation.resourceIdentity === receipt.resourceIdentity,
+        ),
+    );
+    const missingReceipts = plannedOperations.filter(
+      (operation) =>
+        !result.externalWriteReceipts.some(
+          (receipt) =>
+            receipt.operationId === operation.operationId &&
+            receipt.resourceType === operation.resourceType &&
+            receipt.resourceIdentity === operation.resourceIdentity,
+        ),
+    );
+    if (unmatchedReceipts.length > 0 || missingReceipts.length > 0) {
+      return deny(ReasonCode.COVERAGE_INCOMPLETE, "external-write receipt coverage is incomplete", {
+        unmatchedReceipts: unmatchedReceipts.map((receipt) => receipt.operationId),
+        missingReceipts: missingReceipts.map((operation) => operation.operationId),
+      });
+    }
+
+    const missingVerification: Array<{ commandId: string; repositoryIdentity: string | null }> = [];
+    for (const command of input.approvedManifest.verificationCommands.filter((candidate) => candidate.required)) {
+      const repository = result.repositories.find((candidate) => candidate.role === command.repositoryRole);
+      if (!repository) {
+        missingVerification.push({ commandId: command.id, repositoryIdentity: null });
+        continue;
+      }
+      const expectedHead = heads.get(repository.identity);
+      const found = result.bootstrapVerification.some(
+        (verification) =>
+          verification.commandId === command.id &&
+          verification.repositoryIdentity === repository.identity &&
+          verification.exactHead === expectedHead &&
+          verification.status === "PASS",
+      );
+      if (!found) missingVerification.push({ commandId: command.id, repositoryIdentity: repository.identity });
+    }
+    if (missingVerification.length > 0) {
+      return deny(ReasonCode.VERIFICATION_GAP, "required bootstrap verification is missing or not PASS", {
+        missingVerification,
+      });
+    }
+
+    const missingCi = input.approvedManifest.ciWorkflows.flatMap((workflow) =>
+      result.repositories.flatMap((repository) => {
+        const expectedHead = heads.get(repository.identity);
+        const found = result.ciEvidence.some(
+          (evidence) =>
+            evidence.repositoryIdentity === repository.identity &&
+            evidence.checkName === workflow.checkName &&
+            evidence.head === expectedHead &&
+            evidence.conclusion === "PASS" &&
+            (workflow.approvedDigest === null || evidence.workflowDigest === workflow.approvedDigest),
+        );
+        return found ? [] : [{ repositoryIdentity: repository.identity, checkName: workflow.checkName }];
+      }),
+    );
+    if (missingCi.length > 0) {
+      return deny(ReasonCode.VERIFICATION_GAP, "required bootstrap CI evidence is missing or not PASS", {
+        missingCi,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   /**
@@ -496,9 +761,9 @@ export class BootstrapActivation {
 
   /**
    * CP-S52 — the activation facts that must all be present before a bootstrap run may be
-   * confirmed. The CEO's confirmation is *not* one of them: §26.3 orders it the other way
-   * round — the activation result is what makes a confirmation possible, and
-   * `ProductionGate.submitCeoDecision` refuses to confirm a bootstrap run without one.
+   * confirmed. A pre-confirmation activation is intentionally only a pending operational
+   * state: it may open and deliver a handoff, but it must not be recorded as the immutable
+   * final activation result required by Integration §13.5.
    */
   private incompleteness(
     activation: ACPBootstrapActivationResult,
@@ -509,6 +774,7 @@ export class BootstrapActivation {
     if (activation.localBindings.length === 0) missing.push("localBindings");
     // §26.5 — the review and the confirmation are activation facts, not optional extras.
     if (activation.blindReview?.verdict !== "PASS") missing.push("blindReview");
+    if (activation.ceoConfirm?.decision !== "CONFIRM") missing.push("ceoConfirm");
     if (!activation.primaryCtoBinding) missing.push("primaryCtoBinding");
     // A CTO with no route cannot be handed anything.
     if (!activation.buzz.connected) missing.push("buzz");

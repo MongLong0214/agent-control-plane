@@ -19,7 +19,7 @@ export interface TelegramUpdate {
 
 export interface TelegramIngressOptions {
   /** Secret token Telegram echoes in `X-Telegram-Bot-Api-Secret-Token`. */
-  webhookSecret: string | null;
+  webhookSecret: string;
 }
 
 export interface AdmittedTelegramMessage {
@@ -43,7 +43,11 @@ export class TelegramIngress {
   constructor(
     private readonly guard: IngressGuard,
     private readonly options: TelegramIngressOptions,
-  ) {}
+  ) {
+    if (options.webhookSecret.trim().length === 0) {
+      throw new Error("Telegram ingress requires a non-empty webhook secret");
+    }
+  }
 
   admit(
     update: TelegramUpdate,
@@ -63,7 +67,7 @@ export class TelegramIngress {
 
     // Telegram authenticates the webhook by echoing a secret token rather than signing
     // the body, so that token is what the guard verifies.
-    if (this.options.webhookSecret && presentedSecret !== this.options.webhookSecret) {
+    if (presentedSecret !== this.options.webhookSecret) {
       return deny(ReasonCode.INGRESS_SIGNATURE_INVALID, "webhook secret token mismatch", {
         updateId: update.update_id,
       });

@@ -72,7 +72,16 @@ export class IngressGuard {
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly policies: Readonly<Record<string, IngressPolicy>>,
-  ) {}
+  ) {
+    for (const [channel, policy] of Object.entries(policies)) {
+      if (policy.allowedActors.length === 0) {
+        throw new Error(`ingress policy for '${channel}' has no allowed actors`);
+      }
+      if (channel === "telegram" && (!policy.allowedConversations || policy.allowedConversations.length === 0)) {
+        throw new Error("Telegram ingress requires a non-empty conversation allowlist");
+      }
+    }
+  }
 
   /**
    * Whether an actor is allowlisted on a channel. The owner authority checks (§21) reuse
@@ -147,7 +156,7 @@ export class IngressGuard {
       `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES (?, ?, ?, ?)`,
       [request.channel, request.nonce, request.actor, this.clock.nowIso()],
     );
-    this.prune(policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS);
+    this.prune(request.channel, policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS);
 
     this.audit.record({
       kind: "INGRESS_ADMITTED",
@@ -185,8 +194,9 @@ export class IngressGuard {
     return deny(reasonCode, message, { channel: request.channel, actor: request.actor });
   }
 
-  private prune(ttlMs: number): void {
-    this.db.run(`DELETE FROM inbound_messages WHERE received_at < ?`, [
+  private prune(channel: string, ttlMs: number): void {
+    this.db.run(`DELETE FROM inbound_messages WHERE channel = ? AND received_at < ?`, [
+      channel,
       new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString(),
     ]);
   }
