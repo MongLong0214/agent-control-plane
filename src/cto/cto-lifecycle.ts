@@ -280,7 +280,7 @@ export class CtoLifecycle {
           JSON.stringify(handoff), digestOf(handoff), this.clock.nowIso(),
         ],
       );
-      this.outbox.enqueue({
+      const enqueued = this.outbox.enqueue({
         idempotencyKey: `handoff:${handoffId}`,
         roleKey,
         bindingGeneration: current.bindingGeneration,
@@ -289,6 +289,9 @@ export class CtoLifecycle {
         kind: MessageKind.HANDOFF_PACKAGE,
         payload: { handoffId, projectId, handoff },
       });
+      if (!enqueued.allowed) {
+        return enqueued as Decision<{ handoffId: string; incomingSessionId: string }>;
+      }
       return allow(ReasonCode.OK, { handoffId, incomingSessionId: incoming.value });
     });
     if (!prepared.allowed) {
@@ -646,7 +649,12 @@ export class CtoLifecycle {
         }
         const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, "project suspended");
         if (!stopped.allowed) return stopped as Decision<void>;
-        return this.bindings.revoke(roleKey, `project suspended: ${reason}`);
+        // Suspension is the one deliberate exception to a normal revocation: every
+        // owned run was checkpointed to BLOCKED above and cannot regain authority from
+        // this revoked binding. Any runnable state still refuses the revocation.
+        return this.bindings.revoke(roleKey, `project suspended: ${reason}`, {
+          allowBlockedRuns: true,
+        });
       });
       if (!completed.allowed) return completed;
     }

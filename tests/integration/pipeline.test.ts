@@ -279,7 +279,7 @@ describe("one safe project run, end to end", () => {
     const verified = await harness.cp.verification.verify({
       runId: created.value.runId,
       snapshot: frozen.value,
-      commands: [],
+      commands: harness.cp.projects.activeManifest(projectId)!.manifest.verificationCommands,
       contractDigest: frozen.value.contractDigest,
     });
     expect(verified.allowed).toBe(false);
@@ -463,6 +463,7 @@ describe("one safe project run, end to end", () => {
         reviewerRoleBindingGeneration: 1,
         reviewerSessionId: "ses_never_bound",
         reviewerSessionIncarnation: "inc-x",
+        reviewerProviderSessionId: null,
         provider: "scripted",
         model: "scripted-reviewer",
         effort: null,
@@ -473,6 +474,7 @@ describe("one safe project run, end to end", () => {
           verificationEvidence: true,
           projectContext: false,
           withheld: [],
+          binaryArtifacts: [],
         },
         coveredRepositories: [identity],
         coveredFiles: [`${identity}:src/app.js`],

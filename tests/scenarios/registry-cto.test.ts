@@ -289,17 +289,16 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     });
 
     harness.cp.runs.transition(created.value.runId, RunState.AWAITING_HUMAN, "owner decision needed");
-    harness.cp.ceo.recordOwnerDecision({
+    const approved = harness.cp.ceo.recordOwnerDecision({
       runId: created.value.runId,
       item: "public release",
       approved: true,
       note: "approved by owner",
       owner: TEST_OWNER,
     });
+    expect(approved.allowed).toBe(true);
     expect(harness.cp.ceo.humanGateStatus(created.value.runId).satisfied).toBe(true);
-
-    const resumed = harness.cp.runs.transition(created.value.runId, RunState.ACTIVE, "owner approved");
-    expect(resumed.allowed).toBe(true);
+    expect(harness.cp.runs.require(created.value.runId).state).toBe(RunState.ACTIVE);
   });
 
   it("suspending a project requires owner approval and removes the CTO binding", async () => {

@@ -95,18 +95,18 @@ describe("round-two managed-write regressions", () => {
       [replacementSession, core.clock.nowIso(), core.clock.nowIso()],
     );
     core.db.run(
+      `INSERT INTO assignments (assignment_id, role_key, role, run_id, session_id,
+                                session_incarnation, binding_generation, mode, status, created_at)
+       VALUES (?, ?, 'BOOTSTRAP_CTO', ?, ?, 'inc-replacement', 1, 'PREFERRED', 'ACTIVE', ?)`,
+      [newAssignmentId(), replacementRole, replacementRun, replacementSession, core.clock.nowIso()],
+    );
+    core.db.run(
       `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal,
                          contract_digest, owner_session_id, owner_binding_generation,
                          owner_session_incarnation, owner_role_key, created_at)
        VALUES (?, ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'replacement',
                'sha256:contract', ?, 1, 'inc-replacement', ?, ?)`,
       [replacementRun, seeded.projectId, replacementSession, replacementRole, core.clock.nowIso()],
-    );
-    core.db.run(
-      `INSERT INTO assignments (assignment_id, role_key, role, run_id, session_id,
-                                session_incarnation, binding_generation, mode, status, created_at)
-       VALUES (?, ?, 'BOOTSTRAP_CTO', ?, ?, 'inc-replacement', 1, 'PREFERRED', 'ACTIVE', ?)`,
-      [newAssignmentId(), replacementRole, replacementRun, replacementSession, core.clock.nowIso()],
     );
     core.db.run(
       `INSERT INTO run_repositories (run_id, repository_id, repository_role, base_branch)

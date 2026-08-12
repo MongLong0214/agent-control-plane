@@ -294,16 +294,23 @@ export class BindingRegistry {
     });
   }
 
-  revoke(roleKey: string, reason: string): Decision<void> {
+  revoke(
+    roleKey: string,
+    reason: string,
+    options: { allowBlockedRuns?: boolean } = {},
+  ): Decision<void> {
     return this.db.tx(() => {
       const current = this.active(roleKey);
       if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
       const ownedRuns = this.liveRunsOwnedBy(current);
-      if (ownedRuns.length > 0) {
+      const orphaned = options.allowBlockedRuns
+        ? ownedRuns.filter((run) => run.state !== "BLOCKED")
+        : ownedRuns;
+      if (orphaned.length > 0) {
         return deny(
           ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
           "the active binding owns live runs and cannot be revoked without a takeover",
-          { roleKey, runs: ownedRuns.map((run) => run.run_id) },
+          { roleKey, runs: orphaned.map((run) => run.run_id) },
         );
       }
       this.db.run(
@@ -597,9 +604,9 @@ export class BindingRegistry {
     return (row?.maximum ?? 0) + 1;
   }
 
-  private liveRunsOwnedBy(binding: RoleBinding): Array<{ run_id: string }> {
-    return this.db.all<{ run_id: string }>(
-      `SELECT run_id FROM runs
+  private liveRunsOwnedBy(binding: RoleBinding): Array<{ run_id: string; state: string }> {
+    return this.db.all<{ run_id: string; state: string }>(
+      `SELECT run_id, state FROM runs
         WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
           AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
       [binding.sessionId, binding.bindingGeneration, binding.roleKey, ...LIVE_RUN_STATES],

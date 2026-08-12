@@ -316,7 +316,9 @@ describe("round-2 blind-review regressions", () => {
     const setup = await prepareReviewedInputs();
     const forged = structuredClone(setup.snapshot);
     forged.repositories[0]!.diffDigest = "sha256:forged-diff-digest";
-    setup.harness.cp.runs.promoteCandidate(setup.run.runId, candidateSnapshotDigest(forged));
+    const digest = candidateSnapshotDigest(forged);
+    setup.harness.cp.artifacts.put(setup.run.runId, "CANDIDATE_SNAPSHOT", forged, digest);
+    setup.harness.cp.runs.promoteCandidate(setup.run.runId, digest);
     const verification = persistPassingVerification(setup, forged);
     setup.harness.scripted.script({ match: /Candidate review/, text: reviewerPass([`${setup.identity}:src/app.js`]) });
     const result = await setup.harness.cp.review.controlPlaneInvoker()({
@@ -336,7 +338,9 @@ describe("round-2 blind-review regressions", () => {
     const setup = await prepareReviewedInputs();
     const forged = structuredClone(setup.snapshot);
     forged.repositories[0]!.identity = "github:acme/unregistered";
-    setup.harness.cp.runs.promoteCandidate(setup.run.runId, candidateSnapshotDigest(forged));
+    const digest = candidateSnapshotDigest(forged);
+    setup.harness.cp.artifacts.put(setup.run.runId, "CANDIDATE_SNAPSHOT", forged, digest);
+    setup.harness.cp.runs.promoteCandidate(setup.run.runId, digest);
     const verification = persistPassingVerification(setup, forged);
     const result = await setup.harness.cp.review.controlPlaneInvoker()({
       runId: setup.run.runId,
