@@ -1,3 +1,5 @@
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { newSessionId } from "../core/ids.ts";
@@ -21,6 +23,17 @@ export interface SessionRecord {
   updatedAt: string;
   stoppedAt: string | null;
 }
+
+/** The creation response is the only time a runtime receives its session secret. */
+export interface CreatedSession extends SessionRecord {
+  sessionSecret: string | null;
+}
+
+const SESSION_SECRET_BYTES = 32;
+const SESSION_SECRET_HASH = /^[a-f0-9]{64}$/;
+
+const hashSessionSecret = (secret: string): Buffer =>
+  createHash("sha256").update(secret, "utf8").digest();
 
 const LEGAL_LIFECYCLE: Readonly<Record<SessionLifecycle, readonly SessionLifecycle[]>> = {
   [SessionLifecycle.STARTING]: [SessionLifecycle.READY, SessionLifecycle.ERROR, SessionLifecycle.STOPPED],
@@ -51,25 +64,75 @@ export class SessionRegistry {
     osPid?: number | null;
     sessionId?: string;
     incarnation?: string;
-  }): SessionRecord {
+  }): CreatedSession {
     const now = this.clock.nowIso();
     const sessionId = input.sessionId ?? newSessionId();
     const incarnation = input.incarnation ?? `${sessionId}#${now}`;
-    this.db.run(
-      `INSERT INTO sessions (session_id, incarnation, provider, model, effort, lifecycle,
-                             buzz_address, os_pid, workdir, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?)`,
-      [
-        sessionId, incarnation, input.provider, input.model, input.effort ?? null,
-        input.buzzAddress ?? null, input.osPid ?? null, input.workdir ?? null, now, now,
-      ],
-    );
+    const sessionSecret = this.secretStorageAvailable()
+      ? randomBytes(SESSION_SECRET_BYTES).toString("base64url")
+      : null;
+    if (sessionSecret) {
+      this.db.run(
+        `INSERT INTO sessions (session_id, incarnation, provider, model, effort, lifecycle,
+                               buzz_address, os_pid, workdir, session_secret_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?, ?)`,
+        [
+          sessionId, incarnation, input.provider, input.model, input.effort ?? null,
+          input.buzzAddress ?? null, input.osPid ?? null, input.workdir ?? null,
+          hashSessionSecret(sessionSecret).toString("hex"), now, now,
+        ],
+      );
+    } else {
+      this.db.run(
+        `INSERT INTO sessions (session_id, incarnation, provider, model, effort, lifecycle,
+                               buzz_address, os_pid, workdir, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?)`,
+        [
+          sessionId, incarnation, input.provider, input.model, input.effort ?? null,
+          input.buzzAddress ?? null, input.osPid ?? null, input.workdir ?? null, now, now,
+        ],
+      );
+    }
     this.audit.record({
       kind: "SESSION_CREATED",
       sessionId,
       evidence: { provider: input.provider, model: input.model, effort: input.effort ?? null },
     });
-    return this.require(sessionId);
+    return { ...this.require(sessionId), sessionSecret };
+  }
+
+  /**
+   * Verifies an opaque secret without exposing the stored hash. Deployments missing the
+   * required migration refuse authentication explicitly; they never treat an ID alone as
+   * a session proof.
+   */
+  verifySecret(sessionId: string, sessionSecret: string): Decision<SessionRecord> {
+    if (!this.secretStorageAvailable()) {
+      return deny(
+        ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
+        "session secret storage is unavailable; apply the sessions.session_secret_hash migration",
+        { sessionId },
+      );
+    }
+    const row = this.db.get<RawSession & { session_secret_hash: string | null }>(
+      `SELECT * FROM sessions WHERE session_id = ?`,
+      [sessionId],
+    );
+    if (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
+
+    const expected = hashSessionSecret(sessionSecret);
+    const validStoredHash =
+      typeof row.session_secret_hash === "string" && SESSION_SECRET_HASH.test(row.session_secret_hash);
+    const stored = validStoredHash
+      ? Buffer.from(row.session_secret_hash!, "hex")
+      : Buffer.alloc(SESSION_SECRET_BYTES);
+    const matches = timingSafeEqual(expected, stored);
+    if (!validStoredHash || !matches) {
+      return deny(ReasonCode.SESSION_SECRET_INVALID, "session secret does not authenticate this session", {
+        sessionId,
+      });
+    }
+    return allow(ReasonCode.OK, hydrate(row));
   }
 
   transition(sessionId: string, to: SessionLifecycle, reason?: string): Decision<SessionRecord> {
@@ -151,6 +214,12 @@ export class SessionRegistry {
         `SELECT * FROM sessions WHERE lifecycle IN ('STARTING','READY','DRAINING') ORDER BY created_at`,
       )
       .map(hydrate);
+  }
+
+  private secretStorageAvailable(): boolean {
+    return this.db
+      .all<{ name: string }>(`PRAGMA table_info(sessions)`)
+      .some((column) => column.name === "session_secret_hash");
   }
 }
 

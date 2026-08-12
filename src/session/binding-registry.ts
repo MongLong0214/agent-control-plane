@@ -28,9 +28,16 @@ export interface BindInput {
   runId?: string | null;
   taskId?: string | null;
   mode?: "PREFERRED" | "FALLBACK";
-  /** Skip the READY requirement — used only while a session is still starting up. */
-  allowStarting?: boolean;
 }
+
+const LIVE_RUN_STATES = [
+  "QUEUED",
+  "ACTIVE",
+  "BLOCKED",
+  "READY_FOR_CEO_REVIEW",
+  "REVISION_REQUIRED",
+  "AWAITING_HUMAN",
+] as const;
 
 /**
  * Role bindings and their generations (PRD §9.4, §15.7).
@@ -120,10 +127,7 @@ export class BindingRegistry {
       const roleKey = key.value;
       const session = this.sessions.get(input.sessionId);
       if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId: input.sessionId });
-      if (
-        session.lifecycle !== SessionLifecycle.READY &&
-        !(input.allowStarting && session.lifecycle === SessionLifecycle.STARTING)
-      ) {
+      if (session.lifecycle !== SessionLifecycle.READY) {
         return deny(ReasonCode.SESSION_NOT_READY, `session is ${session.lifecycle}`, {
           sessionId: input.sessionId,
           lifecycle: session.lifecycle,
@@ -172,25 +176,36 @@ export class BindingRegistry {
    * fencing the outbox all happen in one transaction; a crash between them would leave
    * messages addressed to a revoked generation.
    */
-  switchTo(input: BindInput & { reason: string; takeover?: boolean }): Decision<RoleBinding> {
+  switchTo(
+    input: BindInput & { reason: string; takeover?: boolean; expectedCurrentGeneration?: number },
+  ): Decision<RoleBinding> {
     return this.db.tx(() => {
       const key = this.resolveRoleKey(input);
       if (!key.allowed) return key as Decision<RoleBinding>;
       const roleKey = key.value;
       const current = this.active(roleKey);
 
+      if (
+        input.expectedCurrentGeneration !== undefined &&
+        current?.bindingGeneration !== input.expectedCurrentGeneration
+      ) {
+        return deny(
+          ReasonCode.BINDING_GENERATION_STALE,
+          "the binding generation changed before the switch could be applied",
+          {
+            roleKey,
+            expectedCurrentGeneration: input.expectedCurrentGeneration,
+            actualCurrentGeneration: current?.bindingGeneration ?? null,
+          },
+        );
+      }
+
       // A plain switch must not orphan work. If the outgoing binding still owns live runs,
       // those runs would be pinned to a revoked generation: the old session is refused
       // because its generation is gone, and the new one because the run still names the
       // old tuple. Either drain first, or ask for an explicit takeover.
       if (current) {
-        const orphaned = this.db.all<{ run_id: string }>(
-          `SELECT run_id FROM runs
-            WHERE owner_session_id = ? AND owner_binding_generation = ?
-              AND state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW',
-                            'REVISION_REQUIRED','AWAITING_HUMAN')`,
-          [current.sessionId, current.bindingGeneration],
-        );
+        const orphaned = this.liveRunsOwnedBy(current);
         if (orphaned.length > 0 && !input.takeover) {
           return deny(
             ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS,
@@ -202,10 +217,7 @@ export class BindingRegistry {
 
       const session = this.sessions.get(input.sessionId);
       if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId: input.sessionId });
-      if (
-        session.lifecycle !== SessionLifecycle.READY &&
-        !(input.allowStarting && session.lifecycle === SessionLifecycle.STARTING)
-      ) {
+      if (session.lifecycle !== SessionLifecycle.READY) {
         return deny(ReasonCode.SESSION_NOT_READY, `incoming session is ${session.lifecycle}`, {
           sessionId: input.sessionId,
         });
@@ -242,12 +254,11 @@ export class BindingRegistry {
         repointed = this.db.run(
           `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
                            owner_session_incarnation = ?, owner_role_key = ?
-            WHERE owner_session_id = ? AND owner_binding_generation = ?
-              AND state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW',
-                            'REVISION_REQUIRED','AWAITING_HUMAN')`,
+            WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
+              AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
           [
             input.sessionId, generation, session.incarnation, roleKey,
-            current.sessionId, current.bindingGeneration,
+            current.sessionId, current.bindingGeneration, current.roleKey, ...LIVE_RUN_STATES,
           ],
         ).changes;
       }
@@ -284,9 +295,17 @@ export class BindingRegistry {
   }
 
   revoke(roleKey: string, reason: string): Decision<void> {
-    const current = this.active(roleKey);
-    if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
     return this.db.tx(() => {
+      const current = this.active(roleKey);
+      if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
+      const ownedRuns = this.liveRunsOwnedBy(current);
+      if (ownedRuns.length > 0) {
+        return deny(
+          ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
+          "the active binding owns live runs and cannot be revoked without a takeover",
+          { roleKey, runs: ownedRuns.map((run) => run.run_id) },
+        );
+      }
       this.db.run(
         `UPDATE assignments SET status = 'REVOKED', revoked_at = ?, revoked_reason = ?
           WHERE assignment_id = ?`,
@@ -356,11 +375,42 @@ export class BindingRegistry {
 
   /**
    * CP-HI-04 producer set for a run: primary/bootstrap CTO, workers, and any
-   * non-blind reviewer. Computed from bindings actually recorded against the run —
-   * including revoked ones, because a session that produced part of the candidate is
-   * still a producer after its binding moves on.
+   * non-blind reviewer. Project-scoped PRIMARY_CTO assignments are included for the
+   * run's whole dispatched lifetime, so a takeover never erases the outgoing producer.
    */
   producerSessions(runId: string): Set<string> {
+    const history = this.producerHistory(runId);
+    if (history.allowed) return history.value;
+    return fail(history.reasonCode, history.message, history.evidence);
+  }
+
+  private producerHistory(runId: string): Decision<Set<string>> {
+    const run = this.db.get<{
+      project_id: string | null;
+      dispatched_at: string | null;
+      ended_at: string | null;
+      owner_session_id: string | null;
+      owner_binding_generation: number | null;
+      owner_role_key: string | null;
+    }>(
+      `SELECT project_id, dispatched_at, ended_at, owner_session_id, owner_binding_generation, owner_role_key
+         FROM runs WHERE run_id = ?`,
+      [runId],
+    );
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    if (
+      !run.dispatched_at ||
+      !run.owner_session_id ||
+      run.owner_binding_generation === null ||
+      !run.owner_role_key
+    ) {
+      return deny(
+        ReasonCode.PRODUCER_HISTORY_UNAVAILABLE,
+        "the run has no complete dispatched owner tuple from which producer history can be reconstructed",
+        { runId },
+      );
+    }
+
     const rows = this.db.all<{ session_id: string }>(
       `SELECT DISTINCT session_id FROM assignments
         WHERE (run_id = ? OR task_id IN (SELECT task_id FROM tasks WHERE run_id = ?))
@@ -369,12 +419,38 @@ export class BindingRegistry {
     );
     const set = new Set(rows.map((r) => r.session_id));
 
-    // The pinned run owner is a producer even if its binding is project-scoped.
-    const owner = this.db.get<{ owner_session_id: string | null }>(
-      `SELECT owner_session_id FROM runs WHERE run_id = ?`,
-      [runId],
+    // PRIMARY_CTO is project-scoped. Its immutable assignment history therefore has to
+    // be intersected with the run lifetime rather than merely inspecting current owner.
+    if (run.project_id) {
+      const until = run.ended_at ?? this.clock.nowIso();
+      for (const row of this.db.all<{ session_id: string }>(
+        `SELECT DISTINCT session_id FROM assignments
+          WHERE project_id = ? AND role = 'PRIMARY_CTO'
+            AND created_at <= ? AND (revoked_at IS NULL OR revoked_at >= ?)`,
+        [run.project_id, until, run.dispatched_at],
+      )) {
+        set.add(row.session_id);
+      }
+    }
+
+    const owner = this.db.get<{ role: Role }>(
+      `SELECT role FROM assignments
+        WHERE role_key = ? AND binding_generation = ? AND session_id = ?`,
+      [run.owner_role_key, run.owner_binding_generation, run.owner_session_id],
     );
-    if (owner?.owner_session_id) set.add(owner.owner_session_id);
+    if (!owner || !PRODUCER_ROLES.includes(owner.role)) {
+      return deny(
+        ReasonCode.PRODUCER_HISTORY_UNAVAILABLE,
+        "the run owner cannot be matched to an immutable producer binding",
+        {
+          runId,
+          roleKey: run.owner_role_key,
+          bindingGeneration: run.owner_binding_generation,
+          sessionId: run.owner_session_id,
+        },
+      );
+    }
+    set.add(run.owner_session_id);
 
     // Sessions that actually executed a task for this run.
     for (const row of this.db.all<{ worker_session_id: string | null }>(
@@ -383,11 +459,34 @@ export class BindingRegistry {
     )) {
       if (row.worker_session_id) set.add(row.worker_session_id);
     }
-    return set;
+    return allow(ReasonCode.OK, set);
   }
 
   assertReviewerIndependence(runId: string, sessionId: string): Decision<void> {
-    const producers = this.producerSessions(runId);
+    // A directly recorded producer is already disqualifying even when an older fixture
+    // or migrated row lacks enough owner history to reconstruct the whole set.
+    const directlyRecorded = this.db.get<{ session_id: string }>(
+      `SELECT session_id FROM assignments
+        WHERE session_id = ?
+          AND (run_id = ? OR task_id IN (SELECT task_id FROM tasks WHERE run_id = ?))
+          AND role IN (${PRODUCER_ROLES.map(() => "?").join(",")})
+        UNION
+       SELECT worker_session_id AS session_id FROM task_executions
+        WHERE worker_session_id = ? AND run_id = ?
+        LIMIT 1`,
+      [sessionId, runId, runId, ...PRODUCER_ROLES, sessionId, runId],
+    );
+    if (directlyRecorded) {
+      return deny(
+        ReasonCode.REVIEWER_SESSION_IS_PRODUCER,
+        "candidate reviewer session belongs to the run's producer set",
+        { runId, sessionId, producers: [sessionId] },
+      );
+    }
+
+    const producerHistory = this.producerHistory(runId);
+    if (!producerHistory.allowed) return producerHistory as Decision<void>;
+    const producers = producerHistory.value;
     if (producers.has(sessionId)) {
       return deny(
         ReasonCode.REVIEWER_SESSION_IS_PRODUCER,
@@ -452,6 +551,36 @@ export class BindingRegistry {
     return this.active(roleKey)?.bindingGeneration === generation;
   }
 
+  /**
+   * Authenticates a runtime and fences its authority in one check. The session secret
+   * proves the session identity; the active binding tuple proves its current generation.
+   */
+  authenticateBoundSession(input: {
+    roleKey: string;
+    sessionId: string;
+    sessionSecret: string;
+    bindingGeneration: number;
+  }): Decision<RoleBinding> {
+    const authenticated = this.sessions.verifySecret(input.sessionId, input.sessionSecret);
+    if (!authenticated.allowed) return authenticated as Decision<RoleBinding>;
+
+    const binding = this.active(input.roleKey);
+    if (
+      !binding ||
+      binding.sessionId !== input.sessionId ||
+      binding.bindingGeneration !== input.bindingGeneration
+    ) {
+      return deny(ReasonCode.BINDING_GENERATION_STALE, "session is not the current role binding", {
+        roleKey: input.roleKey,
+        sessionId: input.sessionId,
+        expectedGeneration: input.bindingGeneration,
+        currentSessionId: binding?.sessionId ?? null,
+        currentGeneration: binding?.bindingGeneration ?? null,
+      });
+    }
+    return allow(ReasonCode.OK, binding);
+  }
+
   history(roleKey: string): RoleBinding[] {
     return this.db
       .all<RawAssignment>(`SELECT * FROM assignments WHERE role_key = ? ORDER BY binding_generation`, [
@@ -466,6 +595,15 @@ export class BindingRegistry {
       [roleKey],
     );
     return (row?.maximum ?? 0) + 1;
+  }
+
+  private liveRunsOwnedBy(binding: RoleBinding): Array<{ run_id: string }> {
+    return this.db.all<{ run_id: string }>(
+      `SELECT run_id FROM runs
+        WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
+          AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
+      [binding.sessionId, binding.bindingGeneration, binding.roleKey, ...LIVE_RUN_STATES],
+    );
   }
 }
 
