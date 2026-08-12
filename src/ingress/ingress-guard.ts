@@ -6,6 +6,7 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 
 export interface IngressRequest {
   channel: "telegram" | "buzz" | "mcp" | "cli";
@@ -31,6 +32,24 @@ export interface IngressPolicy {
   secret?: string | null;
   nonceTtlMs?: number;
 }
+
+export interface OwnerApprovalIngress {
+  runId: string | null;
+  operation: string;
+  parameters: unknown;
+  idempotencyKey: string;
+  approved: boolean;
+}
+
+/** The complete envelope an owner signs or submits through an admitted ingress path. */
+export const ownerApprovalPayload = (input: OwnerApprovalIngress): Record<string, unknown> => ({
+  type: "OWNER_APPROVAL",
+  runId: input.runId,
+  operation: input.operation,
+  parameterDigest: digestOf(input.parameters),
+  idempotencyKey: input.idempotencyKey,
+  approved: input.approved,
+});
 
 const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -161,11 +180,54 @@ export class IngressGuard {
     this.audit.record({
       kind: "INGRESS_ADMITTED",
       actor: request.actor,
-      evidence: { channel: request.channel, conversation: request.conversation ?? null },
+      evidence: {
+        channel: request.channel,
+        conversation: request.conversation ?? null,
+        nonce: request.nonce,
+        payloadDigest: digestOf(request.payload),
+      },
     });
 
     // §27.4 — the payload crosses the boundary as untrusted data.
     return allow(ReasonCode.UNTRUSTED_CONTENT_IS_DATA, { payload: request.payload, untrusted: true });
+  }
+
+  /**
+   * Mints the only receipt accepted by owner-only operations. The signed/admitted payload
+   * is compared to the complete requested operation before the durable receipt is made.
+   */
+  admitOwnerApproval(
+    request: IngressRequest,
+    input: OwnerApprovalIngress,
+  ): Decision<OwnerApprovalReceipt> {
+    const payload = ownerApprovalPayload(input);
+    if (digestOf(request.payload) !== digestOf(payload)) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner ingress payload does not bind the requested operation",
+        { channel: request.channel, actor: request.actor, operation: input.operation },
+      );
+    }
+    const admitted = this.admit(request);
+    if (!admitted.allowed) return admitted as Decision<OwnerApprovalReceipt>;
+
+    const receipt: OwnerApprovalReceipt = {
+      channel: request.channel,
+      actor: request.actor,
+      inboundNonce: request.nonce,
+      runId: input.runId,
+      operation: input.operation,
+      parameterDigest: digestOf(input.parameters),
+      idempotencyKey: input.idempotencyKey,
+      approved: input.approved,
+    };
+    this.audit.record({
+      kind: "OWNER_APPROVAL_INGRESS",
+      actor: `${receipt.channel}:${receipt.actor}`,
+      runId: receipt.runId,
+      evidence: { receiptDigest: digestOf(receipt) },
+    });
+    return allow(ReasonCode.OK, receipt);
   }
 
   recordResult(channel: string, nonce: string, result: unknown): void {

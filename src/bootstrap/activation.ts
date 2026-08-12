@@ -50,6 +50,13 @@ export interface ActivationInput {
   handoff: HandoffPackage;
 }
 
+export interface BootstrapConfirmationInput {
+  runId: string;
+  candidateSnapshotDigest: string;
+  ceoSessionId: string;
+  confirmedAt: string;
+}
+
 interface ApprovedBootstrapPlan {
   bootstrapOperationId: string;
   requestDigest: string;
@@ -159,6 +166,19 @@ export class BootstrapActivation {
         kind: run.kind,
       });
     }
+    if (run.state === RunState.COMPLETED) {
+      const finalized = this.artifacts.latest<ACPBootstrapActivationResult>(
+        input.runId,
+        ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT,
+      );
+      return finalized
+        ? allow(ReasonCode.OK, finalized.content)
+        : deny(
+            ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
+            "completed bootstrap run has no final activation result",
+            { runId: input.runId },
+          );
+    }
 
     // 1. Validate the RepoFactoryResult — including that it does not overclaim.
     const factory = parseRepoFactoryResult(input.factoryResult);
@@ -236,13 +256,13 @@ export class BootstrapActivation {
       });
     }
 
-    // 4/5. Blind review and CEO confirm are recorded from the run's own artifacts —
-    // this method never fabricates them.
+    // 4. Blind review is recorded from the run's own artifact. CEO confirmation is
+    // deliberately not read here: it is the next ordered phase and builds the final
+    // activation result atomically with the COMPLETED transition.
     const reviewArtifact = this.artifacts.latest<{ verdict: string }>(
       input.runId,
       ArtifactKind.BLIND_REVIEW,
     );
-    const ceoDecision = this.runs.get(input.runId)?.state;
 
     // 6. Primary CTO: promote the bootstrap CTO if eligible, otherwise create fresh.
     const promotion = this.canPromoteBootstrapCto(input.runId);
@@ -329,8 +349,7 @@ export class BootstrapActivation {
       blindReview: reviewArtifact
         ? { verdict: reviewArtifact.content.verdict, digest: reviewArtifact.digest }
         : null,
-      ceoConfirm:
-        ceoDecision === RunState.COMPLETED ? { decision: "CONFIRM", at: this.clock.nowIso() } : null,
+      ceoConfirm: null,
       primaryCtoBinding,
       buzz: { connected: Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
       handoffAck,
@@ -340,9 +359,14 @@ export class BootstrapActivation {
       completedAt: this.clock.nowIso(),
     };
 
-    // §26.3 — the factory result is retained for retry, while this operational activation
-    // result is the evidence the CEO gate re-checks before it alone completes the run.
+    // §26.3 — the factory result and doctor observation are retained for retry. Neither
+    // is an activation result: only the CEO-confirm transaction can write that claim.
     this.artifacts.put(input.runId, ArtifactKind.REPO_FACTORY_RESULT, result);
+    this.artifacts.put(input.runId, ArtifactKind.DOCTOR_REPORT, {
+      source: "bootstrap-activation",
+      projectId,
+      report,
+    });
 
     const incomplete = this.incompleteness(activation, report);
     if (incomplete.length > 0) {
@@ -361,10 +385,8 @@ export class BootstrapActivation {
       });
     }
 
-    this.artifacts.put(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT, activation);
-
     this.audit.record({
-      kind: "BOOTSTRAP_ACTIVATED",
+      kind: "BOOTSTRAP_ACTIVATION_READY_FOR_CONFIRM",
       runId: input.runId,
       projectId,
       evidence: {
@@ -372,6 +394,161 @@ export class BootstrapActivation {
         primaryCtoGeneration: primaryCtoBinding.bindingGeneration,
         promotedFromBootstrap: primaryCtoBinding.promotedFromBootstrap,
         doctorStatus: report.status,
+      },
+    });
+    return allow(ReasonCode.OK, activation);
+  }
+
+  /**
+   * Phase J's last operation. ProductionGate invokes this while its completion
+   * transaction is open, so every fact is re-read before the final artifact and run
+   * state become durable together. Calling it outside that transaction is refused.
+   */
+  finalizeBootstrapActivationConfirm(
+    input: BootstrapConfirmationInput,
+  ): Decision<ACPBootstrapActivationResult> {
+    if (!this.db.inTransaction) {
+      return deny(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "bootstrap activation finalization must run inside the CEO completion transaction",
+        { runId: input.runId },
+      );
+    }
+    const run = this.runs.get(input.runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
+    if (run.kind !== RunKind.PROJECT_BOOTSTRAP || run.state !== RunState.READY_FOR_CEO_REVIEW) {
+      return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE, "bootstrap run is not ready to finalize", {
+        runId: input.runId,
+        kind: run.kind,
+        state: run.state,
+      });
+    }
+
+    const factory = this.artifacts.latest<RepoFactoryResult>(input.runId, ArtifactKind.REPO_FACTORY_RESULT);
+    const handoffArtifact = this.artifacts.latest<{
+      handoffId: string;
+      projectId: string;
+      toSessionId: string;
+    }>(input.runId, ArtifactKind.HANDOFF);
+    const doctorArtifact = this.artifacts.latest<{
+      source?: string;
+      projectId?: string;
+      report?: DoctorReport;
+    }>(input.runId, ArtifactKind.DOCTOR_REPORT);
+    const review = this.artifacts.latestForSnapshot<{
+      verdict?: string;
+      candidateSnapshotDigest?: string;
+      reviewerSessionId?: string;
+    }>(input.runId, ArtifactKind.BLIND_REVIEW, input.candidateSnapshotDigest);
+    if (
+      !factory ||
+      !handoffArtifact ||
+      !doctorArtifact ||
+      doctorArtifact.content.source !== "bootstrap-activation" ||
+      !doctorArtifact.content.report ||
+      !review ||
+      review.content.verdict !== "PASS" ||
+      review.content.candidateSnapshotDigest !== input.candidateSnapshotDigest
+    ) {
+      return deny(
+        ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
+        "bootstrap confirmation is missing activation facts bound to this candidate",
+        { runId: input.runId, candidateSnapshotDigest: input.candidateSnapshotDigest },
+      );
+    }
+
+    const projectId = handoffArtifact.content.projectId;
+    if (doctorArtifact.content.projectId !== projectId) {
+      return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE, "bootstrap doctor report belongs to another project", {
+        runId: input.runId,
+        expectedProjectId: projectId,
+        actualProjectId: doctorArtifact.content.projectId ?? null,
+      });
+    }
+    const project = this.projects.get(projectId);
+    const primary = this.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }));
+    const ctoSession = primary ? this.sessions.get(primary.sessionId) : null;
+    const handoffAck = this.acknowledgedActivationHandoff(
+      input.runId,
+      handoffArtifact.content.handoffId,
+      handoffArtifact.content.toSessionId,
+    );
+    const localBindings = factory.content.repositories.flatMap((repository) => {
+      const local = this.repositories.byIdentity(repository.identity);
+      if (
+        !local ||
+        local.projectId !== projectId ||
+        local.repositoryRole !== repository.role ||
+        local.activeManifestDigest !== project?.activeManifestDigest
+      ) {
+        return [];
+      }
+      return [{
+        identity: local.identity,
+        checkoutPath: local.checkoutPath,
+        repositoryRole: local.repositoryRole,
+      }];
+    });
+    if (localBindings.length !== factory.content.repositories.length) {
+      return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE, "bootstrap local bindings changed before confirmation", {
+        runId: input.runId,
+        projectId,
+      });
+    }
+    const reviewer = review.content.reviewerSessionId
+      ? this.bindings.assertReviewerIndependence(input.runId, review.content.reviewerSessionId)
+      : deny(ReasonCode.REVIEWER_NOT_INDEPENDENT, "blind review has no reviewer session", { runId: input.runId });
+    if (!reviewer.allowed) return reviewer as Decision<ACPBootstrapActivationResult>;
+
+    const activation: ACPBootstrapActivationResult = {
+      schema: "agent-control-plane.bootstrap-activation.v1",
+      runId: input.runId,
+      projectId,
+      projectRegistration: {
+        registered: Boolean(project),
+        activeManifestDigest: project?.activeManifestDigest ?? "",
+      },
+      localBindings,
+      blindReview: { verdict: "PASS", digest: review.digest },
+      ceoConfirm: { decision: "CONFIRM", at: input.confirmedAt },
+      primaryCtoBinding: primary
+        ? {
+            roleKey: primary.roleKey,
+            sessionId: primary.sessionId,
+            bindingGeneration: primary.bindingGeneration,
+            promotedFromBootstrap: primary.sessionId === run.ownerSessionId,
+          }
+        : null,
+      buzz: { connected: Boolean(ctoSession?.buzzAddress), address: ctoSession?.buzzAddress ?? null },
+      handoffAck,
+      doctor: {
+        status: doctorArtifact.content.report.status,
+        findings: doctorArtifact.content.report.findings.length,
+      },
+      activity: project?.activity ?? "INACTIVE",
+      availability: project?.availability ?? "UNAVAILABLE",
+      completedAt: input.confirmedAt,
+    };
+    const incomplete = this.incompleteness(activation, doctorArtifact.content.report);
+    if (!activation.ceoConfirm) incomplete.push("ceoConfirm");
+    if (incomplete.length > 0) {
+      return deny(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE, "activation changed before CEO confirmation", {
+        runId: input.runId,
+        incomplete,
+      });
+    }
+
+    this.artifacts.put(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT, activation);
+    this.audit.record({
+      kind: "BOOTSTRAP_ACTIVATED",
+      runId: input.runId,
+      projectId,
+      sessionId: input.ceoSessionId,
+      evidence: {
+        candidateSnapshotDigest: input.candidateSnapshotDigest,
+        blindReviewDigest: review.digest,
+        primaryCtoGeneration: primary?.bindingGeneration ?? null,
+        doctorStatus: activation.doctor.status,
       },
     });
     return allow(ReasonCode.OK, activation);
@@ -745,7 +922,7 @@ export class BootstrapActivation {
     }
 
     const state = this.runs.get(input.runId)?.state;
-    if (state !== RunState.READY_FOR_CEO_REVIEW && state !== RunState.COMPLETED) {
+    if (state !== RunState.READY_FOR_CEO_REVIEW) {
       return deny(
         ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
         "activation requires the bootstrap run to have reached CEO review",
@@ -758,9 +935,9 @@ export class BootstrapActivation {
   }
 
   /**
-   * CP-S52 — the operational facts that must all be present before the CEO gate may
-   * confirm a bootstrap run. CEO confirmation itself is checked by that gate after this
-   * method has supplied the facts it revalidates.
+   * CP-S52 — the operational facts that must all be present before final CEO
+   * confirmation. `activate` prepares these facts; finalization re-reads them and adds
+   * the CEO receipt before it writes ACPBootstrapActivationResult.
    */
   private incompleteness(
     activation: ACPBootstrapActivationResult,

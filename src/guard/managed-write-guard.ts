@@ -148,6 +148,11 @@ interface HeldGrant {
   request: Readonly<GuardRequest>;
 }
 
+interface SourceReadLease {
+  runId: string;
+  repositoryIdentities: ReadonlySet<string>;
+}
+
 interface ClaimRow {
   claim_id: string;
   expires_at: string;
@@ -183,6 +188,7 @@ const GRANT_TTL_MS = 60_000;
 export class ManagedWriteGuard {
   readonly #grants = new Map<string, HeldGrant>();
   readonly #inFlight = new Map<string, HeldGrant>();
+  readonly #sourceReadLeases = new Map<string, SourceReadLease>();
   readonly #directWriteRoots: readonly string[];
 
   constructor(
@@ -306,6 +312,58 @@ export class ManagedWriteGuard {
       }
     }
     return dropped;
+  }
+
+  /**
+   * Freezes managed source identities while a gate re-reads evidence and publishes its
+   * decision. A writer that already holds a grant blocks acquisition; a later writer is
+   * refused by `decide`, so no source mutation can cross this observation window.
+   */
+  acquireSourceReadLease(
+    runId: string,
+    repositoryIdentities: readonly string[],
+  ): Decision<{ leaseId: string; release(): void }> {
+    const identities = [...new Set(repositoryIdentities)];
+    if (!runId || identities.length === 0 || identities.some((identity) => !identity)) {
+      return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "source-read lease requires a run and repository identities", {
+        runId,
+        repositoryIdentities,
+      });
+    }
+    const requested = new Set(identities);
+    const conflicting = [...this.#grants.values(), ...this.#inFlight.values()].find((held) =>
+      held.facts.repositoryIdentity !== null && requested.has(held.facts.repositoryIdentity),
+    );
+    if (conflicting) {
+      return deny(ReasonCode.SOURCE_READ_LEASE_HELD, "a managed source write is already authorised", {
+        runId,
+        repositoryIdentity: conflicting.facts.repositoryIdentity,
+        grantId: conflicting.facts.grantId,
+      });
+    }
+    const leaseId = `source_read_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+    const lease: SourceReadLease = { runId, repositoryIdentities: requested };
+    this.#sourceReadLeases.set(leaseId, lease);
+    let released = false;
+    return allow(ReasonCode.OK, {
+      leaseId,
+      release: () => {
+        if (released) return;
+        released = true;
+        if (this.#sourceReadLeases.get(leaseId) === lease) this.#sourceReadLeases.delete(leaseId);
+      },
+    });
+  }
+
+  assertSourceReadLease(runId: string, leaseId: string): Decision<void> {
+    const lease = this.#sourceReadLeases.get(leaseId);
+    if (!lease || lease.runId !== runId) {
+      return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "source-read lease is not held for this run", {
+        runId,
+        leaseId,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   // -------------------------------------------------------------------------
@@ -798,6 +856,9 @@ export class ManagedWriteGuard {
     const target = this.authorizeTarget({ run, request, operation, resolvedPath, toplevel });
     if (!target.allowed) return target as Decision<GuardGrant>;
 
+    const lease = this.sourceReadLeaseConflict(target.value.identity);
+    if (lease) return lease as Decision<GuardGrant>;
+
     const resources = this.authorizeResources({
       request,
       operation,
@@ -831,6 +892,18 @@ export class ManagedWriteGuard {
       },
       { projectNatured: true, role: identity.value.role },
     );
+  }
+
+  private sourceReadLeaseConflict(repositoryIdentity: string): Decision<void> | null {
+    const held = [...this.#sourceReadLeases.entries()].find(([, lease]) =>
+      lease.repositoryIdentities.has(repositoryIdentity),
+    );
+    if (!held) return null;
+    return deny(ReasonCode.SOURCE_READ_LEASE_HELD, "managed source mutation conflicts with a gate read lease", {
+      leaseId: held[0],
+      repositoryIdentity,
+      runId: held[1].runId,
+    });
   }
 
   private direct(

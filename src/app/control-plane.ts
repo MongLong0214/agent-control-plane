@@ -172,6 +172,7 @@ export class ControlPlane {
       { directWriteRoots: config.directWriteRoots },
     );
     this.tasks = new TaskGraph(this.db, this.clock, this.audit, this.telemetry);
+    this.bindings.attach({ tasks: this.tasks });
     this.runs = new RunEngine(
       this.db, this.clock, this.audit, this.artifacts, this.outbox,
       this.projects, this.repositories, this.tasks, this.claims, this.telemetry,
@@ -244,11 +245,15 @@ export class ControlPlane {
       capacity: { refreshForDispatch: () => this.capacity.refreshForDispatch() },
       continuity: { mode: () => this.continuity.mode() },
     });
-    this.ownerAuthority = new OwnerAuthority(config.ownerIdentities ?? []);
+    this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? []);
     this.cto.attach({ ownerAuthority: this.ownerAuthority });
     this.repair.attach({ ownerAuthority: this.ownerAuthority });
     this.ceo.attach({
       ownerAuthority: this.ownerAuthority,
+      bootstrapActivation: {
+        finalizeBootstrapActivationConfirm: (input) => this.bootstrap.finalizeBootstrapActivationConfirm(input),
+      },
+      sourceReadLeases: this.guard,
       continuity: {
         mode: () => this.continuity.mode(),
         assertCompletionAllowed: (runId) => this.continuity.assertCompletionAllowed(runId),

@@ -88,12 +88,19 @@ const recordBootstrapBlindReview = (harness: Harness, runId: string): string => 
 
   const reviewer = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap-reviewer" });
   harness.cp.sessions.transition(reviewer.sessionId, SessionLifecycle.READY, "test reviewer");
+  const reviewerBinding = harness.cp.bindings.bind({
+    role: Role.BLIND_REVIEWER,
+    roleKey: roleKeyFor(Role.BLIND_REVIEWER, { runId }),
+    runId,
+    sessionId: reviewer.sessionId,
+  });
+  if (!reviewerBinding.allowed) throw new Error(reviewerBinding.message);
 
   harness.cp.artifacts.putEvidence("blind-review-gate", runId, "BLIND_REVIEW", {
     runId,
     candidateSnapshotDigest: candidateSnapshotDigestValue,
     contractDigest: run.contractDigest,
-    reviewerRoleBindingGeneration: 1,
+    reviewerRoleBindingGeneration: reviewerBinding.value.bindingGeneration,
     reviewerSessionId: reviewer.sessionId,
     reviewerSessionIncarnation: reviewer.incarnation,
     reviewerProviderSessionId: reviewer.sessionId,
@@ -722,7 +729,8 @@ describe("Repo Factory boundary (CP-S52)", () => {
     if (!bound.allowed) throw new Error(bound.message);
     expect(harness.cp.runs.require(runId).ownerSessionId).toBe(bootstrapCto.sessionId);
 
-    harness.cp.runs.transition(runId, RunState.ACTIVE, "bootstrap work");
+    const dispatched = await harness.cp.runs.dispatch(runId);
+    if (!dispatched.allowed) throw new Error(dispatched.message);
     const bootstrapCandidate = recordBootstrapBlindReview(harness, runId);
     harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "bootstrap reviewed");
 
@@ -744,6 +752,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(awaitingCeo.allowed).toBe(true);
     if (!awaitingCeo.allowed) return;
     expect(awaitingCeo.value.ceoConfirm).toBeNull();
+    expect(harness.cp.artifacts.latest(runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
 
     const ceoSessionId = bindCeo(harness);
     await harness.cp.continuity.evaluate("bootstrap confirmation");

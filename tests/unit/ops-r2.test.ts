@@ -9,7 +9,7 @@ import { createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { idempotentMcpMutation } from "../../src/mcp/shared.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
-import { ExecutionMode, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
   CANDIDATE_SNAPSHOT_SCHEMA_ID,
   candidateSnapshotDigest,
@@ -17,7 +17,7 @@ import {
 } from "../../src/snapshot/candidate-snapshot.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
-import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
+import { TEST_OWNER, bindCeo, fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -105,12 +105,19 @@ const recordBootstrapBlindReview = (harness: Harness, runId: string): string => 
 
   const reviewer = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap-reviewer" });
   harness.cp.sessions.transition(reviewer.sessionId, SessionLifecycle.READY, "test reviewer");
+  const reviewerBinding = harness.cp.bindings.bind({
+    role: Role.BLIND_REVIEWER,
+    roleKey: roleKeyFor(Role.BLIND_REVIEWER, { runId }),
+    runId,
+    sessionId: reviewer.sessionId,
+  });
+  if (!reviewerBinding.allowed) throw new Error(reviewerBinding.message);
 
   harness.cp.artifacts.putEvidence("blind-review-gate", runId, "BLIND_REVIEW", {
     runId,
     candidateSnapshotDigest: candidateSnapshotDigestValue,
     contractDigest: run.contractDigest,
-    reviewerRoleBindingGeneration: 1,
+    reviewerRoleBindingGeneration: reviewerBinding.value.bindingGeneration,
     reviewerSessionId: reviewer.sessionId,
     reviewerSessionIncarnation: reviewer.incarnation,
     reviewerProviderSessionId: reviewer.sessionId,
@@ -137,7 +144,7 @@ const recordBootstrapBlindReview = (harness: Harness, runId: string): string => 
   return candidateSnapshotDigestValue;
 };
 
-const prepareBootstrap = (harness: Harness, projectId: string) => {
+const prepareBootstrap = async (harness: Harness, projectId: string) => {
   const created = harness.cp.runs.create({
     kind: RunKind.PROJECT_BOOTSTRAP,
     executionMode: ExecutionMode.STANDARD,
@@ -148,8 +155,9 @@ const prepareBootstrap = (harness: Harness, projectId: string) => {
   harness.cp.sessions.transition(bootstrapCto.sessionId, SessionLifecycle.READY, "test");
   const bound = harness.cp.bootstrap.bindBootstrapCto(created.value.runId, bootstrapCto.sessionId);
   if (!bound.allowed) throw new Error(bound.message);
-  harness.cp.runs.transition(created.value.runId, RunState.ACTIVE, "bootstrap work");
-  recordBootstrapBlindReview(harness, created.value.runId);
+  const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+  if (!dispatched.allowed) throw new Error(dispatched.message);
+  const candidateSnapshotDigestValue = recordBootstrapBlindReview(harness, created.value.runId);
   harness.cp.runs.transition(created.value.runId, RunState.READY_FOR_CEO_REVIEW, "reviewed");
   const plan = {
     bootstrapOperationId: "op-bootstrap",
@@ -162,7 +170,7 @@ const prepareBootstrap = (harness: Harness, projectId: string) => {
     }],
   };
   harness.cp.artifacts.put(created.value.runId, "PLAN", plan);
-  return { runId: created.value.runId, plan };
+  return { runId: created.value.runId, plan, candidateSnapshotDigest: candidateSnapshotDigestValue };
 };
 
 const activationInput = (harness: Harness, runId: string, projectId: string, plan: object) => ({
@@ -192,11 +200,21 @@ describe("round-2 ops regressions", () => {
       dryRun: false,
     });
     expect(result.structuredContent?.["reasonCode"]).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+
+    const prepared = await prepareBootstrap(harness, "owner-receipt");
+    const rawPair = harness.cp.ceo.recordOwnerDecision({
+      runId: prepared.runId,
+      item: "public release",
+      approved: true,
+      note: "forged",
+      owner: TEST_OWNER,
+    });
+    expect(rawPair.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
   });
 
   it("#103/#218: a caller cannot act as an active CTO by claiming its session tuple", async () => {
     const harness = makeHarness();
-    const prepared = prepareBootstrap(harness, "peer-project");
+    const prepared = await prepareBootstrap(harness, "peer-project");
     const server = createCtoServer(harness.cp, () =>
       allow(ReasonCode.OK, { actor: "attacker", sessionId: "ses_forged", sessionIncarnation: "forged" }),
     );
@@ -206,7 +224,7 @@ describe("round-2 ops regressions", () => {
 
   it("#104/#109: an unacknowledged, pre-confirmation bootstrap never writes a final activation artifact", async () => {
     const harness = makeHarness();
-    const prepared = prepareBootstrap(harness, "activation-incomplete");
+    const prepared = await prepareBootstrap(harness, "activation-incomplete");
     const result = await harness.cp.bootstrap.activate(
       activationInput(harness, prepared.runId, "activation-incomplete", prepared.plan),
     );
@@ -215,9 +233,40 @@ describe("round-2 ops regressions", () => {
     expect(harness.cp.artifacts.latest(prepared.runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
   });
 
+  it("#109 finalizes the activation result only with the matching CEO-confirmed review candidate", async () => {
+    const harness = makeHarness();
+    const prepared = await prepareBootstrap(harness, "activation-finalize");
+    const input = activationInput(harness, prepared.runId, "activation-finalize", prepared.plan);
+    const pending = await harness.cp.bootstrap.activate(input);
+    if (pending.allowed) throw new Error("handoff must be pending before acknowledgement");
+    const handoffId = pending.evidence["pendingHandoffId"] as string;
+    const primary = harness.cp.bindings.activePrimaryCto("activation-finalize");
+    if (!primary) throw new Error("primary CTO was not bound");
+    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primary.sessionId).allowed).toBe(true);
+
+    const preparedForConfirm = await harness.cp.bootstrap.activate(input);
+    expect(preparedForConfirm.allowed).toBe(true);
+    expect(harness.cp.artifacts.latest(prepared.runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
+
+    const ceoSessionId = bindCeo(harness);
+    await harness.cp.continuity.evaluate("bootstrap confirmation");
+    const confirmed = harness.cp.ceo.submitCeoDecision({
+      runId: prepared.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: prepared.candidateSnapshotDigest,
+      ceoSessionId,
+      rationale: "finalize only after recheck",
+    });
+    expect(confirmed.allowed).toBe(true);
+    expect(harness.cp.artifacts.latest<{ ceoConfirm?: { decision?: string } }>(
+      prepared.runId,
+      "BOOTSTRAP_ACTIVATION_RESULT",
+    )?.content.ceoConfirm?.decision).toBe("CONFIRM");
+  });
+
   it("#105/#202: a valid result from another run is refused before activation writes", async () => {
     const harness = makeHarness();
-    const prepared = prepareBootstrap(harness, "wrong-run");
+    const prepared = await prepareBootstrap(harness, "wrong-run");
     const input = activationInput(harness, prepared.runId, "wrong-run", prepared.plan);
     (input.factoryResult as { runId: string }).runId = "run-from-another-bootstrap";
     const result = await harness.cp.bootstrap.activate(input);
@@ -239,13 +288,13 @@ describe("round-2 ops regressions", () => {
 
   it("#107: an ACK for run A cannot acknowledge run B's distinct bootstrap handoff", async () => {
     const harness = makeHarness();
-    const first = prepareBootstrap(harness, "shared-project");
+    const first = await prepareBootstrap(harness, "shared-project");
     const firstPending = await harness.cp.bootstrap.activate(activationInput(harness, first.runId, "shared-project", first.plan));
     const firstHandoff = firstPending.evidence["pendingHandoffId"] as string;
     const primary = harness.cp.bindings.activePrimaryCto("shared-project")!;
     expect(harness.cp.bootstrap.acknowledgeActivationHandoff(firstHandoff, primary.sessionId).allowed).toBe(true);
 
-    const second = prepareBootstrap(harness, "shared-project");
+    const second = await prepareBootstrap(harness, "shared-project");
     const secondPending = await harness.cp.bootstrap.activate(activationInput(harness, second.runId, "shared-project", second.plan));
     expect(secondPending.allowed).toBe(false);
     expect(secondPending.evidence["pendingHandoffId"]).not.toBe(firstHandoff);
@@ -270,7 +319,7 @@ describe("round-2 ops regressions", () => {
 
   it("#110: CTO MCP routes a bootstrap handoff ACK to BootstrapActivation", async () => {
     const harness = makeHarness();
-    const prepared = prepareBootstrap(harness, "bootstrap-ack");
+    const prepared = await prepareBootstrap(harness, "bootstrap-ack");
     const pending = await harness.cp.bootstrap.activate(activationInput(harness, prepared.runId, "bootstrap-ack", prepared.plan));
     const handoffId = pending.evidence["pendingHandoffId"] as string;
     const primary = harness.cp.bindings.activePrimaryCto("bootstrap-ack")!;
