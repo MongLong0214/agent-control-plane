@@ -2,14 +2,15 @@ import { afterAll, describe, expect, it } from "vitest";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
+import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
-import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
+import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 
 afterAll(cleanupTempDirs);
@@ -27,15 +28,15 @@ const CONTRACT: TaskContract = {
 
 /**
  * A control plane with three named providers so the coverage planner's real preference
- * table (gpt/claude preferred, grok optional) is what gets exercised. Every adapter is
- * still non-production, so none of them can be reached by a production routing path.
+ * table (gpt/claude preferred, grok optional) is what gets exercised. The adapters are
+ * production-eligible test fixtures because these scenarios exercise routing paths.
  */
 const makeMultiProviderHarness = () => {
   const root = tempDir("acp-cont-");
   const clock = new ManualClock("2026-08-12T00:00:00.000Z");
-  const gpt = new ScriptedAdapter(clock, "gpt");
-  const claude = new ScriptedAdapter(clock, "claude");
-  const grok = new ScriptedAdapter(clock, "grok");
+  const gpt = new TestProductionAdapter(clock, "gpt");
+  const claude = new TestProductionAdapter(clock, "claude");
+  const grok = new TestProductionAdapter(clock, "grok");
   const repoPath = makeRepo({ "src/app.js": "module.exports = () => 1;\n" });
 
   const cp = new ControlPlane({
@@ -45,12 +46,16 @@ const makeMultiProviderHarness = () => {
     secretsDir: join(root, "secrets"),
     clock,
     adapters: [gpt, claude, grok],
-    allowNonProductionAdapters: true,
     ctoPreference: { provider: "claude", model: "opus", effort: null },
     reviewer: {
       preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
       fallbacks: [{ provider: "claude", model: "opus", effort: null }],
     },
+  });
+  const buzz = new InMemoryBuzzTransport();
+  const buzzAdapter = new BuzzAdapter(cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, buzz);
+  cp.continuity.attach({
+    buzz: { connect: (sessionId, purpose) => buzzAdapter.connect(sessionId, purpose) },
   });
 
   return { cp, clock, gpt, claude, grok, repoPath };
@@ -111,11 +116,13 @@ describe("resource claims (CP-S13, CP-S14, CP-S15)", () => {
       return created.value.runId;
     };
 
-    // Two runs owned by the same primary CTO, plus a second CTO on another project.
+    // Both active runs are pinned to the same project-scoped primary CTO.
     const runA = await makeRun();
     const dispatched = await harness.cp.runs.dispatch(runA);
     if (!dispatched.allowed) throw new Error(dispatched.message);
     const runB = await makeRun();
+    const secondDispatched = await harness.cp.runs.dispatch(runB);
+    if (!secondDispatched.allowed) throw new Error(secondDispatched.message);
 
     return { harness, projectId, repositoryId, runA, runB, owner: dispatched.value };
   };
