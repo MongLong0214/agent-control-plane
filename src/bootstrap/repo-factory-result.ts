@@ -45,7 +45,7 @@ export const repoFactoryResultSchema = z
           .strict(),
       )
       .min(1),
-    externalWriteReceipts: z.array(externalWriteReceiptSchema).default([]),
+    externalWriteReceipts: z.array(externalWriteReceiptSchema).min(1),
     bootstrapVerification: z
       .array(
         z
@@ -53,11 +53,11 @@ export const repoFactoryResultSchema = z
             commandId: z.string().min(1),
             repositoryIdentity: z.string().min(1),
             exactHead: z.string().min(1),
-            status: z.enum(["PASS", "FAIL", "SKIPPED"]),
+            status: z.literal("PASS"),
           })
           .strict(),
       )
-      .default([]),
+      .min(1),
     ciEvidence: z
       .array(
         z
@@ -65,13 +65,12 @@ export const repoFactoryResultSchema = z
             repositoryIdentity: z.string().min(1),
             checkName: z.string().min(1),
             head: z.string().min(1),
-            conclusion: z.string().min(1),
+            conclusion: z.literal("PASS"),
             workflowDigest: z.string().min(1),
           })
           .strict(),
-      )
-      .default([]),
-    unresolvedGaps: z.array(z.string()).default([]),
+      ),
+    unresolvedGaps: z.array(z.string()),
   })
   .strict();
 
@@ -123,6 +122,20 @@ export const parseRepoFactoryResult = (input: unknown): Decision<RepoFactoryResu
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
       "external write receipts are missing post-write re-read verification",
       { unverified: unverified.map((r) => r.resourceIdentity) },
+    );
+  }
+
+  const duplicateReceiptOperation = new Set<string>();
+  const repeated = parsed.data.externalWriteReceipts.filter((receipt) => {
+    if (duplicateReceiptOperation.has(receipt.operationId)) return true;
+    duplicateReceiptOperation.add(receipt.operationId);
+    return false;
+  });
+  if (repeated.length > 0) {
+    return deny(
+      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+      "external write receipt operation ids must be unique",
+      { operationIds: repeated.map((receipt) => receipt.operationId) },
     );
   }
 

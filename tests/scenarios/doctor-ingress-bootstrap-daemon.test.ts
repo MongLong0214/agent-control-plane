@@ -20,7 +20,7 @@ import { IngressGuard, asUntrustedData } from "../../src/ingress/ingress-guard.t
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   type Harness,
   bindCeo,
@@ -534,7 +534,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
       },
     ],
     bootstrapVerification: [
-      { commandId: "verify", repositoryIdentity: "github:acme/fixture", exactHead: "a".repeat(40), status: "PASS" },
+      { commandId: "verify", repositoryIdentity: "github:acme/fixture", exactHead: gitSync(harness.repoPath, ["rev-parse", "HEAD"]), status: "PASS" },
     ],
     ciEvidence: [],
     unresolvedGaps: [],
@@ -609,6 +609,24 @@ describe("Repo Factory boundary (CP-S52)", () => {
       handoff: HANDOFF,
     };
 
+    const approvedPlan = {
+      bootstrapOperationId: "op-1",
+      requestDigest: digestOf({ r: 1 }),
+      projectManifestDigest: manifestDigest(fixtureManifest("bootstrap-project")),
+      githubOperations: [
+        {
+          operationId: "create-repo",
+          resourceType: "repository",
+          resourceIdentity: "github:acme/fixture",
+        },
+      ],
+    };
+    harness.cp.artifacts.put(runId, "PLAN", approvedPlan);
+    input.factoryResult = factoryResult(harness, "bootstrap-project", {
+      runId,
+      planDigest: digestOf(approvedPlan),
+    });
+
     // §26.5 — with no review of the bootstrap candidate there is nothing to activate on,
     // and nothing has been written yet.
     const noReview = await harness.cp.bootstrap.activate(input);
@@ -655,33 +673,12 @@ describe("Repo Factory boundary (CP-S52)", () => {
     const acked = harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primaryCto.sessionId);
     expect(acked.allowed).toBe(true);
 
-    const activated = await harness.cp.bootstrap.activate(input);
-    if (!activated.allowed)
-      throw new Error(
-        `${activated.reasonCode}: ${activated.message} ${JSON.stringify(activated.evidence["incomplete"])}`,
-      );
-    expect(activated.value.primaryCtoBinding).toBeTruthy();
-    // The bootstrap CTO was healthy and never reviewed this run, so §26.2 promotes it.
-    expect(activated.value.primaryCtoBinding?.promotedFromBootstrap).toBe(true);
-    expect(activated.value.blindReview?.verdict).toBe("PASS");
-    expect(activated.value.buzz.connected).toBe(true);
-    expect(activated.value.handoffAck).toBeTruthy();
-    expect(activated.value.activity).toBe("ACTIVE");
-    expect(activated.value.projectRegistration.activeManifestDigest).toBe(
-      manifestDigest(fixtureManifest("bootstrap-project")),
-    );
-    // §26.3 — the activation result is what makes the completion possible: a bootstrap run
-    // cannot be confirmed without one, and with one the CEO can complete it.
-    const ceo = bindCeo(harness);
-    const confirmed = harness.cp.ceo.submitCeoDecision({
-      runId,
-      decision: "CONFIRM",
-      candidateSnapshotDigest: bootstrapCandidate,
-      ceoSessionId: ceo,
-      rationale: "bootstrap activated",
-    });
-    if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
-    expect(harness.cp.runs.require(runId).state).toBe(RunState.COMPLETED);
+    const awaitingCeo = await harness.cp.bootstrap.activate(input);
+    expect(awaitingCeo.allowed).toBe(false);
+    expect(awaitingCeo.evidence["incomplete"]).toContain("ceoConfirm");
+    // A pre-confirmation record is operationally useful but never masquerades as the
+    // immutable final activation result; the completion transaction must create that.
+    expect(harness.cp.artifacts.latest(runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
 
     const stored = harness.cp.artifacts.latest(runId, "REPO_FACTORY_RESULT");
     expect(JSON.stringify(stored?.content)).not.toContain("primaryCto");
