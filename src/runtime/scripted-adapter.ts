@@ -44,6 +44,9 @@ export class ScriptedAdapter implements ProviderAdapter {
   #responses: ScriptedResponse[] = [];
   #capacity: CapacityReading | null = null;
   #runtime: "HEALTHY" | "DEGRADED" | "UNAVAILABLE" = "HEALTHY";
+  #knownSessions = new Set<string>();
+  #sessionHealth = new Map<string, "HEALTHY" | "DEGRADED" | "UNAVAILABLE">();
+  #nextSessionHealth: "HEALTHY" | "DEGRADED" | "UNAVAILABLE" | null = null;
 
   /**
    * `provider` is overridable so a scenario can model two distinct providers (fan-out,
@@ -74,9 +77,20 @@ export class ScriptedAdapter implements ProviderAdapter {
     this.#runtime = health;
   }
 
+  /** Lets a scenario model a session the provider no longer recognises while its runtime remains healthy. */
+  setNextSessionHealth(health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE"): void {
+    this.#nextSessionHealth = health;
+  }
+
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
+    const externalSessionId = randomUUID();
+    this.#knownSessions.add(externalSessionId);
+    if (this.#nextSessionHealth) {
+      this.#sessionHealth.set(externalSessionId, this.#nextSessionHealth);
+      this.#nextSessionHealth = null;
+    }
     return {
-      externalSessionId: randomUUID(),
+      externalSessionId,
       provider: this.provider,
       model: spec.model,
       effort: spec.effort ?? null,
@@ -85,7 +99,11 @@ export class ScriptedAdapter implements ProviderAdapter {
     };
   }
 
-  async stopSession(): Promise<void> {}
+  async stopSession(handle?: SessionHandle): Promise<void> {
+    if (!handle || handle.provider !== this.provider) return;
+    this.#knownSessions.delete(handle.externalSessionId);
+    this.#sessionHealth.delete(handle.externalSessionId);
+  }
 
   async invoke(request: InvocationRequest): Promise<InvocationResult> {
     this.invocations.push(request);
@@ -129,7 +147,10 @@ export class ScriptedAdapter implements ProviderAdapter {
   }
 
   async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    return handle.provider === this.provider ? this.#runtime : "UNAVAILABLE";
+    if (handle.provider !== this.provider || !this.#knownSessions.has(handle.externalSessionId)) {
+      return "UNAVAILABLE";
+    }
+    return this.#sessionHealth.get(handle.externalSessionId) ?? this.#runtime;
   }
 
   async probeCapacity(): Promise<CapacityReading> {

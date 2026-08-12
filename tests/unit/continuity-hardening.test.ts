@@ -37,8 +37,7 @@ class ProductionTestAdapter implements ProviderAdapter {
   setRuntimeHealth(health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE"): void { this.#scripted.setRuntimeHealth(health); }
   startSession(spec: SessionSpec): Promise<SessionHandle> { return this.#scripted.startSession(spec); }
   stopSession(handle: SessionHandle): Promise<void> {
-    void handle;
-    return this.#scripted.stopSession();
+    return this.#scripted.stopSession(handle);
   }
   invoke(request: InvocationRequest): Promise<InvocationResult> { return this.#scripted.invoke(request); }
   probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> { return this.#scripted.probeRuntime(); }

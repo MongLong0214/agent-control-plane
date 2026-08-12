@@ -13,6 +13,10 @@ const isRoutableBucket = (
   bucket: { remainingPercent: number | null },
   exhaustedPercent: number,
 ): boolean => typeof bucket.remainingPercent === "number" && bucket.remainingPercent > exhaustedPercent;
+
+/** The only lower-priority allocation capabilities defined by §14.5. */
+const isWorkerCapability = (capability: string): boolean =>
+  capability === "worker" || capability === "luna-worker";
 export type AdvisoryCapacityState = "HEALTHY" | "CONSERVE" | "CRITICAL" | "EXHAUSTED";
 
 export interface ProviderCapacity extends CapacityReading {
@@ -59,8 +63,8 @@ export interface DynamicReserveDemand {
   criticalRoleInvocations: number;
   expectedReviews: number;
   inFlightRuns: number;
-  /** Recent observed quota burn; zero is a measured absence of burn, not an unknown bucket. */
-  burnRatePercentPerHour?: number;
+  /** Recent observed quota burn; zero is a measured absence of burn, not an unknown input. */
+  burnRatePercentPerHour: number;
 }
 
 /** The allocation selected by the caller after role routing, before it is activated. */
@@ -143,80 +147,105 @@ export class CapacityMonitor {
   }
 
   /**
-   * §14.2 first bullet — dispatch admission refreshes first, then decides. Admission is
-   * granted when at least one production provider can still serve the roles a run
-   * needs; if every production sensor is unusable the answer is suspend, not guess.
+   * §14.2 first bullet — dispatch admission refreshes first, then decides about the
+   * concrete allocation. An omitted target is not a safe substitute for "any healthy
+   * provider": it loses the provider and capability facts the caller is about to use.
    */
   async refreshForDispatch(target?: DispatchCapacityTarget): Promise<Decision<void>> {
-    const readings = await this.refresh(
-      RefreshTrigger.DISPATCH_ADMISSION,
-      target ? [target.provider] : undefined,
-    );
+    if (!target) {
+      await this.refresh(RefreshTrigger.DISPATCH_ADMISSION);
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "dispatch capacity admission requires an exact allocation target",
+        { target: null },
+      );
+    }
+    if (!this.providers.has(target.provider)) {
+      await this.refresh(RefreshTrigger.DISPATCH_ADMISSION);
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "the selected provider is not registered",
+        { provider: target.provider, capabilities: target.capabilities },
+      );
+    }
+    if (target.capabilities.length === 0) {
+      await this.refresh(RefreshTrigger.DISPATCH_ADMISSION, [target.provider]);
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "dispatch capacity admission requires at least one required capability",
+        { provider: target.provider, capabilities: [] },
+      );
+    }
+
+    const readings = await this.refresh(RefreshTrigger.DISPATCH_ADMISSION, [target.provider]);
+
     const production = readings.filter((r) => this.providers.require(r.provider).isProduction);
     if (production.length === 0) {
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
         "no production provider is registered for dispatch admission",
-        { target: target ?? null },
+        { target },
       );
     }
 
-    if (target) {
-      const selected = production.find((reading) => reading.provider === target.provider);
-      if (!selected) {
-        return deny(
-          ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-          "the selected provider is not production-eligible",
-          { provider: target.provider, capabilities: target.capabilities },
-        );
-      }
-      const unroutable = target.capabilities.filter((capability) => !this.isRoutableFor(selected, capability));
-      if (unroutable.length > 0) {
-        return deny(
-          ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-          "the selected provider lacks current routable capacity for a required capability",
-          { provider: selected.provider, capabilities: unroutable, admission: selected.allocationAdmission },
-        );
-      }
-      if (target.priority === "worker") {
-        const reserve = this.dynamicReserve(selected.provider, target.reserveDemand ?? {
-          criticalRoleInvocations: 0,
-          expectedReviews: 0,
-          inFlightRuns: 0,
-        });
-        const applicable = selected.buckets.filter((bucket) => target.capabilities.some((c) => bucket.capabilities.includes(c)));
-        if (applicable.some((bucket) => bucket.remainingPercent === null || bucket.remainingPercent / 100 <= reserve)) {
-          return deny(
-            ReasonCode.CAPACITY_ADMISSION_CONSERVE,
-            "worker allocation would consume capacity reserved for critical roles",
-            { provider: selected.provider, reserve, capabilities: target.capabilities },
-          );
-        }
-      }
-      return allow(ReasonCode.OK, undefined, {
-        admitted: [{ provider: selected.provider, admission: selected.allocationAdmission }],
-      });
-    }
-
-    const usable = production.filter((r) => r.allocationAdmission !== "SUSPENDED");
-    if (usable.length === 0) {
-      const failed = production.filter((r) => r.sensorHealth === "ERROR");
+    const selected = production.find((reading) => reading.provider === target.provider);
+    if (!selected) {
       return deny(
-        failed.length > 0 ? ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE : ReasonCode.CAPACITY_ADMISSION_SUSPENDED,
-        "no production provider can admit new allocation",
-        {
-          providers: production.map((r) => ({
-            provider: r.provider,
-            sensorHealth: r.sensorHealth,
-            runtimeHealth: r.runtimeHealth,
-            admission: r.allocationAdmission,
-            error: r.error ?? null,
-          })),
-        },
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "the selected provider is not production-eligible",
+        { provider: target.provider, capabilities: target.capabilities },
       );
     }
+    const unroutable = target.capabilities.filter((capability) => !this.isRoutableFor(selected, capability));
+    if (unroutable.length > 0) {
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "the selected provider lacks current routable capacity for a required capability",
+        { provider: selected.provider, capabilities: unroutable, admission: selected.allocationAdmission },
+      );
+    }
+
+    if (target.capabilities.some(isWorkerCapability) && target.priority !== "worker") {
+      return deny(
+        ReasonCode.CAPACITY_ADMISSION_CONSERVE,
+        "worker allocation must declare worker priority so it cannot bypass the dynamic reserve",
+        { provider: selected.provider, capabilities: target.capabilities, priority: target.priority ?? null },
+      );
+    }
+
+    if (target.priority === "worker") {
+      if (!target.reserveDemand) {
+        return deny(
+          ReasonCode.CAPACITY_ADMISSION_CONSERVE,
+          "worker allocation lacks the dynamic-reserve demand needed to protect critical roles",
+          { provider: selected.provider, capabilities: target.capabilities },
+        );
+      }
+      const reserves = new Map(
+        this.dynamicReserveByBucket(selected, target.reserveDemand).map((reserve) => [reserve.bucketId, reserve.reserve]),
+      );
+      const applicable = selected.buckets.filter((bucket) =>
+        target.capabilities.some((capability) => bucket.capabilities.includes(capability)),
+      );
+      const constrained = applicable.filter((bucket) => {
+        const reserve = reserves.get(bucket.id) ?? 1;
+        return bucket.remainingPercent === null || bucket.remainingPercent / 100 <= reserve;
+      });
+      if (constrained.length > 0) {
+        return deny(
+          ReasonCode.CAPACITY_ADMISSION_CONSERVE,
+          "worker allocation would consume capacity reserved for critical roles",
+          {
+            provider: selected.provider,
+            capabilities: target.capabilities,
+            reserves: constrained.map((bucket) => ({ bucketId: bucket.id, reserve: reserves.get(bucket.id) ?? 1 })),
+          },
+        );
+      }
+    }
+
     return allow(ReasonCode.OK, undefined, {
-      admitted: usable.map((r) => ({ provider: r.provider, admission: r.allocationAdmission })),
+      admitted: [{ provider: selected.provider, admission: selected.allocationAdmission }],
     });
   }
 
@@ -304,29 +333,35 @@ export class CapacityMonitor {
     capacity: ProviderCapacity,
     demand: DynamicReserveDemand,
   ): Array<{ bucketId: string; reserve: number }> {
+    const inputs = [
+      demand.criticalRoleInvocations,
+      demand.expectedReviews,
+      demand.inFlightRuns,
+      demand.burnRatePercentPerHour,
+    ];
+    if (inputs.some((input) => !Number.isFinite(input) || input < 0)) {
+      // A malformed demand observation is not zero demand. Preserve every window until
+      // the caller can provide the measured facts §14.5 requires.
+      return capacity.buckets.map((bucket) => ({ bucketId: bucket.id, reserve: 1 }));
+    }
     const weighted =
       demand.criticalRoleInvocations * 2 + demand.expectedReviews * 3 + demand.inFlightRuns;
     const nowMs = new Date(this.clock.nowIso()).getTime();
-    const burn = Math.max(0, demand.burnRatePercentPerHour ?? 0);
+    const burn = demand.burnRatePercentPerHour;
     return capacity.buckets.map((bucket) => {
       // Unknown quota is never imagined as headroom. Lower-priority work must preserve
       // the whole window until a usable observation exists.
       if (bucket.remainingPercent === null) return { bucketId: bucket.id, reserve: 1 };
       const resetMs = bucket.resetAt ? new Date(bucket.resetAt).getTime() : Number.NaN;
-      // A source without a reset horizon is treated conservatively as a one-day window;
-      // it remains dynamic with measured burn instead of pretending the quota never resets.
-      const horizonHours = Number.isFinite(resetMs)
-        ? Math.max(0, (resetMs - nowMs) / (60 * 60 * 1000))
-        : 24;
+      // A lower-priority router cannot manufacture a reset horizon. A missing, malformed,
+      // or already elapsed reset must therefore protect the whole bucket until it is
+      // observed again with a usable horizon.
+      if (!Number.isFinite(resetMs) || resetMs <= nowMs) return { bucketId: bucket.id, reserve: 1 };
+      const horizonHours = (resetMs - nowMs) / (60 * 60 * 1000);
       const expectedBurn = burn * horizonHours;
       const demandShare = weighted / (weighted + Math.max(1, bucket.remainingPercent));
       const burnShare = expectedBurn / Math.max(1, bucket.remainingPercent + expectedBurn);
-      return {
-        bucketId: bucket.id,
-        // Preserve a modest floor even when there is no current critical demand. This is
-        // a guard band for the next mandatory review rather than a fixed global reserve.
-        reserve: Math.max(0.05, Math.min(0.95, demandShare + burnShare)),
-      };
+      return { bucketId: bucket.id, reserve: Math.min(1, demandShare + burnShare) };
     });
   }
 

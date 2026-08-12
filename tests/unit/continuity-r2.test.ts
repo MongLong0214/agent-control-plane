@@ -36,10 +36,12 @@ class ProductionTestAdapter implements ProviderAdapter {
   get defaultModels(): Readonly<Record<string, string>> { return this.#scripted.defaultModels; }
   setCapacity(reading: CapacityReading | null): void { this.#scripted.setCapacity(reading); }
   setRuntimeHealth(health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE"): void { this.#scripted.setRuntimeHealth(health); }
+  setNextSessionHealth(health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE"): void {
+    this.#scripted.setNextSessionHealth(health);
+  }
   startSession(spec: SessionSpec): Promise<SessionHandle> { return this.#scripted.startSession(spec); }
   stopSession(handle: SessionHandle): Promise<void> {
-    void handle;
-    return this.#scripted.stopSession();
+    return this.#scripted.stopSession(handle);
   }
   invoke(request: InvocationRequest): Promise<InvocationResult> { return this.#scripted.invoke(request); }
   probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> { return this.#scripted.probeRuntime(); }
@@ -117,17 +119,29 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(cp.capacity.providersFor("cto")).toEqual([]);
   });
 
-  it("#53/#179 admits only the selected provider and all capabilities it must serve", async () => {
-    const { cp, clock, gpt, claude } = makePlane();
+  it("#53/#179/#328 admits a working capability and denies the selected missing capability", async () => {
+    const { cp, clock, gpt } = makePlane();
     gpt.setCapacity(reading("gpt", clock, [
-      { id: "worker", remainingPercent: 90, resetAt: null, capabilities: ["worker"] },
+      { id: "worker", remainingPercent: 90, resetAt: "2026-08-13T00:00:00.000Z", capabilities: ["worker"] },
     ]));
-    claude.setCapacity({ ...healthy("claude", clock), sensorHealth: "ERROR", buckets: [] });
-    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT);
 
-    const decision = await cp.capacity.refreshForDispatch({ provider: "claude", capabilities: ["cto"] });
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    const worker = await cp.capacity.refreshForDispatch({
+      provider: "gpt",
+      capabilities: ["worker"],
+      priority: "worker",
+      reserveDemand: { criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0 },
+    });
+    expect(worker.allowed).toBe(true);
+    expect(worker.reasonCode).toBe(ReasonCode.OK);
+
+    const cto = await cp.capacity.refreshForDispatch({ provider: "gpt", capabilities: ["cto"] });
+    expect(cto.allowed).toBe(false);
+    expect(cto.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    expect(cto.evidence).toMatchObject({ provider: "gpt", capabilities: ["cto"] });
+
+    const unprioritizedWorker = await cp.capacity.refreshForDispatch({ provider: "gpt", capabilities: ["worker"] });
+    expect(unprioritizedWorker.allowed).toBe(false);
+    expect(unprioritizedWorker.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
   });
 
   it("#178 denies dispatch admission when no production provider exists", async () => {
@@ -143,9 +157,22 @@ describe("round-2 capacity and runtime regressions", () => {
       adapters: [scripted],
       allowNonProductionAdapters: true,
     });
-    const decision = await cp.capacity.refreshForDispatch();
+    const decision = await cp.capacity.refreshForDispatch({ provider: "scripted", capabilities: ["cto"] });
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+  });
+
+  it("#53 fails closed when a dispatcher cannot name a concrete target", async () => {
+    const { cp } = makePlane();
+    const targetless = await cp.capacity.refreshForDispatch();
+    expect(targetless.allowed).toBe(false);
+    expect(targetless.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    expect(targetless.evidence).toEqual({ target: null });
+
+    const unregistered = await cp.capacity.refreshForDispatch({ provider: "missing", capabilities: ["cto"] });
+    expect(unregistered.allowed).toBe(false);
+    expect(unregistered.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    expect(unregistered.evidence).toMatchObject({ provider: "missing", capabilities: ["cto"] });
   });
 
   it("#55/#182 computes reserve per window, includes reset/burn, and reserves unknown capacity", async () => {
@@ -177,8 +204,31 @@ describe("round-2 capacity and runtime regressions", () => {
     });
     expect(denied.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
 
+    // An unknown CTO window reserves CTO capacity, not an unrelated worker window.
+    // Collapsing all provider buckets to one maximum reserve would reject this worker.
     gpt.setCapacity(reading("gpt", clock, [
-      { id: "constrained", remainingPercent: 10, resetAt: null, capabilities: ["worker"] },
+      { id: "worker", remainingPercent: 80, resetAt: "2026-08-13T00:00:00.000Z", capabilities: ["worker"] },
+      { id: "cto", remainingPercent: null, resetAt: null, capabilities: ["cto"] },
+    ]));
+    const unrelatedUnknown = await cp.capacity.refreshForDispatch({
+      provider: "gpt",
+      capabilities: ["worker"],
+      priority: "worker",
+      reserveDemand: { criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0 },
+    });
+    expect(unrelatedUnknown.allowed).toBe(true);
+    expect(unrelatedUnknown.reasonCode).toBe(ReasonCode.OK);
+
+    const missingDemand = await cp.capacity.refreshForDispatch({
+      provider: "gpt",
+      capabilities: ["worker"],
+      priority: "worker",
+    });
+    expect(missingDemand.allowed).toBe(false);
+    expect(missingDemand.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+
+    gpt.setCapacity(reading("gpt", clock, [
+      { id: "constrained", remainingPercent: 10, resetAt: "2026-08-13T00:00:00.000Z", capabilities: ["worker"] },
     ]));
     const reserved = await cp.capacity.refreshForDispatch({
       provider: "gpt",
@@ -187,6 +237,18 @@ describe("round-2 capacity and runtime regressions", () => {
       reserveDemand: { criticalRoleInvocations: 2, expectedReviews: 1, inFlightRuns: 3, burnRatePercentPerHour: 4 },
     });
     expect(reserved.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+
+    gpt.setCapacity(reading("gpt", clock, [
+      { id: "missing-reset", remainingPercent: 80, resetAt: null, capabilities: ["worker"] },
+    ]));
+    const unknownHorizon = await cp.capacity.refreshForDispatch({
+      provider: "gpt",
+      capabilities: ["worker"],
+      priority: "worker",
+      reserveDemand: { criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0 },
+    });
+    expect(unknownHorizon.allowed).toBe(false);
+    expect(unknownHorizon.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
   });
 
   it("#56 rejects a future-dated capacity file instead of keeping it fresh indefinitely", () => {
@@ -242,12 +304,12 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(() => providers.registerTestAdapter(new ScriptedAdapter(clock, "gpt"))).toThrow("already registered");
   });
 
-  it("#57 requires provider evidence for the exact constituted session", async () => {
+  it("#57 rejects a same-provider handle the runtime never constituted", async () => {
     const clock = new ManualClock("2026-08-12T00:00:00.000Z");
     const gpt = new ProductionTestAdapter(clock, "gpt");
     const result = await gpt.probeSession({
-      externalSessionId: "session-owned-by-claude",
-      provider: "claude",
+      externalSessionId: "not-a-constituted-session",
+      provider: "gpt",
       model: "test",
       effort: null,
       pid: null,
@@ -324,17 +386,19 @@ describe("round-2 continuity and persistence regressions", () => {
     expect(decision.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
   });
 
-  it("#57 refuses failover when the exact constituted provider session cannot be probed", async () => {
+  it("#57 refuses failover when a healthy runtime cannot prove its exact constituted session", async () => {
     const plane = makePlane();
     bindCeo(plane);
     plane.gpt.setCapacity(healthy("gpt", plane.clock));
     plane.claude.setCapacity(healthy("claude", plane.clock));
-    plane.gpt.setRuntimeHealth("UNAVAILABLE");
+    plane.gpt.setRuntimeHealth("HEALTHY");
+    plane.gpt.setNextSessionHealth("UNAVAILABLE");
     attachRoutablePorts(plane.cp);
 
     const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "session probe failed");
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
+    expect(await plane.gpt.probeRuntime()).toBe("HEALTHY");
   });
 
   it("#54/#176 refreshes selected capacity when continuity session allocation fails", async () => {
