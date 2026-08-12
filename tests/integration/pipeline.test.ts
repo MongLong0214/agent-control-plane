@@ -453,7 +453,7 @@ describe("one safe project run, end to end", () => {
     // A well-formed review packet from the right producer, but naming a session that was
     // never bound as this run's blind reviewer.
     harness.cp.artifacts.putEvidence(
-      "blind-review-gate",
+      harness.cp.evidenceWriters.BLIND_REVIEW,
       runId,
       "BLIND_REVIEW",
       {

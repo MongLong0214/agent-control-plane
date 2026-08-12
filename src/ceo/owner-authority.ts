@@ -22,7 +22,17 @@ export interface OwnerIdentity {
 export interface OwnerAuthorityPort {
   isAllowedActor(channel: string, actor: string): boolean;
   assertApproval(receipt: OwnerApprovalReceipt): Decision<void>;
+  assertLocalOwner(owner: OwnerIdentity | null | undefined): Decision<OwnerIdentity>;
 }
+
+/**
+ * The one channel on which a `{channel, actor}` pair is not a claim about someone else:
+ * the local operator running the CLI *is* the calling process, so there is no transport
+ * between the human and this code to authenticate. Every other channel arrives over one,
+ * where an identity means nothing until ingress has verified the envelope (§27.1) — which
+ * is why a delegable channel's owner decision must carry an admitted receipt.
+ */
+export const LOCAL_OWNER_CHANNEL = "cli";
 
 /**
  * An owner decision is evidence from an admitted ingress envelope, not a tuple that a
@@ -55,15 +65,50 @@ export class OwnerAuthority implements OwnerAuthorityPort {
   }
 
   /**
+   * §21 — an owner decision made on this host. The pair is accepted only for the local
+   * channel and only for a configured identity; an unconfigured deployment has no owner,
+   * so it can satisfy no human gate.
+   */
+  assertLocalOwner(owner: OwnerIdentity | null | undefined): Decision<OwnerIdentity> {
+    if (!owner || owner.channel !== LOCAL_OWNER_CHANNEL) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "an owner decision from a delegable channel requires an admitted ingress receipt",
+        { channel: owner?.channel ?? null, actor: owner?.actor ?? null },
+      );
+    }
+    if (!this.isAllowedActor(owner.channel, owner.actor)) {
+      return deny(
+        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+        this.#identities.length === 0
+          ? "this deployment has no owner identity, so no owner decision can be attributed"
+          : "the local actor is not an allowlisted owner identity",
+        { channel: owner.channel, actor: owner.actor },
+      );
+    }
+    return allow(ReasonCode.OK, { channel: owner.channel, actor: owner.actor });
+  }
+
+  /**
    * CP-HI-07 — receiving an allowlisted name is not authority. The exact receipt must
    * trace to the immutable admission record written by IngressGuard for this operation.
    */
   assertApproval(receipt: OwnerApprovalReceipt): Decision<void> {
-    if (!receipt || !this.isAllowedActor(receipt.channel, receipt.actor)) {
+    if (!receipt) {
       return deny(
         ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "owner approval requires an admitted receipt from a configured owner identity",
-        { channel: receipt?.channel ?? null, actor: receipt?.actor ?? null },
+        "owner approval requires an admitted ingress receipt",
+        { channel: null, actor: null },
+      );
+    }
+    // A receipt naming someone this deployment never allowlisted is a different failure
+    // from a caller that cannot hold owner authority at all: the actor is simply not an
+    // owner here, which is the ingress allowlist's answer.
+    if (!this.isAllowedActor(receipt.channel, receipt.actor)) {
+      return deny(
+        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+        "the owner approval receipt names an actor that is not an allowlisted owner",
+        { channel: receipt.channel, actor: receipt.actor },
       );
     }
     if (
@@ -90,27 +135,26 @@ export class OwnerAuthority implements OwnerAuthorityPort {
       );
     }
 
-    const expected = digestOf({
-      channel: receipt.channel,
-      actor: receipt.actor,
-      inboundNonce: receipt.inboundNonce,
-      runId: receipt.runId,
-      operation: receipt.operation,
-      parameterDigest: receipt.parameterDigest,
-      idempotencyKey: receipt.idempotencyKey,
-      approved: receipt.approved,
-    });
+    const expected = admittedEnvelopeDigest(receipt);
     const admitted = this.db
       .all<{ evidence_json: string }>(
         `SELECT evidence_json FROM audit_events
-          WHERE kind = 'OWNER_APPROVAL_INGRESS' AND actor = ?
+          WHERE kind = 'INGRESS_ADMITTED' AND actor = ?
           ORDER BY event_id DESC`,
-        [`${receipt.channel}:${receipt.actor}`],
+        [receipt.actor],
       )
       .some((row) => {
         try {
-          const evidence = JSON.parse(row.evidence_json) as { receiptDigest?: unknown };
-          return evidence.receiptDigest === expected;
+          const evidence = JSON.parse(row.evidence_json) as {
+            channel?: unknown;
+            nonce?: unknown;
+            payloadDigest?: unknown;
+          };
+          return (
+            evidence.channel === receipt.channel &&
+            evidence.nonce === receipt.inboundNonce &&
+            evidence.payloadDigest === expected
+          );
         } catch {
           return false;
         }
@@ -130,3 +174,21 @@ export class OwnerAuthority implements OwnerAuthorityPort {
     return this.#identities.length;
   }
 }
+
+/**
+ * The digest IngressGuard recorded for the envelope it verified, recomputed from the
+ * receipt. It has to be derived here rather than by calling `ownerApprovalPayload`: a
+ * receipt carries the parameter *digest*, not the parameters, so the shape below must stay
+ * identical to that function's output. Checking the admitted envelope — rather than the
+ * receipt digest the guard also audits — is what makes the proof durable: the admission
+ * record holds only fields the audit evidence allowlist accepts, so it survives storage.
+ */
+const admittedEnvelopeDigest = (receipt: OwnerApprovalReceipt): string =>
+  digestOf({
+    type: "OWNER_APPROVAL",
+    runId: receipt.runId,
+    operation: receipt.operation,
+    parameterDigest: receipt.parameterDigest,
+    idempotencyKey: receipt.idempotencyKey,
+    approved: receipt.approved,
+  });

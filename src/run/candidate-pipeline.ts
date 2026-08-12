@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -472,4 +474,3 @@ export class CandidatePipeline {
     return verifySnapshotFreshness(snapshot, probes);
   }
 }
-import { randomUUID } from "node:crypto";

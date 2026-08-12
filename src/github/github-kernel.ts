@@ -1706,19 +1706,70 @@ export class GitHubKernel {
       });
     }
 
+    const idempotencyKey = `release_tag:${repositoryIdentity}:${tag}`;
+    const requestDigest = digestOf({ tag, commitSha });
+    const prior = this.receipt(idempotencyKey);
+    if (prior && prior.request_digest !== requestDigest) {
+      return deny(ReasonCode.RESOURCE_COLLISION, "tag is already bound to different operation intent", {
+        idempotencyKey,
+        requestDigest,
+        existingRequestDigest: prior.request_digest,
+      });
+    }
+    if (prior?.verified !== 1 && this.inFlightReservations.has(idempotencyKey)) {
+      return deny(ReasonCode.RESOURCE_COLLISION, "release tag operation is in flight", { idempotencyKey });
+    }
+
     const existing = await this.api()
       .request<{ object?: { sha: string } }>("GET", `/repos/${owner}/${repo}/git/ref/tags/${tag}`)
       .catch(() => null);
     if (existing?.object?.sha) {
-      if (existing.object.sha === commitSha) {
-        return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, { tag, sha: commitSha }, { replayed: true });
+      if (existing.object.sha !== commitSha) {
+        return deny(ReasonCode.RELEASE_TAG_DUPLICATE, "tag already exists on a different commit", {
+          tag,
+          existing: existing.object.sha,
+          requested: commitSha,
+        });
       }
-      return deny(ReasonCode.RELEASE_TAG_DUPLICATE, "tag already exists on a different commit", {
+      // The tag is already on the requested commit. When a reservation from an interrupted
+      // attempt is still open, this read is exactly the reread its completion requires, so
+      // the reservation is finished rather than abandoned as a permanent PENDING row.
+      if (prior && prior.verified !== 1) {
+        const reconciled = this.finalizeReservedReceipt({
+          idempotencyKey,
+          requestDigest,
+          preexisting: false,
+          afterStateDigest: sha256(commitSha),
+          response: { tag, sha: commitSha },
+          reread: true,
+        });
+        if (!reconciled.allowed) return reconciled as Decision<{ tag: string; sha: string }>;
+      }
+      return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, { tag, sha: commitSha }, { replayed: true });
+    }
+    if (prior?.verified === 1) {
+      // A completed receipt records a tag GitHub no longer has. Tagging again would be a
+      // second external write under a receipt that already claims to describe the first.
+      return deny(ReasonCode.RESOURCE_COLLISION, "recorded release tag is absent from GitHub", {
+        idempotencyKey,
         tag,
-        existing: existing.object.sha,
-        requested: commitSha,
       });
     }
+    // GitHub holds no such tag, so a leftover reservation's external write demonstrably did
+    // not happen: releasing it destroys no evidence and lets this attempt reserve afresh.
+    if (prior) this.releaseReservation(idempotencyKey, requestDigest);
+
+    const reserved = this.reserveReceipt({
+      idempotencyKey,
+      operation: "release_tag",
+      runId,
+      repositoryIdentity,
+      resourceType: "tag",
+      resourceIdentity: `${owner}/${repo}@${tag}`,
+      beforeStateDigest: null,
+      requestDigest,
+    });
+    if (!reserved.allowed) return reserved as Decision<{ tag: string; sha: string }>;
 
     const tagged = await this.mediate(
       WriteOperation.GITHUB_RELEASE,
@@ -1730,7 +1781,10 @@ export class GitHubKernel {
         sha: commitSha,
       }),
     );
-    if (!tagged.allowed) return tagged as Decision<{ tag: string; sha: string }>;
+    if (!tagged.allowed) {
+      if (tagged.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
+      return tagged as Decision<{ tag: string; sha: string }>;
+    }
 
     const reread = await this.api().request<{ object: { sha: string } }>(
       "GET",
@@ -1743,6 +1797,18 @@ export class GitHubKernel {
         observed: reread.object.sha,
       });
     }
+
+    // The reread proved the tag, so the reservation is completed here rather than after the
+    // branch cleanup below: the receipt records the tag write, not an unrelated deletion.
+    const finalized = this.finalizeReservedReceipt({
+      idempotencyKey,
+      requestDigest,
+      preexisting: false,
+      afterStateDigest: sha256(commitSha),
+      response: { tag, sha: commitSha },
+      reread: true,
+    });
+    if (!finalized.allowed) return finalized as Decision<{ tag: string; sha: string }>;
 
     if (profile.value.releaseBranchCleanup === "delete") {
       const sourceBranch = merge.sourceBranch;
@@ -1766,20 +1832,6 @@ export class GitHubKernel {
       if (!deleted.allowed) return deleted as Decision<{ tag: string; sha: string }>;
     }
 
-    this.writeReceipt({
-      idempotencyKey: `release_tag:${repositoryIdentity}:${tag}`,
-      operation: "release_tag",
-      runId,
-      repositoryIdentity,
-      resourceType: "tag",
-      resourceIdentity: `${owner}/${repo}@${tag}`,
-      preexisting: false,
-      beforeStateDigest: null,
-      afterStateDigest: sha256(commitSha),
-      requestDigest: digestOf({ tag, commitSha }),
-      response: { tag, sha: commitSha },
-      reread: true,
-    });
     return allow(ReasonCode.OK, { tag, sha: commitSha });
   }
 
@@ -1889,14 +1941,51 @@ export class GitHubKernel {
     if (!slug.allowed) return slug as Decision<{ created: number; updated: number }>;
     const { owner, repo } = slug.value;
 
+    const requestDigest = digestOf(tickets);
+    const idempotencyKey = `issue_project:${repositoryIdentity}:${requestDigest}`;
+    const prior = this.receipt(idempotencyKey);
+    if (prior?.verified === 1) {
+      // This exact ticket set was already projected and reread. Running the writes again
+      // would mutate GitHub under a receipt that already records the completed projection.
+      return allow(
+        ReasonCode.MERGE_IDEMPOTENT_REPLAY,
+        JSON.parse(prior.response_json) as { created: number; updated: number },
+        { replayed: true },
+      );
+    }
+    if (prior && this.inFlightReservations.has(idempotencyKey)) {
+      return deny(ReasonCode.RESOURCE_COLLISION, "issue projection is in flight", { idempotencyKey });
+    }
+
     const existing = await this.api().request<Array<{ number: number; body: string | null }>>(
       "GET",
       `/repos/${owner}/${repo}/issues?state=all&per_page=100`,
     );
     const byMarker = new Map<string, number>();
     for (const issue of existing) {
-      const marker = /<!-- acp-ticket:([^\s]+) -->/.exec(issue.body ?? "")?.[1];
+      const marker = this.ticketMarker(issue.body);
       if (marker) byMarker.set(marker, issue.number);
+    }
+
+    // The reservation is claimed before the first PATCH or POST, so a crash between the
+    // write and its reread leaves a reconcilable PENDING row rather than an unrecorded
+    // projection. A reservation left over from such a crash describes this same intent and
+    // the projection is marker-idempotent, so it is resumed instead of reserved twice — but
+    // it becomes this caller's in-flight write, which no concurrent caller may seize.
+    if (prior) {
+      this.inFlightReservations.add(idempotencyKey);
+    } else {
+      const reserved = this.reserveReceipt({
+        idempotencyKey,
+        operation: "issue_project",
+        runId,
+        repositoryIdentity,
+        resourceType: "issues",
+        resourceIdentity: `${owner}/${repo}`,
+        beforeStateDigest: null,
+        requestDigest,
+      });
+      if (!reserved.allowed) return reserved as Decision<{ created: number; updated: number }>;
     }
 
     let created = 0;
@@ -1904,52 +1993,93 @@ export class GitHubKernel {
     for (const ticket of tickets) {
       const body = `<!-- acp-ticket:${ticket.id} -->\n${ticket.body}`;
       const number = byMarker.get(ticket.id);
-      if (number) {
-        const patched = await this.mediate(
-          WriteOperation.GITHUB_ISSUE,
-          runId,
-          repositoryIdentity,
-          caller,
-          () => this.api().request("PATCH", `/repos/${owner}/${repo}/issues/${number}`, {
-            title: ticket.title,
-            body,
-            labels: ticket.labels ?? [],
-          }),
-        );
-        if (!patched.allowed) return patched as Decision<{ created: number; updated: number }>;
-        updated += 1;
-      } else {
-        const createdIssue = await this.mediate(
-          WriteOperation.GITHUB_ISSUE,
-          runId,
-          repositoryIdentity,
-          caller,
-          () => this.api().request("POST", `/repos/${owner}/${repo}/issues`, {
-            title: ticket.title,
-            body,
-            labels: ticket.labels ?? [],
-          }),
-        );
-        if (!createdIssue.allowed) return createdIssue as Decision<{ created: number; updated: number }>;
-        created += 1;
+      const written = number
+        ? await this.mediate(
+            WriteOperation.GITHUB_ISSUE,
+            runId,
+            repositoryIdentity,
+            caller,
+            () => this.api().request("PATCH", `/repos/${owner}/${repo}/issues/${number}`, {
+              title: ticket.title,
+              body,
+              labels: ticket.labels ?? [],
+            }),
+          )
+        : await this.mediate(
+            WriteOperation.GITHUB_ISSUE,
+            runId,
+            repositoryIdentity,
+            caller,
+            () => this.api().request("POST", `/repos/${owner}/${repo}/issues`, {
+              title: ticket.title,
+              body,
+              labels: ticket.labels ?? [],
+            }),
+          );
+      if (!written.allowed) {
+        // Only a reservation whose external write demonstrably did not happen may be
+        // released: once any ticket has been projected the row stays PENDING as the record
+        // of a partial projection that has to be reconciled.
+        if (created + updated === 0 && written.evidence["effectInvoked"] !== true) {
+          this.releaseReservation(idempotencyKey, requestDigest);
+        }
+        return written as Decision<{ created: number; updated: number }>;
       }
+      if (number) updated += 1;
+      else created += 1;
     }
 
-    this.writeReceipt({
-      idempotencyKey: `issue_project:${repositoryIdentity}:${digestOf(tickets)}`,
-      operation: "issue_project",
-      runId,
-      repositoryIdentity,
-      resourceType: "issues",
-      resourceIdentity: `${owner}/${repo}`,
-      preexisting: byMarker.size > 0,
-      beforeStateDigest: null,
+    if (created + updated === 0) {
+      // Nothing was projected, so no external write happened and there is nothing to
+      // record: the reservation is released rather than completed into an empty receipt.
+      this.releaseReservation(idempotencyKey, requestDigest);
+      return allow(ReasonCode.OK, { created, updated });
+    }
+
+    // §16.2 — the PATCH and POST acknowledgements are not evidence. Re-read the issues and
+    // require every projected ticket to be present with the marker, title and body sent.
+    const reread = await this.api().request<Array<{ number: number; title?: string; body: string | null }>>(
+      "GET",
+      `/repos/${owner}/${repo}/issues?state=all&per_page=100`,
+    );
+    const projected = new Map<string, { number: number; title?: string; body: string | null }>();
+    for (const issue of reread) {
+      const marker = this.ticketMarker(issue.body);
+      if (marker) projected.set(marker, issue);
+    }
+    const unprojected = tickets.filter((ticket) => {
+      const issue = projected.get(ticket.id);
+      return (
+        !issue ||
+        issue.title !== ticket.title ||
+        issue.body !== `<!-- acp-ticket:${ticket.id} -->\n${ticket.body}`
+      );
+    });
+    if (unprojected.length > 0) {
+      return deny(ReasonCode.ISSUE_PROJECTION_UNVERIFIED, "GitHub did not persist the projected tickets", {
+        repositoryIdentity,
+        tickets: unprojected.map((ticket) => ticket.id),
+      });
+    }
+
+    // `preexisting` says the resource was observed rather than written by this kernel; a
+    // completed reservation always records writes this kernel performed, and how many of
+    // them landed on issues that already existed is what `updated` reports.
+    const finalized = this.finalizeReservedReceipt({
+      idempotencyKey,
+      requestDigest,
+      preexisting: false,
       afterStateDigest: digestOf({ created, updated }),
-      requestDigest: digestOf(tickets),
       response: { created, updated },
       reread: true,
     });
+    if (!finalized.allowed) return finalized as Decision<{ created: number; updated: number }>;
     return allow(ReasonCode.OK, { created, updated });
+  }
+
+  /** The projection marker is the idempotency key GitHub itself carries (Integration §17.3). */
+  private ticketMarker(body: string | null | undefined): string | null {
+    return /<!-- acp-ticket:([^\s]+) -->/.exec(body ?? "")?.[1] ?? null;
   }
 
   // -------------------------------------------------------------------------

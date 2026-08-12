@@ -1,3 +1,4 @@
+import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
@@ -60,12 +61,25 @@ export interface CreateRunInput {
 export interface CtoProvisioner {
   ensurePrimaryCto(projectId: string, runId: string): Promise<Decision<RoleBinding>>;
   isDraining(projectId: string): boolean;
+  /**
+   * The provider this project's primary CTO will actually be constituted on — the session
+   * already bound to the role, or the preference dispatch is about to spawn. Required, not
+   * optional: an admission target that can silently go missing is the targetless
+   * admission this closes (§14.2, findings #53/#179).
+   */
+  plannedProvider(projectId: string): string | null;
 }
 
 /** §14.2 — capacity must be refreshed before dispatch admission. */
 export interface CapacityGate {
-  refreshForDispatch(): Promise<Decision<void>>;
+  refreshForDispatch(target?: DispatchCapacityTarget): Promise<Decision<void>>;
 }
+
+/**
+ * The capability a primary CTO consumes. Named the same way the continuity kernel names
+ * it, because the two must agree about what a CTO needs to be routable for (§15.1).
+ */
+const CTO_CAPABILITY = "cto";
 
 export interface ContinuityGate {
   mode(): ContinuityMode;
@@ -187,9 +201,12 @@ export class RunEngine {
     }
 
     // §14.2 — mandatory refresh before admission. A failed probe suspends allocation
-    // rather than dispatching against an unknown quota.
+    // rather than dispatching against an unknown quota, and the admission is asked about
+    // the allocation this dispatch will actually make (§14.3, findings #53/#179).
     if (this.#capacity) {
-      const capacity = await this.#capacity.refreshForDispatch();
+      const capacity = await this.#capacity.refreshForDispatch(
+        this.dispatchCapacityTarget(run) ?? undefined,
+      );
       if (!capacity.allowed) return capacity as Decision<RunRow>;
     }
 
@@ -326,6 +343,37 @@ export class RunEngine {
 
       return allow(ReasonCode.OK, this.require(runId));
     });
+  }
+
+  /**
+   * The allocation dispatch is about to activate: the provider this run's primary CTO will
+   * actually be constituted on, and the capability it has to serve. A targetless admission
+   * answers "some production provider is open", which is not the question dispatch asks —
+   * the CTO provider can be the one that is exhausted (§14.3).
+   *
+   * `null` means no target is derivable, which is only ever true of a run that cannot
+   * dispatch at all: no CTO provisioner is attached, or a projectless run has no pinned
+   * owner. Both are refused within the next few statements, so the mandatory refresh still
+   * happens and no provider is invented to admit against.
+   */
+  private dispatchCapacityTarget(run: RunRow): DispatchCapacityTarget | null {
+    const provider = run.projectId
+      ? (this.#cto?.plannedProvider(run.projectId) ?? null)
+      : this.providerOfPinnedOwner(run.ownerSessionId);
+    if (!provider) return null;
+    // A primary CTO is a critical role, so it is never charged against the dynamic reserve
+    // that exists to protect it (§14.5).
+    return { provider, capabilities: [CTO_CAPABILITY], priority: "critical" };
+  }
+
+  /** A projectless run's owner is already pinned, so its provider is a stored fact. */
+  private providerOfPinnedOwner(sessionId: string | null): string | null {
+    if (!sessionId) return null;
+    return (
+      this.db.get<{ provider: string }>(`SELECT provider FROM sessions WHERE session_id = ?`, [
+        sessionId,
+      ])?.provider ?? null
+    );
   }
 
   /**

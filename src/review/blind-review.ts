@@ -7,7 +7,7 @@ import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
-import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
+import { EVIDENCE_PRODUCERS, type ArtifactStore, type EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import {
   ArtifactKind,
@@ -19,6 +19,7 @@ import {
   roleKeyFor,
 } from "../domain/types.ts";
 import { diffDigest, git } from "../git/git.ts";
+import { canonical } from "../guard/workspace-probe.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { InvocationRequest, InvocationResult, ProviderRegistry } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -147,6 +148,12 @@ export class BlindReviewGate {
     private readonly db: Db,
     private readonly audit: AuditLog,
     private readonly artifacts: ArtifactStore,
+    /**
+     * The capability that makes this gate the only writer of BLIND_REVIEW evidence. It is
+     * issued once by the composition root, so reaching the store is not enough to write a
+     * review packet (#70, CP-HI-04).
+     */
+    private readonly evidenceWriter: EvidenceWriter<"BLIND_REVIEW">,
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
     private readonly providers: ProviderRegistry,
@@ -257,7 +264,13 @@ export class BlindReviewGate {
       }
 
       const validated = this.validateCoverage(packet, expected);
-      this.artifacts.putEvidence("blind-review-gate", request.runId, ArtifactKind.BLIND_REVIEW, validated, snapshotDigest);
+      this.artifacts.putEvidence(
+        this.evidenceWriter,
+        request.runId,
+        ArtifactKind.BLIND_REVIEW,
+        validated,
+        snapshotDigest,
+      );
 
       this.audit.record({
         kind: "BLIND_REVIEW_COMPLETED",
@@ -504,12 +517,16 @@ export class BlindReviewGate {
     prompt: string,
     correlationId: string,
   ): IsolatedInvocationRequest {
-    const denyReadPaths = new Set<string>([process.cwd()]);
+    // Canonical, not as-configured: the sandbox profile matches kernel-resolved paths and
+    // filters this list against the *realpath* of the packet root. A symlink alias — the
+    // `/var` → `/private/var` case every macOS temp path takes — would compile to a deny
+    // rule that never matches anything, so the withholding would be claimed and not done.
+    const denyReadPaths = new Set<string>([canonical(process.cwd())]);
     const databasePath = this.db.raw.name;
-    if (databasePath && databasePath !== ":memory:") denyReadPaths.add(databasePath);
+    if (databasePath && databasePath !== ":memory:") denyReadPaths.add(canonical(databasePath));
     for (const repository of request.snapshot.repositories) {
       const checkout = this.repositories.byIdentity(repository.identity)?.checkoutPath;
-      if (checkout) denyReadPaths.add(checkout);
+      if (checkout) denyReadPaths.add(canonical(checkout));
     }
     return {
       prompt,
@@ -537,9 +554,10 @@ export class BlindReviewGate {
     reviewer: ReviewerBinding,
     result: InvocationResult,
   ): Decision<void> {
-    if ((result as IsolationAttestedResult).isolationAttested === true) {
-      return allow(ReasonCode.OK, undefined);
-    }
+    // Only an explicit attestation counts. Anything else — including an adapter that
+    // simply omits the field — is an unprovable isolation claim, which §18.3 treats as a
+    // lost boundary rather than a benign default.
+    if (result.isolationAttested === true) return allow(ReasonCode.OK, undefined);
     return deny(ReasonCode.ISOLATION_LOST, "reviewer adapter did not attest packet-only isolation", {
       runId,
       provider: reviewer.preference.provider,
@@ -1084,8 +1102,8 @@ type ReviewerIsolation = {
   tools: "none";
 };
 
+/** The isolation field is optional on the wire contract; every reviewer request carries it. */
 type IsolatedInvocationRequest = InvocationRequest & { isolation: ReviewerIsolation };
-type IsolationAttestedResult = InvocationResult & { isolationAttested?: boolean };
 
 interface ReviewOutcome {
   verdict: RawVerdict;

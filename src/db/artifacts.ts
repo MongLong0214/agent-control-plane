@@ -26,17 +26,94 @@ export interface StoredArtifact<T = unknown> {
   superseded: boolean;
 }
 
+/** Artifact kinds whose content a later gate treats as authoritative (CP-HI-04, CP-HI-08). */
+export type EvidenceKind = "VERIFICATION" | "BLIND_REVIEW" | "PRODUCTION_READY_PACKET";
+
 /**
- * Components permitted to write each evidence kind. Passing an arbitrary JSON blob as a
- * verification or review result would let any caller mint a PASS, so those kinds are
- * written only through `putEvidence` and only by the engine that owns them (CP-HI-04,
- * CP-HI-08).
+ * The label written to `produced_by` for each evidence kind, and the value every consumer
+ * compares against.
+ *
+ * It is a *label*, not an authenticator. Authority comes from the writer capability below:
+ * a caller that knows the string "verification-engine" cannot write a VERIFICATION row, so
+ * `producedBy === EVIDENCE_PRODUCERS.VERIFICATION` on a stored row now proves the engine
+ * that owns the kind produced it rather than proving the expected literal was typed.
  */
-export const EVIDENCE_PRODUCERS: Readonly<Record<string, string>> = {
+export const EVIDENCE_PRODUCERS: Readonly<Record<EvidenceKind, string>> = {
   VERIFICATION: "verification-engine",
   BLIND_REVIEW: "blind-review-gate",
   PRODUCTION_READY_PACKET: "production-gate",
 };
+
+/** Own-property check, not `in`: `"toString" in EVIDENCE_PRODUCERS` is true. */
+export const isEvidenceKind = (kind: string): kind is EvidenceKind =>
+  Object.hasOwn(EVIDENCE_PRODUCERS, kind);
+
+/**
+ * The only secret in this module. It is never exported and never stored on a token, so the
+ * sole route to a constructed capability is `ArtifactStore.issueEvidenceWriters`. Symbol
+ * identity — not the description — is what the constructor compares, so re-creating
+ * `Symbol("evidence-writer-mint")` elsewhere buys nothing.
+ */
+const WRITER_MINT: unique symbol = Symbol("evidence-writer-mint");
+
+/**
+ * An opaque per-kind writer capability.
+ *
+ * Exported as a *type only* (`EvidenceWriter`), so no other module can name the
+ * constructor. Two independent runtime barriers back that up: `#minted` is a real private
+ * field, so a structural literal, a spread copy and `Object.create(proto)` all fail
+ * `#minted in value`; and the constructor refuses to run without `WRITER_MINT`, so
+ * smuggling the class out through `Object.getPrototypeOf(writer).constructor` yields
+ * nothing usable either.
+ */
+class EvidenceWriterToken<K extends EvidenceKind> {
+  readonly #minted = true;
+
+  /**
+   * Never read at runtime: it exists so K sits in a contravariant position, which makes a
+   * VERIFICATION capability unassignable to `EvidenceWriter<"BLIND_REVIEW">` and turns a
+   * cross-kind write into a compile error as well as a runtime refusal.
+   */
+  declare private readonly bindsKind: (kind: K) => K;
+
+  constructor(mint: symbol, readonly kind: K) {
+    if (mint !== WRITER_MINT) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "an evidence writer capability cannot be constructed outside its issuer",
+        { kind },
+      );
+    }
+  }
+
+  /** Brand check on the private field: true only for an instance this module constructed. */
+  static kindOf(value: unknown): EvidenceKind | null {
+    if (typeof value !== "object" || value === null) return null;
+    if (!(#minted in value)) return null;
+    return value.kind;
+  }
+}
+
+/**
+ * Opaque handle held by the engine that owns one evidence kind. Callers can pass it and
+ * store it; they cannot construct, widen or re-kind it.
+ */
+export type EvidenceWriter<K extends EvidenceKind> = EvidenceWriterToken<K>;
+
+/** The three capabilities, issued together so no kind is ever left unclaimed. */
+export interface EvidenceWriterSet {
+  readonly VERIFICATION: EvidenceWriter<"VERIFICATION">;
+  readonly BLIND_REVIEW: EvidenceWriter<"BLIND_REVIEW">;
+  readonly PRODUCTION_READY_PACKET: EvidenceWriter<"PRODUCTION_READY_PACKET">;
+}
+
+/**
+ * Databases whose writers have been issued. Keyed by the database rather than by the store
+ * instance because the database is the resource being protected: constructing a second
+ * `ArtifactStore` over the same database would otherwise be a way to mint a second set of
+ * capabilities for rows the composition root already owns.
+ */
+const ISSUED_WRITERS = new WeakSet<Db>();
 
 /** Artifact kinds that must be bound to an exact candidate (§30.2 #7, CP-HI-06). */
 const SNAPSHOT_BOUND: ReadonlySet<string> = new Set([
@@ -56,6 +133,30 @@ export class ArtifactStore {
     private readonly clock: Clock,
   ) {}
 
+  /**
+   * Issues the writer capabilities, once per database.
+   *
+   * Composition-root only, and enforced rather than documented: the root constructs the
+   * store and claims the set before any other component can reach either, so application
+   * code, a tool handler or a compromised engine that later gets hold of a store over this
+   * database finds the capabilities already spent and cannot mint its own (#70, CP-HI-04).
+   */
+  issueEvidenceWriters(): EvidenceWriterSet {
+    if (ISSUED_WRITERS.has(this.db)) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "evidence writer capabilities were already issued for this database",
+        {},
+      );
+    }
+    ISSUED_WRITERS.add(this.db);
+    return {
+      VERIFICATION: new EvidenceWriterToken(WRITER_MINT, "VERIFICATION"),
+      BLIND_REVIEW: new EvidenceWriterToken(WRITER_MINT, "BLIND_REVIEW"),
+      PRODUCTION_READY_PACKET: new EvidenceWriterToken(WRITER_MINT, "PRODUCTION_READY_PACKET"),
+    };
+  }
+
   /** Non-evidence artifacts: contracts, plans, snapshots, handoffs, receipts. */
   put<T>(
     runId: string,
@@ -63,10 +164,10 @@ export class ArtifactStore {
     content: T,
     candidateSnapshotDigest?: string | null,
   ): StoredArtifact<T> {
-    if (kind in EVIDENCE_PRODUCERS) {
+    if (isEvidenceKind(kind)) {
       fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
-        `${kind} is evidence and must be written through putEvidence by ${EVIDENCE_PRODUCERS[kind]}`,
+        `${kind} is evidence and must be written through putEvidence with the writer capability held by ${EVIDENCE_PRODUCERS[kind]}`,
         { runId, kind },
       );
     }
@@ -74,29 +175,37 @@ export class ArtifactStore {
   }
 
   /**
-   * Writes an evidence artifact on behalf of the component that owns that kind. The
-   * producer is recorded and checked, so the gate can distinguish engine output from a
-   * blob some other caller assembled.
+   * Writes an evidence artifact. Authority is the capability the caller holds, never a
+   * name it supplies: the recorded producer is derived from the capability's kind, so a
+   * caller that knows "verification-engine" but holds nothing is refused, and a caller
+   * holding one kind's capability cannot write another's (#70).
    */
-  putEvidence<T>(
-    producer: string,
+  putEvidence<K extends EvidenceKind, T>(
+    writer: EvidenceWriter<K>,
     runId: string,
-    kind: ArtifactKind,
+    kind: K,
     content: T,
     candidateSnapshotDigest: string,
   ): StoredArtifact<T> {
-    const expected = EVIDENCE_PRODUCERS[kind];
-    if (!expected) {
+    if (!isEvidenceKind(kind)) {
       fail(ReasonCode.INVALID_ARGUMENT, `${kind} is not an evidence kind`, { runId, kind });
     }
-    if (expected !== producer) {
+    const held = EvidenceWriterToken.kindOf(writer);
+    if (held === null) {
       fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
-        `${producer} may not write ${kind}; only ${expected} may`,
-        { runId, kind, producer },
+        `${kind} requires the writer capability issued to ${EVIDENCE_PRODUCERS[kind]}; the caller holds none`,
+        { runId, kind },
       );
     }
-    return this.write(runId, kind, content, candidateSnapshotDigest, producer);
+    if (held !== kind) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        `a ${held} writer may not write ${kind}; only ${EVIDENCE_PRODUCERS[kind]} may`,
+        { runId, kind, writerKind: held },
+      );
+    }
+    return this.write(runId, kind, content, candidateSnapshotDigest, EVIDENCE_PRODUCERS[kind]);
   }
 
   private write<T>(

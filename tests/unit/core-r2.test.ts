@@ -163,11 +163,51 @@ describe("round-2 database and evidence regressions", () => {
     );
   });
 
-  it("#70 rejects a generic PASS blob even when the caller supplies an expected producer name", () => {
+  it("#70 refuses a caller that knows the producer name but holds no capability", () => {
+    const { artifacts, runId, digest } = candidateRun();
+    // The attack the finding names: an in-process caller passing the producer *string*.
+    // It is a type error now, so the cast is what an untyped or compromised caller would
+    // effectively do — and it must still be refused at runtime.
+    expect(
+      thrown(() =>
+        artifacts.putEvidence(
+          "verification-engine" as never,
+          runId,
+          ArtifactKind.VERIFICATION,
+          verificationFor(runId, digest),
+          digest,
+        ),
+      ),
+    ).toMatchObject({ reasonCode: ReasonCode.COMPLETION_AUTHORITY_DENIED });
+  });
+
+  it("#70 refuses a capability issued for another evidence kind", () => {
+    const { artifacts, runId, digest } = candidateRun();
+    const writers = artifacts.issueEvidenceWriters();
+    expect(
+      thrown(() =>
+        artifacts.putEvidence(
+          writers.BLIND_REVIEW as never,
+          runId,
+          ArtifactKind.VERIFICATION,
+          verificationFor(runId, digest),
+          digest,
+        ),
+      ),
+    ).toMatchObject({ reasonCode: ReasonCode.COMPLETION_AUTHORITY_DENIED });
+  });
+
+  it("#70 still rejects a generic PASS blob from the engine that does hold the capability", () => {
     const { artifacts, runId, digest } = candidateRun();
     expect(
       thrown(() =>
-        artifacts.putEvidence("verification-engine", runId, ArtifactKind.VERIFICATION, { status: "PASS" }, digest),
+        artifacts.putEvidence(
+          artifacts.issueEvidenceWriters().VERIFICATION,
+          runId,
+          ArtifactKind.VERIFICATION,
+          { status: "PASS" },
+          digest,
+        ),
       ),
     ).toMatchObject({ reasonCode: ReasonCode.INVALID_ARGUMENT });
   });
@@ -178,7 +218,13 @@ describe("round-2 database and evidence regressions", () => {
 
     expect(
       thrown(() =>
-        artifacts.putEvidence("verification-engine", runId, ArtifactKind.VERIFICATION, mismatched, digest),
+        artifacts.putEvidence(
+          artifacts.issueEvidenceWriters().VERIFICATION,
+          runId,
+          ArtifactKind.VERIFICATION,
+          mismatched,
+          digest,
+        ),
       ),
     ).toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_DIGEST_MISMATCH });
     expect(() =>

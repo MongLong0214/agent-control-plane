@@ -6,7 +6,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import { type ProjectManifest, commandsForMode } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
-import type { ArtifactStore } from "../db/artifacts.ts";
+import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow } from "../domain/types.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -107,6 +107,12 @@ export class VerificationEngine {
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly artifacts: ArtifactStore,
+    /**
+     * The capability that makes this engine the only writer of VERIFICATION evidence. It
+     * is issued once by the composition root; holding the store is not enough to write
+     * (#70, CP-HI-04).
+     */
+    private readonly evidenceWriter: EvidenceWriter<"VERIFICATION">,
     private readonly repositories: RepositoryRegistry,
     private readonly worktrees: WorktreeManager,
     private readonly telemetry: Telemetry,
@@ -503,7 +509,13 @@ export class VerificationEngine {
   }
 
   private persist(runId: string, snapshotDigest: string, report: VerificationReport): void {
-    this.artifacts.putEvidence("verification-engine", runId, ArtifactKind.VERIFICATION, report, snapshotDigest);
+    this.artifacts.putEvidence(
+      this.evidenceWriter,
+      runId,
+      ArtifactKind.VERIFICATION,
+      report,
+      snapshotDigest,
+    );
     this.audit.record({
       kind: "VERIFICATION_COMPLETED",
       runId,

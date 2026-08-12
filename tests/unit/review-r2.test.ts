@@ -61,7 +61,7 @@ const persistPassingVerification = (
     reasonCode: ReasonCode.OK,
     gaps: [],
   };
-  setup.harness.cp.artifacts.putEvidence("verification-engine", setup.run.runId, "VERIFICATION", report, snapshotDigest);
+  setup.harness.cp.artifacts.putEvidence(setup.harness.cp.evidenceWriters.VERIFICATION, setup.run.runId, "VERIFICATION", report, snapshotDigest);
   setup.harness.cp.db.run(
     `INSERT OR REPLACE INTO verification_results
        (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source,
@@ -419,5 +419,6 @@ describe("round-2 blind-review regressions", () => {
     expect(result.value.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
     expect(evaluations).toBe(1);
     expect(setup.harness.cp.audit.byKind("REVISION_RETURNED_TO_CTO")).toHaveLength(0);
+    console.log("DEBUG", JSON.stringify(setup.harness.cp.audit.byKind("BLIND_REVIEW_UNAVAILABLE")));
   });
 });

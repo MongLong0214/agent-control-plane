@@ -4,6 +4,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import type { Db } from "../../src/db/database.ts";
 import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { validateBranchContract } from "../../src/github/branch-contract.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -19,6 +20,53 @@ const PROFILE = {
   mergeStrategy: "merge_commit" as const,
   releaseTagPolicy: "semver" as const,
   releaseBranchCleanup: "keep" as const,
+};
+
+/**
+ * #76 — an external-write receipt is never inserted APPLIED: it is reserved PENDING before
+ * the write and completed once its reread has proved the result. A fixture that needs a
+ * historical merge receipt therefore has to model both steps, exactly as the kernel does.
+ */
+const reservedThenCompletedMerge = (
+  db: Db,
+  receipt: {
+    receiptId: string;
+    idempotencyKey: string;
+    runId: string;
+    repositoryIdentity: string;
+    resourceIdentity: string;
+    requestDigest: string;
+    afterStateDigest: string;
+    response: unknown;
+  },
+): void => {
+  db.run(
+    `INSERT INTO github_receipts
+       (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
+        preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at,
+        reread_at, verified, status)
+     VALUES (?, ?, 'merge_execute', ?, ?, 'merge', ?, 0, NULL, NULL, ?, '{"pending":true}', ?, NULL, 0, 'PENDING')`,
+    [
+      receipt.receiptId,
+      receipt.idempotencyKey,
+      receipt.runId,
+      receipt.repositoryIdentity,
+      receipt.resourceIdentity,
+      receipt.requestDigest,
+      "2026-08-12T00:00:00.000Z",
+    ],
+  );
+  db.run(
+    `UPDATE github_receipts
+        SET status = 'APPLIED', after_state_digest = ?, response_json = ?, reread_at = ?, verified = 1
+      WHERE idempotency_key = ? AND status = 'PENDING'`,
+    [
+      receipt.afterStateDigest,
+      JSON.stringify(receipt.response),
+      "2026-08-12T00:00:00.000Z",
+      receipt.idempotencyKey,
+    ],
+  );
 };
 
 const ready = async (ciWorkflows: Array<{ path: string; checkName: string; approvedDigest: string | null }> = []) => {
@@ -65,6 +113,47 @@ const ready = async (ciWorkflows: Array<{ path: string; checkName: string; appro
     exactHeadSha: driven.candidateHead,
   };
   return { github, harness, driven, payload, input };
+};
+
+type Fixture = Awaited<ReturnType<typeof ready>>;
+
+/**
+ * The evidence `releaseTag` demands before it will tag anything: a verified release-to-main
+ * merge this run performed, its exact post-merge verification, and the merge present on the
+ * default branch.
+ */
+const acceptedReleaseMerge = (fixture: Fixture, commit: string): void => {
+  reservedThenCompletedMerge(fixture.harness.cp.db, {
+    receiptId: "rcp_release_merge",
+    idempotencyKey: `merge_execute:${fixture.driven.identity}:1200`,
+    runId: fixture.driven.runId,
+    repositoryIdentity: fixture.driven.identity,
+    resourceIdentity: "acme/fixture#1200",
+    requestDigest: "sha256:release-intent",
+    afterStateDigest: sha256(commit),
+    response: { mergeCommitSha: commit, sourceBranch: "release/1.2.0", targetBranch: "main" },
+  });
+  // A post-merge verification receipt records an observation rather than an external write,
+  // so it is one of the kinds the receipt table still accepts as a single APPLIED insert.
+  fixture.harness.cp.db.run(
+    `INSERT INTO github_receipts
+       (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
+        preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at,
+        reread_at, verified, status)
+     VALUES ('rcp_release_postmerge', ?, 'post_merge_verify', ?, ?, 'commit', ?, 0, NULL, ?, ?, ?, ?, ?, 1, 'APPLIED')`,
+    [
+      `post_merge_verify:${fixture.driven.identity}:${commit}`,
+      fixture.driven.runId,
+      fixture.driven.identity,
+      `acme/fixture@${commit}`,
+      digestOf([{ name: "project-ci", conclusion: "success" }]),
+      "sha256:post-merge",
+      JSON.stringify({ checks: [{ name: "project-ci", conclusion: "success" }] }),
+      "2026-08-12T00:00:00.000Z",
+      "2026-08-12T00:00:00.000Z",
+    ],
+  );
+  fixture.github.markContains(PROFILE.defaultBranch, commit);
 };
 
 describe("round-two GitHub hardening", () => {
@@ -184,24 +273,16 @@ describe("round-two GitHub hardening", () => {
   it("#87/#192: a receipt for the same PR but different merge intent is a resource collision", async () => {
     const fixture = await ready();
     const pullNumber = 999;
-    fixture.harness.cp.db.run(
-      `INSERT INTO github_receipts
-         (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
-          preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at, reread_at, verified)
-       VALUES (?, ?, 'merge_execute', ?, ?, 'merge', ?, 0, NULL, ?, ?, ?, ?, ?, 1)`,
-      [
-        "rcp_other_intent",
-        `merge_execute:${fixture.driven.identity}:${pullNumber}`,
-        fixture.driven.runId,
-        fixture.driven.identity,
-        `acme/fixture#${pullNumber}`,
-        sha256("a".repeat(40)),
-        "sha256:other",
-        JSON.stringify({ mergeCommitSha: "a".repeat(40) }),
-        "2026-08-12T00:00:00.000Z",
-        "2026-08-12T00:00:00.000Z",
-      ],
-    );
+    reservedThenCompletedMerge(fixture.harness.cp.db, {
+      receiptId: "rcp_other_intent",
+      idempotencyKey: `merge_execute:${fixture.driven.identity}:${pullNumber}`,
+      runId: fixture.driven.runId,
+      repositoryIdentity: fixture.driven.identity,
+      resourceIdentity: `acme/fixture#${pullNumber}`,
+      requestDigest: "sha256:other",
+      afterStateDigest: sha256("a".repeat(40)),
+      response: { mergeCommitSha: "a".repeat(40) },
+    });
     const refused = await fixture.harness.cp.github.mergeExecute({
       runId: fixture.driven.runId,
       repositoryIdentity: fixture.driven.identity,
@@ -342,24 +423,16 @@ describe("round-two GitHub hardening", () => {
   it("#96/#196: a non-release merge receipt cannot authorize a release tag", async () => {
     const fixture = await ready();
     const commit = "r".repeat(40);
-    fixture.harness.cp.db.run(
-      `INSERT INTO github_receipts
-         (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type, resource_identity,
-          preexisting, before_state_digest, after_state_digest, request_digest, response_json, created_at, reread_at, verified)
-       VALUES (?, ?, 'merge_execute', ?, ?, 'merge', ?, 0, NULL, ?, ?, ?, ?, ?, 1)`,
-      [
-        "rcp_non_release",
-        `merge_execute:${fixture.driven.identity}:1000`,
-        fixture.driven.runId,
-        fixture.driven.identity,
-        "acme/fixture#1000",
-        sha256(commit),
-        "sha256:intent",
-        JSON.stringify({ mergeCommitSha: commit, sourceBranch: "feature/F1-thing", targetBranch: "dev" }),
-        "2026-08-12T00:00:00.000Z",
-        "2026-08-12T00:00:00.000Z",
-      ],
-    );
+    reservedThenCompletedMerge(fixture.harness.cp.db, {
+      receiptId: "rcp_non_release",
+      idempotencyKey: `merge_execute:${fixture.driven.identity}:1000`,
+      runId: fixture.driven.runId,
+      repositoryIdentity: fixture.driven.identity,
+      resourceIdentity: "acme/fixture#1000",
+      requestDigest: "sha256:intent",
+      afterStateDigest: sha256(commit),
+      response: { mergeCommitSha: commit, sourceBranch: "feature/F1-thing", targetBranch: "dev" },
+    });
     const refused = await fixture.harness.cp.github.releaseTag(
       fixture.driven.runId,
       fixture.driven.identity,
@@ -369,5 +442,94 @@ describe("round-two GitHub hardening", () => {
     );
     expect(refused.reasonCode).toBe(ReasonCode.RELEASE_TAG_COMMIT_NOT_ACCEPTED);
     expect(fixture.github.tags.size).toBe(0);
+  });
+
+  it("#76: a release tag reserves its receipt before tagging and completes it after the reread", async () => {
+    const fixture = await ready();
+    const commit = "r".repeat(40);
+    acceptedReleaseMerge(fixture, commit);
+
+    const statusAtWrite: Array<string | undefined> = [];
+    const original = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async (method, path, body) => {
+      if (method === "POST" && path.endsWith("/git/refs")) {
+        statusAtWrite.push(
+          fixture.harness.cp.db.get<{ status: string }>(
+            `SELECT status FROM github_receipts WHERE operation = 'release_tag'`,
+          )?.status,
+        );
+      }
+      return original(method, path, body);
+    };
+
+    const tagged = await fixture.harness.cp.github.releaseTag(
+      fixture.driven.runId,
+      fixture.driven.identity,
+      "1.2.3",
+      commit,
+      { ownerSessionId: fixture.driven.ownerSessionId, ownerBindingGeneration: fixture.driven.ownerBindingGeneration },
+    );
+    expect(tagged.reasonCode).toBe(ReasonCode.OK);
+    expect(fixture.github.tags.get("1.2.3")).toBe(commit);
+    // The reservation existed *before* GitHub was asked to create the ref.
+    expect(statusAtWrite).toEqual(["PENDING"]);
+    const receipt = fixture.harness.cp.db.get<{
+      status: string;
+      verified: number;
+      preexisting: number;
+      reread_at: string | null;
+      after_state_digest: string | null;
+    }>(
+      `SELECT status, verified, preexisting, reread_at, after_state_digest
+         FROM github_receipts WHERE operation = 'release_tag'`,
+    );
+    expect(receipt).toMatchObject({
+      status: "APPLIED",
+      verified: 1,
+      preexisting: 0,
+      after_state_digest: sha256(commit),
+    });
+    expect(receipt?.reread_at).not.toBeNull();
+
+    const replayed = await fixture.harness.cp.github.releaseTag(
+      fixture.driven.runId,
+      fixture.driven.identity,
+      "1.2.3",
+      commit,
+      { ownerSessionId: fixture.driven.ownerSessionId, ownerBindingGeneration: fixture.driven.ownerBindingGeneration },
+    );
+    expect(replayed.reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+    expect(fixture.github.calls.filter((call) => call.method === "POST" && call.path.endsWith("/git/refs"))).toHaveLength(1);
+  });
+
+  it("#76: a release-tag reservation whose external write never happened is released, not stranded", async () => {
+    const fixture = await ready();
+    const commit = "r".repeat(40);
+    acceptedReleaseMerge(fixture, commit);
+
+    // The guard refuses the fenced write, so no ref was ever created: the reservation is
+    // released and the operation stays retryable rather than colliding with itself forever.
+    const original = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async (method, path, body) => {
+      if (method === "GET" && /\/git\/ref\/tags\//.test(path)) {
+        fixture.harness.cp.db.run(`UPDATE assignments SET status = 'REVOKED' WHERE role_key = ?`, [
+          fixture.harness.cp.runs.require(fixture.driven.runId).ownerRoleKey,
+        ]);
+      }
+      return original(method, path, body);
+    };
+    const refused = await fixture.harness.cp.github.releaseTag(
+      fixture.driven.runId,
+      fixture.driven.identity,
+      "1.2.3",
+      commit,
+      { ownerSessionId: fixture.driven.ownerSessionId, ownerBindingGeneration: fixture.driven.ownerBindingGeneration },
+    );
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
+    expect(fixture.github.tags.size).toBe(0);
+    expect(
+      fixture.harness.cp.db.get(`SELECT receipt_id FROM github_receipts WHERE operation = 'release_tag'`),
+    ).toBeUndefined();
   });
 });

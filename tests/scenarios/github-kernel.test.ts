@@ -614,6 +614,86 @@ describe("issue projection", () => {
     expect(fixture.github.issues).toHaveLength(1);
     expect(fixture.github.issues[0]?.title).toBe("first, retitled");
     expect(fixture.github.issues[0]?.body).toContain("<!-- acp-ticket:T001 -->");
+
+    // Both projections are recorded as completed reservations: the receipt table refuses a
+    // receipt that was not reserved before its external write (#76).
+    const receipts = fixture.harness.cp.db.all<{ status: string; verified: number; reread_at: string | null }>(
+      `SELECT status, verified, reread_at FROM github_receipts WHERE operation = 'issue_project'`,
+    );
+    expect(receipts).toHaveLength(2);
+    for (const receipt of receipts) {
+      expect(receipt.status).toBe("APPLIED");
+      expect(receipt.verified).toBe(1);
+      expect(receipt.reread_at).not.toBeNull();
+    }
+  });
+
+  it("#76: reserves the projection receipt before the first issue write", async () => {
+    const fixture = await setup();
+    const statusAtWrite: Array<string | undefined> = [];
+    const original = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async (method, path, body) => {
+      if (method === "POST" && /\/issues$/.test(path)) {
+        statusAtWrite.push(
+          fixture.harness.cp.db.get<{ status: string }>(
+            `SELECT status FROM github_receipts WHERE operation = 'issue_project'`,
+          )?.status,
+        );
+      }
+      return original(method, path, body);
+    };
+    const tickets = [{ id: "T001", title: "first", body: "do the thing" }];
+
+    const projected = await fixture.harness.cp.github.issueProject(
+      fixture.runId,
+      fixture.identity,
+      tickets,
+      fixture.caller,
+    );
+    expect(projected.reasonCode).toBe(ReasonCode.OK);
+    expect(statusAtWrite).toEqual(["PENDING"]);
+
+    // The same ticket set replays from the completed receipt instead of writing again.
+    const replayed = await fixture.harness.cp.github.issueProject(
+      fixture.runId,
+      fixture.identity,
+      tickets,
+      fixture.caller,
+    );
+    expect(replayed.reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+    expect(replayed.allowed && replayed.value).toEqual({ created: 1, updated: 0 });
+    expect(fixture.github.calls.filter((call) => call.method === "POST" && /\/issues$/.test(call.path))).toHaveLength(1);
+  });
+
+  it("#76: a projection GitHub did not persist is refused and its reservation stays open", async () => {
+    const fixture = await setup();
+    const original = fixture.github.request.bind(fixture.github);
+    let written = 0;
+    fixture.github.request = async (method, path, body) => {
+      // GitHub acknowledges the create but holds something else, which only the reread after
+      // the write can reveal: an acknowledgement is not evidence.
+      if (written > 0 && method === "GET" && /\/issues\?/.test(path)) {
+        fixture.github.issues.at(-1)!.title = "not what was sent";
+      }
+      if (method === "POST" && /\/issues$/.test(path)) written += 1;
+      return original(method, path, body);
+    };
+
+    const refused = await fixture.harness.cp.github.issueProject(
+      fixture.runId,
+      fixture.identity,
+      [{ id: "T001", title: "first", body: "do the thing" }],
+      fixture.caller,
+    );
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.ISSUE_PROJECTION_UNVERIFIED);
+    // The write did happen, so the reservation is kept as the record of a projection that
+    // still has to be reconciled: it is neither deleted nor completed unverified.
+    expect(
+      fixture.harness.cp.db.get<{ status: string; verified: number }>(
+        `SELECT status, verified FROM github_receipts WHERE operation = 'issue_project'`,
+      ),
+    ).toMatchObject({ status: "PENDING", verified: 0 });
   });
 });
 

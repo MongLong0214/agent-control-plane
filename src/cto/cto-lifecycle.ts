@@ -11,10 +11,10 @@ import { Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
-import type { ProviderRegistry } from "../runtime/provider.ts";
+import type { ProviderAdapter, ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import type { SessionRegistry } from "../session/session-registry.ts";
+import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 
 /** PRD §10.2 — the mandatory contents of a handoff package. */
 export interface HandoffPackage {
@@ -117,7 +117,26 @@ export class CtoLifecycle {
     const existing = this.bindings.active(roleKey);
     if (existing) {
       const session = this.sessions.get(existing.sessionId);
-      if (session?.lifecycle === SessionLifecycle.READY) return allow(ReasonCode.OK, existing);
+      if (session?.lifecycle === SessionLifecycle.READY) {
+        // READY is what the control plane last wrote about the session, not proof that the
+        // provider still has one. Reusing a session on that alone is the false-ready path
+        // §14.3 exists to close, so the provider has to answer for the exact session first.
+        const live = await this.probeBoundSession(session);
+        if (live.allowed) return allow(ReasonCode.OK, existing);
+        this.audit.record({
+          kind: "CTO_SESSION_PROBE_FAILED",
+          reasonCode: live.reasonCode,
+          projectId,
+          runId,
+          sessionId: session.sessionId,
+          roleKey,
+          evidence: { provider: session.provider, ...live.evidence },
+        });
+        // The durable ERROR is what makes this a recovery rather than a replacement: a
+        // session the provider disowns genuinely cannot act.
+        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe failed");
+        return this.recoveryTakeover(projectId, "bound CTO session failed its provider probe", runId);
+      }
       if (session?.lifecycle === SessionLifecycle.DRAINING) {
         return deny(
           ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING,
@@ -195,6 +214,18 @@ export class CtoLifecycle {
     if (existing) return allow(ReasonCode.OK, existing);
     const connected = await this.#buzz.connect(sessionId, purpose);
     return connected.allowed ? allow(ReasonCode.OK, connected.value) : (connected as Decision<string | null>);
+  }
+
+  /**
+   * The provider a dispatch for this project will actually route to: the bound Primary
+   * CTO's own provider while one is bound, otherwise the configured preference. §14.2
+   * admission has to be asked about *that* provider — asking about "any healthy provider"
+   * is how a run gets admitted against quota it will never use.
+   */
+  plannedProvider(projectId: string): string | null {
+    const current = this.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }));
+    const bound = current ? this.sessions.get(current.sessionId)?.provider : null;
+    return bound ?? this.preference.provider ?? null;
   }
 
   isDraining(projectId: string): boolean {
@@ -765,7 +796,16 @@ export class CtoLifecycle {
       this.sessions.setBuzzAddress(session.sessionId, connected.value);
     }
 
-    this.sessions.transition(session.sessionId, SessionLifecycle.READY, "spawned");
+    // A started session is not a reachable one: `probeRuntime` above only proved the
+    // binary answers. Only an authenticated answer about *this* handle may turn the
+    // session READY, or the CTO role is handed to a runtime nobody has spoken to.
+    const live = await probeSessionHealth(adapter, handle);
+    if (!live.allowed) {
+      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe failed");
+      return live as Decision<string>;
+    }
+
+    this.sessions.transition(session.sessionId, SessionLifecycle.READY, "provider session verified");
 
     if (this.#readiness) {
       const ready = await this.#readiness.checkSession(session.sessionId);
@@ -776,6 +816,21 @@ export class CtoLifecycle {
     }
 
     return allow(ReasonCode.OK, session.sessionId);
+  }
+
+  /**
+   * §14.3 / §25.6 — provider proof that the session behind an existing binding is still
+   * the session the provider has. The handle is reconstructed from the session record, so
+   * the probe addresses the provider's own id rather than the control plane's alias.
+   */
+  private async probeBoundSession(session: SessionRecord): Promise<Decision<void>> {
+    const adapter = this.providers.get(session.provider);
+    if (!adapter) {
+      return deny(ReasonCode.SESSION_NOT_READY, "no adapter can prove the bound CTO session is live", {
+        provider: session.provider,
+      });
+    }
+    return probeSessionHealth(adapter, handleFor(session));
   }
 
   /** A replacement that never became authoritative must not remain a live orphan. */
@@ -805,6 +860,47 @@ export class CtoLifecycle {
 
 const isUnavailable = (lifecycle: SessionLifecycle | undefined): boolean =>
   lifecycle === SessionLifecycle.ERROR || lifecycle === SessionLifecycle.STOPPED;
+
+/**
+ * The provider handle for a session this kernel already constituted. `spawn` records the
+ * provider's own session id as the incarnation prefix, which is the only durable copy of
+ * it; the control plane's `ses_cto_…` alias means nothing to the runtime.
+ */
+const handleFor = (session: SessionRecord): SessionHandle => ({
+  externalSessionId: session.incarnation.split("#")[0] ?? session.sessionId,
+  provider: session.provider,
+  model: session.model,
+  effort: session.effort,
+  pid: session.osPid,
+  ...(session.workdir ? { workdir: session.workdir } : {}),
+});
+
+/**
+ * An adapter that cannot prove the constituted session is authenticated and reachable
+ * fails the check: a version banner or a lifecycle row is not session liveness (§14.3),
+ * and a DEGRADED answer is not one either.
+ */
+const probeSessionHealth = async (
+  adapter: ProviderAdapter,
+  handle: SessionHandle,
+): Promise<Decision<void>> => {
+  let health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
+  try {
+    health = await adapter.probeSession(handle);
+  } catch (error) {
+    return deny(ReasonCode.SESSION_NOT_READY, "provider session probe did not complete", {
+      provider: adapter.provider,
+      probeError: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (health !== "HEALTHY") {
+    return deny(ReasonCode.SESSION_NOT_READY, "provider cannot prove the CTO session is ready", {
+      provider: adapter.provider,
+      runtimeHealth: health,
+    });
+  }
+  return allow(ReasonCode.OK, undefined);
+};
 
 export const missingHandoffFields = (handoff: HandoffPackage): string[] => {
   const missing: string[] = [];

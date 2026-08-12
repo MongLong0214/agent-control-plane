@@ -96,7 +96,7 @@ const recordBootstrapBlindReview = (harness: Harness, runId: string): string => 
   });
   if (!reviewerBinding.allowed) throw new Error(reviewerBinding.message);
 
-  harness.cp.artifacts.putEvidence("blind-review-gate", runId, "BLIND_REVIEW", {
+  harness.cp.artifacts.putEvidence(harness.cp.evidenceWriters.BLIND_REVIEW, runId, "BLIND_REVIEW", {
     runId,
     candidateSnapshotDigest: candidateSnapshotDigestValue,
     contractDigest: run.contractDigest,

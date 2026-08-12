@@ -6,7 +6,7 @@ import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "./owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
-import type { ArtifactStore } from "../db/artifacts.ts";
+import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import {
   ArtifactKind,
@@ -108,6 +108,12 @@ export const NotificationKind = {
 } as const;
 export type NotificationKind = (typeof NotificationKind)[keyof typeof NotificationKind];
 
+/**
+ * The operation an owner-decision receipt must name. The ingress router mints receipts per
+ * operation, so a receipt admitted for anything else cannot clear a human gate.
+ */
+export const OWNER_DECISION_OPERATION = "owner_decision_submit";
+
 /** PRD §21 — the owner-only gate list. */
 export const HUMAN_GATE_TRIGGERS: readonly string[] = [
   "irreversible production action",
@@ -133,6 +139,8 @@ export class ProductionGate {
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly artifacts: ArtifactStore,
+    /** #70 — the capability that lets this gate write its packet; a name would be forgeable. */
+    private readonly packetWriter: EvidenceWriter<"PRODUCTION_READY_PACKET">,
     private readonly runs: RunEngine,
     private readonly tasks: TaskGraph,
     private readonly bindings: BindingRegistry,
@@ -366,7 +374,7 @@ export class ProductionGate {
 
         this.artifacts.put(input.runId, ArtifactKind.APPROVAL, input.approval, input.candidateSnapshotDigest);
         this.artifacts.putEvidence(
-          "production-gate",
+          this.packetWriter,
           input.runId,
           ArtifactKind.PRODUCTION_READY_PACKET,
           packet,
@@ -911,13 +919,6 @@ export class ProductionGate {
     return this.bindings.assertReviewerIndependence(runId, packet.reviewerSessionId);
   }
 
-  /**
-   * §21 — an owner decision recorded against a specific run and gate item.
-   *
-   * The owner is an identity the deployment allowlisted, verified here. Without that,
-   * "the owner approved" would be a claim any caller could make, and a human gate would
-   * be satisfiable by the very candidate it exists to gate.
-   */
   private assertCurrentCeo(sessionId: string): Decision<void> {
     const binding = this.bindings.active(roleKeyFor(Role.CEO));
     if (!binding) {
@@ -935,35 +936,78 @@ export class ProductionGate {
     return allow(ReasonCode.OK, undefined);
   }
 
-  recordOwnerDecision(input: {
+  /**
+   * §21 — who an owner decision belongs to, as the audit actor `channel:actor`.
+   *
+   * Two things can carry owner authority, and they fail differently. A receipt is evidence
+   * that ingress authenticated an envelope binding this exact decision, so a caller that
+   * supplies none — or one whose receipt binds something else — is asserting an authority
+   * it cannot hold (`OWNER_AUTHORITY_NOT_DELEGABLE`). The local `cli` identity is the
+   * calling process's own operator, so it needs no envelope; what it still needs is to be
+   * an owner *here*, and an actor this deployment never allowlisted is refused as one
+   * (`INGRESS_ACTOR_NOT_ALLOWLISTED`). Conflating the two would leave the second denial
+   * unreachable, and it is the one an operator actually hits.
+   */
+  private attributeOwnerDecision(input: {
     runId: string;
     item: string;
     approved: boolean;
     note: string;
     receipt?: OwnerApprovalReceipt;
-    /** @deprecated A caller-supplied identity is never authority; use `receipt`. */
     owner?: { channel: string; actor: string };
-  }): Decision<void> {
+  }): Decision<string> {
+    const authority = this.#ownerAuthority;
+    if (!authority) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "no owner authority is configured, so an owner decision cannot be attributed",
+        { runId: input.runId },
+      );
+    }
+
     const receipt = input.receipt;
+    if (!receipt) {
+      const local = authority.assertLocalOwner(input.owner);
+      if (!local.allowed) return local as Decision<string>;
+      return allow(ReasonCode.OK, `${local.value.channel}:${local.value.actor}`);
+    }
+
     const parameterDigest = digestOf({ item: input.item, approved: input.approved, note: input.note });
     if (
-      receipt?.runId !== input.runId ||
-      receipt.operation !== "owner_decision_submit" ||
+      receipt.runId !== input.runId ||
+      receipt.operation !== OWNER_DECISION_OPERATION ||
       receipt.parameterDigest !== parameterDigest ||
       receipt.approved !== input.approved
     ) {
       return deny(
         ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
         "owner decision receipt does not bind this exact decision",
-        { runId: input.runId, operation: receipt?.operation ?? null },
+        { runId: input.runId, operation: receipt.operation },
       );
     }
-    const authorised = this.#ownerAuthority?.assertApproval(receipt);
-    if (!authorised?.allowed) return authorised ?? deny(
-      ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-      "no owner authority is configured, so an owner decision cannot be attributed",
-      { runId: input.runId },
-    );
+    const authorised = authority.assertApproval(receipt);
+    if (!authorised.allowed) return authorised as Decision<string>;
+    return allow(ReasonCode.OK, `${receipt.channel}:${receipt.actor}`);
+  }
+
+  /**
+   * §21 — an owner decision recorded against a specific run and gate item. A satisfied
+   * gate resumes the run, so the decision and the resumption are one transaction: a gate
+   * that reads as cleared while the run stays parked is the failure this prevents.
+   */
+  recordOwnerDecision(input: {
+    runId: string;
+    item: string;
+    approved: boolean;
+    note: string;
+    /** The only owner authority a transport can carry (§27.1). */
+    receipt?: OwnerApprovalReceipt;
+    /** The local operator's own identity, for a decision made on this host. */
+    owner?: { channel: string; actor: string };
+  }): Decision<void> {
+    const attributed = this.attributeOwnerDecision(input);
+    if (!attributed.allowed) return attributed as Decision<void>;
+    const actor = attributed.value;
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
     const gate = this.humanGateDefinition(input.runId);
@@ -984,7 +1028,7 @@ export class ProductionGate {
       this.audit.record({
         kind: "OWNER_DECISION",
         runId: input.runId,
-        actor: `${receipt.channel}:${receipt.actor}`,
+        actor,
         evidence: { item: input.item, approved: input.approved, candidateSnapshotDigest, humanGateDigest: gate.digest },
       });
 

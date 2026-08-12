@@ -34,6 +34,12 @@ export interface OutboxMessage extends FencedEnvelope {
   /** Immutable identity of the original enqueue request, retained across retargeting. */
   requestFingerprint: string | null;
   attempts: number;
+  /** Durable classification of the last failed delivery attempt (§34.1). */
+  failureClass: FailureClass | null;
+  /** Whether the recorded failure admits another attempt. */
+  retryEligible: boolean;
+  /** Earliest instant a deferred retry may be claimed; null when nothing is deferred. */
+  nextAttemptAt: string | null;
   createdAt: string;
 }
 
@@ -115,6 +121,9 @@ export class Outbox {
       expiresAt: isoPlus(now, input.ttlMs ?? DEFAULT_TTL_MS),
       status: "PENDING",
       attempts: 0,
+      failureClass: null,
+      retryEligible: false,
+      nextAttemptAt: null,
       createdAt: now,
     };
     this.db.run(
@@ -193,9 +202,6 @@ export class Outbox {
       const now = this.clock.nowIso();
       this.expireOverdue();
       this.reclaimStaleLeases();
-      const retryPredicate = this.hasRetryPolicyColumns()
-        ? "AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)"
-        : "";
 
       const rows = this.db.all<RawOutbox>(
         `SELECT o.* FROM outbox o
@@ -207,10 +213,16 @@ export class Outbox {
                           AND s.lifecycle IN ('READY','DRAINING')
           WHERE o.status = 'PENDING'
             AND o.expires_at > ?
-            ${retryPredicate}
+            -- A deferred retry is not deliverable until its window opens; the deferral is
+            -- durable, so a restarted loop honours it instead of retrying immediately.
+            AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
+            -- An already-attempted row is deliverable again only while its recorded failure
+            -- is retry-eligible. A queued row that carries attempts but no eligibility was
+            -- never judged retryable, so it is not picked up.
+            AND (o.attempts = 0 OR o.retry_eligible = 1)
           ORDER BY o.created_at
           LIMIT ?`,
-        this.hasRetryPolicyColumns() ? [now, now, limit] : [now, limit],
+        [now, now, limit],
       );
 
       const claimed: Array<OutboxMessage & { claimToken: string }> = [];
@@ -260,7 +272,8 @@ export class Outbox {
   markSent(messageId: string, claimToken: string): Decision<void> {
     const changes = this.db.run(
       `UPDATE outbox SET status = 'SENT', sent_at = ?, attempts = attempts + 1,
-                         claim_token = NULL, claimed_at = NULL
+                         claim_token = NULL, claimed_at = NULL,
+                         retry_eligible = 0, next_attempt_at = NULL
         WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
           AND EXISTS (
             SELECT 1 FROM assignments a
@@ -281,36 +294,21 @@ export class Outbox {
     return allow(ReasonCode.OK, undefined);
   }
 
+  /**
+   * Records a failed delivery attempt against the durable retry policy (§34.1).
+   *
+   * A failure is either *deferred* or terminal — never immediately re-queued. The row
+   * returns to PENDING only together with a future `next_attempt_at`, and only when the
+   * recorded failure class is one whose cause can clear on its own and the attempt budget
+   * is not spent. Everything else is REJECTED, so a contract or security failure cannot be
+   * retried into an infinite send loop.
+   */
   markAttemptFailed(
     messageId: string,
     claimToken: string,
     failure: DeliveryFailure | string,
   ): Decision<void> {
     const classified = normalizeFailure(failure);
-    if (!this.hasRetryPolicyColumns()) {
-      const changes = this.db.run(
-        `UPDATE outbox SET status = 'REJECTED', attempts = attempts + 1, last_error = ?,
-                           reason_code = ?, claim_token = NULL, claimed_at = NULL
-          WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
-            AND EXISTS (
-              SELECT 1 FROM assignments a
-                JOIN sessions s ON s.session_id = a.session_id
-               WHERE a.role_key = outbox.role_key
-                 AND a.binding_generation = outbox.binding_generation
-                 AND a.session_id = outbox.target_session_id
-                 AND a.status = 'ACTIVE'
-                 AND s.lifecycle IN ('READY','DRAINING')
-            )`,
-        [classified.error.slice(0, 500), ReasonCode.OUTBOX_RETRY_POLICY_UNAVAILABLE, messageId, claimToken],
-      ).changes;
-      if (changes !== 1) return this.staleClaim(messageId);
-      return deny(
-        ReasonCode.OUTBOX_RETRY_POLICY_UNAVAILABLE,
-        "delivery was terminally rejected because retry policy columns are unavailable",
-        { messageId },
-      );
-    }
-
     const row = this.db.get<{
       attempts: number;
       retry_max_attempts: number;
@@ -336,6 +334,13 @@ export class Outbox {
     const nextAttemptAt = retryable
       ? isoPlus(this.clock.nowIso(), retryDelayMs(attempts, row.retry_backoff_ms))
       : null;
+    // A defective stored policy is a different denial from "this failure earns no retry":
+    // the row carries no usable schedule at all, so nothing about the failure class can
+    // rescue it. Naming that separately keeps an operator from reading a policy defect as a
+    // verdict on the transport.
+    const terminalReason = retryPolicyIsValid
+      ? ReasonCode.OUTBOX_DELIVERY_REJECTED
+      : ReasonCode.OUTBOX_RETRY_POLICY_UNAVAILABLE;
     const changes = this.db.run(
       `UPDATE outbox SET status = ?, attempts = ?, last_error = ?, failure_class = ?,
                          retry_eligible = ?, next_attempt_at = ?, reason_code = ?,
@@ -357,7 +362,7 @@ export class Outbox {
         classified.failureClass,
         retryable ? 1 : 0,
         nextAttemptAt,
-        retryable ? null : ReasonCode.OUTBOX_DELIVERY_REJECTED,
+        retryable ? null : terminalReason,
         messageId,
         claimToken,
       ],
@@ -367,8 +372,10 @@ export class Outbox {
     }
     if (!retryable) {
       return deny(
-        ReasonCode.OUTBOX_DELIVERY_REJECTED,
-        "delivery failure is not eligible for another attempt",
+        terminalReason,
+        retryPolicyIsValid
+          ? "delivery failure is not eligible for another attempt"
+          : "stored retry policy is unusable, so the delivery cannot be deferred",
         {
           messageId,
           failureClass: classified.failureClass,
@@ -378,7 +385,12 @@ export class Outbox {
         },
       );
     }
-    return allow(ReasonCode.OK, undefined);
+    return allow(ReasonCode.OK, undefined, {
+      messageId,
+      failureClass: classified.failureClass,
+      attempts,
+      nextAttemptAt,
+    });
   }
 
   /**
@@ -514,7 +526,8 @@ export class Outbox {
       } else {
         this.db.run(
           `UPDATE outbox SET status = 'REJECTED', reason_code = ?,
-                             claim_token = NULL, claimed_at = NULL
+                             claim_token = NULL, claimed_at = NULL,
+                             retry_eligible = 0, next_attempt_at = NULL
             WHERE message_id = ?`,
           [
             row.expires_at <= now
@@ -539,7 +552,8 @@ export class Outbox {
 
   expireOverdue(): number {
     const result = this.db.run(
-      `UPDATE outbox SET status = 'EXPIRED', reason_code = ?
+      `UPDATE outbox SET status = 'EXPIRED', reason_code = ?,
+                         retry_eligible = 0, next_attempt_at = NULL
         WHERE status IN ('PENDING','IN_FLIGHT') AND expires_at <= ?`,
       [ReasonCode.OUTBOX_EXPIRED, this.clock.nowIso()],
     );
@@ -565,7 +579,8 @@ export class Outbox {
   /** Fence queued and claimed rows whose binding or target lifecycle is no longer valid. */
   fenceUndeliverable(): number {
     return this.db.run(
-      `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL
+      `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
+                         retry_eligible = 0, next_attempt_at = NULL
         WHERE status IN ('PENDING','IN_FLIGHT')
           AND NOT EXISTS (
             SELECT 1 FROM assignments a
@@ -620,12 +635,6 @@ export class Outbox {
     });
   }
 
-  private hasRetryPolicyColumns(): boolean {
-    return ["failure_class", "retry_eligible", "next_attempt_at"].every((column) =>
-      this.hasColumn(column),
-    );
-  }
-
   private hasColumn(column: string): boolean {
     return this.db
       .all<{ name: string }>(`SELECT name FROM pragma_table_info('outbox') WHERE name = ?`, [column])
@@ -648,6 +657,9 @@ interface RawOutbox {
   created_at: string;
   status: OutboxMessage["status"];
   attempts: number;
+  failure_class?: FailureClass | null;
+  retry_eligible?: number | null;
+  next_attempt_at?: string | null;
 }
 
 const hydrate = (row: RawOutbox): OutboxMessage => ({
@@ -664,6 +676,9 @@ const hydrate = (row: RawOutbox): OutboxMessage => ({
   expiresAt: row.expires_at,
   status: row.status,
   attempts: row.attempts,
+  failureClass: row.failure_class ?? null,
+  retryEligible: row.retry_eligible === 1,
+  nextAttemptAt: row.next_attempt_at ?? null,
   createdAt: row.created_at,
 });
 

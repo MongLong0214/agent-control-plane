@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
-import { type Decision, allow, deny, fail } from "../core/errors.ts";
+import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newSessionId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -17,11 +17,33 @@ export interface SessionRecord {
   effort: string | null;
   lifecycle: SessionLifecycle;
   buzzAddress: string | null;
+  /** §27.2 — the authenticated Buzz actor identity this session speaks as, if bound. */
+  buzzActorId: string | null;
   osPid: number | null;
   workdir: string | null;
   createdAt: string;
   updatedAt: string;
   stoppedAt: string | null;
+}
+
+/**
+ * The authority that can vouch for a Buzz actor identity.
+ *
+ * `IngressGuard.isAllowedActor` satisfies this structurally, which is deliberate: the only
+ * thing in the deployment that knows which Buzz actors are authenticated is the ingress
+ * policy (allowlist plus HMAC over the whole envelope, §27.1). Passing the authority in
+ * rather than trusting the caller's word keeps this registry from becoming a second,
+ * weaker source of truth about who an actor is.
+ */
+export interface BuzzActorAuthenticator {
+  isAllowedActor(channel: string, actor: string): boolean;
+}
+
+export interface BindBuzzActorInput {
+  sessionId: string;
+  /** Proof the caller is this session; a session id alone is public and proves nothing. */
+  sessionSecret: string;
+  buzzActorId: string;
 }
 
 /** The creation response is the only time a runtime receives its session secret. */
@@ -146,16 +168,56 @@ export class SessionRegistry {
         { sessionId, from: session.lifecycle, to },
       );
     }
-    this.db.run(
-      `UPDATE sessions SET lifecycle = ?, updated_at = ?, stopped_at = ? WHERE session_id = ?`,
-      [to, this.clock.nowIso(), to === SessionLifecycle.STOPPED ? this.clock.nowIso() : session.stoppedAt, sessionId],
-    );
-    this.audit.record({
-      kind: "SESSION_LIFECYCLE",
-      sessionId,
-      evidence: { from: session.lifecycle, to, reason: reason ?? null },
+    // The lifecycle write and the outbox fence are one transaction: a message left claimed
+    // for a session that has just died would otherwise stay IN_FLIGHT until some later
+    // delivery loop happened to sweep it, and a crash between the two writes would leave it
+    // there permanently.
+    return this.db.tx(() => {
+      this.db.run(
+        `UPDATE sessions SET lifecycle = ?, updated_at = ?, stopped_at = ? WHERE session_id = ?`,
+        [to, this.clock.nowIso(), to === SessionLifecycle.STOPPED ? this.clock.nowIso() : session.stoppedAt, sessionId],
+      );
+      const fenced = this.fenceUndeliveredMessages(sessionId, to);
+      this.audit.record({
+        kind: "SESSION_LIFECYCLE",
+        sessionId,
+        evidence: { from: session.lifecycle, to, reason: reason ?? null },
+      });
+      if (fenced.length > 0) {
+        this.audit.record({
+          kind: "OUTBOX_FENCE",
+          sessionId,
+          reasonCode: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+          evidence: { rejected: fenced, to, reason: reason ?? null },
+        });
+      }
+      return allow(ReasonCode.OK, this.require(sessionId));
     });
-    return allow(ReasonCode.OK, this.require(sessionId));
+  }
+
+  /**
+   * §15.7 — a session entering a terminal state can never receive or acknowledge anything,
+   * so every queued or claimed message addressed to it is fenced here rather than left for
+   * a delivery loop to notice. Claimed rows are included: the claim belongs to a runtime
+   * that is gone, and reclaiming it would only re-offer the message to the same dead target.
+   */
+  private fenceUndeliveredMessages(sessionId: string, to: SessionLifecycle): string[] {
+    if (to !== SessionLifecycle.ERROR && to !== SessionLifecycle.STOPPED) return [];
+    const doomed = this.db
+      .all<{ message_id: string }>(
+        `SELECT message_id FROM outbox
+          WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')`,
+        [sessionId],
+      )
+      .map((row) => row.message_id);
+    if (doomed.length === 0) return [];
+    this.db.run(
+      `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
+                         retry_eligible = 0, next_attempt_at = NULL
+        WHERE target_session_id = ? AND status IN ('PENDING','IN_FLIGHT')`,
+      [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED, sessionId],
+    );
+    return doomed;
   }
 
   setPid(sessionId: string, pid: number | null): void {
@@ -164,6 +226,80 @@ export class SessionRegistry {
       this.clock.nowIso(),
       sessionId,
     ]);
+  }
+
+  /**
+   * §27.2, finding #214 — binds the Buzz actor identity an inbound message may be resolved
+   * through.
+   *
+   * Two independent proofs are required because either alone is forgeable. The session
+   * secret proves the caller *is* the session it names. The ingress authenticator proves the
+   * actor id is one the deployment authenticated on the Buzz channel — a Buzz display name
+   * or channel address is attacker-chosen, so without this a local caller could map any
+   * actor id onto any session and inherit the role that session holds. The binding is
+   * write-once (schema trigger) and unique among live sessions (partial unique index), so a
+   * later caller cannot re-point an authenticated identity at a different session.
+   */
+  bindBuzzActor(
+    input: BindBuzzActorInput,
+    authenticator: BuzzActorAuthenticator,
+  ): Decision<SessionRecord> {
+    const authenticated = this.verifySecret(input.sessionId, input.sessionSecret);
+    if (!authenticated.allowed) return authenticated;
+
+    const actorId = input.buzzActorId.trim();
+    if (actorId.length === 0 || !authenticator.isAllowedActor("buzz", actorId)) {
+      return deny(
+        ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED,
+        "buzz actor identity is not authenticated by the deployment's ingress policy",
+        { sessionId: input.sessionId, buzzActorId: actorId },
+      );
+    }
+    if (
+      authenticated.value.lifecycle === SessionLifecycle.STOPPED ||
+      authenticated.value.lifecycle === SessionLifecycle.ERROR
+    ) {
+      return deny(
+        ReasonCode.SESSION_NOT_READY,
+        "a terminal session cannot acquire an actor identity",
+        { sessionId: input.sessionId, lifecycle: authenticated.value.lifecycle },
+      );
+    }
+
+    try {
+      // Re-binding the identity it already holds is idempotent; anything else is refused
+      // rather than overwritten, which is what makes the mapping non-transferable.
+      const changes = this.db.run(
+        `UPDATE sessions SET buzz_actor_id = ?, updated_at = ?
+          WHERE session_id = ? AND (buzz_actor_id IS NULL OR buzz_actor_id = ?)`,
+        [actorId, this.clock.nowIso(), input.sessionId, actorId],
+      ).changes;
+      if (changes !== 1) {
+        return deny(
+          ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE,
+          "session already speaks as a different buzz actor identity",
+          { sessionId: input.sessionId, buzzActorId: actorId },
+        );
+      }
+    } catch (err) {
+      if (isAcpError(err) && err.reasonCode === ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND) {
+        return deny(err.reasonCode, err.message, {
+          sessionId: input.sessionId,
+          buzzActorId: actorId,
+        });
+      }
+      throw err;
+    }
+
+    this.audit.record({
+      kind: "SESSION_BUZZ_ACTOR_BOUND",
+      sessionId: input.sessionId,
+      // The identity itself belongs in the actor column, which is where every other
+      // channel-scoped actor is recorded; evidence stays a decision summary.
+      actor: `buzz:${actorId}`,
+      evidence: { channel: "buzz" },
+    });
+    return allow(ReasonCode.OK, this.require(input.sessionId));
   }
 
   setBuzzAddress(sessionId: string, address: string | null): void {
@@ -231,6 +367,7 @@ interface RawSession {
   effort: string | null;
   lifecycle: SessionLifecycle;
   buzz_address: string | null;
+  buzz_actor_id: string | null;
   os_pid: number | null;
   workdir: string | null;
   created_at: string;
@@ -246,6 +383,7 @@ const hydrate = (row: RawSession): SessionRecord => ({
   effort: row.effort,
   lifecycle: row.lifecycle,
   buzzAddress: row.buzz_address,
+  buzzActorId: row.buzz_actor_id,
   osPid: row.os_pid,
   workdir: row.workdir,
   createdAt: row.created_at,

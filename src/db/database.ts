@@ -17,7 +17,7 @@ const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
  * migration: it silently keeps an older table whose CHECK constraints are weaker, so a
  * deployment could start with hard invariants missing (§40 Maintainability).
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /**
  * SQLite handle plus the transaction discipline required by PRD §30.3.
@@ -199,6 +199,7 @@ const isAsyncTransactionError = (err: unknown): err is AsyncTransactionError =>
  */
 const TRIGGER_CODES: Record<string, ReasonCode> = {
   SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,
+  SESSION_BUZZ_ACTOR_IMMUTABLE: ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE,
   BINDING_GENERATION_NOT_MONOTONIC: ReasonCode.BINDING_GENERATION_STALE,
   BINDING_IDENTITY_IMMUTABLE: ReasonCode.BINDING_GENERATION_STALE,
   BINDING_REVOKED_TERMINAL: ReasonCode.BINDING_REVOKED,
@@ -223,6 +224,7 @@ const INDEX_CODES: Array<[RegExp, ReasonCode, string]> = [
   [/resource_claims\.branch/, ReasonCode.CLAIM_BRANCH_CONFLICT, "branch already claimed by another holder"],
   [/resource_claims\.declared_path/, ReasonCode.CLAIM_PATH_CONFLICT, "declared write path already claimed by another holder"],
   [/outbox\.idempotency_key/, ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, "outbox idempotency key already used"],
+  [/sessions\.buzz_actor_id/, ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "buzz actor identity is already bound to a live session"],
   [/github_receipts\.idempotency_key/, ReasonCode.MERGE_IDEMPOTENT_REPLAY, "github operation already executed"],
   [/capacity_snapshots\./, ReasonCode.CONFLICT, "duplicate capacity snapshot"],
   [/verification_results\./, ReasonCode.CONFLICT, "duplicate verification result for this candidate"],

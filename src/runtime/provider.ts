@@ -133,8 +133,125 @@ export interface ProviderAdapter {
   probeCapacity(): Promise<CapacityReading>;
 }
 
+/**
+ * PRD §14.2 — the two mandatory refresh points that belong to a provider operation
+ * rather than to a control-plane decision: constituting or invoking a blind reviewer,
+ * and a provider failing.
+ *
+ * Declared here as a narrow port instead of importing the capacity monitor, because the
+ * monitor reads *this* module: the runtime must not depend on the component that measures
+ * it. The literal trigger names are the monitor's own `RefreshTrigger` values.
+ */
+export type RuntimeRefreshTrigger = "BLIND_REVIEW" | "PROVIDER_SWITCH_OR_FAILURE";
+
+export interface RuntimeCapacityObserver {
+  refresh(trigger: RuntimeRefreshTrigger, providerIds?: readonly string[]): Promise<unknown>;
+}
+
+/**
+ * The review gate names its reviewer session `blind-review` / `blind-review-final`, and a
+ * continuity failover names it `continuity:BLIND_REVIEWER`. The purpose is the only role
+ * signal a session constitution carries, so it is what the runtime classifies on.
+ */
+const BLIND_REVIEW_PURPOSE = /blind[-_ ]?review/i;
+
+/**
+ * Wraps an adapter so the §14.2 refreshes happen whoever calls it.
+ *
+ * Handing this wrapper out from the registry is what makes those refreshes mandatory: the
+ * review gate, the CTO lifecycle and the continuity kernel all obtain their adapters from
+ * the registry, so none of them can constitute a reviewer, invoke one, or absorb a
+ * provider failure against a reading nobody re-took.
+ *
+ * Probes are deliberately not wrapped — a probe *is* the measurement, and refreshing on a
+ * failed probe would re-enter the same sensor.
+ */
+class CapacityObservedAdapter implements ProviderAdapter {
+  constructor(
+    private readonly inner: ProviderAdapter,
+    private readonly capacity: RuntimeCapacityObserver,
+  ) {}
+
+  get provider(): string {
+    return this.inner.provider;
+  }
+
+  get isProduction(): boolean {
+    return this.inner.isProduction;
+  }
+
+  get defaultModels(): Readonly<Record<string, string>> {
+    return this.inner.defaultModels;
+  }
+
+  async startSession(spec: SessionSpec): Promise<SessionHandle> {
+    // A reviewer session is constituted before it can be bound, so the refresh belongs
+    // ahead of the call: after it, the allocation has already been made.
+    if (BLIND_REVIEW_PURPOSE.test(spec.purpose)) await this.observe("BLIND_REVIEW");
+    try {
+      return await this.inner.startSession(spec);
+    } catch (err) {
+      await this.observe("PROVIDER_SWITCH_OR_FAILURE");
+      throw err;
+    }
+  }
+
+  async stopSession(handle: SessionHandle): Promise<void> {
+    return this.inner.stopSession(handle);
+  }
+
+  async invoke(request: InvocationRequest): Promise<InvocationResult> {
+    // The packet-only isolation contract is the one part of a request a caller cannot
+    // fake by naming: an isolated invocation *is* a blind review (§18.3).
+    if (request.isolation) await this.observe("BLIND_REVIEW");
+    try {
+      const result = await this.inner.invoke(request);
+      // A refused or timed-out invocation is provider-failure evidence even when the
+      // process exits politely, and §14.2 wants the reading re-taken at that point rather
+      // than whatever the last caller happened to have read.
+      if (!result.ok) await this.observe("PROVIDER_SWITCH_OR_FAILURE");
+      return result;
+    } catch (err) {
+      await this.observe("PROVIDER_SWITCH_OR_FAILURE");
+      throw err;
+    }
+  }
+
+  async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    return this.inner.probeRuntime();
+  }
+
+  async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    return this.inner.probeSession(handle);
+  }
+
+  async probeCapacity(): Promise<CapacityReading> {
+    return this.inner.probeCapacity();
+  }
+
+  private async observe(trigger: RuntimeRefreshTrigger): Promise<void> {
+    try {
+      await this.capacity.refresh(trigger, [this.inner.provider]);
+    } catch {
+      // A sensor that fails while a provider failure is being reported must not replace
+      // the failure being reported. The monitor audits its own probe errors, so the
+      // evidence is not lost by keeping the original error primary here.
+    }
+  }
+}
+
 export class ProviderRegistry {
   readonly #adapters = new Map<string, ProviderAdapter>();
+  #capacity: RuntimeCapacityObserver | null = null;
+
+  /**
+   * §14.2 — routes every adapter this registry hands out through the refresh wrapper.
+   * Wired by the composition root; until it is, adapters are returned unwrapped so that a
+   * unit exercise of the registry itself does not need a capacity monitor.
+   */
+  attachCapacity(capacity: RuntimeCapacityObserver): void {
+    this.#capacity = capacity;
+  }
 
   /** Production registration is an explicit trusted act, never a test convenience. */
   register(adapter: ProviderAdapter): void {
@@ -163,22 +280,27 @@ export class ProviderRegistry {
   }
 
   get(provider: string): ProviderAdapter | null {
-    return this.#adapters.get(provider) ?? null;
+    const adapter = this.#adapters.get(provider);
+    return adapter ? this.observed(adapter) : null;
   }
 
   require(provider: string): ProviderAdapter {
     const adapter = this.#adapters.get(provider);
     if (!adapter) throw new Error(`no adapter registered for provider '${provider}'`);
-    return adapter;
+    return this.observed(adapter);
   }
 
   list(): ProviderAdapter[] {
-    return [...this.#adapters.values()];
+    return [...this.#adapters.values()].map((adapter) => this.observed(adapter));
   }
 
   /** Adapters eligible for real work. Excludes anything that fabricates responses. */
   production(): ProviderAdapter[] {
     return this.list().filter((a) => a.isProduction);
+  }
+
+  private observed(adapter: ProviderAdapter): ProviderAdapter {
+    return this.#capacity ? new CapacityObservedAdapter(adapter, this.#capacity) : adapter;
   }
 
   has(provider: string): boolean {

@@ -93,7 +93,7 @@ const evidenceReadyRun = async (humanGate: string[] = []) => {
     ],
   );
   fixture.harness.cp.artifacts.putEvidence(
-    "verification-engine", fixture.runId, ArtifactKind.VERIFICATION, report, digest,
+    fixture.harness.cp.evidenceWriters.VERIFICATION, fixture.runId, ArtifactKind.VERIFICATION, report, digest,
   );
 
   const reviewer = fixture.harness.cp.sessions.create({ provider: "scripted", model: "reviewer" });
@@ -134,7 +134,7 @@ const evidenceReadyRun = async (humanGate: string[] = []) => {
     createdAt: fixture.harness.clock.nowIso(),
   };
   fixture.harness.cp.artifacts.putEvidence(
-    "blind-review-gate", fixture.runId, ArtifactKind.BLIND_REVIEW, review, digest,
+    fixture.harness.cp.evidenceWriters.BLIND_REVIEW, fixture.runId, ArtifactKind.BLIND_REVIEW, review, digest,
   );
   await fixture.harness.cp.continuity.evaluate("test evidence");
   const approval = {
@@ -209,7 +209,10 @@ describe("round-2 run and production-gate regressions", () => {
       bindingGeneration: fixture.run.ownerBindingGeneration,
     });
     expect(mutation.allowed).toBe(false);
-    expect(mutation.reasonCode).toBe(ReasonCode.SOURCE_READ_LEASE_HELD);
+    // The mutation collided with a live lease. SOURCE_READ_LEASE_HELD is the other
+    // direction of the same window — acquisition refused because a write already holds the
+    // source — so the two conditions keep distinct codes.
+    expect(mutation.reasonCode).toBe(ReasonCode.SOURCE_READ_LEASE_CONFLICT);
     held.value.release();
   });
 

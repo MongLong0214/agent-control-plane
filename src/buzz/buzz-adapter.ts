@@ -166,14 +166,15 @@ export class BuzzAdapter {
   }
 
   /**
-   * §27.2 — resolve an inbound Buzz actor to the role it currently holds. Returns null
-   * when the actor holds no active binding, which is the only safe default.
+   * §27.2 — resolve an inbound Buzz actor to the role it currently holds.
+   *
+   * Resolution goes through `sessions.buzz_actor_id`, which only an authenticated writer can
+   * set (`SessionRegistry.bindBuzzActor`). A delivery channel or display name is never
+   * consulted: it is a shared routing address, not proof of a sender's identity. An actor
+   * with no such binding, whose session is not live, or whose session holds no active role
+   * resolves to null — granting nothing is the only safe default.
    */
   resolveActor(buzzActorId: string): RoleBinding | null {
-    // A delivery channel is a shared routing address, not proof of a sender's identity.
-    // Until the schema contains a separately authenticated actor id, declining every
-    // inbound actor is safer than granting a role based on a channel collision.
-    if (!this.hasAuthenticatedActorColumn()) return null;
     const session = this.db.get<{ session_id: string }>(
       `SELECT session_id FROM sessions
         WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
@@ -233,14 +234,6 @@ export class BuzzAdapter {
       });
     }
     return { delivered, failed };
-  }
-
-  private hasAuthenticatedActorColumn(): boolean {
-    return this.db
-      .all<{ name: string }>(
-        `SELECT name FROM pragma_table_info('sessions') WHERE name = 'buzz_actor_id'`,
-      )
-      .length === 1;
   }
 }
 

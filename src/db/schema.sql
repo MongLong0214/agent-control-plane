@@ -92,6 +92,13 @@ CREATE TABLE IF NOT EXISTS sessions (
   lifecycle      TEXT NOT NULL
                    CHECK (lifecycle IN ('STARTING','READY','DRAINING','STOPPED','ERROR')),
   buzz_address   TEXT,
+  -- §27.2 — the Buzz *actor* identity this session speaks as, which is not the same fact
+  -- as `buzz_address`: an address is a shared routing destination anybody can name, so it
+  -- can never authorize an inbound message. This column is the separately authenticated
+  -- identity an inbound actor is resolved through, and it is written only by
+  -- SessionRegistry.bindBuzzActor, which requires the session secret plus an ingress
+  -- authenticator that vouches for the actor id.
+  buzz_actor_id  TEXT,
   -- Never retain the session secret itself. The hash is enough to bind a local
   -- handshake while keeping credentials out of durable state (§31.5).
   session_secret_hash TEXT,
@@ -120,6 +127,25 @@ WHEN OLD.session_secret_hash IS NOT NULL
   AND (NEW.session_secret_hash IS NULL OR NEW.session_secret_hash <> OLD.session_secret_hash)
 BEGIN
   SELECT RAISE(ABORT, 'SESSION_SECRET_HASH_IMMUTABLE');
+END;
+
+-- Only one *live* session may speak as a given Buzz actor. Two live sessions holding the
+-- same actor id would make inbound resolution ambiguous, which is how an actor could be
+-- routed onto a role it never held. Terminal sessions are excluded so a respawn can
+-- re-register the actor the stopped incarnation used.
+CREATE UNIQUE INDEX IF NOT EXISTS sessions_buzz_actor
+  ON sessions(buzz_actor_id)
+  WHERE buzz_actor_id IS NOT NULL AND lifecycle IN ('STARTING','READY','DRAINING');
+
+-- An actor binding is write-once. If it could be rewritten, one authenticated write would
+-- be enough to later re-point an authenticated actor identity at a different session and
+-- inherit whatever role that session holds.
+CREATE TRIGGER IF NOT EXISTS sessions_buzz_actor_immutable
+BEFORE UPDATE OF buzz_actor_id ON sessions
+WHEN OLD.buzz_actor_id IS NOT NULL
+  AND (NEW.buzz_actor_id IS NULL OR NEW.buzz_actor_id <> OLD.buzz_actor_id)
+BEGIN
+  SELECT RAISE(ABORT, 'SESSION_BUZZ_ACTOR_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -589,24 +615,47 @@ CREATE TABLE IF NOT EXISTS outbox (
   retry_backoff_ms    INTEGER NOT NULL DEFAULT 1000 CHECK (retry_backoff_ms >= 0),
   expires_at         TEXT NOT NULL,
   created_at         TEXT NOT NULL,
+  -- 'RETARGETED' is not a status: retargeting moves binding_generation and
+  -- target_session_id while the row stays PENDING, and the fact is recorded in
+  -- reason_code. Keeping it in this enum let a row be parked in a state no delivery loop
+  -- selects and no fence sweeps, which is neither queued nor terminal.
   status             TEXT NOT NULL
                        CHECK (status IN ('PENDING','IN_FLIGHT','SENT','ACKED','REJECTED',
-                                         'EXPIRED','RETARGETED')),
+                                         'EXPIRED')),
   -- §34.1 — a delivery loop *claims* a message rather than merely selecting it, so two
   -- overlapping loops cannot both send the same envelope.
   claim_token        TEXT,
   claimed_at         TEXT,
   attempts           INTEGER NOT NULL DEFAULT 0,
   last_error         TEXT,
+  -- Retry state is durable, not delivery-loop-local: after a crash the next loop must be
+  -- able to tell a failure that may be attempted again from one that may not, and when.
+  -- The vocabulary is the same as task_executions.failure_class.
+  failure_class      TEXT CHECK (failure_class IN ('transient','repairable','contract','security',
+                                                   'policy','capacity','infrastructure',
+                                                   'unknown_observed')),
+  retry_eligible     INTEGER NOT NULL DEFAULT 0 CHECK (retry_eligible IN (0,1)),
+  next_attempt_at    TEXT,
   sent_at            TEXT,
   acked_at           TEXT,
-  reason_code        TEXT
+  reason_code        TEXT,
+  -- What makes the class meaningful rather than decorative: only a class whose cause can
+  -- plausibly clear on its own may be retried, so a contract, security or policy failure
+  -- cannot be marked retryable by any writer, including raw SQL.
+  CHECK (retry_eligible = 0 OR failure_class IN ('transient','capacity','infrastructure')),
+  -- A retry must be deferred to an instant. Eligibility without a next attempt time is the
+  -- immediate re-send loop §34.1 forbids, and a next attempt time on an ineligible row
+  -- would be a deferral nobody honours.
+  CHECK (retry_eligible = 0 OR next_attempt_at IS NOT NULL),
+  CHECK (next_attempt_at IS NULL OR retry_eligible = 1)
 );
 
 -- §30.2 #5
 CREATE UNIQUE INDEX IF NOT EXISTS outbox_idempotency ON outbox(idempotency_key);
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(status, created_at);
 CREATE INDEX IF NOT EXISTS outbox_role ON outbox(role_key, binding_generation, status);
+-- The delivery loop selects queued rows whose deferral window has opened.
+CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE status = 'PENDING';
 
 -- ---------------------------------------------------------------------------
 -- inbound_messages

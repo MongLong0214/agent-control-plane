@@ -9,6 +9,7 @@ import {
   isAcpError,
 } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import type { EvidenceWriter } from "../../src/db/artifacts.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { redact } from "../../src/db/audit.ts";
 import { legalTargets } from "../../src/domain/run-state.ts";
@@ -79,11 +80,14 @@ describe("evidence can only be written by the engine that owns it", () => {
     ).toThrowError(/must be written through putEvidence/);
   });
 
-  it("putEvidence refuses a producer that does not own the kind", () => {
+  it("putEvidence refuses a capability that does not own the kind", () => {
     const { artifacts, runId, digest, verification } = setup();
+    const writers = artifacts.issueEvidenceWriters();
     expect(() =>
       artifacts.putEvidence(
-        "blind-review-gate",
+        // The BLIND_REVIEW capability is real; the cast is the only way to present it for
+        // another kind, which is what tsc otherwise refuses outright.
+        writers.BLIND_REVIEW as unknown as EvidenceWriter<"VERIFICATION">,
         runId,
         ArtifactKind.VERIFICATION,
         { status: "PASS" },
@@ -92,7 +96,7 @@ describe("evidence can only be written by the engine that owns it", () => {
     ).toThrowError(/may not write VERIFICATION/);
 
     const written = artifacts.putEvidence(
-      "verification-engine",
+      writers.VERIFICATION,
       runId,
       ArtifactKind.VERIFICATION,
       verification,
@@ -104,7 +108,7 @@ describe("evidence can only be written by the engine that owns it", () => {
   it("evidence cannot be rebound to another candidate, edited or deleted", () => {
     const { db, artifacts, runId, digest, verification } = setup();
     artifacts.putEvidence(
-      "verification-engine",
+      artifacts.issueEvidenceWriters().VERIFICATION,
       runId,
       ArtifactKind.VERIFICATION,
       verification,

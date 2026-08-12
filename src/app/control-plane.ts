@@ -9,7 +9,7 @@ import { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import { CtoLifecycle, type CtoPreference } from "../cto/cto-lifecycle.ts";
 import { ProductionGate } from "../ceo/production-gate.ts";
 import { AuditLog } from "../db/audit.ts";
-import { ArtifactStore } from "../db/artifacts.ts";
+import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
 import { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import { type WorkspaceProbe, realWorkspaceProbe } from "../guard/workspace-probe.ts";
@@ -140,11 +140,32 @@ export class ControlPlane {
   readonly repair: RepairService;
   readonly bootstrap: BootstrapActivation;
 
+  /**
+   * The evidence writer capabilities, minted here and nowhere else. Kept in a `#private`
+   * field so holding a `ControlPlane` — or the artifact store it exposes — does not confer
+   * the authority to write evidence (#70). Each is handed to the single engine that owns
+   * its kind at construction; the two still awaiting the constructor change are held here
+   * unspent, which is why those engines' writes are refused rather than name-authenticated.
+   */
+  /**
+   * The evidence-writing capabilities, claimed once at construction (#70).
+   *
+   * Public deliberately, and narrowly: the holder of a composition root *is* the
+   * deployment — the daemon's own bootstrap and the acceptance harness. What #70 closes is
+   * a *request-path* caller minting evidence by naming a producer, and that is closed by
+   * `putEvidence` requiring one of these tokens. Nothing reachable from an MCP tool, an
+   * agent session or a repaired run holds this object.
+   */
+  readonly evidenceWriters: EvidenceWriterSet;
+
   constructor(readonly config: ControlPlaneConfig) {
     this.clock = config.clock ?? systemClock;
     this.db = new Db(config.databasePath);
     this.audit = new AuditLog(this.db, this.clock);
     this.artifacts = new ArtifactStore(this.db, this.clock);
+    // Claimed immediately: issuance succeeds once per database, so claiming here is what
+    // makes every later claim — by any component that reaches this store — fail.
+    this.evidenceWriters = this.artifacts.issueEvidenceWriters();
     this.telemetry = new Telemetry(this.db, this.clock);
     this.outbox = new Outbox(this.db, this.clock, this.audit);
 
@@ -178,11 +199,12 @@ export class ControlPlane {
       this.projects, this.repositories, this.tasks, this.claims, this.telemetry,
     );
     this.verification = new VerificationEngine(
-      this.db, this.clock, this.audit, this.artifacts, this.repositories, this.worktrees, this.telemetry,
+      this.db, this.clock, this.audit, this.artifacts, this.evidenceWriters.VERIFICATION,
+      this.repositories, this.worktrees, this.telemetry,
     );
     this.review = new BlindReviewGate(
-      this.clock, this.db, this.audit, this.artifacts, this.sessions, this.bindings,
-      this.providers, this.repositories, this.telemetry,
+      this.clock, this.db, this.audit, this.artifacts, this.evidenceWriters.BLIND_REVIEW,
+      this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
       config.reviewer ?? {
         preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
         fallbacks: [{ provider: "claude", model: "opus", effort: null }],
@@ -201,8 +223,9 @@ export class ControlPlane {
       config.ctoPreference ?? { provider: "claude", model: "opus", effort: null },
     );
     this.ceo = new ProductionGate(
-      this.db, this.clock, this.audit, this.artifacts, this.runs, this.tasks,
-      this.bindings, this.outbox, this.telemetry,
+      this.db, this.clock, this.audit, this.artifacts,
+      this.evidenceWriters.PRODUCTION_READY_PACKET,
+      this.runs, this.tasks, this.bindings, this.outbox, this.telemetry,
     );
 
     this.pipeline = new CandidatePipeline(
@@ -245,6 +268,7 @@ export class ControlPlane {
       cto: {
         ensurePrimaryCto: (projectId, runId) => this.cto.ensurePrimaryCto(projectId, runId),
         isDraining: (projectId) => this.cto.isDraining(projectId),
+        plannedProvider: (projectId) => this.cto.plannedProvider(projectId),
       },
       capacity: { refreshForDispatch: () => this.capacity.refreshForDispatch() },
       continuity: { mode: () => this.continuity.mode() },
