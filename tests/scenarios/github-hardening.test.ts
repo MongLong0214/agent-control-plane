@@ -27,6 +27,7 @@ interface Fixture {
 
 const setup = async (options: { declareChecks?: boolean } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
+  Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
 
@@ -355,14 +356,14 @@ describe("the merge must land on the evaluated base (§24.6)", () => {
     expect(repository.mergeState).toBe("FAILED");
   });
 
-  it("records MERGED when the merge commit's first parent is the evaluated base", async () => {
+  it("keeps the repository pending until exact post-merge verification completes", async () => {
     const { fixture, pullNumber } = await readyToMerge();
     const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
     expect(merged.allowed).toBe(true);
     const repository = fixture.harness.cp.runs
       .repositoriesOf(fixture.runId)
       .find((r) => r.identity === fixture.identity)!;
-    expect(repository.mergeState).toBe("MERGED");
+    expect(repository.mergeState).toBe("PENDING");
   });
 });
 
@@ -475,32 +476,16 @@ describe("the trusted credential has no read surface (CP-HI-05)", () => {
     expect(JSON.stringify(store)).not.toContain("test-token");
   });
 
-  it("injects the credential into the child process and writes its stdin", async () => {
+  it("does not expose an arbitrary child-process runner that could print the token", async () => {
     const fixture = await setup();
-    // A stand-in for `gh api --input -`: it must receive both the environment variable and
-    // the request body, and it must not hang waiting for stdin to close.
-    const result = await fixture.harness.cp.credentials.run({
-      file: process.execPath,
-      args: [
-        "-e",
-        "let b='';process.stdin.on('data',c=>b+=c).on('end',()=>console.log(JSON.stringify({token:process.env.GH_TOKEN,body:b})))",
-      ],
-      tokenEnvVar: "GH_TOKEN",
-      env: { PATH: process.env["PATH"] ?? "" },
-      input: JSON.stringify({ merge_method: "merge" }),
-      timeoutMs: 30_000,
-    });
-    expect(result.allowed).toBe(true);
-    if (!result.allowed) return;
-    expect(result.value.exitCode).toBe(0);
-    const observed = JSON.parse(result.value.stdout) as { token: string; body: string };
-    expect(observed.token).toBe("test-token");
-    expect(JSON.parse(observed.body)).toEqual({ merge_method: "merge" });
+    const store = fixture.harness.cp.credentials as unknown as Record<string, unknown>;
+    expect(typeof store["run"]).toBe("undefined");
+    expect(typeof store["githubApi"]).toBe("function");
   });
 });
 
 describe("merge order and dependents are enforced by the kernel (§24.7)", () => {
-  it("refuses a merge while an earlier repository in the run is still pending", async () => {
+  it("refuses a dependent PR that was added after the run's candidate was frozen", async () => {
     const fixture = await setup();
 
     // A second repository in the same run, declared to merge after the primary.
@@ -543,20 +528,8 @@ describe("merge order and dependents are enforced by the kernel (§24.7)", () =>
       ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
       exactHeadSha: docsHead,
     });
-    if (!prepared.allowed) throw new Error(`${prepared.reasonCode}: ${prepared.message}`);
-
-    const refused = await fixture.harness.cp.github.mergeEvaluate({
-      runId: fixture.runId,
-      repositoryIdentity: "github:acme/docs",
-      pullNumber: prepared.value.pullNumber,
-      exactHeadSha: docsHead,
-      expectedBaseSha: fixture.github.headShaFor("dev"),
-      mergeStrategy: "merge_commit",
-      ownerSessionId: fixture.caller.ownerSessionId,
-      ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
-    });
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.MERGE_ORDER_VIOLATION);
+    expect(prepared.allowed).toBe(false);
+    expect(prepared.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
     expect(fixture.github.mergeCount).toBe(0);
   });
 
@@ -649,7 +622,8 @@ describe("round-2 review: post-merge coverage and receipts", () => {
     const complete = await harness.cp.github.postMergeVerify(driven.runId, driven.identity, mergeSha, [
       "project-ci",
     ]);
-    expect(complete.allowed).toBe(true);
+    expect(complete.allowed).toBe(false);
+    expect(complete.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
   });
 
   it("refuses a post-merge result for a commit this run never merged (github#6)", async () => {

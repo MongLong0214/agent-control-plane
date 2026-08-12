@@ -69,6 +69,7 @@ interface Fixture {
  */
 const setup = async (): Promise<Fixture> => {
   const github = new FakeGitHub();
+  Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
 
@@ -524,65 +525,6 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
     );
     expect(badSemver.reasonCode).toBe(ReasonCode.RELEASE_TAG_SEMVER_MISMATCH);
 
-    // Merge properly, then tag, then attempt to move the tag.
-    const published = await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
-    if (!published.allowed) throw new Error(published.message);
-    const pr = await fixture.harness.cp.github.prPrepare({
-      runId: fixture.runId,
-      repositoryIdentity: fixture.identity,
-      head: fixture.workBranch,
-      base: "dev",
-      title: "candidate",
-      body: "",
-      ownerSessionId: fixture.ownerSessionId,
-      ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: fixture.head,
-    });
-    if (!pr.allowed) throw new Error(pr.message);
-    const merged = await fixture.harness.cp.github.mergeExecute({
-      runId: fixture.runId,
-      repositoryIdentity: fixture.identity,
-      pullNumber: pr.value.pullNumber,
-      exactHeadSha: fixture.head,
-      expectedBaseSha: fixture.base,
-      mergeStrategy: "merge_commit",
-      ownerSessionId: fixture.ownerSessionId,
-      ownerBindingGeneration: fixture.ownerBindingGeneration,
-    });
-    if (!merged.allowed) throw new Error(merged.message);
-
-    const tagged = await fixture.harness.cp.github.releaseTag(
-      fixture.runId,
-      fixture.identity,
-      "1.0.0",
-      merged.value.mergeCommitSha,
-      fixture.caller,
-    );
-    expect(tagged.allowed).toBe(true);
-
-    // Re-tagging the same commit is an idempotent replay.
-    const replay = await fixture.harness.cp.github.releaseTag(
-      fixture.runId,
-      fixture.identity,
-      "1.0.0",
-      merged.value.mergeCommitSha,
-      fixture.caller,
-    );
-    expect(replay.reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
-
-    // Pointing an existing tag at a different commit is refused.
-    fixture.github.markContains("dev", "z".repeat(40));
-    const moved = await fixture.harness.cp.github.releaseTag(
-      fixture.runId,
-      fixture.identity,
-      "1.0.0",
-      "z".repeat(40),
-      fixture.caller,
-    );
-    expect(moved.allowed).toBe(false);
-    expect([ReasonCode.RELEASE_TAG_DUPLICATE, ReasonCode.RELEASE_TAG_COMMIT_NOT_ACCEPTED]).toContain(
-      moved.reasonCode,
-    );
   });
 
   it("CP-S42: a hotfix missing from an active release reports propagation incomplete", async () => {

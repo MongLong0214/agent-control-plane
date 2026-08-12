@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -33,49 +33,59 @@ export class TrustedCredentialStore {
 
   install(credential: TrustedCredential): void {
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    this.assertInstallTarget(this.#path);
+    this.assertInstallTarget(this.#identityPath);
     writeFileSync(this.#path, credential.token, { mode: 0o600 });
     writeFileSync(this.#identityPath, credential.creatorIdentity, { mode: 0o600 });
     chmodSync(this.directory, 0o700);
+    // `writeFileSync({ mode })` only affects a file at creation time. An existing
+    // permissive token file must be repaired before it is ever cached or used.
+    chmodSync(this.#path, 0o600);
+    chmodSync(this.#identityPath, 0o600);
     this.#cached = credential;
   }
 
   available(): boolean {
-    return existsSync(this.#path) && existsSync(this.#identityPath);
+    return this.metadataOk();
   }
 
   /** The identity a trusted gate must have been created by. Safe to expose. */
   creatorIdentity(): string | null {
-    if (this.#cached) return this.#cached.creatorIdentity;
-    if (!existsSync(this.#identityPath)) return null;
-    return readFileSync(this.#identityPath, "utf8").trim();
+    // Identity is not a secret, but returning it from a store whose isolation has been
+    // lost would let a caller mistake an unsafe credential for a trusted producer.
+    if (!this.metadataOk()) return null;
+    return this.#cached?.creatorIdentity ?? readFileSync(this.#identityPath, "utf8").trim();
   }
 
   /**
-   * Runs one child process with the credential in its environment, under the variable
-   * name the tool expects. The token is never handed to JavaScript callers, so there is
-   * no surface on which it can be logged, returned or forwarded (CP-HI-05).
+   * Executes the one fixed GitHub CLI form the daemon needs. This deliberately is not a
+   * generic process runner: allowing callers to choose an executable or token variable
+   * would make `printenv` an authority-token read API (CP-HI-05).
    *
    * `env` is the *complete* environment of the child apart from the injected token: the
    * daemon's own environment is not inherited, so nothing else leaks either.
    */
-  async run(options: {
-    file: string;
-    args: readonly string[];
-    tokenEnvVar: string;
-    env: Readonly<Record<string, string>>;
+  async githubApi(options: {
+    method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+    path: string;
     input?: string;
-    timeoutMs?: number;
-    maxOutputBytes?: number;
   }): Promise<Decision<{ stdout: string; stderr: string; exitCode: number | null }>> {
     const loaded = this.load();
     if (!loaded.allowed)
       return loaded as Decision<{ stdout: string; stderr: string; exitCode: number | null }>;
 
-    const limit = options.maxOutputBytes ?? 32 * 1024 * 1024;
+    const args = ["api", "-X", options.method, options.path, "-H", "Accept: application/vnd.github+json"];
+    if (options.input !== undefined) args.push("--input", "-");
+    const limit = 32 * 1024 * 1024;
     const result = await new Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean; spawnError: string | null }>(
       (resolve) => {
-        const child = spawn(options.file, [...options.args], {
-          env: { ...options.env, [options.tokenEnvVar]: loaded.value.token },
+        const child = spawn("gh", args, {
+          env: {
+            PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+            HOME: process.env["HOME"] ?? "",
+            GH_PROMPT_DISABLED: "1",
+            GH_TOKEN: loaded.value.token,
+          },
           stdio: ["pipe", "pipe", "pipe"],
         });
         let stdout = "";
@@ -91,7 +101,7 @@ export class TrustedCredentialStore {
         const timer = setTimeout(() => {
           timedOut = true;
           child.kill("SIGKILL");
-        }, options.timeoutMs ?? 120_000);
+        }, 120_000);
         child.on("error", (err) => {
           clearTimeout(timer);
           spawnError = err.message;
@@ -109,12 +119,16 @@ export class TrustedCredentialStore {
     );
 
     if (result.spawnError) {
-      return deny(ReasonCode.PROBE_FAILED, `could not start ${options.file}: ${result.spawnError}`, {
-        file: options.file,
+      return deny(ReasonCode.PROBE_FAILED, `could not start GitHub CLI: ${result.spawnError}`, {
+        operation: options.method,
+        path: options.path,
       });
     }
     if (result.timedOut) {
-      return deny(ReasonCode.PROBE_FAILED, `${options.file} timed out`, { file: options.file });
+      return deny(ReasonCode.PROBE_FAILED, "GitHub CLI timed out", {
+        operation: options.method,
+        path: options.path,
+      });
     }
     return allow(ReasonCode.OK, {
       stdout: result.stdout,
@@ -125,32 +139,58 @@ export class TrustedCredentialStore {
 
   /** Permission audit for the doctor: the secret directory must not be world-readable. */
   permissionsOk(): boolean {
-    if (!existsSync(this.directory)) return false;
-    const mode = statSync(this.directory).mode & 0o777;
-    const fileMode = existsSync(this.#path) ? statSync(this.#path).mode & 0o777 : 0;
-    return (mode & 0o077) === 0 && (fileMode & 0o077) === 0;
+    return this.metadataOk();
   }
 
   private load(): Decision<TrustedCredential> {
-    if (this.#cached) return allow(ReasonCode.OK, this.#cached);
-    if (!this.available()) {
+    // Check metadata before consulting cached bytes. A cache is an optimisation, never
+    // evidence that the token file remains isolated after installation.
+    if (!existsSync(this.#path) || !existsSync(this.#identityPath)) {
       return deny(
         ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE,
         "trusted GitHub credential is not installed",
         { directory: this.directory },
       );
     }
-    if (!this.permissionsOk()) {
+    if (!this.metadataOk()) {
       return deny(
         ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
-        "trusted credential store is group- or world-accessible",
+        "trusted credential store is not a daemon-owned private directory with regular private files",
         { directory: this.directory },
       );
     }
+    if (this.#cached) return allow(ReasonCode.OK, this.#cached);
     this.#cached = {
       token: readFileSync(this.#path, "utf8").trim(),
       creatorIdentity: readFileSync(this.#identityPath, "utf8").trim(),
     };
     return allow(ReasonCode.OK, this.#cached);
+  }
+
+  private metadataOk(): boolean {
+    try {
+      if (!existsSync(this.directory) || !existsSync(this.#path) || !existsSync(this.#identityPath)) {
+        return false;
+      }
+      const directory = lstatSync(this.directory);
+      const token = lstatSync(this.#path);
+      const identity = lstatSync(this.#identityPath);
+      if (!directory.isDirectory() || !token.isFile() || !identity.isFile()) return false;
+      if ((directory.mode & 0o077) !== 0 || (token.mode & 0o077) !== 0 || (identity.mode & 0o077) !== 0) {
+        return false;
+      }
+      const uid = typeof process.getuid === "function" ? process.getuid() : null;
+      return uid === null || (directory.uid === uid && token.uid === uid && identity.uid === uid);
+    } catch {
+      return false;
+    }
+  }
+
+  private assertInstallTarget(path: string): void {
+    if (!existsSync(path)) return;
+    const target = lstatSync(path);
+    if (!target.isFile()) {
+      throw new Error(`trusted credential install refuses non-regular target: ${path}`);
+    }
   }
 }
