@@ -1,8 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { digestOf } from "../../src/core/digest.ts";
+import { allow } from "../../src/core/errors.ts";
 import { ExecutionMode, RunState, SessionLifecycle, roleKeyFor, Role } from "../../src/domain/types.ts";
-import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
+import type { HandoffAcknowledgement, HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { cleanupTempDirs, makeRepo } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
@@ -36,6 +38,23 @@ const HANDOFF: HandoffPackage = {
   repositoryFacts: [],
   knownRisks: [],
   recommendedNextAction: "continue the queued work",
+};
+
+const deliveredHandoffAck = (
+  harness: Harness,
+  handoffId: string,
+  sessionId: string,
+): HandoffAcknowledgement => {
+  const message = harness.cp.outbox.byIdempotencyKey(`handoff:${handoffId}`)!;
+  harness.cp.db.run(`UPDATE outbox SET status = 'SENT' WHERE message_id = ?`, [message.messageId]);
+  return {
+    sessionId,
+    sessionIncarnation: harness.cp.sessions.require(sessionId).incarnation,
+    bindingGeneration: message.bindingGeneration,
+    messageId: message.messageId,
+    payloadDigest: message.payloadDigest,
+    sessionSecret: "scenario-session-secret",
+  };
 };
 
 const newRun = async (harness: Harness, projectId: string, repositoryId: string) => {
@@ -162,6 +181,9 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
 
   it("CP-S10: the old binding stays in force until HANDOFF_ACK, then switches atomically", async () => {
     const harness = makeHarness();
+    harness.cp.cto.attach({
+      handoffAuthentication: { verifyHandoffAcknowledgement: () => allow(ReasonCode.OK, undefined) },
+    });
     const { projectId, repositoryId } = await registerFixtureProject(harness);
     const run = await newRun(harness, projectId, repositoryId);
     const dispatched = await harness.cp.runs.dispatch(run.runId);
@@ -180,7 +202,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
 
     const acked = harness.cp.cto.acknowledgeHandoff(
       prepared.value.handoffId,
-      prepared.value.incomingSessionId,
+      deliveredHandoffAck(harness, prepared.value.handoffId, prepared.value.incomingSessionId),
     );
     expect(acked.allowed).toBe(true);
     if (!acked.allowed) return;
@@ -200,7 +222,15 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     const prepared = await harness.cp.cto.prepareSwitchover(projectId, HANDOFF);
     if (!prepared.allowed) throw new Error(prepared.message);
 
-    const wrong = harness.cp.cto.acknowledgeHandoff(prepared.value.handoffId, "ses_imposter");
+    const message = harness.cp.outbox.byIdempotencyKey(`handoff:${prepared.value.handoffId}`)!;
+    const wrong = harness.cp.cto.acknowledgeHandoff(prepared.value.handoffId, {
+      sessionId: "ses_imposter",
+      sessionIncarnation: "ses_imposter#1",
+      bindingGeneration: message.bindingGeneration,
+      messageId: message.messageId,
+      payloadDigest: message.payloadDigest,
+      sessionSecret: "not-relevant",
+    });
     expect(wrong.allowed).toBe(false);
     expect(wrong.reasonCode).toBe(ReasonCode.HANDOFF_ACK_REQUIRED);
     expect(harness.cp.bindings.require(roleKeyFor(Role.PRIMARY_CTO, { projectId })).bindingGeneration).toBe(1);
@@ -328,7 +358,14 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       contract: { ...CONTRACT, goal: "revise the project contract" },
     });
     if (!change.allowed) throw new Error(change.message);
+    const revisedDigest = harness.cp.projects.storeManifest(revised);
+    if (!revisedDigest.allowed) throw new Error(revisedDigest.message);
+    const candidateSnapshotDigest = digestOf({ runId: change.value.runId, manifest: revisedDigest.value });
     harness.cp.runs.transition(change.value.runId, RunState.ACTIVE, "contract change started");
+    harness.cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [
+      candidateSnapshotDigest,
+      change.value.runId,
+    ]);
     harness.cp.runs.transition(
       change.value.runId,
       RunState.READY_FOR_CEO_REVIEW,
@@ -342,6 +379,27 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       "contract change confirmed",
       {},
       "production-gate",
+    );
+    const grant = {
+      schema: "acp.manifest-activation-grant.v1",
+      projectId,
+      runId: change.value.runId,
+      runKind: "CONTRACT_CHANGE",
+      manifestDigest: revisedDigest.value,
+      candidateSnapshotDigest,
+    };
+    harness.cp.db.run(
+      `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
+                                  content_json, produced_by, created_at)
+       VALUES (?, ?, 'APPROVAL', ?, ?, ?, 'production-gate', ?)`,
+      [
+        `art_manifest_${change.value.runId.slice(-12)}`,
+        change.value.runId,
+        digestOf(grant),
+        candidateSnapshotDigest,
+        JSON.stringify(grant),
+        harness.clock.nowIso(),
+      ],
     );
 
     const unknownRun = harness.cp.projects.activateManifest(projectId, revised, {

@@ -18,12 +18,24 @@ export interface RepositoryRecord {
   trustClass: "OWNER_TRUSTED" | "UNTRUSTED";
   activeManifestDigest: string | null;
   observedRemoteUrl: string | null;
+  /** Trusted accepted head; schema migration will split this from the latest observation. */
   lastObservedHead: string | null;
   lastObservedAt: string | null;
   driftState: "UNKNOWN" | "IN_SYNC" | "DRIFTED";
   registration: "REGISTERED" | "TEMPORARY";
   temporaryForRun: string | null;
   createdAt: string;
+}
+
+/** A live filesystem reading. Unlike `observe`, this has no registry side effect. */
+export interface RepositoryInspection {
+  repositoryId: string;
+  checkoutPath: string;
+  acceptedHead: string | null;
+  observedHead: string | null;
+  observedAt: string;
+  clean: boolean;
+  driftState: RepositoryRecord["driftState"];
 }
 
 /**
@@ -68,26 +80,66 @@ export class RepositoryRegistry {
     }
     const identity = input.identity ?? observedIdentity ?? `local:${root}`;
 
+    const rootPath = canonical(root);
     const existing = this.byIdentity(identity);
+    const existingAtPath = this.byCheckoutPath(rootPath);
+    if (existingAtPath && existingAtPath.identity !== identity) {
+      return deny(
+        ReasonCode.REPOSITORY_CHECKOUT_ALREADY_REGISTERED,
+        "canonical checkout path is already bound to a different repository identity",
+        {
+          checkoutPath: rootPath,
+          requestedIdentity: identity,
+          existingIdentity: existingAtPath.identity,
+        },
+      );
+    }
     // Re-registering the same checkout under the same identity is idempotent: a retried
     // bootstrap or activation must not fail because a previous attempt got this far.
     // A *different* path for a registered identity is still a conflict.
     if (
       existing &&
       existing.registration === "REGISTERED" &&
-      existing.checkoutPath !== canonical(root)
+      existing.checkoutPath !== rootPath
     ) {
       return deny(ReasonCode.CONFLICT, "repository identity already registered", {
         identity,
         existingPath: existing.checkoutPath,
-        requestedPath: canonical(root),
+        requestedPath: rootPath,
       });
     }
 
+    if (existing?.registration === "TEMPORARY") {
+      return deny(
+        ReasonCode.TEMPORARY_REPOSITORY_SCOPE_VIOLATION,
+        "a run-scoped temporary repository cannot be promoted by re-registration",
+        { identity, temporaryForRun: existing.temporaryForRun },
+      );
+    }
+
+    if (existing && hasBindingChange(existing, input)) {
+      return deny(
+        ReasonCode.REPOSITORY_BINDING_CHANGE_REQUIRES_ACTIVATION,
+        "re-registration may not change project, manifest, role, or trust binding",
+        { identity, repositoryId: existing.repositoryId },
+      );
+    }
+
+    if (existing) {
+      // Registration retries are deliberately observationally inert. In particular, a
+      // retry cannot turn a DRIFTED checkout into IN_SYNC or detach its project binding.
+      this.audit.record({
+        kind: "REPOSITORY_REGISTERED",
+        projectId: existing.projectId,
+        evidence: { identity, checkoutPath: existing.checkoutPath, role: existing.repositoryRole, idempotent: true },
+      });
+      return allow(ReasonCode.OK, existing);
+    }
+
     const record: RepositoryRecord = {
-      repositoryId: existing?.repositoryId ?? newRepositoryId(),
+      repositoryId: newRepositoryId(),
       identity,
-      checkoutPath: canonical(root),
+      checkoutPath: rootPath,
       projectId: input.projectId ?? null,
       repositoryRole: input.repositoryRole ?? "primary",
       trustClass: input.trustClass ?? "OWNER_TRUSTED",
@@ -101,32 +153,17 @@ export class RepositoryRegistry {
       createdAt: this.clock.nowIso(),
     };
 
-    if (existing) {
-      this.db.run(
-        `UPDATE repositories SET checkout_path = ?, project_id = ?, repository_role = ?,
-                                 trust_class = ?, active_manifest_digest = ?, observed_remote_url = ?,
-                                 last_observed_head = ?, last_observed_at = ?, drift_state = 'IN_SYNC',
-                                 registration = 'REGISTERED', temporary_for_run = NULL
-          WHERE repository_id = ?`,
-        [
-          record.checkoutPath, record.projectId, record.repositoryRole, record.trustClass,
-          record.activeManifestDigest, record.observedRemoteUrl, record.lastObservedHead,
-          record.lastObservedAt, record.repositoryId,
-        ],
-      );
-    } else {
-      this.db.run(
-        `INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role,
-                                   trust_class, active_manifest_digest, observed_remote_url,
-                                   last_observed_head, last_observed_at, drift_state, registration, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_SYNC', 'REGISTERED', ?)`,
-        [
-          record.repositoryId, record.identity, record.checkoutPath, record.projectId,
-          record.repositoryRole, record.trustClass, record.activeManifestDigest,
-          record.observedRemoteUrl, record.lastObservedHead, record.lastObservedAt, record.createdAt,
-        ],
-      );
-    }
+    this.db.run(
+      `INSERT INTO repositories (repository_id, identity, checkout_path, project_id, repository_role,
+                                 trust_class, active_manifest_digest, observed_remote_url,
+                                 last_observed_head, last_observed_at, drift_state, registration, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_SYNC', 'REGISTERED', ?)`,
+      [
+        record.repositoryId, record.identity, record.checkoutPath, record.projectId,
+        record.repositoryRole, record.trustClass, record.activeManifestDigest,
+        record.observedRemoteUrl, record.lastObservedHead, record.lastObservedAt, record.createdAt,
+      ],
+    );
 
     this.audit.record({
       kind: "REPOSITORY_REGISTERED",
@@ -154,8 +191,17 @@ export class RepositoryRegistry {
       ? normalizeRemoteIdentity(observedRemote)
       : `local:${canonical(root)}`;
 
+    const rootPath = canonical(root);
     const existing = this.byIdentity(identity);
-    if (existing) return allow(ReasonCode.OK, existing);
+    const existingAtPath = this.byCheckoutPath(rootPath);
+    if (existingAtPath && existingAtPath.identity !== identity) {
+      return deny(
+        ReasonCode.REPOSITORY_CHECKOUT_ALREADY_REGISTERED,
+        "canonical checkout path is already bound to a different repository identity",
+        { checkoutPath: rootPath, requestedIdentity: identity, existingIdentity: existingAtPath.identity },
+      );
+    }
+    if (existing) return this.assertRunScope(existing.repositoryId, runId);
 
     const repositoryId = newRepositoryId();
     this.db.run(
@@ -164,34 +210,53 @@ export class RepositoryRegistry {
                                  drift_state, registration, temporary_for_run, created_at)
        VALUES (?, ?, ?, 'OWNER_TRUSTED', ?, ?, ?, 'IN_SYNC', 'TEMPORARY', ?, ?)`,
       [
-        repositoryId, identity, canonical(root), observedRemote,
+        repositoryId, identity, rootPath, observedRemote,
         await tryRevParse(root, "HEAD"), this.clock.nowIso(), runId, this.clock.nowIso(),
       ],
     );
     this.audit.record({
       kind: "REPOSITORY_TEMPORARY_BINDING",
       runId,
-      evidence: { identity, checkoutPath: canonical(root) },
+      evidence: { identity, checkoutPath: rootPath },
     });
     return allow(ReasonCode.OK, this.byIdentity(identity)!);
   }
 
-  /** Re-reads the checkout and records drift; a dirty or moved tree is DRIFTED. */
+  /** Re-reads the checkout and records its verdict without advancing the accepted head. */
   async observe(repositoryId: string): Promise<RepositoryRecord | null> {
+    const inspection = await this.inspect(repositoryId);
+    if (!inspection) return null;
+
+    this.db.run(
+      `UPDATE repositories SET last_observed_at = ?, drift_state = ?
+        WHERE repository_id = ?`,
+      [inspection.observedAt, inspection.driftState, repositoryId],
+    );
+    return this.byId(repositoryId);
+  }
+
+  /** Doctor-safe repository read: inspect the checkout without mutating registry evidence. */
+  async inspect(repositoryId: string): Promise<RepositoryInspection | null> {
     const record = this.byId(repositoryId);
     if (!record) return null;
 
-    const head = await tryRevParse(record.checkoutPath, "HEAD");
-    const clean = head ? await isClean(record.checkoutPath) : false;
-    const drift: RepositoryRecord["driftState"] =
-      head === null ? "UNKNOWN" : head === record.lastObservedHead && clean ? "IN_SYNC" : "DRIFTED";
-
-    this.db.run(
-      `UPDATE repositories SET last_observed_head = ?, last_observed_at = ?, drift_state = ?
-        WHERE repository_id = ?`,
-      [head, this.clock.nowIso(), drift, repositoryId],
-    );
-    return this.byId(repositoryId);
+    const observedHead = await tryRevParse(record.checkoutPath, "HEAD");
+    const clean = observedHead ? await isClean(record.checkoutPath) : false;
+    const driftState: RepositoryRecord["driftState"] =
+      observedHead === null
+        ? "UNKNOWN"
+        : observedHead === record.lastObservedHead && clean
+          ? "IN_SYNC"
+          : "DRIFTED";
+    return {
+      repositoryId,
+      checkoutPath: record.checkoutPath,
+      acceptedHead: record.lastObservedHead,
+      observedHead,
+      observedAt: this.clock.nowIso(),
+      clean,
+      driftState,
+    };
   }
 
   /** Accept the current head as the new baseline after a legitimate managed change. */
@@ -201,6 +266,20 @@ export class RepositoryRegistry {
         WHERE repository_id = ?`,
       [head, this.clock.nowIso(), repositoryId],
     );
+  }
+
+  /** Enforces the §16.3 relation wherever a repository is attached to a run. */
+  assertRunScope(repositoryId: string, runId: string): Decision<RepositoryRecord> {
+    const record = this.byId(repositoryId);
+    if (!record) return deny(ReasonCode.NOT_FOUND, "unknown repository", { repositoryId, runId });
+    if (record.registration === "TEMPORARY" && record.temporaryForRun !== runId) {
+      return deny(
+        ReasonCode.TEMPORARY_REPOSITORY_SCOPE_VIOLATION,
+        "temporary repository binding belongs to another run",
+        { repositoryId, requestedRunId: runId, temporaryForRun: record.temporaryForRun },
+      );
+    }
+    return allow(ReasonCode.OK, record);
   }
 
   byId(repositoryId: string): RepositoryRecord | null {
@@ -213,6 +292,13 @@ export class RepositoryRegistry {
   byIdentity(identity: string): RepositoryRecord | null {
     const row = this.db.get<RawRepository>(`SELECT * FROM repositories WHERE identity = ?`, [
       identity,
+    ]);
+    return row ? hydrate(row) : null;
+  }
+
+  byCheckoutPath(checkoutPath: string): RepositoryRecord | null {
+    const row = this.db.get<RawRepository>(`SELECT * FROM repositories WHERE checkout_path = ?`, [
+      canonical(checkoutPath),
     ]);
     return row ? hydrate(row) : null;
   }
@@ -265,6 +351,21 @@ interface RawRepository {
   temporary_for_run: string | null;
   created_at: string;
 }
+
+/** Existing bindings change only through their owning activation workflow. */
+const hasBindingChange = (
+  existing: RepositoryRecord,
+  input: {
+    projectId?: string | null;
+    repositoryRole?: string;
+    activeManifestDigest?: string | null;
+    trustClass?: "OWNER_TRUSTED" | "UNTRUSTED";
+  },
+): boolean =>
+  (input.projectId !== undefined && input.projectId !== existing.projectId) ||
+  (input.repositoryRole !== undefined && input.repositoryRole !== existing.repositoryRole) ||
+  (input.activeManifestDigest !== undefined && input.activeManifestDigest !== existing.activeManifestDigest) ||
+  (input.trustClass !== undefined && input.trustClass !== existing.trustClass);
 
 const hydrate = (row: RawRepository): RepositoryRecord => ({
   repositoryId: row.repository_id,
