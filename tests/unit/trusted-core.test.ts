@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 
+import { isoPlus } from "../../src/core/clock.ts";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { newAssignmentId, normalizeRemoteIdentity } from "../../src/core/ids.ts";
@@ -187,7 +188,7 @@ describe("managed write guard (CP-HI-01)", () => {
     const core = makeCore();
     const repo = makeRepo();
     const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
-    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit);
+    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
     return { ...core, repo, seeded, guard };
   };
 
@@ -275,7 +276,8 @@ describe("managed write guard (CP-HI-01)", () => {
                                     owner_session_id, owner_binding_generation, acquired_at,
                                     expires_at, status)
        VALUES ('c9', ?, 'src/app.ts', 'run_other', ?, 1, ?, ?, 'HELD')`,
-      [seeded.identity, seeded.sessionId, clock.nowIso(), clock.nowIso()],
+      // A live lease: a claim whose expiry has already passed must not block anyone.
+      [seeded.identity, seeded.sessionId, clock.nowIso(), isoPlus(clock.nowIso(), 3_600_000)],
     );
 
     const decision = guard.evaluate({
@@ -318,6 +320,7 @@ describe("managed write guard (CP-HI-01)", () => {
       core.db,
       fakeWorkspaceProbe(["/synthetic/repo"]),
       core.audit,
+      core.clock,
     );
     const decision = guard.evaluate({
       operation: WriteOperation.FILE_MUTATION,

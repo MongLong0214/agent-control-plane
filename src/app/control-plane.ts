@@ -132,6 +132,7 @@ export class ControlPlane {
       this.db,
       config.workspaceProbe ?? realWorkspaceProbe,
       this.audit,
+      this.clock,
     );
     this.tasks = new TaskGraph(this.db, this.clock, this.audit, this.telemetry);
     this.runs = new RunEngine(

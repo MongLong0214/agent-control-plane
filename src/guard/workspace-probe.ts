@@ -1,43 +1,75 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
 
 /**
- * Filesystem/git facts the Managed Write Guard needs. Injected so the guard can be
- * exercised against a synthetic workspace without shelling out.
+ * Result of asking whether a path lives inside a git work tree.
+ *
+ * `ERROR` is a distinct outcome from `OUTSIDE` on purpose. Collapsing them would let a
+ * missing git binary, a permission error or a dubious-ownership rejection read as "not a
+ * repository", and the guard would then allow an unmanaged write — exactly the silent
+ * degradation CP-HI-08 forbids.
  */
+export type WorktreeProbe =
+  | { status: "INSIDE"; toplevel: string }
+  | { status: "OUTSIDE" }
+  | { status: "ERROR"; reason: string };
+
 export interface WorkspaceProbe {
-  /** Absolute path of the git work tree containing `path`, or null if there is none. */
-  gitToplevel(path: string): string | null;
+  probeWorktree(path: string): WorktreeProbe;
   /** Resolve symlinks as far as the path exists; the guard compares canonical paths. */
   canonical(path: string): string;
 }
 
 export const realWorkspaceProbe: WorkspaceProbe = {
-  gitToplevel(path: string): string | null {
-    // A write target usually does not exist yet, and neither may its parent
-    // directories, so walk up to the nearest ancestor that does before asking git.
-    let start = path;
-    while (!existsSync(start)) {
-      const parent = dirname(start);
-      if (parent === start) return null;
-      start = parent;
+  probeWorktree(path: string): WorktreeProbe {
+    let start: string;
+    try {
+      // A write target usually does not exist yet, and neither may its parents, so walk
+      // up to the nearest ancestor that does before asking git.
+      start = path;
+      while (!existsSync(start)) {
+        const parent = dirname(start);
+        if (parent === start) return { status: "OUTSIDE" };
+        start = parent;
+      }
+      // `git -C` needs a directory; asking about a file fails.
+      if (!statSync(start).isDirectory()) start = dirname(start);
+    } catch (err) {
+      return { status: "ERROR", reason: `path inspection failed: ${(err as Error).message}` };
     }
-    // `git -C` needs a directory. When the target is an existing file, asking git about
-    // the file itself fails and the path would be misread as outside any repository.
-    if (!statSync(start).isDirectory()) start = dirname(start);
+
     try {
       const out = execFileSync("git", ["-C", start, "rev-parse", "--show-toplevel"], {
         encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
+        stdio: ["ignore", "pipe", "pipe"],
+        env: gitProbeEnv(),
       });
-      return realpathSync(out.trim());
-    } catch {
-      return null;
+      return { status: "INSIDE", toplevel: realpathSync(out.trim()) };
+    } catch (err) {
+      const e = err as { status?: number; stderr?: string | Buffer; message?: string };
+      const stderr = typeof e.stderr === "string" ? e.stderr : (e.stderr?.toString("utf8") ?? "");
+      // Only git's own "not a repository" answer establishes non-membership. Anything
+      // else — git absent, dubious ownership, EACCES — is an error and must fail closed.
+      if (/not a git repository/i.test(stderr)) return { status: "OUTSIDE" };
+      return {
+        status: "ERROR",
+        reason: `git rev-parse failed (exit ${e.status ?? "unknown"}): ${(stderr || e.message || "")
+          .trim()
+          .slice(0, 300)}`,
+      };
     }
   },
   canonical,
 };
+
+const gitProbeEnv = (): NodeJS.ProcessEnv => ({
+  PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+  HOME: process.env["HOME"] ?? "",
+  LC_ALL: "C",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_CONFIG_NOSYSTEM: "1",
+});
 
 /**
  * Canonicalises as much of the path as exists, then re-appends the missing tail.
@@ -45,16 +77,18 @@ export const realWorkspaceProbe: WorkspaceProbe = {
  */
 export function canonical(path: string): string {
   const abs = isAbsolute(path) ? path : resolve(path);
-  const parts: string[] = [];
+  const missing: string[] = [];
   let cursor = abs;
   for (;;) {
     if (existsSync(cursor)) {
       const head = realpathSync(cursor);
-      return parts.length ? resolve(head, ...parts.reverse()) : head;
+      return missing.length > 0 ? resolve(head, ...missing.reverse()) : head;
     }
     const parent = dirname(cursor);
     if (parent === cursor) return abs;
-    parts.push(cursor.slice(parent.length + 1));
+    // basename, not an offset slice: at the filesystem root the parent already ends in
+    // the separator, and slicing would drop the component's first character.
+    missing.push(basename(cursor));
     cursor = parent;
   }
 }
@@ -65,13 +99,21 @@ export const isWithin = (parent: string, child: string): boolean => {
   return child === p || child.startsWith(p + sep);
 };
 
-/** In-memory probe for tests: a map of work-tree root -> nothing, plus identity canonicalisation. */
-export const fakeWorkspaceProbe = (worktrees: readonly string[]): WorkspaceProbe => {
+/** In-memory probe for tests: the given roots are work trees, everything else is outside. */
+export const fakeWorkspaceProbe = (
+  worktrees: readonly string[],
+  options: { errorFor?: readonly string[] } = {},
+): WorkspaceProbe => {
   const roots = [...worktrees].map((w) => resolve(w)).sort((a, b) => b.length - a.length);
+  const errors = (options.errorFor ?? []).map((p) => resolve(p));
   return {
-    gitToplevel(path: string): string | null {
+    probeWorktree(path: string): WorktreeProbe {
       const abs = resolve(path);
-      return roots.find((root) => isWithin(root, abs)) ?? null;
+      if (errors.some((e) => isWithin(e, abs))) {
+        return { status: "ERROR", reason: "probe configured to fail for this path" };
+      }
+      const toplevel = roots.find((root) => isWithin(root, abs));
+      return toplevel ? { status: "INSIDE", toplevel } : { status: "OUTSIDE" };
     },
     canonical: (path: string) => resolve(path),
   };

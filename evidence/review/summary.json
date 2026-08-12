@@ -1,0 +1,10 @@
+{
+  "results": [
+    {
+      "key": "guard",
+      "verdict": "BLOCK",
+      "findings": 9,
+      "seconds": 509
+    }
+  ]
+}

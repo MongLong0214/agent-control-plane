@@ -32,7 +32,17 @@ const SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["severity", "category", "file", "summary", "detail", "suggestedFix"],
+        // Structured outputs require `required` to list every property, so `line` is
+        // listed here and made nullable rather than optional.
+        required: [
+          "severity",
+          "category",
+          "file",
+          "line",
+          "summary",
+          "detail",
+          "suggestedFix",
+        ],
         properties: {
           severity: { type: "string", enum: ["BLOCKER", "MAJOR", "MINOR", "INFO"] },
           category: {
