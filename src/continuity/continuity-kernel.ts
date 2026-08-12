@@ -342,6 +342,9 @@ export class ContinuityKernel {
       taskId: scope.taskId ?? null,
       mode: assignment.reason === "preferred" ? "PREFERRED" : "FALLBACK",
       reason: `continuity failover: ${reason}`,
+      // The synchronous check above gives a useful early refusal, while this fence makes
+      // the final revoke-and-rebind atomic with the generation that plan observed.
+      expectedCurrentGeneration: expected?.bindingGeneration,
       // A failover of a role that still owns live work is a takeover: the runs move to the
       // new generation in the same transaction rather than being orphaned.
       takeover: true,
@@ -569,6 +572,7 @@ export class ContinuityKernel {
         purpose,
       });
     } catch (err) {
+      await this.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, [provider]);
       return deny(ReasonCode.SESSION_NOT_READY, "provider refused to create a session", {
         provider,
         error: (err as Error).message,
@@ -589,8 +593,20 @@ export class ContinuityKernel {
       return connected as Decision<{ sessionId: string }>;
     }
     this.sessions.setBuzzAddress(session.sessionId, connected.value);
-    const runtime = await adapter.probeSession(handle);
+    let runtime: "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
+    try {
+      runtime = await adapter.probeSession(handle);
+    } catch (err) {
+      await this.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, [provider]);
+      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe threw");
+      return deny(ReasonCode.SESSION_NOT_READY, "provider session probe did not complete", {
+        provider,
+        error: (err as Error).message,
+        sessionId: session.sessionId,
+      });
+    }
     if (runtime !== "HEALTHY") {
+      await this.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, [provider]);
       this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe failed");
       return deny(ReasonCode.SESSION_NOT_READY, "provider cannot prove the constituted session is ready", {
         provider,

@@ -8,7 +8,7 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { runtimeEnvironment, readCapacityFile } from "../../src/runtime/cli-adapters.ts";
+import { CodexCliAdapter, runtimeEnvironment, readCapacityFile } from "../../src/runtime/cli-adapters.ts";
 import {
   type CapacityReading,
   type InvocationRequest,
@@ -255,6 +255,35 @@ describe("round-2 capacity and runtime regressions", () => {
     });
     expect(result).toBe("UNAVAILABLE");
   });
+
+  it("#132 refuses to falsely attest reviewer isolation when Codex cannot remove tools", async () => {
+    const clock = new ManualClock("2026-08-12T00:00:00.000Z");
+    const packetRoot = tempDir("acp-reviewer-packet-");
+    const adapter = new CodexCliAdapter({
+      clock,
+      capacityFile: join(packetRoot, "capacity.json"),
+      binary: "codex-not-invoked-by-this-test",
+    });
+
+    const result = await adapter.invoke({
+      prompt: "Review the packet only.",
+      workdir: packetRoot,
+      timeoutMs: 1_000,
+      readOnly: true,
+      correlationId: "reviewer-isolation-test",
+      isolation: {
+        packetRoot,
+        denyReadPaths: [join(packetRoot, "../daemon.sqlite")],
+        emptyEnvironment: true,
+        network: "deny",
+        tools: "none",
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.isolationAttested).toBe(false);
+    expect(result.error).toContain("tools:none");
+  });
 });
 
 describe("round-2 continuity and persistence regressions", () => {
@@ -293,6 +322,34 @@ describe("round-2 continuity and persistence regressions", () => {
     const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "route absent");
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
+  });
+
+  it("#57 refuses failover when the exact constituted provider session cannot be probed", async () => {
+    const plane = makePlane();
+    bindCeo(plane);
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.gpt.setRuntimeHealth("UNAVAILABLE");
+    attachRoutablePorts(plane.cp);
+
+    const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "session probe failed");
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
+  });
+
+  it("#54/#176 refreshes selected capacity when continuity session allocation fails", async () => {
+    const plane = makePlane();
+    bindCeo(plane);
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    attachRoutablePorts(plane.cp);
+    vi.spyOn(plane.gpt, "startSession").mockRejectedValueOnce(new Error("provider allocation failed"));
+    const refresh = vi.spyOn(plane.cp.capacity, "refresh");
+
+    const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "provider allocation failed");
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
+    expect(refresh).toHaveBeenCalledWith(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, ["gpt"]);
   });
 
   it("#63 changes and verifies the binding before reporting restoration", async () => {
@@ -404,6 +461,34 @@ describe("round-2 continuity and persistence regressions", () => {
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.BINDING_GENERATION_STALE);
     expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId).toBe(concurrent.sessionId);
+  });
+
+  it("#183 fences a superseding binding that arrives between the freshness check and switch", async () => {
+    const plane = makePlane();
+    const incumbent = bindCeo(plane);
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    attachRoutablePorts(plane.cp);
+    const originalSwitch = plane.cp.bindings.switchTo.bind(plane.cp.bindings);
+
+    vi.spyOn(plane.cp.bindings, "switchTo").mockImplementationOnce((input) => {
+      expect(input.expectedCurrentGeneration).toBe(incumbent.bindingGeneration);
+      const concurrent = plane.cp.sessions.create({ provider: "gpt", model: "concurrent" });
+      plane.cp.sessions.transition(concurrent.sessionId, SessionLifecycle.READY, "concurrent");
+      const newer = originalSwitch({
+        role: Role.CEO,
+        sessionId: concurrent.sessionId,
+        reason: "newer failover",
+        takeover: true,
+      });
+      expect(newer.allowed).toBe(true);
+      return originalSwitch(input);
+    });
+
+    const refused = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "last-moment race");
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.BINDING_GENERATION_STALE);
+    expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration).toBe(2);
   });
 
   it("#64 rolls back a replacement observation when a later bucket insert fails", async () => {
