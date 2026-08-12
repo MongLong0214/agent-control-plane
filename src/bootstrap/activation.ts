@@ -340,10 +340,8 @@ export class BootstrapActivation {
       completedAt: this.clock.nowIso(),
     };
 
-    // §26.3 — the factory result is stored as evidence; only this activation result can
-    // complete the run.
-    // The factory's durable output may be retained for a retry, but a final activation
-    // result is not evidence until every completion predicate is actually true.
+    // §26.3 — the factory result is retained for retry, while this operational activation
+    // result is the evidence the CEO gate re-checks before it alone completes the run.
     this.artifacts.put(input.runId, ArtifactKind.REPO_FACTORY_RESULT, result);
 
     const incomplete = this.incompleteness(activation, report);
@@ -760,10 +758,9 @@ export class BootstrapActivation {
   }
 
   /**
-   * CP-S52 — the activation facts that must all be present before a bootstrap run may be
-   * confirmed. A pre-confirmation activation is intentionally only a pending operational
-   * state: it may open and deliver a handoff, but it must not be recorded as the immutable
-   * final activation result required by Integration §13.5.
+   * CP-S52 — the operational facts that must all be present before the CEO gate may
+   * confirm a bootstrap run. CEO confirmation itself is checked by that gate after this
+   * method has supplied the facts it revalidates.
    */
   private incompleteness(
     activation: ACPBootstrapActivationResult,
@@ -772,9 +769,10 @@ export class BootstrapActivation {
     const missing: string[] = [];
     if (!activation.projectRegistration.registered) missing.push("projectRegistration");
     if (activation.localBindings.length === 0) missing.push("localBindings");
-    // §26.5 — the review and the confirmation are activation facts, not optional extras.
+    // The CEO gate re-checks this activation immediately before its CONFIRM transition.
+    // Requiring that future decision here would deadlock the ordered Phase J flow: the
+    // gate needs the operational activation facts before it can make that decision.
     if (activation.blindReview?.verdict !== "PASS") missing.push("blindReview");
-    if (activation.ceoConfirm?.decision !== "CONFIRM") missing.push("ceoConfirm");
     if (!activation.primaryCtoBinding) missing.push("primaryCtoBinding");
     // A CTO with no route cannot be handed anything.
     if (!activation.buzz.connected) missing.push("buzz");
