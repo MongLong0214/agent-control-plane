@@ -1,7 +1,16 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
@@ -50,6 +59,26 @@ const DENIED_TOOLS = [
   "WebSearch",
   "TodoWrite",
 ];
+
+const resolveExecutable = (binary: string): string => {
+  if (binary.includes("/")) {
+    try {
+      return realpathSync(binary);
+    } catch {
+      return binary;
+    }
+  }
+  for (const directory of (process.env.PATH ?? "").split(":").filter(Boolean)) {
+    const candidate = join(directory, binary);
+    try {
+      accessSync(candidate, constants.X_OK);
+      return realpathSync(candidate);
+    } catch {
+      // Keep searching; an unavailable configured binary is reported by the probe.
+    }
+  }
+  return binary;
+};
 
 /**
  * Reads the structured local capacity file.
@@ -156,6 +185,10 @@ const runCli = async (
     writablePaths?: readonly string[];
     /** Strict packet-only reviewer boundary, distinct from normal agent containment. */
     isolation?: NonNullable<InvocationRequest["isolation"]>;
+    /** Provider state the reviewer CLI must read to authenticate, never inherited wholesale. */
+    reviewerCredentialPaths?: readonly string[];
+    /** Provider config root used while HOME points at the packet directory. */
+    reviewerConfigDirectory?: string;
   },
 ): Promise<{
   stdout: string;
@@ -190,19 +223,46 @@ const runCli = async (
     };
   }
   const isolated = options.isolation !== undefined;
+  const environment = isolated
+    ? reviewerEnvironment(workdir, options.reviewerConfigDirectory)
+    : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch));
+  const profile = isolated
+    ? reviewerProfile(
+        workdir,
+        options.isolation!.denyReadPaths,
+        file,
+        options.reviewerCredentialPaths ?? [],
+      )
+    : runtimeProfile(workdir, realpathSync(scratch), options.denyReadPaths ?? [], options.writablePaths ?? []);
+
+  // sandbox-exec is a wrapper around the provider process. A provider may return a
+  // non-zero status for an invalid answer while the seatbelt still held; prove the
+  // profile separately so isolation attestation cannot be confused with model success.
+  let isolationEnforced = false;
+  if (isolated) {
+    const profileCheck = await profileAccepted(profile, workdir, environment, options.timeoutMs);
+    if (!profileCheck.accepted) {
+      rmSync(scratch, { recursive: true, force: true });
+      return {
+        stdout: "",
+        stderr: profileCheck.stderr || "reviewer isolation profile was not accepted",
+        exitCode: profileCheck.exitCode,
+        timedOut: profileCheck.timedOut,
+        isolationEnforced: false,
+      };
+    }
+    isolationEnforced = true;
+  }
+
   return new Promise((resolve) => {
     const child = spawn("/usr/bin/sandbox-exec", [
       "-p",
-      isolated
-        ? reviewerProfile(workdir, options.isolation!.denyReadPaths)
-        : runtimeProfile(workdir, realpathSync(scratch), options.denyReadPaths ?? [], options.writablePaths ?? []),
+      profile,
       file,
       ...args,
     ], {
       cwd: workdir,
-      // Reviewer invocation is intentionally unauthenticated: retaining HOME/USER to
-      // make a provider CLI work would reintroduce its host account and credentials.
-      env: isolated ? {} : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch)),
+      env: environment,
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -228,24 +288,59 @@ const runCli = async (
     child.on("error", (err) => {
       clearTimeout(timer);
       rmSync(scratch, { recursive: true, force: true });
-      resolve({ stdout, stderr: stderr + err.message, exitCode: null, timedOut, isolationEnforced: false });
+      resolve({ stdout, stderr: stderr + err.message, exitCode: null, timedOut, isolationEnforced });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
       rmSync(scratch, { recursive: true, force: true });
-      // A successful child establishes that sandbox-exec accepted the profile. On any
-      // error or timeout, be conservative: an invalid profile must not be represented
-      // as enforced isolation merely because sandbox-exec itself was launched.
       resolve({
         stdout,
         stderr,
         exitCode: code,
         timedOut,
-        isolationEnforced: isolated && code === 0 && !timedOut,
+        isolationEnforced,
       });
     });
   });
 };
+
+const profileAccepted = async (
+  profile: string,
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<{ accepted: boolean; stderr: string; exitCode: number | null; timedOut: boolean }> =>
+  new Promise((resolve) => {
+    const child = spawn("/usr/bin/sandbox-exec", ["-p", profile, "/usr/bin/true"], {
+      cwd,
+      env: environment,
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    const finish = (exitCode: number | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ accepted: exitCode === 0 && !timedOut, stderr, exitCode, timedOut });
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        process.kill(-(child.pid ?? 0), "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    }, Math.min(Math.max(timeoutMs, 1), 5_000));
+    child.stderr?.on("data", (b: Buffer) => (stderr += b.toString("utf8")));
+    child.on("error", (err) => {
+      stderr += err.message;
+      finish(null);
+    });
+    child.on("close", (code) => finish(code));
+  });
 
 const assertReviewerIsolation = (
   workdir: string,
@@ -317,6 +412,42 @@ export const runtimeEnvironment = (allowlist: readonly string[], scratch: string
   return environment;
 };
 
+/**
+ * A reviewer gets a disposable home and only the provider config root it needs. Keeping
+ * USER preserves the CLI's measured login lookup, while the daemon's normal environment
+ * and authority-bearing variables remain absent.
+ */
+export const reviewerEnvironment = (packetRoot: string, configDirectory?: string): NodeJS.ProcessEnv => ({
+  PATH: [...new Set([
+    dirname(process.execPath),
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ])].join(":"),
+  HOME: packetRoot,
+  ...(process.env["USER"] ? { USER: process.env["USER"] } : {}),
+  TMPDIR: packetRoot,
+  LANG: "C.UTF-8",
+  LC_ALL: "C",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_TERMINAL_PROMPT: "0",
+  ...(configDirectory ? { CLAUDE_CONFIG_DIR: configDirectory } : {}),
+});
+
+const claudeCredentialPaths = (): string[] => {
+  const home = process.env["HOME"] ?? "";
+  const configDirectory = process.env["CLAUDE_CONFIG_DIR"] ?? home;
+  if (!configDirectory) return [];
+  return [
+    join(configDirectory, ".claude"),
+    join(configDirectory, ".claude.json"),
+    home ? join(home, "Library", "Keychains") : "",
+  ].filter(Boolean);
+};
+
 const runtimeProfile = (
   workdir: string,
   scratch: string,
@@ -358,7 +489,12 @@ const runtimeProfile = (
  * all network traffic. Paths supplied by the caller are included as explicit denials as
  * defense in depth; deny-default already keeps them inaccessible unless one is packetRoot.
  */
-const reviewerProfile = (packetRoot: string, denyReadPaths: readonly string[]): string => {
+const reviewerProfile = (
+  packetRoot: string,
+  denyReadPaths: readonly string[],
+  executable: string,
+  credentialPaths: readonly string[],
+): string => {
   const systemReadRoots = ["/System", "/usr", "/bin", "/sbin", "/Library/Apple"];
   const lines = [
     "(version 1)",
@@ -372,12 +508,32 @@ const reviewerProfile = (packetRoot: string, denyReadPaths: readonly string[]): 
     "(allow file-write-data (literal \"/dev/null\"))",
     "(deny network*)",
   ];
+  for (const path of [executable, process.execPath]) {
+    const resolved = resolvePath(path);
+    if (resolved) {
+      lines.push(`(allow file-read* (literal ${quote(resolved)}))`);
+      lines.push(`(allow file-read* (subpath ${quote(dirname(resolved))}))`);
+    }
+  }
+  for (const path of credentialPaths) {
+    const resolved = resolvePath(path);
+    if (resolved) lines.push(`(allow file-read* (subpath ${quote(resolved)}))`);
+  }
   for (const path of denyReadPaths) {
-    if (path && path !== packetRoot && !path.startsWith(`${packetRoot}/`)) {
-      lines.push(`(deny file-read* (subpath ${quote(path)}))`);
+    const resolved = resolvePath(path);
+    if (resolved && resolved !== packetRoot && !resolved.startsWith(`${packetRoot}/`)) {
+      lines.push(`(deny file-read* (subpath ${quote(resolved)}))`);
     }
   }
   return lines.join("\n");
+};
+
+const resolvePath = (path: string): string => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
 };
 
 const quote = (value: string): string => `"${value.replace(/(["\\])/g, "\\$1")}"`;
@@ -389,6 +545,7 @@ const quote = (value: string): string => `"${value.replace(/(["\\])/g, "\\$1")}"
 export class ClaudeCliAdapter implements ProviderAdapter {
   readonly provider = "claude";
   readonly isProduction = true;
+  readonly supportsReviewerIsolation = true;
   readonly defaultModels = {
     cto: "opus",
     reviewer: "opus",
@@ -405,7 +562,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   readonly #denyReadPaths: readonly string[];
 
   constructor(options: CliAdapterOptions) {
-    this.#binary = options.binary ?? "claude";
+    this.#binary = resolveExecutable(options.binary ?? "claude");
     this.#clock = options.clock;
     this.#capacityFile = options.capacityFile;
     this.#freshnessMs = options.freshnessWindowMs ?? DEFAULT_FRESHNESS_MS;
@@ -470,6 +627,10 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
       isolation: request.isolation,
+      reviewerCredentialPaths: request.isolation ? claudeCredentialPaths() : undefined,
+      reviewerConfigDirectory: request.isolation
+        ? process.env["CLAUDE_CONFIG_DIR"] ?? process.env["HOME"]
+        : undefined,
     });
 
     const envelope = safeParse(result.stdout);
@@ -547,6 +708,7 @@ const resolveRuntimeHealth = async (
 export class CodexCliAdapter implements ProviderAdapter {
   readonly provider = "gpt";
   readonly isProduction = true;
+  readonly supportsReviewerIsolation = false;
   readonly defaultModels = {
     reviewer: "gpt-5.6-sol",
     ceo: "gpt-5.6-sol",
@@ -563,7 +725,7 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly #denyReadPaths: readonly string[];
 
   constructor(options: CliAdapterOptions) {
-    this.#binary = options.binary ?? "codex";
+    this.#binary = resolveExecutable(options.binary ?? "codex");
     this.#clock = options.clock;
     this.#capacityFile = options.capacityFile;
     this.#freshnessMs = options.freshnessWindowMs ?? DEFAULT_FRESHNESS_MS;

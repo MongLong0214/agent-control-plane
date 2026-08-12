@@ -118,6 +118,11 @@ export interface ProviderAdapter {
    */
   readonly isProduction: boolean;
   readonly defaultModels: Readonly<Record<string, string>>;
+  /**
+   * A known runtime capability, not proof for a particular invocation. An omitted value
+   * means the adapter must still prove the boundary through `InvocationResult`.
+   */
+  readonly supportsReviewerIsolation?: boolean;
 
   startSession(spec: SessionSpec): Promise<SessionHandle>;
   stopSession(handle: SessionHandle): Promise<void>;
@@ -182,6 +187,10 @@ class CapacityObservedAdapter implements ProviderAdapter {
 
   get defaultModels(): Readonly<Record<string, string>> {
     return this.inner.defaultModels;
+  }
+
+  get supportsReviewerIsolation(): boolean | undefined {
+    return this.inner.supportsReviewerIsolation;
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {

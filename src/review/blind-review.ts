@@ -366,6 +366,10 @@ export class BlindReviewGate {
         attempts.push({ preference, reason: "no adapter registered" });
         continue;
       }
+      if (adapter.supportsReviewerIsolation === false) {
+        attempts.push({ preference, reason: "reviewer isolation is unsupported by adapter" });
+        continue;
+      }
       const health = await adapter.probeRuntime();
       if (health === "UNAVAILABLE") {
         attempts.push({ preference, reason: "runtime unavailable" });
