@@ -5,7 +5,7 @@ period cannot be satisfied by a build, and are marked as such rather than glosse
 
 | # | Definition of Done | Status | Evidence / what is missing |
 |---|---|---|---|
-| 1 | CP-S01–CP-S59 all PASS | **Met** | Every scenario id maps to an executable test; `pnpm trace` reports 59/59 covered and the suite passes. See `evidence/traceability.md`. |
+| 1 | CP-S01–CP-S59 all PASS | **Met** | Every scenario id maps to an executable test; `pnpm trace` reports 59/59 covered and all 275 tests pass. See `evidence/traceability.md`. Scenario coverage is not the same as review clearance — see the review status below. |
 | 2 | DB constraint and transactional failover tests PASS | **Met** | `tests/unit/trusted-core.test.ts` trips each §30.2 constraint; `switchTo` activate/revoke/outbox-fence runs in one transaction and is asserted in CP-S10 and CP-S23. |
 | 3 | One real end-to-end run in each of SIMPLE, STANDARD, GUARDED | **Partly met** | STANDARD ran end to end in 166s against a real project with a real CTO session, real sandboxed verification and a real independent reviewer — see `evidence/e2e-real-project.json`. SIMPLE and GUARDED are exercised by the scenario suite, including the GUARDED human gate, but not yet as real runs with live model sessions. |
 | 4 | One multi-repository run with an explicit merge order | **Partly met** | Multi-repository freezing and staleness are proven with two real repositories (CP-S25), and `run_repositories.merge_order` plus per-repo merge state are implemented. A full two-repository merge sequence has not been executed. |
@@ -103,12 +103,39 @@ them rather than assuming a permissive default.
   the signed bytes from channel, actor, conversation, nonce and payload rather than trusting
   a caller-supplied body.
 
-## Known unresolved findings
+## Independent review status — **BLOCK**, 122 findings open
 
-The independent review's BLOCKER findings are all closed with regression tests. Its MAJOR
-findings are tracked as GitHub issues rather than silently deferred; see the
-`review-major` label on the repository. Nothing in that set is required for the Hard
-Invariants, and each issue records the area, the file and the reviewer's reasoning.
+Two rounds of independent review by GPT-5.6 Sol (nine areas, read-only sandbox, reasoning
+effort `xhigh`, no shared context between rounds). Both are recorded under
+`evidence/review/` — round 1 in `evidence/review-round1/`, round 2 in `evidence/review/`.
+
+| Round | Verdict | BLOCKER | MAJOR | What happened |
+|---|---|---|---|---|
+| 1 | BLOCK in all 9 areas | 55 | 68 | All 55 closed with regression tests across seven commits. |
+| 2 | BLOCK in all 9 areas | 63 | 64 | 5 closed so far; the remaining 122 are filed as GitHub issues. |
+
+**Round 2's BLOCKER count is not a regression.** Round 1's findings were fixed and their
+regressions still pass; round 2 read the *changed*, larger codebase with fresh context and
+went deeper — for example the guard's check-to-act window, evidence-producer impersonation
+by an in-process caller, reviewer attribution under chunked review, and post-merge coverage
+narrowing. Spot-checking confirmed the round-2 findings are accurate rather than stale.
+
+What that means plainly: **this is not production-ready yet, and the review does not say it
+is.** The Hard Invariants have real enforcement and real negative tests, and the end-to-end
+path works against a real project — but an adversarial reader with full source access still
+finds authority and evidence gaps faster than one hardening pass closes them.
+
+Every round-2 finding is a GitHub issue carrying the reviewer's own reasoning, labelled
+`review-blocker` / `review-major` plus `area:<area>`. That is deliberately the handoff
+artifact: the next session works from the tracker, not from a transcript.
+
+Closed from round 2 so far:
+
+- `runtime#1` — only the production gate or a bootstrap activation may write `COMPLETED`.
+- `runtime#12` — releasing a claim requires the run that holds it, in one transaction.
+- `github#5` — post-merge verification requires every declared check, not a caller's subset.
+- `github#6` — post-merge results must belong to a merge this run actually performed.
+- `github#10` — a merge GitHub refused leaves no receipt to replay as success.
 
 ## What would close items 7–9
 
