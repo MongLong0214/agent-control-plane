@@ -4,12 +4,17 @@ import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.
 import { digestOf } from "../../src/core/digest.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { assertCtoRunPeer, createCtoServer } from "../../src/mcp/cto-server.ts";
+import { createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { idempotentMcpMutation } from "../../src/mcp/shared.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
 import { ExecutionMode, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import {
+  CANDIDATE_SNAPSHOT_SCHEMA_ID,
+  candidateSnapshotDigest,
+  type CandidateSnapshot,
+} from "../../src/snapshot/candidate-snapshot.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
 import { fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
@@ -74,6 +79,64 @@ const validResult = (harness: Harness, runId: string, projectId: string, plan: o
   unresolvedGaps: [],
 });
 
+const recordBootstrapBlindReview = (harness: Harness, runId: string): string => {
+  const run = harness.cp.runs.require(runId);
+  const head = gitSync(harness.repoPath, ["rev-parse", "HEAD"]);
+  const snapshot: CandidateSnapshot = {
+    schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
+    runId,
+    contractDigest: run.contractDigest,
+    repositories: [{
+      identity: "github:acme/fixture",
+      repositoryRole: "primary",
+      baseBranch: "dev",
+      baseHead: head,
+      candidateHead: head,
+      treeDigest: `git-tree:${gitSync(harness.repoPath, ["rev-parse", "HEAD^{tree}"])}`,
+      diffDigest: digestOf({ bootstrapCandidate: runId }),
+      worktreeId: null,
+      manifestDigest: null,
+      touchedPaths: [],
+    }],
+    createdAt: harness.clock.nowIso(),
+  };
+  const candidateSnapshotDigestValue = candidateSnapshotDigest(snapshot);
+  harness.cp.artifacts.put(runId, "CANDIDATE_SNAPSHOT", snapshot, candidateSnapshotDigestValue);
+
+  const reviewer = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap-reviewer" });
+  harness.cp.sessions.transition(reviewer.sessionId, SessionLifecycle.READY, "test reviewer");
+
+  harness.cp.artifacts.putEvidence("blind-review-gate", runId, "BLIND_REVIEW", {
+    runId,
+    candidateSnapshotDigest: candidateSnapshotDigestValue,
+    contractDigest: run.contractDigest,
+    reviewerRoleBindingGeneration: 1,
+    reviewerSessionId: reviewer.sessionId,
+    reviewerSessionIncarnation: reviewer.incarnation,
+    reviewerProviderSessionId: reviewer.sessionId,
+    provider: reviewer.provider,
+    model: reviewer.model,
+    effort: reviewer.effort,
+    inputManifest: {
+      contract: true,
+      snapshotManifest: true,
+      diff: true,
+      verificationEvidence: true,
+      projectContext: true,
+      withheld: [],
+      binaryArtifacts: [],
+    },
+    coveredRepositories: ["github:acme/fixture"],
+    coveredFiles: [],
+    omittedItems: [],
+    verdict: "PASS",
+    findings: [],
+    chunked: false,
+    createdAt: harness.clock.nowIso(),
+  }, candidateSnapshotDigestValue);
+  return candidateSnapshotDigestValue;
+};
+
 const prepareBootstrap = (harness: Harness, projectId: string) => {
   const created = harness.cp.runs.create({
     kind: RunKind.PROJECT_BOOTSTRAP,
@@ -86,15 +149,7 @@ const prepareBootstrap = (harness: Harness, projectId: string) => {
   const bound = harness.cp.bootstrap.bindBootstrapCto(created.value.runId, bootstrapCto.sessionId);
   if (!bound.allowed) throw new Error(bound.message);
   harness.cp.runs.transition(created.value.runId, RunState.ACTIVE, "bootstrap work");
-  const candidate = digestOf({ runId: created.value.runId });
-  harness.cp.artifacts.putEvidence("blind-review-gate", created.value.runId, "BLIND_REVIEW", {
-    runId: created.value.runId,
-    candidateSnapshotDigest: candidate,
-    verdict: "PASS",
-    coveredFiles: [],
-    omittedItems: [],
-    findings: [],
-  }, candidate);
+  recordBootstrapBlindReview(harness, created.value.runId);
   harness.cp.runs.transition(created.value.runId, RunState.READY_FOR_CEO_REVIEW, "reviewed");
   const plan = {
     bootstrapOperationId: "op-bootstrap",
@@ -139,18 +194,14 @@ describe("round-2 ops regressions", () => {
     expect(result.structuredContent?.["reasonCode"]).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
   });
 
-  it("#103/#218: a caller cannot act as an active CTO by claiming its session tuple", () => {
+  it("#103/#218: a caller cannot act as an active CTO by claiming its session tuple", async () => {
     const harness = makeHarness();
     const prepared = prepareBootstrap(harness, "peer-project");
-    const actual = harness.cp.runs.require(prepared.runId);
-    expect(actual.ownerSessionId).toBeTruthy();
-    const denied = assertCtoRunPeer(harness.cp, {
-      actor: "attacker",
-      sessionId: actual.ownerSessionId!,
-      sessionIncarnation: "forged-incarnation",
-    }, prepared.runId);
-    expect(denied.allowed).toBe(false);
-    expect(denied.reasonCode).toBe(ReasonCode.MCP_PEER_UNAUTHENTICATED);
+    const server = createCtoServer(harness.cp, () =>
+      allow(ReasonCode.OK, { actor: "attacker", sessionId: "ses_forged", sessionIncarnation: "forged" }),
+    );
+    const denied = await tool(server, "contract_get")({ runId: prepared.runId });
+    expect(denied.structuredContent?.["reasonCode"]).toBe(ReasonCode.MCP_PEER_UNAUTHENTICATED);
   });
 
   it("#104/#109: an unacknowledged, pre-confirmation bootstrap never writes a final activation artifact", async () => {

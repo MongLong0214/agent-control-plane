@@ -297,6 +297,7 @@ export class Daemon {
   }
 
   private recordLockContention(evidence: Record<string, unknown>): void {
+    this.recordStartupFailure(ReasonCode.DAEMON_ALREADY_RUNNING, evidence);
     this.cp.audit.record({
       kind: "DAEMON_START_REFUSED",
       reasonCode: ReasonCode.DAEMON_ALREADY_RUNNING,

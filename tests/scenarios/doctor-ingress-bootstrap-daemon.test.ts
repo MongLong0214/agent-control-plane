@@ -20,6 +20,11 @@ import { IngressGuard, asUntrustedData } from "../../src/ingress/ingress-guard.t
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
+import {
+  CANDIDATE_SNAPSHOT_SCHEMA_ID,
+  candidateSnapshotDigest,
+  type CandidateSnapshot,
+} from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   type Harness,
@@ -55,6 +60,69 @@ const dispatchedRun = async (harness: Harness) => {
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
   if (!dispatched.allowed) throw new Error(dispatched.message);
   return { projectId, repositoryId, identity, run: dispatched.value };
+};
+
+const recordBootstrapBlindReview = (harness: Harness, runId: string): string => {
+  const run = harness.cp.runs.require(runId);
+  const head = gitSync(harness.repoPath, ["rev-parse", "HEAD"]);
+  const snapshot: CandidateSnapshot = {
+    schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
+    runId,
+    contractDigest: run.contractDigest,
+    repositories: [{
+      identity: "github:acme/fixture",
+      repositoryRole: "primary",
+      baseBranch: "dev",
+      baseHead: head,
+      candidateHead: head,
+      treeDigest: `git-tree:${gitSync(harness.repoPath, ["rev-parse", "HEAD^{tree}"])}`,
+      diffDigest: digestOf({ bootstrapCandidate: runId }),
+      worktreeId: null,
+      manifestDigest: null,
+      touchedPaths: [],
+    }],
+    createdAt: harness.clock.nowIso(),
+  };
+  const candidateSnapshotDigestValue = candidateSnapshotDigest(snapshot);
+  harness.cp.artifacts.put(runId, "CANDIDATE_SNAPSHOT", snapshot, candidateSnapshotDigestValue);
+
+  const reviewer = harness.cp.sessions.create({ provider: "scripted", model: "bootstrap-reviewer" });
+  harness.cp.sessions.transition(reviewer.sessionId, SessionLifecycle.READY, "test reviewer");
+
+  harness.cp.artifacts.putEvidence("blind-review-gate", runId, "BLIND_REVIEW", {
+    runId,
+    candidateSnapshotDigest: candidateSnapshotDigestValue,
+    contractDigest: run.contractDigest,
+    reviewerRoleBindingGeneration: 1,
+    reviewerSessionId: reviewer.sessionId,
+    reviewerSessionIncarnation: reviewer.incarnation,
+    reviewerProviderSessionId: reviewer.sessionId,
+    provider: reviewer.provider,
+    model: reviewer.model,
+    effort: reviewer.effort,
+    inputManifest: {
+      contract: true,
+      snapshotManifest: true,
+      diff: true,
+      verificationEvidence: true,
+      projectContext: true,
+      withheld: [],
+      binaryArtifacts: [],
+    },
+    coveredRepositories: ["github:acme/fixture"],
+    coveredFiles: [],
+    omittedItems: [],
+    verdict: "PASS",
+    findings: [],
+    chunked: false,
+    createdAt: harness.clock.nowIso(),
+  }, candidateSnapshotDigestValue);
+  return candidateSnapshotDigestValue;
+};
+
+const prepareDaemonHealth = (harness: Harness): void => {
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+  bindCeo(harness);
 };
 
 describe("doctor (CP-S43 – CP-S45)", () => {
@@ -199,6 +267,19 @@ describe("repair (CP-S47)", () => {
     });
     expect(needsOwner.allowed).toBe(false);
     expect(needsOwner.reasonCode).toBe(ReasonCode.REPAIR_REQUIRES_OWNER);
+
+    const { run, identity } = await dispatchedRun(harness);
+    const claim = harness.cp.claims.acquire({
+      runId: run.runId,
+      ownerSessionId: run.ownerSessionId!,
+      ownerBindingGeneration: run.ownerBindingGeneration!,
+      ownerRoleKey: run.ownerRoleKey!,
+      repositoryIdentity: identity,
+      branch: "repair/stale-claim",
+      ttlMs: 1,
+    });
+    if (!claim.allowed) throw new Error(claim.message);
+    harness.clock.advance(1);
 
     const lowRisk = await harness.cp.repair.execute({
       operationId: "expire_stale_claims",
@@ -642,21 +723,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(harness.cp.runs.require(runId).ownerSessionId).toBe(bootstrapCto.sessionId);
 
     harness.cp.runs.transition(runId, RunState.ACTIVE, "bootstrap work");
-    const bootstrapCandidate = digestOf({ bootstrap: runId });
-    harness.cp.artifacts.putEvidence(
-      "blind-review-gate",
-      runId,
-      "BLIND_REVIEW",
-      {
-        runId,
-        candidateSnapshotDigest: bootstrapCandidate,
-        verdict: "PASS",
-        coveredFiles: ["github:acme/fixture:README.md"],
-        omittedItems: [],
-        findings: [],
-      },
-      bootstrapCandidate,
-    );
+    const bootstrapCandidate = recordBootstrapBlindReview(harness, runId);
     harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "bootstrap reviewed");
 
     // The handoff is opened but not yet acknowledged, so activation is still incomplete —
@@ -674,11 +741,28 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(acked.allowed).toBe(true);
 
     const awaitingCeo = await harness.cp.bootstrap.activate(input);
-    expect(awaitingCeo.allowed).toBe(false);
-    expect(awaitingCeo.evidence["incomplete"]).toContain("ceoConfirm");
-    // A pre-confirmation record is operationally useful but never masquerades as the
-    // immutable final activation result; the completion transaction must create that.
-    expect(harness.cp.artifacts.latest(runId, "BOOTSTRAP_ACTIVATION_RESULT")).toBeNull();
+    expect(awaitingCeo.allowed).toBe(true);
+    if (!awaitingCeo.allowed) return;
+    expect(awaitingCeo.value.ceoConfirm).toBeNull();
+
+    const ceoSessionId = bindCeo(harness);
+    await harness.cp.continuity.evaluate("bootstrap confirmation");
+    const confirmed = harness.cp.ceo.submitCeoDecision({
+      runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: bootstrapCandidate,
+      ceoSessionId,
+      rationale: "activation facts rechecked",
+    });
+    expect(confirmed.allowed).toBe(true);
+
+    const finalized = await harness.cp.bootstrap.activate(input);
+    expect(finalized.allowed).toBe(true);
+    if (!finalized.allowed) return;
+    expect(finalized.value.ceoConfirm?.decision).toBe("CONFIRM");
+    expect(harness.cp.artifacts.latest(runId, "BOOTSTRAP_ACTIVATION_RESULT")?.content).toMatchObject({
+      ceoConfirm: { decision: "CONFIRM" },
+    });
 
     const stored = harness.cp.artifacts.latest(runId, "REPO_FACTORY_RESULT");
     expect(JSON.stringify(stored?.content)).not.toContain("primaryCto");
@@ -722,6 +806,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
 describe("daemon (CP-S58, CP-S59)", () => {
   it("CP-S58: restart reconciles without dispatching the same run twice", async () => {
     const harness = makeHarness();
+    prepareDaemonHealth(harness);
     const stateDir = tempDir("acp-daemon-");
     const { run } = await dispatchedRun(harness);
 
@@ -752,6 +837,7 @@ describe("daemon (CP-S58, CP-S59)", () => {
 
   it("CP-S58: a queued run is resumed exactly once across a restart", async () => {
     const harness = makeHarness();
+    prepareDaemonHealth(harness);
     const stateDir = tempDir("acp-daemon-");
     const { projectId, repositoryId } = await registerFixtureProject(harness);
     const created = harness.cp.runs.create({
@@ -761,6 +847,8 @@ describe("daemon (CP-S58, CP-S59)", () => {
       repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
     });
     if (!created.allowed) throw new Error(created.message);
+    const primaryCto = await harness.cp.cto.ensurePrimaryCto(projectId, "daemon-queued-run");
+    if (!primaryCto.allowed) throw new Error(primaryCto.message);
 
     const daemon = new Daemon(harness.cp, { stateDir });
     const started = await daemon.start();
@@ -778,6 +866,7 @@ describe("daemon (CP-S58, CP-S59)", () => {
 
   it("CP-S58: an execution left RUNNING across a restart is abandoned, not left dangling", async () => {
     const harness = makeHarness();
+    prepareDaemonHealth(harness);
     const stateDir = tempDir("acp-daemon-");
     const { run, repositoryId } = await dispatchedRun(harness);
     const submitted = harness.cp.tasks.submit(run.runId, [
@@ -803,6 +892,7 @@ describe("daemon (CP-S58, CP-S59)", () => {
 
   it("CP-S59: a second instance refuses to start and the backoff grows", async () => {
     const harness = makeHarness();
+    prepareDaemonHealth(harness);
     const stateDir = tempDir("acp-daemon-");
 
     const first = new Daemon(harness.cp, { stateDir });

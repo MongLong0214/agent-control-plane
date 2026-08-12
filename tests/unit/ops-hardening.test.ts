@@ -72,6 +72,18 @@ describe("a destructive repair needs a real owner (§25.7)", () => {
 
   it("still allows a Hermes-authorised low-risk repair without an owner", async () => {
     const harness = makeHarness();
+    const { runId, run, identity } = await activeRun(harness);
+    const claim = harness.cp.claims.acquire({
+      runId,
+      ownerSessionId: run.ownerSessionId!,
+      ownerBindingGeneration: run.ownerBindingGeneration!,
+      ownerRoleKey: run.ownerRoleKey!,
+      repositoryIdentity: identity,
+      branch: "repair/stale-claim",
+      ttlMs: 1,
+    });
+    if (!claim.allowed) throw new Error(claim.message);
+    harness.clock.advance(1);
     const allowed = await harness.cp.repair.execute({
       operationId: "expire_stale_claims",
       parameters: {},
@@ -83,6 +95,8 @@ describe("a destructive repair needs a real owner (§25.7)", () => {
 
   it("accepts the destructive repair once the owner identity checks out", async () => {
     const harness = makeHarness();
+    await registerFixtureProject(harness);
+    await harness.cp.worktrees.create(harness.repoPath, "HEAD", "owner-approved-orphan");
     const allowed = await harness.cp.repair.execute({
       operationId: "prune_orphan_worktrees",
       parameters: {},
