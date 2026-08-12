@@ -6,7 +6,7 @@ import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
-import { ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ContinuityMode, ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
@@ -31,7 +31,7 @@ const CONTRACT: TaskContract = {
  * table (gpt/claude preferred, grok optional) is what gets exercised. The adapters are
  * production-eligible test fixtures because these scenarios exercise routing paths.
  */
-const makeMultiProviderHarness = () => {
+const makeMultiProviderHarness = ({ forwardDispatchTarget = true }: { forwardDispatchTarget?: boolean } = {}) => {
   const root = tempDir("acp-cont-");
   const clock = new ManualClock("2026-08-12T00:00:00.000Z");
   const gpt = new TestProductionAdapter(clock, "gpt");
@@ -57,7 +57,14 @@ const makeMultiProviderHarness = () => {
   cp.continuity.attach({
     buzz: { connect: (sessionId, purpose) => buzzAdapter.connect(sessionId, purpose) },
   });
-
+  // Only CP-S17 below is evidence for the composition root itself. The remaining
+  // scenarios cover independent graph and continuity behavior, so their fixture supplies
+  // the target-preserving port expected after that caller-side repair lands.
+  if (forwardDispatchTarget) {
+    cp.runs.attach({
+      capacity: { refreshForDispatch: (target) => cp.capacity.refreshForDispatch(target) },
+    });
+  }
   return { cp, clock, gpt, claude, grok, repoPath };
 };
 
@@ -333,15 +340,35 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
     expect(probeAudit.length).toBeGreaterThan(0);
   });
 
-  it("CP-S17: dispatch is refused rather than routed against an unknown quota", async () => {
-    const harness = makeMultiProviderHarness();
-    // Make every provider production-eligible for this check by asserting through the
-    // monitor directly: all sensors are in error, so nothing can be admitted.
-    for (const adapter of [harness.gpt, harness.claude, harness.grok]) {
-      adapter.setCapacity(reading(adapter.provider, harness.clock, { sensorHealth: "ERROR", buckets: [] }));
+  it("CP-S17: dispatch refuses its selected CTO provider when its capacity probe fails", async () => {
+    const harness = makeMultiProviderHarness({ forwardDispatchTarget: false });
+    // These providers remain open for worker work. A targetless admission would therefore
+    // pass, even though dispatch is about to constitute a Claude CTO.
+    for (const adapter of [harness.gpt, harness.grok]) {
+      adapter.setCapacity(
+        reading(adapter.provider, harness.clock, {
+          buckets: [{ id: "worker", remainingPercent: 90, resetAt: null, capabilities: ["worker"] }],
+        }),
+      );
     }
-    await harness.cp.capacity.refresh(RefreshTrigger.DISPATCH_ADMISSION);
-    expect(harness.cp.capacity.all().every((c) => c.allocationAdmission === "SUSPENDED")).toBe(true);
+    harness.claude.setCapacity(
+      reading("claude", harness.clock, { sensorHealth: "ERROR", buckets: [], error: "usage source unreadable" }),
+    );
+    const { projectId, repositoryId } = await registerProject(harness);
+    const created = harness.cp.runs.create({
+      projectId,
+      executionMode: ExecutionMode.SIMPLE,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+
+    const refused = await harness.cp.runs.dispatch(created.value.runId);
+    expect(refused.allowed).toBe(false);
+    if (refused.allowed) throw new Error("dispatch unexpectedly admitted failed Claude capacity");
+    expect(refused.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    expect(refused.evidence).toMatchObject({ provider: "claude", capabilities: ["cto"] });
+    expect(harness.cp.runs.require(created.value.runId).state).toBe(RunState.QUEUED);
   });
 
   it("CP-S18: a healthy disposable bucket is what makes Luna Max routable", async () => {
@@ -375,18 +402,29 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
 
   it("the reserve is computed from demand, not fixed", async () => {
     const harness = makeMultiProviderHarness();
-    harness.gpt.setCapacity(reading("gpt", harness.clock));
+    harness.gpt.setCapacity(
+      reading("gpt", harness.clock, {
+        buckets: [{
+          id: "rolling-5h",
+          remainingPercent: 80,
+          resetAt: "2026-08-12T05:00:00.000Z",
+          capabilities: ["worker"],
+        }],
+      }),
+    );
     await harness.cp.capacity.refresh(RefreshTrigger.WORKER_FANOUT, ["gpt"]);
 
     const light = harness.cp.capacity.dynamicReserve("gpt", {
       criticalRoleInvocations: 0,
       expectedReviews: 0,
       inFlightRuns: 0,
+      burnRatePercentPerHour: 0,
     });
     const heavy = harness.cp.capacity.dynamicReserve("gpt", {
       criticalRoleInvocations: 5,
       expectedReviews: 10,
       inFlightRuns: 8,
+      burnRatePercentPerHour: 4,
     });
     expect(heavy).toBeGreaterThan(light);
     expect(heavy).toBeLessThanOrEqual(0.9);
