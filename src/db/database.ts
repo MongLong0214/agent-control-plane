@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import Database from "better-sqlite3";
 import { readFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";
@@ -32,7 +33,15 @@ export class Db {
   #depth = 0;
   #poisoned = false;
 
+  /**
+   * The file this connection opened. Capability issuance is keyed by it: two `Db` objects
+   * over the same file are the same resource, and keying by instance let a second one mint
+   * a fresh set of evidence writers for rows the composition root already owned (#352).
+   */
+  readonly file: string;
+
   constructor(filename: string) {
+    this.file = filename === ":memory:" ? `:memory:${Math.random()}` : resolve(filename);
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
     this.raw = new Database(filename);
     this.raw.pragma("foreign_keys = ON");

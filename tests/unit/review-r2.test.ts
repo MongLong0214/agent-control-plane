@@ -66,7 +66,7 @@ const persistPassingVerification = (
     reasonCode: ReasonCode.OK,
     gaps: [],
   };
-  setup.harness.cp.artifacts.putEvidence(setup.harness.cp.evidenceWriters.VERIFICATION, setup.run.runId, "VERIFICATION", report, snapshotDigest);
+  setup.harness.cp.artifacts.putEvidence(setup.harness.cp.evidenceWritersForTests().VERIFICATION, setup.run.runId, "VERIFICATION", report, snapshotDigest);
   setup.harness.cp.db.run(
     `INSERT OR REPLACE INTO verification_results
        (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source,
@@ -321,7 +321,7 @@ describe("round-2 blind-review regressions", () => {
       setup.harness.cp.db,
       setup.harness.cp.audit,
       setup.harness.cp.artifacts,
-      setup.harness.cp.evidenceWriters.BLIND_REVIEW,
+      setup.harness.cp.evidenceWritersForTests().BLIND_REVIEW,
       setup.harness.cp.sessions,
       setup.harness.cp.bindings,
       setup.harness.cp.providers,
@@ -358,7 +358,7 @@ describe("round-2 blind-review regressions", () => {
       setup.harness.cp.db,
       setup.harness.cp.audit,
       setup.harness.cp.artifacts,
-      setup.harness.cp.evidenceWriters.BLIND_REVIEW,
+      setup.harness.cp.evidenceWritersForTests().BLIND_REVIEW,
       setup.harness.cp.sessions,
       setup.harness.cp.bindings,
       setup.harness.cp.providers,

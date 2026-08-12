@@ -108,12 +108,11 @@ export interface EvidenceWriterSet {
 }
 
 /**
- * Databases whose writers have been issued. Keyed by the database rather than by the store
- * instance because the database is the resource being protected: constructing a second
- * `ArtifactStore` over the same database would otherwise be a way to mint a second set of
- * capabilities for rows the composition root already owns.
+ * Databases whose writers have been issued, keyed by the database *file*. The file is the
+ * resource being protected: keying by `Db` instance let `new ArtifactStore(new Db(samePath))`
+ * mint a second set of capabilities for rows the composition root already owned (#352).
  */
-const ISSUED_WRITERS = new WeakSet<Db>();
+const ISSUED_WRITERS = new Set<string>();
 
 /** Artifact kinds that must be bound to an exact candidate (§30.2 #7, CP-HI-06). */
 const SNAPSHOT_BOUND: ReadonlySet<string> = new Set([
@@ -142,14 +141,14 @@ export class ArtifactStore {
    * database finds the capabilities already spent and cannot mint its own (#70, CP-HI-04).
    */
   issueEvidenceWriters(): EvidenceWriterSet {
-    if (ISSUED_WRITERS.has(this.db)) {
+    if (ISSUED_WRITERS.has(this.db.file)) {
       fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         "evidence writer capabilities were already issued for this database",
         {},
       );
     }
-    ISSUED_WRITERS.add(this.db);
+    ISSUED_WRITERS.add(this.db.file);
     return {
       VERIFICATION: new EvidenceWriterToken(WRITER_MINT, "VERIFICATION"),
       BLIND_REVIEW: new EvidenceWriterToken(WRITER_MINT, "BLIND_REVIEW"),

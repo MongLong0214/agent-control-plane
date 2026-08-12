@@ -9,6 +9,8 @@ import { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import { CtoLifecycle, type CtoPreference } from "../cto/cto-lifecycle.ts";
 import { ProductionGate } from "../ceo/production-gate.ts";
 import { AuditLog } from "../db/audit.ts";
+import { fail } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
 import { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
@@ -43,6 +45,8 @@ export interface ControlPlaneConfig {
    * grant.
    */
   ownerIdentities?: readonly OwnerIdentity[];
+  /** Fixtures only: unlocks `evidenceWritersForTests`. The daemon never sets it (#352). */
+  allowTestEvidenceWriters?: boolean;
   /** Root under which disposable verification worktrees are created. */
   worktreeRoot: string;
   /** Directory holding the structured local capacity files, one per provider. */
@@ -150,13 +154,31 @@ export class ControlPlane {
   /**
    * The evidence-writing capabilities, claimed once at construction (#70).
    *
-   * Public deliberately, and narrowly: the holder of a composition root *is* the
-   * deployment — the daemon's own bootstrap and the acceptance harness. What #70 closes is
-   * a *request-path* caller minting evidence by naming a producer, and that is closed by
-   * `putEvidence` requiring one of these tokens. Nothing reachable from an MCP tool, an
-   * agent session or a repaired run holds this object.
+   * Private, because the earlier justification for exposing it was wrong: the MCP servers
+   * receive the whole composition root, so a public field put the capabilities one property
+   * access away from a tool handler (#352). A test that must write evidence directly asks
+   * for them through `evidenceWritersForTests`, which the daemon's own configuration never
+   * unlocks.
    */
-  readonly evidenceWriters: EvidenceWriterSet;
+  readonly #evidenceWriters: EvidenceWriterSet;
+
+  /**
+   * The capabilities, for a caller that constructed this control plane *as a fixture*.
+   *
+   * Gated by construction, not by convention: `allowTestEvidenceWriters` is a constructor
+   * input, so a request path that gets hold of this object later cannot turn it on. The
+   * daemon never sets it, which is what makes the gate meaningful rather than decorative.
+   */
+  evidenceWritersForTests(): EvidenceWriterSet {
+    if (!this.config.allowTestEvidenceWriters) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "evidence writer capabilities are not available to this deployment",
+        {},
+      );
+    }
+    return this.#evidenceWriters;
+  }
 
   constructor(readonly config: ControlPlaneConfig) {
     this.clock = config.clock ?? systemClock;
@@ -165,7 +187,7 @@ export class ControlPlane {
     this.artifacts = new ArtifactStore(this.db, this.clock);
     // Claimed immediately: issuance succeeds once per database, so claiming here is what
     // makes every later claim — by any component that reaches this store — fail.
-    this.evidenceWriters = this.artifacts.issueEvidenceWriters();
+    this.#evidenceWriters = this.artifacts.issueEvidenceWriters();
     this.telemetry = new Telemetry(this.db, this.clock);
     this.outbox = new Outbox(this.db, this.clock, this.audit);
 
@@ -199,11 +221,11 @@ export class ControlPlane {
       this.projects, this.repositories, this.tasks, this.claims, this.telemetry,
     );
     this.verification = new VerificationEngine(
-      this.db, this.clock, this.audit, this.artifacts, this.evidenceWriters.VERIFICATION,
+      this.db, this.clock, this.audit, this.artifacts, this.#evidenceWriters.VERIFICATION,
       this.repositories, this.worktrees, this.telemetry,
     );
     this.review = new BlindReviewGate(
-      this.clock, this.db, this.audit, this.artifacts, this.evidenceWriters.BLIND_REVIEW,
+      this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
       this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
       config.reviewer ?? {
         preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
@@ -224,7 +246,7 @@ export class ControlPlane {
     );
     this.ceo = new ProductionGate(
       this.db, this.clock, this.audit, this.artifacts,
-      this.evidenceWriters.PRODUCTION_READY_PACKET,
+      this.#evidenceWriters.PRODUCTION_READY_PACKET,
       this.runs, this.tasks, this.bindings, this.outbox, this.telemetry,
     );
 

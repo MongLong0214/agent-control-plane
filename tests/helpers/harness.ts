@@ -55,6 +55,8 @@ console.log('verification ok');`,
     allowNonProductionAdapters: true,
     // §21 — the fixture deployment has exactly one owner identity.
     ownerIdentities: options.ownerIdentities ?? [TEST_OWNER],
+    // A fixture writes evidence directly in a few places; the daemon never unlocks this.
+    allowTestEvidenceWriters: true,
     ctoPreference: { provider: "scripted", model: "scripted-cto", effort: null },
     reviewer: {
       preferred: { provider: "scripted", model: "scripted-reviewer", effort: "xhigh" },

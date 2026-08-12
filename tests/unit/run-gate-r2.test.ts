@@ -93,7 +93,7 @@ const evidenceReadyRun = async (humanGate: string[] = []) => {
     ],
   );
   fixture.harness.cp.artifacts.putEvidence(
-    fixture.harness.cp.evidenceWriters.VERIFICATION, fixture.runId, ArtifactKind.VERIFICATION, report, digest,
+    fixture.harness.cp.evidenceWritersForTests().VERIFICATION, fixture.runId, ArtifactKind.VERIFICATION, report, digest,
   );
 
   const reviewer = fixture.harness.cp.sessions.create({ provider: "scripted", model: "reviewer" });
@@ -134,7 +134,7 @@ const evidenceReadyRun = async (humanGate: string[] = []) => {
     createdAt: fixture.harness.clock.nowIso(),
   };
   fixture.harness.cp.artifacts.putEvidence(
-    fixture.harness.cp.evidenceWriters.BLIND_REVIEW, fixture.runId, ArtifactKind.BLIND_REVIEW, review, digest,
+    fixture.harness.cp.evidenceWritersForTests().BLIND_REVIEW, fixture.runId, ArtifactKind.BLIND_REVIEW, review, digest,
   );
   await fixture.harness.cp.continuity.evaluate("test evidence");
   const approval = {

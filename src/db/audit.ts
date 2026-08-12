@@ -143,6 +143,9 @@ const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
   /\bnsec1[a-z0-9]{20,}/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}/,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\b\d{8,10}:AA[A-Za-z0-9_-]{30,}/,
   /\bBearer\s+[A-Za-z0-9._~+/-]{20,}/i,
   /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./, // JWT
   // KEY=VALUE where the key looks secret, as it appears in an env dump.
@@ -258,7 +261,19 @@ const isBulkContentKey = (key: string): boolean => {
  * a report has to be able to state.
  */
 const CREDENTIAL_NAME =
-  /^(token|secret|password|passwd|credential|credentials|apikey|authorization|privatekey|accesskey|signingkey|servicekey|sessionsecret|cookie|nsec)$/i;
+  /(^|_)(token|secret|password|passwd|credential|credentials|apikey|authorization|privatekey|accesskey|signingkey|servicekey|sessionsecret|cookie|nsec)$|(token|secret|password|credential|apikey|privatekey|accesskey)$/i;
+
+/**
+ * Identifiers evidence has to be able to state, which the suffix rule above would otherwise
+ * read as credentials. Narrow and explicit: adding a name here is a decision to store it, so
+ * the list is short and each entry is an identifier by construction, never a secret.
+ */
+const NOT_A_CREDENTIAL: ReadonlySet<string> = new Set([
+  "rolekey", "idempotencykey", "sortkey", "cachekey", "operationkey", "claimkey",
+]);
+
+/** Depth beyond which content is refused rather than examined; see `credentialBearingField`. */
+const MAX_CREDENTIAL_SCAN_DEPTH = 24;
 
 /**
  * A credential inside content that is about to become *evidence*.
@@ -270,7 +285,8 @@ const CREDENTIAL_NAME =
  * right answer because nothing corroborates an audit row against a produced copy.
  */
 export const credentialBearingField = (value: unknown, depth = 0): string | null => {
-  if (depth > 8) return null;
+  // Deeper than the scan goes is not "clean": an unexamined subtree must not become evidence.
+  if (depth > MAX_CREDENTIAL_SCAN_DEPTH) return "<unexaminable-depth>";
   if (typeof value === "string") {
     return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value)) ? "<value>" : null;
   }
@@ -283,7 +299,15 @@ export const credentialBearingField = (value: unknown, depth = 0): string | null
   }
   if (value && typeof value === "object") {
     for (const [key, nested] of Object.entries(value)) {
-      if (CREDENTIAL_NAME.test(normalizedKey(key)) && nested != null && nested !== "") return key;
+      const normalized = normalizedKey(key);
+      if (
+        !NOT_A_CREDENTIAL.has(normalized) &&
+        CREDENTIAL_NAME.test(normalized) &&
+        nested != null &&
+        nested !== ""
+      ) {
+        return key;
+      }
       const found = credentialBearingField(nested, depth + 1);
       if (found) return found === "<value>" ? key : found;
     }

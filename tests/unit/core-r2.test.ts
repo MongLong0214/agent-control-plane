@@ -212,6 +212,39 @@ describe("round-2 database and evidence regressions", () => {
     ).toMatchObject({ reasonCode: ReasonCode.INVALID_ARGUMENT });
   });
 
+  it("#351 refuses a credential-shaped value inside a field the envelope allows", () => {
+    const { artifacts, runId, digest } = candidateRun();
+    const writer = artifacts.issueEvidenceWriters().VERIFICATION;
+    const base = verificationFor(runId, digest);
+    // A strict envelope stops an unknown `githubToken` field, so the leak that mattered was a
+    // credential *value* inside a field the envelope permits. Each of these reached durable
+    // evidence while the detector matched exact names only.
+    const shapes = [
+      ["github fine-grained pat", "github_pat_11ABCDEFGHIJKLMNOPQRST_abcdefghijklmnopqrstuvwxyz012345"],
+      ["telegram bot token", "123456789:AAF-abcdefghijklmnopqrstuvwxyz0123456789"],
+      ["aws access key id", "AKIAIOSFODNN7EXAMPLE"],
+    ] as const;
+    for (const [what, value] of shapes) {
+      expect(
+        thrown(() =>
+          artifacts.putEvidence(writer, runId, ArtifactKind.VERIFICATION, { ...base, gaps: [value] }, digest),
+        ),
+        what,
+      ).toMatchObject({ reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+    }
+    // And an identifier a report has to be able to state is still storable — the suffix rule
+    // would otherwise read `roleKey` as a credential and refuse honest evidence.
+    expect(
+      artifacts.putEvidence(
+        writer,
+        runId,
+        ArtifactKind.VERIFICATION,
+        { ...base, gaps: ["roleKey=PRIMARY_CTO:prj", "idempotencyKey=abc"] },
+        digest,
+      ).digest,
+    ).toMatch(/^sha256:/);
+  });
+
   it("#71 rejects evidence whose embedded candidate digest differs from its row binding", () => {
     const { db, artifacts, runId, digest } = candidateRun();
     const mismatched = { ...verificationFor(runId, digest), candidateSnapshotDigest: digestOf({ other: true }) };
