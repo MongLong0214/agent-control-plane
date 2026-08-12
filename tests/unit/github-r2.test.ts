@@ -1,6 +1,6 @@
 import { chmodSync } from "node:fs";
 
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -149,14 +149,14 @@ describe("round-two GitHub hardening", () => {
     expect(await fixture.harness.cp.github.ciEvidenceSource().fetch(fixture.driven.identity, fixture.driven.candidateHead)).toEqual([]);
   });
 
-  it("#85: refuses before the irreversible GitHub merge because REST has no expected-base predicate", async () => {
+  it("#85: fences the head, proves the base after merging, and records the residual base race", async () => {
     const fixture = await ready();
     Object.assign(fixture.github, { supportsAtomicExpectedBase: false });
     const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.driven.identity);
     if (!gate.allowed) throw new Error(gate.message);
     const pr = await fixture.harness.cp.github.prPrepare(fixture.input);
     if (!pr.allowed) throw new Error(pr.message);
-    const refused = await fixture.harness.cp.github.mergeExecute({
+    const merged = await fixture.harness.cp.github.mergeExecute({
       runId: fixture.driven.runId,
       repositoryIdentity: fixture.driven.identity,
       pullNumber: pr.value.pullNumber,
@@ -166,8 +166,19 @@ describe("round-two GitHub hardening", () => {
       ownerSessionId: fixture.driven.ownerSessionId,
       ownerBindingGeneration: fixture.driven.ownerBindingGeneration,
     });
-    expect(refused.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
-    expect(fixture.github.mergeCount).toBe(0);
+    expect(merged.allowed).toBe(true);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(
+      fixture.github.calls.find((call) => call.method === "PUT" && call.path.endsWith("/merge"))?.body,
+    ).toEqual({ sha: fixture.driven.candidateHead, merge_method: "merge" });
+    const receipt = fixture.harness.cp.db.get<{ response_json: string }>(
+      `SELECT response_json FROM github_receipts WHERE operation = 'merge_execute'`,
+    );
+    expect(JSON.parse(receipt!.response_json).baseVerification).toEqual({
+      preflight: "exact-base-reread",
+      residualRace: "base-may-move-between-preflight-and-merge",
+      proof: "merge-commit-first-parent",
+    });
   });
 
   it("#87/#192: a receipt for the same PR but different merge intent is a resource collision", async () => {
@@ -221,10 +232,14 @@ describe("round-two GitHub hardening", () => {
 
   it("#89/#200: refuses a GitHub decision when the run's pinned manifest cannot resolve", async () => {
     const fixture = await ready();
-    fixture.harness.cp.db.run(`UPDATE runs SET pinned_manifest_digest = NULL WHERE run_id = ?`, [fixture.driven.runId]);
-    const refused = await fixture.harness.cp.github.prPrepare(fixture.input);
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_DIGEST_MISMATCH);
+    const manifest = vi.spyOn(fixture.harness.cp.projects, "manifest").mockReturnValue(null);
+    try {
+      const refused = await fixture.harness.cp.github.prPrepare(fixture.input);
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_DIGEST_MISMATCH);
+    } finally {
+      manifest.mockRestore();
+    }
   });
 
   it("#90: refuses PR preparation when no frozen candidate exists", async () => {

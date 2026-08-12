@@ -502,6 +502,8 @@ describe("merge order and dependents are enforced by the kernel (§24.7)", () =>
       repositoryRole: "docs",
       baseBranch: "dev",
       mergeOrder: 1,
+      ownerSessionId: fixture.caller.ownerSessionId,
+      ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
     });
     expect(attached.allowed).toBe(true);
 
@@ -616,7 +618,10 @@ describe("round-2 review: post-merge coverage and receipts", () => {
       ["project-ci"],
     );
     expect(narrowed.allowed).toBe(false);
-    expect(narrowed.evidence["failed"]).toEqual([{ name: "security", conclusion: "missing" }]);
+    expect(narrowed.evidence["failed"]).toEqual([
+      { name: "project-ci", conclusion: "untrusted" },
+      { name: "security", conclusion: "missing" },
+    ]);
 
     github.setPostMergeCheck(mergeSha, "security", "success");
     const complete = await harness.cp.github.postMergeVerify(driven.runId, driven.identity, mergeSha, [
