@@ -221,8 +221,12 @@ export class ControlPlane {
     this.repair = new RepairService(this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees, this.repositories);
     this.doctor = new Doctor(
       this.db, this.clock, this.audit, this.projects, this.repositories, this.sessions,
-      this.bindings, this.runs, this.tasks, this.claims, this.capacity, this.continuity,
-      this.outbox, this.github, this.worktrees,
+      this.bindings, this.runs, this.tasks, this.claims, this.capacity, this.providers, this.continuity,
+      this.outbox, this.github, this.worktrees, {
+        directory: config.capacityDir,
+        freshnessMs: config.capacity?.freshnessMs ?? 5 * 60 * 1000,
+        maxClockSkewMs: config.capacity?.maxClockSkewMs ?? 60_000,
+      },
     );
     this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
     this.bootstrap = new BootstrapActivation(
