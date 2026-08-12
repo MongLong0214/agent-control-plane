@@ -107,6 +107,11 @@ export const buildCandidateSnapshot = async (
 export interface FreshnessProbe {
   identity: string;
   checkoutPath: string;
+  /**
+   * Manifest digest currently active for this repository. §16.2 stales the snapshot when
+   * the manifest changes, not only when the candidate head moves.
+   */
+  activeManifestDigest?: string | null;
 }
 
 /**
@@ -137,6 +142,29 @@ export const verifySnapshotFreshness = async (
     const tree = `git-tree:${await treeOf(probe.checkoutPath, repo.candidateHead)}`;
     if (tree !== repo.treeDigest) {
       drift.push({ identity: repo.identity, expectedTree: repo.treeDigest, observedTree: tree });
+      continue;
+    }
+    // A moved base changes what the diff means, even when the candidate head is untouched.
+    const base = await tryRevParse(probe.checkoutPath, repo.baseBranch);
+    if (base !== null && base !== repo.baseHead) {
+      drift.push({
+        identity: repo.identity,
+        baseBranch: repo.baseBranch,
+        expectedBaseHead: repo.baseHead,
+        observedBaseHead: base,
+      });
+      continue;
+    }
+    // And a contract change is drift too: the candidate would be judged by a different bar.
+    if (
+      probe.activeManifestDigest !== undefined &&
+      (probe.activeManifestDigest ?? null) !== repo.manifestDigest
+    ) {
+      drift.push({
+        identity: repo.identity,
+        expectedManifestDigest: repo.manifestDigest,
+        observedManifestDigest: probe.activeManifestDigest ?? null,
+      });
       continue;
     }
     // Uncommitted edits change the source the evidence was produced from, so they

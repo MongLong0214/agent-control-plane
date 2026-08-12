@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { sha256 } from "../core/digest.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
+import { isWithin } from "../guard/workspace-probe.ts";
 
 const exec = promisify(execFile);
 
@@ -17,6 +18,11 @@ export interface SandboxRequest {
   worktreePath: string;
   /** Extra environment values, filtered through the command's own allowlist. */
   env?: Record<string, string>;
+  /**
+   * Additional absolute paths the candidate must not read — the control plane's own
+   * secret store and state directory, and any other checkout on this machine.
+   */
+  denyReadPaths?: readonly string[];
 }
 
 export interface SandboxOutcome {
@@ -41,6 +47,14 @@ export interface SandboxEnforcement {
   networkPolicy: VerificationCommand["network"];
   networkEnforced: boolean;
   writeConfinement: boolean;
+  /**
+   * How reads are restricted. `sensitive-paths` is a deny list, not a whitelist: a
+   * whitelist cannot be expressed for a Node toolchain, because dyld needs a set of
+   * paths that is not enumerable in advance — denying reads wholesale aborts the
+   * interpreter before it starts. So the credential stores are named and denied, and this
+   * field says exactly that rather than claiming full read isolation.
+   */
+  readConfinement: "sensitive-paths" | "none";
   processGroupKill: true;
   mechanism: "seatbelt" | "none";
 }
@@ -69,6 +83,26 @@ const FORBIDDEN_ENV = [
 export const isForbiddenEnvName = (name: string): boolean =>
   FORBIDDEN_ENV.some((pattern) => pattern.test(name));
 
+/**
+ * Credential shapes recognised in a *value*.
+ *
+ * A name blacklist can always be sidestepped — `PROVIDER_TOKEN`,
+ * `CLAUDE_CODE_OAUTH_TOKEN`, `GH_ENTERPRISE_TOKEN` are all names nobody enumerated. What
+ * a credential looks like is far more stable than what it is called.
+ */
+const SECRET_VALUE_SHAPES: readonly RegExp[] = [
+  /^gh[pousr]_[A-Za-z0-9]{16,}$/,
+  /^sk-[A-Za-z0-9_-]{20,}$/,
+  /^nsec1[a-z0-9]{20,}$/,
+  /^xox[baprs]-/,
+  /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /^[A-Za-z0-9+/]{60,}={0,2}$/, // long opaque base64 blobs
+];
+
+export const looksLikeSecretValue = (value: string): boolean =>
+  SECRET_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
+
 const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
 
 /**
@@ -87,34 +121,32 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const scratch = mkdtempSync(join(tmpdir(), "acp-sbx-"));
 
   const mechanism: SandboxEnforcement["mechanism"] = seatbeltAvailable() ? "seatbelt" : "none";
-  const needsConfinement = command.network !== "allow";
 
-  if (mechanism === "none" && needsConfinement) {
+  // Integration §12 allows `allowlist`, but seatbelt cannot express per-host network
+  // policy. Claiming to honour a host allowlist while permitting all traffic would be a
+  // silent downgrade, so it is refused until a mechanism that can enforce it exists.
+  if (command.network === "allowlist") {
     rmSync(scratch, { recursive: true, force: true });
-    const endedAt = new Date().toISOString();
-    return {
-      status: "ERROR",
-      exitCode: null,
-      signal: null,
+    return unconfined(
+      command,
+      startedMs,
       startedAt,
-      endedAt,
-      durationMs: Date.now() - startedMs,
-      stdout: "",
-      stderr: "sandbox confinement mechanism unavailable; refusing to run unconfined",
-      outputDigest: sha256(""),
-      outputTruncated: false,
-      peakRssMb: null,
-      enforcement: {
-        worktreeIsolated: true,
-        secretsStripped: true,
-        networkPolicy: command.network,
-        networkEnforced: false,
-        writeConfinement: false,
-        processGroupKill: true,
-        mechanism,
-      },
-      reasonCode: ReasonCode.SANDBOX_NETWORK_DENIED,
-    };
+      mechanism,
+      "network=allowlist cannot be enforced by the available mechanism",
+    );
+  }
+
+  // Confinement is required for every command, not only when the network must be denied:
+  // an unconfined command can also write anywhere and read any file this user can.
+  if (mechanism === "none") {
+    rmSync(scratch, { recursive: true, force: true });
+    return unconfined(
+      command,
+      startedMs,
+      startedAt,
+      mechanism,
+      "sandbox confinement mechanism unavailable; refusing to run unconfined",
+    );
   }
 
   const env = buildEnv(command, scratch, request.env);
@@ -129,7 +161,12 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
           file: "/usr/bin/sandbox-exec",
           argv: [
             "-p",
-            seatbeltProfile(command, realpathSync(worktreePath), realpathSync(scratch)),
+            seatbeltProfile(
+              command,
+              realpathSync(worktreePath),
+              realpathSync(scratch),
+              request.denyReadPaths ?? [],
+            ),
             ...command.argv,
           ],
         }
@@ -221,6 +258,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
       networkPolicy: command.network,
       networkEnforced: mechanism === "seatbelt" && command.network === "deny",
       writeConfinement: mechanism === "seatbelt",
+      readConfinement: mechanism === "seatbelt" ? "sensitive-paths" : "none",
       processGroupKill: true,
       mechanism,
     },
@@ -258,26 +296,93 @@ const buildEnv = (
   for (const name of command.envAllowlist) {
     if (isForbiddenEnvName(name)) continue; // an allowlist cannot re-admit a secret
     const value = extra?.[name] ?? process.env[name];
-    if (value !== undefined) env[name] = value;
+    if (value === undefined) continue;
+    // A name nobody blacklisted is no reason to pass a credential through.
+    if (looksLikeSecretValue(value)) continue;
+    env[name] = value;
   }
   for (const [name, value] of Object.entries(extra ?? {})) {
-    if (command.envAllowlist.includes(name) && !isForbiddenEnvName(name)) env[name] = value;
+    if (!command.envAllowlist.includes(name)) continue;
+    if (isForbiddenEnvName(name) || looksLikeSecretValue(value)) continue;
+    env[name] = value;
   }
 
-  for (const name of Object.keys(env)) {
-    if (isForbiddenEnvName(name)) delete env[name];
+  for (const [name, value] of Object.entries(env)) {
+    if (isForbiddenEnvName(name) || (value !== undefined && looksLikeSecretValue(value))) {
+      delete env[name];
+    }
   }
   return env;
 };
 
-/** Seatbelt profile: writes confined to the worktree and scratch, network per policy. */
+/**
+ * Paths a toolchain must be able to read to run at all: the interpreter, system
+ * libraries, and the dyld cache. Everything else — the owner's home, other checkouts,
+ * `~/.config/gh`, `.npmrc` — stays unreadable.
+ */
+/**
+ * Locations a candidate command must never read. §33.3 requires provider, GitHub, Buzz
+ * and Telegram secrets to be out of reach; redirecting HOME only defeats lookup by
+ * convention, so the real stores are denied by absolute path as well.
+ */
+const sensitiveReadPaths = (extra: readonly string[]): string[] => {
+  const home = process.env["HOME"] ?? "";
+  const homePaths = home
+    ? [
+        `${home}/.ssh`,
+        `${home}/.aws`,
+        `${home}/.gnupg`,
+        `${home}/.config/gh`,
+        `${home}/.config/gcloud`,
+        `${home}/.claude`,
+        `${home}/.codex`,
+        `${home}/.buzz`,
+        `${home}/.agent-control-plane`,
+        `${home}/.npmrc`,
+        `${home}/.netrc`,
+        `${home}/.gitconfig`,
+        `${home}/.git-credentials`,
+        `${home}/Library/Keychains`,
+        `${home}/Library/Application Support/Code`,
+      ]
+    : [];
+  // seatbelt matches resolved paths, so an unresolved symlinked path (a temp dir under
+  // /var/folders, say) would silently match nothing and the deny would be a no-op.
+  return [...homePaths, ...extra].filter(Boolean).map(resolveIfPossible);
+};
+
+const resolveIfPossible = (path: string): string => {
+  try {
+    return existsSync(path) ? realpathSync(path) : path;
+  } catch {
+    return path;
+  }
+};
+
+/**
+ * Seatbelt profile.
+ *
+ * Reads are denied by default and re-allowed only for the worktree, the scratch root and
+ * the system paths above. §33.3 requires the candidate not to reach provider, GitHub,
+ * Buzz or Telegram secrets, and redirecting HOME only defeats *lookup by convention* —
+ * an absolute path to the owner's credential store would still have worked.
+ */
 const seatbeltProfile = (
   command: VerificationCommand,
   worktreePath: string,
   scratch: string,
+  denyReadPaths: readonly string[],
 ): string => {
   const lines = ["(version 1)", "(allow default)"];
   if (command.network === "deny") lines.push("(deny network*)");
+
+  // A deny path that contains the worktree or the scratch root would stop the command
+  // from reading its own inputs. Such a path is a configuration mistake, not a policy.
+  for (const path of sensitiveReadPaths(denyReadPaths)) {
+    if (isWithin(path, worktreePath) || isWithin(path, scratch)) continue;
+    lines.push(`(deny file-read* (subpath ${quote(path)}))`);
+  }
+
   lines.push(
     "(deny file-write*)",
     `(allow file-write* (subpath ${quote(worktreePath)}))`,
@@ -287,6 +392,38 @@ const seatbeltProfile = (
   );
   return lines.join("\n");
 };
+
+/** Shared shape for a command that was refused rather than run unconfined. */
+const unconfined = (
+  command: VerificationCommand,
+  startedMs: number,
+  startedAt: string,
+  mechanism: SandboxEnforcement["mechanism"],
+  reason: string,
+): SandboxOutcome => ({
+  status: "ERROR",
+  exitCode: null,
+  signal: null,
+  startedAt,
+  endedAt: new Date().toISOString(),
+  durationMs: Date.now() - startedMs,
+  stdout: "",
+  stderr: reason,
+  outputDigest: sha256(""),
+  outputTruncated: false,
+  peakRssMb: null,
+  enforcement: {
+    worktreeIsolated: true,
+    secretsStripped: true,
+    networkPolicy: command.network,
+    networkEnforced: false,
+    writeConfinement: false,
+    readConfinement: "none",
+    processGroupKill: true,
+    mechanism,
+  },
+  reasonCode: ReasonCode.SANDBOX_NETWORK_DENIED,
+});
 
 const quote = (value: string): string => `"${value.replace(/(["\\])/g, "\\$1")}"`;
 

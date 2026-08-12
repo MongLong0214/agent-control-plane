@@ -153,6 +153,8 @@ export class CandidatePipeline {
       snapshot,
       commands,
       contractDigest: run.contractDigest,
+      pinnedManifestDigest: run.pinnedManifestDigest,
+      executionMode: run.executionMode,
       runScoped: Boolean(input.runScopedCommands),
     });
 
@@ -355,6 +357,7 @@ export class CandidatePipeline {
       .map((repo) => ({
         identity: repo.identity,
         checkoutPath: this.repositories.byIdentity(repo.identity)?.checkoutPath ?? "",
+        activeManifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
       }))
       .filter((p) => p.checkoutPath);
     return verifySnapshotFreshness(snapshot, probes);

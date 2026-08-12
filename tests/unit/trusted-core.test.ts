@@ -23,9 +23,11 @@ import { runSandboxed } from "../../src/verify/sandbox.ts";
 import {
   cleanupTempDirs,
   commitAll,
+  gitSync,
   makeCore,
   makeRepo,
   seedRun,
+  tempDir,
   writeFiles,
 } from "../helpers/fixtures.ts";
 
@@ -493,6 +495,10 @@ describe("candidate snapshot (PRD §16)", () => {
     const { clock } = makeCore();
     const repoA = makeRepo({ "a.txt": "1\n" });
     const repoB = makeRepo({ "b.txt": "1\n" });
+    // Work on a branch cut from the base, as the branch contract requires: committing on
+    // the base itself would make baseBranch and the candidate the same commit, and the
+    // freshness check compares the base branch against the frozen base head.
+    gitSync(repoA, ["checkout", "-q", "-b", "task/T1-a"]);
     writeFiles(repoA, { "a.txt": "2\n" });
     commitAll(repoA, "change a");
 
@@ -501,7 +507,7 @@ describe("candidate snapshot (PRD §16)", () => {
         runId: "run_1",
         contractDigest: "sha256:contract",
         repositories: [
-          { identity: "github:acme/a", repositoryRole: "primary", checkoutPath: repoA, baseBranch: "dev", baseRef: "HEAD~1" },
+          { identity: "github:acme/a", repositoryRole: "primary", checkoutPath: repoA, baseBranch: "dev", baseRef: "dev" },
           { identity: "github:acme/b", repositoryRole: "secondary", checkoutPath: repoB, baseBranch: "dev", baseRef: "HEAD" },
         ],
       },
@@ -577,6 +583,72 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(parsed.leak).toEqual([]);
     expect(parsed.home).not.toBe(process.env["HOME"]);
     expect(outcome.enforcement.secretsStripped).toBe(true);
+  });
+
+  it("cannot read a named credential store even by absolute path", async () => {
+    const repo = makeRepo();
+    const secrets = tempDir("acp-secrets-");
+    writeFileSync(join(secrets, "github-authority.token"), "ghp_secret_value_here");
+    writeFileSync(
+      join(repo, "peek.js"),
+      `const fs = require('fs');
+       let read = null;
+       try { read = fs.readFileSync(process.argv[2], 'utf8'); } catch (e) { read = 'DENIED:' + e.code; }
+       console.log(JSON.stringify({ read }));`,
+    );
+
+    const outcome = await runSandboxed({
+      command: parseVerificationCommand({
+        id: "peek",
+        argv: ["node", "peek.js", join(secrets, "github-authority.token")],
+        timeoutSeconds: 60,
+      }),
+      worktreePath: repo,
+      denyReadPaths: [secrets],
+    });
+
+    expect(outcome.status).toBe("PASS");
+    const parsed = JSON.parse(outcome.stdout) as { read: string };
+    expect(parsed.read).toMatch(/^DENIED:/);
+    expect(parsed.read).not.toContain("ghp_secret_value_here");
+    expect(outcome.enforcement.readConfinement).toBe("sensitive-paths");
+  });
+
+  it("drops a secret-shaped value even when its variable name is unknown", async () => {
+    const repo = makeRepo();
+    writeFileSync(
+      join(repo, "env.js"),
+      `console.log(JSON.stringify({ v: process.env.PROVIDER_HANDLE ?? null }));`,
+    );
+    const outcome = await runSandboxed({
+      command: parseVerificationCommand({
+        id: "env",
+        argv: ["node", "env.js"],
+        envAllowlist: ["PROVIDER_HANDLE"],
+        timeoutSeconds: 60,
+      }),
+      worktreePath: repo,
+      // A name no blacklist anticipated, carrying an obvious credential.
+      env: { PROVIDER_HANDLE: "ghp_abcdefghijklmnopqrstuvwxyz01" },
+    });
+    expect(JSON.parse(outcome.stdout)).toEqual({ v: null });
+  });
+
+  it("refuses network=allowlist rather than pretending to enforce it", async () => {
+    const repo = makeRepo();
+    const outcome = await runSandboxed({
+      command: parseVerificationCommand({
+        id: "net",
+        argv: ["node", "-e", "console.log(1)"],
+        network: "allowlist",
+        networkAllowlist: ["registry.npmjs.org"],
+        timeoutSeconds: 30,
+      }),
+      worktreePath: repo,
+    });
+    expect(outcome.status).toBe("ERROR");
+    expect(outcome.reasonCode).toBe(ReasonCode.SANDBOX_NETWORK_DENIED);
+    expect(outcome.enforcement.readConfinement).toBe("none");
   });
 
   it("denies network egress when the command declares network=deny", async () => {

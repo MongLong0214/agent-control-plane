@@ -180,6 +180,10 @@ export class ControlPlane {
       ...(config.githubClient ? [config.githubClient] : []),
     );
     this.verification.attachCi(this.github.ciEvidenceSource());
+    this.verification.attachManifests((digest) => this.projects.manifest(digest));
+    // The database *file*, not its directory: the worktree root lives beside it, and
+    // denying the parent would stop a verification command from reading its own worktree.
+    this.verification.setDenyReadPaths([config.secretsDir, config.databasePath]);
 
     this.repair = new RepairService(this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees, this.repositories);
     this.doctor = new Doctor(

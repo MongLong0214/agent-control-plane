@@ -787,6 +787,96 @@ describe("trusted CI evidence (CP-S29)", () => {
     ).toBe(ReasonCode.VERIFICATION_CI_WORKFLOW_DIGEST_MISMATCH);
   });
 
+  it("an older green CI result does not mask a newer red one for the same head", async () => {
+    const fixture = await setup();
+    const snapshot = await frozen(fixture);
+    const repo = snapshot.repositories[0]!;
+    const base = {
+      commandId: "project-ci",
+      repositoryIdentity: repo.identity,
+      head: repo.candidateHead,
+      workflowDigest: "sha256:approved",
+      creatorIdentity: "github-actions",
+      nonVacuous: true,
+    };
+
+    fixture.harness.cp.verification.attachCi({
+      fetch: async () => [
+        { ...base, conclusion: "success", completedAt: "2026-08-12T00:00:00.000Z" },
+        { ...base, conclusion: "failure", completedAt: "2026-08-12T01:00:00.000Z" },
+      ],
+      approvedWorkflowDigests: async () => ["sha256:approved"],
+      trustedCreators: async () => ["github-actions"],
+    });
+
+    const verified = await fixture.harness.cp.verification.verify({
+      runId: fixture.runId,
+      snapshot,
+      commands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(verified.allowed).toBe(false);
+    expect(
+      fixture.harness.cp.verification.latestReport(fixture.runId, candidateSnapshotDigest(snapshot))!
+        .results[0]?.status,
+    ).toBe("FAIL");
+  });
+
+  it("a CI result belonging to another repository is not evidence for this one", async () => {
+    const fixture = await setup();
+    const snapshot = await frozen(fixture);
+    const repo = snapshot.repositories[0]!;
+
+    fixture.harness.cp.verification.attachCi({
+      fetch: async () => [
+        {
+          commandId: "project-ci",
+          repositoryIdentity: "github:acme/somewhere-else",
+          head: repo.candidateHead,
+          conclusion: "success",
+          workflowDigest: "sha256:approved",
+          creatorIdentity: "github-actions",
+          completedAt: "2026-08-12T00:00:00.000Z",
+          nonVacuous: true,
+        },
+      ],
+      approvedWorkflowDigests: async () => ["sha256:approved"],
+      trustedCreators: async () => ["github-actions"],
+    });
+
+    const verified = await fixture.harness.cp.verification.verify({
+      runId: fixture.runId,
+      snapshot,
+      commands,
+      contractDigest: snapshot.contractDigest,
+    });
+    expect(verified.allowed).toBe(false);
+    expect(
+      fixture.harness.cp.verification.latestReport(fixture.runId, candidateSnapshotDigest(snapshot))!
+        .results[0]?.reasonCode,
+    ).toBe(ReasonCode.EVIDENCE_MISSING);
+  });
+
+  it("CP-HI-03: a command list that does not match the pinned manifest is refused", async () => {
+    const fixture = await setup();
+    const snapshot = await frozen(fixture);
+    const run = fixture.harness.cp.runs.require(fixture.runId);
+
+    const weaker = [
+      parseVerificationCommand({ id: "verify", argv: ["node", "-e", "process.exit(0)"] }),
+    ];
+    const refused = await fixture.harness.cp.verification.verify({
+      runId: fixture.runId,
+      snapshot,
+      commands: weaker,
+      contractDigest: snapshot.contractDigest,
+      pinnedManifestDigest: run.pinnedManifestDigest,
+      executionMode: run.executionMode,
+    });
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT);
+  });
+
   it("CP-S29: a CI result at the exact head from an approved workflow is accepted", async () => {
     const fixture = await setup();
     const snapshot = await frozen(fixture);

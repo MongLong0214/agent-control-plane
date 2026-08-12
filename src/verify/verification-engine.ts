@@ -3,6 +3,7 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
+import { type ProjectManifest, commandsForMode } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
@@ -72,6 +73,13 @@ export interface VerifyOptions {
   commands: readonly VerificationCommand[];
   /** Digest of the approved contract the commands came from (CP-HI-03). */
   contractDigest: string;
+  /**
+   * Manifest the run pinned at dispatch admission, and the execution mode whose profile
+   * selects the commands. Supplied so the engine can *derive* the expected command set
+   * rather than trust the caller's list (CP-HI-03).
+   */
+  pinnedManifestDigest?: string | null;
+  executionMode?: "SIMPLE" | "STANDARD" | "GUARDED";
   /** Commands the CTO proposed for an unregistered repository (§17.5). */
   runScoped?: boolean;
 }
@@ -88,6 +96,9 @@ export interface VerifyOptions {
  */
 export class VerificationEngine {
   #ci: CiEvidenceSource | null = null;
+  private extraDenyReadPaths: string[] = [];
+  /** Injected manifest loader; kept as a function so the engine owns no registry. */
+  private manifests: ((digest: string) => ProjectManifest | null) | null = null;
 
   constructor(
     private readonly db: Db,
@@ -103,6 +114,10 @@ export class VerificationEngine {
     this.#ci = source;
   }
 
+  attachManifests(loader: (digest: string) => ProjectManifest | null): void {
+    this.manifests = loader;
+  }
+
   async verify(options: VerifyOptions): Promise<Decision<VerificationReport>> {
     const { runId, snapshot, commands } = options;
     const snapshotDigest = candidateSnapshotDigest(snapshot);
@@ -116,9 +131,54 @@ export class VerificationEngine {
       );
     }
 
+    // CP-HI-03 — a caller-supplied command list is not evidence of anything. When the run
+    // pinned a manifest, the engine derives the expected commands from that manifest and
+    // refuses a list that does not match it.
+    if (options.pinnedManifestDigest && options.executionMode) {
+      const pinned = this.manifests?.(options.pinnedManifestDigest) ?? null;
+      if (!pinned) {
+        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "pinned manifest is not retrievable", {
+          runId,
+          pinnedManifestDigest: options.pinnedManifestDigest,
+        });
+      }
+      const expected = commandsForMode(pinned, options.executionMode);
+      if (digestOf(expected) !== digestOf([...commands])) {
+        return deny(
+          ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+          "supplied verification commands do not match the run's pinned manifest",
+          {
+            runId,
+            pinnedManifestDigest: options.pinnedManifestDigest,
+            expected: expected.map((c) => c.id),
+            supplied: commands.map((c) => c.id),
+          },
+        );
+      }
+      // Every repository in the candidate must also be pinned to that same manifest.
+      const mismatched = snapshot.repositories.filter(
+        (repo) => repo.manifestDigest !== null && repo.manifestDigest !== options.pinnedManifestDigest,
+      );
+      if (mismatched.length > 0) {
+        return deny(
+          ReasonCode.CONTRACT_DIGEST_MISMATCH,
+          "a repository in the candidate is pinned to a different manifest than the run",
+          {
+            runId,
+            pinnedManifestDigest: options.pinnedManifestDigest,
+            mismatched: mismatched.map((r) => ({ identity: r.identity, manifestDigest: r.manifestDigest })),
+          },
+        );
+      }
+    }
+
     const probes = snapshot.repositories.map((repo) => {
       const record = this.repositories.byIdentity(repo.identity);
-      return { identity: repo.identity, checkoutPath: record?.checkoutPath ?? "" };
+      return {
+        identity: repo.identity,
+        checkoutPath: record?.checkoutPath ?? "",
+        activeManifestDigest: record?.activeManifestDigest ?? null,
+      };
     });
     const fresh = await verifySnapshotFreshness(snapshot, probes.filter((p) => p.checkoutPath));
     if (!fresh.allowed) return fresh as Decision<VerificationReport>;
@@ -158,6 +218,18 @@ export class VerificationEngine {
       }
     }
 
+    // §16.2 — the commands ran against a detached worktree, but the source may have moved
+    // while they ran. A PASS for a candidate that no longer exists is not evidence.
+    const stillFresh = await verifySnapshotFreshness(snapshot, probes.filter((p) => p.checkoutPath));
+    if (!stillFresh.allowed) {
+      const staleReport = this.buildReport(options, snapshotDigest, results, [
+        ...gaps,
+        "the candidate changed while verification was running",
+      ]);
+      this.persist(runId, snapshotDigest, staleReport);
+      return stillFresh as Decision<VerificationReport>;
+    }
+
     const report = this.buildReport(options, snapshotDigest, results, gaps);
     this.persist(runId, snapshotDigest, report);
 
@@ -187,7 +259,13 @@ export class VerificationEngine {
   ): Promise<VerificationResultRecord> {
     const worktreeId = `verify-${runId}-${command.id}-${head.slice(0, 8)}`;
     const outcome = await this.worktrees.withWorktree(checkoutPath, head, worktreeId, (worktree) =>
-      runSandboxed({ command, worktreePath: worktree.path }),
+      runSandboxed({
+        command,
+        worktreePath: worktree.path,
+        // §33.3 — the control plane's own secret store and state must be unreadable to a
+        // candidate, as must every other checkout on this machine.
+        denyReadPaths: this.denyReadPaths(checkoutPath),
+      }),
     );
 
     const record: VerificationResultRecord = {
@@ -247,7 +325,19 @@ export class VerificationEngine {
       this.#ci.trustedCreators(),
     ]);
 
-    const match = checks.find((c) => c.commandId === command.id);
+    // Filter to this command and this repository, but *not* by head: a result for another
+    // head must be reported as a head mismatch rather than as missing evidence.
+    const candidates = checks.filter(
+      (c) => c.commandId === command.id && c.repositoryIdentity === identity,
+    );
+    // Integration §14.4 — the *current* result. If several exist, the newest decides, and
+    // any failure among them is a failure: picking the first success would let an older
+    // green result mask a newer red one.
+    const ordered = [...candidates].sort(
+      (a, b) => new Date(b.completedAt).getTime() - new Date(a.completedAt).getTime(),
+    );
+    const failing = ordered.find((c) => c.conclusion !== "success");
+    const match = failing ?? ordered[0];
     if (!match) {
       const record = { ...base, reasonCode: ReasonCode.EVIDENCE_MISSING };
       this.writeResultRow(runId, snapshotDigest, record);
@@ -363,6 +453,20 @@ export class VerificationEngine {
         record.outputTruncated ? 1 : 0, record.status, record.reasonCode,
       ],
     );
+  }
+
+  /** Absolute paths a candidate command must not read (§33.3). */
+  private denyReadPaths(ownCheckout: string): string[] {
+    const others = this.repositories
+      .list()
+      .map((r) => r.checkoutPath)
+      .filter((path) => path !== ownCheckout);
+    return [...new Set([...others, ...this.extraDenyReadPaths])];
+  }
+
+  /** Wired by the composition root: the secret store and state directory. */
+  setDenyReadPaths(paths: readonly string[]): void {
+    this.extraDenyReadPaths = [...paths];
   }
 
   latestReport(runId: string, snapshotDigest: string): VerificationReport | null {
