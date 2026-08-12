@@ -4,7 +4,7 @@ import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { Outbox } from "../outbox/outbox.ts";
-import type { Doctor, DoctorReport, DoctorScope } from "./doctor.ts";
+import type { Doctor, DoctorReport, DoctorScope, Finding } from "./doctor.ts";
 
 export interface WatchdogDeadlines {
   /** A task execution with no receipt or activity for this long is overdue. */
@@ -53,6 +53,30 @@ export class Watchdog {
     const now = new Date(this.clock.nowIso()).getTime();
     const overdue: WatchdogTick["overdue"] = [];
     const scopes = new Map<string, { scope: DoctorScope; target: string | null }>();
+    const stallFindings = new Map<string, Finding[]>();
+    const addOverdue = (
+      key: string,
+      scope: DoctorScope,
+      target: string | null,
+      kind: string,
+      id: string,
+      ageMs: number,
+      deadlineMs: number,
+    ): void => {
+      overdue.push({ kind, id, ageMs });
+      scopes.set(key, { scope, target });
+      const findings = stallFindings.get(key) ?? [];
+      findings.push({
+        code: "WATCHDOG_STALL",
+        severity: "ERROR",
+        scope: `${kind}:${id}`,
+        blocking: true,
+        confidence: "HIGH",
+        observedEvidence: { kind, id, ageMs, deadlineMs },
+        recommendedAction: "inspect the stalled resource and repair or cancel it before resuming work",
+      });
+      stallFindings.set(key, findings);
+    };
 
     for (const execution of this.db.all<{
       execution_id: string;
@@ -64,8 +88,15 @@ export class Watchdog {
       const since = new Date(execution.last_activity_at ?? execution.started_at).getTime();
       const ageMs = now - since;
       if (ageMs > this.deadlines.taskActivityMs) {
-        overdue.push({ kind: "task_execution", id: execution.execution_id, ageMs });
-        scopes.set(`run:${execution.run_id}`, { scope: "run", target: execution.run_id });
+        addOverdue(
+          `run:${execution.run_id}`,
+          "run",
+          execution.run_id,
+          "task_execution",
+          execution.execution_id,
+          ageMs,
+          this.deadlines.taskActivityMs,
+        );
       }
     }
 
@@ -80,8 +111,15 @@ export class Watchdog {
       const since = new Date(lastEvent?.at ?? run.dispatched_at).getTime();
       const ageMs = now - since;
       if (ageMs > this.deadlines.runProgressMs) {
-        overdue.push({ kind: "run", id: run.run_id, ageMs });
-        scopes.set(`run:${run.run_id}`, { scope: "run", target: run.run_id });
+        addOverdue(
+          `run:${run.run_id}`,
+          "run",
+          run.run_id,
+          "run",
+          run.run_id,
+          ageMs,
+          this.deadlines.runProgressMs,
+        );
       }
     }
 
@@ -90,19 +128,29 @@ export class Watchdog {
     )) {
       const ageMs = now - new Date(session.created_at).getTime();
       if (ageMs > this.deadlines.sessionStartMs) {
-        overdue.push({ kind: "session", id: session.session_id, ageMs });
-        scopes.set(`session:${session.session_id}`, { scope: "session", target: session.session_id });
+        addOverdue(
+          `session:${session.session_id}`,
+          "session",
+          session.session_id,
+          "session",
+          session.session_id,
+          ageMs,
+          this.deadlines.sessionStartMs,
+        );
       }
     }
 
     const expiredClaims = this.claims.overdue();
     for (const claim of expiredClaims) {
-      overdue.push({
-        kind: "claim",
-        id: claim.claimId,
-        ageMs: now - new Date(claim.expiresAt).getTime(),
-      });
-      scopes.set(`run:${claim.runId}`, { scope: "run", target: claim.runId });
+      addOverdue(
+        `run:${claim.runId}`,
+        "run",
+        claim.runId,
+        "claim",
+        claim.claimId,
+        now - new Date(claim.expiresAt).getTime(),
+        0,
+      );
     }
 
     for (const message of this.db.all<{ message_id: string; created_at: string }>(
@@ -110,16 +158,23 @@ export class Watchdog {
     )) {
       const ageMs = now - new Date(message.created_at).getTime();
       if (ageMs > this.deadlines.outboxPendingMs) {
-        overdue.push({ kind: "outbox", id: message.message_id, ageMs });
-        scopes.set("outbox", { scope: "system", target: null });
+        addOverdue(
+          "outbox",
+          "system",
+          null,
+          "outbox",
+          message.message_id,
+          ageMs,
+          this.deadlines.outboxPendingMs,
+        );
       }
     }
 
     this.outbox.expireOverdue();
 
     const reports: DoctorReport[] = [];
-    for (const scope of scopes.values()) {
-      reports.push(await this.doctor.run(scope.scope, scope.target ?? undefined));
+    for (const [key, scope] of scopes) {
+      reports.push(await this.doctor.run(scope.scope, scope.target ?? undefined, stallFindings.get(key)));
     }
 
     if (overdue.length > 0) {

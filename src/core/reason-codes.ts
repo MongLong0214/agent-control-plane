@@ -191,6 +191,9 @@ export const ReasonCode = {
   // --- daemon --------------------------------------------------------------
   DAEMON_ALREADY_RUNNING: "DAEMON_ALREADY_RUNNING",
   DAEMON_LOCK_LOST: "DAEMON_LOCK_LOST",
+  DAEMON_BACKOFF_ACTIVE: "DAEMON_BACKOFF_ACTIVE",
+  DAEMON_STARTUP_FAILED: "DAEMON_STARTUP_FAILED",
+  DAEMON_TIMER_FAILED: "DAEMON_TIMER_FAILED",
 } as const;
 
 export type ReasonCode = (typeof ReasonCode)[keyof typeof ReasonCode];
