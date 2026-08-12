@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 
 import { type Clock, systemClock } from "../core/clock.ts";
@@ -69,7 +70,24 @@ export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): C
   worktreeRoot: join(root, "worktrees"),
   capacityDir: join(root, "capacity"),
   secretsDir: join(root, "secrets"),
+  // §21 — owner identities are declared out of band, one per line as `channel:actor` in
+  // `<root>/owner-identities`. An absent or empty file means this deployment has no owner,
+  // so no human gate can be satisfied; that is the safe reading, not a permissive one.
+  ownerIdentities: readOwnerIdentities(join(root, "owner-identities")),
 });
+
+const readOwnerIdentities = (file: string): OwnerIdentity[] => {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .flatMap((line) => {
+      const at = line.indexOf(":");
+      if (at <= 0) return [];
+      return [{ channel: line.slice(0, at), actor: line.slice(at + 1) }];
+    });
+};
 
 /**
  * Composition root.

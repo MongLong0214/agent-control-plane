@@ -7,8 +7,8 @@
   },
   "directWriteRefused": "WRITE_REQUIRES_MANAGED_RUN",
   "dispatch": {
-    "runId": "run_05f4d4ae2b624ecb92c51a87",
-    "ownerSessionId": "ses_cto_254d8158012443fc8364",
+    "runId": "run_2c690a7566774505a0236836",
+    "ownerSessionId": "ses_cto_66d9b7930f474c9dbe42",
     "ownerBindingGeneration": 1,
     "pinnedManifestDigest": "sha256:905a5dd1724e0b086562cc693a5e5b3065532a70875a055d132c80403d307ae9",
     "activityAfterCto": "ACTIVE"
@@ -16,7 +16,7 @@
   "ctoPlan": {
     "provider": "claude",
     "model": "sonnet",
-    "durationMs": 49324,
+    "durationMs": 49486,
     "parsed": true
   },
   "verification": {
@@ -28,22 +28,22 @@
         "commandId": "reason-codes",
         "source": "local",
         "status": "PASS",
-        "exactHead": "e0a990d8ad0dfa3a6fb1683bd1e174b4cafb31e2"
+        "exactHead": "4a13f542f514cc92ff8cd45ad6a63bf2c9f2b06a"
       }
     ],
-    "digest": "sha256:3b31f9f6f9d3bcc8d5d58611621510b9affc60f74f6ab0e59f51c5c40535c92e"
+    "digest": "sha256:b2c52218bb89c2aff0df61d30d7bd7a08bedc1a5f1081bdb38ef3a55dd6e57bb"
   },
   "blindReview": {
     "verdict": "PASS",
     "provider": "claude",
     "model": "sonnet",
-    "reviewerSessionId": "ses_review_d148bc2c2cac41108314",
+    "reviewerSessionId": "ses_review_f89dbc6a4c0e490ba812",
     "reviewerGeneration": 1,
     "coveredFiles": [
       "github:MongLong0214/agent-control-plane:src/core/reason-codes.ts"
     ],
     "omittedItems": [],
-    "findings": 1,
+    "findings": 0,
     "withheld": [
       "worker reasoning",
       "CTO reasoning",
@@ -52,10 +52,10 @@
       "previous verdicts"
     ]
   },
-  "candidateSnapshotDigest": "sha256:ba8ffa92e4ac31638da49dbaded1206a965bd52fe00d1c9d7e20e7d5033942cf",
+  "candidateSnapshotDigest": "sha256:7548ad9b01f0956a3346e453d811f47d7dc74d558837d6a64ea4eb49ced9d378",
   "ceoConfirm": {
     "state": "COMPLETED",
-    "sessionId": "ses_d1ca1fb55600413bb57f59ee"
+    "sessionId": "ses_548eed9b8c484745b0d8db93"
   },
   "doctor": {
     "scope": "project",
@@ -69,23 +69,23 @@
         "blocking": false,
         "confidence": "MEDIUM",
         "observedEvidence": {
-          "sessionId": "ses_cto_254d8158012443fc8364"
+          "sessionId": "ses_cto_66d9b7930f474c9dbe42"
         },
         "recommendedAction": "reconnect the CTO session to Buzz"
       }
     ],
-    "ranAt": "2026-08-12T08:03:57.464Z"
+    "ranAt": "2026-08-12T11:08:05.550Z"
   },
   "telemetry": {
     "run": [
       {
-        "metricId": 8,
-        "at": "2026-08-12T08:03:57.463Z",
+        "metricId": 10,
+        "at": "2026-08-12T11:08:05.549Z",
         "scope": "run",
         "name": "outcome",
-        "runId": "run_05f4d4ae2b624ecb92c51a87",
+        "runId": "run_2c690a7566774505a0236836",
         "taskId": null,
-        "value": 165799,
+        "value": 110085,
         "text": "COMPLETED",
         "dims": {
           "mode": "STANDARD",
@@ -98,12 +98,12 @@
     "task": [
       {
         "metricId": 4,
-        "at": "2026-08-12T08:02:01.132Z",
+        "at": "2026-08-12T11:07:05.094Z",
         "scope": "task",
         "name": "execution",
-        "runId": "run_05f4d4ae2b624ecb92c51a87",
-        "taskId": "task_5e2c02afe35640df898ce817",
-        "value": 78,
+        "runId": "run_2c690a7566774505a0236836",
+        "taskId": "task_6a4361c94be0409f8ed59868",
+        "value": 77,
         "text": "SUCCEEDED",
         "dims": {
           "category": "implementation",
@@ -115,11 +115,11 @@
       },
       {
         "metricId": 5,
-        "at": "2026-08-12T08:02:01.133Z",
+        "at": "2026-08-12T11:07:05.094Z",
         "scope": "task",
         "name": "execution",
-        "runId": "run_05f4d4ae2b624ecb92c51a87",
-        "taskId": "task_0fa96c5d33c74e24b877fee7",
+        "runId": "run_2c690a7566774505a0236836",
+        "taskId": "task_550128e8fdf04ddab0721ff0",
         "value": 0,
         "text": "SUCCEEDED",
         "dims": {
@@ -134,10 +134,10 @@
     "quality": [
       {
         "metricId": 6,
-        "at": "2026-08-12T08:02:01.353Z",
+        "at": "2026-08-12T11:07:05.375Z",
         "scope": "quality",
         "name": "verification",
-        "runId": "run_05f4d4ae2b624ecb92c51a87",
+        "runId": "run_2c690a7566774505a0236836",
         "taskId": null,
         "value": null,
         "text": "PASS",
@@ -149,10 +149,10 @@
       },
       {
         "metricId": 7,
-        "at": "2026-08-12T08:03:57.460Z",
+        "at": "2026-08-12T11:08:05.386Z",
         "scope": "quality",
         "name": "blind_review",
-        "runId": "run_05f4d4ae2b624ecb92c51a87",
+        "runId": "run_2c690a7566774505a0236836",
         "taskId": null,
         "value": null,
         "text": "PASS",
@@ -160,17 +160,15 @@
           "provider": "claude",
           "model": "sonnet",
           "chunked": false,
-          "findingCategories": [
-            "simplification"
-          ]
+          "findingCategories": []
         }
       },
       {
-        "metricId": 9,
-        "at": "2026-08-12T08:03:57.463Z",
+        "metricId": 11,
+        "at": "2026-08-12T11:08:05.550Z",
         "scope": "quality",
         "name": "ceo_outcome",
-        "runId": "run_05f4d4ae2b624ecb92c51a87",
+        "runId": "run_2c690a7566774505a0236836",
         "taskId": null,
         "value": null,
         "text": "CONFIRM",
@@ -213,6 +211,10 @@
     },
     {
       "kind": "TASK_EXECUTION_FINISHED",
+      "reasonCode": null
+    },
+    {
+      "kind": "CANDIDATE_PROMOTED",
       "reasonCode": null
     },
     {

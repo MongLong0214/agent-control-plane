@@ -104,6 +104,13 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       // A real, pre-existing project. Cloned so the owner's working tree is untouched;
       // the code, history and verification command are the real ones.
       execFileSync("git", ["clone", "--local", "--quiet", REAL_PROJECT, checkout]);
+      // A local clone points `origin` at the source directory. The repository's identity is
+      // its real remote, and the registry now refuses a declared identity that contradicts
+      // what the checkout says — so the clone is pointed at the same remote the source has.
+      const sourceRemote = execFileSync("git", ["-C", REAL_PROJECT, "remote", "get-url", "origin"], {
+        encoding: "utf8",
+      }).trim();
+      execFileSync("git", ["-C", checkout, "remote", "set-url", "origin", sourceRemote]);
       // Local-only exclude: the symlink is a convenience for this checkout and must never
       // enter a candidate. Committing a machine-specific absolute symlink is exactly the
       // scope violation an independent reviewer should refuse.
