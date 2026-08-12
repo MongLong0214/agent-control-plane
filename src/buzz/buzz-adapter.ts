@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
 import type { Clock } from "../core/clock.ts";
@@ -58,11 +58,43 @@ export class BuzzCliTransport implements BuzzTransport {
   }
 
   async send(channel: string, content: string): Promise<void> {
-    await exec(this.binary, ["messages", "send", "--channel", channel, "--content", "-"], {
-      encoding: "utf8",
-      timeout: 60_000,
-      input: content,
-    } as Parameters<typeof exec>[2]);
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        this.binary,
+        ["messages", "send", "--channel", channel, "--content", "-"],
+        { stdio: ["pipe", "ignore", "pipe"] },
+      );
+      let settled = false;
+      let stderr = "";
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (error) reject(error);
+        else resolve();
+      };
+      const timeout = setTimeout(() => {
+        child.kill("SIGTERM");
+        finish(new Error("buzz send timed out after 60000ms"));
+      }, 60_000);
+
+      child.once("error", (error) => finish(error));
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr = `${stderr}${chunk.toString("utf8")}`.slice(-2_000);
+      });
+      child.once("close", (code, signal) => {
+        if (code === 0) finish();
+        else {
+          finish(
+            new Error(
+              `buzz send failed${signal ? ` (${signal})` : ""}${stderr ? `: ${stderr.trim()}` : ""}`,
+            ),
+          );
+        }
+      });
+      child.stdin?.once("error", (error) => finish(error));
+      child.stdin?.end(content, "utf8");
+    });
   }
 }
 
@@ -138,8 +170,13 @@ export class BuzzAdapter {
    * when the actor holds no active binding, which is the only safe default.
    */
   resolveActor(buzzActorId: string): RoleBinding | null {
+    // A delivery channel is a shared routing address, not proof of a sender's identity.
+    // Until the schema contains a separately authenticated actor id, declining every
+    // inbound actor is safer than granting a role based on a channel collision.
+    if (!this.hasAuthenticatedActorColumn()) return null;
     const session = this.db.get<{ session_id: string }>(
-      `SELECT session_id FROM sessions WHERE buzz_address = ? AND lifecycle IN ('READY','DRAINING')`,
+      `SELECT session_id FROM sessions
+        WHERE buzz_actor_id = ? AND lifecycle IN ('READY','DRAINING')`,
       [buzzActorId],
     );
     if (!session) return null;
@@ -162,7 +199,11 @@ export class BuzzAdapter {
         this.outbox.markAttemptFailed(
           message.messageId,
           message.claimToken,
-          "target session has no buzz address",
+          {
+            failureClass: "contract",
+            retryable: false,
+            error: "target session has no buzz address",
+          },
         );
         failed.push(message.messageId);
         continue;
@@ -176,7 +217,11 @@ export class BuzzAdapter {
         if (completed.allowed) delivered.push(message.messageId);
         else failed.push(message.messageId);
       } catch (err) {
-        this.outbox.markAttemptFailed(message.messageId, message.claimToken, (err as Error).message);
+        this.outbox.markAttemptFailed(
+          message.messageId,
+          message.claimToken,
+          classifyTransportFailure(err),
+        );
         failed.push(message.messageId);
       }
     }
@@ -189,6 +234,14 @@ export class BuzzAdapter {
     }
     return { delivered, failed };
   }
+
+  private hasAuthenticatedActorColumn(): boolean {
+    return this.db
+      .all<{ name: string }>(
+        `SELECT name FROM pragma_table_info('sessions') WHERE name = 'buzz_actor_id'`,
+      )
+      .length === 1;
+  }
 }
 
 /**
@@ -198,9 +251,28 @@ export class BuzzAdapter {
 const render = (message: OutboxMessage): string =>
   [
     `<acp-envelope roleKey="${message.roleKey}" bindingGeneration="${message.bindingGeneration}"`,
-    ` runId="${message.runId ?? ""}" messageId="${message.messageId}"`,
+    ` targetSessionId="${message.targetSessionId}" runId="${message.runId ?? ""}"`,
+    ` messageId="${message.messageId}"`,
     ` payloadDigest="${message.payloadDigest}" expiresAt="${message.expiresAt}">`,
     `\n${message.kind}\n`,
     JSON.stringify(message.payload, null, 2),
     "\n</acp-envelope>",
   ].join("");
+
+const classifyTransportFailure = (error: unknown): {
+  failureClass: "transient" | "contract" | "security" | "unknown_observed";
+  retryable: boolean;
+  error: string;
+} => {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/timed out|econn|enotfound|network|temporar|unavailable/i.test(message)) {
+    return { failureClass: "transient", retryable: true, error: message };
+  }
+  if (/auth|permission|forbidden|credential/i.test(message)) {
+    return { failureClass: "security", retryable: false, error: message };
+  }
+  if (/channel|target|invalid|not found/i.test(message)) {
+    return { failureClass: "contract", retryable: false, error: message };
+  }
+  return { failureClass: "unknown_observed", retryable: false, error: message };
+};

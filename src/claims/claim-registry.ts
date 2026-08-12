@@ -68,11 +68,63 @@ export class ClaimRegistry {
         );
       }
 
+      const authorized = this.db.get<{ run_id: string }>(
+        `SELECT r.run_id
+           FROM runs r
+           JOIN assignments a ON a.role_key = r.owner_role_key
+                             AND a.session_id = r.owner_session_id
+                             AND a.binding_generation = r.owner_binding_generation
+                             AND a.status = 'ACTIVE'
+           JOIN run_repositories rr ON rr.run_id = r.run_id
+           JOIN repositories repo ON repo.repository_id = rr.repository_id
+          WHERE r.run_id = ?
+            AND r.state = 'ACTIVE'
+            AND r.owner_role_key = ?
+            AND r.owner_session_id = ?
+            AND r.owner_binding_generation = ?
+            AND a.role_key = ?
+            AND a.session_id = ?
+            AND a.binding_generation = ?
+            AND repo.identity = ?`,
+        [
+          request.runId,
+          request.ownerRoleKey,
+          request.ownerSessionId,
+          request.ownerBindingGeneration,
+          request.ownerRoleKey,
+          request.ownerSessionId,
+          request.ownerBindingGeneration,
+          request.repositoryIdentity,
+        ],
+      );
+      if (!authorized) {
+        return deny(
+          ReasonCode.CLAIM_OWNER_NOT_RUN_OWNER,
+          "claim owner, active run, and participating repository must be one exact tuple",
+          {
+            runId: request.runId,
+            ownerRoleKey: request.ownerRoleKey,
+            ownerSessionId: request.ownerSessionId,
+            ownerBindingGeneration: request.ownerBindingGeneration,
+            repositoryIdentity: request.repositoryIdentity,
+          },
+        );
+      }
+
       const wanted: Array<Pick<ClaimRecord, "branch" | "worktreeId" | "declaredPath">> = [];
       if (request.worktreeId) wanted.push({ branch: null, worktreeId: request.worktreeId, declaredPath: null });
       if (request.branch) wanted.push({ branch: request.branch, worktreeId: null, declaredPath: null });
       for (const path of request.declaredPaths ?? []) {
-        wanted.push({ branch: null, worktreeId: null, declaredPath: normalizePath(path) });
+        const normalized = normalizePath(path);
+        if (!normalized) {
+          return deny(ReasonCode.INVALID_ARGUMENT, "declared path is not repository-relative", {
+            runId: request.runId,
+            path,
+          });
+        }
+        if (!wanted.some((target) => target.declaredPath === normalized)) {
+          wanted.push({ branch: null, worktreeId: null, declaredPath: normalized });
+        }
       }
       if (wanted.length === 0) {
         return deny(ReasonCode.INVALID_ARGUMENT, "a claim needs a branch, worktree or path", {
@@ -253,6 +305,7 @@ export class ClaimRegistry {
     );
     const overlaps: Array<{ path: string; otherRun: string; otherPath: string }> = [];
     for (const path of paths.map(normalizePath)) {
+      if (!path) continue;
       for (const other of others) {
         if (other.declared_path === path) continue; // that is a hard reject, not advice
         if (sharesDirectory(path, other.declared_path)) {
@@ -264,7 +317,29 @@ export class ClaimRegistry {
   }
 }
 
-const normalizePath = (path: string): string => path.replace(/^\.\//, "").replace(/^\/+/, "");
+const normalizePath = (path: string): string | null => {
+  const separatorsNormalized = path.replaceAll("\\", "/");
+  if (
+    separatorsNormalized.length === 0 ||
+    separatorsNormalized.includes("\0") ||
+    separatorsNormalized.startsWith("/") ||
+    /^[A-Za-z]:($|\/)/.test(separatorsNormalized)
+  ) {
+    return null;
+  }
+  const segments = separatorsNormalized.split("/");
+  const normalized: string[] = [];
+  for (const segment of segments) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      if (normalized.length === 0) return null;
+      normalized.pop();
+      continue;
+    }
+    normalized.push(segment);
+  }
+  return normalized.length > 0 ? normalized.join("/") : null;
+};
 
 const sharesDirectory = (a: string, b: string): boolean => {
   const da = a.slice(0, a.lastIndexOf("/") + 1);
