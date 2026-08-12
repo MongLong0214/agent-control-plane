@@ -1,9 +1,8 @@
-import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { promisify } from "node:util";
 
 import type { Clock } from "../core/clock.ts";
 import {
@@ -16,8 +15,6 @@ import {
   extractJson,
 } from "./provider.ts";
 
-const exec = promisify(execFile);
-
 export interface CliAdapterOptions {
   clock: Clock;
   /**
@@ -28,9 +25,16 @@ export interface CliAdapterOptions {
   /** How long a reading stays usable before new allocation is suspended (§14.3). */
   freshnessWindowMs?: number;
   binary?: string;
+  /** Explicit non-authority variables a runtime invocation may inherit. */
+  environmentAllowlist?: readonly string[];
+  /** Control-plane paths that a runtime process must not read or write. */
+  denyReadPaths?: readonly string[];
+  /** Observations beyond this lead are not valid freshness evidence. */
+  maxClockSkewMs?: number;
 }
 
 const DEFAULT_FRESHNESS_MS = 15 * 60 * 1000;
+const DEFAULT_CLOCK_SKEW_MS = 60_000;
 
 /** Tools a read-only invocation must not have. Denied by name, not by permission mode. */
 const DENIED_TOOLS = [
@@ -60,6 +64,7 @@ export const readCapacityFile = (
   file: string,
   clock: Clock,
   freshnessMs: number,
+  maxClockSkewMs = DEFAULT_CLOCK_SKEW_MS,
 ): CapacityReading => {
   const base = {
     provider,
@@ -110,9 +115,19 @@ export const readCapacityFile = (
     if (buckets.length === 0) {
       return { ...base, sensorHealth: "ERROR", runtimeHealth: "UNKNOWN", error: "no buckets" };
     }
+    if (ageMs < -maxClockSkewMs) {
+      return {
+        ...base,
+        sensorHealth: "ERROR",
+        runtimeHealth: "UNKNOWN",
+        error: `observedAt exceeds clock-skew allowance by ${-ageMs}ms`,
+      };
+    }
     return {
       ...base,
-      observedAt,
+      // A small permitted clock lead is normalized before it reaches persistence. This
+      // prevents one future-dated row from masking all observations until that date.
+      observedAt: ageMs < 0 ? clock.nowIso() : observedAt,
       buckets,
       sensorHealth: ageMs > freshnessMs ? "STALE" : "HEALTHY",
       // A quota file says nothing about whether the CLI runs. When the file does not
@@ -132,12 +147,41 @@ export const readCapacityFile = (
 const runCli = async (
   file: string,
   args: readonly string[],
-  options: { cwd: string; timeoutMs: number; stdin?: string },
-): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> =>
-  new Promise((resolve) => {
-    const child = spawn(file, args, {
-      cwd: options.cwd,
-      env: { ...process.env },
+  options: {
+    cwd: string;
+    timeoutMs: number;
+    stdin?: string;
+    environmentAllowlist?: readonly string[];
+    denyReadPaths?: readonly string[];
+    writablePaths?: readonly string[];
+  },
+): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> => {
+  const scratch = mkdtempSync(join(tmpdir(), "acp-runtime-"));
+  if (!existsSync("/usr/bin/sandbox-exec")) {
+    rmSync(scratch, { recursive: true, force: true });
+    return {
+      stdout: "",
+      stderr: "runtime filesystem confinement is unavailable; refusing unconfined CLI execution",
+      exitCode: null,
+      timedOut: false,
+    };
+  }
+  let workdir: string;
+  try {
+    workdir = realpathSync(options.cwd);
+  } catch (err) {
+    rmSync(scratch, { recursive: true, force: true });
+    return { stdout: "", stderr: (err as Error).message, exitCode: null, timedOut: false };
+  }
+  return new Promise((resolve) => {
+    const child = spawn("/usr/bin/sandbox-exec", [
+      "-p",
+      runtimeProfile(workdir, realpathSync(scratch), options.denyReadPaths ?? [], options.writablePaths ?? []),
+      file,
+      ...args,
+    ], {
+      cwd: workdir,
+      env: runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch)),
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -162,13 +206,96 @@ const runCli = async (
     }
     child.on("error", (err) => {
       clearTimeout(timer);
+      rmSync(scratch, { recursive: true, force: true });
       resolve({ stdout, stderr: stderr + err.message, exitCode: null, timedOut });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      rmSync(scratch, { recursive: true, force: true });
       resolve({ stdout, stderr, exitCode: code, timedOut });
     });
   });
+};
+
+const AUTHORITY_ENV = [
+  /GITHUB.*TOKEN/i,
+  /^GH_TOKEN$/i,
+  /^GITHUB_/i,
+  /^BUZZ_/i,
+  /^TELEGRAM_/i,
+  /^ACP_TRUSTED_/i,
+  /SECRET/i,
+  /PASSWORD/i,
+  /CREDENTIAL/i,
+];
+
+const SECRET_VALUE_SHAPES: readonly RegExp[] = [
+  /^gh[pousr]_[A-Za-z0-9]{16,}$/,
+  /^sk-[A-Za-z0-9_-]{20,}$/,
+  /^nsec1[a-z0-9]{20,}$/,
+  /^xox[baprs]-/,
+  /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /^[A-Za-z0-9+/]{60,}={0,2}$/,
+];
+
+const authorityEnvironment = (name: string): boolean => AUTHORITY_ENV.some((pattern) => pattern.test(name));
+const looksLikeCredential = (value: string): boolean => SECRET_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
+
+/** Constructed, never inherited: agent CLIs do not receive daemon authority. */
+export const runtimeEnvironment = (allowlist: readonly string[], scratch: string): NodeJS.ProcessEnv => {
+  const environment: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+    HOME: scratch,
+    TMPDIR: scratch,
+    LANG: "C.UTF-8",
+    LC_ALL: "C",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+  for (const name of allowlist) {
+    if (authorityEnvironment(name)) continue;
+    const value = process.env[name];
+    if (value !== undefined && !looksLikeCredential(value)) environment[name] = value;
+  }
+  return environment;
+};
+
+const runtimeProfile = (
+  workdir: string,
+  scratch: string,
+  denyReadPaths: readonly string[],
+  writablePaths: readonly string[],
+): string => {
+  const home = process.env["HOME"] ?? "";
+  const sensitive = [
+    ...denyReadPaths,
+    ...(
+      home
+        ? [
+            `${home}/.ssh`, `${home}/.aws`, `${home}/.gnupg`, `${home}/.config/gh`,
+            `${home}/.buzz`, `${home}/.agent-control-plane`, `${home}/.git-credentials`,
+          ]
+        : []
+    ),
+  ];
+  const lines = ["(version 1)", "(allow default)"];
+  for (const path of sensitive) {
+    if (!path || path === workdir || path.startsWith(`${workdir}/`) || path === scratch || path.startsWith(`${scratch}/`)) continue;
+    lines.push(`(deny file-read* (subpath ${quote(path)}))`);
+  }
+  lines.push(
+    "(deny file-write*)",
+    `(allow file-write* (subpath ${quote(workdir)}))`,
+    `(allow file-write* (subpath ${quote(scratch)}))`,
+    ...writablePaths.map((path) => `(allow file-write* (subpath ${quote(path)}))`),
+    "(allow file-write* (subpath \"/dev\"))",
+    "(allow file-write-data (literal \"/dev/null\"))",
+  );
+  return lines.join("\n");
+};
+
+const quote = (value: string): string => `"${value.replace(/(["\\])/g, "\\$1")}"`;
 
 /**
  * Claude Code headless adapter. Used for CTO sessions and, under continuity fallback,
@@ -188,12 +315,18 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   readonly #clock: Clock;
   readonly #capacityFile: string;
   readonly #freshnessMs: number;
+  readonly #maxClockSkewMs: number;
+  readonly #environmentAllowlist: readonly string[];
+  readonly #denyReadPaths: readonly string[];
 
   constructor(options: CliAdapterOptions) {
     this.#binary = options.binary ?? "claude";
     this.#clock = options.clock;
     this.#capacityFile = options.capacityFile;
     this.#freshnessMs = options.freshnessWindowMs ?? DEFAULT_FRESHNESS_MS;
+    this.#maxClockSkewMs = options.maxClockSkewMs ?? DEFAULT_CLOCK_SKEW_MS;
+    this.#environmentAllowlist = options.environmentAllowlist ?? [];
+    this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
@@ -206,6 +339,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       model: spec.model,
       effort: spec.effort ?? null,
       pid: null,
+      workdir: spec.workdir,
     };
   }
 
@@ -248,6 +382,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
       stdin: request.prompt,
+      environmentAllowlist: this.#environmentAllowlist,
+      denyReadPaths: this.#denyReadPaths,
     });
 
     const envelope = safeParse(result.stdout);
@@ -269,17 +405,34 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   }
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    try {
-      await exec(this.#binary, ["--version"], { timeout: 15_000 });
-      return "HEALTHY";
-    } catch {
-      return "UNAVAILABLE";
-    }
+    const result = await runCli(this.#binary, ["--version"], {
+      cwd: process.cwd(),
+      timeoutMs: 15_000,
+      environmentAllowlist: this.#environmentAllowlist,
+      denyReadPaths: this.#denyReadPaths,
+    });
+    return result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE";
+  }
+
+  async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    if (handle.provider !== this.provider) return "UNAVAILABLE";
+    const result = await runCli(this.#binary, [
+      "-p", "--output-format", "json", "--model", handle.model, "--session-id", handle.externalSessionId,
+    ], {
+      cwd: handle.workdir ?? process.cwd(),
+      timeoutMs: 30_000,
+      stdin: "Reply with READY.",
+      environmentAllowlist: this.#environmentAllowlist,
+      denyReadPaths: this.#denyReadPaths,
+    });
+    if (result.exitCode !== 0 || result.timedOut) return "UNAVAILABLE";
+    const sessionId = safeParse(result.stdout)?.["session_id"];
+    return sessionId !== undefined && sessionId !== handle.externalSessionId ? "DEGRADED" : "HEALTHY";
   }
 
   async probeCapacity(): Promise<CapacityReading> {
     return resolveRuntimeHealth(
-      readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs),
+      readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs, this.#maxClockSkewMs),
       () => this.probeRuntime(),
     );
   }
@@ -318,12 +471,18 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly #clock: Clock;
   readonly #capacityFile: string;
   readonly #freshnessMs: number;
+  readonly #maxClockSkewMs: number;
+  readonly #environmentAllowlist: readonly string[];
+  readonly #denyReadPaths: readonly string[];
 
   constructor(options: CliAdapterOptions) {
     this.#binary = options.binary ?? "codex";
     this.#clock = options.clock;
     this.#capacityFile = options.capacityFile;
     this.#freshnessMs = options.freshnessWindowMs ?? DEFAULT_FRESHNESS_MS;
+    this.#maxClockSkewMs = options.maxClockSkewMs ?? DEFAULT_CLOCK_SKEW_MS;
+    this.#environmentAllowlist = options.environmentAllowlist ?? [];
+    this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
@@ -333,6 +492,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       model: spec.model,
       effort: spec.effort ?? null,
       pid: null,
+      workdir: spec.workdir,
     };
   }
 
@@ -362,6 +522,9 @@ export class CodexCliAdapter implements ProviderAdapter {
     const result = await runCli(this.#binary, [...args, prompt], {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
+      environmentAllowlist: this.#environmentAllowlist,
+      denyReadPaths: this.#denyReadPaths,
+      writablePaths: [scratch],
     });
 
     const text = existsSync(lastMessage) ? readFileSync(lastMessage, "utf8") : result.stdout;
@@ -381,17 +544,26 @@ export class CodexCliAdapter implements ProviderAdapter {
   }
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
-    try {
-      await exec(this.#binary, ["--version"], { timeout: 15_000 });
-      return "HEALTHY";
-    } catch {
-      return "UNAVAILABLE";
-    }
+    const result = await runCli(this.#binary, ["--version"], {
+      cwd: process.cwd(),
+      timeoutMs: 15_000,
+      environmentAllowlist: this.#environmentAllowlist,
+      denyReadPaths: this.#denyReadPaths,
+    });
+    return result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE";
+  }
+
+  async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    // Codex's one-shot CLI currently exposes no way to attach a randomly constituted
+    // external id to an authenticated operation. Treating `--version` as session proof
+    // would revive the exact false-ready path this interface prevents.
+    void handle;
+    return "UNAVAILABLE";
   }
 
   async probeCapacity(): Promise<CapacityReading> {
     return resolveRuntimeHealth(
-      readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs),
+      readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs, this.#maxClockSkewMs),
       () => this.probeRuntime(),
     );
   }

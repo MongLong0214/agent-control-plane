@@ -9,19 +9,52 @@ import { ControlPlane } from "../../src/app/control-plane.ts";
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ContinuityMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ContinuityKernel } from "../../src/continuity/continuity-kernel.ts";
-import type { CapacityReading } from "../../src/runtime/provider.ts";
+import type {
+  CapacityReading,
+  InvocationRequest,
+  InvocationResult,
+  ProviderAdapter,
+  SessionHandle,
+  SessionSpec,
+} from "../../src/runtime/provider.ts";
 import { readCapacityFile } from "../../src/runtime/cli-adapters.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { fixtureManifest } from "../helpers/harness.ts";
+
+/** Test double with the production adapter contract; ScriptedAdapter itself remains false. */
+class ProductionTestAdapter implements ProviderAdapter {
+  readonly #scripted: ScriptedAdapter;
+  readonly isProduction = true;
+
+  constructor(clock: ManualClock, provider: string) {
+    this.#scripted = new ScriptedAdapter(clock, provider);
+  }
+
+  get provider(): string { return this.#scripted.provider; }
+  get defaultModels(): Readonly<Record<string, string>> { return this.#scripted.defaultModels; }
+  setCapacity(reading: CapacityReading | null): void { this.#scripted.setCapacity(reading); }
+  setRuntimeHealth(health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE"): void { this.#scripted.setRuntimeHealth(health); }
+  startSession(spec: SessionSpec): Promise<SessionHandle> { return this.#scripted.startSession(spec); }
+  stopSession(handle: SessionHandle): Promise<void> {
+    void handle;
+    return this.#scripted.stopSession();
+  }
+  invoke(request: InvocationRequest): Promise<InvocationResult> { return this.#scripted.invoke(request); }
+  probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> { return this.#scripted.probeRuntime(); }
+  probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    return this.#scripted.probeSession(handle);
+  }
+  probeCapacity(): Promise<CapacityReading> { return this.#scripted.probeCapacity(); }
+}
 
 afterAll(cleanupTempDirs);
 
 const makePlane = () => {
   const root = tempDir("acp-cont-hard-");
   const clock = new ManualClock("2026-08-12T00:00:00.000Z");
-  const gpt = new ScriptedAdapter(clock, "gpt");
-  const claude = new ScriptedAdapter(clock, "claude");
+  const gpt = new ProductionTestAdapter(clock, "gpt");
+  const claude = new ProductionTestAdapter(clock, "claude");
   const repoPath = makeRepo({ "src/app.js": "module.exports = () => 1;\n" });
 
   const cp = new ControlPlane({
@@ -31,7 +64,6 @@ const makePlane = () => {
     secretsDir: join(root, "secrets"),
     clock,
     adapters: [gpt, claude],
-    allowNonProductionAdapters: true,
     ctoPreference: { provider: "claude", model: "opus", effort: null },
     reviewer: {
       preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
@@ -303,6 +335,9 @@ describe("failover produces a routable session (§15.7)", () => {
           probed.push(sessionId);
           return allow(ReasonCode.OK, undefined);
         },
+      },
+      buzz: {
+        connect: async (sessionId: string) => allow(ReasonCode.OK, `buzz:${sessionId}`),
       },
     });
 

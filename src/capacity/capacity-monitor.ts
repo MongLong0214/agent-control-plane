@@ -42,6 +42,8 @@ export interface CapacityOptions {
   conservePercent?: number;
   criticalPercent?: number;
   exhaustedPercent?: number;
+  /** Sensor clocks may lead the daemon by this much before their evidence is refused. */
+  maxClockSkewMs?: number;
 }
 
 const DEFAULTS = {
@@ -50,7 +52,25 @@ const DEFAULTS = {
   conservePercent: 25,
   criticalPercent: 10,
   exhaustedPercent: 2,
+  maxClockSkewMs: 60_000,
 };
+
+export interface DynamicReserveDemand {
+  criticalRoleInvocations: number;
+  expectedReviews: number;
+  inFlightRuns: number;
+  /** Recent observed quota burn; zero is a measured absence of burn, not an unknown bucket. */
+  burnRatePercentPerHour?: number;
+}
+
+/** The allocation selected by the caller after role routing, before it is activated. */
+export interface DispatchCapacityTarget {
+  provider: string;
+  capabilities: readonly string[];
+  /** Only lower-priority worker fan-out may consume the dynamic reserve. */
+  priority?: "critical" | "worker";
+  reserveDemand?: DynamicReserveDemand;
+}
 
 /**
  * PRD §14.
@@ -84,8 +104,8 @@ export class CapacityMonitor {
     const readings: ProviderCapacity[] = [];
     for (const adapter of adapters) {
       const reading = await adapter.probeCapacity();
-      this.persist(reading);
       const enriched = this.enrich(reading);
+      this.persist(enriched);
       readings.push(enriched);
 
       this.telemetry.record({
@@ -127,10 +147,56 @@ export class CapacityMonitor {
    * granted when at least one production provider can still serve the roles a run
    * needs; if every production sensor is unusable the answer is suspend, not guess.
    */
-  async refreshForDispatch(): Promise<Decision<void>> {
-    const readings = await this.refresh(RefreshTrigger.DISPATCH_ADMISSION);
+  async refreshForDispatch(target?: DispatchCapacityTarget): Promise<Decision<void>> {
+    const readings = await this.refresh(
+      RefreshTrigger.DISPATCH_ADMISSION,
+      target ? [target.provider] : undefined,
+    );
     const production = readings.filter((r) => this.providers.require(r.provider).isProduction);
-    if (production.length === 0) return allow(ReasonCode.OK, undefined);
+    if (production.length === 0) {
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "no production provider is registered for dispatch admission",
+        { target: target ?? null },
+      );
+    }
+
+    if (target) {
+      const selected = production.find((reading) => reading.provider === target.provider);
+      if (!selected) {
+        return deny(
+          ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+          "the selected provider is not production-eligible",
+          { provider: target.provider, capabilities: target.capabilities },
+        );
+      }
+      const unroutable = target.capabilities.filter((capability) => !this.isRoutableFor(selected, capability));
+      if (unroutable.length > 0) {
+        return deny(
+          ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+          "the selected provider lacks current routable capacity for a required capability",
+          { provider: selected.provider, capabilities: unroutable, admission: selected.allocationAdmission },
+        );
+      }
+      if (target.priority === "worker") {
+        const reserve = this.dynamicReserve(selected.provider, target.reserveDemand ?? {
+          criticalRoleInvocations: 0,
+          expectedReviews: 0,
+          inFlightRuns: 0,
+        });
+        const applicable = selected.buckets.filter((bucket) => target.capabilities.some((c) => bucket.capabilities.includes(c)));
+        if (applicable.some((bucket) => bucket.remainingPercent === null || bucket.remainingPercent / 100 <= reserve)) {
+          return deny(
+            ReasonCode.CAPACITY_ADMISSION_CONSERVE,
+            "worker allocation would consume capacity reserved for critical roles",
+            { provider: selected.provider, reserve, capabilities: target.capabilities },
+          );
+        }
+      }
+      return allow(ReasonCode.OK, undefined, {
+        admitted: [{ provider: selected.provider, admission: selected.allocationAdmission }],
+      });
+    }
 
     const usable = production.filter((r) => r.allocationAdmission !== "SUSPENDED");
     if (usable.length === 0) {
@@ -196,10 +262,11 @@ export class CapacityMonitor {
   providersFor(capability: string): ProviderCapacity[] {
     return this.all().filter(
       (c) =>
+        this.providers.require(c.provider).isProduction &&
         c.allocationAdmission !== "SUSPENDED" &&
         c.runtimeHealth !== "UNAVAILABLE" &&
         c.runtimeHealth !== "UNKNOWN" &&
-        c.buckets.some((b) => isRoutableBucket(b, this.#options.exhaustedPercent) && b.capabilities.includes(capability)),
+        this.isRoutableFor(c, capability),
     );
   }
 
@@ -207,8 +274,13 @@ export class CapacityMonitor {
   isRoutableFor(capacity: ProviderCapacity, capability: string): boolean {
     if (capacity.allocationAdmission === "SUSPENDED") return false;
     if (capacity.runtimeHealth === "UNAVAILABLE" || capacity.runtimeHealth === "UNKNOWN") return false;
-    return capacity.buckets.some(
-      (b) => isRoutableBucket(b, this.#options.exhaustedPercent) && b.capabilities.includes(capability),
+    const applicable = capacity.buckets.filter((bucket) => bucket.capabilities.includes(capability));
+    // Every quota window constraining this capability must be known and usable. A numeric
+    // rolling window cannot certify routing when the weekly window for the same role is
+    // unknown; buckets for other capabilities are deliberately irrelevant.
+    return (
+      applicable.length > 0 &&
+      applicable.every((bucket) => isRoutableBucket(bucket, this.#options.exhaustedPercent))
     );
   }
 
@@ -219,20 +291,43 @@ export class CapacityMonitor {
    */
   dynamicReserve(
     provider: string,
-    demand: { criticalRoleInvocations: number; expectedReviews: number; inFlightRuns: number },
+    demand: DynamicReserveDemand,
   ): number {
     const capacity = this.current(provider);
     if (!capacity) return 1;
+    const reserves = this.dynamicReserveByBucket(capacity, demand);
+    return reserves.length === 0 ? 1 : Math.max(...reserves.map((reserve) => reserve.reserve));
+  }
+
+  /** Per-window reserve facts; callers must not erase distinct reset horizons into one minimum. */
+  dynamicReserveByBucket(
+    capacity: ProviderCapacity,
+    demand: DynamicReserveDemand,
+  ): Array<{ bucketId: string; reserve: number }> {
     const weighted =
       demand.criticalRoleInvocations * 2 + demand.expectedReviews * 3 + demand.inFlightRuns;
-    const headroom = Math.min(
-      ...capacity.buckets.map((b) => b.remainingPercent ?? 100),
-      100,
-    );
-    if (headroom <= 0) return 1;
-    // Reserve grows with demand and shrinks with headroom; clamped so it can never
-    // consume the whole bucket or vanish entirely.
-    return Math.max(0.05, Math.min(0.9, weighted / (weighted + headroom)));
+    const nowMs = new Date(this.clock.nowIso()).getTime();
+    const burn = Math.max(0, demand.burnRatePercentPerHour ?? 0);
+    return capacity.buckets.map((bucket) => {
+      // Unknown quota is never imagined as headroom. Lower-priority work must preserve
+      // the whole window until a usable observation exists.
+      if (bucket.remainingPercent === null) return { bucketId: bucket.id, reserve: 1 };
+      const resetMs = bucket.resetAt ? new Date(bucket.resetAt).getTime() : Number.NaN;
+      // A source without a reset horizon is treated conservatively as a one-day window;
+      // it remains dynamic with measured burn instead of pretending the quota never resets.
+      const horizonHours = Number.isFinite(resetMs)
+        ? Math.max(0, (resetMs - nowMs) / (60 * 60 * 1000))
+        : 24;
+      const expectedBurn = burn * horizonHours;
+      const demandShare = weighted / (weighted + Math.max(1, bucket.remainingPercent));
+      const burnShare = expectedBurn / Math.max(1, bucket.remainingPercent + expectedBurn);
+      return {
+        bucketId: bucket.id,
+        // Preserve a modest floor even when there is no current critical demand. This is
+        // a guard band for the next mandatory review rather than a fixed global reserve.
+        reserve: Math.max(0.05, Math.min(0.95, demandShare + burnShare)),
+      };
+    });
   }
 
   private enrich(input: CapacityReading): ProviderCapacity {
@@ -253,11 +348,29 @@ export class CapacityMonitor {
         unknownBuckets: errored.buckets.map((b) => b.id),
       };
     }
-    const ageMs = Math.max(0, new Date(this.clock.nowIso()).getTime() - observed);
+    const now = new Date(this.clock.nowIso()).getTime();
+    if (observed > now + this.#options.maxClockSkewMs) {
+      return {
+        ...input,
+        observedAt: this.clock.nowIso(),
+        sensorHealth: "ERROR",
+        runtimeHealth: "UNKNOWN",
+        error: `observedAt exceeds clock-skew allowance by ${observed - now}ms`,
+        allocationAdmission: "SUSPENDED",
+        advisoryState: "EXHAUSTED",
+        ageMs: Number.POSITIVE_INFINITY,
+        unknownBuckets: input.buckets.map((bucket) => bucket.id),
+      };
+    }
+    // A small permitted clock lead is normalized before persistence, so it cannot become
+    // a future MAX(observed_at) row that hides every later real observation.
+    const normalizedObservedAt = observed > now ? this.clock.nowIso() : input.observedAt;
+    const ageMs = Math.max(0, now - observed);
     // The monitor decides staleness from the age it can see, so an adapter cannot label a
     // week-old file HEALTHY.
     const reading: CapacityReading = {
       ...input,
+      observedAt: normalizedObservedAt,
       sensorHealth:
         input.sensorHealth === "ERROR"
           ? "ERROR"
@@ -302,38 +415,41 @@ export class CapacityMonitor {
     // A reading is one atomic observation. Re-observing at the same instant must
     // replace the whole bucket set — leaving a bucket behind from a previous
     // observation would let a shrunken or failed sensor read as healthy.
-    this.db.run(`DELETE FROM capacity_snapshots WHERE provider = ? AND observed_at = ?`, [
-      reading.provider,
-      reading.observedAt,
-    ]);
-    for (const bucket of reading.buckets) {
-      this.db.run(
-        `INSERT OR REPLACE INTO capacity_snapshots
-           (snapshot_id, provider, bucket_id, remaining_percent, reset_at, capabilities_json,
-            sensor_health, runtime_health, allocation_admission, observed_at, source)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          `${reading.provider}:${bucket.id}:${reading.observedAt}`,
-          reading.provider, bucket.id, bucket.remainingPercent, bucket.resetAt,
-          JSON.stringify(bucket.capabilities), reading.sensorHealth, reading.runtimeHealth,
-          this.enrich(reading).allocationAdmission, reading.observedAt, reading.source,
-        ],
-      );
-    }
-    if (reading.buckets.length === 0) {
-      // A sensor failure is itself evidence and must be recorded, not dropped.
-      this.db.run(
-        `INSERT OR REPLACE INTO capacity_snapshots
-           (snapshot_id, provider, bucket_id, remaining_percent, reset_at, capabilities_json,
-            sensor_health, runtime_health, allocation_admission, observed_at, source)
-         VALUES (?, ?, '__none__', NULL, NULL, '[]', ?, ?, 'SUSPENDED', ?, ?)`,
-        [
-          `${reading.provider}:__none__:${reading.observedAt}`,
-          reading.provider, reading.sensorHealth, reading.runtimeHealth,
-          reading.observedAt, reading.source,
-        ],
-      );
-    }
+    const admission = this.enrich(reading).allocationAdmission;
+    this.db.tx(() => {
+      this.db.run(`DELETE FROM capacity_snapshots WHERE provider = ? AND observed_at = ?`, [
+        reading.provider,
+        reading.observedAt,
+      ]);
+      for (const bucket of reading.buckets) {
+        this.db.run(
+          `INSERT OR REPLACE INTO capacity_snapshots
+             (snapshot_id, provider, bucket_id, remaining_percent, reset_at, capabilities_json,
+              sensor_health, runtime_health, allocation_admission, observed_at, source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            `${reading.provider}:${bucket.id}:${reading.observedAt}`,
+            reading.provider, bucket.id, bucket.remainingPercent, bucket.resetAt,
+            JSON.stringify(bucket.capabilities), reading.sensorHealth, reading.runtimeHealth,
+            admission, reading.observedAt, reading.source,
+          ],
+        );
+      }
+      if (reading.buckets.length === 0) {
+        // A sensor failure is itself evidence and must be recorded, not dropped.
+        this.db.run(
+          `INSERT OR REPLACE INTO capacity_snapshots
+             (snapshot_id, provider, bucket_id, remaining_percent, reset_at, capabilities_json,
+              sensor_health, runtime_health, allocation_admission, observed_at, source)
+           VALUES (?, ?, '__none__', NULL, NULL, '[]', ?, ?, 'SUSPENDED', ?, ?)`,
+          [
+            `${reading.provider}:__none__:${reading.observedAt}`,
+            reading.provider, reading.sensorHealth, reading.runtimeHealth,
+            reading.observedAt, reading.source,
+          ],
+        );
+      }
+    });
   }
 }
 

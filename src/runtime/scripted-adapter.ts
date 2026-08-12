@@ -75,6 +75,7 @@ export class ScriptedAdapter implements ProviderAdapter {
       model: spec.model,
       effort: spec.effort ?? null,
       pid: null,
+      workdir: spec.workdir,
     };
   }
 
@@ -115,6 +116,10 @@ export class ScriptedAdapter implements ProviderAdapter {
 
   async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
     return this.#runtime;
+  }
+
+  async probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    return handle.provider === this.provider ? this.#runtime : "UNAVAILABLE";
   }
 
   async probeCapacity(): Promise<CapacityReading> {
