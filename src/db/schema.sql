@@ -297,6 +297,29 @@ CREATE INDEX IF NOT EXISTS run_artifacts_run_kind ON run_artifacts(run_id, kind,
 CREATE INDEX IF NOT EXISTS run_artifacts_snapshot ON run_artifacts(candidate_snapshot_digest);
 
 -- ---------------------------------------------------------------------------
+-- handoffs  (PRD §10.2 handoff package, §10.3 recovery package)
+--   Lifecycle: project-scoped and outlives any run — a replacement happens precisely
+--   when the outgoing CTO has zero active runs, so this cannot live in run_artifacts.
+--   Integrity: the ACK is a state machine, and §10.1 forbids switching over before it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS handoffs (
+  handoff_id        TEXT PRIMARY KEY,
+  project_id        TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+  kind              TEXT NOT NULL CHECK (kind IN ('HANDOFF','RECOVERY')),
+  from_session_id   TEXT,
+  from_generation   INTEGER,
+  to_session_id     TEXT NOT NULL REFERENCES sessions(session_id),
+  package_json      TEXT NOT NULL,
+  digest            TEXT NOT NULL,
+  status            TEXT NOT NULL CHECK (status IN ('PENDING','ACKED','REJECTED')),
+  created_at        TEXT NOT NULL,
+  acked_at          TEXT,
+  ack_by_session_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS handoffs_project ON handoffs(project_id, status);
+
+-- ---------------------------------------------------------------------------
 -- verification_results  (PRD §17.6, §17.7)
 --   Lifecycle: one row per (snapshot, command, repository) execution.
 --   Integrity: the completeness gate counts these rows; a JSON blob cannot be

@@ -329,7 +329,7 @@ describe("managed write guard (CP-HI-01)", () => {
 });
 
 describe("outbox fencing (PRD §15.7, §27.5)", () => {
-  const enqueue = (kind = MessageKind.RUN_DISPATCH) => {
+  const enqueue = (kind: MessageKind = MessageKind.RUN_DISPATCH) => {
     const core = makeCore();
     const repo = makeRepo();
     const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });

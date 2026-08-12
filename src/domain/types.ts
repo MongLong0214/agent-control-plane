@@ -221,26 +221,28 @@ export interface RunRow {
   stateReason: string | null;
 }
 
-/** Role key encoding. Scope is part of the key so uniqueness is enforced by the DB. */
-export const roleKeyFor = (
-  role: Role,
-  scope?: { projectId?: string | null; runId?: string | null; taskId?: string | null },
-): string => {
-  switch (role) {
-    case Role.CEO:
-      return "CEO";
-    case Role.PRIMARY_CTO:
-      return `PRIMARY_CTO:${required(scope?.projectId, "projectId")}`;
-    case Role.BOOTSTRAP_CTO:
-      return `BOOTSTRAP_CTO:${required(scope?.runId, "runId")}`;
-    case Role.BLIND_REVIEWER:
-      return `BLIND_REVIEWER:${required(scope?.runId, "runId")}`;
-    case Role.OPTIONAL_ADVERSARIAL_REVIEWER:
-      return `OPTIONAL_ADVERSARIAL_REVIEWER:${required(scope?.runId, "runId")}`;
-    case Role.WORKER:
-      return `WORKER:${required(scope?.taskId, "taskId")}`;
-  }
+export interface RoleScope {
+  projectId?: string | null;
+  runId?: string | null;
+  taskId?: string | null;
+}
+
+/**
+ * Role key encoding. Scope is part of the key, so "one active binding per role key" is
+ * enforceable by a single database index. Keyed by role so a new role cannot be added
+ * without deciding how it is scoped.
+ */
+const ROLE_KEY: Readonly<Record<Role, (scope: RoleScope) => string>> = {
+  [Role.CEO]: () => "CEO",
+  [Role.PRIMARY_CTO]: (s) => `PRIMARY_CTO:${required(s.projectId, "projectId")}`,
+  [Role.BOOTSTRAP_CTO]: (s) => `BOOTSTRAP_CTO:${required(s.runId, "runId")}`,
+  [Role.BLIND_REVIEWER]: (s) => `BLIND_REVIEWER:${required(s.runId, "runId")}`,
+  [Role.OPTIONAL_ADVERSARIAL_REVIEWER]: (s) =>
+    `OPTIONAL_ADVERSARIAL_REVIEWER:${required(s.runId, "runId")}`,
+  [Role.WORKER]: (s) => `WORKER:${required(s.taskId, "taskId")}`,
 };
+
+export const roleKeyFor = (role: Role, scope: RoleScope = {}): string => ROLE_KEY[role](scope);
 
 const required = (value: string | null | undefined, field: string): string => {
   if (!value) throw new Error(`roleKeyFor requires ${field}`);

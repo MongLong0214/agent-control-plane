@@ -51,7 +51,21 @@ export const projectManifestSchema = z
     verificationCommands: z.array(verificationCommandSchema).default([]),
     postMergeCommands: z.array(z.string()).default([]),
     ciWorkflows: z
-      .array(z.object({ path: z.string().min(1), checkName: z.string().min(1) }).strict())
+      .array(
+        z
+          .object({
+            path: z.string().min(1),
+            checkName: z.string().min(1),
+            /**
+             * Digest of the workflow file the contract approved. A CI result counts as
+             * TRUSTED_CI only when the workflow that produced it still matches
+             * (Integration §14.4); without this the evidence cannot be trusted and is
+             * reported missing rather than accepted.
+             */
+            approvedDigest: z.string().nullable().default(null),
+          })
+          .strict(),
+      )
       .default([]),
     commitlore: z
       .object({ mode: z.enum(["required", "preferred", "off"]).default("preferred") })
