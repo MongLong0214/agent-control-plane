@@ -1,5 +1,25 @@
 # Acceptance status against PRD §42
 
+> **The GitHub issue tracker is the single source of truth for remaining work.** This file
+> explains the state; the issues *are* the state. Nothing outstanding lives only here, in a
+> transcript or in a commit message. `node scripts/ssot-report.mjs` reconciles the tracker
+> against every review finding and every declared work item and fails if one is missing.
+>
+> | Query | What it is |
+> |---|---|
+> | `label:review-blocker label:round:r2 is:open` | Blocker-class findings against the current code |
+> | `label:review-major label:round:r2 is:open` | Major findings against the current code |
+> | `label:round:r1 label:needs-triage is:open` | Round-1 majors, may already be fixed — verify first |
+> | `label:round:r1 label:review-blocker is:closed` | Round-1 blockers, fixed, with commit and test named |
+> | `label:acceptance is:open` | PRD §42 items a build cannot satisfy |
+> | `label:prerequisite is:open` | Deployment prerequisites only the owner can supply |
+> | `label:epic is:open` | Repo Factory integration, a separate deliverable |
+> | `label:design-decision is:open` | Deliberate trade-offs recorded for revisit |
+>
+> Closing rule: close with the commit SHA and the regression test that proves it, or with
+> the reason it does not apply. A closed issue with no evidence is not closed.
+
+
 This is a status ledger, not a claim of completion. Items that require an observation
 period cannot be satisfied by a build, and are marked as such rather than glossed.
 

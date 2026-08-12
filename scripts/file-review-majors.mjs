@@ -20,7 +20,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-const reviewDir = join(repoRoot, "evidence", "review");
+const dirArg = process.argv.find((a) => a.startsWith("--dir="));
+const reviewDir = join(repoRoot, dirArg ? dirArg.slice("--dir=".length) : join("evidence", "review"));
+/** Extra labels applied to every issue this invocation files. */
+const extraLabels = (process.argv.find((a) => a.startsWith("--label=")) ?? "")
+  .slice("--label=".length)
+  .split(",")
+  .filter(Boolean);
+/** Prepended to the body when a round's findings predate later fixes. */
+const staleNote = process.argv.find((a) => a.startsWith("--stale-note="))?.slice("--stale-note=".length);
 const dryRun = process.argv.includes("--dry-run");
 const severityArg = process.argv.find((a) => a.startsWith("--severity="));
 const severities = severityArg
@@ -80,6 +88,7 @@ const title = (f) => {
 const body = (f) =>
   [
     marker(f),
+    ...(staleNote ? [`> **${staleNote}**`, ``] : []),
     `Reported by the independent GPT-5.6 Sol production-readiness review (round \`${ROUND}\`,`,
     `read-only sandbox, reasoning effort \`xhigh\`) as a **${f.severity}** finding in the`,
     `\`${f.area}\` area. Filed verbatim so the reasoning survives a session reset; it has not`,
@@ -127,6 +136,12 @@ if (!dryRun) {
       existingLabels.add(name);
     }
   }
+  for (const name of extraLabels) {
+    if (!existingLabels.has(name)) {
+      await gh(["label", "create", name, "--color", "fbca04", "--description", "Review triage state"]);
+      existingLabels.add(name);
+    }
+  }
 }
 
 let created = 0;
@@ -152,6 +167,7 @@ for (const finding of findings) {
         LABELS[finding.severity].name,
         "--label",
         `area:${finding.area}`,
+        ...extraLabels.flatMap((l) => ["--label", l]),
         "--body-file",
         "-",
       ],

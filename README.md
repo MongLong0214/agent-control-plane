@@ -171,6 +171,16 @@ See [docs/capacity-source.md](docs/capacity-source.md).
 - Strong isolation for untrusted repositories, a web dashboard, REST/GraphQL and
   automatic Level 6 routing promotion are backlog (PRD §43).
 
+## Where the remaining work lives
+
+The GitHub issue tracker is the single source of truth. Every finding from both independent
+review rounds, every PRD §42 acceptance item that a build cannot satisfy, every deployment
+prerequisite and every deliberate trade-off is an issue, labelled by severity, round and
+area. `node scripts/ssot-report.mjs` reconciles the tracker against `evidence/review/`,
+`evidence/review-round1/` and the declared work items, and exits non-zero if anything is
+missing. See [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) for the query table and the current
+verdict.
+
 ## Documents
 
 - [Ticket DAG](docs/tickets/tickets.json) — 44 atomic tickets across 7 milestones
