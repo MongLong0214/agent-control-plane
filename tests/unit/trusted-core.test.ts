@@ -453,7 +453,7 @@ describe("portable project manifest (Integration §10.2)", () => {
   });
 
   it("CP-S04 / RF-S05: rejects absolute paths and session identifiers", () => {
-    const withPath = { ...base, repositories: [{ role: "primary", remote: "/Users/isaac/x", manifestRoot: "." }] };
+    const withPath = { ...base, repositories: [{ role: "primary", remote: "/Users/example/x", manifestRoot: "." }] };
     const decision = assertPortableManifest(withPath);
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.MANIFEST_NOT_PORTABLE);

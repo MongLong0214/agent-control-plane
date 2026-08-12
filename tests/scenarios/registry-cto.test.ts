@@ -291,7 +291,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     const manifest = fixtureManifest("bad-project");
     const broken = {
       ...manifest,
-      repositories: [{ role: "primary", remote: "/Users/isaac/projects/x", manifestRoot: "." }],
+      repositories: [{ role: "primary", remote: "/Users/example/projects/x", manifestRoot: "." }],
     };
     const stored = harness.cp.projects.storeManifest(broken);
     expect(stored.allowed).toBe(false);
