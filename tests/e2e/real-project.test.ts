@@ -57,22 +57,32 @@ const manifestFor = (projectId: string): ProjectManifest => ({
     releaseTagPolicy: "semver",
     releaseBranchCleanup: "keep",
   },
-  verificationProfiles: { simple: ["typecheck"], standard: ["typecheck"], guarded: ["typecheck"] },
+  verificationProfiles: {
+    simple: ["reason-codes"],
+    standard: ["reason-codes"],
+    guarded: ["reason-codes"],
+  },
   verificationCommands: [
     {
-      id: "typecheck",
-      // The project's real verification command, invoked without a shell.
-      argv: ["node", "node_modules/typescript/bin/tsc", "--noEmit", "-p", "tsconfig.json"],
+      id: "reason-codes",
+      /**
+       * The project's real reason-code contract check. Chosen over `tsc` because
+       * verification runs in a disposable worktree with no installed packages and no
+       * network (PRD §17.4) — a command that needs `node_modules` cannot execute there.
+       * The typecheck is the repository's CI job and reaches the control plane as
+       * TRUSTED_CI evidence instead.
+       */
+      argv: ["node", "scripts/verify-reason-codes.mjs"],
       repositoryRole: "primary",
       cwd: ".",
-      timeoutSeconds: 600,
+      timeoutSeconds: 120,
       envAllowlist: ["CI"],
       network: "deny",
       networkAllowlist: [],
       required: true,
       evidenceMode: "LOCAL_COMMAND",
       maxOutputBytes: 1_048_576,
-      maxMemoryMb: 4096,
+      maxMemoryMb: 2048,
     },
   ],
   postMergeCommands: [],
