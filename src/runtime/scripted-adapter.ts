@@ -101,6 +101,9 @@ export class ScriptedAdapter implements ProviderAdapter {
         exitCode: 1,
         error: `no scripted response matched prompt: ${request.prompt.slice(0, 200)}`,
         providerSessionId: request.externalSessionId ?? null,
+        // A deterministic in-process double has no OS boundary. It must never certify
+        // reviewer isolation merely because a test supplied the requested shape.
+        isolationAttested: false,
       };
     }
     const response = this.#responses[index]!;
@@ -117,6 +120,7 @@ export class ScriptedAdapter implements ProviderAdapter {
       exitCode: response.ok === false ? 1 : 0,
       error: response.ok === false ? "scripted failure" : null,
       providerSessionId: request.externalSessionId ?? null,
+      isolationAttested: false,
     };
   }
 

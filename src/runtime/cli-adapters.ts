@@ -154,8 +154,16 @@ const runCli = async (
     environmentAllowlist?: readonly string[];
     denyReadPaths?: readonly string[];
     writablePaths?: readonly string[];
+    /** Strict packet-only reviewer boundary, distinct from normal agent containment. */
+    isolation?: NonNullable<InvocationRequest["isolation"]>;
   },
-): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> => {
+): Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  isolationEnforced: boolean;
+}> => {
   const scratch = mkdtempSync(join(tmpdir(), "acp-runtime-"));
   if (!existsSync("/usr/bin/sandbox-exec")) {
     rmSync(scratch, { recursive: true, force: true });
@@ -164,24 +172,37 @@ const runCli = async (
       stderr: "runtime filesystem confinement is unavailable; refusing unconfined CLI execution",
       exitCode: null,
       timedOut: false,
+      isolationEnforced: false,
     };
   }
   let workdir: string;
   try {
     workdir = realpathSync(options.cwd);
+    if (options.isolation) assertReviewerIsolation(workdir, options.isolation);
   } catch (err) {
     rmSync(scratch, { recursive: true, force: true });
-    return { stdout: "", stderr: (err as Error).message, exitCode: null, timedOut: false };
+    return {
+      stdout: "",
+      stderr: (err as Error).message,
+      exitCode: null,
+      timedOut: false,
+      isolationEnforced: false,
+    };
   }
+  const isolated = options.isolation !== undefined;
   return new Promise((resolve) => {
     const child = spawn("/usr/bin/sandbox-exec", [
       "-p",
-      runtimeProfile(workdir, realpathSync(scratch), options.denyReadPaths ?? [], options.writablePaths ?? []),
+      isolated
+        ? reviewerProfile(workdir, options.isolation!.denyReadPaths)
+        : runtimeProfile(workdir, realpathSync(scratch), options.denyReadPaths ?? [], options.writablePaths ?? []),
       file,
       ...args,
     ], {
       cwd: workdir,
-      env: runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch)),
+      // Reviewer invocation is intentionally unauthenticated: retaining HOME/USER to
+      // make a provider CLI work would reintroduce its host account and credentials.
+      env: isolated ? {} : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch)),
       detached: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -207,14 +228,35 @@ const runCli = async (
     child.on("error", (err) => {
       clearTimeout(timer);
       rmSync(scratch, { recursive: true, force: true });
-      resolve({ stdout, stderr: stderr + err.message, exitCode: null, timedOut });
+      resolve({ stdout, stderr: stderr + err.message, exitCode: null, timedOut, isolationEnforced: false });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
       rmSync(scratch, { recursive: true, force: true });
-      resolve({ stdout, stderr, exitCode: code, timedOut });
+      // A successful child establishes that sandbox-exec accepted the profile. On any
+      // error or timeout, be conservative: an invalid profile must not be represented
+      // as enforced isolation merely because sandbox-exec itself was launched.
+      resolve({
+        stdout,
+        stderr,
+        exitCode: code,
+        timedOut,
+        isolationEnforced: isolated && code === 0 && !timedOut,
+      });
     });
   });
+};
+
+const assertReviewerIsolation = (
+  workdir: string,
+  isolation: NonNullable<InvocationRequest["isolation"]>,
+): void => {
+  if (isolation.emptyEnvironment !== true || isolation.network !== "deny" || isolation.tools !== "none") {
+    throw new Error("reviewer isolation contract is incomplete");
+  }
+  if (realpathSync(isolation.packetRoot) !== workdir) {
+    throw new Error("reviewer packet root must be the invocation working directory");
+  }
 };
 
 const AUTHORITY_ENV = [
@@ -309,6 +351,35 @@ const runtimeProfile = (
   return lines.join("\n");
 };
 
+/**
+ * A reviewer cannot use the normal profile: it deliberately permits ordinary host reads
+ * so CTO and worker CLIs can operate in their supplied worktree. This profile starts
+ * from deny-default, grants only the packet directory plus OS runtime files, and denies
+ * all network traffic. Paths supplied by the caller are included as explicit denials as
+ * defense in depth; deny-default already keeps them inaccessible unless one is packetRoot.
+ */
+const reviewerProfile = (packetRoot: string, denyReadPaths: readonly string[]): string => {
+  const systemReadRoots = ["/System", "/usr", "/bin", "/sbin", "/Library/Apple"];
+  const lines = [
+    "(version 1)",
+    "(deny default)",
+    "(allow process*)",
+    "(allow sysctl-read)",
+    ...systemReadRoots.map((path) => `(allow file-read* (subpath ${quote(path)}))`),
+    `(allow file-read* (subpath ${quote(packetRoot)}))`,
+    `(allow file-write* (subpath ${quote(packetRoot)}))`,
+    "(allow file-write* (subpath \"/dev\"))",
+    "(allow file-write-data (literal \"/dev/null\"))",
+    "(deny network*)",
+  ];
+  for (const path of denyReadPaths) {
+    if (path && path !== packetRoot && !path.startsWith(`${packetRoot}/`)) {
+      lines.push(`(deny file-read* (subpath ${quote(path)}))`);
+    }
+  }
+  return lines.join("\n");
+};
+
 const quote = (value: string): string => `"${value.replace(/(["\\])/g, "\\$1")}"`;
 
 /**
@@ -373,7 +444,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     // Make the invocation *be* the constituted session, so the identity the independence
     // check was performed against is the identity that produces the answer.
     if (request.externalSessionId) args.push("--session-id", request.externalSessionId);
-    if (request.readOnly) {
+    if (request.readOnly || request.isolation) {
       // §18.3 — a blind reviewer judges exactly the inputs it was given. Granting it
       // repository tools invites it to go exploring, which both changes what it saw and
       // turns a single verdict into an open-ended tool loop. Plan mode blocks mutation;
@@ -398,6 +469,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       stdin: request.prompt,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
+      isolation: request.isolation,
     });
 
     const envelope = safeParse(result.stdout);
@@ -415,6 +487,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       error: result.timedOut ? "timeout" : result.exitCode === 0 ? null : result.stderr.slice(0, 2000),
       providerSessionId:
         typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null,
+      isolationAttested: request.isolation !== undefined && result.isolationEnforced,
     };
   }
 
@@ -516,6 +589,23 @@ export class CodexCliAdapter implements ProviderAdapter {
 
   async invoke(request: InvocationRequest): Promise<InvocationResult> {
     const started = Date.now();
+    if (request.isolation) {
+      // Codex's current CLI exposes a read-only sandbox, but no host-enforced
+      // no-tools mode. Running it and claiming packet-only isolation would be worse
+      // than an unavailable reviewer, so the review gate must select another adapter.
+      return {
+        ok: false,
+        text: "",
+        json: null,
+        provider: this.provider,
+        model: request.model ?? this.defaultModels.reviewer,
+        durationMs: Date.now() - started,
+        exitCode: null,
+        error: "Codex CLI cannot enforce reviewer tools:none isolation",
+        providerSessionId: null,
+        isolationAttested: false,
+      };
+    }
     const scratch = mkdtempSync(join(tmpdir(), "acp-codex-"));
     const lastMessage = join(scratch, "last-message.txt");
     const model = request.model ?? this.defaultModels.reviewer;
@@ -554,6 +644,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       exitCode: result.exitCode,
       error: result.timedOut ? "timeout" : result.exitCode === 0 ? null : result.stderr.slice(0, 2000),
       providerSessionId: /session[_ ]id[:=]\s*([0-9a-f-]{16,})/i.exec(result.stdout)?.[1] ?? null,
+      isolationAttested: false,
     };
   }
 

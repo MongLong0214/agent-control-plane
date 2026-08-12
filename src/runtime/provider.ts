@@ -31,6 +31,20 @@ export interface InvocationRequest {
    * independence check was performed against is not the session that produced the verdict.
    */
   externalSessionId?: string;
+  /**
+   * The non-negotiable boundary for a blind-review invocation. It deliberately does
+   * not share the more permissive CTO/worker runtime environment: a reviewer may
+   * inspect only its immutable packet and has no authority-bearing host tools.
+   */
+  isolation?: {
+    /** The only directory the reviewer may read or write. */
+    packetRoot: string;
+    /** Daemon and repository roots that must remain unreadable even if discovered. */
+    denyReadPaths: readonly string[];
+    emptyEnvironment: true;
+    network: "deny";
+    tools: "none";
+  };
 }
 
 export interface InvocationResult {
@@ -44,6 +58,11 @@ export interface InvocationResult {
   error: string | null;
   /** Session identity the provider reports for this invocation, when it reports one. */
   providerSessionId: string | null;
+  /**
+   * True only when this adapter actually enforced `InvocationRequest.isolation` for
+   * this invocation. A caller must not turn an unattested result into review evidence.
+   */
+  isolationAttested: boolean;
 }
 
 export interface SessionSpec {
