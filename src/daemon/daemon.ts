@@ -1,4 +1,5 @@
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
@@ -12,6 +13,8 @@ export interface DaemonOptions {
   stateDir: string;
   watchdogIntervalMs?: number;
   deliveryIntervalMs?: number;
+  /** Keeps the daemon-owned structured capacity sensors inside their freshness window. */
+  capacityRefreshIntervalMs?: number;
   buzz?: BuzzAdapter;
   /** Consecutive start failures before the supervisor should back off harder. */
   crashLoopThreshold?: number;
@@ -92,6 +95,7 @@ export class Daemon {
     }
 
     try {
+      await this.refreshCapacitySensors();
       const report = await this.reconcile();
       this.writeHealth(report);
 
@@ -182,6 +186,9 @@ export class Daemon {
   private startTimers(): void {
     const watchdogMs = this.options.watchdogIntervalMs ?? 60_000;
     const deliveryMs = this.options.deliveryIntervalMs ?? 5_000;
+    // The monitor's default freshness window is five minutes. Polling just inside that
+    // boundary keeps the local sensor current without turning it into a per-minute dashboard.
+    const capacityRefreshMs = this.options.capacityRefreshIntervalMs ?? 4 * 60_000;
 
     const watchdog = setInterval(() => {
       void this.runPeriodic("watchdog", async () => {
@@ -191,6 +198,12 @@ export class Daemon {
     }, watchdogMs);
     watchdog.unref();
     this.#timers.push(watchdog);
+
+    const capacitySensor = setInterval(() => {
+      void this.runPeriodic("capacity_sensor", () => this.refreshCapacitySensors());
+    }, capacityRefreshMs);
+    capacitySensor.unref();
+    this.#timers.push(capacitySensor);
 
     if (this.options.buzz) {
       const delivery = setInterval(() => {
@@ -203,6 +216,25 @@ export class Daemon {
       }, deliveryMs);
       delivery.unref();
       this.#timers.push(delivery);
+    }
+  }
+
+  /**
+   * PRD §14.2's structured local interface is daemon-owned evidence, not a static
+   * deployment artifact. Preserve the adapter's timestamp: manufacturing "now" here
+   * would let an old quota reading remain fresh forever.
+   */
+  private async refreshCapacitySensors(): Promise<void> {
+    const directory = this.cp.config.capacityDir;
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    chmodSync(directory, 0o700);
+
+    for (const adapter of this.cp.providers.production()) {
+      const reading = await adapter.probeCapacity();
+      const file = capacitySensorFile(directory, adapter.provider);
+      const temporary = join(directory, `.${adapter.provider}.${process.pid}.${randomUUID()}.json`);
+      writeFileSync(temporary, JSON.stringify(reading, null, 2), { mode: 0o600 });
+      renameSync(temporary, file);
     }
   }
 
@@ -339,6 +371,13 @@ const isAlive = (pid: number): boolean => {
   } catch {
     return false;
   }
+};
+
+const capacitySensorFile = (directory: string, provider: string): string => {
+  if (!/^[A-Za-z0-9_-]+$/.test(provider)) {
+    throw new Error(`unsafe provider id for capacity sensor: ${provider}`);
+  }
+  return join(directory, `${provider}.json`);
 };
 
 const readJson = <T>(path: string): T | null => {

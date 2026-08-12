@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { totalmem } from "node:os";
 
@@ -19,6 +21,7 @@ import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
+import type { ProviderRegistry } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 
@@ -78,10 +81,16 @@ export class Doctor {
     private readonly tasks: TaskGraph,
     private readonly claims: ClaimRegistry,
     private readonly capacity: CapacityMonitor,
+    private readonly providers: ProviderRegistry,
     private readonly continuity: ContinuityKernel,
     private readonly outbox: Outbox,
     private readonly github: GitHubKernel,
     private readonly worktrees: { orphans(repo: string, live: ReadonlySet<string>): Promise<string[]> },
+    private readonly capacitySensorFiles: {
+      directory: string;
+      freshnessMs: number;
+      maxClockSkewMs: number;
+    },
   ) {}
 
   async run(
@@ -102,6 +111,7 @@ export class Doctor {
       findings.push(...this.checkSessions(target ?? null));
     }
     if (scope === "system" || scope === "capacity") {
+      findings.push(...this.checkCapacitySensorFiles());
       findings.push(...(await this.checkCapacity()));
     }
     if (scope === "system") {
@@ -430,6 +440,79 @@ export class Doctor {
     return findings;
   }
 
+  /** The daemon owns these files, so their timestamp is independently checkable evidence. */
+  private checkCapacitySensorFiles(): Finding[] {
+    const findings: Finding[] = [];
+    const now = Date.parse(this.clock.nowIso());
+
+    for (const adapter of this.providers.production()) {
+      const provider = adapter.provider;
+      const file = capacitySensorFile(this.capacitySensorFiles.directory, provider);
+      if (!existsSync(file)) {
+        findings.push({
+          code: ReasonCode.CAPACITY_SENSOR_FILE_MISSING,
+          severity: "ERROR",
+          scope: `provider:${provider}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: { provider, file },
+          recommendedAction: "start the daemon capacity sensor or restore its structured local file",
+        });
+        continue;
+      }
+
+      let observedAt: string | null = null;
+      try {
+        const parsed = JSON.parse(readFileSync(file, "utf8")) as { observedAt?: unknown };
+        observedAt = typeof parsed.observedAt === "string" ? parsed.observedAt : null;
+      } catch (err) {
+        findings.push({
+          code: ReasonCode.CAPACITY_SENSOR_FILE_INVALID,
+          severity: "ERROR",
+          scope: `provider:${provider}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: { provider, file, error: safeErrorMessage(err) },
+          recommendedAction: "replace the capacity sensor file with a valid daemon observation",
+        });
+        continue;
+      }
+
+      const observedMs = observedAt ? Date.parse(observedAt) : Number.NaN;
+      const ageMs = now - observedMs;
+      if (!Number.isFinite(observedMs) || ageMs < -this.capacitySensorFiles.maxClockSkewMs) {
+        findings.push({
+          code: ReasonCode.CAPACITY_SENSOR_FILE_INVALID,
+          severity: "ERROR",
+          scope: `provider:${provider}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: { provider, file, observedAt, now: this.clock.nowIso() },
+          recommendedAction: "write a capacity observation with a valid current timestamp",
+        });
+        continue;
+      }
+      if (ageMs > this.capacitySensorFiles.freshnessMs) {
+        findings.push({
+          code: ReasonCode.CAPACITY_SENSOR_FILE_STALE,
+          severity: "WARN",
+          scope: `provider:${provider}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: {
+            provider,
+            file,
+            observedAt,
+            ageMs,
+            freshnessMs: this.capacitySensorFiles.freshnessMs,
+          },
+          recommendedAction: "refresh the daemon-owned capacity sensor before allocating new work",
+        });
+      }
+    }
+    return findings;
+  }
+
   /** CP-S45 — host pressure maps deterministically to DEGRADED. */
   private async checkHostResources(): Promise<Finding[]> {
     const findings: Finding[] = [];
@@ -656,6 +739,13 @@ const isProcessAlive = (pid: number): boolean => {
 const safeErrorMessage = (err: unknown): string => {
   const message = err instanceof Error ? err.message : String(err);
   return message.replace(/[\r\n\t]/g, " ").slice(0, 500);
+};
+
+const capacitySensorFile = (directory: string, provider: string): string => {
+  if (!/^[A-Za-z0-9_-]+$/.test(provider)) {
+    throw new Error(`unsafe provider id for capacity sensor: ${provider}`);
+  }
+  return join(directory, `${provider}.json`);
 };
 
 const loadAverage = async (): Promise<number[]> => {

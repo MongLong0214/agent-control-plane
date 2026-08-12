@@ -208,6 +208,33 @@ describe("round 2 daemon regressions", () => {
     );
   });
 
+  it("#244: daemon-owned capacity sensors expose missing and stale observations", async () => {
+    const { harness } = await makeDaemonStartHealthy();
+    const missing = await harness.cp.doctor.run("capacity");
+    expect(missing.findings.map((finding) => finding.code)).toContain(ReasonCode.CAPACITY_SENSOR_FILE_MISSING);
+
+    const stateDir = tempDir("acp-daemon-r2-");
+    const probe = vi.spyOn(harness.scripted, "probeCapacity");
+    const daemon = new Daemon(harness.cp, { stateDir, capacityRefreshIntervalMs: 1 });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+
+    const sensor = join(harness.cp.config.capacityDir, "scripted.json");
+    expect(JSON.parse(readFileSync(sensor, "utf8"))).toMatchObject({
+      provider: "scripted",
+      observedAt: harness.clock.nowIso(),
+    });
+
+    probe.mockClear();
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 25));
+    expect(probe).toHaveBeenCalled();
+    await daemon.stop();
+
+    harness.clock.advance(5 * 60 * 1000 + 1);
+    const stale = await harness.cp.doctor.run("capacity");
+    expect(stale.findings.map((finding) => finding.code)).toContain(ReasonCode.CAPACITY_SENSOR_FILE_STALE);
+  });
+
   it("#206: a real startup failure records and enforces crash-loop backoff", async () => {
     const { harness } = await makeDaemonStartHealthy();
     const stateDir = tempDir("acp-daemon-r2-");
