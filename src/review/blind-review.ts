@@ -1,9 +1,14 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import type { Clock } from "../core/clock.ts";
-import { digestOf } from "../core/digest.ts";
+import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
-import type { ArtifactStore } from "../db/artifacts.ts";
+import { EVIDENCE_PRODUCERS, type ArtifactStore } from "../db/artifacts.ts";
+import type { Db } from "../db/database.ts";
 import {
   ArtifactKind,
   type ExecutionMode,
@@ -13,7 +18,7 @@ import {
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
-import { diffDigest, diffText } from "../git/git.ts";
+import { diffDigest, git } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -60,6 +65,8 @@ export interface ReviewPacket {
     projectContext: boolean;
     /** §18.3 — what was deliberately withheld from the reviewer. */
     withheld: string[];
+    /** Immutable representations supplied for binary paths. */
+    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
   };
   coveredRepositories: string[];
   coveredFiles: string[];
@@ -85,6 +92,9 @@ export interface BlindReviewRequest {
   contractDigest: string;
   verification: VerificationReport;
 }
+
+/** Narrow capability the composition root hands to CandidatePipeline, not to agents. */
+export type BlindReviewInvoker = (request: BlindReviewRequest) => Promise<Decision<ReviewPacket>>;
 
 const VERDICT_SCHEMA = {
   type: "object",
@@ -131,8 +141,10 @@ const REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
  * it: `manualInvocation` exists solely to return the denial (§18.2).
  */
 export class BlindReviewGate {
+  readonly #pipelineCapability = Symbol("blind-review-control-plane");
   constructor(
     private readonly clock: Clock,
+    private readonly db: Db,
     private readonly audit: AuditLog,
     private readonly artifacts: ArtifactStore,
     private readonly sessions: SessionRegistry,
@@ -162,69 +174,82 @@ export class BlindReviewGate {
     );
   }
 
-  async review(request: BlindReviewRequest): Promise<Decision<ReviewPacket>> {
+  /** The only control-plane port that can invoke the automatic review transition. */
+  controlPlaneInvoker(): BlindReviewInvoker {
+    return (request) => this.review(request, this.#pipelineCapability);
+  }
+
+  async review(
+    request: BlindReviewRequest,
+    capability?: symbol,
+  ): Promise<Decision<ReviewPacket>> {
+    if (capability !== this.#pipelineCapability) {
+      return this.manualInvocation("unscoped-review-call", request.runId) as Decision<ReviewPacket>;
+    }
     const snapshotDigest = candidateSnapshotDigest(request.snapshot);
 
-    if (request.verification.status !== "PASS") {
-      return deny(
-        ReasonCode.REVIEW_REQUIRED,
-        "blind review runs only after deterministic verification passes",
-        { runId: request.runId, verificationStatus: request.verification.status },
-      );
-    }
-    if (request.verification.candidateSnapshotDigest !== snapshotDigest) {
-      return deny(ReasonCode.EVIDENCE_STALE, "verification evidence is bound to a different candidate", {
-        verificationSnapshot: request.verification.candidateSnapshotDigest,
-        snapshotDigest,
-      });
-    }
+    // The caller's JSON is a transport envelope, never evidence. In particular, a caller
+    // cannot manufacture a PASS report and use the public object graph as a second review
+    // entrance: the exact contract and verification report are reloaded from immutable,
+    // trusted artifacts and corroborated against the engine's result rows.
+    const trusted = this.trustedInputs(request, snapshotDigest);
+    if (!trusted.allowed) return trusted as Decision<ReviewPacket>;
+    request = trusted.value;
 
     const expected = snapshotCoverageTargets(request.snapshot);
     const reviewer = await this.constituteReviewer(request.runId);
     if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
-    const { sessionId, incarnation, externalSessionId, generation, preference, roleKey } =
-      reviewer.value;
+    const reviewers = [reviewer.value];
+    let authoritativeReviewer = reviewer.value;
 
     try {
       const collected = await this.collectDiffs(request.snapshot);
       if (!collected.allowed) return collected as Decision<ReviewPacket>;
-      const { diffs, unreviewable } = collected.value;
+      const { diffs, binaryArtifacts } = collected.value;
 
-      const totalChars = diffs.reduce((n, d) => n + d.diff.length, 0);
+      const totalChars = diffs.reduce((n, d) => n + d.diff.length, 0) + this.promptOverhead(request);
       const chunked = totalChars > CHUNK_THRESHOLD_CHARS;
-      const reviewer = { sessionId, externalSessionId };
 
       const outcome = chunked
-        ? await this.chunkedReview(request, diffs, preference, reviewer)
-        : await this.singleReview(request, diffs, preference, reviewer);
+        ? await this.chunkedReview(request, diffs, authoritativeReviewer)
+        : await this.singleReview(request, diffs, authoritativeReviewer);
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
+      authoritativeReviewer = outcome.value.reviewer;
+      if (authoritativeReviewer.sessionId !== reviewer.value.sessionId) reviewers.push(authoritativeReviewer);
+
+      // A reviewer binding is a fencing token. If something replaced it while the
+      // provider was working, its verdict is no longer attributable to the active role.
+      if (!this.bindings.isCurrent(authoritativeReviewer.roleKey, authoritativeReviewer.generation)) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "reviewer binding changed during review", {
+          runId: request.runId,
+          roleKey: authoritativeReviewer.roleKey,
+          generation: authoritativeReviewer.generation,
+        });
+      }
 
       const packet = this.assemble({
         request,
         snapshotDigest,
-        sessionId,
-        incarnation,
-        generation,
-        preference,
+        reviewer: authoritativeReviewer,
         chunked,
-        raw: {
-          ...outcome.value.verdict,
-          // Anything with no reviewable text is an omission, never a silent pass.
-          omittedItems: [...outcome.value.verdict.omittedItems, ...unreviewable],
-        },
+        raw: outcome.value.verdict,
         providerSessionId: outcome.value.providerSessionId,
         expected,
+        binaryArtifacts,
       });
 
       // §18.4 / CP-HI-04 — re-check independence at packet time: a session can join the
       // producer set after the reviewer was bound.
-      const independence = this.bindings.assertReviewerIndependence(request.runId, sessionId);
+      const independence = this.bindings.assertReviewerIndependence(
+        request.runId,
+        authoritativeReviewer.sessionId,
+      );
       if (!independence.allowed) {
         this.audit.record({
           kind: "BLIND_REVIEW_REJECTED",
           runId: request.runId,
-          sessionId,
+          sessionId: authoritativeReviewer.sessionId,
           reasonCode: independence.reasonCode,
           evidence: independence.evidence,
         });
@@ -237,8 +262,8 @@ export class BlindReviewGate {
       this.audit.record({
         kind: "BLIND_REVIEW_COMPLETED",
         runId: request.runId,
-        sessionId,
-        roleKey,
+        sessionId: authoritativeReviewer.sessionId,
+        roleKey: authoritativeReviewer.roleKey,
         reasonCode:
           validated.verdict === "PASS"
             ? ReasonCode.REVIEW_PASS
@@ -248,9 +273,9 @@ export class BlindReviewGate {
         evidence: {
           candidateSnapshotDigest: snapshotDigest,
           verdict: validated.verdict,
-          provider: preference.provider,
-          model: preference.model,
-          effort: preference.effort,
+          provider: authoritativeReviewer.preference.provider,
+          model: authoritativeReviewer.preference.model,
+          effort: authoritativeReviewer.preference.effort,
           coveredFiles: validated.coveredFiles.length,
           omittedItems: validated.omittedItems,
           chunked,
@@ -264,8 +289,8 @@ export class BlindReviewGate {
         runId: request.runId,
         text: validated.verdict,
         dims: {
-          provider: preference.provider,
-          model: preference.model,
+          provider: authoritativeReviewer.preference.provider,
+          model: authoritativeReviewer.preference.model,
           chunked,
           findingCategories: validated.findings.map((f) => f.category),
         },
@@ -286,9 +311,15 @@ export class BlindReviewGate {
       }
       return allow(ReasonCode.REVIEW_PASS, validated);
     } finally {
-      // The reviewer is per-run and per-candidate; it does not outlive its verdict.
-      this.bindings.revoke(roleKey, "blind review complete");
-      this.sessions.transition(sessionId, SessionLifecycle.STOPPED, "blind review complete");
+      // Do not revoke a replacement owned by another attempt. Each session constituted by
+      // this attempt is stopped explicitly, including the final chunk reviewer.
+      if (this.bindings.isCurrent(authoritativeReviewer.roleKey, authoritativeReviewer.generation)) {
+        this.bindings.revoke(authoritativeReviewer.roleKey, "blind review complete");
+      }
+      for (const reviewer of reviewers) {
+        this.sessions.transition(reviewer.sessionId, SessionLifecycle.STOPPED, "blind review complete");
+        rmSync(reviewer.workdir, { recursive: true, force: true });
+      }
     }
   }
 
@@ -309,6 +340,8 @@ export class BlindReviewGate {
       generation: number;
       preference: ReviewerPreference;
       roleKey: string;
+      /** Empty packet-only directory; candidate checkouts are never reviewer cwd. */
+      workdir: string;
     }>
   > {
     const roleKey = roleKeyFor(Role.BLIND_REVIEWER, { runId });
@@ -326,10 +359,15 @@ export class BlindReviewGate {
         continue;
       }
 
+      // The reviewer receives immutable packet data over stdin. Its cwd is intentionally
+      // empty so a read-only runtime cannot discover the candidate checkout by walking up
+      // from the daemon's repository. Provider-level OS confinement is an additional
+      // boundary; this directory is not represented as a sufficient substitute for it.
+      const workdir = mkdtempSync(join(tmpdir(), "acp-review-"));
       const handle = await adapter.startSession({
         model: preference.model,
         effort: preference.effort,
-        workdir: process.cwd(),
+        workdir,
         purpose,
       });
       const session = this.sessions.create({
@@ -361,6 +399,7 @@ export class BlindReviewGate {
           });
       if (!bound.allowed) {
         this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, "binding refused");
+        rmSync(workdir, { recursive: true, force: true });
         attempts.push({ preference, reason: bound.reasonCode });
         continue;
       }
@@ -372,6 +411,7 @@ export class BlindReviewGate {
         generation: bound.value.bindingGeneration,
         preference,
         roleKey,
+        workdir,
       });
     }
 
@@ -387,19 +427,25 @@ export class BlindReviewGate {
    *
    * Fails closed rather than substituting an empty string: a reviewer handed no diff can
    * still echo the touched paths back and return PASS, and the packet would then claim
-   * `diff: true` for content nobody saw (CP-HI-08). Binary changes have no reviewable
-   * text, so they are declared as omissions instead of being silently dropped.
+   * `diff: true` for content nobody saw (CP-HI-08). Git's binary patch is an immutable,
+   * digest-bound artifact representation, so a legitimate binary update is reviewable
+   * rather than a permanent omission.
    */
   private async collectDiffs(
     snapshot: CandidateSnapshot,
   ): Promise<
     Decision<{
       diffs: Array<{ identity: string; diff: string; files: string[] }>;
-      unreviewable: string[];
+      binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
     }>
   > {
     const diffs: Array<{ identity: string; diff: string; files: string[] }> = [];
-    const unreviewable: string[] = [];
+    const binaryArtifacts: Array<{
+      repository: string;
+      path: string;
+      digest: string;
+      method: "git-binary-patch";
+    }> = [];
 
     for (const repo of snapshot.repositories) {
       const record = this.repositories.byIdentity(repo.identity);
@@ -411,7 +457,14 @@ export class BlindReviewGate {
         );
       }
 
-      const diff = await diffText(record.checkoutPath, repo.baseHead, repo.candidateHead);
+      const diff = (await git(record.checkoutPath, [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--full-index",
+        "--binary",
+        `${repo.baseHead}..${repo.candidateHead}`,
+      ])).stdout;
       // The diff must be the one the frozen candidate describes.
       const observedDigest = await diffDigest(record.checkoutPath, repo.baseHead, repo.candidateHead);
       if (observedDigest !== repo.diffDigest) {
@@ -422,32 +475,42 @@ export class BlindReviewGate {
         });
       }
 
-      for (const path of repo.touchedPaths) {
-        if (new RegExp(`^Binary files .*${escapeRegExp(path)}`, "m").test(diff)) {
-          unreviewable.push(`${repo.identity}:${path} (binary, no reviewable text)`);
+      for (const section of diff.split(/(?=^diff --git )/m).filter(Boolean)) {
+        if (!section.includes("GIT binary patch")) continue;
+        const path = /^diff --git a\/(.+?) b\//m.exec(section)?.[1];
+        if (!path || !repo.touchedPaths.includes(path)) {
+          return deny(ReasonCode.EVIDENCE_MISSING, "binary patch cannot be bound to a touched path", {
+            identity: repo.identity,
+            section: section.slice(0, 200),
+          });
         }
+        binaryArtifacts.push({
+          repository: repo.identity,
+          path,
+          digest: sha256(section),
+          method: "git-binary-patch",
+        });
       }
 
       diffs.push({ identity: repo.identity, diff, files: repo.touchedPaths });
     }
 
-    return allow(ReasonCode.OK, { diffs, unreviewable });
+    return allow(ReasonCode.OK, { diffs, binaryArtifacts });
   }
 
   private async singleReview(
     request: BlindReviewRequest,
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
-    preference: ReviewerPreference,
-    reviewer: { sessionId: string; externalSessionId: string },
-  ): Promise<Decision<{ verdict: RawVerdict; providerSessionId: string | null }>> {
-    const adapter = this.providers.require(preference.provider);
+    reviewer: ReviewerBinding,
+  ): Promise<Decision<ReviewOutcome>> {
+    const adapter = this.providers.require(reviewer.preference.provider);
     const result = await adapter.invoke({
       prompt: this.buildPrompt(request, diffs),
       systemPrompt: REVIEWER_SYSTEM_PROMPT,
-      workdir: process.cwd(),
+      workdir: reviewer.workdir,
       timeoutMs: REVIEW_TIMEOUT_MS,
-      model: preference.model,
-      effort: preference.effort ?? undefined,
+      model: reviewer.preference.model,
+      effort: reviewer.preference.effort ?? undefined,
       responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
       readOnly: true,
       correlationId: `${request.runId}:${reviewer.sessionId}`,
@@ -459,7 +522,7 @@ export class BlindReviewGate {
     if (!result.ok) {
       return deny(ReasonCode.EVIDENCE_MISSING, "reviewer invocation did not complete", {
         runId: request.runId,
-        provider: preference.provider,
+        provider: reviewer.preference.provider,
         exitCode: result.exitCode,
         error: result.error,
       });
@@ -469,12 +532,14 @@ export class BlindReviewGate {
     if (!parsed) {
       return deny(ReasonCode.EVIDENCE_MISSING, "reviewer did not return a parsable verdict", {
         runId: request.runId,
-        provider: preference.provider,
+        provider: reviewer.preference.provider,
         error: result.error,
         raw: result.text.slice(0, 500),
       });
     }
-    return allow(ReasonCode.OK, { verdict: parsed, providerSessionId: result.providerSessionId });
+    const attested = this.assertInvocationIdentity(request.runId, reviewer, result.providerSessionId);
+    if (!attested.allowed) return attested as Decision<ReviewOutcome>;
+    return allow(ReasonCode.OK, { verdict: parsed, providerSessionId: result.providerSessionId!, reviewer });
   }
 
   /**
@@ -484,24 +549,43 @@ export class BlindReviewGate {
   private async chunkedReview(
     request: BlindReviewRequest,
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
-    preference: ReviewerPreference,
-    reviewer: { sessionId: string; externalSessionId: string },
-  ): Promise<Decision<{ verdict: RawVerdict; providerSessionId: string | null }>> {
-    const adapter = this.providers.require(preference.provider);
-    const chunks = splitDiffs(diffs, CHUNK_THRESHOLD_CHARS);
+    reviewer: ReviewerBinding,
+  ): Promise<Decision<ReviewOutcome>> {
+    const adapter = this.providers.require(reviewer.preference.provider);
+    // A chunk adds repository/file fences and the chunk heading beyond the empty-prompt
+    // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
+    // the patch body, remains inside the review budget.
+    const chunkBudget = CHUNK_THRESHOLD_CHARS - this.promptOverhead(request) - 4_096;
+    if (chunkBudget <= 0) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "review prompt metadata exceeds the reviewer context budget", {
+        runId: request.runId,
+        overhead: this.promptOverhead(request),
+        budget: CHUNK_THRESHOLD_CHARS,
+      });
+    }
+    const chunks = splitDiffs(diffs, chunkBudget);
     const covered = new Set<string>();
     const findings: ReviewFinding[] = [];
     const omitted: string[] = [];
     let worst: ReviewVerdict = "PASS";
 
     for (const [index, chunk] of chunks.entries()) {
+      const prompt = this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length });
+      if (prompt.length > CHUNK_THRESHOLD_CHARS) {
+        return deny(ReasonCode.EVIDENCE_MISSING, "a review chunk exceeds the context budget", {
+          runId: request.runId,
+          chunk: index + 1,
+          length: prompt.length,
+          budget: CHUNK_THRESHOLD_CHARS,
+        });
+      }
       const result = await adapter.invoke({
-        prompt: this.buildPrompt(request, chunk, { chunk: index + 1, of: chunks.length }),
+        prompt,
         systemPrompt: REVIEWER_SYSTEM_PROMPT,
-        workdir: process.cwd(),
+        workdir: reviewer.workdir,
         timeoutMs: REVIEW_TIMEOUT_MS,
-        model: preference.model,
-        effort: preference.effort ?? undefined,
+        model: reviewer.preference.model,
+        effort: reviewer.preference.effort ?? undefined,
         responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
         readOnly: true,
         correlationId: `${request.runId}:${reviewer.sessionId}:chunk${index + 1}`,
@@ -513,7 +597,9 @@ export class BlindReviewGate {
         omitted.push(...chunk.flatMap((c) => c.files.map((f) => `${c.identity}:${f}`)));
         continue;
       }
-      for (const file of parsed.coveredFiles) covered.add(file);
+      const chunkCoverage = validateChunkCoverage(parsed.coveredFiles, chunk);
+      if (!chunkCoverage.allowed) return chunkCoverage as Decision<ReviewOutcome>;
+      for (const file of chunkCoverage.value) covered.add(file);
       omitted.push(...parsed.omittedItems);
       findings.push(...parsed.findings);
       worst = worseVerdict(worst, parsed.verdict);
@@ -521,7 +607,7 @@ export class BlindReviewGate {
 
     // Coverage reducer: every touched file must have been seen by at least one chunk.
     const expected = snapshotCoverageTargets(request.snapshot).map((t) => `${t.identity}:${t.path}`);
-    const unseen = expected.filter((key) => !covered.has(key) && !covered.has(key.split(":").slice(1).join(":")));
+    const unseen = expected.filter((key) => !covered.has(key));
     omitted.push(...unseen);
 
     const reduced: RawVerdict = {
@@ -536,10 +622,20 @@ export class BlindReviewGate {
     const finalReviewer = await this.constituteReviewer(request.runId, "blind-review-final");
     if (!finalReviewer.allowed) return finalReviewer as Decision<never>;
 
+    const finalPrompt = this.buildFinalPrompt(request, reduced, chunks.length);
+    if (finalPrompt.length > CHUNK_THRESHOLD_CHARS) {
+      this.disposeReviewer(finalReviewer.value, "final review prompt exceeds context budget");
+      return deny(ReasonCode.EVIDENCE_MISSING, "the reduced final-review prompt exceeds the context budget", {
+        runId: request.runId,
+        length: finalPrompt.length,
+        budget: CHUNK_THRESHOLD_CHARS,
+      });
+    }
+
     const finalResult = await this.providers.require(finalReviewer.value.preference.provider).invoke({
-      prompt: this.buildFinalPrompt(request, reduced, chunks.length),
+      prompt: finalPrompt,
       systemPrompt: REVIEWER_SYSTEM_PROMPT,
-      workdir: process.cwd(),
+      workdir: finalReviewer.value.workdir,
       timeoutMs: REVIEW_TIMEOUT_MS,
       model: finalReviewer.value.preference.model,
       effort: finalReviewer.value.preference.effort ?? undefined,
@@ -550,6 +646,7 @@ export class BlindReviewGate {
     });
 
     if (!finalResult.ok) {
+      this.disposeReviewer(finalReviewer.value, "final review did not complete");
       return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer did not complete", {
         runId: request.runId,
         exitCode: finalResult.exitCode,
@@ -558,21 +655,35 @@ export class BlindReviewGate {
     }
     const finalVerdict = parseVerdict(finalResult.json ?? finalResult.text);
     if (!finalVerdict) {
+      this.disposeReviewer(finalReviewer.value, "final review returned invalid verdict");
       return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer returned no usable verdict", {
         runId: request.runId,
         raw: finalResult.text.slice(0, 500),
       });
     }
 
+    const attested = this.assertInvocationIdentity(
+      request.runId,
+      finalReviewer.value,
+      finalResult.providerSessionId,
+    );
+    if (!attested.allowed) {
+      this.disposeReviewer(finalReviewer.value, "provider session attestation failed");
+      return attested as Decision<ReviewOutcome>;
+    }
+
     return allow(ReasonCode.OK, {
       verdict: {
         // The final reviewer may not erase coverage gaps the reducer established.
         verdict: worseVerdict(finalVerdict.verdict, reduced.omittedItems.length > 0 ? "REVISE" : "PASS"),
-        coveredFiles: [...new Set([...reduced.coveredFiles, ...finalVerdict.coveredFiles])],
+        // Only a reviewer that actually saw a chunk may claim its paths. The final reviewer
+        // judges the reduced result and therefore cannot manufacture diff coverage.
+        coveredFiles: reduced.coveredFiles,
         omittedItems: [...new Set([...reduced.omittedItems, ...finalVerdict.omittedItems])],
         findings: dedupeFindings([...reduced.findings, ...finalVerdict.findings]),
       },
-      providerSessionId: finalResult.providerSessionId,
+      providerSessionId: finalResult.providerSessionId!,
+      reviewer: finalReviewer.value,
     });
   }
 
@@ -622,38 +733,12 @@ export class BlindReviewGate {
       "",
       "## Candidate snapshot manifest",
       "```json",
-      JSON.stringify(
-        {
-          contractDigest: request.snapshot.contractDigest,
-          repositories: request.snapshot.repositories.map((r) => ({
-            identity: r.identity,
-            baseHead: r.baseHead,
-            candidateHead: r.candidateHead,
-            touchedPaths: r.touchedPaths,
-          })),
-        },
-        null,
-        2,
-      ),
+      JSON.stringify(request.snapshot, null, 2),
       "```",
       "",
       "## Deterministic verification evidence",
       "```json",
-      JSON.stringify(
-        {
-          status: request.verification.status,
-          expectedInputs: request.verification.expectedInputs,
-          observedInputs: request.verification.observedInputs,
-          results: request.verification.results.map((r) => ({
-            commandId: r.commandId,
-            source: r.source,
-            status: r.status,
-            exactHead: r.exactHead,
-          })),
-        },
-        null,
-        2,
-      ),
+      JSON.stringify(request.verification, null, 2),
       "```",
       "",
       "## Actual diff",
@@ -699,26 +784,24 @@ export class BlindReviewGate {
   private assemble(input: {
     request: BlindReviewRequest;
     snapshotDigest: string;
-    sessionId: string;
-    incarnation: string;
-    generation: number;
-    preference: ReviewerPreference;
+    reviewer: ReviewerBinding;
     chunked: boolean;
     raw: RawVerdict;
     providerSessionId: string | null;
     expected: Array<{ identity: string; path: string }>;
+    binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
   }): ReviewPacket {
     return {
       runId: input.request.runId,
       candidateSnapshotDigest: input.snapshotDigest,
       contractDigest: input.request.contractDigest,
-      reviewerRoleBindingGeneration: input.generation,
-      reviewerSessionId: input.sessionId,
-      reviewerSessionIncarnation: input.incarnation,
+      reviewerRoleBindingGeneration: input.reviewer.generation,
+      reviewerSessionId: input.reviewer.sessionId,
+      reviewerSessionIncarnation: input.reviewer.incarnation,
       reviewerProviderSessionId: input.providerSessionId,
-      provider: input.preference.provider,
-      model: input.preference.model,
-      effort: input.preference.effort,
+      provider: input.reviewer.preference.provider,
+      model: input.reviewer.preference.model,
+      effort: input.reviewer.preference.effort,
       inputManifest: {
         contract: true,
         snapshotManifest: true,
@@ -732,9 +815,19 @@ export class BlindReviewGate {
           "chat history",
           "producer self-assessment",
           "previous verdicts",
+          "daemon state",
+          "trusted credentials",
+          "candidate checkout paths",
         ],
+        binaryArtifacts: input.binaryArtifacts,
       },
-      coveredRepositories: [...new Set(input.request.snapshot.repositories.map((r) => r.identity))],
+      coveredRepositories: [
+        ...new Set(
+          input.raw.coveredFiles
+            .map((file) => splitCoverageKey(file)?.identity)
+            .filter((identity): identity is string => identity !== undefined),
+        ),
+      ],
       coveredFiles: [...new Set(input.raw.coveredFiles)],
       omittedItems: [...new Set(input.raw.omittedItems)],
       verdict: input.raw.verdict,
@@ -742,6 +835,150 @@ export class BlindReviewGate {
       chunked: input.chunked,
       createdAt: this.clock.nowIso(),
     };
+  }
+
+  /** Reloads the only contract and verification evidence the gate is allowed to trust. */
+  private trustedInputs(
+    request: BlindReviewRequest,
+    snapshotDigest: string,
+  ): Decision<BlindReviewRequest> {
+    const run = this.db.get<{ contract_digest: string; current_candidate_digest: string | null }>(
+      `SELECT contract_digest, current_candidate_digest FROM runs WHERE run_id = ?`,
+      [request.runId],
+    );
+    if (!run || request.snapshot.runId !== request.runId) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "review request is not bound to a persisted run", {
+        runId: request.runId,
+        snapshotRunId: request.snapshot.runId,
+      });
+    }
+    if (run.current_candidate_digest !== snapshotDigest) {
+      return deny(ReasonCode.EVIDENCE_STALE, "review request is not the run's current candidate", {
+        runId: request.runId,
+        currentCandidate: run.current_candidate_digest,
+        snapshotDigest,
+      });
+    }
+    if (request.snapshot.contractDigest !== run.contract_digest || request.contractDigest !== run.contract_digest) {
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "review request is not pinned to the run contract", {
+        runContractDigest: run.contract_digest,
+        snapshotContractDigest: request.snapshot.contractDigest,
+        suppliedContractDigest: request.contractDigest,
+      });
+    }
+
+    const contract = this.artifacts
+      .list<TaskContract>(request.runId, ArtifactKind.TASK_CONTRACT)
+      .find((artifact) => !artifact.superseded && artifact.digest === run.contract_digest);
+    if (!contract || digestOf(contract.content) !== run.contract_digest || digestOf(request.contract) !== run.contract_digest) {
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "the supplied task contract is not the run's immutable contract", {
+        runId: request.runId,
+        expected: run.contract_digest,
+        found: contract?.digest ?? null,
+      });
+    }
+
+    const verification = this.artifacts.latestForSnapshot<VerificationReport>(
+      request.runId,
+      ArtifactKind.VERIFICATION,
+      snapshotDigest,
+    );
+    if (!verification || verification.producedBy !== EVIDENCE_PRODUCERS.VERIFICATION) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "review requires verification produced by the verification engine", {
+        runId: request.runId,
+        candidateSnapshotDigest: snapshotDigest,
+        producedBy: verification?.producedBy ?? null,
+      });
+    }
+    const report = verification.content;
+    if (
+      report.status !== "PASS" ||
+      report.runId !== request.runId ||
+      report.candidateSnapshotDigest !== snapshotDigest ||
+      report.contractDigest !== run.contract_digest ||
+      digestOf(request.verification) !== digestOf(report)
+    ) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "supplied verification report does not match trusted passing evidence", {
+        runId: request.runId,
+        status: report.status,
+        verificationRunId: report.runId,
+        verificationSnapshotDigest: report.candidateSnapshotDigest,
+        verificationContractDigest: report.contractDigest,
+      });
+    }
+
+    const rows = this.db.all<{
+      command_id: string;
+      repository_identity: string;
+      source: string;
+      exact_head: string;
+      status: string;
+    }>(
+      `SELECT command_id, repository_identity, source, exact_head, status
+         FROM verification_results WHERE run_id = ? AND candidate_snapshot_digest = ?`,
+      [request.runId, snapshotDigest],
+    );
+    const reported = new Set(
+      report.results.map((result) => `${result.commandId}\u0000${result.repositoryIdentity}\u0000${result.source}\u0000${result.exactHead}`),
+    );
+    const corroborated = rows.length >= report.expectedInputs && rows.every((row) =>
+      row.status === "PASS" && reported.has(`${row.command_id}\u0000${row.repository_identity}\u0000${row.source}\u0000${row.exact_head}`),
+    );
+    if (!corroborated || report.observedInputs !== report.expectedInputs || report.results.length < report.expectedInputs) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "passing verification report lacks corroborating result rows", {
+        runId: request.runId,
+        expectedInputs: report.expectedInputs,
+        observedInputs: report.observedInputs,
+        reportResults: report.results.length,
+        rows: rows.length,
+      });
+    }
+    return allow(ReasonCode.OK, { ...request, contract: contract.content, verification: report });
+  }
+
+  /** Provider attestation must name the constituted reviewer, not a resumed producer. */
+  private assertInvocationIdentity(
+    runId: string,
+    reviewer: ReviewerBinding,
+    providerSessionId: string | null,
+  ): Decision<void> {
+    if (!providerSessionId) {
+      return deny(ReasonCode.ISOLATION_LOST, "provider did not attest the constituted reviewer session", {
+        runId,
+        expectedProviderSessionId: reviewer.externalSessionId,
+        providerSessionId,
+      });
+    }
+    const producerExternalSessions = [...this.bindings.producerSessions(runId)]
+      .map((sessionId) => this.sessions.get(sessionId)?.incarnation.split("#", 1)[0])
+      .filter((sessionId): sessionId is string => Boolean(sessionId));
+    if (producerExternalSessions.includes(providerSessionId)) {
+      return deny(ReasonCode.REVIEWER_SESSION_IS_PRODUCER, "provider-attested reviewer session belongs to a producer", {
+        runId,
+        providerSessionId,
+        producerExternalSessions,
+      });
+    }
+    if (providerSessionId !== reviewer.externalSessionId) {
+      return deny(ReasonCode.ISOLATION_LOST, "provider did not attest the constituted reviewer session", {
+        runId,
+        expectedProviderSessionId: reviewer.externalSessionId,
+        providerSessionId,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  private promptOverhead(request: BlindReviewRequest): number {
+    return this.buildPrompt(request, []).length;
+  }
+
+  private disposeReviewer(reviewer: ReviewerBinding, reason: string): void {
+    if (this.bindings.isCurrent(reviewer.roleKey, reviewer.generation)) {
+      this.bindings.revoke(reviewer.roleKey, reason);
+    }
+    this.sessions.transition(reviewer.sessionId, SessionLifecycle.STOPPED, reason);
+    rmSync(reviewer.workdir, { recursive: true, force: true });
   }
 
   /**
@@ -762,7 +999,7 @@ export class BlindReviewGate {
     const covered = new Set(packet.coveredFiles.map(normalizeCoverageKey));
     const missing = expected
       .map((t) => `${t.identity}:${t.path}`)
-      .filter((key) => !covered.has(normalizeCoverageKey(key)) && !covered.has(normalizeCoverageKey(key.split(":").slice(1).join(":"))));
+      .filter((key) => !covered.has(normalizeCoverageKey(key)));
 
     if (missing.length === 0) return packet;
     return { ...packet, verdict: "REVISE", omittedItems: [...packet.omittedItems, ...missing] };
@@ -786,6 +1023,22 @@ interface RawVerdict {
   findings: ReviewFinding[];
 }
 
+interface ReviewerBinding {
+  sessionId: string;
+  incarnation: string;
+  externalSessionId: string;
+  generation: number;
+  preference: ReviewerPreference;
+  roleKey: string;
+  workdir: string;
+}
+
+interface ReviewOutcome {
+  verdict: RawVerdict;
+  providerSessionId: string;
+  reviewer: ReviewerBinding;
+}
+
 const REVIEWER_SYSTEM_PROMPT = [
   "You are an independent blind reviewer for a production gate.",
   "You did not write this change and you have no access to how it was produced.",
@@ -806,26 +1059,71 @@ const parseVerdict = (input: unknown): RawVerdict | null => {
           }
         })()
       : input;
-  if (!value || typeof value !== "object") return null;
+  if (!isPlainRecord(value) || !hasExactKeys(value, ["verdict", "coveredFiles", "omittedItems", "findings"])) return null;
   const record = value as Record<string, unknown>;
   const verdict = record["verdict"];
   if (verdict !== "PASS" && verdict !== "REVISE" && verdict !== "BLOCK") return null;
+  if (!isStringArray(record["coveredFiles"]) || !isStringArray(record["omittedItems"])) return null;
+  if (!Array.isArray(record["findings"]) || !record["findings"].every(isReviewFinding)) return null;
   return {
     verdict,
-    coveredFiles: asStringArray(record["coveredFiles"]),
-    omittedItems: asStringArray(record["omittedItems"]),
-    findings: Array.isArray(record["findings"])
-      ? (record["findings"] as ReviewFinding[]).filter((f) => f && typeof f === "object")
-      : [],
+    coveredFiles: record["coveredFiles"],
+    omittedItems: record["omittedItems"],
+    findings: record["findings"],
   };
 };
 
-const asStringArray = (value: unknown): string[] =>
-  Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+const REVIEW_CATEGORIES = new Set<ReviewFindingCategory>([
+  "correctness", "regression", "security", "scope", "performance", "maintainability", "evidence", "freshness", "source",
+]);
+const REVIEW_SEVERITIES = new Set<ReviewFinding["severity"]>(["INFO", "MINOR", "MAJOR", "BLOCKER"]);
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
+  (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+
+const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
+  Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+
+const isStringArray = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item): item is string => typeof item === "string");
+
+const isReviewFinding = (value: unknown): value is ReviewFinding => {
+  if (!isPlainRecord(value) || !hasExactKeys(value, ["category", "severity", "repository", "path", "summary", "detail"])) return false;
+  return (
+    typeof value["category"] === "string" && REVIEW_CATEGORIES.has(value["category"] as ReviewFindingCategory) &&
+    typeof value["severity"] === "string" && REVIEW_SEVERITIES.has(value["severity"] as ReviewFinding["severity"]) &&
+    typeof value["repository"] === "string" &&
+    (typeof value["path"] === "string" || value["path"] === null) &&
+    typeof value["summary"] === "string" &&
+    typeof value["detail"] === "string"
+  );
+};
 
 const normalizeCoverageKey = (key: string): string => key.replace(/^\.\//, "").trim();
 
-const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const splitCoverageKey = (key: string): { identity: string; path: string } | null => {
+  const separator = key.lastIndexOf(":");
+  if (separator <= 0 || separator === key.length - 1) return null;
+  return { identity: key.slice(0, separator), path: key.slice(separator + 1) };
+};
+
+const validateChunkCoverage = (
+  claims: readonly string[],
+  chunk: Array<{ identity: string; diff: string; files: string[] }>,
+): Decision<string[]> => {
+  const assigned = new Set(chunk.flatMap((part) => part.files.map((path) => `${part.identity}:${path}`)));
+  for (const claim of claims) {
+    const parsed = splitCoverageKey(claim);
+    if (!parsed || claim !== `${parsed.identity}:${parsed.path}` || !assigned.has(claim)) {
+      return deny(ReasonCode.COVERAGE_INCOMPLETE, "reviewer claimed coverage outside its assigned chunk", {
+        claim,
+        assigned: [...assigned],
+      });
+    }
+  }
+  return allow(ReasonCode.OK, [...new Set(claims)]);
+};
 
 const worseVerdict = (a: ReviewVerdict, b: ReviewVerdict): ReviewVerdict => {
   const rank = { PASS: 0, REVISE: 1, BLOCK: 2 } as const;
@@ -864,7 +1162,7 @@ const splitDiffs = (
   return chunks.length > 0 ? chunks : [[]];
 };
 
-/** Split one repository's diff on file boundaries so no file straddles two reviewers. */
+/** Split on file boundaries first, then bounded ranges when one file alone is oversized. */
 const splitByFile = (
   repo: { identity: string; diff: string; files: string[] },
   budget: number,
@@ -876,6 +1174,20 @@ const splitByFile = (
   let files: string[] = [];
   for (const section of sections) {
     const named = /^diff --git a\/(\S+) b\//m.exec(section)?.[1];
+    if (section.length > budget) {
+      if (buffer.length > 0) {
+        parts.push({ identity: repo.identity, diff: buffer, files });
+        buffer = "";
+        files = [];
+      }
+      if (!named) {
+        // A malformed patch cannot be attributed to a touched path, so do not pretend a
+        // range split supplies reviewable evidence for it.
+        return [{ identity: repo.identity, diff: repo.diff, files: [] }];
+      }
+      parts.push(...splitOversizedSection(repo.identity, named, section, budget));
+      continue;
+    }
     if (buffer.length + section.length > budget && buffer.length > 0) {
       parts.push({ identity: repo.identity, diff: buffer, files });
       buffer = "";
@@ -888,4 +1200,23 @@ const splitByFile = (
   return parts;
 };
 
-export const __testing = { splitDiffs, parseVerdict, worseVerdict };
+const splitOversizedSection = (
+  identity: string,
+  path: string,
+  section: string,
+  budget: number,
+): Array<{ identity: string; diff: string; files: string[] }> => {
+  const headerEnd = section.indexOf("\n") + 1;
+  const header = headerEnd > 0 ? section.slice(0, headerEnd) : "";
+  const payload = section.slice(header.length);
+  const capacity = budget - header.length;
+  if (capacity <= 0) return [{ identity, diff: section, files: [path] }];
+
+  const parts: Array<{ identity: string; diff: string; files: string[] }> = [];
+  for (let offset = 0; offset < payload.length; offset += capacity) {
+    parts.push({ identity, diff: `${header}${payload.slice(offset, offset + capacity)}`, files: [path] });
+  }
+  return parts;
+};
+
+export const __testing = { splitDiffs, parseVerdict, worseVerdict, validateChunkCoverage };

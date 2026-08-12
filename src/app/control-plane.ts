@@ -176,7 +176,7 @@ export class ControlPlane {
       this.db, this.clock, this.audit, this.artifacts, this.repositories, this.worktrees, this.telemetry,
     );
     this.review = new BlindReviewGate(
-      this.clock, this.audit, this.artifacts, this.sessions, this.bindings,
+      this.clock, this.db, this.audit, this.artifacts, this.sessions, this.bindings,
       this.providers, this.repositories, this.telemetry,
       config.reviewer ?? {
         preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
@@ -202,7 +202,7 @@ export class ControlPlane {
 
     this.pipeline = new CandidatePipeline(
       this.clock, this.audit, this.artifacts, this.runs, this.tasks, this.projects,
-      this.repositories, this.verification, this.review, this.ceo, this.bindings, this.outbox,
+      this.repositories, this.verification, this.review, this.review.controlPlaneInvoker(), this.ceo, this.bindings, this.outbox,
       this.telemetry,
     );
 
