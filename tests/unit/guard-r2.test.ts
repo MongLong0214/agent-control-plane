@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { mkdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { isoPlus } from "../../src/core/clock.ts";
 import { newAssignmentId } from "../../src/core/ids.ts";
@@ -91,6 +91,167 @@ describe("round-two managed-write regressions", () => {
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.SOURCE_READ_LEASE_CONFLICT);
     lease.value.release();
+  });
+
+  it("#337 ignores expired and non-source grants while sweeping expired source-read leases", async () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
+
+    let remoteEntered!: () => void;
+    const remoteEffectEntered = new Promise<void>((resolve) => {
+      remoteEntered = resolve;
+    });
+    let releaseRemote!: () => void;
+    const remoteMayFinish = new Promise<void>((resolve) => {
+      releaseRemote = resolve;
+    });
+    const remote = guard.authorize({
+      operation: WriteOperation.GITHUB_ISSUE,
+      repositoryIdentity: seeded.identity,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    }, async () => {
+      remoteEntered();
+      await remoteMayFinish;
+      return "remote";
+    });
+    await remoteEffectEntered;
+
+    const remoteLease = guard.acquireSourceReadLease(seeded.runId, [seeded.identity]);
+    expect(remoteLease.allowed).toBe(true);
+    expect(remoteLease.reasonCode).toBe(ReasonCode.OK);
+    if (!remoteLease.allowed) return;
+    remoteLease.value.release();
+    releaseRemote();
+    const completedRemote = await remote;
+    expect(completedRemote.allowed).toBe(true);
+    expect(completedRemote.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
+
+    const source = guard.evaluate(managedRequest(seeded, join(repo, "README.md")));
+    expect(source.allowed).toBe(true);
+    core.clock.advance(61_000);
+
+    const lease = guard.acquireSourceReadLease(seeded.runId, [seeded.identity]);
+    expect(lease.allowed).toBe(true);
+    expect(lease.reasonCode).toBe(ReasonCode.OK);
+    if (!lease.allowed) return;
+
+    core.clock.advance(61_000);
+    const afterLeaseExpiry = guard.evaluate(managedRequest(seeded, join(repo, "README.md")));
+    expect(afterLeaseExpiry.allowed).toBe(true);
+    expect(afterLeaseExpiry.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
+  });
+
+  it("#341 leases only ACTIVE participating runs and asserts every required repository", () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
+
+    core.db.run(`UPDATE runs SET state = 'BLOCKED' WHERE run_id = ?`, [seeded.runId]);
+    const terminal = guard.acquireSourceReadLease(seeded.runId, [seeded.identity]);
+    expect(terminal.allowed).toBe(false);
+    expect(terminal.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
+
+    core.db.run(`UPDATE runs SET state = 'ACTIVE' WHERE run_id = ?`, [seeded.runId]);
+    const outside = guard.acquireSourceReadLease(seeded.runId, [seeded.identity, "github:acme/other"]);
+    expect(outside.allowed).toBe(false);
+    expect(outside.reasonCode).toBe(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE);
+
+    const lease = guard.acquireSourceReadLease(seeded.runId, [seeded.identity]);
+    expect(lease.allowed).toBe(true);
+    expect(lease.reasonCode).toBe(ReasonCode.OK);
+    if (!lease.allowed) return;
+    const undercovered = guard.assertSourceReadLease(seeded.runId, lease.value.leaseId, [
+      seeded.identity,
+      "github:acme/other",
+    ]);
+    expect(undercovered.allowed).toBe(false);
+    expect(undercovered.reasonCode).toBe(ReasonCode.SOURCE_READ_LEASE_REQUIRED);
+    expect(guard.assertSourceReadLease(seeded.runId, lease.value.leaseId, [seeded.identity]).reasonCode).toBe(
+      ReasonCode.OK,
+    );
+
+    expect(core.audit.byKind("SOURCE_READ_LEASE_ACQUIRED")[0]?.reasonCode).toBe(ReasonCode.OK);
+    lease.value.release();
+    expect(core.audit.byKind("SOURCE_READ_LEASE_RELEASED").at(-1)?.reasonCode).toBe(ReasonCode.OK);
+  });
+
+  it("#347 rejects a second concurrent authorisation for the same repository target", async () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
+    addBranchClaim(core.db, core.clock, seeded, "claim_dev", "dev");
+    const request = managedRequest(seeded, join(repo, "src", "app.ts"));
+
+    let enteredFirstEffect!: () => void;
+    const firstEffectEntered = new Promise<void>((resolve) => {
+      enteredFirstEffect = resolve;
+    });
+    let releaseFirstEffect!: () => void;
+    const firstEffectMayFinish = new Promise<void>((resolve) => {
+      releaseFirstEffect = resolve;
+    });
+    const first = guard.authorize(request, async () => {
+      enteredFirstEffect();
+      await firstEffectMayFinish;
+      return "first";
+    });
+    await firstEffectEntered;
+
+    const second = await guard.authorize(request, () => "second");
+    expect(second.allowed).toBe(false);
+    expect(second.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+
+    releaseFirstEffect();
+    const completedFirst = await first;
+    expect(completedFirst.allowed).toBe(true);
+    expect(completedFirst.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
+  });
+
+  it("#339 detects a target inode replaced by rename while the effect is in flight", async () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
+    addBranchClaim(core.db, core.clock, seeded, "claim_dev", "dev");
+
+    const target = join(repo, "src", "app.ts");
+    const replacement = join(repo, "src", "replacement.ts");
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "original\n");
+    writeFileSync(replacement, "replacement\n");
+
+    const decision = await guard.authorize(managedRequest(seeded, target), () => {
+      renameSync(target, `${target}.before-swap`);
+      renameSync(replacement, target);
+      return "write attempted";
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_EFFECT_FENCE_LOST);
+  });
+
+  it("#340 permits the first write when its parent directories do not exist yet", async () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
+    addBranchClaim(core.db, core.clock, seeded, "claim_dev", "dev");
+
+    const target = join(repo, "src", "new", "file.ts");
+    const decision = await guard.authorize(managedRequest(seeded, target), () => {
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, "new\n");
+      return "created";
+    });
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
   });
 
   it("#98 snapshots every authority fact instead of trusting a caller-mutated request or grant", () => {
