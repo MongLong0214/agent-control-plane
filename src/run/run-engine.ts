@@ -216,6 +216,56 @@ export class RunEngine {
       const provisioned = await this.#cto.ensurePrimaryCto(run.projectId, runId);
       if (!provisioned.allowed) return provisioned as Decision<RunRow>;
       binding = provisioned.value;
+    } else {
+      // A projectless run has no project-scoped CTO to provision. Bootstrap binds its
+      // run-scoped CTO before dispatch; any other projectless run must prove an equally
+      // concrete owner before it can become ACTIVE.
+      if (
+        !run.ownerSessionId ||
+        run.ownerBindingGeneration == null ||
+        !run.ownerSessionIncarnation ||
+        !run.ownerRoleKey
+      ) {
+        return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "projectless run has no pinned run-scoped owner", {
+          runId,
+          kind: run.kind,
+        });
+      }
+      const active = this.db.get<{
+        session_id: string;
+        session_incarnation: string;
+        binding_generation: number;
+        role_key: string;
+      }>(
+        `SELECT session_id, session_incarnation, binding_generation, role_key
+           FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+        [run.ownerRoleKey],
+      );
+      if (
+        !active ||
+        active.session_id !== run.ownerSessionId ||
+        active.session_incarnation !== run.ownerSessionIncarnation ||
+        active.binding_generation !== run.ownerBindingGeneration
+      ) {
+        return deny(ReasonCode.RUN_OWNER_REVOKED, "projectless run owner is not the active binding", {
+          runId,
+          roleKey: run.ownerRoleKey,
+        });
+      }
+      binding = {
+        assignmentId: "pinned-run-owner",
+        roleKey: active.role_key,
+        role: run.kind === RunKind.PROJECT_BOOTSTRAP ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO,
+        projectId: null,
+        runId: run.kind === RunKind.PROJECT_BOOTSTRAP ? run.runId : null,
+        taskId: null,
+        sessionId: active.session_id,
+        sessionIncarnation: active.session_incarnation,
+        bindingGeneration: active.binding_generation,
+        mode: "PREFERRED",
+        status: "ACTIVE",
+        createdAt: run.createdAt,
+      };
     }
 
     return this.db.tx(() => {
@@ -223,9 +273,11 @@ export class RunEngine {
       const transition = canTransition(fresh.state, RunState.ACTIVE);
       if (!transition.allowed) return transition as Decision<RunRow>;
 
-      const pinnedManifest = fresh.projectId
-        ? (this.projects.get(fresh.projectId)?.activeManifestDigest ?? null)
-        : null;
+      // A caller may pin a manifest while QUEUED. That immutable pin is the dispatch
+      // contract; the current project manifest is used only when no pin exists yet.
+      const effectiveManifest =
+        fresh.pinnedManifestDigest ??
+        (fresh.projectId ? (this.projects.get(fresh.projectId)?.activeManifestDigest ?? null) : null);
 
       this.db.run(
         `UPDATE runs SET state = 'ACTIVE', dispatched_at = ?, state_reason = ?,
@@ -236,7 +288,7 @@ export class RunEngine {
         [
           this.clock.nowIso(), "dispatched", binding?.sessionId ?? null,
           binding?.bindingGeneration ?? null, binding?.sessionIncarnation ?? null,
-          binding?.roleKey ?? null, pinnedManifest, runId,
+          binding?.roleKey ?? null, effectiveManifest, runId,
         ],
       );
 
@@ -255,7 +307,7 @@ export class RunEngine {
             executionMode: fresh.executionMode,
             priority: fresh.priority,
             contractDigest: fresh.contractDigest,
-            pinnedManifestDigest: pinnedManifest,
+            pinnedManifestDigest: effectiveManifest,
           },
         });
       }
@@ -268,7 +320,7 @@ export class RunEngine {
         roleKey: binding?.roleKey ?? null,
         evidence: {
           ownerBindingGeneration: binding?.bindingGeneration ?? null,
-          pinnedManifestDigest: pinnedManifest,
+          pinnedManifestDigest: effectiveManifest,
         },
       });
 
@@ -358,17 +410,76 @@ export class RunEngine {
 
   attachRepository(
     runId: string,
-    input: { repositoryId: string; repositoryRole: string; baseBranch: string; mergeOrder?: number },
+    input: {
+      repositoryId: string;
+      repositoryRole: string;
+      baseBranch: string;
+      mergeOrder?: number;
+      ownerSessionId?: string;
+      ownerBindingGeneration?: number;
+    },
   ): Decision<void> {
     if (!this.repositories.byId(input.repositoryId)) {
       return deny(ReasonCode.NOT_FOUND, "unknown repository", input);
     }
-    this.db.run(
-      `INSERT OR REPLACE INTO run_repositories (run_id, repository_id, repository_role, base_branch, merge_order)
-       VALUES (?, ?, ?, ?, ?)`,
-      [runId, input.repositoryId, input.repositoryRole, input.baseBranch, input.mergeOrder ?? 0],
-    );
-    return allow(ReasonCode.OK, undefined);
+    if (!input.ownerSessionId || input.ownerBindingGeneration == null) {
+      return deny(ReasonCode.RUN_OWNER_REVOKED, "repository participation requires the current run owner", {
+        runId,
+      });
+    }
+    const ownerSessionId = input.ownerSessionId;
+    const ownerBindingGeneration = input.ownerBindingGeneration;
+    const owner = this.assertOwner(runId, ownerSessionId, ownerBindingGeneration);
+    if (!owner.allowed) return owner as Decision<void>;
+    if (owner.value.state !== RunState.ACTIVE) {
+      return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "repository participation is sealed outside ACTIVE", {
+        runId,
+        state: owner.value.state,
+      });
+    }
+
+    return this.db.tx(() => {
+      const freshOwner = this.assertOwner(runId, ownerSessionId, ownerBindingGeneration);
+      if (!freshOwner.allowed) return freshOwner as Decision<void>;
+      if (freshOwner.value.state !== RunState.ACTIVE) {
+        return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, "repository participation is sealed outside ACTIVE", {
+          runId,
+          state: freshOwner.value.state,
+        });
+      }
+
+      const mergeOrder = input.mergeOrder ?? 0;
+      const existing = this.db.get<{
+        repository_role: string;
+        base_branch: string;
+        merge_order: number;
+      }>(
+        `SELECT repository_role, base_branch, merge_order
+           FROM run_repositories WHERE run_id = ? AND repository_id = ?`,
+        [runId, input.repositoryId],
+      );
+      if (
+        existing &&
+        existing.repository_role === input.repositoryRole &&
+        existing.base_branch === input.baseBranch &&
+        existing.merge_order === mergeOrder
+      ) {
+        return allow(ReasonCode.OK, undefined);
+      }
+
+      this.db.run(
+        `INSERT OR REPLACE INTO run_repositories (run_id, repository_id, repository_role, base_branch, merge_order)
+         VALUES (?, ?, ?, ?, ?)`,
+        [runId, input.repositoryId, input.repositoryRole, input.baseBranch, mergeOrder],
+      );
+      this.invalidateCandidateInTx(runId, "repository participation changed", {
+        repositoryId: input.repositoryId,
+        repositoryRole: input.repositoryRole,
+        baseBranch: input.baseBranch,
+        mergeOrder,
+      });
+      return allow(ReasonCode.OK, undefined);
+    });
   }
 
   /**
@@ -417,6 +528,7 @@ export class RunEngine {
           WHERE run_id = ?`,
         [binding.sessionId, binding.bindingGeneration, binding.sessionIncarnation, binding.roleKey, runId],
       );
+      this.tasks.abandonStaleExecutions(runId, binding.bindingGeneration, "owner generation superseded");
       this.audit.record({
         kind: "RECOVERY_TAKEOVER",
         runId,
@@ -461,6 +573,73 @@ export class RunEngine {
         runId,
         evidence: { candidateSnapshotDigest },
       });
+    });
+  }
+
+  /**
+   * A source or participant change makes every candidate-bound claim unusable. The
+   * immutable records remain for audit, but none may be selected as current evidence.
+   */
+  invalidateCandidate(
+    runId: string,
+    reason: string,
+    evidence: Record<string, unknown> = {},
+  ): Decision<RunRow> {
+    return this.db.tx(() => {
+      const run = this.require(runId);
+      if (run.state === RunState.READY_FOR_CEO_REVIEW) {
+        if (!run.ownerSessionId || run.ownerBindingGeneration == null) {
+          return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "cannot return stale candidate to an unpinned owner", {
+            runId,
+          });
+        }
+        const owner = this.assertOwner(runId, run.ownerSessionId, run.ownerBindingGeneration);
+        if (!owner.allowed) return owner;
+      }
+      this.invalidateCandidateInTx(runId, reason, evidence);
+      if (run.state === RunState.READY_FOR_CEO_REVIEW) {
+        const revision = this.transition(runId, RunState.REVISION_REQUIRED, reason, evidence);
+        if (!revision.allowed) return revision;
+        const resumed = this.transition(runId, RunState.ACTIVE, "candidate invalidated for revision", evidence);
+        if (!resumed.allowed) return resumed;
+        const active = resumed.value;
+        if (
+          active.ownerSessionId &&
+          active.ownerBindingGeneration != null &&
+          active.ownerRoleKey
+        ) {
+          this.outbox.enqueue({
+            idempotencyKey: `candidate-invalidated:${runId}:${digestOf(evidence)}`,
+            roleKey: active.ownerRoleKey,
+            bindingGeneration: active.ownerBindingGeneration,
+            targetSessionId: active.ownerSessionId,
+            runId,
+            kind: MessageKind.REVISION_REQUEST,
+            payload: { runId, reasonCode: ReasonCode.SNAPSHOT_STALE, ...evidence },
+          });
+        }
+      }
+      return allow(ReasonCode.OK, this.require(runId));
+    });
+  }
+
+  private invalidateCandidateInTx(
+    runId: string,
+    reason: string,
+    evidence: Record<string, unknown>,
+  ): void {
+    const current = this.currentCandidate(runId);
+    this.db.run(`UPDATE runs SET current_candidate_digest = NULL WHERE run_id = ?`, [runId]);
+    this.db.run(
+      `UPDATE run_artifacts SET superseded = 1
+        WHERE run_id = ? AND candidate_snapshot_digest IS NOT NULL AND superseded = 0`,
+      [runId],
+    );
+    this.audit.record({
+      kind: "CANDIDATE_INVALIDATED",
+      runId,
+      reasonCode: ReasonCode.SNAPSHOT_STALE,
+      evidence: { reason, previousCandidateSnapshotDigest: current, ...evidence },
     });
   }
 
@@ -546,12 +725,14 @@ export class RunEngine {
     worktreeId: string | null;
     mergeOrder: number;
     mergeState: string;
+    activeManifestDigest: string | null;
   }> {
     return this.db.all(
       `SELECT rr.repository_id AS repositoryId, r.identity, r.checkout_path AS checkoutPath,
               rr.repository_role AS repositoryRole, rr.base_branch AS baseBranch,
               rr.work_branch AS workBranch, rr.worktree_id AS worktreeId,
-              rr.merge_order AS mergeOrder, rr.merge_state AS mergeState
+              rr.merge_order AS mergeOrder, rr.merge_state AS mergeState,
+              r.active_manifest_digest AS activeManifestDigest
          FROM run_repositories rr JOIN repositories r ON r.repository_id = rr.repository_id
         WHERE rr.run_id = ? ORDER BY rr.merge_order, r.identity`,
       [runId],
