@@ -151,12 +151,11 @@ export class ControlPlane {
 
     this.providers = new ProviderRegistry();
     for (const adapter of config.adapters ?? this.defaultAdapters()) {
-      if (!adapter.isProduction && !config.allowNonProductionAdapters) {
-        throw new Error(
-          `adapter '${adapter.provider}' fabricates responses; set allowNonProductionAdapters to register it`,
-        );
+      if (adapter.isProduction) this.providers.register(adapter);
+      else if (config.allowNonProductionAdapters) this.providers.registerTestAdapter(adapter);
+      else {
+        throw new Error(`adapter '${adapter.provider}' fabricates responses; it is test-only`);
       }
-      this.providers.register(adapter);
     }
 
     this.worktrees = new WorktreeManager(config.worktreeRoot);
@@ -262,10 +261,14 @@ export class ControlPlane {
       new ClaudeCliAdapter({
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "claude.json"),
+        environmentAllowlist: [],
+        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
       }),
       new CodexCliAdapter({
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "gpt.json"),
+        environmentAllowlist: [],
+        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
       }),
     ];
   }

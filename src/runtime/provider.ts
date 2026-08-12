@@ -59,6 +59,8 @@ export interface SessionHandle {
   model: string;
   effort: string | null;
   pid: number | null;
+  /** Constrained worktree used for the provider operation that constituted this session. */
+  workdir?: string;
 }
 
 /** PRD §14.3 — one bucket of a provider's quota. */
@@ -103,13 +105,41 @@ export interface ProviderAdapter {
   invoke(request: InvocationRequest): Promise<InvocationResult>;
   /** Cheap liveness check for an existing critical session (§14.3). */
   probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">;
+  /**
+   * Authenticated liveness check for the exact session that would receive a critical
+   * role. A binary version check cannot establish this: it says nothing about provider
+   * authentication, network reachability, or the constituted session.
+   */
+  probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE">;
   probeCapacity(): Promise<CapacityReading>;
 }
 
 export class ProviderRegistry {
   readonly #adapters = new Map<string, ProviderAdapter>();
 
+  /** Production registration is an explicit trusted act, never a test convenience. */
   register(adapter: ProviderAdapter): void {
+    if (!adapter.isProduction) {
+      throw new Error(`non-production adapter '${adapter.provider}' cannot be registered for production`);
+    }
+    this.insert(adapter);
+  }
+
+  /**
+   * Test composition may retain deterministic adapters for direct unit exercises, but
+   * every production routing path must still inspect `isProduction` independently.
+   */
+  registerTestAdapter(adapter: ProviderAdapter): void {
+    if (adapter.isProduction) {
+      throw new Error(`production adapter '${adapter.provider}' must use production registration`);
+    }
+    this.insert(adapter);
+  }
+
+  private insert(adapter: ProviderAdapter): void {
+    if (this.#adapters.has(adapter.provider)) {
+      throw new Error(`provider '${adapter.provider}' is already registered`);
+    }
     this.#adapters.set(adapter.provider, adapter);
   }
 

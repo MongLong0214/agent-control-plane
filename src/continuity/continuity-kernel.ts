@@ -27,6 +27,7 @@ export interface RequiredRole {
   capability: string;
   projectId: string | null;
   runId: string | null;
+  taskId: string | null;
   /** Roles the coverage plan must keep on distinct sessions (CP-HI-04). */
   isolationGroup: string;
   inFlight: boolean;
@@ -116,7 +117,8 @@ export class ContinuityKernel {
   /** §15.3 — computed before any failover, never after. */
   computeCoveragePlan(): RoleCoveragePlan {
     const requiredRoles = this.requiredRoles();
-    const capacities = this.capacity.all();
+    const productionProviders = new Set(this.providers.production().map((adapter) => adapter.provider));
+    const capacities = this.capacity.all().filter((capacity) => productionProviders.has(capacity.provider));
     const byProvider = new Map(capacities.map((c) => [c.provider, c]));
 
     const usable = (provider: string, capability: string): ProviderCapacity | null => {
@@ -135,7 +137,7 @@ export class ContinuityKernel {
     // The §15.1 order first, then any other registered provider that can serve the
     // capability. Coverage must reflect the providers this deployment actually has, not a
     // hardcoded roster: an unlisted provider is a fallback, not an absence of coverage.
-    const registered = this.providers.list().map((a) => a.provider);
+    const registered = this.providers.production().map((adapter) => adapter.provider);
     const candidatesFor = (capability: string): string[] => {
       const ranked = (PREFERENCE[capability] ?? []).filter((p) => byProvider.has(p) || registered.includes(p));
       // §14.5 — an optional provider never becomes coverage on its own. It is a
@@ -144,7 +146,9 @@ export class ContinuityKernel {
       return [...ranked, ...rest];
     };
 
-    for (const role of requiredRoles) {
+    // Preserve the capability needed by already-running work before reserving a fresh
+    // session for a role that is merely expected to become active later.
+    for (const role of [...requiredRoles].sort((left, right) => Number(right.inFlight) - Number(left.inFlight))) {
       const preferred = candidatesFor(role.capability);
       const taken = usedByGroup.get(role.isolationGroup) ?? new Set<string>();
 
@@ -183,10 +187,11 @@ export class ContinuityKernel {
           c.runtimeHealth === "UNKNOWN"),
     );
 
+    const activeFallback = requiredRoles.some((role) => this.bindings.active(role.roleKey)?.mode === "FALLBACK");
     const mode: ContinuityMode =
       outcome === "NO_VALID_COVERAGE"
         ? ContinuityMode.SURVIVAL
-        : anyFallback || requiredProvidersDown.length > 0 || outcome === "PARTIAL_COVERAGE"
+        : activeFallback || anyFallback || requiredProvidersDown.length > 0 || outcome === "PARTIAL_COVERAGE"
           ? ContinuityMode.DEGRADED
           : ContinuityMode.NORMAL;
 
@@ -224,18 +229,26 @@ export class ContinuityKernel {
   async evaluate(reason: string): Promise<RoleCoveragePlan> {
     await this.capacity.refresh(RefreshTrigger.CONTINUITY_EVALUATION);
     const plan = this.computeCoveragePlan();
-    const previous = this.mode();
+    let previous: ContinuityMode = ContinuityMode.NORMAL;
+    let transitioned = false;
 
-    // Record *when* coverage was computed, so a completion decision can tell a current
-    // mode from a stale one.
-    this.db.run(`UPDATE continuity_state SET evaluated_at = ? WHERE id = 1`, [this.clock.nowIso()]);
-
-    if (plan.mode !== previous) {
-      this.db.run(`UPDATE continuity_state SET mode = ?, reason_code = ?, changed_at = ? WHERE id = 1`, [
-        plan.mode,
-        plan.outcome,
-        this.clock.nowIso(),
-      ]);
+    // `evaluated_at` is a claim about the mode in the same row. Commit both state facts
+    // and the transition audit together, so a crash cannot leave a freshly evaluated
+    // NORMAL beside an uncommitted SURVIVAL decision.
+    this.db.tx(() => {
+      previous = this.mode();
+      transitioned = plan.mode !== previous;
+      if (transitioned) {
+        this.db.run(
+          `UPDATE continuity_state
+              SET mode = ?, reason_code = ?, changed_at = ?, evaluated_at = ?
+            WHERE id = 1`,
+          [plan.mode, plan.outcome, this.clock.nowIso(), this.clock.nowIso()],
+        );
+      } else {
+        this.db.run(`UPDATE continuity_state SET evaluated_at = ? WHERE id = 1`, [this.clock.nowIso()]);
+      }
+      if (transitioned) {
       this.audit.record({
         kind: "CONTINUITY_ACTIVATED",
         reasonCode:
@@ -253,6 +266,10 @@ export class ContinuityKernel {
           uncovered: plan.uncovered,
         },
       });
+      }
+    });
+
+    if (transitioned) {
       this.telemetry.record({
         scope: "continuity",
         name: "mode_transition",
@@ -283,7 +300,7 @@ export class ContinuityKernel {
   async failover(
     roleKey: string,
     role: Role,
-    scope: { projectId?: string | null; runId?: string | null },
+    scope: { projectId?: string | null; runId?: string | null; taskId?: string | null },
     reason: string,
   ): Promise<Decision<{ provider: string; generation: number }>> {
     const plan = await this.evaluate(`failover:${roleKey}`);
@@ -296,53 +313,33 @@ export class ContinuityKernel {
       );
     }
 
-    const adapter = this.providers.require(assignment.provider);
-    const model = adapter.defaultModels[role === Role.BLIND_REVIEWER ? "reviewer" : role === Role.CEO ? "ceo" : "cto"] ?? "default";
-    const handle = await adapter.startSession({
-      model,
-      effort: role === Role.BLIND_REVIEWER ? "xhigh" : null,
-      workdir: process.cwd(),
-      purpose: `continuity:${role}`,
-    });
-    const session = this.sessions.create({
-      provider: adapter.provider,
-      model,
-      effort: role === Role.BLIND_REVIEWER ? "xhigh" : null,
-      sessionId: `ses_cont_${handle.externalSessionId.replace(/-/g, "").slice(0, 18)}`,
-      incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
-    });
-    this.sessions.transition(session.sessionId, SessionLifecycle.READY, "continuity failover");
+    const expected = this.bindings.active(roleKey);
+    const provisioned = await this.provisionRoutableSession(role, assignment.provider, `continuity:${role}`);
+    if (!provisioned.allowed) return provisioned as Decision<{ provider: string; generation: number }>;
 
-    // Give the role a route before it becomes the role.
-    if (this.#buzz) {
-      const connected = await this.#buzz.connect(session.sessionId, `continuity:${role}`);
-      if (!connected.allowed) {
-        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "buzz connect failed");
-        return connected as Decision<{ provider: string; generation: number }>;
-      }
-      this.sessions.setBuzzAddress(session.sessionId, connected.value);
-    }
-
-    if (!this.#readiness) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, "no readiness probe");
-      return deny(
-        ReasonCode.SESSION_NOT_READY,
-        "no readiness probe is attached; a failover cannot be shown to have produced a routable session",
-        { roleKey, provider: assignment.provider },
-      );
-    }
-    const ready = await this.#readiness.checkSession(session.sessionId);
-    if (!ready.allowed) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "readiness failed");
-      return ready as Decision<{ provider: string; generation: number }>;
+    // This catches a newer binding that arrived while session creation, route connection,
+    // or readiness was awaited. BindingRegistry still performs the final generation check
+    // transactionally (see the handoff for the required cross-owner parameter).
+    const current = this.bindings.active(roleKey);
+    if (
+      current?.assignmentId !== expected?.assignmentId ||
+      current?.bindingGeneration !== expected?.bindingGeneration
+    ) {
+      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "coverage plan superseded");
+      return deny(ReasonCode.BINDING_GENERATION_STALE, "coverage plan was superseded by a newer binding", {
+        roleKey,
+        expectedGeneration: expected?.bindingGeneration ?? null,
+        actualGeneration: current?.bindingGeneration ?? null,
+      });
     }
 
     const switched = this.bindings.switchTo({
       roleKey,
       role,
-      sessionId: session.sessionId,
+      sessionId: provisioned.value.sessionId,
       projectId: scope.projectId ?? null,
       runId: scope.runId ?? null,
+      taskId: scope.taskId ?? null,
       mode: assignment.reason === "preferred" ? "PREFERRED" : "FALLBACK",
       reason: `continuity failover: ${reason}`,
       // A failover of a role that still owns live work is a takeover: the runs move to the
@@ -350,7 +347,7 @@ export class ContinuityKernel {
       takeover: true,
     });
     if (!switched.allowed) {
-      this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, "failover rejected");
+      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "failover rejected");
       return switched as Decision<{ provider: string; generation: number }>;
     }
 
@@ -400,6 +397,41 @@ export class ContinuityKernel {
         });
         continue;
       }
+      if (current.role === Role.CEO) {
+        // The current owner decision has no run pin to inspect. Until the authority path
+        // supplies an explicit finished-decision receipt, retaining the acting CEO is the
+        // only non-preemptive reading of §15.8.
+        deferred.push({
+          roleKey: assignment.roleKey,
+          reasonCode: ReasonCode.RESTORE_WOULD_PREEMPT_INFLIGHT_OWNER,
+        });
+        continue;
+      }
+      const provisioned = await this.provisionRoutableSession(current.role, assignment.provider, "continuity:restore");
+      if (!provisioned.allowed) {
+        deferred.push({ roleKey: assignment.roleKey, reasonCode: provisioned.reasonCode });
+        continue;
+      }
+      const switched = this.bindings.switchTo({
+        roleKey: assignment.roleKey,
+        role: current.role,
+        sessionId: provisioned.value.sessionId,
+        projectId: current.projectId,
+        runId: current.runId,
+        taskId: current.taskId,
+        mode: "PREFERRED",
+        reason: "continuity restoration",
+      });
+      if (!switched.allowed) {
+        this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "restoration rejected");
+        deferred.push({ roleKey: assignment.roleKey, reasonCode: switched.reasonCode });
+        continue;
+      }
+      const active = this.bindings.active(assignment.roleKey);
+      if (active?.sessionId !== provisioned.value.sessionId || active.mode !== "PREFERRED") {
+        deferred.push({ roleKey: assignment.roleKey, reasonCode: ReasonCode.SESSION_NOT_READY });
+        continue;
+      }
       restored.push(assignment.roleKey);
     }
 
@@ -407,6 +439,9 @@ export class ContinuityKernel {
       kind: "CONTINUITY_RESTORE",
       evidence: { restored, deferred, mode: plan.mode },
     });
+    // A recovered provider does not make the system NORMAL until every fallback binding
+    // is actually gone (or remains visible as DEGRADED because restoration was deferred).
+    await this.evaluate("post-restoration coverage");
     return { restored, deferred };
   }
 
@@ -440,6 +475,7 @@ export class ContinuityKernel {
         capability: "ceo",
         projectId: null,
         runId: null,
+        taskId: null,
         isolationGroup: "global",
         inFlight: true,
       },
@@ -457,6 +493,7 @@ export class ContinuityKernel {
         capability: "cto",
         projectId: project.projectId,
         runId: null,
+        taskId: null,
         isolationGroup: `project:${project.projectId}`,
         inFlight: hasWork,
       });
@@ -471,12 +508,103 @@ export class ContinuityKernel {
         capability: "blind-review",
         projectId: run.projectId,
         runId: run.runId,
+        taskId: null,
         isolationGroup: run.projectId ? `project:${run.projectId}` : `run:${run.runId}`,
         inFlight: true,
       });
     }
 
+    // Task executions record the worker session and task scope independently of their
+    // parent run owner. Every open execution is therefore a required continuity role.
+    for (const execution of this.db.all<{ run_id: string; task_id: string; project_id: string | null }>(
+      `SELECT e.run_id, e.task_id, r.project_id
+         FROM task_executions e JOIN runs r ON r.run_id = e.run_id
+        WHERE e.status = 'RUNNING'`,
+    )) {
+      roles.push({
+        roleKey: roleKeyFor(Role.WORKER, { taskId: execution.task_id }),
+        role: Role.WORKER,
+        capability: "worker",
+        projectId: execution.project_id,
+        runId: execution.run_id,
+        taskId: execution.task_id,
+        isolationGroup: `task:${execution.task_id}`,
+        inFlight: true,
+      });
+    }
+
     return roles;
+  }
+
+  /** Constitute a real, routable provider session before it is allowed to own a role. */
+  private async provisionRoutableSession(
+    role: Role,
+    provider: string,
+    purpose: string,
+  ): Promise<Decision<{ sessionId: string }>> {
+    const adapter = this.providers.require(provider);
+    if (!adapter.isProduction) {
+      return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "non-production adapter cannot provide continuity", {
+        provider,
+      });
+    }
+    const buzz = this.#buzz;
+    const readiness = this.#readiness;
+    if (!buzz || !readiness) {
+      return deny(
+        ReasonCode.SESSION_NOT_READY,
+        "a failover requires both a logical route and an independent readiness probe",
+        { provider, hasBuzz: Boolean(buzz), hasReadiness: Boolean(readiness) },
+      );
+    }
+    const model = adapter.defaultModels[
+      role === Role.BLIND_REVIEWER ? "reviewer" : role === Role.CEO ? "ceo" : role === Role.WORKER ? "worker" : "cto"
+    ] ?? "default";
+    let handle;
+    try {
+      handle = await adapter.startSession({
+        model,
+        effort: role === Role.BLIND_REVIEWER ? "xhigh" : null,
+        workdir: process.cwd(),
+        purpose,
+      });
+    } catch (err) {
+      return deny(ReasonCode.SESSION_NOT_READY, "provider refused to create a session", {
+        provider,
+        error: (err as Error).message,
+      });
+    }
+    const session = this.sessions.create({
+      provider: adapter.provider,
+      model,
+      effort: role === Role.BLIND_REVIEWER ? "xhigh" : null,
+      sessionId: `ses_cont_${handle.externalSessionId.replace(/-/g, "").slice(0, 18)}`,
+      incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
+      osPid: handle.pid,
+      workdir: handle.workdir ?? process.cwd(),
+    });
+    const connected = await buzz.connect(session.sessionId, purpose);
+    if (!connected.allowed) {
+      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "buzz connect failed");
+      return connected as Decision<{ sessionId: string }>;
+    }
+    this.sessions.setBuzzAddress(session.sessionId, connected.value);
+    const runtime = await adapter.probeSession(handle);
+    if (runtime !== "HEALTHY") {
+      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "provider session probe failed");
+      return deny(ReasonCode.SESSION_NOT_READY, "provider cannot prove the constituted session is ready", {
+        provider,
+        runtime,
+        sessionId: session.sessionId,
+      });
+    }
+    this.sessions.transition(session.sessionId, SessionLifecycle.READY, "provider session and route verified");
+    const checked = await readiness.checkSession(session.sessionId);
+    if (!checked.allowed) {
+      this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "readiness failed");
+      return checked as Decision<{ sessionId: string }>;
+    }
+    return allow(ReasonCode.OK, { sessionId: session.sessionId });
   }
 
   private partialAction(byProvider: Map<string, ProviderCapacity>): CoverageAction {
