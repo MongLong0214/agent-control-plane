@@ -35,6 +35,15 @@ const enqueue = (
     ttlMs,
   });
 
+const thrown = (fn: () => unknown): unknown => {
+  try {
+    fn();
+  } catch (err) {
+    return err;
+  }
+  throw new Error("expected operation to throw");
+};
+
 describe("round-2 outbox fencing", () => {
   it("#48 fences an in-flight old-generation claim during failover", () => {
     const { core, seeded } = seededCore();
@@ -88,25 +97,65 @@ describe("round-2 outbox fencing", () => {
     expect(refused.reasonCode).toBe(ReasonCode.OUTBOX_TARGET_NOT_CURRENT);
   });
 
-  it("#175 fences a retained message when its target enters ERROR", () => {
+  it("#175 atomically rejects pending and in-flight messages when their target enters ERROR or STOPPED", () => {
     const { core, seeded } = seededCore();
-    const message = enqueue(core, seeded, "outbox:terminal-target");
-    expect(message.allowed).toBe(true);
-    if (!message.allowed) return;
-    core.sessions.transition(seeded.sessionId, SessionLifecycle.ERROR, "runtime failed");
+    const inFlight = enqueue(core, seeded, "outbox:terminal-in-flight");
+    expect(inFlight.allowed).toBe(true);
+    if (!inFlight.allowed) return;
+    const claimed = core.outbox.claimDeliverable()[0]!;
+    const pending = enqueue(core, seeded, "outbox:terminal-pending");
+    expect(pending.allowed).toBe(true);
+    if (!pending.allowed) return;
 
+    const errored = core.sessions.transition(seeded.sessionId, SessionLifecycle.ERROR, "runtime failed");
+    expect(errored.reasonCode).toBe(ReasonCode.OK);
+
+    for (const messageId of [claimed.messageId, pending.value.messageId]) {
+      expect(
+        core.db.get<{ status: string; reason_code: string }>(
+          "SELECT status, reason_code FROM outbox WHERE message_id = ?",
+          [messageId],
+        ),
+      ).toEqual({
+        status: "REJECTED",
+        reason_code: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+      });
+    }
+    expect(core.outbox.markSent(claimed.messageId, claimed.claimToken).reasonCode).toBe(
+      ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+    );
     expect(core.outbox.claimDeliverable()).toHaveLength(0);
-    expect(core.outbox.get(message.value.messageId)?.status).toBe("REJECTED");
 
-    const missing = core.outbox.enqueue({
-      idempotencyKey: "outbox:missing-target",
-      roleKey: seeded.roleKey,
-      bindingGeneration: seeded.generation,
-      targetSessionId: "ses_does_not_exist",
-      runId: seeded.runId,
-      kind: MessageKind.RUN_DISPATCH,
-      payload: { runId: seeded.runId },
+    const stopped = seededCore();
+    const stoppedMessage = enqueue(stopped.core, stopped.seeded, "outbox:stopped-target");
+    expect(stoppedMessage.allowed).toBe(true);
+    if (!stoppedMessage.allowed) return;
+    const stoppedTransition = stopped.core.sessions.transition(
+      stopped.seeded.sessionId,
+      SessionLifecycle.STOPPED,
+      "operator stopped runtime",
+    );
+    expect(stoppedTransition.reasonCode).toBe(ReasonCode.OK);
+    expect(
+      stopped.core.db.get<{ status: string; reason_code: string }>(
+        "SELECT status, reason_code FROM outbox WHERE message_id = ?",
+        [stoppedMessage.value.messageId],
+      ),
+    ).toEqual({
+      status: "REJECTED",
+      reason_code: ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
     });
+
+    const missing = stopped.core.outbox.enqueue({
+      idempotencyKey: "outbox:missing-target",
+      roleKey: stopped.seeded.roleKey,
+      bindingGeneration: stopped.seeded.generation,
+      targetSessionId: "ses_does_not_exist",
+      runId: stopped.seeded.runId,
+      kind: MessageKind.RUN_DISPATCH,
+      payload: { runId: stopped.seeded.runId },
+    });
+    expect(missing.allowed).toBe(false);
     expect(missing.reasonCode).toBe(ReasonCode.OUTBOX_TARGET_NOT_CURRENT);
   });
 
@@ -114,6 +163,22 @@ describe("round-2 outbox fencing", () => {
     const { core, seeded } = seededCore();
     const first = enqueue(core, seeded, "outbox:collision");
     expect(first.allowed).toBe(true);
+    if (!first.allowed) return;
+    expect(
+      core.db.get<{ request_fingerprint: string }>(
+        "SELECT request_fingerprint FROM outbox WHERE message_id = ?",
+        [first.value.messageId],
+      )?.request_fingerprint,
+    ).toMatch(/^sha256:/);
+    expect(
+      thrown(() =>
+        core.db.run(
+          "UPDATE outbox SET request_fingerprint = 'sha256:forged' WHERE message_id = ?",
+          [first.value.messageId],
+        ),
+      ),
+    ).toMatchObject({ reasonCode: ReasonCode.OUTBOX_PAYLOAD_DIGEST_MISMATCH });
+
     const collision = core.outbox.enqueue({
       idempotencyKey: "outbox:collision",
       roleKey: seeded.roleKey,
@@ -133,7 +198,37 @@ describe("round-2 outbox fencing", () => {
     expect(core.outbox.listByRun(seeded.runId)).toHaveLength(1);
   });
 
-  it("#51/#174 records classified bounded retries and fails closed before the retry migration", () => {
+  it("#248 retains retarget provenance without admitting RETARGETED as a delivery state", () => {
+    const { core, seeded } = seededCore();
+    const message = enqueue(core, seeded, "outbox:retargeted");
+    expect(message.allowed).toBe(true);
+    if (!message.allowed) return;
+
+    const successor = core.sessions.create({ provider: "claude", model: "successor" });
+    core.sessions.transition(successor.sessionId, SessionLifecycle.READY, "test successor");
+    const switched = core.bindings.switchTo({
+      role: Role.PRIMARY_CTO,
+      projectId: seeded.projectId,
+      sessionId: successor.sessionId,
+      reason: "test retarget",
+      takeover: true,
+    });
+    expect(switched.reasonCode).toBe(ReasonCode.OK);
+    expect(
+      core.db.get<{ status: string; reason_code: string }>(
+        "SELECT status, reason_code FROM outbox WHERE message_id = ?",
+        [message.value.messageId],
+      ),
+    ).toEqual({ status: "PENDING", reason_code: ReasonCode.OUTBOX_RETARGETED });
+    expect(
+      core.db.get<{ sql: string }>(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbox'",
+      )?.sql,
+    ).not.toMatch(/CHECK\s*\(status\s+IN\s*\([^)]*'RETARGETED'/);
+    expect(core.outbox.claimDeliverable()[0]?.targetSessionId).toBe(successor.sessionId);
+  });
+
+  it("#51 terminally rejects a non-retryable delivery with its durable classification", () => {
     const { core, seeded } = seededCore();
     const message = enqueue(core, seeded, "outbox:permanent-failure");
     expect(message.allowed).toBe(true);
@@ -146,13 +241,31 @@ describe("round-2 outbox fencing", () => {
     });
 
     expect(failed.allowed).toBe(false);
-    expect(failed.reasonCode).toBe(ReasonCode.OUTBOX_RETRY_POLICY_UNAVAILABLE);
-    expect(core.outbox.get(claimed.messageId)?.status).toBe("REJECTED");
+    expect(failed.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
+    expect(
+      core.db.get<{
+        status: string;
+        failure_class: string;
+        retry_eligible: number;
+        next_attempt_at: string | null;
+        reason_code: string;
+      }>(
+        `SELECT status, failure_class, retry_eligible, next_attempt_at, reason_code
+           FROM outbox WHERE message_id = ?`,
+        [claimed.messageId],
+      ),
+    ).toEqual({
+      status: "REJECTED",
+      failure_class: "contract",
+      retry_eligible: 0,
+      next_attempt_at: null,
+      reason_code: ReasonCode.OUTBOX_DELIVERY_REJECTED,
+    });
     expect(core.outbox.claimDeliverable()).toHaveLength(0);
+  });
 
-    core.db.exec(`ALTER TABLE outbox ADD COLUMN failure_class TEXT;
-                  ALTER TABLE outbox ADD COLUMN retry_eligible INTEGER;
-                  ALTER TABLE outbox ADD COLUMN next_attempt_at TEXT;`);
+  it("#174 defers only retryable failures, then terminates at the bounded attempt policy", () => {
+    const { core, seeded } = seededCore();
     const retryMessage = enqueue(core, seeded, "outbox:bounded-retry", 3 * 60 * 60 * 1000);
     expect(retryMessage.allowed).toBe(true);
     if (!retryMessage.allowed) return;
@@ -163,65 +276,63 @@ describe("round-2 outbox fencing", () => {
     expect(core.outbox.get(retryMessage.value.messageId)?.status).toBe("PENDING");
     const initialClaims = core.outbox.claimDeliverable();
     expect(initialClaims).toHaveLength(1);
-    let retryClaim = initialClaims[0]!;
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const result = core.outbox.markAttemptFailed(retryClaim.messageId, retryClaim.claimToken, {
-        failureClass: "transient",
-        retryable: true,
-        error: "relay temporarily unavailable",
-      });
-      expect(result.reasonCode).toBe(
-        attempt === 2 ? ReasonCode.OUTBOX_DELIVERY_REJECTED : ReasonCode.OK,
-      );
-      const row = core.db.get<{
+    const firstClaim = initialClaims[0]!;
+    const deferred = core.outbox.markAttemptFailed(firstClaim.messageId, firstClaim.claimToken, {
+      failureClass: "transient",
+      retryable: true,
+      error: "relay temporarily unavailable",
+    });
+    expect(deferred.reasonCode).toBe(ReasonCode.OK);
+    const deferredRow = core.db.get<{
+      attempts: number;
+      status: string;
+      failure_class: string;
+      retry_eligible: number;
+      next_attempt_at: string | null;
+    }>(
+      `SELECT attempts, status, failure_class, retry_eligible, next_attempt_at
+         FROM outbox WHERE message_id = ?`,
+      [firstClaim.messageId],
+    )!;
+    expect(deferredRow).toMatchObject({
+      attempts: 1,
+      status: "PENDING",
+      failure_class: "transient",
+      retry_eligible: 1,
+    });
+    expect(deferredRow.next_attempt_at).not.toBeNull();
+    expect(core.outbox.claimDeliverable()).toHaveLength(0);
+    core.clock.advance(2_499);
+    expect(core.outbox.claimDeliverable()).toHaveLength(0);
+    core.clock.advance(1);
+    const retryClaim = core.outbox.claimDeliverable()[0]!;
+    const exhausted = core.outbox.markAttemptFailed(retryClaim.messageId, retryClaim.claimToken, {
+      failureClass: "transient",
+      retryable: true,
+      error: "relay temporarily unavailable",
+    });
+    expect(exhausted.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
+    expect(
+      core.db.get<{
         attempts: number;
         status: string;
         failure_class: string;
         retry_eligible: number;
         next_attempt_at: string | null;
+        reason_code: string;
       }>(
-        `SELECT attempts, status, failure_class, retry_eligible, next_attempt_at
+        `SELECT attempts, status, failure_class, retry_eligible, next_attempt_at, reason_code
            FROM outbox WHERE message_id = ?`,
         [retryClaim.messageId],
-      )!;
-      expect(row.attempts).toBe(attempt);
-      expect(row.failure_class).toBe("transient");
-      if (attempt === 2) {
-        expect(row.status).toBe("REJECTED");
-        expect(row.retry_eligible).toBe(0);
-        expect(row.next_attempt_at).toBeNull();
-        expect(
-          core.db.get<{ reason_code: string }>(
-            `SELECT reason_code FROM outbox WHERE message_id = ?`,
-            [retryClaim.messageId],
-          )?.reason_code,
-        ).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
-        break;
-      }
-      expect(row.status).toBe("PENDING");
-      expect(row.retry_eligible).toBe(1);
-      expect(core.outbox.claimDeliverable()).toHaveLength(0);
-      core.clock.advance(2_499);
-      expect(core.outbox.claimDeliverable()).toHaveLength(0);
-      core.clock.advance(1);
-      retryClaim = core.outbox.claimDeliverable()[0]!;
-    }
-
-    const permanent = enqueue(core, seeded, "outbox:permanent-with-policy");
-    expect(permanent.allowed).toBe(true);
-    if (!permanent.allowed) return;
-    const permanentClaim = core.outbox.claimDeliverable()[0]!;
-    const permanentlyRejected = core.outbox.markAttemptFailed(
-      permanentClaim.messageId,
-      permanentClaim.claimToken,
-      {
-        failureClass: "contract",
-        retryable: false,
-        error: "target address is invalid",
-      },
-    );
-    expect(permanentlyRejected.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
-    expect(core.outbox.get(permanentClaim.messageId)?.status).toBe("REJECTED");
+      ),
+    ).toEqual({
+      attempts: 2,
+      status: "REJECTED",
+      failure_class: "transient",
+      retry_eligible: 0,
+      next_attempt_at: null,
+      reason_code: ReasonCode.OUTBOX_DELIVERY_REJECTED,
+    });
 
     const zeroBackoff = enqueue(core, seeded, "outbox:zero-backoff");
     expect(zeroBackoff.allowed).toBe(true);
@@ -239,7 +350,7 @@ describe("round-2 outbox fencing", () => {
         error: "relay temporarily unavailable",
       },
     );
-    expect(refusedZeroBackoff.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
+    expect(refusedZeroBackoff.reasonCode).toBe(ReasonCode.OUTBOX_RETRY_POLICY_UNAVAILABLE);
     expect(core.outbox.get(zeroBackoffClaim.messageId)?.status).toBe("REJECTED");
   });
 });
@@ -262,7 +373,7 @@ describe("round-2 Buzz transport and authority", () => {
     expect(readFileSync(received, "utf8")).toBe("fenced body\n");
   });
 
-  it("#124/#214 never authorizes an actor by a delivery channel address", async () => {
+  it("#321/#124/#214 maps only an authenticated actor identity to an active binding", async () => {
     const { core, seeded } = seededCore();
     const adapter = new BuzzAdapter(
       core.db,
@@ -275,8 +386,43 @@ describe("round-2 Buzz transport and authority", () => {
     );
     const connected = await adapter.connect(seeded.sessionId, "shared-channel");
     expect(connected.allowed).toBe(true);
-
     expect(adapter.resolveActor("channel:shared-channel")).toBeNull();
+
+    const actorSession = core.sessions.create({ provider: "claude", model: "actor-runtime" });
+    if (!actorSession.sessionSecret) throw new Error("session secret was not issued");
+    expect(
+      core.sessions.transition(actorSession.sessionId, SessionLifecycle.READY, "actor runtime ready").reasonCode,
+    ).toBe(ReasonCode.OK);
+    expect(
+      core.bindings.bind({ role: Role.CEO, sessionId: actorSession.sessionId }).reasonCode,
+    ).toBe(ReasonCode.OK);
+
+    const unauthenticated = core.sessions.bindBuzzActor(
+      {
+        sessionId: actorSession.sessionId,
+        sessionSecret: actorSession.sessionSecret,
+        buzzActorId: "actor:untrusted",
+      },
+      { isAllowedActor: () => false },
+    );
+    expect(unauthenticated.allowed).toBe(false);
+    expect(unauthenticated.reasonCode).toBe(ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED);
+    expect(adapter.resolveActor("actor:untrusted")).toBeNull();
+
+    const authenticated = core.sessions.bindBuzzActor(
+      {
+        sessionId: actorSession.sessionId,
+        sessionSecret: actorSession.sessionSecret,
+        buzzActorId: "actor:trusted",
+      },
+      { isAllowedActor: (channel, actor) => channel === "buzz" && actor === "actor:trusted" },
+    );
+    expect(authenticated.reasonCode).toBe(ReasonCode.OK);
+    expect(adapter.resolveActor("actor:trusted")).toMatchObject({
+      role: Role.CEO,
+      sessionId: actorSession.sessionId,
+      status: "ACTIVE",
+    });
   });
 });
 

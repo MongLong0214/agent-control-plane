@@ -610,7 +610,10 @@ CREATE TABLE IF NOT EXISTS outbox (
   payload_digest     TEXT NOT NULL,
   -- A retry/recovery path must bind its request and policy explicitly rather than infer
   -- either from a mutable payload after an outage.
-  request_fingerprint TEXT,
+  -- The original enqueue identity is retained across retargeting. It must be present and
+  -- cannot be rewritten, otherwise an idempotency-key collision could be made to look like
+  -- a replay after the fact.
+  request_fingerprint TEXT NOT NULL,
   retry_max_attempts  INTEGER NOT NULL DEFAULT 5 CHECK (retry_max_attempts >= 0),
   retry_backoff_ms    INTEGER NOT NULL DEFAULT 1000 CHECK (retry_backoff_ms >= 0),
   expires_at         TEXT NOT NULL,
@@ -649,6 +652,13 @@ CREATE TABLE IF NOT EXISTS outbox (
   CHECK (retry_eligible = 0 OR next_attempt_at IS NOT NULL),
   CHECK (next_attempt_at IS NULL OR retry_eligible = 1)
 );
+
+CREATE TRIGGER IF NOT EXISTS outbox_request_fingerprint_immutable
+BEFORE UPDATE OF request_fingerprint ON outbox
+WHEN NEW.request_fingerprint <> OLD.request_fingerprint
+BEGIN
+  SELECT RAISE(ABORT, 'OUTBOX_REQUEST_FINGERPRINT_IMMUTABLE');
+END;
 
 -- §30.2 #5
 CREATE UNIQUE INDEX IF NOT EXISTS outbox_idempotency ON outbox(idempotency_key);

@@ -32,7 +32,7 @@ export interface OutboxMessage extends FencedEnvelope {
   status: "PENDING" | "IN_FLIGHT" | "SENT" | "ACKED" | "REJECTED" | "EXPIRED";
   idempotencyKey: string;
   /** Immutable identity of the original enqueue request, retained across retargeting. */
-  requestFingerprint: string | null;
+  requestFingerprint: string;
   attempts: number;
   /** Durable classification of the last failed delivery attempt (§34.1). */
   failureClass: FailureClass | null;
@@ -106,7 +106,6 @@ export class Outbox {
 
     const now = this.clock.nowIso();
     const requestFingerprint = requestFingerprintOf(input);
-    const withFingerprint = this.hasColumn("request_fingerprint");
     const message: OutboxMessage = {
       messageId: newMessageId(),
       idempotencyKey: input.idempotencyKey,
@@ -117,7 +116,7 @@ export class Outbox {
       kind: input.kind,
       payload: input.payload,
       payloadDigest: payloadDigestOf(input.payload),
-      requestFingerprint: withFingerprint ? requestFingerprint : null,
+      requestFingerprint,
       expiresAt: isoPlus(now, input.ttlMs ?? DEFAULT_TTL_MS),
       status: "PENDING",
       attempts: 0,
@@ -127,57 +126,30 @@ export class Outbox {
       createdAt: now,
     };
     this.db.run(
-      withFingerprint
-        ? `INSERT INTO outbox (message_id, idempotency_key, role_key, binding_generation,
-                               target_session_id, run_id, kind, payload_json, payload_digest,
-                               request_fingerprint, expires_at, created_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`
-        : `INSERT INTO outbox (message_id, idempotency_key, role_key, binding_generation,
-                               target_session_id, run_id, kind, payload_json, payload_digest,
-                               expires_at, created_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
-      withFingerprint
-        ? [
-            message.messageId,
-            message.idempotencyKey,
-            message.roleKey,
-            message.bindingGeneration,
-            message.targetSessionId,
-            message.runId,
-            message.kind,
-            JSON.stringify(message.payload),
-            message.payloadDigest,
-            requestFingerprint,
-            message.expiresAt,
-            message.createdAt,
-          ]
-        : [
-            message.messageId,
-            message.idempotencyKey,
-            message.roleKey,
-            message.bindingGeneration,
-            message.targetSessionId,
-            message.runId,
-            message.kind,
-            JSON.stringify(message.payload),
-            message.payloadDigest,
-            message.expiresAt,
-            message.createdAt,
-          ],
+      `INSERT INTO outbox (message_id, idempotency_key, role_key, binding_generation,
+                           target_session_id, run_id, kind, payload_json, payload_digest,
+                           request_fingerprint, expires_at, created_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')`,
+      [
+        message.messageId,
+        message.idempotencyKey,
+        message.roleKey,
+        message.bindingGeneration,
+        message.targetSessionId,
+        message.runId,
+        message.kind,
+        JSON.stringify(message.payload),
+        message.payloadDigest,
+        requestFingerprint,
+        message.expiresAt,
+        message.createdAt,
+      ],
     );
     return allow(ReasonCode.OK, message);
   }
 
   private replayDecision(existing: OutboxMessage, input: EnqueueInput): Decision<OutboxMessage> {
-    const matches =
-      existing.requestFingerprint === requestFingerprintOf(input) ||
-      (!this.hasColumn("request_fingerprint") &&
-        existing.roleKey === input.roleKey &&
-        existing.bindingGeneration === input.bindingGeneration &&
-        existing.targetSessionId === input.targetSessionId &&
-        existing.runId === (input.runId ?? null) &&
-        existing.kind === input.kind &&
-        existing.payloadDigest === payloadDigestOf(input.payload));
+    const matches = existing.requestFingerprint === requestFingerprintOf(input);
     if (matches) {
       return allow(ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, existing, {
         idempotencyKey: input.idempotencyKey,
@@ -422,19 +394,19 @@ export class Outbox {
       !current ||
       current.binding_generation !== generation ||
       current.session_id !== fromSessionId;
+    const expired = row.status === "EXPIRED" || row.expires_at <= this.clock.nowIso();
     const ineligible =
       row.status === "REJECTED" ||
-      row.status === "EXPIRED" ||
-      row.status === "ACKED" ||
-      row.expires_at <= this.clock.nowIso();
+      expired ||
+      row.status === "ACKED";
+    const rejectionCode = expired
+      ? ReasonCode.OUTBOX_EXPIRED
+      : ReasonCode.OUTBOX_STALE_GENERATION_REJECTED;
 
     if (staleGeneration || ineligible) {
       this.audit.record({
         kind: "OUTBOX_ACK_REJECTED",
-        reasonCode:
-          row.status === "EXPIRED" || row.expires_at <= this.clock.nowIso()
-            ? ReasonCode.OUTBOX_EXPIRED
-            : ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+        reasonCode: rejectionCode,
         runId: row.run_id,
         sessionId: fromSessionId,
         roleKey: row.role_key,
@@ -447,7 +419,7 @@ export class Outbox {
         },
       });
       return deny(
-        ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+        rejectionCode,
         staleGeneration
           ? "ack came from a generation that is no longer active"
           : `message is ${row.status} and cannot be acknowledged`,
@@ -635,11 +607,6 @@ export class Outbox {
     });
   }
 
-  private hasColumn(column: string): boolean {
-    return this.db
-      .all<{ name: string }>(`SELECT name FROM pragma_table_info('outbox') WHERE name = ?`, [column])
-      .length === 1;
-  }
 }
 
 interface RawOutbox {
@@ -652,7 +619,7 @@ interface RawOutbox {
   kind: string;
   payload_json: string;
   payload_digest: string;
-  request_fingerprint?: string | null;
+  request_fingerprint: string;
   expires_at: string;
   created_at: string;
   status: OutboxMessage["status"];
@@ -665,7 +632,7 @@ interface RawOutbox {
 const hydrate = (row: RawOutbox): OutboxMessage => ({
   messageId: row.message_id,
   idempotencyKey: row.idempotency_key,
-  requestFingerprint: row.request_fingerprint ?? null,
+  requestFingerprint: row.request_fingerprint,
   roleKey: row.role_key,
   bindingGeneration: row.binding_generation,
   targetSessionId: row.target_session_id,

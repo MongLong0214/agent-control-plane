@@ -71,15 +71,37 @@ const newRun = async (harness: Harness, projectId: string, repositoryId: string)
 describe("registry authority (CP-S04, CP-S05, CP-S26)", () => {
   it("CP-S05: the absolute checkout path exists only in the repository registry", async () => {
     const harness = makeHarness();
-    const { projectId } = await registerFixtureProject(harness);
+    const projectId = "checkout-path-ssot";
+    const project = harness.cp.projects.register({
+      projectId,
+      name: "fixture",
+      manifest: fixtureManifest(projectId),
+    });
+    expect(project.reasonCode).toBe(ReasonCode.OK);
+    if (!project.allowed || !project.value.activeManifestDigest) {
+      throw new Error("fixture project registration did not store a manifest");
+    }
+    const repository = await harness.cp.repositories.register({
+      checkoutPath: harness.repoPath,
+      projectId,
+      repositoryRole: "primary",
+      activeManifestDigest: project.value.activeManifestDigest,
+      identity: "github:acme/fixture",
+    });
+    expect(repository.reasonCode).toBe(ReasonCode.OK);
+    if (!repository.allowed) throw new Error(repository.message);
 
-    const repository = harness.cp.repositories.byProject(projectId)[0]!;
-    expect(repository.checkoutPath.startsWith("/")).toBe(true);
+    expect(repository.value.checkoutPath).toMatch(/^\//);
 
-    // The committed contract must contain no trace of it.
-    const manifest = harness.cp.projects.activeManifest(projectId)!;
-    expect(JSON.stringify(manifest.manifest)).not.toContain(repository.checkoutPath);
-    expect(JSON.stringify(manifest.manifest)).not.toMatch(/\/Users|\/private|\/tmp/);
+    // The value is re-read from durable manifest storage after registration carries the path.
+    const stored = harness.cp.db.get<{ content_json: string }>(
+      "SELECT content_json FROM manifests WHERE digest = ?",
+      [project.value.activeManifestDigest],
+    );
+    expect(stored?.content_json).not.toContain(harness.repoPath);
+    expect(stored?.content_json).not.toContain(repository.value.checkoutPath);
+    expect(stored?.content_json).not.toMatch(/\/Users|\/private|\/tmp/);
+    expect(JSON.stringify(harness.cp.projects.activeManifest(projectId)?.manifest)).toBe(stored?.content_json);
   });
 
   it("CP-S26: an unregistered repository gets a run-scoped binding and no active project", async () => {

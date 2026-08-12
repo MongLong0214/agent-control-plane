@@ -168,12 +168,12 @@ describe("outbox delivery is claimed, not merely selected", () => {
     expect(outbox.markSent(claimed.messageId, claimed.claimToken).allowed).toBe(true);
   });
 
-  it("fails closed when retry-policy storage is unavailable", () => {
+  it("rejects an unclassified delivery failure instead of retrying it", () => {
     const { outbox } = enqueued();
     const claimed = outbox.claimDeliverable()[0]!;
     const failed = outbox.markAttemptFailed(claimed.messageId, claimed.claimToken, "boom");
     expect(failed.allowed).toBe(false);
-    expect(failed.reasonCode).toBe(ReasonCode.OUTBOX_RETRY_POLICY_UNAVAILABLE);
+    expect(failed.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
     expect(outbox.get(claimed.messageId)?.status).toBe("REJECTED");
     expect(outbox.claimDeliverable()).toHaveLength(0);
   });
@@ -226,6 +226,7 @@ describe("an ACK from a revoked generation changes nothing", () => {
 
     const ack = core.outbox.acknowledge(message.value.messageId, core.seeded.sessionId, 1);
     expect(ack.allowed).toBe(false);
+    expect(ack.reasonCode).toBe(ReasonCode.OUTBOX_EXPIRED);
     expect(core.outbox.get(message.value.messageId)?.status).not.toBe("ACKED");
   });
 });
