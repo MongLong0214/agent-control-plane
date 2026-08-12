@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 /**
- * Files the independent review's MAJOR findings as GitHub issues.
+ * Files the independent review's findings as GitHub issues.
  *
- * The point is honesty about what is *not* fixed: BLOCKERs were closed with regression
- * tests, MAJORs are recorded as work with the reviewer's own reasoning attached, so the
- * next session can pick them up from the tracker rather than from a transcript.
+ * The point is honesty about what is *not* fixed. Every finding the reviewer reported
+ * becomes one issue carrying the reviewer's own reasoning, labelled by severity and area,
+ * so the next session works from the tracker rather than from a transcript.
  *
- * Idempotent: each issue body carries `<!-- acp-review:<area>#<n> -->`, and an existing
- * issue with that marker is updated instead of duplicated.
+ * Idempotent: each issue body carries `<!-- acp-review:<round>:<area>#<n> -->`, and an
+ * existing issue with that marker is updated instead of duplicated.
  *
  * Usage:
- *   node scripts/file-review-majors.mjs           # create/update issues
- *   node scripts/file-review-majors.mjs --dry-run # print what would be filed
+ *   node scripts/file-review-majors.mjs                     # BLOCKER and MAJOR
+ *   node scripts/file-review-majors.mjs --severity=MAJOR    # one severity
+ *   node scripts/file-review-majors.mjs --dry-run
  */
 import { execFile } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
@@ -21,7 +22,19 @@ import { fileURLToPath } from "node:url";
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const reviewDir = join(repoRoot, "evidence", "review");
 const dryRun = process.argv.includes("--dry-run");
-const LABEL = "review-major";
+const severityArg = process.argv.find((a) => a.startsWith("--severity="));
+const severities = severityArg
+  ? severityArg.slice("--severity=".length).split(",")
+  : ["BLOCKER", "MAJOR"];
+/** Review round, so a later round's findings never collide with an earlier one's markers. */
+const ROUND = process.argv.find((a) => a.startsWith("--round="))?.slice("--round=".length) ?? "r2";
+
+const LABELS = {
+  BLOCKER: { name: "review-blocker", color: "b60205", description: "BLOCKER from the independent production-readiness review" },
+  MAJOR: { name: "review-major", color: "d4c5f9", description: "MAJOR from the independent production-readiness review" },
+  MINOR: { name: "review-minor", color: "fef2c0", description: "MINOR from the independent production-readiness review" },
+  INFO: { name: "review-info", color: "c5def5", description: "INFO from the independent production-readiness review" },
+};
 
 const gh = (args, input) =>
   new Promise((resolve, reject) => {
@@ -45,28 +58,32 @@ const areas = readdirSync(reviewDir)
 const findings = [];
 for (const area of areas) {
   const report = JSON.parse(readFileSync(join(reviewDir, `${area}.json`), "utf8"));
-  const majors = (report.findings ?? []).filter((f) => f.severity === "MAJOR");
-  majors.forEach((finding, index) => {
-    findings.push({ area, index: index + 1, ...finding });
-  });
+  // Index within severity, so a marker stays stable even if unrelated findings change.
+  const counters = {};
+  for (const finding of report.findings ?? []) {
+    counters[finding.severity] = (counters[finding.severity] ?? 0) + 1;
+    if (!severities.includes(finding.severity)) continue;
+    findings.push({ area, index: counters[finding.severity], ...finding });
+  }
 }
 
 if (findings.length === 0) {
-  console.log("no MAJOR findings to file");
+  console.log("no findings to file");
   process.exit(0);
 }
 
-const marker = (f) => `<!-- acp-review:${f.area}#${f.index} -->`;
+const marker = (f) => `<!-- acp-review:${ROUND}:${f.area}#${f.severity}${f.index} -->`;
 const title = (f) => {
-  const head = `[review:${f.area}] ${f.summary}`;
+  const head = `[${f.severity.toLowerCase()}:${f.area}] ${f.summary}`;
   return head.length > 240 ? `${head.slice(0, 237)}...` : head;
 };
 const body = (f) =>
   [
     marker(f),
-    `Reported by the independent GPT-5.6 Sol production-readiness review as a **MAJOR**`,
-    `finding in the \`${f.area}\` area. Not a Hard Invariant violation — those were closed`,
-    `with regression tests — but real work that is deliberately not silently deferred.`,
+    `Reported by the independent GPT-5.6 Sol production-readiness review (round \`${ROUND}\`,`,
+    `read-only sandbox, reasoning effort \`xhigh\`) as a **${f.severity}** finding in the`,
+    `\`${f.area}\` area. Filed verbatim so the reasoning survives a session reset; it has not`,
+    `been re-verified by the implementer unless a comment on this issue says so.`,
     ``,
     `**Where** \`${f.file}${f.line ? `:${f.line}` : ""}\``,
     `**Category** ${f.category}`,
@@ -93,24 +110,29 @@ for (const issue of existing) {
 }
 
 if (!dryRun) {
-  const labels = await gh(["label", "list", "--limit", "100", "--json", "name"]);
-  if (!JSON.parse(labels).some((l) => l.name === LABEL)) {
-    await gh([
-      "label",
-      "create",
-      LABEL,
-      "--color",
-      "d4c5f9",
-      "--description",
-      "MAJOR finding from the independent production-readiness review",
-    ]);
+  const existingLabels = new Set(
+    JSON.parse(await gh(["label", "list", "--limit", "200", "--json", "name"])).map((l) => l.name),
+  );
+  for (const severity of severities) {
+    const label = LABELS[severity];
+    if (label && !existingLabels.has(label.name)) {
+      await gh(["label", "create", label.name, "--color", label.color, "--description", label.description]);
+      existingLabels.add(label.name);
+    }
+  }
+  for (const area of areas) {
+    const name = `area:${area}`;
+    if (!existingLabels.has(name)) {
+      await gh(["label", "create", name, "--color", "ededed", "--description", `Review area: ${area}`]);
+      existingLabels.add(name);
+    }
   }
 }
 
 let created = 0;
 let updated = 0;
 for (const finding of findings) {
-  const key = `${finding.area}#${finding.index}`;
+  const key = `${ROUND}:${finding.area}#${finding.severity}${finding.index}`;
   const number = byMarker.get(key);
   if (dryRun) {
     console.log(`${number ? `update #${number}` : "create"}  ${title(finding)}`);
@@ -121,7 +143,18 @@ for (const finding of findings) {
     updated += 1;
   } else {
     const url = await gh(
-      ["issue", "create", "--title", title(finding), "--label", LABEL, "--body-file", "-"],
+      [
+        "issue",
+        "create",
+        "--title",
+        title(finding),
+        "--label",
+        LABELS[finding.severity].name,
+        "--label",
+        `area:${finding.area}`,
+        "--body-file",
+        "-",
+      ],
       body(finding),
     );
     console.log(`created ${url}`);
@@ -131,6 +164,6 @@ for (const finding of findings) {
 
 console.log(
   dryRun
-    ? `${findings.length} MAJOR findings across ${areas.length} areas (dry run)`
-    : `filed ${created} new and updated ${updated} existing issues from ${findings.length} MAJOR findings`,
+    ? `${findings.length} findings across ${areas.length} areas (dry run)`
+    : `filed ${created} new and updated ${updated} existing issues from ${findings.length} findings`,
 );

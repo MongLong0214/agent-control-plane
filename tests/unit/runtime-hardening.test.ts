@@ -479,3 +479,35 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
     expect(applyPassingChange).toBeTypeOf("function");
   });
 });
+
+describe("round-2 review: completion, claims and post-merge coverage", () => {
+  it("refuses a COMPLETED transition that no completion authority carries (runtime#1)", async () => {
+    const harness = makeHarness();
+    const { runId } = await activeRun(harness);
+    harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "pretend");
+
+    const refused = harness.cp.runs.transition(runId, RunState.COMPLETED, "just say it is done");
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.COMPLETION_AUTHORITY_DENIED);
+    expect(harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+  });
+
+  it("refuses to release a claim without naming the run that holds it (runtime#12)", async () => {
+    const harness = makeHarness();
+    const first = await activeRun(harness);
+    const claimed = harness.cp.claims.acquire({
+      runId: first.runId,
+      ownerSessionId: first.run.ownerSessionId!,
+      ownerBindingGeneration: first.run.ownerBindingGeneration!,
+      ownerRoleKey: first.run.ownerRoleKey!,
+      repositoryIdentity: first.identity,
+      branch: "feature/F9-thing",
+    });
+    if (!claimed.allowed) throw new Error(claimed.message);
+
+    const refused = harness.cp.claims.release(claimed.value[0]!.claimId, "run_not_mine");
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE);
+    expect(harness.cp.claims.heldByRun(first.runId).length).toBeGreaterThan(0);
+  });
+});

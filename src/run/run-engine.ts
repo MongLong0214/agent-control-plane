@@ -39,6 +39,9 @@ export interface TaskContract {
   references: string[];
 }
 
+/** Who is allowed to write a COMPLETED run state. */
+export type CompletionAuthority = "production-gate" | "bootstrap-activation";
+
 export interface CreateRunInput {
   projectId?: string | null;
   kind?: RunKind;
@@ -273,12 +276,25 @@ export class RunEngine {
     });
   }
 
+  /**
+   * §19–21 — a state edge is not an authority. COMPLETED in particular is the claim the
+   * whole runtime exists to protect, so it may only be written by the component that
+   * checked the evidence: the production gate, or a bootstrap activation (§26.3).
+   */
   transition(
     runId: string,
     to: RunState,
     reason: string,
     evidence: Record<string, unknown> = {},
+    authority?: CompletionAuthority,
   ): Decision<RunRow> {
+    if (to === RunState.COMPLETED && !authority) {
+      return deny(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "only the production gate or a bootstrap activation may complete a run",
+        { runId, to },
+      );
+    }
     return this.db.tx(() => {
       const run = this.require(runId);
       const check = canTransition(run.state, to);

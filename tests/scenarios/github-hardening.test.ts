@@ -91,6 +91,21 @@ const openPull = async (fixture: Fixture, head = fixture.workBranch, exactHeadSh
   return prepared.value.pullNumber;
 };
 
+/** Publishes the gate, opens the PR and returns its number. */
+const openPullWithGate = async (fixture: Fixture) => {
+  const published = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
+  if (!published.allowed) throw new Error(published.message);
+  return openPull(fixture);
+};
+
+/** Performs the run's real merge and returns the merge commit, for post-merge tests. */
+const mergeForReal = async (fixture: Fixture) => {
+  const pullNumber = await openPullWithGate(fixture);
+  const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+  if (!merged.allowed) throw new Error(`${merged.reasonCode}: ${merged.message}`);
+  return merged.value.mergeCommitSha;
+};
+
 const mergeInput = (fixture: Fixture, pullNumber: number) => ({
   runId: fixture.runId,
   repositoryIdentity: fixture.identity,
@@ -378,10 +393,11 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
 
   it("uses the manifest's declared checks when the caller names none", async () => {
     const fixture = await setup();
+    const mergeSha = await mergeForReal(fixture);
     const refused = await fixture.harness.cp.github.postMergeVerify(
       fixture.runId,
       fixture.identity,
-      "9".repeat(40),
+      mergeSha,
     );
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
@@ -390,7 +406,7 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
 
   it("treats a check that has not completed as a failure", async () => {
     const fixture = await setup();
-    const mergeSha = "9".repeat(40);
+    const mergeSha = await mergeForReal(fixture);
     fixture.github.checkRuns.push({
       id: 9001,
       name: "project-ci",
@@ -546,23 +562,122 @@ describe("merge order and dependents are enforced by the kernel (§24.7)", () =>
 
   it("refuses a merge after any repository in the run failed post-merge verification", async () => {
     const fixture = await setup();
-    const published = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
-    if (!published.allowed) throw new Error(published.message);
-    const pullNumber = await openPull(fixture);
+    const pullNumber = await openPullWithGate(fixture);
+    const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    if (!merged.allowed) throw new Error(merged.message);
 
     // A failed post-merge check on this run blocks anything that follows it.
-    const mergeSha = "8".repeat(40);
-    fixture.github.setPostMergeCheck(mergeSha, "project-ci", "failure");
+    fixture.github.setPostMergeCheck(merged.value.mergeCommitSha, "project-ci", "failure");
     const verified = await fixture.harness.cp.github.postMergeVerify(
       fixture.runId,
       fixture.identity,
-      mergeSha,
+      merged.value.mergeCommitSha,
     );
     expect(verified.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
 
-    const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    const refused = await fixture.harness.cp.github.mergeEvaluate(mergeInput(fixture, pullNumber));
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.DEPENDENT_MERGE_BLOCKED);
-    expect(fixture.github.mergeCount).toBe(0);
+  });
+});
+
+describe("round-2 review: post-merge coverage and receipts", () => {
+  it("requires every declared check, not the subset the caller names (github#5)", async () => {
+    const github = new FakeGitHub();
+    const harness = makeHarness({ githubClient: github });
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+    const driven = await driveToReviewedCandidate(harness, {
+      workBranch: "feature/F1-thing",
+      manifestOverrides: {
+        ciWorkflows: [
+          { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null },
+          { path: ".github/workflows/sec.yml", checkName: "security", approvedDigest: null },
+        ],
+      },
+    });
+    github.setBranch("dev", driven.baseHead);
+    github.setBranch(driven.workBranch, driven.candidateHead);
+    const claimed = harness.cp.claims.acquire({
+      runId: driven.runId,
+      ownerSessionId: driven.ownerSessionId,
+      ownerBindingGeneration: driven.ownerBindingGeneration,
+      ownerRoleKey: harness.cp.runs.require(driven.runId).ownerRoleKey!,
+      repositoryIdentity: driven.identity,
+      branch: driven.workBranch,
+    });
+    if (!claimed.allowed) throw new Error(claimed.message);
+
+    const fixture: Fixture = {
+      harness,
+      github,
+      runId: driven.runId,
+      identity: driven.identity,
+      caller: {
+        ownerSessionId: driven.ownerSessionId,
+        ownerBindingGeneration: driven.ownerBindingGeneration,
+      },
+      head: driven.candidateHead,
+      base: driven.baseHead,
+      workBranch: driven.workBranch,
+      payload: {
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        contractDigest: driven.contractDigest,
+        verificationDigest: driven.verificationDigest,
+        blindReviewDigest: driven.blindReviewDigest,
+        humanGateDigest: NO_HUMAN_GATE_DIGEST,
+        bindingGeneration: driven.ownerBindingGeneration,
+        exactHead: driven.candidateHead,
+        timestamp: "2026-08-12T00:00:00.000Z",
+      },
+    };
+
+    const mergeSha = await mergeForReal(fixture);
+    // Only the check the caller named is green; the other declared check is missing.
+    github.setPostMergeCheck(mergeSha, "project-ci", "success");
+
+    const narrowed = await harness.cp.github.postMergeVerify(
+      driven.runId,
+      driven.identity,
+      mergeSha,
+      ["project-ci"],
+    );
+    expect(narrowed.allowed).toBe(false);
+    expect(narrowed.evidence["failed"]).toEqual([{ name: "security", conclusion: "missing" }]);
+
+    github.setPostMergeCheck(mergeSha, "security", "success");
+    const complete = await harness.cp.github.postMergeVerify(driven.runId, driven.identity, mergeSha, [
+      "project-ci",
+    ]);
+    expect(complete.allowed).toBe(true);
+  });
+
+  it("refuses a post-merge result for a commit this run never merged (github#6)", async () => {
+    const fixture = await setup();
+    const refused = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      "a".repeat(40),
+    );
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+  });
+
+  it("writes no receipt when GitHub refuses the merge (github#10)", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPullWithGate(fixture);
+    // The head moves after the gate and the PR read, so GitHub declines the merge.
+    const pull = fixture.github.pulls.find((p) => p.number === pullNumber)!;
+    const input = mergeInput(fixture, pullNumber);
+    pull.head.sha = "f".repeat(40);
+    fixture.github.checkRuns.find((c) => c.name === GATE_CHECK_NAME)!.head_sha = "f".repeat(40);
+
+    const refused = await fixture.harness.cp.github.mergeExecute({
+      ...input,
+      exactHeadSha: "f".repeat(40),
+    });
+    expect(refused.allowed).toBe(false);
+    const receipts = fixture.harness.cp.github.receipts(fixture.runId);
+    expect(receipts.some((r) => r.operation === "merge_execute")).toBe(false);
   });
 });

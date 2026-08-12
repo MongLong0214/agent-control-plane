@@ -477,10 +477,24 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
 
   it("post-merge verification treats a missing check as a failure, not a pass", async () => {
     const fixture = await setup();
+    const pullNumber = await prepared(fixture);
+    const merged = await fixture.harness.cp.github.mergeExecute({
+      ...{
+        runId: fixture.runId,
+        repositoryIdentity: fixture.identity,
+        pullNumber,
+        exactHeadSha: fixture.head,
+        expectedBaseSha: fixture.base,
+        mergeStrategy: "merge_commit" as const,
+        ownerSessionId: fixture.ownerSessionId,
+        ownerBindingGeneration: fixture.ownerBindingGeneration,
+      },
+    });
+    if (!merged.allowed) throw new Error(merged.message);
     const verified = await fixture.harness.cp.github.postMergeVerify(
       fixture.runId,
       fixture.identity,
-      "9".repeat(40),
+      merged.value.mergeCommitSha,
       ["project-ci"],
     );
     expect(verified.allowed).toBe(false);

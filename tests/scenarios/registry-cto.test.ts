@@ -334,7 +334,15 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       RunState.READY_FOR_CEO_REVIEW,
       "contract change ready",
     );
-    harness.cp.runs.transition(change.value.runId, RunState.COMPLETED, "contract change confirmed");
+    // Standing in for the CEO gate, which is the only production caller allowed to write
+    // COMPLETED; the point under test is what the *activation* then accepts.
+    harness.cp.runs.transition(
+      change.value.runId,
+      RunState.COMPLETED,
+      "contract change confirmed",
+      {},
+      "production-gate",
+    );
 
     const unknownRun = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",

@@ -162,27 +162,35 @@ export class ClaimRegistry {
    * §23.2 — releasing is a write on another run's coordination state when the claim is not
    * yours, so a caller acting for a run must say which run it is acting for.
    */
-  release(claimId: string, expectedRunId?: string): Decision<void> {
-    const row = this.db.get<{ status: string; run_id: string }>(
-      `SELECT status, run_id FROM resource_claims WHERE claim_id = ?`,
-      [claimId],
-    );
-    if (!row) return deny(ReasonCode.NOT_FOUND, "unknown claim", { claimId });
-    if (expectedRunId !== undefined && row.run_id !== expectedRunId) {
-      return deny(
-        ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
-        "claim belongs to another run",
-        { claimId, claimRunId: row.run_id, requestedRunId: expectedRunId },
+  release(claimId: string, runId: string): Decision<void> {
+    // One transaction: read, authorise, update, record. §30.3 — a release that is decided
+    // on one snapshot and applied to another can free a claim another writer just took.
+    return this.db.tx(() => {
+      const row = this.db.get<{ status: string; run_id: string }>(
+        `SELECT status, run_id FROM resource_claims WHERE claim_id = ?`,
+        [claimId],
       );
-    }
-    if (row.status !== "HELD") return deny(ReasonCode.CLAIM_NOT_HELD, "claim is not held", { claimId });
+      if (!row) return deny(ReasonCode.NOT_FOUND, "unknown claim", { claimId });
+      // The run is mandatory: a claim is another run's coordination state, and freeing it
+      // lets that run's resource be taken while it is still working.
+      if (row.run_id !== runId) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "claim belongs to another run", {
+          claimId,
+          claimRunId: row.run_id,
+          requestedRunId: runId,
+        });
+      }
+      if (row.status !== "HELD") {
+        return deny(ReasonCode.CLAIM_NOT_HELD, "claim is not held", { claimId });
+      }
 
-    this.db.run(`UPDATE resource_claims SET status = 'RELEASED', released_at = ? WHERE claim_id = ?`, [
-      this.clock.nowIso(),
-      claimId,
-    ]);
-    this.audit.record({ kind: "CLAIM_RELEASED", runId: row.run_id, evidence: { claimId } });
-    return allow(ReasonCode.OK, undefined);
+      this.db.run(
+        `UPDATE resource_claims SET status = 'RELEASED', released_at = ? WHERE claim_id = ? AND status = 'HELD'`,
+        [this.clock.nowIso(), claimId],
+      );
+      this.audit.record({ kind: "CLAIM_RELEASED", runId: row.run_id, evidence: { claimId } });
+      return allow(ReasonCode.OK, undefined);
+    });
   }
 
   releaseRun(runId: string): number {

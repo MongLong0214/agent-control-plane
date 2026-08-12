@@ -909,7 +909,23 @@ export class GitHubKernel {
       { sha: input.exactHeadSha, merge_method: method },
     );
     if (!merged.merged) {
+      // No receipt: an unmerged attempt is not an idempotent success to replay later.
+      this.audit.record({
+        kind: "MERGE_REFUSED",
+        runId: input.runId,
+        reasonCode: ReasonCode.MERGE_HEAD_STALE,
+        evidence: {
+          repositoryIdentity: input.repositoryIdentity,
+          pullNumber: input.pullNumber,
+          exactHead: input.exactHeadSha,
+        },
+      });
       return deny(ReasonCode.MERGE_HEAD_STALE, "GitHub refused the merge", {
+        pullNumber: input.pullNumber,
+      });
+    }
+    if (!merged.sha) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "GitHub reported a merge with no commit sha", {
         pullNumber: input.pullNumber,
       });
     }
@@ -1036,11 +1052,30 @@ export class GitHubKernel {
         { runId, undeclared, declared },
       );
     }
-    const effective = requiredChecks.length > 0 ? [...requiredChecks] : declared;
+    // Every declared check is required. A caller-supplied subset would be silent coverage
+    // reduction: naming one of two declared checks must not make the other optional.
+    const effective = [...new Set([...declared, ...requiredChecks])];
     if (effective.length === 0) {
       return deny(
         ReasonCode.POST_MERGE_CHECKS_NOT_DECLARED,
         "the pinned manifest declares no post-merge checks, so a merge cannot be verified",
+        { runId, repositoryIdentity, mergeCommitSha },
+      );
+    }
+
+
+    // §24.7 — the commit under verification must be the one this run actually merged into
+    // this repository. Otherwise an unrelated green commit could stand in for a red merge.
+    const mergedHere = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM github_receipts
+        WHERE operation = 'merge_execute' AND run_id = ? AND repository_identity = ?
+          AND after_state_digest = ?`,
+      [runId, repositoryIdentity, sha256(mergeCommitSha)],
+    );
+    if ((mergedHere?.n ?? 0) === 0) {
+      return deny(
+        ReasonCode.EVIDENCE_MISSING,
+        "no merge this run performed on this repository produced that commit",
         { runId, repositoryIdentity, mergeCommitSha },
       );
     }

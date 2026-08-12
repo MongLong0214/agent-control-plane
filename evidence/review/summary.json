@@ -1,52 +1,58 @@
 {
   "results": [
     {
+      "key": "core",
+      "verdict": "BLOCK",
+      "findings": 12,
+      "seconds": 723
+    },
+    {
       "key": "guard",
       "verdict": "BLOCK",
-      "findings": 7,
-      "seconds": 616
+      "findings": 5,
+      "seconds": 689
     },
     {
       "key": "verify",
       "verdict": "BLOCK",
-      "findings": 14,
-      "seconds": 899
+      "findings": 12,
+      "seconds": 1115
     },
     {
       "key": "review",
       "verdict": "BLOCK",
-      "findings": 9,
-      "seconds": 519
+      "findings": 12,
+      "seconds": 672
     },
     {
       "key": "binding",
       "verdict": "BLOCK",
-      "findings": 10,
-      "seconds": 921
+      "findings": 8,
+      "seconds": 588
     },
     {
       "key": "continuity",
       "verdict": "BLOCK",
-      "findings": 12,
-      "seconds": 892
+      "findings": 13,
+      "seconds": 625
     },
     {
       "key": "github",
       "verdict": "BLOCK",
-      "findings": 18,
-      "seconds": 706
+      "findings": 20,
+      "seconds": 541
     },
     {
       "key": "runtime",
       "verdict": "BLOCK",
-      "findings": 19,
-      "seconds": 773
+      "findings": 23,
+      "seconds": 782
     },
     {
       "key": "ops",
       "verdict": "BLOCK",
-      "findings": 24,
-      "seconds": 831
+      "findings": 23,
+      "seconds": 769
     }
   ]
 }

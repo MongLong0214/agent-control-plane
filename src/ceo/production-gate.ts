@@ -390,10 +390,13 @@ export class ProductionGate {
           ? RunState.REVISION_REQUIRED
           : RunState.AWAITING_HUMAN;
 
-    const transition = this.runs.transition(input.runId, target, `CEO ${input.decision}`, {
-      candidateSnapshotDigest: input.candidateSnapshotDigest,
-      rationale: input.rationale,
-    });
+    const transition = this.runs.transition(
+      input.runId,
+      target,
+      `CEO ${input.decision}`,
+      { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale },
+      "production-gate",
+    );
     if (!transition.allowed) return transition as Decision<{ state: RunState }>;
 
     this.audit.record({
