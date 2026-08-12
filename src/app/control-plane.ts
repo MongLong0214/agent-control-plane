@@ -214,6 +214,7 @@ export class ControlPlane {
     );
     this.verification.attachCi(this.github.ciEvidenceSource());
     this.verification.attachManifests((digest) => this.projects.manifest(digest));
+    this.verification.attachRuns((runId) => this.runs.get(runId));
     // The database *file*, not its directory: the worktree root lives beside it, and
     // denying the parent would stop a verification command from reading its own worktree.
     this.verification.setDenyReadPaths([config.secretsDir, config.databasePath]);
