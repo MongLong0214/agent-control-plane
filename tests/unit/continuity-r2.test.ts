@@ -213,10 +213,23 @@ describe("round-2 capacity and runtime regressions", () => {
     if (previousOpaque === undefined) delete process.env.RUNTIME_VALUE;
     else process.env.RUNTIME_VALUE = previousOpaque;
 
+    // An authority-shaped name and a credential-shaped value are both withheld even
+    // though the caller allowlisted them, which is what #58 is about.
     expect(environment.GH_TOKEN).toBeUndefined();
     expect(environment.RUNTIME_VALUE).toBeUndefined();
-    expect(environment.HOME).not.toBe(process.env.HOME);
     expect(environment.PATH).toBeDefined();
+    // HOME is deliberately the real one: an agent session exists to authenticate to its
+    // provider, and both CLIs resolve that login through the invoking user's keychain, so
+    // a scratch HOME does not contain the agent — it stops it being one. Containment is
+    // the withheld variables above plus the write confinement and the denied reads of the
+    // database, secrets and capacity directories.
+    expect(environment.HOME).toBe(process.env.HOME);
+    expect(environment.TMPDIR).not.toBe(process.env.TMPDIR);
+    expect(Object.keys(environment).sort()).toEqual(
+      ["GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT", "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "USER"].filter(
+        (name) => name !== "USER" || process.env["USER"],
+      ),
+    );
   });
 
   it("#59 rejects replacement and keeps scripted adapters out of the production registry", () => {
