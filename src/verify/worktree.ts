@@ -1,8 +1,10 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
+import { fail } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 import { addWorktree, listWorktrees, pruneWorktrees, removeWorktree } from "../git/git.ts";
-import { canonical } from "../guard/workspace-probe.ts";
+import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export interface Worktree {
   worktreeId: string;
@@ -19,20 +21,53 @@ export interface Worktree {
  * second run cannot share its working directory.
  */
 export class WorktreeManager {
-  constructor(private readonly root: string) {
+  private readonly rootPath: string;
+
+  constructor(root: string) {
     mkdirSync(root, { recursive: true });
+    this.rootPath = canonical(root);
   }
 
   async create(repositoryPath: string, head: string, worktreeId: string): Promise<Worktree> {
-    const path = canonical(join(this.root, worktreeId));
-    if (existsSync(path)) await this.destroy(repositoryPath, path);
+    const path = this.managedPath(worktreeId);
+    const known = await listWorktrees(repositoryPath);
+    if (existsSync(path) || known.some((entry) => canonical(entry.path) === path)) {
+      fail(ReasonCode.CONFLICT, "verification worktree id is already in use", {
+        worktreeId,
+        path,
+        repositoryPath: canonical(repositoryPath),
+      });
+    }
     await addWorktree(repositoryPath, path, head);
     return { worktreeId, path, repositoryPath, head };
   }
 
   async destroy(repositoryPath: string, path: string): Promise<void> {
+    const managedPath = this.managedPathFromPath(path);
+    const before = await listWorktrees(repositoryPath);
+    if (!before.some((entry) => canonical(entry.path) === managedPath)) {
+      fail(ReasonCode.NOT_FOUND, "refusing to delete an unregistered worktree path", {
+        path: managedPath,
+        repositoryPath: canonical(repositoryPath),
+      });
+    }
     await removeWorktree(repositoryPath, path);
-    rmSync(path, { recursive: true, force: true });
+    const remaining = await listWorktrees(repositoryPath);
+    if (remaining.some((entry) => canonical(entry.path) === managedPath)) {
+      fail(ReasonCode.ISOLATION_LOST, "git did not remove the managed worktree", {
+        path: managedPath,
+        repositoryPath: canonical(repositoryPath),
+      });
+    }
+    if (existsSync(managedPath)) {
+      const stat = lstatSync(managedPath);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        fail(ReasonCode.ISOLATION_LOST, "managed worktree path changed before cleanup", {
+          path: managedPath,
+        });
+      }
+      rmSync(managedPath, { recursive: true, force: false });
+    }
     await pruneWorktrees(repositoryPath);
   }
 
@@ -58,7 +93,27 @@ export class WorktreeManager {
     const known = await listWorktrees(repositoryPath);
     return known
       .map((w) => canonical(w.path))
-      .filter((path) => path.startsWith(canonical(this.root)))
-      .filter((path) => !liveIds.has(path.slice(canonical(this.root).length + 1)));
+      .filter((path) => isWithin(this.rootPath, path) && path !== this.rootPath)
+      .filter((path) => !liveIds.has(path.slice(this.rootPath.length + 1)));
+  }
+
+  private managedPath(worktreeId: string): string {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(worktreeId)) {
+      fail(ReasonCode.INVALID_ARGUMENT, "worktree id must be a single safe path component", {
+        worktreeId,
+      });
+    }
+    return this.managedPathFromPath(join(this.rootPath, worktreeId));
+  }
+
+  private managedPathFromPath(path: string): string {
+    const resolved = canonical(path);
+    if (!isWithin(this.rootPath, resolved) || resolved === this.rootPath) {
+      fail(ReasonCode.INVALID_ARGUMENT, "worktree path escapes the managed root", {
+        root: this.rootPath,
+        path: resolved,
+      });
+    }
+    return resolved;
   }
 }

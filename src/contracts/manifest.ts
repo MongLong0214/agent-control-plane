@@ -108,14 +108,11 @@ export const projectManifestSchema = z
 export type ProjectManifest = z.infer<typeof projectManifestSchema>;
 
 /**
- * Integration §10.2 — a committed manifest must be machine-portable. These patterns
- * are what makes CP-S04 ("committed manifest with an absolute path is rejected") a
- * mechanical check rather than a review opinion.
+ * Integration §10.2 — a committed manifest must be machine-portable. Secret and
+ * authority identifiers are content-wide concerns; filesystem paths are checked on the
+ * fields that actually carry paths below, never inferred from serialized JSON.
  */
 const NON_PORTABLE_PATTERNS: Array<[RegExp, string]> = [
-  [/(^|["'\s:])\/(Users|home|root|var|opt|tmp|private)\//, "absolute filesystem path"],
-  [/[A-Za-z]:\\\\/, "absolute windows path"],
-  [/(^|["'\s:])~\//, "home-relative path"],
   [/\b(ses|sess|session)_[A-Za-z0-9]{8,}/, "session identifier"],
   [/\bnsec1[a-z0-9]{20,}/, "buzz/nostr private key"],
   [/\b(gh[pousr]_[A-Za-z0-9]{20,})/, "github token"],
@@ -140,8 +137,31 @@ export const assertPortableManifest = (manifest: unknown): Decision<ProjectManif
   );
 
   for (const repo of parsed.data.repositories) {
-    if (repo.manifestRoot.startsWith("/") || repo.manifestRoot.includes("..")) {
+    if (!isPortableRepositoryPath(repo.manifestRoot)) {
       violations.push(`repository '${repo.role}' manifestRoot must be repository-relative`);
+    }
+    if (!isPortableRemoteIdentity(repo.remote)) {
+      violations.push(`repository '${repo.role}' remote must be a portable remote identity`);
+    }
+  }
+  for (const workflow of parsed.data.ciWorkflows) {
+    if (!isPortableRepositoryPath(workflow.path)) {
+      violations.push(`CI workflow '${workflow.checkName}' path must be repository-relative`);
+    }
+  }
+  for (const command of parsed.data.verificationCommands) {
+    for (const [index, arg] of command.argv.entries()) {
+      if (
+        isAbsoluteFilesystemPath(arg) ||
+        arg.startsWith("~/") ||
+        arg.startsWith("~\\") ||
+        arg.split(/[\\/]/).includes("..")
+      ) {
+        violations.push(`verification command '${command.id}' argv[${index}] contains a filesystem path`);
+      }
+    }
+    if (command.network === "allowlist") {
+      violations.push(`verification command '${command.id}' requests unsupported network allowlist`);
     }
   }
 
@@ -165,3 +185,23 @@ export const commandsForMode = (
   const wanted = new Set(manifest.verificationProfiles[key]);
   return manifest.verificationCommands.filter((c) => wanted.has(c.id));
 };
+
+const isPortableRemoteIdentity = (value: string): boolean => {
+  if (!/^(github|git):[^/\\\s:]+\/.+/.test(value)) return false;
+  const parts = value.slice(value.indexOf(":") + 1).split(/[\\/]/);
+  return (
+    !isAbsoluteFilesystemPath(value) &&
+    parts.length >= 2 &&
+    parts.every((part) => part.length > 0 && part !== "." && part !== "..")
+  );
+};
+
+const isPortableRepositoryPath = (value: string): boolean => {
+  if (value === ".") return true;
+  if (isAbsoluteFilesystemPath(value) || value.startsWith("~") || value.length === 0) return false;
+  const parts = value.split(/[\\/]/);
+  return parts.every((part) => part.length > 0 && part !== "." && part !== "..");
+};
+
+const isAbsoluteFilesystemPath = (value: string): boolean =>
+  value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value);

@@ -1,10 +1,13 @@
 import { z } from "zod";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 
 import { digestOf } from "../core/digest.ts";
 import type { Clock } from "../core/clock.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { changedPaths, diffDigest, isClean, revParse, treeOf, tryRevParse } from "../git/git.ts";
+import { changedPaths, diffDigest, git, isClean, revParse, treeOf, tryRevParse } from "../git/git.ts";
+import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export const CANDIDATE_SNAPSHOT_SCHEMA_ID = "agent-control-plane.candidate-snapshot.v1";
 
@@ -71,11 +74,12 @@ export const buildCandidateSnapshot = async (
   clock: Clock,
 ): Promise<CandidateSnapshot> => {
   if (params.repositories.length === 0) {
-    return deny(ReasonCode.EVIDENCE_MISSING, "no repositories") as never;
+    fail(ReasonCode.EVIDENCE_MISSING, "no repositories");
   }
 
   const repositories: SnapshotRepository[] = [];
   for (const input of params.repositories) {
+    await assertWorktreeBinding(input);
     const baseHead = await revParse(input.checkoutPath, input.baseRef ?? input.baseBranch);
     const candidateHead = await revParse(input.checkoutPath, input.candidateRef ?? "HEAD");
     repositories.push({
@@ -146,7 +150,7 @@ export const verifySnapshotFreshness = async (
     }
     // A moved base changes what the diff means, even when the candidate head is untouched.
     const base = await tryRevParse(probe.checkoutPath, repo.baseBranch);
-    if (base !== null && base !== repo.baseHead) {
+    if (base !== repo.baseHead) {
       drift.push({
         identity: repo.identity,
         baseBranch: repo.baseBranch,
@@ -191,3 +195,50 @@ export const snapshotCoverageTargets = (
   snapshot.repositories.flatMap((repo) =>
     repo.touchedPaths.map((path) => ({ identity: repo.identity, path })),
   );
+
+/**
+ * A worktree id is Git's metadata directory name, not an advisory label supplied by a
+ * worker. The gitdir marker is written by Git itself and points back to the linked
+ * checkout, which lets the snapshot bind the recorded id to the exact tree it reads.
+ */
+const assertWorktreeBinding = async (input: SnapshotRepositoryInput): Promise<void> => {
+  if (input.worktreeId == null) return;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(input.worktreeId)) {
+    fail(ReasonCode.INVALID_ARGUMENT, "worktreeId is not a Git worktree metadata id", {
+      worktreeId: input.worktreeId,
+    });
+  }
+
+  const checkout = canonical(input.checkoutPath);
+  const commonDirResult = await git(input.checkoutPath, ["rev-parse", "--git-common-dir"]);
+  const commonDir = canonical(resolve(input.checkoutPath, commonDirResult.stdout.trim()));
+  const metadataRoot = canonical(join(commonDir, "worktrees"));
+  const marker = canonical(join(metadataRoot, input.worktreeId, "gitdir"));
+  if (!isWithin(metadataRoot, marker) || !existsSync(marker)) {
+    fail(ReasonCode.SNAPSHOT_STALE, "recorded worktree metadata is missing", {
+      worktreeId: input.worktreeId,
+      checkoutPath: checkout,
+    });
+  }
+
+  const gitFile = readFileSync(marker, "utf8").trim();
+  const recordedCheckout = canonical(dirname(gitFile));
+  if (recordedCheckout !== checkout) {
+    fail(ReasonCode.SNAPSHOT_STALE, "recorded worktree does not match the checkout", {
+      worktreeId: input.worktreeId,
+      checkoutPath: checkout,
+      recordedCheckout,
+    });
+  }
+
+  const symbolicHead = await git(input.checkoutPath, ["symbolic-ref", "-q", "HEAD"], {
+    allowFailure: true,
+  });
+  if (symbolicHead.exitCode === 0) {
+    fail(ReasonCode.SNAPSHOT_STALE, "recorded candidate worktree is not detached", {
+      worktreeId: input.worktreeId,
+      checkoutPath: checkout,
+      symbolicHead: symbolicHead.stdout.trim(),
+    });
+  }
+};

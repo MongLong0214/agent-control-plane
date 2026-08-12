@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { sha256 } from "../core/digest.ts";
@@ -56,52 +56,44 @@ export interface SandboxEnforcement {
    */
   readConfinement: "sensitive-paths" | "none";
   processGroupKill: true;
+  resourceLimitsEnforced: boolean;
+  childContainmentEnforced: boolean;
   mechanism: "seatbelt" | "none";
 }
 
-/**
- * Environment variables that must never reach a candidate command (PRD §17.4,
- * §33.3, Integration §15). The sandbox builds its environment from an allowlist, so
- * this list is a second, explicit assertion rather than the primary defence.
+/** Only these non-authority values may cross into a verification process. */
+const SAFE_COMMAND_ENV = new Set(["NODE_ENV", "NO_COLOR", "FORCE_COLOR", "TZ"]);
+const SAFE_NODE_ENV = new Set(["development", "test", "production"]);
+const SAFE_BOOLEAN_ENV = new Set(["0", "1"]);
+const RESOURCE_WRAPPER = "/usr/bin/python3";
+
+/*
+ * The wrapper is trusted control-plane code, not candidate-provided shell. It lowers
+ * both soft and hard limits before exec so candidate code cannot raise them again.
+ * RLIMIT_NPROC=1 makes a new session/process group impossible: the initial command is
+ * already its own group leader, and a detached descendant would require a fork first.
  */
-const FORBIDDEN_ENV = [
-  /GITHUB.*TOKEN/i,
-  /^GH_TOKEN$/i,
-  /^GITHUB_/i,
-  /BUZZ_/i,
-  /TELEGRAM_/i,
-  /ANTHROPIC_/i,
-  /OPENAI_/i,
-  /XAI_/i,
-  /_API_KEY$/i,
-  /SECRET/i,
-  /PASSWORD/i,
-  /CREDENTIAL/i,
-  /^ACP_TRUSTED_/i,
-];
+const RESOURCE_WRAPPER_PROGRAM = String.raw`
+import os, resource, sys
 
-export const isForbiddenEnvName = (name: string): boolean =>
-  FORBIDDEN_ENV.some((pattern) => pattern.test(name));
+def hard_limit(kind, value):
+    soft, hard = resource.getrlimit(kind)
+    if soft > value:
+        resource.setrlimit(kind, (value, hard))
+    resource.setrlimit(kind, (value, value))
+    if resource.getrlimit(kind) != (value, value):
+        raise RuntimeError("limit was not applied")
 
-/**
- * Credential shapes recognised in a *value*.
- *
- * A name blacklist can always be sidestepped — `PROVIDER_TOKEN`,
- * `CLAUDE_CODE_OAUTH_TOKEN`, `GH_ENTERPRISE_TOKEN` are all names nobody enumerated. What
- * a credential looks like is far more stable than what it is called.
- */
-const SECRET_VALUE_SHAPES: readonly RegExp[] = [
-  /^gh[pousr]_[A-Za-z0-9]{16,}$/,
-  /^sk-[A-Za-z0-9_-]{20,}$/,
-  /^nsec1[a-z0-9]{20,}$/,
-  /^xox[baprs]-/,
-  /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /^[A-Za-z0-9+/]{60,}={0,2}$/, // long opaque base64 blobs
-];
+try:
+    hard_limit(resource.RLIMIT_CPU, int(sys.argv[1]))
+    hard_limit(resource.RLIMIT_NPROC, 1)
+    hard_limit(resource.RLIMIT_AS, int(sys.argv[2]))
+except Exception as error:
+    print("ACP_RESOURCE_LIMIT_UNAVAILABLE:" + str(error), file=sys.stderr)
+    sys.exit(125)
 
-export const looksLikeSecretValue = (value: string): boolean =>
-  SECRET_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
+os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
+`;
 
 const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
 
@@ -149,35 +141,60 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     );
   }
 
-  const env = buildEnv(command, scratch, request.env);
-  const cwd = join(worktreePath, command.cwd === "." ? "" : command.cwd);
+  const env = buildSandboxEnvironment(command, scratch, request.env);
+  const targets = resolveCommandTargets(command, worktreePath);
+  if (!targets.allowed) {
+    rmSync(scratch, { recursive: true, force: true });
+    return refused(command, startedMs, startedAt, mechanism, targets.reasonCode, targets.reason);
+  }
+  if (!existsSync(RESOURCE_WRAPPER)) {
+    rmSync(scratch, { recursive: true, force: true });
+    return refused(
+      command,
+      startedMs,
+      startedAt,
+      mechanism,
+      ReasonCode.SANDBOX_RESOURCE_LIMIT_UNAVAILABLE,
+      "resource-limit wrapper is unavailable",
+    );
+  }
 
   // seatbelt matches on resolved paths — on macOS the temp root is a symlink
   // (/var/folders -> /private/var/folders), so an unresolved path would confine the
   // command to a directory it can never reach and every write would fail.
-  const { file, argv } =
-    mechanism === "seatbelt"
-      ? {
-          file: "/usr/bin/sandbox-exec",
-          argv: [
-            "-p",
-            seatbeltProfile(
-              command,
-              realpathSync(worktreePath),
-              realpathSync(scratch),
-              request.denyReadPaths ?? [],
-            ),
-            ...command.argv,
-          ],
-        }
-      : { file: command.argv[0]!, argv: command.argv.slice(1) };
+  const resourceArgs = [
+    "-c",
+    RESOURCE_WRAPPER_PROGRAM,
+    String(command.maxCpuSeconds ?? command.timeoutSeconds),
+    String(command.maxMemoryMb * 1024 * 1024),
+    ...command.argv,
+  ];
+  const file = "/usr/bin/sandbox-exec";
+  const argv = [
+    "-p",
+    seatbeltProfile(command, targets.worktree, realpathSync(scratch), request.denyReadPaths ?? []),
+    RESOURCE_WRAPPER,
+    ...resourceArgs,
+  ];
 
   const child = spawn(file, argv, {
-    cwd,
+    cwd: targets.cwd,
     env,
     detached: true, // own process group so the timeout can reap the whole tree
     stdio: ["ignore", "pipe", "pipe"],
   });
+
+  const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolveExit) => {
+      child.on("error", () => resolveExit({ code: null, signal: null }));
+      child.on("close", (code, signal) => resolveExit({ code, signal }));
+    },
+  );
+  const identity = await processIdentity(child.pid);
+  let timedOut = false;
+  let isolationLost = identity === null;
+  let escalation: NodeJS.Timeout | undefined;
+  let closed = false;
 
   const maxBytes = command.maxOutputBytes;
   let outBytes = 0;
@@ -191,7 +208,9 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     if (outBytes > maxBytes) {
       truncated = true;
       chunks.push(buf.toString("utf8").slice(0, Math.max(0, maxBytes - (outBytes - buf.length))));
-      killGroup(child.pid, "SIGKILL");
+      void killKnownGroup(identity, "SIGKILL").then((killed) => {
+        if (!killed) isolationLost = true;
+      });
       return;
     }
     chunks.push(buf.toString("utf8"));
@@ -200,45 +219,44 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   child.stdout?.on("data", collect(stdoutChunks));
   child.stderr?.on("data", collect(stderrChunks));
 
-  let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    killGroup(child.pid, "SIGTERM");
-    setTimeout(() => killGroup(child.pid, "SIGKILL"), 5_000).unref();
+    void killKnownGroup(identity, "SIGTERM").then((killed) => {
+      if (!killed) isolationLost = true;
+      if (closed) return;
+      escalation = setTimeout(() => {
+        void killKnownGroup(identity, "SIGKILL").then((forced) => {
+          if (!forced) isolationLost = true;
+        });
+      }, 5_000);
+      escalation.unref();
+    });
   }, command.timeoutSeconds * 1000);
 
-  let peakRssMb: number | null = null;
-  const memPoll = setInterval(() => {
-    void groupRssMb(child.pid).then((rss) => {
-      if (rss == null) return;
-      peakRssMb = Math.max(peakRssMb ?? 0, rss);
-      if (rss > command.maxMemoryMb) killGroup(child.pid, "SIGKILL");
-    });
-  }, 500);
+  const exit = await exitPromise;
 
-  const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-    (resolve) => {
-      child.on("error", () => resolve({ code: null, signal: null }));
-      child.on("close", (code, signal) => resolve({ code, signal }));
-    },
-  );
-
+  closed = true;
   clearTimeout(timer);
-  clearInterval(memPoll);
-  killGroup(child.pid, "SIGKILL"); // §17.4 child cleanup — orphans do not survive the run
+  if (escalation) clearTimeout(escalation);
+  if (identity && !(await processGroupReaped(identity))) isolationLost = true;
   rmSync(scratch, { recursive: true, force: true });
 
   const stdout = stdoutChunks.join("");
   const stderr = stderrChunks.join("");
   const endedAt = new Date().toISOString();
 
-  const status: SandboxOutcome["status"] = timedOut
-    ? "TIMEOUT"
-    : exit.code === 0
-      ? "PASS"
-      : exit.code == null
-        ? "ERROR"
-        : "FAIL";
+  const resourceUnavailable = exit.code === 125 && stderr.includes("ACP_RESOURCE_LIMIT_UNAVAILABLE:");
+  const resourceExceeded = exit.signal === "SIGXCPU";
+  const status: SandboxOutcome["status"] =
+    isolationLost || resourceUnavailable || resourceExceeded
+      ? "ERROR"
+      : timedOut
+        ? "TIMEOUT"
+        : exit.code === 0
+          ? "PASS"
+          : exit.code == null
+            ? "ERROR"
+            : "FAIL";
 
   return {
     status,
@@ -251,7 +269,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     stderr,
     outputDigest: sha256(`${stdout}\u0000${stderr}`),
     outputTruncated: truncated,
-    peakRssMb,
+    peakRssMb: null,
     enforcement: {
       worktreeIsolated: true,
       secretsStripped: true,
@@ -260,13 +278,21 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
       writeConfinement: mechanism === "seatbelt",
       readConfinement: mechanism === "seatbelt" ? "sensitive-paths" : "none",
       processGroupKill: true,
+      resourceLimitsEnforced: !resourceUnavailable,
+      childContainmentEnforced: !isolationLost,
       mechanism,
     },
-    reasonCode: timedOut
-      ? ReasonCode.VERIFICATION_TIMEOUT
-      : truncated
-        ? ReasonCode.VERIFICATION_OUTPUT_TRUNCATED
-        : null,
+    reasonCode: isolationLost
+      ? ReasonCode.SANDBOX_CHILD_CLEANUP_FAILED
+      : resourceUnavailable
+        ? ReasonCode.SANDBOX_RESOURCE_LIMIT_UNAVAILABLE
+        : resourceExceeded
+          ? ReasonCode.SANDBOX_RESOURCE_LIMIT_EXCEEDED
+          : timedOut
+            ? ReasonCode.VERIFICATION_TIMEOUT
+            : truncated
+              ? ReasonCode.VERIFICATION_OUTPUT_TRUNCATED
+              : null,
   };
 };
 
@@ -275,13 +301,13 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
  * scratch root so a candidate cannot read ~/.gitconfig, ~/.npmrc, ~/.claude or any
  * other credential store through a tool's normal lookup path.
  */
-const buildEnv = (
+export const buildSandboxEnvironment = (
   command: VerificationCommand,
   scratch: string,
   extra: Record<string, string> | undefined,
 ): NodeJS.ProcessEnv => {
   const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+    PATH: [dirname(process.execPath), "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":"),
     HOME: scratch,
     TMPDIR: scratch,
     LANG: "C.UTF-8",
@@ -294,26 +320,18 @@ const buildEnv = (
   };
 
   for (const name of command.envAllowlist) {
-    if (isForbiddenEnvName(name)) continue; // an allowlist cannot re-admit a secret
-    const value = extra?.[name] ?? process.env[name];
-    if (value === undefined) continue;
-    // A name nobody blacklisted is no reason to pass a credential through.
-    if (looksLikeSecretValue(value)) continue;
+    if (!SAFE_COMMAND_ENV.has(name)) continue;
+    const value = extra?.[name];
+    if (value === undefined || !safeEnvironmentValue(name, value)) continue;
     env[name] = value;
-  }
-  for (const [name, value] of Object.entries(extra ?? {})) {
-    if (!command.envAllowlist.includes(name)) continue;
-    if (isForbiddenEnvName(name) || looksLikeSecretValue(value)) continue;
-    env[name] = value;
-  }
-
-  for (const [name, value] of Object.entries(env)) {
-    if (isForbiddenEnvName(name) || (value !== undefined && looksLikeSecretValue(value))) {
-      delete env[name];
-    }
   }
   return env;
 };
+
+const safeEnvironmentValue = (name: string, value: string): boolean =>
+  (name === "NODE_ENV" && SAFE_NODE_ENV.has(value)) ||
+  ((name === "NO_COLOR" || name === "FORCE_COLOR") && SAFE_BOOLEAN_ENV.has(value)) ||
+  (name === "TZ" && /^[A-Za-z0-9_+\-/]{1,64}$/.test(value));
 
 /**
  * Paths a toolchain must be able to read to run at all: the interpreter, system
@@ -400,6 +418,22 @@ const unconfined = (
   startedAt: string,
   mechanism: SandboxEnforcement["mechanism"],
   reason: string,
+): SandboxOutcome => refused(
+  command,
+  startedMs,
+  startedAt,
+  mechanism,
+  ReasonCode.SANDBOX_NETWORK_DENIED,
+  reason,
+);
+
+const refused = (
+  command: VerificationCommand,
+  startedMs: number,
+  startedAt: string,
+  mechanism: SandboxEnforcement["mechanism"],
+  reasonCode: ReasonCode,
+  reason: string,
 ): SandboxOutcome => ({
   status: "ERROR",
   exitCode: null,
@@ -420,38 +454,100 @@ const unconfined = (
     writeConfinement: false,
     readConfinement: "none",
     processGroupKill: true,
+    resourceLimitsEnforced: false,
+    childContainmentEnforced: false,
     mechanism,
   },
-  reasonCode: ReasonCode.SANDBOX_NETWORK_DENIED,
+  reasonCode,
 });
 
 const quote = (value: string): string => `"${value.replace(/(["\\])/g, "\\$1")}"`;
 
-const killGroup = (pid: number | undefined, signal: NodeJS.Signals): void => {
-  if (!pid) return;
+interface ProcessIdentity {
+  pid: number;
+  startedAt: string;
+}
+
+const processIdentity = async (pid: number | undefined): Promise<ProcessIdentity | null> => {
+  if (!pid) return null;
   try {
-    process.kill(-pid, signal);
+    const { stdout } = await exec("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" });
+    const startedAt = stdout.trim();
+    return startedAt ? { pid, startedAt } : null;
   } catch {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      /* already reaped */
-    }
+    return null;
   }
 };
 
-/** Summed RSS of the whole process group, in MB. */
-const groupRssMb = async (pid: number | undefined): Promise<number | null> => {
-  if (!pid) return null;
+/** Signals only the process group whose leader still has the identity we observed. */
+const killKnownGroup = async (
+  identity: ProcessIdentity | null,
+  signal: NodeJS.Signals,
+): Promise<boolean> => {
+  if (!identity) return false;
+  const current = await processIdentity(identity.pid);
+  if (!current || current.startedAt !== identity.startedAt) return false;
   try {
-    const { stdout } = await exec("ps", ["-o", "rss=", "-g", String(pid)], { encoding: "utf8" });
-    const total = stdout
-      .split("\n")
-      .map((l) => Number.parseInt(l.trim(), 10))
-      .filter((n) => Number.isFinite(n))
-      .reduce((a, b) => a + b, 0);
-    return total / 1024;
+    process.kill(-identity.pid, signal);
+    return true;
   } catch {
-    return null;
+    return false;
+  }
+};
+
+/** A close event alone is not enough: an unreaped process group makes PASS impossible. */
+const processGroupReaped = async (identity: ProcessIdentity): Promise<boolean> => {
+  const current = await processIdentity(identity.pid);
+  if (current && current.startedAt === identity.startedAt) return false;
+  try {
+    const { stdout } = await exec("ps", ["-o", "pid=", "-g", String(identity.pid)], {
+      encoding: "utf8",
+    });
+    return stdout.trim().length === 0;
+  } catch {
+    return false;
+  }
+};
+
+type TargetResolution =
+  | { allowed: true; worktree: string; cwd: string }
+  | { allowed: false; reasonCode: ReasonCode; reason: string };
+
+/** Canonical path checks stop committed symlinks from retargeting a verification command. */
+const resolveCommandTargets = (
+  command: VerificationCommand,
+  worktreePath: string,
+): TargetResolution => {
+  try {
+    const worktree = realpathSync(worktreePath);
+    const cwd = realpathSync(resolve(worktree, command.cwd));
+    if (!isWithin(worktree, cwd)) {
+      return {
+        allowed: false,
+        reasonCode: ReasonCode.SANDBOX_PATH_OUTSIDE_WORKTREE,
+        reason: "verification cwd resolves outside the disposable worktree",
+      };
+    }
+
+    for (const arg of command.argv) {
+      const explicitPath = isAbsolute(arg) || arg.startsWith("./") || arg.startsWith("../");
+      const localTarget = !arg.startsWith("-") && existsSync(resolve(cwd, arg));
+      if (!explicitPath && !localTarget) continue;
+      const target = realpathSync(isAbsolute(arg) ? arg : resolve(cwd, arg));
+      if (!isWithin(worktree, target)) {
+        return {
+          allowed: false,
+          reasonCode: ReasonCode.SANDBOX_PATH_OUTSIDE_WORKTREE,
+          reason: `verification target '${arg}' resolves outside the disposable worktree`,
+        };
+      }
+    }
+    return { allowed: true, worktree, cwd };
+  } catch (error) {
+    return {
+      allowed: false,
+      reasonCode: ReasonCode.SANDBOX_PATH_OUTSIDE_WORKTREE,
+      reason: `unable to resolve verification target: ${(error as Error).message}`,
+    };
   }
 };

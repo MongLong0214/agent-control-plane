@@ -1,4 +1,5 @@
 import type { Clock } from "../core/clock.ts";
+import { randomUUID } from "node:crypto";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -7,7 +8,7 @@ import { type ProjectManifest, commandsForMode } from "../contracts/manifest.ts"
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
-import { ArtifactKind } from "../domain/types.ts";
+import { ArtifactKind, type RunRow } from "../domain/types.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   type CandidateSnapshot,
@@ -74,9 +75,8 @@ export interface VerifyOptions {
   /** Digest of the approved contract the commands came from (CP-HI-03). */
   contractDigest: string;
   /**
-   * Manifest the run pinned at dispatch admission, and the execution mode whose profile
-   * selects the commands. Supplied so the engine can *derive* the expected command set
-   * rather than trust the caller's list (CP-HI-03).
+   * Deprecated caller assertions. They are checked against the registered run but never
+   * select a command profile; the engine reads that authority from the run itself.
    */
   pinnedManifestDigest?: string | null;
   executionMode?: "SIMPLE" | "STANDARD" | "GUARDED";
@@ -99,6 +99,8 @@ export class VerificationEngine {
   private extraDenyReadPaths: string[] = [];
   /** Injected manifest loader; kept as a function so the engine owns no registry. */
   private manifests: ((digest: string) => ProjectManifest | null) | null = null;
+  /** Run lookup makes the dispatch-time pin the only command-selection authority. */
+  private runs: ((runId: string) => RunRow | null) | null = null;
 
   constructor(
     private readonly db: Db,
@@ -118,46 +120,79 @@ export class VerificationEngine {
     this.manifests = loader;
   }
 
+  attachRuns(loader: (runId: string) => RunRow | null): void {
+    this.runs = loader;
+  }
+
   async verify(options: VerifyOptions): Promise<Decision<VerificationReport>> {
-    const { runId, snapshot, commands } = options;
+    const { runId, snapshot } = options;
     const snapshotDigest = candidateSnapshotDigest(snapshot);
+    const run = this.runs?.(runId) ?? null;
+    if (!run) {
+      return deny(ReasonCode.NOT_FOUND, "verification requires a registered run", { runId });
+    }
 
     // CP-HI-03 — the pinned contract, not whatever the candidate now contains.
-    if (snapshot.contractDigest !== options.contractDigest) {
+    if (snapshot.contractDigest !== options.contractDigest || run.contractDigest !== options.contractDigest) {
       return deny(
         ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
         "candidate snapshot is pinned to a different contract than the one supplied",
-        { snapshotContract: snapshot.contractDigest, supplied: options.contractDigest },
+        {
+          snapshotContract: snapshot.contractDigest,
+          runContract: run.contractDigest,
+          supplied: options.contractDigest,
+        },
       );
     }
 
-    // CP-HI-03 — a caller-supplied command list is not evidence of anything. When the run
-    // pinned a manifest, the engine derives the expected commands from that manifest and
-    // refuses a list that does not match it.
-    if (options.pinnedManifestDigest && options.executionMode) {
-      const pinned = this.manifests?.(options.pinnedManifestDigest) ?? null;
+    let commands: readonly VerificationCommand[];
+    if (run.pinnedManifestDigest) {
+      if (options.runScoped) {
+        return deny(
+          ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+          "a run with a pinned manifest cannot submit run-scoped commands",
+          { runId, pinnedManifestDigest: run.pinnedManifestDigest },
+        );
+      }
+      if (
+        (options.pinnedManifestDigest != null && options.pinnedManifestDigest !== run.pinnedManifestDigest) ||
+        (options.executionMode != null && options.executionMode !== run.executionMode)
+      ) {
+        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "caller assertions do not match the registered run", {
+          runId,
+          registeredManifestDigest: run.pinnedManifestDigest,
+          registeredExecutionMode: run.executionMode,
+          suppliedManifestDigest: options.pinnedManifestDigest ?? null,
+          suppliedExecutionMode: options.executionMode ?? null,
+        });
+      }
+
+      // CP-HI-03 — the command set is derived from the dispatch-time manifest. A caller
+      // may repeat it for compatibility, but it cannot select a weaker replacement.
+      const pinned = this.manifests?.(run.pinnedManifestDigest) ?? null;
       if (!pinned) {
         return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "pinned manifest is not retrievable", {
           runId,
-          pinnedManifestDigest: options.pinnedManifestDigest,
+          pinnedManifestDigest: run.pinnedManifestDigest,
         });
       }
-      const expected = commandsForMode(pinned, options.executionMode);
-      if (digestOf(expected) !== digestOf([...commands])) {
+      const expected = commandsForMode(pinned, run.executionMode);
+      if (digestOf(expected) !== digestOf([...options.commands])) {
         return deny(
           ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
           "supplied verification commands do not match the run's pinned manifest",
           {
             runId,
-            pinnedManifestDigest: options.pinnedManifestDigest,
+            pinnedManifestDigest: run.pinnedManifestDigest,
             expected: expected.map((c) => c.id),
-            supplied: commands.map((c) => c.id),
+            supplied: options.commands.map((c) => c.id),
           },
         );
       }
+      commands = expected;
       // Every repository in the candidate must also be pinned to that same manifest.
       const mismatched = snapshot.repositories.filter(
-        (repo) => repo.manifestDigest !== null && repo.manifestDigest !== options.pinnedManifestDigest,
+        (repo) => repo.manifestDigest !== run.pinnedManifestDigest,
       );
       if (mismatched.length > 0) {
         return deny(
@@ -165,15 +200,69 @@ export class VerificationEngine {
           "a repository in the candidate is pinned to a different manifest than the run",
           {
             runId,
-            pinnedManifestDigest: options.pinnedManifestDigest,
+            pinnedManifestDigest: run.pinnedManifestDigest,
             mismatched: mismatched.map((r) => ({ identity: r.identity, manifestDigest: r.manifestDigest })),
+          },
+        );
+      }
+    } else {
+      if (!options.runScoped) {
+        return deny(ReasonCode.VERIFICATION_GAP, "run-scoped commands require a temporary repository run", {
+          runId,
+        });
+      }
+      commands = options.commands;
+    }
+
+    const records = snapshot.repositories.map((repo) => ({
+      repo,
+      record: this.repositories.byIdentity(repo.identity),
+    }));
+    for (const { repo, record } of records) {
+      if (!record) continue;
+      if (record.trustClass !== "OWNER_TRUSTED") {
+        return deny(ReasonCode.VERIFICATION_REPOSITORY_UNTRUSTED, "repository is not owner-trusted", {
+          runId,
+          identity: repo.identity,
+          trustClass: record.trustClass,
+        });
+      }
+      if (record.registration === "TEMPORARY" && record.temporaryForRun !== runId) {
+        return deny(ReasonCode.VERIFICATION_GAP, "temporary repository is bound to a different run", {
+          runId,
+          identity: repo.identity,
+          temporaryForRun: record.temporaryForRun,
+        });
+      }
+    }
+    if (!run.pinnedManifestDigest) {
+      const invalidScopedRepository = records.find(
+        ({ repo, record }) =>
+          !record ||
+          record.registration !== "TEMPORARY" ||
+          record.temporaryForRun !== runId ||
+          record.activeManifestDigest !== null ||
+          repo.manifestDigest !== null,
+      );
+      if (invalidScopedRepository) {
+        return deny(
+          ReasonCode.VERIFICATION_GAP,
+          "run-scoped commands require repositories temporary to this run with no pinned manifest",
+          {
+            runId,
+            identity: invalidScopedRepository.repo.identity,
+            registration: invalidScopedRepository.record?.registration ?? null,
+            temporaryForRun: invalidScopedRepository.record?.temporaryForRun ?? null,
+            activeManifestDigest: invalidScopedRepository.record?.activeManifestDigest ?? null,
+            snapshotManifestDigest: invalidScopedRepository.repo.manifestDigest,
           },
         );
       }
     }
 
-    const probes = snapshot.repositories.map((repo) => {
-      const record = this.repositories.byIdentity(repo.identity);
+    const verifiedOptions: VerifyOptions = { ...options, commands };
+
+    const probes = records.map(({ repo, record }) => {
       return {
         identity: repo.identity,
         checkoutPath: record?.checkoutPath ?? "",
@@ -185,7 +274,7 @@ export class VerificationEngine {
 
     if (commands.length === 0) {
       // §17.5 — no defensible verification method is a declared gap, not a pass.
-      const report = this.buildReport(options, snapshotDigest, [], [
+      const report = this.buildReport(verifiedOptions, snapshotDigest, [], [
         "no verification command is configured for this candidate",
       ]);
       this.persist(runId, snapshotDigest, report);
@@ -222,7 +311,7 @@ export class VerificationEngine {
     // while they ran. A PASS for a candidate that no longer exists is not evidence.
     const stillFresh = await verifySnapshotFreshness(snapshot, probes.filter((p) => p.checkoutPath));
     if (!stillFresh.allowed) {
-      const staleReport = this.buildReport(options, snapshotDigest, results, [
+      const staleReport = this.buildReport(verifiedOptions, snapshotDigest, results, [
         ...gaps,
         "the candidate changed while verification was running",
       ]);
@@ -230,7 +319,7 @@ export class VerificationEngine {
       return stillFresh as Decision<VerificationReport>;
     }
 
-    const report = this.buildReport(options, snapshotDigest, results, gaps);
+    const report = this.buildReport(verifiedOptions, snapshotDigest, results, gaps);
     this.persist(runId, snapshotDigest, report);
 
     this.telemetry.record({
@@ -257,7 +346,7 @@ export class VerificationEngine {
     checkoutPath: string,
     head: string,
   ): Promise<VerificationResultRecord> {
-    const worktreeId = `verify-${runId}-${command.id}-${head.slice(0, 8)}`;
+    const worktreeId = `verify-${runId}-${command.id}-${head.slice(0, 8)}-${randomUUID().replaceAll("-", "")}`;
     const outcome = await this.worktrees.withWorktree(checkoutPath, head, worktreeId, (worktree) =>
       runSandboxed({
         command,
@@ -330,21 +419,20 @@ export class VerificationEngine {
     const candidates = checks.filter(
       (c) => c.commandId === command.id && c.repositoryIdentity === identity,
     );
-    // Integration §14.4 — the *current* result. If several exist, the newest decides, and
-    // any failure among them is a failure: picking the first success would let an older
-    // green result mask a newer red one.
-    const ordered = [...candidates].sort(
+    const exactHead = candidates.filter((candidate) => candidate.head === head);
+    // Integration §14.4 — the *current exact-head* result. An obsolete red result must
+    // not hide a later green result, and a result from another head is only diagnostic
+    // when there is no exact candidate evidence at all.
+    const ordered = [...exactHead].sort(
       (a, b) => new Date(b.completedAt).getTime() - new Date(a.completedAt).getTime(),
     );
-    const failing = ordered.find((c) => c.conclusion !== "success");
-    const match = failing ?? ordered[0];
+    const match = ordered[0];
     if (!match) {
-      const record = { ...base, reasonCode: ReasonCode.EVIDENCE_MISSING };
-      this.writeResultRow(runId, snapshotDigest, record);
-      return record;
-    }
-    if (match.head !== head) {
-      const record = { ...base, reasonCode: ReasonCode.VERIFICATION_CI_HEAD_MISMATCH };
+      const record = {
+        ...base,
+        reasonCode:
+          candidates.length > 0 ? ReasonCode.VERIFICATION_CI_HEAD_MISMATCH : ReasonCode.EVIDENCE_MISSING,
+      };
       this.writeResultRow(runId, snapshotDigest, record);
       return record;
     }
@@ -460,8 +548,8 @@ export class VerificationEngine {
     const others = this.repositories
       .list()
       .map((r) => r.checkoutPath)
-      .filter((path) => path !== ownCheckout);
-    return [...new Set([...others, ...this.extraDenyReadPaths])];
+      .filter(Boolean);
+    return [...new Set([ownCheckout, ...others, ...this.extraDenyReadPaths])];
   }
 
   /** Wired by the composition root: the secret store and state directory. */
