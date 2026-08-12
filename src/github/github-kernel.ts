@@ -145,6 +145,13 @@ interface CheckRun {
  * returns the original receipt instead of merging twice (CP-S39).
  */
 export class GitHubKernel {
+  /**
+   * A PENDING row remains reconcilable after a daemon crash. Within this daemon, though,
+   * a second caller must not seize the first caller's in-flight external write merely
+   * because GitHub has already accepted it but the first caller has not reread it yet.
+   */
+  private readonly inFlightReservations = new Set<string>();
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -307,6 +314,9 @@ export class GitHubKernel {
       }
       const cached = JSON.parse(existing.response_json) as { pullNumber?: number; url?: string };
       if (!cached.pullNumber || !cached.url || existing.verified !== 1) {
+        if (this.inFlightReservations.has(idempotencyKey)) {
+          return deny(ReasonCode.RESOURCE_COLLISION, "PR operation is in flight", { idempotencyKey });
+        }
         const open = await this.api().request<PullRequest[]>(
           "GET",
           `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(input.head)}&base=${encodeURIComponent(input.base)}&state=open`,
@@ -487,6 +497,9 @@ export class GitHubKernel {
         });
       }
       if (existing.verified !== 1) {
+        if (this.inFlightReservations.has(idempotencyKey)) {
+          return deny(ReasonCode.RESOURCE_COLLISION, "gate publication is in flight", { idempotencyKey });
+        }
         const creator = this.credentials.creatorIdentity();
         const checks = await this.api().request<{ check_runs: CheckRun[] }>(
           "GET",
@@ -809,17 +822,25 @@ export class GitHubKernel {
 
     const prepared = this.preparedPrIntent(input.runId, input.repositoryIdentity, pull.number);
     if (!prepared.allowed) return prepared as Decision<{ predicates: Record<string, boolean> }>;
-    if (
-      prepared.value.head !== pull.head.ref ||
-      prepared.value.base !== pull.base.ref ||
-      prepared.value.exactHeadSha !== pull.head.sha ||
-      prepared.value.expectedBaseSha !== pull.base.sha ||
-      prepared.value.expectedBaseSha !== input.expectedBaseSha
-    ) {
+    if (prepared.value.head !== pull.head.ref || prepared.value.base !== pull.base.ref) {
       return deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, "live pull request differs from immutable prepare contract", {
         pullNumber: pull.number,
         prepared: prepared.value,
         observed: { head: pull.head, base: pull.base },
+      });
+    }
+
+    if (
+      prepared.value.exactHeadSha !== input.exactHeadSha ||
+      prepared.value.expectedBaseSha !== input.expectedBaseSha
+    ) {
+      return deny(ReasonCode.SNAPSHOT_STALE, "prepared pull request is bound to a different frozen candidate", {
+        pullNumber: pull.number,
+        prepared: {
+          exactHeadSha: prepared.value.exactHeadSha,
+          expectedBaseSha: prepared.value.expectedBaseSha,
+        },
+        supplied: { exactHeadSha: input.exactHeadSha, expectedBaseSha: input.expectedBaseSha },
       });
     }
 
@@ -1139,6 +1160,9 @@ export class GitHubKernel {
         });
       }
       if (!existing.verified) {
+        if (this.inFlightReservations.has(idempotencyKey)) {
+          return deny(ReasonCode.RESOURCE_COLLISION, "merge operation is in flight", { idempotencyKey });
+        }
         const slug = this.slug(input.repositoryIdentity);
         if (!slug.allowed) return slug as Decision<{ mergeCommitSha: string; replayed: boolean }>;
         const pull = await this.api().request<PullRequest>(
@@ -1167,6 +1191,11 @@ export class GitHubKernel {
             sourceBranch: pull.head.ref,
             targetBranch: pull.base.ref,
             expectedBaseSha: input.expectedBaseSha,
+            baseVerification: {
+              preflight: "exact-base-reread",
+              residualRace: "base-may-move-between-preflight-and-merge",
+              proof: "merge-commit-first-parent",
+            },
           },
           reread: true,
         });
@@ -1243,19 +1272,6 @@ export class GitHubKernel {
       });
     }
 
-    // GitHub's pull-request merge endpoint accepts an expected head SHA but has no
-    // expected-base precondition. A preflight followed by a PUT is an irreversible
-    // check-then-act race, so this provider cannot execute a contract-bound merge.
-    // Keep the exact base in the request and refuse rather than merging onto an
-    // unverified target; a future provider must expose an atomic base predicate here.
-    if (!this.api().supportsAtomicExpectedBase) {
-      return deny(
-        ReasonCode.MERGE_BASE_STALE,
-        "GitHub cannot atomically condition this merge on the evaluated base SHA",
-        { expectedBaseSha: input.expectedBaseSha, exactHeadSha: input.exactHeadSha, provider: "github-rest" },
-      );
-    }
-
     const reserved = this.reserveReceipt({
       idempotencyKey,
       operation: "merge_execute",
@@ -1268,12 +1284,13 @@ export class GitHubKernel {
     });
     if (!reserved.allowed) return reserved as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
-    // Passing `sha` makes GitHub refuse the merge if the head moved between evaluate
-    // and execute — the race the exact-head predicate cannot close on its own.
+    // GitHub fences the irreversible write on the exact head. Its REST API has no base
+    // predicate, so the late base reread and first-parent proof below make that residual
+    // race explicit rather than treating the preflight as an atomic guarantee.
     const merged = await this.api().request<{ sha: string; merged: boolean }>(
       "PUT",
       `/repos/${owner}/${repo}/pulls/${input.pullNumber}/merge`,
-      { sha: input.exactHeadSha, expected_base_sha: input.expectedBaseSha, merge_method: method },
+      { sha: input.exactHeadSha, merge_method: method },
     );
     if (!merged.merged) {
       // GitHub explicitly reports no mutation, so this is not an ambiguous outcome and
@@ -1347,6 +1364,11 @@ export class GitHubKernel {
         sourceBranch: preflight.head.ref,
         targetBranch: preflight.base.ref,
         expectedBaseSha: input.expectedBaseSha,
+        baseVerification: {
+          preflight: "exact-base-reread",
+          residualRace: "base-may-move-between-preflight-and-merge",
+          proof: "merge-commit-first-parent",
+        },
       },
       reread: true,
     });
@@ -1435,7 +1457,6 @@ export class GitHubKernel {
       );
     }
 
-
     // §24.7 — the commit under verification must be the one this run actually merged into
     // this repository. Otherwise an unrelated green commit could stand in for a red merge.
     const mergedHere = this.db.get<{ n: number }>(
@@ -1450,6 +1471,35 @@ export class GitHubKernel {
         "no merge this run performed on this repository produced that commit",
         { runId, repositoryIdentity, mergeCommitSha },
       );
+    }
+
+    const idempotencyKey = `post_merge_verify:${repositoryIdentity}:${mergeCommitSha}`;
+    const requestDigest = digestOf({ mergeCommitSha, requiredChecks: effective });
+    const existing = this.receipt(idempotencyKey);
+    if (existing) {
+      if (existing.request_digest !== requestDigest || existing.verified !== 1) {
+        return deny(ReasonCode.RESOURCE_COLLISION, "post-merge verification receipt cannot be replayed", {
+          idempotencyKey,
+          verified: existing.verified === 1,
+        });
+      }
+      const cached = JSON.parse(existing.response_json) as { checks?: Array<{ name: string; conclusion: string }> };
+      if (!Array.isArray(cached.checks)) {
+        return deny(ReasonCode.EVIDENCE_MISSING, "post-merge verification receipt is malformed", {
+          idempotencyKey,
+        });
+      }
+      const failed = cached.checks.filter((check) => check.conclusion !== "success");
+      if (failed.length > 0) {
+        this.setMergeState(runId, repositoryIdentity, "FAILED");
+        return deny(
+          ReasonCode.POST_MERGE_VERIFICATION_FAILED,
+          "recorded post-merge verification failed; dependent merges remain blocked",
+          { mergeCommitSha, failed, replayed: true },
+        );
+      }
+      this.setMergeState(runId, repositoryIdentity, "MERGED");
+      return allow(ReasonCode.OK, { checks: cached.checks });
     }
 
     const response = await this.api().request<{ check_runs: CheckRun[] }>(
@@ -1471,7 +1521,7 @@ export class GitHubKernel {
     const failed = observed.filter((c) => c.conclusion !== "success");
 
     this.writeReceipt({
-      idempotencyKey: `post_merge_verify:${repositoryIdentity}:${mergeCommitSha}`,
+      idempotencyKey,
       operation: "post_merge_verify",
       runId,
       repositoryIdentity,
@@ -1480,7 +1530,7 @@ export class GitHubKernel {
       preexisting: false,
       beforeStateDigest: null,
       afterStateDigest: digestOf(observed),
-      requestDigest: digestOf({ mergeCommitSha, requiredChecks: effective }),
+      requestDigest,
       response: { checks: observed },
       reread: true,
     });
@@ -2255,6 +2305,7 @@ export class GitHubKernel {
           this.clock.nowIso(),
         ],
       );
+      this.inFlightReservations.add(input.idempotencyKey);
       return allow(ReasonCode.OK, undefined);
     } catch {
       return deny(ReasonCode.RESOURCE_COLLISION, "GitHub operation reservation raced another writer", {
@@ -2286,11 +2337,13 @@ export class GitHubKernel {
         input.requestDigest,
       ],
     );
-    return updated.changes === 1
-      ? allow(ReasonCode.OK, undefined)
-      : deny(ReasonCode.RESOURCE_COLLISION, "reserved GitHub receipt could not be finalized", {
-          idempotencyKey: input.idempotencyKey,
-        });
+    if (updated.changes === 1) {
+      this.inFlightReservations.delete(input.idempotencyKey);
+      return allow(ReasonCode.OK, undefined);
+    }
+    return deny(ReasonCode.RESOURCE_COLLISION, "reserved GitHub receipt could not be finalized", {
+      idempotencyKey: input.idempotencyKey,
+    });
   }
 
   /** No external write happened when grant consumption fails, so this reservation is safe to release. */
@@ -2300,6 +2353,7 @@ export class GitHubKernel {
         WHERE idempotency_key = ? AND request_digest = ? AND status = 'PENDING' AND verified = 0`,
       [idempotencyKey, requestDigest],
     );
+    this.inFlightReservations.delete(idempotencyKey);
   }
 
   private writeReceipt(input: {
@@ -2321,27 +2375,25 @@ export class GitHubKernel {
     // reservation exists — operations that record an observation rather than perform a
     // write — the row is inserted APPLIED in one step.
     const now = this.clock.nowIso();
-    const reserved = this.db.get<{ status: string }>(
-      `SELECT status FROM github_receipts WHERE idempotency_key = ?`,
+    const reserved = this.db.get<{ status: string; request_digest: string }>(
+      `SELECT status, request_digest FROM github_receipts WHERE idempotency_key = ?`,
       [input.idempotencyKey],
     );
     if (reserved?.status === "PENDING") {
-      this.db.run(
-        `UPDATE github_receipts
-            SET status = 'APPLIED', resource_identity = ?, preexisting = ?, after_state_digest = ?,
-                response_json = ?, reread_at = ?, verified = ?
-          WHERE idempotency_key = ? AND status = 'PENDING'`,
-        [
-          input.resourceIdentity,
-          input.preexisting ? 1 : 0,
-          input.afterStateDigest,
-          JSON.stringify(input.response),
-          input.reread ? now : null,
-          input.reread ? 1 : 0,
-          input.idempotencyKey,
-        ],
-      );
+      const finalized = this.finalizeReservedReceipt({
+        idempotencyKey: input.idempotencyKey,
+        requestDigest: input.requestDigest,
+        preexisting: input.preexisting,
+        afterStateDigest: input.afterStateDigest,
+        response: input.response,
+        reread: input.reread,
+      });
+      if (!finalized.allowed) throw new Error(`${finalized.reasonCode}: ${finalized.message}`);
       return;
+    }
+    if (reserved?.status === "APPLIED") {
+      if (reserved.request_digest === input.requestDigest) return;
+      throw new Error(`RESOURCE_COLLISION: receipt already records different operation intent (${input.idempotencyKey})`);
     }
     this.db.run(
       `INSERT INTO github_receipts

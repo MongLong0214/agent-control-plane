@@ -48,6 +48,16 @@ const CI_WORKFLOWS = [
   { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null },
 ];
 
+const TRUSTED_CI_COMMANDS = [
+  parseVerificationCommand({
+    id: "project-ci",
+    argv: ["node", "verify.js"],
+    repositoryRole: "primary",
+    evidenceMode: "TRUSTED_CI",
+    timeoutSeconds: 60,
+  }),
+];
+
 interface Fixture {
   harness: Harness;
   github: FakeGitHub;
@@ -72,10 +82,30 @@ const setup = async (): Promise<Fixture> => {
   Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+  harness.cp.verification.attachCi({
+    fetch: async (repositoryIdentity, head) => [
+      {
+        commandId: "project-ci",
+        repositoryIdentity,
+        head,
+        conclusion: "success" as const,
+        workflowDigest: "sha256:approved",
+        creatorIdentity: "github-actions",
+        completedAt: "2026-08-12T00:00:00.000Z",
+        nonVacuous: true,
+      },
+    ],
+    approvedWorkflowDigests: async () => ["sha256:approved"],
+    trustedCreators: async () => ["github-actions"],
+  });
 
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-thing",
-    manifestOverrides: { ciWorkflows: CI_WORKFLOWS },
+    manifestOverrides: {
+      ciWorkflows: CI_WORKFLOWS,
+      verificationProfiles: { simple: ["project-ci"], standard: ["project-ci"], guarded: ["project-ci"] },
+      verificationCommands: TRUSTED_CI_COMMANDS,
+    },
   });
 
   // GitHub's view of the repository matches the frozen candidate.
@@ -220,7 +250,7 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
       exactHeadSha: "d".repeat(40),
     });
     expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.MERGE_HEAD_STALE);
+    expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
   });
 
   it("refuses a PR when the project contract requires issue linkage and none is supplied", async () => {
@@ -318,7 +348,7 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
       ownerBindingGeneration: fixture.ownerBindingGeneration,
     });
     expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID);
+    expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
   });
 
   it("CP-S37: a merge with no gate at all is refused, whatever the target branch is", async () => {
@@ -397,14 +427,14 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
       exactHeadSha: "f".repeat(40),
       expectedBaseSha: fixture.base,
     });
-    expect(staleHead.reasonCode).toBe(ReasonCode.MERGE_HEAD_STALE);
+    expect(staleHead.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
 
     const staleBase = await fixture.harness.cp.github.mergeEvaluate({
       ...base,
       exactHeadSha: fixture.head,
       expectedBaseSha: "0".repeat(40),
     });
-    expect(staleBase.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(staleBase.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
     expect(fixture.github.mergeCount).toBe(0);
   });
 
@@ -500,6 +530,18 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     );
     expect(verified.allowed).toBe(false);
     expect(verified.evidence["failed"]).toEqual([{ name: "project-ci", conclusion: "missing" }]);
+
+    // The failed coverage receipt is immutable: a later check cannot rewrite the fact
+    // that this run first failed exact post-merge verification.
+    fixture.github.setPostMergeCheck(merged.value.mergeCommitSha, "project-ci", "success");
+    const replayed = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      merged.value.mergeCommitSha,
+      ["project-ci"],
+    );
+    expect(replayed.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+    expect(replayed.evidence["failed"]).toEqual([{ name: "project-ci", conclusion: "missing" }]);
   });
 });
 
@@ -685,19 +727,21 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
     expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_NOT_PINNED);
     expect(github.checkRuns).toHaveLength(0);
   });
+
+  it("serializes concurrent production-gate publication before either caller can write", async () => {
+    const fixture = await setup();
+    const concurrent = await Promise.all([
+      fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity),
+      fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity),
+    ]);
+    expect(concurrent.map((result) => result.reasonCode)).toEqual(
+      expect.arrayContaining([ReasonCode.OK, ReasonCode.RESOURCE_COLLISION]),
+    );
+    expect(fixture.github.checkRuns.filter((check) => check.name === GATE_CHECK_NAME)).toHaveLength(1);
+  });
 });
 
 describe("trusted CI evidence (CP-S29)", () => {
-  const commands = [
-    parseVerificationCommand({
-      id: "project-ci",
-      argv: ["node", "verify.js"],
-      repositoryRole: "primary",
-      evidenceMode: "TRUSTED_CI",
-      timeoutSeconds: 60,
-    }),
-  ];
-
   // The fixture already applied the candidate change and froze it; re-freezing returns the
   // same content-addressed snapshot.
   const frozen = async (fixture: Fixture) => {
@@ -732,7 +776,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     const verified = await fixture.harness.cp.verification.verify({
       runId: fixture.runId,
       snapshot,
-      commands,
+      commands: TRUSTED_CI_COMMANDS,
       contractDigest: snapshot.contractDigest,
     });
     expect(verified.allowed).toBe(false);
@@ -766,7 +810,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     const edited = await fixture.harness.cp.verification.verify({
       runId: fixture.runId,
       snapshot,
-      commands,
+      commands: TRUSTED_CI_COMMANDS,
       contractDigest: snapshot.contractDigest,
     });
     expect(edited.allowed).toBe(false);
@@ -801,7 +845,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     const verified = await fixture.harness.cp.verification.verify({
       runId: fixture.runId,
       snapshot,
-      commands,
+      commands: TRUSTED_CI_COMMANDS,
       contractDigest: snapshot.contractDigest,
     });
     expect(verified.allowed).toBe(false);
@@ -836,7 +880,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     const verified = await fixture.harness.cp.verification.verify({
       runId: fixture.runId,
       snapshot,
-      commands,
+      commands: TRUSTED_CI_COMMANDS,
       contractDigest: snapshot.contractDigest,
     });
     expect(verified.allowed).toBe(false);
@@ -891,7 +935,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     const verified = await fixture.harness.cp.verification.verify({
       runId: fixture.runId,
       snapshot,
-      commands,
+      commands: TRUSTED_CI_COMMANDS,
       contractDigest: snapshot.contractDigest,
     });
     expect(verified.allowed).toBe(true);
