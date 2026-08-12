@@ -1,11 +1,11 @@
 import type { Clock } from "../core/clock.ts";
-import type { Evidence } from "../core/errors.ts";
-import type { ReasonCode } from "../core/reason-codes.ts";
+import { allow, deny, type Decision, type Evidence } from "../core/errors.ts";
+import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import type { Db } from "./database.ts";
 
 export interface AuditRecord {
   kind: string;
-  reasonCode?: ReasonCode | null;
+  reasonCode?: ReasonCodeValue | null;
   runId?: string | null;
   projectId?: string | null;
   sessionId?: string | null;
@@ -25,20 +25,35 @@ export class AuditLog {
     private readonly clock: Clock,
   ) {}
 
-  record(entry: AuditRecord): void {
+  record(entry: AuditRecord): Decision<void> {
+    if (!isAllowlistedAuditEvidence(entry.evidence ?? {})) {
+      // Keep the decision itself visible without retaining the rejected payload. An audit
+      // record that might contain a private payload is less useful than a privacy breach.
+      this.insert(entry, ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED, { auditEvidenceRejected: true });
+      return deny(
+        ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
+        "audit evidence contains an unallowlisted field or value shape",
+        { kind: entry.kind },
+      );
+    }
+    this.insert(entry, entry.reasonCode ?? null, redact(entry.evidence ?? {}) as Evidence);
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  private insert(entry: AuditRecord, reasonCode: ReasonCodeValue | null, evidence: Evidence): void {
     this.db.run(
       `INSERT INTO audit_events (at, kind, reason_code, run_id, project_id, session_id, role_key, actor, evidence_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         this.clock.nowIso(),
         entry.kind,
-        entry.reasonCode ?? null,
+        reasonCode,
         entry.runId ?? null,
         entry.projectId ?? null,
         entry.sessionId ?? null,
         entry.roleKey ?? null,
         entry.actor ?? null,
-        JSON.stringify(redact(entry.evidence ?? {})),
+        JSON.stringify(evidence),
       ],
     );
   }
@@ -135,6 +150,63 @@ const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
 ];
 
 const MAX_STRING = 2000;
+
+/**
+ * The audit log is a decision summary, not a generic payload store. New evidence fields
+ * need a deliberate review here before they can cross the durable boundary; otherwise a
+ * new API response shape could quietly become a secret-bearing collection.
+ */
+const AUDIT_EVIDENCE_KEYS: ReadonlySet<string> = new Set([
+  "ackGeneration", "action", "activationGrantDigest", "activeManifestDigest", "activeRuns",
+  "activeSession", "address", "allowed", "approved", "at", "attempt", "attemptedStatus",
+  "availability", "backoffSeconds", "bindingRemoved", "blocking", "blocksCriticalPath", "branch",
+  "candidateSnapshotDigest", "changes", "channel", "checkRunId", "checkoutPath", "chunked", "clean", "code",
+  "claimId", "claimedClassification", "conclusion", "contractDigest", "conversation", "coveredFiles",
+  "creator", "creatorIdentity", "currentGeneration", "currentSession", "decision", "deferred",
+  "delivered", "dependencyCount", "detail", "digest", "doctorStatus", "effort", "error", "evidence",
+  "escalation", "exactHead", "executionGeneration", "executionId", "executionMode", "executions",
+  "expected", "expectedBase", "expectedGeneration", "expectedInputs", "expectedSession", "expiresAt",
+  "consecutiveFailures", "failed", "failureClass", "failures", "findings", "firstAt", "firstSeen",
+  "fixCommitSha", "found", "from",
+  "fromGeneration", "fromSession", "gaps", "generation", "goal", "gotGeneration", "grantId",
+  "handoffId", "head", "humanGate", "humanGateDigest", "idempotencyKey", "idempotent", "identity",
+  "incomingSessionId", "incomplete", "item", "kind", "knownDigests", "mergeCommitSha", "messageId",
+  "method", "missing", "mode", "model", "name", "nested", "nonce", "notification",
+  "observedCheckRunId", "observedDigest", "observedHead", "observedInputs", "omittedItems", "operation",
+  "operationId", "options", "outcome", "overdue", "ownerApproved", "ownerBindingGeneration", "paths",
+  "payloadDigest", "payloadHead", "phase", "pid", "pinnedManifestDigest", "preconditions", "present",
+  "precondition", "previousCandidateSnapshotDigest", "primaryCtoGeneration", "priority", "probeError",
+  "promotedFromBootstrap", "provider",
+  "pullNumber", "purpose", "question", "rationale", "reason", "recommendation", "reconcile",
+  "recordedCheckRunId", "recoveredAfterFailures", "rejected", "released", "repositories",
+  "repositoryIdentity", "resolution", "resolvedPath", "restored", "resultDigest", "results", "retargeted",
+  "retryNotBefore", "risk", "role", "runsRepointed", "runtimeHealth", "scope", "sensorHealth", "severity",
+  "source", "satisfied", "lastError",
+  "startedAt", "status", "statuses", "takeover", "target", "targetBranch", "targetPath", "targetWorktreeId",
+  "taskCount", "taskId", "threshold", "timer", "to", "toGeneration", "toSessionId", "trigger",
+  "triggeredScopes", "uncovered", "verdict", "viaRunKind", "worktreeId", "ok",
+]);
+
+const isPlainRecord = (value: object): value is Record<string, unknown> => {
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+};
+
+/** Unknown fields are rejected before redaction so only explicitly reviewed shapes persist. */
+const isAllowlistedAuditEvidence = (value: unknown, depth = 0): boolean => {
+  if (depth > 8) return true; // redact() replaces deeper material with a fixed marker.
+  if (value == null || typeof value === "string" || typeof value === "boolean" || typeof value === "bigint") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.slice(0, 200).every((item) => isAllowlistedAuditEvidence(item, depth + 1));
+  if (!value || typeof value !== "object" || !isPlainRecord(value)) return false;
+
+  return Object.entries(value).every(([key, nested]) => {
+    // These names are explicitly safe only because redact() replaces their values before
+    // serialization. They stay outside the general allowlist on purpose.
+    if (isSecretKey(key) || isSecretCollectionKey(key) || isBulkContentKey(key)) return true;
+    return AUDIT_EVIDENCE_KEYS.has(key) && isAllowlistedAuditEvidence(nested, depth + 1);
+  });
+};
 
 const scrubValue = (text: string): string => {
   let out = text;

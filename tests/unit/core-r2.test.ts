@@ -224,16 +224,37 @@ describe("round-2 database and evidence regressions", () => {
 
   it("#75 redacts arbitrary secrets stored under requestHeaders before audit serialization", () => {
     const { audit } = makeCore();
-    audit.record({ kind: "TEST", evidence: { requestHeaders: { "X-Service-Key": "arbitrary-password" } } });
+    const recorded = audit.record({
+      kind: "TEST",
+      evidence: { requestHeaders: { "X-Service-Key": "arbitrary-password" } },
+    });
+    expect(recorded.reasonCode).toBe(ReasonCode.OK);
     expect(audit.all()[0]?.evidence).toEqual({ requestHeaders: "[redacted-collection]" });
+  });
+
+  it("#75 rejects an unallowlisted audit-evidence collection before it can serialize a credential", () => {
+    const { audit } = makeCore();
+    const rejected = audit.record({
+      kind: "TEST",
+      evidence: { requestMetadata: { "X-Service-Key": "arbitrary-password" } },
+    });
+
+    expect(rejected).toMatchObject({ allowed: false, reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
+    expect(audit.all()[0]?.evidence).toEqual({ auditEvidenceRejected: true });
   });
 
   it("#76 rejects receipt edits and deletes that would remove an external-write replay marker", () => {
     const { db } = makeCore();
     db.run(
       `INSERT INTO github_receipts (receipt_id, idempotency_key, operation, repository_identity,
-                                    resource_type, resource_identity, request_digest, response_json, created_at)
-       VALUES ('r1', 'key1', 'merge_execute', 'github:acme/fixture', 'pull', '1', 'sha256:request', '{}', 't')`,
+                                    resource_type, resource_identity, request_digest, response_json, created_at, status)
+       VALUES ('r1', 'key1', 'merge_execute', 'github:acme/fixture', 'pull', '1', 'sha256:request', '{"pending":true}', 't', 'PENDING')`,
+    );
+    db.run(
+      `UPDATE github_receipts
+          SET status = 'APPLIED', after_state_digest = 'sha256:after', response_json = '{"applied":true}',
+              reread_at = 't', verified = 1
+        WHERE receipt_id = 'r1'`,
     );
 
     expect(() => db.run("UPDATE github_receipts SET response_json = '{\"forged\":true}' WHERE receipt_id = 'r1'"))
@@ -241,5 +262,28 @@ describe("round-2 database and evidence regressions", () => {
     expect(() => db.run("DELETE FROM github_receipts WHERE receipt_id = 'r1'")).toThrowError(
       /GITHUB_RECEIPT_IMMUTABLE/,
     );
+  });
+
+  it("#76 rejects a completed external-write receipt that bypasses its PENDING reservation", () => {
+    const { db } = makeCore();
+    expect(
+      thrown(() =>
+        db.run(
+          `INSERT INTO github_receipts (receipt_id, idempotency_key, operation, repository_identity,
+                                        resource_type, resource_identity, request_digest, response_json, created_at,
+                                        reread_at, verified, status)
+           VALUES ('r2', 'key2', 'merge_execute', 'github:acme/fixture', 'pull', '2', 'sha256:request', '{}', 't', 't', 1, 'APPLIED')`,
+        ),
+      ),
+    ).toMatchObject({ reasonCode: ReasonCode.GITHUB_RECEIPT_PROTOCOL_VIOLATION });
+
+    db.run(
+      `INSERT INTO github_receipts (receipt_id, idempotency_key, operation, repository_identity,
+                                    resource_type, resource_identity, request_digest, response_json, created_at, status)
+       VALUES ('r3', 'key3', 'merge_execute', 'github:acme/fixture', 'pull', '3', 'sha256:request', '{"pending":true}', 't', 'PENDING')`,
+    );
+    expect(
+      thrown(() => db.run("UPDATE github_receipts SET status = 'APPLIED' WHERE receipt_id = 'r3'")),
+    ).toMatchObject({ reasonCode: ReasonCode.GITHUB_RECEIPT_PROTOCOL_VIOLATION });
   });
 });

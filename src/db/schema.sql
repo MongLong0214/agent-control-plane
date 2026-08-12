@@ -270,6 +270,17 @@ CREATE INDEX IF NOT EXISTS runs_state ON runs(state);
 CREATE INDEX IF NOT EXISTS runs_owner ON runs(owner_session_id, state);
 CREATE INDEX IF NOT EXISTS runs_project ON runs(project_id, state);
 
+-- ---------------------------------------------------------------------------
+-- candidate_pipeline_attempts  (PRD §30.3 candidate-pipeline attempt lease)
+--   Lifecycle: one active orchestration attempt owns a run until its conditional release.
+--   Integrity: run_id is the lease key, so concurrent submissions collide atomically.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS candidate_pipeline_attempts (
+  run_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, owner_session_id TEXT NOT NULL,
+  owner_binding_generation INTEGER NOT NULL, candidate_digest TEXT, state TEXT NOT NULL
+    CHECK (state IN ('RUNNING','RELEASED')), started_at TEXT NOT NULL, released_at TEXT
+);
+
 -- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
 -- while this guard rejects topology bypasses even from a raw SQLite caller.
 CREATE TRIGGER IF NOT EXISTS runs_state_transition_guard
@@ -639,7 +650,16 @@ CREATE TABLE IF NOT EXISTS github_receipts (
   created_at          TEXT NOT NULL,
   reread_at           TEXT,
   verified            INTEGER NOT NULL DEFAULT 0 CHECK (verified IN (0,1)),
-  status              TEXT NOT NULL DEFAULT 'APPLIED' CHECK (status IN ('PENDING','APPLIED'))
+  status              TEXT NOT NULL DEFAULT 'APPLIED' CHECK (status IN ('PENDING','APPLIED')),
+  CHECK (
+    status <> 'PENDING' OR (
+      preexisting = 0
+      AND after_state_digest IS NULL
+      AND reread_at IS NULL
+      AND verified = 0
+      AND response_json = '{"pending":true}'
+    )
+  )
 );
 
 CREATE INDEX IF NOT EXISTS github_receipts_run ON github_receipts(run_id, operation);
@@ -660,12 +680,45 @@ WHEN NOT (
   AND NEW.run_id IS OLD.run_id
   AND NEW.repository_identity = OLD.repository_identity
   AND NEW.resource_type = OLD.resource_type
+  AND NEW.resource_identity = OLD.resource_identity
   AND NEW.request_digest = OLD.request_digest
   AND NEW.before_state_digest IS OLD.before_state_digest
   AND NEW.created_at = OLD.created_at
 )
 BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_IMMUTABLE');
+END;
+
+-- A direct APPLIED row would make it possible to perform a write and create its replay
+-- marker only afterwards. Writes that this kernel originates must first reserve PENDING.
+-- `pr_prepare` may record a pre-existing pull request, which is an observation rather
+-- than a write and therefore remains eligible for direct APPLIED recording.
+CREATE TRIGGER IF NOT EXISTS github_receipts_applied_requires_reservation
+BEFORE INSERT ON github_receipts
+WHEN NEW.status = 'APPLIED'
+ AND (
+   NEW.operation IN ('gate_publish','merge_execute','release_tag','issue_project')
+   OR (NEW.operation = 'pr_prepare' AND NEW.preexisting = 0)
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'GITHUB_RECEIPT_PROTOCOL_VIOLATION');
+END;
+
+-- Completion has to prove a reread and move exactly one unfinished reservation forward.
+-- The immutable trigger above prevents every other edit; this trigger gives malformed
+-- completion attempts their own stable denial rather than treating them as generic edits.
+CREATE TRIGGER IF NOT EXISTS github_receipts_pending_completion
+BEFORE UPDATE ON github_receipts
+WHEN OLD.status = 'PENDING' AND NEW.status = 'APPLIED'
+ AND (
+   NEW.preexisting <> 0
+   OR NEW.after_state_digest IS NULL
+   OR NEW.reread_at IS NULL
+   OR NEW.verified <> 1
+   OR NEW.response_json = '{"pending":true}'
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'GITHUB_RECEIPT_PROTOCOL_VIOLATION');
 END;
 
 -- A PENDING reservation records an *intent* whose external write demonstrably did not
