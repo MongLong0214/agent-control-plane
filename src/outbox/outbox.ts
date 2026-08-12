@@ -44,7 +44,6 @@ export interface DeliveryFailure {
 }
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
-const MAX_DELIVERY_ATTEMPTS = 5;
 const MAX_RETRY_DELAY_MS = 30 * 60 * 1000;
 const RETRYABLE_FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set([
   "transient",
@@ -312,18 +311,30 @@ export class Outbox {
       );
     }
 
-    const row = this.db.get<{ attempts: number }>(
-      `SELECT attempts FROM outbox WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?`,
+    const row = this.db.get<{
+      attempts: number;
+      retry_max_attempts: number;
+      retry_backoff_ms: number;
+    }>(
+      `SELECT attempts, retry_max_attempts, retry_backoff_ms
+         FROM outbox WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?`,
       [messageId, claimToken],
     );
     if (!row) return this.staleClaim(messageId);
     const attempts = row.attempts + 1;
+    const retryPolicyIsValid =
+      Number.isSafeInteger(row.retry_max_attempts) &&
+      row.retry_max_attempts >= 0 &&
+      Number.isSafeInteger(row.retry_backoff_ms) &&
+      // A zero-delay retry would recreate the immediate retry loop that §34.1 forbids.
+      row.retry_backoff_ms > 0;
     const retryable =
+      retryPolicyIsValid &&
       classified.retryable &&
       RETRYABLE_FAILURE_CLASSES.has(classified.failureClass) &&
-      attempts < MAX_DELIVERY_ATTEMPTS;
+      attempts < row.retry_max_attempts;
     const nextAttemptAt = retryable
-      ? isoPlus(this.clock.nowIso(), retryDelayMs(attempts))
+      ? isoPlus(this.clock.nowIso(), retryDelayMs(attempts, row.retry_backoff_ms))
       : null;
     const changes = this.db.run(
       `UPDATE outbox SET status = ?, attempts = ?, last_error = ?, failure_class = ?,
@@ -353,6 +364,19 @@ export class Outbox {
     ).changes;
     if (changes !== 1) {
       return this.staleClaim(messageId);
+    }
+    if (!retryable) {
+      return deny(
+        ReasonCode.OUTBOX_DELIVERY_REJECTED,
+        "delivery failure is not eligible for another attempt",
+        {
+          messageId,
+          failureClass: classified.failureClass,
+          attempts,
+          retryMaxAttempts: row.retry_max_attempts,
+          retryPolicyIsValid,
+        },
+      );
     }
     return allow(ReasonCode.OK, undefined);
   }
@@ -668,5 +692,5 @@ const normalizeFailure = (failure: DeliveryFailure | string): DeliveryFailure =>
         error: failure.error,
       };
 
-const retryDelayMs = (attempts: number): number =>
-  Math.min(1_000 * 2 ** Math.max(0, attempts - 1), MAX_RETRY_DELAY_MS);
+const retryDelayMs = (attempts: number, baseDelayMs: number): number =>
+  Math.min(baseDelayMs * 2 ** Math.max(0, attempts - 1), MAX_RETRY_DELAY_MS);

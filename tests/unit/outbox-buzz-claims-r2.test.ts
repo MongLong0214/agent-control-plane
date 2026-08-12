@@ -58,6 +58,14 @@ describe("round-2 outbox fencing", () => {
     expect(core.outbox.markSent(claimed.messageId, claimed.claimToken).reasonCode).toBe(
       ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
     );
+    expect(
+      core.outbox.markAttemptFailed(claimed.messageId, claimed.claimToken, {
+        failureClass: "transient",
+        retryable: true,
+        error: "relay disconnected",
+      }).reasonCode,
+    ).toBe(ReasonCode.OUTBOX_STALE_GENERATION_REJECTED);
+    expect(core.outbox.get(claimed.messageId)?.status).toBe("REJECTED");
     expect(core.outbox.claimDeliverable()).toHaveLength(0);
   });
 
@@ -89,6 +97,17 @@ describe("round-2 outbox fencing", () => {
 
     expect(core.outbox.claimDeliverable()).toHaveLength(0);
     expect(core.outbox.get(message.value.messageId)?.status).toBe("REJECTED");
+
+    const missing = core.outbox.enqueue({
+      idempotencyKey: "outbox:missing-target",
+      roleKey: seeded.roleKey,
+      bindingGeneration: seeded.generation,
+      targetSessionId: "ses_does_not_exist",
+      runId: seeded.runId,
+      kind: MessageKind.RUN_DISPATCH,
+      payload: { runId: seeded.runId },
+    });
+    expect(missing.reasonCode).toBe(ReasonCode.OUTBOX_TARGET_NOT_CURRENT);
   });
 
   it("#173 denies a different request that reuses an idempotency key", () => {
@@ -137,17 +156,23 @@ describe("round-2 outbox fencing", () => {
     const retryMessage = enqueue(core, seeded, "outbox:bounded-retry", 3 * 60 * 60 * 1000);
     expect(retryMessage.allowed).toBe(true);
     if (!retryMessage.allowed) return;
+    core.db.run(
+      `UPDATE outbox SET retry_max_attempts = 2, retry_backoff_ms = 2_500 WHERE message_id = ?`,
+      [retryMessage.value.messageId],
+    );
     expect(core.outbox.get(retryMessage.value.messageId)?.status).toBe("PENDING");
     const initialClaims = core.outbox.claimDeliverable();
     expect(initialClaims).toHaveLength(1);
     let retryClaim = initialClaims[0]!;
-    for (let attempt = 1; attempt <= 5; attempt += 1) {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
       const result = core.outbox.markAttemptFailed(retryClaim.messageId, retryClaim.claimToken, {
         failureClass: "transient",
         retryable: true,
         error: "relay temporarily unavailable",
       });
-      expect(result.allowed).toBe(true);
+      expect(result.reasonCode).toBe(
+        attempt === 2 ? ReasonCode.OUTBOX_DELIVERY_REJECTED : ReasonCode.OK,
+      );
       const row = core.db.get<{
         attempts: number;
         status: string;
@@ -161,18 +186,61 @@ describe("round-2 outbox fencing", () => {
       )!;
       expect(row.attempts).toBe(attempt);
       expect(row.failure_class).toBe("transient");
-      if (attempt === 5) {
+      if (attempt === 2) {
         expect(row.status).toBe("REJECTED");
         expect(row.retry_eligible).toBe(0);
         expect(row.next_attempt_at).toBeNull();
+        expect(
+          core.db.get<{ reason_code: string }>(
+            `SELECT reason_code FROM outbox WHERE message_id = ?`,
+            [retryClaim.messageId],
+          )?.reason_code,
+        ).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
         break;
       }
       expect(row.status).toBe("PENDING");
       expect(row.retry_eligible).toBe(1);
       expect(core.outbox.claimDeliverable()).toHaveLength(0);
-      core.clock.advance(30 * 60 * 1000);
+      core.clock.advance(2_499);
+      expect(core.outbox.claimDeliverable()).toHaveLength(0);
+      core.clock.advance(1);
       retryClaim = core.outbox.claimDeliverable()[0]!;
     }
+
+    const permanent = enqueue(core, seeded, "outbox:permanent-with-policy");
+    expect(permanent.allowed).toBe(true);
+    if (!permanent.allowed) return;
+    const permanentClaim = core.outbox.claimDeliverable()[0]!;
+    const permanentlyRejected = core.outbox.markAttemptFailed(
+      permanentClaim.messageId,
+      permanentClaim.claimToken,
+      {
+        failureClass: "contract",
+        retryable: false,
+        error: "target address is invalid",
+      },
+    );
+    expect(permanentlyRejected.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
+    expect(core.outbox.get(permanentClaim.messageId)?.status).toBe("REJECTED");
+
+    const zeroBackoff = enqueue(core, seeded, "outbox:zero-backoff");
+    expect(zeroBackoff.allowed).toBe(true);
+    if (!zeroBackoff.allowed) return;
+    core.db.run(`UPDATE outbox SET retry_backoff_ms = 0 WHERE message_id = ?`, [
+      zeroBackoff.value.messageId,
+    ]);
+    const zeroBackoffClaim = core.outbox.claimDeliverable()[0]!;
+    const refusedZeroBackoff = core.outbox.markAttemptFailed(
+      zeroBackoffClaim.messageId,
+      zeroBackoffClaim.claimToken,
+      {
+        failureClass: "transient",
+        retryable: true,
+        error: "relay temporarily unavailable",
+      },
+    );
+    expect(refusedZeroBackoff.reasonCode).toBe(ReasonCode.OUTBOX_DELIVERY_REJECTED);
+    expect(core.outbox.get(zeroBackoffClaim.messageId)?.status).toBe("REJECTED");
   });
 });
 
