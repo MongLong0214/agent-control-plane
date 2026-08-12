@@ -13,3 +13,6 @@ var/
 *.sqlite-wal
 *.sqlite-shm
 .acp-secrets/
+
+# A delegate writes its report here; it is never part of the repository.
+HANDOFF-REPORT.md
