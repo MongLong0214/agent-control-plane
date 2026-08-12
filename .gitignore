@@ -1,4 +1,5 @@
-node_modules/
+# No trailing slash: a `node_modules` symlink must be ignored too, not just a directory.
+node_modules
 dist/
 *.log
 .DS_Store

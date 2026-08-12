@@ -19,8 +19,10 @@ export interface InvocationRequest {
   effort?: string;
   /** JSON Schema the final answer must satisfy, when the caller needs structured output. */
   responseSchema?: Record<string, unknown>;
-  /** Read-only invocations must not be able to mutate a repository. */
+  /** Read-only invocations must not be able to mutate or explore a repository. */
   readOnly: boolean;
+  /** Hard cost ceiling for one invocation, where the runtime supports one. */
+  maxBudgetUsd?: number;
   /** Stable id so an interrupted invocation can be correlated in provider logs. */
   correlationId: string;
 }

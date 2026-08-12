@@ -18,6 +18,7 @@ import {
   buildCandidateSnapshot,
   candidateSnapshotDigest,
 } from "../snapshot/candidate-snapshot.ts";
+import type { Telemetry } from "../telemetry/telemetry.ts";
 import type { VerificationEngine, VerificationReport } from "../verify/verification-engine.ts";
 import type { RunEngine, TaskContract } from "./run-engine.ts";
 import type { TaskGraph } from "./task-graph.ts";
@@ -64,6 +65,7 @@ export class CandidatePipeline {
     private readonly ceo: ProductionGate,
     private readonly bindings: BindingRegistry,
     private readonly outbox: Outbox,
+    private readonly telemetry: Telemetry,
   ) {}
 
   /** Freeze the candidate across every repository participating in the run (§16.2). */
@@ -258,6 +260,18 @@ export class CandidatePipeline {
       roleKey: binding?.roleKey ?? null,
       reasonCode: reasonCode as never,
       evidence,
+    });
+
+    // §31.3 — revision count is run-scope telemetry. The FSM keeps a blind-review
+    // revision inside ACTIVE (§29.2 has no ACTIVE→REVISION_REQUIRED edge), so the count
+    // has to be recorded here rather than inferred from a state change.
+    this.telemetry.record({
+      scope: "run",
+      name: "revision",
+      runId,
+      value: 1,
+      text: reasonCode,
+      dims: { stage: evidence["stage"] ?? null, mode: run.executionMode },
     });
   }
 

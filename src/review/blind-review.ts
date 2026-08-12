@@ -515,9 +515,32 @@ export class BlindReviewGate {
     sections.push(
       "",
       "## Required response",
-      "Return JSON only, matching the supplied schema.",
+      // Only some runtimes enforce a response schema, so the shape is stated here too.
+      "Return a single JSON object and nothing else — no prose before or after it:",
+      "```json",
+      JSON.stringify(
+        {
+          verdict: "PASS | REVISE | BLOCK",
+          coveredFiles: ["<repository-identity>:<path>"],
+          omittedItems: [],
+          findings: [
+            {
+              category: "correctness",
+              severity: "MINOR",
+              repository: "<repository-identity>",
+              path: "<path or null>",
+              summary: "one line",
+              detail: "what is wrong and why it matters",
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "```",
       "`coveredFiles` must list every file you actually examined, formatted `<repository-identity>:<path>`.",
       "`omittedItems` must list anything you could not examine. Do not return PASS with a non-empty omission list.",
+      "`findings` may be empty. Everything you need is above; you have no tools and are not expected to look anything up.",
     );
     return sections.filter(Boolean).join("\n");
   }

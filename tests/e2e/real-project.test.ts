@@ -37,8 +37,12 @@ const CONTRACT: TaskContract = {
   scope: ["src/core/reason-codes.ts"],
   nonGoals: ["renaming any existing reason code"],
   acceptance: [
-    "the project typecheck passes at the exact candidate head",
-    "no existing reason code string changes",
+    // The criteria name the evidence this run actually produces. The full typecheck
+    // needs installed dependencies and so belongs to CI as TRUSTED_CI evidence; stating
+    // it here would promise evidence the local verification cannot supply.
+    "the reason-code contract check (scripts/verify-reason-codes.mjs) passes at the exact candidate head",
+    "no existing reason code string is removed or renamed",
+    "nothing outside src/core/reason-codes.ts is modified",
   ],
   priority: "NORMAL",
   humanGate: [],
@@ -100,6 +104,10 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       // A real, pre-existing project. Cloned so the owner's working tree is untouched;
       // the code, history and verification command are the real ones.
       execFileSync("git", ["clone", "--local", "--quiet", REAL_PROJECT, checkout]);
+      // Local-only exclude: the symlink is a convenience for this checkout and must never
+      // enter a candidate. Committing a machine-specific absolute symlink is exactly the
+      // scope violation an independent reviewer should refuse.
+      writeFileSync(join(checkout, ".git", "info", "exclude"), "node_modules\n");
       symlinkSync(join(REAL_PROJECT, "node_modules"), join(checkout, "node_modules"), "dir");
       // The clone already sits on the project's real default branch.
       expect(gitSync(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");

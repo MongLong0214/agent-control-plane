@@ -32,6 +32,21 @@ export interface CliAdapterOptions {
 
 const DEFAULT_FRESHNESS_MS = 15 * 60 * 1000;
 
+/** Tools a read-only invocation must not have. Denied by name, not by permission mode. */
+const DENIED_TOOLS = [
+  "Bash",
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "Read",
+  "Grep",
+  "Glob",
+  "Task",
+  "WebFetch",
+  "WebSearch",
+  "TodoWrite",
+];
+
 /**
  * Reads the structured local capacity file.
  *
@@ -192,11 +207,18 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       request.model ?? this.defaultModels.cto,
     ];
     if (request.readOnly) {
-      // Plan mode plus a read-only tool allowlist: the reviewer receives the diff in
-      // its prompt and has no reason, and now no ability, to mutate the candidate.
-      // The allowlist goes in as one comma-separated value — the flag is variadic, so
-      // separate arguments would swallow the prompt that follows.
-      args.push("--permission-mode", "plan", "--allowedTools", "Read,Grep,Glob");
+      // §18.3 — a blind reviewer judges exactly the inputs it was given. Granting it
+      // repository tools invites it to go exploring, which both changes what it saw and
+      // turns a single verdict into an open-ended tool loop. Plan mode blocks mutation;
+      // the deny list removes the exploration surface entirely.
+      args.push(
+        "--permission-mode",
+        "plan",
+        "--disallowedTools",
+        DENIED_TOOLS.join(","),
+        "--max-budget-usd",
+        String(request.maxBudgetUsd ?? 5),
+      );
     }
     if (request.systemPrompt) args.push("--append-system-prompt", request.systemPrompt);
 
