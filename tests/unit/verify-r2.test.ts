@@ -30,8 +30,6 @@ const contract = {
   references: [],
 };
 
-const sandboxIt = it;
-
 const frozenPinnedCandidate = async (options: {
   manifest?: ReturnType<typeof fixtureManifest>;
   trustClass?: "OWNER_TRUSTED" | "UNTRUSTED";
@@ -100,7 +98,7 @@ describe("round-2 verification isolation and candidate freshness", () => {
     ).rejects.toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_STALE });
   });
 
-  sandboxIt("#162 refuses a cwd symlink that resolves outside the frozen worktree", async () => {
+  it("#162 refuses a cwd symlink that resolves outside the frozen worktree", async () => {
     const repo = makeRepo();
     const outside = tempDir("acp-outside-");
     // A committed symlink is the candidate-controlled path the command would otherwise
@@ -116,27 +114,71 @@ describe("round-2 verification isolation and candidate freshness", () => {
   });
 
   it("#163 drops an opaque provider token even when a command asks for its name", () => {
-    process.env.PROVIDER_TOKEN = "opaque-value-that-is-not-pattern-matched";
     const env = buildSandboxEnvironment(
-      parseVerificationCommand({ id: "env", argv: ["node", "-e", "process.exit(0)"], envAllowlist: ["PROVIDER_TOKEN"] }),
+      parseVerificationCommand({
+        id: "env",
+        argv: ["node", "-e", "process.exit(0)"],
+        envAllowlist: ["PROVIDER_TOKEN", "NODE_ENV"],
+      }),
       tempDir("acp-env-"),
-      undefined,
+      { PROVIDER_TOKEN: "opaque-value-that-is-not-pattern-matched", NODE_ENV: "test" },
     );
-    delete process.env.PROVIDER_TOKEN;
     expect(env.PROVIDER_TOKEN).toBeUndefined();
+    expect(env.NODE_ENV).toBe("test");
   });
 
-  sandboxIt("#164 refuses the detached-descendant sequence unless containment is established", async () => {
+  it("#164 prevents a detached descendant from escaping containment", async () => {
     const repo = makeRepo();
+    writeFileSync(
+      join(repo, "detached.js"),
+      `const { spawn } = require('node:child_process');
+       const child = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+       child.once('spawn', () => {
+         console.log(JSON.stringify({ childPid: child.pid, spawnError: null }));
+         child.unref();
+       });
+       child.once('error', (error) => {
+         console.log(JSON.stringify({ childPid: null, spawnError: error.code ?? null }));
+       });`,
+    );
     const outcome = await runSandboxed({
       command: parseVerificationCommand({
         id: "detached",
-        argv: ["node", "-e", "require('child_process').spawn('sleep',['30'],{detached:true,stdio:'ignore'}).unref()"],
+        argv: ["node", "detached.js"],
         timeoutSeconds: 2,
       }),
       worktreePath: repo,
     });
-    expect(outcome.status).not.toBe("PASS");
+    let result: { childPid: number | null; spawnError: string | null } | null = null;
+    try {
+      result = JSON.parse(outcome.stdout) as { childPid: number | null; spawnError: string | null };
+    } catch {
+      // The exact sandbox outcome below identifies a wrapper failure before output exists.
+    }
+    let childIsAlive = false;
+    try {
+      expect(outcome).toMatchObject({
+        status: "PASS",
+        reasonCode: null,
+        enforcement: { resourceLimitsEnforced: true, childContainmentEnforced: true },
+      });
+      expect(result).not.toBeNull();
+      if (result === null) return;
+      if (result.childPid === null) {
+        expect(result.spawnError).toBe("EAGAIN");
+      } else {
+        try {
+          process.kill(result.childPid, 0);
+          childIsAlive = true;
+        } catch (error) {
+          expect((error as NodeJS.ErrnoException).code).toBe("ESRCH");
+        }
+        expect(childIsAlive).toBe(false);
+      }
+    } finally {
+      // A failed containment assertion must not leave the escaped probe behind.
+      if (childIsAlive && result !== null && result.childPid !== null) process.kill(result.childPid, "SIGKILL");
+    }
   });
 
   it("#165 treats a deleted frozen base branch as snapshot drift", async () => {
@@ -157,7 +199,7 @@ describe("round-2 verification isolation and candidate freshness", () => {
     expect(fresh).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
   });
 
-  sandboxIt("#166/#233 records observed memory enforcement when Darwin cannot install RLIMIT_AS", async () => {
+  it("#166/#233 reports observed memory enforcement on Darwin and hard enforcement elsewhere", async () => {
     const repo = makeRepo();
     writeFileSync(join(repo, "memory.js"), "Buffer.alloc(512 * 1024 * 1024);\n");
     const outcome = await runSandboxed({
@@ -168,11 +210,20 @@ describe("round-2 verification isolation and candidate freshness", () => {
       }),
       worktreePath: repo,
     });
-    expect(outcome.status).toBe("PASS");
-    expect(outcome.enforcement.memoryLimit).toBe("observed");
+    if (process.platform === "darwin") {
+      expect(outcome).toMatchObject({
+        status: "PASS",
+        reasonCode: null,
+        enforcement: { memoryLimit: "observed" },
+      });
+    } else {
+      expect(outcome.enforcement.memoryLimit).toBe("hard");
+      expect(outcome.enforcement.resourceLimitsEnforced).toBe(true);
+      expect(outcome.status).not.toBe("PASS");
+    }
   });
 
-  sandboxIt("#167 finishes timeout escalation before returning an outcome", async () => {
+  it("#167 finishes timeout escalation before returning an outcome", async () => {
     const repo = makeRepo();
     const outcome = await runSandboxed({
       command: parseVerificationCommand({ id: "timeout", argv: ["node", "-e", "setInterval(() => {}, 1000)"], timeoutSeconds: 1 }),
@@ -306,7 +357,16 @@ describe("round-2 verification isolation and candidate freshness", () => {
       contractDigest: dispatched.value.contractDigest,
       runScoped: true,
     });
-    expect(crossRun).toMatchObject({ allowed: false, reasonCode: ReasonCode.VERIFICATION_GAP });
+    expect(crossRun).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.VERIFICATION_GAP,
+      message: "temporary repository is bound to a different run",
+      evidence: {
+        runId: dispatched.value.runId,
+        identity: temporary.value.identity,
+        temporaryForRun: "other-run",
+      },
+    });
   });
 
   it("#238 throws a typed denial instead of returning one as a candidate snapshot", async () => {

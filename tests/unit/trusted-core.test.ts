@@ -19,7 +19,7 @@ import {
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { assertPortableManifest, PROJECT_MANIFEST_SCHEMA_ID } from "../../src/contracts/manifest.ts";
-import { runSandboxed } from "../../src/verify/sandbox.ts";
+import { buildSandboxEnvironment, runSandboxed } from "../../src/verify/sandbox.ts";
 import {
   cleanupTempDirs,
   commitAll,
@@ -586,52 +586,52 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.enforcement.secretsStripped).toBe(true);
   });
 
-  it("refuses a command that names a credential store by absolute path", async () => {
+  it("#329 denies an attempted credential-store read made inside the command", async () => {
     const repo = makeRepo();
     const secrets = tempDir("acp-secrets-");
-    writeFileSync(join(secrets, "github-authority.token"), "ghp_secret_value_here");
+    const credentialPath = join(secrets, "github-authority.token");
+    writeFileSync(credentialPath, "ghp_secret_value_here");
     writeFileSync(
       join(repo, "peek.js"),
       `const fs = require('fs');
-       let read = null;
-       try { read = fs.readFileSync(process.argv[2], 'utf8'); } catch (e) { read = 'DENIED:' + e.code; }
-       console.log(JSON.stringify({ read }));`,
+       const credentialPath = ${JSON.stringify(credentialPath)};
+       let errno = null;
+       try { fs.readFileSync(credentialPath, 'utf8'); } catch (error) { errno = error.code ?? null; }
+       console.log(JSON.stringify({ errno }));`,
     );
 
     const outcome = await runSandboxed({
       command: parseVerificationCommand({
         id: "peek",
-        argv: ["node", "peek.js", join(secrets, "github-authority.token")],
+        argv: ["node", "peek.js"],
         timeoutSeconds: 60,
       }),
       worktreePath: repo,
       denyReadPaths: [secrets],
     });
 
-    expect(outcome.status).toBe("ERROR");
-    expect(outcome.reasonCode).toBe(ReasonCode.SANDBOX_PATH_OUTSIDE_WORKTREE);
-    expect(outcome.stdout).not.toContain("ghp_secret_value_here");
-    expect(outcome.enforcement.readConfinement).toBe("none");
+    expect(outcome).toMatchObject({
+      status: "PASS",
+      reasonCode: null,
+      enforcement: { readConfinement: "sensitive-paths" },
+    });
+    expect(JSON.parse(outcome.stdout)).toEqual({ errno: "EPERM" });
   });
 
-  it("drops a secret-shaped value even when its variable name is unknown", async () => {
-    const repo = makeRepo();
-    writeFileSync(
-      join(repo, "env.js"),
-      `console.log(JSON.stringify({ v: process.env.PROVIDER_HANDLE ?? null }));`,
-    );
-    const outcome = await runSandboxed({
-      command: parseVerificationCommand({
-        id: "env",
-        argv: ["node", "env.js"],
-        envAllowlist: ["PROVIDER_HANDLE"],
-        timeoutSeconds: 60,
-      }),
-      worktreePath: repo,
-      // A name no blacklist anticipated, carrying an obvious credential.
-      env: { PROVIDER_HANDLE: "ghp_abcdefghijklmnopqrstuvwxyz01" },
+  it("#308 drops a credential-shaped value even through an allowlisted name", () => {
+    const command = parseVerificationCommand({
+      id: "env",
+      argv: ["node", "-e", "process.exit(0)"],
+      envAllowlist: ["TZ"],
     });
-    expect(JSON.parse(outcome.stdout)).toEqual({ v: null });
+    const credential = buildSandboxEnvironment(
+      command,
+      tempDir("acp-env-"),
+      { TZ: "ghp_abcdefghijklmnopqrstuvwxyz01" },
+    );
+    const safe = buildSandboxEnvironment(command, tempDir("acp-env-"), { TZ: "Etc/UTC" });
+    expect(credential.TZ).toBeUndefined();
+    expect(safe.TZ).toBe("Etc/UTC");
   });
 
   it("refuses network=allowlist rather than pretending to enforce it", async () => {
@@ -651,19 +651,41 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.enforcement.readConfinement).toBe("none");
   });
 
-  it("denies network egress when the command declares network=deny", async () => {
+  it("#318 returns the kernel network-denial errno for a refused connection", async () => {
     const repo = makeRepo();
+    writeFileSync(
+      join(repo, "network.js"),
+      `const net = require('node:net');
+       const socket = net.connect({ host: '203.0.113.1', port: 443 });
+       const timer = setTimeout(() => {
+         socket.destroy();
+         console.log(JSON.stringify({ event: 'timeout', errno: null }));
+       }, 1_000);
+       socket.once('connect', () => {
+         clearTimeout(timer);
+         socket.destroy();
+         console.log(JSON.stringify({ event: 'connected', errno: null }));
+       });
+       socket.once('error', (error) => {
+         clearTimeout(timer);
+         console.log(JSON.stringify({ event: 'error', errno: error.code ?? null }));
+       });`,
+    );
     const outcome = await runSandboxed({
       command: parseVerificationCommand({
         id: "net",
-        argv: ["curl", "-sS", "-m", "5", "https://example.com"],
+        argv: ["node", "network.js"],
         network: "deny",
         timeoutSeconds: 30,
       }),
       worktreePath: repo,
     });
-    expect(outcome.enforcement.networkEnforced).toBe(true);
-    expect(outcome.status).not.toBe("PASS");
+    expect(outcome).toMatchObject({
+      status: "PASS",
+      reasonCode: null,
+      enforcement: { networkEnforced: true, networkPolicy: "deny" },
+    });
+    expect(JSON.parse(outcome.stdout)).toEqual({ event: "error", errno: "EPERM" });
   });
 
   it("confines writes to the worktree", async () => {
@@ -732,15 +754,18 @@ describe("verification sandbox (PRD §17.4)", () => {
 });
 
 describe("error contract", () => {
-  it("carries a stable reason code and evidence", () => {
+  it("#317 translates a database CHECK failure into a stable reason code and evidence", () => {
     const { db } = makeCore();
+    let caught: unknown;
     try {
       db.run(`INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
               VALUES ('s', 'i', 'p', 'm', 'NOPE', 'x', 'x')`);
-      expect.unreachable();
     } catch (err) {
-      expect(err instanceof Error).toBe(true);
-      expect(isAcpError(err) || /CHECK constraint/.test((err as Error).message)).toBe(true);
+      caught = err;
     }
+    expect(isAcpError(caught)).toBe(true);
+    if (!isAcpError(caught)) return;
+    expect(caught.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    expect(caught.evidence).toHaveProperty("sqlite");
   });
 });

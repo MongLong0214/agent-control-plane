@@ -72,6 +72,16 @@ export interface SandboxEnforcement {
 const SAFE_COMMAND_ENV = new Set(["NODE_ENV", "NO_COLOR", "FORCE_COLOR", "TZ"]);
 const SAFE_NODE_ENV = new Set(["development", "test", "production"]);
 const SAFE_BOOLEAN_ENV = new Set(["0", "1"]);
+// A harmless name cannot turn an authority-shaped value into sandbox input.
+const CREDENTIAL_VALUE_SHAPES: readonly RegExp[] = [
+  /^gh[pousr]_[A-Za-z0-9]{16,}$/,
+  /^sk-[A-Za-z0-9_-]{20,}$/,
+  /^nsec1[a-z0-9]{20,}$/,
+  /^xox[baprs]-/,
+  /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /^[A-Za-z0-9+/]{60,}={0,2}$/,
+];
 const RESOURCE_WRAPPER = "/usr/bin/python3";
 
 /*
@@ -356,9 +366,14 @@ export const buildSandboxEnvironment = (
 };
 
 const safeEnvironmentValue = (name: string, value: string): boolean =>
-  (name === "NODE_ENV" && SAFE_NODE_ENV.has(value)) ||
-  ((name === "NO_COLOR" || name === "FORCE_COLOR") && SAFE_BOOLEAN_ENV.has(value)) ||
-  (name === "TZ" && /^[A-Za-z0-9_+\-/]{1,64}$/.test(value));
+  !looksLikeCredential(value) && (
+    (name === "NODE_ENV" && SAFE_NODE_ENV.has(value)) ||
+    ((name === "NO_COLOR" || name === "FORCE_COLOR") && SAFE_BOOLEAN_ENV.has(value)) ||
+    (name === "TZ" && /^[A-Za-z0-9_+\-/]{1,64}$/.test(value))
+  );
+
+const looksLikeCredential = (value: string): boolean =>
+  CREDENTIAL_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
 
 /**
  * Paths a toolchain must be able to read to run at all: the interpreter, system
