@@ -201,8 +201,8 @@ export class ControlPlane {
     );
     this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
     this.bootstrap = new BootstrapActivation(
-      this.clock, this.audit, this.artifacts, this.projects, this.repositories,
-      this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo,
+      this.db, this.clock, this.audit, this.artifacts, this.projects, this.repositories,
+      this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox,
     );
 
     // Close the dependency cycles with narrow ports.
@@ -216,6 +216,7 @@ export class ControlPlane {
     });
     this.ownerAuthority = new OwnerAuthority(config.ownerIdentities ?? []);
     this.cto.attach({ ownerAuthority: this.ownerAuthority });
+    this.repair.attach({ ownerAuthority: this.ownerAuthority });
     this.ceo.attach({
       ownerAuthority: this.ownerAuthority,
       continuity: {

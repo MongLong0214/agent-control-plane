@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
+import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
@@ -15,9 +16,12 @@ export interface IngressRequest {
   /** Idempotency key / nonce; a replay of the same nonce is ignored. */
   nonce: string;
   payload: unknown;
-  /** HMAC or webhook secret token presented by the caller, when the channel has one. */
+  /**
+   * Hex HMAC-SHA256 over `ingressSigningInput(request)` — the whole envelope, not a
+   * caller-chosen string. A signature over a body nobody compares to the request proves
+   * nothing about the request (§27.1).
+   */
   signature?: string | null;
-  signedBody?: string | null;
 }
 
 export interface IngressPolicy {
@@ -38,6 +42,30 @@ const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
  * construction: the payload is returned as *data* with a marker, never as instructions
  * that could alter role, scope, credential or human-gate policy.
  */
+/**
+ * The exact bytes an ingress signature covers. Exported so a signer and this verifier
+ * cannot drift apart.
+ */
+export const ingressSigningInput = (request: {
+  channel: string;
+  actor: string;
+  conversation?: string | null;
+  nonce: string;
+  payload: unknown;
+}): string =>
+  JSON.stringify({
+    channel: request.channel,
+    actor: request.actor,
+    conversation: request.conversation ?? null,
+    nonce: request.nonce,
+    payload: digestOf(request.payload),
+  });
+
+export const ingressSignature = (
+  secret: string,
+  request: Parameters<typeof ingressSigningInput>[0],
+): string => createHmac("sha256", secret).update(ingressSigningInput(request)).digest("hex");
+
 export class IngressGuard {
   constructor(
     private readonly db: Db,
@@ -80,10 +108,13 @@ export class IngressGuard {
     }
 
     if (policy.secret) {
-      if (!request.signature || !request.signedBody) {
+      if (!request.signature) {
         return this.refuse(request, ReasonCode.INGRESS_SIGNATURE_INVALID, "missing signature");
       }
-      const expected = createHmac("sha256", policy.secret).update(request.signedBody).digest("hex");
+      // The guard derives the signed bytes itself, so actor, conversation, nonce and
+      // payload are all covered: a captured signature cannot be reused for a new payload
+      // or a fresh nonce.
+      const expected = ingressSignature(policy.secret, request);
       const provided = request.signature;
       const ok =
         expected.length === provided.length &&

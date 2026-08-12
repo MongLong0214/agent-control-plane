@@ -157,11 +157,27 @@ export const createHermesServer = (cp: ControlPlane): McpServer => {
     {
       description:
         "Capacity-driven project suspend. Requires explicit owner approval; Hermes cannot self-approve it.",
-      inputSchema: { projectId: z.string(), reason: z.string(), ownerApproved: z.boolean() },
+      inputSchema: {
+        projectId: z.string(),
+        reason: z.string(),
+        ownerApproved: z.boolean(),
+        // The approval must name the owner identity that gave it (§14.6).
+        ownerChannel: z.string().optional(),
+        ownerActor: z.string().optional(),
+      },
     },
     async (args) =>
       guarded(async () =>
-        respond(await cp.cto.suspendProject(args.projectId, args.ownerApproved, args.reason)),
+        respond(
+          await cp.cto.suspendProject(
+            args.projectId,
+            args.ownerApproved,
+            args.reason,
+            args.ownerChannel && args.ownerActor
+              ? { channel: args.ownerChannel, actor: args.ownerActor }
+              : undefined,
+          ),
+        ),
       ),
   );
 
@@ -250,6 +266,9 @@ export const createHermesServer = (cp: ControlPlane): McpServer => {
         authorizedBy: z.enum(["HERMES", "OWNER"]),
         dryRun: z.boolean().default(true),
         runId: z.string().nullable().optional(),
+        // An OWNER authorisation must name the owner identity behind it (§25.7).
+        ownerChannel: z.string().optional(),
+        ownerActor: z.string().optional(),
       },
     },
     async (args) =>
@@ -258,6 +277,10 @@ export const createHermesServer = (cp: ControlPlane): McpServer => {
           await cp.repair.execute({
             operationId: args.operationId,
             parameters: args.parameters,
+            owner:
+              args.ownerChannel && args.ownerActor
+                ? { channel: args.ownerChannel, actor: args.ownerActor }
+                : null,
             authorizedBy: args.authorizedBy,
             dryRun: args.dryRun,
             runId: args.runId ?? null,

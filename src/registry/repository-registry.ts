@@ -69,10 +69,18 @@ export class RepositoryRegistry {
     const identity = input.identity ?? observedIdentity ?? `local:${root}`;
 
     const existing = this.byIdentity(identity);
-    if (existing && existing.registration === "REGISTERED") {
+    // Re-registering the same checkout under the same identity is idempotent: a retried
+    // bootstrap or activation must not fail because a previous attempt got this far.
+    // A *different* path for a registered identity is still a conflict.
+    if (
+      existing &&
+      existing.registration === "REGISTERED" &&
+      existing.checkoutPath !== canonical(root)
+    ) {
       return deny(ReasonCode.CONFLICT, "repository identity already registered", {
         identity,
         existingPath: existing.checkoutPath,
+        requestedPath: canonical(root),
       });
     }
 

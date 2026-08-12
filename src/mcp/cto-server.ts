@@ -162,7 +162,7 @@ export const createCtoServer = (cp: ControlPlane): McpServer => {
       guarded(() => {
         const owner = cp.runs.assertOwner(args.runId, args.sessionId, args.bindingGeneration);
         if (!owner.allowed) return respond(owner);
-        if (args.claimId) return respond(cp.claims.release(args.claimId));
+        if (args.claimId) return respond(cp.claims.release(args.claimId, args.runId));
         return ok({ released: cp.claims.releaseRun(args.runId) });
       }),
   );
@@ -216,16 +216,28 @@ export const createCtoServer = (cp: ControlPlane): McpServer => {
         if (!args.executionId) {
           return respond(deny(ReasonCode.INVALID_ARGUMENT, "executionId is required", {}));
         }
-        if (args.phase === "activity") {
-          cp.tasks.recordActivity(args.executionId);
-          return ok({ recorded: true });
+        if (!args.executionId) {
+          return respond(
+            deny(ReasonCode.INVALID_ARGUMENT, "activity and finish need an execution id", {
+              phase: args.phase,
+            }),
+          );
         }
+        if (args.phase === "activity") {
+          return respond(cp.tasks.recordActivity(args.executionId, args.runId));
+        }
+        // The run id is passed through, so an owner of one run cannot close another
+        // run's execution (§25.2).
         return respond(
-          cp.tasks.finishExecution(args.executionId, {
-            status: args.status ?? "SUCCEEDED",
-            resultDigest: args.resultDigest ?? null,
-            failureClass: args.failureClass ?? null,
-          }),
+          cp.tasks.finishExecution(
+            args.executionId,
+            {
+              status: args.status ?? "SUCCEEDED",
+              resultDigest: args.resultDigest ?? null,
+              failureClass: args.failureClass ?? null,
+            },
+            args.runId,
+          ),
         );
       }),
   );

@@ -333,7 +333,7 @@ CREATE INDEX IF NOT EXISTS run_artifacts_snapshot ON run_artifacts(candidate_sna
 CREATE TABLE IF NOT EXISTS handoffs (
   handoff_id        TEXT PRIMARY KEY,
   project_id        TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
-  kind              TEXT NOT NULL CHECK (kind IN ('HANDOFF','RECOVERY')),
+  kind              TEXT NOT NULL CHECK (kind IN ('HANDOFF','RECOVERY','BOOTSTRAP')),
   from_session_id   TEXT,
   from_generation   INTEGER,
   to_session_id     TEXT NOT NULL REFERENCES sessions(session_id),

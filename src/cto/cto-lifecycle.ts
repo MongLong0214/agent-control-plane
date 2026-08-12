@@ -163,6 +163,18 @@ export class CtoLifecycle {
     return allow(ReasonCode.OK, { draining: true, activeRuns });
   }
 
+  /**
+   * Connects a session to Buzz if a transport is attached, and records the address. Used
+   * whenever a session becomes a role's authority outside `spawn` (§26.2 promotion).
+   */
+  async ensureBuzz(sessionId: string, purpose: string): Promise<Decision<string | null>> {
+    if (!this.#buzz) return allow(ReasonCode.OK, null);
+    const existing = this.sessions.get(sessionId)?.buzzAddress;
+    if (existing) return allow(ReasonCode.OK, existing);
+    const connected = await this.#buzz.connect(sessionId, purpose);
+    return connected.allowed ? allow(ReasonCode.OK, connected.value) : (connected as Decision<string | null>);
+  }
+
   isDraining(projectId: string): boolean {
     const current = this.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }));
     if (!current) return false;
@@ -578,7 +590,7 @@ export class CtoLifecycle {
   }
 }
 
-const missingHandoffFields = (handoff: HandoffPackage): string[] => {
+export const missingHandoffFields = (handoff: HandoffPackage): string[] => {
   const missing: string[] = [];
   if (!handoff.projectStatus) missing.push("projectStatus");
   if (!handoff.recommendedNextAction) missing.push("recommendedNextAction");

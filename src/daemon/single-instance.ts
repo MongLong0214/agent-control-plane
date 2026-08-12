@@ -20,14 +20,25 @@ export interface LockInfo {
  */
 export class SingleInstanceLock {
   #fd: number | null = null;
+  /** What this instance actually wrote, so release only ever removes its own lock. */
+  #held: LockInfo | null = null;
 
   constructor(private readonly path: string) {}
 
   acquire(startedAt: string): Decision<LockInfo> {
     mkdirSync(dirname(this.path), { recursive: true });
 
+    if (this.#fd !== null) {
+      return deny(ReasonCode.DAEMON_ALREADY_RUNNING, "this lock is already held", {
+        path: this.path,
+      });
+    }
+
     const existing = this.read();
-    if (existing && isAlive(existing.pid) && existing.pid !== process.pid) {
+    // A live holder blocks acquisition even when it is this process: two lock objects in
+    // one process would each believe they own the file, and the second release would
+    // delete the first's lock (§33.1).
+    if (existing && isAlive(existing.pid)) {
       return deny(ReasonCode.DAEMON_ALREADY_RUNNING, "another agentcpd instance holds the lock", {
         holder: existing,
       });
@@ -51,6 +62,7 @@ export class SingleInstanceLock {
 
     const info: LockInfo = { pid: process.pid, startedAt, path: this.path };
     writeSync(this.#fd, JSON.stringify(info));
+    this.#held = info;
     return allow(ReasonCode.OK, info);
   }
 
@@ -78,10 +90,19 @@ export class SingleInstanceLock {
       this.#fd = null;
     }
     try {
-      if (existsSync(this.path) && this.read()?.pid === process.pid) unlinkSync(this.path);
+      const current = this.read();
+      if (
+        this.#held &&
+        existsSync(this.path) &&
+        current?.pid === this.#held.pid &&
+        current.startedAt === this.#held.startedAt
+      ) {
+        unlinkSync(this.path);
+      }
     } catch {
       /* best effort on shutdown */
     }
+    this.#held = null;
   }
 }
 

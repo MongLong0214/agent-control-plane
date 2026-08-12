@@ -12,6 +12,7 @@ import {
   ContinuityMode,
   RunState,
   Role,
+  RunKind,
   roleKeyFor,
 } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
@@ -335,12 +336,15 @@ export class ProductionGate {
       return deny(ReasonCode.RUN_TRANSITION_ILLEGAL, `run is ${run.state}`, { runId: input.runId });
     }
 
+    // A bootstrap run has no candidate to ship, so its evidence is the activation result
+    // rather than a production-ready packet (§26.3).
+    const isBootstrap = run.kind === RunKind.PROJECT_BOOTSTRAP;
     const packet = this.artifacts.latestForSnapshot<ProductionReadyPacket>(
       input.runId,
       ArtifactKind.PRODUCTION_READY_PACKET,
       input.candidateSnapshotDigest,
     );
-    if (!packet) {
+    if (!packet && !isBootstrap) {
       return deny(ReasonCode.EVIDENCE_STALE, "no production-ready packet for this candidate", {
         runId: input.runId,
         candidateSnapshotDigest: input.candidateSnapshotDigest,
@@ -357,12 +361,26 @@ export class ProductionGate {
     const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
     if (!independence.allowed) return independence as Decision<{ state: RunState }>;
 
-    if (input.decision === "CONFIRM" && packet.content.humanGate.required && !packet.content.humanGate.satisfied) {
+    const humanGate = packet ? packet.content.humanGate : this.humanGateStatus(input.runId);
+    if (input.decision === "CONFIRM" && humanGate.required && !humanGate.satisfied) {
       return deny(
         ReasonCode.HUMAN_GATE_UNSATISFIED,
         "candidate requires owner approval that has not been recorded",
-        { runId: input.runId, items: packet.content.humanGate.items },
+        { runId: input.runId, items: humanGate.items },
       );
+    }
+
+    // §26.3 — a bootstrap run is completed by its activation result and nothing else, so
+    // there must be one before the CEO can confirm it.
+    if (input.decision === "CONFIRM" && run.kind === RunKind.PROJECT_BOOTSTRAP) {
+      const activation = this.artifacts.latest(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT);
+      if (!activation) {
+        return deny(
+          ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
+          "a bootstrap run cannot be confirmed without an activation result",
+          { runId: input.runId },
+        );
+      }
     }
 
     const target =

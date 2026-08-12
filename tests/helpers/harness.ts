@@ -5,6 +5,7 @@ import { ControlPlane } from "../../src/app/control-plane.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
+import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -19,6 +20,7 @@ export interface Harness {
   scripted: ScriptedAdapter;
   repoPath: string;
   root: string;
+  buzz: InMemoryBuzzTransport;
 }
 
 /**
@@ -60,7 +62,23 @@ console.log('verification ok');`,
     ...(options.githubClient ? { githubClient: options.githubClient } : {}),
   });
 
-  return { cp, clock, scripted, repoPath, root };
+  // A route for the roles the control plane binds. The daemon wires the real CLI
+  // transport; the fixture wires an in-memory one so "connected" means something.
+  const buzz = new InMemoryBuzzTransport();
+  const adapter = new BuzzAdapter(
+    cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, buzz,
+  );
+  cp.cto.attach({
+    buzz: {
+      connect: (sessionId, purpose) => adapter.connect(sessionId, purpose),
+      disconnect: (sessionId) => adapter.disconnect(sessionId),
+    },
+  });
+  cp.continuity.attach({
+    buzz: { connect: (sessionId, purpose) => adapter.connect(sessionId, purpose) },
+  });
+
+  return { cp, clock, scripted, repoPath, root, buzz };
 };
 
 export const fixtureManifest = (

@@ -343,11 +343,22 @@ export class TaskGraph {
   }
 
   /** §25.2 — a long job records a low-frequency activity lease, not a heartbeat. */
-  recordActivity(executionId: string): void {
+  /** §31.4 — a low-frequency activity lease, scoped to the run that owns the execution. */
+  recordActivity(executionId: string, expectedRunId?: string): Decision<void> {
+    const execution = this.execution(executionId);
+    if (!execution) return deny(ReasonCode.NOT_FOUND, "unknown execution", { executionId });
+    if (expectedRunId !== undefined && execution.runId !== expectedRunId) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "execution belongs to another run", {
+        executionId,
+        executionRunId: execution.runId,
+        requestedRunId: expectedRunId,
+      });
+    }
     this.db.run(`UPDATE task_executions SET last_activity_at = ? WHERE execution_id = ?`, [
       this.clock.nowIso(),
       executionId,
     ]);
+    return allow(ReasonCode.OK, undefined);
   }
 
   /**

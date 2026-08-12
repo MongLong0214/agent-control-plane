@@ -158,12 +158,23 @@ export class ClaimRegistry {
     });
   }
 
-  release(claimId: string): Decision<void> {
+  /**
+   * §23.2 — releasing is a write on another run's coordination state when the claim is not
+   * yours, so a caller acting for a run must say which run it is acting for.
+   */
+  release(claimId: string, expectedRunId?: string): Decision<void> {
     const row = this.db.get<{ status: string; run_id: string }>(
       `SELECT status, run_id FROM resource_claims WHERE claim_id = ?`,
       [claimId],
     );
     if (!row) return deny(ReasonCode.NOT_FOUND, "unknown claim", { claimId });
+    if (expectedRunId !== undefined && row.run_id !== expectedRunId) {
+      return deny(
+        ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+        "claim belongs to another run",
+        { claimId, claimRunId: row.run_id, requestedRunId: expectedRunId },
+      );
+    }
     if (row.status !== "HELD") return deny(ReasonCode.CLAIM_NOT_HELD, "claim is not held", { claimId });
 
     this.db.run(`UPDATE resource_claims SET status = 'RELEASED', released_at = ? WHERE claim_id = ?`, [

@@ -3,6 +3,7 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
+import type { OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
@@ -27,6 +28,11 @@ export interface RepairRequest {
   operationId: string;
   parameters: Record<string, string>;
   authorizedBy: RepairAuthorization;
+  /**
+   * Required whenever `authorizedBy` is OWNER: the identity that authorised it. An enum
+   * a caller sets is a claim, not an authorisation (§25.7, CP-HI-07).
+   */
+  owner?: { channel: string; actor: string } | null;
   runId?: string | null;
   dryRun: boolean;
 }
@@ -109,6 +115,12 @@ export class RepairService {
     private readonly repositories: RepositoryRegistry,
   ) {}
 
+  #ownerAuthority: OwnerAuthorityPort | null = null;
+
+  attach(ports: { ownerAuthority?: OwnerAuthorityPort }): void {
+    if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
+  }
+
   catalog(): RepairOperation[] {
     return Object.values(this.operations);
   }
@@ -121,12 +133,25 @@ export class RepairService {
         allowlist: Object.keys(this.operations),
       });
     }
-    if (operation.authorization === "OWNER" && request.authorizedBy !== "OWNER") {
-      return deny(
-        ReasonCode.REPAIR_REQUIRES_OWNER,
-        "this repair can destroy work and requires owner authorization",
-        { operationId: operation.id, risk: operation.risk },
-      );
+    if (operation.authorization === "OWNER") {
+      const authorised =
+        request.authorizedBy === "OWNER" &&
+        request.owner &&
+        this.#ownerAuthority?.isAllowedActor(request.owner.channel, request.owner.actor) === true;
+      if (!authorised) {
+        return deny(
+          ReasonCode.REPAIR_REQUIRES_OWNER,
+          this.#ownerAuthority
+            ? "this repair can destroy work and requires an allowlisted owner identity"
+            : "no owner authority is configured, so an owner-authorised repair is impossible",
+          {
+            operationId: operation.id,
+            risk: operation.risk,
+            authorizedBy: request.authorizedBy,
+            actor: request.owner?.actor ?? null,
+          },
+        );
+      }
     }
 
     const handlers: Record<string, () => Promise<{ changes: number; evidence: unknown }>> = {

@@ -302,38 +302,33 @@ describe("ingress (CP-S48 – CP-S51)", () => {
 
   it("CP-S49: a Buzz message with an invalid HMAC is refused, and a valid one admitted once", async () => {
     const { guard } = makeIngress();
-    const { createHmac } = await import("node:crypto");
-    const body = JSON.stringify({ command: "status" });
-    const signature = createHmac("sha256", "buzz-secret").update(body).digest("hex");
-
-    const bad = guard.admit({
-      channel: "buzz",
+    const { ingressSignature } = await import("../../src/ingress/ingress-guard.ts");
+    const request = {
+      channel: "buzz" as const,
       actor: "npub-owner",
       nonce: "evt-1",
-      payload: {},
-      signature: "deadbeef",
-      signedBody: body,
-    });
+      payload: { command: "status" },
+    };
+    const signature = ingressSignature("buzz-secret", request);
+
+    const bad = guard.admit({ ...request, signature: "deadbeef" });
     expect(bad.reasonCode).toBe(ReasonCode.INGRESS_SIGNATURE_INVALID);
 
-    const good = guard.admit({
-      channel: "buzz",
-      actor: "npub-owner",
-      nonce: "evt-1",
-      payload: {},
+    // A signature is bound to the envelope it was made for: reusing it for a different
+    // payload or a fresh nonce fails.
+    const swappedPayload = guard.admit({
+      ...request,
+      payload: { command: "merge everything" },
       signature,
-      signedBody: body,
     });
+    expect(swappedPayload.reasonCode).toBe(ReasonCode.INGRESS_SIGNATURE_INVALID);
+    const swappedNonce = guard.admit({ ...request, nonce: "evt-2", signature });
+    expect(swappedNonce.reasonCode).toBe(ReasonCode.INGRESS_SIGNATURE_INVALID);
+
+    const good = guard.admit({ ...request, signature });
     expect(good.allowed).toBe(true);
 
-    const replay = guard.admit({
-      channel: "buzz",
-      actor: "npub-owner",
-      nonce: "evt-1",
-      payload: {},
-      signature,
-      signedBody: body,
-    });
+    const replay = guard.admit({ ...request, signature });
     expect(replay.reasonCode).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
   });
 
@@ -601,9 +596,10 @@ describe("Repo Factory boundary (CP-S52)", () => {
       contract: CONTRACT,
     });
     if (!created.allowed) throw new Error(created.message);
+    const runId = created.value.runId;
 
-    const activated = await harness.cp.bootstrap.activate({
-      runId: created.value.runId,
+    const input = {
+      runId,
       factoryResult: factoryResult(harness, "bootstrap-project"),
       approvedManifest: fixtureManifest("bootstrap-project"),
       localBindings: [
@@ -611,19 +607,83 @@ describe("Repo Factory boundary (CP-S52)", () => {
       ],
       projectName: "bootstrap",
       handoff: HANDOFF,
-    });
+    };
 
-    // Activation carries the facts; the factory result does not and must not.
-    if (!activated.allowed) throw new Error(`${activated.reasonCode}: ${activated.message}`);
+    // §26.5 — with no review of the bootstrap candidate there is nothing to activate on,
+    // and nothing has been written yet.
+    const noReview = await harness.cp.bootstrap.activate(input);
+    expect(noReview.allowed).toBe(false);
+    expect(noReview.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+    expect(harness.cp.projects.get("bootstrap-project")).toBeNull();
+
+    // The bootstrap run produces its own review evidence and reaches CEO review.
+    const bootstrapCto = harness.cp.sessions.create({ provider: "scripted", model: "scripted-cto" });
+    harness.cp.sessions.transition(bootstrapCto.sessionId, SessionLifecycle.READY, "test");
+    const bound = harness.cp.bootstrap.bindBootstrapCto(runId, bootstrapCto.sessionId);
+    if (!bound.allowed) throw new Error(bound.message);
+    expect(harness.cp.runs.require(runId).ownerSessionId).toBe(bootstrapCto.sessionId);
+
+    harness.cp.runs.transition(runId, RunState.ACTIVE, "bootstrap work");
+    const bootstrapCandidate = digestOf({ bootstrap: runId });
+    harness.cp.artifacts.putEvidence(
+      "blind-review-gate",
+      runId,
+      "BLIND_REVIEW",
+      {
+        runId,
+        candidateSnapshotDigest: bootstrapCandidate,
+        verdict: "PASS",
+        coveredFiles: ["github:acme/fixture:README.md"],
+        omittedItems: [],
+        findings: [],
+      },
+      bootstrapCandidate,
+    );
+    harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "bootstrap reviewed");
+
+    // The handoff is opened but not yet acknowledged, so activation is still incomplete —
+    // and the ack has to come from the incoming session itself.
+    const pending = await harness.cp.bootstrap.activate(input);
+    expect(pending.allowed).toBe(false);
+    expect(pending.evidence["incomplete"]).toContain("handoffAck");
+    expect(pending.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+    const handoffId = pending.evidence["pendingHandoffId"] as string;
+    const primaryCto = harness.cp.bindings.activePrimaryCto("bootstrap-project")!;
+    expect(
+      harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, "ses_someone_else").allowed,
+    ).toBe(false);
+    const acked = harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primaryCto.sessionId);
+    expect(acked.allowed).toBe(true);
+
+    const activated = await harness.cp.bootstrap.activate(input);
+    if (!activated.allowed)
+      throw new Error(
+        `${activated.reasonCode}: ${activated.message} ${JSON.stringify(activated.evidence["incomplete"])}`,
+      );
     expect(activated.value.primaryCtoBinding).toBeTruthy();
-    expect(activated.value.primaryCtoBinding?.promotedFromBootstrap).toBe(false);
+    // The bootstrap CTO was healthy and never reviewed this run, so §26.2 promotes it.
+    expect(activated.value.primaryCtoBinding?.promotedFromBootstrap).toBe(true);
+    expect(activated.value.blindReview?.verdict).toBe("PASS");
+    expect(activated.value.buzz.connected).toBe(true);
     expect(activated.value.handoffAck).toBeTruthy();
     expect(activated.value.activity).toBe("ACTIVE");
     expect(activated.value.projectRegistration.activeManifestDigest).toBe(
       manifestDigest(fixtureManifest("bootstrap-project")),
     );
+    // §26.3 — the activation result is what makes the completion possible: a bootstrap run
+    // cannot be confirmed without one, and with one the CEO can complete it.
+    const ceo = bindCeo(harness);
+    const confirmed = harness.cp.ceo.submitCeoDecision({
+      runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: bootstrapCandidate,
+      ceoSessionId: ceo,
+      rationale: "bootstrap activated",
+    });
+    if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
+    expect(harness.cp.runs.require(runId).state).toBe(RunState.COMPLETED);
 
-    const stored = harness.cp.artifacts.latest(created.value.runId, "REPO_FACTORY_RESULT");
+    const stored = harness.cp.artifacts.latest(runId, "REPO_FACTORY_RESULT");
     expect(JSON.stringify(stored?.content)).not.toContain("primaryCto");
   });
 
