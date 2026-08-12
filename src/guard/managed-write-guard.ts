@@ -121,6 +121,8 @@ interface ParticipantRow {
 }
 
 /** A grant is short-lived and single use; see `consume`. */
+const CLAIM_LEASE_EXTENSION_MS = 5 * 60 * 1000;
+
 const GRANT_TTL_MS = 60_000;
 
 /**
@@ -219,6 +221,37 @@ export class ManagedWriteGuard {
           authorised: held.grant.bindingGeneration,
           current: fresh.value.bindingGeneration,
         },
+      );
+    }
+
+    // §23.2 — the *write* needs a claim this run holds, not merely the absence of someone
+    // else's. A claim is what makes the window between this decision and the write safe:
+    // while it is held, the unique claim indexes stop another run from taking the same
+    // branch, worktree or path.
+    if (held.grant.repositoryIdentity && held.grant.runId) {
+      const lease = this.ownClaim(held.grant.runId, held.grant.repositoryIdentity);
+      if (!lease) {
+        this.#grants.delete(grantId);
+        this.audit.record({
+          kind: "MANAGED_WRITE_GUARD_REVOKED",
+          reasonCode: ReasonCode.WRITE_PATH_NOT_CLAIMED,
+          runId: held.grant.runId,
+          evidence: {
+            grantId,
+            repositoryIdentity: held.grant.repositoryIdentity,
+            reason: "no live claim on the repository at write time",
+          },
+        });
+        return deny(
+          ReasonCode.WRITE_PATH_NOT_CLAIMED,
+          "the run holds no live claim on this repository, so the write cannot be fenced",
+          { grantId, runId: held.grant.runId, repositoryIdentity: held.grant.repositoryIdentity },
+        );
+      }
+      // Extend the lease so it cannot lapse while the write is in flight.
+      this.db.run(
+        `UPDATE resource_claims SET expires_at = ? WHERE claim_id = ? AND status = 'HELD'`,
+        [isoPlus(this.clock.nowIso(), CLAIM_LEASE_EXTENSION_MS), lease],
       );
     }
 
@@ -643,8 +676,8 @@ export class ManagedWriteGuard {
     // Which branch and worktree this write actually touches. The run's own declaration is
     // authoritative when it made one; otherwise fall back to what the checkout says, so a
     // run that simply never declared a branch cannot slip past another run's claim.
-    const branchTouched =
-      participant.work_branch ?? (toplevel ? this.probe.currentBranch(toplevel) : null);
+    const checkout = toplevel ?? participant.checkout_path;
+    const branchTouched = participant.work_branch ?? this.probe.currentBranch(checkout);
     // Managed verification worktrees are created under a root and named by their id, so a
     // resolved toplevel's basename is the worktree id when the write lands in one.
     const worktreeTouched = participant.worktree_id ?? (toplevel ? basename(toplevel) : null);
@@ -694,6 +727,19 @@ export class ManagedWriteGuard {
       }
     }
     return null;
+  }
+
+  /** A claim this run currently holds on the repository, if any. */
+  private ownClaim(runId: string, repositoryIdentity: string): string | null {
+    const row = this.db.get<{ claim_id: string }>(
+      `SELECT c.claim_id FROM resource_claims c
+         JOIN runs r ON r.run_id = c.run_id
+        WHERE c.run_id = ? AND c.repository_identity = ? AND c.status = 'HELD'
+          AND c.expires_at > ? AND c.owner_binding_generation = r.owner_binding_generation
+        ORDER BY c.expires_at DESC`,
+      [runId, repositoryIdentity, this.clock.nowIso()],
+    );
+    return row?.claim_id ?? null;
   }
 
   /** Registered checkouts are managed regardless of what the git probe can see. */

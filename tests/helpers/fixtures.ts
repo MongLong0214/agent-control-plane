@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ManualClock } from "../../src/core/clock.ts";
+import { ManualClock, isoPlus } from "../../src/core/clock.ts";
 import { newAssignmentId, newRepositoryId, newRunId, newSessionId } from "../../src/core/ids.ts";
 import { ArtifactStore } from "../../src/db/artifacts.ts";
 import { AuditLog } from "../../src/db/audit.ts";
@@ -105,6 +105,8 @@ export interface SeedRunOptions {
   identity?: string;
   role?: Role;
   state?: string;
+  /** Set false to seed a run that holds no claim, so a write-time refusal can be shown. */
+  claim?: boolean;
 }
 
 export interface SeededRun {
@@ -161,6 +163,17 @@ export const seedRun = (options: SeedRunOptions): SeededRun => {
      VALUES (?, ?, 'primary', 'dev')`,
     [runId, repositoryId],
   );
+  // A run that writes holds a claim on what it writes (§23.2). Seeding one keeps the
+  // fixture a realistic run rather than one the guard would have to refuse at write time.
+  if (options.claim !== false) {
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, declared_path, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES (?, ?, '.', ?, ?, 1, ?, ?, 'HELD')`,
+      [`clm_${runId.slice(-8)}`, identity, runId, sessionId, now, isoPlus(now, 3_600_000)],
+    );
+  }
 
   return { runId, sessionId, repositoryId, identity, generation: 1, roleKey, projectId };
 };

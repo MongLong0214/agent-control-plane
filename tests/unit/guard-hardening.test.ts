@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { symlinkSync } from "node:fs";
 
 import { isoPlus } from "../../src/core/clock.ts";
 import { newAssignmentId } from "../../src/core/ids.ts";
@@ -16,7 +17,14 @@ import {
   fakeWorkspaceProbe,
   realWorkspaceProbe,
 } from "../../src/guard/workspace-probe.ts";
-import { cleanupTempDirs, makeCore, makeRepo, seedRun, writeFiles } from "../helpers/fixtures.ts";
+import {
+  cleanupTempDirs,
+  makeCore,
+  makeRepo,
+  seedRun,
+  tempDir,
+  writeFiles,
+} from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -34,6 +42,19 @@ const setup = (options: { probeFailsOnRepo?: boolean; probeErrorsFor?: string[] 
     : realWorkspaceProbe;
   const guard = new ManagedWriteGuard(core.db, probe, core.audit, core.clock);
   return { ...core, repo, seeded, guard };
+};
+
+const otherRun = (
+  db: ReturnType<typeof makeCore>["db"],
+  clock: ReturnType<typeof makeCore>["clock"],
+  projectId: string,
+) => {
+  db.run(
+    `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal,
+                       contract_digest, created_at)
+     VALUES ('run_other', ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'other', 'sha256:c', ?)`,
+    [projectId, clock.nowIso()],
+  );
 };
 
 const managedRequest = (
@@ -128,15 +149,6 @@ describe("guard is role-aware (CP-HI-04)", () => {
 });
 
 describe("guard enforces the §23.2 claim rejects, not only exact paths", () => {
-  const otherRun = (db: ReturnType<typeof makeCore>["db"], clock: ReturnType<typeof makeCore>["clock"], projectId: string) => {
-    db.run(
-      `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal,
-                         contract_digest, created_at)
-       VALUES ('run_other', ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'other', 'sha256:c', ?)`,
-      [projectId, clock.nowIso()],
-    );
-  };
-
   it("a worktree held by another run blocks the write", () => {
     const { guard, db, clock, seeded, repo } = setup();
     otherRun(db, clock, seeded.projectId);
@@ -358,5 +370,136 @@ describe("path canonicalisation", () => {
     expect(canonical("/private/tmp/acp-nonexistent-x/y/z.ts")).toBe(
       "/private/tmp/acp-nonexistent-x/y/z.ts",
     );
+  });
+});
+
+describe("the write itself must be fenced by a claim (§23.2, G6)", () => {
+  it("refuses to burn a grant when the run holds no live claim at write time", () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo, claim: false });
+    const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
+
+    const decision = guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") }));
+    if (!decision.allowed) throw new Error(decision.message);
+
+    const consumed = guard.consume(decision.value.grantId);
+    expect(consumed.allowed).toBe(false);
+    expect(consumed.reasonCode).toBe(ReasonCode.WRITE_PATH_NOT_CLAIMED);
+  });
+
+  it("refuses a claim taken under a superseded owner generation", () => {
+    const { guard, db, seeded, repo } = setup();
+    db.run(`UPDATE resource_claims SET owner_binding_generation = 0 WHERE run_id = ?`, [seeded.runId]);
+    const decision = guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") }));
+    if (!decision.allowed) throw new Error(decision.message);
+    expect(guard.consume(decision.value.grantId).reasonCode).toBe(ReasonCode.WRITE_PATH_NOT_CLAIMED);
+  });
+
+  it("extends the claim lease so it cannot lapse mid-write", () => {
+    const { guard, db, seeded, repo, clock } = setup();
+    const before = db.get<{ expires_at: string }>(
+      `SELECT expires_at FROM resource_claims WHERE run_id = ?`,
+      [seeded.runId],
+    )!.expires_at;
+    // The lease is close to expiry when the write is authorised.
+    db.run(`UPDATE resource_claims SET expires_at = ? WHERE run_id = ?`, [
+      isoPlus(clock.nowIso(), 2_000),
+      seeded.runId,
+    ]);
+
+    const decision = guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") }));
+    if (!decision.allowed) throw new Error(decision.message);
+    expect(guard.consume(decision.value.grantId).allowed).toBe(true);
+
+    const after = db.get<{ expires_at: string }>(
+      `SELECT expires_at FROM resource_claims WHERE run_id = ?`,
+      [seeded.runId],
+    )!.expires_at;
+    expect(new Date(after).getTime()).toBeGreaterThan(new Date(clock.nowIso()).getTime() + 60_000);
+    expect(before).not.toBe(after);
+  });
+});
+
+describe("a contract write is managed wherever it sits (§4 CP-HI-01, G2)", () => {
+  it("refuses a manifest change outside any repository when no run carries it", () => {
+    const { guard } = setup();
+    for (const operation of [
+      WriteOperation.MANIFEST_CHANGE,
+      WriteOperation.VERIFICATION_CONTRACT_CHANGE,
+    ]) {
+      const decision = guard.evaluate({
+        operation,
+        targetPath: "/tmp/new-project/acp.manifest.json",
+        claimedClassification: "DIRECT",
+      });
+      expect(decision.allowed).toBe(false);
+      expect(decision.reasonCode).toBe(ReasonCode.WRITE_REQUIRES_MANAGED_RUN);
+    }
+  });
+
+  it("holds a caller to a managed run it names, even outside a repository", () => {
+    const { guard, seeded } = setup();
+    const decision = guard.evaluate({
+      operation: WriteOperation.FILE_MUTATION,
+      targetPath: "/tmp/somewhere-else/notes.md",
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+      claimedClassification: "DIRECT",
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE);
+  });
+});
+
+describe("a symlink is resolved before classification (G3)", () => {
+  it("classifies a write through a symlink by its destination, even if it does not exist yet", () => {
+    const { guard, repo } = setup();
+    const outside = tempDir("acp-symlink-");
+    const link = join(outside, "note");
+    // The destination does not exist yet, so existsSync-based resolution would miss it.
+    symlinkSync(join(repo, "src/created-through-link.ts"), link);
+
+    const decision = guard.evaluate({
+      operation: WriteOperation.FILE_MUTATION,
+      targetPath: link,
+      claimedClassification: "DIRECT",
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_REQUIRES_MANAGED_RUN);
+  });
+});
+
+describe("an undeterminable local resource fails closed (G5)", () => {
+  it("refuses a git write when another run claims a branch and ours cannot be determined", () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    // The probe cannot answer which branch the checkout is on.
+    const guard = new ManagedWriteGuard(
+      core.db,
+      fakeWorkspaceProbe([repo], { branches: {} }),
+      core.audit,
+      core.clock,
+    );
+    otherRun(core.db, core.clock, seeded.projectId);
+    core.db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('cb_undet', ?, 'main', 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [seeded.identity, seeded.sessionId, core.clock.nowIso(), isoPlus(core.clock.nowIso(), 3_600_000)],
+    );
+
+    const decision = guard.evaluate({
+      operation: WriteOperation.GIT_COMMIT,
+      repositoryIdentity: seeded.identity,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CLAIM_BRANCH_CONFLICT);
   });
 });
