@@ -1,6 +1,8 @@
 # Acceptance status against PRD §42
 
-> **The GitHub issue tracker is the single source of truth for remaining work.** This file
+> **The GitHub issue tracker is the single source of truth for remaining work** — start at
+> the pinned index, [issue #306](https://github.com/MongLong0214/agent-control-plane/issues/306).
+> This file
 > explains the state; the issues *are* the state. Nothing outstanding lives only here, in a
 > transcript or in a commit message. `node scripts/ssot-report.mjs` reconciles the tracker
 > against every review finding and every declared work item and fails if one is missing.
@@ -123,7 +125,7 @@ them rather than assuming a permissive default.
   the signed bytes from channel, actor, conversation, nonce and payload rather than trusting
   a caller-supplied body.
 
-## Independent review status — **BLOCK**, 122 findings open
+## Independent review status — **BLOCK**, 200 issues open
 
 Two rounds of independent review by GPT-5.6 Sol (nine areas, read-only sandbox, reasoning
 effort `xhigh`, no shared context between rounds). Both are recorded under
@@ -131,8 +133,12 @@ effort `xhigh`, no shared context between rounds). Both are recorded under
 
 | Round | Verdict | BLOCKER | MAJOR | What happened |
 |---|---|---|---|---|
-| 1 | BLOCK in all 9 areas | 55 | 68 | All 55 closed with regression tests across seven commits. |
-| 2 | BLOCK in all 9 areas | 63 | 64 | 5 closed so far; the remaining 122 are filed as GitHub issues. |
+| 1 | BLOCK in all 9 areas | 57 | 66 (+1 minor) | All 57 blockers closed with regression tests; each is a closed issue naming its commit and test. The majors are open and labelled `needs-triage` — they predate the fixes. |
+| 2 | BLOCK in all 9 areas | 63 | 64 (+1 minor) | 5 blockers closed; the rest are open issues. |
+
+Open right now: 58 `review-blocker`, 130 `review-major`, 2 `review-minor`, 3 `acceptance`,
+4 `prerequisite`, 2 `epic`, 1 `design-decision` — 200 issues, reconciled by
+`node scripts/ssot-report.mjs`.
 
 **Round 2's BLOCKER count is not a regression.** Round 1's findings were fixed and their
 regressions still pass; round 2 read the *changed*, larger codebase with fresh context and
