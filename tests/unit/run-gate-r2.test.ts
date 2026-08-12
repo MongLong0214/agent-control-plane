@@ -1,7 +1,11 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
+import { join } from "node:path";
 
 import { deny } from "../../src/core/errors.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
+import { WriteOperation } from "../../src/guard/managed-write-guard.ts";
 import {
   ArtifactKind,
   ExecutionMode,
@@ -156,7 +160,59 @@ const buildPacket = (fixture: Awaited<ReturnType<typeof evidenceReadyRun>>) => {
   return packet.value;
 };
 
+const ownerDecisionReceipt = (
+  harness: Awaited<ReturnType<typeof evidenceReadyRun>>["harness"],
+  runId: string,
+  item: string,
+  approved: boolean,
+  note: string,
+) => {
+  const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+    cli: { allowedActors: [TEST_OWNER.actor] },
+  });
+  const approval = {
+    runId,
+    operation: "owner_decision_submit",
+    parameters: { item, approved, note },
+    idempotencyKey: `owner-decision:${digestOf({ runId, item, approved, note })}`,
+    approved,
+  };
+  const receipt = guard.admitOwnerApproval({
+    channel: TEST_OWNER.channel,
+    actor: TEST_OWNER.actor,
+    nonce: `owner-decision:${digestOf(approval)}`,
+    payload: ownerApprovalPayload(approval),
+  }, approval);
+  if (!receipt.allowed) throw new Error(receipt.message);
+  return receipt.value;
+};
+
 describe("round-2 run and production-gate regressions", () => {
+  it("#131 rejects packet publication with a forged or released source-read lease", async () => {
+    const fixture = await evidenceReadyRun();
+    const forged = fixture.harness.cp.ceo.buildPacket({
+      runId: fixture.runId,
+      candidateSnapshotDigest: fixture.digest,
+      approval: fixture.approval,
+      sourceReadLeaseId: "source_read_forged",
+    });
+    expect(forged.allowed).toBe(false);
+    expect(forged.reasonCode).toBe(ReasonCode.SOURCE_READ_LEASE_REQUIRED);
+
+    const held = fixture.harness.cp.guard.acquireSourceReadLease(fixture.runId, [fixture.identity]);
+    if (!held.allowed) throw new Error(held.message);
+    const mutation = fixture.harness.cp.guard.evaluate({
+      operation: WriteOperation.FILE_MUTATION,
+      targetPath: join(fixture.harness.repoPath, "src", "app.js"),
+      runId: fixture.runId,
+      sessionId: fixture.run.ownerSessionId,
+      bindingGeneration: fixture.run.ownerBindingGeneration,
+    });
+    expect(mutation.allowed).toBe(false);
+    expect(mutation.reasonCode).toBe(ReasonCode.SOURCE_READ_LEASE_HELD);
+    held.value.release();
+  });
+
   it("#138 seals repository participation after a candidate is frozen", async () => {
     const fixture = await evidenceReadyRun();
     const secondPath = makeRepo({ "README.md": "second\n" });
@@ -240,7 +296,8 @@ describe("round-2 run and production-gate regressions", () => {
     });
     expect(late.allowed).toBe(false);
     expect(late.reasonCode).toBe(ReasonCode.BINDING_GENERATION_STALE);
-    expect(fixture.harness.cp.tasks.get(task.taskId)?.state).not.toBe("SUCCEEDED");
+    expect(fixture.harness.cp.tasks.execution(execution.value.executionId)?.status).toBe("ABANDONED");
+    expect(fixture.harness.cp.tasks.get(task.taskId)?.state).toBe("READY");
   });
 
   it("#141 stales the packet when the candidate head moves before CEO confirmation", async () => {
@@ -282,11 +339,13 @@ describe("round-2 run and production-gate regressions", () => {
 
   it("#143 lets an owner rejection revoke an earlier approval", async () => {
     const fixture = await evidenceReadyRun(["public release"]);
+    const approved = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "yes");
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId, item: "public release", approved: true, note: "yes", owner: TEST_OWNER,
+      runId: fixture.runId, item: "public release", approved: true, note: "yes", receipt: approved,
     }).allowed).toBe(true);
+    const rejected = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", false, "no");
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId, item: "public release", approved: false, note: "no", owner: TEST_OWNER,
+      runId: fixture.runId, item: "public release", approved: false, note: "no", receipt: rejected,
     }).allowed).toBe(true);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(false);
   });
@@ -379,7 +438,11 @@ describe("round-2 run and production-gate regressions", () => {
     expect(requested.allowed).toBe(true);
     expect(fixture.harness.cp.runs.require(fixture.runId).state).toBe(RunState.AWAITING_HUMAN);
     const recorded = fixture.harness.cp.ceo.recordOwnerDecision({
-      runId: fixture.runId, item: "public release", approved: true, note: "approved", owner: TEST_OWNER,
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "approved",
+      receipt: ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "approved"),
     });
     expect(recorded.allowed).toBe(true);
     expect(fixture.harness.cp.runs.require(fixture.runId).state).toBe(RunState.ACTIVE);

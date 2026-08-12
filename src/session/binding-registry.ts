@@ -13,6 +13,7 @@ import {
   roleKeyFor,
 } from "../domain/types.ts";
 import type { Outbox } from "../outbox/outbox.ts";
+import type { TaskGraph } from "../run/task-graph.ts";
 import type { SessionRegistry } from "./session-registry.ts";
 
 export interface BindInput {
@@ -48,6 +49,8 @@ const LIVE_RUN_STATES = [
  * read the same maximum.
  */
 export class BindingRegistry {
+  #tasks: TaskGraph | null = null;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -55,6 +58,11 @@ export class BindingRegistry {
     private readonly sessions: SessionRegistry,
     private readonly outbox: Outbox,
   ) {}
+
+  /** Wired after construction because TaskGraph needs no binding registry dependency. */
+  attach(ports: { tasks?: TaskGraph }): void {
+    if (ports.tasks) this.#tasks = ports.tasks;
+  }
 
   /**
    * Derives the canonical role key and rejects a caller-supplied key or scope that does
@@ -251,6 +259,23 @@ export class BindingRegistry {
       // leave a run pinned to a revoked generation.
       let repointed = 0;
       if (current && input.takeover) {
+        const affectedRuns = this.liveRunsOwnedBy(current);
+        const staleExecutions = affectedRuns.flatMap((affected) => this.db.all<{ execution_id: string }>(
+          `SELECT execution_id FROM task_executions
+            WHERE run_id = ? AND status = 'RUNNING' AND owner_binding_generation <> ?`,
+          [affected.run_id, generation],
+        ));
+        if (staleExecutions.length > 0 && !this.#tasks) {
+          return deny(
+            ReasonCode.BINDING_GENERATION_STALE,
+            "takeover cannot repoint live runs until stale executions can be abandoned",
+            {
+              roleKey,
+              runs: affectedRuns.map((run) => run.run_id),
+              executions: staleExecutions.map((execution) => execution.execution_id),
+            },
+          );
+        }
         repointed = this.db.run(
           `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
                            owner_session_incarnation = ?, owner_role_key = ?
@@ -261,6 +286,13 @@ export class BindingRegistry {
             current.sessionId, current.bindingGeneration, current.roleKey, ...LIVE_RUN_STATES,
           ],
         ).changes;
+        for (const affected of affectedRuns) {
+          this.#tasks?.abandonStaleExecutions(
+            affected.run_id,
+            generation,
+            `binding takeover: ${input.reason}`,
+          );
+        }
       }
 
       const fence = current

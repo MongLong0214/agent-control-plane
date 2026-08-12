@@ -4,7 +4,7 @@ import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import type { OwnerAuthorityPort } from "./owner-authority.ts";
+import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "./owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
@@ -83,6 +83,23 @@ export interface Escalation {
   openedAt: string;
 }
 
+export interface BootstrapActivationFinalizer {
+  finalizeBootstrapActivationConfirm(input: {
+    runId: string;
+    candidateSnapshotDigest: string;
+    ceoSessionId: string;
+    confirmedAt: string;
+  }): Decision<unknown>;
+}
+
+export interface SourceReadLeasePort {
+  acquireSourceReadLease(
+    runId: string,
+    repositoryIdentities: readonly string[],
+  ): Decision<{ leaseId: string; release(): void }>;
+  assertSourceReadLease(runId: string, leaseId: string): Decision<void>;
+}
+
 /** PRD §19.3 — the only three automatic Hermes notifications. */
 export const NotificationKind = {
   READY_FOR_CEO_REVIEW: "READY_FOR_CEO_REVIEW",
@@ -108,6 +125,8 @@ export const HUMAN_GATE_TRIGGERS: readonly string[] = [
 export class ProductionGate {
   #continuity: ContinuityGate | null = null;
   #ownerAuthority: OwnerAuthorityPort | null = null;
+  #bootstrapActivation: BootstrapActivationFinalizer | null = null;
+  #sourceReadLeases: SourceReadLeasePort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -124,9 +143,13 @@ export class ProductionGate {
   attach(ports: {
     continuity?: ContinuityGate;
     ownerAuthority?: OwnerAuthorityPort;
+    bootstrapActivation?: BootstrapActivationFinalizer;
+    sourceReadLeases?: SourceReadLeasePort;
   }): void {
     if (ports.continuity) this.#continuity = ports.continuity;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
+    if (ports.bootstrapActivation) this.#bootstrapActivation = ports.bootstrapActivation;
+    if (ports.sourceReadLeases) this.#sourceReadLeases = ports.sourceReadLeases;
   }
 
   /**
@@ -138,6 +161,8 @@ export class ProductionGate {
     runId: string;
     candidateSnapshotDigest: string;
     approval: CtoFinalApproval;
+    /** A caller-held lease, or omitted only when this gate acquires and releases one itself. */
+    sourceReadLeaseId?: string;
   }): Decision<ProductionReadyPacket> {
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
@@ -175,6 +200,32 @@ export class ProductionGate {
 
     const snapshot = this.requireCandidateSnapshot(input.runId, input.candidateSnapshotDigest);
     if (!snapshot.allowed) return snapshot as Decision<ProductionReadyPacket>;
+
+    const sourceLeases = this.#sourceReadLeases;
+    if (!sourceLeases) {
+      return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "production gate has no source-read lease authority", {
+        runId: input.runId,
+      });
+    }
+    const acquired = input.sourceReadLeaseId
+      ? null
+      : sourceLeases.acquireSourceReadLease(
+          input.runId,
+          snapshot.value.repositories.map((repository) => repository.identity),
+        );
+    if (acquired && !acquired.allowed) return acquired as Decision<ProductionReadyPacket>;
+    const sourceReadLeaseId = input.sourceReadLeaseId ?? acquired!.value.leaseId;
+    const releaseSourceReadLease = acquired?.allowed ? acquired.value.release : null;
+    const checkLease = (): Decision<void> => sourceLeases.assertSourceReadLease(input.runId, sourceReadLeaseId);
+    const held = checkLease();
+    if (!held.allowed) {
+      releaseSourceReadLease?.();
+      return held as Decision<ProductionReadyPacket>;
+    }
+
+    try {
+      const freshness = this.revalidateCandidateFreshness(input.runId, input.candidateSnapshotDigest);
+      if (!freshness.allowed) return freshness as Decision<ProductionReadyPacket>;
 
     const verificationArtifact = this.artifacts.latestForSnapshot<VerificationReport>(
       input.runId,
@@ -298,6 +349,10 @@ export class ProductionGate {
     // transition is thrown through the transaction so an earlier artifact cannot escape.
     try {
       return this.db.tx(() => {
+        const stillHeld = checkLease();
+        if (!stillHeld.allowed) {
+          throw acpError(stillHeld.reasonCode, stillHeld.message, stillHeld.evidence);
+        }
         const currentCeo = this.bindings.active(roleKeyFor(Role.CEO));
         if (
           !currentCeo ||
@@ -318,6 +373,11 @@ export class ProductionGate {
           input.candidateSnapshotDigest,
         );
 
+        const afterPacketWrite = checkLease();
+        if (!afterPacketWrite.allowed) {
+          throw acpError(afterPacketWrite.reasonCode, afterPacketWrite.message, afterPacketWrite.evidence);
+        }
+
         const transition = this.runs.transition(
           input.runId,
           RunState.READY_FOR_CEO_REVIEW,
@@ -326,6 +386,11 @@ export class ProductionGate {
         );
         if (!transition.allowed) {
           throw acpError(transition.reasonCode, transition.message, transition.evidence);
+        }
+
+        const afterTransition = checkLease();
+        if (!afterTransition.allowed) {
+          throw acpError(afterTransition.reasonCode, afterTransition.message, afterTransition.evidence);
         }
 
         this.outbox.enqueue({
@@ -363,6 +428,9 @@ export class ProductionGate {
     } catch (error) {
       if (isAcpError(error)) return deny(error.reasonCode, error.message, error.evidence);
       throw error;
+    }
+    } finally {
+      releaseSourceReadLease?.();
     }
   }
 
@@ -422,20 +490,6 @@ export class ProductionGate {
       );
     }
 
-    // §26.3 — a bootstrap run is completed by its activation result and nothing else, so
-    // there must be one before the CEO can confirm it.
-    if (input.decision === "CONFIRM" && run.kind === RunKind.PROJECT_BOOTSTRAP) {
-      const activation = this.artifacts.latest(input.runId, ArtifactKind.BOOTSTRAP_ACTIVATION_RESULT);
-      const activationCheck = activation ? this.validateBootstrapActivation(input.runId, activation.content) : null;
-      if (!activation || !activationCheck?.allowed) {
-        return deny(
-          ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
-          "a bootstrap run cannot be confirmed without a complete activation result",
-          { runId: input.runId, ...(activationCheck?.evidence ?? {}) },
-        );
-      }
-    }
-
     if (input.decision === "CONFIRM" && !isBootstrap) {
       const freshness = this.revalidateCandidateFreshness(input.runId, input.candidateSnapshotDigest);
       if (!freshness.allowed) {
@@ -456,33 +510,57 @@ export class ProductionGate {
           ? RunState.REVISION_REQUIRED
           : RunState.AWAITING_HUMAN;
 
-    const transition = this.runs.transition(
-      input.runId,
-      target,
-      `CEO ${input.decision}`,
-      { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale },
-      "production-gate",
-    );
-    if (!transition.allowed) return transition as Decision<{ state: RunState }>;
+    try {
+      return this.db.tx(() => {
+        if (input.decision === "CONFIRM" && isBootstrap) {
+          const finalizer = this.#bootstrapActivation;
+          if (!finalizer) {
+            return deny(
+              ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE,
+              "bootstrap activation finalizer is not configured",
+              { runId: input.runId },
+            );
+          }
+          const finalized = finalizer.finalizeBootstrapActivationConfirm({
+            runId: input.runId,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            ceoSessionId: input.ceoSessionId,
+            confirmedAt: this.clock.nowIso(),
+          });
+          if (!finalized.allowed) return finalized as Decision<{ state: RunState }>;
+        }
 
-    this.audit.record({
-      kind: "CEO_DECISION",
-      runId: input.runId,
-      sessionId: input.ceoSessionId,
-      evidence: {
-        decision: input.decision,
-        candidateSnapshotDigest: input.candidateSnapshotDigest,
-        rationale: input.rationale,
-      },
-    });
-    this.telemetry.record({
-      scope: "quality",
-      name: "ceo_outcome",
-      runId: input.runId,
-      text: input.decision,
-    });
+        const transition = this.runs.transition(
+          input.runId,
+          target,
+          `CEO ${input.decision}`,
+          { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale },
+          isBootstrap && input.decision === "CONFIRM" ? "bootstrap-activation" : "production-gate",
+        );
+        if (!transition.allowed) return transition as Decision<{ state: RunState }>;
 
-    return allow(ReasonCode.OK, { state: target });
+        this.audit.record({
+          kind: "CEO_DECISION",
+          runId: input.runId,
+          sessionId: input.ceoSessionId,
+          evidence: {
+            decision: input.decision,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            rationale: input.rationale,
+          },
+        });
+        this.telemetry.record({
+          scope: "quality",
+          name: "ceo_outcome",
+          runId: input.runId,
+          text: input.decision,
+        });
+        return allow(ReasonCode.OK, { state: target });
+      });
+    } catch (error) {
+      if (isAcpError(error)) return deny(error.reasonCode, error.message, error.evidence);
+      throw error;
+    }
   }
 
   /**
@@ -862,18 +940,30 @@ export class ProductionGate {
     item: string;
     approved: boolean;
     note: string;
-    owner: { channel: string; actor: string };
+    receipt?: OwnerApprovalReceipt;
+    /** @deprecated A caller-supplied identity is never authority; use `receipt`. */
+    owner?: { channel: string; actor: string };
   }): Decision<void> {
-    const authorised = this.#ownerAuthority?.isAllowedActor(input.owner.channel, input.owner.actor);
-    if (!authorised) {
+    const receipt = input.receipt;
+    const parameterDigest = digestOf({ item: input.item, approved: input.approved, note: input.note });
+    if (
+      receipt?.runId !== input.runId ||
+      receipt.operation !== "owner_decision_submit" ||
+      receipt.parameterDigest !== parameterDigest ||
+      receipt.approved !== input.approved
+    ) {
       return deny(
-        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
-        this.#ownerAuthority
-          ? "actor is not an allowlisted owner identity"
-          : "no owner authority is configured, so an owner decision cannot be attributed",
-        { runId: input.runId, channel: input.owner.channel, actor: input.owner.actor },
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner decision receipt does not bind this exact decision",
+        { runId: input.runId, operation: receipt?.operation ?? null },
       );
     }
+    const authorised = this.#ownerAuthority?.assertApproval(receipt);
+    if (!authorised?.allowed) return authorised ?? deny(
+      ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+      "no owner authority is configured, so an owner decision cannot be attributed",
+      { runId: input.runId },
+    );
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
     const gate = this.humanGateDefinition(input.runId);
@@ -894,7 +984,7 @@ export class ProductionGate {
       this.audit.record({
         kind: "OWNER_DECISION",
         runId: input.runId,
-        actor: `${input.owner.channel}:${input.owner.actor}`,
+        actor: `${receipt.channel}:${receipt.actor}`,
         evidence: { item: input.item, approved: input.approved, candidateSnapshotDigest, humanGateDigest: gate.digest },
       });
 
