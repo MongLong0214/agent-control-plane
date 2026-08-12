@@ -88,7 +88,7 @@ src/
 pnpm install
 pnpm rebuild better-sqlite3     # native binding
 pnpm typecheck
-pnpm test                       # 126 tests, incl. the CP-S01..CP-S59 suite
+pnpm test                       # 271 tests, incl. the CP-S01..CP-S59 suite
 pnpm trace                      # regenerates evidence/traceability.{json,md}
 ```
 
@@ -99,6 +99,18 @@ agentctl project register my-project /abs/path/to/checkout
 agentctl capacity set claude '{"buckets":[{"id":"rolling-5h","remainingPercent":80,"capabilities":["cto","blind-review","ceo","worker"]}]}'
 agentctl doctor
 ```
+
+Declare who the owner is. Owner-only decisions — a human gate, a project suspension, a
+destructive repair — are refused unless they come from an identity listed here, one
+`channel:actor` per line:
+
+```bash
+printf 'cli:%s\ntelegram:123456789\n' "$USER" > ~/.agent-control-plane/owner-identities
+```
+
+An absent or empty file means this deployment has no owner, so no human gate can be
+satisfied. That is deliberate: §21 makes the owner the one authority the runtime may not
+synthesise for itself.
 
 Run the daemon under `launchd` using
 [`deploy/com.agentcontrolplane.agentcpd.plist`](deploy/com.agentcontrolplane.agentcpd.plist).
