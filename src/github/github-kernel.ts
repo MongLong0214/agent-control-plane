@@ -122,6 +122,16 @@ interface PullRequest {
   body?: string | null;
 }
 
+/** The immutable branch and snapshot binding recorded by `prPrepare`. */
+interface PreparedPrIntent {
+  head: string;
+  base: string;
+  exactHeadSha: string;
+  expectedBaseSha: string;
+  sourceBase: string;
+  declaredParent: string | null;
+}
+
 interface CheckRun {
   id: number;
   name: string;
@@ -1214,6 +1224,12 @@ export class GitHubKernel {
     // a capability that a later caller may present in place of the run owner.
     const authority = this.assertAuthority(input.runId, input.repositoryIdentity, input);
     if (!authority.allowed) return authority as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+
+    // Resolve this before any write. Once GitHub may have merged, a missing local run
+    // repository row must not turn a proof failure into a silently untracked merge.
+    const repositoryId = this.mergeRepositoryId(input.runId, input.repositoryIdentity);
+    if (!repositoryId.allowed) return repositoryId as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    const mergeRepositoryId = repositoryId.value;
 
     const idempotencyKey = `merge_execute:${input.repositoryIdentity}:${input.pullNumber}`;
     const requestDigest = digestOf({
