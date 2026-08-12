@@ -160,11 +160,6 @@ interface HeldGrant {
   request: Readonly<GuardRequest>;
 }
 
-interface SourceReadLease {
-  runId: string;
-  repositoryIdentities: ReadonlySet<string>;
-}
-
 interface ClaimRow {
   claim_id: string;
   expires_at: string;
@@ -325,74 +320,6 @@ export class ManagedWriteGuard {
    * Holds the participating source identities stable from the final freshness read
    * through packet publication. Source writes consult this lease before a grant exists.
    */
-  acquireSourceReadLease(
-    runId: string,
-    repositoryIdentities: readonly string[],
-  ): Decision<{ leaseId: string; release(): void }> {
-    const run = this.db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [runId]);
-    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run for source-read lease", { runId });
-    if (run.state !== RunState.ACTIVE) {
-      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "source-read lease requires an ACTIVE run", {
-        runId,
-        state: run.state,
-      });
-    }
-
-    const identities = [...new Set(repositoryIdentities)];
-    if (identities.length === 0) {
-      return deny(ReasonCode.INVALID_ARGUMENT, "source-read lease requires at least one repository", { runId });
-    }
-    const participating = new Set(
-      this.db.all<{ identity: string }>(
-        `SELECT r.identity FROM run_repositories rr
-           JOIN repositories r ON r.repository_id = rr.repository_id
-          WHERE rr.run_id = ?`,
-        [runId],
-      ).map((row) => row.identity),
-    );
-    const outsideScope = identities.filter((identity) => !participating.has(identity));
-    if (outsideScope.length > 0) {
-      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "source-read lease includes a repository outside the run", {
-        runId,
-        outsideScope,
-      });
-    }
-
-    const leaseId = `source_read_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-    const lease: SourceReadLease = Object.freeze({
-      leaseId,
-      runId,
-      repositoryIdentities: Object.freeze(identities),
-    });
-    this.#sourceReadLeases.set(leaseId, lease);
-    for (const identity of identities) {
-      const held = this.#sourceReadLeasesByRepository.get(identity) ?? new Set<string>();
-      held.add(leaseId);
-      this.#sourceReadLeasesByRepository.set(identity, held);
-    }
-
-    let released = false;
-    return allow(ReasonCode.OK, Object.freeze({
-      leaseId,
-      release: () => {
-        if (released) return;
-        released = true;
-        this.releaseSourceReadLease(lease);
-      },
-    }));
-  }
-
-  assertSourceReadLease(runId: string, leaseId: string): Decision<void> {
-    const lease = this.#sourceReadLeases.get(leaseId);
-    if (!lease || lease.runId !== runId) {
-      return deny(ReasonCode.SOURCE_READ_LEASE_NOT_HELD, "source-read lease is not held by this run", {
-        runId,
-        leaseId,
-      });
-    }
-    return allow(ReasonCode.OK, undefined);
-  }
-
   /** Drops grants past their expiry. Called by the watchdog and on each evaluate. */
   expireGrants(): number {
     const now = this.clock.nowIso();
@@ -422,9 +349,8 @@ export class ManagedWriteGuard {
         repositoryIdentities,
       });
     }
-    const requested = new Set(identities);
-    const conflicting = [...this.#grants.values(), ...this.#inFlight.values()].find((held) =>
-      held.facts.repositoryIdentity !== null && requested.has(held.facts.repositoryIdentity),
+    const conflicting = [...this.#grants.values(), ...this.#inFlight.values()].find(
+      (held) => held.facts.repositoryIdentity !== null && identities.includes(held.facts.repositoryIdentity),
     );
     if (conflicting) {
       return deny(ReasonCode.SOURCE_READ_LEASE_HELD, "a managed source write is already authorised", {
@@ -434,15 +360,22 @@ export class ManagedWriteGuard {
       });
     }
     const leaseId = `source_read_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-    const lease: SourceReadLease = { runId, repositoryIdentities: requested };
+    const lease: SourceReadLease = { leaseId, runId, repositoryIdentities: identities };
     this.#sourceReadLeases.set(leaseId, lease);
+    // Indexed by repository as well, so `decide` can answer "is this identity frozen?"
+    // without walking every live lease on the write path.
+    for (const identity of identities) {
+      const held = this.#sourceReadLeasesByRepository.get(identity) ?? new Set<string>();
+      held.add(leaseId);
+      this.#sourceReadLeasesByRepository.set(identity, held);
+    }
     let released = false;
     return allow(ReasonCode.OK, {
       leaseId,
       release: () => {
         if (released) return;
         released = true;
-        if (this.#sourceReadLeases.get(leaseId) === lease) this.#sourceReadLeases.delete(leaseId);
+        this.releaseSourceReadLease(lease);
       },
     });
   }
@@ -979,9 +912,6 @@ export class ManagedWriteGuard {
     const target = this.authorizeTarget({ run, request, operation, resolvedPath, toplevel });
     if (!target.allowed) return target as Decision<GuardGrant>;
 
-    const lease = this.sourceReadLeaseConflict(target.value.identity);
-    if (lease) return lease as Decision<GuardGrant>;
-
     const resources = this.authorizeResources({
       request,
       operation,
@@ -1018,18 +948,6 @@ export class ManagedWriteGuard {
       },
       { projectNatured: true, role: identity.value.role },
     );
-  }
-
-  private sourceReadLeaseConflict(repositoryIdentity: string): Decision<void> | null {
-    const held = [...this.#sourceReadLeases.entries()].find(([, lease]) =>
-      lease.repositoryIdentities.has(repositoryIdentity),
-    );
-    if (!held) return null;
-    return deny(ReasonCode.SOURCE_READ_LEASE_HELD, "managed source mutation conflicts with a gate read lease", {
-      leaseId: held[0],
-      repositoryIdentity,
-      runId: held[1].runId,
-    });
   }
 
   private direct(
