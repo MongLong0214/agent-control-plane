@@ -144,6 +144,14 @@ export const seedRun = (options: SeedRunOptions): SeededRun => {
      VALUES (?, 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
     [sessionId, now, now],
   );
+  // The binding comes first: a run's owner tuple has a composite foreign key onto the
+  // assignment it names (§30.2), so a run cannot be seeded before the binding exists.
+  db.run(
+    `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, session_id,
+                              session_incarnation, binding_generation, mode, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
+    [newAssignmentId(), roleKey, options.role ?? "PRIMARY_CTO", projectId, runId, sessionId, now],
+  );
   db.run(
     `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal,
                        contract_digest, owner_session_id, owner_binding_generation,
@@ -151,12 +159,6 @@ export const seedRun = (options: SeedRunOptions): SeededRun => {
      VALUES (?, ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', ?, 'fixture goal', 'sha256:contract',
              ?, 1, 'inc-1', ?, ?)`,
     [runId, projectId, options.state ?? "ACTIVE", sessionId, roleKey, now],
-  );
-  db.run(
-    `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, session_id,
-                              session_incarnation, binding_generation, mode, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
-    [newAssignmentId(), roleKey, options.role ?? "PRIMARY_CTO", projectId, runId, sessionId, now],
   );
   db.run(
     `INSERT INTO run_repositories (run_id, repository_id, repository_role, base_branch)

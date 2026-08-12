@@ -10,7 +10,7 @@ import {
   candidateSnapshotDigest as digestCandidateSnapshot,
   candidateSnapshotSchema,
 } from "../snapshot/candidate-snapshot.ts";
-import { prohibitedDurableField, redact } from "./audit.ts";
+import { credentialBearingField, prohibitedDurableField } from "./audit.ts";
 import type { Db } from "./database.ts";
 
 export interface StoredArtifact<T = unknown> {
@@ -123,9 +123,20 @@ export class ArtifactStore {
       );
     }
 
-    // Redact before both hashing and serializing. A returned digest is therefore a
-    // digest of exactly the durable representation, never a secret-bearing input.
-    const durableContent = redact(content) as T;
+    // Evidence is stored exactly as produced. Rewriting it would make its digest
+    // uncorroborable: a later gate compares the report it was handed against the stored
+    // row, and CP-HI-06 makes the stored bytes the authority. So content carrying a
+    // credential is *refused* rather than quietly altered — §31.5 is satisfied by
+    // refusing to store it at all, and the producer is the one that must not include it.
+    const credential = credentialBearingField(content);
+    if (credential) {
+      fail(
+        ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED,
+        `${kind} contains a credential and cannot be stored as evidence`,
+        { runId, kind, field: credential },
+      );
+    }
+    const durableContent = content;
     const digest = SNAPSHOT_BOUND.has(kind)
       ? digestOf({ candidateSnapshotDigest, content: durableContent })
       : digestOf(durableContent);
@@ -368,6 +379,19 @@ const blindReviewEvidenceSchema = z
         verificationEvidence: z.boolean(),
         projectContext: z.boolean(),
         withheld: z.array(z.string()),
+        // A binary change has no textual diff, so the reviewer receives a digest-bound
+        // patch artifact instead. Recording which ones were supplied is what separates
+        // "reviewed the binary" from "omitted it".
+        binaryArtifacts: z.array(
+          z
+            .object({
+              repository: z.string().min(1),
+              path: z.string().min(1),
+              digest: DIGEST_SCHEMA,
+              method: z.literal("git-binary-patch"),
+            })
+            .strict(),
+        ),
       })
       .strict(),
     coveredRepositories: z.array(z.string()),

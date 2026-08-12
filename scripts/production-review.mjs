@@ -7,8 +7,9 @@
  * read-only sandbox, so it sees the real code rather than an excerpt someone chose.
  *
  * Usage:
- *   node scripts/production-review.mjs            # every area
- *   node scripts/production-review.mjs core guard # named areas only
+ *   node scripts/production-review.mjs                          # every area
+ *   node scripts/production-review.mjs core guard               # named areas only
+ *   node scripts/production-review.mjs --out=evidence/review-round3
  */
 import { execFile } from "node:child_process";
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
@@ -16,7 +17,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-const outDir = join(repoRoot, "evidence", "review");
+// A later round must not overwrite an earlier one: the filed issues cite their round's
+// evidence path, and `scripts/ssot-report.mjs` reconciles the tracker against it.
+const outArg = process.argv.find((a) => a.startsWith("--out="));
+const outDir = outArg ? join(repoRoot, outArg.slice("--out=".length)) : join(repoRoot, "evidence", "review");
 mkdirSync(outDir, { recursive: true });
 
 const SCHEMA = {
@@ -265,7 +269,7 @@ const run = (key, area) =>
     child.stdin?.end();
   });
 
-const requested = process.argv.slice(2);
+const requested = process.argv.slice(2).filter((a) => !a.startsWith("--"));
 const keys = requested.length > 0 ? requested : Object.keys(AREAS);
 
 for (const key of keys) {

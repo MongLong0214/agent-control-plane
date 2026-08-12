@@ -10,10 +10,12 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
 import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
-import { isAcpError } from "../core/errors.ts";
+import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 import { Daemon } from "./daemon.ts";
 import { createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesServer } from "../mcp/hermes-server.ts";
+import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
 
@@ -36,10 +38,10 @@ export const startLocalMcpListeners = async (
 
   const hermesPath = join(stateDir, "hermes.mcp.sock");
   const ctoPath = join(stateDir, "cto.mcp.sock");
-  const hermes = await startMcpSocket(hermesPath, token, () => createHermesServer(cp));
+  const hermes = await startMcpSocket(hermesPath, token, cp, (auth) => createHermesServer(cp, auth));
   let cto: Server;
   try {
-    cto = await startMcpSocket(ctoPath, token, () => createCtoServer(cp));
+    cto = await startMcpSocket(ctoPath, token, cp, (auth) => createCtoServer(cp, auth));
   } catch (err) {
     await closeSocketServer(hermes);
     if (existsSync(hermesPath)) unlinkSync(hermesPath);
@@ -65,15 +67,23 @@ export const startLocalMcpListeners = async (
 const startMcpSocket = async (
   path: string,
   token: string,
-  factory: () => ReturnType<typeof createHermesServer>,
+  cp: ControlPlane,
+  factory: (authenticate: McpPeerAuthenticator) => ReturnType<typeof createHermesServer>,
 ): Promise<Server> => {
   removeStaleSocket(path);
   const server = createServer((socket) => {
-    void authenticateSocket(socket, token).then(async (transport) => {
-      if (!transport) return;
-      const mcp = factory();
+    void authenticateSocket(socket, token).then(async (accepted) => {
+      if (!accepted) return;
+      // One server per authenticated connection: the peer identity belongs to the
+      // transport, so it can never be re-declared by a tool argument (§21, §27.3).
+      const opening = cp.sessions.verifySecret(accepted.credential.sessionId, accepted.credential.sessionSecret);
+      if (!opening.allowed) {
+        socket.destroy();
+        return;
+      }
+      const mcp = factory(peerAuthenticator(cp, accepted.credential, opening.value.incarnation));
       try {
-        await mcp.connect(transport);
+        await mcp.connect(accepted.transport);
       } catch (err) {
         socket.destroy(err instanceof Error ? err : new Error(String(err)));
       }
@@ -103,11 +113,16 @@ const closeSocketServer = (server: Server): Promise<void> =>
     server.close((err) => (err ? reject(err) : resolveClose()));
   });
 
-const authenticateSocket = (socket: Socket, token: string): Promise<SocketTransport | null> =>
+interface AcceptedConnection {
+  transport: SocketTransport;
+  credential: PeerCredential;
+}
+
+const authenticateSocket = (socket: Socket, token: string): Promise<AcceptedConnection | null> =>
   new Promise((resolveTransport) => {
     let buffer = Buffer.alloc(0);
     let settled = false;
-    const finish = (transport: SocketTransport | null): void => {
+    const finish = (transport: AcceptedConnection | null): void => {
       if (settled) return;
       settled = true;
       socket.removeListener("data", receive);
@@ -133,13 +148,58 @@ const authenticateSocket = (socket: Socket, token: string): Promise<SocketTransp
         return reject();
       }
       if (!localMcpTokenMatches(presented, token)) return reject();
+      const credential = presentedCredential(presented);
+      if (!credential) return reject();
       socket.pause();
-      finish(new SocketTransport(socket, remainder));
+      finish({ transport: new SocketTransport(socket, remainder), credential });
     };
     socket.on("data", receive);
     socket.once("error", reject);
     socket.once("close", reject);
   });
+
+/**
+ * The deployment token proves the caller may reach the socket at all; it says nothing
+ * about *which* session is calling. The handshake therefore also carries the session's
+ * own secret, and every request re-verifies it — a session that has been respawned or
+ * stopped is no longer a peer even on a connection that authenticated earlier.
+ */
+const presentedCredential = (value: unknown): PeerCredential | null => {
+  if (!value || typeof value !== "object") return null;
+  const { sessionId, sessionSecret } = value as { sessionId?: unknown; sessionSecret?: unknown };
+  if (typeof sessionId !== "string" || sessionId.length === 0) return null;
+  if (typeof sessionSecret !== "string" || sessionSecret.length === 0) return null;
+  return { sessionId, sessionSecret };
+};
+
+interface PeerCredential {
+  sessionId: string;
+  sessionSecret: string;
+}
+
+const peerAuthenticator =
+  (cp: ControlPlane, credential: PeerCredential, incarnation: string): McpPeerAuthenticator =>
+  () => {
+    const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
+    if (!session.allowed) return session as Decision<AuthenticatedMcpPeer>;
+    if (session.value.incarnation !== incarnation) {
+      return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "session was respawned since this connection authenticated", {
+        sessionId: credential.sessionId,
+        handshake: incarnation,
+        current: session.value.incarnation,
+      });
+    }
+    if (session.value.lifecycle !== "READY") {
+      return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, `peer session is ${session.value.lifecycle}, not READY`, {
+        sessionId: credential.sessionId,
+      });
+    }
+    return allow(ReasonCode.OK, {
+      actor: credential.sessionId,
+      sessionId: credential.sessionId,
+      sessionIncarnation: incarnation,
+    });
+  };
 
 export const localMcpTokenMatches = (value: unknown, expected: string): boolean => {
   if (!value || typeof value !== "object" || !("token" in value)) return false;

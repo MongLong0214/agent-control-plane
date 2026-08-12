@@ -4,8 +4,9 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
+import type { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
+import { TestProductionAdapter } from "./production-adapter.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -33,7 +34,7 @@ export const makeHarness = (
 ): Harness => {
   const root = tempDir("acp-harness-");
   const clock = new ManualClock("2026-08-12T00:00:00.000Z");
-  const scripted = new ScriptedAdapter(clock);
+  const scripted = new TestProductionAdapter(clock);
 
   const repoPath = makeRepo({
     "README.md": "# fixture project\n",

@@ -57,6 +57,13 @@ export interface SandboxEnforcement {
   readConfinement: "sensitive-paths" | "none";
   processGroupKill: true;
   resourceLimitsEnforced: boolean;
+  /**
+   * Which mechanism bounded memory. `hard` is a kernel address-space limit the candidate
+   * cannot raise; `observed` is the RSS sampling below, used where the kernel does not
+   * honour RLIMIT_AS (Darwin). Recorded because a reader of this evidence must be able to
+   * tell the difference — the CPU and process-count limits are hard in both cases.
+   */
+  memoryLimit: "hard" | "observed";
   childContainmentEnforced: boolean;
   mechanism: "seatbelt" | "none";
 }
@@ -72,6 +79,13 @@ const RESOURCE_WRAPPER = "/usr/bin/python3";
  * both soft and hard limits before exec so candidate code cannot raise them again.
  * RLIMIT_NPROC=1 makes a new session/process group impossible: the initial command is
  * already its own group leader, and a detached descendant would require a fork first.
+ *
+ * The address-space limit is passed as 0 on hosts whose kernel does not honour
+ * RLIMIT_AS (Darwin accepts the call and then ignores it, so `getrlimit` never confirms
+ * it). Refusing every verification on such a host would not be caution — it would make
+ * the only supported platform unable to verify anything — so the caller decides, and the
+ * outcome records which memory bound was actually in force. CPU and process-count limits
+ * are hard requirements everywhere and still fail closed.
  */
 const RESOURCE_WRAPPER_PROGRAM = String.raw`
 import os, resource, sys
@@ -87,13 +101,22 @@ def hard_limit(kind, value):
 try:
     hard_limit(resource.RLIMIT_CPU, int(sys.argv[1]))
     hard_limit(resource.RLIMIT_NPROC, 1)
-    hard_limit(resource.RLIMIT_AS, int(sys.argv[2]))
+    address_space = int(sys.argv[2])
+    if address_space > 0:
+        hard_limit(resource.RLIMIT_AS, address_space)
 except Exception as error:
     print("ACP_RESOURCE_LIMIT_UNAVAILABLE:" + str(error), file=sys.stderr)
     sys.exit(125)
 
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 `;
+
+/**
+ * Darwin's `setrlimit(RLIMIT_AS, …)` succeeds and has no effect, so a hard address-space
+ * bound cannot be established there. Where it cannot, the RSS observation below is the
+ * memory bound and the outcome says so rather than claiming a limit it does not have.
+ */
+const hardAddressSpaceAvailable = (): boolean => process.platform !== "darwin";
 
 const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
 
@@ -162,11 +185,12 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   // seatbelt matches on resolved paths — on macOS the temp root is a symlink
   // (/var/folders -> /private/var/folders), so an unresolved path would confine the
   // command to a directory it can never reach and every write would fail.
+  const hardMemoryLimit = hardAddressSpaceAvailable();
   const resourceArgs = [
     "-c",
     RESOURCE_WRAPPER_PROGRAM,
     String(command.maxCpuSeconds ?? command.timeoutSeconds),
-    String(command.maxMemoryMb * 1024 * 1024),
+    String(hardMemoryLimit ? command.maxMemoryMb * 1024 * 1024 : 0),
     ...command.argv,
   ];
   const file = "/usr/bin/sandbox-exec";
@@ -192,7 +216,9 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   );
   const identity = await processIdentity(child.pid);
   let timedOut = false;
-  let isolationLost = identity === null;
+  // Not knowing the leader's start time only costs us the ability to *signal* the group by
+  // a fenced identity; containment itself is proven after the run by the group listing.
+  let isolationLost = false;
   let escalation: NodeJS.Timeout | undefined;
   let closed = false;
 
@@ -238,7 +264,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   closed = true;
   clearTimeout(timer);
   if (escalation) clearTimeout(escalation);
-  if (identity && !(await processGroupReaped(identity))) isolationLost = true;
+  if (!(await processGroupReaped(child.pid, identity?.startedAt ?? null))) isolationLost = true;
   rmSync(scratch, { recursive: true, force: true });
 
   const stdout = stdoutChunks.join("");
@@ -279,6 +305,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
       readConfinement: mechanism === "seatbelt" ? "sensitive-paths" : "none",
       processGroupKill: true,
       resourceLimitsEnforced: !resourceUnavailable,
+      memoryLimit: hardMemoryLimit ? "hard" : "observed",
       childContainmentEnforced: !isolationLost,
       mechanism,
     },
@@ -455,6 +482,7 @@ const refused = (
     readConfinement: "none",
     processGroupKill: true,
     resourceLimitsEnforced: false,
+    memoryLimit: "observed",
     childContainmentEnforced: false,
     mechanism,
   },
@@ -495,17 +523,33 @@ const killKnownGroup = async (
   }
 };
 
-/** A close event alone is not enough: an unreaped process group makes PASS impossible. */
-const processGroupReaped = async (identity: ProcessIdentity): Promise<boolean> => {
-  const current = await processIdentity(identity.pid);
-  if (current && current.startedAt === identity.startedAt) return false;
+/**
+ * A close event alone is not enough: an unreaped process group makes PASS impossible.
+ *
+ * The group is named by its leader's pid, and `startedAt` fences a reused pid — while the
+ * leader is still the process we launched, the group is by definition not reaped. A leader
+ * we never managed to snapshot is *not* evidence of a leak: a command that exits in
+ * milliseconds is gone before `ps` can describe it, so the group listing is the evidence.
+ *
+ * `ps -g` exits 1 with no output when nothing matches, which is exactly the answer "this
+ * group is empty". Any other failure leaves containment unproven, and CP-HI-08 makes that
+ * a refusal rather than an assumption.
+ */
+const processGroupReaped = async (
+  pid: number | undefined,
+  startedAt: string | null,
+): Promise<boolean> => {
+  if (!pid) return false;
+  if (startedAt !== null) {
+    const current = await processIdentity(pid);
+    if (current && current.startedAt === startedAt) return false;
+  }
   try {
-    const { stdout } = await exec("ps", ["-o", "pid=", "-g", String(identity.pid)], {
-      encoding: "utf8",
-    });
+    const { stdout } = await exec("ps", ["-o", "pid=", "-g", String(pid)], { encoding: "utf8" });
     return stdout.trim().length === 0;
-  } catch {
-    return false;
+  } catch (err) {
+    const failure = err as { code?: number; stdout?: string };
+    return failure.code === 1 && (failure.stdout ?? "").trim().length === 0;
   }
 };
 

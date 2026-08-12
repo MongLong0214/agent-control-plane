@@ -2234,11 +2234,13 @@ export class GitHubKernel {
     }
     try {
       this.db.run(
+        // PENDING is what makes this a reservation rather than a record: it is claimed
+        // before the external call, and only the reread that follows may complete it.
         `INSERT INTO github_receipts
            (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type,
             resource_identity, preexisting, before_state_digest, after_state_digest, request_digest,
-            response_json, created_at, reread_at, verified)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, NULL, 0)`,
+            response_json, created_at, reread_at, verified, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, NULL, 0, 'PENDING')`,
         [
           `rcp_${sha256(input.idempotencyKey).slice(7, 31)}`,
           input.idempotencyKey,
@@ -2271,8 +2273,9 @@ export class GitHubKernel {
   }): Decision<void> {
     const updated = this.db.run(
       `UPDATE github_receipts
-          SET preexisting = ?, after_state_digest = ?, response_json = ?, reread_at = ?, verified = ?
-        WHERE idempotency_key = ? AND request_digest = ? AND verified = 0`,
+          SET status = 'APPLIED', preexisting = ?, after_state_digest = ?, response_json = ?,
+              reread_at = ?, verified = ?
+        WHERE idempotency_key = ? AND request_digest = ? AND status = 'PENDING' AND verified = 0`,
       [
         input.preexisting ? 1 : 0,
         input.afterStateDigest,
@@ -2293,7 +2296,8 @@ export class GitHubKernel {
   /** No external write happened when grant consumption fails, so this reservation is safe to release. */
   private releaseReservation(idempotencyKey: string, requestDigest: string): void {
     this.db.run(
-      `DELETE FROM github_receipts WHERE idempotency_key = ? AND request_digest = ? AND verified = 0`,
+      `DELETE FROM github_receipts
+        WHERE idempotency_key = ? AND request_digest = ? AND status = 'PENDING' AND verified = 0`,
       [idempotencyKey, requestDigest],
     );
   }
@@ -2312,19 +2316,46 @@ export class GitHubKernel {
     response: unknown;
     reread: boolean;
   }): void {
+    // A reserved receipt is *completed*, never replaced: `INSERT OR REPLACE` deletes the
+    // PENDING row first, and an append-only receipt table refuses that (§24.5). Where no
+    // reservation exists — operations that record an observation rather than perform a
+    // write — the row is inserted APPLIED in one step.
+    const now = this.clock.nowIso();
+    const reserved = this.db.get<{ status: string }>(
+      `SELECT status FROM github_receipts WHERE idempotency_key = ?`,
+      [input.idempotencyKey],
+    );
+    if (reserved?.status === "PENDING") {
+      this.db.run(
+        `UPDATE github_receipts
+            SET status = 'APPLIED', resource_identity = ?, preexisting = ?, after_state_digest = ?,
+                response_json = ?, reread_at = ?, verified = ?
+          WHERE idempotency_key = ? AND status = 'PENDING'`,
+        [
+          input.resourceIdentity,
+          input.preexisting ? 1 : 0,
+          input.afterStateDigest,
+          JSON.stringify(input.response),
+          input.reread ? now : null,
+          input.reread ? 1 : 0,
+          input.idempotencyKey,
+        ],
+      );
+      return;
+    }
     this.db.run(
-      `INSERT OR REPLACE INTO github_receipts
+      `INSERT INTO github_receipts
          (receipt_id, idempotency_key, operation, run_id, repository_identity, resource_type,
           resource_identity, preexisting, before_state_digest, after_state_digest, request_digest,
-          response_json, created_at, reread_at, verified)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          response_json, created_at, reread_at, verified, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'APPLIED')`,
       [
         `rcp_${sha256(input.idempotencyKey).slice(7, 31)}`,
         input.idempotencyKey, input.operation, input.runId, input.repositoryIdentity,
         input.resourceType, input.resourceIdentity, input.preexisting ? 1 : 0,
         input.beforeStateDigest, input.afterStateDigest, input.requestDigest,
-        JSON.stringify(input.response), this.clock.nowIso(),
-        input.reread ? this.clock.nowIso() : null, input.reread ? 1 : 0,
+        JSON.stringify(input.response), now,
+        input.reread ? now : null, input.reread ? 1 : 0,
       ],
     );
   }

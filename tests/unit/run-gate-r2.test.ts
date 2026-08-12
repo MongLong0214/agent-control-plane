@@ -118,6 +118,7 @@ const evidenceReadyRun = async (humanGate: string[] = []) => {
       diff: true,
       verificationEvidence: true,
       projectContext: true,
+      binaryArtifacts: [],
       withheld: [],
     },
     coveredRepositories: [repository.identity],

@@ -181,6 +181,45 @@ const isBulkContentKey = (key: string): boolean => {
 };
 
 /**
+ * Names that are a credential in any context. Deliberately narrower than `SECRET_KEY`,
+ * which also matches every `*Key` suffix — `roleKey` and `idempotencyKey` are identifiers
+ * a report has to be able to state.
+ */
+const CREDENTIAL_NAME =
+  /^(token|secret|password|passwd|credential|credentials|apikey|authorization|privatekey|accesskey|signingkey|servicekey|sessionsecret|cookie|nsec)$/i;
+
+/**
+ * A credential inside content that is about to become *evidence*.
+ *
+ * Evidence cannot be rewritten on its way to storage: its digest is what a later gate
+ * corroborates, and CP-HI-06 makes the stored bytes the authority. An artifact that would
+ * need redaction is therefore refused rather than altered — the producer must not put a
+ * credential in evidence at all. Audit records keep using `redact`, where rewriting is the
+ * right answer because nothing corroborates an audit row against a produced copy.
+ */
+export const credentialBearingField = (value: unknown, depth = 0): string | null => {
+  if (depth > 8) return null;
+  if (typeof value === "string") {
+    return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value)) ? "<value>" : null;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = credentialBearingField(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, nested] of Object.entries(value)) {
+      if (CREDENTIAL_NAME.test(normalizedKey(key)) && nested != null && nested !== "") return key;
+      const found = credentialBearingField(nested, depth + 1);
+      if (found) return found === "<value>" ? key : found;
+    }
+  }
+  return null;
+};
+
+/**
  * Full prompts, transcripts, and reasoning must be rejected at any durable boundary;
  * replacing them with a marker is suitable for audit explainability, not an artifact
  * whose digest would otherwise purport to address the original private payload.

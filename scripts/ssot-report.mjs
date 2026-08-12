@@ -67,10 +67,15 @@ const declaredWorkIds = [
   ),
 ].map((m) => m[1]);
 
-const rounds = [
-  ...findingsOf(join("evidence", "review"), "r2"),
-  ...findingsOf(join("evidence", "review-round1"), "r1"),
+// Every review round the repository holds evidence for. A round whose directory does not
+// exist yet contributes nothing, so a new round is one line here and needs no other change.
+const ROUNDS = [
+  ["r1", join("evidence", "review-round1")],
+  ["r2", join("evidence", "review")],
+  ["r3", join("evidence", "review-round3")],
 ];
+
+const rounds = ROUNDS.flatMap(([round, dir]) => findingsOf(dir, round));
 
 const problems = [];
 const tally = {};

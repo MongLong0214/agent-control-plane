@@ -92,9 +92,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   lifecycle      TEXT NOT NULL
                    CHECK (lifecycle IN ('STARTING','READY','DRAINING','STOPPED','ERROR')),
   buzz_address   TEXT,
-  -- Never retain the session secret itself. The digest is enough to bind a local
+  -- Never retain the session secret itself. The hash is enough to bind a local
   -- handshake while keeping credentials out of durable state (§31.5).
-  session_secret_digest TEXT,
+  session_secret_hash TEXT,
   os_pid         INTEGER,
   workdir        TEXT,
   created_at     TEXT NOT NULL,
@@ -108,6 +108,18 @@ BEFORE UPDATE OF incarnation ON sessions
 WHEN NEW.incarnation <> OLD.incarnation
 BEGIN
   SELECT RAISE(ABORT, 'SESSION_INCARNATION_IMMUTABLE');
+END;
+
+-- An issued session secret cannot be rotated in place or cleared: the peer that holds
+-- the plaintext is the only thing that proves an MCP caller is this session, so a
+-- rewritable hash would let a local caller mint itself a new credential for an existing
+-- session. A respawn issues a new session row instead.
+CREATE TRIGGER IF NOT EXISTS sessions_secret_hash_immutable
+BEFORE UPDATE OF session_secret_hash ON sessions
+WHEN OLD.session_secret_hash IS NOT NULL
+  AND (NEW.session_secret_hash IS NULL OR NEW.session_secret_hash <> OLD.session_secret_hash)
+BEGIN
+  SELECT RAISE(ABORT, 'SESSION_SECRET_HASH_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------
@@ -634,14 +646,34 @@ CREATE INDEX IF NOT EXISTS github_receipts_run ON github_receipts(run_id, operat
 
 -- An external-write receipt is the replay marker. Rewriting or deleting it would turn a
 -- completed side effect into an apparently new operation.
+-- A receipt is reserved PENDING *before* the external call and completed once, after the
+-- result has been reread. That one-way completion is the only permitted update: every
+-- identity column stays fixed, an APPLIED receipt can never be touched again, and a
+-- replay therefore cannot rewrite the record of what was already done (§24.5).
 CREATE TRIGGER IF NOT EXISTS github_receipts_immutable
 BEFORE UPDATE ON github_receipts
+WHEN NOT (
+  OLD.status = 'PENDING' AND NEW.status = 'APPLIED'
+  AND NEW.receipt_id = OLD.receipt_id
+  AND NEW.idempotency_key = OLD.idempotency_key
+  AND NEW.operation = OLD.operation
+  AND NEW.run_id IS OLD.run_id
+  AND NEW.repository_identity = OLD.repository_identity
+  AND NEW.resource_type = OLD.resource_type
+  AND NEW.request_digest = OLD.request_digest
+  AND NEW.before_state_digest IS OLD.before_state_digest
+  AND NEW.created_at = OLD.created_at
+)
 BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_IMMUTABLE');
 END;
 
+-- A PENDING reservation records an *intent* whose external write demonstrably did not
+-- happen, so releasing it destroys no evidence and lets the operation be retried. An
+-- APPLIED receipt is the record of something that did happen and can never be removed.
 CREATE TRIGGER IF NOT EXISTS github_receipts_no_delete
 BEFORE DELETE ON github_receipts
+WHEN NOT (OLD.status = 'PENDING' AND OLD.verified = 0 AND OLD.after_state_digest IS NULL)
 BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_IMMUTABLE');
 END;

@@ -31,7 +31,13 @@ export interface ScriptedResponse {
  */
 export class ScriptedAdapter implements ProviderAdapter {
   readonly provider: string;
-  readonly isProduction = false;
+  /**
+   * Typed `boolean` rather than the literal `false` so a *test-owned* subclass can opt
+   * into the production route it needs to exercise. The safety is the runtime check in
+   * `ProviderRegistry.register`, not this type: nothing under `src/` overrides it, so the
+   * shipped composition root still has no production-eligible double.
+   */
+  readonly isProduction: boolean = false;
   readonly defaultModels = { cto: "scripted-cto", reviewer: "scripted-reviewer", worker: "scripted-worker", ceo: "scripted-ceo" } as const;
 
   readonly invocations: InvocationRequest[] = [];
