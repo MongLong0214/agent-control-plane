@@ -205,6 +205,54 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(unprioritizedWorker.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
   });
 
+  it("#54/#176 refreshes before blind-review operations and after a provider failure", async () => {
+    const { cp, clock, gpt, root } = makePlane();
+    gpt.setCapacity({
+      provider: "gpt",
+      sensorHealth: "ERROR",
+      runtimeHealth: "HEALTHY",
+      observedAt: clock.nowIso(),
+      source: "r2-test",
+      buckets: [],
+      error: "usage source unreadable",
+    });
+
+    // This is the registry adapter given to the review gate in the composed control plane,
+    // not a direct monitor exercise. Removing the root attachment leaves no probe audit.
+    const adapter = cp.providers.require("gpt");
+    await adapter.startSession({
+      model: "reviewer",
+      workdir: root,
+      purpose: "blind-review",
+    });
+    const failed = await adapter.invoke({
+      prompt: "provider failure must refresh capacity",
+      workdir: root,
+      timeoutMs: 1_000,
+      readOnly: true,
+      correlationId: "r2-provider-failure",
+      isolation: {
+        packetRoot: root,
+        denyReadPaths: [],
+        emptyEnvironment: true,
+        network: "provider-only",
+        tools: "none",
+      },
+    });
+    expect(failed.ok).toBe(false);
+
+    expect(cp.audit.byKind("CAPACITY_PROBE")).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        reasonCode: ReasonCode.PROBE_FAILED,
+        evidence: expect.objectContaining({ provider: "gpt", trigger: RefreshTrigger.BLIND_REVIEW }),
+      }),
+      expect.objectContaining({
+        reasonCode: ReasonCode.PROBE_FAILED,
+        evidence: expect.objectContaining({ provider: "gpt", trigger: RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE }),
+      }),
+    ]));
+  });
+
   it("#178 denies dispatch admission when no production provider exists", async () => {
     const root = tempDir("acp-no-prod-");
     const clock = new ManualClock("2026-08-12T00:00:00.000Z");

@@ -235,6 +235,9 @@ export class ControlPlane {
     this.capacity = new CapacityMonitor(
       this.db, this.clock, this.audit, this.providers, this.telemetry, config.capacity,
     );
+    // Provider operations must observe capacity through the same monitor that dispatch
+    // uses; otherwise the runtime wrapper is present but no production adapter reaches it.
+    this.providers.attachCapacity(this.capacity);
     this.continuity = new ContinuityKernel(
       this.db, this.clock, this.audit, this.capacity, this.providers,
       this.projects, this.runs, this.sessions, this.bindings, this.telemetry,

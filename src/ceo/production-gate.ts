@@ -501,7 +501,9 @@ export class ProductionGate {
     const independence = this.bindings.assertFinalCeoIndependence(input.runId, input.ceoSessionId);
     if (!independence.allowed) return independence as Decision<{ state: RunState }>;
 
-    const humanGate = packet ? packet.content.humanGate : this.humanGateStatus(input.runId);
+    // The packet records what the owner gate said when it was published, but a later
+    // authenticated rejection is authoritative at confirmation time.
+    const humanGate = this.humanGateStatus(input.runId);
     if (input.decision === "CONFIRM" && humanGate.required && !humanGate.satisfied) {
       return deny(
         ReasonCode.HUMAN_GATE_UNSATISFIED,

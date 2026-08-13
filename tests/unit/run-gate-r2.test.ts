@@ -355,18 +355,30 @@ describe("round-2 run and production-gate regressions", () => {
     expect(confirmed.reasonCode).toBe(ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION);
   });
 
-  it("#143 lets an owner rejection revoke an earlier approval", async () => {
+  it("#143 denies CEO confirmation after an owner rejection revokes an earlier approval", async () => {
     const fixture = await evidenceReadyRun(["public release"]);
     const approved = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "yes");
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
       runId: fixture.runId, item: "public release", approved: true, note: "yes", receipt: approved,
     }).allowed).toBe(true);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(true);
+    buildPacket(fixture);
+
     const rejected = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", false, "no");
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
       runId: fixture.runId, item: "public release", approved: false, note: "no", receipt: rejected,
     }).allowed).toBe(true);
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(false);
+
+    const confirmed = fixture.harness.cp.ceo.submitCeoDecision({
+      runId: fixture.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: fixture.digest,
+      ceoSessionId: fixture.ceoSessionId,
+      rationale: "owner withdrew approval",
+    });
+    expect(confirmed.allowed).toBe(false);
+    expect(confirmed.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
   });
 
   it("#144 refuses report corroboration from another repository identity", async () => {
