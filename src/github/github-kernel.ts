@@ -1266,17 +1266,36 @@ export class GitHubKernel {
           this.releaseReservation(idempotencyKey, requestDigest);
           return this.mergeExecute(input);
         } else if (!pull.merge_commit_sha || pull.head.sha !== input.exactHeadSha) {
+          // GitHub says the PR merged, but its response does not identify the exact merge
+          // we reserved. Keep the durable receipt for a later re-read, but do not leave
+          // this process's reservation wedged forever.
+          this.markMergeUnproven(input, mergeRepositoryId, idempotencyKey);
           return deny(ReasonCode.RESOURCE_COLLISION, "merge operation is pending reconciliation", { idempotencyKey });
         } else {
-          const method = input.mergeStrategy === "squash" ? "squash" : "merge";
-          const onBase = await this.assertMergedOntoBase(
+          const prepared = this.preparedPrIntent(input.runId, input.repositoryIdentity, pull.number);
+          if (!prepared.allowed) {
+            this.recordMergeProofFailure(
+              input,
+              mergeRepositoryId,
+              idempotencyKey,
+              pull.merge_commit_sha,
+              prepared,
+            );
+            return prepared as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+          }
+          const proof = await this.assertExecutedMergeProof(
             slug.value.owner,
             slug.value.repo,
+            pull,
+            prepared.value,
             pull.merge_commit_sha,
             input.expectedBaseSha,
-            method,
+            this.githubMergeMethod(input.mergeStrategy),
           );
-          if (!onBase.allowed) return onBase as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+          if (!proof.allowed) {
+            this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, pull.merge_commit_sha, proof);
+            return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+          }
           const finalized = this.finalizeReservedReceipt({
             idempotencyKey,
             requestDigest,
@@ -1288,7 +1307,8 @@ export class GitHubKernel {
               targetBranch: pull.base.ref,
               expectedBaseSha: input.expectedBaseSha,
               baseVerification: {
-                preflight: "exact-base-reread",
+                preflight: "prepared-base-ref-and-sha",
+                postflight: "prepared-base-ref-points-at-merge-commit",
                 residualRace: "base-may-move-between-preflight-and-merge",
                 proof: "merge-commit-first-parent",
               },
@@ -1296,6 +1316,7 @@ export class GitHubKernel {
             reread: true,
           });
           if (!finalized.allowed) return finalized as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+          this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId, "PENDING");
           return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, {
             mergeCommitSha: pull.merge_commit_sha,
             replayed: true,
@@ -1338,10 +1359,14 @@ export class GitHubKernel {
         { mergeStrategy: input.mergeStrategy },
       );
     }
-    const method = input.mergeStrategy === "squash" ? "squash" : "merge";
+    const method = this.githubMergeMethod(input.mergeStrategy);
+
+    const prepared = this.preparedPrIntent(input.runId, input.repositoryIdentity, input.pullNumber);
+    if (!prepared.allowed) return prepared as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
     // §24.6 — GitHub's merge API accepts an expected *head* but no expected base, so the
-    // base is checked as late as possible before the call and proved after it.
+    // base is checked as late as possible before the call and proved after it. SHA equality
+    // alone is insufficient: another ref can temporarily name the same commit.
     const preflight = await this.api().request<PullRequest>(
       "GET",
       `/repos/${owner}/${repo}/pulls/${input.pullNumber}`,
@@ -1352,6 +1377,8 @@ export class GitHubKernel {
         observed: preflight.head.sha,
       });
     }
+    const preflightBase = this.assertPreparedBaseRef(preflight, prepared.value, "before-put");
+    if (!preflightBase.allowed) return preflightBase as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     if (preflight.base.sha !== input.expectedBaseSha) {
       return deny(ReasonCode.MERGE_BASE_STALE, "base moved between evaluation and execution", {
         expected: input.expectedBaseSha,
@@ -1386,7 +1413,13 @@ export class GitHubKernel {
       ),
     );
     if (!merged.allowed) {
-      if (merged.evidence["effectInvoked"] !== true) this.releaseReservation(idempotencyKey, requestDigest);
+      if (merged.evidence["effectInvoked"] !== true) {
+        this.releaseReservation(idempotencyKey, requestDigest);
+      } else {
+        // The fenced effect ran but did not yield a proveable acknowledgement. Preserve the
+        // PENDING row for recovery while making the run fail closed now.
+        this.markMergeUnproven(input, mergeRepositoryId, idempotencyKey);
+      }
       return merged as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
     const mergeResponse = merged.value as unknown;
@@ -1397,7 +1430,9 @@ export class GitHubKernel {
       typeof mergeResponse.merged !== "boolean"
     ) {
       // A blank acknowledgement can follow an applied PUT, so retain the receipt until a
-      // reconciliation can establish whether the merge occurred.
+      // reconciliation can establish whether the merge occurred. It is nevertheless an
+      // executed-but-unproven merge for this run until that proof succeeds.
+      this.markMergeUnproven(input, mergeRepositoryId, idempotencyKey);
       return deny(ReasonCode.EVIDENCE_MISSING, "GitHub returned no usable merge acknowledgement", {
         pullNumber: input.pullNumber,
       });
@@ -1421,6 +1456,7 @@ export class GitHubKernel {
       });
     }
     if (!("sha" in mergeResponse) || typeof mergeResponse.sha !== "string" || !mergeResponse.sha) {
+      this.markMergeUnproven(input, mergeRepositoryId, idempotencyKey);
       return deny(ReasonCode.EVIDENCE_MISSING, "GitHub reported a merge with no commit sha", {
         pullNumber: input.pullNumber,
       });
@@ -1439,30 +1475,39 @@ export class GitHubKernel {
       },
     });
 
-    const repositoryId = this.runs
-      .repositoriesOf(input.runId)
-      .find((r) => r.identity === input.repositoryIdentity)?.repositoryId;
-    const mergeRepositoryId = repositoryId ?? null;
-
-    // The merge happened; now prove it landed on the base the evidence was bound to. A
-    // mismatch is reported, never smoothed over: the merge commit exists and the run's
-    // evidence no longer describes it (§24.6).
-    const onBase = await this.assertMergedOntoBase(owner, repo, mergeCommitSha, input.expectedBaseSha, method);
-    if (!onBase.allowed) {
-      if (typeof mergeRepositoryId === "string") this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId as string, "FAILED");
-      this.audit.record({
-        kind: "MERGE_BASE_DRIFT",
-        runId: input.runId,
-        reasonCode: ReasonCode.MERGE_BASE_STALE,
-        evidence: {
-          repositoryIdentity: input.repositoryIdentity,
+    // A merge acknowledgement names a commit but does not prove the mutable PR target
+    // still names the branch prepared by this run, nor that branch's current ref points to
+    // that commit. Re-read both before accepting the irreversible write.
+    let postflight: PullRequest;
+    try {
+      postflight = await this.api().request<PullRequest>(
+        "GET",
+        `/repos/${owner}/${repo}/pulls/${input.pullNumber}`,
+      );
+    } catch (error) {
+      const unproven = deny(
+        ReasonCode.MERGE_BASE_STALE,
+        "merged pull request could not be re-read for base proof",
+        {
           mergeCommitSha,
-          expectedBase: input.expectedBaseSha,
-          detail: (onBase as Extract<Decision<void>, { allowed: false }>).message,
+          error: error instanceof Error ? error.message : String(error),
         },
-      });
-      this.rollbackPrepare(input.runId, input.repositoryIdentity, mergeCommitSha, "halt");
-      return onBase as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+      );
+      this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, unproven);
+      return unproven as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+    }
+    const proof = await this.assertExecutedMergeProof(
+      owner,
+      repo,
+      postflight,
+      prepared.value,
+      mergeCommitSha,
+      input.expectedBaseSha,
+      method,
+    );
+    if (!proof.allowed) {
+      this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, proof);
+      return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
 
     const finalized = this.finalizeReservedReceipt({
@@ -1476,7 +1521,8 @@ export class GitHubKernel {
         targetBranch: preflight.base.ref,
         expectedBaseSha: input.expectedBaseSha,
         baseVerification: {
-          preflight: "exact-base-reread",
+          preflight: "prepared-base-ref-and-sha",
+          postflight: "prepared-base-ref-points-at-merge-commit",
           residualRace: "base-may-move-between-preflight-and-merge",
           proof: "merge-commit-first-parent",
         },
@@ -1487,8 +1533,62 @@ export class GitHubKernel {
 
     // API success is only a pending merge: dependents remain blocked until the exact
     // merge commit has passed the pinned post-merge checks.
-    if (typeof mergeRepositoryId === "string") this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId as string, "PENDING");
+    this.runs.setRepositoryMergeState(input.runId, mergeRepositoryId, "PENDING");
     return allow(ReasonCode.OK, { mergeCommitSha, replayed: false });
+  }
+
+  /** Translate the pinned contract vocabulary to GitHub's REST API vocabulary. */
+  private githubMergeMethod(strategy: BranchProfile["mergeStrategy"]): "merge" | "squash" | "rebase" {
+    if (strategy === "squash") return "squash";
+    // `rebase` is intentionally checked at runtime as well as in the manifest schema so a
+    // newly admitted pinned contract cannot silently degrade into GitHub's merge method.
+    if ((strategy as string) === "rebase") return "rebase";
+    return "merge";
+  }
+
+  /** The prepare receipt binds a branch name, not merely the commit it happened to name. */
+  private assertPreparedBaseRef(
+    pull: PullRequest,
+    prepared: PreparedPrIntent,
+    phase: "before-put" | "after-put",
+  ): Decision<void> {
+    if (pull.base.ref === prepared.base) return allow(ReasonCode.OK, undefined);
+    return deny(
+      phase === "before-put" ? ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED : ReasonCode.MERGE_BASE_STALE,
+      "pull request base ref differs from the immutable prepare contract",
+      {
+        pullNumber: pull.number,
+        phase,
+        expected: prepared.base,
+        observed: pull.base.ref,
+      },
+    );
+  }
+
+  /**
+   * GitHub's PUT acknowledgement is only a claim. The subsequent pull re-read proves both
+   * which ref received the write and that that ref still points at the acknowledged commit.
+   */
+  private async assertExecutedMergeProof(
+    owner: string,
+    repo: string,
+    pull: PullRequest,
+    prepared: PreparedPrIntent,
+    mergeCommitSha: string,
+    expectedBaseSha: string,
+    method: "merge" | "squash" | "rebase",
+  ): Promise<Decision<void>> {
+    const preparedBase = this.assertPreparedBaseRef(pull, prepared, "after-put");
+    if (!preparedBase.allowed) return preparedBase;
+    if (pull.base.sha !== mergeCommitSha) {
+      return deny(ReasonCode.MERGE_BASE_STALE, "prepared base ref does not point at the merge commit", {
+        pullNumber: pull.number,
+        baseRef: pull.base.ref,
+        expected: mergeCommitSha,
+        observed: pull.base.sha,
+      });
+    }
+    return this.assertMergedOntoBase(owner, repo, mergeCommitSha, expectedBaseSha, method);
   }
 
   /**
@@ -2402,14 +2502,7 @@ export class GitHubKernel {
     runId: string,
     repositoryIdentity: string,
     pullNumber: number,
-  ): Decision<{
-    head: string;
-    base: string;
-    exactHeadSha: string;
-    expectedBaseSha: string;
-    sourceBase: string;
-    declaredParent: string | null;
-  }> {
+  ): Decision<PreparedPrIntent> {
     const receipts = this.db.all<{ response_json: string; verified: number }>(
       `SELECT response_json, verified FROM github_receipts
         WHERE operation = 'pr_prepare' AND run_id = ? AND repository_identity = ?
@@ -2451,6 +2544,48 @@ export class GitHubKernel {
   private setMergeState(runId: string, repositoryIdentity: string, state: "MERGED" | "FAILED"): void {
     const repositoryId = this.runs.repositoriesOf(runId).find((entry) => entry.identity === repositoryIdentity)?.repositoryId;
     if (repositoryId) this.runs.setRepositoryMergeState(runId, repositoryId, state);
+  }
+
+  private mergeRepositoryId(runId: string, repositoryIdentity: string): Decision<string> {
+    const repositoryId = this.runs.repositoriesOf(runId).find((entry) => entry.identity === repositoryIdentity)?.repositoryId;
+    return repositoryId
+      ? allow(ReasonCode.OK, repositoryId)
+      : deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "repository does not participate in this run", {
+          runId,
+          repositoryIdentity,
+        });
+  }
+
+  /**
+   * The durable PENDING receipt must survive an inconclusive external write, but its
+   * in-memory reservation only prevents duplicate concurrent writes. Keeping that set bit
+   * after a proof failure prevents the very reconciliation the receipt was retained for.
+   */
+  private markMergeUnproven(input: MergeInput, repositoryId: string, idempotencyKey: string): void {
+    this.runs.setRepositoryMergeState(input.runId, repositoryId, "FAILED");
+    this.inFlightReservations.delete(idempotencyKey);
+  }
+
+  private recordMergeProofFailure(
+    input: MergeInput,
+    repositoryId: string,
+    idempotencyKey: string,
+    mergeCommitSha: string,
+    failure: Decision<unknown>,
+  ): void {
+    this.markMergeUnproven(input, repositoryId, idempotencyKey);
+    this.audit.record({
+      kind: "MERGE_BASE_DRIFT",
+      runId: input.runId,
+      reasonCode: failure.reasonCode,
+      evidence: {
+        repositoryIdentity: input.repositoryIdentity,
+        mergeCommitSha,
+        expectedBase: input.expectedBaseSha,
+        detail: failure.allowed ? "merge proof was not established" : failure.message,
+      },
+    });
+    this.rollbackPrepare(input.runId, input.repositoryIdentity, mergeCommitSha, "halt");
   }
 
   private assertAuthority(
