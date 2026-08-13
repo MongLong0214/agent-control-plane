@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, chmodSync, constants, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
@@ -8,7 +8,12 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { CodexCliAdapter, runtimeEnvironment, readCapacityFile } from "../../src/runtime/cli-adapters.ts";
+import {
+  ClaudeCliAdapter,
+  CodexCliAdapter,
+  readCapacityFile,
+  runtimeEnvironment,
+} from "../../src/runtime/cli-adapters.ts";
 import {
   type CapacityReading,
   type InvocationRequest,
@@ -90,6 +95,62 @@ const attachRoutablePorts = (cp: ControlPlane) => {
     readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
     buzz: { connect: async (sessionId) => allow(ReasonCode.OK, `buzz:${sessionId}`) },
   });
+};
+
+type CliProbe = {
+  environment: Record<string, string>;
+  readable: Record<string, boolean>;
+};
+
+const writeCliProbe = (directory: string, paths: readonly string[]): string => {
+  const binary = join(directory, "runtime-probe.mjs");
+  writeFileSync(binary, `#!${process.execPath}
+import { readFileSync } from "node:fs";
+
+const paths = ${JSON.stringify(paths)};
+const readable = Object.fromEntries(paths.map((path) => {
+  try {
+    readFileSync(path, "utf8");
+    return [path, true];
+  } catch {
+    return [path, false];
+  }
+}));
+process.stdout.write(JSON.stringify({ environment: process.env, readable }));
+`);
+  chmodSync(binary, 0o700);
+  return binary;
+};
+
+const noGhPath = (): string =>
+  [dirname(process.execPath), "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    .filter((directory) => {
+      try {
+        accessSync(join(directory, "gh"), constants.X_OK);
+        return false;
+      } catch {
+        return true;
+      }
+    })
+    .join(":");
+
+const withEnvironment = async <T>(
+  replacements: Record<string, string | undefined>,
+  callback: () => Promise<T>,
+): Promise<T> => {
+  const previous = Object.fromEntries(Object.keys(replacements).map((name) => [name, process.env[name]]));
+  try {
+    for (const [name, value] of Object.entries(replacements)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    return await callback();
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 };
 
 const bindCeo = (plane: ReturnType<typeof makePlane>, provider = "gpt", mode: "PREFERRED" | "FALLBACK" = "PREFERRED") => {
@@ -288,10 +349,204 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(environment.HOME).toBe(process.env.HOME);
     expect(environment.TMPDIR).not.toBe(process.env.TMPDIR);
     expect(Object.keys(environment).sort()).toEqual(
-      ["GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT", "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "USER"].filter(
-        (name) => name !== "USER" || process.env["USER"],
-      ),
+      [
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_TERMINAL_PROMPT",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TMPDIR",
+        "USER",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+      ].filter(
+        (name) =>
+          (name !== "USER" || process.env["USER"]) &&
+          (name !== "CLAUDE_SECURESTORAGE_CONFIG_DIR" || process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]),
+      ).sort(),
     );
+  });
+
+  it("#353 denies host keychains and Git credentials without removing the provider HOME or USER", async () => {
+    const clock = new ManualClock("2026-08-12T00:00:00.000Z");
+    const workdir = tempDir("acp-runtime-work-");
+    const hostHome = tempDir("acp-runtime-home-");
+    const hostTmp = tempDir("acp-runtime-host-tmp-");
+    const providerScope = tempDir("acp-runtime-provider-");
+    const ghDirectory = tempDir("acp-runtime-gh-");
+    const workFile = join(workdir, "packet.txt");
+    const gitconfig = join(hostHome, ".gitconfig");
+    const netrc = join(hostHome, ".netrc");
+    const keychain = join(hostHome, "Library", "Keychains", "login.keychain-db");
+    mkdirSync(join(hostHome, "Library", "Keychains"), { recursive: true });
+    writeFileSync(workFile, "packet input");
+    writeFileSync(gitconfig, "[user]\nname = daemon\n");
+    writeFileSync(netrc, "machine github.example login daemon password token\n");
+    writeFileSync(keychain, "daemon provider and GitHub credentials");
+    writeFileSync(join(ghDirectory, "gh"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(ghDirectory, "gh"), 0o700);
+    const binary = writeCliProbe(workdir, [workFile, gitconfig, netrc, keychain]);
+
+    await withEnvironment({
+      HOME: hostHome,
+      USER: "acp-provider",
+      PATH: ghDirectory,
+      TMPDIR: hostTmp,
+      GH_TOKEN: "ghp_this_must_not_reach_the_agent",
+      CLAUDE_SECURESTORAGE_CONFIG_DIR: providerScope,
+    }, async () => {
+      const adapter = new ClaudeCliAdapter({
+        clock,
+        capacityFile: join(workdir, "capacity.json"),
+        binary,
+        // PATH is deliberately listed: an allowlist must not be able to reintroduce gh.
+        environmentAllowlist: ["PATH", "GH_TOKEN"],
+      });
+      const result = await adapter.invoke({
+        prompt: "Report the runtime boundary.",
+        workdir,
+        timeoutMs: 5_000,
+        readOnly: false,
+        correlationId: "runtime-credential-containment",
+      });
+
+      expect(result.ok).toBe(true);
+      const probe = JSON.parse(result.text) as CliProbe;
+      const { TMPDIR, ...fixedEnvironment } = probe.environment;
+      expect(fixedEnvironment).toEqual({
+        PATH: noGhPath(),
+        HOME: hostHome,
+        USER: "acp-provider",
+        LANG: "C.UTF-8",
+        LC_ALL: "C",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_TERMINAL_PROMPT: "0",
+        CLAUDE_SECURESTORAGE_CONFIG_DIR: providerScope,
+      });
+      expect(TMPDIR).not.toBe(hostTmp);
+      expect(TMPDIR).not.toBe(hostHome);
+      const runtimePath = probe.environment.PATH;
+      if (!runtimePath) throw new Error("runtime probe did not receive PATH");
+      expect(runtimePath.split(":")).not.toContain(ghDirectory);
+      expect(probe.environment.GH_TOKEN).toBeUndefined();
+      expect(probe.readable).toEqual({
+        [workFile]: true,
+        [gitconfig]: false,
+        [netrc]: false,
+        [keychain]: false,
+      });
+    });
+  });
+
+  it("#354 drives the real reviewer adapter through an applied packet-only profile", async () => {
+    const clock = new ManualClock("2026-08-12T00:00:00.000Z");
+    const packetRoot = tempDir("acp-reviewer-packet-");
+    const hostHome = tempDir("acp-reviewer-home-");
+    const providerScope = tempDir("acp-reviewer-provider-");
+    const ghDirectory = tempDir("acp-reviewer-gh-");
+    const packetFile = join(packetRoot, "packet.json");
+    const daemonFile = join(tempDir("acp-reviewer-daemon-"), "state.sqlite");
+    const providerConfig = join(providerScope, ".claude.json");
+    const gitconfig = join(hostHome, ".gitconfig");
+    const netrc = join(hostHome, ".netrc");
+    const keychain = join(hostHome, "Library", "Keychains", "login.keychain-db");
+    mkdirSync(join(hostHome, "Library", "Keychains"), { recursive: true });
+    writeFileSync(packetFile, "immutable review input");
+    writeFileSync(daemonFile, "daemon state");
+    writeFileSync(providerConfig, "scoped provider configuration");
+    writeFileSync(gitconfig, "[user]\nname = daemon\n");
+    writeFileSync(netrc, "machine github.example login daemon password token\n");
+    writeFileSync(keychain, "host keychain must not be granted to reviewers");
+    writeFileSync(join(ghDirectory, "gh"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(ghDirectory, "gh"), 0o700);
+    const binary = writeCliProbe(packetRoot, [packetFile, providerConfig, daemonFile, gitconfig, netrc, keychain]);
+
+    await withEnvironment({
+      HOME: hostHome,
+      USER: "acp-reviewer-provider",
+      PATH: ghDirectory,
+      GH_TOKEN: "ghp_this_must_not_reach_the_reviewer",
+      CLAUDE_CONFIG_DIR: providerScope,
+    }, async () => {
+      const adapter = new ClaudeCliAdapter({
+        clock,
+        capacityFile: join(packetRoot, "capacity.json"),
+        binary,
+      });
+      const result = await adapter.invoke({
+        prompt: "Review this packet only.",
+        workdir: packetRoot,
+        timeoutMs: 5_000,
+        readOnly: true,
+        correlationId: "reviewer-isolation-spawn-path",
+        isolation: {
+          packetRoot,
+          denyReadPaths: [daemonFile],
+          emptyEnvironment: true,
+          network: "deny",
+          tools: "none",
+        },
+      });
+
+      // A non-zero provider answer would still attest an applied profile. This stub exits
+      // cleanly so its observations can prove the profile and exact environment instead.
+      expect(result.ok).toBe(true);
+      expect(result.isolationAttested).toBe(true);
+      expect(result.isolationReasonCode).toBeUndefined();
+      const probe = JSON.parse(result.text) as CliProbe;
+      expect(probe.environment).toEqual({
+        PATH: noGhPath(),
+        HOME: packetRoot,
+        USER: "acp-reviewer-provider",
+        TMPDIR: packetRoot,
+        LANG: "C.UTF-8",
+        LC_ALL: "C",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_TERMINAL_PROMPT: "0",
+        CLAUDE_CONFIG_DIR: providerScope,
+        CLAUDE_SECURESTORAGE_CONFIG_DIR: providerScope,
+      });
+      expect(probe.readable).toEqual({
+        [packetFile]: true,
+        [providerConfig]: true,
+        [daemonFile]: false,
+        [gitconfig]: false,
+        [netrc]: false,
+        [keychain]: false,
+      });
+    });
+  });
+
+  it("#354 returns ISOLATION_LOST when the reviewer profile cannot be applied", async () => {
+    const clock = new ManualClock("2026-08-12T00:00:00.000Z");
+    const packetRoot = tempDir("acp-reviewer-profile-failure-");
+    const adapter = new ClaudeCliAdapter({
+      clock,
+      capacityFile: join(packetRoot, "capacity.json"),
+      binary: writeCliProbe(packetRoot, []),
+    });
+
+    const result = await adapter.invoke({
+      prompt: "This provider binary must not run.",
+      workdir: packetRoot,
+      timeoutMs: 5_000,
+      readOnly: true,
+      correlationId: "reviewer-profile-not-applied",
+      isolation: {
+        packetRoot,
+        // `spawn` rejects a seatbelt argv that contains NUL. The adapter must turn that
+        // unusable profile into an unattested isolation result, not an uncaught exception.
+        denyReadPaths: ["/tmp/acp-profile\u0000cannot-apply"],
+        emptyEnvironment: true,
+        network: "deny",
+        tools: "none",
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.isolationAttested).toBe(false);
+    expect(result.isolationReasonCode).toBe(ReasonCode.ISOLATION_LOST);
+    expect(result.error).toContain("null bytes");
   });
 
   it("#59 rejects replacement and keeps scripted adapters out of the production registry", () => {
@@ -344,6 +599,7 @@ describe("round-2 capacity and runtime regressions", () => {
 
     expect(result.ok).toBe(false);
     expect(result.isolationAttested).toBe(false);
+    expect(result.isolationReasonCode).toBe(ReasonCode.ISOLATION_LOST);
     expect(result.error).toContain("tools:none");
   });
 });

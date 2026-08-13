@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 import {
   type CapacityReading,
   type InvocationRequest,
@@ -78,6 +79,25 @@ const resolveExecutable = (binary: string): string => {
     }
   }
   return binary;
+};
+
+/**
+ * Provider executables are resolved before the child environment is constructed, so an
+ * invocation does not need to inherit the daemon's general-purpose tool path. In
+ * particular, keeping `gh` out of PATH prevents a provider tool call from acquiring the
+ * daemon's GitHub identity by convention. Direct paths remain subject to the seatbelt's
+ * credential-store denials below.
+ */
+const agentPath = (): string => {
+  const directories = [dirname(process.execPath), "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+  return [...new Set(directories.filter((directory) => {
+    try {
+      accessSync(join(directory, "gh"), constants.X_OK);
+      return false;
+    } catch {
+      return true;
+    }
+  }))].join(":");
 };
 
 /**
@@ -255,17 +275,30 @@ const runCli = async (
   }
 
   return new Promise((resolve) => {
-    const child = spawn("/usr/bin/sandbox-exec", [
-      "-p",
-      profile,
-      file,
-      ...args,
-    ], {
-      cwd: workdir,
-      env: environment,
-      detached: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("/usr/bin/sandbox-exec", [
+        "-p",
+        profile,
+        file,
+        ...args,
+      ], {
+        cwd: workdir,
+        env: environment,
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (err) {
+      rmSync(scratch, { recursive: true, force: true });
+      resolve({
+        stdout: "",
+        stderr: (err as Error).message,
+        exitCode: null,
+        timedOut: false,
+        isolationEnforced: false,
+      });
+      return;
+    }
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -288,7 +321,7 @@ const runCli = async (
     child.on("error", (err) => {
       clearTimeout(timer);
       rmSync(scratch, { recursive: true, force: true });
-      resolve({ stdout, stderr: stderr + err.message, exitCode: null, timedOut, isolationEnforced });
+      resolve({ stdout, stderr: stderr + err.message, exitCode: null, timedOut, isolationEnforced: false });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
@@ -311,12 +344,18 @@ const profileAccepted = async (
   timeoutMs: number,
 ): Promise<{ accepted: boolean; stderr: string; exitCode: number | null; timedOut: boolean }> =>
   new Promise((resolve) => {
-    const child = spawn("/usr/bin/sandbox-exec", ["-p", profile, "/usr/bin/true"], {
-      cwd,
-      env: environment,
-      detached: true,
-      stdio: ["ignore", "ignore", "pipe"],
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn("/usr/bin/sandbox-exec", ["-p", profile, "/usr/bin/true"], {
+        cwd,
+        env: environment,
+        detached: true,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+    } catch (err) {
+      resolve({ accepted: false, stderr: (err as Error).message, exitCode: null, timedOut: false });
+      return;
+    }
     let stderr = "";
     let timedOut = false;
     let settled = false;
@@ -392,7 +431,7 @@ const looksLikeCredential = (value: string): boolean => SECRET_VALUE_SHAPES.some
  */
 export const runtimeEnvironment = (allowlist: readonly string[], scratch: string): NodeJS.ProcessEnv => {
   const environment: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+    PATH: agentPath(),
     HOME: process.env["HOME"] ?? scratch,
     // Both CLIs resolve their own login through the invoking user's keychain, and neither
     // finds it without USER. Measured, not assumed: with HOME alone `claude --print`
@@ -403,9 +442,17 @@ export const runtimeEnvironment = (allowlist: readonly string[], scratch: string
     LC_ALL: "C",
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
+    // This is a provider namespace selector, not a credential. Preserve it so a
+    // deployment that provisions a dedicated Claude secure-storage scope does not need
+    // the host Keychains directory reopened merely to authenticate its own provider.
+    ...(process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+      ? { CLAUDE_SECURESTORAGE_CONFIG_DIR: process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] }
+      : {}),
   };
   for (const name of allowlist) {
-    if (authorityEnvironment(name)) continue;
+    // PATH is a containment control, not a caller-provided convenience variable. The
+    // provider executable was already resolved before this environment was constructed.
+    if (name === "PATH" || authorityEnvironment(name)) continue;
     const value = process.env[name];
     if (value !== undefined && !looksLikeCredential(value)) environment[name] = value;
   }
@@ -413,20 +460,14 @@ export const runtimeEnvironment = (allowlist: readonly string[], scratch: string
 };
 
 /**
- * A reviewer gets a disposable home and only the provider config root it needs. Keeping
- * USER preserves the CLI's measured login lookup, while the daemon's normal environment
- * and authority-bearing variables remain absent.
+ * A reviewer gets a disposable home and, when the deployment explicitly supplies one,
+ * a dedicated provider credential scope. `CLAUDE_SECURESTORAGE_CONFIG_DIR` makes Claude
+ * use that scope's secure-storage namespace; the profile below never grants the daemon's
+ * login-keychain files. Keeping USER preserves the CLI's measured login lookup, while
+ * the daemon's normal environment and authority-bearing variables remain absent.
  */
 export const reviewerEnvironment = (packetRoot: string, configDirectory?: string): NodeJS.ProcessEnv => ({
-  PATH: [...new Set([
-    dirname(process.execPath),
-    "/usr/local/bin",
-    "/opt/homebrew/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-  ])].join(":"),
+  PATH: agentPath(),
   HOME: packetRoot,
   ...(process.env["USER"] ? { USER: process.env["USER"] } : {}),
   TMPDIR: packetRoot,
@@ -434,18 +475,36 @@ export const reviewerEnvironment = (packetRoot: string, configDirectory?: string
   LC_ALL: "C",
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_TERMINAL_PROMPT: "0",
-  ...(configDirectory ? { CLAUDE_CONFIG_DIR: configDirectory } : {}),
+  ...(configDirectory ? {
+    CLAUDE_CONFIG_DIR: configDirectory,
+    CLAUDE_SECURESTORAGE_CONFIG_DIR: configDirectory,
+  } : {}),
 });
 
-const claudeCredentialPaths = (): string[] => {
-  const home = process.env["HOME"] ?? "";
-  const configDirectory = process.env["CLAUDE_CONFIG_DIR"] ?? home;
+const claudeCredentialPaths = (configDirectory?: string): string[] => {
   if (!configDirectory) return [];
   return [
-    join(configDirectory, ".claude"),
+    join(configDirectory, ".credentials.json"),
     join(configDirectory, ".claude.json"),
-    home ? join(home, "Library", "Keychains") : "",
-  ].filter(Boolean);
+  ];
+};
+
+/** Credential stores that are daemon authority, not provider identity. */
+const hostCredentialPaths = (): string[] => {
+  const home = process.env["HOME"] ?? "";
+  if (!home) return [];
+  return [
+    `${home}/.ssh`,
+    `${home}/.aws`,
+    `${home}/.gnupg`,
+    `${home}/.config/gh`,
+    `${home}/.buzz`,
+    `${home}/.agent-control-plane`,
+    `${home}/.git-credentials`,
+    `${home}/.gitconfig`,
+    `${home}/.netrc`,
+    `${home}/Library/Keychains`,
+  ];
 };
 
 const runtimeProfile = (
@@ -454,18 +513,10 @@ const runtimeProfile = (
   denyReadPaths: readonly string[],
   writablePaths: readonly string[],
 ): string => {
-  const home = process.env["HOME"] ?? "";
   const sensitive = [
     ...denyReadPaths,
-    ...(
-      home
-        ? [
-            `${home}/.ssh`, `${home}/.aws`, `${home}/.gnupg`, `${home}/.config/gh`,
-            `${home}/.buzz`, `${home}/.agent-control-plane`, `${home}/.git-credentials`,
-          ]
-        : []
-    ),
-  ];
+    ...hostCredentialPaths(),
+  ].map(resolvePath);
   const lines = ["(version 1)", "(allow default)"];
   for (const path of sensitive) {
     if (!path || path === workdir || path.startsWith(`${workdir}/`) || path === scratch || path.startsWith(`${scratch}/`)) continue;
@@ -519,7 +570,9 @@ const reviewerProfile = (
     const resolved = resolvePath(path);
     if (resolved) lines.push(`(allow file-read* (subpath ${quote(resolved)}))`);
   }
-  for (const path of denyReadPaths) {
+  // Deny these explicitly as well as starting from deny-default. A future allow rule for
+  // provider state must not accidentally re-open the daemon's keychain or Git identity.
+  for (const path of [...hostCredentialPaths(), ...denyReadPaths]) {
     const resolved = resolvePath(path);
     if (resolved && resolved !== packetRoot && !resolved.startsWith(`${packetRoot}/`)) {
       lines.push(`(deny file-read* (subpath ${quote(resolved)}))`);
@@ -627,9 +680,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
       isolation: request.isolation,
-      reviewerCredentialPaths: request.isolation ? claudeCredentialPaths() : undefined,
+      reviewerCredentialPaths: request.isolation ? claudeCredentialPaths(process.env["CLAUDE_CONFIG_DIR"]) : undefined,
       reviewerConfigDirectory: request.isolation
-        ? process.env["CLAUDE_CONFIG_DIR"] ?? process.env["HOME"]
+        ? process.env["CLAUDE_CONFIG_DIR"]
         : undefined,
     });
 
@@ -649,6 +702,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       providerSessionId:
         typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null,
       isolationAttested: request.isolation !== undefined && result.isolationEnforced,
+      isolationReasonCode:
+        request.isolation !== undefined && !result.isolationEnforced ? ReasonCode.ISOLATION_LOST : undefined,
     };
   }
 
@@ -766,6 +821,7 @@ export class CodexCliAdapter implements ProviderAdapter {
         error: "Codex CLI cannot enforce reviewer tools:none isolation",
         providerSessionId: null,
         isolationAttested: false,
+        isolationReasonCode: ReasonCode.ISOLATION_LOST,
       };
     }
     const scratch = mkdtempSync(join(tmpdir(), "acp-codex-"));
