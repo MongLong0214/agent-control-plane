@@ -1,5 +1,65 @@
 import type { Decision } from "../core/errors.ts";
 import type { ReasonCode } from "../core/reason-codes.ts";
+import type { ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
+
+/**
+ * The complete, per-effect identity a local runtime needs before it can receive a
+ * writable sandbox. This is deliberately a request rather than a capability stored on a
+ * session: a session may outlive a claim, a binding generation, or a source-read fence.
+ */
+export interface ManagedInvocationWrite {
+  operation: WriteOperation;
+  /** Absolute target the provider process may mutate for this one invocation. */
+  targetPath: string;
+  repositoryIdentity?: string | null;
+  targetBranch?: string | null;
+  targetWorktreeId?: string | null;
+  runId: string;
+  sessionId: string;
+  bindingGeneration: number;
+  actor?: string | null;
+}
+
+/**
+ * The only port through which a runtime adapter may start a writable local invocation.
+ * It deliberately returns the guard's decision, rather than a boolean a caller could
+ * mistake for a durable grant.
+ */
+export interface ManagedInvocationWriteBroker {
+  authorize<T>(
+    write: ManagedInvocationWrite,
+    effect: () => T | Promise<T>,
+  ): Promise<Decision<T>>;
+}
+
+/**
+ * Production composition of the local-runtime boundary with CP-HI-01. The guard keeps
+ * the grant in flight while the provider process runs, so revocation, claims and the
+ * source-read fence are rechecked immediately around the actual side effect.
+ */
+export class GuardedInvocationWriteBroker implements ManagedInvocationWriteBroker {
+  constructor(private readonly guard: ManagedWriteGuard) {}
+
+  authorize<T>(
+    write: ManagedInvocationWrite,
+    effect: () => T | Promise<T>,
+  ): Promise<Decision<T>> {
+    return this.guard.authorize(
+      {
+        operation: write.operation,
+        targetPath: write.targetPath,
+        repositoryIdentity: write.repositoryIdentity ?? null,
+        targetBranch: write.targetBranch ?? null,
+        targetWorktreeId: write.targetWorktreeId ?? null,
+        runId: write.runId,
+        sessionId: write.sessionId,
+        bindingGeneration: write.bindingGeneration,
+        actor: write.actor ?? "runtime-cli",
+      },
+      () => effect(),
+    );
+  }
+}
 
 /** Provider ids are deployment config, not architecture (PRD §14.1). */
 export const ProviderId = {
@@ -22,6 +82,13 @@ export interface InvocationRequest {
   responseSchema?: Record<string, unknown>;
   /** Read-only invocations must not be able to mutate or explore a repository. */
   readOnly: boolean;
+  /**
+   * Mandatory for every non-read-only provider invocation. A workdir is only a read
+   * context; it never implicitly grants the provider permission to write that checkout.
+   * The adapter passes this through `ManagedInvocationWriteBroker` immediately around
+   * process launch and grants the seatbelt only this target path.
+   */
+  managedWrite?: ManagedInvocationWrite;
   /** Hard cost ceiling for one invocation, where the runtime supports one. */
   maxBudgetUsd?: number;
   /** Stable id so an interrupted invocation can be correlated in provider logs. */
@@ -44,10 +111,9 @@ export interface InvocationRequest {
     denyReadPaths: readonly string[];
     emptyEnvironment: true;
     /**
-     * A blind reviewer is a model invocation, so its egress cannot be cut without making the
-     * review impossible (measured: the CLI hangs until the invocation times out). The value
-     * records what is actually enforced — reach the provider, nothing else is confined by the
-     * network layer — so a reader of the attestation is not told egress was denied.
+     * The caller requires provider-only egress. A blind reviewer is a model invocation, so
+     * broad egress denial makes the CLI hang; the adapter must actively prove this narrower
+     * boundary before attesting. If the runtime cannot prove it, it returns ISOLATION_LOST.
      */
     network: "provider-only";
     tools: "none";
@@ -83,6 +149,12 @@ export interface SessionSpec {
   effort?: string | null;
   workdir: string;
   purpose: string;
+  /**
+   * Records that a future invocation may request a managed write. It is intentionally
+   * descriptive only: session creation never grants filesystem access, and every effect
+   * still needs `InvocationRequest.managedWrite` at launch time.
+   */
+  writeMode?: "READ_ONLY" | "MANAGED_PER_INVOCATION";
 }
 
 export interface SessionHandle {

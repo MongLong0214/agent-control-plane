@@ -23,7 +23,7 @@ import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
 import { ClaudeCliAdapter, CodexCliAdapter } from "../runtime/cli-adapters.ts";
-import { type ProviderAdapter, ProviderRegistry } from "../runtime/provider.ts";
+import { GuardedInvocationWriteBroker, type ProviderAdapter, ProviderRegistry } from "../runtime/provider.ts";
 import { BindingRegistry } from "../session/binding-registry.ts";
 import { SessionRegistry } from "../session/session-registry.ts";
 import { Telemetry } from "../telemetry/telemetry.ts";
@@ -206,6 +206,17 @@ export class ControlPlane {
     this.telemetry = new Telemetry(this.db, this.clock);
     this.outbox = new Outbox(this.db, this.clock, this.audit);
 
+    // Construct this before the default runtime adapters. A writable CLI process is never
+    // handed an unconstrained checkout: the adapters receive this exact guard-backed broker
+    // and invoke it immediately around process launch (CP-HI-01).
+    this.guard = new ManagedWriteGuard(
+      this.db,
+      config.workspaceProbe ?? realWorkspaceProbe,
+      this.audit,
+      this.clock,
+      { directWriteRoots: config.directWriteRoots },
+    );
+
     this.projects = new ProjectRegistry(this.db, this.clock, this.audit);
     this.repositories = new RepositoryRegistry(this.db, this.clock, this.audit);
     this.sessions = new SessionRegistry(this.db, this.clock, this.audit);
@@ -222,13 +233,6 @@ export class ControlPlane {
     }
 
     this.worktrees = new WorktreeManager(config.worktreeRoot);
-    this.guard = new ManagedWriteGuard(
-      this.db,
-      config.workspaceProbe ?? realWorkspaceProbe,
-      this.audit,
-      this.clock,
-      { directWriteRoots: config.directWriteRoots },
-    );
     this.tasks = new TaskGraph(this.db, this.clock, this.audit, this.telemetry);
     this.bindings.attach({ tasks: this.tasks });
     this.runs = new RunEngine(
@@ -385,18 +389,21 @@ export class ControlPlane {
   }
 
   private defaultAdapters(): ProviderAdapter[] {
+    const managedWriteBroker = new GuardedInvocationWriteBroker(this.guard);
     return [
       new ClaudeCliAdapter({
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "claude.json"),
         environmentAllowlist: [],
         denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
+        managedWriteBroker,
       }),
       new CodexCliAdapter({
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "gpt.json"),
         environmentAllowlist: [],
         denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
+        managedWriteBroker,
       }),
     ];
   }

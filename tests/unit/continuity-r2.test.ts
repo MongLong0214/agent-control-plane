@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { accessSync, chmodSync, constants, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
@@ -892,7 +892,10 @@ describe("round-2 capacity and runtime regressions", () => {
         prompt: "Report the runtime boundary.",
         workdir,
         timeoutMs: 5_000,
-        readOnly: false,
+        // This probe only reads its supplied inputs. A writable runtime now requires a
+        // guard-backed per-effect authorisation, so do not accidentally use this fixture
+        // to retain the old blanket-workdir write path.
+        readOnly: true,
         correlationId: "runtime-credential-containment",
       });
 
@@ -932,7 +935,7 @@ describe("round-2 capacity and runtime regressions", () => {
     });
   });
 
-  it("#354 drives the real reviewer adapter through an applied packet-only profile", async () => {
+  it("#360 refuses reviewer attestation when a live non-provider egress probe succeeds", async () => {
     const clock = new ManualClock("2026-08-12T00:00:00.000Z");
     const packetRoot = tempDir("acp-reviewer-packet-");
     const hostHome = tempDir("acp-reviewer-home-");
@@ -982,42 +985,15 @@ describe("round-2 capacity and runtime regressions", () => {
         },
       });
 
-      // A non-zero provider answer would still attest an applied profile. This stub exits
-      // cleanly so its observations can prove the profile and exact environment instead.
-      expect(result.ok).toBe(true);
-      expect(result.isolationAttested).toBe(true);
-      expect(result.isolationReasonCode).toBeUndefined();
-      const probe = JSON.parse(result.text) as CliProbe;
-      // `__CF_*` is injected by macOS into any sandbox-exec child, and the adapter
-      // canonicalises the packet root (`/var` is a symlink to `/private/var` here), so the
-      // assertion is about the variables we construct and the directory we actually confined to.
-      const reviewerEnv = Object.fromEntries(
-        Object.entries(probe.environment).filter(([name]) => !name.startsWith("__CF_")),
-      );
-      const canonicalPacketRoot = realpathSync(packetRoot);
-      expect(reviewerEnv).toEqual({
-        PATH: noGhPath(),
-        HOME: canonicalPacketRoot,
-        USER: "acp-reviewer-provider",
-        TMPDIR: canonicalPacketRoot,
-        LANG: "C.UTF-8",
-        LC_ALL: "C",
-        GIT_CONFIG_NOSYSTEM: "1",
-        GIT_TERMINAL_PROMPT: "0",
-        CLAUDE_CONFIG_DIR: providerScope,
-        CLAUDE_SECURESTORAGE_CONFIG_DIR: providerScope,
-      });
-      expect(probe.readable).toEqual({
-        [packetFile]: true,
-        [providerConfig]: true,
-        [daemonFile]: false,
-        [gitconfig]: false,
-        [netrc]: false,
-        // Closed: this fixture gives the reviewer a scoped provider config, which is what makes
-        // shutting the host keychain safe. Where a deployment provisions nothing, the keychain
-        // stays open because the provider could not otherwise authenticate at all.
-        [keychain]: false,
-      });
+      // The profile's filesystem and process probes run first, then a child under the same
+      // profile reaches a listener which is not the provider. `allow default` therefore is
+      // not a provider-only boundary, and the adapter must refuse before this reviewer stub
+      // can run. Deleting that live egress probe would make this assertion flip to a false
+      // attestation.
+      expect(result.ok).toBe(false);
+      expect(result.isolationAttested).toBe(false);
+      expect(result.isolationReasonCode).toBe(ReasonCode.ISOLATION_LOST);
+      expect(result.error).toContain("provider-only network probe reached a non-provider endpoint");
     });
   });
 
