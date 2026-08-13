@@ -10,8 +10,8 @@ import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, RunState } from "../domain/types.ts";
-import { requiredBaseFor } from "../github/branch-contract.ts";
-import { currentBranch } from "../git/git.ts";
+import { requiredBaseFor, sourceProbeBranchesFor } from "../github/branch-contract.ts";
+import { currentBranch, mergeBase, revParse, tryRevParse } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
@@ -123,21 +123,25 @@ export class CandidatePipeline {
       ? (this.projects.manifest(run.pinnedManifestDigest)?.branchProfile ?? null)
       : null;
     const repositories = await Promise.all(
-      participants.map(async (repo) => ({
-        identity: repo.identity,
-        repositoryRole: repo.repositoryRole,
-        checkoutPath: repo.checkoutPath,
-        baseBranch: repo.baseBranch,
-        baseRef: repo.baseBranch,
-        sourceBranch: await this.requiredSourceBranch(
+      participants.map(async (repo) => {
+        const source = await this.sourceAtFreeze(
           repo.checkoutPath,
           repo.workBranch,
           repo.baseBranch,
           profile,
-        ),
-        worktreeId: repo.worktreeId,
-        manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
-      })),
+        );
+        return {
+          identity: repo.identity,
+          repositoryRole: repo.repositoryRole,
+          checkoutPath: repo.checkoutPath,
+          baseBranch: repo.baseBranch,
+          baseRef: repo.baseBranch,
+          sourceBranch: source.sourceBranch,
+          sourceHead: source.sourceHead,
+          worktreeId: repo.worktreeId,
+          manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
+        };
+      }),
     );
 
     const snapshot = await buildCandidateSnapshot(
@@ -621,19 +625,60 @@ export class CandidatePipeline {
   }
 
   /**
-   * The live checkout names the branch in ordinary work; a detached managed worktree
-   * uses the branch recorded when it was assigned. In both cases the source is derived
-   * from the profile pinned at dispatch, never from the PR target.
+   * Resolve the origin once, while freezing, and pass the resulting SHA to the snapshot
+   * builder. For release/hotfix candidates, a shared ancestor can make both long-lived
+   * refs appear ancestral; only a unique most-specific ref is recorded. A non-required
+   * winner is retained as evidence so the GitHub kernel can refuse it by branch contract.
    */
-  private async requiredSourceBranch(
+  private async sourceAtFreeze(
     checkoutPath: string,
     workBranch: string | null,
     targetBranch: string,
     profile: BranchProfile | null,
-  ): Promise<string | null> {
-    if (!profile) return null;
+  ): Promise<{ sourceBranch: string | null; sourceHead: string | null }> {
+    if (!profile) return { sourceBranch: null, sourceHead: null };
     const observedBranch = await currentBranch(checkoutPath);
     const candidateBranch = observedBranch === "HEAD" ? workBranch : observedBranch;
-    return candidateBranch ? requiredBaseFor(candidateBranch, profile, targetBranch) : null;
+    if (!candidateBranch) return { sourceBranch: null, sourceHead: null };
+
+    const requiredSource = requiredBaseFor(candidateBranch, profile, targetBranch);
+    if (!requiredSource) return { sourceBranch: null, sourceHead: null };
+
+    const candidateHead = await revParse(checkoutPath, "HEAD");
+    const probes = sourceProbeBranchesFor(candidateBranch, profile, targetBranch);
+    const qualifying = (
+      await Promise.all(
+        probes.map(async (branch) => {
+          const head = await tryRevParse(checkoutPath, branch);
+          if (!head) return null;
+          const ancestor = await mergeBase(checkoutPath, head, candidateHead);
+          return ancestor === head ? { branch, head } : null;
+        }),
+      )
+    ).filter((probe): probe is { branch: string; head: string } => probe !== null);
+
+    const mostSpecific: Array<{ branch: string; head: string }> = [];
+    for (const candidate of qualifying) {
+      let isAncestorOfAnother = false;
+      for (const other of qualifying) {
+        if (candidate.branch === other.branch || candidate.head === other.head) continue;
+        const relation = await mergeBase(checkoutPath, candidate.head, other.head);
+        if (relation === candidate.head) {
+          isAncestorOfAnother = true;
+          break;
+        }
+      }
+      if (!isAncestorOfAnother) mostSpecific.push(candidate);
+    }
+
+    if (mostSpecific.length !== 1) {
+      // No unique fact exists. Carrying no origin preserves the existing fail-closed PR
+      // behavior and prevents a shared ancestor from being silently assigned to dev/main.
+      return { sourceBranch: null, sourceHead: null };
+    }
+    const selected = mostSpecific[0]!;
+    // Keep a unique but wrong origin in the digest. assertFrozenSourceLineage then rejects
+    // the candidate before any PR write, independently of branch divergence.
+    return { sourceBranch: selected.branch, sourceHead: selected.head };
   }
 }
