@@ -104,13 +104,17 @@ const registerProject = async (harness: ReturnType<typeof makeMultiProviderHarne
     identity: "github:acme/fixture",
   });
   if (!repository.allowed) throw new Error(repository.message);
-  return { projectId: "cont-project", repositoryId: repository.value.repositoryId };
+  return {
+    projectId: "cont-project",
+    repositoryId: repository.value.repositoryId,
+    checkoutPath: repository.value.checkoutPath,
+  };
 };
 
 describe("resource claims (CP-S13, CP-S14, CP-S15)", () => {
   const setup = async () => {
     const harness = makeMultiProviderHarness();
-    const { projectId, repositoryId } = await registerProject(harness);
+    const { projectId, repositoryId, checkoutPath } = await registerProject(harness);
 
     const makeRun = async () => {
       const created = harness.cp.runs.create({
@@ -131,11 +135,11 @@ describe("resource claims (CP-S13, CP-S14, CP-S15)", () => {
     const secondDispatched = await harness.cp.runs.dispatch(runB);
     if (!secondDispatched.allowed) throw new Error(secondDispatched.message);
 
-    return { harness, projectId, repositoryId, runA, runB, owner: dispatched.value };
+    return { harness, projectId, repositoryId, checkoutPath, runA, runB, owner: dispatched.value };
   };
 
   it("CP-S13: two runs cannot hold the same worktree", async () => {
-    const { harness, runA, runB, owner } = await setup();
+    const { harness, runA, runB, owner, checkoutPath } = await setup();
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId: "cont-project" });
 
     const first = harness.cp.claims.acquire({
@@ -144,7 +148,7 @@ describe("resource claims (CP-S13, CP-S14, CP-S15)", () => {
       ownerBindingGeneration: owner.ownerBindingGeneration!,
       ownerRoleKey: roleKey,
       repositoryIdentity: "github:acme/fixture",
-      worktreeId: "wt-1",
+      worktreeId: checkoutPath,
     });
     expect(first.allowed).toBe(true);
 
@@ -154,7 +158,7 @@ describe("resource claims (CP-S13, CP-S14, CP-S15)", () => {
       ownerBindingGeneration: owner.ownerBindingGeneration!,
       ownerRoleKey: roleKey,
       repositoryIdentity: "github:acme/fixture",
-      worktreeId: "wt-1",
+      worktreeId: checkoutPath,
     });
     expect(second.allowed).toBe(false);
     expect(second.reasonCode).toBe(ReasonCode.CLAIM_WORKTREE_CONFLICT);
