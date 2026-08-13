@@ -304,6 +304,110 @@ const prepareCapacityReviewedRun = async (plane: ReturnType<typeof makePlane>) =
   };
 };
 
+/**
+ * Creates a real worker allocation after recording a same-window capacity history. The
+ * returned decision is from `TaskGraph.startWorkerExecution`, not from the monitor, so a
+ * reserve input only proves itself when it changes this production allocation outcome.
+ */
+const startWorkerWithMeasuredReserve = async (input: {
+  remainingPercent: number;
+  previousRemainingPercent: number;
+  /** Hours remaining from the latest observation until the bucket resets. */
+  resetAfterObservationHours: number;
+  /** Adds a second ACTIVE, unreviewed run without changing role coverage. */
+  extraExpectedReview?: boolean;
+  /** Starts a real durable execution in that extra run. */
+  extraInFlightRun?: boolean;
+  /** Adds a live CEO binding without adding a run that needs review. */
+  extraCeoDemand?: boolean;
+}) => {
+  const plane = makePlane();
+  const { cp, clock, gpt, claude } = plane;
+  const oneHour = 60 * 60 * 1000;
+  // The first reading is one hour before the allocation. Keep one explicit reset bucket
+  // across both readings so the monitor can measure burn instead of inventing zero.
+  const resetAt = new Date(clock.now().getTime() + oneHour * (1 + input.resetAfterObservationHours)).toISOString();
+  const workerCapacity = (remainingPercent: number): CapacityReading =>
+    reading("gpt", clock, [{
+      id: "worker-window",
+      remainingPercent,
+      resetAt,
+      capabilities: ["worker"],
+    }]);
+  gpt.setCapacity(workerCapacity(input.previousRemainingPercent));
+  await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+  clock.advance(oneHour);
+  gpt.setCapacity(workerCapacity(input.remainingPercent));
+  await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+
+  // Dispatch is deliberately a normal critical CTO allocation on Claude. The subsequent
+  // target is GPT worker capacity, so this test proves the worker gate asks about its own
+  // bucket rather than reusing dispatch capacity as a lease.
+  claude.setCapacity(healthy("claude", clock));
+  const projectId = "worker-reserve-input-project";
+  const project = cp.projects.register({ projectId, name: projectId, manifest: fixtureManifest(projectId) });
+  if (!project.allowed) throw new Error(project.message);
+  const created = cp.runs.create({
+    projectId,
+    executionMode: ExecutionMode.STANDARD,
+    contract: REVIEW_CONTRACT,
+  });
+  if (!created.allowed) throw new Error(created.message);
+  const dispatched = await cp.runs.dispatch(created.value.runId);
+  if (!dispatched.allowed) throw new Error(dispatched.message);
+  const submitted = cp.tasks.submit(created.value.runId, [
+    { key: "worker", title: "reserve input worker", category: "mechanical" },
+  ]);
+  if (!submitted.allowed) throw new Error(submitted.message);
+
+  const extraRunId = "run_reserve_extra";
+  if (input.extraExpectedReview || input.extraInFlightRun) {
+    // Both sides of the in-flight comparison retain this unreviewed ACTIVE run. Adding its
+    // execution therefore changes only `inFlightRuns`, rather than smuggling in another
+    // expected review as well.
+    cp.db.run(
+      `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+       VALUES (?, NULL, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', ?, 'sha256:reserve-extra', ?)`,
+      [extraRunId, "extra durable reserve demand", clock.nowIso()],
+    );
+  }
+  if (input.extraInFlightRun) {
+    cp.db.run(
+      `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, attempt_count, created_at, updated_at)
+       VALUES ('tsk_reserve_extra', ?, 'durable in-flight work', 'mechanical', 'RUNNING', '{}', 1, ?, ?)`,
+      [extraRunId, clock.nowIso(), clock.nowIso()],
+    );
+    cp.db.run(
+      `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
+                                    worker_session_id, worker_process_id, provider, model, repository_id,
+                                    worktree_id, concurrency_width, started_at, last_activity_at, ended_at,
+                                    status, failure_class, result_digest)
+       VALUES ('exe_reserve_extra', ?, 'tsk_reserve_extra', 1, 1, NULL, NULL, 'gpt', 'worker', NULL,
+               NULL, NULL, ?, NULL, NULL, 'RUNNING', NULL, NULL)`,
+      [extraRunId, clock.nowIso()],
+    );
+  }
+  if (input.extraCeoDemand) {
+    const session = cp.sessions.create({ provider: "gpt", model: "reserve-ceo" });
+    const ready = cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "reserve demand fixture");
+    if (!ready.allowed) throw new Error(ready.message);
+    const bound = cp.bindings.bind({ role: Role.CEO, sessionId: session.sessionId });
+    if (!bound.allowed) throw new Error(bound.message);
+  }
+
+  const task = cp.tasks.ready(created.value.runId)[0]!;
+  const demand = cp.capacity.workerReserveDemand("gpt");
+  const started = await cp.tasks.startWorkerExecution({
+    runId: created.value.runId,
+    taskId: task.taskId,
+    ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+    workerSessionId: dispatched.value.ownerSessionId,
+    provider: "gpt",
+    model: "worker",
+  });
+  return { plane, demand, started };
+};
+
 describe("round-2 capacity and runtime regressions", () => {
   it("#52 refuses a capability when one of its applicable quota windows is unknown", async () => {
     const { cp, clock, gpt } = makePlane();
@@ -358,11 +462,19 @@ describe("round-2 capacity and runtime regressions", () => {
     plane.claude.setCapacity(exhaustedReviewer("claude"));
 
     // This enters through the control-plane invoker, not the monitor. Without the reviewer
-    // admission calls, both branches reach the scripted PASS below instead of this refusal.
+    // constitution admission, either adapter would start a reviewer before the later
+    // invocation gate could refuse it. That would already violate the mandatory pre-review
+    // refresh, even though no verdict could be written.
+    const gptReviewerStarts = vi.spyOn(plane.gpt, "startSession");
+    const claudeReviewerStarts = vi.spyOn(plane.claude, "startSession");
     const refused = await plane.cp.review.controlPlaneInvoker()(prepared.request);
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
     expect(plane.cp.audit.byKind("BLIND_REVIEW_COMPLETED")).toHaveLength(0);
+    expect(gptReviewerStarts).not.toHaveBeenCalled();
+    expect(claudeReviewerStarts).not.toHaveBeenCalled();
+    gptReviewerStarts.mockRestore();
+    claudeReviewerStarts.mockRestore();
 
     // Capacity can change after a reviewer session is constituted. The invocation has to
     // re-admit rather than treating the successful constitution probe as a quota lease.
@@ -558,6 +670,128 @@ describe("round-2 capacity and runtime regressions", () => {
     });
     expect(unknownHorizon.allowed).toBe(false);
     expect(unknownHorizon.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+  });
+
+  it("#55/#182 makes every §14.5 reserve input change real worker admission", async () => {
+    // Each pair reaches TaskGraph.startWorkerExecution. The only changed fact in a pair is
+    // the named §14.5 input, and the differing result is therefore evidence that production
+    // allocation consumes that input rather than a monitor-only calculation.
+    const quotaOpen = await startWorkerWithMeasuredReserve({
+      remainingPercent: 50,
+      previousRemainingPercent: 50,
+      resetAfterObservationHours: 1,
+    });
+    const quotaHeld = await startWorkerWithMeasuredReserve({
+      remainingPercent: 20,
+      previousRemainingPercent: 20,
+      resetAfterObservationHours: 1,
+    });
+    expect(quotaOpen.started.allowed).toBe(true);
+    expect(quotaOpen.started.reasonCode).toBe(ReasonCode.OK);
+    expect(quotaHeld.started.allowed).toBe(false);
+    expect(quotaHeld.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    quotaOpen.plane.cp.close();
+    quotaHeld.plane.cp.close();
+
+    const shortHorizon = await startWorkerWithMeasuredReserve({
+      remainingPercent: 50,
+      previousRemainingPercent: 80,
+      resetAfterObservationHours: 0.5,
+    });
+    const longHorizon = await startWorkerWithMeasuredReserve({
+      remainingPercent: 50,
+      previousRemainingPercent: 80,
+      resetAfterObservationHours: 1,
+    });
+    expect(shortHorizon.started.allowed).toBe(true);
+    expect(shortHorizon.started.reasonCode).toBe(ReasonCode.OK);
+    expect(longHorizon.started.allowed).toBe(false);
+    expect(longHorizon.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    shortHorizon.plane.cp.close();
+    longHorizon.plane.cp.close();
+
+    const noBurn = await startWorkerWithMeasuredReserve({
+      remainingPercent: 50,
+      previousRemainingPercent: 50,
+      resetAfterObservationHours: 1,
+    });
+    const measuredBurn = await startWorkerWithMeasuredReserve({
+      remainingPercent: 50,
+      previousRemainingPercent: 80,
+      resetAfterObservationHours: 1,
+    });
+    expect(noBurn.demand.burnRatePercentPerHourByBucket?.["worker-window"]).toBe(0);
+    expect(measuredBurn.demand.burnRatePercentPerHourByBucket?.["worker-window"]).toBe(30);
+    expect(noBurn.started.allowed).toBe(true);
+    expect(noBurn.started.reasonCode).toBe(ReasonCode.OK);
+    expect(measuredBurn.started.allowed).toBe(false);
+    expect(measuredBurn.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    noBurn.plane.cp.close();
+    measuredBurn.plane.cp.close();
+
+    const oneReview = await startWorkerWithMeasuredReserve({
+      remainingPercent: 27,
+      previousRemainingPercent: 27,
+      resetAfterObservationHours: 1,
+    });
+    const twoReviews = await startWorkerWithMeasuredReserve({
+      remainingPercent: 27,
+      previousRemainingPercent: 27,
+      resetAfterObservationHours: 1,
+      extraExpectedReview: true,
+    });
+    expect(oneReview.demand.expectedReviews).toBe(1);
+    expect(twoReviews.demand.expectedReviews).toBe(2);
+    expect(oneReview.started.allowed).toBe(true);
+    expect(oneReview.started.reasonCode).toBe(ReasonCode.OK);
+    expect(twoReviews.started.allowed).toBe(false);
+    expect(twoReviews.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    oneReview.plane.cp.close();
+    twoReviews.plane.cp.close();
+
+    const noFlight = await startWorkerWithMeasuredReserve({
+      remainingPercent: 30,
+      previousRemainingPercent: 30,
+      resetAfterObservationHours: 1,
+      extraExpectedReview: true,
+    });
+    const inFlight = await startWorkerWithMeasuredReserve({
+      remainingPercent: 30,
+      previousRemainingPercent: 30,
+      resetAfterObservationHours: 1,
+      extraExpectedReview: true,
+      extraInFlightRun: true,
+    });
+    expect(noFlight.demand.inFlightRuns).toBe(0);
+    expect(inFlight.demand.inFlightRuns).toBe(1);
+    expect(noFlight.started.allowed).toBe(true);
+    expect(noFlight.started.reasonCode).toBe(ReasonCode.OK);
+    expect(inFlight.started.allowed).toBe(false);
+    expect(inFlight.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    noFlight.plane.cp.close();
+    inFlight.plane.cp.close();
+
+    // At 30%, the CEO's aggregate invocation count alone would still admit; the separate
+    // CEO coverage weight is what crosses the reserve boundary in the second allocation.
+    const baselineRoles = await startWorkerWithMeasuredReserve({
+      remainingPercent: 30,
+      previousRemainingPercent: 30,
+      resetAfterObservationHours: 1,
+    });
+    const ceoCoverage = await startWorkerWithMeasuredReserve({
+      remainingPercent: 30,
+      previousRemainingPercent: 30,
+      resetAfterObservationHours: 1,
+      extraCeoDemand: true,
+    });
+    expect(baselineRoles.demand.roleDemand).toEqual({ ceo: 0, cto: 1, reviewer: 0 });
+    expect(ceoCoverage.demand.roleDemand).toEqual({ ceo: 1, cto: 1, reviewer: 0 });
+    expect(baselineRoles.started.allowed).toBe(true);
+    expect(baselineRoles.started.reasonCode).toBe(ReasonCode.OK);
+    expect(ceoCoverage.started.allowed).toBe(false);
+    expect(ceoCoverage.started.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
+    baselineRoles.plane.cp.close();
+    ceoCoverage.plane.cp.close();
   });
 
   it("#56 rejects a future-dated capacity file instead of keeping it fresh indefinitely", () => {
@@ -925,6 +1159,46 @@ describe("round-2 continuity and persistence regressions", () => {
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
     expect(await plane.gpt.probeRuntime()).toBe("HEALTHY");
+  });
+
+  it("#54/#176 refuses a continuity switch when its selected provider expires after planning", async () => {
+    const plane = makePlane();
+    const before = bindCeo(plane, "claude");
+    const unavailable = (provider: string): CapacityReading => ({
+      provider,
+      sensorHealth: "ERROR",
+      runtimeHealth: "UNAVAILABLE",
+      observedAt: plane.clock.nowIso(),
+      source: "provider-switch-race",
+      buckets: [],
+      error: "capacity expired after continuity planned its fallback",
+    });
+    // The initial continuity evaluation chooses GPT. Its capacity then expires before the
+    // replacement allocation. Deleting the provider-switch admission below makes this
+    // failover succeed, because startSession itself is not a quota admission mechanism.
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(unavailable("claude"));
+    const originalProbe = plane.gpt.probeCapacity.bind(plane.gpt);
+    let probes = 0;
+    vi.spyOn(plane.gpt, "probeCapacity").mockImplementation(async () => {
+      const observed = await originalProbe();
+      if (probes++ === 0) plane.gpt.setCapacity(unavailable("gpt"));
+      return observed;
+    });
+    const started = vi.spyOn(plane.gpt, "startSession");
+    attachRoutablePorts(plane.cp);
+
+    const denied = await plane.cp.continuity.failover(
+      roleKeyFor(Role.CEO),
+      Role.CEO,
+      {},
+      "selected fallback capacity changed",
+    );
+    expect(denied.allowed).toBe(false);
+    expect(denied.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    expect(started).not.toHaveBeenCalled();
+    expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))?.sessionId).toBe(before.sessionId);
+    expect(probes).toBeGreaterThan(1);
   });
 
   it("#54/#176 refreshes selected capacity when continuity session allocation fails", async () => {

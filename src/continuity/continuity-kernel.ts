@@ -1,7 +1,12 @@
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { type ProviderCapacity, type CapacityMonitor, RefreshTrigger } from "../capacity/capacity-monitor.ts";
+import {
+  type DispatchCapacityTarget,
+  type ProviderCapacity,
+  type CapacityMonitor,
+  RefreshTrigger,
+} from "../capacity/capacity-monitor.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
@@ -305,13 +310,35 @@ export class ContinuityKernel {
   ): Promise<Decision<{ provider: string; generation: number }>> {
     const plan = await this.evaluate(`failover:${roleKey}`);
     const assignment = plan.assignments.find((a) => a.roleKey === roleKey);
-    if (!assignment?.provider) {
+    const required = plan.requiredRoles.find((candidate) => candidate.roleKey === roleKey);
+    if (!assignment?.provider || !required) {
       return deny(
         plan.outcome === "NO_VALID_COVERAGE" ? ReasonCode.COVERAGE_NONE : ReasonCode.COVERAGE_PARTIAL,
         "coverage plan cannot staff this role; not failing over",
         { roleKey, plan: { outcome: plan.outcome, action: plan.action, uncovered: plan.uncovered } },
       );
     }
+
+    // `evaluate` supplied the coverage plan, but it is not an allocation lease. A provider
+    // can become exhausted between that refresh and this fresh session, so the selected
+    // replacement must take the dedicated provider-switch trigger and re-admit its exact
+    // capability immediately before `startSession` (§14.2). Worker failover remains a
+    // lower-priority allocation and therefore carries the same dynamic reserve as fan-out.
+    const switchTarget: DispatchCapacityTarget =
+      required.capability === "worker"
+        ? {
+            provider: assignment.provider,
+            capabilities: [required.capability],
+            priority: "worker",
+            reserveDemand: this.capacity.workerReserveDemand(assignment.provider),
+          }
+        : {
+            provider: assignment.provider,
+            capabilities: [required.capability],
+            priority: "critical",
+          };
+    const switchAdmission = await this.capacity.refreshForProviderSwitch(switchTarget);
+    if (!switchAdmission.allowed) return switchAdmission as Decision<{ provider: string; generation: number }>;
 
     const expected = this.bindings.active(roleKey);
     const provisioned = await this.provisionRoutableSession(role, assignment.provider, `continuity:${role}`);
