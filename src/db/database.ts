@@ -251,6 +251,14 @@ export const translate = (err: unknown): unknown => {
   for (const [pattern, code, message] of INDEX_CODES) {
     if (pattern.test(msg)) return acpError(code, message, { sqlite: msg });
   }
+  if (msg.includes("CHECK constraint failed")) {
+    // A CHECK is a value the caller supplied that the schema refuses. It is an argument
+    // fault, and the evidence has to carry which constraint, or the denial says nothing
+    // an operator can act on.
+    return acpError(ReasonCode.INVALID_ARGUMENT, "value violates a database constraint", {
+      sqlite: msg,
+    });
+  }
   if (msg.includes("FOREIGN KEY constraint failed")) {
     return acpError(ReasonCode.RUN_OWNER_REVOKED, "foreign-key authority tuple is invalid", {
       sqlite: msg,

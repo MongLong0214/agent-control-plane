@@ -540,44 +540,44 @@ const runtimeProfile = (
  * all network traffic. Paths supplied by the caller are included as explicit denials as
  * defense in depth; deny-default already keeps them inaccessible unless one is packetRoot.
  */
+/**
+ * The reviewer's confinement.
+ *
+ * Deny-by-default was tried and does not work: the loader needs paths that cannot be
+ * enumerated in advance, so even `/usr/bin/true` fails to start and every review returns
+ * "profile was not accepted" — the same lesson the verification sandbox already recorded
+ * (issue #247 item 1). So this is allow-by-default with a named deny list, and the
+ * attestation says exactly that rather than claiming reads are packet-only:
+ *
+ *   - the daemon's own state, whatever the caller names in `denyReadPaths`
+ *   - the host credential locations: keychains, ssh, aws, gnupg, gh config, git identity
+ *   - every write outside the packet root
+ *   - all network
+ *
+ * What that buys is the thing CP-HI-04 needs: a reviewer cannot read the daemon's database,
+ * another checkout, or a credential, and cannot write anywhere its verdict could leak into.
+ */
 const reviewerProfile = (
   packetRoot: string,
   denyReadPaths: readonly string[],
   executable: string,
   credentialPaths: readonly string[],
 ): string => {
-  const systemReadRoots = ["/System", "/usr", "/bin", "/sbin", "/Library/Apple"];
-  const lines = [
-    "(version 1)",
-    "(deny default)",
-    "(allow process*)",
-    "(allow sysctl-read)",
-    ...systemReadRoots.map((path) => `(allow file-read* (subpath ${quote(path)}))`),
-    `(allow file-read* (subpath ${quote(packetRoot)}))`,
-    `(allow file-write* (subpath ${quote(packetRoot)}))`,
-    "(allow file-write* (subpath \"/dev\"))",
-    "(allow file-write-data (literal \"/dev/null\"))",
-    "(deny network*)",
-  ];
-  for (const path of [executable, process.execPath]) {
-    const resolved = resolvePath(path);
-    if (resolved) {
-      lines.push(`(allow file-read* (literal ${quote(resolved)}))`);
-      lines.push(`(allow file-read* (subpath ${quote(dirname(resolved))}))`);
-    }
-  }
-  for (const path of credentialPaths) {
-    const resolved = resolvePath(path);
-    if (resolved) lines.push(`(allow file-read* (subpath ${quote(resolved)}))`);
-  }
-  // Deny these explicitly as well as starting from deny-default. A future allow rule for
-  // provider state must not accidentally re-open the daemon's keychain or Git identity.
+  void executable;
+  void credentialPaths;
+  const lines = ["(version 1)", "(allow default)", "(deny network*)"];
   for (const path of [...hostCredentialPaths(), ...denyReadPaths]) {
     const resolved = resolvePath(path);
     if (resolved && resolved !== packetRoot && !resolved.startsWith(`${packetRoot}/`)) {
       lines.push(`(deny file-read* (subpath ${quote(resolved)}))`);
     }
   }
+  lines.push(
+    "(deny file-write*)",
+    `(allow file-write* (subpath ${quote(packetRoot)}))`,
+    '(allow file-write* (subpath "/dev"))',
+    '(allow file-write-data (literal "/dev/null"))',
+  );
   return lines.join("\n");
 };
 

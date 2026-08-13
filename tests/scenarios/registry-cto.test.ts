@@ -12,6 +12,7 @@ import {
   bindCeo,
   fixtureManifest,
   makeHarness,
+  ownerDecisionReceipt,
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -316,7 +317,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       item: "public release",
       approved: true,
       note: "approved by owner",
-      owner: TEST_OWNER,
+      receipt: ownerDecisionReceipt(harness, created.value.runId, "public release", true, "approved by owner"),
     });
     expect(approved.allowed).toBe(true);
     expect(harness.cp.ceo.humanGateStatus(created.value.runId).satisfied).toBe(true);

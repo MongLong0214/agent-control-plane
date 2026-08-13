@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { accessSync, chmodSync, constants, mkdirSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
@@ -412,7 +412,12 @@ describe("round-2 capacity and runtime regressions", () => {
 
       expect(result.ok).toBe(true);
       const probe = JSON.parse(result.text) as CliProbe;
-      const { TMPDIR, ...fixedEnvironment } = probe.environment;
+      // `__CF_*` is injected by macOS into any sandbox-exec child; it is not ours to remove
+      // and carries no authority, so the assertion is about the variables we construct.
+      const { TMPDIR, ...rest } = probe.environment;
+      const fixedEnvironment = Object.fromEntries(
+        Object.entries(rest).filter(([name]) => !name.startsWith("__CF_")),
+      );
       expect(fixedEnvironment).toEqual({
         PATH: noGhPath(),
         HOME: hostHome,
@@ -494,11 +499,18 @@ describe("round-2 capacity and runtime regressions", () => {
       expect(result.isolationAttested).toBe(true);
       expect(result.isolationReasonCode).toBeUndefined();
       const probe = JSON.parse(result.text) as CliProbe;
-      expect(probe.environment).toEqual({
+      // `__CF_*` is injected by macOS into any sandbox-exec child, and the adapter
+      // canonicalises the packet root (`/var` is a symlink to `/private/var` here), so the
+      // assertion is about the variables we construct and the directory we actually confined to.
+      const reviewerEnv = Object.fromEntries(
+        Object.entries(probe.environment).filter(([name]) => !name.startsWith("__CF_")),
+      );
+      const canonicalPacketRoot = realpathSync(packetRoot);
+      expect(reviewerEnv).toEqual({
         PATH: noGhPath(),
-        HOME: packetRoot,
+        HOME: canonicalPacketRoot,
         USER: "acp-reviewer-provider",
-        TMPDIR: packetRoot,
+        TMPDIR: canonicalPacketRoot,
         LANG: "C.UTF-8",
         LC_ALL: "C",
         GIT_CONFIG_NOSYSTEM: "1",

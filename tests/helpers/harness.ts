@@ -10,6 +10,8 @@ import { TestProductionAdapter } from "./production-adapter.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts";
 
 /** The single allowlisted owner identity of the fixture deployment. */
@@ -349,4 +351,41 @@ export const driveToReviewedCandidate = async (
     baseHead: repository.baseHead,
     workBranch,
   };
+};
+
+/**
+ * Mints the operation-bound owner proof that the production gate verifies (#102).
+ *
+ * An allowlisted *name* stopped being authority: the gate takes a receipt the ingress guard
+ * admitted for this exact run, operation and parameters, so a caller that merely knows the
+ * owner's identity cannot approve anything.
+ */
+export const ownerDecisionReceipt = (
+  harness: Harness,
+  runId: string,
+  item: string,
+  approved: boolean,
+  note: string,
+  actor: string = TEST_OWNER.actor,
+  channel: "cli" | "telegram" | "buzz" | "mcp" = "cli",
+) => {
+  const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+    [channel]: {
+      allowedActors: [actor],
+      ...(channel === "telegram" ? { allowedConversations: ["owner"] } : {}),
+    },
+  });
+  const approval = {
+    runId,
+    operation: "owner_decision_submit",
+    parameters: { item, approved, note },
+    idempotencyKey: `owner-decision:${digestOf({ runId, item, approved, note, actor })}`,
+    approved,
+  };
+  const admitted = guard.admitOwnerApproval(
+    { channel, actor, nonce: `owner-decision:${digestOf(approval)}`, payload: ownerApprovalPayload(approval) },
+    approval,
+  );
+  if (!admitted.allowed) throw new Error(admitted.message);
+  return admitted.value;
 };

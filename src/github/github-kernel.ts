@@ -929,6 +929,12 @@ export class GitHubKernel {
       });
     }
 
+    // §24.7 first: a sibling repository that failed post-merge verification blocks this merge
+    // whatever the branch state is. Checking freshness ahead of it reported a moved base — a
+    // *consequence* of the earlier merge — and hid the reason the run must stop.
+    const blocked = this.dependentMergeBlocked(input.runId, input.repositoryIdentity);
+    if (!blocked.allowed) return blocked as Decision<{ predicates: Record<string, boolean> }>;
+
     if (pull.head.sha !== input.exactHeadSha) {
       return deny(ReasonCode.MERGE_HEAD_STALE, "pull request head moved since the candidate froze", {
         expected: input.exactHeadSha,
@@ -947,10 +953,6 @@ export class GitHubKernel {
     const claimed = this.assertClaim(input.runId, input.repositoryIdentity, pull.head.ref);
     if (!claimed.allowed) return claimed as Decision<{ predicates: Record<string, boolean> }>;
 
-    // §24.7 — an earlier repository in this run that failed post-merge verification blocks
-    // its dependents, and merge order is not advisory.
-    const blocked = this.dependentMergeBlocked(input.runId, input.repositoryIdentity);
-    if (!blocked.allowed) return blocked as Decision<{ predicates: Record<string, boolean> }>;
     const ordered = this.assertMergeOrder(input.runId, input.repositoryIdentity);
     if (!ordered.allowed) return ordered as Decision<{ predicates: Record<string, boolean> }>;
 
