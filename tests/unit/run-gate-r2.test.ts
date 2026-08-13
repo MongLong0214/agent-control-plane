@@ -35,14 +35,22 @@ const CONTRACT = (humanGate: string[] = []): TaskContract => ({
   references: [],
 });
 
-const activeRun = async (humanGate: string[] = []) => {
+const activeRun = async (
+  humanGate: string[] = [],
+  options: { executionMode?: ExecutionMode; contract?: Partial<TaskContract> } = {},
+) => {
   const harness = makeHarness();
   const registered = await registerFixtureProject(harness);
   const ceoSessionId = bindCeo(harness);
+  const contract = {
+    ...CONTRACT(humanGate),
+    ...options.contract,
+    humanGate: options.contract?.humanGate ?? humanGate,
+  };
   const created = harness.cp.runs.create({
     projectId: registered.projectId,
-    executionMode: ExecutionMode.STANDARD,
-    contract: CONTRACT(humanGate),
+    executionMode: options.executionMode ?? ExecutionMode.STANDARD,
+    contract,
     repositories: [{ repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
   });
   if (!created.allowed) throw new Error(created.message);
@@ -51,8 +59,11 @@ const activeRun = async (humanGate: string[] = []) => {
   return { harness, ...registered, ceoSessionId, run: dispatched.value, runId: created.value.runId };
 };
 
-const evidenceReadyRun = async (humanGate: string[] = []) => {
-  const fixture = await activeRun(humanGate);
+const evidenceReadyRun = async (
+  humanGate: string[] = [],
+  options: { executionMode?: ExecutionMode; contract?: Partial<TaskContract> } = {},
+) => {
+  const fixture = await activeRun(humanGate, options);
   const frozen = await fixture.harness.cp.pipeline.freeze(fixture.runId);
   if (!frozen.allowed) throw new Error(frozen.message);
   const snapshot = frozen.value;
@@ -376,6 +387,97 @@ describe("round-2 run and production-gate regressions", () => {
       candidateSnapshotDigest: fixture.digest,
       ceoSessionId: fixture.ceoSessionId,
       rationale: "owner withdrew approval",
+    });
+    expect(confirmed.allowed).toBe(false);
+    expect(confirmed.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+  });
+
+  it("#373 refuses an owner decision before freeze and supersedes legacy null-bound approvals", async () => {
+    const fixture = await activeRun(["public release"]);
+    const premature = fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "approve a candidate that does not exist yet",
+      receipt: ownerDecisionReceipt(
+        fixture.harness,
+        fixture.runId,
+        "public release",
+        true,
+        "approve a candidate that does not exist yet",
+      ),
+    });
+    expect(premature.allowed).toBe(false);
+    expect(premature.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+    expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)).toHaveLength(0);
+
+    // A row from before this hardening must not remain usable once a candidate is promoted.
+    const legacy = fixture.harness.cp.artifacts.put(fixture.runId, ArtifactKind.APPROVAL, {
+      kind: "OWNER_DECISION",
+      item: "public release",
+      approved: true,
+      note: "legacy unbound approval",
+      at: fixture.harness.clock.nowIso(),
+      humanGateDigest: digestOf(["public release"]),
+      candidateSnapshotDigest: null,
+    });
+    const frozen = await fixture.harness.cp.pipeline.freeze(fixture.runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
+
+    expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)
+      .find((artifact) => artifact.artifactId === legacy.artifactId)?.superseded).toBe(true);
+    const lateLegacy = fixture.harness.cp.artifacts.put(fixture.runId, ArtifactKind.APPROVAL, {
+      kind: "OWNER_DECISION",
+      item: "public release",
+      approved: true,
+      note: "legacy row inserted after candidate promotion",
+      at: fixture.harness.clock.nowIso(),
+      humanGateDigest: digestOf(["public release"]),
+      candidateSnapshotDigest: null,
+    });
+    expect(lateLegacy.superseded).toBe(false);
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
+      required: true,
+      items: ["public release"],
+      satisfied: false,
+    });
+  });
+
+  it("#374 fails closed when a GUARDED run omits every owner decision item", async () => {
+    const fixture = await evidenceReadyRun([], { executionMode: ExecutionMode.GUARDED });
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
+      required: true,
+      items: [],
+      satisfied: false,
+    });
+
+    const packet = fixture.harness.cp.ceo.buildPacket({
+      runId: fixture.runId,
+      candidateSnapshotDigest: fixture.digest,
+      approval: fixture.approval,
+    });
+    expect(packet.allowed).toBe(false);
+    expect(packet.reasonCode).toBe(ReasonCode.HUMAN_GATE_REQUIRED);
+    expect(fixture.harness.cp.runs.require(fixture.runId).state).toBe(RunState.ACTIVE);
+  });
+
+  it("#374 derives a mandatory owner item from a named §21 public release", async () => {
+    const fixture = await evidenceReadyRun([], {
+      contract: { goal: "prepare the public release" },
+    });
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
+      required: true,
+      items: ["undelegated public release"],
+      satisfied: false,
+    });
+    buildPacket(fixture);
+
+    const confirmed = fixture.harness.cp.ceo.submitCeoDecision({
+      runId: fixture.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: fixture.digest,
+      ceoSessionId: fixture.ceoSessionId,
+      rationale: "machine evidence is not an owner decision",
     });
     expect(confirmed.allowed).toBe(false);
     expect(confirmed.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
