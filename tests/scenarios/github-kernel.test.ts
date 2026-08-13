@@ -17,7 +17,9 @@ import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixt
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
   type Harness,
+  approveReviewedCandidateForFinalization,
   driveToReviewedCandidate,
+  installDaemonFinalizerGitHubFixture,
   makeHarness,
   registerFixtureProject,
 } from "../helpers/harness.ts";
@@ -102,7 +104,7 @@ const reflectMergedBase = (github: FakeGitHub): void => {
  * The kernel refuses to publish a gate for digests it cannot resolve, which means these
  * scenarios cannot be set up with placeholder digests.
  */
-const setup = async (): Promise<Fixture> => {
+const setup = async (options: { finalization?: boolean } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -148,6 +150,11 @@ const setup = async (): Promise<Fixture> => {
     branch: driven.workBranch,
   });
   if (!claimed.allowed) throw new Error(claimed.message);
+
+  if (options.finalization !== false) {
+    await approveReviewedCandidateForFinalization(harness, driven);
+    installDaemonFinalizerGitHubFixture(harness);
+  }
 
   return {
     harness,
@@ -232,6 +239,9 @@ const setupLineageFixture = async (input: {
   });
   if (!claimed.allowed) throw new Error(claimed.message);
 
+  await approveReviewedCandidateForFinalization(harness, driven);
+  installDaemonFinalizerGitHubFixture(harness);
+
   return {
     harness,
     github,
@@ -285,7 +295,7 @@ const recordAcceptedReleaseMerge = (fixture: Fixture, commit: string, pullNumber
       WHERE idempotency_key = ? AND status = 'PENDING'`,
     [
       sha256(commit),
-      JSON.stringify({ mergeCommitSha: commit, sourceBranch: "release/1.0.0", targetBranch: "main" }),
+      JSON.stringify({ mergeCommitSha: commit, sourceBranch: fixture.workBranch, targetBranch: "main" }),
       "2026-08-12T00:00:00.000Z",
       idempotencyKey,
     ],
@@ -864,7 +874,11 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
 
 describe("release and hotfix (CP-S41, CP-S42)", () => {
   it("CP-S41: a tag on an unaccepted commit and a conflicting existing tag are both refused", async () => {
-    const fixture = await setup();
+    const fixture = await setupLineageFixture({
+      workBranch: "release/1.2.0",
+      sourceBranch: "dev",
+      baseBranch: "main",
+    });
     const notMerged = await fixture.harness.cp.github.releaseTag(
       fixture.runId,
       fixture.identity,
@@ -886,15 +900,6 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
 
     const releaseCommit = "r".repeat(40);
     recordAcceptedReleaseMerge(fixture, releaseCommit, 1200);
-    const releaseClaim = fixture.harness.cp.claims.acquire({
-      runId: fixture.runId,
-      ownerSessionId: fixture.ownerSessionId,
-      ownerBindingGeneration: fixture.ownerBindingGeneration,
-      ownerRoleKey: fixture.harness.cp.runs.require(fixture.runId).ownerRoleKey!,
-      repositoryIdentity: fixture.identity,
-      branch: "release/1.0.0",
-    });
-    if (!releaseClaim.allowed) throw new Error(releaseClaim.message);
     const tagged = await fixture.harness.cp.github.releaseTag(
       fixture.runId,
       fixture.identity,
@@ -1489,7 +1494,7 @@ describe("trusted CI evidence (CP-S29)", () => {
   };
 
   it("CP-S29: a CI result for a different head is refused, not counted", async () => {
-    const fixture = await setup();
+    const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const repo = snapshot.repositories[0]!;
 
@@ -1528,7 +1533,7 @@ describe("trusted CI evidence (CP-S29)", () => {
   });
 
   it("CP-S29: an unapproved workflow digest or untrusted creator is also refused", async () => {
-    const fixture = await setup();
+    const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const repo = snapshot.repositories[0]!;
     const base = {
@@ -1559,7 +1564,7 @@ describe("trusted CI evidence (CP-S29)", () => {
   });
 
   it("an older green CI result does not mask a newer red one for the same head", async () => {
-    const fixture = await setup();
+    const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const repo = snapshot.repositories[0]!;
     const base = {
@@ -1594,7 +1599,7 @@ describe("trusted CI evidence (CP-S29)", () => {
   });
 
   it("a CI result belonging to another repository is not evidence for this one", async () => {
-    const fixture = await setup();
+    const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const repo = snapshot.repositories[0]!;
 
@@ -1629,7 +1634,7 @@ describe("trusted CI evidence (CP-S29)", () => {
   });
 
   it("CP-HI-03: a command list that does not match the pinned manifest is refused", async () => {
-    const fixture = await setup();
+    const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const run = fixture.harness.cp.runs.require(fixture.runId);
 
@@ -1649,7 +1654,7 @@ describe("trusted CI evidence (CP-S29)", () => {
   });
 
   it("CP-S29: a CI result at the exact head from an approved workflow is accepted", async () => {
-    const fixture = await setup();
+    const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const repo = snapshot.repositories[0]!;
 

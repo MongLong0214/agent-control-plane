@@ -9,6 +9,7 @@ import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fix
 import {
   TEST_OWNER,
   type Harness,
+  finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
   registerFixtureProject,
@@ -81,33 +82,13 @@ const deliveredAck = (
   };
 };
 
-const completeContractChangeWithGrant = (
+const completeContractChangeWithGrant = async (
   harness: Harness,
   projectId: string,
   manifestDigest: string,
 ) => {
-  const created = harness.cp.runs.create({
-    projectId,
-    kind: "CONTRACT_CHANGE",
-    executionMode: ExecutionMode.GUARDED,
-    contract: CONTRACT,
-  });
-  if (!created.allowed) throw new Error(created.message);
-  const runId = created.value.runId;
-  const candidateSnapshotDigest = digestOf({ projectId, runId, candidate: "manifest" });
-  harness.cp.runs.transition(runId, RunState.ACTIVE, "manifest candidate assembled");
-  harness.cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [
-    candidateSnapshotDigest,
-    runId,
-  ]);
-  harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "manifest candidate reviewed");
-  harness.cp.runs.transition(
-    runId,
-    RunState.COMPLETED,
-    "manifest approved",
-    {},
-    harness.cp.completionAuthoritiesForTests().productionGate,
-  );
+  const finalized = await finalizeNoRepositoryRun(harness, projectId, CONTRACT);
+  const { runId, candidateSnapshotDigest } = finalized;
 
   const grant = {
     schema: "acp.manifest-activation-grant.v1",
@@ -238,7 +219,7 @@ describe("round-2 registry regressions", () => {
     const manifestB = { ...fixtureManifest(projectId), postMergeCommands: ["other"] };
     const storedA = harness.cp.projects.storeManifest(manifestA);
     if (!storedA.allowed) throw new Error(storedA.message);
-    const runId = completeContractChangeWithGrant(harness, projectId, storedA.value);
+    const runId = await completeContractChangeWithGrant(harness, projectId, storedA.value);
 
     const refused = harness.cp.projects.activateManifest(projectId, manifestB, {
       runKind: "CONTRACT_CHANGE",
@@ -254,7 +235,7 @@ describe("round-2 registry regressions", () => {
     const revised = { ...fixtureManifest(projectId), postMergeCommands: ["verify"] };
     const stored = harness.cp.projects.storeManifest(revised);
     if (!stored.allowed) throw new Error(stored.message);
-    const runId = completeContractChangeWithGrant(harness, projectId, stored.value);
+    const runId = await completeContractChangeWithGrant(harness, projectId, stored.value);
 
     const activated = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",

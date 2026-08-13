@@ -515,7 +515,12 @@ export class ContinuityKernel {
       if (project.suspended) continue;
       const hasWork = this.runs
         .list({ projectId: project.projectId })
-        .some((r) => r.state !== RunState.COMPLETED && r.state !== RunState.FAILED && r.state !== RunState.CANCELLED);
+        .some((r) =>
+          r.state !== RunState.COMPLETED &&
+          r.state !== RunState.BLOCKED_POST_MERGE &&
+          r.state !== RunState.FAILED &&
+          r.state !== RunState.CANCELLED,
+        );
       if (project.activity !== "ACTIVE" && !hasWork) continue;
       roles.push({
         roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId: project.projectId }),

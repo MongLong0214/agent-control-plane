@@ -4,7 +4,7 @@ import { dirname, isAbsolute } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -79,6 +79,21 @@ const SOURCE_MUTATIONS: ReadonlySet<WriteOperation> = new Set([
 ]);
 
 /**
+ * These are source-side mutations. A remote GitHub operation is deliberately absent: its
+ * admissible window is the daemon finalization state, never ACTIVE. `GITHUB_RELEASE` and
+ * `PROGRAMMATIC_MERGE` remain in SOURCE_MUTATIONS for conservative source-lease collision
+ * detection, but neither is admitted as a source write below.
+ */
+const ACTIVE_SOURCE_OPERATIONS: ReadonlySet<WriteOperation> = new Set([
+  WriteOperation.FILE_MUTATION,
+  WriteOperation.GIT_COMMIT,
+  WriteOperation.GIT_BRANCH,
+  WriteOperation.GIT_TAG,
+  WriteOperation.MANIFEST_CHANGE,
+  WriteOperation.VERIFICATION_CONTRACT_CHANGE,
+]);
+
+/**
  * Roles that may produce a candidate. CP-HI-04 puts the blind reviewer outside the
  * producer set, so a reviewer session holding a binding on the run must not be able to
  * mutate the very candidate it is judging.
@@ -88,6 +103,34 @@ const WRITER_ROLES: ReadonlySet<string> = new Set<string>([
   Role.BOOTSTRAP_CTO,
   Role.WORKER,
 ]);
+
+/**
+ * The GitHub finalization capability is not a caller-provided actor label. It is minted
+ * exactly once by the guard and retained by the daemon composition path, so an MCP/CLI
+ * caller cannot turn a post-approval run into a generic writable run by spelling an actor
+ * string. The guard still rechecks the pinned owner, generation, target and claims below.
+ */
+const DAEMON_FINALIZER_MINT = Symbol("acp.daemon-finalizer-write-authority");
+
+class DaemonFinalizerAuthorityToken {
+  readonly #mint: symbol;
+  readonly #guard: ManagedWriteGuard;
+
+  constructor(mint: symbol, guard: ManagedWriteGuard) {
+    if (mint !== DAEMON_FINALIZER_MINT) {
+      fail(ReasonCode.MERGE_AUTHORITY_DENIED, "daemon finalizer authority cannot be constructed externally", {});
+    }
+    this.#mint = mint;
+    this.#guard = guard;
+  }
+
+  static belongsTo(value: unknown, guard: ManagedWriteGuard): value is DaemonFinalizerAuthority {
+    return value instanceof DaemonFinalizerAuthorityToken && value.#mint === DAEMON_FINALIZER_MINT && value.#guard === guard;
+  }
+}
+
+/** Opaque capability accepted only for the fenced post-approval GitHub write set. */
+export type DaemonFinalizerAuthority = DaemonFinalizerAuthorityToken;
 
 export interface GuardRequest {
   operation: GuardOperation;
@@ -110,6 +153,8 @@ export interface GuardRequest {
   /** Free-form classification supplied by Hermes; recorded, never trusted (§4 CP-HI-01). */
   claimedClassification?: "DIRECT" | "MANAGED" | null;
   actor?: string | null;
+  /** Opaque daemon-held capability; ignored unless the run is in a finalization state. */
+  daemonFinalizerAuthority?: DaemonFinalizerAuthority | null;
 }
 
 export interface GuardGrant {
@@ -204,6 +249,19 @@ const LEASEABLE_RUN_STATES: ReadonlySet<string> = new Set<string>([
   RunState.READY_FOR_CEO_REVIEW,
   RunState.AWAITING_HUMAN,
 ]);
+/** No source mutation may pass these states; only this explicit external write set may. */
+const DAEMON_FINALIZATION_STATES: ReadonlySet<string> = new Set<string>([
+  RunState.CEO_APPROVED,
+  RunState.MERGING,
+  RunState.POST_MERGE_VERIFYING,
+]);
+const DAEMON_FINALIZATION_OPERATIONS: ReadonlySet<WriteOperation> = new Set<WriteOperation>([
+  WriteOperation.GITHUB_PR,
+  WriteOperation.GITHUB_CHECK_RUN,
+  WriteOperation.PROGRAMMATIC_MERGE,
+  WriteOperation.GITHUB_RELEASE,
+  WriteOperation.GITHUB_ISSUE,
+]);
 const SOURCE_READ_LEASE_TTL_MS = 60_000;
 const NO_FOLLOW_READ = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 
@@ -227,6 +285,7 @@ export class ManagedWriteGuard {
   readonly #sourceReadLeases = new Map<string, SourceReadLease>();
   readonly #sourceReadLeasesByRepository = new Map<string, Set<string>>();
   readonly #directWriteRoots: readonly string[];
+  #daemonFinalizerAuthorityClaimed = false;
 
   constructor(
     private readonly db: Db,
@@ -240,6 +299,28 @@ export class ManagedWriteGuard {
       throw new Error("direct write roots must be absolute paths");
     }
     this.#directWriteRoots = Object.freeze([...new Set(roots.map((root) => this.probe.canonical(root)))]);
+  }
+
+  /** Claimed once by the composition root before it exposes any request-facing ports. */
+  claimDaemonFinalizerAuthority(): DaemonFinalizerAuthority {
+    if (this.#daemonFinalizerAuthorityClaimed) {
+      fail(
+        ReasonCode.MERGE_AUTHORITY_DENIED,
+        "daemon finalizer authority was already issued for this guard",
+        {},
+      );
+    }
+    this.#daemonFinalizerAuthorityClaimed = true;
+    return new DaemonFinalizerAuthorityToken(DAEMON_FINALIZER_MINT, this);
+  }
+
+  /**
+   * Internal composition boundary for GitHub reads which nevertheless advance durable
+   * finalization state (notably exact post-merge verification). This exposes no minting
+   * path: callers can only prove possession of the one daemon capability.
+   */
+  hasDaemonFinalizerAuthority(value: unknown): value is DaemonFinalizerAuthority {
+    return DaemonFinalizerAuthorityToken.belongsTo(value, this);
   }
 
   evaluate(request: GuardRequest): Decision<GuardGrant> {
@@ -404,8 +485,8 @@ export class ManagedWriteGuard {
     }
 
     const identities = [...new Set(repositoryIdentities)];
-    if (identities.length === 0 || identities.some((identity) => !identity.trim())) {
-      return deny(ReasonCode.INVALID_ARGUMENT, "source-read lease requires at least one repository", {
+    if (identities.some((identity) => !identity.trim())) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "source-read lease contains an empty repository identity", {
         runId,
         repositoryIdentities,
       });
@@ -497,8 +578,8 @@ export class ManagedWriteGuard {
       });
     }
     const required = [...new Set(repositoryIdentities)];
-    if (required.length === 0 || required.some((identity) => !identity.trim())) {
-      return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "source-read lease requires repository coverage", {
+    if (required.some((identity) => !identity.trim())) {
+      return deny(ReasonCode.SOURCE_READ_LEASE_REQUIRED, "source-read lease contains an empty repository identity", {
         runId,
         leaseId,
       });
@@ -543,6 +624,10 @@ export class ManagedWriteGuard {
       bindingGeneration: facts.bindingGeneration,
       claimedClassification: request.claimedClassification ?? null,
       actor: request.actor ?? null,
+      // Retain the opaque daemon capability for the pre/post-effect revalidation. Dropping
+      // it here would let the first guard pass but make the fenced settle phase deny after
+      // GitHub had already accepted the write.
+      daemonFinalizerAuthority: request.daemonFinalizerAuthority ?? null,
     });
     this.#grants.set(facts.grantId, { facts, request: snapshot });
     return allow(decision.reasonCode, this.publicGrant(facts), decision.evidence);
@@ -1155,18 +1240,47 @@ export class ManagedWriteGuard {
     if (!run) {
       return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "run does not exist", { runId: request.runId });
     }
-    if (run.state !== RunState.ACTIVE) {
-      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, `run is ${run.state}, not ACTIVE`, {
+    // Validate the concrete repository/path before state admission. A closed run must not
+    // turn an out-of-scope remote target into an apparently well-formed request merely
+    // because the state refusal happens first.
+    const target = this.authorizeTarget({ run, request, operation, resolvedPath, toplevel });
+    if (!target.allowed) return target as Decision<GuardGrant>;
+    const daemonFinalizationWrite =
+      DAEMON_FINALIZATION_OPERATIONS.has(operation) &&
+      DaemonFinalizerAuthorityToken.belongsTo(request.daemonFinalizerAuthority, this);
+    if (run.state === RunState.ACTIVE) {
+      if (!ACTIVE_SOURCE_OPERATIONS.has(operation)) {
+        return deny(
+          ReasonCode.WRITE_RUN_NOT_ACTIVE,
+          `${operation} is not a source write admitted while ACTIVE`,
+          { runId: run.run_id, state: run.state, operation },
+        );
+      }
+    } else if (DAEMON_FINALIZATION_STATES.has(run.state)) {
+      if (!DAEMON_FINALIZATION_OPERATIONS.has(operation)) {
+        return deny(
+          ReasonCode.WRITE_RUN_NOT_ACTIVE,
+          `${operation} is not a daemon finalization operation in ${run.state}`,
+          { runId: run.run_id, state: run.state, operation },
+        );
+      }
+      if (!daemonFinalizationWrite) {
+        return deny(
+          ReasonCode.MERGE_AUTHORITY_DENIED,
+          "post-approval GitHub writes require the daemon finalizer capability",
+          { runId: run.run_id, state: run.state, operation },
+        );
+      }
+    } else {
+      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, `run is ${run.state}, not writable`, {
         runId: run.run_id,
         state: run.state,
+        operation,
       });
     }
 
     const identity = this.authorizeSession(run, request);
     if (!identity.allowed) return identity as Decision<GuardGrant>;
-
-    const target = this.authorizeTarget({ run, request, operation, resolvedPath, toplevel });
-    if (!target.allowed) return target as Decision<GuardGrant>;
 
     const resources = this.authorizeResources({
       request,

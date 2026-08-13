@@ -54,7 +54,10 @@ describe("run state machine (PRD §29.2)", () => {
   it("permits exactly the documented transitions", () => {
     expect(canTransition(RunState.QUEUED, RunState.ACTIVE).allowed).toBe(true);
     expect(canTransition(RunState.ACTIVE, RunState.READY_FOR_CEO_REVIEW).allowed).toBe(true);
-    expect(canTransition(RunState.READY_FOR_CEO_REVIEW, RunState.COMPLETED).allowed).toBe(true);
+    expect(canTransition(RunState.READY_FOR_CEO_REVIEW, RunState.CEO_APPROVED).allowed).toBe(true);
+    expect(canTransition(RunState.CEO_APPROVED, RunState.MERGING).allowed).toBe(true);
+    expect(canTransition(RunState.MERGING, RunState.POST_MERGE_VERIFYING).allowed).toBe(true);
+    expect(canTransition(RunState.POST_MERGE_VERIFYING, RunState.COMPLETED).allowed).toBe(true);
     expect(canTransition(RunState.REVISION_REQUIRED, RunState.ACTIVE).allowed).toBe(true);
   });
 
@@ -294,7 +297,7 @@ describe("managed write guard (CP-HI-01)", () => {
     expect(decision.reasonCode).toBe(ReasonCode.WRITE_PATH_NOT_CLAIMED);
   });
 
-  it("classifies path-free github operations by repository participation and refuses branchless remote writes", () => {
+  it("refuses GitHub writes while ACTIVE and still validates remote arguments before state admission", () => {
     const { guard, seeded } = setup();
     const request = {
       operation: WriteOperation.GITHUB_PR,
@@ -308,9 +311,8 @@ describe("managed write guard (CP-HI-01)", () => {
     expect(branchless.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
 
     const participating = guard.evaluate({ ...request, targetBranch: "feature/fixture" });
-    expect(participating.allowed).toBe(true);
-    expect(participating.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
-    if (participating.allowed) expect(participating.value.classification).toBe("MANAGED");
+    expect(participating.allowed).toBe(false);
+    expect(participating.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
 
     expect(
       guard.evaluate({

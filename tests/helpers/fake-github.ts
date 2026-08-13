@@ -7,6 +7,9 @@ export interface FakePull {
   merged: boolean;
   state: string;
   html_url: string;
+  title?: string;
+  body?: string | null;
+  merge_commit_sha?: string | null;
 }
 
 export interface FakeCheckRun {
@@ -16,6 +19,8 @@ export interface FakeCheckRun {
   conclusion: string | null;
   status: string;
   app?: { slug?: string } | null;
+  check_suite?: { id?: number } | null;
+  details_url?: string | null;
   output?: { title?: string | null; summary?: string | null; text?: string | null } | null;
   completed_at?: string | null;
 }
@@ -38,6 +43,10 @@ export class FakeGitHub implements GitHubClient {
   commitParents = new Map<string, string[]>();
   /** When set, the next merge records this sha as the merge commit's first parent. */
   driftBaseTo: string | null = null;
+  /** Lets a scenario use a real local candidate commit for trusted workflow-file inspection. */
+  nextMergeSha: string | null = null;
+  /** Synchronous hook used to model Actions publishing its exact-merge check before a reread. */
+  onMerge: ((input: { mergeSha: string; pull: FakePull }) => void) | null = null;
   readonly calls: Array<{ method: string; path: string; body?: unknown }> = [];
   mergeCount = 0;
   #nextId = 100;
@@ -61,7 +70,7 @@ export class FakeGitHub implements GitHubClient {
       ) as unknown as T;
     }
     if (method === "POST" && /\/pulls$/.test(path)) {
-      const input = body as { head: string; base: string };
+      const input = body as { head: string; base: string; title?: string; body?: string };
       const pull: FakePull = {
         number: this.#nextId++,
         head: { sha: this.headShaFor(input.head), ref: input.head },
@@ -69,6 +78,8 @@ export class FakeGitHub implements GitHubClient {
         merged: false,
         state: "open",
         html_url: `https://github.test/pull/${this.#nextId}`,
+        title: input.title,
+        body: input.body ?? null,
       };
       this.pulls.push(pull);
       return pull as unknown as T;
@@ -90,11 +101,13 @@ export class FakeGitHub implements GitHubClient {
       this.mergeCount += 1;
       pull.merged = true;
       pull.state = "closed";
-      const mergeSha = `merge${this.mergeCount}`.padEnd(40, "0");
+      const mergeSha = this.nextMergeSha ?? `merge${this.mergeCount}`.padEnd(40, "0");
+      this.nextMergeSha = null;
       const firstParent = this.driftBaseTo ?? pull.base.sha;
       this.driftBaseTo = null;
       this.commitParents.set(mergeSha, [firstParent, pull.head.sha]);
       this.markContains(pull.base.ref, mergeSha);
+      this.onMerge?.({ mergeSha, pull });
       return { merged: true, sha: mergeSha } as unknown as T;
     }
 
@@ -121,6 +134,18 @@ export class FakeGitHub implements GitHubClient {
         (c) => c.head_sha === sha && (!name || c.name === decodeURIComponent(name)),
       );
       return { check_runs: runs } as unknown as T;
+    }
+    if (method === "GET" && /\/check-suites\/\d+$/.test(path)) {
+      const id = Number(/\/check-suites\/(\d+)$/.exec(path)![1]);
+      const suite = this.#checkSuites.get(id);
+      if (!suite) throw new Error(`no check suite ${id}`);
+      return suite as unknown as T;
+    }
+    if (method === "GET" && /\/actions\/runs\/\d+$/.test(path)) {
+      const id = Number(/\/actions\/runs\/(\d+)$/.exec(path)![1]);
+      const run = this.#actionsRuns.get(id);
+      if (!run) throw new Error(`no actions run ${id}`);
+      return run as unknown as T;
     }
 
     if (method === "GET" && /\/commits\/[^/]+$/.test(path)) {
@@ -222,5 +247,36 @@ export class FakeGitHub implements GitHubClient {
     });
   }
 
+  /** Add a check with the complete suite → Actions run provenance chain the kernel requires. */
+  setTrustedPostMergeCheck(mergeSha: string, name: string, workflowPath: string): void {
+    const suiteId = this.#nextId++;
+    const actionRunId = this.#nextId++;
+    this.#checkSuites.set(suiteId, { head_sha: mergeSha, app: { slug: "github-actions" } });
+    this.#actionsRuns.set(actionRunId, {
+      head_sha: mergeSha,
+      path: workflowPath,
+      status: "completed",
+      conclusion: "success",
+    });
+    this.checkRuns.push({
+      id: this.#nextId++,
+      name,
+      head_sha: mergeSha,
+      conclusion: "success",
+      status: "completed",
+      app: { slug: "github-actions" },
+      check_suite: { id: suiteId },
+      details_url: `https://github.test/acme/fixture/actions/runs/${actionRunId}/job/1`,
+      completed_at: "2026-08-12T00:00:00.000Z",
+    });
+  }
+
   readonly #heads = new Map<string, string>();
+  readonly #checkSuites = new Map<number, { head_sha: string; app: { slug: string } }>();
+  readonly #actionsRuns = new Map<number, {
+    head_sha: string;
+    path: string;
+    status: string;
+    conclusion: string;
+  }>();
 }

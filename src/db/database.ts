@@ -44,7 +44,7 @@ const assertReadQuery = (sql: string): void => {
  * preserve an older table whose constraints are weaker, so version mismatch is refused
  * instead of pretending that a deployed database was migrated (§40 Maintainability).
  */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
 const RUN_STATE_TRANSITION_MINT: unique symbol = Symbol("run-state-transition-mint");

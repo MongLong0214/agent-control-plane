@@ -49,7 +49,11 @@ export const candidateSnapshotSchema = z
     schema: z.literal(CANDIDATE_SNAPSHOT_SCHEMA_ID),
     runId: z.string().min(1),
     contractDigest: z.string().min(1),
-    repositories: z.array(snapshotRepositorySchema).min(1),
+    // An empty snapshot is reserved for an administrative run with no participating
+    // repositories. Ordinary candidate construction still rejects an empty input below;
+    // keeping the schema able to represent the explicit no-op case lets that fact be
+    // persisted and re-read by the CEO gate and daemon finalizer.
+    repositories: z.array(snapshotRepositorySchema),
     createdAt: z.string().min(1),
   })
   .strict()
@@ -165,6 +169,24 @@ export const buildCandidateSnapshot = async (
     createdAt: clock.nowIso(),
   });
 };
+
+/**
+ * Builds the candidate proof for a run whose repository participation set is empty.
+ * This is intentionally separate from ordinary candidate construction: source work still
+ * needs at least one repository, while a contract/administrative run can have a real,
+ * digest-bound candidate that says there is nothing to merge.
+ */
+export const buildNoRepositoryCandidateSnapshot = (
+  params: { runId: string; contractDigest: string },
+  clock: Clock,
+): CandidateSnapshot =>
+  candidateSnapshotSchema.parse({
+    schema: CANDIDATE_SNAPSHOT_SCHEMA_ID,
+    runId: params.runId,
+    contractDigest: params.contractDigest,
+    repositories: [],
+    createdAt: clock.nowIso(),
+  });
 
 export interface FreshnessProbe {
   identity: string;

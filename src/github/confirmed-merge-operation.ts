@@ -2,7 +2,8 @@ import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
-import { RunState } from "../domain/types.ts";
+import { ArtifactKind, RunState } from "../domain/types.ts";
+import type { DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ReviewPacket } from "../review/blind-review.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -12,9 +13,11 @@ import {
   NO_HUMAN_GATE_DIGEST,
   type GatePayload,
   type GitHubKernel,
+  type MergeInput,
+  type PrepareInput,
 } from "./github-kernel.ts";
 
-/** Input accepted by the daemon/operator surface after the CEO's durable CONFIRM. */
+/** Input derived by the daemon from durable run state; never accepted from an MCP caller. */
 export interface ConfirmedMergeInput {
   runId: string;
   repositoryIdentity: string;
@@ -29,94 +32,133 @@ export interface ConfirmedMergeInput {
   humanGateDigest?: string;
 }
 
-export interface ConfirmedMergeResult {
-  checkRunId: number;
-  pullNumber: number;
-  pullUrl: string;
-  mergeCommitSha: string;
-  replayed: boolean;
+export interface ConfirmedMergePlan {
+  runId: string;
+  repositoryIdentity: string;
+  candidateSnapshotDigest: string;
+  exactHeadSha: string;
+  expectedBaseSha: string;
+  payload: GatePayload;
+  prepare: PrepareInput;
+  merge: Omit<MergeInput, "pullNumber">;
 }
 
-/** Narrow composition-root ports: this coordinator cannot write artifacts or state itself. */
+/**
+ * Narrow composition-root ports. The token is deliberately required here: a coordinator
+ * assembled by `agentctl`, Hermes, or a CTO has no way to call the external-write steps.
+ */
 export interface ConfirmedMergePorts {
   github: Pick<GitHubKernel, "gatePublish" | "prPrepare" | "mergeExecute">;
   runs: Pick<RunEngine, "get" | "currentCandidate">;
   artifacts: Pick<ArtifactStore, "latestForSnapshot">;
   projects: Pick<ProjectRegistry, "manifest">;
   clock: Pick<Clock, "nowIso">;
+  daemonFinalizerAuthority: DaemonFinalizerAuthority;
 }
 
+const FINALIZATION_STATES: ReadonlySet<RunState> = new Set([
+  RunState.CEO_APPROVED,
+  RunState.MERGING,
+  RunState.POST_MERGE_VERIFYING,
+]);
+
 /**
- * The only shipped orchestration path for CP-016. It derives all merge-critical SHA,
- * evidence and owner values from durable state instead of allowing an operator argument
- * to select them. Post-merge checks intentionally run in their own later operation: a
- * successful merge starts CI, and an immediate verification would permanently record a
- * predictable "missing" result before that CI can report.
+ * Reconstruct one repository's immutable finalization plan from durable evidence. The
+ * plan contains no caller-selected SHA, contract digest, owner, or merge strategy.
  */
-export const executeConfirmedMerge = async (
+export const deriveConfirmedMergePlan = (
   ports: ConfirmedMergePorts,
   input: ConfirmedMergeInput,
-): Promise<Decision<ConfirmedMergeResult>> => {
+): Decision<ConfirmedMergePlan> => {
   const run = ports.runs.get(input.runId);
   if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
-  if (run.state !== RunState.COMPLETED) {
+  if (!FINALIZATION_STATES.has(run.state)) {
     return deny(
       ReasonCode.GATE_AUTHORITY_DENIED,
-      "the GitHub merge operation requires a CEO-confirmed run",
-      { runId: input.runId, state: run.state, requiredState: RunState.COMPLETED },
+      "the GitHub finalization operation requires durable CEO approval",
+      { runId: input.runId, state: run.state, requiredStates: [...FINALIZATION_STATES] },
     );
   }
   if (!run.ownerSessionId || run.ownerBindingGeneration == null) {
-    return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "confirmed run has no pinned owner", { runId: input.runId });
+    return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "CEO-approved run has no pinned owner", { runId: input.runId });
   }
   if (!run.pinnedManifestDigest) {
-    return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "confirmed run has no pinned manifest", { runId: input.runId });
+    return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "CEO-approved run has no pinned manifest", { runId: input.runId });
   }
 
   const candidateDigest = ports.runs.currentCandidate(input.runId);
   if (!candidateDigest) {
-    return deny(ReasonCode.EVIDENCE_MISSING, "confirmed run has no current candidate", { runId: input.runId });
+    return deny(ReasonCode.EVIDENCE_MISSING, "CEO-approved run has no current candidate", { runId: input.runId });
   }
   const snapshot = ports.artifacts.latestForSnapshot<CandidateSnapshot>(
     input.runId,
-    "CANDIDATE_SNAPSHOT",
+    ArtifactKind.CANDIDATE_SNAPSHOT,
     candidateDigest,
   );
   const repository = snapshot?.content.repositories.find((entry) => entry.identity === input.repositoryIdentity);
-  if (!repository) {
+  if (!snapshot || snapshot.superseded || !repository) {
     return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "candidate does not include the requested repository", {
       runId: input.runId,
       repositoryIdentity: input.repositoryIdentity,
     });
   }
+  if (
+    snapshot.content.contractDigest !== run.contractDigest ||
+    repository.manifestDigest !== run.pinnedManifestDigest
+  ) {
+    return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "candidate no longer proves the pinned contract and manifest", {
+      runId: input.runId,
+      candidateSnapshotDigest: candidateDigest,
+      pinnedManifestDigest: run.pinnedManifestDigest,
+    });
+  }
+
+  const packet = ports.artifacts.latestForSnapshot<{ candidateSnapshotDigest?: string }>(
+    input.runId,
+    ArtifactKind.PRODUCTION_READY_PACKET,
+    candidateDigest,
+  );
+  if (!packet || packet.superseded || packet.content.candidateSnapshotDigest !== candidateDigest) {
+    return deny(ReasonCode.EVIDENCE_STALE, "CEO-approved run lacks its current production-ready packet", {
+      runId: input.runId,
+      candidateSnapshotDigest: candidateDigest,
+    });
+  }
   const verification = ports.artifacts.latestForSnapshot<VerificationReport>(
     input.runId,
-    "VERIFICATION",
+    ArtifactKind.VERIFICATION,
     candidateDigest,
   );
   const review = ports.artifacts.latestForSnapshot<ReviewPacket>(
     input.runId,
-    "BLIND_REVIEW",
+    ArtifactKind.BLIND_REVIEW,
     candidateDigest,
   );
-  if (!verification || !review) {
-    return deny(ReasonCode.EVIDENCE_MISSING, "confirmed run is missing merge-gate evidence", {
+  if (
+    !verification ||
+    verification.superseded ||
+    verification.content.status !== "PASS" ||
+    !review ||
+    review.superseded ||
+    review.content.verdict !== "PASS"
+  ) {
+    return deny(ReasonCode.EVIDENCE_MISSING, "CEO-approved run is missing current merge-gate evidence", {
       runId: input.runId,
-      candidateDigest,
+      candidateSnapshotDigest: candidateDigest,
       verification: Boolean(verification),
-      blindReview: Boolean(review),
+      review: Boolean(review),
     });
   }
   const manifest = ports.projects.manifest(run.pinnedManifestDigest);
   if (!manifest?.branchProfile) {
-    return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "confirmed run's branch contract is unavailable", {
+    return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "CEO-approved run's branch contract is unavailable", {
       runId: input.runId,
       pinnedManifestDigest: run.pinnedManifestDigest,
     });
   }
   const humanGateDigest = input.humanGateDigest ?? (run.humanGateRequired ? null : NO_HUMAN_GATE_DIGEST);
   if (!humanGateDigest) {
-    return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "a human-gated confirmed run needs its current decision digest", {
+    return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "a human-gated run needs its current decision digest", {
       runId: input.runId,
     });
   }
@@ -132,41 +174,59 @@ export const executeConfirmedMerge = async (
     exactHead: repository.candidateHead,
     timestamp: ports.clock.nowIso(),
   };
-  const gate = await ports.github.gatePublish(payload, input.repositoryIdentity);
-  if (!gate.allowed) return gate as Decision<ConfirmedMergeResult>;
-
-  const prepared = await ports.github.prPrepare({
-    runId: input.runId,
-    repositoryIdentity: input.repositoryIdentity,
-    head: input.head,
-    base: repository.baseBranch,
-    title: input.title,
-    body: input.body ?? "",
-    declaredParent: input.declaredParent ?? null,
-    linkedIssues: input.linkedIssues,
-    requireLinkage: input.requireLinkage,
+  const owner = {
     ownerSessionId: run.ownerSessionId,
     ownerBindingGeneration: run.ownerBindingGeneration,
-    exactHeadSha: repository.candidateHead,
-  });
-  if (!prepared.allowed) return prepared as Decision<ConfirmedMergeResult>;
-
-  const merged = await ports.github.mergeExecute({
+    daemonFinalizerAuthority: ports.daemonFinalizerAuthority,
+  };
+  return allow(ReasonCode.OK, {
     runId: input.runId,
     repositoryIdentity: input.repositoryIdentity,
-    pullNumber: prepared.value.pullNumber,
+    candidateSnapshotDigest: candidateDigest,
     exactHeadSha: repository.candidateHead,
     expectedBaseSha: repository.baseHead,
-    mergeStrategy: manifest.branchProfile.mergeStrategy,
-    ownerSessionId: run.ownerSessionId,
-    ownerBindingGeneration: run.ownerBindingGeneration,
-  });
-  if (!merged.allowed) return merged as Decision<ConfirmedMergeResult>;
-  return allow(merged.reasonCode, {
-    checkRunId: gate.value.checkRunId,
-    pullNumber: prepared.value.pullNumber,
-    pullUrl: prepared.value.url,
-    mergeCommitSha: merged.value.mergeCommitSha,
-    replayed: merged.value.replayed,
+    payload,
+    prepare: {
+      runId: input.runId,
+      repositoryIdentity: input.repositoryIdentity,
+      head: input.head,
+      base: repository.baseBranch,
+      title: input.title,
+      body: input.body ?? "",
+      declaredParent: input.declaredParent ?? null,
+      linkedIssues: input.linkedIssues,
+      requireLinkage: input.requireLinkage,
+      exactHeadSha: repository.candidateHead,
+      ...owner,
+    },
+    merge: {
+      runId: input.runId,
+      repositoryIdentity: input.repositoryIdentity,
+      exactHeadSha: repository.candidateHead,
+      expectedBaseSha: repository.baseHead,
+      mergeStrategy: manifest.branchProfile.mergeStrategy,
+      ...owner,
+    },
   });
 };
+
+/** Prepare every PR before a gate or merge is released. */
+export const prepareConfirmedMerge = async (
+  ports: ConfirmedMergePorts,
+  plan: ConfirmedMergePlan,
+): Promise<Decision<{ pullNumber: number; url: string }>> => ports.github.prPrepare(plan.prepare);
+
+/** Publish the candidate-bound gate after the PR intent is durable. */
+export const publishConfirmedMergeGate = async (
+  ports: ConfirmedMergePorts,
+  plan: ConfirmedMergePlan,
+): Promise<Decision<{ checkRunId: number }>> =>
+  ports.github.gatePublish(plan.payload, plan.repositoryIdentity, ports.daemonFinalizerAuthority);
+
+/** Execute one already-prepared merge. Exact post-merge verification is a later daemon step. */
+export const executePreparedConfirmedMerge = async (
+  ports: ConfirmedMergePorts,
+  plan: ConfirmedMergePlan,
+  pullNumber: number,
+): Promise<Decision<{ mergeCommitSha: string; replayed: boolean }>> =>
+  ports.github.mergeExecute({ ...plan.merge, pullNumber });

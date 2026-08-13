@@ -8,7 +8,7 @@ import { deriveHumanGate } from "../ceo/human-gate.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db, RunStateTransitionAuthority } from "../db/database.ts";
-import { canTransition } from "../domain/run-state.ts";
+import { canTransition, isTerminal } from "../domain/run-state.ts";
 import {
   ArtifactKind,
   ContinuityMode,
@@ -54,7 +54,7 @@ const COMPLETION_MINT = Symbol("acp.completion-authority");
 
 class CompletionAuthorityToken {
   readonly #mint: symbol;
-  constructor(mint: symbol, readonly source: "production-gate" | "bootstrap-activation") {
+  constructor(mint: symbol, readonly source: "daemon-finalizer" | "bootstrap-activation") {
     if (mint !== COMPLETION_MINT) {
       throw new Error("completion authority cannot be constructed outside the run engine");
     }
@@ -64,11 +64,21 @@ class CompletionAuthorityToken {
   static isValid(value: unknown): value is CompletionAuthority {
     return value instanceof CompletionAuthorityToken && value.#mint === COMPLETION_MINT;
   }
+
+  static hasSource(
+    value: unknown,
+    source: "daemon-finalizer" | "bootstrap-activation",
+  ): value is CompletionAuthority {
+    return CompletionAuthorityToken.isValid(value) && value.source === source;
+  }
 }
 
 export type CompletionAuthority = CompletionAuthorityToken;
 
 export interface CompletionAuthoritySet {
+  /** Held only by the daemon finalizer for ordinary production runs. */
+  readonly daemonFinalizer: CompletionAuthority;
+  /** Compatibility alias for fixture code; it is the same daemon-only capability. */
   readonly productionGate: CompletionAuthority;
   readonly bootstrapActivation: CompletionAuthority;
 }
@@ -378,8 +388,10 @@ export class RunEngine {
       );
     }
     ISSUED_COMPLETION_AUTHORITIES.add(this.db.file);
+    const daemonFinalizer = new CompletionAuthorityToken(COMPLETION_MINT, "daemon-finalizer");
     return {
-      productionGate: new CompletionAuthorityToken(COMPLETION_MINT, "production-gate"),
+      daemonFinalizer,
+      productionGate: daemonFinalizer,
       bootstrapActivation: new CompletionAuthorityToken(COMPLETION_MINT, "bootstrap-activation"),
     };
   }
@@ -466,8 +478,9 @@ export class RunEngine {
 
   /**
    * §19–21 — a state edge is not an authority. COMPLETED in particular is the claim the
-   * whole runtime exists to protect, so it may only be written by the component that
-   * checked the evidence: the production gate, or a bootstrap activation (§26.3).
+   * whole runtime exists to protect, so ordinary production runs complete only after the
+   * daemon finalizer has checked exact post-merge evidence. Bootstrap activation keeps its
+   * own separate capability (§26.3).
    */
   transition(
     runId: string,
@@ -479,16 +492,42 @@ export class RunEngine {
     if (to === RunState.COMPLETED && !CompletionAuthorityToken.isValid(authority)) {
       return deny(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
-        "only the production gate or a bootstrap activation may complete a run",
+        "only the daemon finalizer or a bootstrap activation may complete a run",
         { runId, to, supplied: typeof authority },
       );
     }
     return this.db.tx(() => {
       const run = this.require(runId);
-      const check = canTransition(run.state, to);
+      if (to === RunState.COMPLETED) {
+        const expectedSource = run.kind === RunKind.PROJECT_BOOTSTRAP
+          ? "bootstrap-activation"
+          : "daemon-finalizer";
+        if (!CompletionAuthorityToken.hasSource(authority, expectedSource)) {
+          return deny(
+            ReasonCode.COMPLETION_AUTHORITY_DENIED,
+            "completion authority does not own this run kind",
+            { runId, kind: run.kind, expectedSource },
+          );
+        }
+        if (run.kind !== RunKind.PROJECT_BOOTSTRAP && run.state !== RunState.POST_MERGE_VERIFYING) {
+          return deny(
+            ReasonCode.RUN_TRANSITION_ILLEGAL,
+            "ordinary runs may complete only after daemon exact post-merge verification",
+            { runId, kind: run.kind, state: run.state },
+          );
+        }
+        if (run.kind === RunKind.PROJECT_BOOTSTRAP && run.state !== RunState.READY_FOR_CEO_REVIEW) {
+          return deny(
+            ReasonCode.RUN_TRANSITION_ILLEGAL,
+            "bootstrap activation may complete only from CEO review",
+            { runId, kind: run.kind, state: run.state },
+          );
+        }
+      }
+      const check = canTransition(run.state, to, run.kind);
       if (!check.allowed) return check as Decision<RunRow>;
 
-      const terminal = to === RunState.COMPLETED || to === RunState.FAILED || to === RunState.CANCELLED;
+      const terminal = isTerminal(to);
       // §29 — the state edge, its evidence and its envelope are one operation. The database
       // refuses the update unless this raises the marker, so a legal edge cannot be taken
       // outside the runtime authority (#66).
@@ -860,7 +899,8 @@ export class RunEngine {
     return this.db
       .all<RawRun>(
         `SELECT * FROM runs WHERE owner_session_id = ?
-          AND state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW','REVISION_REQUIRED','AWAITING_HUMAN')`,
+          AND state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW','CEO_APPROVED',
+                        'MERGING','POST_MERGE_VERIFYING','REVISION_REQUIRED','AWAITING_HUMAN')`,
         [sessionId],
       )
       .map(hydrate);

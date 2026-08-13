@@ -93,6 +93,10 @@ export interface WorkerExecutionBindingGate {
  */
 const CLOSED_TO_NEW_TASKS: ReadonlySet<RunState> = new Set([
   RunState.READY_FOR_CEO_REVIEW,
+  RunState.CEO_APPROVED,
+  RunState.MERGING,
+  RunState.POST_MERGE_VERIFYING,
+  RunState.BLOCKED_POST_MERGE,
   RunState.AWAITING_HUMAN,
   RunState.COMPLETED,
   RunState.FAILED,

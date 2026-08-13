@@ -263,8 +263,9 @@ CREATE TABLE IF NOT EXISTS runs (
   priority                  TEXT NOT NULL CHECK (priority IN ('CRITICAL','NORMAL','LOW')),
   state                     TEXT NOT NULL
                               CHECK (state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW',
-                                               'REVISION_REQUIRED','AWAITING_HUMAN','COMPLETED',
-                                               'FAILED','CANCELLED')),
+                                               'CEO_APPROVED','MERGING','POST_MERGE_VERIFYING',
+                                               'BLOCKED_POST_MERGE','REVISION_REQUIRED','AWAITING_HUMAN',
+                                               'COMPLETED','FAILED','CANCELLED')),
   goal                      TEXT NOT NULL,
   contract_digest           TEXT NOT NULL,
   pinned_manifest_digest    TEXT REFERENCES manifests(digest),
@@ -326,6 +327,31 @@ CREATE TABLE IF NOT EXISTS candidate_pipeline_attempts (
 CREATE INDEX IF NOT EXISTS candidate_pipeline_attempts_running_deadline
   ON candidate_pipeline_attempts(state, deadline_at);
 
+-- ---------------------------------------------------------------------------
+-- finalization_attempts
+--   Lifecycle: the daemon owns one recoverable finalization lease per CEO-approved run.
+--   Integrity: the lease is durable independently of individual GitHub receipts, so a
+--   restart can resume the same ordered sequence without inventing a second attempt.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS finalization_attempts (
+  run_id                 TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  attempt_id             TEXT NOT NULL,
+  lease_owner            TEXT NOT NULL,
+  candidate_digest       TEXT NOT NULL,
+  state                  TEXT NOT NULL CHECK (state IN ('RUNNING','RELEASED','COMPLETED','BLOCKED')),
+  started_at             TEXT NOT NULL,
+  deadline_at            TEXT NOT NULL,
+  released_at            TEXT,
+  completed_at           TEXT,
+  last_step              TEXT NOT NULL,
+  failure_reason         TEXT,
+  compensation_plan_json TEXT,
+  CHECK (compensation_plan_json IS NULL OR json_valid(compensation_plan_json) = 1)
+);
+
+CREATE INDEX IF NOT EXISTS finalization_attempts_running_deadline
+  ON finalization_attempts(state, deadline_at);
+
 -- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
 -- while this guard rejects topology bypasses even from a raw SQLite caller.
 CREATE TRIGGER IF NOT EXISTS runs_state_transition_guard
@@ -335,7 +361,10 @@ WHEN NEW.state <> OLD.state
    (OLD.state = 'QUEUED' AND NEW.state IN ('ACTIVE','CANCELLED')) OR
    (OLD.state = 'ACTIVE' AND NEW.state IN ('BLOCKED','READY_FOR_CEO_REVIEW','FAILED','CANCELLED','AWAITING_HUMAN')) OR
    (OLD.state = 'BLOCKED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED','AWAITING_HUMAN')) OR
-   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
+   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('CEO_APPROVED','COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
+   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING')) OR
+   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE')) OR
+   (OLD.state = 'POST_MERGE_VERIFYING' AND NEW.state IN ('MERGING','COMPLETED','BLOCKED_POST_MERGE')) OR
    (OLD.state = 'REVISION_REQUIRED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED')) OR
    (OLD.state = 'AWAITING_HUMAN' AND NEW.state IN ('ACTIVE','CANCELLED','FAILED'))
  )
@@ -353,7 +382,10 @@ WHEN NEW.state <> OLD.state
    (OLD.state = 'QUEUED' AND NEW.state IN ('ACTIVE','CANCELLED')) OR
    (OLD.state = 'ACTIVE' AND NEW.state IN ('BLOCKED','READY_FOR_CEO_REVIEW','FAILED','CANCELLED','AWAITING_HUMAN')) OR
    (OLD.state = 'BLOCKED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED','AWAITING_HUMAN')) OR
-   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
+   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('CEO_APPROVED','COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
+   (OLD.state = 'CEO_APPROVED' AND NEW.state IN ('MERGING')) OR
+   (OLD.state = 'MERGING' AND NEW.state IN ('POST_MERGE_VERIFYING','BLOCKED_POST_MERGE')) OR
+   (OLD.state = 'POST_MERGE_VERIFYING' AND NEW.state IN ('MERGING','COMPLETED','BLOCKED_POST_MERGE')) OR
    (OLD.state = 'REVISION_REQUIRED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED')) OR
    (OLD.state = 'AWAITING_HUMAN' AND NEW.state IN ('ACTIVE','CANCELLED','FAILED'))
  )
@@ -439,7 +471,8 @@ BEFORE INSERT ON tasks
 WHEN EXISTS (
   SELECT 1 FROM runs
    WHERE run_id = NEW.run_id
-     AND state IN ('READY_FOR_CEO_REVIEW','AWAITING_HUMAN','COMPLETED','FAILED','CANCELLED')
+     AND state IN ('READY_FOR_CEO_REVIEW','CEO_APPROVED','MERGING','POST_MERGE_VERIFYING',
+                   'BLOCKED_POST_MERGE','AWAITING_HUMAN','COMPLETED','FAILED','CANCELLED')
 )
 BEGIN
   SELECT RAISE(ABORT, 'TASK_INSERT_RUN_SEALED');

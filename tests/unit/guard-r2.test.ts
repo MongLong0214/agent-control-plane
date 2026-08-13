@@ -92,44 +92,23 @@ describe("round-two managed-write regressions", () => {
     lease.value.release();
   });
 
-  it("#337 ignores expired and non-source grants while sweeping expired source-read leases", async () => {
+  it("#337 keeps source-read lease expiry compatible with ACTIVE-only source writes", async () => {
     const core = makeCore();
     const repo = makeRepo();
     const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
     const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
     addBranchClaim(core.db, core.clock, seeded, "claim_issue", "issue/fence");
 
-    let remoteEntered!: () => void;
-    const remoteEffectEntered = new Promise<void>((resolve) => {
-      remoteEntered = resolve;
-    });
-    let releaseRemote!: () => void;
-    const remoteMayFinish = new Promise<void>((resolve) => {
-      releaseRemote = resolve;
-    });
-    const remote = guard.authorize({
+    const remote = await guard.authorize({
       operation: WriteOperation.GITHUB_ISSUE,
       repositoryIdentity: seeded.identity,
       targetBranch: "issue/fence",
       runId: seeded.runId,
       sessionId: seeded.sessionId,
       bindingGeneration: seeded.generation,
-    }, async () => {
-      remoteEntered();
-      await remoteMayFinish;
-      return "remote";
-    });
-    await remoteEffectEntered;
-
-    const remoteLease = guard.acquireSourceReadLease(seeded.runId, [seeded.identity]);
-    expect(remoteLease.allowed).toBe(true);
-    expect(remoteLease.reasonCode).toBe(ReasonCode.OK);
-    if (!remoteLease.allowed) return;
-    remoteLease.value.release();
-    releaseRemote();
-    const completedRemote = await remote;
-    expect(completedRemote.allowed).toBe(true);
-    expect(completedRemote.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
+    }, () => "remote");
+    expect(remote.allowed).toBe(false);
+    expect(remote.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
 
     const source = guard.evaluate(managedRequest(seeded, join(repo, "README.md")));
     expect(source.allowed).toBe(true);

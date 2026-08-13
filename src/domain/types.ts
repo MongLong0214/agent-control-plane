@@ -5,6 +5,14 @@ export const RunState = {
   ACTIVE: "ACTIVE",
   BLOCKED: "BLOCKED",
   READY_FOR_CEO_REVIEW: "READY_FOR_CEO_REVIEW",
+  /** CEO confirmation has been durably accepted; only the daemon may finalize GitHub. */
+  CEO_APPROVED: "CEO_APPROVED",
+  /** The daemon is preparing and executing the ordered merge sequence. */
+  MERGING: "MERGING",
+  /** The daemon is checking the exact merge commit before releasing the next repository. */
+  POST_MERGE_VERIFYING: "POST_MERGE_VERIFYING",
+  /** A merge happened but its required post-merge proof did not complete; manual compensation is required. */
+  BLOCKED_POST_MERGE: "BLOCKED_POST_MERGE",
   REVISION_REQUIRED: "REVISION_REQUIRED",
   AWAITING_HUMAN: "AWAITING_HUMAN",
   COMPLETED: "COMPLETED",

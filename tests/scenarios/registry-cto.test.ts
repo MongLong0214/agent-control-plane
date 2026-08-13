@@ -10,6 +10,7 @@ import {
   TEST_OWNER,
   type Harness,
   bindCeo,
+  finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
   ownerDecisionReceipt,
@@ -377,39 +378,18 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     expect(unbacked.allowed).toBe(false);
     expect(unbacked.reasonCode).toBe(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN);
 
-    const change = harness.cp.runs.create({
-      projectId,
-      kind: "CONTRACT_CHANGE",
-      executionMode: ExecutionMode.GUARDED,
-      contract: { ...CONTRACT, goal: "revise the project contract" },
-    });
-    if (!change.allowed) throw new Error(change.message);
     const revisedDigest = harness.cp.projects.storeManifest(revised);
     if (!revisedDigest.allowed) throw new Error(revisedDigest.message);
-    const candidateSnapshotDigest = digestOf({ runId: change.value.runId, manifest: revisedDigest.value });
-    harness.cp.runs.transition(change.value.runId, RunState.ACTIVE, "contract change started");
-    harness.cp.db.run(`UPDATE runs SET current_candidate_digest = ? WHERE run_id = ?`, [
-      candidateSnapshotDigest,
-      change.value.runId,
-    ]);
-    harness.cp.runs.transition(
-      change.value.runId,
-      RunState.READY_FOR_CEO_REVIEW,
-      "contract change ready",
+    const finalized = await finalizeNoRepositoryRun(
+      harness,
+      projectId,
+      { ...CONTRACT, goal: "revise the project contract" },
     );
-    // Standing in for the CEO gate, which is the only production caller allowed to write
-    // COMPLETED; the point under test is what the *activation* then accepts.
-    harness.cp.runs.transition(
-      change.value.runId,
-      RunState.COMPLETED,
-      "contract change confirmed",
-      {},
-      harness.cp.completionAuthoritiesForTests().productionGate,
-    );
+    const { runId, candidateSnapshotDigest } = finalized;
     const grant = {
       schema: "acp.manifest-activation-grant.v1",
       projectId,
-      runId: change.value.runId,
+      runId,
       runKind: "CONTRACT_CHANGE",
       manifestDigest: revisedDigest.value,
       candidateSnapshotDigest,
@@ -419,8 +399,8 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
                                   content_json, produced_by, created_at)
        VALUES (?, ?, 'APPROVAL', ?, ?, ?, 'production-gate', ?)`,
       [
-        `art_manifest_${change.value.runId.slice(-12)}`,
-        change.value.runId,
+        `art_manifest_${runId.slice(-12)}`,
+        runId,
         digestOf(grant),
         candidateSnapshotDigest,
         JSON.stringify(grant),
@@ -436,7 +416,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
 
     const allowed = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",
-      runId: change.value.runId,
+      runId,
     });
     expect(allowed.allowed).toBe(true);
   });

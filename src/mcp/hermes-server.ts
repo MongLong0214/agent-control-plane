@@ -11,7 +11,7 @@ import type { CtoLifecycle } from "../cto/cto-lifecycle.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
 import type { ExecutionMode, RunPriority } from "../domain/types.ts";
-import { RunKind } from "../domain/types.ts";
+import { RunKind, RunState } from "../domain/types.ts";
 import type { RepairService } from "../doctor/repair.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
@@ -73,7 +73,10 @@ const HERMES_MCP_PORTS = new WeakSet<object>();
  * database facade nor a service instance, so an MCP tool handler cannot recover raw SQL from
  * the daemon's composition root (#352).
  */
-export const createHermesMcpPort = (source: HermesMcpSource) => {
+export const createHermesMcpPort = (
+  source: HermesMcpSource,
+  options: { onCeoApproved?: (runId: string) => void | Promise<unknown> } = {},
+) => {
   const port = Object.freeze({
     mutation: createMcpMutationPort(source),
     createRun: (input: Parameters<RunEngine["create"]>[0]) => source.runs.create(input),
@@ -113,7 +116,16 @@ export const createHermesMcpPort = (source: HermesMcpSource) => {
       plan: source.continuity.computeCoveragePlan(),
       capacity: source.capacity.all(),
     }),
-    submitCeoDecision: (input: Parameters<ProductionGate["submitCeoDecision"]>[0]) => source.ceo.submitCeoDecision(input),
+    submitCeoDecision: (input: Parameters<ProductionGate["submitCeoDecision"]>[0]) => {
+      const decision = source.ceo.submitCeoDecision(input);
+      // Hermes owns the CEO decision, not GitHub finalization. The daemon supplies this
+      // internal callback at composition time so a live daemon begins the durable sequence
+      // immediately after confirmation instead of waiting for a restart scan.
+      if (decision.allowed && decision.value.state === RunState.CEO_APPROVED && options.onCeoApproved) {
+        void Promise.resolve(options.onCeoApproved(input.runId)).catch(() => undefined);
+      }
+      return decision;
+    },
     executeRepair: (input: Parameters<RepairService["execute"]>[0]) => source.repair.execute(input),
   });
   HERMES_MCP_PORTS.add(port);

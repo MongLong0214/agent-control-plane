@@ -3,19 +3,20 @@ import { chmodSync } from "node:fs";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
-import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { Db } from "../../src/db/database.ts";
-import { RunState } from "../../src/domain/types.ts";
-import type { ControlPlane } from "../../src/app/control-plane.ts";
-import { dispatch as dispatchAgentctl } from "../../src/cli/agentctl.ts";
 import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { validateBranchContract } from "../../src/github/branch-contract.ts";
-import { executeConfirmedMerge, type ConfirmedMergePorts } from "../../src/github/confirmed-merge-operation.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
+import * as confirmedMergeOperation from "../../src/github/confirmed-merge-operation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
-import { driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
+import {
+  approveReviewedCandidateForFinalization,
+  driveToReviewedCandidate,
+  installDaemonFinalizerGitHubFixture,
+  makeHarness,
+} from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -98,7 +99,10 @@ const reflectMergedBase = (github: FakeGitHub): void => {
   };
 };
 
-const ready = async (ciWorkflows: Array<{ path: string; checkName: string; approvedDigest: string | null }> = []) => {
+const ready = async (
+  ciWorkflows: Array<{ path: string; checkName: string; approvedDigest: string | null }> = [],
+  options: { preclaimReleaseBranch?: string } = {},
+) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -119,6 +123,21 @@ const ready = async (ciWorkflows: Array<{ path: string; checkName: string; appro
     branch: driven.workBranch,
   });
   if (!claimed.allowed) throw new Error(claimed.message);
+  if (options.preclaimReleaseBranch) {
+    // A release tag is a daemon-side effect after CEO confirmation, but its release branch
+    // claim must have been established while this run was still allowed to prepare source.
+    const releaseClaim = harness.cp.claims.acquire({
+      runId: driven.runId,
+      ownerSessionId: driven.ownerSessionId,
+      ownerBindingGeneration: driven.ownerBindingGeneration,
+      ownerRoleKey: harness.cp.runs.require(driven.runId).ownerRoleKey!,
+      repositoryIdentity: driven.identity,
+      branch: options.preclaimReleaseBranch,
+    });
+    if (!releaseClaim.allowed) throw new Error(releaseClaim.message);
+  }
+  await approveReviewedCandidateForFinalization(harness, driven);
+  installDaemonFinalizerGitHubFixture(harness);
   const payload = {
     runId: driven.runId,
     candidateSnapshotDigest: driven.candidateSnapshotDigest,
@@ -140,6 +159,7 @@ const ready = async (ciWorkflows: Array<{ path: string; checkName: string; appro
     ownerSessionId: driven.ownerSessionId,
     ownerBindingGeneration: driven.ownerBindingGeneration,
     exactHeadSha: driven.candidateHead,
+    daemonFinalizerAuthority: harness.cp.daemonFinalizationAuthorities().write,
   };
   return { github, harness, driven, payload, input };
 };
@@ -183,18 +203,13 @@ const acceptedReleaseMerge = (fixture: Fixture, commit: string): void => {
     ],
   );
   fixture.github.markContains(PROFILE.defaultBranch, commit);
-  const releaseClaim = fixture.harness.cp.claims.acquire({
-    runId: fixture.driven.runId,
-    ownerSessionId: fixture.driven.ownerSessionId,
-    ownerBindingGeneration: fixture.driven.ownerBindingGeneration,
-    ownerRoleKey: fixture.harness.cp.runs.require(fixture.driven.runId).ownerRoleKey!,
-    repositoryIdentity: fixture.driven.identity,
-    branch: "release/1.2.0",
-  });
-  if (!releaseClaim.allowed) throw new Error(releaseClaim.message);
 };
 
 describe("round-two GitHub hardening", () => {
+  it("keeps the daemon finalizer as the only high-level merge sequence", () => {
+    expect("executeConfirmedMerge" in confirmedMergeOperation).toBe(false);
+  });
+
   it("#77: exposes only the fixed credential-store API", () => {
     const store = new TrustedCredentialStore(tempDir("credential-boundary-"));
     store.install({ token: "never-exposed", creatorIdentity: "acp" });
@@ -325,96 +340,6 @@ describe("round-two GitHub hardening", () => {
     // provider path; silently restoring the old no-op option fails typechecking here.
     // @ts-expect-error GitHubClient deliberately exposes no unsupported atomic-base flag.
     void client.supportsAtomicExpectedBase;
-  });
-
-  it("#386: the confirmed operator sequence derives its gate, PR and merge inputs from durable state", async () => {
-    const fixture = await ready();
-    const calls = {
-      gatePublish: vi.fn(async () => allow(ReasonCode.OK, { checkRunId: 71 })),
-      prPrepare: vi.fn(async () => allow(ReasonCode.OK, { pullNumber: 72, url: "https://github.test/pull/72" })),
-      mergeExecute: vi.fn(async () => allow(ReasonCode.OK, { mergeCommitSha: "m".repeat(40), replayed: false })),
-    };
-    const completed = { ...fixture.harness.cp.runs.require(fixture.driven.runId), state: RunState.COMPLETED };
-    const ports = {
-      github: calls,
-      runs: {
-        get: (runId: string) => (runId === fixture.driven.runId ? completed : null),
-        currentCandidate: fixture.harness.cp.runs.currentCandidate.bind(fixture.harness.cp.runs),
-      },
-      artifacts: fixture.harness.cp.artifacts,
-      projects: fixture.harness.cp.projects,
-      clock: fixture.harness.cp.clock,
-    } as ConfirmedMergePorts;
-    const input = {
-      runId: fixture.driven.runId,
-      repositoryIdentity: fixture.driven.identity,
-      head: fixture.driven.workBranch,
-      title: "operator candidate",
-    };
-
-    const merged = await executeConfirmedMerge(ports, input);
-    expect(merged).toMatchObject({
-      allowed: true,
-      value: { checkRunId: 71, pullNumber: 72, mergeCommitSha: "m".repeat(40), replayed: false },
-    });
-    expect(calls.gatePublish).toHaveBeenCalledWith(
-      expect.objectContaining({
-        runId: fixture.driven.runId,
-        candidateSnapshotDigest: fixture.driven.candidateSnapshotDigest,
-        exactHead: fixture.driven.candidateHead,
-      }),
-      fixture.driven.identity,
-    );
-    expect(calls.prPrepare).toHaveBeenCalledWith(expect.objectContaining({
-      head: fixture.driven.workBranch,
-      base: "dev",
-      exactHeadSha: fixture.driven.candidateHead,
-      ownerSessionId: fixture.driven.ownerSessionId,
-    }));
-    expect(calls.mergeExecute).toHaveBeenCalledWith(expect.objectContaining({
-      pullNumber: 72,
-      exactHeadSha: fixture.driven.candidateHead,
-      expectedBaseSha: fixture.driven.baseHead,
-      mergeStrategy: "merge_commit",
-    }));
-    expect(calls.gatePublish.mock.invocationCallOrder[0]).toBeLessThan(calls.prPrepare.mock.invocationCallOrder[0]!);
-    expect(calls.prPrepare.mock.invocationCallOrder[0]).toBeLessThan(calls.mergeExecute.mock.invocationCallOrder[0]!);
-
-    const unconfirmed = await executeConfirmedMerge({
-      ...ports,
-      runs: {
-        get: fixture.harness.cp.runs.get.bind(fixture.harness.cp.runs),
-        currentCandidate: fixture.harness.cp.runs.currentCandidate.bind(fixture.harness.cp.runs),
-      },
-    }, input);
-    expect(unconfirmed.reasonCode).toBe(ReasonCode.GATE_AUTHORITY_DENIED);
-    expect(calls.gatePublish).toHaveBeenCalledTimes(1);
-
-    // Exercise the shipped CLI handler itself, not merely the coordinator it delegates to.
-    // Removing `agentctl github merge` turns this into an unknown-command exit and leaves
-    // the three kernel calls at one each.
-    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-    try {
-      const exit = await dispatchAgentctl({
-        github: calls,
-        runs: ports.runs,
-        artifacts: fixture.harness.cp.artifacts,
-        projects: fixture.harness.cp.projects,
-        clock: fixture.harness.cp.clock,
-      } as unknown as ControlPlane, "github", [
-        "merge",
-        input.runId,
-        input.repositoryIdentity,
-        input.head,
-        input.title,
-      ], false);
-      expect(exit).toBe(0);
-    } finally {
-      stdout.mockRestore();
-    }
-    expect(calls.gatePublish).toHaveBeenCalledTimes(2);
-    expect(calls.prPrepare).toHaveBeenCalledTimes(2);
-    expect(calls.mergeExecute).toHaveBeenCalledTimes(2);
   });
 
   it("#87/#192: a receipt for the same PR but different merge intent is a resource collision", async () => {
@@ -562,9 +487,32 @@ describe("round-two GitHub hardening", () => {
       requireLinkage: true,
       linkedIssues: [123],
     });
-    expect(result.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(result.reasonCode).toBe(ReasonCode.OK);
     const created = fixture.github.calls.find((call) => call.method === "POST" && call.path.endsWith("/pulls"));
     expect(JSON.stringify(created?.body)).toContain("Closes #123");
+  });
+
+  it("#199: refuses a PR when GitHub does not persist the required linkage", async () => {
+    const fixture = await ready();
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async (method, path, body) => {
+      if (method === "POST" && path.endsWith("/pulls")) {
+        const input = body as { head: string; base: string; title?: string };
+        // The remote accepts the create but drops the body. The kernel must fail on its
+        // authoritative reread rather than treating the successful POST as proof.
+        return request(method, path, { ...input, body: undefined });
+      }
+      return request(method, path, body);
+    };
+
+    const refused = await fixture.harness.cp.github.prPrepare({
+      ...fixture.input,
+      requireLinkage: true,
+      linkedIssues: [123],
+    });
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.PR_LINKAGE_MISSING);
+    expect(fixture.github.pulls).toHaveLength(1);
   });
 
   it("#96/#196: a non-release merge receipt cannot authorize a release tag", async () => {
@@ -592,7 +540,7 @@ describe("round-two GitHub hardening", () => {
   });
 
   it("#76: a release tag reserves its receipt before tagging and completes it after the reread", async () => {
-    const fixture = await ready();
+    const fixture = await ready([], { preclaimReleaseBranch: "release/1.2.0" });
     const commit = "r".repeat(40);
     acceptedReleaseMerge(fixture, commit);
 
@@ -650,7 +598,7 @@ describe("round-two GitHub hardening", () => {
   });
 
   it("#76: a release-tag reservation whose external write never happened is released, not stranded", async () => {
-    const fixture = await ready();
+    const fixture = await ready([], { preclaimReleaseBranch: "release/1.2.0" });
     const commit = "r".repeat(40);
     acceptedReleaseMerge(fixture, commit);
 
