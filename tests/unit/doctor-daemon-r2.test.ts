@@ -6,10 +6,11 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { startBuzzActorIngressListener, startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
-import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { buzzActorBindingSigningRequest, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -81,10 +82,59 @@ const exchangeSocketLines = (
     }, 5_000);
     socket.setEncoding("utf8");
     socket.once("connect", () => {
-      socket.write(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+      if (lines.length > 0) socket.write(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
     });
     socket.on("data", (chunk: string) => {
       received += chunk;
+      if (complete(received)) socket.end();
+    });
+    socket.once("error", (error) => finish(error));
+    socket.once("close", () => finish());
+  });
+
+/** A post-initialization switch proves request authentication does not trust the handshake alone. */
+const exchangeAfterMcpInitialization = (
+  socketPath: string,
+  handshake: unknown,
+  afterInitialize: () => readonly unknown[],
+  complete: (received: string) => boolean,
+): Promise<string> =>
+  new Promise((resolveExchange, rejectExchange) => {
+    const socket = createConnection(socketPath);
+    let received = "";
+    let initialized = false;
+    let settled = false;
+    let timeout: NodeJS.Timeout | null = null;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (error) rejectExchange(error);
+      else resolveExchange(received);
+    };
+    timeout = setTimeout(() => {
+      socket.destroy();
+      finish(new Error("local socket response timed out"));
+    }, 5_000);
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify(handshake)}\n${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "ops-regression", version: "1" },
+        },
+      })}\n`);
+    });
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      if (!initialized && received.includes('"id":1')) {
+        initialized = true;
+        socket.write(`${afterInitialize().map((line) => JSON.stringify(line)).join("\n")}\n`);
+      }
       if (complete(received)) socket.end();
     });
     socket.once("error", (error) => finish(error));
@@ -280,6 +330,8 @@ describe("round 2 daemon regressions", () => {
     if (!peer.sessionSecret) throw new Error("test peer needs a session secret");
     expect(harness.cp.sessions.transition(peer.sessionId, SessionLifecycle.READY, "MCP test peer").reasonCode)
       .toBe(ReasonCode.OK);
+    expect(harness.cp.bindings.bind({ role: Role.CEO, sessionId: peer.sessionId }).reasonCode)
+      .toBe(ReasonCode.OK);
 
     const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-mcp-r2-"), "local-test-token");
     const hermesSocket = listeners.socketPaths[0];
@@ -347,12 +399,131 @@ describe("round 2 daemon regressions", () => {
     }
   });
 
-  it("#214: a forged Buzz binding envelope cannot write a session actor through the daemon ingress", async () => {
+  it("#338: Hermes accepts only its current CEO binding at handshake and on every request", async () => {
+    const harness = makeHarness();
+    const ceo = harness.cp.sessions.create({ provider: "scripted", model: "hermes-ceo" });
+    const replacement = harness.cp.sessions.create({ provider: "scripted", model: "replacement-ceo" });
+    const worker = harness.cp.sessions.create({ provider: "scripted", model: "worker-with-secret" });
+    if (!ceo.sessionSecret || !replacement.sessionSecret || !worker.sessionSecret) {
+      throw new Error("test peers need session secrets");
+    }
+    for (const session of [ceo, replacement, worker]) {
+      expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "MCP test peer").reasonCode)
+        .toBe(ReasonCode.OK);
+    }
+    expect(harness.cp.bindings.bind({ role: Role.CEO, sessionId: ceo.sessionId }).reasonCode)
+      .toBe(ReasonCode.OK);
+
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-mcp-binding-"), "local-test-token");
+    const hermesSocket = listeners.socketPaths[0];
+    if (!hermesSocket) throw new Error("Hermes MCP listener was not started");
+    const create = vi.spyOn(harness.cp.runs, "create");
+    const toolCall = {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "run_create",
+        arguments: { idempotencyKey: "mcp-role-denied", executionMode: "SIMPLE", contract: CONTRACT },
+      },
+    };
+
+    try {
+      const wrongRole = await exchangeSocketLines(
+        hermesSocket,
+        [
+          { token: "local-test-token", sessionId: worker.sessionId, sessionSecret: worker.sessionSecret },
+          { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "ops-regression", version: "1" } } },
+          { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+          toolCall,
+        ],
+        (received) => received.includes('"reasonCode"'),
+      );
+      expect(JSON.parse(wrongRole.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+      });
+
+      let switched = false;
+      const staleRequest = await exchangeAfterMcpInitialization(
+        hermesSocket,
+        { token: "local-test-token", sessionId: ceo.sessionId, sessionSecret: ceo.sessionSecret },
+        () => {
+          const switchResult = harness.cp.bindings.switchTo({
+            role: Role.CEO,
+            sessionId: replacement.sessionId,
+            reason: "test CEO replacement",
+          });
+          expect(switchResult.reasonCode).toBe(ReasonCode.OK);
+          switched = true;
+          return [{ jsonrpc: "2.0", method: "notifications/initialized", params: {} }, toolCall];
+        },
+        (received) => received.includes(ReasonCode.BINDING_GENERATION_STALE),
+      );
+      expect(switched).toBe(true);
+      expect(staleRequest).toContain(ReasonCode.BINDING_GENERATION_STALE);
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      create.mockRestore();
+      await listeners.close();
+    }
+  });
+
+  it("#346: silent and non-READY local MCP peers are refused during the bounded handshake", async () => {
+    const harness = makeHarness();
+    const starting = harness.cp.sessions.create({ provider: "scripted", model: "starting-peer" });
+    if (!starting.sessionSecret) throw new Error("test peer needs a session secret");
+    const listeners = await startLocalMcpListeners(
+      harness.cp,
+      tempDir("acp-mcp-handshake-"),
+      "local-test-token",
+      { handshakeTimeoutMs: 25 },
+    );
+    const hermesSocket = listeners.socketPaths[0];
+    if (!hermesSocket) throw new Error("Hermes MCP listener was not started");
+
+    try {
+      const silent = await exchangeSocketLines(
+        hermesSocket,
+        [],
+        (received) => received.includes('"reasonCode"'),
+      );
+      expect(JSON.parse(silent.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      });
+
+      const nonReady = await exchangeSocketLines(
+        hermesSocket,
+        [{ token: "local-test-token", sessionId: starting.sessionId, sessionSecret: starting.sessionSecret }],
+        (received) => received.includes('"reasonCode"'),
+      );
+      expect(JSON.parse(nonReady.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      });
+    } finally {
+      await listeners.close();
+    }
+  });
+
+  it("#124/#214: a signed Buzz admission binds the actor identity the adapter resolves", async () => {
     const { harness } = await createQueuedRun();
     const session = harness.cp.sessions.create({ provider: "scripted", model: "buzz-peer" });
     if (!session.sessionSecret) throw new Error("test session needs a session secret");
     expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "Buzz test peer").reasonCode)
       .toBe(ReasonCode.OK);
+    expect(harness.cp.bindings.bind({ role: Role.CEO, sessionId: session.sessionId }).reasonCode)
+      .toBe(ReasonCode.OK);
+    const adapter = new BuzzAdapter(
+      harness.cp.db,
+      harness.cp.clock,
+      harness.cp.audit,
+      harness.cp.sessions,
+      harness.cp.bindings,
+      harness.cp.outbox,
+      new InMemoryBuzzTransport(),
+    );
 
     const listener = await startBuzzActorIngressListener(harness.cp, tempDir("acp-buzz-ingress-"), {
       allowedActors: ["npub-authenticated"],
@@ -376,6 +547,7 @@ describe("round 2 daemon regressions", () => {
         reasonCode: ReasonCode.INGRESS_SIGNATURE_INVALID,
       });
       expect(harness.cp.sessions.require(session.sessionId).buzzActorId).toBeNull();
+      expect(adapter.resolveActor("npub-authenticated")).toBeNull();
 
       const signature = ingressSignature(
         "buzz-ingress-test-secret",
@@ -388,6 +560,11 @@ describe("round 2 daemon regressions", () => {
       );
       expect(JSON.parse(admitted.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
       expect(harness.cp.sessions.require(session.sessionId).buzzActorId).toBe("npub-authenticated");
+      expect(adapter.resolveActor("npub-authenticated")).toMatchObject({
+        role: Role.CEO,
+        sessionId: session.sessionId,
+        status: "ACTIVE",
+      });
     } finally {
       await listener.close();
     }

@@ -170,7 +170,12 @@ const prepareBootstrap = async (harness: Harness, projectId: string) => {
     }],
   };
   harness.cp.artifacts.put(created.value.runId, "PLAN", plan);
-  return { runId: created.value.runId, plan, candidateSnapshotDigest: candidateSnapshotDigestValue };
+  return {
+    runId: created.value.runId,
+    plan,
+    candidateSnapshotDigest: candidateSnapshotDigestValue,
+    bootstrapCtoSessionId: bootstrapCto.sessionId,
+  };
 };
 
 const activationInput = (harness: Harness, runId: string, projectId: string, plan: object) => ({
@@ -295,13 +300,32 @@ describe("round-2 ops regressions", () => {
     const firstPending = await harness.cp.bootstrap.activate(activationInput(harness, first.runId, "shared-project", first.plan));
     const firstHandoff = firstPending.evidence["pendingHandoffId"] as string;
     const primary = harness.cp.bindings.activePrimaryCto("shared-project")!;
-    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(firstHandoff, primary.sessionId).allowed).toBe(true);
 
     const second = await prepareBootstrap(harness, "shared-project");
     const secondPending = await harness.cp.bootstrap.activate(activationInput(harness, second.runId, "shared-project", second.plan));
     expect(secondPending.allowed).toBe(false);
-    expect(secondPending.evidence["pendingHandoffId"]).not.toBe(firstHandoff);
-    expect(secondPending.evidence["incomplete"]).toContain("handoffAck");
+    const secondHandoff = secondPending.evidence["pendingHandoffId"] as string;
+    expect(secondHandoff).not.toBe(firstHandoff);
+
+    // B's real incoming CTO cannot acknowledge A's package merely because it is a live
+    // session in the same bootstrap flow.
+    const crossRunAck = harness.cp.bootstrap.acknowledgeActivationHandoff(
+      firstHandoff,
+      second.bootstrapCtoSessionId,
+    );
+    expect(crossRunAck.reasonCode).toBe(ReasonCode.HANDOFF_ACK_REQUIRED);
+
+    // A's valid ACK after B has opened must still leave B pending: B queries its own
+    // run-scoped handoff artifact rather than any ACK for the project/recipient tuple.
+    expect(harness.cp.bootstrap.acknowledgeActivationHandoff(firstHandoff, primary.sessionId).reasonCode)
+      .toBe(ReasonCode.OK);
+    const stillPending = await harness.cp.bootstrap.activate(
+      activationInput(harness, second.runId, "shared-project", second.plan),
+    );
+    expect(stillPending.allowed).toBe(false);
+    expect(stillPending.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
+    expect(stillPending.evidence["pendingHandoffId"]).toBe(secondHandoff);
+    expect(stillPending.evidence["incomplete"]).toContain("handoffAck");
   });
 
   it("#108/#217: a replayed MCP mutation returns its stored first response without executing twice", async () => {
@@ -318,6 +342,41 @@ describe("round-2 ops regressions", () => {
     });
     expect(executions).toBe(1);
     expect(replay).toEqual(first);
+  });
+
+  it("#345: an unfinished MCP mutation reservation recovers after a throw or bounded crash delay", async () => {
+    const harness = makeHarness();
+    const peer = { actor: "authenticated-peer" };
+    let executions = 0;
+
+    await expect(idempotentMcpMutation(harness.cp, peer, "mcp-throw", () => {
+      executions += 1;
+      throw new Error("tool process exited");
+    })).rejects.toThrow("tool process exited");
+    expect(harness.cp.db.get(`SELECT nonce FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, ["mcp-throw"])).toBeUndefined();
+
+    const afterThrow = await idempotentMcpMutation(harness.cp, peer, "mcp-throw", () => {
+      executions += 1;
+      return { content: [{ type: "text" as const, text: "retried" }], structuredContent: { reasonCode: ReasonCode.OK } };
+    });
+    expect(afterThrow.structuredContent?.["reasonCode"]).toBe(ReasonCode.OK);
+    expect(executions).toBe(2);
+
+    harness.cp.db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('mcp', ?, ?, ?)`,
+      ["mcp-crash", peer.actor, harness.clock.nowIso()],
+    );
+    const inProgress = await idempotentMcpMutation(harness.cp, peer, "mcp-crash", () => {
+      throw new Error("must not execute during recovery window");
+    });
+    expect(inProgress.structuredContent?.["reasonCode"]).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
+
+    harness.clock.advance(60_000);
+    const recovered = await idempotentMcpMutation(harness.cp, peer, "mcp-crash", () => ({
+      content: [{ type: "text" as const, text: "recovered" }],
+      structuredContent: { reasonCode: ReasonCode.OK },
+    }));
+    expect(recovered.structuredContent?.["reasonCode"]).toBe(ReasonCode.OK);
   });
 
   it("#110: CTO MCP routes a bootstrap handoff ACK to BootstrapActivation", async () => {
