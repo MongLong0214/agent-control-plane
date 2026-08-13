@@ -41,7 +41,7 @@ export interface BranchContractInput {
    * Immutable source line recorded when the candidate was frozen. A PR target is
    * mutable, so it cannot prove where a branch was cut from.
    */
-  sourceBase?: string | null;
+  sourceBranch?: string | null;
 }
 
 interface RuleContext extends BranchContractInput {
@@ -153,9 +153,9 @@ export const validateBranchContract = (input: BranchContractInput): Decision<Bra
   if (!rule.allowed) return rule;
 
   const requiredBase = requiredBaseFor(input.head, input.profile, input.declaredParent);
-  if (requiredBase && input.sourceBase !== undefined && input.sourceBase !== requiredBase) {
+  if (requiredBase && input.sourceBranch !== undefined && input.sourceBranch !== requiredBase) {
     return refuse("branch was not frozen from the required source lineage", {
-      sourceBase: input.sourceBase,
+      sourceBranch: input.sourceBranch,
       requiredBase,
     });
   }

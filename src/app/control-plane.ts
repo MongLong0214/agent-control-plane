@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 
 import { type Clock, systemClock } from "../core/clock.ts";
+import { digestOf } from "../core/digest.ts";
 import { CapacityMonitor, type CapacityOptions } from "../capacity/capacity-monitor.ts";
 import { ClaimRegistry } from "../claims/claim-registry.ts";
 import { ContinuityKernel } from "../continuity/continuity-kernel.ts";
@@ -352,9 +353,16 @@ export class ControlPlane {
       continuity: { mode: () => this.continuity.mode() },
     });
     this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? []);
-    // The GitHub kernel re-checks every durable owner decision against this verifier at
-    // publication and merge time; an APPROVAL row alone is never human authority.
-    this.github.attach({ ownerAuthority: this.ownerAuthority });
+    // The GitHub kernel binds the production gate's single human-gate predicate to its
+    // payload. It never reinterprets APPROVAL artifacts or ingress receipts itself.
+    this.github.attach({
+      humanGateStatus: {
+        humanGateStatus: (runId) => {
+          const status = this.ceo.humanGateStatus(runId);
+          return { ...status, humanGateDigest: digestOf(status.items) };
+        },
+      },
+    });
     this.cto.attach({
       ownerAuthority: this.ownerAuthority,
       // §10.1's recipient is intentionally unbound until this acknowledgement switches

@@ -7,7 +7,7 @@ import type { BranchProfile, ProjectManifest } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
-import { fileAt, mergeBase, revParse } from "../git/git.ts";
+import { fileAt, mergeBase } from "../git/git.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -18,8 +18,6 @@ import { EVIDENCE_PRODUCERS } from "../db/artifacts.ts";
 import { WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
-import { OWNER_DECISION_OPERATION } from "../ceo/production-gate.ts";
-import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 
 export const GATE_CHECK_NAME = "acp-production-gate";
 
@@ -110,6 +108,21 @@ export interface MergeInput {
   ownerBindingGeneration: number;
 }
 
+/**
+ * The GitHub boundary deliberately reads the owner-gate predicate through this narrow port.
+ * `ProductionGate.humanGateStatus` is the sole place that interprets approval artifacts and
+ * their ingress receipts; the kernel only binds its result to a gate payload.
+ */
+export interface HumanGateStatusPort {
+  humanGateStatus(runId: string): {
+    required: boolean;
+    items: readonly string[];
+    satisfied: boolean;
+    /** Digest of the current ProductionGate definition, supplied with the status. */
+    humanGateDigest: string;
+  };
+}
+
 interface PullRequest {
   number: number;
   head: { sha: string; ref: string };
@@ -128,9 +141,12 @@ interface PreparedPrIntent {
   base: string;
   exactHeadSha: string;
   expectedBaseSha: string;
-  sourceBase: string;
-  /** Immutable commit resolved from the required source branch when this candidate was prepared. */
-  sourceBaseSha: string;
+  /** Digest of the immutable candidate snapshot that supplied the frozen origin. */
+  candidateSnapshotDigest: string;
+  /** Immutable source branch recorded inside the candidate snapshot. */
+  sourceBranch: string;
+  /** Immutable source commit recorded inside the candidate snapshot. */
+  sourceHead: string;
   declaredParent: string | null;
 }
 
@@ -139,25 +155,6 @@ interface GitHubWriteTarget {
   targetBranch: string;
   /** Registered local checkout used by the guard to bind remote writes to this repository. */
   targetPath: string;
-}
-
-interface OwnerDecisionContent {
-  kind?: string;
-  item?: string;
-  approved?: boolean;
-  note?: string;
-  humanGateDigest?: string;
-  candidateSnapshotDigest?: string | null;
-  /** Durable ingress proof; `recordOwnerDecision` must persist this exact receipt. */
-  receipt?: OwnerApprovalReceipt;
-}
-
-interface CurrentHumanGate {
-  required: boolean;
-  items: string[];
-  satisfied: boolean;
-  /** A current, authenticated decision artifact named by a gate payload. */
-  payloadDigest: string | null;
 }
 
 interface CheckRun {
@@ -189,11 +186,8 @@ export class GitHubKernel {
    * because GitHub has already accepted it but the first caller has not reread it yet.
    */
   private readonly inFlightReservations = new Set<string>();
-  /**
-   * Owner authority remains outside the kernel. The kernel only accepts a durable decision
-   * whose ingress receipt this authority can still corroborate (CP-HI-07).
-   */
-  private ownerAuthority: OwnerAuthorityPort | null = null;
+  /** `ProductionGate.humanGateStatus` is the sole human-gate predicate. */
+  private humanGateStatusPort: HumanGateStatusPort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -208,8 +202,8 @@ export class GitHubKernel {
     private readonly client?: GitHubClient,
   ) {}
 
-  attach(ports: { ownerAuthority?: OwnerAuthorityPort }): void {
-    if (ports.ownerAuthority) this.ownerAuthority = ports.ownerAuthority;
+  attach(ports: { humanGateStatus?: HumanGateStatusPort }): void {
+    if (ports.humanGateStatus) this.humanGateStatusPort = ports.humanGateStatus;
   }
 
   /**
@@ -283,6 +277,10 @@ export class GitHubKernel {
 
     const candidate = this.candidateRepository(input.runId, input.repositoryIdentity);
     if (!candidate.allowed) return candidate as Decision<{ pullNumber: number; url: string }>;
+    const candidateSnapshotDigest = this.runs.currentCandidate(input.runId);
+    if (!candidateSnapshotDigest) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "run has no current frozen candidate", { runId: input.runId });
+    }
     if (input.exactHeadSha !== candidate.value.candidateHead) {
       return deny(ReasonCode.SNAPSHOT_STALE, "PR head is not the run's frozen candidate", {
         runId: input.runId,
@@ -302,14 +300,14 @@ export class GitHubKernel {
     if (!profile.allowed) return profile as Decision<{ pullNumber: number; url: string }>;
     // The candidate snapshot's base is the PR *target*. It cannot prove the branch this
     // source was cut from: release/* may target main although it must originate at dev, and
-    // hotfix/* may target dev/release although it must originate at main. Resolve the required
-    // origin from the pinned branch contract and prove it against commit ancestry instead.
-    const lineage = await this.assertSourceLineageAtPrepare(
+    // hotfix/* may target dev/release although it must originate at main. Validate the frozen
+    // origin from the pinned branch contract against the candidate's recorded commit instead.
+    const lineage = await this.assertFrozenSourceLineage(
       input.repositoryIdentity,
       input.head,
       profile.value,
       input.declaredParent ?? null,
-      candidate.value.candidateHead,
+      candidate.value,
     );
     if (!lineage.allowed) return lineage as Decision<{ pullNumber: number; url: string }>;
     const releases = await this.activeReleases(input.repositoryIdentity);
@@ -320,7 +318,7 @@ export class GitHubKernel {
       profile: profile.value,
       declaredParent: input.declaredParent ?? null,
       activeReleases: releases.value,
-      sourceBase: lineage.value.sourceBase,
+      sourceBranch: lineage.value.sourceBranch,
     });
     if (!contract.allowed) return contract as Decision<{ pullNumber: number; url: string }>;
 
@@ -332,6 +330,13 @@ export class GitHubKernel {
 
     const linkedIssues = [...new Set(input.linkedIssues ?? [])].sort((a, b) => a - b);
     const prBody = this.prBody(input.body, input.runId, linkedIssues, Boolean(input.requireLinkage));
+    if (this.runs.currentCandidate(input.runId) !== candidateSnapshotDigest) {
+      return deny(ReasonCode.SNAPSHOT_STALE, "candidate changed while preparing its pull request", {
+        runId: input.runId,
+        expected: candidateSnapshotDigest,
+        current: this.runs.currentCandidate(input.runId),
+      });
+    }
     const request = {
       runId: input.runId,
       repositoryIdentity: input.repositoryIdentity,
@@ -339,8 +344,9 @@ export class GitHubKernel {
       base: input.base,
       exactHeadSha: input.exactHeadSha,
       expectedBaseSha: candidate.value.baseHead,
-      sourceBase: lineage.value.sourceBase,
-      sourceBaseSha: lineage.value.sourceBaseSha,
+      candidateSnapshotDigest,
+      sourceBranch: lineage.value.sourceBranch,
+      sourceHead: lineage.value.sourceHead,
       title: input.title,
       body: prBody,
       declaredParent: input.declaredParent ?? null,
@@ -866,20 +872,8 @@ export class GitHubKernel {
       );
     }
 
-    if (run.humanGateRequired) {
-      const humanGate = this.assertCurrentHumanGate(
-        payload.runId,
-        current,
-        payload.humanGateDigest,
-      );
-      if (!humanGate.allowed) return humanGate as Decision<void>;
-    } else if (payload.humanGateDigest !== NO_HUMAN_GATE_DIGEST) {
-      return deny(
-        ReasonCode.GATE_EVIDENCE_NOT_BACKED,
-        "run needs no owner decision; the payload must carry the canonical no-human-gate digest",
-        { runId: payload.runId, expected: NO_HUMAN_GATE_DIGEST, observed: payload.humanGateDigest },
-      );
-    }
+    const humanGate = this.assertGatePayloadHumanGateStatus(payload);
+    if (!humanGate.allowed) return humanGate;
 
     const snapshot = this.artifacts.latestForSnapshot<CandidateSnapshot>(
       payload.runId,
@@ -925,6 +919,7 @@ export class GitHubKernel {
     }
     const candidate = this.candidateRepository(input.runId, input.repositoryIdentity);
     if (!candidate.allowed) return candidate as Decision<{ predicates: Record<string, boolean> }>;
+    const candidateSnapshotDigest = this.runs.currentCandidate(input.runId);
     if (
       input.exactHeadSha !== candidate.value.candidateHead ||
       input.expectedBaseSha !== candidate.value.baseHead
@@ -958,15 +953,21 @@ export class GitHubKernel {
 
     if (
       prepared.value.exactHeadSha !== input.exactHeadSha ||
-      prepared.value.expectedBaseSha !== input.expectedBaseSha
+      prepared.value.expectedBaseSha !== input.expectedBaseSha ||
+      prepared.value.candidateSnapshotDigest !== candidateSnapshotDigest
     ) {
       return deny(ReasonCode.SNAPSHOT_STALE, "prepared pull request is bound to a different frozen candidate", {
         pullNumber: pull.number,
         prepared: {
           exactHeadSha: prepared.value.exactHeadSha,
           expectedBaseSha: prepared.value.expectedBaseSha,
+          candidateSnapshotDigest: prepared.value.candidateSnapshotDigest,
         },
-        supplied: { exactHeadSha: input.exactHeadSha, expectedBaseSha: input.expectedBaseSha },
+        supplied: {
+          exactHeadSha: input.exactHeadSha,
+          expectedBaseSha: input.expectedBaseSha,
+          candidateSnapshotDigest,
+        },
       });
     }
 
@@ -1005,7 +1006,7 @@ export class GitHubKernel {
       profile: profile.value,
       declaredParent: prepared.value.declaredParent,
       activeReleases: releases.value,
-      sourceBase: prepared.value.sourceBase,
+      sourceBranch: prepared.value.sourceBranch,
     });
     if (!contract.allowed) {
       return deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, contract.message, contract.evidence);
@@ -1013,7 +1014,7 @@ export class GitHubKernel {
     const lineage = await this.assertPreparedSourceLineage(
       input.repositoryIdentity,
       prepared.value,
-      input.exactHeadSha,
+      candidate.value,
     );
     if (!lineage.allowed) return lineage as Decision<{ predicates: Record<string, boolean> }>;
 
@@ -2575,176 +2576,122 @@ export class GitHubKernel {
   }
 
   /**
-   * The frozen PR target is not source lineage. Resolve the required source branch and record
-   * its exact commit alongside the prepare receipt, after proving the candidate descends from
-   * that commit. This admits release→main and hotfix→dev/release without accepting a
-   * caller-supplied target name as proof of ancestry.
+   * The frozen PR target is not source lineage. The candidate snapshot already captured the
+   * origin branch and SHA inside its digest, so never re-resolve a live branch here: a later
+   * source advance must not rewrite a candidate's origin or make it stale.
    */
-  private async assertSourceLineageAtPrepare(
+  private async assertFrozenSourceLineage(
     repositoryIdentity: string,
     head: string,
     profile: BranchProfile,
     declaredParent: string | null,
-    candidateHead: string,
-  ): Promise<Decision<{ sourceBase: string; sourceBaseSha: string }>> {
-    const sourceBase = requiredBaseFor(head, profile, declaredParent);
-    if (!sourceBase) {
+    candidate: CandidateSnapshot["repositories"][number],
+  ): Promise<Decision<{ sourceBranch: string; sourceHead: string }>> {
+    const requiredSourceBranch = requiredBaseFor(head, profile, declaredParent);
+    if (!requiredSourceBranch) {
       return deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "branch class has no required source lineage", {
         repositoryIdentity,
         head,
       });
     }
+    const { sourceBranch, sourceHead } = candidate;
+    if (!sourceBranch || !sourceHead) {
+      return deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "frozen candidate has no source lineage", {
+        repositoryIdentity,
+        head,
+        candidateHead: candidate.candidateHead,
+        sourceBranch: sourceBranch ?? null,
+        sourceHead: sourceHead ?? null,
+      });
+    }
+    if (sourceBranch !== requiredSourceBranch) {
+      return deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "frozen candidate source branch violates the branch contract", {
+        repositoryIdentity,
+        head,
+        sourceBranch,
+        requiredSourceBranch,
+      });
+    }
     const repository = this.repositories.byIdentity(repositoryIdentity);
     if (!repository) {
       return deny(ReasonCode.EVIDENCE_MISSING, "candidate repository has no local checkout for source lineage proof", {
         repositoryIdentity,
       });
     }
-    let sourceBaseSha: string;
-    try {
-      sourceBaseSha = await revParse(repository.checkoutPath, sourceBase);
-    } catch (error) {
-      return deny(ReasonCode.PROBE_FAILED, "could not resolve the required source branch for lineage proof", {
-        repositoryIdentity,
-        sourceBase,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-    const observed = await mergeBase(repository.checkoutPath, sourceBaseSha, candidateHead);
-    return observed === sourceBaseSha
-      ? allow(ReasonCode.OK, { sourceBase, sourceBaseSha })
+    const observed = await mergeBase(repository.checkoutPath, sourceHead, candidate.candidateHead);
+    return observed === sourceHead
+      ? allow(ReasonCode.OK, { sourceBranch, sourceHead })
       : deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "candidate does not descend from the required source", {
           repositoryIdentity,
-          sourceBase,
-          expectedSourceBaseHead: sourceBaseSha,
+          sourceBranch,
+          expectedSourceHead: sourceHead,
           mergeBase: observed,
         });
   }
 
-  /** Re-check the immutable prepare receipt against the exact candidate before a merge. */
+  /** Re-check the immutable prepare receipt against the exact frozen origin before a merge. */
   private async assertPreparedSourceLineage(
     repositoryIdentity: string,
     prepared: PreparedPrIntent,
-    candidateHead: string,
+    candidate: CandidateSnapshot["repositories"][number],
   ): Promise<Decision<void>> {
+    if (candidate.sourceBranch !== prepared.sourceBranch || candidate.sourceHead !== prepared.sourceHead) {
+      return deny(ReasonCode.SNAPSHOT_STALE, "prepared pull request has a different frozen source lineage", {
+        repositoryIdentity,
+        prepared: { sourceBranch: prepared.sourceBranch, sourceHead: prepared.sourceHead },
+        current: { sourceBranch: candidate.sourceBranch ?? null, sourceHead: candidate.sourceHead ?? null },
+      });
+    }
     const repository = this.repositories.byIdentity(repositoryIdentity);
     if (!repository) {
       return deny(ReasonCode.EVIDENCE_MISSING, "candidate repository has no local checkout for source lineage proof", {
         repositoryIdentity,
       });
     }
-    const observed = await mergeBase(repository.checkoutPath, prepared.sourceBaseSha, candidateHead);
-    return observed === prepared.sourceBaseSha
+    const observed = await mergeBase(repository.checkoutPath, prepared.sourceHead, candidate.candidateHead);
+    return observed === prepared.sourceHead
       ? allow(ReasonCode.OK, undefined)
       : deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, "candidate no longer descends from prepared source lineage", {
           repositoryIdentity,
-          sourceBase: prepared.sourceBase,
-          expectedSourceBaseHead: prepared.sourceBaseSha,
+          sourceBranch: prepared.sourceBranch,
+          expectedSourceHead: prepared.sourceHead,
           mergeBase: observed,
         });
   }
 
   /**
-   * CP-HI-07 at the GitHub boundary. `APPROVAL` is not evidence-writer protected, so a
-   * stored boolean cannot be treated as owner authority. Every latest decision must carry
-   * the admitted ingress receipt that produced it, be for this exact candidate and human-gate
-   * definition, and still be accepted by OwnerAuthority when the gate is published or merged.
+   * CP-HI-07 at the GitHub boundary. The kernel owns payload binding, not owner-decision
+   * interpretation: `ProductionGate.humanGateStatus` is re-read for both publication and
+   * merge, then its current definition digest is bound to the payload.
    */
-  private assertCurrentHumanGate(
-    runId: string,
-    candidateSnapshotDigest: string,
-    namedDecisionDigest: string,
-  ): Decision<CurrentHumanGate> {
-    const run = this.runs.get(runId);
-    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
-
-    const contract = this.artifacts.latest<{ humanGate?: unknown }>(runId, "TASK_CONTRACT");
-    const items = Array.isArray(contract?.content.humanGate) && contract.content.humanGate.every(
-      (item): item is string => typeof item === "string" && item.length > 0,
-    )
-      ? [...contract.content.humanGate]
-      : [];
-    const required = run.humanGateRequired;
-    if (!required) {
-      return allow(ReasonCode.OK, { required: false, items: [], satisfied: true, payloadDigest: null });
-    }
-    if (items.length === 0) {
-      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "run requires a human gate with no durable gate items", {
-        runId,
+  private assertGatePayloadHumanGateStatus(payload: GatePayload): Decision<void> {
+    const port = this.humanGateStatusPort;
+    if (!port) {
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "GitHub kernel has no human-gate status port", {
+        runId: payload.runId,
       });
     }
-    const authority = this.ownerAuthority;
-    if (!authority) {
-      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "GitHub kernel has no owner-authority verifier", {
-        runId,
+    const status = port.humanGateStatus(payload.runId);
+    if (!status.required) {
+      return payload.humanGateDigest === NO_HUMAN_GATE_DIGEST
+        ? allow(ReasonCode.OK, undefined)
+        : deny(
+            ReasonCode.GATE_EVIDENCE_NOT_BACKED,
+            "run needs no owner decision; the payload must carry the canonical no-human-gate digest",
+            { runId: payload.runId, expected: NO_HUMAN_GATE_DIGEST, observed: payload.humanGateDigest },
+          );
+    }
+    if (!status.satisfied || payload.humanGateDigest !== status.humanGateDigest) {
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "current human-gate status does not satisfy this payload", {
+        runId: payload.runId,
+        required: status.required,
+        items: status.items,
+        satisfied: status.satisfied,
+        expectedDigest: status.humanGateDigest,
+        suppliedDigest: payload.humanGateDigest,
       });
     }
-
-    const definitionDigest = digestOf(items);
-    const latest = new Map<string, { approved: boolean; digest: string }>();
-    for (const artifact of this.artifacts.list<OwnerDecisionContent>(runId, "APPROVAL")) {
-      const decision = artifact.content;
-      if (
-        artifact.superseded ||
-        artifact.candidateSnapshotDigest !== candidateSnapshotDigest ||
-        decision.kind !== "OWNER_DECISION" ||
-        !decision.item ||
-        !items.includes(decision.item) ||
-        typeof decision.approved !== "boolean" ||
-        typeof decision.note !== "string" ||
-        decision.humanGateDigest !== definitionDigest ||
-        decision.candidateSnapshotDigest !== candidateSnapshotDigest ||
-        !decision.receipt
-      ) {
-        continue;
-      }
-
-      const receipt = decision.receipt;
-      if (
-        receipt.runId !== runId ||
-        receipt.operation !== OWNER_DECISION_OPERATION ||
-        receipt.approved !== decision.approved ||
-        receipt.parameterDigest !== digestOf({
-          item: decision.item,
-          approved: decision.approved,
-          note: decision.note,
-        })
-      ) {
-        continue;
-      }
-      const admitted = authority.assertApproval(receipt);
-      if (!admitted.allowed) continue;
-
-      // ArtifactStore.list is durable creation order (then rowid). A later authenticated
-      // rejection therefore revokes the earlier yes for this same candidate and gate item.
-      latest.set(decision.item, { approved: decision.approved, digest: artifact.digest });
-    }
-
-    const satisfied = items.every((item) => latest.get(item)?.approved === true);
-    if (!satisfied) {
-      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "every current human-gate item needs an authenticated approval", {
-        runId,
-        candidateSnapshotDigest,
-        items,
-        decisions: items.map((item) => ({ item, approved: latest.get(item)?.approved ?? null })),
-      });
-    }
-    const named = [...latest.values()].some((decision) =>
-      decision.approved && decision.digest === namedDecisionDigest,
-    );
-    if (!named) {
-      return deny(
-        ReasonCode.HUMAN_GATE_UNSATISFIED,
-        "gate payload does not name a current authenticated owner decision",
-        { runId, candidateSnapshotDigest, digest: namedDecisionDigest },
-      );
-    }
-    return allow(ReasonCode.OK, {
-      required: true,
-      items,
-      satisfied: true,
-      payloadDigest: namedDecisionDigest,
-    });
+    return allow(ReasonCode.OK, undefined);
   }
 
   private hasPrLinkage(body: string | null | undefined, linkedIssues: readonly number[]): boolean {
@@ -2783,8 +2730,9 @@ export class GitHubKernel {
       typeof intent.base !== "string" ||
       typeof intent.exactHeadSha !== "string" ||
       typeof intent.expectedBaseSha !== "string" ||
-      typeof intent.sourceBase !== "string" ||
-      typeof intent.sourceBaseSha !== "string" ||
+      typeof intent.candidateSnapshotDigest !== "string" ||
+      typeof intent.sourceBranch !== "string" ||
+      typeof intent.sourceHead !== "string" ||
       (intent.declaredParent !== null && typeof intent.declaredParent !== "string")
     ) {
       return deny(ReasonCode.EVIDENCE_MISSING, "pull request has no immutable prepare contract", {
@@ -2798,8 +2746,9 @@ export class GitHubKernel {
       base: intent.base,
       exactHeadSha: intent.exactHeadSha,
       expectedBaseSha: intent.expectedBaseSha,
-      sourceBase: intent.sourceBase,
-      sourceBaseSha: intent.sourceBaseSha,
+      candidateSnapshotDigest: intent.candidateSnapshotDigest,
+      sourceBranch: intent.sourceBranch,
+      sourceHead: intent.sourceHead,
       declaredParent: intent.declaredParent,
     });
   }

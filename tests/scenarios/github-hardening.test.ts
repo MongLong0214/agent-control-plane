@@ -317,6 +317,26 @@ const putOwnerDecision = (
   ).digest;
 };
 
+/** Go through the only owner-decision ingress that ProductionGate is allowed to count. */
+const recordOwnerDecision = (
+  fixture: Fixture,
+  input: { item: string; approved: boolean; note: string },
+): void => {
+  const receipt = ownerDecisionReceipt(
+    fixture.harness,
+    fixture.runId,
+    input.item,
+    input.approved,
+    input.note,
+  );
+  const recorded = fixture.harness.cp.ceo.recordOwnerDecision({
+    runId: fixture.runId,
+    ...input,
+    receipt,
+  });
+  if (!recorded.allowed) throw new Error(`${recorded.reasonCode}: ${recorded.message}`);
+};
+
 /** A live, unrelated identity makes an ownership denial prove the owner check actually ran. */
 const unrelatedCaller = (fixture: Pick<OwnerAuthorityFixture, "harness" | "caller">) => {
   const session = fixture.harness.cp.sessions.create({ provider: "scripted", model: "unrelated-github-caller" });
@@ -401,44 +421,37 @@ describe("a production gate asserts evidence that exists (§24.4, CP-HI-06)", ()
 });
 
 describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, #381)", () => {
-  it("requires each current item, an admitted receipt and the current candidate; a later rejection revokes merge", async () => {
+  it("refuses a two-item gate after only one current item is approved", async () => {
     const items = ["irreversible production action", "undelegated public release"] as const;
     const fixture = await setup({ humanGate: items });
-    const staleCandidate = `sha256:${"a".repeat(64)}`;
-
-    // Both rows look like approvals, but one has no receipt and the other is bound to an
-    // earlier candidate. Neither can clear the gate for the candidate being merged.
-    const bare = putOwnerDecision(fixture, items, {
-      item: items[0],
-      approved: true,
-      note: "approve without durable receipt",
-      receipt: false,
-    });
-    putOwnerDecision(fixture, items, {
-      item: items[1],
-      approved: true,
-      note: "approval for prior candidate",
-      candidateSnapshotDigest: staleCandidate,
-    });
-    const incomplete = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: bare },
-      fixture.identity,
-    );
-    expect(incomplete.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
-    expect(fixture.github.checkRuns).toHaveLength(0);
-
-    const first = putOwnerDecision(fixture, items, {
+    recordOwnerDecision(fixture, {
       item: items[0],
       approved: true,
       note: "approve production action",
     });
-    putOwnerDecision(fixture, items, {
+    const refused = await fixture.harness.cp.github.gatePublish(
+      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      fixture.identity,
+    );
+    expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(fixture.github.checkRuns).toHaveLength(0);
+  });
+
+  it("refuses merge after a later owner rejection revokes a published gate", async () => {
+    const items = ["irreversible production action", "undelegated public release"] as const;
+    const fixture = await setup({ humanGate: items });
+    recordOwnerDecision(fixture, {
+      item: items[0],
+      approved: true,
+      note: "approve production action",
+    });
+    recordOwnerDecision(fixture, {
       item: items[1],
       approved: true,
       note: "approve release",
     });
     const published = await fixture.harness.cp.github.gatePublish(
-      { ...fixture.payload, humanGateDigest: first },
+      { ...fixture.payload, humanGateDigest: digestOf(items) },
       fixture.identity,
     );
     if (!published.allowed) throw new Error(`${published.reasonCode}: ${published.message}`);
@@ -446,7 +459,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
 
     // Later decisions win. The gate check remains a historical projection, but merge must
     // refuse once an authenticated owner withdraws one of the approvals.
-    putOwnerDecision(fixture, items, {
+    recordOwnerDecision(fixture, {
       item: items[1],
       approved: false,
       note: "withdraw release approval",
@@ -454,6 +467,123 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
     const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
     expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
     expect(fixture.github.mergeCount).toBe(0);
+  });
+
+  it("refuses an approval artifact bound to a different candidate", async () => {
+    const items = ["undelegated public release"] as const;
+    const fixture = await setup({ humanGate: items });
+    putOwnerDecision(fixture, items, {
+      item: items[0],
+      approved: true,
+      note: "approval for a prior candidate",
+      candidateSnapshotDigest: `sha256:${"a".repeat(64)}`,
+    });
+
+    const refused = await fixture.harness.cp.github.gatePublish(
+      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      fixture.identity,
+    );
+    expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(fixture.github.checkRuns).toHaveLength(0);
+  });
+
+  it("refuses an approval-shaped artifact a caller inserted directly", async () => {
+    const items = ["undelegated public release"] as const;
+    const fixture = await setup({ humanGate: items });
+    putOwnerDecision(fixture, items, {
+      item: items[0],
+      approved: true,
+      note: "bare direct artifact",
+      receipt: false,
+    });
+
+    const refused = await fixture.harness.cp.github.gatePublish(
+      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      fixture.identity,
+    );
+    expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(fixture.github.checkRuns).toHaveLength(0);
+  });
+
+  it("refuses an approval whose retained ingress receipt is not exact", async () => {
+    const items = ["undelegated public release"] as const;
+    const fixture = await setup({ humanGate: items });
+    const receipt = ownerDecisionReceipt(
+      fixture.harness,
+      fixture.runId,
+      items[0],
+      true,
+      "the receipt's note",
+    );
+    fixture.harness.cp.artifacts.put(
+      fixture.runId,
+      "APPROVAL",
+      {
+        kind: "OWNER_DECISION",
+        item: items[0],
+        approved: true,
+        note: "a substituted note",
+        humanGateDigest: digestOf(items),
+        candidateSnapshotDigest: fixture.payload.candidateSnapshotDigest,
+        receipt,
+      },
+      fixture.payload.candidateSnapshotDigest,
+    );
+
+    const refused = await fixture.harness.cp.github.gatePublish(
+      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      fixture.identity,
+    );
+    expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(fixture.github.checkRuns).toHaveLength(0);
+  });
+
+  it("uses the attached ProductionGate status port instead of rereading approval artifacts", async () => {
+    const items = ["undelegated public release"] as const;
+    const fixture = await setup({ humanGate: items });
+    recordOwnerDecision(fixture, { item: items[0], approved: true, note: "approved" });
+    fixture.harness.cp.github.attach({
+      humanGateStatus: {
+        humanGateStatus: () => ({
+          required: true,
+          items,
+          satisfied: false,
+          humanGateDigest: digestOf(items),
+        }),
+      },
+    });
+
+    const refused = await fixture.harness.cp.github.gatePublish(
+      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      fixture.identity,
+    );
+    expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(fixture.github.checkRuns).toHaveLength(0);
+  });
+
+  it("re-reads the attached ProductionGate status port at merge evaluation", async () => {
+    const items = ["undelegated public release"] as const;
+    const fixture = await setup({ humanGate: items });
+    recordOwnerDecision(fixture, { item: items[0], approved: true, note: "approved" });
+    const published = await fixture.harness.cp.github.gatePublish(
+      { ...fixture.payload, humanGateDigest: digestOf(items) },
+      fixture.identity,
+    );
+    if (!published.allowed) throw new Error(`${published.reasonCode}: ${published.message}`);
+    const pullNumber = await openPull(fixture);
+    fixture.harness.cp.github.attach({
+      humanGateStatus: {
+        humanGateStatus: () => ({
+          required: true,
+          items,
+          satisfied: false,
+          humanGateDigest: digestOf(items),
+        }),
+      },
+    });
+
+    const refused = await fixture.harness.cp.github.mergeEvaluate(mergeInput(fixture, pullNumber));
+    expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
   });
 });
 

@@ -227,7 +227,7 @@ describe("round-two GitHub hardening", () => {
       head: "hotfix/H1-fix",
       base: "main",
       profile: PROFILE,
-      sourceBase: "dev",
+      sourceBranch: "dev",
     });
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION);
@@ -239,7 +239,7 @@ describe("round-two GitHub hardening", () => {
       base: "dev",
       profile: PROFILE,
       declaredParent: "release/1.2.0",
-      sourceBase: "release/1.2.0",
+      sourceBranch: "release/1.2.0",
       activeReleases: ["release/1.2.0"],
     });
     expect(refused.allowed).toBe(false);
