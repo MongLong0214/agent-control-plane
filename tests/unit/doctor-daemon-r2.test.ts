@@ -8,9 +8,14 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { startBuzzActorIngressListener, startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
+import {
+  startBuzzActorIngressListener,
+  startLocalMcpListeners,
+  startSessionLaunchChannel,
+} from "../../src/daemon/agentcpd.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { buzzActorBindingSigningRequest, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -29,6 +34,17 @@ const CONTRACT: TaskContract = {
   references: [],
 };
 
+const HANDOFF: HandoffPackage = {
+  projectStatus: "ACTIVE/HEALTHY",
+  activeManifestDigest: null,
+  recentDecisions: [],
+  openBlockers: [],
+  queuedWork: [],
+  repositoryFacts: [],
+  knownRisks: [],
+  recommendedNextAction: "continue",
+};
+
 const createQueuedRun = async () => {
   const harness = makeHarness();
   const { projectId, repositoryId, identity } = await registerFixtureProject(harness);
@@ -39,7 +55,7 @@ const createQueuedRun = async () => {
     repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
   });
   if (!created.allowed) throw new Error(created.message);
-  return { harness, repositoryId, identity, run: created.value };
+  return { harness, projectId, repositoryId, identity, run: created.value };
 };
 
 const createDispatchedRun = async () => {
@@ -140,6 +156,49 @@ const exchangeAfterMcpInitialization = (
     socket.once("error", (error) => finish(error));
     socket.once("close", () => finish());
   });
+
+interface LaunchedCredential {
+  sessionId: string;
+  sessionIncarnation: string;
+  sessionSecret: string;
+}
+
+/** Reads a launched runtime's one-time local credential exactly as the runtime would. */
+const claimLaunchedCredential = async (
+  socketPath: string,
+  externalSessionId: string,
+): Promise<LaunchedCredential> => {
+  const received = await exchangeSocketLines(
+    socketPath,
+    [{ externalSessionId }],
+    (body) => body.includes("\n"),
+  );
+  const body = JSON.parse(received.trim()) as {
+    ok?: unknown;
+    sessionId?: unknown;
+    sessionIncarnation?: unknown;
+    sessionSecret?: unknown;
+  };
+  if (
+    body.ok !== true ||
+    typeof body.sessionId !== "string" ||
+    typeof body.sessionIncarnation !== "string" ||
+    typeof body.sessionSecret !== "string"
+  ) {
+    throw new Error("launch credential was not available");
+  }
+  return {
+    sessionId: body.sessionId,
+    sessionIncarnation: body.sessionIncarnation,
+    sessionSecret: body.sessionSecret,
+  };
+};
+
+const externalSessionIdOf = (incarnation: string): string => {
+  const externalSessionId = incarnation.split("#", 1)[0];
+  if (!externalSessionId) throw new Error("session incarnation has no external session id");
+  return externalSessionId;
+};
 
 describe("round 2 doctor regressions", () => {
   it("#111/#208: repeated diagnostics do not acknowledge repository drift", async () => {
@@ -518,6 +577,285 @@ describe("round 2 daemon regressions", () => {
       });
     } finally {
       await listeners.close();
+    }
+  });
+
+  it("#378: a launched, unbound replacement can acknowledge only its delivered normal handoff", async () => {
+    const harness = makeHarness();
+    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-"));
+    harness.cp.cto.attach({ sessionLaunch: launch });
+    const { projectId } = await registerFixtureProject(harness);
+
+    try {
+      const incumbent = await harness.cp.cto.ensurePrimaryCto(projectId, "normal handoff setup");
+      expect(incumbent.allowed).toBe(true);
+      const prepared = await harness.cp.cto.prepareSwitchover(projectId, HANDOFF);
+      expect(prepared.allowed).toBe(true);
+      if (!prepared.allowed) return;
+
+      const incoming = harness.cp.sessions.require(prepared.value.incomingSessionId);
+      const credential = await claimLaunchedCredential(
+        launch.socketPath,
+        externalSessionIdOf(incoming.incarnation),
+      );
+      expect(credential).toMatchObject({
+        sessionId: incoming.sessionId,
+        sessionIncarnation: incoming.incarnation,
+      });
+
+      // The launch credential is consumed before the channel replies, so it cannot be
+      // replayed by another local peer that learned the provider session id later.
+      const replay = await exchangeSocketLines(
+        launch.socketPath,
+        [{ externalSessionId: externalSessionIdOf(incoming.incarnation) }],
+        (received) => received.includes("\n"),
+      );
+      expect(JSON.parse(replay.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      });
+
+      const envelope = harness.cp.outbox.byIdempotencyKey(`handoff:${prepared.value.handoffId}`);
+      expect(envelope).not.toBeNull();
+      const claimed = harness.cp.outbox.claimDeliverable();
+      const delivery = claimed.find((message) => message.messageId === envelope!.messageId);
+      expect(delivery).toBeDefined();
+      expect(harness.cp.outbox.markSent(envelope!.messageId, delivery!.claimToken).allowed).toBe(true);
+
+      const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-mcp-handoff-"), "local-test-token");
+      const ctoSocket = listeners.socketPaths[1];
+      if (!ctoSocket) throw new Error("CTO MCP listener was not started");
+      const handshake = {
+        token: "local-test-token",
+        sessionId: credential.sessionId,
+        sessionSecret: credential.sessionSecret,
+      };
+      const initialize = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "replacement-cto", version: "1" },
+        },
+      };
+
+      try {
+        const wrongTool = await exchangeSocketLines(
+          ctoSocket,
+          [
+            handshake,
+            initialize,
+            { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+            {
+              jsonrpc: "2.0",
+              id: 2,
+              method: "tools/call",
+              params: {
+                name: "capacity_get",
+                arguments: { idempotencyKey: "handoff-wrong-tool", refresh: false },
+              },
+            },
+          ],
+          (received) => received.includes('"id":2'),
+        );
+        expect(wrongTool).toContain(ReasonCode.MCP_PEER_UNAUTHENTICATED);
+
+        const acknowledged = await exchangeSocketLines(
+          ctoSocket,
+          [
+            handshake,
+            initialize,
+            { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+            {
+              jsonrpc: "2.0",
+              id: 2,
+              method: "tools/call",
+              params: {
+                name: "handoff_ack",
+                arguments: {
+                  idempotencyKey: "handoff-ack",
+                  handoffId: prepared.value.handoffId,
+                  messageId: envelope!.messageId,
+                  payloadDigest: envelope!.payloadDigest,
+                  bindingGeneration: envelope!.bindingGeneration,
+                },
+              },
+            },
+          ],
+          (received) => received.includes('"id":2'),
+        );
+        expect(acknowledged).toContain(ReasonCode.OK);
+        expect(harness.cp.bindings.activePrimaryCto(projectId)?.sessionId)
+          .toBe(prepared.value.incomingSessionId);
+      } finally {
+        await listeners.close();
+      }
+    } finally {
+      await launch.close();
+    }
+  });
+
+  it("#378: a pending recipient is refused when its outgoing CTO generation has moved", async () => {
+    const harness = makeHarness();
+    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-stale-"));
+    harness.cp.cto.attach({ sessionLaunch: launch });
+    const { projectId } = await registerFixtureProject(harness);
+
+    try {
+      expect((await harness.cp.cto.ensurePrimaryCto(projectId, "stale handoff setup")).allowed).toBe(true);
+      const prepared = await harness.cp.cto.prepareSwitchover(projectId, HANDOFF);
+      expect(prepared.allowed).toBe(true);
+      if (!prepared.allowed) return;
+
+      const incoming = harness.cp.sessions.require(prepared.value.incomingSessionId);
+      const credential = await claimLaunchedCredential(
+        launch.socketPath,
+        externalSessionIdOf(incoming.incarnation),
+      );
+      const envelope = harness.cp.outbox.byIdempotencyKey(`handoff:${prepared.value.handoffId}`);
+      expect(envelope).not.toBeNull();
+      const claimed = harness.cp.outbox.claimDeliverable();
+      const delivery = claimed.find((message) => message.messageId === envelope!.messageId);
+      expect(delivery).toBeDefined();
+      expect(harness.cp.outbox.markSent(envelope!.messageId, delivery!.claimToken).allowed).toBe(true);
+
+      // Model a concurrent binding switch through the binding API rather than mutating the
+      // handoff row. The package remains PENDING, but its captured outgoing generation is
+      // no longer the authority that could authorize an ACK.
+      const successor = harness.cp.sessions.create({ provider: "scripted", model: "replacement" });
+      expect(harness.cp.sessions.transition(successor.sessionId, SessionLifecycle.READY, "replacement ready").allowed)
+        .toBe(true);
+      expect(harness.cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO,
+        projectId,
+        sessionId: successor.sessionId,
+        reason: "concurrent binding switch",
+      }).allowed).toBe(true);
+
+      const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-mcp-stale-handoff-"), "local-test-token");
+      const ctoSocket = listeners.socketPaths[1];
+      if (!ctoSocket) throw new Error("CTO MCP listener was not started");
+      try {
+        const refused = await exchangeSocketLines(
+          ctoSocket,
+          [{ token: "local-test-token", sessionId: credential.sessionId, sessionSecret: credential.sessionSecret }],
+          (received) => received.includes('"reasonCode"'),
+        );
+        expect(JSON.parse(refused.trim())).toMatchObject({
+          ok: false,
+          reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+        });
+      } finally {
+        await listeners.close();
+      }
+    } finally {
+      await launch.close();
+    }
+  });
+
+  it("#379: a draining current CTO can submit an in-flight receipt while new dispatch remains denied", async () => {
+    const { harness, projectId, repositoryId, run } = await createQueuedRun();
+    const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-"));
+    harness.cp.cto.attach({ sessionLaunch: launch });
+
+    try {
+      const dispatched = await harness.cp.runs.dispatch(run.runId);
+      expect(dispatched.allowed).toBe(true);
+      if (!dispatched.allowed || !dispatched.value.ownerSessionId || !dispatched.value.ownerBindingGeneration) return;
+      const outgoing = harness.cp.sessions.require(dispatched.value.ownerSessionId);
+      const credential = await claimLaunchedCredential(
+        launch.socketPath,
+        externalSessionIdOf(outgoing.incarnation),
+      );
+
+      const task = harness.cp.tasks.submit(run.runId, [{
+        key: "finish-existing-work",
+        title: "finish existing work",
+        category: "implementation",
+      }]);
+      expect(task.allowed).toBe(true);
+      if (!task.allowed) return;
+      const execution = harness.cp.tasks.startExecution({
+        runId: run.runId,
+        taskId: task.value[0]!.taskId,
+        ownerBindingGeneration: dispatched.value.ownerBindingGeneration,
+        workerSessionId: outgoing.sessionId,
+        provider: "scripted",
+        model: "scripted-worker",
+        repositoryId,
+      });
+      expect(execution.allowed).toBe(true);
+      if (!execution.allowed) return;
+      harness.clock.advance(1_000);
+
+      const draining = harness.cp.cto.requestReplacement(projectId, "replace after existing work");
+      expect(draining).toMatchObject({ allowed: true, value: { activeRuns: 1 } });
+      expect(harness.cp.sessions.require(outgoing.sessionId).lifecycle).toBe(SessionLifecycle.DRAINING);
+
+      const queued = harness.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      expect(queued.allowed).toBe(true);
+      if (!queued.allowed) return;
+      const newDispatch = await harness.cp.runs.dispatch(queued.value.runId);
+      expect(newDispatch.allowed).toBe(false);
+      expect(newDispatch.reasonCode).toBe(ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING);
+      expect(harness.cp.runs.require(queued.value.runId).state).toBe(RunState.QUEUED);
+
+      const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-mcp-draining-"), "local-test-token");
+      const ctoSocket = listeners.socketPaths[1];
+      if (!ctoSocket) throw new Error("CTO MCP listener was not started");
+      try {
+        const submitted = await exchangeSocketLines(
+          ctoSocket,
+          [
+            {
+              token: "local-test-token",
+              sessionId: credential.sessionId,
+              sessionSecret: credential.sessionSecret,
+            },
+            {
+              jsonrpc: "2.0",
+              id: 1,
+              method: "initialize",
+              params: {
+                protocolVersion: "2025-11-25",
+                capabilities: {},
+                clientInfo: { name: "draining-cto", version: "1" },
+              },
+            },
+            { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+            {
+              jsonrpc: "2.0",
+              id: 2,
+              method: "tools/call",
+              params: {
+                name: "task_receipt_submit",
+                arguments: {
+                  idempotencyKey: "draining-in-flight-activity",
+                  runId: run.runId,
+                  taskId: task.value[0]!.taskId,
+                  phase: "activity",
+                  executionId: execution.value.executionId,
+                },
+              },
+            },
+          ],
+          (received) => received.includes('"id":2'),
+        );
+        expect(submitted).toContain(ReasonCode.OK);
+        expect(harness.cp.tasks.execution(execution.value.executionId)?.lastActivityAt)
+          .toBe(harness.clock.nowIso());
+      } finally {
+        await listeners.close();
+      }
+    } finally {
+      await launch.close();
     }
   });
 
