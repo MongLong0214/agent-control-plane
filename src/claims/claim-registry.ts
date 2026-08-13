@@ -1,3 +1,5 @@
+import { isAbsolute } from "node:path";
+
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -5,6 +7,7 @@ import { newClaimId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { canonical } from "../guard/workspace-probe.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 
 export interface ClaimRequest {
@@ -14,6 +17,10 @@ export interface ClaimRequest {
   ownerRoleKey: string;
   repositoryIdentity: string;
   branch?: string | null;
+  /**
+   * Canonical registered checkout path. This is deliberately not an opaque caller-chosen
+   * label: §23.2's worktree fence has to name the directory being protected.
+   */
   worktreeId?: string | null;
   /** Repository-relative exact paths the holder intends to write. Optional (§23.2). */
   declaredPaths?: readonly string[];
@@ -68,8 +75,8 @@ export class ClaimRegistry {
         );
       }
 
-      const authorized = this.db.get<{ run_id: string }>(
-        `SELECT r.run_id
+      const authorized = this.db.get<{ run_id: string; checkout_path: string }>(
+        `SELECT r.run_id, repo.checkout_path
            FROM runs r
            JOIN assignments a ON a.role_key = r.owner_role_key
                              AND a.session_id = r.owner_session_id
@@ -111,8 +118,20 @@ export class ClaimRegistry {
         );
       }
 
+      if (request.worktreeId !== undefined && request.worktreeId !== null && !request.worktreeId.trim()) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "worktree claim must not be empty", {
+          repositoryIdentity: request.repositoryIdentity,
+        });
+      }
+      const canonicalWorktree = request.worktreeId
+        ? this.canonicalWorktree(request.worktreeId, authorized.checkout_path, request.repositoryIdentity)
+        : null;
+      if (canonicalWorktree && !canonicalWorktree.allowed) return canonicalWorktree as Decision<ClaimRecord[]>;
+
       const wanted: Array<Pick<ClaimRecord, "branch" | "worktreeId" | "declaredPath">> = [];
-      if (request.worktreeId) wanted.push({ branch: null, worktreeId: request.worktreeId, declaredPath: null });
+      if (canonicalWorktree?.allowed) {
+        wanted.push({ branch: null, worktreeId: canonicalWorktree.value, declaredPath: null });
+      }
       if (request.branch) wanted.push({ branch: request.branch, worktreeId: null, declaredPath: null });
       for (const path of request.declaredPaths ?? []) {
         const normalized = normalizePath(path);
@@ -175,13 +194,47 @@ export class ClaimRegistry {
         evidence: {
           repositoryIdentity: request.repositoryIdentity,
           branch: request.branch ?? null,
-          worktreeId: request.worktreeId ?? null,
+          worktreeId: canonicalWorktree?.allowed ? canonicalWorktree.value : null,
           paths: request.declaredPaths ?? [],
           expiresAt,
         },
       });
       return allow(ReasonCode.OK, created);
     });
+  }
+
+  /**
+   * `repositories.checkout_path` is registered from a real worktree probe and is unique
+   * machine-local state. Accepting an opaque ID here would make the unique worktree index
+   * protect a string rather than a directory (#357).
+   */
+  private canonicalWorktree(
+    requestedWorktreeId: string,
+    checkoutPath: string,
+    repositoryIdentity: string,
+  ): Decision<string> {
+    const expected = canonical(checkoutPath);
+    if (!isAbsolute(requestedWorktreeId)) {
+      return deny(
+        ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
+        "worktree claim must name an absolute registered checkout path",
+        { repositoryIdentity, declaredWorktreeId: requestedWorktreeId, registeredWorktreeId: expected },
+      );
+    }
+    const requested = canonical(requestedWorktreeId);
+    if (requested !== expected) {
+      return deny(
+        ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
+        "worktree claim must name the repository's canonical registered checkout path",
+        {
+          repositoryIdentity,
+          declaredWorktreeId: requestedWorktreeId,
+          canonicalDeclaredWorktreeId: requested,
+          registeredWorktreeId: expected,
+        },
+      );
+    }
+    return allow(ReasonCode.OK, expected);
   }
 
   private findConflict(

@@ -1,12 +1,13 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { symlinkSync } from "node:fs";
 
 import { isoPlus } from "../../src/core/clock.ts";
 import { newAssignmentId } from "../../src/core/ids.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ClaimRegistry } from "../../src/claims/claim-registry.ts";
 import {
   ManagedWriteGuard,
   ReadOperation,
@@ -140,6 +141,27 @@ describe("guard refuses arguments it cannot authorise reliably", () => {
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
   });
+
+  it("#356 refuses a path-only claim from burning a remote release without its branch or ref", async () => {
+    const { guard, seeded } = setup();
+    // `seedRun` gives this run a repository-wide path claim (`.`). Before #356 that
+    // unrelated local claim admitted a path-free release and invoked the effect.
+    let effectInvoked = false;
+    const decision = await guard.authorize({
+      operation: WriteOperation.GITHUB_RELEASE,
+      repositoryIdentity: seeded.identity,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    }, () => {
+      effectInvoked = true;
+      return "release attempted";
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    expect(effectInvoked).toBe(false);
+  });
 });
 
 describe("guard is role-aware (CP-HI-04)", () => {
@@ -172,7 +194,7 @@ describe("guard is role-aware (CP-HI-04)", () => {
 });
 
 describe("guard enforces the §23.2 claim rejects, not only exact paths", () => {
-  it("a worktree held by another run blocks the write", () => {
+  it("#357 blocks a checkout held under its canonical registered worktree path", () => {
     const { guard, db, clock, seeded, repo } = setup();
     otherRun(db, clock, seeded.projectId);
     db.run(
@@ -182,7 +204,7 @@ describe("guard enforces the §23.2 claim rejects, not only exact paths", () => 
        VALUES ('cw', ?, ?, 'run_other', ?, 1, ?, ?, 'HELD')`,
       [
         seeded.identity,
-        basename(repo),
+        canonical(repo),
         seeded.sessionId,
         clock.nowIso(),
         isoPlus(clock.nowIso(), 3_600_000),
@@ -192,6 +214,29 @@ describe("guard enforces the §23.2 claim rejects, not only exact paths", () => 
     const decision = guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") }));
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.CLAIM_WORKTREE_CONFLICT);
+  });
+
+  it("#357 refuses a caller-chosen worktree label before it can claim a registered checkout", () => {
+    const { db, clock, audit, bindings, seeded } = setup();
+    const claims = new ClaimRegistry(db, clock, audit, bindings);
+
+    const claimed = claims.acquire({
+      runId: seeded.runId,
+      ownerSessionId: seeded.sessionId,
+      ownerBindingGeneration: seeded.generation,
+      ownerRoleKey: seeded.roleKey,
+      repositoryIdentity: seeded.identity,
+      worktreeId: "custom",
+    });
+
+    expect(claimed.allowed).toBe(false);
+    expect(claimed.reasonCode).toBe(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH);
+    expect(
+      db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM resource_claims WHERE run_id = ? AND worktree_id = 'custom'`,
+        [seeded.runId],
+      )?.n,
+    ).toBe(0);
   });
 
   it("a branch held by another run blocks the write", () => {
@@ -302,6 +347,7 @@ describe("guard binds each operation to exactly one repository", () => {
       // A path inside the participating repository, but a different declared repository.
       targetPath: join(repo, "src/app.ts"),
       repositoryIdentity: "github:acme/unrelated",
+      targetBranch: "dev",
       runId: seeded.runId,
       sessionId: seeded.sessionId,
       bindingGeneration: seeded.generation,
@@ -321,6 +367,128 @@ describe("guard binds each operation to exactly one repository", () => {
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE);
     expect(String(decision.allowed === false ? decision.message : "")).toContain("work tree");
+  });
+});
+
+describe("remote writes name and fence their branch or ref (#356)", () => {
+  it("allows a release-branch PR while another run's feature branch remains HELD", async () => {
+    const { guard, db, clock, seeded } = setup();
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('feature_held', ?, 'feature/theirs', 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [seeded.identity, seeded.sessionId, clock.nowIso(), isoPlus(clock.nowIso(), 3_600_000)],
+    );
+    ownBranchClaim(db, clock, seeded, "release/mine");
+
+    const decision = await guard.authorize({
+      operation: WriteOperation.GITHUB_PR,
+      repositoryIdentity: seeded.identity,
+      targetBranch: "release/mine",
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    }, () => "PR written");
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
+    expect(
+      db.get<{ status: string }>(`SELECT status FROM resource_claims WHERE claim_id = 'feature_held'`)?.status,
+    ).toBe("HELD");
+  });
+
+  it("serializes concurrent remote writes on the same operation and branch", async () => {
+    const { guard, db, clock, seeded } = setup();
+    ownBranchClaim(db, clock, seeded, "release/fence");
+    const request = {
+      operation: WriteOperation.GITHUB_PR,
+      repositoryIdentity: seeded.identity,
+      targetBranch: "release/fence",
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    };
+
+    let enterFirst!: () => void;
+    const firstEntered = new Promise<void>((resolve) => {
+      enterFirst = resolve;
+    });
+    let releaseFirst!: () => void;
+    const firstMayFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const first = guard.authorize(request, async () => {
+      enterFirst();
+      await firstMayFinish;
+      return "first";
+    });
+    await firstEntered;
+
+    let secondEffectInvoked = false;
+    const second = await guard.authorize(request, () => {
+      secondEffectInvoked = true;
+      return "second";
+    });
+    expect(second.allowed).toBe(false);
+    expect(second.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+    expect(secondEffectInvoked).toBe(false);
+
+    releaseFirst();
+    expect((await first).reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
+  });
+});
+
+describe("expired leases and SQLite's HELD index stay coherent (#358)", () => {
+  it("expires a stale branch slot before a remote write, leaving the unique slot reclaimable", async () => {
+    const { guard, db, clock, seeded } = setup();
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('expired_dev', ?, 'dev', 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [seeded.identity, seeded.sessionId, clock.nowIso(), clock.nowIso()],
+    );
+    ownBranchClaim(db, clock, seeded, "release/live");
+
+    let effectInvoked = false;
+    const remote = await guard.authorize({
+      operation: WriteOperation.GITHUB_PR,
+      repositoryIdentity: seeded.identity,
+      targetBranch: "release/live",
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    }, () => {
+      effectInvoked = true;
+      return "remote write";
+    });
+
+    expect(remote.allowed).toBe(true);
+    expect(effectInvoked).toBe(true);
+    expect(
+      db.get<{ status: string }>(`SELECT status FROM resource_claims WHERE claim_id = 'expired_dev'`)?.status,
+    ).toBe("EXPIRED");
+    // This raw insert deliberately exercises the partial unique index. If the guard only
+    // filtered on expires_at instead of expiring the row, SQLite would still reject it.
+    expect(() =>
+      db.run(
+        `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                      owner_session_id, owner_binding_generation, acquired_at,
+                                      expires_at, status)
+         VALUES ('reclaimed_dev', ?, 'dev', ?, ?, ?, ?, ?, 'HELD')`,
+        [
+          seeded.identity,
+          seeded.runId,
+          seeded.sessionId,
+          seeded.generation,
+          clock.nowIso(),
+          isoPlus(clock.nowIso(), 3_600_000),
+        ],
+      ),
+    ).not.toThrow();
   });
 });
 

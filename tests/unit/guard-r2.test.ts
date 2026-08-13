@@ -97,6 +97,7 @@ describe("round-two managed-write regressions", () => {
     const repo = makeRepo();
     const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
     const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
+    addBranchClaim(core.db, core.clock, seeded, "claim_issue", "issue/fence");
 
     let remoteEntered!: () => void;
     const remoteEffectEntered = new Promise<void>((resolve) => {
@@ -109,6 +110,7 @@ describe("round-two managed-write regressions", () => {
     const remote = guard.authorize({
       operation: WriteOperation.GITHUB_ISSUE,
       repositoryIdentity: seeded.identity,
+      targetBranch: "issue/fence",
       runId: seeded.runId,
       sessionId: seeded.sessionId,
       bindingGeneration: seeded.generation,
