@@ -17,6 +17,13 @@ export const snapshotRepositorySchema = z
     repositoryRole: z.string().min(1),
     baseBranch: z.string().min(1),
     baseHead: z.string().regex(/^[0-9a-f]{40}$/),
+    /**
+     * The branch the candidate was required to be cut from, not the mutable PR
+     * target. These remain optional only so pre-lineage snapshot artifacts can be
+     * parsed; every snapshot built after this field was introduced writes both.
+     */
+    sourceBranch: z.string().min(1).nullable().optional(),
+    sourceHead: z.string().regex(/^[0-9a-f]{40}$/).nullable().optional(),
     candidateHead: z.string().regex(/^[0-9a-f]{40}$/),
     treeDigest: z.string().min(1),
     diffDigest: z.string().min(1),
@@ -24,7 +31,18 @@ export const snapshotRepositorySchema = z
     manifestDigest: z.string().nullable(),
     touchedPaths: z.array(z.string()),
   })
-  .strict();
+  .strict()
+  .superRefine((repository, ctx) => {
+    const hasSourceBranch = repository.sourceBranch != null;
+    const hasSourceHead = repository.sourceHead != null;
+    if (hasSourceBranch !== hasSourceHead) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "sourceBranch and sourceHead must be recorded together",
+        path: hasSourceBranch ? ["sourceHead"] : ["sourceBranch"],
+      });
+    }
+  });
 
 export const candidateSnapshotSchema = z
   .object({
@@ -54,6 +72,8 @@ export interface SnapshotRepositoryInput {
   checkoutPath: string;
   baseBranch: string;
   baseRef?: string;
+  /** Required branch origin, resolved to its exact SHA as part of the freeze. */
+  sourceBranch?: string | null;
   candidateRef?: string;
   worktreeId?: string | null;
   manifestDigest?: string | null;
@@ -82,7 +102,8 @@ export const duplicateRepositoryRoles = (
  *
  * The digest deliberately excludes `createdAt`: identity is the exact content of the
  * candidate, so re-freezing an unchanged candidate must produce the same digest,
- * while any moved head, tree or pinned manifest must produce a different one.
+ * while any moved head, tree, pinned manifest, or frozen source lineage must produce
+ * a different one.
  */
 export const candidateSnapshotDigest = (snapshot: CandidateSnapshot): string =>
   digestOf({
@@ -114,12 +135,16 @@ export const buildCandidateSnapshot = async (
   for (const input of params.repositories) {
     await assertWorktreeBinding(input);
     const baseHead = await revParse(input.checkoutPath, input.baseRef ?? input.baseBranch);
+    const sourceBranch = input.sourceBranch ?? null;
+    const sourceHead = sourceBranch === null ? null : await revParse(input.checkoutPath, sourceBranch);
     const candidateHead = await revParse(input.checkoutPath, input.candidateRef ?? "HEAD");
     repositories.push({
       identity: input.identity,
       repositoryRole: input.repositoryRole,
       baseBranch: input.baseBranch,
       baseHead,
+      sourceBranch,
+      sourceHead,
       candidateHead,
       treeDigest: `git-tree:${await treeOf(input.checkoutPath, candidateHead)}`,
       diffDigest: await diffDigest(input.checkoutPath, baseHead, candidateHead),
@@ -192,6 +217,8 @@ export const verifySnapshotFreshness = async (
       });
       continue;
     }
+    // The frozen source SHA, not the moving source branch ref, is the lineage evidence.
+    // Advancing that branch after freeze must therefore not rewrite or stale a candidate.
     // And a contract change is drift too: the candidate would be judged by a different bar.
     if (
       probe.activeManifestDigest !== undefined &&

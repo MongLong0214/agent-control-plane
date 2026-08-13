@@ -4,12 +4,14 @@ import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { commandsForMode } from "../contracts/manifest.ts";
+import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, RunState } from "../domain/types.ts";
+import { requiredBaseFor } from "../github/branch-contract.ts";
+import { currentBranch } from "../git/git.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProductionGate, ProductionReadyPacket } from "../ceo/production-gate.ts";
@@ -115,19 +117,34 @@ export class CandidatePipeline {
       return deny(ReasonCode.EVIDENCE_MISSING, "run has no participating repository", { runId });
     }
 
+    // This is the dispatch-time contract, so a later project-profile change cannot alter
+    // the branch a frozen candidate is asserted to have been cut from.
+    const profile: BranchProfile | null = run.pinnedManifestDigest
+      ? (this.projects.manifest(run.pinnedManifestDigest)?.branchProfile ?? null)
+      : null;
+    const repositories = await Promise.all(
+      participants.map(async (repo) => ({
+        identity: repo.identity,
+        repositoryRole: repo.repositoryRole,
+        checkoutPath: repo.checkoutPath,
+        baseBranch: repo.baseBranch,
+        baseRef: repo.baseBranch,
+        sourceBranch: await this.requiredSourceBranch(
+          repo.checkoutPath,
+          repo.workBranch,
+          repo.baseBranch,
+          profile,
+        ),
+        worktreeId: repo.worktreeId,
+        manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
+      })),
+    );
+
     const snapshot = await buildCandidateSnapshot(
       {
         runId,
         contractDigest: run.contractDigest,
-        repositories: participants.map((repo) => ({
-          identity: repo.identity,
-          repositoryRole: repo.repositoryRole,
-          checkoutPath: repo.checkoutPath,
-          baseBranch: repo.baseBranch,
-          baseRef: repo.baseBranch,
-          worktreeId: repo.worktreeId,
-          manifestDigest: this.repositories.byIdentity(repo.identity)?.activeManifestDigest ?? null,
-        })),
+        repositories,
       },
       this.clock,
     );
@@ -144,6 +161,8 @@ export class CandidatePipeline {
         repositories: snapshot.repositories.map((r) => ({
           identity: r.identity,
           candidateHead: r.candidateHead,
+          sourceBranch: r.sourceBranch ?? null,
+          sourceHead: r.sourceHead ?? null,
           files: r.touchedPaths.length,
         })),
       },
@@ -599,5 +618,22 @@ export class CandidatePipeline {
       }))
       .filter((p) => p.checkoutPath);
     return verifySnapshotFreshness(snapshot, probes);
+  }
+
+  /**
+   * The live checkout names the branch in ordinary work; a detached managed worktree
+   * uses the branch recorded when it was assigned. In both cases the source is derived
+   * from the profile pinned at dispatch, never from the PR target.
+   */
+  private async requiredSourceBranch(
+    checkoutPath: string,
+    workBranch: string | null,
+    targetBranch: string,
+    profile: BranchProfile | null,
+  ): Promise<string | null> {
+    if (!profile) return null;
+    const observedBranch = await currentBranch(checkoutPath);
+    const candidateBranch = observedBranch === "HEAD" ? workBranch : observedBranch;
+    return candidateBranch ? requiredBaseFor(candidateBranch, profile, targetBranch) : null;
   }
 }
