@@ -23,8 +23,7 @@ import {
   makeRepo,
   seedRun,
   tempDir,
-  writeFiles,
-} from "../helpers/fixtures.ts";
+  writeFiles, transitionSeededRun } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -345,7 +344,9 @@ describe("guard grants are fenced, short-lived and single use", () => {
     const decision = guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") }));
     if (!decision.allowed) throw new Error(decision.message);
 
-    db.run(`UPDATE runs SET state = 'BLOCKED' WHERE run_id = ?`, [seeded.runId]);
+    // The grant was issued while the run was ACTIVE; the point is what `consume` does once it
+    // is not. §29 refuses a raw state edge (#66), so the edge is taken through the authority.
+    transitionSeededRun(db, seeded.runId, "BLOCKED");
     const consumed = guard.consume(decision.value.grantId);
     expect(consumed.allowed).toBe(false);
     expect(consumed.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);

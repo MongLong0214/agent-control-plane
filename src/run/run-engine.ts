@@ -6,7 +6,7 @@ import { newRunId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
-import type { Db } from "../db/database.ts";
+import type { Db, RunStateTransitionAuthority } from "../db/database.ts";
 import { canTransition } from "../domain/run-state.ts";
 import {
   ArtifactKind,
@@ -90,6 +90,14 @@ export interface ContinuityGate {
 }
 
 export class RunEngine {
+  /**
+   * §29 authority. The database refuses `UPDATE runs SET state` unless this operation raised
+   * its marker, so the engine is the only component that can move a run — a raw caller can
+   * take a *legal* edge only by going through here, which also writes the transition evidence
+   * and the outbox envelope in the same transaction (#66).
+   */
+  readonly #stateTransitions: RunStateTransitionAuthority;
+
   #cto: CtoProvisioner | null = null;
   #capacity: CapacityGate | null = null;
   #continuity: ContinuityGate | null = null;
@@ -105,7 +113,9 @@ export class RunEngine {
     private readonly tasks: TaskGraph,
     private readonly claims: ClaimRegistry,
     private readonly telemetry: Telemetry,
-  ) {}
+  ) {
+    this.#stateTransitions = db.claimRunStateTransitionAuthority();
+  }
 
   /** Wired after construction because the CTO lifecycle also needs the run engine. */
   attach(ports: {
@@ -257,49 +267,58 @@ export class RunEngine {
         fresh.pinnedManifestDigest ??
         (fresh.projectId ? (this.projects.get(fresh.projectId)?.activeManifestDigest ?? null) : null);
 
-      this.db.run(
-        `UPDATE runs SET state = 'ACTIVE', dispatched_at = ?, state_reason = ?,
-                         owner_session_id = ?, owner_binding_generation = ?,
-                         owner_session_incarnation = ?, owner_role_key = ?,
-                         pinned_manifest_digest = COALESCE(pinned_manifest_digest, ?)
-          WHERE run_id = ?`,
-        [
-          this.clock.nowIso(), "dispatched", binding?.sessionId ?? null,
-          binding?.bindingGeneration ?? null, binding?.sessionIncarnation ?? null,
-          binding?.roleKey ?? null, effectiveManifest, runId,
-        ],
-      );
-
-      if (binding) {
-        // §30.3 — the state transition and its outbox enqueue are one transaction.
-        this.outbox.enqueue({
-          idempotencyKey: `run-dispatch:${runId}:${binding.bindingGeneration}`,
-          roleKey: binding.roleKey,
-          bindingGeneration: binding.bindingGeneration,
-          targetSessionId: binding.sessionId,
-          runId,
-          kind: MessageKind.RUN_DISPATCH,
-          payload: {
-            runId,
-            goal: fresh.goal,
-            executionMode: fresh.executionMode,
-            priority: fresh.priority,
-            contractDigest: fresh.contractDigest,
-            pinnedManifestDigest: effectiveManifest,
-          },
-        });
-      }
-
-      this.audit.record({
-        kind: "DISPATCHED",
+      // §29/§30.3 — activation, its envelope and its audit record are one operation; the
+      // database refuses the state write unless this raises the marker (#66).
+      this.db.applyRunStateTransition(this.#stateTransitions, {
         runId,
-        projectId: fresh.projectId,
-        sessionId: binding?.sessionId ?? null,
-        roleKey: binding?.roleKey ?? null,
-        evidence: {
-          ownerBindingGeneration: binding?.bindingGeneration ?? null,
-          pinnedManifestDigest: effectiveManifest,
+        toState: RunState.ACTIVE,
+        recordTransitionEvidence: () => {
+          this.audit.record({
+            kind: "DISPATCHED",
+            runId,
+            projectId: fresh.projectId,
+            sessionId: binding?.sessionId ?? null,
+            roleKey: binding?.roleKey ?? null,
+            evidence: {
+              ownerBindingGeneration: binding?.bindingGeneration ?? null,
+              pinnedManifestDigest: effectiveManifest,
+            },
+          });
+          return allow(ReasonCode.OK, undefined);
         },
+        enqueueTransitionEnvelope: () => {
+          if (!binding) return allow(ReasonCode.OK, undefined);
+          const enqueued = this.outbox.enqueue({
+            idempotencyKey: `run-dispatch:${runId}:${binding.bindingGeneration}`,
+            roleKey: binding.roleKey,
+            bindingGeneration: binding.bindingGeneration,
+            targetSessionId: binding.sessionId,
+            runId,
+            kind: MessageKind.RUN_DISPATCH,
+            payload: {
+              runId,
+              goal: fresh.goal,
+              executionMode: fresh.executionMode,
+              priority: fresh.priority,
+              contractDigest: fresh.contractDigest,
+              pinnedManifestDigest: effectiveManifest,
+            },
+          });
+          return enqueued.allowed ? allow(ReasonCode.OK, undefined) : (enqueued as Decision<unknown>);
+        },
+        updateState: () =>
+          this.db.run(
+            `UPDATE runs SET state = 'ACTIVE', dispatched_at = ?, state_reason = ?,
+                             owner_session_id = ?, owner_binding_generation = ?,
+                             owner_session_incarnation = ?, owner_role_key = ?,
+                             pinned_manifest_digest = COALESCE(pinned_manifest_digest, ?)
+              WHERE run_id = ?`,
+            [
+              this.clock.nowIso(), "dispatched", binding?.sessionId ?? null,
+              binding?.bindingGeneration ?? null, binding?.sessionIncarnation ?? null,
+              binding?.roleKey ?? null, effectiveManifest, runId,
+            ],
+          ),
       });
 
       return allow(ReasonCode.OK, this.require(runId));
@@ -411,12 +430,31 @@ export class RunEngine {
       if (!check.allowed) return check as Decision<RunRow>;
 
       const terminal = to === RunState.COMPLETED || to === RunState.FAILED || to === RunState.CANCELLED;
-      this.db.run(
-        `UPDATE runs SET state = ?, state_reason = ?, ended_at = ?,
-                         revision_count = revision_count + ?
-          WHERE run_id = ?`,
-        [to, reason, terminal ? this.clock.nowIso() : null, to === RunState.REVISION_REQUIRED ? 1 : 0, runId],
-      );
+      // §29 — the state edge, its evidence and its envelope are one operation. The database
+      // refuses the update unless this raises the marker, so a legal edge cannot be taken
+      // outside the runtime authority (#66).
+      const applied = this.db.applyRunStateTransition(this.#stateTransitions, {
+        runId,
+        toState: to,
+        recordTransitionEvidence: () => {
+          this.audit.record({
+            kind: "RUN_TRANSITION",
+            runId,
+            projectId: run.projectId,
+            evidence: { from: run.state, to, reason, ...evidence },
+          });
+          return allow(ReasonCode.OK, undefined);
+        },
+        enqueueTransitionEnvelope: () => allow(ReasonCode.OK, undefined),
+        updateState: () =>
+          this.db.run(
+            `UPDATE runs SET state = ?, state_reason = ?, ended_at = ?,
+                             revision_count = revision_count + ?
+              WHERE run_id = ?`,
+            [to, reason, terminal ? this.clock.nowIso() : null, to === RunState.REVISION_REQUIRED ? 1 : 0, runId],
+          ),
+      });
+      void applied;
 
       if (terminal) {
         this.claims.releaseRun(runId);
@@ -437,12 +475,6 @@ export class RunEngine {
         });
       }
 
-      this.audit.record({
-        kind: "RUN_TRANSITION",
-        runId,
-        projectId: run.projectId,
-        evidence: { from: run.state, to, reason, ...evidence },
-      });
       return allow(ReasonCode.OK, this.require(runId));
     });
   }

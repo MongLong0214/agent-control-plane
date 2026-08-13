@@ -12,8 +12,7 @@ import {
   makeCore,
   makeRepo,
   seedRun,
-  tempDir,
-} from "../helpers/fixtures.ts";
+  tempDir, transitionSeededRun } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -151,12 +150,13 @@ describe("round-two managed-write regressions", () => {
     const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
     const guard = new ManagedWriteGuard(core.db, realWorkspaceProbe, core.audit, core.clock);
 
-    core.db.run(`UPDATE runs SET state = 'BLOCKED' WHERE run_id = ?`, [seeded.runId]);
+    // A run that is not deciding on a candidate cannot freeze source. The edge goes through the
+    // §29 authority because a raw `UPDATE runs SET state` is refused now (#66).
+    transitionSeededRun(core.db, seeded.runId, "BLOCKED");
     const terminal = guard.acquireSourceReadLease(seeded.runId, [seeded.identity]);
     expect(terminal.allowed).toBe(false);
     expect(terminal.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
-
-    core.db.run(`UPDATE runs SET state = 'ACTIVE' WHERE run_id = ?`, [seeded.runId]);
+    transitionSeededRun(core.db, seeded.runId, "ACTIVE");
     const outside = guard.acquireSourceReadLease(seeded.runId, [seeded.identity, "github:acme/other"]);
     expect(outside.allowed).toBe(false);
     expect(outside.reasonCode).toBe(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE);

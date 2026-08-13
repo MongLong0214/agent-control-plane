@@ -5,7 +5,7 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
-import { cleanupTempDirs, gitSync, makeRepo } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, makeRepo} from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
   type Harness,
@@ -496,8 +496,10 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
       repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
     });
     if (!created.allowed) throw new Error(created.message);
+    // The owner tuple is not a state edge, so it is written directly; the edge itself goes
+    // through the §29 authority, because a raw `UPDATE runs SET state` is refused now (#66).
     harness.cp.db.run(
-      `UPDATE runs SET state = 'ACTIVE', owner_session_id = ?, owner_binding_generation = ?,
+      `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
                        owner_role_key = ?, owner_session_incarnation = ?
         WHERE run_id = ?`,
       [
@@ -508,6 +510,8 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
         created.value.runId,
       ],
     );
+    const activated = harness.cp.runs.transition(created.value.runId, RunState.ACTIVE, "fixture activation");
+    if (!activated.allowed) throw new Error(activated.message);
 
     const refused = harness.cp.cto.acknowledgeHandoff(
       prepared.value.handoffId,

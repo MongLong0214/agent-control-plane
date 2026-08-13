@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ManualClock, isoPlus } from "../../src/core/clock.ts";
+import { allow } from "../../src/core/errors.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { newAssignmentId, newRepositoryId, newRunId, newSessionId } from "../../src/core/ids.ts";
 import { ArtifactStore } from "../../src/db/artifacts.ts";
 import { AuditLog } from "../../src/db/audit.ts";
@@ -178,4 +180,29 @@ export const seedRun = (options: SeedRunOptions): SeededRun => {
   }
 
   return { runId, sessionId, repositoryId, identity, generation: 1, roleKey, projectId };
+};
+
+/**
+ * Moves a seeded run through the §29 authority, the way the engine does.
+ *
+ * A raw `UPDATE runs SET state` is refused by the database now (#66), and that is the point —
+ * so a unit test with no RunEngine claims the authority itself and takes the edge as one
+ * operation, rather than proving the trigger works a second time.
+ */
+const seededRunAuthorities = new Map<string, ReturnType<Db["claimRunStateTransitionAuthority"]>>();
+
+export const transitionSeededRun = (db: Db, runId: string, toState: string): void => {
+  // Claimed once per database: the authority is issued exactly once, which is the point of it.
+  let authority = seededRunAuthorities.get(db.file);
+  if (!authority) {
+    authority = db.claimRunStateTransitionAuthority();
+    seededRunAuthorities.set(db.file, authority);
+  }
+  db.applyRunStateTransition(authority, {
+    runId,
+    toState,
+    recordTransitionEvidence: () => allow(ReasonCode.OK, undefined),
+    enqueueTransitionEnvelope: () => allow(ReasonCode.OK, undefined),
+    updateState: () => db.run(`UPDATE runs SET state = ? WHERE run_id = ?`, [toState, runId]),
+  });
 };
