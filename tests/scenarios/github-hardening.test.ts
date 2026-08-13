@@ -26,8 +26,32 @@ interface Fixture {
   payload: GatePayload;
 }
 
+/** Model GitHub's post-merge pull re-read: its target ref advances to the merge SHA. */
+const reflectMergedBase = (github: FakeGitHub): void => {
+  const request = github.request.bind(github);
+  github.request = async <T>(
+    method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+    path: string,
+    body?: unknown,
+  ): Promise<T> => {
+    const response = await request<T>(method, path, body);
+    if (method !== "PUT" || !/\/pulls\/\d+\/merge$/.test(path) || !response || typeof response !== "object") {
+      return response;
+    }
+    const merge = response as { merged?: unknown; sha?: unknown };
+    const pullNumber = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
+    const pull = github.pulls.find((entry) => entry.number === pullNumber);
+    if (merge.merged !== true || typeof merge.sha !== "string" || !pull) return response;
+    pull.base.sha = merge.sha;
+    (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = merge.sha;
+    github.setBranch(pull.base.ref, merge.sha);
+    return response;
+  };
+};
+
 const setup = async (options: { declareChecks?: boolean } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
+  reflectMergedBase(github);
   Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
@@ -561,6 +585,7 @@ describe("merge order and dependents are enforced by the kernel (§24.7)", () =>
 describe("round-2 review: post-merge coverage and receipts", () => {
   it("requires every declared check, not the subset the caller names (github#5)", async () => {
     const github = new FakeGitHub();
+    reflectMergedBase(github);
     const harness = makeHarness({ githubClient: github });
     harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
     const driven = await driveToReviewedCandidate(harness, {

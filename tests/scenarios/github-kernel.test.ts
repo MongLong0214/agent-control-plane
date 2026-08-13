@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -72,6 +72,29 @@ interface Fixture {
   payload: GatePayload;
 }
 
+/** Model GitHub's post-merge pull re-read: its target ref advances to the merge SHA. */
+const reflectMergedBase = (github: FakeGitHub): void => {
+  const request = github.request.bind(github);
+  github.request = async <T>(
+    method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+    path: string,
+    body?: unknown,
+  ): Promise<T> => {
+    const response = await request<T>(method, path, body);
+    if (method !== "PUT" || !/\/pulls\/\d+\/merge$/.test(path) || !response || typeof response !== "object") {
+      return response;
+    }
+    const merge = response as { merged?: unknown; sha?: unknown };
+    const pullNumber = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
+    const pull = github.pulls.find((entry) => entry.number === pullNumber);
+    if (merge.merged !== true || typeof merge.sha !== "string" || !pull) return response;
+    pull.base.sha = merge.sha;
+    (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = merge.sha;
+    github.setBranch(pull.base.ref, merge.sha);
+    return response;
+  };
+};
+
 /**
  * A real run driven to production-ready, so the gate payload names evidence that exists.
  * The kernel refuses to publish a gate for digests it cannot resolve, which means these
@@ -79,6 +102,7 @@ interface Fixture {
  */
 const setup = async (): Promise<Fixture> => {
   const github = new FakeGitHub();
+  reflectMergedBase(github);
   Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
@@ -946,6 +970,139 @@ describe("crash and acknowledgement recovery", () => {
         `SELECT status, verified FROM github_receipts WHERE operation = 'merge_execute'`,
       ),
     ).toEqual({ status: "PENDING", verified: 0 });
+    expect(
+      mergeFixture.harness.cp.runs
+        .repositoriesOf(mergeFixture.runId)
+        .find((entry) => entry.identity === mergeFixture.identity)?.mergeState,
+    ).toBe("FAILED");
+  });
+});
+
+describe("merge target proof (#350)", () => {
+  const openPreparedPull = async (fixture: Fixture) => {
+    const gate = await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
+    if (!gate.allowed) throw new Error(gate.message);
+    const pr = await fixture.harness.cp.github.prPrepare(prepareInput(fixture));
+    if (!pr.allowed) throw new Error(pr.message);
+    return pr.value.pullNumber;
+  };
+
+  it("blocks a same-SHA PR base retarget in preflight before GitHub merges", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    fixture.github.setBranch("other", fixture.base);
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    const request = fixture.github.request.bind(fixture.github);
+    let pullReads = 0;
+    fixture.github.request = async (method, path, body) => {
+      if (method === "GET" && path.endsWith(`/pulls/${pullNumber}`) && ++pullReads === 2) {
+        pull.base = { ref: "other", sha: fixture.base };
+      }
+      return request(method, path, body);
+    };
+
+    const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(refused.reasonCode).toBe(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED);
+    expect(fixture.github.mergeCount).toBe(0);
+    expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(0);
+  });
+
+  it("fails an executed retarget and clears its local reservation for reconciliation", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    fixture.github.setBranch("other", fixture.base);
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async (method, path, body) => {
+      if (method === "PUT" && path.endsWith("/merge")) {
+        // The retarget occurs after the last preflight but before the remote merge; `other`
+        // still starts at A, so first-parent-only proof would falsely accept this write.
+        pull.base = { ref: "other", sha: fixture.base };
+      }
+      return request(method, path, body);
+    };
+
+    const input = mergeInput(fixture, pullNumber);
+    const first = await fixture.harness.cp.github.mergeExecute(input);
+    expect(first.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(
+      fixture.harness.cp.db.get<{ status: string; verified: number }>(
+        `SELECT status, verified FROM github_receipts WHERE operation = 'merge_execute'`,
+      ),
+    ).toEqual({ status: "PENDING", verified: 0 });
+    expect(
+      fixture.harness.cp.runs.repositoriesOf(fixture.runId).find((entry) => entry.identity === fixture.identity)
+        ?.mergeState,
+    ).toBe("FAILED");
+
+    // The durable receipt stays PENDING, but the in-process reservation must be released so
+    // this call reaches the reconcile proof instead of returning RESOURCE_COLLISION. Model a
+    // restart-era PENDING state as well: reconciliation must independently fail closed.
+    const repository = fixture.harness.cp.runs
+      .repositoriesOf(fixture.runId)
+      .find((entry) => entry.identity === fixture.identity)!;
+    fixture.harness.cp.runs.setRepositoryMergeState(fixture.runId, repository.repositoryId, "PENDING");
+    const reconciled = await fixture.harness.cp.github.mergeExecute(input);
+    expect(reconciled.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(
+      fixture.harness.cp.runs.repositoriesOf(fixture.runId).find((entry) => entry.identity === fixture.identity)
+        ?.mergeState,
+    ).toBe("FAILED");
+  });
+
+  it("requires the prepared base ref itself to point at the acknowledged merge commit", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      const response = await request<T>(method, path, body);
+      if (method === "PUT" && path.endsWith("/merge")) {
+        // A target-branch write immediately after the merge acknowledgement must not be
+        // mistaken for the acknowledged merge still being the target ref's tip.
+        fixture.github.setBranch("dev", fixture.base);
+        pull.base.sha = fixture.base;
+      }
+      return response;
+    };
+
+    const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(refused.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(
+      fixture.harness.cp.runs.repositoriesOf(fixture.runId).find((entry) => entry.identity === fixture.identity)
+        ?.mergeState,
+    ).toBe("FAILED");
+  });
+
+  it("sends a pinned rebase strategy to GitHub as rebase", async () => {
+    const fixture = await setup();
+    const originalManifest = fixture.harness.cp.projects.manifest.bind(fixture.harness.cp.projects);
+    const manifest = vi.spyOn(fixture.harness.cp.projects, "manifest").mockImplementation((digest) => {
+      const pinned = originalManifest(digest);
+      return pinned
+        ? { ...pinned, branchProfile: { ...pinned.branchProfile, mergeStrategy: "rebase" as never } }
+        : null;
+    });
+    try {
+      const pullNumber = await openPreparedPull(fixture);
+      const merged = await fixture.harness.cp.github.mergeExecute({
+        ...mergeInput(fixture, pullNumber),
+        mergeStrategy: "rebase" as never,
+      });
+      expect(merged.reasonCode).toBe(ReasonCode.OK);
+      expect(
+        fixture.github.calls.find((call) => call.method === "PUT" && call.path.endsWith("/merge"))?.body,
+      ).toEqual({ sha: fixture.head, merge_method: "rebase" });
+    } finally {
+      manifest.mockRestore();
+    }
   });
 });
 

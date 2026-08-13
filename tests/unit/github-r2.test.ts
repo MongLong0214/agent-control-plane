@@ -69,8 +69,32 @@ const reservedThenCompletedMerge = (
   );
 };
 
+/** Model GitHub's post-merge pull re-read: its target ref advances to the merge SHA. */
+const reflectMergedBase = (github: FakeGitHub): void => {
+  const request = github.request.bind(github);
+  github.request = async <T>(
+    method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+    path: string,
+    body?: unknown,
+  ): Promise<T> => {
+    const response = await request<T>(method, path, body);
+    if (method !== "PUT" || !/\/pulls\/\d+\/merge$/.test(path) || !response || typeof response !== "object") {
+      return response;
+    }
+    const merge = response as { merged?: unknown; sha?: unknown };
+    const pullNumber = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
+    const pull = github.pulls.find((entry) => entry.number === pullNumber);
+    if (merge.merged !== true || typeof merge.sha !== "string" || !pull) return response;
+    pull.base.sha = merge.sha;
+    (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = merge.sha;
+    github.setBranch(pull.base.ref, merge.sha);
+    return response;
+  };
+};
+
 const ready = async (ciWorkflows: Array<{ path: string; checkName: string; approvedDigest: string | null }> = []) => {
   const github = new FakeGitHub();
+  reflectMergedBase(github);
   Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
@@ -274,7 +298,8 @@ describe("round-two GitHub hardening", () => {
       `SELECT response_json FROM github_receipts WHERE operation = 'merge_execute'`,
     );
     expect(JSON.parse(receipt!.response_json).baseVerification).toEqual({
-      preflight: "exact-base-reread",
+      preflight: "prepared-base-ref-and-sha",
+      postflight: "prepared-base-ref-points-at-merge-commit",
       residualRace: "base-may-move-between-preflight-and-merge",
       proof: "merge-commit-first-parent",
     });
