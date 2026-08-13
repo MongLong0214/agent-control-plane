@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { allow, isAcpError } from "../../src/core/errors.ts";
@@ -189,21 +189,54 @@ describe("a CEO decision comes from the session that holds the role (CP-HI-07)",
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
   });
 
-  it("#375 refuses final confirmation when work appears after the packet", async () => {
-    const { harness, driven } = await readyForReview();
-    // TaskGraph owns normal admission denial. This models a missed admission path and proves
-    // that a durable packet alone cannot remain a completion claim after its graph changes.
-    harness.cp.db.run(
-      `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
-       VALUES (?, ?, ?, 'implementation', 'PENDING', '{}', ?, ?)`,
-      [
-        "task_post_packet",
-        driven.runId,
-        "work admitted after packet publication",
-        harness.clock.nowIso(),
-        harness.clock.nowIso(),
-      ],
-    );
+  it("#375 refuses final confirmation when work is admitted during packet publication", async () => {
+    const harness = makeHarness();
+    const driven = await driveToReviewedCandidate(harness);
+    await harness.cp.continuity.evaluate("test");
+
+    // The packet's first completeness check races legitimate task admission while the run is
+    // still ACTIVE. Once the packet transitions the run to READY_FOR_CEO_REVIEW, the seal
+    // correctly prevents any further admission; CONFIRM must still recheck this real graph.
+    const realCompleteness = harness.cp.tasks.completeness.bind(harness.cp.tasks);
+    let injected = false;
+    const interleave = vi.spyOn(harness.cp.tasks, "completeness").mockImplementation((runId) => {
+      const completeness = realCompleteness(runId);
+      if (runId === driven.runId && !injected && completeness.allowed) {
+        const submitted = harness.cp.tasks.submit(runId, [
+          { key: "late", title: "work admitted during packet publication", category: "implementation" },
+        ]);
+        if (!submitted.allowed) throw new Error(`${submitted.reasonCode}: ${submitted.message}`);
+        injected = true;
+      }
+      return completeness;
+    });
+
+    try {
+      const packet = harness.cp.ceo.buildPacket({
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        approval: {
+          runId: driven.runId,
+          candidateSnapshotDigest: driven.candidateSnapshotDigest,
+          resultSummary: "done",
+          recommendation: "merge",
+          residualRisk: [],
+          approvedBySessionId: driven.ownerSessionId,
+          approvedByGeneration: driven.ownerBindingGeneration,
+          approvedAt: harness.clock.nowIso(),
+        },
+      });
+      if (!packet.allowed) throw new Error(`${packet.reasonCode}: ${packet.message}`);
+    } finally {
+      interleave.mockRestore();
+    }
+
+    expect(injected).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+    const staleCompleteness = harness.cp.tasks.completeness(driven.runId);
+    expect(staleCompleteness.allowed).toBe(false);
+    expect(staleCompleteness.reasonCode).toBe(ReasonCode.TASK_RESULT_COUNT_MISMATCH);
+
     const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
 
     const refused = harness.cp.ceo.submitCeoDecision({
