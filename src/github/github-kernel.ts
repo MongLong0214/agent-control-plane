@@ -1011,13 +1011,6 @@ export class GitHubKernel {
     if (!contract.allowed) {
       return deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, contract.message, contract.evidence);
     }
-    const lineage = await this.assertPreparedSourceLineage(
-      input.repositoryIdentity,
-      prepared.value,
-      candidate.value,
-    );
-    if (!lineage.allowed) return lineage as Decision<{ predicates: Record<string, boolean> }>;
-
     const gate = await this.verifyGate(input.repositoryIdentity, pull.head.sha, input.runId);
     if (!gate.allowed) return gate as Decision<{ predicates: Record<string, boolean> }>;
 
@@ -2625,36 +2618,6 @@ export class GitHubKernel {
           repositoryIdentity,
           sourceBranch,
           expectedSourceHead: sourceHead,
-          mergeBase: observed,
-        });
-  }
-
-  /** Re-check the immutable prepare receipt against the exact frozen origin before a merge. */
-  private async assertPreparedSourceLineage(
-    repositoryIdentity: string,
-    prepared: PreparedPrIntent,
-    candidate: CandidateSnapshot["repositories"][number],
-  ): Promise<Decision<void>> {
-    if (candidate.sourceBranch !== prepared.sourceBranch || candidate.sourceHead !== prepared.sourceHead) {
-      return deny(ReasonCode.SNAPSHOT_STALE, "prepared pull request has a different frozen source lineage", {
-        repositoryIdentity,
-        prepared: { sourceBranch: prepared.sourceBranch, sourceHead: prepared.sourceHead },
-        current: { sourceBranch: candidate.sourceBranch ?? null, sourceHead: candidate.sourceHead ?? null },
-      });
-    }
-    const repository = this.repositories.byIdentity(repositoryIdentity);
-    if (!repository) {
-      return deny(ReasonCode.EVIDENCE_MISSING, "candidate repository has no local checkout for source lineage proof", {
-        repositoryIdentity,
-      });
-    }
-    const observed = await mergeBase(repository.checkoutPath, prepared.sourceHead, candidate.candidateHead);
-    return observed === prepared.sourceHead
-      ? allow(ReasonCode.OK, undefined)
-      : deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, "candidate no longer descends from prepared source lineage", {
-          repositoryIdentity,
-          sourceBranch: prepared.sourceBranch,
-          expectedSourceHead: prepared.sourceHead,
           mergeBase: observed,
         });
   }

@@ -183,6 +183,26 @@ export const requiredBaseFor = (
 ): string | null =>
   REQUIRED_BASE[classifyBranch(branch, profile).class](profile, declaredParent ?? null);
 
+/**
+ * Origins to compare during freeze when the origin is not captured by the branch-creation
+ * caller. Release and hotfix branches are the only classes whose PR target can be another
+ * long-lived branch, so ancestry against the configured long-lived refs must be disambiguated
+ * before one of them is recorded in the candidate snapshot. Other classes have one declared
+ * source and probing alternatives would reject valid parent-lineage candidates.
+ */
+export const sourceProbeBranchesFor = (
+  branch: string,
+  profile: BranchProfile,
+  declaredParent?: string | null,
+): string[] => {
+  const required = requiredBaseFor(branch, profile, declaredParent);
+  if (!required) return [];
+  const branchClass = classifyBranch(branch, profile).class;
+  return branchClass === "release" || branchClass === "hotfix"
+    ? [...new Set([required, ...profile.longLived])]
+    : [required];
+};
+
 /** Integration §9.6 — every target a hotfix must reach. */
 export const hotfixPropagationTargets = (
   profile: BranchProfile,

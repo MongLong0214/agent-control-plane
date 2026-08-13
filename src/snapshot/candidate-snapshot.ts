@@ -74,6 +74,8 @@ export interface SnapshotRepositoryInput {
   baseRef?: string;
   /** Required branch origin, resolved to its exact SHA as part of the freeze. */
   sourceBranch?: string | null;
+  /** The exact origin SHA selected by freeze; this ref is never re-resolved here. */
+  sourceHead?: string | null;
   candidateRef?: string;
   worktreeId?: string | null;
   manifestDigest?: string | null;
@@ -136,7 +138,14 @@ export const buildCandidateSnapshot = async (
     await assertWorktreeBinding(input);
     const baseHead = await revParse(input.checkoutPath, input.baseRef ?? input.baseBranch);
     const sourceBranch = input.sourceBranch ?? null;
-    const sourceHead = sourceBranch === null ? null : await revParse(input.checkoutPath, sourceBranch);
+    const sourceHead = input.sourceHead ?? null;
+    if ((sourceBranch === null) !== (sourceHead === null)) {
+      fail(ReasonCode.INVALID_ARGUMENT, "sourceBranch and sourceHead must be supplied together", {
+        identity: input.identity,
+        sourceBranch,
+        sourceHead,
+      });
+    }
     const candidateHead = await revParse(input.checkoutPath, input.candidateRef ?? "HEAD");
     repositories.push({
       identity: input.identity,

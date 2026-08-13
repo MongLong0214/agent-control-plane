@@ -196,6 +196,8 @@ const setupLineageFixture = async (input: {
   activeReleases?: readonly string[];
   /** Advance the required source separately to prove a candidate was cut from the wrong branch. */
   divergentBranch?: "dev" | "main";
+  /** Keep main and dev at their shared root so the freeze resolver must reject ambiguity. */
+  sharedAncestor?: boolean;
 }): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
@@ -224,8 +226,10 @@ const setupLineageFixture = async (input: {
     commitAll(harness.repoPath, `advance required source ${input.divergentBranch}`);
   }
   gitSync(harness.repoPath, ["checkout", "-q", input.sourceBranch]);
-  writeFiles(harness.repoPath, { "LINEAGE.md": `cut ${input.workBranch} from ${input.sourceBranch}\n` });
-  commitAll(harness.repoPath, `advance ${input.sourceBranch} before cut`);
+  if (!input.sharedAncestor) {
+    writeFiles(harness.repoPath, { "LINEAGE.md": `cut ${input.workBranch} from ${input.sourceBranch}\n` });
+    commitAll(harness.repoPath, `advance ${input.sourceBranch} before cut`);
+  }
 
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: input.workBranch,
@@ -678,6 +682,36 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
     // If the merge-base proof is deleted, the required branch name still looks correct and
     // this formerly accepted main target would create a PR. The failure proves ancestry,
     // rather than target naming, is the enforcement.
+    expect(refused.reasonCode).toBe(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION);
+    expect(fixture.github.pulls).toHaveLength(0);
+  });
+
+  it("#422: a release cut from main is refused when main and dev still share their ancestor", async () => {
+    // C is the exact tip of both main and dev. The release is then cut from main at C and
+    // receives its candidate commit; dev is deliberately never advanced.
+    const fixture = await setupLineageFixture({
+      workBranch: "release/1.2.0",
+      sourceBranch: "main",
+      baseBranch: "main",
+      sharedAncestor: true,
+    });
+    expect(gitSync(fixture.harness.repoPath, ["rev-parse", "main"])).toBe(
+      gitSync(fixture.harness.repoPath, ["rev-parse", "dev"]),
+    );
+
+    const refused = await fixture.harness.cp.github.prPrepare({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      head: fixture.workBranch,
+      base: "main",
+      title: "ambiguous-origin release candidate",
+      body: "",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+      exactHeadSha: fixture.head,
+    });
+
+    expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION);
     expect(fixture.github.pulls).toHaveLength(0);
   });
