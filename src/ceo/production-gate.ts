@@ -533,6 +533,14 @@ export class ProductionGate {
 
     try {
       return this.db.tx(() => {
+        // A packet is immutable audit evidence of the graph at publication time, not a
+        // completion token. Re-read completeness under the same write transaction as the
+        // terminal transition so work admitted after publication cannot complete the run.
+        if (input.decision === "CONFIRM") {
+          const completeness = this.tasks.completeness(input.runId);
+          if (!completeness.allowed) return completeness as Decision<{ state: RunState }>;
+        }
+
         if (input.decision === "CONFIRM" && isBootstrap) {
           const finalizer = this.#bootstrapActivation;
           if (!finalizer) {
@@ -975,14 +983,14 @@ export class ProductionGate {
    * process can be reached by an untrusted request path, so only an admitted receipt that
    * binds this exact operation proves non-delegable owner authority (CP-HI-07).
    */
-  private attributeOwnerDecision(input: {
+  private assertOwnerDecisionReceipt(input: {
     runId: string;
     item: string;
     approved: boolean;
     note: string;
-    receipt?: OwnerApprovalReceipt;
+    receipt?: unknown;
     owner?: { channel: string; actor: string };
-  }): Decision<string> {
+  }): Decision<OwnerApprovalReceipt> {
     const authority = this.#ownerAuthority;
     if (!authority) {
       return deny(
@@ -993,7 +1001,7 @@ export class ProductionGate {
     }
 
     const receipt = input.receipt;
-    if (!receipt) {
+    if (!isOwnerApprovalReceipt(receipt)) {
       return deny(
         ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
         "owner decision requires an admitted ingress receipt, not a caller-supplied identity",
@@ -1019,8 +1027,8 @@ export class ProductionGate {
       );
     }
     const authorised = authority.assertApproval(receipt);
-    if (!authorised.allowed) return authorised as Decision<string>;
-    return allow(ReasonCode.OK, `${receipt.channel}:${receipt.actor}`);
+    if (!authorised.allowed) return authorised as Decision<OwnerApprovalReceipt>;
+    return allow(ReasonCode.OK, receipt);
   }
 
   /**
@@ -1038,9 +1046,10 @@ export class ProductionGate {
     /** @deprecated Identity alone is never authority; use an admitted receipt. */
     owner?: { channel: string; actor: string };
   }): Decision<void> {
-    const attributed = this.attributeOwnerDecision(input);
-    if (!attributed.allowed) return attributed as Decision<void>;
-    const actor = attributed.value;
+    const admittedReceipt = this.assertOwnerDecisionReceipt(input);
+    if (!admittedReceipt.allowed) return admittedReceipt as Decision<void>;
+    const receipt = admittedReceipt.value;
+    const actor = `${receipt.channel}:${receipt.actor}`;
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
     const gate = this.humanGateDefinition(input.runId);
@@ -1064,6 +1073,9 @@ export class ProductionGate {
         at: this.clock.nowIso(),
         humanGateDigest: gate.digest,
         candidateSnapshotDigest,
+        // The receipt is part of the durable decision, not a one-time ingress check. A
+        // later consumer must be able to re-admit the exact operation and parameters.
+        receipt,
       }, candidateSnapshotDigest);
       this.audit.record({
         kind: "OWNER_DECISION",
@@ -1127,26 +1139,42 @@ export class ProductionGate {
 
     const currentCandidate = this.runs.currentCandidate(runId);
     if (!currentCandidate) return { required: true, items, satisfied: false };
+    // An approval row is only evidence of owner authority while its retained ingress receipt
+    // can still be admitted. In particular, never let a direct ArtifactStore write turn an
+    // APPROVAL-shaped object into an owner decision (CP-HI-07).
+    if (!this.#ownerAuthority) return { required: true, items, satisfied: false };
     const latestDecision = new Map<string, boolean>();
     for (const artifact of this.artifacts.list<{
       kind?: string;
       item?: string;
       approved?: boolean;
+      note?: unknown;
       humanGateDigest?: string;
       candidateSnapshotDigest?: string | null;
+      receipt?: unknown;
     }>(runId, ArtifactKind.APPROVAL)) {
       const decision = artifact.content;
       if (
         artifact.superseded ||
         decision.kind !== "OWNER_DECISION" ||
-        !decision.item ||
+        typeof decision.item !== "string" ||
+        decision.item.length === 0 ||
         typeof decision.approved !== "boolean" ||
+        typeof decision.note !== "string" ||
         decision.humanGateDigest !== gate.digest ||
         artifact.candidateSnapshotDigest !== currentCandidate ||
         decision.candidateSnapshotDigest !== currentCandidate
       ) {
         continue;
       }
+      const retainedReceipt = this.assertOwnerDecisionReceipt({
+        runId,
+        item: decision.item,
+        approved: decision.approved,
+        note: decision.note,
+        receipt: decision.receipt,
+      });
+      if (!retainedReceipt.allowed) continue;
       // ArtifactStore.list is durable creation order (then rowid), so assignment makes
       // a later explicit rejection revoke an earlier approval for the same gate item.
       latestDecision.set(decision.item, decision.approved);
@@ -1289,3 +1317,15 @@ export class ProductionGate {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Content loaded from an artifact is untrusted JSON until it has this complete receipt shape. */
+const isOwnerApprovalReceipt = (value: unknown): value is OwnerApprovalReceipt =>
+  isRecord(value) &&
+  typeof value.channel === "string" &&
+  typeof value.actor === "string" &&
+  typeof value.inboundNonce === "string" &&
+  (typeof value.runId === "string" || value.runId === null) &&
+  typeof value.operation === "string" &&
+  typeof value.parameterDigest === "string" &&
+  typeof value.idempotencyKey === "string" &&
+  typeof value.approved === "boolean";

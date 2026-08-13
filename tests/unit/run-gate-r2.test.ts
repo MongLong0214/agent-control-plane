@@ -444,6 +444,90 @@ describe("round-2 run and production-gate regressions", () => {
     });
   });
 
+  it("#381 retains the admitted owner receipt so its decision satisfies the durable human gate", async () => {
+    const fixture = await evidenceReadyRun(["public release"]);
+    const receipt = ownerDecisionReceipt(
+      fixture.harness,
+      fixture.runId,
+      "public release",
+      true,
+      "approved after reviewing the release",
+    );
+
+    const recorded = fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "approved after reviewing the release",
+      receipt,
+    });
+    expect(recorded.allowed).toBe(true);
+
+    const stored = fixture.harness.cp.artifacts
+      .list<{ receipt?: unknown }>(fixture.runId, ArtifactKind.APPROVAL)
+      .at(-1);
+    expect(stored?.content.receipt).toEqual(receipt);
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
+      required: true,
+      items: ["public release"],
+      satisfied: true,
+    });
+  });
+
+  it("#381 ignores owner-decision-shaped rows without an admitted, parameter-bound receipt", async () => {
+    const absent = await evidenceReadyRun(["public release"]);
+    absent.harness.cp.artifacts.put(absent.runId, ArtifactKind.APPROVAL, {
+      kind: "OWNER_DECISION",
+      item: "public release",
+      approved: true,
+      note: "no proof was retained",
+      at: absent.harness.clock.nowIso(),
+      humanGateDigest: digestOf(["public release"]),
+      candidateSnapshotDigest: absent.digest,
+    }, absent.digest);
+    expect(absent.harness.cp.ceo.humanGateStatus(absent.runId).satisfied).toBe(false);
+
+    const notAdmitted = await evidenceReadyRun(["public release"]);
+    const admittedReceipt = ownerDecisionReceipt(
+      notAdmitted.harness,
+      notAdmitted.runId,
+      "public release",
+      true,
+      "the real decision",
+    );
+    notAdmitted.harness.cp.artifacts.put(notAdmitted.runId, ArtifactKind.APPROVAL, {
+      kind: "OWNER_DECISION",
+      item: "public release",
+      approved: true,
+      note: "the real decision",
+      at: notAdmitted.harness.clock.nowIso(),
+      humanGateDigest: digestOf(["public release"]),
+      candidateSnapshotDigest: notAdmitted.digest,
+      receipt: { ...admittedReceipt, inboundNonce: "forged-ingress-nonce" },
+    }, notAdmitted.digest);
+    expect(notAdmitted.harness.cp.ceo.humanGateStatus(notAdmitted.runId).satisfied).toBe(false);
+
+    const mismatched = await evidenceReadyRun(["public release"]);
+    const receiptForOtherParameters = ownerDecisionReceipt(
+      mismatched.harness,
+      mismatched.runId,
+      "public release",
+      true,
+      "the actual approved note",
+    );
+    mismatched.harness.cp.artifacts.put(mismatched.runId, ArtifactKind.APPROVAL, {
+      kind: "OWNER_DECISION",
+      item: "public release",
+      approved: true,
+      note: "a substituted note",
+      at: mismatched.harness.clock.nowIso(),
+      humanGateDigest: digestOf(["public release"]),
+      candidateSnapshotDigest: mismatched.digest,
+      receipt: receiptForOtherParameters,
+    }, mismatched.digest);
+    expect(mismatched.harness.cp.ceo.humanGateStatus(mismatched.runId).satisfied).toBe(false);
+  });
+
   it("#374 fails closed when a GUARDED run omits every owner decision item", async () => {
     const fixture = await evidenceReadyRun([], { executionMode: ExecutionMode.GUARDED });
     expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId)).toEqual({
