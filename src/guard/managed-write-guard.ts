@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, constants as fsConstants, fstatSync, openSync, statSync, type Stats } from "node:fs";
-import { basename, dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
@@ -96,11 +96,12 @@ export interface GuardRequest {
   /** Normalized remote identity, required for every remote operation. */
   repositoryIdentity?: string | null;
   /**
-   * The branch this operation mutates. GIT_BRANCH must always name one because the
-   * checkout branch says nothing about the branch the command will change.
+   * The branch or stable remote ref this operation mutates. GIT_BRANCH and every
+   * remote write must always name one: the checkout branch says nothing about the
+   * ref a command or GitHub request will change.
    */
   targetBranch?: string | null;
-  /** The worktree this operation mutates when it cannot be recovered from the path. */
+  /** Absolute canonical registered checkout path when the operation mutates a worktree. */
   targetWorktreeId?: string | null;
   /** Managed run identity claimed by the caller. */
   runId?: string | null;
@@ -152,6 +153,8 @@ interface ParticipantRow {
 interface TargetResource {
   branch: string | null;
   worktreeId: string | null;
+  /** A remote write does not reach a local checkout, so it cannot name one. */
+  worktreeIsRelevant: boolean;
   relativePath: string | null;
 }
 
@@ -662,6 +665,9 @@ export class ManagedWriteGuard {
     if (!grant.repositoryIdentity || !grant.runId) return allow(ReasonCode.OK, undefined);
 
     return this.db.tx(() => {
+      // The partial unique indexes define a HELD row as occupied. Sweep before reading so
+      // the guard never treats an expired row as absent while SQLite still reserves it.
+      this.expireOverdueClaims();
       const rows = this.requiredClaims(grant);
       if (!rows.allowed) return rows as Decision<void>;
       const required = rows.value;
@@ -678,8 +684,8 @@ export class ManagedWriteGuard {
         const updated = this.db.run(
           `UPDATE resource_claims
               SET expires_at = CASE WHEN expires_at > ? THEN expires_at ELSE ? END
-            WHERE claim_id = ? AND status = 'HELD' AND expires_at > ?`,
-          [deadline, deadline, claim.claim_id, this.clock.nowIso()],
+            WHERE claim_id = ? AND status = 'HELD'`,
+          [deadline, deadline, claim.claim_id],
         );
         if (updated.changes !== 1) {
           return deny(
@@ -694,13 +700,13 @@ export class ManagedWriteGuard {
   }
 
   private requiredClaims(grant: GuardGrant): Decision<ClaimRow[]> {
-    const common = [grant.runId, grant.repositoryIdentity, this.clock.nowIso()];
+    const common = [grant.runId, grant.repositoryIdentity];
     const query = (where: string, params: unknown[]): ClaimRow[] =>
       this.db.all<ClaimRow>(
         `SELECT c.claim_id, c.expires_at FROM resource_claims c
            JOIN runs r ON r.run_id = c.run_id
           WHERE c.run_id = ? AND c.repository_identity = ? AND c.status = 'HELD'
-            AND c.expires_at > ? AND c.owner_binding_generation = r.owner_binding_generation
+            AND c.owner_binding_generation = r.owner_binding_generation
             AND ${where}`,
         [...common, ...params],
       );
@@ -724,7 +730,8 @@ export class ManagedWriteGuard {
       required.push(...path);
     }
     if (required.length === 0) {
-      // A path-free remote operation has repository identity as its only target fact.
+      // A local git operation can name only a registered repository; remote writes are
+      // refused earlier unless they name a branch/ref.
       const repository = query("1 = 1", []);
       const identity = grant.repositoryIdentity;
       if (repository.length === 0 || !identity) return this.claimMissing(grant, "repository", identity ?? "");
@@ -934,7 +941,16 @@ export class ManagedWriteGuard {
   }
 
   private inFlightTargetKey(grant: GuardGrant): string | null {
-    if (!grant.repositoryIdentity || !grant.resolvedPath) return null;
+    if (!grant.repositoryIdentity) return null;
+    const operation = grant.operation as WriteOperation;
+    if (OPERATION_CLASS[operation] === "REMOTE") {
+      // Remote writes have no local path to fence. Their stable branch/ref is therefore
+      // the serialization key; validation refuses a remote grant without one (#356).
+      return grant.targetBranch
+        ? JSON.stringify([grant.repositoryIdentity, operation, grant.targetBranch])
+        : null;
+    }
+    if (!grant.resolvedPath) return null;
     return JSON.stringify([grant.repositoryIdentity, grant.resolvedPath]);
   }
 
@@ -1015,6 +1031,15 @@ export class ManagedWriteGuard {
       return this.direct(request, ReasonCode.DIRECT_READ_ONLY_ALLOWED, null, null);
     }
 
+    // `HELD` is what the partial unique indexes enforce. Expire stale leases in the
+    // same immediate transaction that reads claims, so a lease is never ignored by the
+    // guard while it still occupies the database coordination slot (#358).
+    return this.db.tx(() => this.decideWrite(request));
+  }
+
+  private decideWrite(request: GuardRequest): Decision<GuardGrant> {
+    this.expireOverdueClaims();
+
     const operation = request.operation as WriteOperation;
     const operationClass = OPERATION_CLASS[operation];
     if (!operationClass) {
@@ -1039,11 +1064,25 @@ export class ManagedWriteGuard {
     ) {
       return deny(ReasonCode.INVALID_ARGUMENT, "target worktree id must not be empty", { operation });
     }
+    if (request.targetWorktreeId && !isAbsolute(request.targetWorktreeId)) {
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        "target worktree id must be the absolute canonical checkout path",
+        { operation, targetWorktreeId: request.targetWorktreeId },
+      );
+    }
     if (operationClass === "FILESYSTEM" && !request.targetPath) {
       return deny(ReasonCode.INVALID_ARGUMENT, `${operation} requires a target path`, { operation });
     }
     if (operationClass === "REMOTE" && !request.repositoryIdentity) {
       return deny(ReasonCode.INVALID_ARGUMENT, `${operation} requires a repository identity`, { operation });
+    }
+    if (operationClass === "REMOTE" && !request.targetBranch) {
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        `${operation} requires the branch or remote ref it will mutate`,
+        { operation },
+      );
     }
     if (operationClass === "GIT_LOCAL" && !request.targetPath && !request.repositoryIdentity) {
       return deny(
@@ -1402,21 +1441,30 @@ export class ManagedWriteGuard {
     }
 
     const branch = input.request.targetBranch ?? observedBranch;
-    const actualWorktree = input.toplevel ? basename(input.toplevel) : null;
-    if (input.request.targetWorktreeId && input.toplevel && input.request.targetWorktreeId !== actualWorktree) {
+    // The repository registry's canonical checkout path is the worktree identity. A
+    // basename is caller-independent only by accident: arbitrary strings can otherwise
+    // describe the same checkout (#357).
+    const actualWorktree = input.toplevel ? input.participant.checkout_path : null;
+    const declaredWorktree = input.request.targetWorktreeId
+      ? this.probe.canonical(input.request.targetWorktreeId)
+      : null;
+    if (declaredWorktree && input.toplevel && declaredWorktree !== actualWorktree) {
       return deny(
         ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
         "declared worktree does not match the resolved target work tree",
         {
-          declaredWorktreeId: input.request.targetWorktreeId,
+          declaredWorktreeId: declaredWorktree,
           observedWorktreeId: actualWorktree,
           toplevel: input.toplevel,
         },
       );
     }
 
-    const needsWorktree = this.hasHeldWorktreeClaim(input.participant.identity);
-    const worktreeId = input.request.targetWorktreeId ?? (needsWorktree ? actualWorktree : null);
+    // Remote writes mutate a GitHub ref rather than a local checkout. They must name the
+    // ref, but a separate run's local worktree claim must not make different refs collide.
+    const worktreeIsRelevant = input.operationClass !== "REMOTE";
+    const needsWorktree = worktreeIsRelevant && this.hasHeldWorktreeClaim(input.participant.identity);
+    const worktreeId = declaredWorktree ?? (needsWorktree ? actualWorktree : null);
     if (needsWorktree && !worktreeId) {
       return deny(
         ReasonCode.CLAIM_WORKTREE_CONFLICT,
@@ -1429,7 +1477,7 @@ export class ManagedWriteGuard {
       input.resolvedPath && isWithin(input.participant.checkout_path, input.resolvedPath)
         ? input.resolvedPath.slice(input.participant.checkout_path.length + 1)
         : null;
-    return allow(ReasonCode.OK, { branch, worktreeId, relativePath });
+    return allow(ReasonCode.OK, { branch, worktreeId, worktreeIsRelevant, relativePath });
   }
 
   /** §23.2 hard rejects against the resource this operation actually names or reaches. */
@@ -1447,15 +1495,15 @@ export class ManagedWriteGuard {
     }>(
       `SELECT claim_id, run_id, branch, worktree_id, declared_path
          FROM resource_claims
-        WHERE status = 'HELD' AND repository_identity = ? AND run_id <> ? AND expires_at > ?`,
-      [participant.identity, runId, this.clock.nowIso()],
+        WHERE status = 'HELD' AND repository_identity = ? AND run_id <> ?`,
+      [participant.identity, runId],
     );
     if (held.length === 0) return null;
 
     const undeterminable = held.filter(
       (claim) =>
         (claim.branch !== null && resource.branch === null) ||
-        (claim.worktree_id !== null && resource.worktreeId === null),
+        (resource.worktreeIsRelevant && claim.worktree_id !== null && resource.worktreeId === null),
     );
     if (undeterminable.length > 0) {
       return deny(
@@ -1501,9 +1549,17 @@ export class ManagedWriteGuard {
   private hasHeldWorktreeClaim(repositoryIdentity: string): boolean {
     return !!this.db.get<{ claim_id: string }>(
       `SELECT claim_id FROM resource_claims
-        WHERE repository_identity = ? AND status = 'HELD' AND worktree_id IS NOT NULL AND expires_at > ?`,
-      [repositoryIdentity, this.clock.nowIso()],
+        WHERE repository_identity = ? AND status = 'HELD' AND worktree_id IS NOT NULL`,
+      [repositoryIdentity],
     );
+  }
+
+  /** Keep guard reads aligned with the partial indexes, which reserve every HELD row. */
+  private expireOverdueClaims(): number {
+    return this.db.run(
+      `UPDATE resource_claims SET status = 'EXPIRED' WHERE status = 'HELD' AND expires_at <= ?`,
+      [this.clock.nowIso()],
+    ).changes;
   }
 
   private isDirectArtifactPath(resolvedPath: string): boolean {
