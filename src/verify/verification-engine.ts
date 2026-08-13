@@ -53,6 +53,8 @@ export interface VerificationResultRecord {
   outputTruncated: boolean;
   status: "PASS" | "FAIL" | "TIMEOUT" | "ERROR" | "SKIPPED";
   reasonCode: string | null;
+  /** Local sandbox measurement; CI evidence has no host-process RSS. */
+  peakRssMb?: number | null;
   enforcement?: SandboxEnforcement;
 }
 
@@ -83,6 +85,14 @@ export interface VerifyOptions {
   /** Commands the CTO proposed for an unregistered repository (§17.5). */
   runScoped?: boolean;
 }
+
+const memoryEvidenceReason = (
+  peakRssMb: number | null | undefined,
+  maxMemoryMb: number,
+): ReasonCode | null => {
+  if (peakRssMb == null) return ReasonCode.SANDBOX_RESOURCE_LIMIT_UNAVAILABLE;
+  return peakRssMb > maxMemoryMb ? ReasonCode.SANDBOX_RESOURCE_LIMIT_EXCEEDED : null;
+};
 
 /**
  * PRD §17.
@@ -362,6 +372,8 @@ export class VerificationEngine {
         denyReadPaths: this.denyReadPaths(checkoutPath),
       }),
     );
+    const memoryFailure = memoryEvidenceReason(outcome.peakRssMb, command.maxMemoryMb);
+    const passingMemoryFailure = outcome.status === "PASS" ? memoryFailure : null;
 
     const record: VerificationResultRecord = {
       commandId: command.id,
@@ -373,9 +385,13 @@ export class VerificationEngine {
       exitCode: outcome.exitCode,
       outputDigest: outcome.outputDigest,
       outputTruncated: outcome.outputTruncated,
-      // Truncated output is not usable evidence, whatever the exit code said.
-      status: outcome.outputTruncated && outcome.status === "PASS" ? "ERROR" : outcome.status,
-      reasonCode: outcome.reasonCode,
+      // Truncated output or unmeasured/over-cap memory is not usable passing evidence.
+      status:
+        outcome.status === "PASS" && (outcome.outputTruncated || passingMemoryFailure !== null)
+          ? "ERROR"
+          : outcome.status,
+      reasonCode: passingMemoryFailure ?? outcome.reasonCode,
+      peakRssMb: outcome.peakRssMb,
       enforcement: outcome.enforcement,
     };
     this.writeResultRow(runId, snapshotDigest, record);
@@ -477,8 +493,20 @@ export class VerificationEngine {
       .reduce((n, c) => n + (c.evidenceMode === "BOTH_REQUIRED" ? 2 : 1), 0);
     const requiredIds = new Set(options.commands.filter((c) => c.required).map((c) => c.id));
     const observedInputs = results.filter((r) => requiredIds.has(r.commandId)).length;
+    const commandsById = new Map(options.commands.map((command) => [command.id, command]));
+    const localMemoryFailure = (record: VerificationResultRecord): ReasonCode | null => {
+      if (record.source !== "local") return null;
+      const command = commandsById.get(record.commandId);
+      return command ? memoryEvidenceReason(record.peakRssMb, command.maxMemoryMb) : null;
+    };
 
-    const failed = results.filter((r) => requiredIds.has(r.commandId) && r.status !== "PASS");
+    // This is a second fail-closed gate over the sandbox result. A future sandbox regression
+    // must not turn a missing RSS observation into authoritative PASS evidence.
+    const failed = results.filter(
+      (record) =>
+        requiredIds.has(record.commandId) &&
+        (record.status !== "PASS" || localMemoryFailure(record) !== null),
+    );
     const incomplete = gaps.length > 0 || observedInputs !== expectedInputs;
 
     const status: VerificationReport["status"] = incomplete
@@ -492,7 +520,7 @@ export class VerificationEngine {
         ? ReasonCode.VERIFICATION_GAP
         : ReasonCode.VERIFICATION_INCOMPLETE
       : failed.length > 0
-        ? (failed[0]!.reasonCode ?? ReasonCode.VERIFICATION_COMMAND_FAILED)
+        ? (failed[0]!.reasonCode ?? localMemoryFailure(failed[0]!) ?? ReasonCode.VERIFICATION_COMMAND_FAILED)
         : ReasonCode.OK;
 
     return {
