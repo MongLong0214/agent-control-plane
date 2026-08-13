@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -238,7 +238,11 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
       child.on("close", (code, signal) => resolveExit({ code, signal }));
     },
   );
-  const identity = await processIdentity(child.pid);
+  // Start both probes at once. A successful command can legitimately disappear before
+  // `ps -o lstart` returns; that loses only the fenced signalling handle, not a recorded
+  // RSS observation or the later process-group containment proof.
+  const identityAttempt = processIdentity(child.pid);
+  let identity: ProcessIdentity | null = null;
   let timedOut = false;
   // Not knowing the leader's start time only costs us the ability to *signal* the group by
   // a fenced identity; containment itself is proven after the run by the group listing.
@@ -321,6 +325,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   // Sample immediately so a short command has evidence too, then retain the peak for the
   // whole process-group lifetime. A command that cannot be sampled is not eligible to pass.
   await sampleRss();
+  identity = await identityAttempt;
   const memoryPoll = setInterval(() => {
     void sampleRss();
   }, RSS_SAMPLE_INTERVAL_MS);
@@ -342,8 +347,9 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
 
   const resourceUnavailable = exit.code === 125 && stderr.includes("ACP_RESOURCE_LIMIT_UNAVAILABLE:");
   const resourceExceeded = exit.signal === "SIGXCPU";
-  const memoryLimitObserved =
-    !resourceUnavailable && !hardMemoryLimit && peakRssMb !== null && identity !== null;
+  // The RSS sample is the memory evidence. A leader identity is needed only to signal a
+  // live group; requiring it here makes a cleanly reaped, fast command impossible to pass.
+  const memoryLimitObserved = !resourceUnavailable && !hardMemoryLimit && peakRssMb !== null;
   const memoryEvidenceUnavailable =
     peakRssMb === null || (!hardMemoryLimit && !memoryLimitObserved);
   const status: SandboxOutcome["status"] =
@@ -437,36 +443,34 @@ const looksLikeCredential = (value: string): boolean =>
   CREDENTIAL_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));
 
 /**
- * Paths a toolchain must be able to read to run at all: the interpreter, system
- * libraries, and the dyld cache. Everything else — the owner's home, other checkouts,
- * `~/.config/gh`, `.npmrc` — stays unreadable.
+ * Named locations a candidate command must never read. Seatbelt retains allow-default
+ * reads for dyld and the Node toolchain, so these absolute denies—not HOME redirection
+ * alone—protect provider, GitHub, Buzz and Telegram authority stores.
  */
-/**
- * Locations a candidate command must never read. §33.3 requires provider, GitHub, Buzz
- * and Telegram secrets to be out of reach; redirecting HOME only defeats lookup by
- * convention, so the real stores are denied by absolute path as well.
- */
-const sensitiveReadPaths = (extra: readonly string[]): string[] => {
-  const home = process.env["HOME"] ?? "";
-  const homePaths = home
-    ? [
-        `${home}/.ssh`,
-        `${home}/.aws`,
-        `${home}/.gnupg`,
-        `${home}/.config/gh`,
-        `${home}/.config/gcloud`,
-        `${home}/.claude`,
-        `${home}/.codex`,
-        `${home}/.buzz`,
-        `${home}/.agent-control-plane`,
-        `${home}/.npmrc`,
-        `${home}/.netrc`,
-        `${home}/.gitconfig`,
-        `${home}/.git-credentials`,
-        `${home}/Library/Keychains`,
-        `${home}/Library/Application Support/Code`,
-      ]
-    : [];
+export const sensitiveReadPaths = (extra: readonly string[]): string[] => {
+  // A candidate can call os.userInfo().homedir(), which reads the passwd entry rather
+  // than HOME. Cover that account home as well as an explicitly configured daemon HOME.
+  const homes = [...new Set([homedir(), process.env["HOME"]].filter((home): home is string => Boolean(home)))];
+  const homePaths = homes.flatMap((home) => [
+    `${home}/.ssh`,
+    `${home}/.aws`,
+    `${home}/.gnupg`,
+    `${home}/.config/gh`,
+    `${home}/.config/git/credentials`,
+    `${home}/.config/gcloud`,
+    `${home}/.claude`,
+    `${home}/.codex`,
+    `${home}/.buzz`,
+    `${home}/.agent-control-plane`,
+    `${home}/.npmrc`,
+    `${home}/.netrc`,
+    `${home}/.gitconfig`,
+    `${home}/.git-credentials`,
+    `${home}/.docker/config.json`,
+    `${home}/Library/Keychains`,
+    `${home}/Library/Application Support/Code`,
+    `${home}/Library/Application Support/GitHub CLI`,
+  ]);
   // seatbelt matches resolved paths, so an unresolved symlinked path (a temp dir under
   // /var/folders, say) would silently match nothing and the deny would be a no-op.
   return [...homePaths, ...extra].filter(Boolean).map(resolveIfPossible);

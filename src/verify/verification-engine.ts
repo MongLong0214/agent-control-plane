@@ -1,9 +1,9 @@
 import type { Clock } from "../core/clock.ts";
 import { randomUUID } from "node:crypto";
-import { digestOf } from "../core/digest.ts";
+import { canonicalJson, digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import type { VerificationCommand } from "../contracts/verification-command.ts";
+import { type VerificationCommand, verificationCommandSchema } from "../contracts/verification-command.ts";
 import { type ProjectManifest, commandsForMode } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
@@ -13,6 +13,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   type CandidateSnapshot,
   candidateSnapshotDigest,
+  duplicateRepositoryRoles,
   verifySnapshotFreshness,
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
@@ -148,6 +149,15 @@ export class VerificationEngine {
       return deny(ReasonCode.NOT_FOUND, "verification requires a registered run", { runId });
     }
 
+    const duplicateRoles = duplicateRepositoryRoles(snapshot.repositories);
+    if (duplicateRoles.length > 0) {
+      return deny(
+        ReasonCode.VERIFICATION_GAP,
+        "candidate maps a verification repository role to more than one identity",
+        { runId, duplicateRoles },
+      );
+    }
+
     // CP-HI-03 — the pinned contract, not whatever the candidate now contains.
     if (snapshot.contractDigest !== options.contractDigest || run.contractDigest !== options.contractDigest) {
       return deny(
@@ -274,6 +284,14 @@ export class VerificationEngine {
           },
         );
       }
+
+      // §17.5 has no project manifest to pin at dispatch, so the first usable
+      // run-scoped command set becomes this run's immutable verification contract.
+      // A retry may re-submit it verbatim, but cannot replace a real failing suite with
+      // a weaker argv after observing the first result.
+      const scoped = this.pinRunScopedCommands(runId, commands);
+      if (!scoped.allowed) return scoped as Decision<VerificationReport>;
+      commands = scoped.value;
     }
 
     const verifiedOptions: VerifyOptions = { ...options, commands };
@@ -304,11 +322,16 @@ export class VerificationEngine {
     const gaps: string[] = [];
 
     for (const command of commands) {
-      const repo = snapshot.repositories.find((r) => r.repositoryRole === command.repositoryRole);
-      if (!repo) {
-        gaps.push(`command '${command.id}' targets repositoryRole '${command.repositoryRole}' which is not in the candidate`);
+      const matchingRepositories = snapshot.repositories.filter(
+        (repository) => repository.repositoryRole === command.repositoryRole,
+      );
+      if (matchingRepositories.length !== 1) {
+        gaps.push(
+          `command '${command.id}' targets repositoryRole '${command.repositoryRole}' which does not map to exactly one candidate repository`,
+        );
         continue;
       }
+      const repo = matchingRepositories[0]!;
       const record = this.repositories.byIdentity(repo.identity);
       if (!record) {
         gaps.push(`repository '${repo.identity}' has no local binding`);
@@ -352,6 +375,105 @@ export class VerificationEngine {
       report.status === "INCOMPLETE" ? "verification evidence is incomplete" : "verification failed",
       { runId, snapshotDigest, report },
     );
+  }
+
+  /** Persist and retrieve the §17.5 contract without treating a caller's argv as durable authority. */
+  private pinRunScopedCommands(
+    runId: string,
+    supplied: readonly VerificationCommand[],
+  ): Decision<readonly VerificationCommand[]> {
+    const parsed = verificationCommandSchema.array().safeParse([...supplied]);
+    if (!parsed.success) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "run-scoped verification commands are malformed", {
+        runId,
+        issues: parsed.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
+      });
+    }
+    const proposed = parsed.data;
+    const proposedDigest = digestOf(proposed);
+
+    return this.db.tx(() => {
+      const current = this.db.get<{
+        pinned_run_scoped_commands_digest: string | null;
+        pinned_run_scoped_commands_json: string | null;
+      }>(
+        `SELECT pinned_run_scoped_commands_digest, pinned_run_scoped_commands_json
+           FROM runs WHERE run_id = ?`,
+        [runId],
+      );
+      if (!current) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+
+      if (
+        current.pinned_run_scoped_commands_digest === null &&
+        current.pinned_run_scoped_commands_json === null
+      ) {
+        this.db.run(
+          `UPDATE runs
+              SET pinned_run_scoped_commands_digest = ?, pinned_run_scoped_commands_json = ?
+            WHERE run_id = ?
+              AND pinned_run_scoped_commands_digest IS NULL
+              AND pinned_run_scoped_commands_json IS NULL`,
+          [proposedDigest, canonicalJson(proposed), runId],
+        );
+      }
+
+      const pinned = this.db.get<{
+        pinned_run_scoped_commands_digest: string | null;
+        pinned_run_scoped_commands_json: string | null;
+      }>(
+        `SELECT pinned_run_scoped_commands_digest, pinned_run_scoped_commands_json
+           FROM runs WHERE run_id = ?`,
+        [runId],
+      );
+      if (
+        !pinned ||
+        pinned.pinned_run_scoped_commands_digest === null ||
+        pinned.pinned_run_scoped_commands_json === null
+      ) {
+        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run-scoped verification contract was not durably pinned", {
+          runId,
+        });
+      }
+
+      let persisted: readonly VerificationCommand[];
+      try {
+        const decoded: unknown = JSON.parse(pinned.pinned_run_scoped_commands_json);
+        const parsedPersisted = verificationCommandSchema.array().safeParse(decoded);
+        if (!parsedPersisted.success) {
+          return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "stored run-scoped verification contract is malformed", {
+            runId,
+          });
+        }
+        persisted = parsedPersisted.data;
+      } catch {
+        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "stored run-scoped verification contract is malformed", {
+          runId,
+        });
+      }
+
+      const persistedDigest = digestOf(persisted);
+      if (persistedDigest !== pinned.pinned_run_scoped_commands_digest) {
+        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "stored run-scoped verification contract digest is invalid", {
+          runId,
+          stored: pinned.pinned_run_scoped_commands_digest,
+          calculated: persistedDigest,
+        });
+      }
+      if (proposedDigest !== persistedDigest) {
+        return deny(
+          ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
+          "supplied run-scoped verification commands do not match the run's pinned contract",
+          {
+            runId,
+            pinnedDigest: persistedDigest,
+            suppliedDigest: proposedDigest,
+            expected: persisted.map((command) => command.id),
+            supplied: proposed.map((command) => command.id),
+          },
+        );
+      }
+      return allow(ReasonCode.OK, persisted);
+    });
   }
 
   private async runLocal(
