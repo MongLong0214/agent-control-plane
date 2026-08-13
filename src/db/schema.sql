@@ -268,6 +268,9 @@ CREATE TABLE IF NOT EXISTS runs (
   goal                      TEXT NOT NULL,
   contract_digest           TEXT NOT NULL,
   pinned_manifest_digest    TEXT REFERENCES manifests(digest),
+  -- §17.5 has no project manifest; its first verified command set is pinned here instead.
+  pinned_run_scoped_commands_digest TEXT,
+  pinned_run_scoped_commands_json   TEXT,
   -- §30.2 #6 — run owner is (session, binding generation), pinned at dispatch admission.
   owner_session_id          TEXT REFERENCES sessions(session_id),
   owner_binding_generation  INTEGER,
@@ -287,6 +290,7 @@ CREATE TABLE IF NOT EXISTS runs (
   CHECK ((owner_session_id IS NULL) = (owner_binding_generation IS NULL)),
   CHECK ((owner_session_id IS NULL) = (owner_session_incarnation IS NULL)),
   CHECK ((owner_session_id IS NULL) = (owner_role_key IS NULL)),
+  CHECK ((pinned_run_scoped_commands_digest IS NULL) = (pinned_run_scoped_commands_json IS NULL)),
   FOREIGN KEY (owner_role_key, owner_binding_generation, owner_session_id, owner_session_incarnation)
     REFERENCES assignments(role_key, binding_generation, session_id, session_incarnation)
     DEFERRABLE INITIALLY DEFERRED
@@ -366,6 +370,25 @@ WHEN NEW.pinned_manifest_digest IS NOT OLD.pinned_manifest_digest
  AND NOT (OLD.pinned_manifest_digest IS NULL AND NEW.pinned_manifest_digest IS NOT NULL)
 BEGIN
   SELECT RAISE(ABORT, 'PINNED_MANIFEST_IMMUTABLE');
+END;
+
+-- The temporary-repository path has no project manifest at dispatch time. Its command
+-- contract may be filled once by VerificationEngine, but never changed after a result
+-- reveals that the first suite failed.
+CREATE TRIGGER IF NOT EXISTS runs_pinned_run_scoped_commands_immutable
+BEFORE UPDATE OF pinned_run_scoped_commands_digest, pinned_run_scoped_commands_json ON runs
+WHEN (
+  NEW.pinned_run_scoped_commands_digest IS NOT OLD.pinned_run_scoped_commands_digest
+  OR NEW.pinned_run_scoped_commands_json IS NOT OLD.pinned_run_scoped_commands_json
+)
+ AND NOT (
+  OLD.pinned_run_scoped_commands_digest IS NULL
+  AND OLD.pinned_run_scoped_commands_json IS NULL
+  AND NEW.pinned_run_scoped_commands_digest IS NOT NULL
+  AND NEW.pinned_run_scoped_commands_json IS NOT NULL
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'PINNED_RUN_SCOPED_COMMANDS_IMMUTABLE');
 END;
 
 -- ---------------------------------------------------------------------------

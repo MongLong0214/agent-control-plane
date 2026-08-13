@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { addWorktree, listWorktrees, pruneWorktrees, removeWorktree } from "../git/git.ts";
+import { git, listWorktrees, pruneWorktrees, removeWorktree, revParse, treeOf } from "../git/git.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export interface Worktree {
@@ -38,8 +38,54 @@ export class WorktreeManager {
         repositoryPath: canonical(repositoryPath),
       });
     }
-    await addWorktree(repositoryPath, path, head);
-    return { worktreeId, path, repositoryPath, head };
+
+    // Resolve the ref before materialising it. A worktree created for `HEAD` must still
+    // be tied to this exact commit even if the source checkout moves while Git is making
+    // the disposable tree.
+    const expectedHead = await revParse(repositoryPath, head);
+    const expectedTree = await treeOf(repositoryPath, expectedHead);
+    try {
+      // `worktree add` performs a checkout, which normally invokes a repository-local
+      // post-checkout hook as the control-plane user. Candidate-controlled hooks therefore
+      // must be disabled before Git has a chance to materialise any verification input.
+      await git(repositoryPath, [
+        "-c", "core.hooksPath=/dev/null",
+        "worktree", "add", "--detach", path, expectedHead,
+      ]);
+
+      const [materializedHead, materializedTree, status] = await Promise.all([
+        revParse(path, "HEAD"),
+        treeOf(path, "HEAD"),
+        // Include untracked files explicitly: a hook that adds a replacement executable
+        // must not hide behind a repository's status.showUntrackedFiles preference.
+        git(path, ["status", "--porcelain", "--untracked-files=all"]),
+      ]);
+      if (
+        materializedHead !== expectedHead ||
+        materializedTree !== expectedTree ||
+        status.stdout.trim().length > 0
+      ) {
+        fail(ReasonCode.SNAPSHOT_STALE, "verification worktree differs from the frozen candidate", {
+          repositoryPath: canonical(repositoryPath),
+          worktreePath: path,
+          expectedHead,
+          materializedHead,
+          expectedTree: `git-tree:${expectedTree}`,
+          materializedTree: `git-tree:${materializedTree}`,
+          status: status.stdout.trim(),
+        });
+      }
+      return { worktreeId, path, repositoryPath, head: expectedHead };
+    } catch (error) {
+      // A failed post-add integrity check must not leave the potentially tampered tree
+      // available for a later command. The path was just proven to be under our root.
+      const after = await listWorktrees(repositoryPath);
+      if (after.some((entry) => canonical(entry.path) === path)) {
+        await removeWorktree(repositoryPath, path);
+        await pruneWorktrees(repositoryPath);
+      }
+      throw error;
+    }
   }
 
   async destroy(repositoryPath: string, path: string): Promise<void> {

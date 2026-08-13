@@ -17,7 +17,10 @@ export const verificationCommandSchema = z
     envAllowlist: z.array(z.string()).default([]),
     network: z.enum(["deny", "allowlist", "allow"]).default("deny"),
     networkAllowlist: z.array(z.string()).default([]),
-    required: z.boolean().default(true),
+    // §17.7's authoritative input count has no optional-evidence counterpart at the
+    // production and review gates. Rejecting `false` keeps the contract singular: every
+    // declared command is an input that must be corroborated before publication.
+    required: z.literal(true).default(true),
     evidenceMode: z.enum(["LOCAL_COMMAND", "TRUSTED_CI", "BOTH_REQUIRED"]).default("LOCAL_COMMAND"),
     maxOutputBytes: z.number().int().positive().max(64 * 1024 * 1024).default(1024 * 1024),
     maxMemoryMb: z.number().int().positive().max(65536).default(4096),

@@ -34,7 +34,16 @@ export const candidateSnapshotSchema = z
     repositories: z.array(snapshotRepositorySchema).min(1),
     createdAt: z.string().min(1),
   })
-  .strict();
+  .strict()
+  .superRefine((snapshot, ctx) => {
+    for (const duplicate of duplicateRepositoryRoles(snapshot.repositories)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `repositoryRole '${duplicate.repositoryRole}' maps to multiple candidate repositories`,
+        path: ["repositories"],
+      });
+    }
+  });
 
 export type SnapshotRepository = z.infer<typeof snapshotRepositorySchema>;
 export type CandidateSnapshot = z.infer<typeof candidateSnapshotSchema>;
@@ -49,6 +58,24 @@ export interface SnapshotRepositoryInput {
   worktreeId?: string | null;
   manifestDigest?: string | null;
 }
+
+/** A verification command must resolve to exactly one repository identity. */
+export const duplicateRepositoryRoles = (
+  repositories: readonly Readonly<{ identity: string; repositoryRole: string }>[],
+): Array<{ repositoryRole: string; identities: string[] }> => {
+  const identitiesByRole = new Map<string, string[]>();
+  for (const repository of repositories) {
+    const identities = identitiesByRole.get(repository.repositoryRole) ?? [];
+    identities.push(repository.identity);
+    identitiesByRole.set(repository.repositoryRole, identities);
+  }
+  return [...identitiesByRole.entries()]
+    .filter(([, identities]) => identities.length > 1)
+    .map(([repositoryRole, identities]) => ({
+      repositoryRole,
+      identities: [...new Set(identities)].sort(),
+    }));
+};
 
 /**
  * PRD §16.1/§16.2 — freeze every participating repository, then verify.
@@ -75,6 +102,12 @@ export const buildCandidateSnapshot = async (
 ): Promise<CandidateSnapshot> => {
   if (params.repositories.length === 0) {
     fail(ReasonCode.EVIDENCE_MISSING, "no repositories");
+  }
+  const duplicateRoles = duplicateRepositoryRoles(params.repositories);
+  if (duplicateRoles.length > 0) {
+    fail(ReasonCode.VERIFICATION_GAP, "candidate maps a repository role to more than one identity", {
+      duplicateRoles,
+    });
   }
 
   const repositories: SnapshotRepository[] = [];
