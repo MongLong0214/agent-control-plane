@@ -261,8 +261,11 @@ const validateBackup = (backupPath: string): BackupManifest => {
       });
     }
     if (version < SCHEMA_VERSION) migrationChainFrom(version);
-    assertLoadBearingInvariants(raw, { includeMigrationLedger: version >= SCHEMA_VERSION });
-    if (version >= SCHEMA_VERSION) assertMigrationLedgerAt(raw, version);
+    assertLoadBearingInvariants(raw, {
+      includeMigrationLedger: version >= 12,
+      includeBaselineLedger: version >= 14,
+    });
+    if (version >= 12) assertMigrationLedgerAt(raw, version);
   } finally {
     raw.close();
   }

@@ -8,6 +8,13 @@ import { deriveHumanGate } from "../ceo/human-gate.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db, RunStateTransitionAuthority } from "../db/database.ts";
+import {
+  normalizeHarnessIdentity,
+  type BaselineHarnessInput,
+  BaselineRecordKind,
+  type QualityObservationInput,
+} from "../export/baseline-contract.ts";
+import { BaselineRecorder } from "../export/baseline-recorder.ts";
 import { canTransition, isTerminal } from "../domain/run-state.ts";
 import {
   ArtifactKind,
@@ -91,6 +98,8 @@ export interface CreateRunInput {
   executionMode: ExecutionMode;
   priority?: RunPriority;
   contract: TaskContract;
+  /** Optional exact harness identity for an ACP 2.0 baseline; missing values remain null. */
+  baselineHarness?: BaselineHarnessInput;
   repositories?: ReadonlyArray<{
     repositoryId: string;
     repositoryRole: string;
@@ -143,6 +152,7 @@ export class RunEngine {
   #cto: CtoProvisioner | null = null;
   #capacity: CapacityGate | null = null;
   #continuity: ContinuityGate | null = null;
+  readonly #baseline: BaselineRecorder;
 
   constructor(
     private readonly db: Db,
@@ -157,6 +167,7 @@ export class RunEngine {
     private readonly telemetry: Telemetry,
   ) {
     this.#stateTransitions = db.claimRunStateTransitionAuthority();
+    this.#baseline = new BaselineRecorder(db, clock, audit);
   }
 
   /** Wired after construction because the CTO lifecycle also needs the run engine. */
@@ -209,6 +220,12 @@ export class RunEngine {
       }
 
       this.artifacts.put(runId, ArtifactKind.TASK_CONTRACT, input.contract);
+      const schemaVersion = Number(this.db.raw.pragma("user_version", { simple: true }));
+      const harness = this.#baseline.pinHarness(
+        runId,
+        normalizeHarnessIdentity(input.baselineHarness, Number.isInteger(schemaVersion) ? schemaVersion : null),
+      );
+      if (!harness.allowed) fail(harness.reasonCode, harness.message, harness.evidence);
       this.audit.record({
         kind: "RUN_CREATED",
         runId,
@@ -322,6 +339,8 @@ export class RunEngine {
         runId,
         toState: RunState.ACTIVE,
         recordTransitionEvidence: () => {
+          const baseline = this.recordDispatchBaseline(runId, fresh, binding, effectiveManifest);
+          if (!baseline.allowed) return baseline;
           this.audit.record({
             kind: "DISPATCHED",
             runId,
@@ -394,6 +413,55 @@ export class RunEngine {
       productionGate: daemonFinalizer,
       bootstrapActivation: new CompletionAuthorityToken(COMPLETION_MINT, "bootstrap-activation"),
     };
+  }
+
+  /**
+   * V1-BR-01/07 recording only: this captures the role session and the immutable harness
+   * context at dispatch. It never chooses a provider or substitutes a model.
+   */
+  private recordDispatchBaseline(
+    runId: string,
+    run: RunRow,
+    binding: RoleBinding | null,
+    effectiveManifest: string | null,
+  ): Decision<void> {
+    const harness = this.#baseline.harness(runId);
+    const context = this.#baseline.record(runId, BaselineRecordKind.HARNESS_DISPATCH_CONTEXT, {
+      harnessDigest: harness?.digest ?? null,
+      projectManifestDigest: effectiveManifest,
+      contractDigest: run.contractDigest,
+      ownerSessionId: binding?.sessionId ?? null,
+      ownerBindingGeneration: binding?.bindingGeneration ?? null,
+    });
+    if (!context.allowed) return context as Decision<void>;
+
+    if (!binding) return allow(ReasonCode.OK, undefined);
+    const session = this.db.get<{
+      provider: string;
+      model: string;
+      effort: string | null;
+      incarnation: string;
+    }>(
+      `SELECT provider, model, effort, incarnation FROM sessions WHERE session_id = ?`,
+      [binding.sessionId],
+    );
+    const role = this.#baseline.record(runId, BaselineRecordKind.ROLE_SESSION, {
+      logicalRole: binding.role,
+      provider: session?.provider ?? null,
+      requestedModel: session?.model ?? null,
+      observedModel: null,
+      observedModelVersion: null,
+      reasoningEffort: session?.effort ?? null,
+      sessionId: binding.sessionId,
+      sessionIncarnation: session?.incarnation ?? binding.sessionIncarnation,
+      providerSessionId: null,
+      bindingGeneration: binding.bindingGeneration,
+      harnessDigest: harness?.digest ?? null,
+      adapterVersion: harness?.identity.adapterVersion ?? null,
+      toolPolicyDigest: harness?.identity.toolPolicyDigest ?? null,
+      qualificationEligible: false,
+    });
+    return role.allowed ? allow(ReasonCode.OK, undefined) : (role as Decision<void>);
   }
 
   /**
@@ -535,6 +603,14 @@ export class RunEngine {
         runId,
         toState: to,
         recordTransitionEvidence: () => {
+          if (terminal) {
+            const baseline = this.#baseline.record(runId, BaselineRecordKind.RUN_OUTCOME, {
+              state: to,
+              terminal: true,
+              revisionCount: run.revisionCount,
+            });
+            if (!baseline.allowed) return baseline;
+          }
           this.audit.record({
             kind: "RUN_TRANSITION",
             runId,
@@ -582,6 +658,18 @@ export class RunEngine {
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
     this.tasks.cancelAll(runId, reason);
     return this.transition(runId, RunState.CANCELLED, reason);
+  }
+
+  /**
+   * V1-BR-04 recording boundary for facts that may arrive after review or merge. This
+   * records an immutable observation only; finalization remains owned by the production
+   * gate and is intentionally not changed here.
+   */
+  recordQualityObservation(runId: string, input: QualityObservationInput): Decision<void> {
+    if (!this.get(runId)) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    const recorded = this.#baseline.recordQualityObservation(runId, input);
+    if (!recorded.allowed) return recorded as Decision<void>;
+    return allow(ReasonCode.OK, undefined);
   }
 
   setPriority(runId: string, priority: RunPriority): Decision<RunRow> {

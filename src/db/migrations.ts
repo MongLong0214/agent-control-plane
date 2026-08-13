@@ -7,7 +7,8 @@ import type Database from "better-sqlite3";
 import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
-export const SCHEMA_VERSION = 13;
+/** The ordered registry is the only authority for changing a deployed schema. */
+export const SCHEMA_VERSION = 14;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -170,7 +171,44 @@ const v13: SchemaMigration = {
   checksum: () => migrationChecksum("v13-finalization-state-machine"),
 };
 
-export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13]);
+const BASELINE_RECORDS_DDL = `
+  CREATE TABLE IF NOT EXISTS baseline_records (
+    record_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    record_kind    TEXT NOT NULL,
+    schema_id      TEXT NOT NULL,
+    recorded_at    TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    payload_digest TEXT NOT NULL CHECK (payload_digest LIKE 'sha256:%'),
+    UNIQUE (run_id, record_kind, payload_digest)
+  );
+
+  CREATE TRIGGER IF NOT EXISTS baseline_records_immutable
+  BEFORE UPDATE ON baseline_records
+  BEGIN
+    SELECT RAISE(ABORT, 'BASELINE_RECORD_IMMUTABLE');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS baseline_records_no_delete
+  BEFORE DELETE ON baseline_records
+  BEGIN
+    SELECT RAISE(ABORT, 'BASELINE_RECORD_IMMUTABLE');
+  END;
+
+  CREATE INDEX IF NOT EXISTS baseline_records_run_kind
+    ON baseline_records(run_id, record_kind, recorded_at, record_id);
+`;
+
+/** v14 adds the immutable baseline evidence ledger after the reserved v13 state machine. */
+const v14: SchemaMigration = {
+  id: "v14-baseline-evidence-ledger",
+  fromVersion: 13,
+  toVersion: 14,
+  apply: (raw) => raw.exec(BASELINE_RECORDS_DDL),
+  checksum: () => sha256(`v14-baseline-evidence-ledger\n${BASELINE_RECORDS_DDL}`),
+};
+
+export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13, v14]);
 
 const REQUIRED_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
   { name: "runs_state_transition_authority_guard", sentinel: "RUN_STATE_TRANSITION_AUTHORITY_DENIED" },
@@ -188,6 +226,11 @@ const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }
   { name: "schema_migrations_no_delete", sentinel: "SCHEMA_MIGRATION_RECEIPT_IMMUTABLE" },
 ];
 
+const REQUIRED_BASELINE_LEDGER_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
+  { name: "baseline_records_immutable", sentinel: "BASELINE_RECORD_IMMUTABLE" },
+  { name: "baseline_records_no_delete", sentinel: "BASELINE_RECORD_IMMUTABLE" },
+];
+
 /**
  * Names alone are not enough: a same-named no-op trigger would make a corrupt database look
  * healthy. The embedded denial marker proves that each load-bearing guard still has its
@@ -195,11 +238,14 @@ const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }
  */
 export const assertLoadBearingInvariants = (
   raw: Database.Database,
-  options: { includeMigrationLedger: boolean },
+  options: { includeMigrationLedger: boolean; includeBaselineLedger?: boolean },
 ): void => {
-  const expected = options.includeMigrationLedger
-    ? [...REQUIRED_TRIGGERS, ...REQUIRED_LEDGER_TRIGGERS]
-    : REQUIRED_TRIGGERS;
+  const expected = [
+    ...(options.includeMigrationLedger
+      ? [...REQUIRED_TRIGGERS, ...REQUIRED_LEDGER_TRIGGERS]
+      : REQUIRED_TRIGGERS),
+    ...(options.includeBaselineLedger ? REQUIRED_BASELINE_LEDGER_TRIGGERS : []),
+  ];
   for (const trigger of expected) {
     const row = raw
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")

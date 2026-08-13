@@ -125,6 +125,30 @@ const SNAPSHOT_BOUND: ReadonlySet<string> = new Set([
   "PRODUCTION_READY_PACKET",
 ]);
 
+/** Whether an artifact's digest includes its candidate binding as well as its content. */
+export const isSnapshotBoundArtifact = (kind: string): boolean => SNAPSHOT_BOUND.has(kind);
+
+/**
+ * The one digest formula used both when evidence is stored and when an offline export
+ * corroborates it. Keeping this public avoids an exporter reimplementing a subtly weaker
+ * formula that covers content but forgets the candidate it is asserting.
+ */
+export const digestArtifactContent = (
+  kind: ArtifactKind,
+  content: unknown,
+  candidateSnapshotDigest: string | null,
+): string =>
+  isSnapshotBoundArtifact(kind)
+    ? digestOf({ candidateSnapshotDigest, content })
+    : digestOf(content);
+
+/** A stored artifact is publishable only if its declared digest still addresses its bytes. */
+export const artifactDigestMatches = (
+  artifact: Pick<StoredArtifact, "kind" | "content" | "candidateSnapshotDigest" | "digest">,
+): boolean =>
+  artifact.digest ===
+  digestArtifactContent(artifact.kind, artifact.content, artifact.candidateSnapshotDigest);
+
 /**
  * Typed immutable artifact store (PRD §30.1). Content is addressed by its canonical
  * digest, and the row-level trigger makes rewriting an artifact impossible — evidence
@@ -272,9 +296,7 @@ export class ArtifactStore {
       );
     }
     const durableContent = content;
-    const digest = SNAPSHOT_BOUND.has(kind)
-      ? digestOf({ candidateSnapshotDigest, content: durableContent })
-      : digestOf(durableContent);
+    const digest = digestArtifactContent(kind, durableContent, candidateSnapshotDigest);
     const existing = this.db.get<RawArtifact>(
       `SELECT * FROM run_artifacts
         WHERE run_id = ? AND kind = ? AND digest = ? AND candidate_snapshot_digest IS ?`,
