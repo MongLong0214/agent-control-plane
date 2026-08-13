@@ -227,6 +227,12 @@ export const driveToReviewedCandidate = async (
   options: {
     projectId?: string;
     workBranch?: string;
+    /** Lets GitHub regressions exercise release/hotfix targets without bypassing the run path. */
+    baseBranch?: string;
+    /** Lets GitHub regressions exercise the real durable human-gate contract. */
+    humanGate?: readonly string[];
+    /** Extra candidate-relative paths the scripted blind reviewer must attest to. */
+    reviewedPaths?: readonly string[];
     manifestOverrides?: Partial<ProjectManifest>;
   } = {},
 ): Promise<{
@@ -259,7 +265,7 @@ export const driveToReviewedCandidate = async (
     nonGoals: [],
     acceptance: ["verify.js exits 0"],
     priority: "NORMAL",
-    humanGate: [],
+    humanGate: [...(options.humanGate ?? [])],
     references: [],
   };
 
@@ -267,7 +273,7 @@ export const driveToReviewedCandidate = async (
     projectId,
     executionMode: ExecutionMode.STANDARD,
     contract,
-    repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: options.baseBranch ?? "dev" }],
   });
   if (!created.allowed) throw new Error(created.message);
   const runId = created.value.runId;
@@ -311,7 +317,10 @@ export const driveToReviewedCandidate = async (
   });
   if (!verified.allowed) throw new Error(`${verified.reasonCode}: ${verified.message}`);
 
-  harness.scripted.script({ match: /Candidate review/, text: reviewerPass([`${identity}:src/app.js`]) });
+  harness.scripted.script({
+    match: /Candidate review/,
+    text: reviewerPass((options.reviewedPaths ?? ["src/app.js"]).map((path) => `${identity}:${path}`)),
+  });
   const reviewed = await harness.cp.review.controlPlaneInvoker()({
     runId,
     projectId,

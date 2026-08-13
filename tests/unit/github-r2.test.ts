@@ -3,10 +3,16 @@ import { chmodSync } from "node:fs";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
+import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { Db } from "../../src/db/database.ts";
+import { RunState } from "../../src/domain/types.ts";
+import type { ControlPlane } from "../../src/app/control-plane.ts";
+import { dispatch as dispatchAgentctl } from "../../src/cli/agentctl.ts";
 import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { validateBranchContract } from "../../src/github/branch-contract.ts";
+import { executeConfirmedMerge, type ConfirmedMergePorts } from "../../src/github/confirmed-merge-operation.ts";
+import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import { driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
@@ -95,7 +101,6 @@ const reflectMergedBase = (github: FakeGitHub): void => {
 const ready = async (ciWorkflows: Array<{ path: string; checkName: string; approvedDigest: string | null }> = []) => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
-  Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
   const driven = await driveToReviewedCandidate(harness, {
@@ -178,6 +183,15 @@ const acceptedReleaseMerge = (fixture: Fixture, commit: string): void => {
     ],
   );
   fixture.github.markContains(PROFILE.defaultBranch, commit);
+  const releaseClaim = fixture.harness.cp.claims.acquire({
+    runId: fixture.driven.runId,
+    ownerSessionId: fixture.driven.ownerSessionId,
+    ownerBindingGeneration: fixture.driven.ownerBindingGeneration,
+    ownerRoleKey: fixture.harness.cp.runs.require(fixture.driven.runId).ownerRoleKey!,
+    repositoryIdentity: fixture.driven.identity,
+    branch: "release/1.2.0",
+  });
+  if (!releaseClaim.allowed) throw new Error(releaseClaim.message);
 };
 
 describe("round-two GitHub hardening", () => {
@@ -274,7 +288,6 @@ describe("round-two GitHub hardening", () => {
 
   it("#85: fences the head, proves the base after merging, and records the residual base race", async () => {
     const fixture = await ready();
-    Object.assign(fixture.github, { supportsAtomicExpectedBase: false });
     const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.driven.identity);
     if (!gate.allowed) throw new Error(gate.message);
     const pr = await fixture.harness.cp.github.prPrepare(fixture.input);
@@ -303,6 +316,105 @@ describe("round-two GitHub hardening", () => {
       residualRace: "base-may-move-between-preflight-and-merge",
       proof: "merge-commit-first-parent",
     });
+  });
+
+  it("#384: does not advertise an atomic expected-base capability the REST merge endpoint cannot honor", () => {
+    const client: GitHubClient = new FakeGitHub();
+    expect("supportsAtomicExpectedBase" in client).toBe(false);
+    // If a future implementation adds this capability, it must also add a real atomic
+    // provider path; silently restoring the old no-op option fails typechecking here.
+    // @ts-expect-error GitHubClient deliberately exposes no unsupported atomic-base flag.
+    void client.supportsAtomicExpectedBase;
+  });
+
+  it("#386: the confirmed operator sequence derives its gate, PR and merge inputs from durable state", async () => {
+    const fixture = await ready();
+    const calls = {
+      gatePublish: vi.fn(async () => allow(ReasonCode.OK, { checkRunId: 71 })),
+      prPrepare: vi.fn(async () => allow(ReasonCode.OK, { pullNumber: 72, url: "https://github.test/pull/72" })),
+      mergeExecute: vi.fn(async () => allow(ReasonCode.OK, { mergeCommitSha: "m".repeat(40), replayed: false })),
+    };
+    const completed = { ...fixture.harness.cp.runs.require(fixture.driven.runId), state: RunState.COMPLETED };
+    const ports = {
+      github: calls,
+      runs: {
+        get: (runId: string) => (runId === fixture.driven.runId ? completed : null),
+        currentCandidate: fixture.harness.cp.runs.currentCandidate.bind(fixture.harness.cp.runs),
+      },
+      artifacts: fixture.harness.cp.artifacts,
+      projects: fixture.harness.cp.projects,
+      clock: fixture.harness.cp.clock,
+    } as ConfirmedMergePorts;
+    const input = {
+      runId: fixture.driven.runId,
+      repositoryIdentity: fixture.driven.identity,
+      head: fixture.driven.workBranch,
+      title: "operator candidate",
+    };
+
+    const merged = await executeConfirmedMerge(ports, input);
+    expect(merged).toMatchObject({
+      allowed: true,
+      value: { checkRunId: 71, pullNumber: 72, mergeCommitSha: "m".repeat(40), replayed: false },
+    });
+    expect(calls.gatePublish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: fixture.driven.runId,
+        candidateSnapshotDigest: fixture.driven.candidateSnapshotDigest,
+        exactHead: fixture.driven.candidateHead,
+      }),
+      fixture.driven.identity,
+    );
+    expect(calls.prPrepare).toHaveBeenCalledWith(expect.objectContaining({
+      head: fixture.driven.workBranch,
+      base: "dev",
+      exactHeadSha: fixture.driven.candidateHead,
+      ownerSessionId: fixture.driven.ownerSessionId,
+    }));
+    expect(calls.mergeExecute).toHaveBeenCalledWith(expect.objectContaining({
+      pullNumber: 72,
+      exactHeadSha: fixture.driven.candidateHead,
+      expectedBaseSha: fixture.driven.baseHead,
+      mergeStrategy: "merge_commit",
+    }));
+    expect(calls.gatePublish.mock.invocationCallOrder[0]).toBeLessThan(calls.prPrepare.mock.invocationCallOrder[0]!);
+    expect(calls.prPrepare.mock.invocationCallOrder[0]).toBeLessThan(calls.mergeExecute.mock.invocationCallOrder[0]!);
+
+    const unconfirmed = await executeConfirmedMerge({
+      ...ports,
+      runs: {
+        get: fixture.harness.cp.runs.get.bind(fixture.harness.cp.runs),
+        currentCandidate: fixture.harness.cp.runs.currentCandidate.bind(fixture.harness.cp.runs),
+      },
+    }, input);
+    expect(unconfirmed.reasonCode).toBe(ReasonCode.GATE_AUTHORITY_DENIED);
+    expect(calls.gatePublish).toHaveBeenCalledTimes(1);
+
+    // Exercise the shipped CLI handler itself, not merely the coordinator it delegates to.
+    // Removing `agentctl github merge` turns this into an unknown-command exit and leaves
+    // the three kernel calls at one each.
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      const exit = await dispatchAgentctl({
+        github: calls,
+        runs: ports.runs,
+        artifacts: fixture.harness.cp.artifacts,
+        projects: fixture.harness.cp.projects,
+        clock: fixture.harness.cp.clock,
+      } as unknown as ControlPlane, "github", [
+        "merge",
+        input.runId,
+        input.repositoryIdentity,
+        input.head,
+        input.title,
+      ], false);
+      expect(exit).toBe(0);
+    } finally {
+      stdout.mockRestore();
+    }
+    expect(calls.gatePublish).toHaveBeenCalledTimes(2);
+    expect(calls.prPrepare).toHaveBeenCalledTimes(2);
+    expect(calls.mergeExecute).toHaveBeenCalledTimes(2);
   });
 
   it("#87/#192: a receipt for the same PR but different merge intent is a resource collision", async () => {
