@@ -104,14 +104,13 @@ describe("MCP evidence authority has no route through a tool handler (#352)", ()
     expect(createCtoServer(ctoPort, authenticate)).toBeDefined();
   });
 
-  it("issues evidence writers once for the underlying database file, including a symlink alias", () => {
+  it("issues evidence writers once for the underlying database file and refuses a symlink alias", () => {
     const root = tempDir("acp-evidence-file-");
     const databasePath = join(root, "state.sqlite");
     const aliasPath = join(root, "state-alias.sqlite");
     const clock = new ManualClock("2026-08-13T00:00:00.000Z");
     const first = new Db(databasePath);
     let samePath: Db | undefined;
-    let alias: Db | undefined;
 
     try {
       new ArtifactStore(first, clock).issueEvidenceWriters();
@@ -128,14 +127,13 @@ describe("MCP evidence authority has no route through a tool handler (#352)", ()
       );
 
       symlinkSync(databasePath, aliasPath);
-      alias = new Db(aliasPath);
-      // `realpathSync` makes aliases of one SQLite file one authority domain.
-      expect(alias.file).toBe(first.file);
-      expect(denialCode(() => alias!.claimEvidenceWritePort())).toBe(
-        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+      // A state alias could be switched after an operator inspected the primary path, so
+      // preflight rejects it before SQLite follows it. This takes precedence over the older
+      // capability-domain alias behavior.
+      expect(denialCode(() => new Db(aliasPath))).toBe(
+        ReasonCode.STATE_PATH_INSECURE,
       );
     } finally {
-      alias?.close();
       samePath?.close();
       first.close();
     }

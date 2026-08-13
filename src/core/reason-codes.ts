@@ -13,6 +13,8 @@ export const ReasonCode = {
   NOT_FOUND: "NOT_FOUND",
   INVALID_ARGUMENT: "INVALID_ARGUMENT",
   CONFLICT: "CONFLICT",
+  /** A daemon-state path is missing, permissive, wrongly owned, or symlinked. */
+  STATE_PATH_INSECURE: "STATE_PATH_INSECURE",
 
   // --- CP-HI-01 Managed Write Guard ---------------------------------------
   WRITE_REQUIRES_MANAGED_RUN: "WRITE_REQUIRES_MANAGED_RUN",

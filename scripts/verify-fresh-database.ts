@@ -13,11 +13,10 @@
  *      three-wave merge the only trustworthy statement about the schema is one made by
  *      creating a database and interrogating it.
  *
- *   2. `Db.applySchema` (src/db/database.ts) has no ordered migration path, by design:
- *      `CREATE TABLE IF NOT EXISTS` would keep an older table whose CHECKs are weaker.
- *      That decision is only safe if an older database is *refused*. This script opens
- *      tampered copies at an older, a newer and a pre-versioning `user_version` and
- *      records what the code actually does with each.
+ *   2. `Db.applySchema` (src/db/database.ts) has an explicit ordered path for the released
+ *      older version, while a newer or pre-versioning file is refused. This script opens
+ *      tampered copies at each of those `user_version` cases and records what the code
+ *      actually does with each.
  *
  * Everything happens in a throwaway directory under the OS temp dir; the script never
  * touches a real deployment state directory, and every probe insert is rolled back.
@@ -110,6 +109,7 @@ const root = mkdtempSync(join(tmpdir(), "acp-schema-check-"));
 const config = defaultConfig(root);
 let cp: ControlPlane | null = null;
 let fresh: Db | null = null;
+let inspection: Database.Database | null = null;
 
 const finish = (): never => {
   try {
@@ -119,6 +119,11 @@ const finish = (): never => {
   }
   try {
     fresh?.close();
+  } catch {
+    /* same */
+  }
+  try {
+    inspection?.close();
   } catch {
     /* same */
   }
@@ -134,7 +139,11 @@ try {
   finish();
 }
 
-const db = cp!.db.raw;
+// Db intentionally exposes only a schema-version diagnostic surface. This verifier needs
+// a throwaway SQL handle for integrity, schema introspection and rollback probes, so open a
+// second connection to the same temporary file and close it in finish().
+const db = new Database(config.databasePath);
+inspection = db;
 
 // --- user_version ---------------------------------------------------------
 const userVersion = Number(db.pragma("user_version", { simple: true }));
@@ -440,10 +449,13 @@ for (const table of tables) {
 }
 db.pragma("foreign_keys = ON");
 observed["satisfiability"] = satisfiability;
+db.close();
+inspection = null;
 
 // --------------------------------------------------------------------------
-// Re-opening the *same* version must stay clean, and every other version must be
-// refused. This is check 2: there is no migration path, so silence would be the bug.
+// Re-opening the *same* version must stay clean, an older ordered version must migrate,
+// and a newer or pre-versioning version must be refused. This is check 2: the version
+// contract is deliberately asymmetric.
 // --------------------------------------------------------------------------
 cp!.close();
 cp = null;
@@ -468,21 +480,31 @@ const tamper = (label: string, mutate: (raw: Database.Database) => void) => {
     handle.close();
   });
   observed[label] = outcome;
-  if (outcome.ok) {
-    problems.push(
-      `a database at ${label} was opened and reused instead of being refused; ` +
-        `there is no migration path, so its constraints are unverified`,
-    );
-  }
   return outcome;
 };
 
-const older = tamper("olderVersion", (raw) => raw.pragma(`user_version = ${SCHEMA_VERSION - 1}`));
+const older = tamper("olderVersion", (raw) => {
+  // A v11 file predates the v12 ledger; stamping a current ledger-bearing file to 11
+  // would make the migration fail on its duplicate receipt rather than test the path.
+  raw.exec("DROP TABLE schema_migrations");
+  raw.pragma(`user_version = ${SCHEMA_VERSION - 1}`);
+});
 const newer = tamper("newerVersion", (raw) => raw.pragma(`user_version = ${SCHEMA_VERSION + 1}`));
 const preVersioning = tamper("preVersioningVersion", (raw) => raw.pragma("user_version = 0"));
 
+if (!older.ok) {
+  problems.push(`an older schema version failed to migrate: ${older.message}`);
+}
 for (const [label, outcome] of [
-  ["older", older],
+  ["newer", newer],
+  ["pre-versioning", preVersioning],
+] as const) {
+  if (outcome.ok) {
+    problems.push(`${label} database was opened instead of being refused`);
+  }
+}
+
+for (const [label, outcome] of [
   ["newer", newer],
   ["pre-versioning", preVersioning],
 ] as const) {
@@ -557,7 +579,7 @@ function report(): void {
   for (const note of notes) console.log(`note: ${note}`);
   console.log("");
   if (problems.length === 0) {
-    console.log("OK — fresh database applies cleanly and every other schema version is refused");
+    console.log("OK — fresh database applies cleanly, older schemas migrate, and newer/pre-versioning schemas are refused");
   } else {
     console.log(`${problems.length} problem(s):`);
     for (const problem of problems) console.log(`  - ${problem}`);

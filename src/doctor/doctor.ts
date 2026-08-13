@@ -13,6 +13,7 @@ import type { ClaimRegistry } from "../claims/claim-registry.ts";
 import type { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { inspectDatabaseStatePaths, inspectPrivatePath } from "../db/state-preflight.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { GitHubKernel } from "../github/github-kernel.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
@@ -91,6 +92,12 @@ export class Doctor {
       freshnessMs: number;
       maxClockSkewMs: number;
     },
+    private readonly statePaths: {
+      databasePath: string;
+      worktreeRoot: string;
+      secretsDir: string;
+      capacityDir: string;
+    },
   ) {}
 
   async run(
@@ -115,6 +122,7 @@ export class Doctor {
       findings.push(...(await this.checkCapacity()));
     }
     if (scope === "system") {
+      findings.push(...this.checkStatePaths());
       findings.push(...(await this.checkHostResources()));
       findings.push(...this.checkClaims());
       findings.push(...this.checkOutbox());
@@ -165,6 +173,35 @@ export class Doctor {
   }
 
   // --- checks --------------------------------------------------------------
+
+  /** A startup preflight prevents trust; Doctor makes later chmod/symlink drift observable. */
+  private checkStatePaths(): Finding[] {
+    const inspections = [
+      ...inspectDatabaseStatePaths(this.statePaths.databasePath),
+      inspectPrivatePath(this.statePaths.worktreeRoot, "directory"),
+      inspectPrivatePath(this.statePaths.secretsDir, "directory"),
+      inspectPrivatePath(this.statePaths.capacityDir, "directory"),
+    ];
+    return inspections
+      .filter((inspection) => !inspection.secure)
+      .map((inspection) => ({
+        code: "STATE_PATH_INSECURE",
+        severity: "CRITICAL" as const,
+        scope: "host",
+        blocking: true,
+        confidence: "HIGH" as const,
+        observedEvidence: {
+          path: inspection.path,
+          kind: inspection.kind,
+          reason: inspection.reason,
+          expectedMode: inspection.expectedMode.toString(8),
+          actualMode: inspection.actualMode === null ? null : inspection.actualMode.toString(8),
+          ownerUid: inspection.ownerUid,
+          currentUid: inspection.currentUid,
+        },
+        recommendedAction: "stop the daemon and restore owner-only, non-symlinked state paths from a trusted backup",
+      }));
+  }
 
   private checkBindings(projectId: string | null): Finding[] {
     const findings: Finding[] = [];

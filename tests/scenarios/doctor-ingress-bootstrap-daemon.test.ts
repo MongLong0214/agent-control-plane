@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -217,6 +217,18 @@ describe("doctor (CP-S43 – CP-S45)", () => {
     const report = await harness.cp.doctor.run("project", projectId);
     const finding = report.findings.find((f) => f.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION");
     expect(finding?.severity).toBe("CRITICAL");
+    expect(report.status).toBe("ERROR");
+  });
+
+  it("reports state-path permission drift as a blocking, actionable finding", async () => {
+    const harness = makeHarness();
+    chmodSync(harness.cp.config.worktreeRoot, 0o755);
+
+    const report = await harness.cp.doctor.run("system");
+    const finding = report.findings.find(
+      (candidate) => candidate.code === "STATE_PATH_INSECURE" && candidate.observedEvidence.path === harness.cp.config.worktreeRoot,
+    );
+    expect(finding).toMatchObject({ severity: "CRITICAL", blocking: true });
     expect(report.status).toBe("ERROR");
   });
 });

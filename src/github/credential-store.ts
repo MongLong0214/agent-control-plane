@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { assertPrivatePath, ensurePrivateDirectory, inspectPrivatePath } from "../db/state-preflight.ts";
 
 export interface TrustedCredential {
   token: string;
@@ -32,7 +33,7 @@ export class TrustedCredentialStore {
   }
 
   install(credential: TrustedCredential): void {
-    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    ensurePrivateDirectory(this.directory);
     this.assertInstallTarget(this.#path);
     this.assertInstallTarget(this.#identityPath);
     writeFileSync(this.#path, credential.token, { mode: 0o600 });
@@ -172,15 +173,11 @@ export class TrustedCredentialStore {
       if (!existsSync(this.directory) || !existsSync(this.#path) || !existsSync(this.#identityPath)) {
         return false;
       }
-      const directory = lstatSync(this.directory);
-      const token = lstatSync(this.#path);
-      const identity = lstatSync(this.#identityPath);
-      if (!directory.isDirectory() || !token.isFile() || !identity.isFile()) return false;
-      if ((directory.mode & 0o077) !== 0 || (token.mode & 0o077) !== 0 || (identity.mode & 0o077) !== 0) {
-        return false;
-      }
-      const uid = typeof process.getuid === "function" ? process.getuid() : null;
-      return uid === null || (directory.uid === uid && token.uid === uid && identity.uid === uid);
+      return [
+        inspectPrivatePath(this.directory, "directory"),
+        inspectPrivatePath(this.#path, "file"),
+        inspectPrivatePath(this.#identityPath, "file"),
+      ].every((inspection) => inspection.secure);
     } catch {
       return false;
     }
@@ -188,9 +185,6 @@ export class TrustedCredentialStore {
 
   private assertInstallTarget(path: string): void {
     if (!existsSync(path)) return;
-    const target = lstatSync(path);
-    if (!target.isFile()) {
-      throw new Error(`trusted credential install refuses non-regular target: ${path}`);
-    }
+    assertPrivatePath(path, "file");
   }
 }
