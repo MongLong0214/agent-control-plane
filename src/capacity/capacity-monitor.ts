@@ -217,6 +217,16 @@ export class CapacityMonitor {
     return this.refreshForAllocation(RefreshTrigger.BLIND_REVIEW, target, "blind review");
   }
 
+  /**
+   * §14.2 — a continuity replacement is an allocation on a newly selected provider, not
+   * merely a coverage calculation. Re-probe and admit the exact replacement target before
+   * a fresh session is constituted; a prior CONTINUITY_EVALUATION cannot be treated as a
+   * lease across the provider switch.
+   */
+  async refreshForProviderSwitch(target?: DispatchCapacityTarget): Promise<Decision<void>> {
+    return this.refreshForAllocation(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, target, "provider switch");
+  }
+
   private async refreshForAllocation(
     trigger: RefreshTrigger,
     target: DispatchCapacityTarget | undefined,
