@@ -10,7 +10,7 @@ import type { Db } from "../db/database.ts";
 import { FailureClass as FailureClassCode, type FailureClass } from "../domain/types.ts";
 import {
   type FencedEnvelope,
-  type MessageKind,
+  MessageKind,
   RETARGETABLE_KINDS,
   payloadDigestOf,
 } from "./envelope.ts";
@@ -59,6 +59,42 @@ const RETRYABLE_FAILURE_CLASSES: ReadonlySet<FailureClass> = new Set([
 const KNOWN_FAILURE_CLASSES: ReadonlySet<string> = new Set(Object.values(FailureClassCode));
 
 /**
+ * The ordinary recipient must still hold the exact active binding. The only exception is
+ * the §10.1 handoff package: its recipient is deliberately unbound until that recipient
+ * presents the delivered envelope and the binding generation switches. Keep the exception
+ * in the delivery predicates as well as enqueue admission; otherwise a valid package can
+ * be persisted but can never be claimed or marked SENT.
+ */
+const liveDeliveryTarget = (outboxAlias: "o" | "outbox"): string => `(
+  EXISTS (
+    SELECT 1 FROM assignments a
+      JOIN sessions s ON s.session_id = a.session_id
+     WHERE a.role_key = ${outboxAlias}.role_key
+       AND a.binding_generation = ${outboxAlias}.binding_generation
+       AND a.session_id = ${outboxAlias}.target_session_id
+       AND a.status = 'ACTIVE'
+       AND s.lifecycle IN ('READY','DRAINING')
+  )
+  OR EXISTS (
+    SELECT 1 FROM handoffs h
+      JOIN sessions recipient ON recipient.session_id = h.to_session_id
+      JOIN sessions outgoing ON outgoing.session_id = h.from_session_id
+      JOIN assignments a ON a.role_key = ${outboxAlias}.role_key
+                         AND a.binding_generation = ${outboxAlias}.binding_generation
+                         AND a.session_id = h.from_session_id
+                         AND a.status = 'ACTIVE'
+     WHERE ${outboxAlias}.kind = 'HANDOFF_PACKAGE'
+       AND h.kind = 'HANDOFF'
+       AND h.to_session_id = ${outboxAlias}.target_session_id
+       AND h.from_generation = ${outboxAlias}.binding_generation
+       AND h.status = 'PENDING'
+       AND ${outboxAlias}.idempotency_key = 'handoff:' || h.handoff_id
+       AND recipient.lifecycle = 'READY'
+       AND outgoing.lifecycle IN ('READY','DRAINING')
+  )
+)`;
+
+/**
  * Durable, fenced message queue (PRD §15.7, §27.5, §34.1).
  *
  * Enqueue happens inside the same transaction as the state change that justified the
@@ -92,7 +128,13 @@ export class Outbox {
     const existing = this.byIdempotencyKey(input.idempotencyKey);
     if (existing) return this.replayDecision(existing, input);
 
-    if (!this.isCurrentTarget(input.roleKey, input.bindingGeneration, input.targetSessionId)) {
+    if (!this.isCurrentTarget(
+      input.roleKey,
+      input.bindingGeneration,
+      input.targetSessionId,
+      input.kind,
+      input.idempotencyKey,
+    )) {
       return deny(
         ReasonCode.OUTBOX_TARGET_NOT_CURRENT,
         "outbox target is not the ready session holding the requested role generation",
@@ -177,12 +219,6 @@ export class Outbox {
 
       const rows = this.db.all<RawOutbox>(
         `SELECT o.* FROM outbox o
-           JOIN assignments a ON a.role_key = o.role_key
-                              AND a.binding_generation = o.binding_generation
-                              AND a.session_id = o.target_session_id
-                              AND a.status = 'ACTIVE'
-           JOIN sessions s ON s.session_id = o.target_session_id
-                          AND s.lifecycle IN ('READY','DRAINING')
           WHERE o.status = 'PENDING'
             AND o.expires_at > ?
             -- A deferred retry is not deliverable until its window opens; the deferral is
@@ -192,6 +228,7 @@ export class Outbox {
             -- is retry-eligible. A queued row that carries attempts but no eligibility was
             -- never judged retryable, so it is not picked up.
             AND (o.attempts = 0 OR o.retry_eligible = 1)
+            AND ${liveDeliveryTarget("o")}
           ORDER BY o.created_at
           LIMIT ?`,
         [now, now, limit],
@@ -203,15 +240,7 @@ export class Outbox {
         const updated = this.db.run(
           `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = ?, claimed_at = ?
             WHERE message_id = ? AND status = 'PENDING'
-              AND EXISTS (
-                SELECT 1 FROM assignments a
-                  JOIN sessions s ON s.session_id = a.session_id
-                 WHERE a.role_key = outbox.role_key
-                   AND a.binding_generation = outbox.binding_generation
-                   AND a.session_id = outbox.target_session_id
-                   AND a.status = 'ACTIVE'
-                   AND s.lifecycle IN ('READY','DRAINING')
-              )`,
+              AND ${liveDeliveryTarget("outbox")}`,
           [token, now, row.message_id],
         );
         // Compare-and-set: another loop may have taken it between the select and here.
@@ -227,15 +256,7 @@ export class Outbox {
     return this.db.run(
       `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL
         WHERE status = 'IN_FLIGHT' AND claimed_at <= ?
-          AND EXISTS (
-            SELECT 1 FROM assignments a
-              JOIN sessions s ON s.session_id = a.session_id
-             WHERE a.role_key = outbox.role_key
-               AND a.binding_generation = outbox.binding_generation
-               AND a.session_id = outbox.target_session_id
-               AND a.status = 'ACTIVE'
-               AND s.lifecycle IN ('READY','DRAINING')
-          )`,
+          AND ${liveDeliveryTarget("outbox")}`,
       [new Date(new Date(this.clock.nowIso()).getTime() - leaseMs).toISOString()],
     ).changes;
   }
@@ -247,15 +268,7 @@ export class Outbox {
                          claim_token = NULL, claimed_at = NULL,
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
-          AND EXISTS (
-            SELECT 1 FROM assignments a
-              JOIN sessions s ON s.session_id = a.session_id
-             WHERE a.role_key = outbox.role_key
-               AND a.binding_generation = outbox.binding_generation
-               AND a.session_id = outbox.target_session_id
-               AND a.status = 'ACTIVE'
-               AND s.lifecycle IN ('READY','DRAINING')
-          )`,
+          AND ${liveDeliveryTarget("outbox")}`,
       [this.clock.nowIso(), messageId, claimToken],
     ).changes;
     if (changes !== 1) {
@@ -318,15 +331,7 @@ export class Outbox {
                          retry_eligible = ?, next_attempt_at = ?, reason_code = ?,
                          claim_token = NULL, claimed_at = NULL
         WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
-          AND EXISTS (
-            SELECT 1 FROM assignments a
-              JOIN sessions s ON s.session_id = a.session_id
-             WHERE a.role_key = outbox.role_key
-               AND a.binding_generation = outbox.binding_generation
-               AND a.session_id = outbox.target_session_id
-               AND a.status = 'ACTIVE'
-               AND s.lifecycle IN ('READY','DRAINING')
-          )`,
+          AND ${liveDeliveryTarget("outbox")}`,
       [
         retryable ? "PENDING" : "REJECTED",
         attempts,
@@ -554,15 +559,7 @@ export class Outbox {
       `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE status IN ('PENDING','IN_FLIGHT')
-          AND NOT EXISTS (
-            SELECT 1 FROM assignments a
-              JOIN sessions s ON s.session_id = a.session_id
-             WHERE a.role_key = outbox.role_key
-               AND a.binding_generation = outbox.binding_generation
-               AND a.session_id = outbox.target_session_id
-               AND a.status = 'ACTIVE'
-               AND s.lifecycle IN ('READY','DRAINING')
-          )`,
+          AND NOT ${liveDeliveryTarget("outbox")}`,
       [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED],
     ).changes;
   }
@@ -578,7 +575,13 @@ export class Outbox {
    * its recipient — the fence is still the outgoing binding, so a superseded generation
    * cannot send, and a session that is not READY cannot receive.
    */
-  private isCurrentTarget(roleKey: string, bindingGeneration: number, sessionId: string): boolean {
+  private isCurrentTarget(
+    roleKey: string,
+    bindingGeneration: number,
+    sessionId: string,
+    kind: MessageKind,
+    idempotencyKey: string,
+  ): boolean {
     const holder = this.db.get(
       `SELECT 1 FROM assignments a
         JOIN sessions s ON s.session_id = a.session_id
@@ -588,15 +591,21 @@ export class Outbox {
     );
     if (holder) return true;
 
+    if (kind !== MessageKind.HANDOFF_PACKAGE) return false;
+
     return Boolean(
       this.db.get(
         `SELECT 1 FROM handoffs h
-          JOIN sessions s ON s.session_id = h.to_session_id
+          JOIN sessions recipient ON recipient.session_id = h.to_session_id
+          JOIN sessions outgoing ON outgoing.session_id = h.from_session_id
           JOIN assignments a ON a.role_key = ? AND a.binding_generation = ?
                             AND a.session_id = h.from_session_id AND a.status = 'ACTIVE'
-          WHERE h.to_session_id = ? AND h.status = 'PENDING' AND h.from_generation = ?
-            AND s.lifecycle = 'READY'`,
-        [roleKey, bindingGeneration, sessionId, bindingGeneration],
+          WHERE h.kind = 'HANDOFF' AND h.to_session_id = ?
+            AND h.status = 'PENDING' AND h.from_generation = ?
+            AND ? = 'handoff:' || h.handoff_id
+            AND recipient.lifecycle = 'READY'
+            AND outgoing.lifecycle IN ('READY','DRAINING')`,
+        [roleKey, bindingGeneration, sessionId, bindingGeneration, idempotencyKey],
       ),
     );
   }
