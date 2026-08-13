@@ -370,6 +370,20 @@ export class CandidatePipeline {
       const acquiredAt = this.clock.now();
       const startedAt = acquiredAt.toISOString();
       const deadlineAt = new Date(acquiredAt.getTime() + ATTEMPT_LEASE_TTL_MS).toISOString();
+      // Read the prior holder in the same transaction so a direct acquisition reclaim is
+      // evidence-producing too. A watchdog is not guaranteed to run between a crash and
+      // the next submit, so silently replacing an expired RUNNING row would erase the
+      // only durable record of that interrupted attempt.
+      const prior = this.db.get<{
+        attempt_id: string;
+        started_at: string;
+        deadline_at: string;
+        state: string;
+      }>(
+        `SELECT attempt_id, started_at, deadline_at, state
+           FROM candidate_pipeline_attempts WHERE run_id = ?`,
+        [input.runId],
+      );
       const inserted = this.db.run(
         `INSERT INTO candidate_pipeline_attempts
            (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
@@ -388,7 +402,18 @@ export class CandidatePipeline {
                 AND candidate_pipeline_attempts.deadline_at <= ?)`,
         [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, startedAt, deadlineAt, startedAt],
       );
-      if (inserted.changes === 1) return allow(ReasonCode.OK, undefined);
+      if (inserted.changes === 1) {
+        if (prior?.state === "RUNNING" && prior.deadline_at <= startedAt) {
+          this.recordAttemptReclaimed({
+            runId: input.runId,
+            attemptId: prior.attempt_id,
+            startedAt: prior.started_at,
+            deadlineAt: prior.deadline_at,
+            ageMs: acquiredAt.getTime() - new Date(prior.started_at).getTime(),
+          }, "acquire");
+        }
+        return allow(ReasonCode.OK, undefined);
+      }
       const current = this.db.get<{
         attempt_id: string;
         owner_session_id: string;
@@ -413,8 +438,8 @@ export class CandidatePipeline {
    * synchronous, conditional transaction: a watchdog may observe a stale row just as a
    * new submission replaces it, and must never release that new holder's fence.
    *
-   * The watchdog owns the diagnostic/audit consequence; this method owns the candidate
-   * pipeline's state transition and returns the exact rows it changed.
+   * The watchdog owns the diagnostic report; this method owns the candidate pipeline's
+   * state transition, durable reclaim audit, and the exact rows it changed.
    */
   reclaimExpiredAttempts(): ReclaimedCandidatePipelineAttempt[] {
     return this.db.tx(() => {
@@ -442,15 +467,36 @@ export class CandidatePipeline {
         );
         if (released.changes !== 1) continue;
         const startedAt = new Date(attempt.started_at).getTime();
-        reclaimed.push({
+        const reclaimedAttempt = {
           runId: attempt.run_id,
           attemptId: attempt.attempt_id,
           startedAt: attempt.started_at,
           deadlineAt: attempt.deadline_at,
           ageMs: now.getTime() - startedAt,
-        });
+        };
+        reclaimed.push(reclaimedAttempt);
+        this.recordAttemptReclaimed(reclaimedAttempt, "sweep");
       }
       return reclaimed;
+    });
+  }
+
+  /** Records every state-changing reclamation, whether the watchdog or a new submit finds it. */
+  private recordAttemptReclaimed(
+    attempt: ReclaimedCandidatePipelineAttempt,
+    via: "acquire" | "sweep",
+  ): void {
+    this.audit.record({
+      kind: "CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED",
+      runId: attempt.runId,
+      reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
+      evidence: {
+        attemptId: attempt.attemptId,
+        startedAt: attempt.startedAt,
+        deadlineAt: attempt.deadlineAt,
+        ageMs: attempt.ageMs,
+        via,
+      },
     });
   }
 
