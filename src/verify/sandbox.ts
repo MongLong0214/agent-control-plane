@@ -70,10 +70,15 @@ export interface SandboxEnforcement {
   mechanism: "seatbelt" | "none";
 }
 
-/** Only these non-authority values may cross into a verification process. */
-const SAFE_COMMAND_ENV = new Set(["NODE_ENV", "NO_COLOR", "FORCE_COLOR", "TZ"]);
 const SAFE_NODE_ENV = new Set(["development", "test", "production"]);
 const SAFE_BOOLEAN_ENV = new Set(["0", "1"]);
+/** Only these non-authority values may cross into a verification process. */
+const SAFE_COMMAND_ENV: ReadonlyMap<string, (value: string) => boolean> = new Map([
+  ["NODE_ENV", (value) => SAFE_NODE_ENV.has(value)],
+  ["NO_COLOR", (value) => SAFE_BOOLEAN_ENV.has(value)],
+  ["FORCE_COLOR", (value) => SAFE_BOOLEAN_ENV.has(value)],
+  ["TZ", (value) => /^[A-Za-z0-9_+\-/]{1,64}$/.test(value)],
+]);
 // A harmless name cannot turn an authority-shaped value into sandbox input.
 const CREDENTIAL_VALUE_SHAPES: readonly RegExp[] = [
   /^gh[pousr]_[A-Za-z0-9]{16,}$/,
@@ -419,20 +424,14 @@ export const buildSandboxEnvironment = (
   };
 
   for (const name of command.envAllowlist) {
-    if (!SAFE_COMMAND_ENV.has(name)) continue;
+    const accepts = SAFE_COMMAND_ENV.get(name);
     const value = extra?.[name];
-    if (value === undefined || !safeEnvironmentValue(name, value)) continue;
+    if (!accepts || value === undefined) continue;
+    if (looksLikeCredential(value) || !accepts(value)) continue;
     env[name] = value;
   }
   return env;
 };
-
-const safeEnvironmentValue = (name: string, value: string): boolean =>
-  !looksLikeCredential(value) && (
-    (name === "NODE_ENV" && SAFE_NODE_ENV.has(value)) ||
-    ((name === "NO_COLOR" || name === "FORCE_COLOR") && SAFE_BOOLEAN_ENV.has(value)) ||
-    (name === "TZ" && /^[A-Za-z0-9_+\-/]{1,64}$/.test(value))
-  );
 
 const looksLikeCredential = (value: string): boolean =>
   CREDENTIAL_VALUE_SHAPES.some((pattern) => pattern.test(value.trim()));

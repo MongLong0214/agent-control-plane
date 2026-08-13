@@ -1,4 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
+import { chmodSync, existsSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import { allow } from "../../src/core/errors.ts";
@@ -128,6 +130,26 @@ const directReview = async (setup: Awaited<ReturnType<typeof prepareReviewedInpu
     verification: setup.verification,
   });
 };
+
+const writeAttestingReviewerStub = (directory: string, coveredFiles: readonly string[]): string => {
+  const binary = join(directory, "attesting-reviewer.mjs");
+  writeFileSync(
+    binary,
+    `#!${process.execPath}
+const sessionIndex = process.argv.indexOf("--session-id");
+const sessionId = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : null;
+const result = ${JSON.stringify(reviewerPass([...coveredFiles]))};
+process.stdout.write(JSON.stringify({ result, session_id: sessionId }));
+`,
+  );
+  chmodSync(binary, 0o700);
+  return binary;
+};
+
+const seatbeltCanApply = (): boolean =>
+  process.platform === "darwin" &&
+  existsSync("/usr/bin/sandbox-exec") &&
+  spawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
 
 const invokeGate = (
   gate: BlindReviewGate,
@@ -340,6 +362,72 @@ describe("round-2 blind-review regressions", () => {
     expect(probes).toBe(0);
   });
 
+  it("#332 accepts a packet only after the real reviewer adapter attests isolation", async () => {
+    const setup = await prepareReviewedInputs();
+    const claude = new ClaudeCliAdapter({
+      clock: setup.harness.clock,
+      capacityFile: join(setup.harness.root, "claude-capacity.json"),
+      binary: writeAttestingReviewerStub(setup.harness.root, [`${setup.identity}:src/app.js`]),
+    });
+    const canApplySeatbelt = seatbeltCanApply();
+    const direct = await claude.invoke({
+      prompt: "Review this packet only.",
+      workdir: setup.harness.root,
+      timeoutMs: 5_000,
+      readOnly: true,
+      correlationId: "real-reviewer-attestation",
+      externalSessionId: "stub-reviewer-session",
+      isolation: {
+        packetRoot: setup.harness.root,
+        denyReadPaths: [setup.harness.repoPath],
+        emptyEnvironment: true,
+        network: "provider-only",
+        tools: "none",
+      },
+    });
+    setup.harness.cp.providers.register(claude);
+    const gate = new BlindReviewGate(
+      setup.harness.cp.clock,
+      setup.harness.cp.db,
+      setup.harness.cp.audit,
+      setup.harness.cp.artifacts,
+      setup.harness.cp.evidenceWritersForTests().BLIND_REVIEW,
+      setup.harness.cp.sessions,
+      setup.harness.cp.bindings,
+      setup.harness.cp.providers,
+      setup.harness.cp.repositories,
+      setup.harness.cp.telemetry,
+      {
+        preferred: { provider: "claude", model: "opus", effort: null },
+        fallbacks: [],
+      },
+    );
+
+    const result = await invokeGate(gate, setup);
+
+    if (!canApplySeatbelt) {
+      // A real adapter must expose an unapplied profile as an isolation loss, never as a PASS.
+      expect(direct).toMatchObject({
+        ok: false,
+        isolationAttested: false,
+        isolationReasonCode: ReasonCode.ISOLATION_LOST,
+      });
+      expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.ISOLATION_LOST });
+      return;
+    }
+
+    expect(direct).toMatchObject({
+      ok: true,
+      isolationAttested: true,
+      isolationReasonCode: undefined,
+    });
+    expect(result).toMatchObject({
+      allowed: true,
+      reasonCode: ReasonCode.REVIEW_PASS,
+      value: { provider: "claude" },
+    });
+  });
+
   it("#334 uses a packet-local reviewer home and reports answer failure separately", async () => {
     const setup = await prepareReviewedInputs();
     const claude = new HealthyProbeClaudeAdapter({
@@ -492,15 +580,18 @@ describe("round-2 blind-review regressions", () => {
   });
 
   it("#135 range-splits an oversized single-file patch", () => {
+    const header = "diff --git a/large.ts b/large.ts\n";
+    const payload = Array.from({ length: 250 }, (_, index) => index.toString(36).padStart(4, "0")).join("");
     const chunks = __testing.splitDiffs([{
       identity: "github:acme/fixture",
-      diff: `diff --git a/large.ts b/large.ts\n${"x".repeat(1_000)}`,
+      diff: `${header}${payload}`,
       files: ["large.ts"],
     }], 100);
     const parts = chunks.flat();
     expect(parts.length).toBeGreaterThan(1);
     expect(parts.every((part) => part.diff.length <= 100)).toBe(true);
-    expect(parts.every((part) => part.files[0] === "large.ts")).toBe(true);
+    expect(parts.every((part) => part.files.length === 1 && part.files[0] === "large.ts")).toBe(true);
+    expect(parts.map((part) => part.diff.slice(header.length)).join("")).toBe(payload);
   });
 
   it("#136 supplies a digest-bound git binary patch instead of permanently omitting it", async () => {
