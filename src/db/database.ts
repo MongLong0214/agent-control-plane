@@ -1,11 +1,34 @@
 import Database from "better-sqlite3";
-import { readFileSync, realpathSync } from "node:fs";
-import { mkdirSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import {
+  DEFAULT_BACKUP_RETENTION,
+  assertIntegrity,
+  backupDatabase,
+  backupOpenDatabaseSync,
+  nextBackupPath,
+  pruneAutomaticBackups,
+  restoreDatabase,
+  type DatabaseBackup,
+} from "./backup.ts";
+import {
+  SCHEMA_VERSION as CURRENT_SCHEMA_VERSION,
+  assertLoadBearingInvariants,
+  assertMigrationLedgerAt,
+  bootstrapChecksum,
+  installMigrationLedger,
+  migrationChainFrom,
+  schemaDdl,
+  type SchemaMigration,
+} from "./migrations.ts";
+import {
+  assertPrivateDatabaseFiles,
+  ensurePrivateDirectory,
+  finalizeNewPrivateDatabaseFiles,
+} from "./state-preflight.ts";
 
 export type SqliteDatabase = Database.Database;
 
@@ -15,7 +38,6 @@ export interface DatabaseDiagnostics {
   pragma(source: string, options?: Database.PragmaOptions): unknown;
 }
 
-const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 const USER_VERSION_PRAGMA = /^\s*user_version(?:\s*=\s*\d+)?\s*;?\s*$/i;
 const TABLE_INFO_PRAGMA = /^\s*PRAGMA\s+(?:main\.)?table_info\s*\([^)]*\)\s*;?\s*$/i;
 
@@ -38,13 +60,15 @@ const assertReadQuery = (sql: string): void => {
   fail(ReasonCode.INVALID_ARGUMENT, "database reads must be queries", {});
 };
 
-/**
- * Version of the shape in schema.sql. Bump this whenever a constraint, trigger or column
- * changes. There is no ordered migration path: `CREATE TABLE IF NOT EXISTS` would silently
- * preserve an older table whose constraints are weaker, so version mismatch is refused
- * instead of pretending that a deployed database was migrated (§40 Maintainability).
- */
-export const SCHEMA_VERSION = 11;
+/** Version of the shape in schema.sql plus its ordered migration registry. */
+export const SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
+
+export interface DbOpenOptions {
+  /** Number of generated manual/pre-migration backups retained beside the database. */
+  backupRetention?: number;
+  /** Test-only fault injection that proves a committed migration is restored from its backup. */
+  afterMigration?: (migration: SchemaMigration) => void;
+}
 
 const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
 const RUN_STATE_TRANSITION_MINT: unique symbol = Symbol("run-state-transition-mint");
@@ -143,6 +167,7 @@ export class Db {
   #depth = 0;
   #poisoned = false;
   #evidenceWriteMarkerDepth = 0;
+  #schemaMigrationMarkerDepth = 0;
   #runStateTransitionMarkers: Array<{ runId: string; toState: string }> = [];
 
   /**
@@ -152,9 +177,15 @@ export class Db {
    */
   readonly file: string;
 
-  constructor(filename: string) {
-    if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
+  constructor(filename: string, private readonly options: DbOpenOptions = {}) {
+    const persistent = filename !== ":memory:";
+    const databaseExisted = persistent && existsSync(filename);
+    if (persistent) {
+      ensurePrivateDirectory(dirname(filename));
+      if (databaseExisted) assertPrivateDatabaseFiles(filename);
+    }
     this.#raw = new Database(filename);
+    if (persistent) finalizeNewPrivateDatabaseFiles(filename, databaseExisted);
     // `resolve()` only removes lexical path segments. It leaves a symlink alias distinct,
     // which would let two connections to one SQLite file receive separate capabilities.
     // Resolve after SQLite creates the file so the issuance key names the actual file.
@@ -164,6 +195,7 @@ export class Db {
     if (filename !== ":memory:") {
       this.#raw.pragma("journal_mode = WAL");
       this.#raw.pragma("synchronous = FULL");
+      finalizeNewPrivateDatabaseFiles(filename, databaseExisted);
     }
     // These functions are connection-local markers, not caller-supplied values. A raw SQL
     // caller can invoke them but cannot make either return true outside the owning operation.
@@ -174,6 +206,9 @@ export class Db {
       const marker = this.#runStateTransitionMarkers[this.#runStateTransitionMarkers.length - 1];
       return marker && marker.runId === runId && marker.toState === toState ? 1 : 0;
     });
+    this.#raw.function("acp_schema_migration_authorized", () =>
+      this.#schemaMigrationMarkerDepth > 0 ? 1 : 0,
+    );
     this.raw = Object.freeze({
       name: this.#raw.name,
       pragma: (source: string, options?: Database.PragmaOptions): unknown => {
@@ -183,20 +218,29 @@ export class Db {
         return this.#raw.pragma(source, options);
       },
     });
-    this.applySchema();
+    if (persistent) assertIntegrity(this.#raw, this.file);
+    this.applySchema(filename);
   }
 
   /**
-   * Applies the schema exactly once and pins the version. Anything unexpected fails
-   * closed rather than running against a database whose constraints are unknown.
+   * Applies a fresh schema or an explicit ordered migration chain. A current-version
+   * database is inspected, never repaired in place: missing triggers are corruption, not
+   * an invitation to silently trust the file after CREATE IF NOT EXISTS happens to pass.
    */
-  private applySchema(): void {
+  private applySchema(filename: string): void {
     const version = Number(this.#raw.pragma("user_version", { simple: true }));
     const alreadyPopulated =
       this.#raw
         .prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'runs'`)
         .get() as { n: number };
 
+    if (version > SCHEMA_VERSION) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        "database schema is newer than this build",
+        { expected: SCHEMA_VERSION, found: version },
+      );
+    }
     if (version === 0 && alreadyPopulated.n > 0) {
       throw acpError(
         ReasonCode.INTERNAL_ERROR,
@@ -205,22 +249,134 @@ export class Db {
       );
     }
     if (version === 0) {
-      this.#raw.exec(readFileSync(schemaPath, "utf8"));
-      this.#raw.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.bootstrapFreshSchema();
       return;
     }
-    if (version !== SCHEMA_VERSION) {
+    if (version === SCHEMA_VERSION) {
+      assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true });
+      assertMigrationLedgerAt(this.#raw, version);
+      return;
+    }
+    this.migrate(filename, version);
+  }
+
+  private bootstrapFreshSchema(): void {
+    this.#raw.exec("BEGIN IMMEDIATE");
+    try {
+      this.#raw.exec(schemaDdl());
+      installMigrationLedger(this.#raw);
+      assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true });
+      this.recordMigrationReceipt({
+        version: SCHEMA_VERSION,
+        migrationId: `bootstrap-v${SCHEMA_VERSION}`,
+        checksum: bootstrapChecksum(),
+        backup: null,
+      });
+      this.#raw.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.#raw.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.#raw.exec("ROLLBACK");
+      } catch {
+        /* a failed schema transaction may already be rolled back by SQLite */
+      }
+      throw error;
+    }
+    assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true });
+    assertMigrationLedgerAt(this.#raw, SCHEMA_VERSION);
+  }
+
+  private migrate(filename: string, fromVersion: number): void {
+    const migrations = migrationChainFrom(fromVersion);
+    const backup = backupOpenDatabaseSync(
+      this.#raw,
+      this.file,
+      nextBackupPath(this.file, `pre-migration-v${fromVersion}`),
+    );
+    try {
+      for (const migration of migrations) {
+        this.applyMigration(migration, migration.fromVersion === fromVersion ? backup : null);
+        this.options.afterMigration?.(migration);
+      }
+      assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true });
+      assertMigrationLedgerAt(this.#raw, SCHEMA_VERSION);
+      pruneAutomaticBackups(this.file, this.options.backupRetention ?? DEFAULT_BACKUP_RETENTION);
+    } catch (error) {
+      const migrationError = error instanceof Error ? error.message : String(error);
+      if (this.#raw.open) this.#raw.close();
+      try {
+        restoreDatabase(filename, backup.path);
+      } catch (restoreError) {
+        throw acpError(
+          ReasonCode.INTERNAL_ERROR,
+          "migration failed and the automatic backup could not be restored",
+          {
+            fromVersion,
+            backupPath: backup.path,
+            migrationError,
+            restoreError: restoreError instanceof Error ? restoreError.message : String(restoreError),
+          },
+        );
+      }
       throw acpError(
         ReasonCode.INTERNAL_ERROR,
-        version < SCHEMA_VERSION
-          ? "database schema is older than this build and no migration is defined"
-          : "database schema is newer than this build",
-        { expected: SCHEMA_VERSION, found: version },
+        "migration failed; the original database was restored from its automatic backup",
+        { fromVersion, backupPath: backup.path, migrationError },
       );
     }
-    // Same version: re-running the idempotent DDL adds nothing, but it does verify the
-    // file still parses against this SQLite build.
-    this.#raw.exec(readFileSync(schemaPath, "utf8"));
+  }
+
+  private applyMigration(migration: SchemaMigration, backup: DatabaseBackup | null): void {
+    this.#raw.exec("BEGIN IMMEDIATE");
+    try {
+      migration.apply(this.#raw);
+      assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true });
+      this.recordMigrationReceipt({
+        version: migration.toVersion,
+        migrationId: migration.id,
+        checksum: migration.checksum(),
+        backup,
+      });
+      // user_version and the receipt commit together. An interrupted migration is therefore
+      // either wholly absent or wholly visible; there is no version that claims a step the
+      // ledger did not record.
+      this.#raw.pragma(`user_version = ${migration.toVersion}`);
+      this.#raw.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.#raw.exec("ROLLBACK");
+      } catch {
+        /* a failed migration transaction may already be rolled back by SQLite */
+      }
+      throw error;
+    }
+  }
+
+  private recordMigrationReceipt(input: {
+    version: number;
+    migrationId: string;
+    checksum: string;
+    backup: DatabaseBackup | null;
+  }): void {
+    this.#schemaMigrationMarkerDepth += 1;
+    try {
+      this.#raw
+        .prepare(
+          `INSERT INTO schema_migrations
+             (version, migration_id, checksum, backup_file, backup_checksum, applied_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.version,
+          input.migrationId,
+          input.checksum,
+          input.backup?.path ?? null,
+          input.backup?.sha256 ?? null,
+          new Date().toISOString(),
+        );
+    } finally {
+      this.#schemaMigrationMarkerDepth -= 1;
+    }
   }
 
   /**
@@ -385,6 +541,30 @@ export class Db {
     }
   }
 
+  /**
+   * Creates a manifest-checked, owner-private SQLite snapshot. This is safe while another
+   * daemon connection is active, but not from inside this connection's uncommitted write
+   * transaction because that would intentionally omit the caller's pending authority facts.
+   */
+  async backup(destination?: string): Promise<DatabaseBackup> {
+    this.assertUsable();
+    if (this.file.startsWith(":memory:")) {
+      throw acpError(ReasonCode.INVALID_ARGUMENT, "an in-memory database has no restorable backup path", {});
+    }
+    if (this.#depth > 0) {
+      throw acpError(ReasonCode.CONFLICT, "backup cannot run inside an open database transaction", {});
+    }
+    const backup = destination === undefined
+      ? await backupDatabase(this.file)
+      : await backupDatabase(this.file, destination);
+    // A caller-supplied destination is an operator-named snapshot and is not retention
+    // collateral. Generated manual snapshots share the configured bounded retention set.
+    if (destination === undefined) {
+      pruneAutomaticBackups(this.file, this.options.backupRetention ?? DEFAULT_BACKUP_RETENTION);
+    }
+    return backup;
+  }
+
   close(): void {
     if (this.#raw.open) this.#raw.close();
   }
@@ -451,6 +631,8 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   GITHUB_RECEIPT_PROTOCOL_VIOLATION: ReasonCode.GITHUB_RECEIPT_PROTOCOL_VIOLATION,
   MANIFEST_IMMUTABLE: ReasonCode.CONFLICT,
   AUDIT_APPEND_ONLY: ReasonCode.CONFLICT,
+  SCHEMA_MIGRATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  SCHEMA_MIGRATION_RECEIPT_IMMUTABLE: ReasonCode.CONFLICT,
 };
 
 /**
@@ -497,4 +679,4 @@ export const translate = (err: unknown): unknown => {
   return err;
 };
 
-export const openDb = (filename: string): Db => new Db(filename);
+export const openDb = (filename: string, options?: DbOpenOptions): Db => new Db(filename, options);

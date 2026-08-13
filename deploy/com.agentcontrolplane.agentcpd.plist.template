@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentcontrolplane.agentcpd</string>
+
+  <!-- Rendered by install-launchd.sh. No checked-in plist is loadable as a daemon. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ACP_LAUNCHER__</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__ACP_WORKING_DIRECTORY__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>__ACP_STDOUT_PATH__</string>
+
+  <key>StandardErrorPath</key>
+  <string>__ACP_STDERR_PATH__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Secrets are fetched by the owner-only launcher from Keychain at process start. -->
+    <key>HOME</key>
+    <string>__ACP_HOME__</string>
+    <key>PATH</key>
+    <string>__ACP_PATH__</string>
+  </dict>
+
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+</dict>
+</plist>

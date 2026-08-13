@@ -9,7 +9,8 @@
   },
   "bin": {
     "agentctl": "./dist/cli/agentctl.js",
-    "agentcpd": "./dist/daemon/agentcpd.js"
+    "agentcpd": "./dist/daemon/agentcpd.js",
+    "agentcpd-state": "./dist/db/state-admin.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql",

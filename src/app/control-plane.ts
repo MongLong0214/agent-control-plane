@@ -14,6 +14,7 @@ import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
+import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import { type WorkspaceProbe, realWorkspaceProbe } from "../guard/workspace-probe.ts";
@@ -199,6 +200,11 @@ export class ControlPlane {
 
   constructor(readonly config: ControlPlaneConfig) {
     this.clock = config.clock ?? systemClock;
+    // These roots are trusted before any service is constructed. Db and WorktreeManager
+    // independently verify their own paths too; keeping the composition root explicit
+    // closes direct credential/capacity entry points before they can create a permissive dir.
+    ensurePrivateDirectory(config.secretsDir);
+    ensurePrivateDirectory(config.capacityDir);
     this.db = new Db(config.databasePath);
     this.audit = new AuditLog(this.db, this.clock);
     this.artifacts = new ArtifactStore(this.db, this.clock);
@@ -332,6 +338,11 @@ export class ControlPlane {
         directory: config.capacityDir,
         freshnessMs: config.capacity?.freshnessMs ?? 5 * 60 * 1000,
         maxClockSkewMs: config.capacity?.maxClockSkewMs ?? 60_000,
+      }, {
+        databasePath: config.databasePath,
+        worktreeRoot: config.worktreeRoot,
+        secretsDir: config.secretsDir,
+        capacityDir: config.capacityDir,
       },
     );
     this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);

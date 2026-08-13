@@ -1,8 +1,9 @@
-import { existsSync, lstatSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { git, listWorktrees, pruneWorktrees, removeWorktree, revParse, treeOf } from "../git/git.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
@@ -24,7 +25,10 @@ export class WorktreeManager {
   private readonly rootPath: string;
 
   constructor(root: string) {
-    mkdirSync(root, { recursive: true });
+    // Verification executes candidate-controlled code below this root. A permissive or
+    // symlinked root would let another local user plant/observe worktree contents before
+    // Git's own isolation checks ever run.
+    ensurePrivateDirectory(root);
     this.rootPath = canonical(root);
   }
 

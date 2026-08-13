@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
+import { chmodSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
@@ -12,6 +13,8 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { EvidenceWriter } from "../../src/db/artifacts.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
 import { redact } from "../../src/db/audit.ts";
+import { WorktreeManager } from "../../src/verify/worktree.ts";
+import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { legalTargets } from "../../src/domain/run-state.ts";
 import { ArtifactKind, RunState } from "../../src/domain/types.ts";
 import {
@@ -208,6 +211,63 @@ describe("schema versioning fails closed", () => {
     first.close();
 
     expect(() => new Db(path)).toThrowError(/predates schema versioning/);
+  });
+});
+
+describe("state path preflight", () => {
+  it("refuses a permissive state directory before SQLite opens or repairs it", () => {
+    const root = tempDir("acp-insecure-state-");
+    chmodSync(root, 0o755);
+    const path = join(root, "state.sqlite");
+
+    try {
+      new Db(path);
+      throw new Error("expected state preflight denial");
+    } catch (error) {
+      expect(isAcpError(error) && error.reasonCode).toBe(ReasonCode.STATE_PATH_INSECURE);
+    }
+  });
+
+  it("refuses a database file made group-readable after a prior clean open", () => {
+    const path = join(tempDir("acp-insecure-db-"), "state.sqlite");
+    const first = new Db(path);
+    first.close();
+    chmodSync(path, 0o644);
+
+    try {
+      new Db(path);
+      throw new Error("expected database preflight denial");
+    } catch (error) {
+      expect(isAcpError(error) && error.reasonCode).toBe(ReasonCode.STATE_PATH_INSECURE);
+    }
+  });
+
+  it("refuses a world-writable worktree root before candidate code can be materialised", () => {
+    const root = join(tempDir("acp-insecure-worktrees-"), "worktrees");
+    mkdirSync(root, { mode: 0o777 });
+    chmodSync(root, 0o777);
+
+    try {
+      new WorktreeManager(root);
+      throw new Error("expected worktree preflight denial");
+    } catch (error) {
+      expect(isAcpError(error) && error.reasonCode).toBe(ReasonCode.STATE_PATH_INSECURE);
+    }
+  });
+
+  it("refuses a symlinked secret-store directory before a credential can be installed", () => {
+    const root = tempDir("acp-insecure-secrets-");
+    const realDirectory = join(root, "real-secrets");
+    const alias = join(root, "secrets");
+    mkdirSync(realDirectory, { mode: 0o700 });
+    symlinkSync(realDirectory, alias);
+
+    try {
+      new TrustedCredentialStore(alias).install({ token: "test-token", creatorIdentity: "fixture" });
+      throw new Error("expected secret-store preflight denial");
+    } catch (error) {
+      expect(isAcpError(error) && error.reasonCode).toBe(ReasonCode.STATE_PATH_INSECURE);
+    }
   });
 });
 

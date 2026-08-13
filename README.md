@@ -112,8 +112,8 @@ An absent or empty file means this deployment has no owner, so no human gate can
 satisfied. That is deliberate: §21 makes the owner the one authority the runtime may not
 synthesise for itself.
 
-Run the daemon under `launchd` using
-[`deploy/com.agentcontrolplane.agentcpd.plist`](deploy/com.agentcontrolplane.agentcpd.plist).
+Run the daemon under `launchd` with the rendered installer described in
+[`deploy/README.md`](deploy/README.md); do not load the checked-in plist template directly.
 
 ## Verification isolation
 
