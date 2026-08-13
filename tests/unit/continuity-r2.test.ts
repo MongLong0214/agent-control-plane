@@ -7,7 +7,7 @@ import { ControlPlane } from "../../src/app/control-plane.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ArtifactKind, ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
   ClaudeCliAdapter,
   CodexCliAdapter,
@@ -23,9 +23,12 @@ import {
   type SessionHandle,
   type SessionSpec,
 } from "../../src/runtime/provider.ts";
-import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { fixtureManifest } from "../helpers/harness.ts";
+import { ScriptedAdapter, type ScriptedResponse } from "../../src/runtime/scripted-adapter.ts";
+import type { TaskContract } from "../../src/run/run-engine.ts";
+import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
+import type { VerificationReport } from "../../src/verify/verification-engine.ts";
+import { cleanupTempDirs, commitAll, makeRepo, tempDir } from "../helpers/fixtures.ts";
+import { fixtureManifest, reviewerPass } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -39,6 +42,7 @@ class ProductionTestAdapter implements ProviderAdapter {
 
   get provider(): string { return this.#scripted.provider; }
   get defaultModels(): Readonly<Record<string, string>> { return this.#scripted.defaultModels; }
+  get invocations(): readonly InvocationRequest[] { return this.#scripted.invocations; }
   setCapacity(reading: CapacityReading | null): void { this.#scripted.setCapacity(reading); }
   setRuntimeHealth(health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE"): void { this.#scripted.setRuntimeHealth(health); }
   setNextSessionHealth(health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE"): void {
@@ -48,7 +52,16 @@ class ProductionTestAdapter implements ProviderAdapter {
   stopSession(handle: SessionHandle): Promise<void> {
     return this.#scripted.stopSession(handle);
   }
-  invoke(request: InvocationRequest): Promise<InvocationResult> { return this.#scripted.invoke(request); }
+  async invoke(request: InvocationRequest): Promise<InvocationResult> {
+    const result = await this.#scripted.invoke(request);
+    // This test-owned adapter does not perform I/O, so an isolated reviewer request is
+    // packet-only by construction. Production adapters still have to attest their boundary.
+    return request.isolation ? { ...result, isolationAttested: true } : result;
+  }
+  script(...responses: ScriptedResponse[]): this {
+    this.#scripted.script(...responses);
+    return this;
+  }
   probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> { return this.#scripted.probeRuntime(); }
   probeSession(handle: SessionHandle): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
     return this.#scripted.probeSession(handle);
@@ -86,6 +99,7 @@ const makePlane = () => {
     secretsDir: join(root, "secrets"),
     clock,
     adapters: [gpt, claude],
+    allowTestEvidenceWriters: true,
   });
   return { cp, clock, gpt, claude, root };
 };
@@ -165,6 +179,131 @@ const bindCeo = (plane: ReturnType<typeof makePlane>, provider = "gpt", mode: "P
   return bound.value;
 };
 
+const REVIEW_CONTRACT: TaskContract = {
+  goal: "review-capacity fixture",
+  why: "prove mandatory reviewer admission",
+  scope: ["src/app.js"],
+  nonGoals: [],
+  acceptance: ["review runs only with current blind-review capacity"],
+  priority: "NORMAL",
+  humanGate: [],
+  references: [],
+};
+
+/** Builds immutable review inputs so the assertion reaches the real review allocator. */
+const prepareCapacityReviewedRun = async (plane: ReturnType<typeof makePlane>) => {
+  const { cp, clock, gpt, claude } = plane;
+  const projectId = "review-capacity-project";
+  const repoPath = makeRepo({ "src/app.js": "module.exports = () => 1;\n" });
+  gpt.setCapacity(healthy("gpt", clock));
+  claude.setCapacity(healthy("claude", clock));
+  const project = cp.projects.register({ projectId, name: projectId, manifest: fixtureManifest(projectId) });
+  if (!project.allowed) throw new Error(project.message);
+  const repository = await cp.repositories.register({
+    checkoutPath: repoPath,
+    projectId,
+    repositoryRole: "primary",
+    identity: "github:acme/review-capacity",
+  });
+  if (!repository.allowed) throw new Error(repository.message);
+  const created = cp.runs.create({
+    projectId,
+    executionMode: ExecutionMode.STANDARD,
+    contract: REVIEW_CONTRACT,
+    repositories: [{ repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+  });
+  if (!created.allowed) throw new Error(created.message);
+  const dispatched = await cp.runs.dispatch(created.value.runId);
+  if (!dispatched.allowed) throw new Error(dispatched.message);
+  const tasks = cp.tasks.submit(created.value.runId, [{ key: "impl", title: "impl", category: "implementation" }]);
+  if (!tasks.allowed) throw new Error(tasks.message);
+  const task = cp.tasks.ready(created.value.runId)[0]!;
+  const execution = cp.tasks.startExecution({
+    runId: created.value.runId,
+    taskId: task.taskId,
+    ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+    workerSessionId: dispatched.value.ownerSessionId,
+    provider: "gpt",
+    model: "worker",
+    repositoryId: repository.value.repositoryId,
+  });
+  if (!execution.allowed) throw new Error(execution.message);
+  writeFileSync(join(repoPath, "src/app.js"), "module.exports = () => 2;\n");
+  const head = commitAll(repoPath, "review capacity change");
+  cp.tasks.finishExecution(execution.value.executionId, { status: "SUCCEEDED", resultDigest: `sha256:${head}` });
+  const frozen = await cp.pipeline.freeze(created.value.runId);
+  if (!frozen.allowed) throw new Error(frozen.message);
+
+  const snapshotDigest = candidateSnapshotDigest(frozen.value);
+  const snapshotRepository = frozen.value.repositories[0]!;
+  const now = clock.nowIso();
+  const verification: VerificationReport = {
+    runId: created.value.runId,
+    candidateSnapshotDigest: snapshotDigest,
+    contractDigest: dispatched.value.contractDigest,
+    expectedInputs: 1,
+    observedInputs: 1,
+    results: [{
+      commandId: "verify",
+      repositoryIdentity: snapshotRepository.identity,
+      source: "local",
+      exactHead: snapshotRepository.candidateHead,
+      startedAt: now,
+      endedAt: now,
+      exitCode: 0,
+      outputDigest: "sha256:review-capacity-verification",
+      outputTruncated: false,
+      status: "PASS",
+      reasonCode: null,
+    }],
+    status: "PASS",
+    reasonCode: ReasonCode.OK,
+    gaps: [],
+  };
+  cp.artifacts.putEvidence(
+    cp.evidenceWritersForTests().VERIFICATION,
+    created.value.runId,
+    ArtifactKind.VERIFICATION,
+    verification,
+    snapshotDigest,
+  );
+  cp.db.run(
+    `INSERT INTO verification_results
+       (result_id, run_id, candidate_snapshot_digest, command_id, repository_identity, source,
+        exact_head, started_at, ended_at, exit_code, output_digest, output_truncated, status, reason_code)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      `${snapshotDigest}:verify:${snapshotRepository.identity}:local`,
+      created.value.runId,
+      snapshotDigest,
+      "verify",
+      snapshotRepository.identity,
+      "local",
+      snapshotRepository.candidateHead,
+      now,
+      now,
+      0,
+      "sha256:review-capacity-verification",
+      0,
+      "PASS",
+      null,
+    ],
+  );
+  return {
+    run: dispatched.value,
+    request: {
+      runId: created.value.runId,
+      projectId,
+      executionMode: dispatched.value.executionMode,
+      snapshot: frozen.value,
+      contract: REVIEW_CONTRACT,
+      contractDigest: dispatched.value.contractDigest,
+      verification,
+    },
+    identity: snapshotRepository.identity,
+  };
+};
+
 describe("round-2 capacity and runtime regressions", () => {
   it("#52 refuses a capability when one of its applicable quota windows is unknown", async () => {
     const { cp, clock, gpt } = makePlane();
@@ -190,7 +329,10 @@ describe("round-2 capacity and runtime regressions", () => {
       provider: "gpt",
       capabilities: ["worker"],
       priority: "worker",
-      reserveDemand: { criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0 },
+      reserveDemand: {
+        criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0,
+        roleDemand: { ceo: 0, cto: 0, reviewer: 0 },
+      },
     });
     expect(worker.allowed).toBe(true);
     expect(worker.reasonCode).toBe(ReasonCode.OK);
@@ -205,52 +347,96 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(unprioritizedWorker.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
   });
 
-  it("#54/#176 refreshes before blind-review operations and after a provider failure", async () => {
-    const { cp, clock, gpt, root } = makePlane();
-    gpt.setCapacity({
-      provider: "gpt",
+  it("#54/#176 refuses mandatory blind review without its own capacity and admits it when restored", async () => {
+    const plane = makePlane();
+    const prepared = await prepareCapacityReviewedRun(plane);
+    const exhaustedReviewer = (provider: string) =>
+      reading(provider, plane.clock, [{
+        id: "review", remainingPercent: 1, resetAt: null, capabilities: ["blind-review"],
+      }]);
+    plane.gpt.setCapacity(exhaustedReviewer("gpt"));
+    plane.claude.setCapacity(exhaustedReviewer("claude"));
+
+    // This enters through the control-plane invoker, not the monitor. Without the reviewer
+    // admission calls, both branches reach the scripted PASS below instead of this refusal.
+    const refused = await plane.cp.review.controlPlaneInvoker()(prepared.request);
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    expect(plane.cp.audit.byKind("BLIND_REVIEW_COMPLETED")).toHaveLength(0);
+
+    // Capacity can change after a reviewer session is constituted. The invocation has to
+    // re-admit rather than treating the successful constitution probe as a quota lease.
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    const startSession = plane.gpt.startSession.bind(plane.gpt);
+    const exhaustAfterConstitution = vi.spyOn(plane.gpt, "startSession").mockImplementation(async (spec) => {
+      const handle = await startSession(spec);
+      plane.gpt.setCapacity(exhaustedReviewer("gpt"));
+      return handle;
+    });
+    plane.gpt.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${prepared.identity}:src/app.js`]),
+    });
+    const refusedAtInvocation = await plane.cp.review.controlPlaneInvoker()(prepared.request);
+    expect(refusedAtInvocation.allowed).toBe(false);
+    expect(refusedAtInvocation.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
+    expect(plane.gpt.invocations).toHaveLength(0);
+    exhaustAfterConstitution.mockRestore();
+
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    const admitted = await plane.cp.review.controlPlaneInvoker()(prepared.request);
+    expect(admitted.allowed).toBe(true);
+    expect(admitted.reasonCode).toBe(ReasonCode.REVIEW_PASS);
+  });
+
+  it("#54/#176 turns a provider failure into current continuity state before the next dispatch", async () => {
+    const plane = makePlane();
+    bindCeo(plane, "gpt");
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.gpt.script({ match: /allocation failure/, text: "", ok: false });
+    const failedCapacity = (provider: string): CapacityReading => ({
+      provider,
       sensorHealth: "ERROR",
       runtimeHealth: "HEALTHY",
-      observedAt: clock.nowIso(),
-      source: "r2-test",
+      observedAt: plane.clock.nowIso(),
+      source: "r2-provider-failure",
       buckets: [],
-      error: "usage source unreadable",
+      error: "usage source unreadable after allocation failure",
     });
-
-    // This is the registry adapter given to the review gate in the composed control plane,
-    // not a direct monitor exercise. Removing the root attachment leaves no probe audit.
-    const adapter = cp.providers.require("gpt");
-    await adapter.startSession({
-      model: "reviewer",
-      workdir: root,
-      purpose: "blind-review",
-    });
-    const failed = await adapter.invoke({
-      prompt: "provider failure must refresh capacity",
-      workdir: root,
+    // The invocation is a registry-routed provider operation. Its failed result must refresh
+    // and evaluate continuity; merely recording the failure leaves the stale NORMAL mode.
+    plane.gpt.setCapacity(failedCapacity("gpt"));
+    plane.claude.setCapacity(failedCapacity("claude"));
+    const failed = await plane.cp.providers.require("gpt").invoke({
+      prompt: "allocation failure",
+      workdir: plane.root,
       timeoutMs: 1_000,
       readOnly: true,
-      correlationId: "r2-provider-failure",
-      isolation: {
-        packetRoot: root,
-        denyReadPaths: [],
-        emptyEnvironment: true,
-        network: "provider-only",
-        tools: "none",
-      },
+      correlationId: "provider-failure-continuity",
     });
     expect(failed.ok).toBe(false);
+    expect(plane.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
 
-    expect(cp.audit.byKind("CAPACITY_PROBE")).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        reasonCode: ReasonCode.PROBE_FAILED,
-        evidence: expect.objectContaining({ provider: "gpt", trigger: RefreshTrigger.BLIND_REVIEW }),
-      }),
-      expect.objectContaining({
-        reasonCode: ReasonCode.PROBE_FAILED,
-        evidence: expect.objectContaining({ provider: "gpt", trigger: RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE }),
-      }),
-    ]));
+    // Recovery facts alone do not erase a SURVIVAL transition. If the failure refresh did
+    // not evaluate continuity, this next dispatch would get past this exact reason code.
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    const project = plane.cp.projects.register({
+      projectId: "failure-continuity-project",
+      name: "failure continuity",
+      manifest: fixtureManifest("failure-continuity-project"),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    const created = plane.cp.runs.create({
+      projectId: project.value.projectId,
+      executionMode: ExecutionMode.SIMPLE,
+      contract: REVIEW_CONTRACT,
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const refused = await plane.cp.runs.dispatch(created.value.runId);
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION);
   });
 
   it("#178 denies dispatch admission when no production provider exists", async () => {
@@ -297,6 +483,7 @@ describe("round-2 capacity and runtime regressions", () => {
       expectedReviews: 1,
       inFlightRuns: 3,
       burnRatePercentPerHour: 4,
+      roleDemand: { ceo: 0, cto: 1, reviewer: 1 },
     });
     expect(reserves).toEqual(expect.arrayContaining([expect.objectContaining({ bucketId: "unknown", reserve: 1 })]));
     expect(cp.capacity.dynamicReserve("gpt", {
@@ -304,12 +491,16 @@ describe("round-2 capacity and runtime regressions", () => {
       expectedReviews: 1,
       inFlightRuns: 3,
       burnRatePercentPerHour: 4,
+      roleDemand: { ceo: 0, cto: 1, reviewer: 1 },
     })).toBe(1);
     const denied = await cp.capacity.refreshForDispatch({
       provider: "gpt",
       capabilities: ["worker"],
       priority: "worker",
-      reserveDemand: { criticalRoleInvocations: 2, expectedReviews: 1, inFlightRuns: 3, burnRatePercentPerHour: 4 },
+      reserveDemand: {
+        criticalRoleInvocations: 2, expectedReviews: 1, inFlightRuns: 3, burnRatePercentPerHour: 4,
+        roleDemand: { ceo: 0, cto: 1, reviewer: 1 },
+      },
     });
     expect(denied.reasonCode).toBe(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE);
 
@@ -323,7 +514,10 @@ describe("round-2 capacity and runtime regressions", () => {
       provider: "gpt",
       capabilities: ["worker"],
       priority: "worker",
-      reserveDemand: { criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0 },
+      reserveDemand: {
+        criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0,
+        roleDemand: { ceo: 0, cto: 0, reviewer: 0 },
+      },
     });
     expect(unrelatedUnknown.allowed).toBe(true);
     expect(unrelatedUnknown.reasonCode).toBe(ReasonCode.OK);
@@ -343,7 +537,10 @@ describe("round-2 capacity and runtime regressions", () => {
       provider: "gpt",
       capabilities: ["worker"],
       priority: "worker",
-      reserveDemand: { criticalRoleInvocations: 2, expectedReviews: 1, inFlightRuns: 3, burnRatePercentPerHour: 4 },
+      reserveDemand: {
+        criticalRoleInvocations: 2, expectedReviews: 1, inFlightRuns: 3, burnRatePercentPerHour: 4,
+        roleDemand: { ceo: 0, cto: 1, reviewer: 1 },
+      },
     });
     expect(reserved.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);
 
@@ -354,7 +551,10 @@ describe("round-2 capacity and runtime regressions", () => {
       provider: "gpt",
       capabilities: ["worker"],
       priority: "worker",
-      reserveDemand: { criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0 },
+      reserveDemand: {
+        criticalRoleInvocations: 0, expectedReviews: 0, inFlightRuns: 0, burnRatePercentPerHour: 0,
+        roleDemand: { ceo: 0, cto: 0, reviewer: 0 },
+      },
     });
     expect(unknownHorizon.allowed).toBe(false);
     expect(unknownHorizon.reasonCode).toBe(ReasonCode.CAPACITY_ADMISSION_CONSERVE);

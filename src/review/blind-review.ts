@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -94,6 +95,11 @@ export interface BlindReviewRequest {
   verification: VerificationReport;
 }
 
+/** The composition root supplies the capacity admission that reviewer allocation needs. */
+export interface BlindReviewCapacityGate {
+  refreshForBlindReview(target?: DispatchCapacityTarget): Promise<Decision<void>>;
+}
+
 /** Narrow capability the composition root hands to CandidatePipeline, not to agents. */
 export type BlindReviewInvoker = (request: BlindReviewRequest) => Promise<Decision<ReviewPacket>>;
 
@@ -143,6 +149,7 @@ const REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
  */
 export class BlindReviewGate {
   readonly #pipelineCapability = Symbol("blind-review-control-plane");
+  #capacity: BlindReviewCapacityGate | null = null;
   constructor(
     private readonly clock: Clock,
     private readonly db: Db,
@@ -164,6 +171,11 @@ export class BlindReviewGate {
       fallbacks: ReviewerPreference[];
     },
   ) {}
+
+  /** Closed by the production composition root once the capacity monitor exists. */
+  attach(ports: { capacity?: BlindReviewCapacityGate }): void {
+    if (ports.capacity) this.#capacity = ports.capacity;
+  }
 
   /** §18.2 — CTO and Hermes do not invoke the review. */
   manualInvocation(actor: string, runId: string): Decision<never> {
@@ -359,6 +371,7 @@ export class BlindReviewGate {
   > {
     const roleKey = roleKeyFor(Role.BLIND_REVIEWER, { runId });
     const attempts: Array<{ preference: ReviewerPreference; reason: string }> = [];
+    let capacityFailure: Decision<void> | null = null;
 
     for (const preference of [this.preferences.preferred, ...this.preferences.fallbacks]) {
       const adapter = this.providers.get(preference.provider);
@@ -373,6 +386,15 @@ export class BlindReviewGate {
       const health = await adapter.probeRuntime();
       if (health === "UNAVAILABLE") {
         attempts.push({ preference, reason: "runtime unavailable" });
+        continue;
+      }
+      // A runtime probe does not allocate a reviewer. Once a provider is healthy enough
+      // to constitute one, refresh and admit immediately before `startSession`; this is
+      // the capacity precondition for the allocation, not a best-effort observation.
+      const capacity = await this.admitReviewer(preference.provider);
+      if (!capacity.allowed) {
+        capacityFailure ??= capacity;
+        attempts.push({ preference, reason: capacity.reasonCode });
         continue;
       }
 
@@ -432,6 +454,13 @@ export class BlindReviewGate {
       });
     }
 
+    if (capacityFailure) {
+      return deny(
+        capacityFailure.reasonCode,
+        "no blind reviewer could be constituted with current routable capacity",
+        { runId, attempts, capacity: capacityFailure.evidence },
+      );
+    }
     return deny(
       ReasonCode.ISOLATION_LOST,
       "no isolated blind reviewer could be constituted; the gate is not lowered",
@@ -576,6 +605,8 @@ export class BlindReviewGate {
     reviewer: ReviewerBinding,
   ): Promise<Decision<ReviewOutcome>> {
     const adapter = this.providers.require(reviewer.preference.provider);
+    const capacity = await this.admitReviewer(reviewer.preference.provider);
+    if (!capacity.allowed) return capacity as Decision<ReviewOutcome>;
     const result = await adapter.invoke(this.reviewInvocation(
       request,
       reviewer,
@@ -647,6 +678,8 @@ export class BlindReviewGate {
           budget: CHUNK_THRESHOLD_CHARS,
         });
       }
+      const capacity = await this.admitReviewer(reviewer.preference.provider);
+      if (!capacity.allowed) return capacity as Decision<ReviewOutcome>;
       const result = await adapter.invoke(this.reviewInvocation(
         request,
         reviewer,
@@ -696,6 +729,11 @@ export class BlindReviewGate {
       });
     }
 
+    const finalCapacity = await this.admitReviewer(finalReviewer.value.preference.provider);
+    if (!finalCapacity.allowed) {
+      this.disposeReviewer(finalReviewer.value, "final reviewer capacity admission refused");
+      return finalCapacity as Decision<ReviewOutcome>;
+    }
     const finalResult = await this.providers.require(finalReviewer.value.preference.provider).invoke(
       this.reviewInvocation(
         request,
@@ -999,6 +1037,20 @@ export class BlindReviewGate {
       });
     }
     return allow(ReasonCode.OK, { ...request, contract: contract.content, verification: report });
+  }
+
+  /**
+   * Standalone unit gates may exercise packet parsing without a composition root. Every
+   * production `ControlPlane` attaches this port; its presence makes reviewer capacity a
+   * precondition instead of a best-effort probe hidden in the runtime adapter.
+   */
+  private async admitReviewer(provider: string): Promise<Decision<void>> {
+    if (!this.#capacity) return allow(ReasonCode.OK, undefined);
+    return this.#capacity.refreshForBlindReview({
+      provider,
+      capabilities: ["blind-review"],
+      priority: "critical",
+    });
   }
 
   /** Provider attestation must name the constituted reviewer, not a resumed producer. */

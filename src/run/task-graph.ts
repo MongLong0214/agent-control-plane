@@ -1,4 +1,8 @@
 import type { Clock } from "../core/clock.ts";
+import type {
+  DynamicReserveDemand,
+  WorkerFanoutCapacityTarget,
+} from "../capacity/capacity-monitor.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { newTaskId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -59,6 +63,12 @@ export interface ExecutionRecord {
   ownerBindingGeneration: number;
 }
 
+/** The worker allocator must admit its exact lower-priority allocation before recording it. */
+export interface WorkerCapacityGate {
+  refreshForWorkerFanout(target?: WorkerFanoutCapacityTarget): Promise<Decision<void>>;
+  workerReserveDemand(provider: string): DynamicReserveDemand;
+}
+
 /**
  * The CTO creates, extends and serialises the graph; the control plane checks only what
  * is machine-checkable — dependency integrity, readiness, and completion evidence
@@ -80,12 +90,19 @@ const CLOSED_TO_NEW_TASKS: ReadonlySet<RunState> = new Set([
 ]);
 
 export class TaskGraph {
+  #capacity: WorkerCapacityGate | null = null;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly telemetry: Telemetry,
   ) {}
+
+  /** Closed by the composition root after the capacity monitor exists. */
+  attach(ports: { capacity?: WorkerCapacityGate }): void {
+    if (ports.capacity) this.#capacity = ports.capacity;
+  }
 
   /**
    * A graph may only be created or extended while the run is still doing work. Adding a
@@ -257,6 +274,34 @@ export class TaskGraph {
     });
   }
 
+  /**
+   * §14.2/§14.5 production worker path. A receipt is not enough to make a worker
+   * allocation safe: fan-out first re-probes the selected provider and withholds the
+   * dynamic reserve needed by active CEO/CTO/reviewer coverage. `startExecution` remains
+   * the synchronous receipt primitive used by tests and recovery import; the MCP worker
+   * allocator is deliberately routed only through this admission method.
+   */
+  async startWorkerExecution(input: ExecutionStart): Promise<Decision<ExecutionRecord>> {
+    if (!this.#capacity) {
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "worker execution has no attached capacity admission gate",
+        { runId: input.runId, taskId: input.taskId, provider: input.provider },
+      );
+    }
+    const target: WorkerFanoutCapacityTarget = {
+      provider: input.provider,
+      capabilities: [this.workerCapability(input.model)],
+      priority: "worker",
+      // The monitor reads durable role/running-work facts. Passing the complete demand on
+      // this production path makes worker priority explicit instead of caller-optional.
+      reserveDemand: this.#capacity.workerReserveDemand(input.provider),
+    };
+    const capacity = await this.#capacity.refreshForWorkerFanout(target);
+    if (!capacity.allowed) return capacity as Decision<ExecutionRecord>;
+    return this.startExecution(input);
+  }
+
   finishExecution(
     executionId: string,
     outcome: {
@@ -390,6 +435,11 @@ export class TaskGraph {
       executionId,
     ]);
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /** Luna has its own disposable-capacity bucket; all other worker models use worker. */
+  private workerCapability(model: string): "worker" | "luna-worker" {
+    return /luna/i.test(model) ? "luna-worker" : "worker";
   }
 
   /**

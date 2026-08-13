@@ -419,12 +419,14 @@ describe("provider capacity (CP-S16, CP-S17, CP-S18)", () => {
       expectedReviews: 0,
       inFlightRuns: 0,
       burnRatePercentPerHour: 0,
+      roleDemand: { ceo: 0, cto: 0, reviewer: 0 },
     });
     const heavy = harness.cp.capacity.dynamicReserve("gpt", {
       criticalRoleInvocations: 5,
       expectedReviews: 10,
       inFlightRuns: 8,
       burnRatePercentPerHour: 4,
+      roleDemand: { ceo: 1, cto: 2, reviewer: 3 },
     });
     expect(heavy).toBeGreaterThan(light);
     expect(heavy).toBeLessThanOrEqual(0.9);

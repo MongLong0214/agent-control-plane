@@ -65,6 +65,22 @@ export interface DynamicReserveDemand {
   inFlightRuns: number;
   /** Recent observed quota burn; zero is a measured absence of burn, not an unknown input. */
   burnRatePercentPerHour: number;
+  /**
+   * Current critical-role coverage demand. This stays separate from raw invocation
+   * count: a provider must preserve capacity for the roles it may need to cover, not
+   * merely for work that has already started.
+   */
+  roleDemand: {
+    ceo: number;
+    cto: number;
+    reviewer: number;
+  };
+  /**
+   * When a worker allocator has historical readings, use the bucket's own measured
+   * burn rather than smoothing a short rolling window into a weekly one. An absent
+   * entry is unknown and reserves that bucket completely.
+   */
+  burnRatePercentPerHourByBucket?: Readonly<Record<string, number>>;
 }
 
 /** The allocation selected by the caller after role routing, before it is activated. */
@@ -74,6 +90,17 @@ export interface DispatchCapacityTarget {
   /** Only lower-priority worker fan-out may consume the dynamic reserve. */
   priority?: "critical" | "worker";
   reserveDemand?: DynamicReserveDemand;
+}
+
+/** The exact target a lower-priority worker allocator is about to activate. */
+export interface WorkerFanoutCapacityTarget extends DispatchCapacityTarget {
+  priority: "worker";
+  reserveDemand: DynamicReserveDemand;
+}
+
+/** Provider failure has to re-evaluate continuity after the new reading is persisted. */
+export interface ProviderFailureContinuity {
+  evaluate(reason: string): Promise<unknown>;
 }
 
 /**
@@ -87,7 +114,7 @@ export interface DispatchCapacityTarget {
  */
 export class CapacityMonitor {
   readonly #options: Required<CapacityOptions>;
-
+  #providerFailureContinuity: ProviderFailureContinuity | null = null;
 
   constructor(
     private readonly db: Db,
@@ -100,50 +127,71 @@ export class CapacityMonitor {
     this.#options = { ...DEFAULTS, ...options };
   }
 
+  /**
+   * The monitor owns the fresh observation, while the continuity kernel owns the plan
+   * derived from it. Keeping this as a narrow port avoids a monitor → kernel import cycle.
+   */
+  attach(ports: { providerFailureContinuity?: ProviderFailureContinuity }): void {
+    if (ports.providerFailureContinuity) this.#providerFailureContinuity = ports.providerFailureContinuity;
+  }
+
   async refresh(trigger: RefreshTrigger, providerIds?: readonly string[]): Promise<ProviderCapacity[]> {
-    const adapters = providerIds
-      ? providerIds.map((id) => this.providers.require(id))
-      : this.providers.list();
+    try {
+      const adapters = providerIds
+        ? providerIds.map((id) => this.providers.require(id))
+        : this.providers.list();
 
-    const readings: ProviderCapacity[] = [];
-    for (const adapter of adapters) {
-      const reading = await adapter.probeCapacity();
-      const enriched = this.enrich(reading);
-      this.persist(enriched);
-      readings.push(enriched);
+      const readings: ProviderCapacity[] = [];
+      for (const adapter of adapters) {
+        const reading = await adapter.probeCapacity();
+        const enriched = this.enrich(reading);
+        this.persist(enriched);
+        readings.push(enriched);
 
-      this.telemetry.record({
-        scope: "capacity",
-        name: "reading",
-        text: enriched.allocationAdmission,
-        dims: {
-          provider: enriched.provider,
-          sensorHealth: enriched.sensorHealth,
-          runtimeHealth: enriched.runtimeHealth,
-          advisoryState: enriched.advisoryState,
-          trigger,
-          buckets: enriched.buckets.map((b) => ({ id: b.id, remainingPercent: b.remainingPercent })),
-        },
-      });
-
-      if (enriched.sensorHealth === "ERROR" || enriched.allocationAdmission === "SUSPENDED") {
-        this.audit.record({
-          kind: "CAPACITY_PROBE",
-          reasonCode:
-            enriched.sensorHealth === "ERROR"
-              ? ReasonCode.PROBE_FAILED
-              : ReasonCode.CAPACITY_ADMISSION_SUSPENDED,
-          evidence: {
+        this.telemetry.record({
+          scope: "capacity",
+          name: "reading",
+          text: enriched.allocationAdmission,
+          dims: {
             provider: enriched.provider,
-            trigger,
             sensorHealth: enriched.sensorHealth,
             runtimeHealth: enriched.runtimeHealth,
-            error: enriched.error ?? null,
+            advisoryState: enriched.advisoryState,
+            trigger,
+            buckets: enriched.buckets.map((b) => ({ id: b.id, remainingPercent: b.remainingPercent })),
           },
         });
+
+        if (enriched.sensorHealth === "ERROR" || enriched.allocationAdmission === "SUSPENDED") {
+          this.audit.record({
+            kind: "CAPACITY_PROBE",
+            reasonCode:
+              enriched.sensorHealth === "ERROR"
+                ? ReasonCode.PROBE_FAILED
+                : ReasonCode.CAPACITY_ADMISSION_SUSPENDED,
+            evidence: {
+              provider: enriched.provider,
+              trigger,
+              sensorHealth: enriched.sensorHealth,
+              runtimeHealth: enriched.runtimeHealth,
+              error: enriched.error ?? null,
+            },
+          });
+        }
+      }
+      return readings;
+    } finally {
+      // A provider operation is not handled merely because its failed probe was stored. The
+      // persisted facts must immediately drive a fresh coverage plan, otherwise SURVIVAL can
+      // remain stale until some unrelated caller happens to ask for continuity (§14.2/§15.6).
+      // `finally` matters here: a thrown probe is failure evidence too, not an excuse to
+      // leave the previous coverage plan in force.
+      if (trigger === RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE && this.#providerFailureContinuity) {
+        await this.#providerFailureContinuity.evaluate(
+          `capacity refresh after provider switch or allocation failure${providerIds?.length ? `: ${providerIds.join(", ")}` : ""}`,
+        );
       }
     }
-    return readings;
   }
 
   /**
@@ -152,16 +200,38 @@ export class CapacityMonitor {
    * provider": it loses the provider and capability facts the caller is about to use.
    */
   async refreshForDispatch(target?: DispatchCapacityTarget): Promise<Decision<void>> {
+    return this.refreshForAllocation(RefreshTrigger.DISPATCH_ADMISSION, target, "dispatch");
+  }
+
+  /**
+   * §14.2/§14.5 — worker fan-out is a separate allocation class. Requiring both the
+   * explicit worker priority and measured demand stops a caller from presenting the same
+   * lower-priority work as an ordinary dispatch to consume the critical-role reserve.
+   */
+  async refreshForWorkerFanout(target?: WorkerFanoutCapacityTarget): Promise<Decision<void>> {
+    return this.refreshForAllocation(RefreshTrigger.WORKER_FANOUT, target, "worker fan-out");
+  }
+
+  /** Mandatory reviewer constitution and every reviewer invocation admit this exact role. */
+  async refreshForBlindReview(target?: DispatchCapacityTarget): Promise<Decision<void>> {
+    return this.refreshForAllocation(RefreshTrigger.BLIND_REVIEW, target, "blind review");
+  }
+
+  private async refreshForAllocation(
+    trigger: RefreshTrigger,
+    target: DispatchCapacityTarget | undefined,
+    operation: string,
+  ): Promise<Decision<void>> {
     if (!target) {
-      await this.refresh(RefreshTrigger.DISPATCH_ADMISSION);
+      await this.refresh(trigger);
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-        "dispatch capacity admission requires an exact allocation target",
+        `${operation} capacity admission requires an exact allocation target`,
         { target: null },
       );
     }
     if (!this.providers.has(target.provider)) {
-      await this.refresh(RefreshTrigger.DISPATCH_ADMISSION);
+      await this.refresh(trigger);
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
         "the selected provider is not registered",
@@ -169,21 +239,21 @@ export class CapacityMonitor {
       );
     }
     if (target.capabilities.length === 0) {
-      await this.refresh(RefreshTrigger.DISPATCH_ADMISSION, [target.provider]);
+      await this.refresh(trigger, [target.provider]);
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-        "dispatch capacity admission requires at least one required capability",
+        `${operation} capacity admission requires at least one required capability`,
         { provider: target.provider, capabilities: [] },
       );
     }
 
-    const readings = await this.refresh(RefreshTrigger.DISPATCH_ADMISSION, [target.provider]);
+    const readings = await this.refresh(trigger, [target.provider]);
 
     const production = readings.filter((r) => this.providers.require(r.provider).isProduction);
     if (production.length === 0) {
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
-        "no production provider is registered for dispatch admission",
+        `no production provider is registered for ${operation} capacity admission`,
         { target },
       );
     }
@@ -194,6 +264,26 @@ export class CapacityMonitor {
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
         "the selected provider is not production-eligible",
         { provider: target.provider, capabilities: target.capabilities },
+      );
+    }
+    if (
+      trigger === RefreshTrigger.WORKER_FANOUT &&
+      (!target.capabilities.some(isWorkerCapability) || target.priority !== "worker")
+    ) {
+      return deny(
+        ReasonCode.CAPACITY_ADMISSION_CONSERVE,
+        "worker fan-out must name a worker capability and worker priority",
+        { provider: selected.provider, capabilities: target.capabilities, priority: target.priority ?? null },
+      );
+    }
+    if (
+      trigger === RefreshTrigger.BLIND_REVIEW &&
+      (!target.capabilities.includes("blind-review") || target.priority !== "critical")
+    ) {
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "blind-review admission must name the critical blind-review capability",
+        { provider: selected.provider, capabilities: target.capabilities, priority: target.priority ?? null },
       );
     }
     const unroutable = target.capabilities.filter((capability) => !this.isRoutableFor(selected, capability));
@@ -247,6 +337,50 @@ export class CapacityMonitor {
     return allow(ReasonCode.OK, undefined, {
       admitted: [{ provider: selected.provider, admission: selected.allocationAdmission }],
     });
+  }
+
+  /**
+   * §14.5 production input. Counts are read from durable state immediately before the
+   * worker allocator asks for admission; callers cannot manufacture a zero-demand reserve.
+   */
+  workerReserveDemand(provider: string): DynamicReserveDemand {
+    const roles = this.db.all<{ role: string; n: number }>(
+      `SELECT role, COUNT(*) AS n
+         FROM assignments
+        WHERE status = 'ACTIVE'
+          AND role IN ('CEO', 'PRIMARY_CTO', 'BOOTSTRAP_CTO', 'BLIND_REVIEWER')
+        GROUP BY role`,
+    );
+    const roleDemand = { ceo: 0, cto: 0, reviewer: 0 };
+    for (const row of roles) {
+      if (row.role === "CEO") roleDemand.ceo += row.n;
+      else if (row.role === "PRIMARY_CTO" || row.role === "BOOTSTRAP_CTO") roleDemand.cto += row.n;
+      else if (row.role === "BLIND_REVIEWER") roleDemand.reviewer += row.n;
+    }
+    const expectedReviews = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n
+         FROM runs r
+        WHERE r.state IN ('ACTIVE', 'BLOCKED', 'READY_FOR_CEO_REVIEW', 'REVISION_REQUIRED', 'AWAITING_HUMAN')
+          AND NOT EXISTS (
+            SELECT 1 FROM run_artifacts a
+             WHERE a.run_id = r.run_id AND a.kind = 'BLIND_REVIEW' AND a.superseded = 0
+          )`,
+    )?.n ?? 0;
+    const inFlightRuns = this.db.get<{ n: number }>(
+      `SELECT COUNT(DISTINCT run_id) AS n FROM task_executions WHERE status = 'RUNNING'`,
+    )?.n ?? 0;
+    const rates = this.measuredBurnRateByBucket(provider);
+    const knownRates = Object.values(rates).filter((rate) => Number.isFinite(rate));
+    return {
+      criticalRoleInvocations: roleDemand.ceo + roleDemand.cto + roleDemand.reviewer,
+      expectedReviews,
+      inFlightRuns,
+      // The per-bucket map is authoritative when present. This aggregate is retained for
+      // callers that need a compact fact and remains unknown when no window was measured.
+      burnRatePercentPerHour: knownRates.length > 0 ? Math.max(...knownRates) : Number.NaN,
+      roleDemand,
+      burnRatePercentPerHourByBucket: rates,
+    };
   }
 
   /** Latest known state for a provider, recomputed from the newest stored buckets. */
@@ -333,11 +467,18 @@ export class CapacityMonitor {
     capacity: ProviderCapacity,
     demand: DynamicReserveDemand,
   ): Array<{ bucketId: string; reserve: number }> {
+    // Types protect product callers, but evidence crossing a process boundary can still be
+    // malformed at runtime. An absent role-demand object is unknown demand, never zero.
+    const roleDemand = demand.roleDemand;
+    if (!roleDemand) return capacity.buckets.map((bucket) => ({ bucketId: bucket.id, reserve: 1 }));
     const inputs = [
       demand.criticalRoleInvocations,
       demand.expectedReviews,
       demand.inFlightRuns,
       demand.burnRatePercentPerHour,
+      roleDemand.ceo,
+      roleDemand.cto,
+      roleDemand.reviewer,
     ];
     if (inputs.some((input) => !Number.isFinite(input) || input < 0)) {
       // A malformed demand observation is not zero demand. Preserve every window until
@@ -345,9 +486,13 @@ export class CapacityMonitor {
       return capacity.buckets.map((bucket) => ({ bucketId: bucket.id, reserve: 1 }));
     }
     const weighted =
-      demand.criticalRoleInvocations * 2 + demand.expectedReviews * 3 + demand.inFlightRuns;
+      demand.criticalRoleInvocations * 2 +
+      demand.expectedReviews * 3 +
+      demand.inFlightRuns +
+      roleDemand.ceo * 5 +
+      roleDemand.cto * 4 +
+      roleDemand.reviewer * 3;
     const nowMs = new Date(this.clock.nowIso()).getTime();
-    const burn = demand.burnRatePercentPerHour;
     return capacity.buckets.map((bucket) => {
       // Unknown quota is never imagined as headroom. Lower-priority work must preserve
       // the whole window until a usable observation exists.
@@ -358,11 +503,64 @@ export class CapacityMonitor {
       // observed again with a usable horizon.
       if (!Number.isFinite(resetMs) || resetMs <= nowMs) return { bucketId: bucket.id, reserve: 1 };
       const horizonHours = (resetMs - nowMs) / (60 * 60 * 1000);
+      const burn = demand.burnRatePercentPerHourByBucket
+        ? (demand.burnRatePercentPerHourByBucket[bucket.id] ?? Number.NaN)
+        : demand.burnRatePercentPerHour;
+      // A known aggregate cannot certify a different, unmeasured quota window. Preserve
+      // that bucket until it has its own burn observation.
+      if (!Number.isFinite(burn) || burn < 0) return { bucketId: bucket.id, reserve: 1 };
       const expectedBurn = burn * horizonHours;
       const demandShare = weighted / (weighted + Math.max(1, bucket.remainingPercent));
       const burnShare = expectedBurn / Math.max(1, bucket.remainingPercent + expectedBurn);
       return { bucketId: bucket.id, reserve: Math.min(1, demandShare + burnShare) };
     });
+  }
+
+  /**
+   * Recent, same-window deltas are the only burn evidence used for a worker reserve. A
+   * first observation, a malformed timestamp, or a reset that increased quota is not a
+   * measured zero; the caller receives NaN and the corresponding bucket is held back.
+   */
+  private measuredBurnRateByBucket(provider: string): Record<string, number> {
+    const rows = this.db.all<{
+      bucket_id: string;
+      remaining_percent: number;
+      reset_at: string | null;
+      observed_at: string;
+    }>(
+      `SELECT bucket_id, remaining_percent, reset_at, observed_at
+         FROM capacity_snapshots
+        WHERE provider = ? AND remaining_percent IS NOT NULL
+        ORDER BY bucket_id ASC, observed_at DESC`,
+      [provider],
+    );
+    const byBucket = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const entries = byBucket.get(row.bucket_id) ?? [];
+      entries.push(row);
+      byBucket.set(row.bucket_id, entries);
+    }
+    const rates: Record<string, number> = {};
+    for (const [bucketId, entries] of byBucket) {
+      const latest = entries[0];
+      const previous = entries[1];
+      if (!latest || !previous || latest.reset_at !== previous.reset_at) {
+        rates[bucketId] = Number.NaN;
+        continue;
+      }
+      const latestAt = new Date(latest.observed_at).getTime();
+      const previousAt = new Date(previous.observed_at).getTime();
+      const elapsedHours = (latestAt - previousAt) / (60 * 60 * 1000);
+      if (!Number.isFinite(elapsedHours) || elapsedHours <= 0) {
+        rates[bucketId] = Number.NaN;
+        continue;
+      }
+      // An increase under one reset window is inconsistent evidence. Treating it as no
+      // burn would understate reserve, so hold the bucket rather than guessing a rate.
+      const consumed = previous.remaining_percent - latest.remaining_percent;
+      rates[bucketId] = consumed < 0 ? Number.NaN : consumed / elapsedHours;
+    }
+    return rates;
   }
 
   private enrich(input: CapacityReading): ProviderCapacity {

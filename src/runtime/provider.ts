@@ -152,34 +152,28 @@ export interface ProviderAdapter {
 }
 
 /**
- * PRD §14.2 — the two mandatory refresh points that belong to a provider operation
- * rather than to a control-plane decision: constituting or invoking a blind reviewer,
- * and a provider failing.
+ * PRD §14.2 — provider failure belongs to a provider operation rather than to a
+ * control-plane decision. Blind-review allocation is admitted by `BlindReviewGate`: a
+ * bare runtime observer can refresh but cannot deny a `startSession` without turning a
+ * capacity decision into an exception.
  *
  * Declared here as a narrow port instead of importing the capacity monitor, because the
  * monitor reads *this* module: the runtime must not depend on the component that measures
  * it. The literal trigger names are the monitor's own `RefreshTrigger` values.
  */
-export type RuntimeRefreshTrigger = "BLIND_REVIEW" | "PROVIDER_SWITCH_OR_FAILURE";
+export type RuntimeRefreshTrigger = "PROVIDER_SWITCH_OR_FAILURE";
 
 export interface RuntimeCapacityObserver {
   refresh(trigger: RuntimeRefreshTrigger, providerIds?: readonly string[]): Promise<unknown>;
 }
 
 /**
- * The review gate names its reviewer session `blind-review` / `blind-review-final`, and a
- * continuity failover names it `continuity:BLIND_REVIEWER`. The purpose is the only role
- * signal a session constitution carries, so it is what the runtime classifies on.
- */
-const BLIND_REVIEW_PURPOSE = /blind[-_ ]?review/i;
-
-/**
- * Wraps an adapter so the §14.2 refreshes happen whoever calls it.
+ * Wraps an adapter so provider failures cannot escape without a §14.2 refresh.
  *
- * Handing this wrapper out from the registry is what makes those refreshes mandatory: the
- * review gate, the CTO lifecycle and the continuity kernel all obtain their adapters from
- * the registry, so none of them can constitute a reviewer, invoke one, or absorb a
- * provider failure against a reading nobody re-took.
+ * Handing this wrapper out from the registry is what makes the failure refresh mandatory:
+ * the review gate, the CTO lifecycle and the continuity kernel all obtain their adapters
+ * from the registry. Blind-review refresh and admission live one layer higher, where a
+ * denial can be returned as a stable `Decision` rather than ignored.
  *
  * Probes are deliberately not wrapped — a probe *is* the measurement, and refreshing on a
  * failed probe would re-enter the same sensor.
@@ -207,9 +201,6 @@ class CapacityObservedAdapter implements ProviderAdapter {
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
-    // A reviewer session is constituted before it can be bound, so the refresh belongs
-    // ahead of the call: after it, the allocation has already been made.
-    if (BLIND_REVIEW_PURPOSE.test(spec.purpose)) await this.observe("BLIND_REVIEW");
     try {
       return await this.inner.startSession(spec);
     } catch (err) {
@@ -223,9 +214,6 @@ class CapacityObservedAdapter implements ProviderAdapter {
   }
 
   async invoke(request: InvocationRequest): Promise<InvocationResult> {
-    // The packet-only isolation contract is the one part of a request a caller cannot
-    // fake by naming: an isolated invocation *is* a blind review (§18.3).
-    if (request.isolation) await this.observe("BLIND_REVIEW");
     try {
       const result = await this.inner.invoke(request);
       // A refused or timed-out invocation is provider-failure evidence even when the

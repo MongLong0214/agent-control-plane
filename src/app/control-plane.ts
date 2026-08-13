@@ -238,10 +238,24 @@ export class ControlPlane {
     // Provider operations must observe capacity through the same monitor that dispatch
     // uses; otherwise the runtime wrapper is present but no production adapter reaches it.
     this.providers.attachCapacity(this.capacity);
+    this.tasks.attach({
+      capacity: {
+        refreshForWorkerFanout: (target) => this.capacity.refreshForWorkerFanout(target),
+        workerReserveDemand: (provider) => this.capacity.workerReserveDemand(provider),
+      },
+    });
+    this.review.attach({
+      capacity: { refreshForBlindReview: (target) => this.capacity.refreshForBlindReview(target) },
+    });
     this.continuity = new ContinuityKernel(
       this.db, this.clock, this.audit, this.capacity, this.providers,
       this.projects, this.runs, this.sessions, this.bindings, this.telemetry,
     );
+    this.capacity.attach({
+      providerFailureContinuity: {
+        evaluate: (reason) => this.continuity.evaluate(reason),
+      },
+    });
     this.cto = new CtoLifecycle(
       this.db, this.clock, this.audit, this.projects, this.sessions, this.bindings,
       this.providers, this.outbox, this.runs,
