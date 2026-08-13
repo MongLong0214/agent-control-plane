@@ -4,7 +4,8 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { Daemon } from "../../src/daemon/daemon.ts";
+import { Daemon, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
+import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import type { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";
@@ -17,6 +18,8 @@ import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts
 
 /** The single allowlisted owner identity of the fixture deployment. */
 export const TEST_OWNER = { channel: "cli", actor: "test-owner" } as const;
+export const TEST_OPERATOR_TOKEN = "operator-token";
+export const TEST_MCP_TOKEN = "mcp-token";
 
 export interface Harness {
   cp: ControlPlane;
@@ -166,6 +169,53 @@ export const bindCeo = (harness: Harness): string => {
   });
   if (!bound.allowed) throw new Error(`CEO binding failed: ${bound.message}`);
   return session.sessionId;
+};
+
+export interface StartedOperator {
+  harness: Harness;
+  daemon: Daemon;
+  socketPath: string;
+  peer: AuthenticatedOperatorPeer;
+  close(): Promise<void>;
+}
+
+/** Starts the same authenticated in-process operator surface used by socket integration tests. */
+export const makeStartedOperator = async (options: {
+  operatorToken?: string;
+  operatorActor?: string;
+} = {}): Promise<StartedOperator> => {
+  const harness = makeHarness();
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+  bindCeo(harness);
+  const stateDir = tempDir("acp-operator-daemon-");
+  const daemon = new Daemon(harness.cp, { stateDir });
+  const started = await daemon.start();
+  if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
+  const operatorToken = options.operatorToken ?? TEST_OPERATOR_TOKEN;
+  const operatorActor = options.operatorActor ?? TEST_OWNER.actor;
+  const peer: AuthenticatedOperatorPeer = {
+    channel: "cli",
+    peerId: `cli:${operatorActor}`,
+    actor: operatorActor,
+    // This value is only used for direct daemon calls; the listener supplies its live value.
+    incarnation: "test-live-incarnation",
+  };
+  const listener = await startOperatorSocket(
+    daemon,
+    stateDir,
+    { token: operatorToken, peerId: peer.peerId, actor: peer.actor },
+    { mcpToken: TEST_MCP_TOKEN },
+  );
+  return {
+    harness,
+    daemon,
+    socketPath: listener.socketPath,
+    peer,
+    close: async () => {
+      await listener.close();
+      await daemon.stop();
+    },
+  };
 };
 
 /**

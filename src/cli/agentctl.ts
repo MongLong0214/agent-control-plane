@@ -20,7 +20,9 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl doctor [scope] [target]        run a read-only doctor pass
   agentctl run show <runId>               run state, tasks, evidence
   agentctl run list [state]               list runs
+  agentctl run export <runId>             export host-anchored run evidence
   agentctl run cancel <runId> <reason>    cancel a run and its task graph
+  agentctl baseline export --from <ISO> --to <ISO>
   agentctl continuity status              continuity mode and role coverage plan
   agentctl outbox retry                   reset delivery attempts on pending messages
   agentctl owner approve <runId> <item>   record an owner decision for a human gate
@@ -124,6 +126,7 @@ export const dispatch = async (
     const [sub, ...params] = args;
     if (sub === "show") return call("run.show", { runId: required(params[0], "runId") });
     if (sub === "list") return call("run.list", params[0] ? { state: params[0] as RunState } : {});
+    if (sub === "export") return call("run.export", { runId: required(params[0], "runId") });
     if (sub === "cancel") {
       return call("run.cancel", {
         runId: required(params[0], "runId"),
@@ -131,6 +134,22 @@ export const dispatch = async (
       });
     }
     return fail(`unknown run subcommand: ${sub ?? ""}`);
+  }
+
+  if (command === "baseline") {
+    if (args[0] !== "export") return fail(`unknown baseline subcommand: ${args[0] ?? ""}`);
+    let from: string | undefined;
+    let to: string | undefined;
+    for (let index = 1; index < args.length; index += 2) {
+      const option = args[index];
+      const value = args[index + 1];
+      if (option !== "--from" && option !== "--to") return fail(`unknown baseline option: ${option ?? ""}`);
+      if (!value) return fail(`missing required argument: ${option}`);
+      if (option === "--from") from = value;
+      if (option === "--to") to = value;
+    }
+    if (!from || !to) return fail("baseline export requires --from and --to");
+    return call("baseline.export", { from, to });
   }
 
   if (command === "continuity") {

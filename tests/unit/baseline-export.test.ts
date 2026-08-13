@@ -1,11 +1,16 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 
-import { dispatch as dispatchAgentctl } from "../../src/cli/agentctl.ts";
+import { createOperatorClient, dispatch as dispatchAgentctl } from "../../src/cli/agentctl.ts";
 import { parseRepoFactoryResult, REPO_FACTORY_RESULT_SCHEMA_ID } from "../../src/bootstrap/repo-factory-result.ts";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
 import { ArtifactKind, ExecutionMode, TaskClass } from "../../src/domain/types.ts";
-import { BASELINE_RECORD_SCHEMA_ID, BaselineRecordKind } from "../../src/export/baseline-contract.ts";
+import {
+  BASELINE_EXPORT_SCHEMA_ID,
+  BASELINE_RECORD_SCHEMA_ID,
+  BaselineRecordKind,
+  RUN_EVIDENCE_EXPORT_SCHEMA_ID,
+} from "../../src/export/baseline-contract.ts";
 import { validateExperimentIsolation } from "../../src/export/experiment-isolation.ts";
 import {
   assessBaselineMinimum,
@@ -20,7 +25,13 @@ import {
 } from "../../src/export/run-evidence.ts";
 import { Db } from "../../src/db/database.ts";
 import { migrationChainFrom, SCHEMA_VERSION } from "../../src/db/migrations.ts";
-import { bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import {
+  bindWorker,
+  makeHarness,
+  makeStartedOperator,
+  registerFixtureProject,
+  TEST_OPERATOR_TOKEN,
+} from "../helpers/harness.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -376,28 +387,38 @@ describe("host-anchored redacted run-evidence export", () => {
     expect(exported.reasonCode).toBe("EVIDENCE_MISSING");
   });
 
-  it("keeps evidence export out of direct ControlPlane CLI dispatch", async () => {
-    const harness = makeHarness();
-    const created = harness.cp.runs.create({ executionMode: ExecutionMode.STANDARD, contract });
-    expect(created.allowed).toBe(true);
-    if (!created.allowed) return;
-
-    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  it("routes evidence export through the authenticated operator socket", async () => {
+    const running = await makeStartedOperator();
     try {
-      expect(
-        await dispatchAgentctl(harness.cp, "run", ["export", created.value.runId], false),
-      ).toBe(2);
-      expect(
-        await dispatchAgentctl(
-          harness.cp,
-          "baseline",
-          ["export", "--from", "2020-01-01T00:00:00.000Z", "--to", "2030-01-01T00:00:00.000Z"],
-          false,
-        ),
-      ).toBe(2);
-      expect(stderr).toHaveBeenCalled();
+      const created = running.harness.cp.runs.create({ executionMode: ExecutionMode.STANDARD, contract });
+      expect(created.allowed).toBe(true);
+      if (!created.allowed) return;
+
+      const client = createOperatorClient({
+        socketPath: running.socketPath,
+        token: TEST_OPERATOR_TOKEN,
+      });
+      const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      try {
+        expect(await dispatchAgentctl(client, "run", ["export", created.value.runId], false)).toBe(0);
+        expect(
+          await dispatchAgentctl(
+            client,
+            "baseline",
+            ["export", "--from", "2020-01-01T00:00:00.000Z", "--to", "2030-01-01T00:00:00.000Z"],
+            false,
+          ),
+        ).toBe(0);
+        const bundles = stdout.mock.calls.map(([value]) => JSON.parse(String(value)) as { schema?: string });
+        expect(bundles).toEqual([
+          expect.objectContaining({ schema: RUN_EVIDENCE_EXPORT_SCHEMA_ID }),
+          expect.objectContaining({ schema: BASELINE_EXPORT_SCHEMA_ID }),
+        ]);
+      } finally {
+        stdout.mockRestore();
+      }
     } finally {
-      stderr.mockRestore();
+      await running.close();
     }
   });
 });
