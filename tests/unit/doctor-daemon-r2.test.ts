@@ -757,7 +757,7 @@ describe("round 2 daemon regressions", () => {
     }
   });
 
-  it("#379: a draining current CTO can submit an in-flight receipt while new dispatch remains denied", async () => {
+  it("#379/#380: a draining CTO can submit an in-flight receipt and the MCP boundary requires its worker identity", async () => {
     const { harness, projectId, repositoryId, run } = await createQueuedRun();
     const launch = await startSessionLaunchChannel(tempDir("acp-session-launch-"));
     harness.cp.cto.attach({ sessionLaunch: launch });
@@ -779,11 +779,15 @@ describe("round 2 daemon regressions", () => {
       }]);
       expect(task.allowed).toBe(true);
       if (!task.allowed) return;
+      const taskRecord = task.value[0];
+      if (!taskRecord) throw new Error("task submission returned no task");
+      const taskId = taskRecord.taskId;
+      const workerSessionId = bindWorker(harness, taskId);
       const execution = harness.cp.tasks.startExecution({
         runId: run.runId,
-        taskId: task.value[0]!.taskId,
+        taskId,
         ownerBindingGeneration: dispatched.value.ownerBindingGeneration,
-        workerSessionId: outgoing.sessionId,
+        workerSessionId,
         provider: "scripted",
         model: "scripted-worker",
         repositoryId,
@@ -813,6 +817,50 @@ describe("round 2 daemon regressions", () => {
       const ctoSocket = listeners.socketPaths[1];
       if (!ctoSocket) throw new Error("CTO MCP listener was not started");
       try {
+        const missingWorker = await exchangeSocketLines(
+          ctoSocket,
+          [
+            {
+              token: "local-test-token",
+              sessionId: credential.sessionId,
+              sessionSecret: credential.sessionSecret,
+            },
+            {
+              jsonrpc: "2.0",
+              id: 1,
+              method: "initialize",
+              params: {
+                protocolVersion: "2025-11-25",
+                capabilities: {},
+                clientInfo: { name: "draining-cto", version: "1" },
+              },
+            },
+            { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+            {
+              jsonrpc: "2.0",
+              id: 2,
+              method: "tools/call",
+              params: {
+                name: "task_receipt_submit",
+                arguments: {
+                  idempotencyKey: "missing-worker-session-id",
+                  runId: run.runId,
+                  taskId,
+                  phase: "started",
+                  provider: "scripted",
+                  model: "scripted-worker",
+                  repositoryId,
+                },
+              },
+            },
+          ],
+          (received) => received.includes('"id":2'),
+        );
+        expect(missingWorker).toContain("Input validation error: Invalid arguments for tool task_receipt_submit");
+        expect(missingWorker).toContain("workerSessionId");
+        expect(missingWorker).not.toContain(ReasonCode.WORKER_BINDING_REQUIRED);
+        expect(harness.cp.tasks.executions(run.runId)).toHaveLength(1);
+
         const submitted = await exchangeSocketLines(
           ctoSocket,
           [
@@ -841,9 +889,10 @@ describe("round 2 daemon regressions", () => {
                 arguments: {
                   idempotencyKey: "draining-in-flight-activity",
                   runId: run.runId,
-                  taskId: task.value[0]!.taskId,
+                  taskId,
                   phase: "activity",
                   executionId: execution.value.executionId,
+                  workerSessionId,
                 },
               },
             },
