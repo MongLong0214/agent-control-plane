@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { DispatchCapacityTarget } from "../capacity/capacity-monitor.ts";
@@ -216,10 +216,10 @@ export class BlindReviewGate {
     request = trusted.value;
 
     const expected = snapshotCoverageTargets(request.snapshot);
-    const reviewer = await this.constituteReviewer(request.runId);
-    if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
-    const reviewers = [reviewer.value];
-    let authoritativeReviewer = reviewer.value;
+    const reviewers: ReviewerBinding[] = [];
+    const rememberReviewer = (reviewer: ReviewerBinding): void => {
+      reviewers.push(reviewer);
+    };
 
     try {
       const collected = await this.collectDiffs(request.snapshot);
@@ -229,13 +229,18 @@ export class BlindReviewGate {
       const totalChars = diffs.reduce((n, d) => n + d.diff.length, 0) + this.promptOverhead(request);
       const chunked = totalChars > CHUNK_THRESHOLD_CHARS;
 
-      const outcome = chunked
-        ? await this.chunkedReview(request, diffs, authoritativeReviewer)
-        : await this.singleReview(request, diffs, authoritativeReviewer);
+      let outcome: Decision<ReviewOutcome>;
+      if (chunked) {
+        outcome = await this.chunkedReview(request, diffs, rememberReviewer);
+      } else {
+        const reviewer = await this.constituteReviewer(request.runId);
+        if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
+        rememberReviewer(reviewer.value);
+        outcome = await this.singleReview(request, diffs, reviewer.value);
+      }
 
       if (!outcome.allowed) return outcome as Decision<ReviewPacket>;
-      authoritativeReviewer = outcome.value.reviewer;
-      if (authoritativeReviewer.sessionId !== reviewer.value.sessionId) reviewers.push(authoritativeReviewer);
+      const authoritativeReviewer = outcome.value.reviewer;
 
       // A reviewer binding is a fencing token. If something replaced it while the
       // provider was working, its verdict is no longer attributable to the active role.
@@ -305,6 +310,15 @@ export class BlindReviewGate {
           omittedItems: validated.omittedItems,
           chunked,
           findings: validated.findings.length,
+          // The final reviewer is the packet authority. Persist the distinct chunk
+          // reviewers too, because they are the sessions that actually saw the diff.
+          chunkReviewerSessions: outcome.value.chunkReviewers.map((chunkReviewer) => ({
+            sessionId: chunkReviewer.sessionId,
+            incarnation: chunkReviewer.incarnation,
+            providerSessionId: chunkReviewer.providerSessionId,
+            generation: chunkReviewer.generation,
+            provider: chunkReviewer.provider,
+          })),
         },
       });
 
@@ -336,10 +350,12 @@ export class BlindReviewGate {
       }
       return allow(ReasonCode.REVIEW_PASS, validated);
     } finally {
-      // Do not revoke a replacement owned by another attempt. Each session constituted by
-      // this attempt is stopped explicitly, including the final chunk reviewer.
-      if (this.bindings.isCurrent(authoritativeReviewer.roleKey, authoritativeReviewer.generation)) {
-        this.bindings.revoke(authoritativeReviewer.roleKey, "blind review complete");
+      // Do not revoke a replacement owned by another attempt. Every reviewer constituted
+      // by this attempt is stopped explicitly, including a chunk reviewer on an error path
+      // before a final reviewer exists.
+      const latestReviewer = reviewers.at(-1);
+      if (latestReviewer && this.bindings.isCurrent(latestReviewer.roleKey, latestReviewer.generation)) {
+        this.bindings.revoke(latestReviewer.roleKey, "blind review complete");
       }
       for (const reviewer of reviewers) {
         this.sessions.transition(reviewer.sessionId, SessionLifecycle.STOPPED, "blind review complete");
@@ -356,7 +372,7 @@ export class BlindReviewGate {
    */
   private async constituteReviewer(
     runId: string,
-    purpose: "blind-review" | "blind-review-final" = "blind-review",
+    purpose: "blind-review" | "blind-review-chunk" | "blind-review-final" = "blind-review",
   ): Promise<
     Decision<{
       sessionId: string;
@@ -557,6 +573,13 @@ export class BlindReviewGate {
     const denyReadPaths = new Set<string>([canonical(process.cwd())]);
     const databasePath = this.db.raw.name;
     if (databasePath && databasePath !== ":memory:") denyReadPaths.add(canonical(databasePath));
+    // A reviewer must not discover producer reasoning by reading the host provider's
+    // conversation stores. The runtime adapter must enforce this request before it may
+    // attest isolation; including the canonical paths here makes that contract explicit.
+    const hostHome = homedir();
+    for (const providerState of [join(hostHome, ".claude"), join(hostHome, ".codex")]) {
+      denyReadPaths.add(canonical(providerState));
+    }
     for (const repository of request.snapshot.repositories) {
       const checkout = this.repositories.byIdentity(repository.identity)?.checkoutPath;
       if (checkout) denyReadPaths.add(canonical(checkout));
@@ -590,12 +613,16 @@ export class BlindReviewGate {
     // Only an explicit attestation counts. Anything else — including an adapter that
     // simply omits the field — is an unprovable isolation claim, which §18.3 treats as a
     // lost boundary rather than a benign default.
-    if (result.isolationAttested === true) return allow(ReasonCode.OK, undefined);
+    if (result.isolationAttested === true && result.isolationReasonCode === undefined) {
+      return allow(ReasonCode.OK, undefined);
+    }
     return deny(ReasonCode.ISOLATION_LOST, "reviewer adapter did not attest packet-only isolation", {
       runId,
       provider: reviewer.preference.provider,
       reviewerSessionId: reviewer.sessionId,
       packetRoot: reviewer.workdir,
+      isolationAttested: result.isolationAttested,
+      isolationReasonCode: result.isolationReasonCode ?? null,
     });
   }
 
@@ -638,7 +665,12 @@ export class BlindReviewGate {
     }
     const attested = this.assertInvocationIdentity(request.runId, reviewer, result.providerSessionId);
     if (!attested.allowed) return attested as Decision<ReviewOutcome>;
-    return allow(ReasonCode.OK, { verdict: parsed, providerSessionId: result.providerSessionId!, reviewer });
+    return allow(ReasonCode.OK, {
+      verdict: parsed,
+      providerSessionId: result.providerSessionId!,
+      reviewer,
+      chunkReviewers: [],
+    });
   }
 
   /**
@@ -648,9 +680,8 @@ export class BlindReviewGate {
   private async chunkedReview(
     request: BlindReviewRequest,
     diffs: Array<{ identity: string; diff: string; files: string[] }>,
-    reviewer: ReviewerBinding,
+    rememberReviewer: (reviewer: ReviewerBinding) => void,
   ): Promise<Decision<ReviewOutcome>> {
-    const adapter = this.providers.require(reviewer.preference.provider);
     // A chunk adds repository/file fences and the chunk heading beyond the empty-prompt
     // measurement. Reserve a bounded envelope so the complete serialized prompt, not only
     // the patch body, remains inside the review budget.
@@ -663,9 +694,15 @@ export class BlindReviewGate {
       });
     }
     const chunks = splitDiffs(diffs, chunkBudget);
-    const covered = new Set<string>();
+    const coveredFiles = new Set<string>();
+    const coveredSlices = new Set<string>();
+    const expectedSlices = new Map<string, string>();
+    for (const part of chunks.flat()) {
+      for (const target of part.coverageTargets) expectedSlices.set(target.slice, target.file);
+    }
     const findings: ReviewFinding[] = [];
     const omitted: string[] = [];
+    const chunkReviewers: ChunkReviewerEvidence[] = [];
     let worst: ReviewVerdict = "PASS";
 
     for (const [index, chunk] of chunks.entries()) {
@@ -678,8 +715,17 @@ export class BlindReviewGate {
           budget: CHUNK_THRESHOLD_CHARS,
         });
       }
+      // CP-HI-04 / ADR-0006: every chunk is a fresh provider session and a fresh
+      // packet-only workdir. Reusing one session turns the second chunk into a later
+      // conversation turn that can read earlier verdicts.
+      const constituted = await this.constituteReviewer(request.runId, "blind-review-chunk");
+      if (!constituted.allowed) return constituted as Decision<ReviewOutcome>;
+      const reviewer = constituted.value;
+      rememberReviewer(reviewer);
+
       const capacity = await this.admitReviewer(reviewer.preference.provider);
       if (!capacity.allowed) return capacity as Decision<ReviewOutcome>;
+      const adapter = this.providers.require(reviewer.preference.provider);
       const result = await adapter.invoke(this.reviewInvocation(
         request,
         reviewer,
@@ -688,6 +734,19 @@ export class BlindReviewGate {
       ));
       const isolation = this.assertIsolationAttested(request.runId, reviewer, result);
       if (!isolation.allowed) return isolation as Decision<ReviewOutcome>;
+      // The chunk reviewers are the only reviewers that received the candidate diff.
+      // Verify the provider's session attestation for each one before accepting any of
+      // their coverage or findings; checking only the final reducer reviewer proves the
+      // wrong invocation was independent.
+      const attested = this.assertInvocationIdentity(request.runId, reviewer, result.providerSessionId);
+      if (!attested.allowed) return attested as Decision<ReviewOutcome>;
+      chunkReviewers.push({
+        sessionId: reviewer.sessionId,
+        incarnation: reviewer.incarnation,
+        providerSessionId: result.providerSessionId!,
+        generation: reviewer.generation,
+        provider: reviewer.preference.provider,
+      });
       const parsed = result.ok ? parseVerdict(result.json ?? result.text) : null;
       if (!parsed) {
         // A chunk that did not produce a usable verdict is an omission, not a pass.
@@ -696,20 +755,26 @@ export class BlindReviewGate {
       }
       const chunkCoverage = validateChunkCoverage(parsed.coveredFiles, chunk);
       if (!chunkCoverage.allowed) return chunkCoverage as Decision<ReviewOutcome>;
-      for (const file of chunkCoverage.value) covered.add(file);
+      for (const file of chunkCoverage.value.files) coveredFiles.add(file);
+      for (const slice of chunkCoverage.value.slices) coveredSlices.add(slice);
       omitted.push(...parsed.omittedItems);
       findings.push(...parsed.findings);
       worst = worseVerdict(worst, parsed.verdict);
     }
 
-    // Coverage reducer: every touched file must have been seen by at least one chunk.
+    // Coverage reducer: every touched file must have been seen by at least one chunk,
+    // and every range slice of an oversized file must have been claimed by the chunk
+    // that actually contained it. A first-slice claim cannot cover later slices.
     const expected = snapshotCoverageTargets(request.snapshot).map((t) => `${t.identity}:${t.path}`);
-    const unseen = expected.filter((key) => !covered.has(key));
-    omitted.push(...unseen);
+    const unseenFiles = expected.filter((key) => !coveredFiles.has(key));
+    const unseenSlices = [...expectedSlices.entries()]
+      .filter(([slice]) => !coveredSlices.has(slice))
+      .map(([, file]) => file);
+    omitted.push(...unseenFiles, ...unseenSlices);
 
     const reduced: RawVerdict = {
       verdict: worst,
-      coveredFiles: [...covered],
+      coveredFiles: [...coveredFiles],
       omittedItems: [...new Set(omitted)],
       findings: dedupeFindings(findings),
     };
@@ -718,10 +783,10 @@ export class BlindReviewGate {
     // and only that judgement is authoritative.
     const finalReviewer = await this.constituteReviewer(request.runId, "blind-review-final");
     if (!finalReviewer.allowed) return finalReviewer as Decision<never>;
+    rememberReviewer(finalReviewer.value);
 
     const finalPrompt = this.buildFinalPrompt(request, reduced, chunks.length);
     if (finalPrompt.length > CHUNK_THRESHOLD_CHARS) {
-      this.disposeReviewer(finalReviewer.value, "final review prompt exceeds context budget");
       return deny(ReasonCode.EVIDENCE_MISSING, "the reduced final-review prompt exceeds the context budget", {
         runId: request.runId,
         length: finalPrompt.length,
@@ -731,7 +796,6 @@ export class BlindReviewGate {
 
     const finalCapacity = await this.admitReviewer(finalReviewer.value.preference.provider);
     if (!finalCapacity.allowed) {
-      this.disposeReviewer(finalReviewer.value, "final reviewer capacity admission refused");
       return finalCapacity as Decision<ReviewOutcome>;
     }
     const finalResult = await this.providers.require(finalReviewer.value.preference.provider).invoke(
@@ -744,12 +808,10 @@ export class BlindReviewGate {
     );
     const finalIsolation = this.assertIsolationAttested(request.runId, finalReviewer.value, finalResult);
     if (!finalIsolation.allowed) {
-      this.disposeReviewer(finalReviewer.value, "final reviewer did not attest isolation");
       return finalIsolation as Decision<ReviewOutcome>;
     }
 
     if (!finalResult.ok) {
-      this.disposeReviewer(finalReviewer.value, "final review did not complete");
       return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer did not complete", {
         runId: request.runId,
         exitCode: finalResult.exitCode,
@@ -758,7 +820,6 @@ export class BlindReviewGate {
     }
     const finalVerdict = parseVerdict(finalResult.json ?? finalResult.text);
     if (!finalVerdict) {
-      this.disposeReviewer(finalReviewer.value, "final review returned invalid verdict");
       return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer returned no usable verdict", {
         runId: request.runId,
         raw: finalResult.text.slice(0, 500),
@@ -771,14 +832,17 @@ export class BlindReviewGate {
       finalResult.providerSessionId,
     );
     if (!attested.allowed) {
-      this.disposeReviewer(finalReviewer.value, "provider session attestation failed");
       return attested as Decision<ReviewOutcome>;
     }
 
     return allow(ReasonCode.OK, {
       verdict: {
-        // The final reviewer may not erase coverage gaps the reducer established.
-        verdict: worseVerdict(finalVerdict.verdict, reduced.omittedItems.length > 0 ? "REVISE" : "PASS"),
+        // A final reviewer judges the reduction but cannot erase a BLOCK/REVISE reached
+        // by a reviewer that saw the diff, nor a mechanical coverage omission.
+        verdict: worseVerdict(
+          worseVerdict(finalVerdict.verdict, reduced.verdict),
+          reduced.omittedItems.length > 0 ? "REVISE" : "PASS",
+        ),
         // Only a reviewer that actually saw a chunk may claim its paths. The final reviewer
         // judges the reduced result and therefore cannot manufacture diff coverage.
         coveredFiles: reduced.coveredFiles,
@@ -787,6 +851,7 @@ export class BlindReviewGate {
       },
       providerSessionId: finalResult.providerSessionId!,
       reviewer: finalReviewer.value,
+      chunkReviewers,
     });
   }
 
@@ -911,16 +976,14 @@ export class BlindReviewGate {
         diff: true,
         verificationEvidence: true,
         projectContext: false,
-        // §18.3 — the reviewer is blind to how the candidate was produced.
+        // §18.3 — these are logical inputs the gate never serializes into a reviewer
+        // prompt. Filesystem confinement is attested separately by the runtime; do not
+        // turn this manifest into a static, unmeasured sandbox claim.
         withheld: [
           "worker reasoning",
           "CTO reasoning",
           "chat history",
           "producer self-assessment",
-          "previous verdicts",
-          "daemon state",
-          "trusted credentials",
-          "candidate checkout paths",
         ],
         binaryArtifacts: input.binaryArtifacts,
       },
@@ -1090,14 +1153,6 @@ export class BlindReviewGate {
     return this.buildPrompt(request, []).length;
   }
 
-  private disposeReviewer(reviewer: ReviewerBinding, reason: string): void {
-    if (this.bindings.isCurrent(reviewer.roleKey, reviewer.generation)) {
-      this.bindings.revoke(reviewer.roleKey, reason);
-    }
-    this.sessions.transition(reviewer.sessionId, SessionLifecycle.STOPPED, reason);
-    rmSync(reviewer.workdir, { recursive: true, force: true });
-  }
-
   /**
    * §18.4 — PASS requires `omittedItems=0` *and* a covered set that accounts for every
    * touched file. A reviewer that simply forgot to mention a file has not covered it.
@@ -1165,6 +1220,16 @@ interface ReviewOutcome {
   verdict: RawVerdict;
   providerSessionId: string;
   reviewer: ReviewerBinding;
+  /** Durable audit evidence for the fresh sessions that saw individual diff chunks. */
+  chunkReviewers: ChunkReviewerEvidence[];
+}
+
+interface ChunkReviewerEvidence {
+  sessionId: string;
+  incarnation: string;
+  providerSessionId: string;
+  generation: number;
+  provider: string;
 }
 
 const REVIEWER_SYSTEM_PROMPT = [
@@ -1236,10 +1301,36 @@ const splitCoverageKey = (key: string): { identity: string; path: string } | nul
   return { identity: key.slice(0, separator), path: key.slice(separator + 1) };
 };
 
+interface SliceCoverageTarget {
+  /** The public `<repository>:<path>` claim a reviewer is allowed to make. */
+  file: string;
+  /** Internal, unique identity for the exact diff range that supplied that path. */
+  slice: string;
+}
+
+interface ReviewChunkPart {
+  identity: string;
+  diff: string;
+  files: string[];
+  coverageTargets: SliceCoverageTarget[];
+}
+
+type ReviewChunkInput = ReviewChunkPart | { identity: string; diff: string; files: string[] };
+
+const coverageTargetsFor = (part: ReviewChunkInput): SliceCoverageTarget[] =>
+  "coverageTargets" in part
+    ? part.coverageTargets
+    : part.files.map((path) => ({
+        file: `${part.identity}:${path}`,
+        // The fallback exists only for the direct unit helper. Production chunks always
+        // carry the explicit range identity generated by splitDiffs.
+        slice: `${part.identity}:${path}:whole`,
+      }));
+
 const validateChunkCoverage = (
   claims: readonly string[],
-  chunk: Array<{ identity: string; diff: string; files: string[] }>,
-): Decision<string[]> => {
+  chunk: readonly ReviewChunkInput[],
+): Decision<{ files: string[]; slices: string[] }> => {
   const assigned = new Set(chunk.flatMap((part) => part.files.map((path) => `${part.identity}:${path}`)));
   for (const claim of claims) {
     const parsed = splitCoverageKey(claim);
@@ -1250,7 +1341,13 @@ const validateChunkCoverage = (
       });
     }
   }
-  return allow(ReasonCode.OK, [...new Set(claims)]);
+  const files = [...new Set(claims)];
+  const claimed = new Set(files);
+  const slices = chunk
+    .flatMap(coverageTargetsFor)
+    .filter((target) => claimed.has(target.file))
+    .map((target) => target.slice);
+  return allow(ReasonCode.OK, { files, slices: [...new Set(slices)] });
 };
 
 const worseVerdict = (a: ReviewVerdict, b: ReviewVerdict): ReviewVerdict => {
@@ -1271,9 +1368,9 @@ const dedupeFindings = (findings: ReviewFinding[]): ReviewFinding[] => {
 const splitDiffs = (
   diffs: Array<{ identity: string; diff: string; files: string[] }>,
   budget: number,
-): Array<Array<{ identity: string; diff: string; files: string[] }>> => {
-  const chunks: Array<Array<{ identity: string; diff: string; files: string[] }>> = [];
-  let current: Array<{ identity: string; diff: string; files: string[] }> = [];
+): ReviewChunkPart[][] => {
+  const chunks: ReviewChunkPart[][] = [];
+  let current: ReviewChunkPart[] = [];
   let size = 0;
   for (const repo of diffs) {
     for (const part of splitByFile(repo, budget)) {
@@ -1294,55 +1391,73 @@ const splitDiffs = (
 const splitByFile = (
   repo: { identity: string; diff: string; files: string[] },
   budget: number,
-): Array<{ identity: string; diff: string; files: string[] }> => {
-  if (repo.diff.length <= budget) return [repo];
+): ReviewChunkPart[] => {
+  if (repo.diff.length <= budget) return [wholeFilePart(repo.identity, repo.diff, repo.files)];
   const sections = repo.diff.split(/(?=^diff --git )/m).filter(Boolean);
-  const parts: Array<{ identity: string; diff: string; files: string[] }> = [];
+  const parts: ReviewChunkPart[] = [];
   let buffer = "";
   let files: string[] = [];
   for (const section of sections) {
     const named = /^diff --git a\/(\S+) b\//m.exec(section)?.[1];
     if (section.length > budget) {
       if (buffer.length > 0) {
-        parts.push({ identity: repo.identity, diff: buffer, files });
+        parts.push(wholeFilePart(repo.identity, buffer, files));
         buffer = "";
         files = [];
       }
       if (!named) {
         // A malformed patch cannot be attributed to a touched path, so do not pretend a
         // range split supplies reviewable evidence for it.
-        return [{ identity: repo.identity, diff: repo.diff, files: [] }];
+        return [wholeFilePart(repo.identity, repo.diff, [])];
       }
       parts.push(...splitOversizedSection(repo.identity, named, section, budget));
       continue;
     }
     if (buffer.length + section.length > budget && buffer.length > 0) {
-      parts.push({ identity: repo.identity, diff: buffer, files });
+      parts.push(wholeFilePart(repo.identity, buffer, files));
       buffer = "";
       files = [];
     }
     buffer += section;
     if (named) files.push(named);
   }
-  if (buffer.length > 0) parts.push({ identity: repo.identity, diff: buffer, files });
+  if (buffer.length > 0) parts.push(wholeFilePart(repo.identity, buffer, files));
   return parts;
 };
+
+const wholeFilePart = (identity: string, diff: string, files: string[]): ReviewChunkPart => ({
+  identity,
+  diff,
+  files,
+  coverageTargets: files.map((path) => ({
+    file: `${identity}:${path}`,
+    slice: `${identity}:${path}:whole`,
+  })),
+});
 
 const splitOversizedSection = (
   identity: string,
   path: string,
   section: string,
   budget: number,
-): Array<{ identity: string; diff: string; files: string[] }> => {
+): ReviewChunkPart[] => {
   const headerEnd = section.indexOf("\n") + 1;
   const header = headerEnd > 0 ? section.slice(0, headerEnd) : "";
   const payload = section.slice(header.length);
   const capacity = budget - header.length;
-  if (capacity <= 0) return [{ identity, diff: section, files: [path] }];
+  if (capacity <= 0) return [wholeFilePart(identity, section, [path])];
 
-  const parts: Array<{ identity: string; diff: string; files: string[] }> = [];
+  const parts: ReviewChunkPart[] = [];
   for (let offset = 0; offset < payload.length; offset += capacity) {
-    parts.push({ identity, diff: `${header}${payload.slice(offset, offset + capacity)}`, files: [path] });
+    parts.push({
+      identity,
+      diff: `${header}${payload.slice(offset, offset + capacity)}`,
+      files: [path],
+      coverageTargets: [{
+        file: `${identity}:${path}`,
+        slice: `${identity}:${path}:range:${offset}`,
+      }],
+    });
   }
   return parts;
 };

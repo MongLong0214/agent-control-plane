@@ -1,11 +1,12 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { chmodSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { BlindReviewGate, __testing } from "../../src/review/blind-review.ts";
 import { CandidatePipeline } from "../../src/run/candidate-pipeline.ts";
 import { canonical } from "../../src/guard/workspace-probe.ts";
@@ -131,15 +132,60 @@ const directReview = async (setup: Awaited<ReturnType<typeof prepareReviewedInpu
   });
 };
 
-const writeAttestingReviewerStub = (directory: string, coveredFiles: readonly string[]): string => {
-  const binary = join(directory, "attesting-reviewer.mjs");
+const invokePreparedReview = (setup: Awaited<ReturnType<typeof prepareReviewedInputs>>) =>
+  setup.harness.cp.review.controlPlaneInvoker()({
+    runId: setup.run.runId,
+    projectId: setup.projectId,
+    executionMode: setup.run.executionMode,
+    snapshot: setup.snapshot,
+    contract: CONTRACT,
+    contractDigest: setup.run.contractDigest,
+    verification: setup.verification,
+  });
+
+const prepareLargeReviewedInputs = async () => {
+  const setup = await prepareReviewedInputs();
+  writeFiles(setup.harness.repoPath, {
+    "src/app.js": `module.exports = () => 2;\n// ${"x".repeat(130_000)}\n`,
+  });
+  commitAll(setup.harness.repoPath, "large reviewed change");
+  const frozen = await setup.harness.cp.pipeline.freeze(setup.run.runId);
+  if (!frozen.allowed) throw new Error(frozen.message);
+  return {
+    ...setup,
+    snapshot: frozen.value,
+    verification: persistPassingVerification(setup, frozen.value),
+  };
+};
+
+const writeIsolationProbeReviewerStub = (
+  directory: string,
+  deniedReadTarget: string,
+  coveredFiles: readonly string[],
+): string => {
+  const binary = join(directory, "isolation-probe-reviewer.mjs");
   writeFileSync(
     binary,
     `#!${process.execPath}
+import { readFileSync } from "node:fs";
 const sessionIndex = process.argv.indexOf("--session-id");
 const sessionId = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : null;
-const result = ${JSON.stringify(reviewerPass([...coveredFiles]))};
+const isRuntimeProbe = process.argv.includes("--version");
+let denied = false;
+if (!isRuntimeProbe) {
+  try {
+    readFileSync(${JSON.stringify(deniedReadTarget)}, "utf8");
+  } catch {
+    denied = true;
+  }
+}
+const result = isRuntimeProbe
+  ? "isolation-probe-reviewer 1.0"
+  : denied
+  ? ${JSON.stringify(reviewerPass([...coveredFiles]))}
+  : "isolation probe unexpectedly read the producer checkout";
 process.stdout.write(JSON.stringify({ result, session_id: sessionId }));
+process.exitCode = isRuntimeProbe || denied ? 0 : 1;
 `,
   );
   chmodSync(binary, 0o700);
@@ -242,40 +288,158 @@ describe("round-2 blind-review regressions", () => {
     expect(result.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
   });
 
-  it("#128 records the final chunk reviewer's binding as authoritative", async () => {
+  it("#364 rechecks reviewer independence when assembling the packet", async () => {
     const setup = await prepareReviewedInputs();
-    writeFiles(setup.harness.repoPath, { "src/app.js": `module.exports = () => 2;\n// ${"x".repeat(130_000)}\n` });
-    commitAll(setup.harness.repoPath, "large reviewed change");
-    const frozen = await setup.harness.cp.pipeline.freeze(setup.run.runId);
-    if (!frozen.allowed) throw new Error(frozen.message);
-    const verification = persistPassingVerification(setup, frozen.value);
+    const originalProducerSessions = setup.harness.cp.bindings.producerSessions.bind(setup.harness.cp.bindings);
+    let injected = false;
+    setup.harness.cp.bindings.producerSessions = (runId: string) => {
+      const producersBeforeInjection = originalProducerSessions(runId);
+      if (!injected && runId === setup.run.runId) {
+        const reviewer = setup.harness.cp.bindings.active(roleKeyFor(Role.BLIND_REVIEWER, { runId }));
+        if (!reviewer) throw new Error("reviewer was not bound before identity attestation");
+        const producerBinding = setup.harness.cp.bindings.bind({
+          role: Role.OPTIONAL_ADVERSARIAL_REVIEWER,
+          runId,
+          sessionId: reviewer.sessionId,
+        });
+        if (!producerBinding.allowed) throw new Error(producerBinding.message);
+        injected = true;
+      }
+      // The invocation-identity check receives the pre-injection set. The packet-time
+      // check must observe the new producer binding and refuse the otherwise valid PASS.
+      return producersBeforeInjection;
+    };
+
+    const result = await directReview(setup);
+
+    expect(injected).toBe(true);
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
+    expect(setup.harness.cp.review.latestPacket(
+      setup.run.runId,
+      candidateSnapshotDigest(setup.snapshot),
+    )).toBeNull();
+  });
+
+  it("#128 constitutes a distinct reviewer session for every chunk and records the final authority", async () => {
+    const setup = await prepareLargeReviewedInputs();
     setup.harness.scripted.script(
       { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
       { match: /Final review/, text: reviewerPass([]) },
     );
-    const result = await setup.harness.cp.review.controlPlaneInvoker()({
-      runId: setup.run.runId,
-      projectId: setup.projectId,
-      executionMode: setup.run.executionMode,
-      snapshot: frozen.value,
-      contract: CONTRACT,
-      contractDigest: setup.run.contractDigest,
-      verification,
-    });
+    const result = await invokePreparedReview(setup);
     if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+    const chunkInvocations = setup.harness.scripted.invocations.filter((invocation) => /Review chunk/.test(invocation.prompt));
+
     expect(result.value.chunked).toBe(true);
-    expect(result.value.reviewerRoleBindingGeneration).toBe(2);
+    expect(chunkInvocations.length).toBeGreaterThan(1);
+    expect(new Set(chunkInvocations.map((invocation) => invocation.externalSessionId)).size).toBe(chunkInvocations.length);
+    expect(result.value.reviewerRoleBindingGeneration).toBe(chunkInvocations.length + 1);
     expect(setup.harness.cp.sessions.require(result.value.reviewerSessionId).lifecycle).toBe("STOPPED");
+    expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_COMPLETED")[0]?.evidence).toMatchObject({
+      chunkReviewerSessions: expect.arrayContaining([
+        expect.objectContaining({ provider: "scripted" }),
+      ]),
+    });
   });
 
-  it("#129 rejects a chunk reviewer claiming a path assigned to another chunk", () => {
-    const coverage = __testing.validateChunkCoverage(["github:acme/fixture:two.ts"], [{
-      identity: "github:acme/fixture",
-      diff: "diff --git a/one.ts b/one.ts\n",
-      files: ["one.ts"],
-    }]);
-    expect(coverage.allowed).toBe(false);
-    expect(coverage.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+  it("#129 rejects an out-of-chunk coverage claim through the chunked review gate", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([`${setup.identity}:not-in-this-chunk.ts`]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+
+    const result = await invokePreparedReview(setup);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+  });
+
+  it("#359 keeps a chunk BLOCK with only MAJOR findings from becoming a final PASS", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    const covered = `${setup.identity}:src/app.js`;
+    const chunkBlock = JSON.stringify({
+      verdict: "BLOCK",
+      coveredFiles: [covered],
+      omittedItems: [],
+      findings: [{
+        category: "correctness",
+        severity: "MAJOR",
+        repository: setup.identity,
+        path: "src/app.js",
+        summary: "chunk found a material defect",
+        detail: "the reviewer that saw this range blocked the candidate",
+      }],
+    });
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: chunkBlock },
+      { match: /Review chunk/, text: reviewerPass([covered]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+
+    const result = await invokePreparedReview(setup);
+    const packet = setup.harness.cp.review.latestPacket(
+      setup.run.runId,
+      candidateSnapshotDigest(setup.snapshot),
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.REVIEW_BLOCK);
+    expect(packet).toMatchObject({
+      verdict: "BLOCK",
+      findings: [expect.objectContaining({ severity: "MAJOR", summary: "chunk found a material defect" })],
+    });
+  });
+
+  it("#362 requires every range slice of an oversized file to claim coverage", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    const covered = `${setup.identity}:src/app.js`;
+    // The first range claims the file; every later range returns a usable response but
+    // does not claim it. File-level first-slice-wins coverage would incorrectly PASS.
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([covered]) },
+      { match: /Review chunk/, text: reviewerPass([]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+
+    const result = await invokePreparedReview(setup);
+    const packet = setup.harness.cp.review.latestPacket(
+      setup.run.runId,
+      candidateSnapshotDigest(setup.snapshot),
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.REVIEW_REVISE);
+    expect(packet).toMatchObject({ verdict: "REVISE" });
+    expect(packet?.omittedItems).toContain(covered);
+  });
+
+  it("#363 refuses a chunk verdict attested to a producer provider session", async () => {
+    const setup = await prepareLargeReviewedInputs();
+    const producerProviderSession = setup.harness.cp.sessions
+      .require(setup.run.ownerSessionId!)
+      .incarnation.split("#", 1)[0]!;
+    const originalInvoke = setup.harness.scripted.invoke.bind(setup.harness.scripted);
+    setup.harness.scripted.invoke = async (request) => {
+      const result = await originalInvoke(request);
+      return /Review chunk/.test(request.prompt)
+        ? { ...result, providerSessionId: producerProviderSession }
+        : result;
+    };
+    setup.harness.scripted.script(
+      { match: /Review chunk/, text: reviewerPass([`${setup.identity}:src/app.js`]), once: false },
+      { match: /Final review/, text: reviewerPass([]) },
+    );
+
+    const result = await invokePreparedReview(setup);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
+    expect(setup.harness.cp.review.latestPacket(
+      setup.run.runId,
+      candidateSnapshotDigest(setup.snapshot),
+    )).toBeNull();
   });
 
   it("#130 serializes concurrent candidate submissions across a reconstructed pipeline", async () => {
@@ -362,12 +526,16 @@ describe("round-2 blind-review regressions", () => {
     expect(probes).toBe(0);
   });
 
-  it("#332 accepts a packet only after the real reviewer adapter attests isolation", async () => {
+  it("#332 proves the real reviewer child cannot read the withheld producer checkout", async () => {
     const setup = await prepareReviewedInputs();
     const claude = new ClaudeCliAdapter({
       clock: setup.harness.clock,
       capacityFile: join(setup.harness.root, "claude-capacity.json"),
-      binary: writeAttestingReviewerStub(setup.harness.root, [`${setup.identity}:src/app.js`]),
+      binary: writeIsolationProbeReviewerStub(
+        setup.harness.root,
+        join(setup.harness.repoPath, "src/app.js"),
+        [`${setup.identity}:src/app.js`],
+      ),
     });
     const canApplySeatbelt = seatbeltCanApply();
     const direct = await claude.invoke({
@@ -510,6 +678,42 @@ describe("round-2 blind-review regressions", () => {
     expect(result.reasonCode).toBe(ReasonCode.OK);
   });
 
+  it("#335 lets a new submission reclaim an expired crash lease and records the reclaim", async () => {
+    const setup = await prepareReviewedInputs();
+    setup.harness.cp.verification.verify = async () => allow(ReasonCode.OK, setup.verification);
+    setup.harness.scripted.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    const startedAt = new Date(setup.harness.clock.now().getTime() - 31 * 60 * 1000).toISOString();
+    const deadlineAt = new Date(setup.harness.clock.now().getTime() - 1_000).toISOString();
+    setup.harness.cp.db.run(
+      `INSERT INTO candidate_pipeline_attempts
+         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
+       VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, ?, NULL)`,
+      [setup.run.runId, "attempt_crashed", "session-crashed", 1, startedAt, deadlineAt],
+    );
+
+    // Do not run the watchdog first: this is the daemon-restart path where acquireAttempt
+    // must reclaim the expired durable row itself rather than returning CONFLICT forever.
+    const result = await setup.harness.cp.pipeline.submitResult({
+      runId: setup.run.runId,
+      ownerSessionId: setup.run.ownerSessionId!,
+      ownerBindingGeneration: setup.run.ownerBindingGeneration!,
+      resultSummary: "done",
+      recommendation: "merge",
+    });
+
+    expect(result.allowed).toBe(true);
+    expect(result.reasonCode).toBe(ReasonCode.OK);
+    expect(setup.harness.cp.audit.byKind("CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED")).toHaveLength(1);
+    expect(setup.harness.cp.audit.byKind("CANDIDATE_PIPELINE_ATTEMPT_RECLAIMED")[0]).toMatchObject({
+      runId: setup.run.runId,
+      reasonCode: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
+      evidence: expect.objectContaining({ attemptId: "attempt_crashed", deadlineAt, via: "acquire" }),
+    });
+  });
+
   it("#344 validates the owner before reserving the submission lease", async () => {
     const setup = await prepareReviewedInputs();
     setup.harness.cp.verification.verify = async () => allow(ReasonCode.OK, setup.verification);
@@ -536,12 +740,21 @@ describe("round-2 blind-review regressions", () => {
     expect(accepted.reasonCode).toBe(ReasonCode.OK);
   });
 
-  it("#132 gives the reviewer an empty packet-only working directory", async () => {
+  it("#360 requests denial of host provider conversation stores for every reviewer", async () => {
     const setup = await prepareReviewedInputs();
     const result = await directReview(setup);
+    const invocation = setup.harness.scripted.invocations[0] as unknown as {
+      workdir: string;
+      isolation?: { denyReadPaths: string[] };
+    };
+
     expect(result.allowed).toBe(true);
-    expect(setup.harness.scripted.invocations[0]?.workdir).not.toBe(setup.harness.repoPath);
-    expect(result.allowed && result.value.inputManifest.withheld).toContain("daemon state");
+    expect(invocation.workdir).not.toBe(setup.harness.repoPath);
+    expect(invocation.isolation?.denyReadPaths).toEqual(expect.arrayContaining([
+      canonical(setup.harness.repoPath),
+      canonical(join(homedir(), ".claude")),
+      canonical(join(homedir(), ".codex")),
+    ]));
   });
 
   it("#132 rejects a reviewer adapter that does not attest its requested isolation", async () => {
@@ -567,6 +780,21 @@ describe("round-2 blind-review regressions", () => {
       tools: "none",
     }));
     expect(invocation.isolation?.denyReadPaths).toContain(canonical(setup.harness.repoPath));
+  });
+
+  it("#360 rejects an adapter that contradicts its isolation attestation", async () => {
+    const setup = await prepareReviewedInputs();
+    const originalInvoke = setup.harness.scripted.invoke.bind(setup.harness.scripted);
+    setup.harness.scripted.invoke = async (request) => ({
+      ...(await originalInvoke(request)),
+      isolationAttested: true,
+      isolationReasonCode: ReasonCode.ISOLATION_LOST,
+    });
+
+    const result = await directReview(setup);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
   });
 
   it("#133 rejects a PASS response that omits required evidence fields", () => {
