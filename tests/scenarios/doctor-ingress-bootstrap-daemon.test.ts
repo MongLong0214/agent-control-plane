@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -20,6 +20,7 @@ import { IngressGuard, asUntrustedData } from "../../src/ingress/ingress-guard.t
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
 import { NO_HUMAN_GATE_DIGEST } from "../../src/github/github-kernel.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
+import { createHermesBootstrapAuthority } from "../../src/bootstrap/hermes-bootstrap.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import {
   CANDIDATE_SNAPSHOT_SCHEMA_ID,
@@ -133,6 +134,124 @@ const prepareDaemonHealth = (harness: Harness): void => {
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
   bindCeo(harness);
 };
+
+const HERMES_BOOTSTRAP_RUNTIME = String.raw`
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const net = require("node:net");
+const modePath = process.argv[1];
+const secretPath = process.argv[2];
+const invalid = process.argv[3] === "invalid";
+const bootstrapSocket = process.env.ACP_HERMES_BOOTSTRAP_SOCKET;
+const token = process.env.ACP_HERMES_BOOTSTRAP_TOKEN;
+fs.writeFileSync(modePath, String(fs.statSync(bootstrapSocket).mode & 0o777));
+const runtimeNonce = "runtime-possession-nonce-123";
+const runtimeProof = invalid
+  ? "0".repeat(64)
+  : crypto.createHmac("sha256", token).update(runtimeNonce).digest("hex");
+const socket = net.createConnection(bootstrapSocket, () => {
+  socket.write(JSON.stringify({ runtimeNonce, runtimeProof }) + "\n");
+});
+let received = "";
+socket.setEncoding("utf8");
+socket.on("data", (chunk) => {
+  received += chunk;
+  const boundary = received.indexOf("\n");
+  if (boundary === -1) return;
+  const response = JSON.parse(received.slice(0, boundary));
+  if (!response.ok) process.exit(2);
+  fs.writeFileSync(secretPath, response.sessionSecret);
+  process.exit(0);
+});
+socket.on("error", () => process.exit(3));
+`;
+
+describe("Hermes CEO bootstrap authority", () => {
+  it("refuses to constitute authority when the daemon lock fence is not held", async () => {
+    const harness = makeHarness();
+    const stateDir = tempDir("acp-hermes-bootstrap-lock-");
+    const authority = createHermesBootstrapAuthority(harness.cp, {
+      stateDir,
+      mcpSocketPath: join(stateDir, "hermes.mcp.sock"),
+      mcpToken: "deployment-mcp-token",
+      authorityHeld: () => false,
+    });
+    try {
+      const result = await authority.bootstrap({ command: [process.execPath, "-e", "process.exit(0)"] });
+      expect(result.allowed).toBe(false);
+      expect(result.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
+      expect(harness.cp.bindings.history(roleKeyFor(Role.CEO))).toHaveLength(0);
+    } finally {
+      await authority.close();
+      harness.cp.close();
+    }
+  });
+
+  it("requires runtime possession, creates only generation 1, and does not publish the session secret", async () => {
+    const harness = makeHarness();
+    const stateDir = tempDir("acp-hermes-bootstrap-");
+    const modePath = join(stateDir, "runtime-mode");
+    const secretPath = join(stateDir, "runtime-secret");
+    const authority = createHermesBootstrapAuthority(harness.cp, {
+      stateDir,
+      mcpSocketPath: join(stateDir, "hermes.mcp.sock"),
+      mcpToken: "deployment-mcp-token",
+      runtimeTimeoutMs: 5_000,
+    });
+    const verifySecret = vi.spyOn(harness.cp.sessions, "verifySecret");
+
+    try {
+      const invalid = await authority.bootstrap({
+        command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath, "invalid"],
+      });
+      expect(invalid.allowed).toBe(false);
+      expect(invalid.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED);
+      expect(harness.cp.bindings.history(roleKeyFor(Role.CEO))).toHaveLength(0);
+
+      const result = await authority.bootstrap({
+        command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath],
+        model: "hermes-bootstrap-test",
+      });
+      expect(result).toMatchObject({
+        allowed: true,
+        value: { bindingGeneration: 1 },
+      });
+      if (!result.allowed) return;
+
+      expect(existsSync(join(stateDir, "hermes.bootstrap.sock"))).toBe(false);
+      expect(Number(readFileSync(modePath, "utf8"))).toBe(0o600);
+
+      const sessionSecret = readFileSync(secretPath, "utf8");
+      expect(sessionSecret.length).toBeGreaterThan(20);
+      expect(JSON.stringify(result)).not.toContain(sessionSecret);
+      expect(JSON.stringify(harness.cp.audit.all())).not.toContain(sessionSecret);
+      expect(verifySecret).toHaveBeenCalledWith(result.value.sessionId, sessionSecret);
+      expect(harness.cp.sessions.get(result.value.sessionId)?.lifecycle).toBe(SessionLifecycle.READY);
+      expect(harness.cp.bindings.history(roleKeyFor(Role.CEO)).map((binding) => binding.bindingGeneration))
+        .toEqual([1]);
+
+      const rerun = await authority.bootstrap({
+        command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath],
+      });
+      expect(rerun.allowed).toBe(false);
+      expect(rerun.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
+
+      expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "bootstrap generation-1 test cleanup").allowed)
+        .toBe(true);
+      const afterRevoke = await authority.bootstrap({
+        command: [join(stateDir, "no-hermes-runtime-command")],
+      });
+      expect(afterRevoke.allowed).toBe(false);
+      expect(afterRevoke.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_ALREADY_INITIALIZED);
+      expect(harness.cp.bindings.history(roleKeyFor(Role.CEO)).map((binding) => binding.bindingGeneration))
+        .toEqual([1]);
+    } finally {
+      verifySecret.mockRestore();
+      await authority.close();
+      harness.cp.close();
+    }
+  });
+});
 
 describe("doctor (CP-S43 – CP-S45)", () => {
   it("CP-S43: a running receipt with a dead worker process is detected", async () => {

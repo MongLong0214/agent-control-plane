@@ -35,6 +35,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl capacity show                  current provider capacity and admission
   agentctl project register <name> <path> register a project and its primary repository
   agentctl project list                   list projects with derived activity
+  agentctl bootstrap hermes -- <command>  launch Hermes and establish CEO generation 1
   agentctl daemon status                  daemon lock (read-only local inspection)
 `;
 
@@ -120,6 +121,20 @@ export const dispatch = async (
 
   if (command === "doctor") {
     return call("doctor.run", { scope: args[0] ?? "system", target: args[1] ?? null });
+  }
+
+  if (command === "bootstrap") {
+    if (args[0] !== "hermes") return fail(`unknown bootstrap subcommand: ${args[0] ?? ""}`);
+    const separator = args.indexOf("--", 1);
+    const hermesCommand = separator === -1 ? args.slice(1) : args.slice(separator + 1);
+    if (hermesCommand.length === 0) {
+      return fail("bootstrap hermes requires -- followed by a command and its arguments");
+    }
+    return call(
+      "bootstrap.hermes",
+      { command: hermesCommand },
+      `hermes-bootstrap:${digestOf(hermesCommand)}`,
+    );
   }
 
   if (command === "run") {

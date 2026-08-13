@@ -9,6 +9,10 @@ import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
 import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
+import {
+  createHermesBootstrapAuthority,
+  type HermesBootstrapAuthority,
+} from "../bootstrap/hermes-bootstrap.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -89,6 +93,8 @@ export interface LocalOperatorSocketOptions {
   handshakeTimeoutMs?: number;
   /** Used only to reject accidental reuse of the non-identifying MCP deployment token. */
   mcpToken?: string;
+  /** The sole additional operator method: a fresh-install Hermes authority bootstrap. */
+  bootstrapHermes?: (params: Record<string, unknown>) => Promise<Decision<unknown>>;
 }
 
 interface LiveOperatorBinding extends LocalOperatorCredential {
@@ -313,7 +319,7 @@ export const startBuzzActorIngressListener = async (
  * is never accepted here: it is shared deployment authentication, not operator identity.
  */
 export const startOperatorSocket = async (
-  daemon: Pick<Daemon, "handleOperatorRequest">,
+  daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
   stateDir: string,
   credential: LocalOperatorCredential,
   options: LocalOperatorSocketOptions = {},
@@ -347,7 +353,7 @@ export const startOperatorSocket = async (
   };
   const socketPath = join(stateDir, "agentcpd.operator.sock");
   removeStaleSocket(socketPath);
-  const server = createServer((socket) => serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs));
+  const server = createServer((socket) => serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs, options));
   try {
     await listenSocket(server, socketPath);
   } catch (err) {
@@ -439,9 +445,10 @@ const endWithDecision = <T>(socket: Socket, decision: Decision<T>): void => {
 
 const serveOperatorRequest = (
   socket: Socket,
-  daemon: Pick<Daemon, "handleOperatorRequest">,
+  daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
   binding: LiveOperatorBinding,
   handshakeTimeoutMs: number,
+  options: LocalOperatorSocketOptions,
 ): void => {
   let buffer = Buffer.alloc(0);
   let settled = false;
@@ -472,6 +479,23 @@ const serveOperatorRequest = (
     }
     const peer = authenticateOperatorPeer(value, binding);
     if (!peer.allowed) return finish(peer);
+    const method = operatorRequestMethod(value);
+    if (method === "bootstrap.hermes") {
+      if (!options.bootstrapHermes) {
+        return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "Hermes bootstrap is not enabled on this socket", {}));
+      }
+      if (!daemon.lock.held()) {
+        return finish(deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock is not held for Hermes bootstrap", {}));
+      }
+      const params = operatorRequestParams(value);
+      if (!params) return finish(deny(ReasonCode.INVALID_ARGUMENT, "Hermes bootstrap parameters are invalid", {}));
+      void options.bootstrapHermes(params).then(finish).catch((error: unknown) => {
+        finish(deny(ReasonCode.INTERNAL_ERROR, "Hermes bootstrap request failed", {
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      });
+      return;
+    }
     void daemon.handleOperatorRequest(value, peer.value).then(finish).catch((error: unknown) => {
       finish(deny(ReasonCode.INTERNAL_ERROR, "operator request failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -493,6 +517,22 @@ const serveOperatorRequest = (
     finish(deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator handshake timed out"));
   }, handshakeTimeoutMs);
   timeout.unref();
+};
+
+const operatorRequestMethod = (value: unknown): string | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const method = (value as { method?: unknown }).method;
+  return typeof method === "string" ? method : null;
+};
+
+const operatorRequestParams = (value: unknown): Record<string, unknown> | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const params = (value as { params?: unknown }).params ?? {};
+  if (!params || typeof params !== "object" || Array.isArray(params)) return null;
+  const prototype = Object.getPrototypeOf(params);
+  return prototype === Object.prototype || prototype === null
+    ? params as Record<string, unknown>
+    : null;
 };
 
 /**
@@ -1135,8 +1175,16 @@ export const main = async (): Promise<void> => {
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
   let operator: LocalOperatorListener | null = null;
+  let hermesBootstrap: HermesBootstrapAuthority | null = null;
   try {
-    listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
+    hermesBootstrap = createHermesBootstrapAuthority(cp, {
+      stateDir,
+      mcpSocketPath: join(stateDir, "hermes.mcp.sock"),
+      mcpToken,
+      authorityHeld: () => daemon.lock.held(),
+    });
+    // The operator socket is opened first so the uninitialized-only bootstrap door can be
+    // reached without exposing a normal Hermes listener that has no bound peer yet.
     operator = await startOperatorSocket(
       daemon,
       stateDir,
@@ -1145,13 +1193,18 @@ export const main = async (): Promise<void> => {
         peerId: `cli:${operatorActor}`,
         actor: operatorActor,
       },
-      { mcpToken },
+      {
+        mcpToken,
+        bootstrapHermes: (params) => hermesBootstrap!.bootstrap(params),
+      },
     );
+    listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
     if (buzzActorIngressPolicy) {
       buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
     }
   } catch (err) {
     await operator?.close();
+    await hermesBootstrap?.close();
     await listeners?.close();
     await sessionLaunch.close();
     await daemon.stop();
@@ -1165,6 +1218,7 @@ export const main = async (): Promise<void> => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
     await buzzActorIngress?.close();
     await operator?.close();
+    await hermesBootstrap?.close();
     await listeners?.close();
     await sessionLaunch.close();
     await daemon.stop();
