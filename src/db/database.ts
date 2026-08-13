@@ -326,8 +326,10 @@ export class Db {
   }
 
   private applyMigration(migration: SchemaMigration, backup: DatabaseBackup | null): void {
-    this.#raw.exec("BEGIN IMMEDIATE");
+    const foreignKeysOff = migration.foreignKeysOffDuringApply === true;
+    if (foreignKeysOff) this.#raw.pragma("foreign_keys = OFF");
     try {
+      this.#raw.exec("BEGIN IMMEDIATE");
       migration.apply(this.#raw);
       assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true });
       this.recordMigrationReceipt({
@@ -341,12 +343,20 @@ export class Db {
       // ledger did not record.
       this.#raw.pragma(`user_version = ${migration.toVersion}`);
       this.#raw.exec("COMMIT");
+      if (foreignKeysOff) {
+        this.#raw.pragma("foreign_keys = ON");
+        const violations = this.#raw.prepare("PRAGMA foreign_key_check").all();
+        if (violations.length > 0) {
+          throw new Error(`migration left ${violations.length} foreign-key violation(s)`);
+        }
+      }
     } catch (error) {
       try {
         this.#raw.exec("ROLLBACK");
       } catch {
         /* a failed migration transaction may already be rolled back by SQLite */
       }
+      if (foreignKeysOff) this.#raw.pragma("foreign_keys = ON");
       throw error;
     }
   }

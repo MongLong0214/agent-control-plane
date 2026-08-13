@@ -78,7 +78,11 @@ const reflectMergedBase = (github: FakeGitHub): void => {
   };
 };
 
-const setup = async (options: { declareChecks?: boolean; humanGate?: readonly string[] } = {}): Promise<Fixture> => {
+const setup = async (options: {
+  declareChecks?: boolean;
+  humanGate?: readonly string[];
+  allowUnsatisfiedHumanGate?: boolean;
+} = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
   const harness = makeHarness({ githubClient: github });
@@ -104,20 +108,26 @@ const setup = async (options: { declareChecks?: boolean; humanGate?: readonly st
   });
   if (!claimed.allowed) throw new Error(claimed.message);
 
-  for (const item of options.humanGate ?? []) {
-    const decision = harness.cp.ceo.recordOwnerDecision({
-      runId: driven.runId,
-      item,
-      approved: true,
-      note: `approve ${item}`,
-      receipt: ownerDecisionReceipt(harness, driven.runId, item, true, `approve ${item}`),
-    });
-    if (!decision.allowed) throw new Error(`${decision.reasonCode}: ${decision.message}`);
+  if (!options.allowUnsatisfiedHumanGate) {
+    for (const item of options.humanGate ?? []) {
+      const decision = harness.cp.ceo.recordOwnerDecision({
+        runId: driven.runId,
+        item,
+        approved: true,
+        note: `approve ${item}`,
+        receipt: ownerDecisionReceipt(harness, driven.runId, item, true, `approve ${item}`),
+      });
+      if (!decision.allowed) throw new Error(`${decision.reasonCode}: ${decision.message}`);
+    }
   }
-  await approveReviewedCandidateForFinalization(harness, driven);
+  await approveReviewedCandidateForFinalization(harness, driven, {
+    bypassCeoConfirmation: options.allowUnsatisfiedHumanGate,
+  });
   installDaemonFinalizerGitHubFixture(harness);
-  const humanGateDigest = harness.cp.ceo.currentHumanGateDecisionDigest(driven.runId);
-  if (!humanGateDigest.allowed) throw new Error(`${humanGateDigest.reasonCode}: ${humanGateDigest.message}`);
+  const humanGateStatus = harness.cp.ceo.humanGateStatus(driven.runId);
+  const humanGateDigest = humanGateStatus.required
+    ? digestOf(humanGateStatus.items)
+    : NO_HUMAN_GATE_DIGEST;
 
   return {
     harness,
@@ -137,7 +147,7 @@ const setup = async (options: { declareChecks?: boolean; humanGate?: readonly st
       contractDigest: driven.contractDigest,
       verificationDigest: driven.verificationDigest,
       blindReviewDigest: driven.blindReviewDigest,
-      humanGateDigest: humanGateDigest.value,
+      humanGateDigest,
       bindingGeneration: driven.ownerBindingGeneration,
       exactHead: driven.candidateHead,
       timestamp: "2026-08-12T00:00:00.000Z",
@@ -445,7 +455,7 @@ describe("a production gate asserts evidence that exists (§24.4, CP-HI-06)", ()
 describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, #381)", () => {
   it("refuses a two-item gate after only one current item is approved", async () => {
     const items = ["irreversible production action", "undelegated public release"] as const;
-    const fixture = await setup({ humanGate: items });
+    const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     recordOwnerDecision(fixture, {
       item: items[0],
       approved: true,
@@ -461,7 +471,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
 
   it("refuses merge after a later owner rejection revokes a published gate", async () => {
     const items = ["irreversible production action", "undelegated public release"] as const;
-    const fixture = await setup({ humanGate: items });
+    const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     recordOwnerDecision(fixture, {
       item: items[0],
       approved: true,
@@ -493,7 +503,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
 
   it("refuses an approval artifact bound to a different candidate", async () => {
     const items = ["undelegated public release"] as const;
-    const fixture = await setup({ humanGate: items });
+    const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     putOwnerDecision(fixture, items, {
       item: items[0],
       approved: true,
@@ -511,7 +521,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
 
   it("refuses an approval-shaped artifact a caller inserted directly", async () => {
     const items = ["undelegated public release"] as const;
-    const fixture = await setup({ humanGate: items });
+    const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     putOwnerDecision(fixture, items, {
       item: items[0],
       approved: true,
@@ -529,7 +539,7 @@ describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, 
 
   it("refuses an approval whose retained ingress receipt is not exact", async () => {
     const items = ["undelegated public release"] as const;
-    const fixture = await setup({ humanGate: items });
+    const fixture = await setup({ humanGate: items, allowUnsatisfiedHumanGate: true });
     const receipt = ownerDecisionReceipt(
       fixture.harness,
       fixture.runId,

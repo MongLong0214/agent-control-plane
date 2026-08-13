@@ -7,7 +7,7 @@ import type Database from "better-sqlite3";
 import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -25,6 +25,8 @@ export interface SchemaMigration {
   apply(raw: Database.Database): void;
   /** Captures the exact source shape applied in this migration receipt. */
   checksum(): string;
+  /** A reviewed parent-table rebuild may need foreign-key checks disabled for its transaction. */
+  foreignKeysOffDuringApply?: boolean;
 }
 
 const sha256 = (input: string): string =>
@@ -89,7 +91,86 @@ const v12: SchemaMigration = {
   checksum: () => migrationChecksum("v12-migration-ledger-and-invariant-replay"),
 };
 
-export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12]);
+/**
+ * v13 carries the finalization state machine introduced after the v12 ledger release. The
+ * state CHECK and its transition/sealing triggers are part of the durable contract, so this
+ * is an explicit parent-table rebuild rather than another `CREATE IF NOT EXISTS` replay.
+ */
+const v13: SchemaMigration = {
+  id: "v13-finalization-state-machine",
+  fromVersion: 12,
+  toVersion: 13,
+  foreignKeysOffDuringApply: true,
+  apply: (raw) => {
+    raw.exec(`
+      DROP TRIGGER IF EXISTS runs_state_transition_guard;
+      DROP TRIGGER IF EXISTS runs_state_transition_authority_guard;
+      DROP TRIGGER IF EXISTS tasks_run_work_sealed;
+
+      CREATE TABLE runs_finalization_migration (
+        run_id                    TEXT PRIMARY KEY,
+        project_id                TEXT REFERENCES projects(project_id) ON DELETE CASCADE,
+        kind                      TEXT NOT NULL
+                                  CHECK (kind IN ('STANDARD_WORK','PROJECT_BOOTSTRAP','CONTRACT_CHANGE')),
+        execution_mode            TEXT NOT NULL CHECK (execution_mode IN ('SIMPLE','STANDARD','GUARDED')),
+        priority                  TEXT NOT NULL CHECK (priority IN ('CRITICAL','NORMAL','LOW')),
+        state                     TEXT NOT NULL
+                                  CHECK (state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW',
+                                                   'CEO_APPROVED','MERGING','POST_MERGE_VERIFYING',
+                                                   'BLOCKED_POST_MERGE','REVISION_REQUIRED','AWAITING_HUMAN',
+                                                   'COMPLETED','FAILED','CANCELLED')),
+        goal                      TEXT NOT NULL,
+        contract_digest           TEXT NOT NULL,
+        pinned_manifest_digest    TEXT REFERENCES manifests(digest),
+        pinned_run_scoped_commands_digest TEXT,
+        pinned_run_scoped_commands_json   TEXT,
+        owner_session_id          TEXT REFERENCES sessions(session_id),
+        owner_binding_generation  INTEGER,
+        owner_session_incarnation TEXT,
+        owner_role_key            TEXT,
+        current_candidate_digest  TEXT,
+        human_gate_required       INTEGER NOT NULL DEFAULT 0 CHECK (human_gate_required IN (0,1)),
+        revision_count            INTEGER NOT NULL DEFAULT 0,
+        created_at                TEXT NOT NULL,
+        dispatched_at             TEXT,
+        ended_at                  TEXT,
+        state_reason              TEXT,
+        CHECK ((owner_session_id IS NULL) = (owner_binding_generation IS NULL)),
+        CHECK ((owner_session_id IS NULL) = (owner_session_incarnation IS NULL)),
+        CHECK ((owner_session_id IS NULL) = (owner_role_key IS NULL)),
+        CHECK ((pinned_run_scoped_commands_digest IS NULL) = (pinned_run_scoped_commands_json IS NULL)),
+        FOREIGN KEY (owner_role_key, owner_binding_generation, owner_session_id, owner_session_incarnation)
+          REFERENCES assignments(role_key, binding_generation, session_id, session_incarnation)
+          DEFERRABLE INITIALLY DEFERRED
+      );
+
+      INSERT INTO runs_finalization_migration (
+        run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest,
+        pinned_manifest_digest, pinned_run_scoped_commands_digest, pinned_run_scoped_commands_json,
+        owner_session_id, owner_binding_generation, owner_session_incarnation, owner_role_key,
+        current_candidate_digest, human_gate_required, revision_count, created_at, dispatched_at,
+        ended_at, state_reason
+      )
+      SELECT
+        run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest,
+        pinned_manifest_digest, pinned_run_scoped_commands_digest, pinned_run_scoped_commands_json,
+        owner_session_id, owner_binding_generation, owner_session_incarnation, owner_role_key,
+        current_candidate_digest, human_gate_required, revision_count, created_at, dispatched_at,
+        ended_at, state_reason
+      FROM runs;
+
+      DROP TABLE runs;
+      ALTER TABLE runs_finalization_migration RENAME TO runs;
+    `);
+
+    // Re-run the current idempotent DDL after the rebuild. The three dropped triggers are
+    // recreated with the finalization edges and the new task-sealing states.
+    raw.exec(schemaDdl());
+  },
+  checksum: () => migrationChecksum("v13-finalization-state-machine"),
+};
+
+export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13]);
 
 const REQUIRED_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
   { name: "runs_state_transition_authority_guard", sentinel: "RUN_STATE_TRANSITION_AUTHORITY_DENIED" },
