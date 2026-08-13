@@ -12,6 +12,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunKind, SessionLifecycle } from "../../src/domain/types.ts";
 import {
   buildCandidateSnapshot,
+  candidateSnapshotDigest,
   verifySnapshotFreshness,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { buildSandboxEnvironment, memoryLimitForPlatform, runSandboxed } from "../../src/verify/sandbox.ts";
@@ -41,8 +42,12 @@ const sandboxIt = (name: string, fn: SandboxTest): void => {
 const frozenPinnedCandidate = async (options: {
   manifest?: ReturnType<typeof fixtureManifest>;
   trustClass?: "OWNER_TRUSTED" | "UNTRUSTED";
+  baseBranch?: string;
+  workBranch?: string;
+  beforeRun?: (repositoryPath: string) => void;
 } = {}) => {
   const harness = makeHarness();
+  options.beforeRun?.(harness.repoPath);
   const manifest = options.manifest ?? fixtureManifest("verify-r2-project");
   const project = harness.cp.projects.register({ projectId: manifest.projectId, name: "verify-r2", manifest });
   if (!project.allowed) throw new Error(project.message);
@@ -59,18 +64,66 @@ const frozenPinnedCandidate = async (options: {
     projectId: manifest.projectId,
     executionMode: ExecutionMode.STANDARD,
     contract,
-    repositories: [{ repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    repositories: [{
+      repositoryId: repository.value.repositoryId,
+      repositoryRole: "primary",
+      baseBranch: options.baseBranch ?? "dev",
+    }],
   });
   if (!created.allowed) throw new Error(created.message);
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
   if (!dispatched.allowed) throw new Error(dispatched.message);
-  applyPassingChange(harness.repoPath, "task/verify-r2");
+  applyPassingChange(harness.repoPath, options.workBranch ?? "task/verify-r2");
   const snapshot = await harness.cp.pipeline.freeze(created.value.runId);
   if (!snapshot.allowed) throw new Error(snapshot.message);
   return { harness, manifest, repository: repository.value, run: dispatched.value, snapshot: snapshot.value };
 };
 
 describe("round-2 verification isolation and candidate freshness", () => {
+  it("#382 freezes the required source commit even when that source branch later advances", async () => {
+    const { harness, run, snapshot } = await frozenPinnedCandidate({
+      baseBranch: "main",
+      workBranch: "release/1.2.3",
+      beforeRun: (repositoryPath) => {
+        // `main` is the release target, while the release branch is cut from a later
+        // `dev` commit. Distinct SHAs make a target-derived source impossible to hide.
+        gitSync(repositoryPath, ["branch", "main", "dev"]);
+        writeFiles(repositoryPath, { "README.md": "# dev source before release\n" });
+        commitAll(repositoryPath, "advance dev before release");
+      },
+    });
+    const frozenRepository = snapshot.repositories[0]!;
+    const sourceAtFreeze = gitSync(harness.repoPath, ["rev-parse", "dev"]);
+    const frozenDigest = candidateSnapshotDigest(snapshot);
+
+    expect(frozenRepository).toMatchObject({
+      baseBranch: "main",
+      sourceBranch: "dev",
+      sourceHead: sourceAtFreeze,
+    });
+    expect(frozenRepository.sourceHead).not.toBe(frozenRepository.baseHead);
+
+    gitSync(harness.repoPath, ["checkout", "-q", "dev"]);
+    writeFiles(harness.repoPath, { "README.md": "# dev source after release freeze\n" });
+    const advancedSourceHead = commitAll(harness.repoPath, "advance dev after release freeze");
+    gitSync(harness.repoPath, ["checkout", "-q", "release/1.2.3"]);
+
+    // The frozen SHA is the evidence. A moving source ref is not candidate drift.
+    const fresh = await verifySnapshotFreshness(snapshot, [{
+      identity: frozenRepository.identity,
+      checkoutPath: harness.repoPath,
+    }]);
+    expect(fresh).toMatchObject({ allowed: true, reasonCode: ReasonCode.OK });
+    expect(snapshot.repositories[0]!.sourceHead).toBe(sourceAtFreeze);
+    expect(harness.cp.runs.currentCandidate(run.runId)).toBe(frozenDigest);
+
+    // The source SHA is load-bearing: replacing it would create a different candidate
+    // identity, so no PR receipt can silently prove the advanced source instead.
+    const rewritten = structuredClone(snapshot);
+    rewritten.repositories[0]!.sourceHead = advancedSourceHead;
+    expect(candidateSnapshotDigest(rewritten)).not.toBe(frozenDigest);
+  });
+
   it("#160 refuses a weaker caller command even when pin fields are omitted", async () => {
     const { harness, run, snapshot } = await frozenPinnedCandidate();
     const refused = await harness.cp.verification.verify({
