@@ -88,7 +88,7 @@ src/
 pnpm install
 pnpm rebuild better-sqlite3     # native binding
 pnpm typecheck
-pnpm test                       # 271 tests, incl. the CP-S01..CP-S59 suite
+pnpm test                       # runs the full Vitest suite, including the documented CP scenarios
 pnpm trace                      # regenerates evidence/traceability.{json,md}
 ```
 

@@ -18,5 +18,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
+      - run: pnpm lint
       - run: pnpm typecheck
+      - run: pnpm build
       - run: pnpm test
+      - run: pnpm trace
+      - run: node scripts/ssot-report.mjs

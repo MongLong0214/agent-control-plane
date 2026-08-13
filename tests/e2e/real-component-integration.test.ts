@@ -14,22 +14,21 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 
 /**
- * End-to-end acceptance on a real pre-existing project, registered by hand with no Repo
- * Factory involvement.
+ * Opt-in component integration on a real pre-existing project, registered by hand with
+ * no Repo Factory involvement.
  *
- * What is real here: the repository and its code, the verification command (this
- * project's own typecheck) executed in a seatbelt-confined disposable worktree, the
- * blind reviewer (a fresh headless Claude session invoked over the real CLI), the
- * candidate snapshot, and every gate decision.
+ * It exercises a real repository, a seatbelt-confined verification command, a fresh
+ * headless Claude reviewer, a candidate snapshot, and the component-level gates. It
+ * deliberately constructs `ControlPlane` and invokes component APIs directly; the worker
+ * edit also uses `writeFileSync` and git directly. It therefore does not exercise the
+ * deployed Hermes or CTO MCP transports, Buzz, the daemon-managed worker runtime, GitHub
+ * App merge, or post-merge verification. Those surfaces require deployment E2E evidence.
  *
- * The CTO's plan is produced by a real session invocation; the worker edit and receipts
- * are driven through the same service calls the CTO MCP surface exposes.
- *
- * Opt-in via ACP_E2E=1 because it spends real provider quota.
+ * Opt in with ACP_COMPONENT_INTEGRATION=1 because it spends real provider quota.
  */
-const ENABLED = process.env["ACP_E2E"] === "1";
-const REAL_PROJECT = resolve(process.env["ACP_E2E_PROJECT"] ?? process.cwd());
-const REVIEWER_MODEL = process.env["ACP_E2E_MODEL"] ?? "sonnet";
+const ENABLED = process.env["ACP_COMPONENT_INTEGRATION"] === "1";
+const REAL_PROJECT = resolve(process.env["ACP_COMPONENT_INTEGRATION_PROJECT"] ?? process.cwd());
+const REVIEWER_MODEL = process.env["ACP_COMPONENT_INTEGRATION_MODEL"] ?? "sonnet";
 
 /**
  * §42 #3 wants one real run per execution mode. The flow is the same one: §12.1 keeps
@@ -37,9 +36,11 @@ const REVIEWER_MODEL = process.env["ACP_E2E_MODEL"] ?? "sonnet";
  * plan document optional, so the mode is a parameter rather than a second copy of the run.
  * GUARDED additionally carries a human gate, and a real owner decision has to satisfy it.
  */
-const MODE = (process.env["ACP_E2E_MODE"] ?? "STANDARD") as "SIMPLE" | "STANDARD" | "GUARDED";
+const MODE = (process.env["ACP_COMPONENT_INTEGRATION_MODE"] ?? "STANDARD") as "SIMPLE" | "STANDARD" | "GUARDED";
 const EVIDENCE_FILE =
-  MODE === "STANDARD" ? "e2e-real-project.json" : `e2e-real-project-${MODE.toLowerCase()}.json`;
+  MODE === "STANDARD"
+    ? "component-integration-real-project.json"
+    : `component-integration-real-project-${MODE.toLowerCase()}.json`;
 /** The identity this deployment allowlists in `~/.agent-control-plane/owner-identities`. */
 const OWNER = { channel: "cli", actor: process.env["USER"] ?? "" } as const;
 
@@ -108,11 +109,11 @@ const manifestFor = (projectId: string): ProjectManifest => ({
   commitlore: { mode: "preferred" },
 });
 
-describe.runIf(ENABLED)("E2E: real project, real verification, real blind review", () => {
+describe.runIf(ENABLED)("component integration: real project, verification, and blind review", () => {
   it(
-    `drives ${MODE}: User → Hermes → ACP → Primary CTO → workers → verification → fresh blind review → packet → confirm`,
+    `drives ${MODE} through direct component calls to verification, fresh blind review, packet, and confirm`,
     async () => {
-      const root = tempDir("acp-e2e-");
+      const root = tempDir("acp-component-integration-");
       const checkout = join(root, "project");
 
       // A real, pre-existing project. Cloned so the owner's working tree is untouched;
@@ -314,7 +315,7 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       expect(implExecution.allowed).toBe(true);
       if (!implExecution.allowed) return;
 
-      gitSync(checkout, ["checkout", "-q", "-b", "task/E2E-1-reason-code-count"]);
+      gitSync(checkout, ["checkout", "-q", "-b", "task/component-integration-1-reason-code-count"]);
       const target = join(checkout, "src/core/reason-codes.ts");
       const addition = [
         "",
