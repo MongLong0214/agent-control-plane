@@ -6,8 +6,8 @@
   "testRun": {
     "reporter": "vitest-json",
     "success": true,
-    "total": 575,
-    "passed": 574,
+    "total": 643,
+    "passed": 642,
     "failed": 0,
     "pending": 1
   },
@@ -956,6 +956,10 @@
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "#422: a release cut from main is refused when main and dev still share their ancestor"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
           "title": "refuses a PR when the project contract requires issue linkage and none is supplied"
         }
       ],
@@ -1062,6 +1066,10 @@
         {
           "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
           "title": "reports a CTO binding that points at a dead session as critical"
+        },
+        {
+          "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "reports state-path permission drift as a blocking, actionable finding"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -1092,6 +1100,10 @@
         {
           "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
           "title": "reports a CTO binding that points at a dead session as critical"
+        },
+        {
+          "file": "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+          "title": "reports state-path permission drift as a blocking, actionable finding"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -1364,6 +1376,10 @@
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "#422: a release cut from main is refused when main and dev still share their ancestor"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
           "title": "refuses a PR when the project contract requires issue linkage and none is supplied"
         }
       ],
@@ -1400,6 +1416,10 @@
         {
           "file": "tests/scenarios/github-kernel.test.ts",
           "title": "#382: a release cut from main cannot use its main target to masquerade as a dev cut"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "#422: a release cut from main is refused when main and dev still share their ancestor"
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
