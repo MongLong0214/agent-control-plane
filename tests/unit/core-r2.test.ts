@@ -4,13 +4,14 @@ import { join } from "node:path";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ArtifactKind } from "../../src/domain/types.ts";
+import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   CANDIDATE_SNAPSHOT_SCHEMA_ID,
   candidateSnapshotDigest,
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { Db } from "../../src/db/database.ts";
-import { cleanupTempDirs, makeCore, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, makeCore, makeRepo, seedRun, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -100,19 +101,86 @@ describe("round-2 database and evidence regressions", () => {
     reopened.close();
   });
 
-  it("#66 rejects a QUEUED-to-COMPLETED raw state bypass and terminal mutation", () => {
-    const { db } = makeCore();
-    insertRun(db, "run_state");
+  it("#66 refuses a legal raw state edge unless the evidence-and-outbox operation marks it", () => {
+    const { db, audit, outbox, clock } = makeCore();
+    const seeded = seedRun({ db, clock, repoPath: makeRepo(), state: "QUEUED" });
 
-    expect(() => db.run("UPDATE runs SET state = 'COMPLETED' WHERE run_id = 'run_state'")).toThrowError(
-      /RUN_STATE_TRANSITION_ILLEGAL/,
-    );
-    db.run("UPDATE runs SET state = 'ACTIVE' WHERE run_id = 'run_state'");
-    db.run("UPDATE runs SET state = 'READY_FOR_CEO_REVIEW' WHERE run_id = 'run_state'");
-    db.run("UPDATE runs SET state = 'COMPLETED' WHERE run_id = 'run_state'");
-    expect(() => db.run("UPDATE runs SET state = 'ACTIVE' WHERE run_id = 'run_state'")).toThrowError(
-      /RUN_STATE_TRANSITION_ILLEGAL/,
-    );
+    expect(
+      thrown(() => db.run(`UPDATE runs SET state = 'COMPLETED' WHERE run_id = ?`, [seeded.runId])),
+    ).toMatchObject({ reasonCode: ReasonCode.RUN_TRANSITION_ILLEGAL });
+    // ACTIVE is a legal edge, so topology-only enforcement used to accept this write. The
+    // assertion becomes green again if the authority trigger is removed.
+    expect(
+      thrown(() => db.run(`UPDATE runs SET state = 'ACTIVE' WHERE run_id = ?`, [seeded.runId])),
+    ).toMatchObject({ reasonCode: ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED });
+
+    const authority = db.claimRunStateTransitionAuthority();
+    expect(
+      thrown(() =>
+        db.applyRunStateTransition(authority, {
+          runId: seeded.runId,
+          toState: "ACTIVE",
+          recordTransitionEvidence: () =>
+            audit.record({
+              kind: "RUN_TRANSITION",
+              runId: seeded.runId,
+              projectId: seeded.projectId,
+              evidence: { from: "QUEUED", to: "ACTIVE", reason: "unroutable fixture dispatch" },
+            }),
+          enqueueTransitionEnvelope: () =>
+            outbox.enqueue({
+              idempotencyKey: `run-dispatch:${seeded.runId}`,
+              roleKey: seeded.roleKey,
+              bindingGeneration: seeded.generation + 1,
+              targetSessionId: seeded.sessionId,
+              runId: seeded.runId,
+              kind: MessageKind.RUN_DISPATCH,
+              payload: { runId: seeded.runId },
+            }),
+          updateState: () => db.run(`UPDATE runs SET state = 'ACTIVE' WHERE run_id = ?`, [seeded.runId]),
+        }),
+      ),
+    ).toMatchObject({ reasonCode: ReasonCode.OUTBOX_TARGET_NOT_CURRENT });
+    // The audit write happened before its denied enqueue; the enclosing operation must leave
+    // neither fact durable, otherwise a later retry would be evidence for the wrong transition.
+    expect(audit.byKind("RUN_TRANSITION")).toHaveLength(0);
+    expect(db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [seeded.runId])?.state)
+      .toBe("QUEUED");
+
+    db.applyRunStateTransition(authority, {
+      runId: seeded.runId,
+      toState: "ACTIVE",
+      recordTransitionEvidence: () =>
+        audit.record({
+          kind: "RUN_TRANSITION",
+          runId: seeded.runId,
+          projectId: seeded.projectId,
+          evidence: { from: "QUEUED", to: "ACTIVE", reason: "fixture dispatch" },
+        }),
+      enqueueTransitionEnvelope: () =>
+        outbox.enqueue({
+          idempotencyKey: `run-dispatch:${seeded.runId}`,
+          roleKey: seeded.roleKey,
+          bindingGeneration: seeded.generation,
+          targetSessionId: seeded.sessionId,
+          runId: seeded.runId,
+          kind: MessageKind.RUN_DISPATCH,
+          payload: { runId: seeded.runId },
+        }),
+      updateState: () => {
+        // The marker covers this exact edge, not every legal transition the engine could name.
+        expect(
+          thrown(() => db.run(`UPDATE runs SET state = 'CANCELLED' WHERE run_id = ?`, [seeded.runId])),
+        ).toMatchObject({ reasonCode: ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED });
+        return db.run(`UPDATE runs SET state = 'ACTIVE' WHERE run_id = ?`, [seeded.runId]);
+      },
+    });
+
+    expect(db.get<{ state: string }>(`SELECT state FROM runs WHERE run_id = ?`, [seeded.runId])?.state)
+      .toBe("ACTIVE");
+    expect(audit.all()).toContainEqual(expect.objectContaining({ kind: "RUN_TRANSITION", runId: seeded.runId }));
+    expect(db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM outbox WHERE run_id = ?`, [seeded.runId])?.n)
+      .toBe(1);
   });
 
   it("#67 allows the first contract pin but rejects replacement", () => {
@@ -210,6 +278,38 @@ describe("round-2 database and evidence regressions", () => {
         ),
       ),
     ).toMatchObject({ reasonCode: ReasonCode.INVALID_ARGUMENT });
+  });
+
+  it("#70/#352 rejects a raw evidence insert even when it names the real producer and candidate", () => {
+    const { db, artifacts, runId, digest } = candidateRun();
+    const evidence = verificationFor(runId, digest);
+    const writer = artifacts.issueEvidenceWriters().VERIFICATION;
+
+    // A tool handler may hold Db, but not the native connection that could replace the marker
+    // function or drop this trigger before issuing the SQL below.
+    expect((db.raw as unknown as { function?: unknown; prepare?: unknown }).function).toBeUndefined();
+    expect(
+      thrown(() => db.run("DROP TRIGGER run_artifacts_evidence_authority_guard")),
+    ).toMatchObject({ reasonCode: ReasonCode.INVALID_ARGUMENT });
+    expect(
+      thrown(() =>
+        db.run(
+          `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
+                                      content_json, produced_by, created_at)
+           VALUES ('raw_evidence', ?, 'VERIFICATION', ?, ?, ?, 'verification-engine', 't')`,
+          [runId, digestOf({ candidateSnapshotDigest: digest, content: evidence }), digest, canonicalJson(evidence)],
+        ),
+      ),
+    ).toMatchObject({ reasonCode: ReasonCode.COMPLETION_AUTHORITY_DENIED });
+
+    const written = artifacts.putEvidence(
+      writer,
+      runId,
+      ArtifactKind.VERIFICATION,
+      evidence,
+      digest,
+    );
+    expect(written.producedBy).toBe("verification-engine");
   });
 
   it("#351 refuses a credential-shaped value inside a field the envelope allows", () => {
@@ -360,16 +460,19 @@ describe("round-2 database and evidence regressions", () => {
 
   it("#76 rejects a completed external-write receipt that bypasses its PENDING reservation", () => {
     const { db } = makeCore();
-    expect(
-      thrown(() =>
-        db.run(
-          `INSERT INTO github_receipts (receipt_id, idempotency_key, operation, repository_identity,
-                                        resource_type, resource_identity, request_digest, response_json, created_at,
-                                        reread_at, verified, status)
-           VALUES ('r2', 'key2', 'merge_execute', 'github:acme/fixture', 'pull', '2', 'sha256:request', '{}', 't', 't', 1, 'APPLIED')`,
+    for (const operation of ["merge_execute", "release_tag", "issue_project"] as const) {
+      expect(
+        thrown(() =>
+          db.run(
+            `INSERT INTO github_receipts (receipt_id, idempotency_key, operation, repository_identity,
+                                          resource_type, resource_identity, request_digest, response_json, created_at,
+                                          reread_at, verified, status)
+             VALUES (?, ?, ?, 'github:acme/fixture', 'pull', '2', 'sha256:request', '{}', 't', 't', 1, 'APPLIED')`,
+            [`r2_${operation}`, `key2_${operation}`, operation],
+          ),
         ),
-      ),
-    ).toMatchObject({ reasonCode: ReasonCode.GITHUB_RECEIPT_PROTOCOL_VIOLATION });
+      ).toMatchObject({ reasonCode: ReasonCode.GITHUB_RECEIPT_PROTOCOL_VIOLATION });
+    }
 
     db.run(
       `INSERT INTO github_receipts (receipt_id, idempotency_key, operation, repository_identity,

@@ -5,12 +5,39 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { acpError, isAcpError } from "../core/errors.ts";
+import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 export type SqliteDatabase = Database.Database;
 
+/** Diagnostics deliberately expose neither a SQL executor nor function registration. */
+export interface DatabaseDiagnostics {
+  readonly name: string;
+  pragma(source: string, options?: Database.PragmaOptions): unknown;
+}
+
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
+const USER_VERSION_PRAGMA = /^\s*user_version(?:\s*=\s*\d+)?\s*;?\s*$/i;
+const TABLE_INFO_PRAGMA = /^\s*PRAGMA\s+(?:main\.)?table_info\s*\([^)]*\)\s*;?\s*$/i;
+
+const firstSqlVerb = (sql: string): string =>
+  sql
+    .replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, "")
+    .match(/^([A-Za-z]+)/)?.[1]?.toUpperCase() ?? "";
+
+// The Db facade has no schema-administration use at runtime. Keeping only data statements
+// here means a handler that receives it cannot remove the triggers that enforce authority.
+const assertDataMutation = (sql: string): void => {
+  if (["INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"].includes(firstSqlVerb(sql))) return;
+  fail(ReasonCode.INVALID_ARGUMENT, "database mutations must be data statements", {});
+};
+
+// Schema introspection keeps compatibility checks from depending on an engine-private handle;
+// every other PRAGMA remains unavailable here because a setter changes connection authority.
+const assertReadQuery = (sql: string): void => {
+  if (["SELECT", "WITH", "EXPLAIN"].includes(firstSqlVerb(sql)) || TABLE_INFO_PRAGMA.test(sql)) return;
+  fail(ReasonCode.INVALID_ARGUMENT, "database reads must be queries", {});
+};
 
 /**
  * Version of the shape in schema.sql. Bump this whenever a constraint, trigger or column
@@ -18,7 +45,89 @@ const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
  * preserve an older table whose constraints are weaker, so version mismatch is refused
  * instead of pretending that a deployed database was migrated (§40 Maintainability).
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
+
+const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
+const RUN_STATE_TRANSITION_MINT: unique symbol = Symbol("run-state-transition-mint");
+
+/** Issuance follows the file rather than a connection, so a second Db cannot remint authority. */
+const ISSUED_EVIDENCE_WRITE_PORTS = new Set<string>();
+const ISSUED_RUN_STATE_TRANSITION_AUTHORITIES = new Set<string>();
+
+/**
+ * Opaque authority to enter the evidence-write marker. The token never crosses the
+ * ArtifactStore boundary: a producer capability carries it in a module-private WeakMap.
+ */
+class EvidenceWritePortToken {
+  readonly #minted = true;
+  readonly #db: Db;
+
+  constructor(mint: symbol, db: Db) {
+    this.#db = db;
+    if (mint !== EVIDENCE_WRITE_MINT) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "an evidence-write port cannot be constructed outside its issuer",
+        {},
+      );
+    }
+  }
+
+  static belongsTo(value: unknown, db: Db): value is EvidenceWritePort {
+    if (typeof value !== "object" || value === null || !(#minted in value)) return false;
+    return value.#db === db;
+  }
+}
+
+export type EvidenceWritePort = EvidenceWritePortToken;
+
+/**
+ * Opaque authority held by the run engine. It turns on the connection-local marker only
+ * while the one transition operation records its proof, enqueues its envelope, and updates.
+ */
+class RunStateTransitionAuthorityToken {
+  readonly #minted = true;
+  readonly #db: Db;
+
+  constructor(mint: symbol, db: Db) {
+    this.#db = db;
+    if (mint !== RUN_STATE_TRANSITION_MINT) {
+      fail(
+        ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
+        "a run-state transition authority cannot be constructed outside its issuer",
+        {},
+      );
+    }
+  }
+
+  static belongsTo(value: unknown, db: Db): value is RunStateTransitionAuthority {
+    if (typeof value !== "object" || value === null || !(#minted in value)) return false;
+    return value.#db === db;
+  }
+}
+
+export type RunStateTransitionAuthority = RunStateTransitionAuthorityToken;
+
+export interface EvidenceArtifactInsert {
+  artifactId: string;
+  runId: string;
+  kind: string;
+  digest: string;
+  candidateSnapshotDigest: string | null;
+  contentJson: string;
+  producedBy: string;
+  createdAt: string;
+}
+
+/** The first two admissions must succeed before the marker can cover the state update. */
+export interface RunStateTransitionWork<T> {
+  /** The only row and target state for which this operation may raise the marker. */
+  runId: string;
+  toState: string;
+  recordTransitionEvidence(): Decision<void>;
+  enqueueTransitionEnvelope(): Decision<unknown>;
+  updateState(): T;
+}
 
 /**
  * SQLite handle plus the transaction discipline required by PRD §30.3.
@@ -29,9 +138,13 @@ export const SCHEMA_VERSION = 7;
  * a read-then-write race.
  */
 export class Db {
-  readonly raw: SqliteDatabase;
+  readonly #raw: SqliteDatabase;
+  /** Limited compatibility surface for diagnostics; authority must never receive the handle. */
+  readonly raw: DatabaseDiagnostics;
   #depth = 0;
   #poisoned = false;
+  #evidenceWriteMarkerDepth = 0;
+  #runStateTransitionMarkers: Array<{ runId: string; toState: string }> = [];
 
   /**
    * The file this connection opened. Capability issuance is keyed by it: two `Db` objects
@@ -43,13 +156,31 @@ export class Db {
   constructor(filename: string) {
     this.file = filename === ":memory:" ? `:memory:${Math.random()}` : resolve(filename);
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
-    this.raw = new Database(filename);
-    this.raw.pragma("foreign_keys = ON");
-    this.raw.pragma("busy_timeout = 10000");
+    this.#raw = new Database(filename);
+    this.#raw.pragma("foreign_keys = ON");
+    this.#raw.pragma("busy_timeout = 10000");
     if (filename !== ":memory:") {
-      this.raw.pragma("journal_mode = WAL");
-      this.raw.pragma("synchronous = FULL");
+      this.#raw.pragma("journal_mode = WAL");
+      this.#raw.pragma("synchronous = FULL");
     }
+    // These functions are connection-local markers, not caller-supplied values. A raw SQL
+    // caller can invoke them but cannot make either return true outside the owning operation.
+    this.#raw.function("acp_evidence_write_authorized", () =>
+      this.#evidenceWriteMarkerDepth > 0 ? 1 : 0,
+    );
+    this.#raw.function("acp_run_state_transition_authorized", (runId: unknown, toState: unknown) => {
+      const marker = this.#runStateTransitionMarkers[this.#runStateTransitionMarkers.length - 1];
+      return marker && marker.runId === runId && marker.toState === toState ? 1 : 0;
+    });
+    this.raw = Object.freeze({
+      name: this.#raw.name,
+      pragma: (source: string, options?: Database.PragmaOptions): unknown => {
+        if (!USER_VERSION_PRAGMA.test(source)) {
+          fail(ReasonCode.INVALID_ARGUMENT, "only the schema-version pragma is available for diagnostics", {});
+        }
+        return this.#raw.pragma(source, options);
+      },
+    });
     this.applySchema();
   }
 
@@ -58,9 +189,9 @@ export class Db {
    * closed rather than running against a database whose constraints are unknown.
    */
   private applySchema(): void {
-    const version = Number(this.raw.pragma("user_version", { simple: true }));
+    const version = Number(this.#raw.pragma("user_version", { simple: true }));
     const alreadyPopulated =
-      this.raw
+      this.#raw
         .prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'runs'`)
         .get() as { n: number };
 
@@ -72,8 +203,8 @@ export class Db {
       );
     }
     if (version === 0) {
-      this.raw.exec(readFileSync(schemaPath, "utf8"));
-      this.raw.pragma(`user_version = ${SCHEMA_VERSION}`);
+      this.#raw.exec(readFileSync(schemaPath, "utf8"));
+      this.#raw.pragma(`user_version = ${SCHEMA_VERSION}`);
       return;
     }
     if (version !== SCHEMA_VERSION) {
@@ -87,7 +218,7 @@ export class Db {
     }
     // Same version: re-running the idempotent DDL adds nothing, but it does verify the
     // file still parses against this SQLite build.
-    this.raw.exec(readFileSync(schemaPath, "utf8"));
+    this.#raw.exec(readFileSync(schemaPath, "utf8"));
   }
 
   /**
@@ -98,15 +229,15 @@ export class Db {
   tx<T>(fn: () => T): T {
     this.assertUsable();
     if (this.#depth > 0) return this.guardSync(fn());
-    this.raw.exec("BEGIN IMMEDIATE");
+    this.#raw.exec("BEGIN IMMEDIATE");
     this.#depth += 1;
     try {
       const out = this.guardSync(fn());
-      this.raw.exec("COMMIT");
+      this.#raw.exec("COMMIT");
       return out;
     } catch (err) {
       try {
-        this.raw.exec("ROLLBACK");
+        this.#raw.exec("ROLLBACK");
       } catch {
         /* rollback of an already-aborted tx is not itself an error */
       }
@@ -137,32 +268,123 @@ export class Db {
     return this.#depth > 0;
   }
 
-  exec(sql: string): void {
-    this.assertUsable();
-    this.raw.exec(sql);
+  /** Claimed by ArtifactStore while the composition root is still being constructed. */
+  claimEvidenceWritePort(): EvidenceWritePort {
+    if (ISSUED_EVIDENCE_WRITE_PORTS.has(this.file)) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "evidence-write authority was already issued for this database",
+        {},
+      );
+    }
+    ISSUED_EVIDENCE_WRITE_PORTS.add(this.file);
+    return new EvidenceWritePortToken(EVIDENCE_WRITE_MINT, this);
+  }
+
+  /** Claimed by RunEngine at construction; raw callers never receive this capability. */
+  claimRunStateTransitionAuthority(): RunStateTransitionAuthority {
+    if (ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.has(this.file)) {
+      fail(
+        ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
+        "run-state transition authority was already issued for this database",
+        {},
+      );
+    }
+    ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.add(this.file);
+    return new RunStateTransitionAuthorityToken(RUN_STATE_TRANSITION_MINT, this);
+  }
+
+  /**
+   * The sole transaction-shaped opening for a state update. Evidence and the outbox envelope
+   * are written before the marker permits `UPDATE runs SET state`, so any failure rolls all
+   * three facts back together rather than leaving a naked state edge behind.
+   */
+  applyRunStateTransition<T>(
+    authority: RunStateTransitionAuthority,
+    work: RunStateTransitionWork<T>,
+  ): T {
+    if (!RunStateTransitionAuthorityToken.belongsTo(authority, this)) {
+      fail(
+        ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
+        "run-state updates require the authority held by the run engine",
+        {},
+      );
+    }
+    return this.tx(() => {
+      const evidence = this.guardSync(work.recordTransitionEvidence());
+      if (!evidence.allowed) fail(evidence.reasonCode, evidence.message, evidence.evidence);
+      const envelope = this.guardSync(work.enqueueTransitionEnvelope());
+      if (!envelope.allowed) fail(envelope.reasonCode, envelope.message, envelope.evidence);
+      this.#runStateTransitionMarkers.push({ runId: work.runId, toState: work.toState });
+      try {
+        return this.guardSync(work.updateState());
+      } finally {
+        this.#runStateTransitionMarkers.pop();
+      }
+    });
+  }
+
+  /**
+   * Evidence rows may be inserted only while the opaque producer port holds the marker.
+   * `produced_by` remains an auditable label; it is not the thing that authorizes the write.
+   */
+  insertEvidenceArtifact(
+    authority: EvidenceWritePort,
+    artifact: EvidenceArtifactInsert,
+  ): Database.RunResult {
+    if (!EvidenceWritePortToken.belongsTo(authority, this)) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "evidence rows require the writer capability issued to their producer",
+        { runId: artifact.runId, kind: artifact.kind },
+      );
+    }
+    this.#evidenceWriteMarkerDepth += 1;
+    try {
+      return this.run(
+        `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
+                                    content_json, produced_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          artifact.artifactId,
+          artifact.runId,
+          artifact.kind,
+          artifact.digest,
+          artifact.candidateSnapshotDigest,
+          artifact.contentJson,
+          artifact.producedBy,
+          artifact.createdAt,
+        ],
+      );
+    } finally {
+      this.#evidenceWriteMarkerDepth -= 1;
+    }
   }
 
   all<T>(sql: string, params: unknown[] = []): T[] {
     this.assertUsable();
-    return this.raw.prepare(sql).all(...(params as never[])) as T[];
+    assertReadQuery(sql);
+    return this.#raw.prepare(sql).all(...(params as never[])) as T[];
   }
 
   get<T>(sql: string, params: unknown[] = []): T | undefined {
     this.assertUsable();
-    return this.raw.prepare(sql).get(...(params as never[])) as T | undefined;
+    assertReadQuery(sql);
+    return this.#raw.prepare(sql).get(...(params as never[])) as T | undefined;
   }
 
   run(sql: string, params: unknown[] = []): Database.RunResult {
     this.assertUsable();
+    assertDataMutation(sql);
     try {
-      return this.raw.prepare(sql).run(...(params as never[]));
+      return this.#raw.prepare(sql).run(...(params as never[]));
     } catch (err) {
       throw translate(err);
     }
   }
 
   close(): void {
-    if (this.raw.open) this.raw.close();
+    if (this.#raw.open) this.#raw.close();
   }
 
   private assertUsable(): void {
@@ -176,7 +398,7 @@ export class Db {
 
   private poison(): void {
     this.#poisoned = true;
-    if (this.raw.open) this.raw.close();
+    if (this.#raw.open) this.#raw.close();
   }
 }
 
@@ -215,7 +437,9 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   BINDING_REVOKED_TERMINAL: ReasonCode.BINDING_REVOKED,
   PINNED_MANIFEST_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
   RUN_STATE_TRANSITION_ILLEGAL: ReasonCode.RUN_TRANSITION_ILLEGAL,
+  RUN_STATE_TRANSITION_AUTHORITY_DENIED: ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
   EVIDENCE_CANDIDATE_MISMATCH: ReasonCode.SNAPSHOT_DIGEST_MISMATCH,
+  EVIDENCE_WRITE_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   ARTIFACT_IMMUTABLE: ReasonCode.CONFLICT,
   GITHUB_RECEIPT_IMMUTABLE: ReasonCode.CONFLICT,
   GITHUB_RECEIPT_PROTOCOL_VIOLATION: ReasonCode.GITHUB_RECEIPT_PROTOCOL_VIOLATION,

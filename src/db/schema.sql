@@ -331,6 +331,25 @@ BEGIN
   SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
 END;
 
+-- A legal edge is not, by itself, authority to take it. The marker is connection-local and
+-- scoped to one run and target state while Db.applyRunStateTransition writes the audit proof
+-- and outbox envelope in the same transaction; a raw UPDATE cannot manufacture that fact.
+CREATE TRIGGER IF NOT EXISTS runs_state_transition_authority_guard
+BEFORE UPDATE OF state ON runs
+WHEN NEW.state <> OLD.state
+ AND (
+   (OLD.state = 'QUEUED' AND NEW.state IN ('ACTIVE','CANCELLED')) OR
+   (OLD.state = 'ACTIVE' AND NEW.state IN ('BLOCKED','READY_FOR_CEO_REVIEW','FAILED','CANCELLED','AWAITING_HUMAN')) OR
+   (OLD.state = 'BLOCKED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED','AWAITING_HUMAN')) OR
+   (OLD.state = 'READY_FOR_CEO_REVIEW' AND NEW.state IN ('COMPLETED','REVISION_REQUIRED','AWAITING_HUMAN')) OR
+   (OLD.state = 'REVISION_REQUIRED' AND NEW.state IN ('ACTIVE','FAILED','CANCELLED')) OR
+   (OLD.state = 'AWAITING_HUMAN' AND NEW.state IN ('ACTIVE','CANCELLED','FAILED'))
+ )
+ AND acp_run_state_transition_authorized(NEW.run_id, NEW.state) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_AUTHORITY_DENIED');
+END;
+
 -- CP-HI-03 — dispatch/pinning may fill an empty pin once; no later operation may
 -- rewrite, clear, or replace the contract that the run will be judged against.
 CREATE TRIGGER IF NOT EXISTS runs_pinned_manifest_immutable
@@ -468,6 +487,25 @@ WHEN NEW.kind IN ('VERIFICATION','BLIND_REVIEW','PRODUCTION_READY_PACKET')
  )
 BEGIN
   SELECT RAISE(ABORT, 'EVIDENCE_CANDIDATE_MISMATCH');
+END;
+
+-- A matching candidate and the expected producer label are necessary evidence facts, but
+-- neither identifies who wrote the row. Only ArtifactStore can hold the connection-local
+-- marker carried by an issued writer capability, which closes direct Db.run insertions (#70).
+CREATE TRIGGER IF NOT EXISTS run_artifacts_evidence_authority_guard
+BEFORE INSERT ON run_artifacts
+WHEN NEW.kind IN ('VERIFICATION','BLIND_REVIEW','PRODUCTION_READY_PACKET')
+ AND json_valid(NEW.content_json) = 1
+ AND json_extract(NEW.content_json, '$.candidateSnapshotDigest') IS NEW.candidate_snapshot_digest
+ AND EXISTS (
+   SELECT 1 FROM run_artifacts snapshot
+    WHERE snapshot.run_id = NEW.run_id
+      AND snapshot.kind = 'CANDIDATE_SNAPSHOT'
+      AND snapshot.candidate_snapshot_digest = NEW.candidate_snapshot_digest
+ )
+ AND acp_evidence_write_authorized() <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'EVIDENCE_WRITE_AUTHORITY_DENIED');
 END;
 
 -- Evidence is append-only except for one one-way staleness mark. Every metadata field,

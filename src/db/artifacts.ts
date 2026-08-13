@@ -11,7 +11,7 @@ import {
   candidateSnapshotSchema,
 } from "../snapshot/candidate-snapshot.ts";
 import { credentialBearingField, prohibitedDurableField } from "./audit.ts";
-import type { Db } from "./database.ts";
+import type { Db, EvidenceWritePort } from "./database.ts";
 
 export interface StoredArtifact<T = unknown> {
   artifactId: string;
@@ -114,6 +114,10 @@ export interface EvidenceWriterSet {
  */
 const ISSUED_WRITERS = new Set<string>();
 
+// The port is deliberately not a token property: a caller can obtain a token's constructor
+// through its prototype, while this module-private map never hands the database marker out.
+const EVIDENCE_WRITE_PORTS = new WeakMap<object, EvidenceWritePort>();
+
 /** Artifact kinds that must be bound to an exact candidate (§30.2 #7, CP-HI-06). */
 const SNAPSHOT_BOUND: ReadonlySet<string> = new Set([
   "VERIFICATION",
@@ -148,11 +152,18 @@ export class ArtifactStore {
         {},
       );
     }
+    const writePort = this.db.claimEvidenceWritePort();
     ISSUED_WRITERS.add(this.db.file);
+    const verification = new EvidenceWriterToken(WRITER_MINT, "VERIFICATION");
+    const blindReview = new EvidenceWriterToken(WRITER_MINT, "BLIND_REVIEW");
+    const productionReady = new EvidenceWriterToken(WRITER_MINT, "PRODUCTION_READY_PACKET");
+    EVIDENCE_WRITE_PORTS.set(verification, writePort);
+    EVIDENCE_WRITE_PORTS.set(blindReview, writePort);
+    EVIDENCE_WRITE_PORTS.set(productionReady, writePort);
     return {
-      VERIFICATION: new EvidenceWriterToken(WRITER_MINT, "VERIFICATION"),
-      BLIND_REVIEW: new EvidenceWriterToken(WRITER_MINT, "BLIND_REVIEW"),
-      PRODUCTION_READY_PACKET: new EvidenceWriterToken(WRITER_MINT, "PRODUCTION_READY_PACKET"),
+      VERIFICATION: verification,
+      BLIND_REVIEW: blindReview,
+      PRODUCTION_READY_PACKET: productionReady,
     };
   }
 
@@ -204,7 +215,22 @@ export class ArtifactStore {
         { runId, kind, writerKind: held },
       );
     }
-    return this.write(runId, kind, content, candidateSnapshotDigest, EVIDENCE_PRODUCERS[kind]);
+    const writePort = EVIDENCE_WRITE_PORTS.get(writer);
+    if (!writePort) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        `${kind} requires a writer issued by this artifact store`,
+        { runId, kind },
+      );
+    }
+    return this.write(
+      runId,
+      kind,
+      content,
+      candidateSnapshotDigest,
+      EVIDENCE_PRODUCERS[kind],
+      writePort,
+    );
   }
 
   private write<T>(
@@ -213,6 +239,7 @@ export class ArtifactStore {
     content: T,
     candidateSnapshotDigest: string | null,
     producedBy: string,
+    evidenceWritePort?: EvidenceWritePort,
   ): StoredArtifact<T> {
     if (SNAPSHOT_BOUND.has(kind) && !candidateSnapshotDigest) {
       fail(
@@ -266,21 +293,40 @@ export class ArtifactStore {
       createdAt: this.clock.nowIso(),
       superseded: false,
     };
-    this.db.run(
-      `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
-                                  content_json, produced_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        artifact.artifactId,
+    const contentJson = canonicalJson(durableContent);
+    if (isEvidenceKind(kind)) {
+      const writePort = evidenceWritePort ?? fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        `${kind} requires an evidence writer capability`,
+        { runId, kind },
+      );
+      this.db.insertEvidenceArtifact(writePort, {
+        artifactId: artifact.artifactId,
         runId,
         kind,
         digest,
-        artifact.candidateSnapshotDigest,
-        canonicalJson(durableContent),
+        candidateSnapshotDigest: artifact.candidateSnapshotDigest,
+        contentJson,
         producedBy,
-        artifact.createdAt,
-      ],
-    );
+        createdAt: artifact.createdAt,
+      });
+    } else {
+      this.db.run(
+        `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
+                                    content_json, produced_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          artifact.artifactId,
+          runId,
+          kind,
+          digest,
+          artifact.candidateSnapshotDigest,
+          contentJson,
+          producedBy,
+          artifact.createdAt,
+        ],
+      );
+    }
     return artifact;
   }
 
