@@ -17,7 +17,8 @@ import {
   IngressGuard,
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
-import { Role, SessionLifecycle, type RoleBinding } from "../domain/types.ts";
+import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
+import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { Daemon } from "./daemon.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
@@ -25,6 +26,9 @@ import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.t
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
 const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
+// A normal handoff package remains deliverable for thirty minutes. Do not make its recipient's
+// one-time bootstrap proof expire sooner than the package it must acknowledge.
+const SESSION_LAUNCH_TTL_MS = 30 * 60_000;
 
 export interface LocalMcpListeners {
   socketPaths: readonly string[];
@@ -36,11 +40,120 @@ export interface LocalMcpListenerOptions {
   handshakeTimeoutMs?: number;
 }
 
+/** A one-time, owner-only credential handoff for a runtime that was just constituted. */
+export interface LocalSessionLaunchChannel {
+  socketPath: string;
+  prepare(): Promise<Decision<void>>;
+  provision(input: SessionLaunchCredential): Promise<Decision<void>>;
+  close(): Promise<void>;
+}
+
 /** A daemon-owned local hop from the authenticated Buzz relay to SessionRegistry. */
 export interface LocalBuzzActorIngress {
   socketPath: string;
   close(): Promise<void>;
 }
+
+interface PendingLaunchCredential {
+  credential: SessionLaunchCredential;
+  expiresAtMs: number;
+}
+
+/**
+ * The provider-issued external session id is a high-entropy, recipient-scoped rendezvous
+ * key. The channel lives on an owner-only socket, retains no credential durably, and deletes
+ * an entry before replying, so a runtime can obtain its MCP proof exactly once.
+ */
+export const startSessionLaunchChannel = async (stateDir: string): Promise<LocalSessionLaunchChannel> => {
+  const socketPath = join(stateDir, "cto.launch.sock");
+  const pending = new Map<string, PendingLaunchCredential>();
+  let server: Server | null = null;
+  let opening: Promise<Decision<void>> | null = null;
+  let closing: Promise<void> | null = null;
+  let closed = false;
+
+  const pruneExpired = (): void => {
+    const now = Date.now();
+    for (const [externalSessionId, launch] of pending) {
+      if (launch.expiresAtMs <= now) pending.delete(externalSessionId);
+    }
+  };
+  const prepare = async (): Promise<Decision<void>> => {
+    if (closed) {
+      return deny(ReasonCode.CONFLICT, "session launch channel is closed", { socketPath });
+    }
+    if (server) return allow(ReasonCode.OK, undefined);
+    if (opening) return opening;
+
+    opening = (async (): Promise<Decision<void>> => {
+      let candidate: Server | null = null;
+      try {
+        // `main` creates the channel object before `Daemon.start` so queued-run resume can
+        // use it, but this binding is deliberately delayed until `CtoLifecycle.spawn` runs
+        // under the daemon lock. A losing daemon can therefore never unlink the winner's
+        // live launch socket while it is merely attempting startup.
+        removeStaleSocket(socketPath);
+        candidate = createServer((socket) => serveSessionLaunchCredential(socket, pending));
+        await listenSocket(candidate, socketPath);
+        if (closed) {
+          await closeSocketServer(candidate);
+          return deny(ReasonCode.CONFLICT, "session launch channel closed while opening", { socketPath });
+        }
+        server = candidate;
+        return allow(ReasonCode.OK, undefined);
+      } catch (error) {
+        if (candidate) {
+          try {
+            await closeSocketServer(candidate);
+          } catch {
+            /* an unsuccessful listen owns no server that needs further cleanup */
+          }
+        }
+        return deny(ReasonCode.CONFLICT, "could not open the session launch channel", {
+          socketPath,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        opening = null;
+      }
+    })();
+    return opening;
+  };
+
+  return {
+    socketPath,
+    prepare,
+    provision: async (credential) => {
+      const prepared = await prepare();
+      if (!prepared.allowed) return prepared;
+      pruneExpired();
+      if (pending.has(credential.externalSessionId)) {
+        return deny(
+          ReasonCode.CONFLICT,
+          "a launch credential is already pending for this external session",
+          { sessionId: credential.sessionId },
+        );
+      }
+      pending.set(credential.externalSessionId, {
+        credential,
+        expiresAtMs: Date.now() + SESSION_LAUNCH_TTL_MS,
+      });
+      return allow(ReasonCode.OK, undefined);
+    },
+    close: async () => {
+      if (closing) return closing;
+      closed = true;
+      closing = (async () => {
+        pending.clear();
+        if (opening) await opening;
+        const active = server;
+        server = null;
+        if (active) await closeSocketServer(active);
+      })();
+      return closing;
+    },
+  };
+};
 
 /**
  * PRD §27.3 — each role gets its own owner-only Unix socket and must present the
@@ -82,7 +195,12 @@ export const startLocalMcpListeners = async (
       cp,
       [Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO],
       handshakeTimeoutMs,
-      (auth) => createCtoServer(ctoPort, auth),
+      (auth, opening) => createCtoServer(
+        ctoPort,
+        auth,
+        opening.kind === "PENDING_HANDOFF_ACK" ? { pendingHandoffId: opening.handoffId } : undefined,
+      ),
+      true,
     );
   } catch (err) {
     await closeSocketServer(hermes);
@@ -152,7 +270,8 @@ const startMcpSocket = async (
   cp: ControlPlane,
   expectedRoles: readonly Role[],
   handshakeTimeoutMs: number,
-  factory: (authenticate: McpPeerAuthenticator) => ReturnType<typeof createHermesServer>,
+  factory: (authenticate: McpPeerAuthenticator, opening: BoundSocketPeer) => ReturnType<typeof createHermesServer>,
+  permitPendingHandoffAck = false,
 ): Promise<Server> => {
   removeStaleSocket(path);
   const server = createServer((socket) => {
@@ -160,12 +279,12 @@ const startMcpSocket = async (
       if (!accepted) return;
       // One server per authenticated connection: the peer identity belongs to the
       // transport, so it can never be re-declared by a tool argument (§21, §27.3).
-      const opening = authenticateSocketPeer(cp, accepted.credential, expectedRoles);
+      const opening = authenticateSocketPeer(cp, accepted.credential, expectedRoles, permitPendingHandoffAck);
       if (!opening.allowed) {
         endWithDecision(socket, opening);
         return;
       }
-      const mcp = factory(peerAuthenticator(cp, accepted.credential, opening.value));
+      const mcp = factory(peerAuthenticator(cp, accepted.credential, opening.value), opening.value);
       try {
         await mcp.connect(accepted.transport);
       } catch (err) {
@@ -211,6 +330,71 @@ const endWithDecision = <T>(socket: Socket, decision: Decision<T>): void => {
         evidence: decision.evidence,
       };
   socket.end(`${JSON.stringify(body)}\n`);
+};
+
+/**
+ * The launch channel is intentionally much smaller than MCP: it accepts one externally
+ * constituted session id, returns that session's credential once, and closes.  It never
+ * accepts a caller-supplied control-plane session id or writes any received value durably.
+ */
+const serveSessionLaunchCredential = (
+  socket: Socket,
+  pending: Map<string, PendingLaunchCredential>,
+): void => {
+  let buffer = Buffer.alloc(0);
+  let settled = false;
+  const finish = (body: Record<string, unknown>): void => {
+    if (settled) return;
+    settled = true;
+    socket.removeListener("data", receive);
+    socket.end(`${JSON.stringify(body)}\n`);
+  };
+  const refuse = (): void => finish({ ok: false, reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED });
+  const receive = (chunk: Buffer): void => {
+    buffer = Buffer.concat([buffer, chunk]);
+    if (buffer.length > MAX_MCP_LINE_BYTES) return refuse();
+    const boundary = buffer.indexOf(0x0a);
+    if (boundary === -1) return;
+    if (buffer.subarray(boundary + 1).length > 0) return refuse();
+    let request: unknown;
+    try {
+      request = JSON.parse(buffer.subarray(0, boundary).toString("utf8")) as unknown;
+    } catch {
+      return refuse();
+    }
+    const externalSessionId = launchExternalSessionId(request);
+    if (!externalSessionId) return refuse();
+    const launch = pending.get(externalSessionId);
+    if (!launch || launch.expiresAtMs <= Date.now()) {
+      pending.delete(externalSessionId);
+      return refuse();
+    }
+
+    // Consume before writing. If the peer disappears while receiving its response, retrying
+    // this session is unsafe because the plaintext could already have crossed the socket.
+    pending.delete(externalSessionId);
+    finish({
+      ok: true,
+      sessionId: launch.credential.sessionId,
+      sessionIncarnation: launch.credential.sessionIncarnation,
+      sessionSecret: launch.credential.sessionSecret,
+    });
+  };
+  socket.on("data", receive);
+  socket.once("error", () => {
+    if (!settled) {
+      settled = true;
+      socket.removeListener("data", receive);
+    }
+  });
+};
+
+const launchExternalSessionId = (value: unknown): string | null => {
+  if (!value || typeof value !== "object") return null;
+  const externalSessionId = (value as { externalSessionId?: unknown }).externalSessionId;
+  return typeof externalSessionId === "string" && externalSessionId.length > 0
+    ? externalSessionId
+    : null;
 };
 
 const serveBuzzActorBinding = (socket: Socket, ingress: BuzzActorIngress): void => {
@@ -286,9 +470,25 @@ interface AcceptedConnection {
   credential: PeerCredential;
 }
 
-interface BoundSocketPeer {
+interface ActiveBoundSocketPeer {
+  kind: "BOUND";
   binding: RoleBinding;
   sessionIncarnation: string;
+}
+
+/** The sole unbound peer shape: a recipient of one current normal handoff. */
+interface PendingHandoffSocketPeer {
+  kind: "PENDING_HANDOFF_ACK";
+  handoffId: string;
+  sessionIncarnation: string;
+  fromGeneration: number;
+}
+
+type BoundSocketPeer = ActiveBoundSocketPeer | PendingHandoffSocketPeer;
+
+interface PendingNormalHandoff {
+  handoffId: string;
+  fromGeneration: number;
 }
 
 /**
@@ -299,11 +499,15 @@ const authenticateSocketPeer = (
   cp: ControlPlane,
   credential: PeerCredential,
   expectedRoles: readonly Role[],
+  permitPendingHandoffAck = false,
 ): Decision<BoundSocketPeer> => {
   const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
   if (!session.allowed) return session as Decision<BoundSocketPeer>;
-  if (session.value.lifecycle !== SessionLifecycle.READY) {
-    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "peer session is not READY", {
+  if (
+    session.value.lifecycle !== SessionLifecycle.READY &&
+    session.value.lifecycle !== SessionLifecycle.DRAINING
+  ) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "peer session is not eligible for a local MCP socket", {
       sessionId: credential.sessionId,
       lifecycle: session.value.lifecycle,
     });
@@ -313,9 +517,27 @@ const authenticateSocketPeer = (
     .bySession(credential.sessionId)
     .find((binding) => binding.status === "ACTIVE" && expectedRoles.includes(binding.role));
   if (!candidate) {
+    if (permitPendingHandoffAck && session.value.lifecycle === SessionLifecycle.READY) {
+      const pending = currentPendingNormalHandoff(cp, credential.sessionId);
+      if (pending.allowed) {
+        return allow(ReasonCode.OK, {
+          kind: "PENDING_HANDOFF_ACK",
+          handoffId: pending.value.handoffId,
+          fromGeneration: pending.value.fromGeneration,
+          sessionIncarnation: session.value.incarnation,
+        });
+      }
+    }
     return deny(ReasonCode.BINDING_GENERATION_STALE, "session does not hold this socket's current role", {
       sessionId: credential.sessionId,
       expectedRoles,
+    });
+  }
+  if (!lifecyclePermitsBoundSocket(session.value.lifecycle, candidate.role)) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "peer session cannot use this socket in its lifecycle", {
+      sessionId: credential.sessionId,
+      lifecycle: session.value.lifecycle,
+      role: candidate.role,
     });
   }
   const authenticated = cp.bindings.authenticateBoundSession({
@@ -334,10 +556,67 @@ const authenticateSocketPeer = (
     });
   }
   return allow(ReasonCode.OK, {
+    kind: "BOUND",
     binding: authenticated.value,
     sessionIncarnation: session.value.incarnation,
   });
 };
+
+/**
+ * Normal handoff recipients are intentionally unbound.  This predicate is their entire
+ * authority: one PENDING HANDOFF row addressed to them, plus the still-current outgoing
+ * PRIMARY_CTO generation that created it.  Bootstrap and recovery handoffs never qualify.
+ */
+const currentPendingNormalHandoff = (
+  cp: ControlPlane,
+  sessionId: string,
+): Decision<PendingNormalHandoff> => {
+  const rows = cp.db.all<{
+    handoff_id: string;
+    project_id: string;
+    from_session_id: string | null;
+    from_generation: number | null;
+  }>(
+    `SELECT handoff_id, project_id, from_session_id, from_generation
+       FROM handoffs
+      WHERE to_session_id = ? AND kind = 'HANDOFF' AND status = 'PENDING'
+      ORDER BY created_at`,
+    [sessionId],
+  );
+  if (rows.length !== 1) {
+    return deny(ReasonCode.BINDING_GENERATION_STALE, "session has no unique pending normal handoff", {
+      sessionId,
+      pendingHandoffs: rows.length,
+    });
+  }
+  const handoff = rows[0]!;
+  if (handoff.from_session_id === null || handoff.from_generation === null) {
+    return deny(ReasonCode.BINDING_GENERATION_STALE, "normal handoff has no outgoing binding fence", {
+      handoffId: handoff.handoff_id,
+    });
+  }
+  const outgoing = cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId: handoff.project_id }));
+  if (
+    !outgoing ||
+    outgoing.sessionId !== handoff.from_session_id ||
+    outgoing.bindingGeneration !== handoff.from_generation
+  ) {
+    return deny(ReasonCode.BINDING_GENERATION_STALE, "handoff outgoing binding is no longer current", {
+      handoffId: handoff.handoff_id,
+      expectedGeneration: handoff.from_generation,
+      currentGeneration: outgoing?.bindingGeneration ?? null,
+    });
+  }
+  return allow(ReasonCode.OK, {
+    handoffId: handoff.handoff_id,
+    fromGeneration: handoff.from_generation,
+  });
+};
+
+/** A draining primary keeps only its already-fenced authority; no other draining role does. */
+const lifecyclePermitsBoundSocket = (lifecycle: SessionLifecycle, role: Role): boolean =>
+  lifecycle === SessionLifecycle.READY ||
+  (lifecycle === SessionLifecycle.DRAINING && role === Role.PRIMARY_CTO);
 
 const authenticateSocket = (
   socket: Socket,
@@ -427,10 +706,34 @@ const peerAuthenticator =
         current: session.value.incarnation,
       });
     }
-    if (session.value.lifecycle !== "READY") {
-      return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, `peer session is ${session.value.lifecycle}, not READY`, {
-        sessionId: credential.sessionId,
-      });
+    if (opening.kind === "PENDING_HANDOFF_ACK") {
+      if (session.value.lifecycle !== SessionLifecycle.READY) {
+        return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "pending handoff recipient is not READY", {
+          sessionId: credential.sessionId,
+          lifecycle: session.value.lifecycle,
+        });
+      }
+      const pending = currentPendingNormalHandoff(cp, credential.sessionId);
+      if (
+        !pending.allowed ||
+        pending.value.handoffId !== opening.handoffId ||
+        pending.value.fromGeneration !== opening.fromGeneration
+      ) {
+        return deny(ReasonCode.BINDING_GENERATION_STALE, "pending handoff is no longer current for this socket", {
+          sessionId: credential.sessionId,
+          handoffId: opening.handoffId,
+          expectedGeneration: opening.fromGeneration,
+        });
+      }
+      return allow(ReasonCode.OK, authenticatedPeer(credential, opening.sessionIncarnation));
+    }
+
+    if (!lifecyclePermitsBoundSocket(session.value.lifecycle, opening.binding.role)) {
+      return deny(
+        ReasonCode.MCP_PEER_UNAUTHENTICATED,
+        `peer session is ${session.value.lifecycle} and cannot retain this role's socket authority`,
+        { sessionId: credential.sessionId, lifecycle: session.value.lifecycle, role: opening.binding.role },
+      );
     }
     const bound = cp.bindings.authenticateBoundSession({
       roleKey: opening.binding.roleKey,
@@ -447,12 +750,23 @@ const peerAuthenticator =
         binding: bound.value.sessionIncarnation,
       });
     }
-    return allow(ReasonCode.OK, {
-      actor: credential.sessionId,
-      sessionId: credential.sessionId,
-      sessionIncarnation: opening.sessionIncarnation,
-    });
+    return allow(ReasonCode.OK, authenticatedPeer(credential, opening.sessionIncarnation));
   };
+
+/**
+ * The plaintext is attached only to this in-process peer context. It never becomes a tool
+ * argument or response; `handoff_ack` uses it to construct the lifecycle's authenticated
+ * envelope, which verifies it again against SessionRegistry before switching generations.
+ */
+const authenticatedPeer = (
+  credential: PeerCredential,
+  sessionIncarnation: string,
+): AuthenticatedMcpPeer & { sessionSecret: string } => ({
+  actor: credential.sessionId,
+  sessionId: credential.sessionId,
+  sessionIncarnation,
+  sessionSecret: credential.sessionSecret,
+});
 
 export const localMcpTokenMatches = (value: unknown, expected: string): boolean => {
   if (!value || typeof value !== "object" || !("token" in value)) return false;
@@ -575,6 +889,14 @@ export const main = async (): Promise<void> => {
   const mcpToken = process.env["ACP_MCP_TOKEN"];
   if (!mcpToken) throw new Error("ACP_MCP_TOKEN is required for authenticated local MCP sockets");
 
+  let sessionLaunch: LocalSessionLaunchChannel;
+  try {
+    sessionLaunch = await startSessionLaunchChannel(stateDir);
+  } catch (err) {
+    cp.close();
+    throw err;
+  }
+
   const buzz = new BuzzAdapter(
     cp.db,
     cp.clock,
@@ -590,6 +912,7 @@ export const main = async (): Promise<void> => {
       disconnect: (sessionId) => buzz.disconnect(sessionId),
     },
     readiness: { checkSession: (id) => cp.doctor.sessionReadiness(id) },
+    sessionLaunch,
   });
 
   const daemon = new Daemon(cp, { stateDir, buzz });
@@ -602,6 +925,7 @@ export const main = async (): Promise<void> => {
     );
     const backoffSeconds = daemon.crashLoopState().backoffSeconds;
     if (backoffSeconds > 0) await waitForBackoff(backoffSeconds);
+    await sessionLaunch.close();
     cp.close();
     process.exit(1);
   }
@@ -615,6 +939,7 @@ export const main = async (): Promise<void> => {
     }
   } catch (err) {
     await listeners?.close();
+    await sessionLaunch.close();
     await daemon.stop();
     cp.close();
     throw err;
@@ -626,6 +951,7 @@ export const main = async (): Promise<void> => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
     await buzzActorIngress?.close();
     await listeners?.close();
+    await sessionLaunch.close();
     await daemon.stop();
     cp.close();
     process.exit(0);

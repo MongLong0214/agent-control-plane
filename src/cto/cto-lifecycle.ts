@@ -63,6 +63,29 @@ export interface HandoffAuthentication {
   verifyHandoffAcknowledgement(input: HandoffAcknowledgement): Decision<void>;
 }
 
+/**
+ * The one-time bootstrap credential for a freshly constituted runtime.  It is deliberately
+ * a narrow launch capability rather than a value retained by the lifecycle: the registry
+ * hashes the secret, and the launch channel is the sole route that may see its plaintext.
+ */
+export interface SessionLaunchCredential {
+  sessionId: string;
+  sessionIncarnation: string;
+  externalSessionId: string;
+  sessionSecret: string;
+}
+
+/**
+ * A daemon-owned, recipient-scoped channel used exactly once while a runtime starts.  It
+ * keeps a session secret out of handoffs, outbox payloads, audit evidence, and provider
+ * prompts while still giving the newly created runtime the proof it needs for local MCP.
+ */
+export interface SessionLaunchChannel {
+  /** Opens the recipient-scoped channel before the provider can start its runtime. */
+  prepare(): Promise<Decision<void>>;
+  provision(input: SessionLaunchCredential): Promise<Decision<void>>;
+}
+
 export interface CtoPreference {
   provider: string;
   model: string;
@@ -82,6 +105,7 @@ export class CtoLifecycle {
   #readiness: ReadinessProbe | null = null;
   #ownerAuthority: OwnerAuthorityPort | null = null;
   #handoffAuthentication: HandoffAuthentication | null = null;
+  #sessionLaunch: SessionLaunchChannel | null = null;
 
   constructor(
     private readonly db: Db,
@@ -101,11 +125,13 @@ export class CtoLifecycle {
     readiness?: ReadinessProbe;
     ownerAuthority?: OwnerAuthorityPort;
     handoffAuthentication?: HandoffAuthentication;
+    sessionLaunch?: SessionLaunchChannel;
   }): void {
     if (ports.buzz) this.#buzz = ports.buzz;
     if (ports.readiness) this.#readiness = ports.readiness;
     if (ports.ownerAuthority) this.#ownerAuthority = ports.ownerAuthority;
     if (ports.handoffAuthentication) this.#handoffAuthentication = ports.handoffAuthentication;
+    if (ports.sessionLaunch) this.#sessionLaunch = ports.sessionLaunch;
   }
 
   /**
@@ -772,6 +798,14 @@ export class CtoLifecycle {
       });
     }
 
+    // A provider implementation may start a live runtime from `startSession`. Prepare the
+    // owner-only channel first, so that runtime never races a not-yet-listening credential
+    // endpoint. In the daemon this happens only after its single-instance lock is acquired.
+    if (this.#sessionLaunch) {
+      const prepared = await this.#sessionLaunch.prepare();
+      if (!prepared.allowed) return prepared as Decision<string>;
+    }
+
     const handle = await adapter.startSession({
       model: this.preference.model,
       effort: this.preference.effort,
@@ -786,6 +820,33 @@ export class CtoLifecycle {
       incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
       osPid: handle.pid,
     });
+
+    // `SessionRegistry.create` is intentionally the only issuer of the plaintext secret.
+    // The normal daemon attaches a one-time local launch channel, so a freshly spawned
+    // replacement receives the credential before it is allowed to acknowledge a handoff.
+    // A direct in-process composition (for example, an offline diagnostic) has no runtime
+    // to provision and therefore leaves this optional rather than manufacturing a second,
+    // weaker delivery path here.
+    if (this.#sessionLaunch) {
+      if (!session.sessionSecret) {
+        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session secret storage unavailable");
+        return deny(
+          ReasonCode.SESSION_SECRET_STORAGE_UNAVAILABLE,
+          "a spawned CTO cannot receive its session credential because secret storage is unavailable",
+          { sessionId: session.sessionId },
+        );
+      }
+      const provisioned = await this.#sessionLaunch.provision({
+        sessionId: session.sessionId,
+        sessionIncarnation: session.incarnation,
+        externalSessionId: handle.externalSessionId,
+        sessionSecret: session.sessionSecret,
+      });
+      if (!provisioned.allowed) {
+        this.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "session launch credential provisioning failed");
+        return provisioned as Decision<string>;
+      }
+    }
 
     if (this.#buzz) {
       const connected = await this.#buzz.connect(session.sessionId, `${purpose}:${projectId}`);

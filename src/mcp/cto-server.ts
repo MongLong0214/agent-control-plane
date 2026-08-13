@@ -9,7 +9,7 @@ import type { Clock } from "../core/clock.ts";
 import { allow, deny, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { parseVerificationCommand } from "../contracts/verification-command.ts";
-import type { CtoLifecycle } from "../cto/cto-lifecycle.ts";
+import type { CtoLifecycle, HandoffAcknowledgement } from "../cto/cto-lifecycle.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import type { Doctor } from "../doctor/doctor.ts";
@@ -152,7 +152,8 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
     prepareSwitchover: (...args: Parameters<CtoLifecycle["prepareSwitchover"]>) => source.cto.prepareSwitchover(...args),
     handoffKind: (handoffId: string) => source.db.get<{ kind: string }>(`SELECT kind FROM handoffs WHERE handoff_id = ?`, [handoffId])?.kind ?? null,
     acknowledgeBootstrap: (handoffId: string, sessionId: string) => source.bootstrap.acknowledgeActivationHandoff(handoffId, sessionId),
-    acknowledgeCto: (handoffId: string, sessionId: string) => source.cto.acknowledgeHandoff(handoffId, sessionId),
+    acknowledgeCto: (handoffId: string, acknowledgement: HandoffAcknowledgement) =>
+      source.cto.acknowledgeHandoff(handoffId, acknowledgement),
     // A read an operator asked for is a capacity *report*, not evidence that a worker
     // allocation was admitted — `startWorkerExecution` owns the WORKER_FANOUT trigger.
     refreshCapacity: () => source.capacity.refresh("DOCTOR_CAPACITY_REPORT"),
@@ -166,6 +167,19 @@ export const createCtoMcpPort = (source: CtoMcpSource) => {
 };
 
 export type CtoMcpPort = ReturnType<typeof createCtoMcpPort>;
+
+/**
+ * The daemon supplies this only for an unbound recipient of a current normal handoff. The
+ * sealed port still owns all lifecycle calls; this context merely narrows which registered
+ * operation the transport-authenticated connection may reach.
+ */
+export interface CtoMcpAccess {
+  pendingHandoffId?: string;
+}
+
+interface SessionSecretPeer extends AuthenticatedMcpPeer {
+  sessionSecret?: string;
+}
 
 const assertCtoMcpPort = (port: CtoMcpPort): void => {
   if (!CTO_MCP_PORTS.has(port)) {
@@ -187,18 +201,35 @@ export const assertCtoRunPeer = (
 const createCtoServerFromPort = (
   port: CtoMcpPort,
   authenticate: McpPeerAuthenticator,
+  access: CtoMcpAccess = {},
 ): McpServer => {
   const server = new McpServer({ name: "agent-control-plane-cto", version: "1.3.0" });
-  const read = (execute: (peer: AuthenticatedMcpPeer) => Promise<ToolResult> | ToolResult) =>
+  const peerFor = (toolName: string): Decision<AuthenticatedMcpPeer> => {
+    const peer = authenticateMcpPeer(authenticate);
+    if (!peer.allowed) return peer;
+    if (access.pendingHandoffId && toolName !== "handoff_ack") {
+      return deny(
+        ReasonCode.MCP_PEER_UNAUTHENTICATED,
+        "an unbound handoff recipient may only acknowledge its pending handoff",
+        { handoffId: access.pendingHandoffId, toolName },
+      );
+    }
+    return peer;
+  };
+  const read = (
+    toolName: string,
+    execute: (peer: AuthenticatedMcpPeer) => Promise<ToolResult> | ToolResult,
+  ) =>
     guarded(() => {
-      const peer = authenticateMcpPeer(authenticate);
+      const peer = peerFor(toolName);
       return peer.allowed ? execute(peer.value) : respond(peer);
     });
   const write = (
+    toolName: string,
     idempotencyKey: string,
     execute: (peer: AuthenticatedMcpPeer) => Promise<ToolResult> | ToolResult,
   ) => guarded(async () => {
-    const peer = authenticateMcpPeer(authenticate);
+    const peer = peerFor(toolName);
     return peer.allowed
       ? port.mutation.execute(peer.value, idempotencyKey, () => execute(peer.value))
       : respond(peer);
@@ -209,7 +240,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "run_ack",
     { description: "Acknowledge a dispatched run and its fenced envelope.", inputSchema: { ...mutation, ...runIdentity, messageId: z.string() } },
-    async (args) => write(args.idempotencyKey, (peer) => {
+    async (args) => write("run_ack", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
       return fenced.allowed ? respond(port.acknowledge(args.messageId, fenced.value.sessionId, fenced.value.bindingGeneration)) : respond(fenced);
     }),
@@ -217,7 +248,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "contract_get",
     { description: "The pinned task contract and verification contract for a run.", inputSchema: runIdentity },
-    async (args) => read((peer) => {
+    async (args) => read("contract_get", (peer) => {
       const fenced = owner(peer, args.runId);
       return fenced.allowed ? ok(port.contractForRun(args.runId)) : respond(fenced);
     }),
@@ -248,7 +279,7 @@ const createCtoServerFromPort = (
         tasks: z.array(z.object({ key: z.string(), title: z.string(), category: z.enum(["mechanical", "implementation", "investigation", "integration", "test", "review", "docs", "migration", "benchmark", "security"]), dependsOn: z.array(z.string()).default([]), spec: z.record(z.unknown()).default({}) })).min(1),
       },
     },
-    async (args) => write(args.idempotencyKey, (peer) => {
+    async (args) => write("plan_submit", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
       port.putPlan(args.runId, args.plan);
@@ -258,7 +289,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "resource_claim",
     { description: "Claim a branch, worktree and exact write paths.", inputSchema: { ...mutation, ...runIdentity, repositoryIdentity: z.string(), branch: z.string().nullable().optional(), worktreeId: z.string().nullable().optional(), declaredPaths: z.array(z.string()).default([]), ttlMs: z.number().int().positive().optional() } },
-    async (args) => write(args.idempotencyKey, (peer) => {
+    async (args) => write("resource_claim", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
       const roleKey = port.ownerRoleKeyForRun(args.runId);
@@ -272,7 +303,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "resource_release",
     { description: "Release held claims.", inputSchema: { ...mutation, ...runIdentity, claimId: z.string().nullable().optional() } },
-    async (args) => write(args.idempotencyKey, (peer) => {
+    async (args) => write("resource_release", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
       return args.claimId ? respond(port.releaseClaim(args.claimId, args.runId)) : ok({ released: port.releaseRunClaims(args.runId) });
@@ -284,7 +315,7 @@ const createCtoServerFromPort = (
       description: "Open or close a task execution receipt.",
       inputSchema: { ...mutation, ...runIdentity, taskId: z.string(), phase: z.enum(["started", "activity", "finished"]), executionId: z.string().nullable().optional(), provider: z.string().default("unknown"), model: z.string().default("unknown"), workerSessionId: z.string().nullable().optional(), workerProcessId: z.number().int().nullable().optional(), repositoryId: z.string().nullable().optional(), worktreeId: z.string().nullable().optional(), status: z.enum(["SUCCEEDED", "FAILED", "ABANDONED", "TIMEOUT"]).optional(), failureClass: z.enum(["transient", "repairable", "contract", "security", "policy", "capacity", "infrastructure", "unknown_observed"]).optional(), resultDigest: z.string().nullable().optional() },
     },
-    async (args) => write(args.idempotencyKey, async (peer) => {
+    async (args) => write("task_receipt_submit", args.idempotencyKey, async (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
       if (args.phase === "started") {
@@ -312,7 +343,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "result_submit",
     { description: "Submit a candidate for automatic verification and blind review.", inputSchema: { ...mutation, ...runIdentity, resultSummary: z.string(), recommendation: z.string(), residualRisk: z.array(z.string()).default([]), runScopedCommands: z.array(z.record(z.unknown())).default([]) } },
-    async (args) => write(args.idempotencyKey, async (peer) => {
+    async (args) => write("result_submit", args.idempotencyKey, async (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
       const commands = args.runScopedCommands.map((command) => parseVerificationCommand(command));
@@ -322,7 +353,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "escalation_open",
     { description: "Escalate a decision to the CEO.", inputSchema: { ...mutation, ...runIdentity, question: z.string(), options: z.array(z.string()).min(1), ctoRecommendation: z.string(), whyItMatters: z.string(), blocksCriticalPath: z.boolean() } },
-    async (args) => write(args.idempotencyKey, (peer) => {
+    async (args) => write("escalation_open", args.idempotencyKey, (peer) => {
       const fenced = owner(peer, args.runId);
       if (!fenced.allowed) return respond(fenced);
       return respond(port.openEscalation({ runId: args.runId, question: args.question, options: args.options, ctoRecommendation: args.ctoRecommendation, whyItMatters: args.whyItMatters, blocksCriticalPath: args.blocksCriticalPath, openedBySessionId: fenced.value.sessionId, openedAt: new Date().toISOString() }));
@@ -331,7 +362,7 @@ const createCtoServerFromPort = (
   server.registerTool(
     "handoff_submit",
     { description: "Submit a structured CTO handoff.", inputSchema: { ...mutation, projectId: z.string(), handoff: z.object({ projectStatus: z.string(), activeManifestDigest: z.string().nullable(), recentDecisions: z.array(z.string()).default([]), openBlockers: z.array(z.string()).default([]), queuedWork: z.array(z.string()).default([]), repositoryFacts: z.array(z.object({ identity: z.string(), branch: z.string().nullable(), head: z.string().nullable() })).default([]), knownRisks: z.array(z.string()).default([]), recommendedNextAction: z.string() }) } },
-    async (args) => write(args.idempotencyKey, async (peer) => {
+    async (args) => write("handoff_submit", args.idempotencyKey, async (peer) => {
       if (!peer.sessionId || !peer.sessionIncarnation) return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation"));
       const binding = port.activePrimaryCto(args.projectId);
       if (!binding || binding.sessionId !== peer.sessionId || binding.sessionIncarnation !== peer.sessionIncarnation) return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "authenticated peer is not this project's primary CTO", { projectId: args.projectId }));
@@ -340,23 +371,53 @@ const createCtoServerFromPort = (
   );
   server.registerTool(
     "handoff_ack",
-    { description: "Acknowledge a handoff as the authenticated incoming CTO.", inputSchema: { ...mutation, handoffId: z.string() } },
-    async (args) => write(args.idempotencyKey, (peer) => {
+    {
+      description: "Acknowledge a handoff as the authenticated incoming CTO.",
+      inputSchema: {
+        ...mutation,
+        handoffId: z.string(),
+        messageId: z.string().min(1),
+        payloadDigest: z.string().min(1),
+        bindingGeneration: z.number().int().positive(),
+      },
+    },
+    async (args) => write("handoff_ack", args.idempotencyKey, (peer) => {
       if (!peer.sessionId || !peer.sessionIncarnation) return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP peer is missing a session incarnation"));
       if (!port.sessionIsCurrent(peer.sessionId, peer.sessionIncarnation)) {
         return respond(deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "CTO MCP session incarnation is not current"));
       }
+      if (access.pendingHandoffId && access.pendingHandoffId !== args.handoffId) {
+        return respond(deny(
+          ReasonCode.HANDOFF_ACK_REQUIRED,
+          "pending handoff recipient may acknowledge only its delivered handoff",
+          { expected: access.pendingHandoffId, got: args.handoffId },
+        ));
+      }
       const kind = port.handoffKind(args.handoffId);
       if (!kind) return respond(deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId: args.handoffId }));
-      return kind === "BOOTSTRAP"
-        ? respond(port.acknowledgeBootstrap(args.handoffId, peer.sessionId))
-        : respond(port.acknowledgeCto(args.handoffId, peer.sessionId));
+      if (kind === "BOOTSTRAP") return respond(port.acknowledgeBootstrap(args.handoffId, peer.sessionId));
+      const sessionSecret = (peer as SessionSecretPeer).sessionSecret;
+      if (!sessionSecret) {
+        return respond(deny(
+          ReasonCode.MCP_PEER_UNAUTHENTICATED,
+          "CTO MCP peer has no session credential for a normal handoff acknowledgement",
+          { handoffId: args.handoffId },
+        ));
+      }
+      return respond(port.acknowledgeCto(args.handoffId, {
+        sessionId: peer.sessionId,
+        sessionIncarnation: peer.sessionIncarnation,
+        sessionSecret,
+        messageId: args.messageId,
+        payloadDigest: args.payloadDigest,
+        bindingGeneration: args.bindingGeneration,
+      }));
     }),
   );
   server.registerTool(
     "capacity_get",
     { description: "Normalized provider capacity.", inputSchema: { ...mutation, refresh: z.boolean().default(false) } },
-    async (args) => write(args.idempotencyKey, async () => {
+    async (args) => write("capacity_get", args.idempotencyKey, async () => {
       if (args.refresh) await port.refreshCapacity();
       return ok({ providers: port.capacity(), continuityMode: port.continuityMode() });
     }),
@@ -364,12 +425,12 @@ const createCtoServerFromPort = (
   server.registerTool(
     "doctor_run",
     { description: "Read-only doctor pass.", inputSchema: { scope: z.enum(["system", "project", "cto", "run", "session", "capacity", "github", "worktree"]).default("run"), target: z.string().optional() } },
-    async (args) => read(async () => ok(await port.doctorRun(args.scope, args.target))),
+    async (args) => read("doctor_run", async () => ok(await port.doctorRun(args.scope, args.target))),
   );
   server.registerTool(
     "blind_review_request",
     { description: "Not available: blind review is invoked by the control plane.", inputSchema: runIdentity },
-    async (args) => read((peer) => {
+    async (args) => read("blind_review_request", (peer) => {
       const fenced = owner(peer, args.runId);
       return fenced.allowed ? respond(port.manualReview(fenced.value.sessionId, args.runId)) : respond(fenced);
     }),
@@ -381,7 +442,8 @@ const createCtoServerFromPort = (
 export const createCtoServer = (
   port: CtoMcpPort,
   authenticate: McpPeerAuthenticator,
+  access: CtoMcpAccess = {},
 ): McpServer => {
   assertCtoMcpPort(port);
-  return createCtoServerFromPort(port, authenticate);
+  return createCtoServerFromPort(port, authenticate, access);
 };
