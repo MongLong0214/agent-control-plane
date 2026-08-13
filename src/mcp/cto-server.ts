@@ -313,7 +313,7 @@ const createCtoServerFromPort = (
     "task_receipt_submit",
     {
       description: "Open or close a task execution receipt.",
-      inputSchema: { ...mutation, ...runIdentity, taskId: z.string(), phase: z.enum(["started", "activity", "finished"]), executionId: z.string().nullable().optional(), provider: z.string().default("unknown"), model: z.string().default("unknown"), workerSessionId: z.string().nullable().optional(), workerProcessId: z.number().int().nullable().optional(), repositoryId: z.string().nullable().optional(), worktreeId: z.string().nullable().optional(), status: z.enum(["SUCCEEDED", "FAILED", "ABANDONED", "TIMEOUT"]).optional(), failureClass: z.enum(["transient", "repairable", "contract", "security", "policy", "capacity", "infrastructure", "unknown_observed"]).optional(), resultDigest: z.string().nullable().optional() },
+      inputSchema: { ...mutation, ...runIdentity, taskId: z.string(), phase: z.enum(["started", "activity", "finished"]), executionId: z.string().nullable().optional(), provider: z.string().default("unknown"), model: z.string().default("unknown"), workerSessionId: z.string(), workerProcessId: z.number().int().nullable().optional(), repositoryId: z.string().nullable().optional(), worktreeId: z.string().nullable().optional(), status: z.enum(["SUCCEEDED", "FAILED", "ABANDONED", "TIMEOUT"]).optional(), failureClass: z.enum(["transient", "repairable", "contract", "security", "policy", "capacity", "infrastructure", "unknown_observed"]).optional(), resultDigest: z.string().nullable().optional() },
     },
     async (args) => write("task_receipt_submit", args.idempotencyKey, async (peer) => {
       const fenced = owner(peer, args.runId);
@@ -324,7 +324,7 @@ const createCtoServerFromPort = (
             runId: args.runId,
             taskId: args.taskId,
             ownerBindingGeneration: fenced.value.bindingGeneration,
-            workerSessionId: args.workerSessionId ?? null,
+            workerSessionId: args.workerSessionId,
             workerProcessId: args.workerProcessId ?? null,
             provider: args.provider,
             model: args.model,
