@@ -3,20 +3,25 @@ import {
   accessSync,
   constants,
   existsSync,
+  lstatSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { canonical, isWithin } from "../guard/workspace-probe.ts";
 import {
   type CapacityReading,
+  type ManagedInvocationWrite,
+  type ManagedInvocationWriteBroker,
   type InvocationRequest,
   type InvocationResult,
   type ProviderAdapter,
@@ -39,6 +44,11 @@ export interface CliAdapterOptions {
   environmentAllowlist?: readonly string[];
   /** Control-plane paths that a runtime process must not read or write. */
   denyReadPaths?: readonly string[];
+  /**
+   * CP-HI-01 composition for a writable runtime. Omitting this is safe: non-read-only
+   * invocations are refused rather than inheriting write access to their workdir.
+   */
+  managedWriteBroker?: ManagedInvocationWriteBroker;
   /**
    * A credential store this deployment provisioned for the provider. Its presence is what
    * makes closing the host keychain possible rather than self-defeating: on macOS the
@@ -259,7 +269,9 @@ const runCli = async (
   let workdir: string;
   try {
     workdir = realpathSync(options.cwd);
-    if (options.isolation) assertReviewerIsolation(workdir, options.isolation);
+    if (options.isolation) {
+      assertReviewerIsolation(workdir, options.isolation, options.reviewerCredentialPaths ?? []);
+    }
   } catch (err) {
     rmSync(scratch, { recursive: true, force: true });
     return {
@@ -289,19 +301,27 @@ const runCli = async (
         options.providerCredentialDir,
       );
 
-  // sandbox-exec is a wrapper around the provider process. A provider may return a
-  // non-zero status for an invalid answer while the seatbelt still held; prove the
-  // profile separately so isolation attestation cannot be confused with model success.
+  // sandbox-exec accepting a profile only says its syntax parsed. A reviewer may attest
+  // isolation only after live probes prove the requested transcript, no-tools and network
+  // boundaries. In particular, an allow-default profile paired with `/usr/bin/true` is not
+  // evidence that a denied path or egress rule actually bites.
   let isolationEnforced = false;
   if (isolated) {
-    const profileCheck = await profileAccepted(profile, workdir, environment, options.timeoutMs);
-    if (!profileCheck.accepted) {
+    const isolation = await proveReviewerIsolation(
+      profile,
+      workdir,
+      environment,
+      options.isolation!,
+      args,
+      options.timeoutMs,
+    );
+    if (!isolation.enforced) {
       rmSync(scratch, { recursive: true, force: true });
       return {
         stdout: "",
-        stderr: profileCheck.stderr || "reviewer isolation profile was not accepted",
-        exitCode: profileCheck.exitCode,
-        timedOut: profileCheck.timedOut,
+        stderr: isolation.reason,
+        exitCode: null,
+        timedOut: false,
         isolationEnforced: false,
       };
     }
@@ -371,25 +391,36 @@ const runCli = async (
   });
 };
 
-const profileAccepted = async (
+interface ProfileCommandResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+}
+
+/** Run a tiny, real child under precisely the profile the reviewer would receive. */
+const runProfileCommand = async (
   profile: string,
   cwd: string,
   environment: NodeJS.ProcessEnv,
+  file: string,
+  args: readonly string[],
   timeoutMs: number,
-): Promise<{ accepted: boolean; stderr: string; exitCode: number | null; timedOut: boolean }> =>
+): Promise<ProfileCommandResult> =>
   new Promise((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("/usr/bin/sandbox-exec", ["-p", profile, "/usr/bin/true"], {
+      child = spawn("/usr/bin/sandbox-exec", ["-p", profile, file, ...args], {
         cwd,
         env: environment,
         detached: true,
-        stdio: ["ignore", "ignore", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (err) {
-      resolve({ accepted: false, stderr: (err as Error).message, exitCode: null, timedOut: false });
+      resolve({ stdout: "", stderr: (err as Error).message, exitCode: null, timedOut: false });
       return;
     }
+    let stdout = "";
     let stderr = "";
     let timedOut = false;
     let settled = false;
@@ -397,7 +428,7 @@ const profileAccepted = async (
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ accepted: exitCode === 0 && !timedOut, stderr, exitCode, timedOut });
+      resolve({ stdout, stderr, exitCode, timedOut });
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -407,6 +438,7 @@ const profileAccepted = async (
         child.kill("SIGKILL");
       }
     }, Math.min(Math.max(timeoutMs, 1), 5_000));
+    child.stdout?.on("data", (b: Buffer) => (stdout += b.toString("utf8")));
     child.stderr?.on("data", (b: Buffer) => (stderr += b.toString("utf8")));
     child.on("error", (err) => {
       stderr += err.message;
@@ -415,15 +447,254 @@ const profileAccepted = async (
     child.on("close", (code) => finish(code));
   });
 
+const profileAccepted = async (
+  profile: string,
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<{ accepted: boolean; stderr: string; exitCode: number | null; timedOut: boolean }> => {
+  // Reviewer profiles deny arbitrary process execution. `process.execPath` is the one
+  // runtime executable they explicitly permit, so it is the meaningful syntax/liveness
+  // probe rather than `/usr/bin/true`, which the no-tools profile should refuse.
+  const result = await runProfileCommand(profile, cwd, environment, process.execPath, ["-e", "process.exit(0)"], timeoutMs);
+  return {
+    accepted: result.exitCode === 0 && !result.timedOut,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+  };
+};
+
+type IsolationProbe = { enforced: true } | { enforced: false; reason: string };
+
+const reviewerToolContractPresent = (args: readonly string[]): boolean => {
+  const mode = args.indexOf("--permission-mode");
+  const denied = args.indexOf("--disallowedTools");
+  if (mode === -1 || args[mode + 1] !== "plan" || denied === -1) return false;
+  const configured = new Set((args[denied + 1] ?? "").split(",").filter(Boolean));
+  return DENIED_TOOLS.every((tool) => configured.has(tool));
+};
+
+const reviewerTranscriptRoots = (): string[] => {
+  const homes = [...new Set([homedir(), process.env["HOME"]].filter((home): home is string => Boolean(home)))];
+  return homes.flatMap((home) => [`${home}/.claude`, `${home}/.codex`]);
+};
+
+const parseProbe = (text: string): Record<string, unknown> | null => safeParse(text.trim());
+
+const probeDeniedTranscriptPaths = async (
+  profile: string,
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+  packetRoot: string,
+  denyReadPaths: readonly string[],
+  timeoutMs: number,
+): Promise<IsolationProbe> => {
+  const paths = [...new Set([...denyReadPaths, ...reviewerTranscriptRoots()].map(resolvePath))]
+    .filter((path) => path && path !== packetRoot && !path.startsWith(`${packetRoot}/`));
+  const existing: Array<{ path: string; kind: "directory" | "file" }> = [];
+  for (const path of paths) {
+    try {
+      existing.push({ path, kind: lstatSync(path).isDirectory() ? "directory" : "file" });
+    } catch {
+      // An absent transcript cannot demonstrate a denial. At least one real requested path
+      // must be probeable below; otherwise the adapter refuses to attest.
+    }
+  }
+  if (existing.length === 0) {
+    return { enforced: false, reason: "reviewer isolation has no existing transcript path to probe" };
+  }
+
+  const source = [
+    "const fs = require('node:fs');",
+    "const [target, kind] = process.argv.slice(1);",
+    "try {",
+    "  if (kind === 'directory') fs.readdirSync(target); else fs.readFileSync(target);",
+    "  process.stdout.write(JSON.stringify({ denied: false }));",
+    "} catch (error) {",
+    "  process.stdout.write(JSON.stringify({ denied: error && (error.code === 'EPERM' || error.code === 'EACCES'), code: error && error.code }));",
+    "}",
+  ].join("\n");
+  for (const target of existing) {
+    const result = await runProfileCommand(
+      profile,
+      cwd,
+      environment,
+      process.execPath,
+      ["-e", source, target.path, target.kind],
+      timeoutMs,
+    );
+    const observation = parseProbe(result.stdout);
+    if (result.exitCode !== 0 || result.timedOut || observation?.["denied"] !== true) {
+      return {
+        enforced: false,
+        reason: `reviewer transcript denial probe did not bite for ${target.path}: ${
+          result.stderr || result.stdout || "no denial observed"
+        }`,
+      };
+    }
+  }
+  return { enforced: true };
+};
+
+const probeNoTools = async (
+  profile: string,
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+  packetRoot: string,
+  timeoutMs: number,
+): Promise<IsolationProbe> => {
+  // A model-facing denylist alone cannot stop a malicious Bash tool. The actual profile
+  // denies all process execution except the provider and Node runtimes, so prove a shell
+  // cannot start under this very profile.
+  const shell = await runProfileCommand(profile, cwd, environment, "/bin/sh", ["-c", "exit 0"], timeoutMs);
+  if (shell.exitCode === 0 || shell.timedOut) {
+    return { enforced: false, reason: "reviewer no-tools probe could execute a shell" };
+  }
+
+  const writeTarget = join(dirname(packetRoot), `.acp-review-write-probe-${randomUUID()}`);
+  const source = [
+    "const fs = require('node:fs');",
+    "try {",
+    "  fs.writeFileSync(process.argv[1], 'probe');",
+    "  process.stdout.write(JSON.stringify({ denied: false }));",
+    "} catch (error) {",
+    "  process.stdout.write(JSON.stringify({ denied: error && (error.code === 'EPERM' || error.code === 'EACCES'), code: error && error.code }));",
+    "}",
+  ].join("\n");
+  const write = await runProfileCommand(
+    profile,
+    cwd,
+    environment,
+    process.execPath,
+    ["-e", source, writeTarget],
+    timeoutMs,
+  );
+  const observation = parseProbe(write.stdout);
+  const escapedWrite = existsSync(writeTarget);
+  // If a boundary failure created the exact probe file, remove only that uniquely-created
+  // target before returning the denial. It is never a caller-provided path.
+  if (escapedWrite) rmSync(writeTarget, { force: true });
+  if (write.exitCode !== 0 || write.timedOut || observation?.["denied"] !== true || escapedWrite) {
+    return { enforced: false, reason: "reviewer no-tools probe could write outside the packet" };
+  }
+  return { enforced: true };
+};
+
+/**
+ * Seatbelt has no safe provider-host allowlist here: `(deny network*)` blocks the model
+ * call entirely, while allow-default permits arbitrary egress. Rather than turn either
+ * fact into an attestation, actively demonstrate that a non-provider loopback endpoint is
+ * reachable and fail closed. A future egress proxy may replace this probe with positive
+ * provider-route evidence; until then no reviewer process is launched under this contract.
+ */
+const probeProviderOnlyNetwork = async (
+  profile: string,
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<IsolationProbe> =>
+  new Promise((resolve) => {
+    const server = createServer((socket) => socket.end());
+    let finished = false;
+    const finish = (result: IsolationProbe): void => {
+      if (finished) return;
+      finished = true;
+      server.close(() => resolve(result));
+    };
+    server.once("error", (error) => finish({
+      enforced: false,
+      reason: `could not start provider-only network probe: ${error.message}`,
+    }));
+    server.listen(0, "127.0.0.1", async () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        finish({ enforced: false, reason: "provider-only network probe has no TCP address" });
+        return;
+      }
+      const source = [
+        "const net = require('node:net');",
+        "const socket = net.connect({ host: '127.0.0.1', port: Number(process.argv[1]) });",
+        "let done = false;",
+        "const finish = (value) => { if (done) return; done = true; process.stdout.write(JSON.stringify(value)); process.exit(0); };",
+        "socket.once('connect', () => finish({ connected: true }));",
+        "socket.once('error', (error) => finish({ connected: false, code: error && error.code }));",
+        "setTimeout(() => finish({ connected: false, timeout: true }), 1000);",
+      ].join("\n");
+      const result = await runProfileCommand(
+        profile,
+        cwd,
+        environment,
+        process.execPath,
+        ["-e", source, String(address.port)],
+        timeoutMs,
+      );
+      const observation = parseProbe(result.stdout);
+      if (observation?.["connected"] === true) {
+        finish({
+          enforced: false,
+          reason: "provider-only network probe reached a non-provider endpoint; refusing false isolation attestation",
+        });
+        return;
+      }
+      finish({
+        enforced: false,
+        reason: "provider-only network cannot be proven by the available seatbelt mechanism",
+      });
+    });
+  });
+
+const proveReviewerIsolation = async (
+  profile: string,
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+  isolation: NonNullable<InvocationRequest["isolation"]>,
+  args: readonly string[],
+  timeoutMs: number,
+): Promise<IsolationProbe> => {
+  if (!reviewerToolContractPresent(args)) {
+    return { enforced: false, reason: "reviewer no-tools CLI contract is incomplete" };
+  }
+  const profileCheck = await profileAccepted(profile, cwd, environment, timeoutMs);
+  if (!profileCheck.accepted) {
+    return {
+      enforced: false,
+      reason: profileCheck.stderr || "reviewer isolation profile was not accepted",
+    };
+  }
+  const transcripts = await probeDeniedTranscriptPaths(
+    profile,
+    cwd,
+    environment,
+    cwd,
+    isolation.denyReadPaths,
+    timeoutMs,
+  );
+  if (!transcripts.enforced) return transcripts;
+  const tools = await probeNoTools(profile, cwd, environment, cwd, timeoutMs);
+  if (!tools.enforced) return tools;
+  return probeProviderOnlyNetwork(profile, cwd, environment, timeoutMs);
+};
+
 const assertReviewerIsolation = (
   workdir: string,
   isolation: NonNullable<InvocationRequest["isolation"]>,
+  credentialPaths: readonly string[],
 ): void => {
   if (isolation.emptyEnvironment !== true || isolation.network !== "provider-only" || isolation.tools !== "none") {
     throw new Error("reviewer isolation contract is incomplete");
   }
   if (realpathSync(isolation.packetRoot) !== workdir) {
     throw new Error("reviewer packet root must be the invocation working directory");
+  }
+  // A provider credential scope inside a normal conversation store would make the profile
+  // choose between provider login and producer-history isolation. That is not a trade-off
+  // the adapter may silently make: require a dedicated scope or fail the review closed.
+  const transcriptRoots = reviewerTranscriptRoots().map(resolvePath);
+  for (const credentialPath of credentialPaths.map(resolvePath)) {
+    if (transcriptRoots.some((root) => credentialPath === root || credentialPath.startsWith(`${root}/`))) {
+      throw new Error("reviewer credential scope overlaps a host transcript store");
+    }
   }
 };
 
@@ -508,7 +779,8 @@ export const reviewerEnvironment = (packetRoot: string, configDirectory?: string
   // scoped credential store, it cannot log in and every review returns EVIDENCE_MISSING —
   // measured on a real run, not inferred. Where the deployment provisioned a scope, the
   // reviewer gets that and nothing else; where it did not, it authenticates the way any
-  // other session does, and `isolation.providerCredentials` records which of the two held.
+  // other session does. Login availability is not isolation evidence: the runtime still
+  // has to prove every requested reviewer boundary before it launches the review.
   HOME: configDirectory ? packetRoot : (process.env["HOME"] ?? packetRoot),
   ...(process.env["USER"] ? { USER: process.env["USER"] } : {}),
   TMPDIR: packetRoot,
@@ -525,6 +797,7 @@ export const reviewerEnvironment = (packetRoot: string, configDirectory?: string
 const claudeCredentialPaths = (configDirectory?: string): string[] => {
   if (!configDirectory) return [];
   return [
+    configDirectory,
     join(configDirectory, ".credentials.json"),
     join(configDirectory, ".claude.json"),
   ];
@@ -579,8 +852,11 @@ const runtimeProfile = (
   }
   lines.push(
     "(deny file-write*)",
-    `(allow file-write* (subpath ${quote(workdir)}))`,
     `(allow file-write* (subpath ${quote(scratch)}))`,
+    // `workdir` is intentionally absent. A provider gets a writable checkout only when
+    // its particular invocation has passed through the guard-backed broker, and then only
+    // for the exact target that broker authorised. A caller cannot regain blanket checkout
+    // access merely by choosing `readOnly: false`.
     ...writablePaths.map((path) => `(allow file-write* (subpath ${quote(path)}))`),
     "(allow file-write* (subpath \"/dev\"))",
     "(allow file-write-data (literal \"/dev/null\"))",
@@ -589,28 +865,14 @@ const runtimeProfile = (
 };
 
 /**
- * A reviewer cannot use the normal profile: it deliberately permits ordinary host reads
- * so CTO and worker CLIs can operate in their supplied worktree. This profile starts
- * from deny-default, grants only the packet directory plus OS runtime files, and denies
- * all network traffic. Paths supplied by the caller are included as explicit denials as
- * defense in depth; deny-default already keeps them inaccessible unless one is packetRoot.
- */
-/**
- * The reviewer's confinement.
+ * The reviewer's confinement. Seatbelt must retain allow-default reads for dyld and Node,
+ * so transcript and credential roots are explicit denies and are actively probed before an
+ * attestation. The profile also permits only the provider executable and Node runtime to
+ * exec; a shell probe confirms that a model cannot turn `Bash` into host process access.
  *
- * Deny-by-default was tried and does not work: the loader needs paths that cannot be
- * enumerated in advance, so even `/usr/bin/true` fails to start and every review returns
- * "profile was not accepted" — the same lesson the verification sandbox already recorded
- * (issue #247 item 1). So this is allow-by-default with a named deny list, and the
- * attestation says exactly that rather than claiming reads are packet-only:
- *
- *   - the daemon's own state, whatever the caller names in `denyReadPaths`
- *   - the host credential locations: keychains, ssh, aws, gnupg, gh config, git identity
- *   - every write outside the packet root
- *   - all network
- *
- * What that buys is the thing CP-HI-04 needs: a reviewer cannot read the daemon's database,
- * another checkout, or a credential, and cannot write anywhere its verdict could leak into.
+ * There is intentionally no broad `(deny network*)`: it blocks the provider call itself.
+ * `proveReviewerIsolation` tests the resulting profile against a live non-provider endpoint
+ * and fails closed rather than claiming the requested provider-only policy held.
  */
 const reviewerProfile = (
   packetRoot: string,
@@ -618,22 +880,28 @@ const reviewerProfile = (
   executable: string,
   credentialPaths: readonly string[],
 ): string => {
-  void executable;
-  void credentialPaths;
-  // Network is *not* denied, and the contract says so rather than claiming otherwise: a
-  // blind reviewer is a model invocation, so cutting its egress does not confine it, it
-  // makes it impossible — measured, the CLI simply hangs until the invocation times out.
-  // The confinement that matters for CP-HI-04 is the filesystem: the reviewer cannot read
-  // the daemon's state, another checkout or a credential, and cannot write outside its
-  // packet, so it cannot reach the candidate it is judging or leave anything behind.
   const lines = ["(version 1)", "(allow default)"];
-  for (const path of [...hostCredentialPaths(credentialPaths[0]), ...denyReadPaths]) {
+  const sensitive = [
+    ...hostCredentialPaths(credentialPaths[0]),
+    ...reviewerTranscriptRoots(),
+    ...denyReadPaths,
+  ];
+  for (const path of [...new Set(sensitive)]) {
     const resolved = resolvePath(path);
     if (resolved && resolved !== packetRoot && !resolved.startsWith(`${packetRoot}/`)) {
       lines.push(`(deny file-read* (subpath ${quote(resolved)}))`);
     }
   }
+  // `sandbox-exec` evaluates this profile for the initial exec too. The resolved provider
+  // binary and Node are the only executables it may start; all arbitrary tools are denied.
+  lines.push("(deny process-exec*)");
+  for (const allowed of [...new Set([resolvePath(executable), resolvePath(process.execPath)])]) {
+    if (allowed) lines.push(`(allow process-exec (literal ${quote(allowed)}))`);
+  }
   lines.push(
+    // The provider may need packet-local transient state, but it cannot write a checkout,
+    // daemon state, transcript or any sibling path. The active no-tools probe tests that
+    // this deny/allow boundary really rejects a write outside the packet.
     "(deny file-write*)",
     `(allow file-write* (subpath ${quote(packetRoot)}))`,
     '(allow file-write* (subpath "/dev"))',
@@ -651,6 +919,65 @@ const resolvePath = (path: string): string => {
 };
 
 const quote = (value: string): string => `"${value.replace(/(["\\])/g, "\\$1")}"`;
+
+type ManagedWriteScope =
+  | { allowed: true; targetPath: string; write: ManagedInvocationWrite }
+  | { allowed: false; reason: string };
+
+/**
+ * A workdir is an input location, never a blanket write grant. Keep this check beside the
+ * sandbox profile so a malformed or cross-checkout authorisation cannot widen the profile
+ * before the guard sees it.
+ */
+const managedWriteScope = (request: InvocationRequest): ManagedWriteScope => {
+  if (request.readOnly || request.isolation) {
+    return { allowed: false, reason: "a read-only or isolated invocation may not request a managed write" };
+  }
+  if (!request.managedWrite) {
+    return {
+      allowed: false,
+      reason: "WRITE_REQUIRES_MANAGED_RUN: writable runtime invocation lacks per-effect authorisation",
+    };
+  }
+  try {
+    const workdir = canonical(request.workdir);
+    const targetPath = canonical(request.managedWrite.targetPath);
+    if (!isWithin(workdir, targetPath)) {
+      return {
+        allowed: false,
+        reason: "WRITE_TARGET_OUTSIDE_RUN_SCOPE: authorised write target is outside invocation workdir",
+      };
+    }
+    return { allowed: true, targetPath, write: { ...request.managedWrite, targetPath } };
+  } catch (error) {
+    return {
+      allowed: false,
+      reason: `WRITE_REQUIRES_MANAGED_RUN: could not resolve managed write target: ${
+        error instanceof Error ? error.message : "unknown error"
+      }`,
+    };
+  }
+};
+
+const refusedInvocation = (
+  request: InvocationRequest,
+  provider: string,
+  model: string,
+  started: number,
+  error: string,
+): InvocationResult => ({
+  ok: false,
+  text: "",
+  json: null,
+  provider,
+  model,
+  durationMs: Date.now() - started,
+  exitCode: null,
+  error,
+  providerSessionId: null,
+  isolationAttested: false,
+  ...(request.isolation ? { isolationReasonCode: ReasonCode.ISOLATION_LOST } : {}),
+});
 
 /**
  * Claude Code headless adapter. Used for CTO sessions and, under continuity fallback,
@@ -675,6 +1002,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   readonly #environmentAllowlist: readonly string[];
   readonly #denyReadPaths: readonly string[];
   readonly #providerCredentialDir: string | undefined;
+  readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
 
   constructor(options: CliAdapterOptions) {
     this.#binary = resolveExecutable(options.binary ?? "claude");
@@ -685,6 +1013,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     this.#environmentAllowlist = options.environmentAllowlist ?? [];
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
     this.#providerCredentialDir = options.providerCredentialDir;
+    this.#managedWriteBroker = options.managedWriteBroker;
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
@@ -738,19 +1067,50 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     // The prompt goes over stdin rather than as a positional argument: several of the
     // CLI's options are variadic, and a trailing positional is liable to be swallowed by
     // whichever flag precedes it.
-    const result = await runCli(this.#binary, args, {
+    const execute = (writablePaths: readonly string[]) => runCli(this.#binary, args, {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
       stdin: request.prompt,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
       providerCredentialDir: this.#providerCredentialDir,
+      writablePaths,
       isolation: request.isolation,
       reviewerCredentialPaths: request.isolation ? claudeCredentialPaths(process.env["CLAUDE_CONFIG_DIR"]) : undefined,
       reviewerConfigDirectory: request.isolation
         ? process.env["CLAUDE_CONFIG_DIR"]
         : undefined,
     });
+
+    let result: Awaited<ReturnType<typeof runCli>>;
+    if (request.readOnly || request.isolation) {
+      result = await execute([]);
+    } else {
+      const scope = managedWriteScope(request);
+      if (!scope.allowed) {
+        return refusedInvocation(request, this.provider, request.model ?? this.defaultModels.cto, started, scope.reason);
+      }
+      if (!this.#managedWriteBroker) {
+        return refusedInvocation(
+          request,
+          this.provider,
+          request.model ?? this.defaultModels.cto,
+          started,
+          "WRITE_REQUIRES_MANAGED_RUN: this runtime has no guard-backed local-write broker",
+        );
+      }
+      const authorised = await this.#managedWriteBroker.authorize(scope.write, () => execute([scope.targetPath]));
+      if (!authorised.allowed) {
+        return refusedInvocation(
+          request,
+          this.provider,
+          request.model ?? this.defaultModels.cto,
+          started,
+          `${authorised.reasonCode}: ${authorised.message}`,
+        );
+      }
+      result = authorised.value;
+    }
 
     const envelope = safeParse(result.stdout);
     const text =
@@ -847,6 +1207,7 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly #environmentAllowlist: readonly string[];
   readonly #denyReadPaths: readonly string[];
   readonly #providerCredentialDir: string | undefined;
+  readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
 
   constructor(options: CliAdapterOptions) {
     this.#binary = resolveExecutable(options.binary ?? "codex");
@@ -857,6 +1218,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#environmentAllowlist = options.environmentAllowlist ?? [];
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
     this.#providerCredentialDir = options.providerCredentialDir;
+    this.#managedWriteBroker = options.managedWriteBroker;
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
@@ -911,14 +1273,46 @@ export class CodexCliAdapter implements ProviderAdapter {
       ? `${request.systemPrompt}\n\n---\n\n${request.prompt}`
       : request.prompt;
 
-    const result = await runCli(this.#binary, [...args, prompt], {
+    const execute = (writablePaths: readonly string[]) => runCli(this.#binary, [...args, prompt], {
       cwd: request.workdir,
       timeoutMs: request.timeoutMs,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
       providerCredentialDir: this.#providerCredentialDir,
-      writablePaths: [scratch],
+      writablePaths,
     });
+    let result: Awaited<ReturnType<typeof runCli>>;
+    if (request.readOnly) {
+      result = await execute([]);
+    } else {
+      const scope = managedWriteScope(request);
+      if (!scope.allowed) {
+        rmSync(scratch, { recursive: true, force: true });
+        return refusedInvocation(request, this.provider, model, started, scope.reason);
+      }
+      if (!this.#managedWriteBroker) {
+        rmSync(scratch, { recursive: true, force: true });
+        return refusedInvocation(
+          request,
+          this.provider,
+          model,
+          started,
+          "WRITE_REQUIRES_MANAGED_RUN: this runtime has no guard-backed local-write broker",
+        );
+      }
+      const authorised = await this.#managedWriteBroker.authorize(scope.write, () => execute([scope.targetPath]));
+      if (!authorised.allowed) {
+        rmSync(scratch, { recursive: true, force: true });
+        return refusedInvocation(
+          request,
+          this.provider,
+          model,
+          started,
+          `${authorised.reasonCode}: ${authorised.message}`,
+        );
+      }
+      result = authorised.value;
+    }
 
     const text = existsSync(lastMessage) ? readFileSync(lastMessage, "utf8") : result.stdout;
     rmSync(scratch, { recursive: true, force: true });
@@ -972,3 +1366,10 @@ const safeParse = (text: string): Record<string, unknown> | null => {
     return null;
   }
 };
+
+/** Real seatbelt probes exposed only for regression tests; production uses `runCli`. */
+export const __testing = Object.freeze({
+  reviewerProfile,
+  probeNoTools,
+  probeDeniedTranscriptPaths,
+});

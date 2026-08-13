@@ -528,7 +528,7 @@ describe("round-2 blind-review regressions", () => {
     expect(probes).toBe(0);
   });
 
-  it("#332 proves the real reviewer child cannot read the withheld producer checkout", async () => {
+  it("#360 refuses a reviewer rather than attest an unbounded provider network", async () => {
     const setup = await prepareReviewedInputs();
     const claude = new ClaudeCliAdapter({
       clock: setup.harness.clock,
@@ -575,27 +575,18 @@ describe("round-2 blind-review regressions", () => {
 
     const result = await invokeGate(gate, setup);
 
-    if (!canApplySeatbelt) {
-      // A real adapter must expose an unapplied profile as an isolation loss, never as a PASS.
-      expect(direct).toMatchObject({
-        ok: false,
-        isolationAttested: false,
-        isolationReasonCode: ReasonCode.ISOLATION_LOST,
-      });
-      expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.ISOLATION_LOST });
-      return;
-    }
-
+    // The active probe must fail closed whether seatbelt is unavailable or, as on macOS,
+    // its allow-default profile can reach a non-provider endpoint. If the adapter merely
+    // flips an attestation boolean again, both assertions turn into false passes.
     expect(direct).toMatchObject({
-      ok: true,
-      isolationAttested: true,
-      isolationReasonCode: undefined,
+      ok: false,
+      isolationAttested: false,
+      isolationReasonCode: ReasonCode.ISOLATION_LOST,
     });
-    expect(result).toMatchObject({
-      allowed: true,
-      reasonCode: ReasonCode.REVIEW_PASS,
-      value: { provider: "claude" },
-    });
+    if (canApplySeatbelt) {
+      expect(direct.error).toContain("provider-only network probe reached a non-provider endpoint");
+    }
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.ISOLATION_LOST });
   });
 
   it("#334 uses a packet-local reviewer home and reports answer failure separately", async () => {
