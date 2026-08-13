@@ -181,6 +181,33 @@ describe("capacity sensor honesty (§14.2)", () => {
     expect(capacity.sensorHealth).toBe("ERROR");
     expect(capacity.allocationAdmission).toBe("SUSPENDED");
   });
+
+  it("replaces a prior healthy reading with SUSPENDED when the live collector throws", async () => {
+    const { cp, clock, gpt } = makePlane();
+    gpt.setCapacity(reading("gpt", clock, [
+      { id: "rolling-5h", remainingPercent: 90, resetAt: null, capabilities: FULL },
+    ]));
+    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+    expect(cp.capacity.current("gpt")?.allocationAdmission).toBe("OPEN");
+
+    gpt.probeCapacity = async () => { throw new Error("interactive /usage PTY crashed"); };
+    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+
+    const failed = cp.capacity.current("gpt")!;
+    expect(failed).toMatchObject({
+      sensorHealth: "ERROR",
+      allocationAdmission: "SUSPENDED",
+      runtimeHealth: "UNKNOWN",
+    });
+    const admission = await cp.capacity.refreshForBlindReview({
+      provider: "gpt",
+      capabilities: ["blind-review"],
+      priority: "critical",
+    });
+    expect(admission).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
+    // If the exception catch/persist step is removed, refresh throws or retains OPEN;
+    // either outcome breaks this test instead of routing on the old quota.
+  });
 });
 
 describe("completion requires a current continuity mode (§15.6)", () => {

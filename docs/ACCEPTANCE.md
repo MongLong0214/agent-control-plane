@@ -133,11 +133,11 @@ verified against a modelled GitHub API, including that a same-named check from a
 creator is refused (CP-S35). The other API paths the kernel uses were checked against the
 live repository and return the expected shapes.
 
-**No provider exposes a quota interface.** `claude` has no `usage` subcommand and `codex`
-has no usage command, so capacity comes from a structured local file and fails closed when
-it is absent or stale. The daemon now owns that file and the doctor asserts its freshness,
-but the quota numbers themselves still come from whoever writes them (#244). See
-`docs/capacity-source.md`.
+**Provider capacity is collected from interactive `/usage`.** Claude, Codex, and Grok each
+have a PTY collector that sends the slash command and accepts only explicit
+remaining-quota/reset statements. A trust prompt, activity-only screen, timeout, or parse
+failure is persisted as an error and suspends new allocation; the daemon's JSON mirror is
+diagnostic output, not an owner-maintained capacity input. See `docs/capacity-source.md`.
 
 **Buzz delivery is unverified live.** `BUZZ_PRIVATE_KEY` is not configured here, so the CLI
 transport has not been exercised against the relay; delivery is covered through the
@@ -146,9 +146,10 @@ doctor for precisely this reason.
 
 **A verification worktree has no installed dependencies.** A disposable worktree contains
 only committed files and, under `network: "deny"`, cannot fetch anything. A project needs a
-dependency-free command, an install command declared with a network allowlist, or
-`TRUSTED_CI` evidence. This repository uses the first for local verification
-(`scripts/verify-reason-codes.mjs`) and the third for its typecheck.
+dependency-free command or `TRUSTED_CI` evidence. `network: "allowlist"` is deliberately
+rejected until a proxy/firewall backend can enforce destination policy; a manifest must not
+advertise an allowlist that seatbelt cannot apply. This repository uses the first for local
+verification (`scripts/verify-reason-codes.mjs`) and the third for its typecheck.
 
 ## Operating requirements the hardening pass introduced
 

@@ -17,6 +17,12 @@ import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import {
+  ClaudeUsageCollector,
+  CodexUsageCollector,
+  GrokUsageCollector,
+  type UsageCollector,
+} from "../capacity/usage-collectors.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 import {
   type CapacityReading,
@@ -25,6 +31,7 @@ import {
   type InvocationRequest,
   type InvocationResult,
   type ProviderAdapter,
+  ProviderSessionProvisionError,
   type SessionHandle,
   type SessionSpec,
   extractJson,
@@ -33,8 +40,8 @@ import {
 export interface CliAdapterOptions {
   clock: Clock;
   /**
-   * Structured local capacity interface (PRD §14.2, first-choice source). A JSON file
-   * the owner or a future provider CLI maintains; see docs/capacity-source.md.
+   * Daemon-owned capacity mirror path. Kept for doctor compatibility and deny-path
+   * confinement; shipped adapters never treat a human-edited file as a capacity source.
    */
   capacityFile: string;
   /** How long a reading stays usable before new allocation is suspended (§14.3). */
@@ -57,6 +64,8 @@ export interface CliAdapterOptions {
    * "Not logged in", and dispatch then fails SESSION_NOT_READY).
    */
   providerCredentialDir?: string;
+  /** Dependency-injection seam for a real /usage collector; production supplies one below. */
+  usageCollector?: UsageCollector;
   /** Observations beyond this lead are not valid freshness evidence. */
   maxClockSkewMs?: number;
 }
@@ -119,12 +128,9 @@ const agentPath = (): string => {
 };
 
 /**
- * Reads the structured local capacity file.
- *
- * Neither shipped CLI exposes a quota interface today, so this file *is* the sensor.
- * When it is absent, unreadable or past its freshness window the reading is ERROR or
- * STALE — never a guess. §14.3 is explicit that routing has no UNKNOWN quota, so a
- * failed sensor suspends new allocation rather than inventing a number.
+ * Legacy mirror parser retained for migration/doctor fixtures. Production CLI adapters
+ * collect interactive provider usage instead; this function must not become a fallback
+ * after a failed live collection.
  */
 export const readCapacityFile = (
   provider: string,
@@ -230,7 +236,7 @@ const sanctionedSettingsFile = (scratch: string): string => {
   return file;
 };
 
-const runCli = async (
+const productionRunCli = async (
   file: string,
   args: readonly string[],
   options: {
@@ -247,6 +253,10 @@ const runCli = async (
     reviewerCredentialPaths?: readonly string[];
     /** Provider config root used while HOME points at the packet directory. */
     reviewerConfigDirectory?: string;
+    /** A provider-specific reviewer environment, constructed rather than inherited. */
+    reviewerEnvironment?: NodeJS.ProcessEnv;
+    /** Extra provider runtime executables required by a reviewed invocation. */
+    reviewerExecutablePaths?: readonly string[];
   },
 ): Promise<{
   stdout: string;
@@ -284,7 +294,7 @@ const runCli = async (
   }
   const isolated = options.isolation !== undefined;
   const environment = isolated
-    ? reviewerEnvironment(workdir, options.reviewerConfigDirectory)
+    ? (options.reviewerEnvironment ?? reviewerEnvironment(workdir, options.reviewerConfigDirectory))
     : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch), options.providerCredentialDir);
   const profile = isolated
     ? reviewerProfile(
@@ -292,6 +302,7 @@ const runCli = async (
         options.isolation!.denyReadPaths,
         file,
         options.reviewerCredentialPaths ?? [],
+        options.reviewerExecutablePaths ?? [],
       )
     : runtimeProfile(
         workdir,
@@ -391,6 +402,11 @@ const runCli = async (
   });
 };
 
+// The production path always uses productionRunCli. This narrow test-only seam lets the
+// provider-session contract be regression-tested without weakening or faking the live
+// reviewer isolation probes themselves.
+let runCli: typeof productionRunCli = productionRunCli;
+
 interface ProfileCommandResult {
   stdout: string;
   stderr: string;
@@ -470,9 +486,25 @@ type IsolationProbe = { enforced: true } | { enforced: false; reason: string };
 const reviewerToolContractPresent = (args: readonly string[]): boolean => {
   const mode = args.indexOf("--permission-mode");
   const denied = args.indexOf("--disallowedTools");
-  if (mode === -1 || args[mode + 1] !== "plan" || denied === -1) return false;
-  const configured = new Set((args[denied + 1] ?? "").split(",").filter(Boolean));
-  return DENIED_TOOLS.every((tool) => configured.has(tool));
+  if (mode !== -1 && args[mode + 1] === "plan" && denied !== -1) {
+    const configured = new Set((args[denied + 1] ?? "").split(",").filter(Boolean));
+    return DENIED_TOOLS.every((tool) => configured.has(tool));
+  }
+  // Codex has no equivalent model-facing --tools=none switch for `exec`. Its reviewer
+  // path therefore combines a provider-recognised read-only sandbox with an exact
+  // host-profile no-shell/no-write proof, and refuses if any of those command controls
+  // disappear. The profile probe below is the enforcement; these flags are the required
+  // provider-side half of that contract.
+  const isCodexExec = args[0] === "exec";
+  const readOnly = args.some((arg) => arg === 'sandbox_mode="read-only"') ||
+    args.some((arg, index) => arg === "-s" && args[index + 1] === "read-only");
+  return isCodexExec &&
+    args.includes("--json") &&
+    args.includes("--strict-config") &&
+    args.includes("--ignore-user-config") &&
+    args.includes("--ignore-rules") &&
+    args.includes("--skip-git-repo-check") &&
+    readOnly;
 };
 
 const reviewerTranscriptRoots = (): string[] => {
@@ -803,6 +835,27 @@ const claudeCredentialPaths = (configDirectory?: string): string[] => {
   ];
 };
 
+/**
+ * Codex keeps its authenticated session state under CODEX_HOME. A packet reviewer is
+ * allowed to use it only when the deployment supplied a dedicated reviewer-only root;
+ * pointing it at ~/.codex would make prior producer transcripts readable by the provider
+ * CLI before the model even receives its packet.
+ */
+const codexCredentialPaths = (configDirectory?: string): string[] =>
+  configDirectory ? [configDirectory] : [];
+
+const codexReviewerEnvironment = (packetRoot: string, configDirectory: string): NodeJS.ProcessEnv => ({
+  PATH: agentPath(),
+  HOME: packetRoot,
+  CODEX_HOME: configDirectory,
+  ...(process.env["USER"] ? { USER: process.env["USER"] } : {}),
+  TMPDIR: packetRoot,
+  LANG: "C.UTF-8",
+  LC_ALL: "C",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_TERMINAL_PROMPT: "0",
+});
+
 /** Credential stores that are daemon authority, not provider identity. */
 const hostCredentialPaths = (providerCredentialDir?: string): string[] => {
   const home = process.env["HOME"] ?? "";
@@ -879,6 +932,7 @@ const reviewerProfile = (
   denyReadPaths: readonly string[],
   executable: string,
   credentialPaths: readonly string[],
+  additionalExecutables: readonly string[] = [],
 ): string => {
   const lines = ["(version 1)", "(allow default)"];
   const sensitive = [
@@ -895,7 +949,15 @@ const reviewerProfile = (
   // `sandbox-exec` evaluates this profile for the initial exec too. The resolved provider
   // binary and Node are the only executables it may start; all arbitrary tools are denied.
   lines.push("(deny process-exec*)");
-  for (const allowed of [...new Set([resolvePath(executable), resolvePath(process.execPath)])]) {
+  // Some packaged provider CLIs are a small Node launcher followed by a provider-owned
+  // native executable. Both are enumerated by the adapter; a broad executable directory
+  // or shell allowance would turn a no-tools reviewer into an ordinary local agent.
+  for (const allowed of [...new Set([
+    resolvePath(executable),
+    ...additionalExecutables.map(resolvePath),
+    resolvePath(process.execPath),
+    "/usr/bin/env",
+  ])]) {
     if (allowed) lines.push(`(allow process-exec (literal ${quote(allowed)}))`);
   }
   lines.push(
@@ -1003,6 +1065,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   readonly #denyReadPaths: readonly string[];
   readonly #providerCredentialDir: string | undefined;
   readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
+  readonly #usageCollector: UsageCollector;
 
   constructor(options: CliAdapterOptions) {
     this.#binary = resolveExecutable(options.binary ?? "claude");
@@ -1014,6 +1077,11 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
     this.#providerCredentialDir = options.providerCredentialDir;
     this.#managedWriteBroker = options.managedWriteBroker;
+    this.#usageCollector = options.usageCollector ?? new ClaudeUsageCollector({
+      clock: this.#clock,
+      binary: this.#binary,
+      providerCredentialDir: this.#providerCredentialDir,
+    });
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
@@ -1076,9 +1144,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       providerCredentialDir: this.#providerCredentialDir,
       writablePaths,
       isolation: request.isolation,
-      reviewerCredentialPaths: request.isolation ? claudeCredentialPaths(process.env["CLAUDE_CONFIG_DIR"]) : undefined,
+      reviewerCredentialPaths: request.isolation ? claudeCredentialPaths(this.#providerCredentialDir) : undefined,
       reviewerConfigDirectory: request.isolation
-        ? process.env["CLAUDE_CONFIG_DIR"]
+        ? this.#providerCredentialDir
         : undefined,
     });
 
@@ -1163,7 +1231,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
 
   async probeCapacity(): Promise<CapacityReading> {
     return resolveRuntimeHealth(
-      readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs, this.#maxClockSkewMs),
+      await this.#usageCollector.collect(),
       () => this.probeRuntime(),
     );
   }
@@ -1184,6 +1252,82 @@ const resolveRuntimeHealth = async (
   return reading;
 };
 
+const codexThreadId = (output: string): string | null => {
+  for (const line of output.split("\n")) {
+    const event = safeParse(line);
+    if (event?.["type"] === "thread.started" && typeof event["thread_id"] === "string") {
+      return event["thread_id"];
+    }
+  }
+  return null;
+};
+
+const codexLastAgentMessage = (output: string): string | null => {
+  let text: string | null = null;
+  for (const line of output.split("\n")) {
+    const event = safeParse(line);
+    const item = event?.["item"];
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (record["type"] === "agent_message" && typeof record["text"] === "string") text = record["text"];
+  }
+  return text;
+};
+
+const codexPlatformTriple = (): string | null => {
+  if (process.platform === "darwin") return process.arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin";
+  if (process.platform === "linux") return process.arch === "arm64" ? "aarch64-unknown-linux-musl" : "x86_64-unknown-linux-musl";
+  if (process.platform === "win32") return process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+  return null;
+};
+
+/** Resolve the provider-owned native executable behind the npm launcher, when present. */
+const codexReviewerExecutables = (binary: string): string[] => {
+  const resolved = resolvePath(binary);
+  const triple = codexPlatformTriple();
+  if (!triple) return [resolved];
+  const packageRoot = dirname(dirname(resolved));
+  const target = join(
+    packageRoot,
+    "node_modules",
+    "@openai",
+    `codex-${process.platform === "darwin" ? "darwin" : process.platform}-${process.arch}`,
+    "vendor",
+    triple,
+    "bin",
+    process.platform === "win32" ? "codex.exe" : "codex",
+  );
+  return existsSync(target) ? [resolved, resolvePath(target)] : [resolved];
+};
+
+const codexReviewerArgs = (
+  action: "bootstrap" | "resume",
+  model: string,
+  effort: string | null | undefined,
+  sessionId?: string,
+): string[] => {
+  const args = action === "bootstrap"
+    ? ["exec"]
+    : ["exec", "resume"];
+  args.push(
+    "--json",
+    "--strict-config",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--skip-git-repo-check",
+    "-m",
+    model,
+    // Resume does not expose --sandbox, so retain the same provider-recognised setting
+    // on both turns. --strict-config turns a renamed/unsupported setting into refusal.
+    "-c",
+    'sandbox_mode="read-only"',
+  );
+  if (effort) args.push("-c", `model_reasoning_effort="${effort}"`);
+  if (action === "bootstrap") args.push("-s", "read-only", "-");
+  else if (sessionId) args.push(sessionId, "-");
+  return args;
+};
+
 /**
  * Codex CLI adapter. Preferred runtime for the blind reviewer (GPT-5.6 Sol at xhigh
  * effort, §18.1) and for mechanical worker tasks.
@@ -1191,7 +1335,9 @@ const resolveRuntimeHealth = async (
 export class CodexCliAdapter implements ProviderAdapter {
   readonly provider = "gpt";
   readonly isProduction = true;
-  readonly supportsReviewerIsolation = false;
+  readonly supportsReviewerIsolation = true;
+  readonly requiresReviewerProviderSessionProof = true;
+  readonly supportsReviewerEffortAttestation = true;
   readonly defaultModels = {
     reviewer: "gpt-5.6-sol",
     ceo: "gpt-5.6-sol",
@@ -1208,6 +1354,8 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly #denyReadPaths: readonly string[];
   readonly #providerCredentialDir: string | undefined;
   readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
+  readonly #reviewerSessions = new Map<string, { workdir: string; model: string; effort: string | null }>();
+  readonly #usageCollector: UsageCollector;
 
   constructor(options: CliAdapterOptions) {
     this.#binary = resolveExecutable(options.binary ?? "codex");
@@ -1219,9 +1367,15 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
     this.#providerCredentialDir = options.providerCredentialDir;
     this.#managedWriteBroker = options.managedWriteBroker;
+    this.#usageCollector = options.usageCollector ?? new CodexUsageCollector({
+      clock: this.#clock,
+      binary: this.#binary,
+      providerCredentialDir: this.#providerCredentialDir,
+    });
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
+    if (spec.isolation) return this.startPacketReviewerSession(spec);
     return {
       externalSessionId: randomUUID(),
       provider: this.provider,
@@ -1232,29 +1386,17 @@ export class CodexCliAdapter implements ProviderAdapter {
     };
   }
 
-  async stopSession(): Promise<void> {
-    /* codex exec is one-shot */
+  async stopSession(handle: SessionHandle): Promise<void> {
+    // The dedicated credential root is deployment-owned and may contain the provider's
+    // auth state. Only forget the one freshly constituted reviewer id; the review gate
+    // removes its packet root in its own finally block.
+    this.#reviewerSessions.delete(handle.externalSessionId);
   }
 
   async invoke(request: InvocationRequest): Promise<InvocationResult> {
     const started = Date.now();
     if (request.isolation) {
-      // Codex's current CLI exposes a read-only sandbox, but no host-enforced
-      // no-tools mode. Running it and claiming packet-only isolation would be worse
-      // than an unavailable reviewer, so the review gate must select another adapter.
-      return {
-        ok: false,
-        text: "",
-        json: null,
-        provider: this.provider,
-        model: request.model ?? this.defaultModels.reviewer,
-        durationMs: Date.now() - started,
-        exitCode: null,
-        error: "Codex CLI cannot enforce reviewer tools:none isolation",
-        providerSessionId: null,
-        isolationAttested: false,
-        isolationReasonCode: ReasonCode.ISOLATION_LOST,
-      };
+      return this.invokePacketReviewer(request, started);
     }
     const scratch = mkdtempSync(join(tmpdir(), "acp-codex-"));
     const lastMessage = join(scratch, "last-message.txt");
@@ -1352,9 +1494,195 @@ export class CodexCliAdapter implements ProviderAdapter {
 
   async probeCapacity(): Promise<CapacityReading> {
     return resolveRuntimeHealth(
-      readCapacityFile(this.provider, this.#capacityFile, this.#clock, this.#freshnessMs, this.#maxClockSkewMs),
+      await this.#usageCollector.collect(),
       () => this.probeRuntime(),
     );
+  }
+
+  /**
+   * A reviewer is not bound to a local UUID. The first turn runs in the exact packet
+   * profile, asks no task question, and extracts Codex's provider-issued `thread_id`.
+   * The answer turn then uses `exec resume <thread_id>` under the same profile.
+   */
+  private async startPacketReviewerSession(spec: SessionSpec): Promise<SessionHandle> {
+    if (!this.#providerCredentialDir) {
+      throw new ProviderSessionProvisionError(
+        ReasonCode.ISOLATION_LOST,
+        "Codex packet reviewer requires a dedicated CODEX_HOME credential scope",
+      );
+    }
+    const credentialPaths = codexCredentialPaths(this.#providerCredentialDir);
+    const args = codexReviewerArgs("bootstrap", spec.model, spec.effort);
+    const result = await runCli(this.#binary, args, {
+      cwd: spec.workdir,
+      timeoutMs: 60_000,
+      stdin: "This is a packet-only reviewer session identity handshake. Reply exactly READY and do not use tools.",
+      isolation: spec.isolation,
+      reviewerCredentialPaths: credentialPaths,
+      reviewerEnvironment: codexReviewerEnvironment(spec.workdir, this.#providerCredentialDir),
+      reviewerExecutablePaths: codexReviewerExecutables(this.#binary),
+    });
+    if (!result.isolationEnforced) {
+      throw new ProviderSessionProvisionError(
+        ReasonCode.ISOLATION_LOST,
+        result.stderr || "Codex reviewer isolation proof did not complete",
+      );
+    }
+    if (result.exitCode !== 0 || result.timedOut) {
+      throw new ProviderSessionProvisionError(
+        ReasonCode.ISOLATION_LOST,
+        result.timedOut ? "Codex reviewer session identity handshake timed out" : result.stderr || "Codex reviewer session identity handshake failed",
+      );
+    }
+    const providerSessionId = codexThreadId(result.stdout);
+    if (!providerSessionId) {
+      throw new ProviderSessionProvisionError(
+        ReasonCode.ISOLATION_LOST,
+        "Codex did not report a provider thread id for the packet reviewer session",
+      );
+    }
+    this.#reviewerSessions.set(providerSessionId, {
+      workdir: spec.workdir,
+      model: spec.model,
+      effort: spec.effort ?? null,
+    });
+    return {
+      externalSessionId: providerSessionId,
+      provider: this.provider,
+      model: spec.model,
+      effort: spec.effort ?? null,
+      providerSessionProven: true,
+      pid: null,
+      workdir: spec.workdir,
+    };
+  }
+
+  private async invokePacketReviewer(request: InvocationRequest, started: number): Promise<InvocationResult> {
+    const model = request.model ?? this.defaultModels.reviewer;
+    const expectedSessionId = request.externalSessionId;
+    const constituted = expectedSessionId ? this.#reviewerSessions.get(expectedSessionId) : undefined;
+    if (
+      !expectedSessionId ||
+      !constituted ||
+      constituted.workdir !== request.workdir ||
+      constituted.model !== model ||
+      constituted.effort !== (request.effort ?? null) ||
+      !this.#providerCredentialDir
+    ) {
+      return refusedInvocation(
+        request,
+        this.provider,
+        model,
+        started,
+        "Codex reviewer invocation is not bound to a freshly proved provider session",
+      );
+    }
+
+    const args = codexReviewerArgs("resume", model, request.effort, expectedSessionId);
+    const result = await runCli(this.#binary, args, {
+      cwd: request.workdir,
+      timeoutMs: request.timeoutMs,
+      stdin: request.systemPrompt ? `${request.systemPrompt}\n\n---\n\n${request.prompt}` : request.prompt,
+      isolation: request.isolation,
+      reviewerCredentialPaths: codexCredentialPaths(this.#providerCredentialDir),
+      reviewerEnvironment: codexReviewerEnvironment(request.workdir, this.#providerCredentialDir),
+      reviewerExecutablePaths: codexReviewerExecutables(this.#binary),
+    });
+    const observedSessionId = codexThreadId(result.stdout);
+    const sessionMatches = !observedSessionId || observedSessionId === expectedSessionId;
+    const text = codexLastAgentMessage(result.stdout) ?? result.stdout;
+    const enforced = result.isolationEnforced && sessionMatches;
+    return {
+      ok: result.exitCode === 0 && !result.timedOut && enforced,
+      text,
+      json: extractJson(text),
+      provider: this.provider,
+      model,
+      durationMs: Date.now() - started,
+      exitCode: result.exitCode,
+      error: !sessionMatches
+        ? "Codex resume reported a provider session other than the constituted reviewer"
+        : result.timedOut
+          ? "timeout"
+          : result.exitCode === 0 && result.isolationEnforced
+            ? null
+            : result.stderr.slice(0, 2000),
+      providerSessionId: enforced ? expectedSessionId : null,
+      isolationAttested: enforced,
+      isolationReasonCode: enforced ? undefined : ReasonCode.ISOLATION_LOST,
+      effortAttested: enforced && request.effort !== undefined,
+    };
+  }
+}
+
+/**
+ * Grok is deliberately a sensor and optional diversity provider, not a critical-path
+ * fallback. Its collector is real, while any attempted required-role invocation is
+ * refused at the adapter boundary.
+ */
+export class GrokCliAdapter implements ProviderAdapter {
+  readonly provider = "grok";
+  readonly isProduction = true;
+  readonly optionalAdversarialOnly = true;
+  readonly supportsReviewerIsolation = false;
+  readonly defaultModels = { reviewer: "grok", adversarialReviewer: "grok" } as const;
+
+  readonly #binary: string;
+  readonly #clock: Clock;
+  readonly #denyReadPaths: readonly string[];
+  readonly #providerCredentialDir: string | undefined;
+  readonly #usageCollector: UsageCollector;
+
+  constructor(options: CliAdapterOptions) {
+    this.#binary = resolveExecutable(options.binary ?? "grok");
+    this.#clock = options.clock;
+    this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
+    this.#providerCredentialDir = options.providerCredentialDir;
+    this.#usageCollector = options.usageCollector ?? new GrokUsageCollector({
+      clock: this.#clock,
+      binary: this.#binary,
+      providerCredentialDir: this.#providerCredentialDir,
+    });
+  }
+
+  async startSession(spec: SessionSpec): Promise<SessionHandle> {
+    void spec;
+    throw new ProviderSessionProvisionError(
+      ReasonCode.ISOLATION_LOST,
+      "Grok is registered only for optional adversarial review and cannot constitute a required role",
+    );
+  }
+
+  async stopSession(): Promise<void> {
+    /* Grok never owns a required control-plane session. */
+  }
+
+  async invoke(request: InvocationRequest): Promise<InvocationResult> {
+    return refusedInvocation(
+      request,
+      this.provider,
+      request.model ?? this.defaultModels.adversarialReviewer,
+      Date.now(),
+      "Grok is optional adversarial-review only; required-role invocation is refused",
+    );
+  }
+
+  async probeRuntime(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    const result = await runCli(this.#binary, ["--version"], {
+      cwd: process.cwd(),
+      timeoutMs: 15_000,
+      denyReadPaths: this.#denyReadPaths,
+      providerCredentialDir: this.#providerCredentialDir,
+    });
+    return result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE";
+  }
+
+  async probeSession(): Promise<"HEALTHY" | "DEGRADED" | "UNAVAILABLE"> {
+    return "UNAVAILABLE";
+  }
+
+  async probeCapacity(): Promise<CapacityReading> {
+    return resolveRuntimeHealth(await this.#usageCollector.collect(), () => this.probeRuntime());
   }
 }
 
@@ -1372,4 +1700,11 @@ export const __testing = Object.freeze({
   reviewerProfile,
   probeNoTools,
   probeDeniedTranscriptPaths,
+  reviewerToolContractPresent,
+  codexReviewerArgs,
+  codexThreadId,
+  codexLastAgentMessage,
+  setRunCli: (stub: typeof productionRunCli | null): void => {
+    runCli = stub ?? productionRunCli;
+  },
 });

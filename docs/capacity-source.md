@@ -1,78 +1,71 @@
 # Provider capacity source
 
-PRD §14.2 lets a provider adapter choose the most reliable usage source available, in
-this order:
+Capacity is observed from each provider CLI's interactive `/usage` surface. It is not
+an owner-maintained quota file. A reading becomes routable only when the collector has
+captured a fresh provider response containing an explicit remaining-quota percentage.
 
-1. a structured local interface
-2. an official CLI or status interface
-3. `/usage` parsing
-4. an explicitly approved stable source
+## Collection contract
 
-## What is actually available today
+Each refresh starts a fresh pseudo-terminal session, enters the CLI, sends `/usage`, and
+parses only stable quota-window statements. The raw terminal output is not persisted;
+its SHA-256 digest is retained in the reading source for audit correlation.
 
-Neither shipped CLI exposes a quota interface. `claude` has no `usage` subcommand, and
-`codex` has no usage or limits command. There is no local file either CLI maintains that
-carries remaining-quota-per-window.
+| Provider | Collector | Normalised capabilities |
+|---|---|---|
+| Claude | `ClaudeUsageCollector` | `cto`, `ceo`, `blind-review`, `worker` |
+| Codex/GPT | `CodexUsageCollector` | `ceo`, `blind-review`, `worker`, `luna-worker` |
+| Grok | `GrokUsageCollector` | `adversarial-review` only |
 
-Rather than invent a parser for output that does not exist, the adapters implement
-option 1: a **structured local capacity file** that the owner (or a future provider CLI,
-or a small collector script) maintains. This is the honest position — §14.3 states plainly
-that routing has no `UNKNOWN` quota, so a sensor that cannot read must suspend new
-allocation instead of guessing.
+Grok is optional diversity only. It never advertises a critical continuity capability and
+its absence does not degrade a required-role coverage plan.
 
-## File location and shape
+The collectors do not answer trust prompts, permission prompts, login prompts, or reset
+redemption prompts. Any such prompt is a failed observation. This prevents a capacity
+refresh from gaining authority merely to obtain a number.
 
-```
-~/.agent-control-plane/capacity/<provider>.json
-```
+The parser accepts an explicit shape such as:
 
-```json
-{
-  "observedAt": "2026-08-12T07:40:00.000Z",
-  "runtimeHealth": "HEALTHY",
-  "buckets": [
-    {
-      "id": "rolling-5h",
-      "remainingPercent": 62,
-      "resetAt": "2026-08-12T12:00:00.000Z",
-      "capabilities": ["ceo", "blind-review", "luna-worker"]
-    },
-    {
-      "id": "weekly",
-      "remainingPercent": 41,
-      "resetAt": "2026-08-18T00:00:00.000Z",
-      "capabilities": ["luna-worker"]
-    }
-  ]
-}
+```text
+5-hour limit: 62% remaining — resets in 1h 15m
+weekly limit: 41% left — resets at 2026-08-18T00:00:00Z
 ```
 
-Write it with the CLI so the timestamp is filled in for you:
+It normalises `observedAt`, `remainingPercent`, `resetAt`, and provider capabilities into
+separate quota buckets. A token-activity chart, plan label, or bare percentage is not a
+quota measurement and is rejected rather than guessed. A usable percentage with no
+machine-readable reset keeps `resetAt: null`; the worker reserve then protects that window
+until a real reset horizon is observed.
 
-```
-agentctl capacity set gpt '{"buckets":[{"id":"rolling-5h","remainingPercent":62,"capabilities":["ceo","blind-review","luna-worker"]}]}'
-agentctl capacity show
-```
+## Failure behaviour
 
-`capabilities` is what the continuity kernel routes on. The names the kernel looks for
-are `ceo`, `cto`, `blind-review`, `worker` and `luna-worker`.
+If the PTY cannot launch, the CLI is unavailable, `/usage` needs human interaction, the
+command times out, or parsing cannot find an explicit remaining-quota percentage, the
+collector emits an `ERROR` reading with no buckets. The capacity monitor persists that
+failure and suspends new allocation immediately. It never falls back to a prior reading or
+to a local JSON value.
 
-## How the three signals are derived
+The daemon may mirror the most recent observation under its capacity directory for doctor
+inspection. That mirror is an output, not an input: editing it cannot create routable
+capacity.
 
-| Signal | Source |
-|---|---|
-| `sensorHealth` | `HEALTHY` when the file parses and is fresh; `STALE` past the freshness window; `ERROR` when absent, unparsable, or carrying no buckets |
-| `runtimeHealth` | the file's `runtimeHealth`, or a live `--version` probe of the CLI when the sensor failed |
-| `allocationAdmission` | derived: `SUSPENDED` on sensor error, unavailable runtime, or a stale reading past the grace window; `CONSERVE` when the lowest bucket is at or under 25%; otherwise `OPEN` |
+## Deployment credential scopes
 
-A stale reading remains usable inside a grace window (15 minutes by default) and suspends
-new allocation past it. A failed probe suspends new allocation immediately while existing
-critical sessions get their own runtime health probe — §14.3 keeps those two questions
-separate on purpose.
+Normal provider usage may use each CLI's ordinary authentication. Packet-only blind review
+has a stricter requirement: set `ACP_CODEX_REVIEWER_HOME` to a dedicated Codex home that
+contains reviewer credentials but no producer session history. The reviewer process uses
+that exact scope with a packet-local `HOME`; it never repurposes `~/.codex`.
 
-## Adding a real usage interface later
+`ACP_CLAUDE_REVIEWER_CONFIG_DIR` and `ACP_GROK_CREDENTIAL_DIR` are corresponding optional
+deployment scopes. They are not capacity values and must not be written into manifests.
 
-When a provider ships one, the change is local to that adapter: add the new source ahead
-of the file source in its `probeCapacity`, and add a parser fixture test (PRD §36 requires
-one). Nothing above the adapter changes, because the adapter's job is exactly to hide
-collection differences (§40 Maintainability).
+## Live limitations observed on this machine
+
+Codex's current `/usage` command was reachable through a real PTY, but its available view
+reported token activity rather than a remaining quota/reset window, so it correctly
+produced no routable capacity. Claude and Grok stopped at their interactive trust prompts;
+the collector refused to approve them. Those are failed observations, not reasons to reuse
+a manually written file.
+
+The collector path is real and will normalise a provider-reported quota view as soon as the
+CLI exposes one in the accepted shape. Until then, capacity remains unknown and allocation
+stays suspended by design.

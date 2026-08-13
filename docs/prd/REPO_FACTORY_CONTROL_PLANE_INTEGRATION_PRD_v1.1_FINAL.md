@@ -710,7 +710,8 @@ Drift Status
 - 기본 `sh -c`, Pipe, Redirect, Command Substitution, Shell Interpolation 금지
 - Privileged Shell Profile은 별도 GUARDED Contract와 권한 필요
 - `cwd`는 Repository-relative
-- Network는 `deny | allowlist | allow`
+- v1 Network는 `deny | allow`만 지원한다. `allowlist`는 destination policy를 실제로
+  강제할 proxy/firewall backend가 생길 때까지 manifest schema에서 거부한다.
 - Output·Resource Limit 필수
 - Evidence Mode는 `LOCAL_COMMAND | TRUSTED_CI | BOTH_REQUIRED`
 - 다른 Head의 CI Result는 Stale

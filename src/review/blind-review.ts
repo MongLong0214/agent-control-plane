@@ -22,7 +22,12 @@ import {
 import { diffDigest, git } from "../git/git.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
-import type { InvocationRequest, InvocationResult, ProviderRegistry } from "../runtime/provider.ts";
+import {
+  ProviderSessionProvisionError,
+  type InvocationRequest,
+  type InvocationResult,
+  type ProviderRegistry,
+} from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
 import {
@@ -141,6 +146,19 @@ const CHUNK_THRESHOLD_CHARS = 120_000;
 const REVIEW_TIMEOUT_MS = 20 * 60 * 1000;
 
 /**
+ * A compact commitment to every logical packet input. The snapshot digest binds the
+ * actual candidate heads and diffs; coverage targets make omissions mechanically visible
+ * to the reviewer before it answers.
+ */
+const reviewPacketDigest = (request: BlindReviewRequest): string =>
+  digestOf({
+    candidateSnapshotDigest: candidateSnapshotDigest(request.snapshot),
+    contractDigest: request.contractDigest,
+    verificationDigest: digestOf(request.verification),
+    coverageTargets: snapshotCoverageTargets(request.snapshot).map(({ identity, path }) => `${identity}:${path}`),
+  });
+
+/**
  * PRD §18 — mandatory independent blind review.
  *
  * The gate is invoked by the control plane after deterministic verification passes.
@@ -233,7 +251,7 @@ export class BlindReviewGate {
       if (chunked) {
         outcome = await this.chunkedReview(request, diffs, rememberReviewer);
       } else {
-        const reviewer = await this.constituteReviewer(request.runId);
+        const reviewer = await this.constituteReviewer(request);
         if (!reviewer.allowed) return reviewer as Decision<ReviewPacket>;
         rememberReviewer(reviewer.value);
         outcome = await this.singleReview(request, diffs, reviewer.value);
@@ -371,7 +389,7 @@ export class BlindReviewGate {
    * reviewer can be constituted the gate is not lowered — the caller waits.
    */
   private async constituteReviewer(
-    runId: string,
+    request: BlindReviewRequest,
     purpose: "blind-review" | "blind-review-chunk" | "blind-review-final" = "blind-review",
   ): Promise<
     Decision<{
@@ -385,18 +403,37 @@ export class BlindReviewGate {
       workdir: string;
     }>
   > {
+    const runId = request.runId;
     const roleKey = roleKeyFor(Role.BLIND_REVIEWER, { runId });
     const attempts: Array<{ preference: ReviewerPreference; reason: string }> = [];
     let capacityFailure: Decision<void> | null = null;
 
     for (const preference of [this.preferences.preferred, ...this.preferences.fallbacks]) {
+      const isPreferred = preference === this.preferences.preferred;
       const adapter = this.providers.get(preference.provider);
       if (!adapter) {
         attempts.push({ preference, reason: "no adapter registered" });
+        // An omitted GPT adapter is a deployment/configuration defect, not measured
+        // evidence that GPT is down. Routing to Claude here would make the fallback
+        // indistinguishable from the original always-Claude failure mode.
+        if (isPreferred) {
+          return deny(ReasonCode.ISOLATION_LOST, "preferred reviewer adapter is not registered", {
+            runId,
+            provider: preference.provider,
+            attempts,
+          });
+        }
         continue;
       }
       if (adapter.supportsReviewerIsolation === false) {
         attempts.push({ preference, reason: "reviewer isolation is unsupported by adapter" });
+        if (isPreferred) {
+          return deny(ReasonCode.ISOLATION_LOST, "preferred reviewer adapter cannot enforce packet isolation", {
+            runId,
+            provider: preference.provider,
+            attempts,
+          });
+        }
         continue;
       }
       const health = await adapter.probeRuntime();
@@ -419,12 +456,50 @@ export class BlindReviewGate {
       // from the daemon's repository. Provider-level OS confinement is an additional
       // boundary; this directory is not represented as a sufficient substitute for it.
       const workdir = mkdtempSync(join(tmpdir(), "acp-review-"));
-      const handle = await adapter.startSession({
-        model: preference.model,
-        effort: preference.effort,
-        workdir,
-        purpose,
-      });
+      let handle;
+      try {
+        handle = await adapter.startSession({
+          model: preference.model,
+          effort: preference.effort,
+          workdir,
+          purpose,
+          isolation: this.reviewerIsolation(request, workdir),
+        });
+      } catch (error) {
+        rmSync(workdir, { recursive: true, force: true });
+        const message = error instanceof Error ? error.message : "provider reviewer session setup failed";
+        // A missing OS/profile/provider-identity proof is not a capacity outage. Falling
+        // back to Claude here would hide a broken mandatory GPT gate behind a successful
+        // alternate review, which is exactly the P0-07 failure mode.
+        if (error instanceof ProviderSessionProvisionError) {
+          return deny(error.reasonCode, "preferred reviewer isolation could not be proved", {
+            runId,
+            provider: preference.provider,
+            model: preference.model,
+            effort: preference.effort,
+            reason: message,
+            attempts,
+          });
+        }
+        return deny(ReasonCode.ISOLATION_LOST, "reviewer session creation failed without an availability proof", {
+          runId,
+          provider: preference.provider,
+          model: preference.model,
+          effort: preference.effort,
+          reason: message,
+          attempts,
+        });
+      }
+      if (adapter.requiresReviewerProviderSessionProof === true && handle.providerSessionProven !== true) {
+        rmSync(workdir, { recursive: true, force: true });
+        return deny(ReasonCode.ISOLATION_LOST, "reviewer adapter did not prove a provider-issued fresh session", {
+          runId,
+          provider: preference.provider,
+          model: preference.model,
+          effort: preference.effort,
+          attempts,
+        });
+      }
       const session = this.sessions.create({
         provider: adapter.provider,
         model: preference.model,
@@ -442,7 +517,7 @@ export class BlindReviewGate {
             role: Role.BLIND_REVIEWER,
             sessionId: session.sessionId,
             runId,
-            mode: preference === this.preferences.preferred ? "PREFERRED" : "FALLBACK",
+            mode: isPreferred ? "PREFERRED" : "FALLBACK",
             reason: `constituting ${purpose}`,
           })
         : this.bindings.bind({
@@ -450,13 +525,29 @@ export class BlindReviewGate {
             role: Role.BLIND_REVIEWER,
             sessionId: session.sessionId,
             runId,
-            mode: preference === this.preferences.preferred ? "PREFERRED" : "FALLBACK",
+            mode: isPreferred ? "PREFERRED" : "FALLBACK",
           });
       if (!bound.allowed) {
         this.sessions.transition(session.sessionId, SessionLifecycle.STOPPED, "binding refused");
         rmSync(workdir, { recursive: true, force: true });
         attempts.push({ preference, reason: bound.reasonCode });
         continue;
+      }
+
+      if (!isPreferred) {
+        const preferredAttempt = attempts.find((attempt) => attempt.preference === this.preferences.preferred);
+        this.audit.record({
+          kind: "BLIND_REVIEW_FALLBACK",
+          runId,
+          sessionId: session.sessionId,
+          roleKey,
+          reasonCode: ReasonCode.OK,
+          evidence: {
+            from: this.preferences.preferred.provider,
+            provider: preference.provider,
+            reason: preferredAttempt?.reason ?? "preferred provider unavailable",
+          },
+        });
       }
 
       return allow(ReasonCode.OK, {
@@ -566,6 +657,22 @@ export class BlindReviewGate {
     prompt: string,
     correlationId: string,
   ): IsolatedInvocationRequest {
+    return {
+      prompt,
+      systemPrompt: REVIEWER_SYSTEM_PROMPT,
+      workdir: reviewer.workdir,
+      timeoutMs: REVIEW_TIMEOUT_MS,
+      model: reviewer.preference.model,
+      effort: reviewer.preference.effort ?? undefined,
+      responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
+      readOnly: true,
+      correlationId,
+      externalSessionId: reviewer.externalSessionId,
+      isolation: this.reviewerIsolation(request, reviewer.workdir),
+    };
+  }
+
+  private reviewerIsolation(request: BlindReviewRequest, workdir: string): ReviewerIsolation {
     // Canonical, not as-configured: the sandbox profile matches kernel-resolved paths and
     // filters this list against the *realpath* of the packet root. A symlink alias — the
     // `/var` → `/private/var` case every macOS temp path takes — would compile to a deny
@@ -585,23 +692,11 @@ export class BlindReviewGate {
       if (checkout) denyReadPaths.add(canonical(checkout));
     }
     return {
-      prompt,
-      systemPrompt: REVIEWER_SYSTEM_PROMPT,
-      workdir: reviewer.workdir,
-      timeoutMs: REVIEW_TIMEOUT_MS,
-      model: reviewer.preference.model,
-      effort: reviewer.preference.effort ?? undefined,
-      responseSchema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
-      readOnly: true,
-      correlationId,
-      externalSessionId: reviewer.externalSessionId,
-      isolation: {
-        packetRoot: reviewer.workdir,
-        denyReadPaths: [...denyReadPaths],
-        emptyEnvironment: true,
-        network: "provider-only",
-        tools: "none",
-      },
+      packetRoot: workdir,
+      denyReadPaths: [...denyReadPaths],
+      emptyEnvironment: true,
+      network: "provider-only",
+      tools: "none",
     };
   }
 
@@ -614,6 +709,20 @@ export class BlindReviewGate {
     // simply omits the field — is an unprovable isolation claim, which §18.3 treats as a
     // lost boundary rather than a benign default.
     if (result.isolationAttested === true && result.isolationReasonCode === undefined) {
+      const adapter = this.providers.require(reviewer.preference.provider);
+      if (
+        adapter.supportsReviewerEffortAttestation === true &&
+        reviewer.preference.effort !== null &&
+        result.effortAttested !== true
+      ) {
+        return deny(ReasonCode.ISOLATION_LOST, "reviewer adapter did not attest the configured effort", {
+          runId,
+          provider: reviewer.preference.provider,
+          model: reviewer.preference.model,
+          effort: reviewer.preference.effort,
+          reviewerSessionId: reviewer.sessionId,
+        });
+      }
       return allow(ReasonCode.OK, undefined);
     }
     return deny(ReasonCode.ISOLATION_LOST, "reviewer adapter did not attest packet-only isolation", {
@@ -718,7 +827,7 @@ export class BlindReviewGate {
       // CP-HI-04 / ADR-0006: every chunk is a fresh provider session and a fresh
       // packet-only workdir. Reusing one session turns the second chunk into a later
       // conversation turn that can read earlier verdicts.
-      const constituted = await this.constituteReviewer(request.runId, "blind-review-chunk");
+      const constituted = await this.constituteReviewer(request, "blind-review-chunk");
       if (!constituted.allowed) return constituted as Decision<ReviewOutcome>;
       const reviewer = constituted.value;
       rememberReviewer(reviewer);
@@ -781,7 +890,7 @@ export class BlindReviewGate {
 
     // §18.5 — the reduced result is not the verdict. A *final fresh reviewer* judges it,
     // and only that judgement is authoritative.
-    const finalReviewer = await this.constituteReviewer(request.runId, "blind-review-final");
+    const finalReviewer = await this.constituteReviewer(request, "blind-review-final");
     if (!finalReviewer.allowed) return finalReviewer as Decision<never>;
     rememberReviewer(finalReviewer.value);
 
@@ -869,6 +978,11 @@ export class BlindReviewGate {
       "",
       "## Task contract",
       `Goal: ${request.contract.goal}`,
+      "",
+      "## Packet identity and required coverage",
+      `Packet digest: ${reviewPacketDigest(request)}`,
+      "Required coverage:",
+      ...snapshotCoverageTargets(request.snapshot).map((target) => `- ${target.identity}:${target.path}`),
       "Acceptance criteria:",
       ...request.contract.acceptance.map((a) => `- ${a}`),
       "",
@@ -903,6 +1017,11 @@ export class BlindReviewGate {
       "```json",
       JSON.stringify(request.snapshot, null, 2),
       "```",
+      "",
+      "## Packet identity and required coverage",
+      `Packet digest: ${reviewPacketDigest(request)}`,
+      "Required coverage:",
+      ...snapshotCoverageTargets(request.snapshot).map((target) => `- ${target.identity}:${target.path}`),
       "",
       "## Deterministic verification evidence",
       "```json",

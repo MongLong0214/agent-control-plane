@@ -23,7 +23,7 @@ import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
-import { ClaudeCliAdapter, CodexCliAdapter } from "../runtime/cli-adapters.ts";
+import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter } from "../runtime/cli-adapters.ts";
 import { GuardedInvocationWriteBroker, type ProviderAdapter, ProviderRegistry } from "../runtime/provider.ts";
 import { BindingRegistry } from "../session/binding-registry.ts";
 import { SessionRegistry } from "../session/session-registry.ts";
@@ -416,6 +416,7 @@ export class ControlPlane {
         environmentAllowlist: [],
         denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
         managedWriteBroker,
+        providerCredentialDir: process.env["ACP_CLAUDE_REVIEWER_CONFIG_DIR"],
       }),
       new CodexCliAdapter({
         clock: this.clock,
@@ -423,6 +424,17 @@ export class ControlPlane {
         environmentAllowlist: [],
         denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
         managedWriteBroker,
+        // A reviewer can only use this deployment-provisioned dedicated CODEX_HOME. The
+        // ordinary ~/.codex tree is intentionally never repurposed as a blind-review
+        // credential scope because it can contain producer conversations.
+        providerCredentialDir: process.env["ACP_CODEX_REVIEWER_HOME"],
+      }),
+      new GrokCliAdapter({
+        clock: this.clock,
+        capacityFile: join(this.config.capacityDir, "grok.json"),
+        environmentAllowlist: [],
+        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
+        providerCredentialDir: process.env["ACP_GROK_CREDENTIAL_DIR"],
       }),
     ];
   }

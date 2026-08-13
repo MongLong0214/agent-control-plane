@@ -143,7 +143,24 @@ export class CapacityMonitor {
 
       const readings: ProviderCapacity[] = [];
       for (const adapter of adapters) {
-        const reading = await adapter.probeCapacity();
+        let reading: CapacityReading;
+        try {
+          reading = await adapter.probeCapacity();
+        } catch (error) {
+          // A collector crash is not permission to keep a previous favorable reading.
+          // Persist an explicit unknown observation so every allocation path sees
+          // SUSPENDED immediately, even when a provider adapter failed before it could
+          // construct its own ERROR reading.
+          reading = {
+            provider: adapter.provider,
+            sensorHealth: "ERROR",
+            runtimeHealth: "UNKNOWN",
+            observedAt: this.clock.nowIso(),
+            buckets: [],
+            source: "capacity-collector-exception",
+            error: error instanceof Error ? error.message : "capacity collector threw a non-error value",
+          };
+        }
         const enriched = this.enrich(reading);
         this.persist(enriched);
         readings.push(enriched);

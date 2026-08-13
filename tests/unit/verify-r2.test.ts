@@ -380,11 +380,15 @@ exec /bin/ps "$@"
     expect(outcome.reasonCode).not.toBeNull();
   });
 
-  it("#168 rejects a project contract that requests unsupported host allowlisting", () => {
+  it("#168 rejects a project contract that requests unsupported host allowlisting at schema validation", () => {
     const manifest = fixtureManifest("allowlist-contract");
     manifest.verificationCommands[0]!.network = "allowlist";
     manifest.verificationCommands[0]!.networkAllowlist = ["registry.npmjs.org"];
-    expect(assertPortableManifest(manifest)).toMatchObject({ allowed: false, reasonCode: ReasonCode.MANIFEST_NOT_PORTABLE });
+    expect(assertPortableManifest(manifest)).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.INVALID_ARGUMENT,
+      message: expect.stringContaining("schema validation"),
+    });
   });
 
   it("#169 chooses the newest exact-head CI result instead of an obsolete failure", async () => {

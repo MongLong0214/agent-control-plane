@@ -96,7 +96,6 @@ Register an existing project by hand — no Repo Factory needed:
 
 ```bash
 agentctl project register my-project /abs/path/to/checkout
-agentctl capacity set claude '{"buckets":[{"id":"rolling-5h","remainingPercent":80,"capabilities":["cto","blind-review","ceo","worker"]}]}'
 agentctl doctor
 ```
 
@@ -132,11 +131,12 @@ fetch them. A project therefore needs one of:
 - a verification command that needs no installed dependencies (this repo's
   `scripts/verify-reason-codes.mjs` is one — it checks the reason-code contract with
   nothing but Node),
-- an install step declared as its own command with `network: "allowlist"` ahead of the
-  build in the profile's command order, or
 - `evidenceMode: "TRUSTED_CI"`, letting CI do the dependency-heavy work and having the
   control plane accept the result only at the exact candidate head from an approved
   workflow digest.
+
+`network: "allowlist"` is not a supported workaround: the manifest schema rejects it
+until a proxy or firewall backend can enforce destination policy.
 
 ## Persistence
 
@@ -154,8 +154,10 @@ cloud database are all deliberately absent (§30.4).
 
 ## Provider capacity
 
-Neither shipped CLI exposes a quota interface, so the adapters read a structured local
-capacity file and fail closed when it is absent or stale. There is no `UNKNOWN` route.
+Capacity is collected through each provider CLI's interactive `/usage` surface. The
+collectors accept only explicit remaining-quota readings and fail closed on a trust prompt,
+activity-only output, timeout, or parser failure; a daemon JSON mirror is not an operator
+input. There is no `UNKNOWN` route.
 See [docs/capacity-source.md](docs/capacity-source.md).
 
 ## Known boundaries

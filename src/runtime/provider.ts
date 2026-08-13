@@ -142,6 +142,11 @@ export interface InvocationResult {
    * than reducing every failed isolation setup to a provider error string.
    */
   isolationReasonCode?: typeof ReasonCode.ISOLATION_LOST;
+  /**
+   * The adapter accepted and applied the requested effort through a provider-supported
+   * invocation setting. Used only by adapters that can make this a measured fact.
+   */
+  effortAttested?: boolean;
 }
 
 export interface SessionSpec {
@@ -149,6 +154,13 @@ export interface SessionSpec {
   effort?: string | null;
   workdir: string;
   purpose: string;
+  /**
+   * Present only while constituting a packet-only reviewer. Some runtimes can create
+   * the provider conversation before the first verdict; carrying the exact boundary
+   * here lets them prove that provider-issued identity under the same confinement that
+   * will later produce the answer.
+   */
+  isolation?: InvocationRequest["isolation"];
   /**
    * Records that a future invocation may request a managed write. It is intentionally
    * descriptive only: session creation never grants filesystem access, and every effect
@@ -162,9 +174,30 @@ export interface SessionHandle {
   provider: string;
   model: string;
   effort: string | null;
+  /**
+   * True only when the adapter observed this id from the provider while creating the
+   * session. A locally generated correlation id is deliberately not enough for a
+   * packet-only reviewer that cannot pass an id into the provider.
+   */
+  providerSessionProven?: boolean;
   pid: number | null;
   /** Constrained worktree used for the provider operation that constituted this session. */
   workdir?: string;
+}
+
+/**
+ * A provider adapter may distinguish a lost reviewer boundary from ordinary runtime
+ * failure. The blind-review gate must never reinterpret the former as permission to
+ * silently route the mandatory GPT review to Claude.
+ */
+export class ProviderSessionProvisionError extends Error {
+  constructor(
+    readonly reasonCode: typeof ReasonCode.ISOLATION_LOST,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ProviderSessionProvisionError";
+  }
 }
 
 /** PRD §14.3 — one bucket of a provider's quota. */
@@ -187,6 +220,8 @@ export interface CapacityReading {
   observedAt: string;
   buckets: CapacityBucket[];
   source: string;
+  /** Digest of the provider's interactive output; raw provider text is never persisted. */
+  rawOutputDigest?: string;
   error?: string;
 }
 
@@ -208,6 +243,12 @@ export interface ProviderAdapter {
    * means the adapter must still prove the boundary through `InvocationResult`.
    */
   readonly supportsReviewerIsolation?: boolean;
+  /** A packet reviewer must have a provider-issued session id before it is bound. */
+  readonly requiresReviewerProviderSessionProof?: boolean;
+  /** This adapter can attest that its reviewer effort setting was accepted. */
+  readonly supportsReviewerEffortAttestation?: boolean;
+  /** Provider may contribute only optional adversarial work, never a required role. */
+  readonly optionalAdversarialOnly?: boolean;
 
   startSession(spec: SessionSpec): Promise<SessionHandle>;
   stopSession(handle: SessionHandle): Promise<void>;
@@ -270,6 +311,18 @@ class CapacityObservedAdapter implements ProviderAdapter {
 
   get supportsReviewerIsolation(): boolean | undefined {
     return this.inner.supportsReviewerIsolation;
+  }
+
+  get requiresReviewerProviderSessionProof(): boolean | undefined {
+    return this.inner.requiresReviewerProviderSessionProof;
+  }
+
+  get supportsReviewerEffortAttestation(): boolean | undefined {
+    return this.inner.supportsReviewerEffortAttestation;
+  }
+
+  get optionalAdversarialOnly(): boolean | undefined {
+    return this.inner.optionalAdversarialOnly;
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
