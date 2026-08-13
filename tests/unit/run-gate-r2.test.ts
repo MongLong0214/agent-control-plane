@@ -188,6 +188,21 @@ const ownerDecisionReceipt = (
 };
 
 describe("round-2 run and production-gate regressions", () => {
+  it("#102 refuses a caller-supplied local owner identity", async () => {
+    const fixture = await evidenceReadyRun(["public release"]);
+    const forged = fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "forged local tuple",
+      owner: TEST_OWNER,
+    });
+    expect(forged.allowed).toBe(false);
+    expect(forged.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(false);
+    expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)).toHaveLength(0);
+  });
+
   it("#131 rejects packet publication with a forged or released source-read lease", async () => {
     const fixture = await evidenceReadyRun();
     const forged = fixture.harness.cp.ceo.buildPacket({
@@ -346,6 +361,7 @@ describe("round-2 run and production-gate regressions", () => {
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
       runId: fixture.runId, item: "public release", approved: true, note: "yes", receipt: approved,
     }).allowed).toBe(true);
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(true);
     const rejected = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", false, "no");
     expect(fixture.harness.cp.ceo.recordOwnerDecision({
       runId: fixture.runId, item: "public release", approved: false, note: "no", receipt: rejected,
@@ -456,6 +472,7 @@ describe("round-2 run and production-gate regressions", () => {
 
   it("#225 refuses a projectless run that has no run-scoped owner binding", async () => {
     const harness = makeHarness();
+    const refresh = vi.spyOn(harness.cp.capacity, "refreshForDispatch");
     const created = harness.cp.runs.create({
       executionMode: ExecutionMode.STANDARD,
       contract: CONTRACT(),
@@ -464,6 +481,7 @@ describe("round-2 run and production-gate regressions", () => {
     const dispatched = await harness.cp.runs.dispatch(created.value.runId);
     expect(dispatched.allowed).toBe(false);
     expect(dispatched.reasonCode).toBe(ReasonCode.RUN_OWNER_NOT_PINNED);
+    expect(refresh).not.toHaveBeenCalled();
     expect(harness.cp.runs.require(created.value.runId).state).toBe(RunState.QUEUED);
   });
 

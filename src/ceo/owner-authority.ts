@@ -22,17 +22,7 @@ export interface OwnerIdentity {
 export interface OwnerAuthorityPort {
   isAllowedActor(channel: string, actor: string): boolean;
   assertApproval(receipt: OwnerApprovalReceipt): Decision<void>;
-  assertLocalOwner(owner: OwnerIdentity | null | undefined): Decision<OwnerIdentity>;
 }
-
-/**
- * The one channel on which a `{channel, actor}` pair is not a claim about someone else:
- * the local operator running the CLI *is* the calling process, so there is no transport
- * between the human and this code to authenticate. Every other channel arrives over one,
- * where an identity means nothing until ingress has verified the envelope (§27.1) — which
- * is why a delegable channel's owner decision must carry an admitted receipt.
- */
-export const LOCAL_OWNER_CHANNEL = "cli";
 
 /**
  * An owner decision is evidence from an admitted ingress envelope, not a tuple that a
@@ -62,31 +52,6 @@ export class OwnerAuthority implements OwnerAuthorityPort {
 
   isAllowedActor(channel: string, actor: string): boolean {
     return this.#identities.some((i) => i.channel === channel && i.actor === actor);
-  }
-
-  /**
-   * §21 — an owner decision made on this host. The pair is accepted only for the local
-   * channel and only for a configured identity; an unconfigured deployment has no owner,
-   * so it can satisfy no human gate.
-   */
-  assertLocalOwner(owner: OwnerIdentity | null | undefined): Decision<OwnerIdentity> {
-    if (!owner || owner.channel !== LOCAL_OWNER_CHANNEL) {
-      return deny(
-        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
-        "an owner decision from a delegable channel requires an admitted ingress receipt",
-        { channel: owner?.channel ?? null, actor: owner?.actor ?? null },
-      );
-    }
-    if (!this.isAllowedActor(owner.channel, owner.actor)) {
-      return deny(
-        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
-        this.#identities.length === 0
-          ? "this deployment has no owner identity, so no owner decision can be attributed"
-          : "the local actor is not an allowlisted owner identity",
-        { channel: owner.channel, actor: owner.actor },
-      );
-    }
-    return allow(ReasonCode.OK, { channel: owner.channel, actor: owner.actor });
   }
 
   /**

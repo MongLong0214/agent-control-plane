@@ -391,6 +391,19 @@ describe("round-2 blind-review regressions", () => {
       [setup.run.runId, "attempt_crashed", "session-crashed", 1, startedAt],
     );
 
+    const reclaimed = setup.harness.cp.pipeline.reclaimExpiredAttempts();
+
+    expect(reclaimed).toEqual([expect.objectContaining({
+      runId: setup.run.runId,
+      attemptId: "attempt_crashed",
+      startedAt,
+      ageMs: 31 * 60 * 1000,
+    })]);
+    expect(setup.harness.cp.db.get<{ state: string; released_at: string | null }>(
+      `SELECT state, released_at FROM candidate_pipeline_attempts WHERE run_id = ?`,
+      [setup.run.runId],
+    )).toEqual({ state: "RELEASED", released_at: setup.harness.clock.nowIso() });
+
     const result = await setup.harness.cp.pipeline.submitResult({
       runId: setup.run.runId,
       ownerSessionId: setup.run.ownerSessionId!,

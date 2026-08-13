@@ -1,13 +1,14 @@
 import { afterAll, describe, expect, it } from "vitest";
 
+import { digestOf } from "../../src/core/digest.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs, gitSync, makeRepo } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
   type Harness,
-  applyPassingChange,
   bindCeo,
   driveToReviewedCandidate,
   makeHarness,
@@ -68,6 +69,35 @@ const activeRun = async (harness: Harness, projectId = "fixture-project") => {
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);
   if (!dispatched.allowed) throw new Error(dispatched.message);
   return { ...registered, runId: created.value.runId, run: dispatched.value };
+};
+
+/** Mints the operation-bound owner proof that ProductionGate, not the caller, verifies. */
+const ownerDecisionReceipt = (
+  harness: Harness,
+  runId: string,
+  item: string,
+  approved: boolean,
+  note: string,
+  actor: string = TEST_OWNER.actor,
+) => {
+  const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+    cli: { allowedActors: [actor] },
+  });
+  const approval = {
+    runId,
+    operation: "owner_decision_submit",
+    parameters: { item, approved, note },
+    idempotencyKey: `owner-decision:${digestOf({ runId, item, approved, note, actor })}`,
+    approved,
+  };
+  const admitted = guard.admitOwnerApproval({
+    channel: "cli",
+    actor,
+    nonce: `owner-decision:${digestOf(approval)}`,
+    payload: ownerApprovalPayload(approval),
+  }, approval);
+  if (!admitted.allowed) throw new Error(admitted.message);
+  return admitted.value;
 };
 
 describe("the dispatch-time contract pin is immutable (CP-HI-03)", () => {
@@ -168,7 +198,7 @@ describe("an owner decision needs an owner (§21)", () => {
       item: "public release",
       approved: true,
       note: "",
-      owner: { channel: "cli", actor: "someone-else" },
+      receipt: ownerDecisionReceipt(harness, runId, "public release", true, "", "someone-else"),
     });
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED);
@@ -183,7 +213,7 @@ describe("an owner decision needs an owner (§21)", () => {
       item: "public release",
       approved: true,
       note: "",
-      owner: TEST_OWNER,
+      receipt: ownerDecisionReceipt(harness, runId, "public release", true, ""),
     });
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED);
@@ -197,7 +227,7 @@ describe("an owner decision needs an owner (§21)", () => {
       item: "public release",
       approved: true,
       note: "go ahead",
-      owner: TEST_OWNER,
+      receipt: ownerDecisionReceipt(harness, runId, "public release", true, "go ahead"),
     });
     expect(recorded.allowed).toBe(true);
     const event = harness.cp.audit.byKind("OWNER_DECISION").at(-1)!;
@@ -506,7 +536,6 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
     if (!acked.allowed) return;
     expect(acked.value.sessionId).toBe(prepared.value.incomingSessionId);
     expect(acked.value.bindingGeneration).toBe(outgoing.bindingGeneration + 1);
-    expect(applyPassingChange).toBeTypeOf("function");
   });
 });
 
