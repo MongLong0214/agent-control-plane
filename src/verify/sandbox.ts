@@ -60,10 +60,12 @@ export interface SandboxEnforcement {
   /**
    * Which mechanism bounded memory. `hard` is a kernel address-space limit the candidate
    * cannot raise; `observed` is the RSS sampling below, used where the kernel does not
-   * honour RLIMIT_AS (Darwin). Recorded because a reader of this evidence must be able to
-   * tell the difference — the CPU and process-count limits are hard in both cases.
+   * honour RLIMIT_AS (Darwin). `none` means neither mechanism was established, and can
+   * therefore never accompany a passing outcome. Recorded because a reader of this evidence
+   * must be able to tell the difference — the CPU and process-count limits are hard in both
+   * cases.
    */
-  memoryLimit: "hard" | "observed";
+  memoryLimit: "hard" | "observed" | "none";
   childContainmentEnforced: boolean;
   mechanism: "seatbelt" | "none";
 }
@@ -124,9 +126,16 @@ os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 /**
  * Darwin's `setrlimit(RLIMIT_AS, …)` succeeds and has no effect, so a hard address-space
  * bound cannot be established there. Where it cannot, the RSS observation below is the
- * memory bound and the outcome says so rather than claiming a limit it does not have.
+ * memory bound and the outcome says so rather than claiming a limit it does not have. The
+ * hard-address-space backend is unavailable only on Darwin.
  */
-const hardAddressSpaceAvailable = (): boolean => process.platform !== "darwin";
+export const memoryLimitForPlatform = (
+  platform: NodeJS.Platform = process.platform,
+): "hard" | "observed" => (platform === "darwin" ? "observed" : "hard");
+
+const hardAddressSpaceAvailable = (): boolean => memoryLimitForPlatform() === "hard";
+
+const RSS_SAMPLE_INTERVAL_MS = 100;
 
 const seatbeltAvailable = (): boolean => existsSync("/usr/bin/sandbox-exec");
 
@@ -255,6 +264,41 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   child.stdout?.on("data", collect(stdoutChunks));
   child.stderr?.on("data", collect(stderrChunks));
 
+  let peakRssMb: number | null = null;
+  let memoryLimitExceeded = false;
+  let sampling = false;
+  let inFlightRssSample: Promise<void> | null = null;
+
+  const sampleRss = (): Promise<void> => {
+    if (sampling) return inFlightRssSample ?? Promise.resolve();
+    if (closed) return Promise.resolve();
+
+    sampling = true;
+    const sample = (async () => {
+      try {
+        const rss = await groupRssMb(child.pid);
+        if (rss === null) return;
+
+        peakRssMb = Math.max(peakRssMb ?? 0, rss);
+        if (rss <= command.maxMemoryMb || memoryLimitExceeded) return;
+
+        // RSS is the Darwin memory boundary, so crossing it is a resource-limit breach,
+        // not a generic command failure. Reap the entire candidate process group at once.
+        memoryLimitExceeded = true;
+        const killed = await killKnownGroup(identity, "SIGKILL");
+        if (!killed && !closed) isolationLost = true;
+      } catch {
+        // A missing sample remains null and the PASS gate below refuses to claim observation.
+      }
+    })();
+    inFlightRssSample = sample;
+    void sample.then(() => {
+      sampling = false;
+      if (inFlightRssSample === sample) inFlightRssSample = null;
+    });
+    return sample;
+  };
+
   const timer = setTimeout(() => {
     timedOut = true;
     void killKnownGroup(identity, "SIGTERM").then((killed) => {
@@ -269,11 +313,21 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     });
   }, command.timeoutSeconds * 1000);
 
+  // Sample immediately so a short command has evidence too, then retain the peak for the
+  // whole process-group lifetime. A command that cannot be sampled is not eligible to pass.
+  await sampleRss();
+  const memoryPoll = setInterval(() => {
+    void sampleRss();
+  }, RSS_SAMPLE_INTERVAL_MS);
+  memoryPoll.unref();
+
   const exit = await exitPromise;
 
   closed = true;
   clearTimeout(timer);
   if (escalation) clearTimeout(escalation);
+  clearInterval(memoryPoll);
+  if (inFlightRssSample) await inFlightRssSample;
   if (!(await processGroupReaped(child.pid, identity?.startedAt ?? null))) isolationLost = true;
   rmSync(scratch, { recursive: true, force: true });
 
@@ -283,13 +337,17 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
 
   const resourceUnavailable = exit.code === 125 && stderr.includes("ACP_RESOURCE_LIMIT_UNAVAILABLE:");
   const resourceExceeded = exit.signal === "SIGXCPU";
+  const memoryLimitObserved =
+    !resourceUnavailable && !hardMemoryLimit && peakRssMb !== null && identity !== null;
+  const memoryEvidenceUnavailable =
+    peakRssMb === null || (!hardMemoryLimit && !memoryLimitObserved);
   const status: SandboxOutcome["status"] =
-    isolationLost || resourceUnavailable || resourceExceeded
+    isolationLost || resourceUnavailable || resourceExceeded || memoryLimitExceeded
       ? "ERROR"
       : timedOut
         ? "TIMEOUT"
         : exit.code === 0
-          ? "PASS"
+          ? memoryEvidenceUnavailable ? "ERROR" : "PASS"
           : exit.code == null
             ? "ERROR"
             : "FAIL";
@@ -305,7 +363,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
     stderr,
     outputDigest: sha256(`${stdout}\u0000${stderr}`),
     outputTruncated: truncated,
-    peakRssMb: null,
+    peakRssMb,
     enforcement: {
       worktreeIsolated: true,
       secretsStripped: true,
@@ -314,8 +372,10 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
       writeConfinement: mechanism === "seatbelt",
       readConfinement: mechanism === "seatbelt" ? "sensitive-paths" : "none",
       processGroupKill: true,
-      resourceLimitsEnforced: !resourceUnavailable,
-      memoryLimit: hardMemoryLimit ? "hard" : "observed",
+      // A hard address-space limit still needs an RSS sample for auditable peak evidence.
+      resourceLimitsEnforced:
+        !resourceUnavailable && peakRssMb !== null && (hardMemoryLimit || memoryLimitObserved),
+      memoryLimit: resourceUnavailable ? "none" : hardMemoryLimit ? "hard" : memoryLimitObserved ? "observed" : "none",
       childContainmentEnforced: !isolationLost,
       mechanism,
     },
@@ -323,8 +383,10 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
       ? ReasonCode.SANDBOX_CHILD_CLEANUP_FAILED
       : resourceUnavailable
         ? ReasonCode.SANDBOX_RESOURCE_LIMIT_UNAVAILABLE
-        : resourceExceeded
+        : resourceExceeded || memoryLimitExceeded
           ? ReasonCode.SANDBOX_RESOURCE_LIMIT_EXCEEDED
+          : exit.code === 0 && memoryEvidenceUnavailable
+            ? ReasonCode.SANDBOX_RESOURCE_LIMIT_UNAVAILABLE
           : timedOut
             ? ReasonCode.VERIFICATION_TIMEOUT
             : truncated
@@ -497,7 +559,7 @@ const refused = (
     readConfinement: "none",
     processGroupKill: true,
     resourceLimitsEnforced: false,
-    memoryLimit: "observed",
+    memoryLimit: "none",
     childContainmentEnforced: false,
     mechanism,
   },
@@ -565,6 +627,22 @@ const processGroupReaped = async (
   } catch (err) {
     const failure = err as { code?: number; stdout?: string };
     return failure.code === 1 && (failure.stdout ?? "").trim().length === 0;
+  }
+};
+
+/** Summed resident set size of the entire candidate process group, in MB. */
+const groupRssMb = async (pid: number | undefined): Promise<number | null> => {
+  if (!pid) return null;
+  try {
+    const { stdout } = await exec("ps", ["-o", "rss=", "-g", String(pid)], { encoding: "utf8" });
+    const rssPages = stdout
+      .split("\n")
+      .map((line) => Number.parseInt(line.trim(), 10))
+      .filter((value) => Number.isFinite(value));
+    if (rssPages.length === 0) return null;
+    return rssPages.reduce((total, value) => total + value, 0) / 1024;
+  } catch {
+    return null;
   }
 };
 

@@ -14,7 +14,7 @@ import {
   buildCandidateSnapshot,
   verifySnapshotFreshness,
 } from "../../src/snapshot/candidate-snapshot.ts";
-import { buildSandboxEnvironment, runSandboxed } from "../../src/verify/sandbox.ts";
+import { buildSandboxEnvironment, memoryLimitForPlatform, runSandboxed } from "../../src/verify/sandbox.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
 
 afterEach(cleanupTempDirs);
@@ -28,6 +28,14 @@ const contract = {
   priority: "NORMAL" as const,
   humanGate: [],
   references: [],
+};
+
+type SandboxTest = () => void | Promise<void>;
+
+// Seatbelt is the executable sandbox backend on Darwin. Unsupported hosts must not make these
+// platform-specific checks look like passing evidence; the Linux mechanism is asserted below.
+const sandboxIt = (name: string, fn: SandboxTest): void => {
+  if (process.platform === "darwin") it(name, fn);
 };
 
 const frozenPinnedCandidate = async (options: {
@@ -98,7 +106,7 @@ describe("round-2 verification isolation and candidate freshness", () => {
     ).rejects.toMatchObject({ reasonCode: ReasonCode.SNAPSHOT_STALE });
   });
 
-  it("#162 refuses a cwd symlink that resolves outside the frozen worktree", async () => {
+  sandboxIt("#162 refuses a cwd symlink that resolves outside the frozen worktree", async () => {
     const repo = makeRepo();
     const outside = tempDir("acp-outside-");
     // A committed symlink is the candidate-controlled path the command would otherwise
@@ -127,7 +135,7 @@ describe("round-2 verification isolation and candidate freshness", () => {
     expect(env.NODE_ENV).toBe("test");
   });
 
-  it("#164 prevents a detached descendant from escaping containment", async () => {
+  sandboxIt("#164 prevents a detached descendant from escaping containment", async () => {
     const repo = makeRepo();
     writeFileSync(
       join(repo, "detached.js"),
@@ -199,31 +207,53 @@ describe("round-2 verification isolation and candidate freshness", () => {
     expect(fresh).toMatchObject({ allowed: false, reasonCode: ReasonCode.SNAPSHOT_STALE });
   });
 
-  it("#166/#233 reports observed memory enforcement on Darwin and hard enforcement elsewhere", async () => {
+  sandboxIt("#348/#349 samples Darwin RSS, kills over-cap memory, and records a normal peak", async () => {
     const repo = makeRepo();
-    writeFileSync(join(repo, "memory.js"), "Buffer.alloc(512 * 1024 * 1024);\n");
+    writeFileSync(
+      join(repo, "memory.js"),
+      `const allocation = Buffer.alloc(512 * 1024 * 1024, 1);
+       setInterval(() => { void allocation[0]; }, 1_000);`,
+    );
     const outcome = await runSandboxed({
       command: parseVerificationCommand({
         id: "memory",
         argv: ["node", "memory.js"],
         maxMemoryMb: 16,
+        timeoutSeconds: 5,
       }),
       worktreePath: repo,
     });
-    if (process.platform === "darwin") {
-      expect(outcome).toMatchObject({
-        status: "PASS",
-        reasonCode: null,
-        enforcement: { memoryLimit: "observed" },
-      });
-    } else {
-      expect(outcome.enforcement.memoryLimit).toBe("hard");
-      expect(outcome.enforcement.resourceLimitsEnforced).toBe(true);
-      expect(outcome.status).not.toBe("PASS");
-    }
+    expect(outcome).toMatchObject({
+      status: "ERROR",
+      signal: "SIGKILL",
+      reasonCode: ReasonCode.SANDBOX_RESOURCE_LIMIT_EXCEEDED,
+      enforcement: { memoryLimit: "observed", resourceLimitsEnforced: true },
+    });
+    expect(outcome.peakRssMb).toBeTypeOf("number");
+    expect(outcome.peakRssMb).toBeGreaterThan(16);
+
+    const normal = await runSandboxed({
+      command: parseVerificationCommand({
+        id: "memory-normal",
+        argv: ["node", "-e", "setTimeout(() => process.exit(0), 500)"],
+        maxMemoryMb: 256,
+        timeoutSeconds: 5,
+      }),
+      worktreePath: repo,
+    });
+    expect(normal).toMatchObject({
+      status: "PASS",
+      reasonCode: null,
+      enforcement: { memoryLimit: "observed", resourceLimitsEnforced: true },
+    });
+    expect(normal.peakRssMb).toBeTypeOf("number");
   });
 
-  it("#167 finishes timeout escalation before returning an outcome", async () => {
+  it("#348/#349 selects Linux hard memory enforcement", () => {
+    expect(memoryLimitForPlatform("linux")).toBe("hard");
+  });
+
+  sandboxIt("#167 finishes timeout escalation before returning an outcome", async () => {
     const repo = makeRepo();
     const outcome = await runSandboxed({
       command: parseVerificationCommand({ id: "timeout", argv: ["node", "-e", "setInterval(() => {}, 1000)"], timeoutSeconds: 1 }),
