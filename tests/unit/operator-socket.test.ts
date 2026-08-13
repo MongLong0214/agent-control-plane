@@ -6,15 +6,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
-import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
+import { OPERATOR_METHOD } from "../../src/daemon/daemon.ts";
 import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import {
+  makeStartedOperator,
   TEST_OWNER,
-  bindCeo,
-  makeHarness,
+  TEST_MCP_TOKEN,
+  TEST_OPERATOR_TOKEN,
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import type { Harness } from "../helpers/harness.ts";
@@ -23,8 +24,8 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 afterAll(cleanupTempDirs);
 
 const execFile = promisify(execFileCallback);
-const OPERATOR_TOKEN = "operator-token";
-const MCP_TOKEN = "mcp-token";
+const OPERATOR_TOKEN = TEST_OPERATOR_TOKEN;
+const MCP_TOKEN = TEST_MCP_TOKEN;
 
 const CONTRACT: TaskContract = {
   goal: "operator socket regression",
@@ -63,51 +64,6 @@ const operatorRequest = (
       reject(error);
     });
   });
-
-const makeStartedOperator = async (options: {
-  operatorToken?: string;
-  operatorActor?: string;
-} = {}): Promise<{
-  harness: Harness;
-  daemon: Daemon;
-  socketPath: string;
-  peer: AuthenticatedOperatorPeer;
-  close(): Promise<void>;
-}> => {
-  const harness = makeHarness();
-  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
-  bindCeo(harness);
-  const stateDir = tempDir("acp-operator-daemon-");
-  const daemon = new Daemon(harness.cp, { stateDir });
-  const started = await daemon.start();
-  if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
-  const operatorToken = options.operatorToken ?? OPERATOR_TOKEN;
-  const operatorActor = options.operatorActor ?? TEST_OWNER.actor;
-  const peer: AuthenticatedOperatorPeer = {
-    channel: "cli",
-    peerId: `cli:${operatorActor}`,
-    actor: operatorActor,
-    // The listener supplies the real incarnation; this value is only for direct daemon
-    // calls in the lock-loss test, where no socket can supply it after stop.
-    incarnation: "test-live-incarnation",
-  };
-  const listener = await startOperatorSocket(
-    daemon,
-    stateDir,
-    { token: operatorToken, peerId: peer.peerId, actor: peer.actor },
-    { mcpToken: MCP_TOKEN },
-  );
-  return {
-    harness,
-    daemon,
-    socketPath: listener.socketPath,
-    peer,
-    close: async () => {
-      await listener.close();
-      await daemon.stop();
-    },
-  };
-};
 
 const createQueuedRun = async (harness: Harness): Promise<string> => {
   const registered = await registerFixtureProject(harness);
@@ -178,11 +134,16 @@ describe("authenticated operator socket (#393/#405)", () => {
     const socketPath = join(tempDir("acp-operator-down-"), "missing.operator.sock");
     const client = createOperatorClient({ socketPath, token: "operator-token", timeoutMs: 250 });
     const result = await client.request("run.cancel", { runId: "run_missing", reason: "test" }, "down-mutation");
+    const exportResult = await client.request("run.export", { runId: "run_missing" }, "down-export");
 
     expect(result.allowed).toBe(false);
     expect(result.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
     if (result.allowed) return;
     expect(result.message).toMatch(/no direct database fallback/);
+    expect(exportResult.allowed).toBe(false);
+    expect(exportResult.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
+    if (exportResult.allowed) return;
+    expect(exportResult.message).toMatch(/no direct database fallback/);
   });
 
   it("refuses an in-process operator request after the daemon lock is released", async () => {

@@ -10,6 +10,7 @@ import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-c
 import type { DoctorScope } from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
+import { RunEvidenceExporter } from "../export/run-evidence.ts";
 import { IngressGuard, ownerApprovalPayload } from "../ingress/ingress-guard.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
@@ -49,6 +50,8 @@ export const OPERATOR_METHOD = {
   DOCTOR_RUN: "doctor.run",
   RUN_SHOW: "run.show",
   RUN_LIST: "run.list",
+  RUN_EXPORT: "run.export",
+  BASELINE_EXPORT: "baseline.export",
   RUN_CANCEL: "run.cancel",
   CONTINUITY_STATUS: "continuity.status",
   OUTBOX_RETRY: "outbox.retry",
@@ -143,6 +146,7 @@ export class Daemon {
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
   readonly #operatorResults = new Map<string, { fingerprint: string; result: Decision<unknown> }>();
   readonly #finalizer: ApprovedRunFinalizer;
+  readonly #evidenceExporter: RunEvidenceExporter;
 
   constructor(
     private readonly cp: ControlPlane,
@@ -153,6 +157,7 @@ export class Daemon {
     chmodSync(options.stateDir, 0o700);
     this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
+    this.#evidenceExporter = new RunEvidenceExporter(cp.db, cp.artifacts, cp.clock, cp.audit);
   }
 
   /**
@@ -272,6 +277,20 @@ export class Daemon {
             ReasonCode.OK,
             this.cp.runs.list(state ? { state } : {}),
           );
+        }
+
+        case OPERATOR_METHOD.RUN_EXPORT: {
+          const runId = requiredOperatorString(request.params, "runId");
+          if (!runId.allowed) return runId;
+          return this.#evidenceExporter.exportRun(runId.value);
+        }
+
+        case OPERATOR_METHOD.BASELINE_EXPORT: {
+          const from = requiredOperatorString(request.params, "from");
+          if (!from.allowed) return from;
+          const to = requiredOperatorString(request.params, "to");
+          if (!to.allowed) return to;
+          return this.#evidenceExporter.exportBaseline({ from: from.value, to: to.value });
         }
 
         case OPERATOR_METHOD.RUN_CANCEL: {
