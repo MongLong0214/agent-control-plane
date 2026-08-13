@@ -234,8 +234,12 @@ exec /bin/ps "$@"
       command: parseVerificationCommand({
         id: "cpu-limit",
         argv: ["node", "-e", "while(1){}"],
+        // The wall-clock budget has to be wide enough that CPU exhaustion always happens
+        // first: a busy loop accrues CPU time only as fast as its share of the machine, so a
+        // 3s timeout against a 1s CPU limit reports TIMEOUT under load and SIGXCPU when idle.
+        // That is a test that depends on the scheduler, not on the limit it names.
         maxCpuSeconds: 1,
-        timeoutSeconds: 3,
+        timeoutSeconds: 30,
         maxMemoryMb: 256,
       }),
       worktreePath: repo,

@@ -7,8 +7,8 @@
   },
   "directWriteRefused": "WRITE_REQUIRES_MANAGED_RUN",
   "dispatch": {
-    "runId": "run_93c469c16c6d4008999a4d2a",
-    "ownerSessionId": "ses_cto_b438e4770d0143018143",
+    "runId": "run_01813f6432c54d9d8bfc1da5",
+    "ownerSessionId": "ses_cto_d757f7b936b8456ea9be",
     "ownerBindingGeneration": 1,
     "pinnedManifestDigest": "sha256:905a5dd1724e0b086562cc693a5e5b3065532a70875a055d132c80403d307ae9",
     "activityAfterCto": "ACTIVE"
@@ -16,7 +16,7 @@
   "ctoPlan": {
     "provider": "claude",
     "model": "sonnet",
-    "durationMs": 80011,
+    "durationMs": 114860,
     "parsed": true
   },
   "humanGateRefusedNonOwner": "INGRESS_ACTOR_NOT_ALLOWLISTED",
@@ -39,16 +39,16 @@
         "commandId": "reason-codes",
         "source": "local",
         "status": "PASS",
-        "exactHead": "43e56229e457e3f226fc4ebe6890a9f51add58c5"
+        "exactHead": "fec22e1a6b54a5211ce62bf6d131062017dadafd"
       }
     ],
-    "digest": "sha256:8ace4e336f49b722734def221f5ab021bcfb362360e6eb885cf94914ec2d7ad6"
+    "digest": "sha256:c12db39bd09f4a4cc1b9faec2f60bd2a84c987b96cde2d6dd0422ab271af93c4"
   },
   "blindReview": {
     "verdict": "PASS",
     "provider": "claude",
     "model": "sonnet",
-    "reviewerSessionId": "ses_review_03dc687c74d94269b7e6",
+    "reviewerSessionId": "ses_review_c573833b3fa746bdbb5c",
     "reviewerGeneration": 1,
     "coveredFiles": [
       "github:MongLong0214/agent-control-plane:src/core/reason-codes.ts"
@@ -66,10 +66,10 @@
       "candidate checkout paths"
     ]
   },
-  "candidateSnapshotDigest": "sha256:f8aebf9befbfda347b90e0aa137b0b6a3755860547114f92c974c1c4f7bc48a0",
+  "candidateSnapshotDigest": "sha256:966e0407cd190b48ba5fe16980da45f11eba04404b86026d579105f5f271834e",
   "ceoConfirm": {
     "state": "COMPLETED",
-    "sessionId": "ses_c126bab0a5994ab1ba8e9f2b"
+    "sessionId": "ses_82ecc0086aaf4de8b2566eea"
   },
   "doctor": {
     "scope": "project",
@@ -83,23 +83,23 @@
         "blocking": false,
         "confidence": "MEDIUM",
         "observedEvidence": {
-          "sessionId": "ses_cto_b438e4770d0143018143"
+          "sessionId": "ses_cto_d757f7b936b8456ea9be"
         },
         "recommendedAction": "reconnect the CTO session to Buzz"
       }
     ],
-    "ranAt": "2026-08-13T01:33:39.414Z"
+    "ranAt": "2026-08-13T02:50:08.508Z"
   },
   "telemetry": {
     "run": [
       {
-        "metricId": 10,
-        "at": "2026-08-13T01:33:39.414Z",
+        "metricId": 12,
+        "at": "2026-08-13T02:50:08.503Z",
         "scope": "run",
         "name": "outcome",
-        "runId": "run_93c469c16c6d4008999a4d2a",
+        "runId": "run_01813f6432c54d9d8bfc1da5",
         "taskId": null,
-        "value": 139336,
+        "value": 199638,
         "text": "COMPLETED",
         "dims": {
           "mode": "GUARDED",
@@ -112,12 +112,12 @@
     "task": [
       {
         "metricId": 4,
-        "at": "2026-08-13T01:32:44.842Z",
+        "at": "2026-08-13T02:48:54.658Z",
         "scope": "task",
         "name": "execution",
-        "runId": "run_93c469c16c6d4008999a4d2a",
-        "taskId": "task_e48ead1e753e488aa8c2290f",
-        "value": 89,
+        "runId": "run_01813f6432c54d9d8bfc1da5",
+        "taskId": "task_b194895c0f3a4ce89f41953e",
+        "value": 844,
         "text": "SUCCEEDED",
         "dims": {
           "category": "implementation",
@@ -129,12 +129,12 @@
       },
       {
         "metricId": 5,
-        "at": "2026-08-13T01:32:44.843Z",
+        "at": "2026-08-13T02:48:54.667Z",
         "scope": "task",
         "name": "execution",
-        "runId": "run_93c469c16c6d4008999a4d2a",
-        "taskId": "task_f4550b8cc2bc471d96485955",
-        "value": 0,
+        "runId": "run_01813f6432c54d9d8bfc1da5",
+        "taskId": "task_f8f6fcca281d466f82513476",
+        "value": 4,
         "text": "SUCCEEDED",
         "dims": {
           "category": "test",
@@ -148,10 +148,10 @@
     "quality": [
       {
         "metricId": 6,
-        "at": "2026-08-13T01:32:45.234Z",
+        "at": "2026-08-13T02:48:57.424Z",
         "scope": "quality",
         "name": "verification",
-        "runId": "run_93c469c16c6d4008999a4d2a",
+        "runId": "run_01813f6432c54d9d8bfc1da5",
         "taskId": null,
         "value": null,
         "text": "PASS",
@@ -162,11 +162,11 @@
         }
       },
       {
-        "metricId": 7,
-        "at": "2026-08-13T01:33:39.226Z",
+        "metricId": 9,
+        "at": "2026-08-13T02:50:07.047Z",
         "scope": "quality",
         "name": "blind_review",
-        "runId": "run_93c469c16c6d4008999a4d2a",
+        "runId": "run_01813f6432c54d9d8bfc1da5",
         "taskId": null,
         "value": null,
         "text": "PASS",
@@ -178,11 +178,11 @@
         }
       },
       {
-        "metricId": 11,
-        "at": "2026-08-13T01:33:39.414Z",
+        "metricId": 13,
+        "at": "2026-08-13T02:50:08.503Z",
         "scope": "quality",
         "name": "ceo_outcome",
-        "runId": "run_93c469c16c6d4008999a4d2a",
+        "runId": "run_01813f6432c54d9d8bfc1da5",
         "taskId": null,
         "value": null,
         "text": "CONFIRM",
@@ -272,11 +272,11 @@
       "reasonCode": "OK"
     },
     {
-      "kind": "CLAIM_RELEASED",
+      "kind": "RUN_TRANSITION",
       "reasonCode": null
     },
     {
-      "kind": "RUN_TRANSITION",
+      "kind": "CLAIM_RELEASED",
       "reasonCode": null
     },
     {
