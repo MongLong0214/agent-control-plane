@@ -7,7 +7,8 @@ import { ControlPlane } from "../../src/app/control-plane.ts";
 import { ManualClock } from "../../src/core/clock.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ArtifactKind, ContinuityMode, ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
+import { ArtifactKind, ContinuityMode, ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import {
   ClaudeCliAdapter,
   CodexCliAdapter,
@@ -552,6 +553,403 @@ describe("round-2 capacity and runtime regressions", () => {
     const refused = await plane.cp.runs.dispatch(created.value.runId);
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION);
+  });
+
+  it("P0-06: daemon provider-failure coordination replaces a GPT-bound CEO with a fresh Claude generation", async () => {
+    const plane = makePlane();
+    const before = bindCeo(plane, "gpt");
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    // The daemon's system doctor checks the daemon-owned GitHub credential independently
+    // of this continuity case; install the fixture credential so startup is meaningful.
+    plane.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    // The daemon supplies the real readiness port. The test's in-memory route gives the
+    // fresh session the same independently addressable prerequisite production requires.
+    attachRoutablePorts(plane.cp);
+
+    const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    try {
+      plane.gpt.script({ match: /provider failure/, text: "", ok: false });
+      plane.gpt.setCapacity({
+        provider: "gpt",
+        sensorHealth: "ERROR",
+        runtimeHealth: "UNAVAILABLE",
+        observedAt: plane.clock.nowIso(),
+        source: "p0-06-failure",
+        buckets: [],
+        error: "GPT allocation failed",
+      });
+
+      const failed = await plane.cp.providers.require("gpt").invoke({
+        prompt: "provider failure",
+        workdir: plane.root,
+        timeoutMs: 1_000,
+        readOnly: true,
+        correlationId: "p0-06-daemon-failover",
+      });
+      expect(failed.ok).toBe(false);
+
+      // This is intentionally a binding assertion, not a mode assertion. Removing the
+      // daemon's coordinator callback leaves the old GPT session at generation 1 and
+      // makes each assertion below fail even though evaluate() still records DEGRADED.
+      const after = plane.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(after.sessionId).not.toBe(before.sessionId);
+      expect(after.bindingGeneration).toBe(before.bindingGeneration + 1);
+      expect(after.mode).toBe("FALLBACK");
+      expect(plane.cp.sessions.require(after.sessionId).provider).toBe("claude");
+      expect(plane.cp.continuity.mode()).toBe(ContinuityMode.DEGRADED);
+      expect(plane.cp.audit.byKind("CONTINUITY_RECONCILED")).toHaveLength(1);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("P0-06: a GPT outage replaces the active GPT reviewer while retaining its healthy Claude CTO", async () => {
+    const plane = makePlane();
+    const ceoBefore = bindCeo(plane, "gpt");
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    attachRoutablePorts(plane.cp);
+
+    const projectId = "p0-06-reviewer-failover";
+    const project = plane.cp.projects.register({
+      projectId,
+      name: "P0 continuity reviewer failover",
+      manifest: fixtureManifest(projectId),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    try {
+      const run = plane.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.SIMPLE,
+        contract: REVIEW_CONTRACT,
+      });
+      if (!run.allowed) throw new Error(run.message);
+      const dispatched = await plane.cp.runs.dispatch(run.value.runId);
+      if (!dispatched.allowed) throw new Error(dispatched.message);
+      const ctoBefore = plane.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))!;
+      expect(plane.cp.sessions.require(ctoBefore.sessionId).provider).toBe("claude");
+
+      const reviewerSession = plane.cp.sessions.create({ provider: "gpt", model: "reviewer" });
+      const reviewerReady = plane.cp.sessions.transition(reviewerSession.sessionId, SessionLifecycle.READY, "test reviewer ready");
+      if (!reviewerReady.allowed) throw new Error(reviewerReady.message);
+      const reviewerBefore = plane.cp.bindings.bind({
+        role: Role.BLIND_REVIEWER,
+        projectId,
+        runId: run.value.runId,
+        sessionId: reviewerSession.sessionId,
+      });
+      if (!reviewerBefore.allowed) throw new Error(reviewerBefore.message);
+
+      plane.gpt.script({ match: /reviewer provider failure/, text: "", ok: false });
+      plane.gpt.setCapacity({
+        provider: "gpt",
+        sensorHealth: "ERROR",
+        runtimeHealth: "UNAVAILABLE",
+        observedAt: plane.clock.nowIso(),
+        source: "p0-06-reviewer-failure",
+        buckets: [],
+        error: "GPT allocation failed",
+      });
+      const failed = await plane.cp.providers.require("gpt").invoke({
+        prompt: "reviewer provider failure",
+        workdir: plane.root,
+        timeoutMs: 1_000,
+        readOnly: true,
+        correlationId: "p0-06-daemon-reviewer-failover",
+      });
+      expect(failed.ok).toBe(false);
+
+      const ceoAfter = plane.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(ceoAfter.sessionId).not.toBe(ceoBefore.sessionId);
+      expect(plane.cp.sessions.require(ceoAfter.sessionId).provider).toBe("claude");
+      const ctoAfter = plane.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))!;
+      expect(ctoAfter.sessionId).toBe(ctoBefore.sessionId);
+      expect(ctoAfter.bindingGeneration).toBe(ctoBefore.bindingGeneration);
+      const reviewerAfter = plane.cp.bindings.active(roleKeyFor(Role.BLIND_REVIEWER, { runId: run.value.runId }))!;
+      expect(reviewerAfter.sessionId).not.toBe(reviewerBefore.value.sessionId);
+      expect(reviewerAfter.bindingGeneration).toBe(reviewerBefore.value.bindingGeneration + 1);
+      expect(plane.cp.sessions.require(reviewerAfter.sessionId).provider).toBe("claude");
+      expect(reviewerAfter.sessionId).not.toBe(ctoAfter.sessionId);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("P0-06: daemon provider-failure coordination takes over an active Claude CTO and fences its late result", async () => {
+    const plane = makePlane();
+    bindCeo(plane, "gpt");
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    attachRoutablePorts(plane.cp);
+
+    const projectId = "p0-06-cto-takeover";
+    const project = plane.cp.projects.register({
+      projectId,
+      name: "P0 continuity CTO takeover",
+      manifest: fixtureManifest(projectId),
+    });
+    if (!project.allowed) throw new Error(project.message);
+
+    // Create a provider-recognised incumbent: dispatch probes the exact external id, so
+    // a bare READY row would conceal a false-ready CTO path instead of exercising takeover.
+    const incumbentHandle = await plane.claude.startSession({
+      model: "opus",
+      effort: null,
+      workdir: plane.root,
+      purpose: "p0-06 incumbent CTO",
+    });
+    const incumbentSession = plane.cp.sessions.create({
+      provider: "claude",
+      model: "opus",
+      incarnation: `${incumbentHandle.externalSessionId}#${plane.clock.nowIso()}`,
+      workdir: plane.root,
+    });
+    const incumbentReady = plane.cp.sessions.transition(
+      incumbentSession.sessionId,
+      SessionLifecycle.READY,
+      "test incumbent ready",
+    );
+    if (!incumbentReady.allowed) throw new Error(incumbentReady.message);
+    const incumbent = plane.cp.bindings.bind({
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: incumbentSession.sessionId,
+    });
+    if (!incumbent.allowed) throw new Error(incumbent.message);
+
+    const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    try {
+      const run = plane.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.SIMPLE,
+        contract: REVIEW_CONTRACT,
+      });
+      if (!run.allowed) throw new Error(run.message);
+      const dispatched = await plane.cp.runs.dispatch(run.value.runId);
+      if (!dispatched.allowed) throw new Error(dispatched.message);
+      expect(dispatched.value.ownerSessionId).toBe(incumbent.value.sessionId);
+      expect(dispatched.value.ownerBindingGeneration).toBe(incumbent.value.bindingGeneration);
+
+      const submitted = plane.cp.tasks.submit(run.value.runId, [{
+        key: "incumbent-work",
+        title: "work owned before CTO failover",
+        category: "implementation",
+      }]);
+      if (!submitted.allowed) throw new Error(submitted.message);
+      const task = plane.cp.tasks.ready(run.value.runId)[0]!;
+      const worker = plane.cp.sessions.create({ provider: "gpt", model: "worker" });
+      const workerReady = plane.cp.sessions.transition(worker.sessionId, SessionLifecycle.READY, "test worker ready");
+      if (!workerReady.allowed) throw new Error(workerReady.message);
+      const workerBinding = plane.cp.bindings.bind({
+        role: Role.WORKER,
+        taskId: task.taskId,
+        sessionId: worker.sessionId,
+      });
+      if (!workerBinding.allowed) throw new Error(workerBinding.message);
+      const execution = plane.cp.tasks.startExecution({
+        runId: run.value.runId,
+        taskId: task.taskId,
+        ownerBindingGeneration: incumbent.value.bindingGeneration,
+        workerSessionId: worker.sessionId,
+        provider: "gpt",
+        model: "worker",
+      });
+      if (!execution.allowed) throw new Error(execution.message);
+
+      plane.claude.script({ match: /Claude provider failure/, text: "", ok: false });
+      plane.claude.setCapacity({
+        provider: "claude",
+        sensorHealth: "ERROR",
+        runtimeHealth: "UNAVAILABLE",
+        observedAt: plane.clock.nowIso(),
+        source: "p0-06-cto-failure",
+        buckets: [],
+        error: "Claude allocation failed",
+      });
+      const failed = await plane.cp.providers.require("claude").invoke({
+        prompt: "Claude provider failure",
+        workdir: plane.root,
+        timeoutMs: 1_000,
+        readOnly: true,
+        correlationId: "p0-06-daemon-cto-takeover",
+      });
+      expect(failed.ok).toBe(false);
+
+      // Removing the daemon callback leaves the Claude assignment and its old run owner
+      // intact. These assertions therefore prove a fresh GPT binding was actually made,
+      // rather than merely recording a DEGRADED continuity mode.
+      const replacement = plane.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))!;
+      expect(replacement.sessionId).not.toBe(incumbent.value.sessionId);
+      expect(replacement.bindingGeneration).toBe(incumbent.value.bindingGeneration + 1);
+      expect(replacement.mode).toBe("FALLBACK");
+      expect(plane.cp.sessions.require(replacement.sessionId).provider).toBe("gpt");
+      const reassigned = plane.cp.runs.require(run.value.runId);
+      expect(reassigned.ownerSessionId).toBe(replacement.sessionId);
+      expect(reassigned.ownerBindingGeneration).toBe(replacement.bindingGeneration);
+
+      // The old worker's result has a durable execution generation from before takeover.
+      // It must be forensic-only: no task state or run owner may be mutated by it.
+      const late = plane.cp.tasks.finishExecution(execution.value.executionId, {
+        status: "SUCCEEDED",
+        resultDigest: "sha256:late-incumbent-result",
+      });
+      expect(late.allowed).toBe(false);
+      expect(late.reasonCode).toBe(ReasonCode.BINDING_GENERATION_STALE);
+      expect(plane.cp.tasks.execution(execution.value.executionId)!.status).toBe("ABANDONED");
+      expect(plane.cp.runs.require(run.value.runId).ownerBindingGeneration).toBe(replacement.bindingGeneration);
+      expect(plane.cp.audit.byKind("TASK_EXECUTION_LATE_RESULT_IGNORED")).toHaveLength(1);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("P0-06: daemon reconciliation does not preempt a healthy acting CEO when GPT recovers", async () => {
+    const plane = makePlane();
+    const acting = bindCeo(plane, "claude", "FALLBACK");
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    attachRoutablePorts(plane.cp);
+
+    const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    try {
+      const reconciled = await daemon.reconcileContinuity("GPT recovered while Claude acting CEO remains healthy");
+      expect(reconciled?.reassigned).toEqual([]);
+      const current = plane.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(current.sessionId).toBe(acting.sessionId);
+      expect(current.bindingGeneration).toBe(acting.bindingGeneration);
+      expect(current.mode).toBe("FALLBACK");
+      expect(plane.cp.continuity.mode()).toBe(ContinuityMode.DEGRADED);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("P0-06: daemon reconciliation restores an idle acting CTO to the recovered preferred provider", async () => {
+    const plane = makePlane();
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    attachRoutablePorts(plane.cp);
+
+    const projectId = "p0-06-restore-cto";
+    const project = plane.cp.projects.register({
+      projectId,
+      name: "P0 continuity CTO restore",
+      manifest: fixtureManifest(projectId),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    const actingSession = plane.cp.sessions.create({ provider: "gpt", model: "acting-cto" });
+    const actingReady = plane.cp.sessions.transition(actingSession.sessionId, SessionLifecycle.READY, "test acting CTO ready");
+    if (!actingReady.allowed) throw new Error(actingReady.message);
+    const acting = plane.cp.bindings.bind({
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: actingSession.sessionId,
+      mode: "FALLBACK",
+    });
+    if (!acting.allowed) throw new Error(acting.message);
+
+    const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    try {
+      const reconciled = await daemon.reconcileContinuity("Claude recovered before new project work");
+      expect(reconciled?.restored).toContain(roleKeyFor(Role.PRIMARY_CTO, { projectId }));
+      const restored = plane.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))!;
+      expect(restored.sessionId).not.toBe(acting.value.sessionId);
+      expect(restored.bindingGeneration).toBe(acting.value.bindingGeneration + 1);
+      expect(restored.mode).toBe("PREFERRED");
+      expect(plane.cp.sessions.require(restored.sessionId).provider).toBe("claude");
+      expect(plane.cp.continuity.mode()).toBe(ContinuityMode.NORMAL);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("P0-06: when neither provider can cover an active run, daemon reconciliation blocks the run and revokes dead bindings", async () => {
+    const plane = makePlane();
+    bindCeo(plane, "gpt");
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    attachRoutablePorts(plane.cp);
+
+    const projectId = "p0-06-survival";
+    const project = plane.cp.projects.register({
+      projectId,
+      name: "P0 continuity survival",
+      manifest: fixtureManifest(projectId),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    try {
+      const created = plane.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.SIMPLE,
+        contract: REVIEW_CONTRACT,
+      });
+      if (!created.allowed) throw new Error(created.message);
+      const dispatched = await plane.cp.runs.dispatch(created.value.runId);
+      if (!dispatched.allowed) throw new Error(dispatched.message);
+      expect(plane.cp.runs.require(created.value.runId).state).toBe(RunState.ACTIVE);
+
+      plane.gpt.script({ match: /all providers unavailable/, text: "", ok: false });
+      for (const adapter of [plane.gpt, plane.claude]) {
+        adapter.setCapacity({
+          provider: adapter.provider,
+          sensorHealth: "ERROR",
+          runtimeHealth: "UNAVAILABLE",
+          observedAt: plane.clock.nowIso(),
+          source: "p0-06-no-coverage",
+          buckets: [],
+          error: "all critical providers unavailable",
+        });
+      }
+      const failed = await plane.cp.providers.require("gpt").invoke({
+        prompt: "all providers unavailable",
+        workdir: plane.root,
+        timeoutMs: 1_000,
+        readOnly: true,
+        correlationId: "p0-06-daemon-survival",
+      });
+      expect(failed.ok).toBe(false);
+
+      // This proves the no-coverage branch changes durable authority/work state. Without
+      // pause+revoke, the mode alone would be SURVIVAL while this run stayed executable.
+      expect(plane.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
+      expect(plane.cp.runs.require(created.value.runId).state).toBe(RunState.BLOCKED);
+      expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))).toBeNull();
+      expect(plane.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))).toBeNull();
+    } finally {
+      await daemon.stop();
+    }
   });
 
   it("#178 denies dispatch admission when no production provider exists", async () => {
