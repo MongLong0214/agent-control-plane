@@ -53,7 +53,7 @@ these 12 failures arrived with them.
 |---|---|---|---|
 | 1 | CP-S01–CP-S59 all PASS | **Met in part — regressed mid-change** | All 59 scenario ids map to an executable test (`npx tsx src/tools/traceability.ts`: 59/59, 0 missing; `evidence/traceability.md`). Two of those tests are failing at `9bbbae6`: **CP-S54** and **CP-S55**. Mapping is not passing, and passing is not review clearance — see the review status below. |
 | 2 | DB constraint and transactional failover tests PASS | **Met** | `tests/unit/trusted-core.test.ts` trips each §30.2 constraint; `switchTo` activate/revoke/outbox-fence runs in one transaction and is asserted in CP-S10 and CP-S23. Both files pass in the run above. |
-| 3 | One real end-to-end run in each of SIMPLE, STANDARD, GUARDED | **Met** | Three real runs on the hardened code, one per mode, each recorded in full: `evidence/e2e-real-project.json` (STANDARD, 139 s), `evidence/e2e-real-project-simple.json` (SIMPLE, 146 s), `evidence/e2e-real-project-guarded.json` (GUARDED, 129 s). Durations are `telemetry.run[0].value` in ms. Closed as #239. Detail below. |
+| 3 | One real end-to-end run in each of SIMPLE, STANDARD, GUARDED | **Not met — component-integration evidence only** | Three opt-in component-integration runs cover one mode each, but they directly construct `ControlPlane` and bypass deployed Hermes/CTO MCP transports, Buzz, the daemon-managed worker runtime, GitHub App merge, and post-merge verification. The historical records retain their `e2e-real-project` filenames: STANDARD 139 s, SIMPLE 146 s, GUARDED 129 s. They are not deployment-E2E evidence. |
 | 4 | One multi-repository run with an explicit merge order | **Met in part** | Multi-repository freezing and staleness are proven with two real repositories (CP-S25), `run_repositories.merge_order` and per-repository merge state are implemented, and merge order is enforced with a regression test. A real two-repository run merging in declared order, with the first repository's post-merge verification gating the second, has not been executed — #240. |
 | 5 | Zero role/session independence violations under GPT-down and Claude-down continuity | **Met** | CP-S19–CP-S22, CP-S24, CP-S34, all in `tests/scenarios/graph-capacity-continuity.test.ts`, all passing. Distinct sessions are asserted, and a failover the coverage plan cannot staff is refused rather than downgraded. |
 | 6 | Repo Factory bootstrap → primary CTO activation → doctor | **Met on the control-plane side** | Activation runs from a fixture `repo-factory.result.v2` through registration, binding, handoff ACK and doctor (CP-S52, passing). The producing side is a separate deliverable and does not exist yet — #246. |
@@ -62,14 +62,16 @@ these 12 failures arrived with them.
 | 9 | Zero owner interrupts for routine technical revision during dogfood | **Not met** | Follows item 7. #241. CP-S33 and CP-S53 prove routine revision and churn do not notify upward, and both pass. |
 | 10 | Every P0 requirement linked to a scenario and evidence | **Met** | 22/22 requirements covered, 0 gaps, generated from the PRD tables rather than hand-maintained. |
 
-## What the three real end-to-end runs produced
+## What the three real component-integration runs produced
 
 One run per execution mode, against a local clone of this repository registered by hand, on
-the code at `273f53c`. The mode is a parameter of one test — `tests/e2e/real-project.test.ts`,
-run with `ACP_E2E=1 ACP_E2E_MODE=SIMPLE|STANDARD|GUARDED` — because §12.1 makes contract,
+the code at `273f53c`. The mode is a parameter of one test —
+`tests/e2e/real-component-integration.test.ts`, run with
+`ACP_COMPONENT_INTEGRATION=1 ACP_COMPONENT_INTEGRATION_MODE=SIMPLE|STANDARD|GUARDED` — because §12.1 makes contract,
 snapshot, verification and blind review mandatory in SIMPLE too; only the plan document is
 optional. So the three records differ in what the mode adds, not in how much of the pipeline
-ran.
+ran. The test calls control-plane components directly, so it is not evidence that the
+deployment transports or GitHub finalization path work end to end.
 
 | mode | run | duration | record |
 |---|---|---|---|
@@ -202,13 +204,12 @@ words:
   evidence can tell the difference, which is the part that matters. Revisit when verification
   can run in a container or VM per attempt. #166/#233 are closed against this.
 - **A GitHub merge executes with a fenced head and a proven base, rather than not at all.**
-  GitHub's REST merge cannot atomically condition on an expected base, and refusing every
-  merge would make item 4 above permanently unreachable. The merge carries the expected
-  *head*, rereads the base immediately before, proves after the fact by first-parent walk
-  which base it landed on, moves the repository to FAILED when that proof fails, and records
-  the residual race in the receipt. A provider that can condition atomically may set
-  `supportsAtomicExpectedBase` (`src/github/github-kernel.ts`). #85 is closed against this;
-  the residual window is real and named.
+  GitHub's REST merge conditions on the exact expected *head*, not an expected base. The
+  base is reread immediately before the merge and then proved after the fact by a
+  first-parent walk; a failed proof moves the repository to FAILED and records the residual
+  race in the receipt. The residual base race is bounded by that exact-head condition and
+  post-merge verification, not by an atomic expected-base predicate. #85 is closed against
+  this; the residual window is real and named.
 - **Evidence is refused, never rewritten.** Redaction applied to evidence on the way to
   storage made every digest uncorroborable — a gate compares the report it was handed against
   the stored row, and the two could never match. §31.5 is now satisfied by *refusing* to store
