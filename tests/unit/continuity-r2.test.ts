@@ -399,6 +399,10 @@ describe("round-2 capacity and runtime regressions", () => {
         clock,
         capacityFile: join(workdir, "capacity.json"),
         binary,
+        // The deployment provisioned a provider credential store, which is what makes closing
+        // the host keychain possible rather than self-defeating — without one, denying it stops
+        // every session authenticating and dispatch fails SESSION_NOT_READY.
+        providerCredentialDir: providerScope,
         // PATH is deliberately listed: an allowlist must not be able to reintroduce gh.
         environmentAllowlist: ["PATH", "GH_TOKEN"],
       });
@@ -438,6 +442,9 @@ describe("round-2 capacity and runtime regressions", () => {
         [workFile]: true,
         [gitconfig]: false,
         [netrc]: false,
+        // Closed, because this fixture provisioned a provider credential store. Without one,
+        // denying the host keychain would stop the provider authenticating at all — #354
+        // asserts that open case, and dispatch fails SESSION_NOT_READY when it is wrong.
         [keychain]: false,
       });
     });
@@ -488,7 +495,7 @@ describe("round-2 capacity and runtime regressions", () => {
           packetRoot,
           denyReadPaths: [daemonFile],
           emptyEnvironment: true,
-          network: "deny",
+          network: "provider-only",
           tools: "none",
         },
       });
@@ -524,6 +531,9 @@ describe("round-2 capacity and runtime regressions", () => {
         [daemonFile]: false,
         [gitconfig]: false,
         [netrc]: false,
+        // Closed: this fixture gives the reviewer a scoped provider config, which is what makes
+        // shutting the host keychain safe. Where a deployment provisions nothing, the keychain
+        // stays open because the provider could not otherwise authenticate at all.
         [keychain]: false,
       });
     });
@@ -550,7 +560,7 @@ describe("round-2 capacity and runtime regressions", () => {
         // unusable profile into an unattested isolation result, not an uncaught exception.
         denyReadPaths: ["/tmp/acp-profile\u0000cannot-apply"],
         emptyEnvironment: true,
-        network: "deny",
+        network: "provider-only",
         tools: "none",
       },
     });
@@ -604,7 +614,7 @@ describe("round-2 capacity and runtime regressions", () => {
         packetRoot,
         denyReadPaths: [join(packetRoot, "../daemon.sqlite")],
         emptyEnvironment: true,
-        network: "deny",
+        network: "provider-only",
         tools: "none",
       },
     });

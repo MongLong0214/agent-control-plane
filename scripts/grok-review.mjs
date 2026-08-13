@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Independent production-readiness review by Grok.
+ * Independent production-readiness review by Grok (grok-4.6-build, reasoning effort `xhigh`,
+ * which is the CLI's maximum — `max` is rejected).
  *
  * Same shape as `scripts/production-review.mjs` (GPT-5.6 Sol) on purpose: the areas are the
  * ones the PRD gives distinct authority to, the reviewer reads the repository itself rather
@@ -161,6 +162,7 @@ const run = (key, area) =>
       "-p", prompt(key, area),
       "--output-format", "json",
       "--json-schema", JSON.stringify(SCHEMA),
+      "--reasoning-effort", "xhigh",
       "--permission-mode", "plan",
       "--disable-web-search",
       "--no-subagents",

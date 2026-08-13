@@ -311,15 +311,30 @@ describe("round-2 database and evidence regressions", () => {
     expect(audit.all()[0]?.evidence).toEqual({ requestHeaders: "[redacted-collection]" });
   });
 
-  it("#75 rejects an unallowlisted audit-evidence collection before it can serialize a credential", () => {
+  it("#75 keeps a credential out of durable audit even under a name nobody allowlisted", () => {
     const { audit } = makeCore();
+    // A name-only allowlist rejected the real CANDIDATE_FROZEN record and stopped runs from
+    // reaching review, so the boundary asserts the invariant instead: whatever the field is
+    // called, the credential must not be in the stored row.
+    audit.record({ kind: "TEST", evidence: { requestMetadata: { "X-Service-Key": "arbitrary-password" } } });
+    const stored = JSON.stringify(audit.all()[0]?.evidence ?? {});
+    expect(stored).not.toContain("arbitrary-password");
+    expect(stored).toContain("redacted");
+  });
+
+  it("#75 refuses a free-form payload under a field nobody allowlisted", () => {
+    const { audit } = makeCore();
+    // The shape §31.5 exists to keep out: an unknown name carrying prose, which is what a
+    // prompt or a transcript looks like. Identifier-shaped values stay admissible.
     const rejected = audit.record({
       kind: "TEST",
-      evidence: { requestMetadata: { "X-Service-Key": "arbitrary-password" } },
+      evidence: { modelNotes: `${"the operator asked the model to summarise the incident. ".repeat(8)}` },
     });
-
     expect(rejected).toMatchObject({ allowed: false, reasonCode: ReasonCode.TRUSTED_CREDENTIAL_LEAK_BLOCKED });
     expect(audit.all()[0]?.evidence).toEqual({ auditEvidenceRejected: true });
+
+    const admitted = audit.record({ kind: "TEST", evidence: { attemptCount: 3, worktreeId: "verify-abc123" } });
+    expect(admitted.allowed).toBe(true);
   });
 
   it("#76 rejects receipt edits and deletes that would remove an external-write replay marker", () => {

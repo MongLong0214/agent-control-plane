@@ -39,6 +39,14 @@ export interface CliAdapterOptions {
   environmentAllowlist?: readonly string[];
   /** Control-plane paths that a runtime process must not read or write. */
   denyReadPaths?: readonly string[];
+  /**
+   * A credential store this deployment provisioned for the provider. Its presence is what
+   * makes closing the host keychain possible rather than self-defeating: on macOS the
+   * provider's own login and the host's other secrets share one store, so denying it without
+   * an alternative stops every session authenticating (measured: `claude --print` answers
+   * "Not logged in", and dispatch then fails SESSION_NOT_READY).
+   */
+  providerCredentialDir?: string;
   /** Observations beyond this lead are not valid freshness evidence. */
   maxClockSkewMs?: number;
 }
@@ -193,6 +201,25 @@ export const readCapacityFile = (
   }
 };
 
+
+/**
+ * A settings file the control plane owns, so a managed session runs no code the daemon did
+ * not sanction.
+ *
+ * The provider CLI reads *hooks* — arbitrary shell commands — from the operator's own
+ * settings. Two problems, one measured: unsanctioned code executes inside a managed session,
+ * and a hook whose binary is not on the agent's restricted PATH makes the CLI exit non-zero,
+ * which the review gate correctly reads as "no verdict" and the whole run stops at
+ * REVIEW_UNAVAILABLE. Replacing the config directory is not an option — OAuth is bound to it
+ * on this platform, and pointing it elsewhere answers "Not logged in" — so the settings are
+ * overridden instead, which leaves authentication untouched.
+ */
+const sanctionedSettingsFile = (scratch: string): string => {
+  const file = join(scratch, "acp-settings.json");
+  writeFileSync(file, JSON.stringify({ hooks: {}, enabledPlugins: {} }), { mode: 0o600 });
+  return file;
+};
+
 const runCli = async (
   file: string,
   args: readonly string[],
@@ -202,6 +229,7 @@ const runCli = async (
     stdin?: string;
     environmentAllowlist?: readonly string[];
     denyReadPaths?: readonly string[];
+    providerCredentialDir?: string;
     writablePaths?: readonly string[];
     /** Strict packet-only reviewer boundary, distinct from normal agent containment. */
     isolation?: NonNullable<InvocationRequest["isolation"]>;
@@ -245,7 +273,7 @@ const runCli = async (
   const isolated = options.isolation !== undefined;
   const environment = isolated
     ? reviewerEnvironment(workdir, options.reviewerConfigDirectory)
-    : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch));
+    : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch), options.providerCredentialDir);
   const profile = isolated
     ? reviewerProfile(
         workdir,
@@ -253,7 +281,13 @@ const runCli = async (
         file,
         options.reviewerCredentialPaths ?? [],
       )
-    : runtimeProfile(workdir, realpathSync(scratch), options.denyReadPaths ?? [], options.writablePaths ?? []);
+    : runtimeProfile(
+        workdir,
+        realpathSync(scratch),
+        options.denyReadPaths ?? [],
+        options.writablePaths ?? [],
+        options.providerCredentialDir,
+      );
 
   // sandbox-exec is a wrapper around the provider process. A provider may return a
   // non-zero status for an invalid answer while the seatbelt still held; prove the
@@ -385,7 +419,7 @@ const assertReviewerIsolation = (
   workdir: string,
   isolation: NonNullable<InvocationRequest["isolation"]>,
 ): void => {
-  if (isolation.emptyEnvironment !== true || isolation.network !== "deny" || isolation.tools !== "none") {
+  if (isolation.emptyEnvironment !== true || isolation.network !== "provider-only" || isolation.tools !== "none") {
     throw new Error("reviewer isolation contract is incomplete");
   }
   if (realpathSync(isolation.packetRoot) !== workdir) {
@@ -429,7 +463,11 @@ const looksLikeCredential = (value: string): boolean => SECRET_VALUE_SHAPES.some
  * confining writes to the scratch and work directories — not by blinding the provider to
  * its own login.
  */
-export const runtimeEnvironment = (allowlist: readonly string[], scratch: string): NodeJS.ProcessEnv => {
+export const runtimeEnvironment = (
+  allowlist: readonly string[],
+  scratch: string,
+  providerCredentialDir?: string,
+): NodeJS.ProcessEnv => {
   const environment: NodeJS.ProcessEnv = {
     PATH: agentPath(),
     HOME: process.env["HOME"] ?? scratch,
@@ -445,9 +483,7 @@ export const runtimeEnvironment = (allowlist: readonly string[], scratch: string
     // This is a provider namespace selector, not a credential. Preserve it so a
     // deployment that provisions a dedicated Claude secure-storage scope does not need
     // the host Keychains directory reopened merely to authenticate its own provider.
-    ...(process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
-      ? { CLAUDE_SECURESTORAGE_CONFIG_DIR: process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] }
-      : {}),
+    ...(providerCredentialDir ? { CLAUDE_SECURESTORAGE_CONFIG_DIR: providerCredentialDir } : {}),
   };
   for (const name of allowlist) {
     // PATH is a containment control, not a caller-provided convenience variable. The
@@ -468,7 +504,12 @@ export const runtimeEnvironment = (allowlist: readonly string[], scratch: string
  */
 export const reviewerEnvironment = (packetRoot: string, configDirectory?: string): NodeJS.ProcessEnv => ({
   PATH: agentPath(),
-  HOME: packetRoot,
+  // A reviewer is still a provider session: with HOME pointed at the packet root and no
+  // scoped credential store, it cannot log in and every review returns EVIDENCE_MISSING —
+  // measured on a real run, not inferred. Where the deployment provisioned a scope, the
+  // reviewer gets that and nothing else; where it did not, it authenticates the way any
+  // other session does, and `isolation.providerCredentials` records which of the two held.
+  HOME: configDirectory ? packetRoot : (process.env["HOME"] ?? packetRoot),
   ...(process.env["USER"] ? { USER: process.env["USER"] } : {}),
   TMPDIR: packetRoot,
   LANG: "C.UTF-8",
@@ -490,7 +531,7 @@ const claudeCredentialPaths = (configDirectory?: string): string[] => {
 };
 
 /** Credential stores that are daemon authority, not provider identity. */
-const hostCredentialPaths = (): string[] => {
+const hostCredentialPaths = (providerCredentialDir?: string): string[] => {
   const home = process.env["HOME"] ?? "";
   if (!home) return [];
   return [
@@ -503,19 +544,33 @@ const hostCredentialPaths = (): string[] => {
     `${home}/.git-credentials`,
     `${home}/.gitconfig`,
     `${home}/.netrc`,
-    `${home}/Library/Keychains`,
+    // The login keychain is denied only when the deployment gave the provider somewhere else
+    // to keep its own credentials. On macOS the provider's login and the host's other secrets
+    // live in the same store, so denying it outright does not confine an agent — it stops the
+    // agent authenticating at all, and every session then fails SESSION_NOT_READY (measured:
+    // `claude --print` answers "Not logged in"). Where a scoped store is configured, the host
+    // keychain is closed; where it is not, it stays open and the isolation evidence says so.
+    ...(providerCredentialDir ? [`${home}/Library/Keychains`] : []),
   ];
 };
+
+/**
+ * A provider credential scope the deployment provisioned, if any. Its presence is what makes
+ * closing the host keychain possible rather than self-defeating; see `hostCredentialPaths`.
+ */
+export const scopedProviderCredentials = (): string | null =>
+  process.env["ACP_PROVIDER_CREDENTIAL_DIR"] ?? process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] ?? null;
 
 const runtimeProfile = (
   workdir: string,
   scratch: string,
   denyReadPaths: readonly string[],
   writablePaths: readonly string[],
+  providerCredentialDir?: string,
 ): string => {
   const sensitive = [
     ...denyReadPaths,
-    ...hostCredentialPaths(),
+    ...hostCredentialPaths(providerCredentialDir),
   ].map(resolvePath);
   const lines = ["(version 1)", "(allow default)"];
   for (const path of sensitive) {
@@ -565,8 +620,14 @@ const reviewerProfile = (
 ): string => {
   void executable;
   void credentialPaths;
-  const lines = ["(version 1)", "(allow default)", "(deny network*)"];
-  for (const path of [...hostCredentialPaths(), ...denyReadPaths]) {
+  // Network is *not* denied, and the contract says so rather than claiming otherwise: a
+  // blind reviewer is a model invocation, so cutting its egress does not confine it, it
+  // makes it impossible — measured, the CLI simply hangs until the invocation times out.
+  // The confinement that matters for CP-HI-04 is the filesystem: the reviewer cannot read
+  // the daemon's state, another checkout or a credential, and cannot write outside its
+  // packet, so it cannot reach the candidate it is judging or leave anything behind.
+  const lines = ["(version 1)", "(allow default)"];
+  for (const path of [...hostCredentialPaths(credentialPaths[0]), ...denyReadPaths]) {
     const resolved = resolvePath(path);
     if (resolved && resolved !== packetRoot && !resolved.startsWith(`${packetRoot}/`)) {
       lines.push(`(deny file-read* (subpath ${quote(resolved)}))`);
@@ -613,6 +674,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   readonly #maxClockSkewMs: number;
   readonly #environmentAllowlist: readonly string[];
   readonly #denyReadPaths: readonly string[];
+  readonly #providerCredentialDir: string | undefined;
 
   constructor(options: CliAdapterOptions) {
     this.#binary = resolveExecutable(options.binary ?? "claude");
@@ -622,6 +684,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     this.#maxClockSkewMs = options.maxClockSkewMs ?? DEFAULT_CLOCK_SKEW_MS;
     this.#environmentAllowlist = options.environmentAllowlist ?? [];
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
+    this.#providerCredentialDir = options.providerCredentialDir;
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
@@ -651,6 +714,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       "--model",
       request.model ?? this.defaultModels.cto,
     ];
+    // Hooks and plugins are the operator's, not this run's; see `sanctionedSettingsFile`.
+    args.push("--settings", sanctionedSettingsFile(mkdtempSync(join(tmpdir(), "acp-settings-"))));
     // Make the invocation *be* the constituted session, so the identity the independence
     // check was performed against is the identity that produces the answer.
     if (request.externalSessionId) args.push("--session-id", request.externalSessionId);
@@ -679,6 +744,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       stdin: request.prompt,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
+      providerCredentialDir: this.#providerCredentialDir,
       isolation: request.isolation,
       reviewerCredentialPaths: request.isolation ? claudeCredentialPaths(process.env["CLAUDE_CONFIG_DIR"]) : undefined,
       reviewerConfigDirectory: request.isolation
@@ -713,6 +779,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       timeoutMs: 15_000,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
+      providerCredentialDir: this.#providerCredentialDir,
     });
     return result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE";
   }
@@ -727,6 +794,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       stdin: "Reply with READY.",
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
+      providerCredentialDir: this.#providerCredentialDir,
     });
     if (result.exitCode !== 0 || result.timedOut) return "UNAVAILABLE";
     const sessionId = safeParse(result.stdout)?.["session_id"];
@@ -778,6 +846,7 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly #maxClockSkewMs: number;
   readonly #environmentAllowlist: readonly string[];
   readonly #denyReadPaths: readonly string[];
+  readonly #providerCredentialDir: string | undefined;
 
   constructor(options: CliAdapterOptions) {
     this.#binary = resolveExecutable(options.binary ?? "codex");
@@ -787,6 +856,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#maxClockSkewMs = options.maxClockSkewMs ?? DEFAULT_CLOCK_SKEW_MS;
     this.#environmentAllowlist = options.environmentAllowlist ?? [];
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
+    this.#providerCredentialDir = options.providerCredentialDir;
   }
 
   async startSession(spec: SessionSpec): Promise<SessionHandle> {
@@ -846,6 +916,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       timeoutMs: request.timeoutMs,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
+      providerCredentialDir: this.#providerCredentialDir,
       writablePaths: [scratch],
     });
 
@@ -872,6 +943,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       timeoutMs: 15_000,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
+      providerCredentialDir: this.#providerCredentialDir,
     });
     return result.exitCode === 0 && !result.timedOut ? "HEALTHY" : "UNAVAILABLE";
   }

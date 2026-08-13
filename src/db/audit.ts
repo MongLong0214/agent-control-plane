@@ -207,8 +207,33 @@ const isAllowlistedAuditEvidence = (value: unknown, depth = 0): boolean => {
     // These names are explicitly safe only because redact() replaces their values before
     // serialization. They stay outside the general allowlist on purpose.
     if (isSecretKey(key) || isSecretCollectionKey(key) || isBulkContentKey(key)) return true;
-    return AUDIT_EVIDENCE_KEYS.has(key) && isAllowlistedAuditEvidence(nested, depth + 1);
+    if (AUDIT_EVIDENCE_KEYS.has(key)) return isAllowlistedAuditEvidence(nested, depth + 1);
+    // A name-only allowlist made every new audit field a refusal — it rejected the real
+    // CANDIDATE_FROZEN record and stopped a run from ever reaching review. What §31.5 is
+    // actually protecting against is a *payload*: a prompt, a transcript, a credential. So an
+    // unknown name is admitted for values that cannot be one — numbers, booleans, and short
+    // identifier-shaped strings — and refused for free-form text, which is what a private
+    // payload looks like.
+    return isIdentifierLikeAuditValue(nested, depth);
   });
+};
+
+/** The value shapes an unknown audit field may carry; see `isAllowlistedAuditEvidence`. */
+const MAX_UNKNOWN_AUDIT_STRING = 200;
+
+const isIdentifierLikeAuditValue = (value: unknown, depth: number): boolean => {
+  if (value == null || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "bigint") return true;
+  if (typeof value === "string") {
+    if (value.length > MAX_UNKNOWN_AUDIT_STRING) return false;
+    return !SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value));
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 200).every((item) => isIdentifierLikeAuditValue(item, depth + 1));
+  }
+  if (isPlainRecord(value)) return isAllowlistedAuditEvidence(value, depth + 1);
+  return false;
 };
 
 const scrubValue = (text: string): string => {

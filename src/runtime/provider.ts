@@ -43,7 +43,13 @@ export interface InvocationRequest {
     /** Daemon and repository roots that must remain unreadable even if discovered. */
     denyReadPaths: readonly string[];
     emptyEnvironment: true;
-    network: "deny";
+    /**
+     * A blind reviewer is a model invocation, so its egress cannot be cut without making the
+     * review impossible (measured: the CLI hangs until the invocation times out). The value
+     * records what is actually enforced — reach the provider, nothing else is confined by the
+     * network layer — so a reader of the attestation is not told egress was denied.
+     */
+    network: "provider-only";
     tools: "none";
   };
 }

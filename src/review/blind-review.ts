@@ -547,7 +547,7 @@ export class BlindReviewGate {
         packetRoot: reviewer.workdir,
         denyReadPaths: [...denyReadPaths],
         emptyEnvironment: true,
-        network: "deny",
+        network: "provider-only",
         tools: "none",
       },
     };
@@ -1102,7 +1102,7 @@ type ReviewerIsolation = {
   packetRoot: string;
   denyReadPaths: readonly string[];
   emptyEnvironment: true;
-  network: "deny";
+  network: "provider-only";
   tools: "none";
 };
 

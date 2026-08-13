@@ -469,7 +469,7 @@ describe("round-2 blind-review regressions", () => {
     expect(invocation.isolation).toEqual(expect.objectContaining({
       packetRoot: invocation.workdir,
       emptyEnvironment: true,
-      network: "deny",
+      network: "provider-only",
       tools: "none",
     }));
     expect(invocation.isolation?.denyReadPaths).toContain(canonical(setup.harness.repoPath));
