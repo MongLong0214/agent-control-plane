@@ -125,6 +125,29 @@ export const TaskCategory = {
 } as const;
 export type TaskCategory = (typeof TaskCategory)[keyof typeof TaskCategory];
 
+/**
+ * ACP 2.0 baseline vocabulary (V1-BR-05).
+ *
+ * This is deliberately separate from the v1 operational `TaskCategory`: the latter
+ * tells the current task graph how work is being handled, while this small, stable
+ * vocabulary is the historical label an offline experiment may compare across runs.
+ * It is a record only; nothing in v1 uses it to route, optimize, or select a model.
+ */
+export const TaskClass = {
+  MECHANICAL_CHANGE: "MECHANICAL_CHANGE",
+  LOCAL_BUG_FIX: "LOCAL_BUG_FIX",
+  BOUNDED_FEATURE: "BOUNDED_FEATURE",
+  TEST_OR_FIXTURE: "TEST_OR_FIXTURE",
+  DEPENDENCY_OR_MIGRATION: "DEPENDENCY_OR_MIGRATION",
+  MULTI_REPO_CHANGE: "MULTI_REPO_CHANGE",
+  PERFORMANCE: "PERFORMANCE",
+  SECURITY: "SECURITY",
+  ARCHITECTURE: "ARCHITECTURE",
+  PRODUCT_OR_OWNER_JUDGMENT: "PRODUCT_OR_OWNER_JUDGMENT",
+  OTHER: "OTHER",
+} as const;
+export type TaskClass = (typeof TaskClass)[keyof typeof TaskClass];
+
 export const FailureClass = {
   transient: "transient",
   repairable: "repairable",

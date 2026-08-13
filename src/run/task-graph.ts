@@ -3,12 +3,26 @@ import type {
   DynamicReserveDemand,
   WorkerFanoutCapacityTarget,
 } from "../capacity/capacity-monitor.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { digestOf } from "../core/digest.ts";
+import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { newTaskId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import { type FailureClass, RunState, type TaskCategory, TaskState } from "../domain/types.ts";
+import {
+  type FailureClass,
+  RunState,
+  type TaskCategory,
+  type TaskClass,
+  TaskState,
+} from "../domain/types.ts";
+import {
+  BaselineRecordKind,
+  isTaskClass,
+  taskClassForCategory,
+  type UsageEvidenceInput,
+} from "../export/baseline-contract.ts";
+import { BaselineRecorder } from "../export/baseline-recorder.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 
 export interface TaskSpec {
@@ -16,6 +30,9 @@ export interface TaskSpec {
   key: string;
   title: string;
   category: TaskCategory;
+  /** Stable baseline label; omitted values use the documented transparent category mapping. */
+  taskClass?: TaskClass;
+  taskClassConfidence?: number | null;
   dependsOn?: readonly string[];
   spec?: Record<string, unknown>;
 }
@@ -45,6 +62,26 @@ export interface ExecutionStart {
   repositoryId?: string | null;
   worktreeId?: string | null;
   concurrencyWidth?: number | null;
+  /** Provider-returned identity fields. Omit rather than copying requested values when unavailable. */
+  observedProvider?: string | null;
+  observedModel?: string | null;
+  observedModelVersion?: string | null;
+  providerSessionId?: string | null;
+  reasoningEffort?: string | null;
+  adapterVersion?: string | null;
+  toolPolicyDigest?: string | null;
+  contextPacketDigest?: string | null;
+  /** Must match the immutable run harness when the caller knows it. */
+  harnessDigest?: string | null;
+}
+
+export interface ExecutionOutcome {
+  status: "SUCCEEDED" | "FAILED" | "ABANDONED" | "TIMEOUT";
+  resultDigest?: string | null;
+  failureClass?: FailureClass | null;
+  /** A final baseline label may refine the transparent proposal without erasing history. */
+  finalTaskClass?: TaskClass;
+  finalTaskClassConfidence?: number | null;
 }
 
 export interface ExecutionRecord {
@@ -106,13 +143,16 @@ const CLOSED_TO_NEW_TASKS: ReadonlySet<RunState> = new Set([
 export class TaskGraph {
   #capacity: WorkerCapacityGate | null = null;
   #workerBindings: WorkerExecutionBindingGate | null = null;
+  readonly #baseline: BaselineRecorder;
 
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly telemetry: Telemetry,
-  ) {}
+  ) {
+    this.#baseline = new BaselineRecorder(db, clock, audit);
+  }
 
   /** Closed by the composition root after the capacity monitor exists. */
   attach(ports: { capacity?: WorkerCapacityGate; workerBindings?: WorkerExecutionBindingGate }): void {
@@ -176,6 +216,17 @@ export class TaskGraph {
 
       for (const spec of specs) {
         const taskId = idByKey.get(spec.key)!;
+        const classification = this.#baseline.recordTaskClassification(runId, {
+          taskId,
+          classification: spec.taskClass ?? taskClassForCategory(spec.category),
+          confidence: spec.taskClassConfidence ?? null,
+          stage: "PROPOSED",
+          source: "TASK_GRAPH",
+          replacesPayloadDigest: null,
+        });
+        if (!classification.allowed) {
+          fail(classification.reasonCode, classification.message, classification.evidence);
+        }
         this.db.run(
           `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
            VALUES (?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
@@ -194,6 +245,14 @@ export class TaskGraph {
 
       this.refreshReadiness(runId);
       const created = specs.map((s) => this.require(idByKey.get(s.key)!));
+      const graphBaseline = this.#baseline.record(
+        runId,
+        BaselineRecordKind.GRAPH_SNAPSHOT,
+        this.graphSnapshot(runId),
+      );
+      if (!graphBaseline.allowed) {
+        fail(graphBaseline.reasonCode, graphBaseline.message, graphBaseline.evidence);
+      }
 
       this.audit.record({
         kind: "TASK_GRAPH_SUBMITTED",
@@ -257,6 +316,75 @@ export class TaskGraph {
       const attempt = task.attemptCount + 1;
       const executionId = `${input.taskId}#${attempt}`;
       const now = this.clock.nowIso();
+      const pinnedHarness = this.#baseline.harness(input.runId);
+      if (
+        input.harnessDigest != null &&
+        pinnedHarness != null &&
+        input.harnessDigest !== pinnedHarness.digest
+      ) {
+        return deny(ReasonCode.CONFLICT, "execution harness differs from the run's immutable harness", {
+          runId: input.runId,
+          executionId,
+          pinnedHarnessDigest: pinnedHarness.digest,
+          suppliedHarnessDigest: input.harnessDigest,
+        });
+      }
+      const session = this.db.get<{
+        incarnation: string;
+        effort: string | null;
+      }>(`SELECT incarnation, effort FROM sessions WHERE session_id = ?`, [input.workerSessionId]);
+      const workerBindingIdentity = this.db.get<{ binding_generation: number }>(
+        `SELECT binding_generation FROM assignments
+          WHERE role = 'WORKER' AND task_id = ? AND session_id = ? AND status = 'ACTIVE'`,
+        [input.taskId, input.workerSessionId],
+      );
+      const contract = this.db.get<{ contract_digest: string }>(
+        `SELECT contract_digest FROM runs WHERE run_id = ?`,
+        [input.runId],
+      );
+      const contextPacketDigest = input.contextPacketDigest ?? digestOf({
+        schema: "agent-control-plane.task-invocation-packet.v1",
+        runId: input.runId,
+        taskId: input.taskId,
+        taskSpecDigest: digestOf(task.spec),
+        dependencyTaskIds: [...task.dependsOn].sort(),
+        contractDigest: contract?.contract_digest ?? null,
+      });
+      const observedProvider = input.observedProvider ?? null;
+      const observedModel = input.observedModel ?? null;
+      const suppliedHarnessDigest = input.harnessDigest ?? null;
+      const harnessMatches = pinnedHarness !== null && suppliedHarnessDigest === pinnedHarness.digest;
+      const invocationBaseline = this.#baseline.recordInvocationStarted(input.runId, {
+        executionId,
+        taskId: input.taskId,
+        logicalRole: "WORKER",
+        provider: input.provider,
+        requestedModel: input.model,
+        observedProvider,
+        observedModel,
+        observedModelVersion: input.observedModelVersion ?? null,
+        reasoningEffort: input.reasoningEffort ?? session?.effort ?? null,
+        sessionId: input.workerSessionId,
+        sessionIncarnation: session?.incarnation ?? null,
+        providerSessionId: input.providerSessionId ?? null,
+        workerBindingGeneration: workerBindingIdentity?.binding_generation ?? null,
+        ownerBindingGeneration: input.ownerBindingGeneration,
+        // Do not inherit the run pin when the invocation did not supply an attestation.
+        // An omitted digest is an unknown/mixed-harness fact, not proof of compatibility.
+        harnessDigest: suppliedHarnessDigest,
+        adapterVersion: input.adapterVersion ?? null,
+        toolPolicyDigest: input.toolPolicyDigest ?? null,
+        contextPacketDigest,
+        startedAt: now,
+        providerDriftObserved: observedProvider === null ? null : observedProvider !== input.provider,
+        modelDriftObserved: observedModel === null ? null : observedModel !== input.model,
+        qualificationEligible:
+          harnessMatches &&
+          observedModel !== null &&
+          observedModel === input.model &&
+          (observedProvider === null || observedProvider === input.provider),
+      });
+      if (!invocationBaseline.allowed) return invocationBaseline as Decision<ExecutionRecord>;
 
       this.db.run(
         `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
@@ -326,11 +454,7 @@ export class TaskGraph {
 
   finishExecution(
     executionId: string,
-    outcome: {
-      status: "SUCCEEDED" | "FAILED" | "ABANDONED" | "TIMEOUT";
-      resultDigest?: string | null;
-      failureClass?: FailureClass | null;
-    },
+    outcome: ExecutionOutcome,
     /** When given, the execution must belong to this run (§25.2). */
     expectedRunId?: string,
   ): Decision<ExecutionRecord> {
@@ -392,6 +516,43 @@ export class TaskGraph {
       }
 
       const now = this.clock.nowIso();
+      const durationMs = new Date(now).getTime() - new Date(execution.startedAt).getTime();
+      const invocationBaseline = this.#baseline.recordInvocationFinished(execution.runId, {
+        executionId,
+        endedAt: now,
+        durationMs: Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : null,
+        outcome: outcome.status,
+        failureClass: outcome.failureClass ?? null,
+        resultDigest: outcome.resultDigest ?? null,
+      });
+      if (!invocationBaseline.allowed) return invocationBaseline as Decision<ExecutionRecord>;
+      const task = this.get(execution.taskId);
+      if (!task) return deny(ReasonCode.NOT_FOUND, "execution's task is missing", { executionId });
+      const priorClassification = this.#baseline
+        .records(execution.runId)
+        .filter(
+          (record) =>
+            record.kind === BaselineRecordKind.TASK_CLASSIFICATION &&
+            record.payload["taskId"] === execution.taskId,
+        )
+        .at(-1);
+      const classificationBaseline = this.#baseline.recordTaskClassification(execution.runId, {
+        taskId: execution.taskId,
+        classification:
+          outcome.finalTaskClass ??
+          (isTaskClass(priorClassification?.payload["classification"])
+            ? priorClassification.payload["classification"]
+            : taskClassForCategory(task.category)),
+        confidence:
+          outcome.finalTaskClassConfidence ??
+          (typeof priorClassification?.payload["confidence"] === "number"
+            ? priorClassification.payload["confidence"]
+            : null),
+        stage: "FINAL",
+        source: "TASK_GRAPH",
+        replacesPayloadDigest: priorClassification?.payloadDigest ?? null,
+      });
+      if (!classificationBaseline.allowed) return classificationBaseline as Decision<ExecutionRecord>;
       this.db.run(
         `UPDATE task_executions SET status = ?, ended_at = ?, result_digest = ?, failure_class = ?
           WHERE execution_id = ?`,
@@ -417,9 +578,6 @@ export class TaskGraph {
         },
       });
 
-      const durationMs =
-        new Date(now).getTime() - new Date(execution.startedAt).getTime();
-      const task = this.get(execution.taskId);
       this.telemetry.record({
         scope: "task",
         name: "execution",
@@ -457,6 +615,98 @@ export class TaskGraph {
       executionId,
     ]);
     return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * V1-BR-02 recording boundary. Runtime adapters may report provider, CLI, quota, or
+   * estimated usage here; missing information is explicitly `UNAVAILABLE`, never zeroed.
+   */
+  recordUsage(input: UsageEvidenceInput): Decision<void> {
+    if (input.executionId) {
+      const execution = this.execution(input.executionId);
+      if (!execution) return deny(ReasonCode.NOT_FOUND, "unknown execution", { executionId: input.executionId });
+      if (execution.runId !== input.runId) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "usage receipt belongs to another run", {
+          executionId: input.executionId,
+          executionRunId: execution.runId,
+          requestedRunId: input.runId,
+        });
+      }
+    }
+    const recorded = this.#baseline.recordUsage(input);
+    if (!recorded.allowed) return recorded as Decision<void>;
+    this.telemetry.record({
+      scope: "run",
+      name: "usage_evidence",
+      runId: input.runId,
+      text: input.source,
+      dims: { executionId: input.executionId ?? null, confidence: input.confidence ?? null },
+    });
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /** Structural graph facts only — no scheduling or topology-selection policy is applied. */
+  private graphSnapshot(runId: string): Record<string, unknown> {
+    const tasks = this.db.all<{ task_id: string }>(
+      `SELECT task_id FROM tasks WHERE run_id = ? ORDER BY task_id`,
+      [runId],
+    );
+    const dependencies = this.db.all<{ task_id: string; depends_on: string }>(
+      `SELECT d.task_id, d.depends_on
+         FROM task_dependencies d JOIN tasks t ON t.task_id = d.task_id
+        WHERE t.run_id = ? ORDER BY d.task_id, d.depends_on`,
+      [runId],
+    );
+    const parents = new Map(tasks.map((task) => [task.task_id, [] as string[]]));
+    const children = new Map(tasks.map((task) => [task.task_id, [] as string[]]));
+    for (const dependency of dependencies) {
+      parents.get(dependency.task_id)?.push(dependency.depends_on);
+      children.get(dependency.depends_on)?.push(dependency.task_id);
+    }
+    const depthMemo = new Map<string, number>();
+    const depth = (taskId: string): number => {
+      const known = depthMemo.get(taskId);
+      if (known !== undefined) return known;
+      const value = 1 + Math.max(0, ...(parents.get(taskId) ?? []).map(depth));
+      depthMemo.set(taskId, value);
+      return value;
+    };
+    const indegree = new Map(tasks.map((task) => [task.task_id, (parents.get(task.task_id) ?? []).length]));
+    let frontier = tasks
+      .map((task) => task.task_id)
+      .filter((taskId) => indegree.get(taskId) === 0)
+      .sort();
+    let maxStructuralReadyWidth = frontier.length;
+    while (frontier.length > 0) {
+      const next = new Set<string>();
+      for (const taskId of frontier) {
+        for (const child of children.get(taskId) ?? []) {
+          const remaining = (indegree.get(child) ?? 0) - 1;
+          indegree.set(child, remaining);
+          if (remaining === 0) next.add(child);
+        }
+      }
+      frontier = [...next].sort();
+      maxStructuralReadyWidth = Math.max(maxStructuralReadyWidth, frontier.length);
+    }
+    const planRevisionCount = this.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM run_artifacts WHERE run_id = ? AND kind = 'PLAN'`,
+      [runId],
+    )?.n ?? 0;
+    const priorGraphRevisions = this.#baseline
+      .records(runId)
+      .filter((record) => record.kind === BaselineRecordKind.GRAPH_SNAPSHOT).length;
+    return {
+      nodeCount: tasks.length,
+      edgeCount: dependencies.length,
+      graphDepth: tasks.length === 0 ? 0 : Math.max(...tasks.map((task) => depth(task.task_id))),
+      maxStructuralReadyWidth,
+      planRevisionCount,
+      graphRevisionCount: priorGraphRevisions + 1,
+      serializedVsParallelDecision:
+        maxStructuralReadyWidth > 1 ? "PARALLEL_ELIGIBLE" : "SERIALIZED_BY_DEPENDENCIES",
+      claimConflictCount: null,
+    };
   }
 
   /** Luna has its own disposable-capacity bucket; all other worker models use worker. */

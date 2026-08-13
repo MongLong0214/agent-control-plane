@@ -982,6 +982,38 @@ CREATE INDEX IF NOT EXISTS audit_run ON audit_events(run_id, at);
 CREATE INDEX IF NOT EXISTS audit_kind ON audit_events(kind, at);
 
 -- ---------------------------------------------------------------------------
+-- baseline_records
+--   Lifecycle: append-only structural observations used by offline baseline exports.
+--   Integrity: the canonical record and its digest remain immutable, so an export can
+--   reconcile derived claims with the durable facts from which they were built.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS baseline_records (
+  record_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id         TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  record_kind    TEXT NOT NULL,
+  schema_id      TEXT NOT NULL,
+  recorded_at    TEXT NOT NULL,
+  payload_json   TEXT NOT NULL,
+  payload_digest TEXT NOT NULL CHECK (payload_digest LIKE 'sha256:%'),
+  UNIQUE (run_id, record_kind, payload_digest)
+);
+
+CREATE TRIGGER IF NOT EXISTS baseline_records_immutable
+BEFORE UPDATE ON baseline_records
+BEGIN
+  SELECT RAISE(ABORT, 'BASELINE_RECORD_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS baseline_records_no_delete
+BEFORE DELETE ON baseline_records
+BEGIN
+  SELECT RAISE(ABORT, 'BASELINE_RECORD_IMMUTABLE');
+END;
+
+CREATE INDEX IF NOT EXISTS baseline_records_run_kind
+  ON baseline_records(run_id, record_kind, recorded_at, record_id);
+
+-- ---------------------------------------------------------------------------
 -- telemetry_metrics  (PRD §31)
 --   Lifecycle: normalized metrics have a long retention while raw bounded logs
 --   have a short one (§31.5), so they cannot share a table with audit_events.
