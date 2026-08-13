@@ -1,4 +1,6 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import { createConnection } from "node:net";
+import { readFileSync } from "node:fs";
 
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -6,6 +8,7 @@ import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
+import { startDaemonMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { idempotentMcpMutation } from "../../src/mcp/shared.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
@@ -16,8 +19,14 @@ import {
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
-import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
-import { bindCeo, fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
+import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
+import {
+  bindCeo,
+  driveToReviewedCandidate,
+  fixtureManifest,
+  makeHarness,
+  type Harness,
+} from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -191,7 +200,157 @@ const tool = (server: object, name: string) => (
   server as unknown as { _registeredTools: Record<string, { handler: (args: Record<string, unknown>) => Promise<{ structuredContent?: Record<string, unknown> }> }> }
 )._registeredTools[name]!.handler;
 
+const exchangeMcp = (socketPath: string, lines: readonly unknown[]): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    let received = "";
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("live MCP wiring test timed out"));
+    }, 5_000);
+    socket.setEncoding("utf8");
+    socket.once("connect", () => socket.write(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`));
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      if (received.includes('"id":2')) {
+        clearTimeout(timeout);
+        socket.end();
+        resolve(received);
+      }
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+
 describe("round-2 ops regressions", () => {
+  it("notifies the daemon-owned finalizer after an ordinary CEO confirmation", async () => {
+    const harness = makeHarness();
+    const driven = await driveToReviewedCandidate(harness);
+    await harness.cp.continuity.evaluate("CEO-to-daemon handoff");
+    const packet = harness.cp.ceo.buildPacket({
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      approval: {
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        resultSummary: "ready for finalization",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: driven.ownerSessionId,
+        approvedByGeneration: driven.ownerBindingGeneration,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    if (!packet.allowed) throw new Error(packet.message);
+    const observed: string[] = [];
+    const port = createHermesMcpPort(harness.cp, {
+      onCeoApproved: (runId) => {
+        observed.push(runId);
+      },
+    });
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const confirmed = port.submitCeoDecision({
+      runId: driven.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceo.sessionId,
+      rationale: "notify daemon after durable decision",
+    });
+    expect(confirmed.allowed).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.CEO_APPROVED);
+    expect(observed).toEqual([driven.runId]);
+  });
+
+  it("the live daemon listener invokes finalization after the wire CEO confirmation", async () => {
+    const harness = makeHarness();
+    const driven = await driveToReviewedCandidate(harness);
+    // The creation response is the only place a session secret exists. Use a fresh CEO
+    // session for the live socket so the test authenticates the actual local transport.
+    const createdCeo = harness.cp.sessions.create({ provider: "scripted", model: "wire-ceo" });
+    harness.cp.sessions.transition(createdCeo.sessionId, SessionLifecycle.READY, "wire CEO");
+    const switched = harness.cp.bindings.switchTo({
+      role: Role.CEO,
+      sessionId: createdCeo.sessionId,
+      reason: "live wiring test CEO",
+    });
+    if (!switched.allowed) throw new Error(switched.message);
+    await harness.cp.continuity.evaluate("live CEO-to-daemon wiring");
+    const packet = harness.cp.ceo.buildPacket({
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      approval: {
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        resultSummary: "ready for finalization",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: driven.ownerSessionId,
+        approvedByGeneration: driven.ownerBindingGeneration,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    if (!packet.allowed) throw new Error(packet.message);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
+    if (!ceo) throw new Error("fixture CEO binding missing");
+    if (!createdCeo.sessionSecret) throw new Error("fixture CEO session has no secret");
+
+    const finalize = async (runId: string) => allow(ReasonCode.OK, { runId });
+    const finalizer = { finalizeApprovedRun: finalize };
+    const listeners = await startDaemonMcpListeners(
+      harness.cp,
+      tempDir("acp-live-ceo-daemon-wiring-"),
+      "live-mcp-token",
+      finalizer,
+    );
+    const hermesSocket = listeners.socketPaths[0];
+    if (!hermesSocket) throw new Error("Hermes MCP listener was not started");
+    const observed = vi.spyOn(finalizer, "finalizeApprovedRun");
+    try {
+      const response = await exchangeMcp(hermesSocket, [
+        { token: "live-mcp-token", sessionId: createdCeo.sessionId, sessionSecret: createdCeo.sessionSecret },
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-11-25",
+            capabilities: {},
+            clientInfo: { name: "live-wiring-test", version: "1" },
+          },
+        },
+        { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+        {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "ceo_decision_submit",
+            arguments: {
+              idempotencyKey: "live-ceo-confirmation",
+              runId: driven.runId,
+              decision: "CONFIRM",
+              candidateSnapshotDigest: driven.candidateSnapshotDigest,
+              ceoSessionId: ceo.sessionId,
+              rationale: "exercise the live daemon callback",
+            },
+          },
+        },
+      ]);
+      expect(response).toContain('"id":2');
+      await vi.waitFor(() => expect(observed).toHaveBeenCalledWith(driven.runId));
+    } finally {
+      observed.mockRestore();
+      await listeners.close();
+    }
+  });
+
+  it("main composes the live listener with the lock-held daemon", () => {
+    const source = readFileSync(new URL("../../src/daemon/agentcpd.ts", import.meta.url), "utf8");
+    expect(source).toMatch(/listeners = await startDaemonMcpListeners\(cp, stateDir, mcpToken, daemon\)/);
+  });
+
   it("#102: Hermes cannot fabricate owner approval by naming an allowlisted identity", async () => {
     const harness = makeHarness();
     const server = createHermesServer(

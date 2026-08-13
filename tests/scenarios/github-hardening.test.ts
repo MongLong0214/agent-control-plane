@@ -9,8 +9,10 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
+  approveReviewedCandidateForFinalization,
   type Harness,
   driveToReviewedCandidate,
+  installDaemonFinalizerGitHubFixture,
   makeHarness,
   ownerDecisionReceipt,
   registerFixtureProject,
@@ -102,6 +104,21 @@ const setup = async (options: { declareChecks?: boolean; humanGate?: readonly st
   });
   if (!claimed.allowed) throw new Error(claimed.message);
 
+  for (const item of options.humanGate ?? []) {
+    const decision = harness.cp.ceo.recordOwnerDecision({
+      runId: driven.runId,
+      item,
+      approved: true,
+      note: `approve ${item}`,
+      receipt: ownerDecisionReceipt(harness, driven.runId, item, true, `approve ${item}`),
+    });
+    if (!decision.allowed) throw new Error(`${decision.reasonCode}: ${decision.message}`);
+  }
+  await approveReviewedCandidateForFinalization(harness, driven);
+  installDaemonFinalizerGitHubFixture(harness);
+  const humanGateDigest = harness.cp.ceo.currentHumanGateDecisionDigest(driven.runId);
+  if (!humanGateDigest.allowed) throw new Error(`${humanGateDigest.reasonCode}: ${humanGateDigest.message}`);
+
   return {
     harness,
     github,
@@ -120,7 +137,7 @@ const setup = async (options: { declareChecks?: boolean; humanGate?: readonly st
       contractDigest: driven.contractDigest,
       verificationDigest: driven.verificationDigest,
       blindReviewDigest: driven.blindReviewDigest,
-      humanGateDigest: NO_HUMAN_GATE_DIGEST,
+      humanGateDigest: humanGateDigest.value,
       bindingGeneration: driven.ownerBindingGeneration,
       exactHead: driven.candidateHead,
       timestamp: "2026-08-12T00:00:00.000Z",
@@ -186,6 +203,11 @@ const setupTrustedPostMergeFixture = async (): Promise<Fixture> => {
   });
   if (!claimed.allowed) throw new Error(claimed.message);
 
+  await approveReviewedCandidateForFinalization(harness, driven);
+  installDaemonFinalizerGitHubFixture(harness);
+  const humanGateDigest = harness.cp.ceo.currentHumanGateDecisionDigest(driven.runId);
+  if (!humanGateDigest.allowed) throw new Error(`${humanGateDigest.reasonCode}: ${humanGateDigest.message}`);
+
   return {
     harness,
     github,
@@ -204,7 +226,7 @@ const setupTrustedPostMergeFixture = async (): Promise<Fixture> => {
       contractDigest: driven.contractDigest,
       verificationDigest: driven.verificationDigest,
       blindReviewDigest: driven.blindReviewDigest,
-      humanGateDigest: NO_HUMAN_GATE_DIGEST,
+      humanGateDigest: humanGateDigest.value,
       bindingGeneration: driven.ownerBindingGeneration,
       exactHead: driven.candidateHead,
       timestamp: "2026-08-12T00:00:00.000Z",
@@ -980,33 +1002,8 @@ describe("merge order and dependents are enforced by the kernel (§24.7)", () =>
       ownerSessionId: fixture.caller.ownerSessionId,
       ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
     });
-    expect(attached.allowed).toBe(true);
-
-    const docsHead = "d2".padEnd(40, "0");
-    fixture.github.setBranch("feature/F2-docs", docsHead);
-    const claimed = fixture.harness.cp.claims.acquire({
-      runId: fixture.runId,
-      ownerSessionId: fixture.caller.ownerSessionId,
-      ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
-      ownerRoleKey: fixture.harness.cp.runs.require(fixture.runId).ownerRoleKey!,
-      repositoryIdentity: "github:acme/docs",
-      branch: "feature/F2-docs",
-    });
-    if (!claimed.allowed) throw new Error(claimed.message);
-
-    const prepared = await fixture.harness.cp.github.prPrepare({
-      runId: fixture.runId,
-      repositoryIdentity: "github:acme/docs",
-      head: "feature/F2-docs",
-      base: "dev",
-      title: "docs",
-      body: "",
-      ownerSessionId: fixture.caller.ownerSessionId,
-      ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
-      exactHeadSha: docsHead,
-    });
-    expect(prepared.allowed).toBe(false);
-    expect(prepared.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(attached.allowed).toBe(false);
+    expect(attached.reasonCode).toBe(ReasonCode.RUN_TRANSITION_ILLEGAL);
     expect(fixture.github.mergeCount).toBe(0);
   });
 
@@ -1057,6 +1054,8 @@ describe("round-2 review: post-merge coverage and receipts", () => {
       branch: driven.workBranch,
     });
     if (!claimed.allowed) throw new Error(claimed.message);
+    await approveReviewedCandidateForFinalization(harness, driven);
+    installDaemonFinalizerGitHubFixture(harness);
 
     const fixture: Fixture = {
       harness,

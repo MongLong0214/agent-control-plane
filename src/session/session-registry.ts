@@ -320,7 +320,8 @@ export class SessionRegistry {
       .all<{ run_id: string }>(
         `SELECT run_id FROM runs
           WHERE owner_session_id = ?
-            AND state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW','REVISION_REQUIRED','AWAITING_HUMAN')`,
+            AND state IN ('QUEUED','ACTIVE','BLOCKED','READY_FOR_CEO_REVIEW','CEO_APPROVED',
+                          'MERGING','POST_MERGE_VERIFYING','REVISION_REQUIRED','AWAITING_HUMAN')`,
         [sessionId],
       )
       .map((r) => r.run_id);

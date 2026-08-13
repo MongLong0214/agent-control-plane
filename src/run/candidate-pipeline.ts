@@ -22,6 +22,7 @@ import type { BindingRegistry } from "../session/binding-registry.ts";
 import {
   type CandidateSnapshot,
   buildCandidateSnapshot,
+  buildNoRepositoryCandidateSnapshot,
   candidateSnapshotDigest,
   verifySnapshotFreshness,
 } from "../snapshot/candidate-snapshot.ts";
@@ -113,9 +114,6 @@ export class CandidatePipeline {
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
 
     const participants = this.runs.repositoriesOf(runId);
-    if (participants.length === 0) {
-      return deny(ReasonCode.EVIDENCE_MISSING, "run has no participating repository", { runId });
-    }
 
     // This is the dispatch-time contract, so a later project-profile change cannot alter
     // the branch a frozen candidate is asserted to have been cut from.
@@ -144,14 +142,16 @@ export class CandidatePipeline {
       }),
     );
 
-    const snapshot = await buildCandidateSnapshot(
-      {
-        runId,
-        contractDigest: run.contractDigest,
-        repositories,
-      },
-      this.clock,
-    );
+    const snapshot = participants.length === 0
+      ? buildNoRepositoryCandidateSnapshot({ runId, contractDigest: run.contractDigest }, this.clock)
+      : await buildCandidateSnapshot(
+          {
+            runId,
+            contractDigest: run.contractDigest,
+            repositories,
+          },
+          this.clock,
+        );
 
     this.artifacts.put(runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, candidateSnapshotDigest(snapshot));
     // One transaction records the new candidate and stales everything bound to an older
@@ -220,6 +220,39 @@ export class CandidatePipeline {
     const snapshotDigest = candidateSnapshotDigest(snapshot);
     const boundAttempt = this.bindAttemptCandidate(input.runId, attemptId, snapshotDigest);
     if (!boundAttempt.allowed) return boundAttempt as Decision<PipelineOutcome>;
+
+    // No repository means no source, verification command, or blind-review input exists to
+    // inspect. Publish the explicit no-op packet through the same production gate, then let
+    // CEO confirmation and the daemon own completion exactly as for a repository run.
+    if (snapshot.repositories.length === 0) {
+      const sourceReadLease = this.guard.acquireSourceReadLease(input.runId, []);
+      if (!sourceReadLease.allowed) return sourceReadLease as Decision<PipelineOutcome>;
+      try {
+        const built = this.ceo.buildPacket({
+          runId: input.runId,
+          candidateSnapshotDigest: snapshotDigest,
+          sourceReadLeaseId: sourceReadLease.value.leaseId,
+          approval: {
+            runId: input.runId,
+            candidateSnapshotDigest: snapshotDigest,
+            resultSummary: input.resultSummary,
+            recommendation: input.recommendation,
+            residualRisk: input.residualRisk ?? [],
+            approvedBySessionId: input.ownerSessionId,
+            approvedByGeneration: input.ownerBindingGeneration,
+            approvedAt: this.clock.nowIso(),
+          },
+        } as Parameters<ProductionGate["buildPacket"]>[0] & { sourceReadLeaseId: string });
+        if (!built.allowed) return built as Decision<PipelineOutcome>;
+        return allow(ReasonCode.OK, {
+          stage: "COMPLETED_REVIEW",
+          packet: built.value,
+          snapshotDigest,
+        });
+      } finally {
+        sourceReadLease.value.release();
+      }
+    }
 
     const commands = this.resolveCommands(
       run.pinnedManifestDigest,

@@ -8,6 +8,12 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
+import {
+  ApprovedRunFinalizer,
+  type DaemonFinalizationAuthorities,
+  type ReclaimedFinalizationAttempt,
+  type FinalizationResult,
+} from "./finalizer.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
 
 export interface DaemonOptions {
@@ -28,6 +34,8 @@ export interface ReconcileReport {
   expiredMessages: number;
   orphanedExecutions: string[];
   sessionsMarkedError: string[];
+  reclaimedFinalizationAttempts: ReclaimedFinalizationAttempt[];
+  resumedFinalizations: string[];
   doctorStatus: string;
 }
 
@@ -77,14 +85,17 @@ export class Daemon {
   #timerFailures = new Map<string, TimerFailure>();
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
+  readonly #finalizer: ApprovedRunFinalizer;
 
   constructor(
     private readonly cp: ControlPlane,
     private readonly options: DaemonOptions,
+    authorities?: DaemonFinalizationAuthorities,
   ) {
     mkdirSync(options.stateDir, { recursive: true });
     chmodSync(options.stateDir, 0o700);
     this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
+    this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
   }
 
   async start(): Promise<Decision<ReconcileReport>> {
@@ -132,6 +143,7 @@ export class Daemon {
       }
 
       report.resumedRuns = await this.resumeQueuedRuns();
+      report.resumedFinalizations = await this.resumeApprovedRuns();
       this.writeHealth(report);
       this.startTimers();
       this.clearCrashLoop();
@@ -155,6 +167,7 @@ export class Daemon {
   async reconcile(): Promise<ReconcileReport> {
     const expiredClaims = this.cp.claims.expireOverdue();
     const expiredMessages = this.cp.outbox.expireOverdue();
+    const reclaimedFinalizationAttempts = this.#finalizer.reclaimExpiredAttempts();
 
     // Reconcile sessions against real processes before anything trusts a binding.
     const sessionsMarkedError: string[] = [];
@@ -192,6 +205,8 @@ export class Daemon {
       expiredMessages,
       orphanedExecutions,
       sessionsMarkedError,
+      reclaimedFinalizationAttempts,
+      resumedFinalizations: [],
       doctorStatus: report.status,
     };
   }
@@ -329,6 +344,21 @@ export class Daemon {
     }
   }
 
+  /**
+   * The production entry point for the post-CEO sequence. A caller that did not win the
+   * daemon lock cannot use this object as a second finalizer, even in the same process.
+   */
+  async finalizeApprovedRun(runId: string): Promise<Decision<FinalizationResult>> {
+    if (!this.lock.held()) {
+      return deny(ReasonCode.DAEMON_LOCK_LOST, "daemon finalization requires the held single-instance lock", {
+        runId,
+      });
+    }
+    const finalized = await this.#finalizer.finalizeApprovedRun(runId);
+    this.writeHealth(null);
+    return finalized;
+  }
+
   private async resumeQueuedRuns(): Promise<string[]> {
     const resumedRuns: string[] = [];
     // The doctor has already passed. Idempotency lives in the outbox key, so a run
@@ -396,6 +426,19 @@ export class Daemon {
     }
   }
 
+  /** Recover CEO-approved work after the durable lease and GitHub receipt reconciliations. */
+  private async resumeApprovedRuns(): Promise<string[]> {
+    const resumed: string[] = [];
+    const states = [RunState.CEO_APPROVED, RunState.MERGING, RunState.POST_MERGE_VERIFYING];
+    for (const state of states) {
+      for (const run of this.cp.runs.list({ state })) {
+        const finalized = await this.finalizeApprovedRun(run.runId);
+        if (finalized.allowed) resumed.push(run.runId);
+      }
+    }
+    return resumed;
+  }
+
   private startTimers(): void {
     const watchdogMs = this.options.watchdogIntervalMs ?? 60_000;
     const deliveryMs = this.options.deliveryIntervalMs ?? 5_000;
@@ -406,7 +449,11 @@ export class Daemon {
     const watchdog = setInterval(() => {
       void this.runPeriodic("watchdog", async () => {
         const tick = await this.cp.watchdog.tick();
-        if (tick.overdue.length > 0) this.writeHealth(null);
+        // This is a targeted recovery sweep, not a second workflow engine: the durable
+        // finalization lease and GitHub receipts remain the sole source of work. It retries
+        // an interrupted callback without requiring a daemon restart.
+        const finalized = await this.resumeApprovedRuns();
+        if (tick.overdue.length > 0 || finalized.length > 0) this.writeHealth(null);
       });
     }, watchdogMs);
     watchdog.unref();
@@ -493,6 +540,10 @@ export class Daemon {
         active: this.cp.runs.list({ state: RunState.ACTIVE }).length,
         blocked: this.cp.runs.list({ state: RunState.BLOCKED }).length,
         readyForCeo: this.cp.runs.list({ state: RunState.READY_FOR_CEO_REVIEW }).length,
+        ceoApproved: this.cp.runs.list({ state: RunState.CEO_APPROVED }).length,
+        merging: this.cp.runs.list({ state: RunState.MERGING }).length,
+        postMergeVerifying: this.cp.runs.list({ state: RunState.POST_MERGE_VERIFYING }).length,
+        blockedPostMerge: this.cp.runs.list({ state: RunState.BLOCKED_POST_MERGE }).length,
       },
       lastReconcile: reconcile,
       timerHealth: {

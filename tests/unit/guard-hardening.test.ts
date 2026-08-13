@@ -7,6 +7,7 @@ import { symlinkSync } from "node:fs";
 import { isoPlus } from "../../src/core/clock.ts";
 import { newAssignmentId } from "../../src/core/ids.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { RunState } from "../../src/domain/types.ts";
 import { ClaimRegistry } from "../../src/claims/claim-registry.ts";
 import {
   ManagedWriteGuard,
@@ -25,6 +26,7 @@ import {
   seedRun,
   tempDir,
   writeFiles, transitionSeededRun } from "../helpers/fixtures.ts";
+import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -373,6 +375,9 @@ describe("guard binds each operation to exactly one repository", () => {
 describe("remote writes name and fence their branch or ref (#356)", () => {
   it("allows a release-branch PR while another run's feature branch remains HELD", async () => {
     const { guard, db, clock, seeded } = setup();
+    transitionSeededRun(db, seeded.runId, RunState.READY_FOR_CEO_REVIEW);
+    transitionSeededRun(db, seeded.runId, RunState.CEO_APPROVED);
+    const daemonAuthority = guard.claimDaemonFinalizerAuthority();
     otherRun(db, clock, seeded.projectId);
     db.run(
       `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
@@ -390,6 +395,7 @@ describe("remote writes name and fence their branch or ref (#356)", () => {
       runId: seeded.runId,
       sessionId: seeded.sessionId,
       bindingGeneration: seeded.generation,
+      daemonFinalizerAuthority: daemonAuthority,
     }, () => "PR written");
 
     expect(decision.allowed).toBe(true);
@@ -401,6 +407,9 @@ describe("remote writes name and fence their branch or ref (#356)", () => {
 
   it("serializes concurrent remote writes on the same operation and branch", async () => {
     const { guard, db, clock, seeded } = setup();
+    transitionSeededRun(db, seeded.runId, RunState.READY_FOR_CEO_REVIEW);
+    transitionSeededRun(db, seeded.runId, RunState.CEO_APPROVED);
+    const daemonAuthority = guard.claimDaemonFinalizerAuthority();
     ownBranchClaim(db, clock, seeded, "release/fence");
     const request = {
       operation: WriteOperation.GITHUB_PR,
@@ -409,6 +418,7 @@ describe("remote writes name and fence their branch or ref (#356)", () => {
       runId: seeded.runId,
       sessionId: seeded.sessionId,
       bindingGeneration: seeded.generation,
+      daemonFinalizerAuthority: daemonAuthority,
     };
 
     let enterFirst!: () => void;
@@ -443,6 +453,9 @@ describe("remote writes name and fence their branch or ref (#356)", () => {
 describe("expired leases and SQLite's HELD index stay coherent (#358)", () => {
   it("expires a stale branch slot before a remote write, leaving the unique slot reclaimable", async () => {
     const { guard, db, clock, seeded } = setup();
+    transitionSeededRun(db, seeded.runId, RunState.READY_FOR_CEO_REVIEW);
+    transitionSeededRun(db, seeded.runId, RunState.CEO_APPROVED);
+    const daemonAuthority = guard.claimDaemonFinalizerAuthority();
     otherRun(db, clock, seeded.projectId);
     db.run(
       `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
@@ -461,6 +474,7 @@ describe("expired leases and SQLite's HELD index stay coherent (#358)", () => {
       runId: seeded.runId,
       sessionId: seeded.sessionId,
       bindingGeneration: seeded.generation,
+      daemonFinalizerAuthority: daemonAuthority,
     }, () => {
       effectInvoked = true;
       return "remote write";
@@ -553,6 +567,58 @@ describe("guard grants are fenced, short-lived and single use", () => {
     if (!decision.allowed) return;
     expect(decision.value.classification).toBe("DIRECT");
     expect(guard.consume(decision.value.grantId).allowed).toBe(false);
+  });
+});
+
+describe("post-CEO finalization authority (P0-01)", () => {
+  it("admits only the daemon's fenced GitHub write after CEO approval and refuses all writes after completion", () => {
+    const { guard, db, clock, seeded, repo } = setup();
+    ownBranchClaim(db, clock, seeded, "feature/fixture");
+    transitionSeededRun(db, seeded.runId, RunState.READY_FOR_CEO_REVIEW);
+    // In production ControlPlane claims this opaque value once and hands it only to the
+    // daemon finalizer. This direct guard fixture is the narrow unit equivalent.
+    const daemonAuthority = guard.claimDaemonFinalizerAuthority();
+    const beforeCeo = guard.evaluate(managedRequest(seeded, {
+      operation: WriteOperation.PROGRAMMATIC_MERGE,
+      repositoryIdentity: seeded.identity,
+      targetBranch: "feature/fixture",
+      daemonFinalizerAuthority: daemonAuthority,
+    }));
+    expect(beforeCeo.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
+
+    transitionSeededRun(db, seeded.runId, RunState.CEO_APPROVED);
+
+    const sourceDenied = guard.evaluate(managedRequest(seeded, {
+      operation: WriteOperation.FILE_MUTATION,
+      targetPath: join(repo, "src/after-ceo.ts"),
+    }));
+    expect(sourceDenied.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
+
+    const remoteRequest = managedRequest(seeded, {
+      operation: WriteOperation.GITHUB_PR,
+      repositoryIdentity: seeded.identity,
+      targetBranch: "feature/fixture",
+    });
+    const unprivileged = guard.evaluate(remoteRequest);
+    expect(unprivileged.allowed).toBe(false);
+    expect(unprivileged.reasonCode).toBe(ReasonCode.MERGE_AUTHORITY_DENIED);
+
+    const daemonWrite = guard.evaluate({ ...remoteRequest, daemonFinalizerAuthority: daemonAuthority });
+    expect(daemonWrite.allowed).toBe(true);
+
+    transitionSeededRun(db, seeded.runId, RunState.MERGING);
+    transitionSeededRun(db, seeded.runId, RunState.POST_MERGE_VERIFYING);
+    transitionSeededRun(db, seeded.runId, RunState.COMPLETED);
+    const completed = guard.evaluate({ ...remoteRequest, daemonFinalizerAuthority: daemonAuthority });
+    expect(completed.allowed).toBe(false);
+    expect(completed.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
+  });
+});
+
+describe("daemon finalization capability construction boundary", () => {
+  it("does not expose the daemon capability from a production-shaped control plane", () => {
+    const fixture = makeHarness({ allowTestEvidenceWriters: false });
+    expect(() => fixture.cp.daemonFinalizationAuthorities()).toThrow(/only exposed to an explicitly unlocked fixture/);
   });
 });
 

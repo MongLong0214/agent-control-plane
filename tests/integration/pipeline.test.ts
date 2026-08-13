@@ -143,7 +143,7 @@ describe("one safe project run, end to end", () => {
       rationale: "evidence is complete",
     });
     expect(decision.allowed).toBe(true);
-    expect(harness.cp.runs.require(runId).state).toBe(RunState.COMPLETED);
+    expect(harness.cp.runs.require(runId).state).toBe(RunState.CEO_APPROVED);
   });
 
   it("CP-S33: a REVISE verdict returns to the CTO and does not notify the CEO", async () => {

@@ -449,7 +449,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         rationale: "verification and an independent review both pass at this exact candidate",
       });
       expect(confirmed.allowed).toBe(true);
-      expect(cp.runs.require(runId).state).toBe(RunState.COMPLETED);
+      expect(cp.runs.require(runId).state).toBe(RunState.CEO_APPROVED);
 
       evidence["ceoConfirm"] = { state: cp.runs.require(runId).state, sessionId: hermes.sessionId };
       evidence["doctor"] = await cp.doctor.run("project", projectId);

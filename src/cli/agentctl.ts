@@ -7,9 +7,9 @@ import { digestOf } from "../core/digest.ts";
 import { IngressGuard, ownerApprovalPayload } from "../ingress/ingress-guard.ts";
 import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
 import { isAcpError } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 import type { RunState } from "../domain/types.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
-import { executeConfirmedMerge } from "../github/confirmed-merge-operation.ts";
 
 /**
  * PRD §28.4 — the minimal operator CLI.
@@ -27,10 +27,8 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl continuity status              continuity mode and role coverage plan
   agentctl outbox retry                   reset delivery attempts on pending messages
   agentctl owner approve <runId> <item>   record an owner decision for a human gate
-  agentctl github merge <runId> <repo> <head> <title> [humanGateDigest]
-                                        publish the gate, prepare and merge a CEO-confirmed candidate
-  agentctl github post-merge <runId> <repo> <mergeSha>
-                                        verify configured checks after the merge's CI completes
+  agentctl github merge ...             refused: agentcpd owns CEO-approved finalization
+  agentctl github post-merge ...        refused: agentcpd owns exact post-merge verification
   agentctl repair list                    show the repair operation allowlist
   agentctl repair dry-run <op> [k=v...]   evaluate a repair without changing anything
   agentctl repair execute <op> [k=v...]   execute a repair (owner-risk ops need --owner)
@@ -182,34 +180,17 @@ export const dispatch = async (
 
     github: async () => {
       const [sub, ...params] = args;
-      if (sub === "merge") {
-        const decision = await executeConfirmedMerge(
-          {
-            github: cp.github,
-            runs: cp.runs,
-            artifacts: cp.artifacts,
-            projects: cp.projects,
-            clock: cp.clock,
-          },
-          {
-            runId: required(params[0], "runId"),
-            repositoryIdentity: required(params[1], "repositoryIdentity"),
-            head: required(params[2], "head"),
-            title: required(params[3], "title"),
-            ...(params[4] ? { humanGateDigest: params[4] } : {}),
-          },
-        );
-        print(decision);
-        return decision.allowed ? 0 : 1;
-      }
-      if (sub === "post-merge") {
-        const decision = await cp.github.postMergeVerify(
-          required(params[0], "runId"),
-          required(params[1], "repositoryIdentity"),
-          required(params[2], "mergeCommitSha"),
-        );
-        print(decision);
-        return decision.allowed ? 0 : 1;
+      if (sub === "merge" || sub === "post-merge") {
+        // `agentctl` is deliberately not a second control-plane/finalizer process (#393).
+        // The daemon resumes every CEO-approved run under its single-instance lock; exposing
+        // the coordinator here would let a CLI invocation bypass that durable ownership.
+        print({
+          allowed: false,
+          reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED,
+          message: "GitHub finalization is daemon-owned; agentcpd will resume an approved run",
+          evidence: { operation: sub, args: params },
+        });
+        return 1;
       }
       return fail(`unknown github subcommand: ${sub ?? ""}`);
     },

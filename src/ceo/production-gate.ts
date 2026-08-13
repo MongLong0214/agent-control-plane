@@ -239,83 +239,141 @@ export class ProductionGate {
       const freshness = this.revalidateCandidateFreshness(input.runId, input.candidateSnapshotDigest);
       if (!freshness.allowed) return freshness as Decision<ProductionReadyPacket>;
 
-    const verificationArtifact = this.artifacts.latestForSnapshot<VerificationReport>(
-      input.runId,
-      ArtifactKind.VERIFICATION,
-      input.candidateSnapshotDigest,
-    );
-    if (!verificationArtifact || verificationArtifact.content.status !== "PASS") {
-      return deny(ReasonCode.EVIDENCE_MISSING, "no passing verification for this candidate", {
-        runId: input.runId,
-        candidateSnapshotDigest: input.candidateSnapshotDigest,
-        status: verificationArtifact?.content.status ?? null,
-      });
-    }
-    if (verificationArtifact.producedBy !== "verification-engine") {
-      return deny(ReasonCode.EVIDENCE_MISSING, "verification artifact was not written by the engine", {
-        runId: input.runId,
-        producedBy: verificationArtifact.producedBy,
-      });
-    }
+      const noParticipatingRepositories =
+        snapshot.value.repositories.length === 0 && this.runs.repositoriesOf(input.runId).length === 0;
+      let verificationForPacket: ProductionReadyPacket["verification"];
+      let reviewForPacket: ProductionReadyPacket["blindReview"];
 
-    // The JSON report alone is not the evidence: it must agree with the normalized
-    // per-command rows the engine wrote. A hand-assembled PASS blob has no rows behind it.
-    const corroboration = this.corroborateVerification(
-      input.runId,
-      input.candidateSnapshotDigest,
-      verificationArtifact.content,
-    );
-    if (!corroboration.allowed) return corroboration as Decision<ProductionReadyPacket>;
+      if (noParticipatingRepositories) {
+        // There is no source, command, or reviewer input in this predicate. Persist the
+        // explicit no-op fact in the packet summary fields; the daemon adds the authoritative
+        // "nothing to merge" completion evidence when it closes the run.
+        verificationForPacket = {
+          status: "PASS",
+          expectedInputs: 0,
+          observedInputs: 0,
+          commands: [],
+          digest: digestOf({
+            kind: "NO_PARTICIPATING_REPOSITORIES",
+            runId: input.runId,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+          }),
+        };
+        reviewForPacket = {
+          verdict: "PASS",
+          digest: digestOf({
+            kind: "NO_PARTICIPATING_REPOSITORIES",
+            runId: input.runId,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            review: "NOT_APPLICABLE",
+          }),
+          provider: "not-applicable",
+          model: "not-applicable",
+          coveredFiles: 0,
+          omittedItems: 0,
+          findings: 0,
+        };
+      } else {
+        const verificationArtifact = this.artifacts.latestForSnapshot<VerificationReport>(
+          input.runId,
+          ArtifactKind.VERIFICATION,
+          input.candidateSnapshotDigest,
+        );
+        if (!verificationArtifact || verificationArtifact.content.status !== "PASS") {
+          return deny(ReasonCode.EVIDENCE_MISSING, "no passing verification for this candidate", {
+            runId: input.runId,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+            status: verificationArtifact?.content.status ?? null,
+          });
+        }
+        if (verificationArtifact.producedBy !== "verification-engine") {
+          return deny(ReasonCode.EVIDENCE_MISSING, "verification artifact was not written by the engine", {
+            runId: input.runId,
+            producedBy: verificationArtifact.producedBy,
+          });
+        }
 
-    const reviewArtifact = this.artifacts.latestForSnapshot<ReviewPacket>(
-      input.runId,
-      ArtifactKind.BLIND_REVIEW,
-      input.candidateSnapshotDigest,
-    );
-    if (!reviewArtifact) {
-      return deny(ReasonCode.REVIEW_REQUIRED, "no blind review for this candidate", {
-        runId: input.runId,
-        candidateSnapshotDigest: input.candidateSnapshotDigest,
-      });
-    }
-    if (reviewArtifact.producedBy !== "blind-review-gate") {
-      return deny(ReasonCode.REVIEW_REQUIRED, "review artifact was not written by the review gate", {
-        runId: input.runId,
-        producedBy: reviewArtifact.producedBy,
-      });
-    }
+        // The JSON report alone is not the evidence: it must agree with the normalized
+        // per-command rows the engine wrote. A hand-assembled PASS blob has no rows behind it.
+        const corroboration = this.corroborateVerification(
+          input.runId,
+          input.candidateSnapshotDigest,
+          verificationArtifact.content,
+        );
+        if (!corroboration.allowed) return corroboration as Decision<ProductionReadyPacket>;
 
-    // CP-HI-04 — the reviewer named in the packet must be a session that really held the
-    // BLIND_REVIEWER binding for this run at that generation, and must not be a producer.
-    const provenance = this.reviewerProvenance(input.runId, reviewArtifact.content);
-    if (!provenance.allowed) return provenance as Decision<ProductionReadyPacket>;
+        const reviewArtifact = this.artifacts.latestForSnapshot<ReviewPacket>(
+          input.runId,
+          ArtifactKind.BLIND_REVIEW,
+          input.candidateSnapshotDigest,
+        );
+        if (!reviewArtifact) {
+          return deny(ReasonCode.REVIEW_REQUIRED, "no blind review for this candidate", {
+            runId: input.runId,
+            candidateSnapshotDigest: input.candidateSnapshotDigest,
+          });
+        }
+        if (reviewArtifact.producedBy !== "blind-review-gate") {
+          return deny(ReasonCode.REVIEW_REQUIRED, "review artifact was not written by the review gate", {
+            runId: input.runId,
+            producedBy: reviewArtifact.producedBy,
+          });
+        }
 
-    if (reviewArtifact.content.verdict !== "PASS") {
-      return deny(ReasonCode.REVIEW_REQUIRED, "blind review has not passed", {
-        verdict: reviewArtifact.content.verdict,
-      });
-    }
-    if (reviewArtifact.content.omittedItems.length > 0) {
-      return deny(ReasonCode.COVERAGE_INCOMPLETE, "blind review reports omitted items", {
-        omittedItems: reviewArtifact.content.omittedItems,
-      });
-    }
+        // CP-HI-04 — the reviewer named in the packet must be a session that really held the
+        // BLIND_REVIEWER binding for this run at that generation, and must not be a producer.
+        const provenance = this.reviewerProvenance(input.runId, reviewArtifact.content);
+        if (!provenance.allowed) return provenance as Decision<ProductionReadyPacket>;
 
-    const blockers = reviewArtifact.content.findings.filter((f) => f.severity === "BLOCKER");
-    if (blockers.length > 0) {
-      return deny(ReasonCode.REVIEW_BLOCK, "candidate has unresolved blocker findings", {
-        blockers: blockers.map((b) => b.summary),
-      });
-    }
+        if (reviewArtifact.content.verdict !== "PASS") {
+          return deny(ReasonCode.REVIEW_REQUIRED, "blind review has not passed", {
+            verdict: reviewArtifact.content.verdict,
+          });
+        }
+        if (reviewArtifact.content.omittedItems.length > 0) {
+          return deny(ReasonCode.COVERAGE_INCOMPLETE, "blind review reports omitted items", {
+            omittedItems: reviewArtifact.content.omittedItems,
+          });
+        }
 
-    const humanGate = this.humanGateStatus(input.runId);
-    if (humanGate.required && humanGate.items.length === 0) {
-      return deny(
-        ReasonCode.HUMAN_GATE_REQUIRED,
-        "run requires an owner gate but its contract names no owner decision item",
-        { runId: input.runId, executionMode: run.executionMode },
-      );
-    }
+        const blockers = reviewArtifact.content.findings.filter((f) => f.severity === "BLOCKER");
+        if (blockers.length > 0) {
+          return deny(ReasonCode.REVIEW_BLOCK, "candidate has unresolved blocker findings", {
+            blockers: blockers.map((b) => b.summary),
+          });
+        }
+
+        verificationForPacket = {
+          status: verificationArtifact.content.status,
+          expectedInputs: verificationArtifact.content.expectedInputs,
+          observedInputs: verificationArtifact.content.observedInputs,
+          commands: verificationArtifact.content.results.map((r) => ({
+            commandId: r.commandId,
+            source: r.source,
+            status: r.status,
+            exactHead: r.exactHead,
+          })),
+          digest: verificationArtifact.digest,
+        };
+        reviewForPacket = {
+          verdict: reviewArtifact.content.verdict,
+          digest: reviewArtifact.digest,
+          provider: reviewArtifact.content.provider,
+          model: reviewArtifact.content.model,
+          coveredFiles: reviewArtifact.content.coveredFiles.length,
+          omittedItems: reviewArtifact.content.omittedItems.length,
+          findings: reviewArtifact.content.findings.length,
+        };
+      }
+
+      const humanGate = this.humanGateStatus(input.runId);
+      if (humanGate.required && humanGate.items.length === 0) {
+        return deny(
+          ReasonCode.HUMAN_GATE_REQUIRED,
+          "run requires an owner gate but its contract names no owner decision item",
+          { runId: input.runId, executionMode: run.executionMode },
+        );
+      }
 
     const packet: ProductionReadyPacket = {
       runId: input.runId,
@@ -323,27 +381,8 @@ export class ProductionGate {
       goal: run.goal,
       resultSummary: input.approval.resultSummary,
       candidateSnapshotDigest: input.candidateSnapshotDigest,
-      verification: {
-        status: verificationArtifact.content.status,
-        expectedInputs: verificationArtifact.content.expectedInputs,
-        observedInputs: verificationArtifact.content.observedInputs,
-        commands: verificationArtifact.content.results.map((r) => ({
-          commandId: r.commandId,
-          source: r.source,
-          status: r.status,
-          exactHead: r.exactHead,
-        })),
-        digest: verificationArtifact.digest,
-      },
-      blindReview: {
-        verdict: reviewArtifact.content.verdict,
-        digest: reviewArtifact.digest,
-        provider: reviewArtifact.content.provider,
-        model: reviewArtifact.content.model,
-        coveredFiles: reviewArtifact.content.coveredFiles.length,
-        omittedItems: reviewArtifact.content.omittedItems.length,
-        findings: reviewArtifact.content.findings.length,
-      },
+      verification: verificationForPacket,
+      blindReview: reviewForPacket,
       knownResidualRisk: input.approval.residualRisk,
       changedRepositories: snapshot.value.repositories.map((repo) => ({
         identity: repo.identity,
@@ -526,7 +565,7 @@ export class ProductionGate {
 
     const target =
       input.decision === "CONFIRM"
-        ? RunState.COMPLETED
+        ? (isBootstrap ? RunState.COMPLETED : RunState.CEO_APPROVED)
         : input.decision === "FINAL_REVISE"
           ? RunState.REVISION_REQUIRED
           : RunState.AWAITING_HUMAN;
@@ -566,7 +605,7 @@ export class ProductionGate {
           { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale },
           isBootstrap && input.decision === "CONFIRM"
             ? this.completion.bootstrapActivation
-            : this.completion.productionGate,
+            : undefined,
         );
         if (!transition.allowed) return transition as Decision<{ state: RunState }>;
 
@@ -592,6 +631,55 @@ export class ProductionGate {
       if (isAcpError(error)) return deny(error.reasonCode, error.message, error.evidence);
       throw error;
     }
+  }
+
+  /**
+   * Re-read the durable confirmation that authorized an irreversible finalization. State is
+   * necessary but deliberately not sufficient here: the generic run transition primitive is
+   * used by several internal recovery paths, whereas only `submitCeoDecision(CONFIRM)` may
+   * release the daemon's GitHub sequence for this exact candidate.
+   */
+  currentCeoConfirmation(runId: string, candidateSnapshotDigest: string): Decision<void> {
+    const run = this.runs.get(runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    if (
+      run.state !== RunState.CEO_APPROVED &&
+      run.state !== RunState.MERGING &&
+      run.state !== RunState.POST_MERGE_VERIFYING
+    ) {
+      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "run is not in a CEO-finalization state", {
+        runId,
+        state: run.state,
+      });
+    }
+    if (this.runs.currentCandidate(runId) !== candidateSnapshotDigest) {
+      return deny(ReasonCode.EVIDENCE_STALE, "CEO confirmation no longer names the current candidate", {
+        runId,
+        candidateSnapshotDigest,
+        currentCandidateSnapshotDigest: this.runs.currentCandidate(runId),
+      });
+    }
+    const confirmed = this.audit
+      .forRun(runId)
+      .slice()
+      .reverse()
+      .find((entry) =>
+        entry.kind === "CEO_DECISION" &&
+        entry.evidence.decision === "CONFIRM" &&
+        entry.evidence.candidateSnapshotDigest === candidateSnapshotDigest,
+      );
+    if (!confirmed) {
+      return deny(ReasonCode.GATE_AUTHORITY_DENIED, "run has no durable CEO confirmation for this candidate", {
+        runId,
+        candidateSnapshotDigest,
+      });
+    }
+    return allow(ReasonCode.OK, undefined, {
+      runId,
+      candidateSnapshotDigest,
+      ceoSessionId: confirmed.sessionId,
+      confirmedAt: confirmed.at,
+    });
   }
 
   /**
@@ -1181,6 +1269,72 @@ export class ProductionGate {
     }
 
     return { required: true, items, satisfied: items.every((item) => latestDecision.get(item) === true) };
+  }
+
+  /**
+   * The GitHub gate names an actual authenticated owner-decision artifact, not merely the
+   * human-gate definition. Keep the selection beside `humanGateStatus` so the daemon never
+   * turns a free-form digest into owner authority; the kernel independently re-validates it
+   * when it publishes and again when it merges.
+   */
+  currentHumanGateDecisionDigest(runId: string): Decision<string> {
+    const gate = this.humanGateDefinition(runId);
+    if (!gate.required) return allow(ReasonCode.OK, digestOf({ humanGate: "NOT_REQUIRED" }));
+    if (gate.items.length === 0) {
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "run requires a human gate with no durable gate items", {
+        runId,
+      });
+    }
+    const candidateSnapshotDigest = this.runs.currentCandidate(runId);
+    if (!candidateSnapshotDigest || !this.#ownerAuthority) {
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "no current authenticated owner decision exists", {
+        runId,
+      });
+    }
+
+    const latest = new Map<string, { approved: boolean; digest: string }>();
+    for (const artifact of this.artifacts.list<{
+      kind?: string;
+      item?: string;
+      approved?: boolean;
+      note?: unknown;
+      humanGateDigest?: string;
+      candidateSnapshotDigest?: string | null;
+      receipt?: unknown;
+    }>(runId, ArtifactKind.APPROVAL)) {
+      const decision = artifact.content;
+      if (
+        artifact.superseded ||
+        decision.kind !== "OWNER_DECISION" ||
+        typeof decision.item !== "string" ||
+        !gate.items.includes(decision.item) ||
+        typeof decision.approved !== "boolean" ||
+        typeof decision.note !== "string" ||
+        decision.humanGateDigest !== gate.digest ||
+        artifact.candidateSnapshotDigest !== candidateSnapshotDigest ||
+        decision.candidateSnapshotDigest !== candidateSnapshotDigest
+      ) {
+        continue;
+      }
+      const retainedReceipt = this.assertOwnerDecisionReceipt({
+        runId,
+        item: decision.item,
+        approved: decision.approved,
+        note: decision.note,
+        receipt: decision.receipt,
+      });
+      if (retainedReceipt.allowed) {
+        latest.set(decision.item, { approved: decision.approved, digest: artifact.digest });
+      }
+    }
+    if (!gate.items.every((item) => latest.get(item)?.approved === true)) {
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "every current owner-gate item needs approval", {
+        runId,
+        items: gate.items,
+      });
+    }
+    const named = gate.items.map((item) => latest.get(item)!.digest).sort()[0]!;
+    return allow(ReasonCode.OK, named);
   }
 
   /**

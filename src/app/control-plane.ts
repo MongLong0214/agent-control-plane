@@ -16,14 +16,14 @@ import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
-import { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
+import { ManagedWriteGuard, type DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
 import { type WorkspaceProbe, realWorkspaceProbe } from "../guard/workspace-probe.ts";
 import { Outbox } from "../outbox/outbox.ts";
 import { ProjectRegistry } from "../registry/project-registry.ts";
 import { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review.ts";
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
-import { type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
+import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
 import { ClaudeCliAdapter, CodexCliAdapter } from "../runtime/cli-adapters.ts";
 import { GuardedInvocationWriteBroker, type ProviderAdapter, ProviderRegistry } from "../runtime/provider.ts";
@@ -39,6 +39,8 @@ import { Doctor } from "../doctor/doctor.ts";
 import { Watchdog } from "../doctor/watchdog.ts";
 import { RepairService } from "../doctor/repair.ts";
 import { BootstrapActivation } from "../bootstrap/activation.ts";
+import { Daemon, type DaemonOptions } from "../daemon/daemon.ts";
+import type { DaemonFinalizationAuthorities } from "../daemon/finalizer.ts";
 
 export interface ControlPlaneConfig {
   databasePath: string;
@@ -166,6 +168,8 @@ export class ControlPlane {
   readonly #evidenceWriters: EvidenceWriterSet;
   /** #371 — completion is a capability; the gate and bootstrap activation each hold one. */
   readonly #completionAuthorities: CompletionAuthoritySet;
+  /** The daemon's one non-forgeable admission to post-CEO GitHub writes. */
+  readonly #daemonFinalizerAuthority: DaemonFinalizerAuthority;
 
   /**
    * The capabilities, for a caller that constructed this control plane *as a fixture*.
@@ -198,6 +202,40 @@ export class ControlPlane {
     return this.#evidenceWriters;
   }
 
+  /**
+   * Narrow daemon-only composition input. MCP ports receive function-only surfaces and never
+   * this capability; a raw actor string is deliberately insufficient at the guard boundary.
+   */
+  daemonFinalizationAuthorities(): {
+    readonly write: DaemonFinalizerAuthority;
+    readonly completion: CompletionAuthority;
+  } {
+    if (!this.config.allowTestEvidenceWriters) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "daemon finalization authorities are only exposed to an explicitly unlocked fixture",
+        {},
+      );
+    }
+    return Object.freeze({
+      write: this.#daemonFinalizerAuthority,
+      completion: this.#completionAuthorities.daemonFinalizer,
+    });
+  }
+
+  /**
+   * Production daemon construction is the only non-test path that receives the private
+   * finalization capabilities. The returned Daemon owns the lock that gates their use; no
+   * request-facing object receives the bundle.
+   */
+  createDaemon(options: DaemonOptions): Daemon {
+    const authorities: DaemonFinalizationAuthorities = {
+      write: this.#daemonFinalizerAuthority,
+      completion: this.#completionAuthorities.daemonFinalizer,
+    };
+    return new Daemon(this, options, authorities);
+  }
+
   constructor(readonly config: ControlPlaneConfig) {
     this.clock = config.clock ?? systemClock;
     // These roots are trusted before any service is constructed. Db and WorktreeManager
@@ -224,6 +262,9 @@ export class ControlPlane {
       this.clock,
       { directWriteRoots: config.directWriteRoots },
     );
+    // Claim before any request-facing service is assembled. A second component cannot mint
+    // itself a daemon identity after it has obtained the composition root.
+    this.#daemonFinalizerAuthority = this.guard.claimDaemonFinalizerAuthority();
 
     this.projects = new ProjectRegistry(this.db, this.clock, this.audit);
     this.repositories = new RepositoryRegistry(this.db, this.clock, this.audit);

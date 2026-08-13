@@ -15,7 +15,11 @@ import type { CiCheck, CiEvidenceSource, VerificationReport } from "../verify/ve
 import type { ReviewPacket } from "../review/blind-review.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import { EVIDENCE_PRODUCERS } from "../db/artifacts.ts";
-import { WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
+import {
+  WriteOperation,
+  type DaemonFinalizerAuthority,
+  type ManagedWriteGuard,
+} from "../guard/managed-write-guard.ts";
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
 
@@ -95,6 +99,8 @@ export interface PrepareInput {
   ownerSessionId: string;
   ownerBindingGeneration: number;
   exactHeadSha: string;
+  /** Opaque capability supplied only by the daemon finalizer after CEO approval. */
+  daemonFinalizerAuthority?: DaemonFinalizerAuthority;
 }
 
 export interface MergeInput {
@@ -106,6 +112,14 @@ export interface MergeInput {
   mergeStrategy: BranchProfile["mergeStrategy"];
   ownerSessionId: string;
   ownerBindingGeneration: number;
+  /** Opaque capability supplied only by the daemon finalizer after CEO approval. */
+  daemonFinalizerAuthority?: DaemonFinalizerAuthority;
+}
+
+interface GitHubCaller {
+  ownerSessionId: string;
+  ownerBindingGeneration: number;
+  daemonFinalizerAuthority?: DaemonFinalizerAuthority;
 }
 
 /**
@@ -220,7 +234,7 @@ export class GitHubKernel {
     runId: string,
     repositoryIdentity: string,
     target: GitHubWriteTarget,
-    caller?: { ownerSessionId: string; ownerBindingGeneration: number },
+    caller?: GitHubCaller,
     effect?: () => T | Promise<T>,
   ): Promise<Decision<T>> {
     const run = this.runs.get(runId);
@@ -248,7 +262,42 @@ export class GitHubKernel {
       bindingGeneration: generation,
       claimedClassification: "MANAGED",
       actor: "github-kernel",
+      daemonFinalizerAuthority: caller?.daemonFinalizerAuthority,
     }, () => effect());
+  }
+
+  /**
+   * A completed receipt is safe to re-read from any caller, but a fresh GitHub effect is
+   * admitted only while finalization is in progress and only with the daemon capability.
+   * Do this before reserving a receipt so an unauthorised caller cannot manufacture a
+   * durable PENDING record without ever reaching GitHub.
+   */
+  private assertFreshDaemonFinalization(
+    runId: string,
+    authority: DaemonFinalizerAuthority | undefined,
+    operation: string,
+  ): Decision<void> {
+    const run = this.runs.get(runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+    if (
+      run.state !== "CEO_APPROVED" &&
+      run.state !== "MERGING" &&
+      run.state !== "POST_MERGE_VERIFYING"
+    ) {
+      return deny(ReasonCode.WRITE_RUN_NOT_ACTIVE, "fresh GitHub finalization requires a CEO-approved run", {
+        runId,
+        state: run.state,
+        operation,
+      });
+    }
+    if (!this.guard.hasDaemonFinalizerAuthority(authority)) {
+      return deny(ReasonCode.MERGE_AUTHORITY_DENIED, "fresh GitHub finalization requires daemon authority", {
+        runId,
+        state: run.state,
+        operation,
+      });
+    }
+    return allow(ReasonCode.OK, undefined);
   }
 
   private api(): GitHubClient {
@@ -433,6 +482,13 @@ export class GitHubKernel {
       }, { replayed: true });
     }
 
+    const finalization = this.assertFreshDaemonFinalization(
+      input.runId,
+      input.daemonFinalizerAuthority,
+      "pr_prepare",
+    );
+    if (!finalization.allowed) return finalization as Decision<{ pullNumber: number; url: string }>;
+
     const open = await this.api().request<PullRequest[]>(
       "GET",
       `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(input.head)}&base=${encodeURIComponent(input.base)}&state=open`,
@@ -582,7 +638,11 @@ export class GitHubKernel {
    * §24.4 — publishes `acp-production-gate` and records the payload locally. The local
    * record is the authority; the check run is a projection of it.
    */
-  async gatePublish(payload: GatePayload, repositoryIdentity: string): Promise<Decision<{ checkRunId: number }>> {
+  async gatePublish(
+    payload: GatePayload,
+    repositoryIdentity: string,
+    daemonFinalizerAuthority?: DaemonFinalizerAuthority,
+  ): Promise<Decision<{ checkRunId: number }>> {
     if (!this.credentials.available()) {
       return deny(
         ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE,
@@ -648,7 +708,7 @@ export class GitHubKernel {
         // No check with this name and head exists, so the reserved POST demonstrably did
         // not happen and the next attempt can safely claim a fresh reservation.
         this.releaseReservation(idempotencyKey, payloadDigest);
-        return this.gatePublish(payload, repositoryIdentity);
+        return this.gatePublish(payload, repositoryIdentity, daemonFinalizerAuthority);
       }
       const replay = await this.verifyGate(repositoryIdentity, payload.exactHead, payload.runId);
       if (!replay.allowed || digestOf(replay.value) !== payloadDigest) {
@@ -662,6 +722,13 @@ export class GitHubKernel {
         { replayed: true },
       );
     }
+
+    const finalization = this.assertFreshDaemonFinalization(
+      payload.runId,
+      daemonFinalizerAuthority,
+      "gate_publish",
+    );
+    if (!finalization.allowed) return finalization as Decision<{ checkRunId: number }>;
 
     const target = this.writeTargetForRun(payload.runId, repositoryIdentity);
     if (!target.allowed) return target as Decision<{ checkRunId: number }>;
@@ -682,7 +749,7 @@ export class GitHubKernel {
       payload.runId,
       repositoryIdentity,
       target.value,
-      undefined,
+      { ownerSessionId: this.runs.require(payload.runId).ownerSessionId!, ownerBindingGeneration: payload.bindingGeneration, daemonFinalizerAuthority },
       () => this.api().request<CheckRun>("POST", `/repos/${owner}/${repo}/check-runs`, {
         name: GATE_CHECK_NAME,
         head_sha: payload.exactHead,
@@ -1370,6 +1437,13 @@ export class GitHubKernel {
       return allow(ReasonCode.MERGE_IDEMPOTENT_REPLAY, { ...cached, replayed: true });
     }
 
+    const finalization = this.assertFreshDaemonFinalization(
+      input.runId,
+      input.daemonFinalizerAuthority,
+      "merge_execute",
+    );
+    if (!finalization.allowed) return finalization as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+
     const evaluation = await this.mergeEvaluate(input);
     if (!evaluation.allowed) return evaluation as Decision<{ mergeCommitSha: string; replayed: boolean }>;
 
@@ -1670,6 +1744,7 @@ export class GitHubKernel {
     repositoryIdentity: string,
     mergeCommitSha: string,
     requiredChecks: readonly string[] = [],
+    daemonFinalizerAuthority?: DaemonFinalizerAuthority,
   ): Promise<Decision<{ checks: Array<{ name: string; conclusion: string }> }>> {
     const slug = this.slug(repositoryIdentity);
     if (!slug.allowed) return slug as Decision<{ checks: Array<{ name: string; conclusion: string }> }>;
@@ -1741,6 +1816,13 @@ export class GitHubKernel {
       this.setMergeState(runId, repositoryIdentity, "MERGED");
       return allow(ReasonCode.OK, { checks: cached.checks });
     }
+
+    const finalization = this.assertFreshDaemonFinalization(
+      runId,
+      daemonFinalizerAuthority,
+      "post_merge_verify",
+    );
+    if (!finalization.allowed) return finalization as Decision<{ checks: Array<{ name: string; conclusion: string }> }>;
 
     // Filter by the declared name server-side, then paginate. An unrelated check flood must
     // not hide the one trusted check we are required to assess, while same-name duplicates
@@ -1834,7 +1916,7 @@ export class GitHubKernel {
     repositoryIdentity: string,
     tag: string,
     commitSha: string,
-    caller: { ownerSessionId: string; ownerBindingGeneration: number },
+    caller: GitHubCaller,
   ): Promise<Decision<{ tag: string; sha: string }>> {
     const authority = this.assertAuthority(runId, repositoryIdentity, caller);
     if (!authority.allowed) return authority as Decision<{ tag: string; sha: string }>;
@@ -1958,6 +2040,13 @@ export class GitHubKernel {
         tag,
       });
     }
+
+    const finalization = this.assertFreshDaemonFinalization(
+      runId,
+      caller.daemonFinalizerAuthority,
+      "release_tag",
+    );
+    if (!finalization.allowed) return finalization as Decision<{ tag: string; sha: string }>;
     // GitHub holds no such tag, so a leftover reservation's external write demonstrably did
     // not happen: releasing it destroys no evidence and lets this attempt reserve afresh.
     if (prior) this.releaseReservation(idempotencyKey, requestDigest);
@@ -2142,7 +2231,7 @@ export class GitHubKernel {
     runId: string,
     repositoryIdentity: string,
     tickets: ReadonlyArray<{ id: string; title: string; body: string; labels?: string[] }>,
-    caller: { ownerSessionId: string; ownerBindingGeneration: number },
+    caller: GitHubCaller,
   ): Promise<Decision<{ created: number; updated: number }>> {
     const authority = this.assertAuthority(runId, repositoryIdentity, caller);
     if (!authority.allowed) return authority as Decision<{ created: number; updated: number }>;
@@ -2163,6 +2252,12 @@ export class GitHubKernel {
         { replayed: true },
       );
     }
+    const finalization = this.assertFreshDaemonFinalization(
+      runId,
+      caller.daemonFinalizerAuthority,
+      "issue_project",
+    );
+    if (!finalization.allowed) return finalization as Decision<{ created: number; updated: number }>;
     if (prior && this.inFlightReservations.has(idempotencyKey)) {
       return deny(ReasonCode.RESOURCE_COLLISION, "issue projection is in flight", { idempotencyKey });
     }

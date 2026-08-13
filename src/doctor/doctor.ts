@@ -212,7 +212,12 @@ export class Doctor {
       const binding = this.bindings.activePrimaryCto(project.projectId);
       const openRuns = this.runs
         .list({ projectId: project.projectId })
-        .filter((r) => r.state !== RunState.COMPLETED && r.state !== RunState.FAILED && r.state !== RunState.CANCELLED);
+        .filter((r) =>
+          r.state !== RunState.COMPLETED &&
+          r.state !== RunState.BLOCKED_POST_MERGE &&
+          r.state !== RunState.FAILED &&
+          r.state !== RunState.CANCELLED,
+        );
 
       if (!binding && openRuns.length > 0 && !project.suspended) {
         findings.push({

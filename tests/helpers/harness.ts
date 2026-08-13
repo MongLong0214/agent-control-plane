@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { ManualClock } from "../../src/core/clock.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
-import { ExecutionMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import type { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";
@@ -32,7 +33,11 @@ export interface Harness {
  * git and every gate are the production implementations.
  */
 export const makeHarness = (
-  options: { githubClient?: GitHubClient; ownerIdentities?: readonly OwnerIdentity[] } = {},
+  options: {
+    githubClient?: GitHubClient;
+    ownerIdentities?: readonly OwnerIdentity[];
+    allowTestEvidenceWriters?: boolean;
+  } = {},
 ): Harness => {
   const root = tempDir("acp-harness-");
   const clock = new ManualClock("2026-08-12T00:00:00.000Z");
@@ -58,7 +63,7 @@ console.log('verification ok');`,
     // §21 — the fixture deployment has exactly one owner identity.
     ownerIdentities: options.ownerIdentities ?? [TEST_OWNER],
     // A fixture writes evidence directly in a few places; the daemon never unlocks this.
-    allowTestEvidenceWriters: true,
+    allowTestEvidenceWriters: options.allowTestEvidenceWriters ?? true,
     ctoPreference: { provider: "scripted", model: "scripted-cto", effort: null },
     reviewer: {
       preferred: { provider: "scripted", model: "scripted-reviewer", effort: "xhigh" },
@@ -384,6 +389,156 @@ export const driveToReviewedCandidate = async (
     baseHead: repository.baseHead,
     workBranch,
   };
+};
+
+/**
+ * Move a real reviewed candidate through the same packet and CEO-confirmation path that
+ * production uses before the daemon receives authority to perform GitHub finalization.
+ *
+ * Keeping this separate from `driveToReviewedCandidate` matters: source-work tests still
+ * need a genuinely ACTIVE run, while GitHub-write tests must not quietly exercise the
+ * superseded "ACTIVE may merge" contract.
+ */
+export const approveReviewedCandidateForFinalization = async (
+  harness: Harness,
+  driven: Awaited<ReturnType<typeof driveToReviewedCandidate>>,
+): Promise<void> => {
+  await harness.cp.continuity.evaluate("test finalization packet");
+  const packet = harness.cp.ceo.buildPacket({
+    runId: driven.runId,
+    candidateSnapshotDigest: driven.candidateSnapshotDigest,
+    approval: {
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      resultSummary: "candidate verified",
+      recommendation: "merge",
+      residualRisk: [],
+      approvedBySessionId: driven.ownerSessionId,
+      approvedByGeneration: driven.ownerBindingGeneration,
+      approvedAt: harness.clock.nowIso(),
+    },
+  });
+  if (!packet.allowed) throw new Error(`${packet.reasonCode}: ${packet.message}`);
+  const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
+  if (!ceo) throw new Error("fixture CEO binding missing");
+  const confirmed = harness.cp.ceo.submitCeoDecision({
+    runId: driven.runId,
+    decision: "CONFIRM",
+    candidateSnapshotDigest: driven.candidateSnapshotDigest,
+    ceoSessionId: ceo.sessionId,
+    rationale: "test finalization approval",
+  });
+  if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
+};
+
+/**
+ * Test-only adapter for low-level kernel cases. It models calls made by the daemon, rather
+ * than making a CLI or source worker capable of possessing the opaque finalizer token.
+ */
+export const installDaemonFinalizerGitHubFixture = (harness: Harness): void => {
+  const kernel = harness.cp.github;
+  const authority = harness.cp.daemonFinalizationAuthorities().write;
+  const daemonKernel = new Proxy(kernel, {
+    get(target, property, receiver) {
+      if (property === "prPrepare") {
+        return (input: Parameters<typeof kernel.prPrepare>[0]) =>
+          target.prPrepare({ ...input, daemonFinalizerAuthority: authority });
+      }
+      if (property === "gatePublish") {
+        return (
+          payload: Parameters<typeof kernel.gatePublish>[0],
+          repositoryIdentity: Parameters<typeof kernel.gatePublish>[1],
+        ) => target.gatePublish(payload, repositoryIdentity, authority);
+      }
+      if (property === "mergeExecute") {
+        return (input: Parameters<typeof kernel.mergeExecute>[0]) =>
+          target.mergeExecute({ ...input, daemonFinalizerAuthority: authority });
+      }
+      if (property === "postMergeVerify") {
+        return (...input: Parameters<typeof kernel.postMergeVerify>) =>
+          target.postMergeVerify(input[0], input[1], input[2], input[3], authority);
+      }
+      if (property === "releaseTag") {
+        return (...input: Parameters<typeof kernel.releaseTag>) =>
+          target.releaseTag(input[0], input[1], input[2], input[3], {
+            ...input[4],
+            daemonFinalizerAuthority: authority,
+          });
+      }
+      if (property === "issueProject") {
+        return (...input: Parameters<typeof kernel.issueProject>) =>
+          target.issueProject(input[0], input[1], input[2], {
+            ...input[3],
+            daemonFinalizerAuthority: authority,
+          });
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  Object.defineProperty(harness.cp, "github", {
+    configurable: true,
+    enumerable: true,
+    value: daemonKernel,
+    writable: false,
+  });
+};
+
+/**
+ * Drives an empty participation set through the production candidate packet, CEO confirmation,
+ * and lock-held daemon finalizer. The registry tests use this instead of manually advancing
+ * the state machine with a completion capability.
+ */
+export const finalizeNoRepositoryRun = async (
+  harness: Harness,
+  projectId: string,
+  contract: TaskContract,
+): Promise<{ runId: string; candidateSnapshotDigest: string }> => {
+  bindCeo(harness);
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+  const created = harness.cp.runs.create({
+    projectId,
+    kind: RunKind.CONTRACT_CHANGE,
+    // These registry fixtures declare no human-gate item. Keep that contract honest while
+    // exercising the real packet/CEO/daemon path; guarded runs still fail closed when they
+    // omit their required owner item.
+    executionMode: ExecutionMode.STANDARD,
+    contract,
+  });
+  if (!created.allowed) throw new Error(created.message);
+  const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+  if (!dispatched.allowed) throw new Error(dispatched.message);
+  await harness.cp.continuity.evaluate("empty run candidate packet");
+  const submitted = await harness.cp.pipeline.submitResult({
+    runId: created.value.runId,
+    ownerSessionId: dispatched.value.ownerSessionId!,
+    ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+    resultSummary: "no participating repositories",
+    recommendation: "complete administrative contract change",
+    residualRisk: [],
+  });
+  if (!submitted.allowed) throw new Error(`${submitted.reasonCode}: ${submitted.message}`);
+  const candidateSnapshotDigest = harness.cp.runs.currentCandidate(created.value.runId);
+  if (!candidateSnapshotDigest) throw new Error("empty run did not produce a candidate snapshot");
+  await harness.cp.continuity.evaluate("empty run finalization");
+  const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
+  if (!ceo) throw new Error("fixture CEO binding missing");
+  const confirmed = harness.cp.ceo.submitCeoDecision({
+    runId: created.value.runId,
+    decision: "CONFIRM",
+    candidateSnapshotDigest,
+    ceoSessionId: ceo.sessionId,
+    rationale: "nothing participates in this administrative finalization",
+  });
+  if (!confirmed.allowed) throw new Error(`${confirmed.reasonCode}: ${confirmed.message}`);
+
+  const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-empty-finalization-") });
+  const started = await daemon.start();
+  if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
+  await daemon.stop();
+  if (harness.cp.runs.require(created.value.runId).state !== "COMPLETED") {
+    throw new Error("empty finalization did not complete through the daemon");
+  }
+  return { runId: created.value.runId, candidateSnapshotDigest };
 };
 
 /**

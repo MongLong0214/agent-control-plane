@@ -69,7 +69,6 @@ export interface DbOpenOptions {
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
   afterMigration?: (migration: SchemaMigration) => void;
 }
-
 const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
 const RUN_STATE_TRANSITION_MINT: unique symbol = Symbol("run-state-transition-mint");
 

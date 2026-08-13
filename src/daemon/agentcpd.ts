@@ -19,7 +19,6 @@ import {
 } from "../ingress/ingress-guard.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
-import { Daemon } from "./daemon.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
@@ -35,9 +34,22 @@ export interface LocalMcpListeners {
   close(): Promise<void>;
 }
 
+/** Main's live listener composition: CEO CONFIRM is handed to the lock-held daemon. */
+export const startDaemonMcpListeners = (
+  cp: ControlPlane,
+  stateDir: string,
+  token: string,
+  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown> },
+): Promise<LocalMcpListeners> =>
+  startLocalMcpListeners(cp, stateDir, token, {
+    onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
+  });
+
 /** Tests shorten the deadline without weakening the daemon's production default. */
 export interface LocalMcpListenerOptions {
   handshakeTimeoutMs?: number;
+  /** Internal daemon notification after a successful ordinary CEO confirmation. */
+  onCeoApproved?: (runId: string) => void | Promise<unknown>;
 }
 
 /** A one-time, owner-only credential handoff for a runtime that was just constituted. */
@@ -177,7 +189,7 @@ export const startLocalMcpListeners = async (
   // Server handlers receive these function-only ports, never the composition root. The
   // transport still needs `cp` to authenticate a socket, but a tool cannot turn that into
   // raw database access or evidence-write authority (#352).
-  const hermesPort = createHermesMcpPort(cp);
+  const hermesPort = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
   const ctoPort = createCtoMcpPort(cp);
   const hermes = await startMcpSocket(
     hermesPath,
@@ -915,7 +927,7 @@ export const main = async (): Promise<void> => {
     sessionLaunch,
   });
 
-  const daemon = new Daemon(cp, { stateDir, buzz });
+  const daemon = cp.createDaemon({ stateDir, buzz });
 
   const started = await daemon.start();
   if (!started.allowed) {
@@ -933,7 +945,7 @@ export const main = async (): Promise<void> => {
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
   try {
-    listeners = await startLocalMcpListeners(cp, stateDir, mcpToken);
+    listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
     if (buzzActorIngressPolicy) {
       buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
     }
