@@ -311,6 +311,10 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       satisfied: false,
     });
 
+    const frozen = await harness.cp.pipeline.freeze(created.value.runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
+    expect(harness.cp.runs.currentCandidate(created.value.runId)).toBeTruthy();
+
     harness.cp.runs.transition(created.value.runId, RunState.AWAITING_HUMAN, "owner decision needed");
     const approved = harness.cp.ceo.recordOwnerDecision({
       runId: created.value.runId,

@@ -347,47 +347,6 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       cp.tasks.finishExecution(verifyExecution.value.executionId, { status: "SUCCEEDED", resultDigest: "sha256:task-report" });
 
       // --- the full candidate path: freeze, verify, review, packet ----------
-      // A GUARDED run must not complete on machine evidence alone (§12.3, §21). The gate is
-      // cleared by a real decision from the identity this host allowlists, recorded before
-      // the packet is published so the packet states a gate that is genuinely satisfied —
-      // and an identity that is not the owner is refused, which is what makes it a gate.
-      if (MODE === "GUARDED") {
-        const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [OWNER.actor] } });
-        const receiptFor = (item: string, actor: string) => {
-          const approval = {
-            runId,
-            operation: "owner_decision_submit",
-            parameters: { item, approved: true, note: "reviewed the contract and the declared scope" },
-            idempotencyKey: `owner-decision:${item}:${actor}`,
-            approved: true,
-          };
-          return guard.admitOwnerApproval(
-            { channel: "cli", actor, nonce: `owner-decision:${item}:${actor}`, payload: ownerApprovalPayload(approval) },
-            approval,
-          );
-        };
-
-        // Naming the owner is not being the owner: an identity this host never allowlisted
-        // cannot even obtain a receipt, so it cannot clear the gate (#102).
-        const impostor = receiptFor(CONTRACT.humanGate[0]!, "someone-else");
-        expect(impostor.allowed).toBe(false);
-        evidence["humanGateRefusedNonOwner"] = impostor.reasonCode;
-
-        for (const item of CONTRACT.humanGate) {
-          const admitted = receiptFor(item, OWNER.actor);
-          if (!admitted.allowed) throw new Error(`owner ingress refused: ${admitted.message}`);
-          const decided = cp.ceo.recordOwnerDecision({
-            runId,
-            item,
-            approved: true,
-            note: "reviewed the contract and the declared scope",
-            receipt: admitted.value,
-          });
-          expect(decided.allowed).toBe(true);
-        }
-        evidence["ownerDecision"] = { owner: OWNER, items: CONTRACT.humanGate, via: "admitted cli ingress receipt" };
-      }
-
       const outcome = await cp.pipeline.submitResult({
         runId,
         ownerSessionId: run.ownerSessionId!,
@@ -438,6 +397,45 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
         .byKind("CEO_NOTIFICATION")
         .filter((e) => e.evidence["notification"] === "READY_FOR_CEO_REVIEW");
       expect(notified).toHaveLength(1);
+
+      // A GUARDED run must not complete on machine evidence alone (§12.3, §21). Record the
+      // real owner decision only after submitResult has frozen the current candidate, then
+      // before CEO confirmation. An identity that is not the owner cannot obtain a receipt,
+      // so it cannot clear the gate (#102).
+      if (MODE === "GUARDED") {
+        const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [OWNER.actor] } });
+        const receiptFor = (item: string, actor: string) => {
+          const approval = {
+            runId,
+            operation: "owner_decision_submit",
+            parameters: { item, approved: true, note: "reviewed the contract and the declared scope" },
+            idempotencyKey: `owner-decision:${item}:${actor}`,
+            approved: true,
+          };
+          return guard.admitOwnerApproval(
+            { channel: "cli", actor, nonce: `owner-decision:${item}:${actor}`, payload: ownerApprovalPayload(approval) },
+            approval,
+          );
+        };
+
+        const impostor = receiptFor(CONTRACT.humanGate[0]!, "someone-else");
+        expect(impostor.allowed).toBe(false);
+        evidence["humanGateRefusedNonOwner"] = impostor.reasonCode;
+
+        for (const item of CONTRACT.humanGate) {
+          const admitted = receiptFor(item, OWNER.actor);
+          if (!admitted.allowed) throw new Error(`owner ingress refused: ${admitted.message}`);
+          const decided = cp.ceo.recordOwnerDecision({
+            runId,
+            item,
+            approved: true,
+            note: "reviewed the contract and the declared scope",
+            receipt: admitted.value,
+          });
+          expect(decided.allowed).toBe(true);
+        }
+        evidence["ownerDecision"] = { owner: OWNER, items: CONTRACT.humanGate, via: "admitted cli ingress receipt" };
+      }
 
       const confirmed = cp.ceo.submitCeoDecision({
         runId,
