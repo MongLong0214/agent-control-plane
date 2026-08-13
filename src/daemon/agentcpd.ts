@@ -12,6 +12,11 @@ import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import {
+  BuzzActorIngress,
+  IngressGuard,
+  type IngressPolicy,
+} from "../ingress/ingress-guard.ts";
 import { Daemon } from "./daemon.ts";
 import { createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesServer } from "../mcp/hermes-server.ts";
@@ -21,6 +26,12 @@ const MAX_MCP_LINE_BYTES = 1024 * 1024;
 
 export interface LocalMcpListeners {
   socketPaths: readonly string[];
+  close(): Promise<void>;
+}
+
+/** A daemon-owned local hop from the authenticated Buzz relay to SessionRegistry. */
+export interface LocalBuzzActorIngress {
+  socketPath: string;
   close(): Promise<void>;
 }
 
@@ -64,6 +75,46 @@ export const startLocalMcpListeners = async (
   };
 };
 
+/**
+ * Hosts the only production writer for `sessions.buzz_actor_id`. The relay submits a
+ * signed Buzz envelope over this owner-only socket; the handler verifies that envelope
+ * before it lets SessionRegistry verify the runtime's separate session secret.
+ */
+export const startBuzzActorIngressListener = async (
+  cp: ControlPlane,
+  stateDir: string,
+  policy: IngressPolicy,
+): Promise<LocalBuzzActorIngress> => {
+  if (!policy.secret || policy.secret.trim().length === 0) {
+    throw new Error("Buzz actor ingress requires a non-empty signing secret");
+  }
+
+  const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy });
+  const ingress = new BuzzActorIngress(guard, cp.sessions);
+  const socketPath = join(stateDir, "buzz-actor.ingress.sock");
+  removeStaleSocket(socketPath);
+  const server = createServer((socket) => serveBuzzActorBinding(socket, ingress));
+
+  try {
+    await listenSocket(server, socketPath);
+  } catch (err) {
+    if (existsSync(socketPath)) unlinkSync(socketPath);
+    throw err;
+  }
+
+  return {
+    socketPath,
+    close: async () => {
+      await closeSocketServer(server);
+      try {
+        if (existsSync(socketPath)) unlinkSync(socketPath);
+      } catch {
+        /* closing the server already releases its socket; this is only cleanup */
+      }
+    },
+  };
+};
+
 const startMcpSocket = async (
   path: string,
   token: string,
@@ -90,7 +141,11 @@ const startMcpSocket = async (
     });
   });
 
-  return new Promise<Server>((resolveServer, reject) => {
+  return listenSocket(server, path);
+};
+
+const listenSocket = (server: Server, path: string): Promise<Server> =>
+  new Promise<Server>((resolveServer, reject) => {
     server.once("error", reject);
     server.listen(path, () => {
       server.removeListener("error", reject);
@@ -98,7 +153,6 @@ const startMcpSocket = async (
       resolveServer(server);
     });
   });
-};
 
 const removeStaleSocket = (path: string): void => {
   if (!existsSync(path)) return;
@@ -113,6 +167,87 @@ const closeSocketServer = (server: Server): Promise<void> =>
     server.close((err) => (err ? reject(err) : resolveClose()));
   });
 
+/** A compact wire result for local authenticated ingress; secret-bearing values stay local. */
+const endWithDecision = <T>(socket: Socket, decision: Decision<T>): void => {
+  const body = decision.allowed
+    ? { ok: true, reasonCode: decision.reasonCode, evidence: decision.evidence }
+    : {
+        ok: false,
+        reasonCode: decision.reasonCode,
+        message: decision.message,
+        evidence: decision.evidence,
+      };
+  socket.end(`${JSON.stringify(body)}\n`);
+};
+
+const serveBuzzActorBinding = (socket: Socket, ingress: BuzzActorIngress): void => {
+  let buffer = Buffer.alloc(0);
+  let settled = false;
+  const finish = (decision: Decision<unknown>): void => {
+    if (settled) return;
+    settled = true;
+    socket.removeListener("data", receive);
+    endWithDecision(socket, decision);
+  };
+  const receive = (chunk: Buffer): void => {
+    buffer = Buffer.concat([buffer, chunk]);
+    if (buffer.length > MAX_MCP_LINE_BYTES) {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz actor ingress message exceeds local transport limit"));
+    }
+    const boundary = buffer.indexOf(0x0a);
+    if (boundary === -1) return;
+    const line = buffer.subarray(0, boundary).toString("utf8");
+    // This endpoint accepts exactly one relay envelope per connection. Ignoring a second
+    // line would make its replay and ordering semantics impossible to reason about.
+    if (buffer.subarray(boundary + 1).length > 0) {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz actor ingress accepts one envelope per connection"));
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(line) as unknown;
+    } catch {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz actor ingress message is not JSON"));
+    }
+    const input = presentedBuzzActorBinding(value);
+    if (!input) {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz actor ingress message is incomplete"));
+    }
+    finish(ingress.bindActor(input));
+  };
+  socket.on("data", receive);
+  socket.once("error", () => {
+    settled = true;
+    socket.removeListener("data", receive);
+  });
+};
+
+const presentedBuzzActorBinding = (value: unknown): {
+  actor: string;
+  sessionId: string;
+  sessionSecret: string;
+  nonce: string;
+  signature: string | null;
+} | null => {
+  if (!value || typeof value !== "object") return null;
+  const { actor, sessionId, sessionSecret, nonce, signature } = value as {
+    actor?: unknown;
+    sessionId?: unknown;
+    sessionSecret?: unknown;
+    nonce?: unknown;
+    signature?: unknown;
+  };
+  if (
+    typeof actor !== "string" ||
+    typeof sessionId !== "string" ||
+    typeof sessionSecret !== "string" ||
+    typeof nonce !== "string" ||
+    (signature !== undefined && signature !== null && typeof signature !== "string")
+  ) {
+    return null;
+  }
+  return { actor, sessionId, sessionSecret, nonce, signature: signature ?? null };
+};
+
 interface AcceptedConnection {
   transport: SocketTransport;
   credential: PeerCredential;
@@ -126,14 +261,23 @@ const authenticateSocket = (socket: Socket, token: string): Promise<AcceptedConn
       if (settled) return;
       settled = true;
       socket.removeListener("data", receive);
-      socket.removeListener("error", reject);
-      socket.removeListener("close", reject);
+      socket.removeListener("error", transportError);
+      socket.removeListener("close", transportClosed);
       resolveTransport(transport);
     };
-    const reject = (): void => {
-      socket.destroy();
+    const reject = (respond = true): void => {
+      if (settled) return;
+      if (respond && !socket.destroyed) {
+        // The client receives the stable denial without ever reaching an MCP transport
+        // or a tool handler. This makes the ordering observable to both callers and tests.
+        endWithDecision(socket, deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "local MCP authentication failed"));
+      } else {
+        socket.destroy();
+      }
       finish(null);
     };
+    const transportError = (): void => reject(false);
+    const transportClosed = (): void => reject(false);
     const receive = (chunk: Buffer): void => {
       buffer = Buffer.concat([buffer, chunk]);
       if (buffer.length > MAX_MCP_LINE_BYTES) return reject();
@@ -154,8 +298,8 @@ const authenticateSocket = (socket: Socket, token: string): Promise<AcceptedConn
       finish({ transport: new SocketTransport(socket, remainder), credential });
     };
     socket.on("data", receive);
-    socket.once("error", reject);
-    socket.once("close", reject);
+    socket.once("error", transportError);
+    socket.once("close", transportClosed);
   });
 
 /**
@@ -287,6 +431,22 @@ class SocketTransport implements Transport {
   };
 }
 
+/** The actor allowlist is deployment configuration, never a relay-supplied claim. */
+const configuredBuzzActorIngressPolicy = (): IngressPolicy | null => {
+  const secret = process.env["ACP_BUZZ_INGRESS_SECRET"]?.trim() ?? "";
+  const allowedActors = (process.env["ACP_BUZZ_ALLOWED_ACTORS"] ?? "")
+    .split(",")
+    .map((actor) => actor.trim())
+    .filter((actor) => actor.length > 0);
+  if (secret.length === 0 && allowedActors.length === 0) return null;
+  if (secret.length === 0 || allowedActors.length === 0) {
+    throw new Error(
+      "ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS must be configured together",
+    );
+  }
+  return { allowedActors, secret };
+};
+
 /**
  * `agentcpd` — the single local runtime authority (PRD §33.1).
  *
@@ -295,6 +455,13 @@ class SocketTransport implements Transport {
  */
 export const main = async (): Promise<void> => {
   const config = defaultConfig();
+  const stateDir = dirname(config.databasePath);
+  const buzzActorIngressPolicy = configuredBuzzActorIngressPolicy();
+  if (process.env["BUZZ_PRIVATE_KEY"] && !buzzActorIngressPolicy) {
+    throw new Error(
+      "Buzz transport requires ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS for authenticated actor binding",
+    );
+  }
   const cp = new ControlPlane(config);
   const mcpToken = process.env["ACP_MCP_TOKEN"];
   if (!mcpToken) throw new Error("ACP_MCP_TOKEN is required for authenticated local MCP sockets");
@@ -316,7 +483,7 @@ export const main = async (): Promise<void> => {
     readiness: { checkSession: (id) => cp.doctor.sessionReadiness(id) },
   });
 
-  const daemon = new Daemon(cp, { stateDir: dirname(config.databasePath), buzz });
+  const daemon = new Daemon(cp, { stateDir, buzz });
 
   const started = await daemon.start();
   if (!started.allowed) {
@@ -330,10 +497,15 @@ export const main = async (): Promise<void> => {
     process.exit(1);
   }
 
-  let listeners: LocalMcpListeners;
+  let listeners: LocalMcpListeners | null = null;
+  let buzzActorIngress: LocalBuzzActorIngress | null = null;
   try {
-    listeners = await startLocalMcpListeners(cp, dirname(config.databasePath), mcpToken);
+    listeners = await startLocalMcpListeners(cp, stateDir, mcpToken);
+    if (buzzActorIngressPolicy) {
+      buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
+    }
   } catch (err) {
+    await listeners?.close();
     await daemon.stop();
     cp.close();
     throw err;
@@ -343,7 +515,8 @@ export const main = async (): Promise<void> => {
 
   const shutdown = async (signal: string): Promise<void> => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
-    await listeners.close();
+    await buzzActorIngress?.close();
+    await listeners?.close();
     await daemon.stop();
     cp.close();
     process.exit(0);

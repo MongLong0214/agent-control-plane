@@ -13,6 +13,8 @@ export interface WatchdogDeadlines {
   runProgressMs: number;
   /** A session left STARTING this long never came up. */
   sessionStartMs: number;
+  /** A crashed candidate pipeline attempt is reclaimed after this durable lease age. */
+  candidatePipelineAttemptMs: number;
   /** A pending outbox message older than this has not been delivered. */
   outboxPendingMs: number;
 }
@@ -21,6 +23,9 @@ export const DEFAULT_DEADLINES: WatchdogDeadlines = {
   taskActivityMs: 30 * 60 * 1000,
   runProgressMs: 2 * 60 * 60 * 1000,
   sessionStartMs: 5 * 60 * 1000,
+  // Match CandidatePipeline's durable attempt lease. A later submit can reclaim too,
+  // but this sweep makes a crash visible and frees the run before another submit arrives.
+  candidatePipelineAttemptMs: 30 * 60 * 1000,
   outboxPendingMs: 10 * 60 * 1000,
 };
 
@@ -98,6 +103,46 @@ export class Watchdog {
           this.deadlines.taskActivityMs,
         );
       }
+    }
+
+    // `candidate_pipeline_attempts` survives process death. Reclaim with the stale row's
+    // exact attempt tuple so a concurrent fresh submit cannot be released accidentally.
+    for (const attempt of this.db.all<{
+      run_id: string;
+      attempt_id: string;
+      started_at: string;
+    }>(`SELECT run_id, attempt_id, started_at
+          FROM candidate_pipeline_attempts WHERE state = 'RUNNING'`)) {
+      const ageMs = now - new Date(attempt.started_at).getTime();
+      if (ageMs <= this.deadlines.candidatePipelineAttemptMs) continue;
+      const reclaimed = this.db.run(
+        `UPDATE candidate_pipeline_attempts
+            SET state = 'RELEASED', released_at = ?
+          WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND started_at = ?`,
+        [this.clock.nowIso(), attempt.run_id, attempt.attempt_id, attempt.started_at],
+      );
+      if (reclaimed.changes !== 1) continue;
+
+      const key = `run:${attempt.run_id}`;
+      overdue.push({ kind: "candidate_pipeline_attempt", id: attempt.attempt_id, ageMs });
+      scopes.set(key, { scope: "run", target: attempt.run_id });
+      const findings = stallFindings.get(key) ?? [];
+      findings.push({
+        code: ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
+        severity: "ERROR",
+        scope: `candidate_pipeline_attempt:${attempt.attempt_id}`,
+        blocking: true,
+        confidence: "HIGH",
+        observedEvidence: {
+          attemptId: attempt.attempt_id,
+          startedAt: attempt.started_at,
+          ageMs,
+          deadlineMs: this.deadlines.candidatePipelineAttemptMs,
+          reclaimed: true,
+        },
+        recommendedAction: "inspect the interrupted candidate pipeline and submit a fresh result",
+      });
+      stallFindings.set(key, findings);
     }
 
     for (const run of this.db.all<{ run_id: string; dispatched_at: string | null }>(
