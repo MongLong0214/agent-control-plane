@@ -19,7 +19,7 @@ import {
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ReviewPacket } from "../review/blind-review.ts";
-import type { RunEngine } from "../run/run-engine.ts";
+import type { RunEngine, CompletionAuthoritySet } from "../run/run-engine.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
@@ -149,6 +149,8 @@ export class ProductionGate {
     private readonly artifacts: ArtifactStore,
     /** #70 — the capability that lets this gate write its packet; a name would be forgeable. */
     private readonly packetWriter: EvidenceWriter<"PRODUCTION_READY_PACKET">,
+    /** #371 — completing a run needs a capability, not the string "production-gate". */
+    private readonly completion: CompletionAuthoritySet,
     private readonly runs: RunEngine,
     private readonly tasks: TaskGraph,
     private readonly bindings: BindingRegistry,
@@ -557,7 +559,9 @@ export class ProductionGate {
           target,
           `CEO ${input.decision}`,
           { candidateSnapshotDigest: input.candidateSnapshotDigest, rationale: input.rationale },
-          isBootstrap && input.decision === "CONFIRM" ? "bootstrap-activation" : "production-gate",
+          isBootstrap && input.decision === "CONFIRM"
+            ? this.completion.bootstrapActivation
+            : this.completion.productionGate,
         );
         if (!transition.allowed) return transition as Decision<{ state: RunState }>;
 

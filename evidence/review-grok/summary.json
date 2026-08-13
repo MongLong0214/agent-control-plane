@@ -1,0 +1,41 @@
+{
+  "reviewer": "grok",
+  "results": [
+    {
+      "key": "guard",
+      "verdict": "ERROR",
+      "findings": 0,
+      "seconds": 764
+    },
+    {
+      "key": "verify",
+      "verdict": "BLOCK",
+      "findings": 12,
+      "seconds": 929
+    },
+    {
+      "key": "review",
+      "verdict": "ERROR",
+      "findings": 0,
+      "seconds": 817
+    },
+    {
+      "key": "github",
+      "verdict": "ERROR",
+      "findings": 0,
+      "seconds": 258
+    },
+    {
+      "key": "runtime",
+      "verdict": "BLOCK",
+      "findings": 12,
+      "seconds": 705
+    },
+    {
+      "key": "binding",
+      "verdict": "ERROR",
+      "findings": 0,
+      "seconds": 722
+    }
+  ]
+}

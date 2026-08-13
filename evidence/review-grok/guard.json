@@ -1,5 +1,113 @@
 {
-  "verdict": "ERROR",
-  "error": "Unexpected non-whitespace character after JSON at position 97 (line 1 column 98)",
-  "stderr": ""
+  "verdict": "REVISE",
+  "filesExamined": [
+    "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
+    "docs/ACCEPTANCE.md",
+    "docs/adr/ADR-0001-runtime-and-persistence.md",
+    "docs/adr/ADR-0002-invariants-as-types-and-constraints.md",
+    "docs/adr/ADR-0003-role-binding-generation-and-fencing.md",
+    "src/guard/managed-write-guard.ts",
+    "src/guard/workspace-probe.ts",
+    "src/claims/claim-registry.ts",
+    "src/db/schema.sql",
+    "src/db/database.ts",
+    "src/github/github-kernel.ts",
+    "src/app/control-plane.ts",
+    "src/run/candidate-pipeline.ts",
+    "src/ceo/production-gate.ts",
+    "src/mcp/cto-server.ts",
+    "src/runtime/cli-adapters.ts",
+    "src/cto/cto-lifecycle.ts",
+    "src/git/git.ts",
+    "src/verify/worktree.ts",
+    "src/domain/types.ts",
+    "src/registry/project-registry.ts",
+    "tests/unit/guard-hardening.test.ts",
+    "tests/unit/guard-r2.test.ts",
+    "tests/unit/outbox-buzz-claims-r2.test.ts",
+    "tests/unit/trusted-core.test.ts",
+    "tests/helpers/fixtures.ts"
+  ],
+  "omittedItems": [
+    "Did not run the test suite (instructed not to; other agents are editing the tree).",
+    "GitHub kernel receipt, merge-proof and branch-contract logic beyond mediate()/assertClaim() — outside the assigned modules except as the sole production authorize() caller.",
+    "Whether the single-instance daemon lock actually prevents two processes from holding independent in-memory grants and source-read leases.",
+    "REPO_FACTORY integration PRD (cited by an earlier review; not this area's SSOT).",
+    "ADRs 0004–0008 beyond a grep for guard/claim language.",
+    "Live GitHub behaviour of two concurrent runs on different branches of one identity (traced in code, not exercised against the API)."
+  ],
+  "findings": [
+    {
+      "severity": "MAJOR",
+      "category": "enforcement-not-on-path",
+      "file": "src/guard/managed-write-guard.ts",
+      "line": 19,
+      "summary": "CP-HI-01 enumerates file/git/manifest writes, but the only production caller of the guard is GitHub.",
+      "detail": "PRD §4 CP-HI-01 says every project-natured write (file mutation, commit/branch/tag, manifest/verification-contract change, GitHub write, programmatic merge) is inspected by a tool adapter on operation and target, not by Hermes' label. ADR-0002 repeats that the enforcement point is ManagedWriteGuard. In this tree the only production authorize() call is GitHubKernel.mediate (src/github/github-kernel.ts:209). git.ts addWorktree/removeWorktree, ProjectRegistry.activateManifest, and the Claude/Codex adapters never consult the guard. Those adapters sandbox-allow the entire invocation workdir (src/runtime/cli-adapters.ts:580–584); CTO spawn uses process.cwd() (src/cto/cto-lifecycle.ts:778). Sequence: dispatch a CTO/worker whose tools can Edit/Write/Bash in a participating checkout; never call evaluate/authorize/resource_claim; mutate files or git commit during another run's source-read lease. decide() never runs, so claimConflict, renewRequiredClaims, SOURCE_READ_LEASE_CONFLICT and the in-flight fence do not exist for that write. ACCEPTANCE's sentence that a worker who writes without claiming is refused with WRITE_PATH_NOT_CLAIMED is true only of consume/authorize, which this path never reaches. This is the fail-open that lets the product produce candidates at all — wrapping every agent Write/Bash would stop the only way work lands in a checkout. claimedClassification is correctly ignored (line 260 records it; decide() never reads it). Tests that would fail if the *library* checks were deleted: guard-hardening 'a git probe error is not evidence…', 'a blind reviewer bound to the run cannot mutate…', 'refuses to burn a grant when the run holds no live claim', guard-r2 '#131 blocks a managed source mutation…'. None of those tests spawn an adapter or git.ts, so they still pass if the real mutation primitives stay unwired.",
+      "suggestedFix": "Either (a) make FILE_MUTATION/GIT_* real adapters that every control-plane-owned checkout mutation must call, and confine agent sessions so the only writable project path is one just authorised, or (b) strike those operations from CP-HI-01 and ACCEPTANCE and state that the guard is the GitHub/control-plane write broker only. Do not leave a complete-looking FILE_MUTATION fence that no production write can hit."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-bypass",
+      "file": "src/github/github-kernel.ts",
+      "line": 209,
+      "summary": "mediate() never names the branch or path, so the in-flight fence is dead on the only production authorize() path and §23.2 remote checks collapse.",
+      "detail": "mediate() calls guard.authorize with operation, repositoryIdentity, run, session and generation only — no targetBranch, targetWorktreeId or targetPath (src/github/github-kernel.ts:209–217). Consequences in decide()/authorizeResources/requiredClaims/inFlightTargetKey: (1) REMOTE observedBranch is forced null (managed-write-guard.ts:1378–1404). Any other run's HELD branch or worktree claim then matches the undeterminable filter (1455–1470) and every GitHub write is CLAIM_BRANCH_CONFLICT, including a PR/merge on a *different* branch. That is the fail-closed that breaks §23.3 ('two runs on different branches of one repository must both be able to work'); the FILE_MUTATION test 'a different branch in the same repository is not a conflict' never exercises GITHUB_*. (2) requiredClaims sees no branch/worktree/path and accepts any live row on the repository (726–731). gate_publish, issue_project and release_tag have no assertClaim; a README.md path claim authorises a check-run, issue projection or release tag. prPrepare/mergeEvaluate do assertClaim on the head branch (github-kernel.ts:241, 953) but merge_execute only re-checks that before the later mediate(), and mediate itself will burn a leftover path claim if the branch row was released in the gap. (3) inFlightTargetKey returns null without resolvedPath (936–938), so #inFlightByTarget never records a GitHub write. Two concurrent authorize() calls for PROGRAMMATIC_MERGE/GITHUB_PR on the same identity both proceed; kernel receipts are the real serializer, not the guard. guard-r2 '#347 rejects a second concurrent authorisation for the same repository target' uses FILE_MUTATION with a path — deleting the remote in-flight hole does not fail that test. trusted-core 'classifies path-free github operations' only asserts evaluate().allowed, so it still passes if consume/authorize/requiredClaims are deleted.",
+      "suggestedFix": "Extend mediate() with the branch (and, where it exists, the PR head / tag / check-run ref) the kernel already has. Pass it as targetBranch so claimConflict compares the touched branch, requiredClaims demands a live claim on that branch, and inFlightTargetKey keys [identity, operation, branch]. Add a regression that run A holds branch feature, run B holds branch release, and B's GITHUB_PR/PROGRAMMATIC_MERGE is allowed while A's feature remains HELD — and that a path-only claim cannot burn a GITHUB_RELEASE grant."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-bypass",
+      "file": "src/guard/managed-write-guard.ts",
+      "line": 1405,
+      "summary": "§23.2 same-worktree reject compares a caller-chosen string to basename(toplevel), so it does not name the directory.",
+      "detail": "ClaimRegistry.acquire stores request.worktreeId verbatim (src/claims/claim-registry.ts:115) with no probe that it is this checkout. The unique index is (repository_identity, worktree_id) WHERE HELD (schema.sql:629–631) — uniqueness of the string, not of the directory. The guard's observed id is basename(toplevel) (managed-write-guard.ts:1405). claimConflict only fires when those strings are equal (1474). Sequence: run A acquires worktreeId 'custom' via MCP resource_claim on github:acme/app whose checkout is /Users/isaac/projects/app (basename 'app'); run B acquires branch dev (allowed — different column); B FILE_MUTATION or a GitHub write that resolves worktreeId to 'app'. A's row is 'custom', not 'app', so there is no CLAIM_WORKTREE_CONFLICT. If B also holds a matching own claim, consume/authorize succeeds. Two writers on the same worktree. A refusal that depends on the first caller typing the basename is not enforcement. The test 'a worktree held by another run blocks the write' inserts basename(repo) and would still pass after this hole is left open. hasHeldWorktreeClaim (1501–1506) only forces the writer to *have* some resolved worktree id; it does not require that id equal a held claim's id unless the strings match.",
+      "suggestedFix": "Canonicalise worktree identity to the probe's toplevel path (or a hash of it) at acquire time; reject a worktreeId that is not that checkout. Compare claims against that identity, not basename(). Add a test that a claim of 'custom' on /repo/app does not fence /repo/app and cannot be used to consume a write there."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "fail-open",
+      "file": "src/guard/managed-write-guard.ts",
+      "line": 1450,
+      "summary": "The guard treats a HELD claim as gone at expires_at, while the unique index still occupies the slot.",
+      "detail": "claimConflict and requiredClaims filter expires_at > now (1450, 702–703). The §30.2 indexes (schema.sql:629–638) key only on status='HELD'. expireOverdue() is called from ClaimRegistry.acquire, daemon tick and repair — not from decide(). Sequence: run A still has status=HELD on branch dev, expires_at in the past, expireOverdue not yet swept; run B holds any other live claim on the same identity. B's GITHUB_PR/GITHUB_RELEASE evaluate ignores A's row (clock-expired) and requiredClaims accepts B's path/branch row. A cannot re-acquire or transfer dev until something sweeps the row (unique index). The test 'an expired lease does not block anyone' inserts expires_at=now and only checks evaluate().allowed on FILE_MUTATION; it would still pass if the unique-index occupant kept blocking acquires, and it never checks a remote write or a subsequent acquire. This is a coordination hole, not a silent COMPLETED run, so it is not a BLOCKER.",
+      "suggestedFix": "Have decide() and assertClaim run expireOverdue in the same transaction as the read (or predicate the unique indexes on expires_at > now). A HELD row past expires_at must be either still blocking or already reclaimable — not one in the guard and the other in SQLite."
+    },
+    {
+      "severity": "MINOR",
+      "category": "legacy-api",
+      "file": "src/guard/managed-write-guard.ts",
+      "line": 273,
+      "summary": "consume() still returns WRITE_ALLOWED without holding the in-flight or filesystem fence.",
+      "detail": "Issue #247 item 4 recorded consume-then-mutate as a deliberate residual. authorize() (286–356) later holds #inFlight, captures parent/target/toplevel fds, re-checks immediately before and after the effect, and is what GitHub uses. consume() (273–279) still activate()s, audits CONSUMED, and returns. Two evaluate() grants for the same path can both consume(); #inFlightByTarget is never consulted. Issue 247's comment says items 4/5 are being closed by #97; #97 covers authorize() ancestor swap, not this API. Most claim-fencing unit tests still call consume() rather than authorize(), so a regression that only breaks the fenced lifecycle can stay green. I disagree with keeping a public success path that is the pre-#97 hole.",
+      "suggestedFix": "Stop returning WRITE_ALLOWED from consume() (make it deny, or restrict it to tests). Move the claim-renewal tests onto authorize() so deleting the fence or in-flight map fails them."
+    },
+    {
+      "severity": "MINOR",
+      "category": "hidden-wildcard",
+      "file": "src/guard/managed-write-guard.ts",
+      "line": 722,
+      "summary": "requiredClaims treats declared_path='.' as covering every file; the claim API cannot create that row.",
+      "detail": "Path coverage is `c.declared_path = ? OR c.declared_path = '.'` (719–724). ClaimRegistry.normalizePath drops '.' segments and returns null for '.' (320–341), so MCP resource_claim cannot acquire it. tests/helpers/fixtures.ts:173–178 insert '.' on every seedRun. That means a detached-HEAD FILE_MUTATION (no targetBranch, no worktree id) can burn a fixture claim as a repo-wide lease, and no production acquire path can reproduce the fixture. Deleting the OR '.' branch would not fail any test that also holds a real branch claim (the usual consume tests add one).",
+      "suggestedFix": "Remove the '.' special case, or make normalizePath('.') a documented repo-wide lease and stop inserting it only from fixtures."
+    },
+    {
+      "severity": "INFO",
+      "category": "hollow-test",
+      "file": "tests/unit/guard-hardening.test.ts",
+      "line": 110,
+      "summary": "Several tests named as invariant regressions would still pass if the check they describe were deleted.",
+      "detail": "'a registered checkout is managed even when git cannot answer' (110–117) calls setup({ probeErrorsFor: ['/somewhere-else'] }); the repo probe succeeds, so deleting registeredContaining() leaves evaluate() allowed. trusted-core 'classifies path-free github operations' (297–307) only asserts evaluate().allowed — deleting renewRequiredClaims/consume claim fencing does not touch it. 'a different branch in the same repository is not a conflict' (249–278) is an allow-case: deleting claimConflict() still passes. Contrast with checks that *are* load-bearing: probe ERROR→PROBE_FAILED (95–108), reviewer→REVIEWER_SESSION_IS_PRODUCER (146–171), consume without claim→WRITE_PATH_NOT_CLAIMED (403–415), #131 SOURCE_READ_LEASE_CONFLICT, #347 RESOURCE_COLLISION, #97/#339 WRITE_EFFECT_FENCE_LOST, #99 DIRECT_WRITE_ROOT_REQUIRED, #100 GIT_BRANCH vs foreign branch, #98 frozen grant, trusted-core unique-index insert of a second HELD branch.",
+      "suggestedFix": "Point the registered-checkout test's errorFor at the actual repo path (and still expect a managed decision, or PROBE_FAILED if you refuse to classify without git). Drive the GitHub participation test through authorize(), not evaluate(). Keep allow-tests but pair each with a delete-the-check sibling."
+    },
+    {
+      "severity": "INFO",
+      "category": "trade-off",
+      "file": "src/guard/managed-write-guard.ts",
+      "line": 286,
+      "summary": "Issue #247 item 4 is half-superseded; I agree a GitHub call cannot be transactional, and disagree that this excuses the remaining holes.",
+      "detail": "authorize() now holds authority and filesystem identity across the effect; that is the right answer to #247.4 for FILESYSTEM. REMOTE effects still cannot be rolled back — GitHubKernel's exact-head / receipt / first-parent proof is the compensating control, and that reasoning holds. It does not hold for (a) leaving consume() as a success API, (b) an in-flight map that cannot key a remote write, or (c) a source-read lease that only freezes writers who already call this guard. #247 items 1, 6, 7, 8, 9 sit outside this area. Item 7's residual merge-base race is real and named; this review does not re-litigate it.",
+      "suggestedFix": "Update #247 item 4 to describe authorize() as the required write API and list the remaining remote-keying and unwired FILE_MUTATION gaps explicitly, rather than calling the window closed by #97 alone."
+    }
+  ]
 }

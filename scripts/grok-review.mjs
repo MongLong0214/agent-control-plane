@@ -184,9 +184,12 @@ const run = (key, area) =>
           // `result` does not exist on it). With --json-schema that text *is* the JSON report,
           // but the field also carries narration, so the report is the last JSON object in it.
           const envelope = JSON.parse(stdout.slice(stdout.indexOf("{")));
-          const answer = typeof envelope.text === "string" ? envelope.text : "";
-          const opening = answer.lastIndexOf("{\"verdict\"");
-          const report = JSON.parse(opening >= 0 ? answer.slice(opening) : answer);
+          // `structuredOutput` is the schema-validated answer. `text` is not it: with a
+          // schema the CLI streams a snapshot per turn and concatenates them, so parsing text
+          // yields "unexpected character after JSON" — measured, three reviews were recorded as
+          // ERROR before this was understood.
+          const report = envelope.structuredOutput ??
+            JSON.parse(typeof envelope.text === "string" ? envelope.text.slice(envelope.text.lastIndexOf('{"verdict"')) : "{}");
           if (envelope.stopReason && envelope.stopReason !== "end_turn") {
             // A cancelled run has partial narration and no verdict; treating it as a review
             // would let an interrupted reviewer read as a clean one.

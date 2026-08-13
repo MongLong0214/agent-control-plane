@@ -40,8 +40,39 @@ export interface TaskContract {
   references: string[];
 }
 
-/** Who is allowed to write a COMPLETED run state. */
-export type CompletionAuthority = "production-gate" | "bootstrap-activation";
+/**
+ * Who is allowed to write a COMPLETED run state.
+ *
+ * A token, not a string. It was a string literal, which meant any in-process caller could
+ * complete a run by passing `"production-gate"` — the authority was documentation, not a
+ * fence. The token is minted behind a private symbol and handed out once per kind by
+ * `RunEngine.issueCompletionAuthorities`, which the composition root calls; nothing else can
+ * construct one, and the type is exported without the constructor.
+ */
+const COMPLETION_MINT = Symbol("acp.completion-authority");
+
+class CompletionAuthorityToken {
+  readonly #mint: symbol;
+  constructor(mint: symbol, readonly source: "production-gate" | "bootstrap-activation") {
+    if (mint !== COMPLETION_MINT) {
+      throw new Error("completion authority cannot be constructed outside the run engine");
+    }
+    this.#mint = mint;
+  }
+
+  static isValid(value: unknown): value is CompletionAuthority {
+    return value instanceof CompletionAuthorityToken && value.#mint === COMPLETION_MINT;
+  }
+}
+
+export type CompletionAuthority = CompletionAuthorityToken;
+
+export interface CompletionAuthoritySet {
+  readonly productionGate: CompletionAuthority;
+  readonly bootstrapActivation: CompletionAuthority;
+}
+
+const ISSUED_COMPLETION_AUTHORITIES = new Set<string>();
 
 export interface CreateRunInput {
   projectId?: string | null;
@@ -326,6 +357,26 @@ export class RunEngine {
   }
 
   /**
+   * Issues the completion capabilities, once per database. The composition root claims them
+   * and hands one to the production gate and one to bootstrap activation; a later caller that
+   * gets hold of this engine finds them spent.
+   */
+  issueCompletionAuthorities(): CompletionAuthoritySet {
+    if (ISSUED_COMPLETION_AUTHORITIES.has(this.db.file)) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "completion authorities were already issued for this database",
+        {},
+      );
+    }
+    ISSUED_COMPLETION_AUTHORITIES.add(this.db.file);
+    return {
+      productionGate: new CompletionAuthorityToken(COMPLETION_MINT, "production-gate"),
+      bootstrapActivation: new CompletionAuthorityToken(COMPLETION_MINT, "bootstrap-activation"),
+    };
+  }
+
+  /**
    * The allocation dispatch is about to activate: the provider this run's primary CTO will
    * actually be constituted on, and the capability it has to serve. A targetless admission
    * answers "some production provider is open", which is not the question dispatch asks —
@@ -417,11 +468,11 @@ export class RunEngine {
     evidence: Record<string, unknown> = {},
     authority?: CompletionAuthority,
   ): Decision<RunRow> {
-    if (to === RunState.COMPLETED && !authority) {
+    if (to === RunState.COMPLETED && !CompletionAuthorityToken.isValid(authority)) {
       return deny(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         "only the production gate or a bootstrap activation may complete a run",
-        { runId, to },
+        { runId, to, supplied: typeof authority },
       );
     }
     return this.db.tx(() => {

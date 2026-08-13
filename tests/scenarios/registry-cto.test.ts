@@ -400,7 +400,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       RunState.COMPLETED,
       "contract change confirmed",
       {},
-      "production-gate",
+      harness.cp.completionAuthoritiesForTests().productionGate,
     );
     const grant = {
       schema: "acp.manifest-activation-grant.v1",

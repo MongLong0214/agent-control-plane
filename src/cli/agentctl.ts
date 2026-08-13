@@ -2,6 +2,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { digestOf } from "../core/digest.ts";
+import { IngressGuard, ownerApprovalPayload } from "../ingress/ingress-guard.ts";
 import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
 import { isAcpError } from "../core/errors.ts";
 import type { RunState } from "../domain/types.ts";
@@ -131,12 +133,42 @@ const dispatch = async (
       // The local operator acts on the "cli" channel; the actor is their OS user, which
       // the deployment must have allowlisted as an owner identity (§21).
       const actor = process.env["ACP_OWNER_ACTOR"] ?? process.env["USER"] ?? "";
-      const decision = cp.ceo.recordOwnerDecision({
-        runId: required(args[1], "runId"),
-        item: required(args[2], "item"),
+      const runId = required(args[1], "runId");
+      const item = required(args[2], "item");
+      const note = args.slice(3).join(" ");
+      // §21 stopped accepting an identity as authority (#102), so this command has to *be* the
+      // ingress it claims to be: it admits the approval through the guard, which checks the
+      // channel policy, the nonce and that the payload binds this exact operation, and then
+      // hands the gate the receipt that admission produced. Passing a `{channel, actor}` tuple
+      // is refused, which left the shipped operator command unable to satisfy a human gate at
+      // all (#372).
+      const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [actor] } });
+      const approval = {
+        runId,
+        operation: "owner_decision_submit",
+        parameters: { item, approved: true, note },
+        idempotencyKey: `owner-decision:${digestOf({ runId, item, note, actor })}`,
         approved: true,
-        note: args.slice(3).join(" "),
-        owner: { channel: "cli", actor },
+      };
+      const admitted = guard.admitOwnerApproval(
+        {
+          channel: "cli",
+          actor,
+          nonce: `owner-decision:${digestOf(approval)}`,
+          payload: ownerApprovalPayload(approval),
+        },
+        approval,
+      );
+      if (!admitted.allowed) {
+        print(admitted);
+        return 1;
+      }
+      const decision = cp.ceo.recordOwnerDecision({
+        runId,
+        item,
+        approved: true,
+        note,
+        receipt: admitted.value,
       });
       print(decision);
       return decision.allowed ? 0 : 1;

@@ -20,7 +20,7 @@ import { ProjectRegistry } from "../registry/project-registry.ts";
 import { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review.ts";
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
-import { RunEngine } from "../run/run-engine.ts";
+import { type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
 import { ClaudeCliAdapter, CodexCliAdapter } from "../runtime/cli-adapters.ts";
 import { type ProviderAdapter, ProviderRegistry } from "../runtime/provider.ts";
@@ -161,6 +161,8 @@ export class ControlPlane {
    * unlocks.
    */
   readonly #evidenceWriters: EvidenceWriterSet;
+  /** #371 — completion is a capability; the gate and bootstrap activation each hold one. */
+  readonly #completionAuthorities: CompletionAuthoritySet;
 
   /**
    * The capabilities, for a caller that constructed this control plane *as a fixture*.
@@ -169,6 +171,19 @@ export class ControlPlane {
    * input, so a request path that gets hold of this object later cannot turn it on. The
    * daemon never sets it, which is what makes the gate meaningful rather than decorative.
    */
+  /**
+   * The completion capabilities, for a caller that built this control plane *as a fixture* —
+   * gated by the same constructor input as `evidenceWritersForTests`, which the daemon never
+   * sets. A test that completed a run by passing the string "production-gate" was performing
+   * the forgery #371 describes.
+   */
+  completionAuthoritiesForTests(): CompletionAuthoritySet {
+    if (!this.config.allowTestEvidenceWriters) {
+      fail(ReasonCode.COMPLETION_AUTHORITY_DENIED, "completion authorities are not available to this deployment", {});
+    }
+    return this.#completionAuthorities;
+  }
+
   evidenceWritersForTests(): EvidenceWriterSet {
     if (!this.config.allowTestEvidenceWriters) {
       fail(
@@ -220,6 +235,7 @@ export class ControlPlane {
       this.db, this.clock, this.audit, this.artifacts, this.outbox,
       this.projects, this.repositories, this.tasks, this.claims, this.telemetry,
     );
+    this.#completionAuthorities = this.runs.issueCompletionAuthorities();
     this.verification = new VerificationEngine(
       this.db, this.clock, this.audit, this.artifacts, this.#evidenceWriters.VERIFICATION,
       this.repositories, this.worktrees, this.telemetry,
@@ -264,6 +280,7 @@ export class ControlPlane {
     this.ceo = new ProductionGate(
       this.db, this.clock, this.audit, this.artifacts,
       this.#evidenceWriters.PRODUCTION_READY_PACKET,
+      this.#completionAuthorities,
       this.runs, this.tasks, this.bindings, this.outbox, this.telemetry,
     );
 

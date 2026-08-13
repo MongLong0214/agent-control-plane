@@ -631,6 +631,10 @@
       "tests": [
         {
           "file": "ests/scenarios/graph-capacity-continuity.test.ts",
+          "title": "(file scope)"
+        },
+        {
+          "file": "ests/scenarios/graph-capacity-continuity.test.ts",
           "title": "provider capacity (CP-S16, CP-S17, CP-S18)"
         },
         {
@@ -639,7 +643,7 @@
         },
         {
           "file": "ests/scenarios/graph-capacity-continuity.test.ts",
-          "title": "CP-S17: dispatch is refused rather than routed against an unknown quota"
+          "title": "CP-S17: dispatch refuses its selected CTO provider when its capacity probe fails"
         }
       ],
       "status": "COVERED"
@@ -971,7 +975,7 @@
         },
         {
           "file": "ests/scenarios/github-kernel.test.ts",
-          "title": "CP-S41: a tag on a commit the kernel never merged, and a duplicate tag, are both refused"
+          "title": "CP-S41: a tag on an unaccepted commit and a conflicting existing tag are both refused"
         }
       ],
       "status": "COVERED"

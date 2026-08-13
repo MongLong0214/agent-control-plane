@@ -1,5 +1,119 @@
 {
-  "verdict": "ERROR",
-  "error": "Unexpected non-whitespace character after JSON at position 97 (line 1 column 98)",
-  "stderr": ""
+  "verdict": "BLOCK",
+  "filesExamined": [
+    "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
+    "docs/adr/ADR-0006-blind-review-independence-and-coverage.md",
+    "docs/adr/ADR-0002-invariants-as-types-and-constraints.md",
+    "docs/ACCEPTANCE.md",
+    "src/review/blind-review.ts",
+    "src/run/candidate-pipeline.ts",
+    "src/session/binding-registry.ts",
+    "src/ceo/production-gate.ts",
+    "src/domain/types.ts",
+    "src/db/artifacts.ts",
+    "src/db/schema.sql",
+    "src/runtime/cli-adapters.ts",
+    "src/runtime/scripted-adapter.ts",
+    "src/runtime/provider.ts",
+    "src/snapshot/candidate-snapshot.ts",
+    "src/git/git.ts",
+    "src/run/task-graph.ts",
+    "src/continuity/continuity-kernel.ts",
+    "src/mcp/cto-server.ts",
+    "src/app/control-plane.ts",
+    "src/verify/sandbox.ts",
+    "src/core/reason-codes.ts",
+    "tests/unit/review-r2.test.ts",
+    "tests/integration/pipeline.test.ts",
+    "tests/helpers/harness.ts",
+    "tests/helpers/production-adapter.ts",
+    "tests/unit/binding-hardening.test.ts",
+    "tests/unit/binding-r2.test.ts",
+    "tests/unit/run-gate-r2.test.ts",
+    "tests/scenarios/graph-capacity-continuity.test.ts",
+    "evidence/review/review.json",
+    "evidence/review-round1/review.json"
+  ],
+  "omittedItems": [
+    "GitHub issue #247 comments (issue body only)",
+    "GitHub issue #132 current discussion thread",
+    "ADR-0001, ADR-0003, ADR-0004, ADR-0005, ADR-0007, ADR-0008 were not read in full",
+    "Live proof that a Claude reviewer process actually opens sibling session transcripts under the current seatbelt (the profile permits the read; it was not executed)",
+    "Whether a session that performed managed writes without a task_executions row can later pass assertReviewerIndependence",
+    "The test suite was not executed (as instructed)"
+  ],
+  "findings": [
+    {
+      "severity": "BLOCKER",
+      "category": "invariant-violation",
+      "file": "src/review/blind-review.ts",
+      "line": 743,
+      "summary": "On large diffs, a final reviewer who never sees the candidate can erase a chunk BLOCK/REVISE and publish PASS",
+      "detail": "§18.5 and ADR-0006 require chunk reviewers → coverage reducer → dedupe → a final fresh reviewer. chunkedReview does compute reduced.verdict as the worst chunk verdict (blind-review.ts:638–681) and even puts that BLOCK/REVISE into the final prompt. The gate then discards it: worseVerdict(finalVerdict.verdict, reduced.omittedItems.length > 0 ? \"REVISE\" : \"PASS\") (line 743) floors only on omissions, not on reduced.verdict. Sequence: (1) totalChars > 120_000 enters chunkedReview; (2) a chunk that saw the diff returns {verdict:\"BLOCK\", coveredFiles:[all assigned files], omittedItems:[], findings:[{severity:\"MAJOR\", ...}]}; (3) reduced.verdict is BLOCK; (4) constituteReviewer(\"blind-review-final\") gets a new session whose prompt is only the contract plus the reduced JSON — no diff (buildFinalPrompt, 756–780); (5) that session returns PASS with empty findings; (6) assembled verdict is PASS, findings are the chunk MAJORs, omittedItems empty; (7) validateCoverage keeps PASS; (8) putEvidence stores a trusted BLIND_REVIEW PASS; (9) CandidatePipeline treats REVIEW_PASS as COMPLETED_REVIEW; (10) ProductionGate.buildPacket only rejects leftover BLOCKER-severity findings (production-gate.ts:312–316), so MAJOR-only or finding-less BLOCKs ship. Single-file review cannot do this: a BLOCK is denied at 312–317 before a packet can complete. The only reviewers who saw the code are not the recorded verdict. #128 asserts generation==2 and would still pass if this floor stayed missing — it never checks that a chunk BLOCK cannot become PASS.",
+      "suggestedFix": "Treat reduced.verdict as a floor: worseVerdict(finalVerdict.verdict, reduced.verdict, omissions?REVISE:PASS). Give the final reviewer the candidate (or make the reducer, not an uninformed session, authoritative). Add a regression that a chunk BLOCK with only MAJOR findings cannot be stored or published as PASS."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "isolation",
+      "file": "src/runtime/cli-adapters.ts",
+      "line": 615,
+      "summary": "Reviewer isolation is attested without being enforced; producer chat history and the network remain readable",
+      "detail": "CP-HI-04 / §18.3 / §18.7 require a fresh isolated session that does not see worker/CTO reasoning, chat history, or previous verdicts. The gate now claims that: reviewInvocation sets isolation {emptyEnvironment, network:\"provider-only\", tools:\"none\"} and denyReadPaths for cwd/db/checkouts (blind-review.ts:518–553); assertIsolationAttested requires isolationAttested===true (556–570); the packet always lists those inputs as withheld (877–886). What the OS actually does: reviewerProfile is (allow default) plus a named deny list (cli-adapters.ts:615–643); network is explicitly not denied (623–628); isolationEnforced is set after sandbox-exec -p profile /usr/bin/true succeeds (296–308, 374–416), which an allow-default profile always does; DENIED_TOOLS is a CLI denylist, not tools:none. hostCredentialPaths (534–555) omits ~/.claude and ~/.codex, which the verification sandbox does deny (src/verify/sandbox.ts:458–459). Sequence: preferred GPT is skipped because CodexCliAdapter.supportsReviewerIsolation===false (834, 369–372); every production review is Claude; reviewerEnvironment keeps real HOME unless CLAUDE_CONFIG_DIR is set (505–523); the seatbelt does not deny ~/.claude/projects; the process can read CTO transcripts and, with network open, the snapshot's identity+SHAs. #247 item 5 honestly said isolation is binding history, not a sandbox. The code later grew an attestation and a withheld list that the profile does not implement — fail-open that kept Claude able to log in, dressed as a gate. Tests: #132 first case (review-r2.test.ts:533–539) only checks workdir!==repoPath and a hardcoded withheld string — it still passes if the isolation object is removed. #332 passes if the deny list is emptied, because it only asserts isolationAttested after /usr/bin/true. The second #132 case would fail if assertIsolationAttested were deleted; that only locks the boolean, not the boundary.",
+      "suggestedFix": "Make isolationAttested mean a measured boundary (deny ~/.claude/~/.codex at least as strictly as verification; do not claim network:provider-only or tools:none unless the seatbelt enforces them). Stop writing a static withheld list; record what the profile actually denied. Keep Codex skipped until it can isolate, but do not let Claude attestation imply packet-only reads. Replace #132/#332 with a probe that a reviewer child cannot open a producer transcript or checkout path."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-violation",
+      "file": "src/review/blind-review.ts",
+      "line": 650,
+      "summary": "All chunk reviews share one provider session, so later chunks are anchored on earlier verdicts",
+      "detail": "§18.3 forbids previous-verdict anchoring. §18.5 and ADR-0006 speak of chunk reviewers (plural) plus a final fresh reviewer. Implementation: constituteReviewer once, then every chunk calls adapter.invoke with the same reviewer.externalSessionId (640–655). Claude is invoked with --session-id on that id (cli-adapters.ts:721). Later chunks are turns in the same conversation that already contains prior chunk prompts and PASS/REVISE/BLOCK answers. assemble() still records withheld: [\"previous verdicts\"] (877–886). Only the final reviewer is a new session (686). Independence of who saw the diff is therefore one shared context, not per-chunk isolation. No test constitutes a distinct session per chunk; #128 only checks that the final binding generation is 2.",
+      "suggestedFix": "Constitute a fresh reviewer (new externalSessionId, new workdir) per chunk, or invoke each chunk with a one-shot session id. Persist per-chunk session ids. Add a test that chunk N's invocation does not reuse chunk 1's provider session."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "coverage",
+      "file": "src/review/blind-review.ts",
+      "line": 672,
+      "summary": "An oversized file is marked fully reviewed if any one range-slice claims it",
+      "detail": "ADR-0006 rejected sampling large diffs. Files over the chunk budget are range-split by splitOversizedSection (1279–1295), each part carrying files:[path]. The reducer then does covered.add(claim) and treats expected ⊆ covered as complete (672–675). Sequence: a 300k file becomes three slices; slice 1 returns PASS with coveredFiles:[identity:large.ts]; slices 2 and 3 return parsed PASS with coveredFiles:[]; unseen is empty; omittedItems stays empty; PASS is possible though most of the file was never in a successful examination. A later slice that fails to parse does push the path into omitted (659–662) and would block PASS — the hole is the successful empty claim, not the hard failure. #135 only checks that the bytes split; #128 scripts /Review chunk/ with once:false so every slice claims the file. Deleting the ≥1-chunk rule or keeping first-slice-wins would not fail those tests.",
+      "suggestedFix": "Require every range slice of a split file to produce a usable coveredFiles claim for that path (or union omissions). Track coverage by (path, sliceIndex), not by path. Add a test where the second range of one file returns empty coveredFiles and the packet cannot PASS."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-violation",
+      "file": "src/review/blind-review.ts",
+      "line": 608,
+      "summary": "Provider-session independence is enforced for single review and the final rubber-stamp, not for the chunk invocations that actually see the diff",
+      "detail": "CP-HI-04 is checked against the session that produced the verdict, not a synthetic id (ADR-0006; assertInvocationIdentity 1004–1034). singleReview calls it (608–610). chunkedReview calls it only for the final reviewer (730–738). The chunk loop (650–669) checks isolationAttested and parseVerdict only. Sequence: constitute independent session R; adapter.invoke for chunks resumes producer provider session P and returns providerSessionId=P (or any non-checked value); chunks supply the only real coverage; final fresh session F, who never sees the diff, returns PASS; packet names F; CEO provenance checks F. #127 would fail if the single-review identity check were deleted. Nothing fails if the chunk loop never calls assertInvocationIdentity.",
+      "suggestedFix": "Call assertInvocationIdentity on every chunk result and abort the review on mismatch, the same as singleReview. Add a test that a chunk attested to a producer provider session cannot yield a stored PASS."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "test-integrity",
+      "file": "tests/unit/review-r2.test.ts",
+      "line": 271,
+      "summary": "Several named regression tests still pass if the enforcement they advertise is removed",
+      "detail": "Independence and missing-file coverage do have tests that would go red: CP-S31 (pipeline.test.ts:290–319) if assertReviewerIndependence always allowed; CP-S32 (321–357) if validateCoverage were deleted; #127 if assertInvocationIdentity were deleted on the single-review path; the second #132 case if assertIsolationAttested were deleted. The following would not: #129 (271–279) calls validateChunkCoverage directly — deleting the call at 664 leaves the test green; first #132 (533–539) and #332 only inspect workdir/withheld/isolationAttested, not an actual denied read; #128 (245–269) never asserts that reduced.verdict is a floor; no test binds a reviewer then adds that session to the producer set and requires the packet-time recheck (249–264) to fail. ADR-0006's second independence check and the chunk coverage bind are therefore unguarded in the sense of the earlier 26-test audit.",
+      "suggestedFix": "Drive #129 through chunkedReview, not __testing. Make #132/#332 open a producer transcript or checkout path from the child and expect EPERM/ISOLATION_LOST. Add packet-time independence and chunk-BLOCK-cannot-PASS cases. Close #132 only against a test that fails when the seatbelt deny list is emptied."
+    },
+    {
+      "severity": "MINOR",
+      "category": "enforcement-location",
+      "file": "src/ceo/production-gate.ts",
+      "line": 306,
+      "summary": "The publication gate does not recompute coverage against the snapshot, contrary to ADR-0006",
+      "detail": "ADR-0006: given the snapshot and the packet, coverage completeness is recomputable after the fact. buildPacket re-checks independence (reviewerProvenance, 296–299) and omittedItems.length (306–310) but never compares packet.coveredFiles to snapshotCoverageTargets. A BLIND_REVIEW row with verdict PASS, omittedItems [], and coveredFiles missing touched paths is enough. The write path's validateCoverage (1053–1071) currently prevents that in production; the CEO is the gate that claims to re-verify. run-gate-r2.test.ts:128–137 already publishes via the test writer with coveredFiles:[] (that fixture happens to freeze an unchanged tree, so the hole is not triggered there).",
+      "suggestedFix": "In buildPacket, recompute expected coverage from the stored snapshot and deny COVERAGE_INCOMPLETE unless coveredFiles covers every touched path. Do not trust omittedItems alone."
+    },
+    {
+      "severity": "MINOR",
+      "category": "prd-conformance",
+      "file": "src/run/task-graph.ts",
+      "line": 401,
+      "summary": "§34.3 completeness never compares an expected task/result count; a 0-task run can synthesise",
+      "detail": "§34.3: synthesis and completion are blocked when expected and observed task/result counts differ. completeness() allows tasks.length===0 (401–403). CANCELLED is treated as a successful terminal state (404–406), but cancelAll is only used from RunEngine.cancel, which also leaves the run CANCELLED so submitResult cannot proceed — that branch is not a live bypass. The live gap is: never submit a graph, then submitResult → freeze → verify → blind review → packet. No test in tests/ references completeness() or TASK_RESULT_COUNT_MISMATCH. Review still runs, so this is not a CP-HI-04 skip; it is a missing count gate on the same completion path.",
+      "suggestedFix": "Store an expected task/result count when the graph is sealed and refuse submitResult unless succeeded receipts match it. If SIMPLE is allowed to have no graph, say so in the check and keep STANDARD/GUARDED fail-closed. Add a negative test."
+    }
+  ]
 }

@@ -101,7 +101,13 @@ const completeContractChangeWithGrant = (
     runId,
   ]);
   harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "manifest candidate reviewed");
-  harness.cp.runs.transition(runId, RunState.COMPLETED, "manifest approved", {}, "production-gate");
+  harness.cp.runs.transition(
+    runId,
+    RunState.COMPLETED,
+    "manifest approved",
+    {},
+    harness.cp.completionAuthoritiesForTests().productionGate,
+  );
 
   const grant = {
     schema: "acp.manifest-activation-grant.v1",
