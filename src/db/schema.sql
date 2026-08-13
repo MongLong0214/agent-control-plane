@@ -302,9 +302,16 @@ CREATE INDEX IF NOT EXISTS runs_project ON runs(project_id, state);
 --   Integrity: run_id is the lease key, so concurrent submissions collide atomically.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS candidate_pipeline_attempts (
-  run_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, owner_session_id TEXT NOT NULL,
-  owner_binding_generation INTEGER NOT NULL, candidate_digest TEXT, state TEXT NOT NULL
-    CHECK (state IN ('RUNNING','RELEASED')), started_at TEXT NOT NULL, released_at TEXT
+  -- The foreign key is what stops rows accumulating for runs that never existed: the lease is
+  -- taken by run id, and without it a bogus submission leaves a permanent orphan (#344).
+  run_id                   TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+  attempt_id               TEXT NOT NULL,
+  owner_session_id         TEXT NOT NULL,
+  owner_binding_generation INTEGER NOT NULL,
+  candidate_digest         TEXT,
+  state                    TEXT NOT NULL CHECK (state IN ('RUNNING','RELEASED')),
+  started_at               TEXT NOT NULL,
+  released_at              TEXT
 );
 
 -- §29 is a persisted state machine. The service owns authority/evidence/outbox work,

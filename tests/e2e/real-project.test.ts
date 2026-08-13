@@ -10,7 +10,6 @@ import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/cont
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { ClaudeCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
-import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 
@@ -432,7 +431,6 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
         withheld: reviewPacket.inputManifest.withheld,
       };
       evidence["candidateSnapshotDigest"] = snapshotDigest;
-      expect(candidateSnapshotDigest).toBeTypeOf("function");
 
       // --- Hermes final confirmation ---------------------------------------
       expect(cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);

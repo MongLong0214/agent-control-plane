@@ -17,7 +17,7 @@ export const branchProfileSchema = z
     updateStrategy: z.enum(["rebase_before_review", "merge_from_target"]).default(
       "rebase_before_review",
     ),
-    mergeStrategy: z.enum(["merge_commit", "fast_forward", "squash"]).default("merge_commit"),
+    mergeStrategy: z.enum(["merge_commit", "fast_forward", "squash", "rebase"]).default("merge_commit"),
     releaseTagPolicy: z.enum(["semver", "none"]).default("semver"),
     releaseBranchCleanup: z.enum(["delete", "keep"]).default("keep"),
   })
