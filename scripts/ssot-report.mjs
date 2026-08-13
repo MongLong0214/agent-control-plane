@@ -20,13 +20,30 @@ import { fileURLToPath } from "node:url";
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const asJson = process.argv.includes("--json");
 
-const issues = JSON.parse(
-  execFileSync(
-    "gh",
-    ["issue", "list", "--state", "all", "--limit", "600", "--json", "number,state,body,labels,title"],
-    { cwd: repoRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
-  ),
-);
+const listIssues = () => {
+  try {
+    return execFileSync(
+      "gh",
+      ["issue", "list", "--state", "all", "--limit", "600", "--json", "number,state,body,labels,title"],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+  } catch (error) {
+    const stderr =
+      error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "").trim() : "";
+    console.error(
+      "SSOT reconciliation cannot run: GitHub issues could not be listed. Set GH_TOKEN (in GitHub Actions, use GH_TOKEN: ${{ github.token }}) or authenticate gh locally.",
+    );
+    if (stderr) console.error(stderr);
+    process.exit(1);
+  }
+};
+
+const issues = JSON.parse(listIssues());
 
 const reviewMarkers = new Map();
 const workMarkers = new Map();
