@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
+import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-kernel.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
@@ -28,6 +29,24 @@ export interface ReconcileReport {
   orphanedExecutions: string[];
   sessionsMarkedError: string[];
   doctorStatus: string;
+}
+
+/**
+ * The result of reconciling a fresh coverage plan with the bindings that actually own
+ * roles. A plan alone is diagnostic; these are the durable effects that make it real.
+ */
+export interface ContinuityReconcileReport {
+  plan: RoleCoveragePlan;
+  reassigned: Array<{
+    roleKey: string;
+    fromGeneration: number;
+    toGeneration: number;
+    provider: string;
+  }>;
+  pausedRuns: Array<{ runId: string; roleKey: string; reasonCode: string }>;
+  unresolved: Array<{ roleKey: string; reasonCode: string }>;
+  restored: string[];
+  restorationDeferred: Array<{ roleKey: string; reasonCode: string }>;
 }
 
 interface CrashLoopFile {
@@ -56,6 +75,8 @@ export class Daemon {
   #timers: NodeJS.Timeout[] = [];
   #startedAt: string | null = null;
   #timerFailures = new Map<string, TimerFailure>();
+  #continuityCoordinatorInstalled = false;
+  #continuityReconciling = false;
 
   constructor(
     private readonly cp: ControlPlane,
@@ -95,6 +116,7 @@ export class Daemon {
     }
 
     try {
+      this.installContinuityCoordinator();
       await this.refreshCapacitySensors();
       const report = await this.reconcile();
       this.writeHealth(report);
@@ -103,6 +125,7 @@ export class Daemon {
         const reasonCode =
           report.doctorStatus === "BLOCKED" ? ReasonCode.DOCTOR_BLOCKED : ReasonCode.DOCTOR_ERROR;
         this.recordStartupFailure(reasonCode, { reconcile: report });
+        this.uninstallContinuityCoordinator();
         this.lock.release();
         this.#startedAt = null;
         return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
@@ -121,6 +144,7 @@ export class Daemon {
     } catch (err) {
       const evidence = { error: safeErrorMessage(err) };
       this.recordStartupFailure(ReasonCode.DAEMON_STARTUP_FAILED, evidence);
+      this.uninstallContinuityCoordinator();
       this.lock.release();
       this.#startedAt = null;
       return deny(ReasonCode.DAEMON_STARTUP_FAILED, "daemon startup failed", evidence);
@@ -172,6 +196,139 @@ export class Daemon {
     };
   }
 
+  /**
+   * P0-06 / PRD §15.7. The daemon owns the only automatic reconciliation entry point:
+   * after a provider failure has persisted a fresh capacity observation, compare each
+   * required role's active binding with the planned provider and drive the kernel's
+   * existing atomic failover only where the old binding is no longer covered.
+   *
+   * `failover()` itself refreshes the selected provider immediately before it allocates.
+   * That refresh is also provider-failure evidence, so the capacity callback can re-enter
+   * here while the original reconciliation awaits it. Re-entry intentionally returns
+   * without waiting: awaiting the outer reconciliation would deadlock the admission it is
+   * currently performing. The outer pass observes the fresh facts before it completes.
+   */
+  async reconcileContinuity(reason: string): Promise<ContinuityReconcileReport | null> {
+    if (this.#continuityReconciling) return null;
+    this.#continuityReconciling = true;
+    try {
+      const plan = await this.cp.continuity.evaluate(`daemon continuity reconciliation: ${reason}`);
+      const reassigned: ContinuityReconcileReport["reassigned"] = [];
+      const pausedRuns: ContinuityReconcileReport["pausedRuns"] = [];
+      const unresolved: ContinuityReconcileReport["unresolved"] = [];
+
+      for (const required of plan.requiredRoles) {
+        const current = this.cp.bindings.active(required.roleKey);
+        // An unbound role is deliberately not auto-created here. In particular, a fresh
+        // CEO needs the one-time possession-proven bootstrap path; continuity is allowed
+        // to replace an existing authority, not forge generation 1 for an absent one.
+        if (!current) continue;
+
+        const assignment = plan.assignments.find((candidate) => candidate.roleKey === required.roleKey);
+        const session = this.cp.sessions.get(current.sessionId);
+        const currentCapacity = session ? this.cp.capacity.current(session.provider) : null;
+        const currentStillCovered =
+          session?.lifecycle === SessionLifecycle.READY &&
+          currentCapacity !== null &&
+          this.cp.capacity.isRoutableFor(currentCapacity, required.capability);
+        // A new plan may prefer a recovered provider over an already healthy fallback.
+        // That is restoration, not failure, and §15.8 keeps the acting owner in place
+        // until the explicit non-preemptive restore path can safely move it.
+        if (currentStillCovered) continue;
+
+        if (!assignment?.provider) {
+          unresolved.push({
+            roleKey: required.roleKey,
+            reasonCode: plan.outcome === "NO_VALID_COVERAGE" ? ReasonCode.COVERAGE_NONE : ReasonCode.COVERAGE_PARTIAL,
+          });
+          pausedRuns.push(...this.pauseAffectedRuns(required, "coverage plan cannot staff the bound role"));
+          this.revokePausedBinding(required, "coverage plan cannot staff the bound role");
+          continue;
+        }
+
+        const failedOver = await this.cp.continuity.failover(
+          required.roleKey,
+          required.role,
+          {
+            projectId: required.projectId,
+            runId: required.runId,
+            taskId: required.taskId,
+          },
+          reason,
+        );
+        if (!failedOver.allowed) {
+          unresolved.push({ roleKey: required.roleKey, reasonCode: failedOver.reasonCode });
+          pausedRuns.push(...this.pauseAffectedRuns(required, `failover refused: ${failedOver.reasonCode}`));
+          this.revokePausedBinding(required, `continuity failover refused: ${failedOver.reasonCode}`);
+          continue;
+        }
+
+        const active = this.cp.bindings.active(required.roleKey);
+        const replacement = active ? this.cp.sessions.get(active.sessionId) : null;
+        // `failover` promises an atomic switch, but verify the exact durable endpoint
+        // before reporting success. A route that was only planned is never coverage.
+        if (
+          !active ||
+          !replacement ||
+          replacement.lifecycle !== SessionLifecycle.READY ||
+          replacement.provider !== failedOver.value.provider ||
+          active.bindingGeneration !== failedOver.value.generation
+        ) {
+          unresolved.push({ roleKey: required.roleKey, reasonCode: ReasonCode.SESSION_NOT_READY });
+          pausedRuns.push(...this.pauseAffectedRuns(required, "failover did not leave a ready planned binding"));
+          this.revokePausedBinding(required, "continuity failover did not leave a ready planned binding");
+          continue;
+        }
+        reassigned.push({
+          roleKey: required.roleKey,
+          fromGeneration: current.bindingGeneration,
+          toGeneration: active.bindingGeneration,
+          provider: replacement.provider,
+        });
+      }
+
+      // A recovered preferred provider may receive new work again, but must not seize an
+      // acting owner. The kernel's restore path has the role-specific no-preemption
+      // barriers; invoke it only after the failure pass achieved full durable coverage.
+      const restorationNeeded = plan.assignments.some((assignment) =>
+        assignment.reason === "preferred" && this.cp.bindings.active(assignment.roleKey)?.mode === "FALLBACK",
+      );
+      const restoration = restorationNeeded && unresolved.length === 0
+        ? await this.cp.continuity.restore()
+        : { restored: [], deferred: [] };
+
+      this.cp.audit.record({
+        kind: "CONTINUITY_RECONCILED",
+        reasonCode:
+          unresolved.length > 0
+            ? plan.outcome === "NO_VALID_COVERAGE"
+              ? ReasonCode.COVERAGE_NONE
+              : ReasonCode.COVERAGE_PARTIAL
+            : ReasonCode.OK,
+        evidence: {
+          reason,
+          outcome: plan.outcome,
+          action: plan.action,
+          mode: plan.mode,
+          reassigned,
+          pausedRuns,
+          unresolved,
+          restoration,
+        },
+      });
+      return {
+        plan,
+        reassigned,
+        pausedRuns,
+        unresolved,
+        restored: restoration.restored,
+        restorationDeferred: restoration.deferred,
+      };
+    } finally {
+      this.#continuityReconciling = false;
+    }
+  }
+
   private async resumeQueuedRuns(): Promise<string[]> {
     const resumedRuns: string[] = [];
     // The doctor has already passed. Idempotency lives in the outbox key, so a run
@@ -181,6 +338,62 @@ export class Daemon {
       if (dispatched.allowed) resumedRuns.push(run.runId);
     }
     return resumedRuns;
+  }
+
+  /**
+   * A partial plan may not leave work running under an uncovered generation. The state
+   * machine has an explicit pause for active work and an explicit human wait for a
+   * candidate already awaiting CEO review; queued work has not acquired the dead role.
+   */
+  private pauseAffectedRuns(required: RequiredRole, reason: string): ContinuityReconcileReport["pausedRuns"] {
+    const affected = required.role === "CEO"
+      ? this.cp.runs.list()
+      : required.runId
+        ? [this.cp.runs.get(required.runId)].filter((run): run is NonNullable<typeof run> => Boolean(run))
+        : required.projectId
+          ? this.cp.runs.list({ projectId: required.projectId })
+          : [];
+    const paused: ContinuityReconcileReport["pausedRuns"] = [];
+    for (const run of affected) {
+      if (run.state === RunState.ACTIVE) {
+        const blocked = this.cp.runs.transition(run.runId, RunState.BLOCKED, reason, {
+          roleKey: required.roleKey,
+          continuityAction: "PAUSE_NEW_WORK",
+        });
+        if (blocked.allowed) {
+          paused.push({ runId: run.runId, roleKey: required.roleKey, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+        }
+      } else if (run.state === RunState.READY_FOR_CEO_REVIEW) {
+        const waiting = this.cp.runs.transition(run.runId, RunState.AWAITING_HUMAN, reason, {
+          roleKey: required.roleKey,
+          continuityAction: "PAUSE_NEW_WORK",
+        });
+        if (waiting.allowed) {
+          paused.push({ runId: run.runId, roleKey: required.roleKey, reasonCode: ReasonCode.COVERAGE_INCOMPLETE });
+        }
+      }
+    }
+    return paused;
+  }
+
+  /**
+   * Once affected work is paused, revoke the dead endpoint so an old generation cannot
+   * resume it through a late message. BindingRegistry fences queued/in-flight outbox rows
+   * in the same transaction; blocked runs are the documented revocation exception.
+   */
+  private revokePausedBinding(required: RequiredRole, reason: string): void {
+    const current = this.cp.bindings.active(required.roleKey);
+    if (!current) return;
+    const revoked = this.cp.bindings.revoke(required.roleKey, reason, { allowBlockedRuns: true });
+    if (!revoked.allowed) {
+      this.cp.audit.record({
+        kind: "CONTINUITY_REVOKE_DEFERRED",
+        roleKey: required.roleKey,
+        sessionId: current.sessionId,
+        reasonCode: revoked.reasonCode,
+        evidence: { reason },
+      });
+    }
   }
 
   private startTimers(): void {
@@ -200,7 +413,10 @@ export class Daemon {
     this.#timers.push(watchdog);
 
     const capacitySensor = setInterval(() => {
-      void this.runPeriodic("capacity_sensor", () => this.refreshCapacitySensors());
+      void this.runPeriodic("capacity_sensor", async () => {
+        await this.refreshCapacitySensors();
+        await this.reconcileContinuity("periodic capacity sensor refresh");
+      });
     }, capacityRefreshMs);
     capacitySensor.unref();
     this.#timers.push(capacitySensor);
@@ -217,6 +433,32 @@ export class Daemon {
       delivery.unref();
       this.#timers.push(delivery);
     }
+  }
+
+  private installContinuityCoordinator(): void {
+    if (this.#continuityCoordinatorInstalled) return;
+    this.cp.continuity.attach({
+      readiness: { checkSession: (sessionId) => this.cp.doctor.sessionReadiness(sessionId) },
+      ...(this.options.buzz
+        ? { buzz: { connect: (sessionId: string, purpose: string) => this.options.buzz!.connect(sessionId, purpose) } }
+        : {}),
+    });
+    this.cp.capacity.attach({
+      providerFailureContinuity: {
+        evaluate: (reason) => this.reconcileContinuity(reason),
+      },
+    });
+    this.#continuityCoordinatorInstalled = true;
+  }
+
+  private uninstallContinuityCoordinator(): void {
+    if (!this.#continuityCoordinatorInstalled) return;
+    // Before a daemon has the lock (or after it relinquishes it), capacity failure still
+    // refreshes the durable mode but cannot cause a second authority to switch bindings.
+    this.cp.capacity.attach({
+      providerFailureContinuity: { evaluate: (reason) => this.cp.continuity.evaluate(reason) },
+    });
+    this.#continuityCoordinatorInstalled = false;
   }
 
   /**
@@ -358,6 +600,7 @@ export class Daemon {
   async stop(): Promise<void> {
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
+    this.uninstallContinuityCoordinator();
     this.cp.audit.record({ kind: "DAEMON_STOPPED", evidence: { pid: process.pid } });
     this.lock.release();
   }
