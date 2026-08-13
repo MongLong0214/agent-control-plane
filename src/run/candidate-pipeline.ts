@@ -59,6 +59,19 @@ export type PipelineOutcome =
   | { stage: "CANDIDATE_STALE"; reasonCode: string; snapshotDigest: string };
 
 /**
+ * A durable submission lease that a watchdog reclaimed after its holder disappeared.
+ * `deadlineAt` is derived from the current lease lifetime until the schema owns it as a
+ * column; exposing it here keeps the watchdog from duplicating lease policy.
+ */
+export interface ReclaimedCandidatePipelineAttempt {
+  runId: string;
+  attemptId: string;
+  startedAt: string;
+  deadlineAt: string;
+  ageMs: number;
+}
+
+/**
  * The candidate completion path (PRD §§16–19).
  *
  * Freeze → verify → *automatically* blind review → production-ready packet. The
@@ -389,6 +402,52 @@ export class CandidatePipeline {
         runId: input.runId,
         current,
       });
+    });
+  }
+
+  /**
+   * Releases leases whose owner can no longer be assumed live. This is deliberately a
+   * synchronous, conditional transaction: a watchdog may observe a stale row just as a
+   * new submission replaces it, and must never release that new holder's fence.
+   *
+   * The watchdog owns the diagnostic/audit consequence; this method owns the candidate
+   * pipeline's state transition and returns the exact rows it changed.
+   */
+  reclaimExpiredAttempts(): ReclaimedCandidatePipelineAttempt[] {
+    return this.db.tx(() => {
+      const now = this.clock.now();
+      const releasedAt = now.toISOString();
+      const staleBefore = new Date(now.getTime() - ATTEMPT_LEASE_TTL_MS).toISOString();
+      const stale = this.db.all<{
+        run_id: string;
+        attempt_id: string;
+        started_at: string;
+      }>(
+        `SELECT run_id, attempt_id, started_at
+           FROM candidate_pipeline_attempts
+          WHERE state = 'RUNNING' AND started_at < ?
+          ORDER BY started_at, run_id`,
+        [staleBefore],
+      );
+      const reclaimed: ReclaimedCandidatePipelineAttempt[] = [];
+      for (const attempt of stale) {
+        const released = this.db.run(
+          `UPDATE candidate_pipeline_attempts
+              SET state = 'RELEASED', released_at = ?
+            WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND started_at < ?`,
+          [releasedAt, attempt.run_id, attempt.attempt_id, staleBefore],
+        );
+        if (released.changes !== 1) continue;
+        const startedAt = new Date(attempt.started_at).getTime();
+        reclaimed.push({
+          runId: attempt.run_id,
+          attemptId: attempt.attempt_id,
+          startedAt: attempt.started_at,
+          deadlineAt: new Date(startedAt + ATTEMPT_LEASE_TTL_MS).toISOString(),
+          ageMs: now.getTime() - startedAt,
+        });
+      }
+      return reclaimed;
     });
   }
 

@@ -951,14 +951,9 @@ export class ProductionGate {
   /**
    * §21 — who an owner decision belongs to, as the audit actor `channel:actor`.
    *
-   * Two things can carry owner authority, and they fail differently. A receipt is evidence
-   * that ingress authenticated an envelope binding this exact decision, so a caller that
-   * supplies none — or one whose receipt binds something else — is asserting an authority
-   * it cannot hold (`OWNER_AUTHORITY_NOT_DELEGABLE`). The local `cli` identity is the
-   * calling process's own operator, so it needs no envelope; what it still needs is to be
-   * an owner *here*, and an actor this deployment never allowlisted is refused as one
-   * (`INGRESS_ACTOR_NOT_ALLOWLISTED`). Conflating the two would leave the second denial
-   * unreachable, and it is the one an operator actually hits.
+   * An allowlisted `{channel, actor}` pair is still caller-controlled data. Even a local
+   * process can be reached by an untrusted request path, so only an admitted receipt that
+   * binds this exact operation proves non-delegable owner authority (CP-HI-07).
    */
   private attributeOwnerDecision(input: {
     runId: string;
@@ -979,9 +974,15 @@ export class ProductionGate {
 
     const receipt = input.receipt;
     if (!receipt) {
-      const local = authority.assertLocalOwner(input.owner);
-      if (!local.allowed) return local as Decision<string>;
-      return allow(ReasonCode.OK, `${local.value.channel}:${local.value.actor}`);
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner decision requires an admitted ingress receipt, not a caller-supplied identity",
+        {
+          runId: input.runId,
+          channel: input.owner?.channel ?? null,
+          actor: input.owner?.actor ?? null,
+        },
+      );
     }
 
     const parameterDigest = digestOf({ item: input.item, approved: input.approved, note: input.note });
@@ -1014,7 +1015,7 @@ export class ProductionGate {
     note: string;
     /** The only owner authority a transport can carry (§27.1). */
     receipt?: OwnerApprovalReceipt;
-    /** The local operator's own identity, for a decision made on this host. */
+    /** @deprecated Identity alone is never authority; use an admitted receipt. */
     owner?: { channel: string; actor: string };
   }): Decision<void> {
     const attributed = this.attributeOwnerDecision(input);
@@ -1200,6 +1201,11 @@ export class ProductionGate {
    * documented notification kinds are emitted, and this is the only emitter.
    */
   notify(kind: NotificationKind, runId: string, payload: Record<string, unknown>): Decision<void> {
+    // Audit evidence is intentionally a reviewed, bounded vocabulary. The delivery needs
+    // the full explanation, but persisting its unreviewed field name causes AuditLog to
+    // replace the whole evidence payload and makes the notification impossible to trace.
+    const { whyItMatters: _whyItMatters, ...auditPayload } = payload;
+    const auditEvidence = { notification: kind, ...auditPayload };
     const ceo = this.bindings.active(roleKeyFor(Role.CEO));
     if (!ceo) {
       this.audit.record({
@@ -1207,7 +1213,7 @@ export class ProductionGate {
         runId,
         reasonCode: ReasonCode.GATE_AUTHORITY_DENIED,
         roleKey: "CEO",
-        evidence: { notification: kind, ...payload },
+        evidence: auditEvidence,
       });
       return deny(ReasonCode.GATE_AUTHORITY_DENIED, "no CEO binding can receive notification", {
         runId,
@@ -1218,7 +1224,7 @@ export class ProductionGate {
       kind: "CEO_NOTIFICATION",
       runId,
       roleKey: ceo.roleKey,
-      evidence: { notification: kind, ...payload },
+      evidence: auditEvidence,
     });
     this.outbox.enqueue({
       idempotencyKey: `notify:${kind}:${runId}:${digestOf(payload)}`,

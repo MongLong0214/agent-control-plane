@@ -200,16 +200,6 @@ export class RunEngine {
       }
     }
 
-    // §14.2 — mandatory refresh before admission. A failed probe suspends allocation
-    // rather than dispatching against an unknown quota, and the admission is asked about
-    // the allocation this dispatch will actually make (§14.3, findings #53/#179).
-    if (this.#capacity) {
-      const capacity = await this.#capacity.refreshForDispatch(
-        this.dispatchCapacityTarget(run) ?? undefined,
-      );
-      if (!capacity.allowed) return capacity as Decision<RunRow>;
-    }
-
     let binding: RoleBinding | null = null;
     if (run.projectId) {
       if (this.#cto?.isDraining(run.projectId)) {
@@ -229,60 +219,31 @@ export class RunEngine {
         );
       }
       if (!this.#cto) return deny(ReasonCode.INTERNAL_ERROR, "no CTO provisioner attached", { runId });
-      // §9.5 — a run against a project with no primary CTO creates one.
-      const provisioned = await this.#cto.ensurePrimaryCto(run.projectId, runId);
+    } else {
+      // A projectless run has no project-scoped CTO to provision. Resolve its existing
+      // owner before capacity: otherwise admission has no target and hides an authority
+      // failure behind CAPACITY_UNKNOWN_NOT_ROUTABLE.
+      const pinned = this.projectlessOwnerBinding(run);
+      if (!pinned.allowed) return pinned as Decision<RunRow>;
+      binding = pinned.value;
+    }
+
+    // §14.2 — capacity is still refreshed before the first allocation or state transition.
+    // Local identity validation comes first because it neither allocates nor routes, and a
+    // capacity check cannot be meaningful until there is a concrete owner/provider target.
+    if (this.#capacity) {
+      const capacity = await this.#capacity.refreshForDispatch(
+        this.dispatchCapacityTarget(run) ?? undefined,
+      );
+      if (!capacity.allowed) return capacity as Decision<RunRow>;
+    }
+
+    if (run.projectId) {
+      // §9.5 — a run against a project with no primary CTO creates one only after the
+      // selected provider has passed dispatch admission.
+      const provisioned = await this.#cto!.ensurePrimaryCto(run.projectId, runId);
       if (!provisioned.allowed) return provisioned as Decision<RunRow>;
       binding = provisioned.value;
-    } else {
-      // A projectless run has no project-scoped CTO to provision. Bootstrap binds its
-      // run-scoped CTO before dispatch; any other projectless run must prove an equally
-      // concrete owner before it can become ACTIVE.
-      if (
-        !run.ownerSessionId ||
-        run.ownerBindingGeneration == null ||
-        !run.ownerSessionIncarnation ||
-        !run.ownerRoleKey
-      ) {
-        return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "projectless run has no pinned run-scoped owner", {
-          runId,
-          kind: run.kind,
-        });
-      }
-      const active = this.db.get<{
-        session_id: string;
-        session_incarnation: string;
-        binding_generation: number;
-        role_key: string;
-      }>(
-        `SELECT session_id, session_incarnation, binding_generation, role_key
-           FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
-        [run.ownerRoleKey],
-      );
-      if (
-        !active ||
-        active.session_id !== run.ownerSessionId ||
-        active.session_incarnation !== run.ownerSessionIncarnation ||
-        active.binding_generation !== run.ownerBindingGeneration
-      ) {
-        return deny(ReasonCode.RUN_OWNER_REVOKED, "projectless run owner is not the active binding", {
-          runId,
-          roleKey: run.ownerRoleKey,
-        });
-      }
-      binding = {
-        assignmentId: "pinned-run-owner",
-        roleKey: active.role_key,
-        role: run.kind === RunKind.PROJECT_BOOTSTRAP ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO,
-        projectId: null,
-        runId: run.kind === RunKind.PROJECT_BOOTSTRAP ? run.runId : null,
-        taskId: null,
-        sessionId: active.session_id,
-        sessionIncarnation: active.session_incarnation,
-        bindingGeneration: active.binding_generation,
-        mode: "PREFERRED",
-        status: "ACTIVE",
-        createdAt: run.createdAt,
-      };
     }
 
     return this.db.tx(() => {
@@ -351,10 +312,9 @@ export class RunEngine {
    * answers "some production provider is open", which is not the question dispatch asks —
    * the CTO provider can be the one that is exhausted (§14.3).
    *
-   * `null` means no target is derivable, which is only ever true of a run that cannot
-   * dispatch at all: no CTO provisioner is attached, or a projectless run has no pinned
-   * owner. Both are refused within the next few statements, so the mandatory refresh still
-   * happens and no provider is invented to admit against.
+   * `null` means the project has no planned provider. A projectless run's pin is validated
+   * before this method is reached, so a missing owner is reported as an authority failure
+   * rather than as a targetless capacity probe.
    */
   private dispatchCapacityTarget(run: RunRow): DispatchCapacityTarget | null {
     const provider = run.projectId
@@ -374,6 +334,56 @@ export class RunEngine {
         sessionId,
       ])?.provider ?? null
     );
+  }
+
+  /** Resolves the durable owner a projectless run must already have before dispatch. */
+  private projectlessOwnerBinding(run: RunRow): Decision<RoleBinding> {
+    if (
+      !run.ownerSessionId ||
+      run.ownerBindingGeneration == null ||
+      !run.ownerSessionIncarnation ||
+      !run.ownerRoleKey
+    ) {
+      return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "projectless run has no pinned run-scoped owner", {
+        runId: run.runId,
+        kind: run.kind,
+      });
+    }
+    const active = this.db.get<{
+      session_id: string;
+      session_incarnation: string;
+      binding_generation: number;
+      role_key: string;
+    }>(
+      `SELECT session_id, session_incarnation, binding_generation, role_key
+         FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+      [run.ownerRoleKey],
+    );
+    if (
+      !active ||
+      active.session_id !== run.ownerSessionId ||
+      active.session_incarnation !== run.ownerSessionIncarnation ||
+      active.binding_generation !== run.ownerBindingGeneration
+    ) {
+      return deny(ReasonCode.RUN_OWNER_REVOKED, "projectless run owner is not the active binding", {
+        runId: run.runId,
+        roleKey: run.ownerRoleKey,
+      });
+    }
+    return allow(ReasonCode.OK, {
+      assignmentId: "pinned-run-owner",
+      roleKey: active.role_key,
+      role: run.kind === RunKind.PROJECT_BOOTSTRAP ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO,
+      projectId: null,
+      runId: run.kind === RunKind.PROJECT_BOOTSTRAP ? run.runId : null,
+      taskId: null,
+      sessionId: active.session_id,
+      sessionIncarnation: active.session_incarnation,
+      bindingGeneration: active.binding_generation,
+      mode: "PREFERRED",
+      status: "ACTIVE",
+      createdAt: run.createdAt,
+    });
   }
 
   /**
