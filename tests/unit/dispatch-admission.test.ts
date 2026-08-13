@@ -4,7 +4,7 @@ import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -106,13 +106,14 @@ const startWorkerFanoutWith = async (remainingPercent: number) => {
   harness.scripted.setCapacity(capacity(remainingPercent));
   await harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
   const task = harness.cp.tasks.ready(created.value.runId)[0]!;
+  const workerSessionId = bindWorker(harness, task.taskId);
   return {
     harness,
     started: await harness.cp.tasks.startWorkerExecution({
       runId: created.value.runId,
       taskId: task.taskId,
       ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
-      workerSessionId: dispatched.value.ownerSessionId,
+      workerSessionId,
       provider: "scripted",
       model: "worker",
       repositoryId,

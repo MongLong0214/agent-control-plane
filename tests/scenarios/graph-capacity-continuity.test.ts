@@ -9,7 +9,7 @@ import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ContinuityMode, ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { CapacityReading } from "../../src/runtime/provider.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
-import { fixtureManifest } from "../helpers/harness.ts";
+import { bindWorkerForTask, fixtureManifest } from "../helpers/harness.ts";
 import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 
@@ -260,12 +260,14 @@ describe("parallel execution (CP-S12)", () => {
 
     const ready = harness.cp.tasks.ready(created.value.runId);
     expect(ready).toHaveLength(2); // both independent tasks are ready at once
+    const firstWorkerSessionId = bindWorkerForTask(harness.cp, ready[0]!.taskId);
+    const secondWorkerSessionId = bindWorkerForTask(harness.cp, ready[1]!.taskId);
 
     const first = harness.cp.tasks.startExecution({
       runId: created.value.runId,
       taskId: ready[0]!.taskId,
       ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
-      workerSessionId: null,
+      workerSessionId: firstWorkerSessionId,
       provider: "gpt",
       model: "gpt-5.6-luna-max",
       concurrencyWidth: 1,
@@ -274,7 +276,7 @@ describe("parallel execution (CP-S12)", () => {
       runId: created.value.runId,
       taskId: ready[1]!.taskId,
       ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
-      workerSessionId: null,
+      workerSessionId: secondWorkerSessionId,
       provider: "claude",
       model: "sonnet",
       concurrencyWidth: 2,

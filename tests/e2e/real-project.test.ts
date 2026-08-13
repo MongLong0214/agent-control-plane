@@ -12,6 +12,7 @@ import { ClaudeCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
+import { bindWorkerForTask } from "../helpers/harness.ts";
 
 /**
  * End-to-end acceptance on a real pre-existing project, registered by hand with no Repo
@@ -300,11 +301,12 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       expect(claim.allowed).toBe(true);
 
       const implTask = cp.tasks.ready(runId)[0]!;
+      const implWorkerSessionId = bindWorkerForTask(cp, implTask.taskId);
       const implExecution = cp.tasks.startExecution({
         runId,
         taskId: implTask.taskId,
         ownerBindingGeneration: run.ownerBindingGeneration!,
-        workerSessionId: run.ownerSessionId,
+        workerSessionId: implWorkerSessionId,
         workerProcessId: process.pid,
         provider: "claude",
         model: REVIEWER_MODEL,
@@ -333,11 +335,12 @@ describe.runIf(ENABLED)("E2E: real project, real verification, real blind review
       });
 
       const verifyTask = cp.tasks.ready(runId)[0]!;
+      const verifyWorkerSessionId = bindWorkerForTask(cp, verifyTask.taskId);
       const verifyExecution = cp.tasks.startExecution({
         runId,
         taskId: verifyTask.taskId,
         ownerBindingGeneration: run.ownerBindingGeneration!,
-        workerSessionId: run.ownerSessionId,
+        workerSessionId: verifyWorkerSessionId,
         workerProcessId: process.pid,
         provider: "claude",
         model: REVIEWER_MODEL,

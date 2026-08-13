@@ -13,6 +13,7 @@ import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
+import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import { type WorkspaceProbe, realWorkspaceProbe } from "../guard/workspace-probe.ts";
 import { Outbox } from "../outbox/outbox.ts";
@@ -230,6 +231,21 @@ export class ControlPlane {
       { directWriteRoots: config.directWriteRoots },
     );
     this.tasks = new TaskGraph(this.db, this.clock, this.audit, this.telemetry);
+    this.tasks.attach({
+      workerBindings: {
+        hasLiveWorkerBinding: (taskId, sessionId) => {
+          const binding = this.bindings.active(roleKeyFor(Role.WORKER, { taskId }));
+          const session = this.sessions.get(sessionId);
+          return Boolean(
+            binding &&
+              binding.role === Role.WORKER &&
+              binding.taskId === taskId &&
+              binding.sessionId === sessionId &&
+              session?.lifecycle === SessionLifecycle.READY,
+          );
+        },
+      },
+    });
     this.bindings.attach({ tasks: this.tasks });
     this.runs = new RunEngine(
       this.db, this.clock, this.audit, this.artifacts, this.outbox,

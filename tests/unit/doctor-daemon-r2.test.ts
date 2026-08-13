@@ -14,7 +14,7 @@ import { ExecutionMode, Role, RunState, SessionLifecycle } from "../../src/domai
 import { buzzActorBindingSigningRequest, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { bindCeo, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -157,25 +157,26 @@ describe("round 2 doctor regressions", () => {
     expect(harness.cp.repositories.list()[0]!.lastObservedHead).toBe(baseline.lastObservedHead);
   });
 
-  it("#112/#209: a RUNNING receipt without a worker identity blocks the doctor", async () => {
+  it("#112/#209: an unbound session cannot create a RUNNING receipt", async () => {
     const { harness, repositoryId, run } = await createDispatchedRun();
     const task = harness.cp.tasks.submit(run.runId, [{ key: "work", title: "work", category: "implementation" }]);
     if (!task.allowed) throw new Error(task.message);
+    const worker = harness.cp.sessions.create({ provider: "scripted", model: "scripted-worker" });
+    const ready = harness.cp.sessions.transition(worker.sessionId, SessionLifecycle.READY, "test worker");
+    if (!ready.allowed) throw new Error(ready.message);
     const receipt = harness.cp.tasks.startExecution({
       runId: run.runId,
       taskId: task.value[0]!.taskId,
       ownerBindingGeneration: run.ownerBindingGeneration!,
-      workerSessionId: null,
+      workerSessionId: worker.sessionId,
       workerProcessId: null,
       provider: "scripted",
       model: "scripted-worker",
       repositoryId,
     });
-    expect(receipt.allowed).toBe(true);
-
-    const report = await harness.cp.doctor.run("run", run.runId);
-    expect(report.findings.map((finding) => finding.code)).toContain("WORKER_IDENTITY_MISSING");
-    expect(report.status).toBe("BLOCKED");
+    expect(receipt.allowed).toBe(false);
+    expect(receipt.reasonCode).toBe(ReasonCode.WORKER_BINDING_REQUIRED);
+    expect(harness.cp.tasks.executions(run.runId)).toHaveLength(0);
   });
 
   it("#113/#210: a failed worktree probe blocks instead of becoming an empty result", async () => {
@@ -194,11 +195,12 @@ describe("round 2 doctor regressions", () => {
     const { harness, repositoryId, run } = await createDispatchedRun();
     const task = harness.cp.tasks.submit(run.runId, [{ key: "work", title: "work", category: "implementation" }]);
     if (!task.allowed) throw new Error(task.message);
+    const workerSessionId = bindWorker(harness, task.value[0]!.taskId);
     const receipt = harness.cp.tasks.startExecution({
       runId: run.runId,
       taskId: task.value[0]!.taskId,
       ownerBindingGeneration: run.ownerBindingGeneration!,
-      workerSessionId: null,
+      workerSessionId,
       workerProcessId: process.pid,
       provider: "scripted",
       model: "scripted-worker",

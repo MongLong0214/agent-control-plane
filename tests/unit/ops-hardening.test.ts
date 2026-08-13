@@ -24,6 +24,7 @@ import {
   TEST_OWNER,
   type Harness,
   bindCeo,
+  bindWorker,
   makeHarness,
   registerFixtureProject,
 } from "../helpers/harness.ts";
@@ -277,11 +278,12 @@ describe("coordination state belongs to the run that holds it (§23.2)", () => {
     ]);
     if (!submitted.allowed) throw new Error(submitted.message);
     const task = harness.cp.tasks.ready(runId)[0]!;
+    const workerSessionId = bindWorker(harness, task.taskId);
     const execution = harness.cp.tasks.startExecution({
       runId,
       taskId: task.taskId,
       ownerBindingGeneration: run.ownerBindingGeneration!,
-      workerSessionId: run.ownerSessionId,
+      workerSessionId,
       provider: "scripted",
       model: "scripted-worker",
     });

@@ -30,6 +30,7 @@ import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   type Harness,
   bindCeo,
+  bindWorker,
   fixtureManifest,
   makeHarness,
   registerFixtureProject,
@@ -141,12 +142,13 @@ describe("doctor (CP-S43 – CP-S45)", () => {
       { key: "a", title: "work", category: "implementation" },
     ]);
     if (!submitted.allowed) throw new Error(submitted.message);
+    const workerSessionId = bindWorker(harness, submitted.value[0]!.taskId);
 
     harness.cp.tasks.startExecution({
       runId: run.runId,
       taskId: submitted.value[0]!.taskId,
       ownerBindingGeneration: run.ownerBindingGeneration!,
-      workerSessionId: run.ownerSessionId,
+      workerSessionId,
       // A pid that certainly is not running.
       workerProcessId: 2_147_483_600,
       provider: "scripted",
@@ -227,11 +229,12 @@ describe("watchdog (CP-S46)", () => {
       { key: "a", title: "work", category: "implementation" },
     ]);
     if (!submitted.allowed) throw new Error(submitted.message);
+    const workerSessionId = bindWorker(harness, submitted.value[0]!.taskId);
     harness.cp.tasks.startExecution({
       runId: run.runId,
       taskId: submitted.value[0]!.taskId,
       ownerBindingGeneration: run.ownerBindingGeneration!,
-      workerSessionId: run.ownerSessionId,
+      workerSessionId,
       provider: "scripted",
       model: "scripted-worker",
       repositoryId,
@@ -475,11 +478,12 @@ describe("CEO notification policy (CP-S53, CP-S54)", () => {
 
     for (const task of [submitted.value[0]!, submitted.value[1]!]) {
       harness.cp.tasks.refreshReadiness(run.runId);
+      const workerSessionId = bindWorker(harness, task.taskId);
       const execution = harness.cp.tasks.startExecution({
         runId: run.runId,
         taskId: task.taskId,
         ownerBindingGeneration: run.ownerBindingGeneration!,
-        workerSessionId: run.ownerSessionId,
+        workerSessionId,
         provider: "scripted",
         model: "scripted-worker",
         repositoryId,
@@ -541,12 +545,13 @@ describe("telemetry (CP-S56, CP-S57)", () => {
       { key: "a", title: "work", category: "mechanical" },
     ]);
     if (!submitted.allowed) throw new Error(submitted.message);
+    const workerSessionId = bindWorker(harness, submitted.value[0]!.taskId);
 
     const execution = harness.cp.tasks.startExecution({
       runId: run.runId,
       taskId: submitted.value[0]!.taskId,
       ownerBindingGeneration: run.ownerBindingGeneration!,
-      workerSessionId: run.ownerSessionId,
+      workerSessionId,
       provider: "scripted",
       model: "scripted-worker",
       repositoryId,
@@ -898,11 +903,12 @@ describe("daemon (CP-S58, CP-S59)", () => {
       { key: "a", title: "work", category: "implementation" },
     ]);
     if (!submitted.allowed) throw new Error(submitted.message);
+    const workerSessionId = bindWorker(harness, submitted.value[0]!.taskId);
     harness.cp.tasks.startExecution({
       runId: run.runId,
       taskId: submitted.value[0]!.taskId,
       ownerBindingGeneration: run.ownerBindingGeneration!,
-      workerSessionId: run.ownerSessionId,
+      workerSessionId,
       provider: "scripted",
       model: "scripted-worker",
       repositoryId,

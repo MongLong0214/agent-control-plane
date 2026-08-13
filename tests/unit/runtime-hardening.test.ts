@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
-import { allow } from "../../src/core/errors.ts";
+import { allow, isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
@@ -10,6 +10,7 @@ import {
   TEST_OWNER,
   type Harness,
   bindCeo,
+  bindWorker,
   driveToReviewedCandidate,
   makeHarness,
   registerFixtureProject,
@@ -315,7 +316,7 @@ describe("task executions belong to the run that drives them (§25.2)", () => {
       runId: first.runId,
       taskId: foreignTask.taskId,
       ownerBindingGeneration: first.run.ownerBindingGeneration!,
-      workerSessionId: first.run.ownerSessionId,
+      workerSessionId: first.run.ownerSessionId!,
       provider: "scripted",
       model: "scripted-worker",
     });
@@ -331,11 +332,12 @@ describe("task executions belong to the run that drives them (§25.2)", () => {
     ]);
     if (!submitted.allowed) throw new Error(submitted.message);
     const task = harness.cp.tasks.ready(second.runId)[0]!;
+    const workerSessionId = bindWorker(harness, task.taskId);
     const execution = harness.cp.tasks.startExecution({
       runId: second.runId,
       taskId: task.taskId,
       ownerBindingGeneration: second.run.ownerBindingGeneration!,
-      workerSessionId: second.run.ownerSessionId,
+      workerSessionId,
       provider: "scripted",
       model: "scripted-worker",
     });
@@ -358,11 +360,12 @@ describe("task executions belong to the run that drives them (§25.2)", () => {
     ]);
     if (!submitted.allowed) throw new Error(submitted.message);
     const task = harness.cp.tasks.ready(runId)[0]!;
+    const workerSessionId = bindWorker(harness, task.taskId);
     const execution = harness.cp.tasks.startExecution({
       runId,
       taskId: task.taskId,
       ownerBindingGeneration: run.ownerBindingGeneration!,
-      workerSessionId: run.ownerSessionId,
+      workerSessionId,
       provider: "scripted",
       model: "scripted-worker",
     });
@@ -417,6 +420,130 @@ describe("a completed run's work is sealed (§34.3)", () => {
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.RUN_TRANSITION_ILLEGAL);
     expect(harness.cp.tasks.list(driven.runId).some((t) => t.title.includes("extra work"))).toBe(false);
+  });
+
+  it("#375 refuses new tasks after a packet is escalated to AWAITING_HUMAN", async () => {
+    const harness = makeHarness();
+    const driven = await driveToReviewedCandidate(harness);
+    await harness.cp.continuity.evaluate("test");
+    const packet = harness.cp.ceo.buildPacket({
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      approval: {
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        resultSummary: "done",
+        recommendation: "owner decision needed",
+        residualRisk: [],
+        approvedBySessionId: driven.ownerSessionId,
+        approvedByGeneration: driven.ownerBindingGeneration,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    if (!packet.allowed) throw new Error(packet.message);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+    const escalated = harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId,
+      decision: "OWNER_DECISION_REQUIRED",
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceo.sessionId,
+      rationale: "the owner must decide the release condition",
+    });
+    expect(escalated.allowed).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.AWAITING_HUMAN);
+
+    const refused = harness.cp.tasks.submit(driven.runId, [
+      { key: "post-packet", title: "post-packet mutation", category: "implementation" },
+    ]);
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.RUN_TRANSITION_ILLEGAL);
+    expect(harness.cp.tasks.list(driven.runId).some((task) => task.title === "post-packet mutation")).toBe(false);
+
+    let caught: unknown;
+    try {
+      harness.cp.db.run(
+        `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+         VALUES ('tsk_raw_post_packet', ?, 'raw post-packet mutation', 'implementation', 'PENDING', '{}', ?, ?)`,
+        [driven.runId, harness.clock.nowIso(), harness.clock.nowIso()],
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(isAcpError(caught)).toBe(true);
+    if (!isAcpError(caught)) throw new Error("raw post-packet task insert did not fail structurally");
+    expect(caught.reasonCode).toBe(ReasonCode.RUN_TRANSITION_ILLEGAL);
+  });
+});
+
+describe("worker execution provenance is admission-bound (CP-HI-04)", () => {
+  it("#380 refuses both worker start paths until the named session holds WORKER:<taskId>", async () => {
+    const harness = makeHarness();
+    const { runId, run } = await activeRun(harness);
+    const submitted = harness.cp.tasks.submit(runId, [
+      { key: "impl", title: "bound worker work", category: "implementation" },
+    ]);
+    if (!submitted.allowed) throw new Error(submitted.message);
+    const task = harness.cp.tasks.ready(runId)[0]!;
+    const unbound = harness.cp.sessions.create({ provider: "scripted", model: "scripted-worker" });
+    const ready = harness.cp.sessions.transition(unbound.sessionId, SessionLifecycle.READY, "test worker");
+    if (!ready.allowed) throw new Error(ready.message);
+    const input = {
+      runId,
+      taskId: task.taskId,
+      ownerBindingGeneration: run.ownerBindingGeneration!,
+      workerSessionId: unbound.sessionId,
+      provider: "scripted",
+      model: "scripted-worker",
+    };
+
+    const workerAdmission = await harness.cp.tasks.startWorkerExecution(input);
+    expect(workerAdmission.allowed).toBe(false);
+    expect(workerAdmission.reasonCode).toBe(ReasonCode.WORKER_BINDING_REQUIRED);
+    const receiptAdmission = harness.cp.tasks.startExecution(input);
+    expect(receiptAdmission.allowed).toBe(false);
+    expect(receiptAdmission.reasonCode).toBe(ReasonCode.WORKER_BINDING_REQUIRED);
+    expect(harness.cp.tasks.get(task.taskId)!.state).toBe("READY");
+    expect(harness.cp.tasks.executions(runId)).toHaveLength(0);
+
+    const workerSessionId = bindWorker(harness, task.taskId);
+    const started = harness.cp.tasks.startExecution({ ...input, workerSessionId });
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) throw new Error(started.message);
+    expect(started.value.workerSessionId).toBe(workerSessionId);
+  });
+
+  it("#380 makes the worker column non-null and rejects a raw unbound receipt", async () => {
+    const harness = makeHarness();
+    const { runId, run } = await activeRun(harness);
+    const submitted = harness.cp.tasks.submit(runId, [
+      { key: "impl", title: "raw receipt work", category: "implementation" },
+    ]);
+    if (!submitted.allowed) throw new Error(submitted.message);
+    const task = harness.cp.tasks.ready(runId)[0]!;
+    const unbound = harness.cp.sessions.create({ provider: "scripted", model: "scripted-worker" });
+    const ready = harness.cp.sessions.transition(unbound.sessionId, SessionLifecycle.READY, "test worker");
+    if (!ready.allowed) throw new Error(ready.message);
+
+    const column = harness.cp.db
+      .all<{ name: string; notnull: number }>("PRAGMA table_info(task_executions)")
+      .find((entry) => entry.name === "worker_session_id");
+    expect(column?.notnull).toBe(1);
+
+    let caught: unknown;
+    try {
+      harness.cp.db.run(
+        `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
+                                      worker_session_id, provider, model, started_at, status)
+         VALUES (?, ?, ?, 1, ?, ?, 'scripted', 'scripted-worker', ?, 'RUNNING')`,
+        [`${task.taskId}#1`, runId, task.taskId, run.ownerBindingGeneration!, unbound.sessionId, harness.clock.nowIso()],
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(isAcpError(caught)).toBe(true);
+    if (!isAcpError(caught)) throw new Error("raw receipt did not fail with a structured denial");
+    expect(caught.reasonCode).toBe(ReasonCode.WORKER_BINDING_REQUIRED);
+    expect(harness.cp.tasks.executions(runId)).toHaveLength(0);
   });
 });
 

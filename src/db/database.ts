@@ -44,7 +44,7 @@ const assertReadQuery = (sql: string): void => {
  * preserve an older table whose constraints are weaker, so version mismatch is refused
  * instead of pretending that a deployed database was migrated (§40 Maintainability).
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
 const RUN_STATE_TRANSITION_MINT: unique symbol = Symbol("run-state-transition-mint");
@@ -437,6 +437,9 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   BINDING_GENERATION_NOT_MONOTONIC: ReasonCode.BINDING_GENERATION_STALE,
   BINDING_IDENTITY_IMMUTABLE: ReasonCode.BINDING_GENERATION_STALE,
   BINDING_REVOKED_TERMINAL: ReasonCode.BINDING_REVOKED,
+  TASK_EXECUTION_WORKER_BINDING_REQUIRED: ReasonCode.WORKER_BINDING_REQUIRED,
+  TASK_EXECUTION_WORKER_IDENTITY_IMMUTABLE: ReasonCode.CONFLICT,
+  TASK_INSERT_RUN_SEALED: ReasonCode.RUN_TRANSITION_ILLEGAL,
   PINNED_MANIFEST_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
   PINNED_RUN_SCOPED_COMMANDS_IMMUTABLE: ReasonCode.CANDIDATE_CANNOT_WEAKEN_CONTRACT,
   RUN_STATE_TRANSITION_ILLEGAL: ReasonCode.RUN_TRANSITION_ILLEGAL,
