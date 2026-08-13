@@ -1,4 +1,5 @@
 import type { Decision } from "../core/errors.ts";
+import type { ReasonCode } from "../core/reason-codes.ts";
 
 /** Provider ids are deployment config, not architecture (PRD §14.1). */
 export const ProviderId = {
@@ -63,6 +64,12 @@ export interface InvocationResult {
    * this invocation. A caller must not turn an unattested result into review evidence.
    */
   isolationAttested: boolean;
+  /**
+   * The stable control-plane reason when a requested packet boundary was not enforced.
+   * It complements the boolean so adapter callers can surface an auditable refusal rather
+   * than reducing every failed isolation setup to a provider error string.
+   */
+  isolationReasonCode?: typeof ReasonCode.ISOLATION_LOST;
 }
 
 export interface SessionSpec {
