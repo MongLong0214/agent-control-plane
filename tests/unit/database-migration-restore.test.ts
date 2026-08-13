@@ -138,7 +138,7 @@ const codeOf = (action: () => unknown): string => {
 const assertFourLoadBearingOperations = (db: Db): void => {
   expect(codeOf(() => db.run("UPDATE run_artifacts SET content_json = '{}'"))).toBe(ReasonCode.CONFLICT);
   expect(codeOf(() => db.run("DELETE FROM github_receipts"))).toBe(ReasonCode.CONFLICT);
-  expect(codeOf(() => db.run("UPDATE runs SET state = 'COMPLETED' WHERE run_id = 'run_history'"))).toBe(
+  expect(codeOf(() => db.run("UPDATE runs SET state = 'CEO_APPROVED' WHERE run_id = 'run_history'"))).toBe(
     ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
   );
   expect(
@@ -162,23 +162,35 @@ describe("versioned SQLite migration", () => {
     try {
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(history(migrated)).toEqual(before);
-      const receipt = migrated.get<{
+      const receipts = migrated.all<{
+        version: number;
         migration_id: string;
         checksum: string;
-        backup_file: string;
-        backup_checksum: string;
+        backup_file: string | null;
+        backup_checksum: string | null;
       }>(
-        `SELECT migration_id, checksum, backup_file, backup_checksum
-           FROM schema_migrations WHERE version = ?`,
-        [SCHEMA_VERSION],
+        `SELECT version, migration_id, checksum, backup_file, backup_checksum
+           FROM schema_migrations ORDER BY version`,
       );
-      expect(receipt).toMatchObject({
-        migration_id: "v12-migration-ledger-and-invariant-replay",
-        checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-        backup_checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-      });
-      expect(receipt?.backup_file).toBeTruthy();
-      expect(existsSync(receipt!.backup_file)).toBe(true);
+      expect(receipts.map((entry) => [entry.version, entry.migration_id])).toEqual([
+        [12, "v12-migration-ledger-and-invariant-replay"],
+        [SCHEMA_VERSION, "v13-finalization-state-machine"],
+      ]);
+      expect(receipts).toEqual([
+        expect.objectContaining({
+          version: 12,
+          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          backup_checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+        }),
+        expect.objectContaining({
+          version: SCHEMA_VERSION,
+          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          backup_file: null,
+          backup_checksum: null,
+        }),
+      ]);
+      expect(receipts[0]?.backup_file).toBeTruthy();
+      expect(existsSync(receipts[0]!.backup_file!)).toBe(true);
 
       // Four database-level guard rails are exercised after the actual migration, not on a
       // fresh test database. Removing any required trigger makes one negative operation pass.
@@ -192,6 +204,7 @@ describe("versioned SQLite migration", () => {
     const controlPlane = new ControlPlane({
       ...defaultConfig(join(path, "..")),
       adapters: [new TestProductionAdapter(systemClock)],
+      allowTestEvidenceWriters: true,
     });
     const daemon = new Daemon(controlPlane, { stateDir: join(path, "..") });
     let daemonRunning = false;

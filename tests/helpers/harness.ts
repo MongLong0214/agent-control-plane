@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { ManualClock } from "../../src/core/clock.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
-import { ExecutionMode, Role, RunKind, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import type { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
@@ -402,6 +402,7 @@ export const driveToReviewedCandidate = async (
 export const approveReviewedCandidateForFinalization = async (
   harness: Harness,
   driven: Awaited<ReturnType<typeof driveToReviewedCandidate>>,
+  options: { bypassCeoConfirmation?: boolean } = {},
 ): Promise<void> => {
   await harness.cp.continuity.evaluate("test finalization packet");
   const packet = harness.cp.ceo.buildPacket({
@@ -419,6 +420,22 @@ export const approveReviewedCandidateForFinalization = async (
     },
   });
   if (!packet.allowed) throw new Error(`${packet.reasonCode}: ${packet.message}`);
+
+  if (options.bypassCeoConfirmation) {
+    // Low-level GitHub boundary fixtures need a CEO-approved state while the durable human
+    // gate is deliberately unsatisfied. ProductionGate correctly refuses CONFIRM in that
+    // situation; this state-only fixture keeps the test focused on the kernel's own re-check
+    // without making the production path capable of bypassing that predicate.
+    const staged = harness.cp.runs.transition(
+      driven.runId,
+      RunState.CEO_APPROVED,
+      "synthetic finalization state for GitHub boundary fixture",
+      { candidateSnapshotDigest: driven.candidateSnapshotDigest },
+    );
+    if (!staged.allowed) throw new Error(`${staged.reasonCode}: ${staged.message}`);
+    return;
+  }
+
   const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
   if (!ceo) throw new Error("fixture CEO binding missing");
   const confirmed = harness.cp.ceo.submitCeoDecision({
