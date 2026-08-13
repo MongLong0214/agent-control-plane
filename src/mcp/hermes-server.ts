@@ -45,8 +45,8 @@ const mutation = { idempotencyKey: z.string().min(1) };
 
 /**
  * Inputs from the composition root are reduced to function-only capabilities before a server
- * is built. This compatibility shape also permits direct unit callers to pass their fixture
- * control plane, while production passes a pre-built sealed port (#352).
+ * is built. Server factories never accept this shape, so a handler cannot receive a fixture or
+ * production composition root through a compatibility shortcut (#352).
  */
 export interface HermesMcpSource extends McpMutationSource {
   readonly db: Db;
@@ -65,13 +65,16 @@ export interface HermesMcpSource extends McpMutationSource {
   readonly bindings: BindingRegistry;
 }
 
+/** Only ports constructed below may be attached to an MCP server. */
+const HERMES_MCP_PORTS = new WeakSet<object>();
+
 /**
  * Builds function-only Hermes operations. The returned object deliberately exposes neither a
  * database facade nor a service instance, so an MCP tool handler cannot recover raw SQL from
  * the daemon's composition root (#352).
  */
-export const createHermesMcpPort = (source: HermesMcpSource) =>
-  Object.freeze({
+export const createHermesMcpPort = (source: HermesMcpSource) => {
+  const port = Object.freeze({
     mutation: createMcpMutationPort(source),
     createRun: (input: Parameters<RunEngine["create"]>[0]) => source.runs.create(input),
     dispatchRun: (runId: string) => source.runs.dispatch(runId),
@@ -113,11 +116,17 @@ export const createHermesMcpPort = (source: HermesMcpSource) =>
     submitCeoDecision: (input: Parameters<ProductionGate["submitCeoDecision"]>[0]) => source.ceo.submitCeoDecision(input),
     executeRepair: (input: Parameters<RepairService["execute"]>[0]) => source.repair.execute(input),
   });
+  HERMES_MCP_PORTS.add(port);
+  return port;
+};
 
 export type HermesMcpPort = ReturnType<typeof createHermesMcpPort>;
 
-const isHermesMcpPort = (source: HermesMcpPort | HermesMcpSource): source is HermesMcpPort =>
-  typeof (source as Partial<HermesMcpPort>).mutation?.execute === "function";
+const assertHermesMcpPort = (port: HermesMcpPort): void => {
+  if (!HERMES_MCP_PORTS.has(port)) {
+    throw new Error("createHermesServer requires a sealed HermesMcpPort from createHermesMcpPort");
+  }
+};
 
 /**
  * This scope deliberately receives only the port. Every registered handler closes over this
@@ -273,7 +282,9 @@ const createHermesServerFromPort = (
  * argument, because an MCP caller may assert any string it likes.
  */
 export const createHermesServer = (
-  source: HermesMcpPort | HermesMcpSource,
+  port: HermesMcpPort,
   authenticate: McpPeerAuthenticator,
-): McpServer =>
-  createHermesServerFromPort(isHermesMcpPort(source) ? source : createHermesMcpPort(source), authenticate);
+): McpServer => {
+  assertHermesMcpPort(port);
+  return createHermesServerFromPort(port, authenticate);
+};

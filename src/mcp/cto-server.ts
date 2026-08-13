@@ -39,10 +39,9 @@ const mutation = { idempotencyKey: z.string().min(1) };
 const runIdentity = { runId: z.string() };
 
 /**
- * Composition inputs are accepted only to construct a sealed port. The server never retains
- * this object: individual functions below close over the operations they need, not a raw
- * database executor or the control plane. Keeping this compatibility adapter lets direct unit
- * callers stay concise while daemon MCP handlers have no route to arbitrary SQL (#352).
+ * Composition inputs are accepted only while the daemon constructs a sealed port. Server
+ * factories never accept this shape, so a handler cannot be handed a raw database executor or
+ * the control plane as a convenience shortcut (#352).
  */
 export interface CtoMcpSource extends McpMutationSource {
   readonly db: Db;
@@ -64,6 +63,9 @@ export interface CtoMcpSource extends McpMutationSource {
   readonly bindings: BindingRegistry;
   readonly tasks: TaskGraph;
 }
+
+/** Only ports constructed below may be attached to an MCP server. */
+const CTO_MCP_PORTS = new WeakSet<object>();
 
 /**
  * Verifies the transport identity against durable session and binding facts. The session
@@ -103,8 +105,8 @@ const assertCtoRunPeerFromSource = (
  * root is reachable from the resulting object, so adding a tool cannot accidentally inherit
  * a database executor from the daemon (#352).
  */
-export const createCtoMcpPort = (source: CtoMcpSource) =>
-  Object.freeze({
+export const createCtoMcpPort = (source: CtoMcpSource) => {
+  const port = Object.freeze({
     mutation: createMcpMutationPort(source),
     assertRunPeer: (peer: AuthenticatedMcpPeer, runId: string) => assertCtoRunPeerFromSource(source, peer, runId),
     sessionIsCurrent: (sessionId: string, incarnation: string) => {
@@ -159,11 +161,17 @@ export const createCtoMcpPort = (source: CtoMcpSource) =>
     doctorRun: (...args: Parameters<Doctor["run"]>) => source.doctor.run(...args),
     manualReview: (sessionId: string, runId: string) => source.review.manualInvocation(sessionId, runId),
   });
+  CTO_MCP_PORTS.add(port);
+  return port;
+};
 
 export type CtoMcpPort = ReturnType<typeof createCtoMcpPort>;
 
-const isCtoMcpPort = (source: CtoMcpPort | CtoMcpSource): source is CtoMcpPort =>
-  typeof (source as Partial<CtoMcpPort>).mutation?.execute === "function";
+const assertCtoMcpPort = (port: CtoMcpPort): void => {
+  if (!CTO_MCP_PORTS.has(port)) {
+    throw new Error("createCtoServer requires a sealed CtoMcpPort from createCtoMcpPort");
+  }
+};
 
 /** PRD §28.2 — CTO tools operate only as an authenticated, fenced session peer. */
 export const assertCtoRunPeer = (
@@ -371,7 +379,9 @@ const createCtoServerFromPort = (
 
 /** PRD §28.2 — CTO tools operate only as an authenticated, fenced session peer. */
 export const createCtoServer = (
-  source: CtoMcpPort | CtoMcpSource,
+  port: CtoMcpPort,
   authenticate: McpPeerAuthenticator,
-): McpServer =>
-  createCtoServerFromPort(isCtoMcpPort(source) ? source : createCtoMcpPort(source), authenticate);
+): McpServer => {
+  assertCtoMcpPort(port);
+  return createCtoServerFromPort(port, authenticate);
+};

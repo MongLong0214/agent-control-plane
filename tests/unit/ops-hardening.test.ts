@@ -1,9 +1,24 @@
 import { afterAll, describe, expect, it } from "vitest";
+import { symlinkSync } from "node:fs";
 import { join } from "node:path";
 
+import { ManualClock } from "../../src/core/clock.ts";
+import { isAcpError, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ArtifactStore } from "../../src/db/artifacts.ts";
+import { Db } from "../../src/db/database.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
+import {
+  createCtoMcpPort,
+  createCtoServer,
+  type CtoMcpPort,
+} from "../../src/mcp/cto-server.ts";
+import {
+  createHermesMcpPort,
+  createHermesServer,
+  type HermesMcpPort,
+} from "../../src/mcp/hermes-server.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
@@ -27,6 +42,15 @@ const CONTRACT: TaskContract = {
   references: [],
 };
 
+const denialCode = (action: () => unknown): string => {
+  try {
+    action();
+  } catch (error) {
+    return isAcpError(error) ? error.reasonCode : `unstructured:${String(error)}`;
+  }
+  return "not-denied";
+};
+
 const activeRun = async (harness: Harness, projectId = "fixture-project") => {
   const registered = await registerFixtureProject(harness, projectId);
   bindCeo(harness);
@@ -43,6 +67,118 @@ const activeRun = async (harness: Harness, projectId = "fixture-project") => {
   if (!dispatched.allowed) throw new Error(dispatched.message);
   return { ...registered, runId: created.value.runId, run: dispatched.value };
 };
+
+describe("MCP evidence authority has no route through a tool handler (#352)", () => {
+  it("accepts only factory-sealed operation ports, never the composition root", () => {
+    const harness = makeHarness();
+    const hermesPort = createHermesMcpPort(harness.cp);
+    const ctoPort = createCtoMcpPort(harness.cp);
+    const authenticate = () => allow(ReasonCode.OK, { actor: "port-surface-test" });
+
+    // The root may own infrastructure, but its private evidence and completion capabilities
+    // are not ordinary properties that a handler can reach.
+    expect(Reflect.has(harness.cp, "evidenceWriters")).toBe(false);
+    expect(Reflect.has(harness.cp, "completionAuthorities")).toBe(false);
+    for (const port of [hermesPort, ctoPort]) {
+      expect(Object.isFrozen(port)).toBe(true);
+      for (const authority of ["db", "artifacts", "evidenceWriters", "completionAuthorities"]) {
+        expect(Reflect.has(port, authority)).toBe(false);
+      }
+    }
+
+    // A cast models an untyped caller. The module-private registration is the runtime
+    // boundary: neither the root nor a structural copy is an MCP port.
+    expect(() => createHermesServer(harness.cp as unknown as HermesMcpPort, authenticate))
+      .toThrowError(/requires a sealed HermesMcpPort/);
+    expect(() => createCtoServer(harness.cp as unknown as CtoMcpPort, authenticate))
+      .toThrowError(/requires a sealed CtoMcpPort/);
+    expect(() => createHermesServer({ ...hermesPort }, authenticate)).toThrowError(
+      /requires a sealed HermesMcpPort/,
+    );
+    expect(() => createCtoServer({ ...ctoPort }, authenticate)).toThrowError(
+      /requires a sealed CtoMcpPort/,
+    );
+
+    expect(createHermesServer(hermesPort, authenticate)).toBeDefined();
+    expect(createCtoServer(ctoPort, authenticate)).toBeDefined();
+  });
+
+  it("issues evidence writers once for the underlying database file, including a symlink alias", () => {
+    const root = tempDir("acp-evidence-file-");
+    const databasePath = join(root, "state.sqlite");
+    const aliasPath = join(root, "state-alias.sqlite");
+    const clock = new ManualClock("2026-08-13T00:00:00.000Z");
+    const first = new Db(databasePath);
+    let samePath: Db | undefined;
+    let alias: Db | undefined;
+
+    try {
+      new ArtifactStore(first, clock).issueEvidenceWriters();
+
+      samePath = new Db(databasePath);
+      expect(samePath.file).toBe(first.file);
+      expect(denialCode(() => samePath!.claimEvidenceWritePort())).toBe(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+      );
+      // This deliberately names ArtifactStore's own guard. If its Set check is deleted,
+      // Db's independent guard has a different message and this regression fails.
+      expect(() => new ArtifactStore(samePath!, clock).issueEvidenceWriters()).toThrowError(
+        /evidence writer capabilities were already issued for this database/,
+      );
+
+      symlinkSync(databasePath, aliasPath);
+      alias = new Db(aliasPath);
+      // `realpathSync` makes aliases of one SQLite file one authority domain.
+      expect(alias.file).toBe(first.file);
+      expect(denialCode(() => alias!.claimEvidenceWritePort())).toBe(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+      );
+    } finally {
+      alias?.close();
+      samePath?.close();
+      first.close();
+    }
+  });
+
+  it("rejects a raw evidence INSERT even with the genuine producer string and candidate", () => {
+    const { db, clock } = (() => {
+      const database = new Db(":memory:");
+      const testClock = new ManualClock("2026-08-13T00:00:00.000Z");
+      return { db: database, clock: testClock };
+    })();
+    const runId = "run_raw_evidence";
+    const candidateSnapshotDigest = `sha256:${"a".repeat(64)}`;
+
+    try {
+      db.run(
+        `INSERT INTO runs (run_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+         VALUES (?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'raw evidence attack', 'sha256:contract', ?)`,
+        [runId, clock.nowIso()],
+      );
+      // The raw attacker can make the prerequisite row and supply the expected metadata.
+      // The database marker, not these strings, must still reject the evidence write.
+      db.run(
+        `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
+                                    content_json, produced_by, created_at)
+         VALUES ('candidate_for_raw_attack', ?, 'CANDIDATE_SNAPSHOT', 'sha256:candidate', ?, '{}', 'service', ?)`,
+        [runId, candidateSnapshotDigest, clock.nowIso()],
+      );
+      const evidence = JSON.stringify({ candidateSnapshotDigest });
+      expect(
+        denialCode(() =>
+          db.run(
+            `INSERT INTO run_artifacts (artifact_id, run_id, kind, digest, candidate_snapshot_digest,
+                                        content_json, produced_by, created_at)
+             VALUES ('raw_evidence', ?, 'VERIFICATION', 'sha256:raw', ?, ?, 'verification-engine', ?)`,
+            [runId, candidateSnapshotDigest, evidence, clock.nowIso()],
+          ),
+        ),
+      ).toBe(ReasonCode.COMPLETION_AUTHORITY_DENIED);
+    } finally {
+      db.close();
+    }
+  });
+});
 
 describe("a destructive repair needs a real owner (§25.7)", () => {
   it("refuses an OWNER-authorised repair with no owner identity behind it", async () => {
