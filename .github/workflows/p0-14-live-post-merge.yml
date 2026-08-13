@@ -1,0 +1,16 @@
+name: p0-14-live-post-merge
+
+on:
+  push:
+    branches:
+      - acp/p0-14-live-20260814-085734-77184
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prove the disposable merge SHA reached Actions
+        run: test -n "$GITHUB_SHA"
