@@ -28,7 +28,7 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import { cleanupTempDirs, commitAll, makeRepo, tempDir } from "../helpers/fixtures.ts";
-import { fixtureManifest, reviewerPass } from "../helpers/harness.ts";
+import { bindWorkerForTask, fixtureManifest, reviewerPass } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -218,11 +218,12 @@ const prepareCapacityReviewedRun = async (plane: ReturnType<typeof makePlane>) =
   const tasks = cp.tasks.submit(created.value.runId, [{ key: "impl", title: "impl", category: "implementation" }]);
   if (!tasks.allowed) throw new Error(tasks.message);
   const task = cp.tasks.ready(created.value.runId)[0]!;
+  const workerSessionId = bindWorkerForTask(cp, task.taskId);
   const execution = cp.tasks.startExecution({
     runId: created.value.runId,
     taskId: task.taskId,
     ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
-    workerSessionId: dispatched.value.ownerSessionId,
+    workerSessionId,
     provider: "gpt",
     model: "worker",
     repositoryId: repository.value.repositoryId,
@@ -377,14 +378,15 @@ const startWorkerWithMeasuredReserve = async (input: {
        VALUES ('tsk_reserve_extra', ?, 'durable in-flight work', 'mechanical', 'RUNNING', '{}', 1, ?, ?)`,
       [extraRunId, clock.nowIso(), clock.nowIso()],
     );
+    const extraWorkerSessionId = bindWorkerForTask(cp, "tsk_reserve_extra");
     cp.db.run(
       `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
                                     worker_session_id, worker_process_id, provider, model, repository_id,
                                     worktree_id, concurrency_width, started_at, last_activity_at, ended_at,
                                     status, failure_class, result_digest)
-       VALUES ('exe_reserve_extra', ?, 'tsk_reserve_extra', 1, 1, NULL, NULL, 'gpt', 'worker', NULL,
+       VALUES ('exe_reserve_extra', ?, 'tsk_reserve_extra', 1, 1, ?, NULL, 'gpt', 'worker', NULL,
                NULL, NULL, ?, NULL, NULL, 'RUNNING', NULL, NULL)`,
-      [extraRunId, clock.nowIso()],
+      [extraRunId, extraWorkerSessionId, clock.nowIso()],
     );
   }
   if (input.extraCeoDemand) {
@@ -396,12 +398,13 @@ const startWorkerWithMeasuredReserve = async (input: {
   }
 
   const task = cp.tasks.ready(created.value.runId)[0]!;
+  const workerSessionId = bindWorkerForTask(cp, task.taskId);
   const demand = cp.capacity.workerReserveDemand("gpt");
   const started = await cp.tasks.startWorkerExecution({
     runId: created.value.runId,
     taskId: task.taskId,
     ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
-    workerSessionId: dispatched.value.ownerSessionId,
+    workerSessionId,
     provider: "gpt",
     model: "worker",
   });
@@ -1275,11 +1278,12 @@ describe("round-2 continuity and persistence regressions", () => {
     const tasks = plane.cp.tasks.submit(run.value.runId, [{ key: "task", title: "task", category: "mechanical" }]);
     if (!tasks.allowed) throw new Error(tasks.message);
     const task = plane.cp.tasks.ready(run.value.runId)[0]!;
+    const workerSessionId = bindWorkerForTask(plane.cp, task.taskId);
     const execution = plane.cp.tasks.startExecution({
       runId: run.value.runId,
       taskId: task.taskId,
       ownerBindingGeneration: 1,
-      workerSessionId: null,
+      workerSessionId,
       provider: "gpt",
       model: "worker",
     });

@@ -20,7 +20,7 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
-import { TEST_OWNER, bindCeo, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { TEST_OWNER, bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -298,11 +298,12 @@ describe("round-2 run and production-gate regressions", () => {
     ]);
     if (!submitted.allowed) throw new Error(submitted.message);
     const task = fixture.harness.cp.tasks.ready(fixture.runId)[0]!;
+    const workerSessionId = bindWorker(fixture.harness, task.taskId);
     const execution = fixture.harness.cp.tasks.startExecution({
       runId: fixture.runId,
       taskId: task.taskId,
       ownerBindingGeneration: fixture.run.ownerBindingGeneration!,
-      workerSessionId: fixture.run.ownerSessionId,
+      workerSessionId,
       provider: "scripted",
       model: "worker",
     });

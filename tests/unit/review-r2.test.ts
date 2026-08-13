@@ -20,6 +20,7 @@ import { cleanupTempDirs, commitAll, writeFiles } from "../helpers/fixtures.ts";
 import {
   applyPassingChange,
   bindCeo,
+  bindWorker,
   makeHarness,
   registerFixtureProject,
   reviewerPass,
@@ -101,11 +102,12 @@ const prepareReviewedInputs = async () => {
   const submitted = harness.cp.tasks.submit(run.runId, [{ key: "impl", title: "impl", category: "implementation" }]);
   if (!submitted.allowed) throw new Error(submitted.message);
   const task = harness.cp.tasks.ready(run.runId)[0]!;
+  const workerSessionId = bindWorker(harness, task.taskId);
   const execution = harness.cp.tasks.startExecution({
     runId: run.runId,
     taskId: task.taskId,
     ownerBindingGeneration: run.ownerBindingGeneration!,
-    workerSessionId: run.ownerSessionId,
+    workerSessionId,
     provider: "scripted",
     model: "scripted-worker",
     repositoryId,

@@ -37,7 +37,8 @@ export interface ExecutionStart {
   runId: string;
   taskId: string;
   ownerBindingGeneration: number;
-  workerSessionId: string | null;
+  /** The session that holds the active, task-scoped WORKER binding. */
+  workerSessionId: string;
   workerProcessId?: number | null;
   provider: string;
   model: string;
@@ -59,7 +60,7 @@ export interface ExecutionRecord {
   resultDigest: string | null;
   provider: string;
   model: string;
-  workerSessionId: string | null;
+  workerSessionId: string;
   ownerBindingGeneration: number;
 }
 
@@ -67,6 +68,14 @@ export interface ExecutionRecord {
 export interface WorkerCapacityGate {
   refreshForWorkerFanout(target?: WorkerFanoutCapacityTarget): Promise<Decision<void>>;
   workerReserveDemand(provider: string): DynamicReserveDemand;
+}
+
+/**
+ * Deliberately narrow binding port. TaskGraph can verify the worker that a receipt names,
+ * but it receives neither the binding registry nor authority to mutate bindings.
+ */
+export interface WorkerExecutionBindingGate {
+  hasLiveWorkerBinding(taskId: string, sessionId: string): boolean;
 }
 
 /**
@@ -84,6 +93,7 @@ export interface WorkerCapacityGate {
  */
 const CLOSED_TO_NEW_TASKS: ReadonlySet<RunState> = new Set([
   RunState.READY_FOR_CEO_REVIEW,
+  RunState.AWAITING_HUMAN,
   RunState.COMPLETED,
   RunState.FAILED,
   RunState.CANCELLED,
@@ -91,6 +101,7 @@ const CLOSED_TO_NEW_TASKS: ReadonlySet<RunState> = new Set([
 
 export class TaskGraph {
   #capacity: WorkerCapacityGate | null = null;
+  #workerBindings: WorkerExecutionBindingGate | null = null;
 
   constructor(
     private readonly db: Db,
@@ -100,8 +111,9 @@ export class TaskGraph {
   ) {}
 
   /** Closed by the composition root after the capacity monitor exists. */
-  attach(ports: { capacity?: WorkerCapacityGate }): void {
+  attach(ports: { capacity?: WorkerCapacityGate; workerBindings?: WorkerExecutionBindingGate }): void {
     if (ports.capacity) this.#capacity = ports.capacity;
+    if (ports.workerBindings) this.#workerBindings = ports.workerBindings;
   }
 
   /**
@@ -228,6 +240,8 @@ export class TaskGraph {
           requestedRunId: input.runId,
         });
       }
+      const workerBinding = this.assertLiveWorkerBinding(input);
+      if (!workerBinding.allowed) return workerBinding as Decision<ExecutionRecord>;
       if (task.state !== TaskState.READY && task.state !== TaskState.FAILED) {
         return deny(
           ReasonCode.TASK_DEPENDENCY_UNSATISFIED,
@@ -282,6 +296,10 @@ export class TaskGraph {
    * allocator is deliberately routed only through this admission method.
    */
   async startWorkerExecution(input: ExecutionStart): Promise<Decision<ExecutionRecord>> {
+    // Do not ask capacity to allocate a worker whose durable identity is already invalid.
+    // `startExecution` repeats this check inside its transaction after the async probe.
+    const workerBinding = this.assertLiveWorkerBinding(input);
+    if (!workerBinding.allowed) return workerBinding as Decision<ExecutionRecord>;
     if (!this.#capacity) {
       return deny(
         ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
@@ -440,6 +458,24 @@ export class TaskGraph {
   /** Luna has its own disposable-capacity bucket; all other worker models use worker. */
   private workerCapability(model: string): "worker" | "luna-worker" {
     return /luna/i.test(model) ? "luna-worker" : "worker";
+  }
+
+  /** CP-HI-04 — every receipt names the session currently bound as this task's worker. */
+  private assertLiveWorkerBinding(
+    input: Pick<ExecutionStart, "runId" | "taskId" | "workerSessionId">,
+  ): Decision<void> {
+    if (this.#workerBindings?.hasLiveWorkerBinding(input.taskId, input.workerSessionId)) {
+      return allow(ReasonCode.OK, undefined);
+    }
+    return deny(
+      ReasonCode.WORKER_BINDING_REQUIRED,
+      "worker execution requires the live WORKER binding for its task",
+      {
+        runId: input.runId,
+        taskId: input.taskId,
+        workerSessionId: input.workerSessionId,
+      },
+    );
   }
 
   /**
@@ -636,7 +672,7 @@ interface RawExecution {
   result_digest: string | null;
   provider: string;
   model: string;
-  worker_session_id: string | null;
+  worker_session_id: string;
   owner_binding_generation: number;
 }
 

@@ -164,6 +164,29 @@ export const bindCeo = (harness: Harness): string => {
 };
 
 /**
+ * Fixtures model a real worker as its own READY session with the task-scoped binding that
+ * execution admission persists. Reusing the CTO session here would hide CP-HI-04 gaps.
+ */
+export const bindWorkerForTask = (
+  controlPlane: Pick<ControlPlane, "sessions" | "bindings">,
+  taskId: string,
+): string => {
+  const session = controlPlane.sessions.create({ provider: "scripted", model: "scripted-worker" });
+  const ready = controlPlane.sessions.transition(session.sessionId, SessionLifecycle.READY, "test worker");
+  if (!ready.allowed) throw new Error(`worker session readiness failed: ${ready.message}`);
+  const bound = controlPlane.bindings.bind({
+    role: Role.WORKER,
+    sessionId: session.sessionId,
+    taskId,
+  });
+  if (!bound.allowed) throw new Error(`worker binding failed: ${bound.message}`);
+  return session.sessionId;
+};
+
+export const bindWorker = (harness: Harness, taskId: string): string =>
+  bindWorkerForTask(harness.cp, taskId);
+
+/**
  * Work happens on a task branch cut from the base, exactly as the branch contract
  * requires — committing straight onto the base branch would make base and candidate the
  * same commit and produce an empty diff.
@@ -287,11 +310,12 @@ export const driveToReviewedCandidate = async (
   ]);
   if (!tasks.allowed) throw new Error(tasks.message);
   const impl = harness.cp.tasks.ready(runId)[0]!;
+  const workerSessionId = bindWorker(harness, impl.taskId);
   const execution = harness.cp.tasks.startExecution({
     runId,
     taskId: impl.taskId,
     ownerBindingGeneration: run.ownerBindingGeneration!,
-    workerSessionId: run.ownerSessionId,
+    workerSessionId,
     provider: "scripted",
     model: "scripted-worker",
     repositoryId,

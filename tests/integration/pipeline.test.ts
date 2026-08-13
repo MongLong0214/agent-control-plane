@@ -10,6 +10,7 @@ import {
   applyFailingChange,
   applyPassingChange,
   bindCeo,
+  bindWorker,
   makeHarness,
   registerFixtureProject,
   reviewerPass,
@@ -57,11 +58,12 @@ const drive = async (
 
   // The worker performs the actual repository change, under the run's owner generation.
   const impl = harness.cp.tasks.ready(runId)[0]!;
+  const implWorkerSessionId = bindWorker(harness, impl.taskId);
   const execution = harness.cp.tasks.startExecution({
     runId,
     taskId: impl.taskId,
     ownerBindingGeneration: run.ownerBindingGeneration!,
-    workerSessionId: run.ownerSessionId,
+    workerSessionId: implWorkerSessionId,
     provider: "scripted",
     model: "scripted-worker",
     repositoryId,
@@ -78,11 +80,12 @@ const drive = async (
   });
 
   const second = harness.cp.tasks.ready(runId)[0]!;
+  const secondWorkerSessionId = bindWorker(harness, second.taskId);
   const secondExecution = harness.cp.tasks.startExecution({
     runId,
     taskId: second.taskId,
     ownerBindingGeneration: run.ownerBindingGeneration!,
-    workerSessionId: run.ownerSessionId,
+    workerSessionId: secondWorkerSessionId,
     provider: "scripted",
     model: "scripted-worker",
     repositoryId,

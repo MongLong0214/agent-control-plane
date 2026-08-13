@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 
+import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PRODUCER_ROLES, ROLE_CLASS, Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { cleanupTempDirs, makeCore, makeRepo, seedRun } from "../helpers/fixtures.ts";
@@ -52,11 +53,12 @@ describe("CP-HI-04 role classification is exhaustive", () => {
 });
 
 describe("#380 — worker execution provenance is fail-closed", () => {
-  const recordAnonymousWorkerExecution = (
+  const recordWorkerExecution = (
     db: ReturnType<typeof makeCore>["db"],
     clock: ReturnType<typeof makeCore>["clock"],
     runId: string,
     taskId: string,
+    workerSessionId: string | null,
     workerProcessId: number | null = null,
   ) => {
     db.run(
@@ -67,32 +69,29 @@ describe("#380 — worker execution provenance is fail-closed", () => {
     db.run(
       `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
                                     worker_session_id, worker_process_id, provider, model, started_at, status)
-       VALUES (?, ?, ?, 1, 1, NULL, ?, 'scripted', 'worker', ?, 'RUNNING')`,
-      [`${taskId}#1`, runId, taskId, workerProcessId, clock.nowIso()],
+       VALUES (?, ?, ?, 1, 1, ?, ?, 'scripted', 'worker', ?, 'RUNNING')`,
+      [`${taskId}#1`, runId, taskId, workerSessionId, workerProcessId, clock.nowIso()],
     );
   };
 
-  it("refuses reviewer admission when an execution omitted every durable worker identity", () => {
-    const { db, clock, bindings, seeded, session } = setup();
+  it("refuses an anonymous worker receipt before reviewer admission is even possible", () => {
+    const { db, clock, seeded } = setup();
     db.run(`UPDATE runs SET dispatched_at = ? WHERE run_id = ?`, [clock.nowIso(), seeded.runId]);
-    recordAnonymousWorkerExecution(db, clock, seeded.runId, "tsk_anonymous_worker");
-
-    const reviewer = session("ses_reviewer_after_anonymous_work");
-    const refused = bindings.bind({
-      role: Role.BLIND_REVIEWER,
-      sessionId: reviewer,
-      runId: seeded.runId,
-      projectId: seeded.projectId,
-    });
-    expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.PRODUCER_HISTORY_UNAVAILABLE);
+    let caught: unknown;
+    try {
+      recordWorkerExecution(db, clock, seeded.runId, "tsk_anonymous_worker", null);
+    } catch (error) {
+      caught = error;
+    }
+    expect(isAcpError(caught)).toBe(true);
+    if (!isAcpError(caught)) throw new Error("anonymous receipt did not fail structurally");
+    expect(caught.reasonCode).toBe(ReasonCode.WORKER_BINDING_REQUIRED);
   });
 
-  it("refuses the bound worker as reviewer even when an older receipt omitted workerSessionId", () => {
+  it("refuses the bound worker as reviewer from its persisted worker receipt", () => {
     const { db, clock, bindings, seeded, session } = setup();
     db.run(`UPDATE runs SET dispatched_at = ? WHERE run_id = ?`, [clock.nowIso(), seeded.runId]);
     const taskId = "tsk_bound_worker";
-    recordAnonymousWorkerExecution(db, clock, seeded.runId, taskId);
     const worker = session("ses_worker_from_bound_history");
     const workerBinding = bindings.bind({
       role: Role.WORKER,
@@ -102,6 +101,7 @@ describe("#380 — worker execution provenance is fail-closed", () => {
       projectId: seeded.projectId,
     });
     expect(workerBinding.allowed).toBe(true);
+    recordWorkerExecution(db, clock, seeded.runId, taskId, worker);
 
     const refused = bindings.bind({
       role: Role.BLIND_REVIEWER,
@@ -113,7 +113,7 @@ describe("#380 — worker execution provenance is fail-closed", () => {
     expect(refused.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
   });
 
-  it("refuses W as reviewer when the null receipt durably identifies W by process id", () => {
+  it("refuses W as reviewer when the receipt records W alongside its process id", () => {
     const { db, clock, sessions, bindings, seeded } = setup();
     db.run(`UPDATE runs SET dispatched_at = ? WHERE run_id = ?`, [clock.nowIso(), seeded.runId]);
     const worker = sessions.create({
@@ -123,13 +123,16 @@ describe("#380 — worker execution provenance is fail-closed", () => {
       osPid: 424_242,
     });
     expect(sessions.transition(worker.sessionId, SessionLifecycle.READY, "worker session ready").allowed).toBe(true);
-    recordAnonymousWorkerExecution(
-      db,
-      clock,
-      seeded.runId,
-      "tsk_worker_process_identity",
-      worker.osPid,
-    );
+    const taskId = "tsk_worker_process_identity";
+    const workerBinding = bindings.bind({
+      role: Role.WORKER,
+      sessionId: worker.sessionId,
+      taskId,
+      runId: seeded.runId,
+      projectId: seeded.projectId,
+    });
+    expect(workerBinding.allowed).toBe(true);
+    recordWorkerExecution(db, clock, seeded.runId, taskId, worker.sessionId, worker.osPid);
 
     const refused = bindings.bind({
       role: Role.BLIND_REVIEWER,

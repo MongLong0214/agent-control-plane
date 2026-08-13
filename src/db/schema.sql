@@ -431,6 +431,20 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS tasks_run ON tasks(run_id, state);
 
+-- §34.3 — task admission is closed as soon as a packet exists, while an owner is deciding
+-- on that packet, or after the run ends. TaskGraph returns the same denial at its public
+-- admission point; this trigger protects direct SQL writers and cross-connection races.
+CREATE TRIGGER IF NOT EXISTS tasks_run_work_sealed
+BEFORE INSERT ON tasks
+WHEN EXISTS (
+  SELECT 1 FROM runs
+   WHERE run_id = NEW.run_id
+     AND state IN ('READY_FOR_CEO_REVIEW','AWAITING_HUMAN','COMPLETED','FAILED','CANCELLED')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_INSERT_RUN_SEALED');
+END;
+
 -- DAG edges. Separate table because the dependency relation is queried in both
 -- directions (readiness and blast radius) and must be integrity-checked.
 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -449,7 +463,9 @@ CREATE TABLE IF NOT EXISTS task_executions (
   task_id                  TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
   attempt                  INTEGER NOT NULL,
   owner_binding_generation INTEGER NOT NULL,
-  worker_session_id        TEXT REFERENCES sessions(session_id),
+  -- CP-HI-04 — a receipt cannot omit the session that produced the work. The trigger
+  -- below additionally proves that this session held the worker binding at admission.
+  worker_session_id        TEXT NOT NULL REFERENCES sessions(session_id),
   worker_process_id        INTEGER,
   provider                 TEXT NOT NULL,
   model                    TEXT NOT NULL,
@@ -469,6 +485,37 @@ CREATE TABLE IF NOT EXISTS task_executions (
 );
 
 CREATE INDEX IF NOT EXISTS task_executions_open ON task_executions(status, started_at);
+
+-- A caller cannot fabricate a receipt for an arbitrary session. At insertion the named
+-- session must hold the active, canonical WORKER:<taskId> binding and be ready to work.
+-- TaskGraph performs the same check for an explainable denial; this is the durable backstop
+-- for every raw SQL writer.
+CREATE TRIGGER IF NOT EXISTS task_executions_worker_binding_required
+BEFORE INSERT ON task_executions
+WHEN NOT EXISTS (
+  SELECT 1 FROM assignments a
+    JOIN sessions s ON s.session_id = a.session_id
+   WHERE a.role = 'WORKER'
+     AND a.role_key = 'WORKER:' || NEW.task_id
+     AND a.task_id = NEW.task_id
+     AND a.session_id = NEW.worker_session_id
+     AND a.status = 'ACTIVE'
+     AND s.lifecycle = 'READY'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_BINDING_REQUIRED');
+END;
+
+-- The identity recorded at admission is historical provenance. Rewriting its task, run,
+-- or worker afterwards would turn a valid receipt into a claim for someone else's work.
+CREATE TRIGGER IF NOT EXISTS task_executions_worker_identity_immutable
+BEFORE UPDATE OF run_id, task_id, worker_session_id ON task_executions
+WHEN NEW.run_id <> OLD.run_id
+  OR NEW.task_id <> OLD.task_id
+  OR NEW.worker_session_id <> OLD.worker_session_id
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_IDENTITY_IMMUTABLE');
+END;
 
 -- ---------------------------------------------------------------------------
 -- run_artifacts  (PRD §30.1) — typed immutable artifacts.
