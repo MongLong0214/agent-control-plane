@@ -17,7 +17,7 @@ import {
 } from "../../src/snapshot/candidate-snapshot.ts";
 import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { cleanupTempDirs, gitSync } from "../helpers/fixtures.ts";
-import { TEST_OWNER, bindCeo, fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
+import { bindCeo, fixtureManifest, makeHarness, type Harness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -207,7 +207,10 @@ describe("round-2 ops regressions", () => {
       item: "public release",
       approved: true,
       note: "forged",
-      owner: TEST_OWNER,
+      // `cli:test-owner` is a legitimate local operator in this fixture. The attacker
+      // instead claims that same allowlisted actor came through a delegable transport,
+      // without the ingress receipt that such a transport must carry.
+      owner: { channel: "mcp", actor: "test-owner" },
     });
     expect(rawPair.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
   });

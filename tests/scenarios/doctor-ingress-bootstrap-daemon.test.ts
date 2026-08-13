@@ -742,9 +742,11 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(pending.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
     const handoffId = pending.evidence["pendingHandoffId"] as string;
     const primaryCto = harness.cp.bindings.activePrimaryCto("bootstrap-project")!;
-    expect(
-      harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, "ses_someone_else").allowed,
-    ).toBe(false);
+    const unrelated = harness.cp.sessions.create({ provider: "scripted", model: "unrelated-cto" });
+    harness.cp.sessions.transition(unrelated.sessionId, SessionLifecycle.READY, "unrelated handoff caller");
+    const wrongAck = harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, unrelated.sessionId);
+    expect(wrongAck.allowed).toBe(false);
+    expect(wrongAck.reasonCode).toBe(ReasonCode.HANDOFF_ACK_REQUIRED);
     const acked = harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, primaryCto.sessionId);
     expect(acked.allowed).toBe(true);
 
@@ -919,11 +921,15 @@ describe("daemon (CP-S58, CP-S59)", () => {
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.DAEMON_ALREADY_RUNNING);
     expect(second.crashLoopState().failures).toBe(1);
-    expect(second.crashLoopState().backoffSeconds).toBeGreaterThan(0);
+    const firstBackoffSeconds = second.crashLoopState().backoffSeconds;
+    expect(firstBackoffSeconds).toBeGreaterThan(0);
 
     const third = new Daemon(harness.cp, { stateDir });
-    await third.start();
+    const refusedAgain = await third.start();
+    expect(refusedAgain.allowed).toBe(false);
+    expect(refusedAgain.reasonCode).toBe(ReasonCode.DAEMON_ALREADY_RUNNING);
     expect(third.crashLoopState().failures).toBe(2);
+    expect(third.crashLoopState().backoffSeconds).toBeGreaterThan(firstBackoffSeconds);
     expect(harness.cp.audit.byKind("DAEMON_START_REFUSED").length).toBeGreaterThan(0);
     await first.stop();
   });

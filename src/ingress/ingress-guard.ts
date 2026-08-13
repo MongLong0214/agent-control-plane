@@ -7,6 +7,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
+import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 
 export interface IngressRequest {
   channel: "telegram" | "buzz" | "mcp" | "cli";
@@ -41,6 +42,16 @@ export interface OwnerApprovalIngress {
   approved: boolean;
 }
 
+/** A Buzz relay asks to associate its authenticated actor with one local session. */
+export interface BuzzActorBindingIngress {
+  actor: string;
+  sessionId: string;
+  /** Possession proof for the local runtime; it is never included in the signed payload. */
+  sessionSecret: string;
+  nonce: string;
+  signature?: string | null;
+}
+
 /** The complete envelope an owner signs or submits through an admitted ingress path. */
 export const ownerApprovalPayload = (input: OwnerApprovalIngress): Record<string, unknown> => ({
   type: "OWNER_APPROVAL",
@@ -49,6 +60,28 @@ export const ownerApprovalPayload = (input: OwnerApprovalIngress): Record<string
   parameterDigest: digestOf(input.parameters),
   idempotencyKey: input.idempotencyKey,
   approved: input.approved,
+});
+
+/**
+ * The relay's signature binds its actor to this exact local session. The session secret
+ * travels on the protected local hop but is deliberately outside this durable ingress
+ * envelope: it proves possession to SessionRegistry and must never enter audit evidence.
+ */
+export const buzzActorBindingPayload = (
+  input: Pick<BuzzActorBindingIngress, "sessionId">,
+): Record<string, unknown> => ({
+  type: "BUZZ_ACTOR_BIND",
+  sessionId: input.sessionId,
+});
+
+/** The exact signed Buzz envelope for an actor-to-session binding request. */
+export const buzzActorBindingSigningRequest = (
+  input: Pick<BuzzActorBindingIngress, "actor" | "sessionId" | "nonce">,
+): IngressRequest => ({
+  channel: "buzz",
+  actor: input.actor,
+  nonce: input.nonce,
+  payload: buzzActorBindingPayload(input),
 });
 
 const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -109,6 +142,11 @@ export class IngressGuard {
    */
   isAllowedActor(channel: string, actor: string): boolean {
     return this.policies[channel]?.allowedActors.includes(actor) ?? false;
+  }
+
+  /** Actor-to-session binding is never allowed on an unsigned ingress channel. */
+  requiresSignature(channel: string): boolean {
+    return (this.policies[channel]?.secret?.trim().length ?? 0) > 0;
   }
 
   admit(request: IngressRequest): Decision<{ payload: unknown; untrusted: true }> {
@@ -261,6 +299,55 @@ export class IngressGuard {
       channel,
       new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString(),
     ]);
+  }
+}
+
+/**
+ * The production write path for §27.2 Buzz identity binding.
+ *
+ * A current allowlist entry is not enough: `SessionRegistry.bindBuzzActor` can only run
+ * after `IngressGuard.admit` has verified the relay HMAC and consumed the nonce. The
+ * signed payload includes the target session id, while the session secret independently
+ * proves that the local caller is that session. Neither a captured Buzz envelope nor a
+ * stolen session id can therefore bind an actor on its own.
+ */
+export class BuzzActorIngress {
+  constructor(
+    private readonly guard: IngressGuard,
+    private readonly sessions: SessionRegistry,
+  ) {}
+
+  bindActor(input: BuzzActorBindingIngress): Decision<SessionRecord> {
+    if (!this.guard.requiresSignature("buzz")) {
+      return deny(
+        ReasonCode.INGRESS_SIGNATURE_INVALID,
+        "buzz actor binding requires a signed ingress policy",
+      );
+    }
+    if (
+      input.actor.trim().length === 0 ||
+      input.sessionId.trim().length === 0 ||
+      input.sessionSecret.length === 0 ||
+      input.nonce.trim().length === 0
+    ) {
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        "buzz actor binding requires an actor, session proof, and nonce",
+      );
+    }
+
+    const request = buzzActorBindingSigningRequest(input);
+    const admitted = this.guard.admit({ ...request, signature: input.signature ?? null });
+    if (!admitted.allowed) return admitted as Decision<SessionRecord>;
+
+    return this.sessions.bindBuzzActor(
+      {
+        sessionId: input.sessionId,
+        sessionSecret: input.sessionSecret,
+        buzzActorId: input.actor,
+      },
+      this.guard,
+    );
   }
 }
 

@@ -1,14 +1,16 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
-import { localMcpTokenMatches, startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
+import { startBuzzActorIngressListener, startLocalMcpListeners } from "../../src/daemon/agentcpd.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
-import { ExecutionMode, RunState } from "../../src/domain/types.ts";
+import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { buzzActorBindingSigningRequest, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
@@ -54,6 +56,40 @@ const makeDaemonStartHealthy = async () => {
   if (!dispatched.allowed) throw new Error(dispatched.message);
   return { ...setup, run: dispatched.value };
 };
+
+/** Sends complete local-protocol lines and waits for a caller-selected terminal response. */
+const exchangeSocketLines = (
+  socketPath: string,
+  lines: readonly unknown[],
+  complete: (received: string) => boolean,
+): Promise<string> =>
+  new Promise((resolveExchange, rejectExchange) => {
+    const socket = createConnection(socketPath);
+    let received = "";
+    let settled = false;
+    let timeout: NodeJS.Timeout | null = null;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (error) rejectExchange(error);
+      else resolveExchange(received);
+    };
+    timeout = setTimeout(() => {
+      socket.destroy();
+      finish(new Error("local socket response timed out"));
+    }, 5_000);
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      socket.write(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+    });
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      if (complete(received)) socket.end();
+    });
+    socket.once("error", (error) => finish(error));
+    socket.once("close", () => finish());
+  });
 
 describe("round 2 doctor regressions", () => {
   it("#111/#208: repeated diagnostics do not acknowledge repository drift", async () => {
@@ -129,6 +165,45 @@ describe("round 2 doctor regressions", () => {
     expect(harness.cp.audit.byKind("DOCTOR_REPORT").at(-1)?.evidence).toMatchObject({ status: "BLOCKED" });
   });
 
+  it("#335: watchdog reclaims an aged crashed candidate attempt and records its exact finding", async () => {
+    const { harness, run } = await createDispatchedRun();
+    const startedAt = harness.clock.nowIso();
+    harness.cp.db.run(
+      `INSERT INTO candidate_pipeline_attempts
+         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, released_at)
+       VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, NULL)`,
+      [
+        run.runId,
+        "attempt_crashed",
+        run.ownerSessionId,
+        run.ownerBindingGeneration,
+        startedAt,
+      ],
+    );
+    harness.clock.advance(30 * 60 * 1000 + 1);
+
+    const tick = await harness.cp.watchdog.tick();
+    const report = tick.reports.find((candidate) => candidate.scope === "run" && candidate.target === run.runId);
+
+    expect(tick.overdue).toContainEqual({
+      kind: "candidate_pipeline_attempt",
+      id: "attempt_crashed",
+      ageMs: 30 * 60 * 1000 + 1,
+    });
+    expect(
+      report?.findings.find((finding) => finding.code === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE),
+    ).toMatchObject({
+      blocking: true,
+      observedEvidence: { attemptId: "attempt_crashed", reclaimed: true },
+    });
+    expect(
+      harness.cp.db.get<{ state: string; released_at: string | null }>(
+        `SELECT state, released_at FROM candidate_pipeline_attempts WHERE run_id = ?`,
+        [run.runId],
+      ),
+    ).toMatchObject({ state: "RELEASED", released_at: harness.clock.nowIso() });
+  });
+
   it("#115/#212: an absent repository denies repair with observed precondition evidence", async () => {
     const { harness } = await createQueuedRun();
 
@@ -201,11 +276,121 @@ describe("round 2 daemon regressions", () => {
 
   it("#119/#207: a forged local MCP token is refused before MCP dispatch", async () => {
     const { harness } = await createQueuedRun();
-    expect(localMcpTokenMatches({ token: "forged" }, "local-test-token")).toBe(false);
-    expect(localMcpTokenMatches({ token: "local-test-token" }, "local-test-token")).toBe(true);
-    await expect(startLocalMcpListeners(harness.cp, tempDir("acp-mcp-r2-"), "")).rejects.toThrow(
-      "ACP_MCP_TOKEN must be configured",
-    );
+    const peer = harness.cp.sessions.create({ provider: "scripted", model: "mcp-peer" });
+    if (!peer.sessionSecret) throw new Error("test peer needs a session secret");
+    expect(harness.cp.sessions.transition(peer.sessionId, SessionLifecycle.READY, "MCP test peer").reasonCode)
+      .toBe(ReasonCode.OK);
+
+    const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-mcp-r2-"), "local-test-token");
+    const hermesSocket = listeners.socketPaths[0];
+    if (!hermesSocket) throw new Error("Hermes MCP listener was not started");
+    const create = vi.spyOn(harness.cp.runs, "create");
+    const mcpRequest = (token: string, idempotencyKey: string) => [
+      { token, sessionId: peer.sessionId, sessionSecret: peer.sessionSecret },
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "ops-regression", version: "1" },
+        },
+      },
+      { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "run_create",
+          arguments: {
+            idempotencyKey,
+            executionMode: "SIMPLE",
+            contract: CONTRACT,
+          },
+        },
+      },
+    ];
+
+    try {
+      // First prove that this exact wire sequence does reach the real tool handler when
+      // authenticated; otherwise a forged-token test could pass because the protocol was
+      // malformed rather than because the token boundary stopped dispatch.
+      const admitted = await exchangeSocketLines(
+        hermesSocket,
+        mcpRequest("local-test-token", "mcp-token-valid"),
+        (received) => received.includes('"id":2'),
+      );
+      expect(admitted).toContain('"id":2');
+      expect(create).toHaveBeenCalledTimes(1);
+      create.mockClear();
+
+      const refused = await exchangeSocketLines(
+        hermesSocket,
+        mcpRequest("forged", "mcp-token-forged"),
+        (received) => received.includes('"reasonCode"'),
+      );
+      expect(JSON.parse(refused.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.MCP_PEER_UNAUTHENTICATED,
+      });
+      expect(create).not.toHaveBeenCalled();
+      expect(
+        harness.cp.db.get(`SELECT nonce FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`, [
+          "mcp-token-forged",
+        ]),
+      ).toBeUndefined();
+    } finally {
+      create.mockRestore();
+      await listeners.close();
+    }
+  });
+
+  it("#214: a forged Buzz binding envelope cannot write a session actor through the daemon ingress", async () => {
+    const { harness } = await createQueuedRun();
+    const session = harness.cp.sessions.create({ provider: "scripted", model: "buzz-peer" });
+    if (!session.sessionSecret) throw new Error("test session needs a session secret");
+    expect(harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "Buzz test peer").reasonCode)
+      .toBe(ReasonCode.OK);
+
+    const listener = await startBuzzActorIngressListener(harness.cp, tempDir("acp-buzz-ingress-"), {
+      allowedActors: ["npub-authenticated"],
+      secret: "buzz-ingress-test-secret",
+    });
+    const input = {
+      actor: "npub-authenticated",
+      sessionId: session.sessionId,
+      sessionSecret: session.sessionSecret,
+      nonce: "buzz-bind-1",
+    };
+
+    try {
+      const forged = await exchangeSocketLines(
+        listener.socketPath,
+        [{ ...input, signature: "forged" }],
+        (received) => received.includes('"reasonCode"'),
+      );
+      expect(JSON.parse(forged.trim())).toMatchObject({
+        ok: false,
+        reasonCode: ReasonCode.INGRESS_SIGNATURE_INVALID,
+      });
+      expect(harness.cp.sessions.require(session.sessionId).buzzActorId).toBeNull();
+
+      const signature = ingressSignature(
+        "buzz-ingress-test-secret",
+        buzzActorBindingSigningRequest(input),
+      );
+      const admitted = await exchangeSocketLines(
+        listener.socketPath,
+        [{ ...input, signature }],
+        (received) => received.includes('"reasonCode"'),
+      );
+      expect(JSON.parse(admitted.trim())).toMatchObject({ ok: true, reasonCode: ReasonCode.OK });
+      expect(harness.cp.sessions.require(session.sessionId).buzzActorId).toBe("npub-authenticated");
+    } finally {
+      await listener.close();
+    }
   });
 
   it("#244: daemon-owned capacity sensors expose missing and stale observations", async () => {
