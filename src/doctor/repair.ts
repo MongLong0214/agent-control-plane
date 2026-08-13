@@ -14,6 +14,7 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   type RepairWorktreeAuthority,
   type ManagedWriteGuard,
+  WorktreeAction,
   WriteOperation,
 } from "../guard/managed-write-guard.ts";
 import type { WorktreeAuthorization, WorktreeManager } from "../verify/worktree.ts";
@@ -465,9 +466,9 @@ export class RepairService {
       },
     };
     return {
-      remove: { ...common, request: { ...common.request, targetPath: path } },
-      cleanup: { ...common, request: { ...common.request, targetPath: path } },
-      prune: { ...common, request: { ...common.request, targetPath: checkoutPath } },
+      remove: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.REMOVE } },
+      cleanup: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.CLEANUP } },
+      prune: { ...common, request: { ...common.request, targetPath: checkoutPath, worktreeAction: WorktreeAction.PRUNE } },
     };
   }
 

@@ -14,7 +14,7 @@ import {
   revParse,
   treeOf,
 } from "../git/git.ts";
-import { WriteOperation } from "../guard/managed-write-guard.ts";
+import { WorktreeAction, WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export interface Worktree {
@@ -222,18 +222,24 @@ export class WorktreeManager {
         operation: authorization.request.operation,
       });
     }
-    if (!authorization.request.targetPath || canonical(authorization.request.targetPath) !== canonical(path)) {
+    if (authorization.request.worktreeAction !== WorktreeAction.CLEANUP) {
+      return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "local cleanup requires a CLEANUP lifecycle authorization", {
+        action: authorization.request.worktreeAction ?? null,
+      });
+    }
+    const managedPath = this.managedPathFromPath(path);
+    if (!authorization.request.targetPath || canonical(authorization.request.targetPath) !== managedPath) {
       return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "local cleanup target does not match the guard request", {
-        path,
+        path: managedPath,
         authorizedTarget: authorization.request.targetPath ?? null,
       });
     }
     return authorization.guard.authorize(authorization.request, () => {
-      const stat = lstatSync(path);
+      const stat = lstatSync(managedPath);
       if (!stat.isDirectory() || stat.isSymbolicLink()) {
-        fail(ReasonCode.ISOLATION_LOST, "managed worktree path changed before cleanup", { path });
+        fail(ReasonCode.ISOLATION_LOST, "managed worktree path changed before cleanup", { path: managedPath });
       }
-      rmSync(path, { recursive: true, force: false });
+      rmSync(managedPath, { recursive: true, force: false });
     });
   }
 }

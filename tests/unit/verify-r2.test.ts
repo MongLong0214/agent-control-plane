@@ -18,7 +18,7 @@ import {
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { buildSandboxEnvironment, memoryLimitForPlatform, runSandboxed } from "../../src/verify/sandbox.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
-import { WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
+import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
 import type { WorktreeAuthorization } from "../../src/verify/worktree.ts";
 
 afterEach(cleanupTempDirs);
@@ -58,10 +58,10 @@ const testWorktreeAuthorization = (
     },
   };
   return {
-    add: { ...common, request: { ...common.request, targetPath: path } },
-    remove: { ...common, request: { ...common.request, targetPath: path } },
-    cleanup: { ...common, request: { ...common.request, targetPath: path } },
-    prune: { ...common, request: { ...common.request, targetPath: repositoryPath } },
+    add: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.ADD } },
+    remove: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.REMOVE } },
+    cleanup: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.CLEANUP } },
+    prune: { ...common, request: { ...common.request, targetPath: repositoryPath, worktreeAction: WorktreeAction.PRUNE } },
   };
 };
 
