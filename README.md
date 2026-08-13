@@ -1,188 +1,107 @@
 # Agent Control Plane
 
-> A single local runtime authority that turns managed project intent into verified
-> production-ready results, and binds logical roles to replaceable model runtime sessions.
+> **Status: not production-ready.** Read [the current status](docs/STATUS.md) before
+> attempting to operate or depend on this repository.
 
-Implements `AGENT_CONTROL_PLANE_PRD_v1.3_FINAL` and the control-plane half of
-`REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL`. Both are vendored under
-[`docs/prd/`](docs/prd/) and are the only implementation input.
+Agent Control Plane is intended to be a single local runtime authority for managed project
+work: when fully accepted, it turns managed project intent into verified production-ready
+results. This checkout currently establishes only verifiable candidate results: it records
+the run, binds the sessions that may act, freezes the candidate and contract, verifies it,
+requires blind review, and records the decision path. It is deliberately not a general
+autonomous agent framework, a hosted service, or an unattended deployment product.
 
-## What it is
+The normative implementation inputs are the vendored [control-plane PRD](docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md)
+and [Repo Factory integration PRD](docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md).
+The [closeout review](docs/review/AGENT_CONTROL_PLANE_v1.0_FINAL_IMPLEMENTATION_CLOSEOUT_REVIEW.md)
+is vendored evidence of what remains wrong; it is not hidden history and it is not a
+passing acceptance record.
 
-Hermes stays a free-form assistant. The control plane activates only for real project
-execution, and from that point it owns official run state, session and role binding,
-global resource claims, verification, mandatory blind review, the trusted GitHub gate and
-merge, continuity, the doctor, and decision-grade telemetry.
+## The authority boundary
 
-```
-User ──┬─ Buzz
-       └─ Telegram
-             ↓ authenticated ingress
-        Hermes (CEO endpoint)
-             ↓ MCP
-┌──────────── agentcpd ────────────┐
-│ run / contract                   │
-│ session registry + role binding  │
-│ provider capacity monitor        │
-│ role continuity kernel           │
-│ task graph / resource receipts   │
-│ verification engine (sandboxed)  │
-│ mandatory blind review gate      │
-│ GitHub integration kernel        │
-│ doctor + watchdog                │
-│ outbox + audit + telemetry       │
-└──────────────────────────────────┘
-             ↓ Buzz dispatch
-     Primary CTO sessions → workers
-```
+The intended model is one local authority: `agentcpd` owns authoritative state changes,
+production-gate publication, and programmatic merge. Tools and model sessions supply
+requests and evidence; they must not decide that work is complete on their own.
 
-## The eight hard invariants, and where each one lives
+That is the contract, not a claim that every current surface meets it. In particular, the
+direct `agentctl` composition root is an open authority-boundary blocker; do not use direct
+CLI mutations as a production control path. See [the tracked issue](https://github.com/MongLong0214/agent-control-plane/issues/393).
 
-| Invariant | Enforced by |
+## Hard invariants
+
+These are the product, not optional policies. Their normative text is in PRD §4.
+
+| Invariant | What must remain true |
 |---|---|
-| CP-HI-01 managed write | `src/guard/managed-write-guard.ts` — inspects operation + resolved path, never the caller's label |
-| CP-HI-02 single authority | only `agentcpd` transitions a run to COMPLETED or publishes a gate |
-| CP-HI-03 contract pinning | `runs.pinned_manifest_digest`, compared before verification |
-| CP-HI-04 reviewer independence | `bindings.producerSessions()`, checked at bind time and again at packet time |
-| CP-HI-05 trusted credential | `src/github/credential-store.ts` — `withToken` never returns the value |
-| CP-HI-06 exact evidence | `candidateSnapshotDigest` on every verification and review row, enforced by a `CHECK` |
-| CP-HI-07 owner authority | human-gate items require a recorded owner decision |
-| CP-HI-08 no silent degradation | every gate returns a stable reason code; absent evidence is a distinct non-passing status |
+| CP-HI-01 — Managed Write Guard | A project-affecting write needs a valid managed-run identity; a caller's label is not authority. |
+| CP-HI-02 — Single Runtime Authority | Project actors cannot independently complete a run, publish an authoritative gate, or merge. |
+| CP-HI-03 — Candidate Contract Pinning | Verification is bound to the approved contract digest and frozen candidate, not a mutable replacement. |
+| CP-HI-04 — Independent Quality Role | A blind reviewer cannot be a producer for the same run, and the final CEO role is separate. |
+| CP-HI-05 — Trusted GitHub Credential | Only the daemon may access the credential for the production gate and programmatic merge. |
+| CP-HI-06 — Exact Evidence | Verification, review, gate, and merge evidence bind the same exact candidate snapshot; changed source stales it. |
+| CP-HI-07 — Non-delegable Human Role | Provider failover does not invent owner authority. |
+| CP-HI-08 — No Silent Degradation | Missing, stale, incomplete, failed, or unisolated evidence must not appear as PASS. |
 
-Uniqueness and monotonicity that a race could defeat live in SQLite partial indexes and
-triggers, not in application code — see [ADR-0002](docs/adr/ADR-0002-invariants-as-types-and-constraints.md).
+## Local development and inspection
 
-## Layout
-
-```
-src/
-  core/         digests, ids, clock, stable reason codes
-  db/           schema, transactions, artifacts, audit
-  domain/       vocabulary and the run state machine
-  guard/        managed write guard
-  contracts/    portable project manifest, verification command
-  snapshot/     candidate snapshot: freeze, digest, staleness
-  verify/       seatbelt sandbox, worktrees, verification engine
-  review/       mandatory independent blind review
-  ceo/          production-ready packet, CEO decision, escalation
-  run/          run engine, task graph, candidate pipeline
-  claims/       global resource claim registry
-  registry/     project and repository registries
-  session/      session registry and role binding
-  capacity/     provider capacity monitor
-  continuity/   role coverage plan and failover
-  cto/          CTO lifecycle: create, drain, handoff, recovery
-  github/       branch contract, trusted kernel, credential store
-  doctor/       doctor, watchdog, repair
-  bootstrap/    Repo Factory contract surface
-  ingress/      ingress guard, Telegram
-  buzz/         Buzz transport and actor→binding resolution
-  mcp/          Hermes and CTO MCP surfaces
-  cli/          agentctl
-  daemon/       agentcpd, single-instance lock, reconciliation
-```
-
-## Running it
+This is a development workflow, not a production-install recipe. The required Node version
+is declared in [package metadata](package.json).
 
 ```bash
 pnpm install
-pnpm rebuild better-sqlite3     # native binding
-pnpm typecheck
-pnpm test                       # runs the full Vitest suite, including the documented CP scenarios
-pnpm trace                      # regenerates evidence/traceability.{json,md}
+pnpm rebuild better-sqlite3
+pnpm build
+pnpm test
+pnpm trace
+node scripts/ssot-report.mjs
 ```
 
-Register an existing project by hand — no Repo Factory needed:
+After a build, inspect the CLI surface and the daemon lock without invoking a project
+mutation:
 
 ```bash
-agentctl project register my-project /abs/path/to/checkout
-agentctl capacity set claude '{"buckets":[{"id":"rolling-5h","remainingPercent":80,"capabilities":["cto","blind-review","ceo","worker"]}]}'
-agentctl doctor
+node dist/cli/agentctl.js help
+node dist/cli/agentctl.js daemon status
 ```
 
-Declare who the owner is. Owner-only decisions — a human gate, a project suspension, a
-destructive repair — are refused unless they come from an identity listed here, one
-`channel:actor` per line:
+For a disposable local experiment, set a fresh local MCP token and start the daemon in the
+foreground:
 
 ```bash
-printf 'cli:%s\ntelegram:123456789\n' "$USER" > ~/.agent-control-plane/owner-identities
+export ACP_MCP_TOKEN="$(openssl rand -hex 32)"
+node dist/daemon/agentcpd.js
 ```
 
-An absent or empty file means this deployment has no owner, so no human gate can be
-satisfied. That is deliberate: §21 makes the owner the one authority the runtime may not
-synthesise for itself.
+The daemon's default state root is local to the user's home directory. Its required owner,
+provider, Buzz, and ingress configuration is deliberately not guessed. Read
+[operations](docs/OPERATIONS.md) before configuring any of it.
 
 Run the daemon under `launchd` with the rendered installer described in
-[`deploy/README.md`](deploy/README.md); do not load the checked-in plist template directly.
+[`deploy/README.md`](deploy/README.md). Do **not** load the checked-in plist template
+directly — it carries unresolved deployment values — and note that a real launchd
+installation and reboot have not yet been accepted; that work is tracked in
+[the deployment issue](https://github.com/MongLong0214/agent-control-plane/issues/400).
 
-## Verification isolation
+## Current limits and evidence
 
-Candidate commands run in a disposable git worktree, under a macOS seatbelt profile that
-denies network when the contract says `deny` and confines writes to the worktree and a
-scratch root. The environment is constructed, not inherited: `HOME` and `TMPDIR` point
-into the scratch directory so a tool's normal credential lookup finds nothing. If the
-confinement mechanism is unavailable the command is **not run** — the result is `ERROR`
-with `SANDBOX_NETWORK_DENIED`, never a pass. See
-[ADR-0004](docs/adr/ADR-0004-verification-sandbox-isolation.md).
+The repository does not claim live acceptance for any path that has not been observed. In
+particular, it does not claim a real GitHub App gate publication, a live Buzz or Telegram
+round trip, a launchd installation, or the PRD observation window. The links, blockers, and
+milestones are maintained in [current status](docs/STATUS.md).
 
-**A consequence worth planning for:** a fresh worktree contains only committed files, so
-it has no `node_modules`, no `.venv`, no build cache — and with `network: "deny"` it cannot
-fetch them. A project therefore needs one of:
+`pnpm trace` writes [traceability evidence](evidence/traceability.md) from the PRD and a
+fresh Vitest JSON result set. Its value is declaration coverage: a labelled executable leaf
+appeared with status `passed`. Behavioural coverage and production-entry-point coverage are
+not measured, so this report is not proof that a requirement is met in the running system.
+`node scripts/ssot-report.mjs` reconciles the tracked review findings and declared work items
+with GitHub issues; it does not certify the semantic correctness of a code change.
 
-- a verification command that needs no installed dependencies (this repo's
-  `scripts/verify-reason-codes.mjs` is one — it checks the reason-code contract with
-  nothing but Node),
-- an install step declared as its own command with `network: "allowlist"` ahead of the
-  build in the profile's command order, or
-- `evidenceMode: "TRUSTED_CI"`, letting CI do the dependency-heavy work and having the
-  control plane accept the result only at the exact candidate head from an approved
-  workflow digest.
+## Public-repository posture
 
-## Persistence
+This repository has no published license grant. Public visibility must not be read as
+permission to reuse, redistribute, or deploy it; ask the repository owner for terms. This
+checkout intentionally includes neither a `LICENSE` nor a `CHANGELOG`; acceptance and status
+history are maintained in [the ledger](docs/ACCEPTANCE.md) and [current status](docs/STATUS.md).
 
-21 tables: the eleven PRD §30.1 names plus ten additions, each justified inline in
-[`src/db/schema.sql`](src/db/schema.sql) by the independent lifecycle, integrity constraint
-or query it exists for — §40 requires exactly that justification. `tasks` and
-`task_dependencies` are separate from `task_executions` because a task node outlives its
-attempts and the DAG is queried in both directions; `verification_results` exists because
-the completeness gate *counts* rows and a JSON blob cannot be counted or uniquely
-constrained; `handoffs` is project-scoped and a replacement happens precisely when the run
-count is zero, so it cannot live in `run_artifacts`.
-
-Event sourcing, an audit hash chain, a generic policy DSL, distributed consensus and a
-cloud database are all deliberately absent (§30.4).
-
-## Provider capacity
-
-Neither shipped CLI exposes a quota interface, so the adapters read a structured local
-capacity file and fail closed when it is absent or stale. There is no `UNKNOWN` route.
-See [docs/capacity-source.md](docs/capacity-source.md).
-
-## Known boundaries
-
-- **Production gate publishing needs a GitHub App.** GitHub does not permit personal
-  access tokens to create check runs, so `acp-production-gate` requires an App
-  installation with `checks:write`. The kernel's predicate logic is verified against a
-  modelled GitHub API, including that a same-named check from any other creator is
-  refused.
-- **Buzz delivery is unverified live.** The transport is implemented over the `buzz` CLI
-  but `BUZZ_PRIVATE_KEY` is not configured in this environment, so delivery has only been
-  exercised through the in-memory transport.
-- Strong isolation for untrusted repositories, a web dashboard, REST/GraphQL and
-  automatic Level 6 routing promotion are backlog (PRD §43).
-
-## Where the remaining work lives
-
-The GitHub issue tracker is the single source of truth. Every finding from both independent
-review rounds, every PRD §42 acceptance item that a build cannot satisfy, every deployment
-prerequisite and every deliberate trade-off is an issue, labelled by severity, round and
-area. `node scripts/ssot-report.mjs` reconciles the tracker against `evidence/review/`,
-`evidence/review-round1/` and the declared work items, and exits non-zero if anything is
-missing. See [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) for the query table and the current
-verdict.
-
-## Documents
-
-- [Ticket DAG](docs/tickets/tickets.json) — 44 atomic tickets across 7 milestones
-- [ADRs](docs/adr/) — the eight decisions that shape the implementation
-- [Traceability](evidence/traceability.md) — requirement → scenario → executable test
+There is no production support or uptime commitment. See [security reporting guidance](docs/SECURITY.md)
+and [contribution guidance](docs/CONTRIBUTING.md). The architecture decisions live in
+[the ADRs](docs/adr/), while acceptance history lives in [the ledger](docs/ACCEPTANCE.md).

@@ -35,7 +35,7 @@ of that commit (`git archive HEAD`), because the working tree is being edited co
 npx vitest run --reporter=dot     423 passed | 12 failed | 1 skipped  (436, 7 of 26 files failing)
 npx tsc --noEmit                  clean
 npx eslint .                      clean
-npx tsx src/tools/traceability.ts 22/22 requirements, 0 gaps; 59/59 scenarios mapped
+npx tsx src/tools/traceability.ts declaration-coverage report; behavioural coverage is not measured
 node scripts/ssot-report.mjs      252 findings, 47 open, 205 closed, 0 missing
 ```
 
@@ -51,7 +51,7 @@ these 12 failures arrived with them.
 
 | # | Definition of Done | Status | Evidence / what is missing |
 |---|---|---|---|
-| 1 | CP-S01–CP-S59 all PASS | **Met in part — regressed mid-change** | All 59 scenario ids map to an executable test (`npx tsx src/tools/traceability.ts`: 59/59, 0 missing; `evidence/traceability.md`). Two of those tests are failing at `9bbbae6`: **CP-S54** and **CP-S55**. Mapping is not passing, and passing is not review clearance — see the review status below. |
+| 1 | CP-S01–CP-S59 all PASS | **Met in part — regressed mid-change** | The generated traceability report records declaration coverage for the scenario ids; it does not measure behavioural or production-entry-point coverage. Two of the scenario tests were failing at `9bbbae6`: **CP-S54** and **CP-S55**. Mapping is not passing, and passing is not review clearance — see the review status below. |
 | 2 | DB constraint and transactional failover tests PASS | **Met** | `tests/unit/trusted-core.test.ts` trips each §30.2 constraint; `switchTo` activate/revoke/outbox-fence runs in one transaction and is asserted in CP-S10 and CP-S23. Both files pass in the run above. |
 | 3 | One real end-to-end run in each of SIMPLE, STANDARD, GUARDED | **Not met — component-integration evidence only** | Three opt-in component-integration runs cover one mode each, but they directly construct `ControlPlane` and bypass deployed Hermes/CTO MCP transports, Buzz, the daemon-managed worker runtime, GitHub App merge, and post-merge verification. The historical records retain their `e2e-real-project` filenames: STANDARD 139 s, SIMPLE 146 s, GUARDED 129 s. They are not deployment-E2E evidence. |
 | 4 | One multi-repository run with an explicit merge order | **Met in part** | Multi-repository freezing and staleness are proven with two real repositories (CP-S25), `run_repositories.merge_order` and per-repository merge state are implemented, and merge order is enforced with a regression test. A real two-repository run merging in declared order, with the first repository's post-merge verification gating the second, has not been executed — #240. |
@@ -60,7 +60,7 @@ these 12 failures arrived with them.
 | 7 | Scenario suite + ≥3 dogfood projects + ≥30 observed run/bootstrap lifecycles with zero false completions, duplicate dispatches, accepted stale-generation results, forged gates or unauthorised merges | **Not met — requires an observation period** | The mechanisms each have a negative test proving the zero is enforced rather than hoped for. The *count* needs real operating time across three projects. Three lifecycles exist so far, the three runs of item 3. Tracked as #241. |
 | 8 | Recorded observation window and duration for the zero counts | **Not met** | Follows item 7. #241. |
 | 9 | Zero owner interrupts for routine technical revision during dogfood | **Not met** | Follows item 7. #241. CP-S33 and CP-S53 prove routine revision and churn do not notify upward, and both pass. |
-| 10 | Every P0 requirement linked to a scenario and evidence | **Met** | 22/22 requirements covered, 0 gaps, generated from the PRD tables rather than hand-maintained. |
+| 10 | Every P0 requirement linked to a scenario and evidence | **Met** | The generated report links P0 requirements to scenario declarations from the PRD tables. This is declaration traceability, not behavioural proof that a requirement is met. |
 
 ## What the three real component-integration runs produced
 
