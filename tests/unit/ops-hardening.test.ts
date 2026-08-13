@@ -3,11 +3,14 @@ import { symlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { isAcpError, allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ArtifactStore } from "../../src/db/artifacts.ts";
 import { Db } from "../../src/db/database.ts";
+import { REPAIR_OWNER_APPROVAL_OPERATION } from "../../src/doctor/repair.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
+import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
 import {
   createCtoMcpPort,
@@ -232,11 +235,38 @@ describe("a destructive repair needs a real owner (§25.7)", () => {
     const harness = makeHarness();
     await registerFixtureProject(harness);
     await harness.cp.worktrees.create(harness.repoPath, "HEAD", "owner-approved-orphan");
+    const approval = {
+      runId: null,
+      operation: REPAIR_OWNER_APPROVAL_OPERATION,
+      parameters: { operationId: "prune_orphan_worktrees", parameters: {}, dryRun: true },
+      idempotencyKey: "repair-test-owner",
+      approved: true,
+    };
+    const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+      cli: { allowedActors: [TEST_OWNER.actor] },
+    });
+    const admitted = guard.admitOwnerApproval({
+      channel: TEST_OWNER.channel,
+      actor: TEST_OWNER.actor,
+      nonce: `repair:${digestOf(approval)}`,
+      payload: ownerApprovalPayload(approval),
+    }, approval);
+    expect(admitted.allowed).toBe(true);
+    if (!admitted.allowed) return;
+    const mismatched = await harness.cp.repair.execute({
+      operationId: "prune_orphan_worktrees",
+      parameters: { unexpected: "parameter" },
+      authorizedBy: "OWNER",
+      ownerApproval: admitted.value,
+      dryRun: true,
+    });
+    expect(mismatched.allowed).toBe(false);
+    expect(mismatched.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
     const allowed = await harness.cp.repair.execute({
       operationId: "prune_orphan_worktrees",
       parameters: {},
       authorizedBy: "OWNER",
-      owner: TEST_OWNER,
+      ownerApproval: admitted.value,
       dryRun: true,
     });
     expect(allowed.allowed).toBe(true);

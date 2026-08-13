@@ -3,7 +3,7 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
-import type { OwnerAuthorityPort } from "../ceo/owner-authority.ts";
+import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
@@ -13,6 +13,9 @@ import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { WorktreeManager } from "../verify/worktree.ts";
 
 export type RepairAuthorization = "HERMES" | "OWNER";
+
+/** The exact admitted ingress operation used for owner-authorised repair. */
+export const REPAIR_OWNER_APPROVAL_OPERATION = "repair_execute";
 
 /** PRD §25.7 — the operation contract every repair must satisfy. */
 export interface RepairOperation {
@@ -29,14 +32,41 @@ export interface RepairRequest {
   operationId: string;
   parameters: Record<string, string>;
   authorizedBy: RepairAuthorization;
-  /**
-   * Required whenever `authorizedBy` is OWNER: the identity that authorised it. An enum
-   * a caller sets is a claim, not an authorisation (§25.7, CP-HI-07).
-   */
+  /** Required whenever an OWNER operation is requested: an admitted ingress receipt. */
+  ownerApproval?: OwnerApprovalReceipt | null;
+  /** @deprecated Identity tuples are never authority; use `ownerApproval`. */
   owner?: { channel: string; actor: string } | null;
   runId?: string | null;
   dryRun: boolean;
 }
+
+const assertRepairApproval = (
+  request: RepairRequest,
+  receipt: OwnerApprovalReceipt,
+): Decision<void> => {
+  const expectedParameters = {
+    operationId: request.operationId,
+    parameters: request.parameters,
+    dryRun: request.dryRun,
+  };
+  if (
+    receipt.runId !== (request.runId ?? null) ||
+    receipt.operation !== REPAIR_OWNER_APPROVAL_OPERATION ||
+    receipt.parameterDigest !== digestOf(expectedParameters) ||
+    receipt.approved !== true
+  ) {
+    return deny(
+      ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+      "owner repair receipt does not bind this exact repair operation",
+      {
+        operationId: request.operationId,
+        receiptOperation: receipt.operation,
+        receiptRunId: receipt.runId,
+      },
+    );
+  }
+  return allow(ReasonCode.OK, undefined);
+};
 
 export interface RepairReceipt {
   operationId: string;
@@ -135,24 +165,32 @@ export class RepairService {
       });
     }
     if (operation.authorization === "OWNER") {
-      const authorised =
-        request.authorizedBy === "OWNER" &&
-        request.owner &&
-        this.#ownerAuthority?.isAllowedActor(request.owner.channel, request.owner.actor) === true;
-      if (!authorised) {
+      if (request.authorizedBy !== "OWNER" || !request.ownerApproval) {
         return deny(
           ReasonCode.REPAIR_REQUIRES_OWNER,
           this.#ownerAuthority
-            ? "this repair can destroy work and requires an allowlisted owner identity"
+            ? "this repair can destroy work and requires an admitted owner ingress receipt"
             : "no owner authority is configured, so an owner-authorised repair is impossible",
           {
             operationId: operation.id,
             risk: operation.risk,
             authorizedBy: request.authorizedBy,
-            actor: request.owner?.actor ?? null,
+            actor: request.ownerApproval?.actor ?? request.owner?.actor ?? null,
           },
         );
       }
+
+      const exactApproval = assertRepairApproval(request, request.ownerApproval);
+      if (!exactApproval.allowed) return exactApproval;
+      const admitted = this.#ownerAuthority?.assertApproval(request.ownerApproval);
+      if (!admitted) {
+        return deny(
+          ReasonCode.REPAIR_REQUIRES_OWNER,
+          "no owner authority is configured, so an owner-authorised repair is impossible",
+          { operationId: operation.id },
+        );
+      }
+      if (!admitted.allowed) return admitted as Decision<RepairReceipt>;
     }
 
     const plan = await this.plan(operation, request);

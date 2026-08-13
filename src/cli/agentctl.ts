@@ -1,22 +1,19 @@
 #!/usr/bin/env node
-import { mkdirSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { createConnection } from "node:net";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { defaultConfig } from "../app/control-plane.ts";
 import { digestOf } from "../core/digest.ts";
-import { IngressGuard, ownerApprovalPayload } from "../ingress/ingress-guard.ts";
-import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
-import { isAcpError } from "../core/errors.ts";
+import { type Decision, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { RunState } from "../domain/types.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
 
 /**
- * PRD §28.4 — the minimal operator CLI.
- *
- * Read paths open the same database the daemon uses; write paths are limited to the
- * operations §28.4 names, and repair still goes through the authorised repair contract
- * rather than touching state directly.
+ * PRD §28.4 — the operator CLI is a client, never a composition root. Every command other
+ * than the lock-only status inspection crosses the authenticated daemon socket.
  */
 const USAGE = `agentctl — Agent Control Plane operator CLI
 
@@ -36,8 +33,45 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl capacity show                  current provider capacity and admission
   agentctl project register <name> <path> register a project and its primary repository
   agentctl project list                   list projects with derived activity
-  agentctl daemon status                  daemon lock and health
+  agentctl daemon status                  daemon lock (read-only local inspection)
 `;
+
+export interface OperatorClientOptions {
+  socketPath: string;
+  token?: string;
+  timeoutMs?: number;
+}
+
+export interface OperatorClient {
+  request(
+    method: string,
+    params?: Record<string, unknown>,
+    idempotencyKey?: string,
+  ): Promise<Decision<unknown>>;
+}
+
+const OPERATOR_MUTATION_METHOD_NAMES = new Set([
+  "run.cancel",
+  "outbox.retry",
+  "owner.approve",
+  "repair.dry-run",
+  "repair.execute",
+  "capacity.set",
+  "project.register",
+]);
+
+/** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
+export const createOperatorClient = (options: OperatorClientOptions): OperatorClient => ({
+  request: (method, params = {}, idempotencyKey) =>
+    exchangeOperatorRequest(options, {
+      requestId: randomUUID(),
+      method,
+      params,
+      ...(idempotencyKey || OPERATOR_MUTATION_METHOD_NAMES.has(method)
+        ? { idempotencyKey: idempotencyKey ?? `operator:${digestOf({ method, params })}` }
+        : {}),
+    }),
+});
 
 export const main = async (argv: string[]): Promise<number> => {
   const [command, ...rest] = argv;
@@ -48,231 +82,216 @@ export const main = async (argv: string[]): Promise<number> => {
 
   const config = defaultConfig();
   const owner = rest.includes("--owner");
-  const args = rest.filter((a) => a !== "--owner");
+  const args = rest.filter((arg) => arg !== "--owner");
 
+  // This is deliberately the one offline inspection: it reads lock metadata only and never
+  // opens SQLite. All state and every mutation use the operator socket below.
   if (command === "daemon" && args[0] === "status") {
     const lock = new SingleInstanceLock(join(config.databasePath, "..", "agentcpd.lock"));
     print({ lock: lock.read(), databasePath: config.databasePath });
     return 0;
   }
 
-  const cp = new ControlPlane(config);
-  try {
-    return await dispatch(cp, command, args, owner);
-  } finally {
-    cp.close();
-  }
+  const client = createOperatorClient({
+    socketPath:
+      process.env["ACP_OPERATOR_SOCKET"] ?? join(config.databasePath, "..", "agentcpd.operator.sock"),
+    token: process.env["ACP_OPERATOR_TOKEN"],
+  });
+  return dispatch(client, command, args, owner);
 };
 
 export const dispatch = async (
-  cp: ControlPlane,
+  client: OperatorClient,
   command: string,
   args: string[],
   owner: boolean,
 ): Promise<number> => {
-  const handlers: Record<string, () => Promise<number>> = {
-    doctor: async () => {
-      const scope = (args[0] ?? "system") as Parameters<typeof cp.doctor.run>[0];
-      print(await cp.doctor.run(scope, args[1]));
-      return 0;
-    },
-
-    run: async () => {
-      const [sub, ...params] = args;
-      if (sub === "show") {
-        const runId = required(params[0], "runId");
-        const run = cp.runs.get(runId);
-        if (!run) return fail(`unknown run ${runId}`);
-        print({
-          run,
-          tasks: cp.tasks.list(runId),
-          executions: cp.tasks.executions(runId),
-          evidence: cp.ceo.evidence(runId),
-          claims: cp.claims.heldByRun(runId),
-          humanGate: cp.ceo.humanGateStatus(runId),
-          outbox: cp.outbox.listByRun(runId).map((m) => ({
-            kind: m.kind,
-            status: m.status,
-            bindingGeneration: m.bindingGeneration,
-          })),
-        });
-        return 0;
-      }
-      if (sub === "list") {
-        const state = params[0] as RunState | undefined;
-        print(cp.runs.list(state ? { state } : {}));
-        return 0;
-      }
-      if (sub === "cancel") {
-        const decision = cp.runs.cancel(required(params[0], "runId"), params.slice(1).join(" ") || "operator cancel");
-        print(decision);
-        return decision.allowed ? 0 : 1;
-      }
-      return fail(`unknown run subcommand: ${sub ?? ""}`);
-    },
-
-    continuity: async () => {
-      print({
-        mode: cp.continuity.mode(),
-        plan: cp.continuity.computeCoveragePlan(),
-        capacity: cp.capacity.all(),
-      });
-      return 0;
-    },
-
-    outbox: async () => {
-      if (args[0] !== "retry") return fail(`unknown outbox subcommand: ${args[0] ?? ""}`);
-      const decision = await cp.repair.execute({
-        operationId: "retry_outbox",
-        parameters: {},
-        authorizedBy: "HERMES",
-        dryRun: false,
-      });
-      print(decision);
-      return decision.allowed ? 0 : 1;
-    },
-
-    owner: async () => {
-      if (args[0] !== "approve") return fail(`unknown owner subcommand: ${args[0] ?? ""}`);
-      // The local operator acts on the "cli" channel; the actor is their OS user, which
-      // the deployment must have allowlisted as an owner identity (§21).
-      const actor = process.env["ACP_OWNER_ACTOR"] ?? process.env["USER"] ?? "";
-      const runId = required(args[1], "runId");
-      const item = required(args[2], "item");
-      const note = args.slice(3).join(" ");
-      // §21 stopped accepting an identity as authority (#102), so this command has to *be* the
-      // ingress it claims to be: it admits the approval through the guard, which checks the
-      // channel policy, the nonce and that the payload binds this exact operation, and then
-      // hands the gate the receipt that admission produced. Passing a `{channel, actor}` tuple
-      // is refused, which left the shipped operator command unable to satisfy a human gate at
-      // all (#372).
-      const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { cli: { allowedActors: [actor] } });
-      const approval = {
-        runId,
-        operation: "owner_decision_submit",
-        parameters: { item, approved: true, note },
-        idempotencyKey: `owner-decision:${digestOf({ runId, item, note, actor })}`,
-        approved: true,
-      };
-      const admitted = guard.admitOwnerApproval(
-        {
-          channel: "cli",
-          actor,
-          nonce: `owner-decision:${digestOf(approval)}`,
-          payload: ownerApprovalPayload(approval),
-        },
-        approval,
-      );
-      if (!admitted.allowed) {
-        print(admitted);
-        return 1;
-      }
-      const decision = cp.ceo.recordOwnerDecision({
-        runId,
-        item,
-        approved: true,
-        note,
-        receipt: admitted.value,
-      });
-      print(decision);
-      return decision.allowed ? 0 : 1;
-    },
-
-    github: async () => {
-      const [sub, ...params] = args;
-      if (sub === "merge" || sub === "post-merge") {
-        // `agentctl` is deliberately not a second control-plane/finalizer process (#393).
-        // The daemon resumes every CEO-approved run under its single-instance lock; exposing
-        // the coordinator here would let a CLI invocation bypass that durable ownership.
-        print({
-          allowed: false,
-          reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED,
-          message: "GitHub finalization is daemon-owned; agentcpd will resume an approved run",
-          evidence: { operation: sub, args: params },
-        });
-        return 1;
-      }
-      return fail(`unknown github subcommand: ${sub ?? ""}`);
-    },
-
-    repair: async () => {
-      const [sub, operationId, ...params] = args;
-      if (sub === "list") {
-        print(cp.repair.catalog());
-        return 0;
-      }
-      if (sub !== "dry-run" && sub !== "execute") return fail(`unknown repair subcommand: ${sub ?? ""}`);
-      const parameters: Record<string, string> = {};
-      for (const param of params) {
-        const [k, ...v] = param.split("=");
-        if (k) parameters[k] = v.join("=");
-      }
-      const decision = await cp.repair.execute({
-        operationId: required(operationId, "operation"),
-        parameters,
-        authorizedBy: owner ? "OWNER" : "HERMES",
-        dryRun: sub === "dry-run",
-      });
-      print(decision);
-      return decision.allowed ? 0 : 1;
-    },
-
-    capacity: async () => {
-      if (args[0] === "show") {
-        print({ providers: cp.capacity.all() });
-        return 0;
-      }
-      if (args[0] === "set") {
-        const provider = required(args[1], "provider");
-        const payload = required(args.slice(2).join(" "), "json");
-        mkdirSync(cp.config.capacityDir, { recursive: true });
-        const parsed = JSON.parse(payload) as Record<string, unknown>;
-        // The owner publishes quota, not runtime health: an unstated runtime is probed
-        // by the adapter, never assumed healthy.
-        const body = { observedAt: cp.clock.nowIso(), runtimeHealth: "UNKNOWN", ...parsed };
-        writeFileSync(join(cp.config.capacityDir, `${provider}.json`), JSON.stringify(body, null, 2), {
-          mode: 0o600,
-        });
-        print({ wrote: join(cp.config.capacityDir, `${provider}.json`), body });
-        return 0;
-      }
-      return fail(`unknown capacity subcommand: ${args[0] ?? ""}`);
-    },
-
-    project: async () => {
-      if (args[0] === "list") {
-        print(
-          cp.projects.list().map((p) => ({
-            ...p,
-            repositories: cp.repositories.byProject(p.projectId).map((r) => r.identity),
-          })),
-        );
-        return 0;
-      }
-      if (args[0] === "register") {
-        const name = required(args[1], "name");
-        const path = required(args[2], "checkoutPath");
-        const project = cp.projects.register({ name, projectId: args[3] ?? undefined });
-        if (!project.allowed) {
-          print(project);
-          return 1;
-        }
-        const repository = await cp.repositories.register({
-          checkoutPath: path,
-          projectId: project.value.projectId,
-          repositoryRole: "primary",
-        });
-        print({ project: project.value, repository });
-        return repository.allowed ? 0 : 1;
-      }
-      return fail(`unknown project subcommand: ${args[0] ?? ""}`);
-    },
+  const call = async (
+    method: string,
+    params: Record<string, unknown> = {},
+    idempotencyKey?: string,
+  ): Promise<number> => {
+    const decision = await client.request(method, params, idempotencyKey);
+    print(decision.allowed ? decision.value : decision);
+    return decision.allowed ? 0 : 1;
   };
 
-  const handler = handlers[command];
-  if (!handler) return fail(`unknown command: ${command}`);
-  return handler();
+  if (command === "doctor") {
+    return call("doctor.run", { scope: args[0] ?? "system", target: args[1] ?? null });
+  }
+
+  if (command === "run") {
+    const [sub, ...params] = args;
+    if (sub === "show") return call("run.show", { runId: required(params[0], "runId") });
+    if (sub === "list") return call("run.list", params[0] ? { state: params[0] as RunState } : {});
+    if (sub === "cancel") {
+      return call("run.cancel", {
+        runId: required(params[0], "runId"),
+        reason: params.slice(1).join(" ") || "operator cancel",
+      });
+    }
+    return fail(`unknown run subcommand: ${sub ?? ""}`);
+  }
+
+  if (command === "continuity") {
+    if (args[0] !== "status") return fail(`unknown continuity subcommand: ${args[0] ?? ""}`);
+    return call("continuity.status");
+  }
+
+  if (command === "outbox") {
+    if (args[0] !== "retry") return fail(`unknown outbox subcommand: ${args[0] ?? ""}`);
+    return call("outbox.retry");
+  }
+
+  if (command === "owner") {
+    if (args[0] !== "approve") return fail(`unknown owner subcommand: ${args[0] ?? ""}`);
+    return call("owner.approve", {
+      runId: required(args[1], "runId"),
+      item: required(args[2], "item"),
+      note: args.slice(3).join(" "),
+      approved: true,
+    });
+  }
+
+  if (command === "github") {
+    const [sub, ...params] = args;
+    if (sub === "merge" || sub === "post-merge") {
+      // Finalization is intentionally not an operator method. The daemon resumes the durable
+      // finalizer after CEO confirmation while holding the single-instance lock.
+      print({
+        allowed: false,
+        reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED,
+        message: "GitHub finalization is daemon-owned; agentcpd will resume an approved run",
+        evidence: { operation: sub, args: params },
+      });
+      return 1;
+    }
+    return fail(`unknown github subcommand: ${sub ?? ""}`);
+  }
+
+  if (command === "repair") {
+    const [sub, operationId, ...params] = args;
+    if (sub === "list") return call("repair.list");
+    if (sub !== "dry-run" && sub !== "execute") {
+      return fail(`unknown repair subcommand: ${sub ?? ""}`);
+    }
+    const parameters: Record<string, string> = {};
+    for (const param of params) {
+      const [key, ...value] = param.split("=");
+      if (key) parameters[key] = value.join("=");
+    }
+    return call(`repair.${sub}`, {
+      operationId: required(operationId, "operation"),
+      parameters,
+      owner,
+    });
+  }
+
+  if (command === "capacity") {
+    if (args[0] === "show") return call("capacity.show");
+    if (args[0] === "set") {
+      const provider = required(args[1], "provider");
+      const payload = required(args.slice(2).join(" "), "json");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload) as unknown;
+      } catch {
+        return fail("json must be valid JSON");
+      }
+      return call("capacity.set", { provider, payload: parsed });
+    }
+    return fail(`unknown capacity subcommand: ${args[0] ?? ""}`);
+  }
+
+  if (command === "project") {
+    if (args[0] === "list") return call("project.list");
+    if (args[0] === "register") {
+      return call("project.register", {
+        name: required(args[1], "name"),
+        checkoutPath: required(args[2], "checkoutPath"),
+        projectId: args[3] ?? undefined,
+      });
+    }
+    return fail(`unknown project subcommand: ${args[0] ?? ""}`);
+  }
+
+  if (command === "daemon" && args[0] === "status") return call("daemon.status");
+  return fail(`unknown command: ${command}`);
 };
+
+const exchangeOperatorRequest = (
+  options: OperatorClientOptions,
+  request: { requestId: string; method: string; params: Record<string, unknown>; idempotencyKey?: string },
+): Promise<Decision<unknown>> => {
+  const token = options.token?.trim() ?? "";
+  if (token.length === 0) {
+    return Promise.resolve(
+      deny(
+        ReasonCode.OPERATOR_UNAUTHENTICATED,
+        "agentctl needs the separately provisioned ACP_OPERATOR_TOKEN to reach agentcpd",
+        { socketPath: options.socketPath },
+      ),
+    );
+  }
+
+  return new Promise<Decision<unknown>>((resolveExchange) => {
+    const socket = createConnection(options.socketPath);
+    const timeoutMs = options.timeoutMs ?? 5_000;
+    let received = "";
+    let settled = false;
+    let timeout: NodeJS.Timeout | null = null;
+    const finish = (result: Decision<unknown>): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      socket.end();
+      resolveExchange(result);
+    };
+    const unavailable = (error: unknown): void =>
+      finish(
+        deny(
+          ReasonCode.DAEMON_LOCK_LOST,
+          "agentcpd operator socket is unavailable; no direct database fallback was attempted",
+          { socketPath: options.socketPath, error: error instanceof Error ? error.message : String(error) },
+        ),
+      );
+
+    timeout = setTimeout(() => {
+      socket.destroy();
+      unavailable(new Error("operator request timed out"));
+    }, timeoutMs);
+    timeout.unref();
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify({ token, ...request })}\n`);
+    });
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      const boundary = received.indexOf("\n");
+      if (boundary === -1) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(received.slice(0, boundary)) as unknown;
+      } catch {
+        return finish(deny(ReasonCode.INTERNAL_ERROR, "agentcpd returned invalid operator JSON", {}));
+      }
+      if (!isDecision(parsed)) {
+        return finish(deny(ReasonCode.INTERNAL_ERROR, "agentcpd returned an invalid operator decision", {}));
+      }
+      finish(parsed);
+    });
+    socket.once("error", unavailable);
+    socket.once("close", () => {
+      if (!settled) unavailable(new Error("operator socket closed before a response"));
+    });
+  });
+};
+
+const isDecision = (value: unknown): value is Decision<unknown> =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as { allowed?: unknown }).allowed === "boolean" &&
+  typeof (value as { reasonCode?: unknown }).reasonCode === "string";
 
 const print = (value: unknown): void => {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);

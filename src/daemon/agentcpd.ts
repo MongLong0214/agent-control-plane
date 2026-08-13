@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve } from "node:path";
@@ -22,6 +22,7 @@ import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
+import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
 const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -64,6 +65,35 @@ export interface LocalSessionLaunchChannel {
 export interface LocalBuzzActorIngress {
   socketPath: string;
   close(): Promise<void>;
+}
+
+/** The authenticated local RPC endpoint used by `agentctl`. */
+export interface LocalOperatorListener {
+  socketPath: string;
+  close(): Promise<void>;
+}
+
+/**
+ * A dedicated operator credential is bound to one configured local peer before a socket
+ * accepts a request. The actor is deliberately not read from the request body. The token is
+ * provisioned separately from ACP_MCP_TOKEN; the latter is a deployment gate for MCP and has
+ * no peer identity of its own.
+ */
+export interface LocalOperatorCredential {
+  token: string;
+  peerId: string;
+  actor: string;
+}
+
+export interface LocalOperatorSocketOptions {
+  handshakeTimeoutMs?: number;
+  /** Used only to reject accidental reuse of the non-identifying MCP deployment token. */
+  mcpToken?: string;
+}
+
+interface LiveOperatorBinding extends LocalOperatorCredential {
+  incarnation: string;
+  active: boolean;
 }
 
 interface PendingLaunchCredential {
@@ -276,6 +306,69 @@ export const startBuzzActorIngressListener = async (
   };
 };
 
+/**
+ * The operator surface is deliberately a one-request protocol rather than a general RPC
+ * framework. A dedicated credential is bound to a configured peer and a live listener
+ * incarnation before the daemon applies the per-method lock/authority checks. The MCP token
+ * is never accepted here: it is shared deployment authentication, not operator identity.
+ */
+export const startOperatorSocket = async (
+  daemon: Pick<Daemon, "handleOperatorRequest">,
+  stateDir: string,
+  credential: LocalOperatorCredential,
+  options: LocalOperatorSocketOptions = {},
+): Promise<LocalOperatorListener> => {
+  const token = credential.token.trim();
+  const mcpToken = options.mcpToken?.trim() || process.env["ACP_MCP_TOKEN"]?.trim();
+  if (token.length === 0) {
+    throw new Error(
+      "ACP_OPERATOR_TOKEN is required for the operator socket; ACP_MCP_TOKEN identifies no peer and cannot be reused",
+    );
+  }
+  if (mcpToken && token === mcpToken) {
+    throw new Error(
+      "ACP_OPERATOR_TOKEN must be a dedicated credential distinct from ACP_MCP_TOKEN; the MCP token identifies no peer",
+    );
+  }
+  if (credential.peerId.trim().length === 0 || credential.actor.trim().length === 0) {
+    throw new Error("operator socket requires a server-configured peer id and actor");
+  }
+  const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS;
+  if (!Number.isInteger(handshakeTimeoutMs) || handshakeTimeoutMs <= 0) {
+    throw new Error("operator handshake timeout must be a positive integer");
+  }
+
+  const binding: LiveOperatorBinding = {
+    token,
+    peerId: credential.peerId.trim(),
+    actor: credential.actor.trim(),
+    incarnation: randomUUID(),
+    active: true,
+  };
+  const socketPath = join(stateDir, "agentcpd.operator.sock");
+  removeStaleSocket(socketPath);
+  const server = createServer((socket) => serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs));
+  try {
+    await listenSocket(server, socketPath);
+  } catch (err) {
+    if (existsSync(socketPath)) unlinkSync(socketPath);
+    throw err;
+  }
+
+  return {
+    socketPath,
+    close: async () => {
+      binding.active = false;
+      await closeSocketServer(server);
+      try {
+        if (existsSync(socketPath)) unlinkSync(socketPath);
+      } catch {
+        /* closing the server already releases its socket; this is only cleanup */
+      }
+    },
+  };
+};
+
 const startMcpSocket = async (
   path: string,
   token: string,
@@ -342,6 +435,88 @@ const endWithDecision = <T>(socket: Socket, decision: Decision<T>): void => {
         evidence: decision.evidence,
       };
   socket.end(`${JSON.stringify(body)}\n`);
+};
+
+const serveOperatorRequest = (
+  socket: Socket,
+  daemon: Pick<Daemon, "handleOperatorRequest">,
+  binding: LiveOperatorBinding,
+  handshakeTimeoutMs: number,
+): void => {
+  let buffer = Buffer.alloc(0);
+  let settled = false;
+  let timeout: NodeJS.Timeout | null = null;
+  const finish = (decision: Decision<unknown>): void => {
+    if (settled) return;
+    settled = true;
+    if (timeout) clearTimeout(timeout);
+    socket.removeListener("data", receive);
+    if (!socket.destroyed) socket.end(`${JSON.stringify(decision)}\n`);
+  };
+  const receive = (chunk: Buffer): void => {
+    buffer = Buffer.concat([buffer, chunk]);
+    if (buffer.length > MAX_MCP_LINE_BYTES) {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "operator request exceeds local transport limit"));
+    }
+    const boundary = buffer.indexOf(0x0a);
+    if (boundary === -1) return;
+    if (buffer.subarray(boundary + 1).length > 0) {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "operator socket accepts one request per connection"));
+    }
+
+    let value: unknown;
+    try {
+      value = JSON.parse(buffer.subarray(0, boundary).toString("utf8")) as unknown;
+    } catch {
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "operator request is not JSON"));
+    }
+    const peer = authenticateOperatorPeer(value, binding);
+    if (!peer.allowed) return finish(peer);
+    void daemon.handleOperatorRequest(value, peer.value).then(finish).catch((error: unknown) => {
+      finish(deny(ReasonCode.INTERNAL_ERROR, "operator request failed", {
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    });
+  };
+  socket.on("data", receive);
+  socket.once("error", () => {
+    if (timeout) clearTimeout(timeout);
+    settled = true;
+    socket.removeListener("data", receive);
+  });
+  socket.once("close", () => {
+    if (timeout) clearTimeout(timeout);
+    settled = true;
+    socket.removeListener("data", receive);
+  });
+  timeout = setTimeout(() => {
+    finish(deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator handshake timed out"));
+  }, handshakeTimeoutMs);
+  timeout.unref();
+};
+
+/**
+ * Operator authentication is a credential-to-peer lookup, not a bearer check. The request
+ * can present a token, but it cannot select the peer id, actor, or incarnation returned here.
+ * The daemon lock is checked again for every request, so this binding is live only while the
+ * lock-held daemon that created it remains authoritative.
+ */
+const authenticateOperatorPeer = (
+  value: unknown,
+  binding: LiveOperatorBinding,
+): Decision<AuthenticatedOperatorPeer> => {
+  if (!localMcpTokenMatches(value, binding.token)) {
+    return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator socket authentication failed");
+  }
+  if (!binding.active) {
+    return deny(ReasonCode.OPERATOR_UNAUTHENTICATED, "operator peer binding is no longer live");
+  }
+  return allow(ReasonCode.OK, {
+    channel: "cli",
+    peerId: binding.peerId,
+    actor: binding.actor,
+    incarnation: binding.incarnation,
+  });
 };
 
 /**
@@ -897,9 +1072,24 @@ export const main = async (): Promise<void> => {
       "Buzz transport requires ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS for authenticated actor binding",
     );
   }
-  const cp = new ControlPlane(config);
   const mcpToken = process.env["ACP_MCP_TOKEN"];
   if (!mcpToken) throw new Error("ACP_MCP_TOKEN is required for authenticated local MCP sockets");
+  const operatorToken = process.env["ACP_OPERATOR_TOKEN"]?.trim();
+  if (!operatorToken) {
+    throw new Error(
+      "ACP_OPERATOR_TOKEN is required for the operator socket; ACP_MCP_TOKEN identifies no peer and cannot be reused",
+    );
+  }
+  if (operatorToken === mcpToken.trim()) {
+    throw new Error(
+      "ACP_OPERATOR_TOKEN must be a dedicated credential distinct from ACP_MCP_TOKEN; the MCP token identifies no peer",
+    );
+  }
+  const operatorActor = process.env["ACP_OPERATOR_ACTOR"]?.trim() || process.env["USER"]?.trim() || "";
+  if (!operatorActor) {
+    throw new Error("ACP_OPERATOR_ACTOR or USER is required to establish the operator peer identity");
+  }
+  const cp = new ControlPlane(config);
 
   let sessionLaunch: LocalSessionLaunchChannel;
   try {
@@ -944,12 +1134,24 @@ export const main = async (): Promise<void> => {
 
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
+  let operator: LocalOperatorListener | null = null;
   try {
     listeners = await startDaemonMcpListeners(cp, stateDir, mcpToken, daemon);
+    operator = await startOperatorSocket(
+      daemon,
+      stateDir,
+      {
+        token: operatorToken,
+        peerId: `cli:${operatorActor}`,
+        actor: operatorActor,
+      },
+      { mcpToken },
+    );
     if (buzzActorIngressPolicy) {
       buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
     }
   } catch (err) {
+    await operator?.close();
     await listeners?.close();
     await sessionLaunch.close();
     await daemon.stop();
@@ -962,6 +1164,7 @@ export const main = async (): Promise<void> => {
   const shutdown = async (signal: string): Promise<void> => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
     await buzzActorIngress?.close();
+    await operator?.close();
     await listeners?.close();
     await sessionLaunch.close();
     await daemon.stop();

@@ -15,7 +15,7 @@ Usage:
   deploy/install-launchd.sh rollback --database-backup PATH
 
 The job always uses $HOME/.agent-control-plane because that is agentcpd's configured
-state root. Secrets never go in the plist: store ACP_MCP_TOKEN (required) and optional
+state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required) and optional
 Buzz variables as generic-password Keychain items under the selected service.
 EOF
 }
@@ -173,7 +173,8 @@ optional_keychain_value() {
 }
 
 export ACP_MCP_TOKEN="$(required_keychain_value ACP_MCP_TOKEN)"
-for optional in BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_BUZZ_ALLOWED_ACTORS BUZZ_RELAY_URL ACP_BUZZ_BINARY ACP_BUZZ_CHANNEL; do
+export ACP_OPERATOR_TOKEN="$(required_keychain_value ACP_OPERATOR_TOKEN)"
+for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_BUZZ_ALLOWED_ACTORS BUZZ_RELAY_URL ACP_BUZZ_BINARY ACP_BUZZ_CHANNEL; do
   optional_keychain_value "$optional"
 done
 
@@ -228,6 +229,7 @@ case "$command_name" in
     private_directory "$state_dir"
     private_directory "$deploy_backups_dir"
     keychain_required ACP_MCP_TOKEN
+    keychain_required ACP_OPERATOR_TOKEN
     snapshot_current_deployment
     stop_job
     wait_for_stop

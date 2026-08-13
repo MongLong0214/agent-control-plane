@@ -8,13 +8,21 @@ pnpm build
 deploy/install-launchd.sh install --app-root "$(pwd)" --node "$(command -v node)"
 ```
 
-Before installation, put the required MCP token in the logged-in user's Keychain. The value
-is fetched only by the owner-only launcher immediately before it starts `agentcpd`; it is not
-stored in the plist or inherited by agent sessions.
+Before installation, put both required, distinct credentials in the logged-in user's Keychain.
+`ACP_MCP_TOKEN` authenticates MCP deployment sockets but identifies no peer; `ACP_OPERATOR_TOKEN`
+is the separately provisioned credential for `agentctl` and must never be the same value. Both are
+fetched only by the owner-only launcher immediately before it starts `agentcpd`; neither is stored
+in the plist or inherited by agent sessions.
 
 ```bash
 security add-generic-password -U -s com.agentcontrolplane.agentcpd -a ACP_MCP_TOKEN -w
+security add-generic-password -U -s com.agentcontrolplane.agentcpd -a ACP_OPERATOR_TOKEN -w
 ```
+
+The daemon binds the operator credential to its configured local CLI peer. Set
+`ACP_OPERATOR_ACTOR` in the daemon environment when the host's `USER` is not the actor declared
+in `~/.agent-control-plane/owner-identities`; the CLI cannot supply or override this identity in
+an operator request.
 
 Optional Buzz configuration uses the same Keychain service and these account names:
 `BUZZ_PRIVATE_KEY`, `ACP_BUZZ_INGRESS_SECRET`, `ACP_BUZZ_ALLOWED_ACTORS`, `BUZZ_RELAY_URL`,

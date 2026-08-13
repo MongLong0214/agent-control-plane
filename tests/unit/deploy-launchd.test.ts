@@ -26,6 +26,7 @@ interface InstallerHarness {
   bin: string;
   launchLog: string;
   securityLog: string;
+  launcherEnvLog: string;
   stateAdminLog: string;
   loaded: string;
   lock: string;
@@ -52,6 +53,7 @@ const makeHarness = (): InstallerHarness => {
 
   const launchLog = join(home, "launchctl.log");
   const securityLog = join(home, "security.log");
+  const launcherEnvLog = join(home, "launcher-env.log");
   const stateAdminLog = join(home, "state-admin.log");
   const loaded = join(home, "launchd.loaded");
   const lock = join(home, ".agent-control-plane", "agentcpd.lock");
@@ -91,7 +93,11 @@ esac
 set -euo pipefail
 printf '%s\\n' "$*" >> "$ACP_SECURITY_LOG"
 [[ "\${1:-}" == "find-generic-password" ]] || exit 64
-printf 'fake-keychain-value\\n'
+case "$*" in
+  *" -a ACP_MCP_TOKEN") printf 'mcp-provisioned-token\\n' ;;
+  *" -a ACP_OPERATOR_TOKEN") printf 'operator-provisioned-token\\n' ;;
+  *) printf 'fake-keychain-value\\n' ;;
+esac
 `,
   );
   writeExecutable(
@@ -110,6 +116,10 @@ if [[ "$target" == *"render-launchd-plist.mjs" ]]; then
   fi
   exec "$ACP_REAL_NODE" "$@"
 fi
+if [[ "$target" == *"agentcpd.js" ]]; then
+  printf '%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" >> "$ACP_LAUNCHER_ENV_LOG"
+  exit 0
+fi
 exit 90
 `,
   );
@@ -119,6 +129,7 @@ exit 90
     bin,
     launchLog,
     securityLog,
+    launcherEnvLog,
     stateAdminLog,
     loaded,
     lock,
@@ -129,6 +140,7 @@ exit 90
       PATH: `${bin}:${process.env["PATH"] ?? "/usr/bin:/bin"}`,
       ACP_LAUNCHCTL_LOG: launchLog,
       ACP_SECURITY_LOG: securityLog,
+      ACP_LAUNCHER_ENV_LOG: launcherEnvLog,
       ACP_STATE_ADMIN_LOG: stateAdminLog,
       ACP_LAUNCHD_LOADED: loaded,
       ACP_LOCK_PATH: lock,
@@ -158,6 +170,9 @@ const subcommands = (log: string): string[] =>
 
 const plistPath = (harness: InstallerHarness): string =>
   join(harness.home, "Library", "LaunchAgents", `${label}.plist`);
+
+const launcherPath = (harness: InstallerHarness): string =>
+  join(harness.home, ".agent-control-plane", "agentcpd-launch.sh");
 
 const assertRenderedPlist = (harness: InstallerHarness): void => {
   const plist = readFileSync(plistPath(harness), "utf8");
@@ -223,6 +238,40 @@ describe("launchd deployment artifact", () => {
     expect(readFileSync(harness.securityLog, "utf8")).toContain(
       "find-generic-password -w -s test-service -a ACP_MCP_TOKEN",
     );
+    expect(readFileSync(harness.securityLog, "utf8")).toContain(
+      "find-generic-password -w -s test-service -a ACP_OPERATOR_TOKEN",
+    );
+  });
+
+  it("executes the rendered launcher with distinct MCP and operator credentials", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(
+      installer,
+      ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+    );
+
+    expect(installed.status).toBe(0);
+    const launcherSecurity = join(harness.home, "launcher-security.bash");
+    writeFileSync(
+      launcherSecurity,
+      `security() { "${join(harness.bin, "security")}" "$@"; }\n`,
+      { mode: 0o600 },
+    );
+
+    const launcherEnv: NodeJS.ProcessEnv = { ...harness.env, BASH_ENV: launcherSecurity };
+    delete launcherEnv["ACP_MCP_TOKEN"];
+    delete launcherEnv["ACP_OPERATOR_TOKEN"];
+    const launched = spawnSync("bash", [launcherPath(harness)], {
+      encoding: "utf8",
+      env: launcherEnv,
+    });
+
+    expect(launched.status).toBe(0);
+    const [mcpToken, operatorToken] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    expect(mcpToken).toBe("mcp-provisioned-token");
+    expect(operatorToken).toBe("operator-provisioned-token");
+    expect(operatorToken).not.toBe(mcpToken);
   });
 
   it("waits for the old daemon lock during upgrade before rendering the replacement", () => {

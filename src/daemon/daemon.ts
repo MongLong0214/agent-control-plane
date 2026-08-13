@@ -4,9 +4,14 @@ import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
 import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-kernel.ts";
+import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
+import type { DoctorScope } from "../doctor/doctor.ts";
+import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
+import { IngressGuard, ownerApprovalPayload } from "../ingress/ingress-guard.ts";
+import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
 import {
   ApprovedRunFinalizer,
@@ -37,6 +42,56 @@ export interface ReconcileReport {
   reclaimedFinalizationAttempts: ReclaimedFinalizationAttempt[];
   resumedFinalizations: string[];
   doctorStatus: string;
+}
+
+/** Methods exposed by the authenticated local operator socket. */
+export const OPERATOR_METHOD = {
+  DOCTOR_RUN: "doctor.run",
+  RUN_SHOW: "run.show",
+  RUN_LIST: "run.list",
+  RUN_CANCEL: "run.cancel",
+  CONTINUITY_STATUS: "continuity.status",
+  OUTBOX_RETRY: "outbox.retry",
+  OWNER_APPROVE: "owner.approve",
+  REPAIR_LIST: "repair.list",
+  REPAIR_DRY_RUN: "repair.dry-run",
+  REPAIR_EXECUTE: "repair.execute",
+  CAPACITY_SHOW: "capacity.show",
+  CAPACITY_SET: "capacity.set",
+  PROJECT_LIST: "project.list",
+  PROJECT_REGISTER: "project.register",
+  DAEMON_STATUS: "daemon.status",
+} as const;
+
+export type OperatorMethod = (typeof OPERATOR_METHOD)[keyof typeof OPERATOR_METHOD];
+
+/** Read requests are never cached: an operator must see fresh daemon state. */
+export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
+  OPERATOR_METHOD.RUN_CANCEL,
+  OPERATOR_METHOD.OUTBOX_RETRY,
+  OPERATOR_METHOD.OWNER_APPROVE,
+  OPERATOR_METHOD.REPAIR_DRY_RUN,
+  OPERATOR_METHOD.REPAIR_EXECUTE,
+  OPERATOR_METHOD.CAPACITY_SET,
+  OPERATOR_METHOD.PROJECT_REGISTER,
+]);
+
+export interface OperatorRequest {
+  requestId: string;
+  method: OperatorMethod;
+  params: Record<string, unknown>;
+  idempotencyKey?: string;
+}
+
+/**
+ * The operator socket derives this identity from its server-side credential binding. It is
+ * intentionally not part of OperatorRequest: an actor in a request body is only a claim.
+ */
+export interface AuthenticatedOperatorPeer {
+  readonly channel: "cli";
+  readonly peerId: string;
+  readonly actor: string;
+  readonly incarnation: string;
 }
 
 /**
@@ -85,6 +140,8 @@ export class Daemon {
   #timerFailures = new Map<string, TimerFailure>();
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
+  readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
+  readonly #operatorResults = new Map<string, { fingerprint: string; result: Decision<unknown> }>();
   readonly #finalizer: ApprovedRunFinalizer;
 
   constructor(
@@ -96,6 +153,372 @@ export class Daemon {
     chmodSync(options.stateDir, 0o700);
     this.lock = new SingleInstanceLock(join(options.stateDir, "agentcpd.lock"));
     this.#finalizer = new ApprovedRunFinalizer(cp, undefined, authorities);
+  }
+
+  /**
+   * The authenticated operator socket's only application entry point. Reads and writes use
+   * the daemon's already-open composition root; a write is refused after the single-instance
+   * lock is lost, so the socket can never become a second runtime authority.
+   */
+  async handleOperatorRequest(
+    input: unknown,
+    peerInput?: AuthenticatedOperatorPeer,
+  ): Promise<Decision<unknown>> {
+    const peer = parseAuthenticatedOperatorPeer(peerInput);
+    if (!peer.allowed) return peer;
+    const parsed = parseOperatorRequest(input);
+    if (!parsed.allowed) return parsed;
+    const request = parsed.value;
+    const fingerprint = digestOf({
+      peerId: peer.value.peerId,
+      incarnation: peer.value.incarnation,
+      method: request.method,
+      params: request.params,
+    });
+    const key = OPERATOR_MUTATION_METHODS.has(request.method) && request.idempotencyKey
+      ? `${peer.value.peerId}:${peer.value.incarnation}:${request.idempotencyKey}`
+      : undefined;
+
+    if (key) {
+      const cached = this.#operatorResults.get(key);
+      if (cached) {
+        return cached.fingerprint === fingerprint
+          ? cached.result
+          : deny(ReasonCode.CONFLICT, "operator idempotency key was reused for different parameters", {
+              idempotencyKey: key,
+              method: request.method,
+            });
+      }
+      const inFlight = this.#operatorInFlight.get(key);
+      if (inFlight) return inFlight;
+
+      const operation = this.executeOperatorRequest(request, peer.value);
+      this.#operatorInFlight.set(key, operation);
+      void operation.then((result) => {
+        this.#operatorInFlight.delete(key);
+        this.rememberOperatorResult(key, fingerprint, result);
+      });
+      return operation;
+    }
+
+    return this.executeOperatorRequest(request, peer.value);
+  }
+
+  private rememberOperatorResult(
+    key: string,
+    fingerprint: string,
+    result: Decision<unknown>,
+  ): void {
+    // Keep retries idempotent for the daemon lifetime without allowing an unbounded operator
+    // client to turn the authority into a memory store.
+    while (this.#operatorResults.size >= 1024) {
+      const oldest = this.#operatorResults.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.#operatorResults.delete(oldest);
+    }
+    this.#operatorResults.set(key, { fingerprint, result });
+  }
+
+  private async executeOperatorRequest(
+    request: OperatorRequest,
+    peer: AuthenticatedOperatorPeer,
+  ): Promise<Decision<unknown>> {
+    if (!this.lock.held()) {
+      return deny(
+        ReasonCode.DAEMON_LOCK_LOST,
+        "agentcpd no longer holds the single-instance lock; operator request refused",
+        { method: request.method },
+      );
+    }
+
+    try {
+      switch (request.method) {
+        case OPERATOR_METHOD.DOCTOR_RUN: {
+          const scope = request.params["scope"] ?? "system";
+          const target = request.params["target"];
+          if (!isDoctorScope(scope)) return invalidOperatorParam("scope", scope);
+          if (target !== undefined && target !== null && typeof target !== "string") {
+            return invalidOperatorParam("target", target);
+          }
+          return allow(ReasonCode.OK, await this.cp.doctor.run(scope, target as string | undefined));
+        }
+
+        case OPERATOR_METHOD.RUN_SHOW: {
+          const runId = requiredOperatorString(request.params, "runId");
+          if (!runId.allowed) return runId;
+          const run = this.cp.runs.get(runId.value);
+          if (!run) return deny(ReasonCode.NOT_FOUND, `unknown run ${runId.value}`, { runId: runId.value });
+          return allow(ReasonCode.OK, {
+            run,
+            tasks: this.cp.tasks.list(runId.value),
+            executions: this.cp.tasks.executions(runId.value),
+            evidence: this.cp.ceo.evidence(runId.value),
+            claims: this.cp.claims.heldByRun(runId.value),
+            humanGate: this.cp.ceo.humanGateStatus(runId.value),
+            outbox: this.cp.outbox.listByRun(runId.value).map((message) => ({
+              kind: message.kind,
+              status: message.status,
+              bindingGeneration: message.bindingGeneration,
+            })),
+          });
+        }
+
+        case OPERATOR_METHOD.RUN_LIST: {
+          const state = request.params["state"];
+          if (state !== undefined && state !== null && !isRunState(state)) {
+            return invalidOperatorParam("state", state);
+          }
+          return allow(
+            ReasonCode.OK,
+            this.cp.runs.list(state ? { state } : {}),
+          );
+        }
+
+        case OPERATOR_METHOD.RUN_CANCEL: {
+          const runId = requiredOperatorString(request.params, "runId");
+          if (!runId.allowed) return runId;
+          const reason = request.params["reason"] ?? "operator cancel";
+          if (typeof reason !== "string") return invalidOperatorParam("reason", reason);
+          return this.cp.runs.cancel(runId.value, reason);
+        }
+
+        case OPERATOR_METHOD.CONTINUITY_STATUS:
+          return allow(ReasonCode.OK, {
+            mode: this.cp.continuity.mode(),
+            plan: this.cp.continuity.computeCoveragePlan(),
+            capacity: this.cp.capacity.all(),
+          });
+
+        case OPERATOR_METHOD.OUTBOX_RETRY:
+          return this.cp.repair.execute({
+            operationId: "retry_outbox",
+            parameters: {},
+            authorizedBy: "HERMES",
+            dryRun: false,
+          });
+
+        case OPERATOR_METHOD.OWNER_APPROVE:
+          return this.executeOwnerApproval(request, peer);
+
+        case OPERATOR_METHOD.REPAIR_LIST:
+          return allow(ReasonCode.OK, this.cp.repair.catalog());
+
+        case OPERATOR_METHOD.REPAIR_DRY_RUN:
+          return this.executeRepair(request, peer, true);
+
+        case OPERATOR_METHOD.REPAIR_EXECUTE:
+          return this.executeRepair(request, peer, false);
+
+        case OPERATOR_METHOD.CAPACITY_SHOW:
+          return allow(ReasonCode.OK, { providers: this.cp.capacity.all() });
+
+        case OPERATOR_METHOD.CAPACITY_SET:
+          return this.setCapacity(request.params);
+
+        case OPERATOR_METHOD.PROJECT_LIST:
+          return allow(
+            ReasonCode.OK,
+            this.cp.projects.list().map((project) => ({
+              ...project,
+              repositories: this.cp.repositories.byProject(project.projectId).map((repository) => repository.identity),
+            })),
+          );
+
+        case OPERATOR_METHOD.PROJECT_REGISTER:
+          return this.registerProject(request.params);
+
+        case OPERATOR_METHOD.DAEMON_STATUS:
+          return allow(ReasonCode.OK, {
+            lock: this.lock.read(),
+            databasePath: this.cp.config.databasePath,
+            health: readJson(join(this.options.stateDir, "health.json")),
+          });
+      }
+    } catch (error) {
+      return deny(ReasonCode.INTERNAL_ERROR, "operator request failed", {
+        method: request.method,
+        error: safeErrorMessage(error),
+      });
+    }
+  }
+
+  private executeOwnerApproval(
+    request: OperatorRequest,
+    peer: AuthenticatedOperatorPeer,
+  ): Decision<unknown> {
+    const runId = requiredOperatorString(request.params, "runId");
+    if (!runId.allowed) return runId;
+    const item = requiredOperatorString(request.params, "item");
+    if (!item.allowed) return item;
+    const note = request.params["note"] ?? "";
+    if (typeof note !== "string") return invalidOperatorParam("note", note);
+    const approved = request.params["approved"] ?? true;
+    if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
+    const approval = {
+      runId: runId.value,
+      operation: "owner_decision_submit",
+      parameters: { item: item.value, approved, note },
+      idempotencyKey:
+        request.idempotencyKey ??
+        `owner-decision:${digestOf({
+          runId: runId.value,
+          item: item.value,
+          approved,
+          note,
+          peerId: peer.peerId,
+          incarnation: peer.incarnation,
+        })}`,
+      approved,
+    };
+    const admitted = this.admitCliOwnerApproval(peer.actor, approval, `owner-decision:${digestOf(approval)}`);
+    if (!admitted.allowed) return admitted;
+    return this.cp.ceo.recordOwnerDecision({
+      runId: runId.value,
+      item: item.value,
+      approved,
+      note,
+      receipt: admitted.value,
+    });
+  }
+
+  private executeRepair(
+    request: OperatorRequest,
+    peer: AuthenticatedOperatorPeer,
+    dryRun: boolean,
+  ): Decision<unknown> | Promise<Decision<unknown>> {
+    const operationId = requiredOperatorString(request.params, "operationId");
+    if (!operationId.allowed) return operationId;
+    const parameters = operatorStringRecord(request.params["parameters"] ?? {});
+    if (!parameters.allowed) return parameters;
+    const runId = request.params["runId"];
+    if (runId !== undefined && runId !== null && typeof runId !== "string") {
+      return invalidOperatorParam("runId", runId);
+    }
+    const owner = request.params["owner"] ?? false;
+    if (typeof owner !== "boolean") return invalidOperatorParam("owner", owner);
+    const authorizedBy = owner ? "OWNER" : "HERMES";
+
+    if (!owner) {
+      return this.cp.repair.execute({
+        operationId: operationId.value,
+        parameters: parameters.value,
+        authorizedBy,
+        dryRun,
+        runId: (runId as string | null | undefined) ?? null,
+      });
+    }
+
+    const approval = {
+      runId: (runId as string | null | undefined) ?? null,
+      operation: REPAIR_OWNER_APPROVAL_OPERATION,
+      parameters: {
+        operationId: operationId.value,
+        parameters: parameters.value,
+        dryRun,
+      },
+      idempotencyKey:
+        request.idempotencyKey ??
+        `repair:${digestOf({
+          operationId: operationId.value,
+          parameters: parameters.value,
+          dryRun,
+          runId: runId ?? null,
+          peerId: peer.peerId,
+          incarnation: peer.incarnation,
+        })}`,
+      approved: true,
+    };
+    const admitted = this.admitCliOwnerApproval(peer.actor, approval, `repair:${digestOf(approval)}`);
+    if (!admitted.allowed) return admitted;
+    return this.cp.repair.execute({
+      operationId: operationId.value,
+      parameters: parameters.value,
+      authorizedBy,
+      ownerApproval: admitted.value,
+      dryRun,
+      runId: (runId as string | null | undefined) ?? null,
+    });
+  }
+
+  private admitCliOwnerApproval(
+    actor: string,
+    approval: { runId: string | null; operation: string; parameters: unknown; idempotencyKey: string; approved: boolean },
+    nonce: string,
+  ): Decision<OwnerApprovalReceipt> {
+    const allowedActors = (this.cp.config.ownerIdentities ?? [])
+      .filter((identity) => identity.channel === "cli")
+      .map((identity) => identity.actor);
+    if (allowedActors.length === 0) {
+      return deny(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED, "no CLI owner identity is configured", {
+        channel: "cli",
+        actor,
+      });
+    }
+    const guard = new IngressGuard(this.cp.db, this.cp.clock, this.cp.audit, {
+      cli: { allowedActors },
+    });
+    return guard.admitOwnerApproval(
+      {
+        channel: "cli",
+        actor,
+        nonce,
+        payload: ownerApprovalPayload(approval),
+      },
+      approval,
+    );
+  }
+
+  private setCapacity(params: Record<string, unknown>): Decision<unknown> {
+    const provider = requiredOperatorString(params, "provider");
+    if (!provider.allowed) return provider;
+    let payload: unknown = params["payload"];
+    if (typeof payload === "string") {
+      try {
+        payload = JSON.parse(payload) as unknown;
+      } catch {
+        return deny(ReasonCode.INVALID_ARGUMENT, "capacity payload is not valid JSON", { provider: provider.value });
+      }
+    }
+    if (!isPlainRecord(payload)) return invalidOperatorParam("payload", payload);
+
+    const body = {
+      ...payload,
+      provider: provider.value,
+      observedAt: this.cp.clock.nowIso(),
+      // The operator publishes quota facts; runtime health remains daemon-observed.
+      runtimeHealth: "UNKNOWN",
+    };
+    const directory = this.cp.config.capacityDir;
+    const file = capacitySensorFile(directory, provider.value);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const temporary = join(directory, `.${provider.value}.${process.pid}.${randomUUID()}.json`);
+    writeFileSync(temporary, JSON.stringify(body, null, 2), { mode: 0o600 });
+    renameSync(temporary, file);
+    return allow(ReasonCode.OK, { wrote: file, body });
+  }
+
+  private async registerProject(params: Record<string, unknown>): Promise<Decision<unknown>> {
+    const name = requiredOperatorString(params, "name");
+    if (!name.allowed) return name;
+    const checkoutPath = requiredOperatorString(params, "checkoutPath");
+    if (!checkoutPath.allowed) return checkoutPath;
+    const projectId = params["projectId"];
+    if (projectId !== undefined && projectId !== null && typeof projectId !== "string") {
+      return invalidOperatorParam("projectId", projectId);
+    }
+    const project = this.cp.projects.register({
+      name: name.value,
+      projectId: (projectId as string | undefined) ?? undefined,
+    });
+    if (!project.allowed) return project;
+    const repository = await this.cp.repositories.register({
+      checkoutPath: checkoutPath.value,
+      projectId: project.value.projectId,
+      repositoryRole: "primary",
+    });
+    if (!repository.allowed) return repository;
+    return allow(ReasonCode.OK, { project: project.value, repository: repository.value });
   }
 
   async start(): Promise<Decision<ReconcileReport>> {
@@ -673,6 +1096,92 @@ const capacitySensorFile = (directory: string, provider: string): string => {
   }
   return join(directory, `${provider}.json`);
 };
+
+const parseAuthenticatedOperatorPeer = (
+  peer: AuthenticatedOperatorPeer | undefined,
+): Decision<AuthenticatedOperatorPeer> => {
+  if (
+    !peer ||
+    peer.channel !== "cli" ||
+    peer.peerId.trim().length === 0 ||
+    peer.actor.trim().length === 0 ||
+    peer.incarnation.trim().length === 0
+  ) {
+    return deny(
+      ReasonCode.OPERATOR_UNAUTHENTICATED,
+      "operator request requires an authenticated live peer binding",
+      {},
+    );
+  }
+  return allow(ReasonCode.OK, peer);
+};
+
+const parseOperatorRequest = (value: unknown): Decision<OperatorRequest> => {
+  if (!isPlainRecord(value)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "operator request must be a JSON object", {});
+  }
+  const requestId = value["requestId"];
+  const method = value["method"];
+  const params = value["params"] ?? {};
+  const idempotencyKey = value["idempotencyKey"];
+  if (typeof requestId !== "string" || requestId.length === 0) {
+    return invalidOperatorParam("requestId", requestId);
+  }
+  if (typeof method !== "string" || !isOperatorMethod(method)) {
+    return deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "operator method is not allowlisted", { method });
+  }
+  if (!isPlainRecord(params)) return invalidOperatorParam("params", params);
+  if (idempotencyKey !== undefined && typeof idempotencyKey !== "string") {
+    return invalidOperatorParam("idempotencyKey", idempotencyKey);
+  }
+  return allow(ReasonCode.OK, {
+    requestId,
+    method,
+    params,
+    ...(idempotencyKey ? { idempotencyKey } : {}),
+  });
+};
+
+const isOperatorMethod = (value: string): value is OperatorMethod =>
+  (Object.values(OPERATOR_METHOD) as readonly string[]).includes(value);
+
+const isDoctorScope = (value: unknown): value is DoctorScope =>
+  ["system", "project", "cto", "run", "session", "capacity", "github", "worktree"].includes(value as string);
+
+const isRunState = (value: unknown): value is (typeof RunState)[keyof typeof RunState] =>
+  Object.values(RunState).includes(value as (typeof RunState)[keyof typeof RunState]);
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+};
+
+const requiredOperatorString = (
+  params: Record<string, unknown>,
+  name: string,
+): Decision<string> => {
+  const value = params[name];
+  return typeof value === "string" && value.length > 0
+    ? allow(ReasonCode.OK, value)
+    : invalidOperatorParam(name, value);
+};
+
+const operatorStringRecord = (value: unknown): Decision<Record<string, string>> => {
+  if (!isPlainRecord(value)) return invalidOperatorParam("parameters", value);
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry !== "string") return invalidOperatorParam(`parameters.${key}`, entry);
+    result[key] = entry;
+  }
+  return allow(ReasonCode.OK, result);
+};
+
+const invalidOperatorParam = (name: string, value: unknown): Decision<never> =>
+  deny(ReasonCode.INVALID_ARGUMENT, `operator parameter '${name}' is invalid`, {
+    parameter: name,
+    receivedType: value === null ? "null" : typeof value,
+  });
 
 const readJson = <T>(path: string): T | null => {
   try {
