@@ -4,8 +4,8 @@ import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.
 import { digestOf } from "../../src/core/digest.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { createCtoServer } from "../../src/mcp/cto-server.ts";
-import { createHermesServer } from "../../src/mcp/hermes-server.ts";
+import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
+import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { idempotentMcpMutation } from "../../src/mcp/shared.ts";
 import { IngressGuard, ingressSignature } from "../../src/ingress/ingress-guard.ts";
 import { TelegramIngress } from "../../src/ingress/telegram.ts";
@@ -194,7 +194,10 @@ const tool = (server: object, name: string) => (
 describe("round-2 ops regressions", () => {
   it("#102: Hermes cannot fabricate owner approval by naming an allowlisted identity", async () => {
     const harness = makeHarness();
-    const server = createHermesServer(harness.cp, () => allow(ReasonCode.OK, { actor: "hermes-daemon" }));
+    const server = createHermesServer(
+      createHermesMcpPort(harness.cp),
+      () => allow(ReasonCode.OK, { actor: "hermes-daemon" }),
+    );
     const result = await tool(server, "repair_execute")({
       idempotencyKey: "owner-forgery",
       operationId: "prune_orphan_worktrees",
@@ -223,7 +226,7 @@ describe("round-2 ops regressions", () => {
   it("#103/#218: a caller cannot act as an active CTO by claiming its session tuple", async () => {
     const harness = makeHarness();
     const prepared = await prepareBootstrap(harness, "peer-project");
-    const server = createCtoServer(harness.cp, () =>
+    const server = createCtoServer(createCtoMcpPort(harness.cp), () =>
       allow(ReasonCode.OK, { actor: "attacker", sessionId: "ses_forged", sessionIncarnation: "forged" }),
     );
     const denied = await tool(server, "contract_get")({ runId: prepared.runId });
@@ -385,7 +388,7 @@ describe("round-2 ops regressions", () => {
     const pending = await harness.cp.bootstrap.activate(activationInput(harness, prepared.runId, "bootstrap-ack", prepared.plan));
     const handoffId = pending.evidence["pendingHandoffId"] as string;
     const primary = harness.cp.bindings.activePrimaryCto("bootstrap-ack")!;
-    const server = createCtoServer(harness.cp, () => allow(ReasonCode.OK, {
+    const server = createCtoServer(createCtoMcpPort(harness.cp), () => allow(ReasonCode.OK, {
       actor: "primary-cto",
       sessionId: primary.sessionId,
       sessionIncarnation: primary.sessionIncarnation,

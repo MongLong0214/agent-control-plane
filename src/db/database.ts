@@ -1,6 +1,5 @@
-import { resolve } from "node:path";
 import Database from "better-sqlite3";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -154,9 +153,12 @@ export class Db {
   readonly file: string;
 
   constructor(filename: string) {
-    this.file = filename === ":memory:" ? `:memory:${Math.random()}` : resolve(filename);
     if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
     this.#raw = new Database(filename);
+    // `resolve()` only removes lexical path segments. It leaves a symlink alias distinct,
+    // which would let two connections to one SQLite file receive separate capabilities.
+    // Resolve after SQLite creates the file so the issuance key names the actual file.
+    this.file = filename === ":memory:" ? `:memory:${Math.random()}` : realpathSync(filename);
     this.#raw.pragma("foreign_keys = ON");
     this.#raw.pragma("busy_timeout = 10000");
     if (filename !== ":memory:") {
