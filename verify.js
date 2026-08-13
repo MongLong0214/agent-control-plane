@@ -1,4 +1,4 @@
-const app = require("./src/app.js");
+import app from "./src/app.js";
 
 if (app() !== 2) {
   console.error("expected app() === 2");
