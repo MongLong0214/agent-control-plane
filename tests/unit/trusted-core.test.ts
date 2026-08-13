@@ -294,25 +294,29 @@ describe("managed write guard (CP-HI-01)", () => {
     expect(decision.reasonCode).toBe(ReasonCode.WRITE_PATH_NOT_CLAIMED);
   });
 
-  it("classifies path-free github operations by repository participation", () => {
+  it("classifies path-free github operations by repository participation and refuses branchless remote writes", () => {
     const { guard, seeded } = setup();
-    expect(
-      guard.evaluate({
-        operation: WriteOperation.GITHUB_PR,
-        repositoryIdentity: seeded.identity,
-        runId: seeded.runId,
-        sessionId: seeded.sessionId,
-        bindingGeneration: seeded.generation,
-      }).allowed,
-    ).toBe(true);
+    const request = {
+      operation: WriteOperation.GITHUB_PR,
+      repositoryIdentity: seeded.identity,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    };
+    const branchless = guard.evaluate(request);
+    expect(branchless.allowed).toBe(false);
+    expect(branchless.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+
+    const participating = guard.evaluate({ ...request, targetBranch: "feature/fixture" });
+    expect(participating.allowed).toBe(true);
+    expect(participating.reasonCode).toBe(ReasonCode.WRITE_ALLOWED);
+    if (participating.allowed) expect(participating.value.classification).toBe("MANAGED");
 
     expect(
       guard.evaluate({
-        operation: WriteOperation.GITHUB_PR,
+        ...request,
         repositoryIdentity: "github:acme/unrelated",
-        runId: seeded.runId,
-        sessionId: seeded.sessionId,
-        bindingGeneration: seeded.generation,
+        targetBranch: "feature/fixture",
       }).reasonCode,
     ).toBe(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE);
   });
