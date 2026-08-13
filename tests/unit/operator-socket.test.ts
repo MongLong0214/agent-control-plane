@@ -1,0 +1,384 @@
+import { afterAll, describe, expect, it } from "vitest";
+import { execFile as execFileCallback } from "node:child_process";
+import { createConnection } from "node:net";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
+import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
+import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ExecutionMode } from "../../src/domain/types.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import {
+  TEST_OWNER,
+  bindCeo,
+  makeHarness,
+  registerFixtureProject,
+} from "../helpers/harness.ts";
+import type { Harness } from "../helpers/harness.ts";
+import type { TaskContract } from "../../src/run/run-engine.ts";
+
+afterAll(cleanupTempDirs);
+
+const execFile = promisify(execFileCallback);
+const OPERATOR_TOKEN = "operator-token";
+const MCP_TOKEN = "mcp-token";
+
+const CONTRACT: TaskContract = {
+  goal: "operator socket regression",
+  why: "prove the CLI is not a second runtime authority",
+  scope: [],
+  nonGoals: [],
+  acceptance: ["operator requests are daemon-owned"],
+  priority: "NORMAL",
+  humanGate: [],
+  references: [],
+};
+
+const operatorRequest = (
+  socketPath: string,
+  token: string,
+  request: Record<string, unknown>,
+): Promise<Record<string, unknown>> =>
+  new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    let received = "";
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("operator socket test timed out"));
+    }, 5_000);
+    socket.setEncoding("utf8");
+    socket.once("connect", () => socket.write(`${JSON.stringify({ token, ...request })}\n`));
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      if (!received.includes("\n")) return;
+      clearTimeout(timeout);
+      socket.end();
+      resolve(JSON.parse(received.trim()) as Record<string, unknown>);
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+
+const makeStartedOperator = async (options: {
+  operatorToken?: string;
+  operatorActor?: string;
+} = {}): Promise<{
+  harness: Harness;
+  daemon: Daemon;
+  socketPath: string;
+  peer: AuthenticatedOperatorPeer;
+  close(): Promise<void>;
+}> => {
+  const harness = makeHarness();
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+  bindCeo(harness);
+  const stateDir = tempDir("acp-operator-daemon-");
+  const daemon = new Daemon(harness.cp, { stateDir });
+  const started = await daemon.start();
+  if (!started.allowed) throw new Error(`${started.reasonCode}: ${started.message}`);
+  const operatorToken = options.operatorToken ?? OPERATOR_TOKEN;
+  const operatorActor = options.operatorActor ?? TEST_OWNER.actor;
+  const peer: AuthenticatedOperatorPeer = {
+    channel: "cli",
+    peerId: `cli:${operatorActor}`,
+    actor: operatorActor,
+    // The listener supplies the real incarnation; this value is only for direct daemon
+    // calls in the lock-loss test, where no socket can supply it after stop.
+    incarnation: "test-live-incarnation",
+  };
+  const listener = await startOperatorSocket(
+    daemon,
+    stateDir,
+    { token: operatorToken, peerId: peer.peerId, actor: peer.actor },
+    { mcpToken: MCP_TOKEN },
+  );
+  return {
+    harness,
+    daemon,
+    socketPath: listener.socketPath,
+    peer,
+    close: async () => {
+      await listener.close();
+      await daemon.stop();
+    },
+  };
+};
+
+const createQueuedRun = async (harness: Harness): Promise<string> => {
+  const registered = await registerFixtureProject(harness);
+  const created = harness.cp.runs.create({
+    projectId: registered.projectId,
+    executionMode: ExecutionMode.STANDARD,
+    contract: CONTRACT,
+    repositories: [{ repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+  });
+  if (!created.allowed) throw new Error(created.message);
+  return created.value.runId;
+};
+
+describe("authenticated operator socket (#393/#405)", () => {
+  it("routes a CLI-shaped mutation through the lock-held daemon and opens a 0600 socket", async () => {
+    const running = await makeStartedOperator();
+    try {
+      const runId = await createQueuedRun(running.harness);
+      const client = createOperatorClient({ socketPath: running.socketPath, token: OPERATOR_TOKEN });
+      const code = await dispatch(client, "run", ["cancel", runId, "operator", "test"], false);
+
+      expect(code).toBe(0);
+      expect(running.harness.cp.runs.get(runId)?.state).toBe("CANCELLED");
+      expect(statSync(running.socketPath).mode & 0o777).toBe(0o600);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("runs the real CLI process without creating its default state directory", async () => {
+    const running = await makeStartedOperator();
+    const isolatedHome = tempDir("acp-operator-cli-home-");
+    try {
+      const runId = await createQueuedRun(running.harness);
+      const cli = await execFile(
+        process.execPath,
+        [
+          join(process.cwd(), "node_modules/tsx/dist/cli.mjs"),
+          join(process.cwd(), "src/cli/agentctl.ts"),
+          "run",
+          "cancel",
+          runId,
+          "child",
+          "process",
+        ],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            HOME: isolatedHome,
+            ACP_OPERATOR_SOCKET: running.socketPath,
+            ACP_OPERATOR_TOKEN: OPERATOR_TOKEN,
+          },
+          maxBuffer: 2 * 1024 * 1024,
+        },
+      );
+
+      expect(cli.stderr).toBe("");
+      expect(JSON.parse(cli.stdout) as { state?: unknown }).toMatchObject({ state: "CANCELLED" });
+      expect(running.harness.cp.runs.get(runId)?.state).toBe("CANCELLED");
+      expect(existsSync(join(isolatedHome, ".agent-control-plane"))).toBe(false);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("fails closed when the daemon is down rather than opening the database directly", async () => {
+    const socketPath = join(tempDir("acp-operator-down-"), "missing.operator.sock");
+    const client = createOperatorClient({ socketPath, token: "operator-token", timeoutMs: 250 });
+    const result = await client.request("run.cancel", { runId: "run_missing", reason: "test" }, "down-mutation");
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
+    if (result.allowed) return;
+    expect(result.message).toMatch(/no direct database fallback/);
+  });
+
+  it("refuses an in-process operator request after the daemon lock is released", async () => {
+    const running = await makeStartedOperator();
+    try {
+      await running.daemon.stop();
+      const result = await running.daemon.handleOperatorRequest({
+        requestId: "after-stop",
+        method: "run.cancel",
+        params: { runId: "run_missing", reason: "must fail closed" },
+        idempotencyKey: "after-stop-once",
+      }, running.peer);
+      expect(result.allowed).toBe(false);
+      expect(result.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("coalesces concurrent requests and replays the same result idempotently", async () => {
+    const running = await makeStartedOperator();
+    try {
+      const runId = await createQueuedRun(running.harness);
+      const params = { runId, reason: "same operator request" };
+      const [first, second] = await Promise.all([
+        createOperatorClient({ socketPath: running.socketPath, token: OPERATOR_TOKEN })
+          .request("run.cancel", params),
+        createOperatorClient({ socketPath: running.socketPath, token: OPERATOR_TOKEN })
+          .request("run.cancel", params),
+      ]);
+
+      expect(first).toMatchObject({ allowed: true, reasonCode: ReasonCode.OK });
+      expect(second).toEqual(first);
+      expect(running.harness.cp.audit.byKind("RUN_TRANSITION")).toHaveLength(1);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("rejects the MCP credential and a wrong credential for every operator method", async () => {
+    const running = await makeStartedOperator();
+    try {
+      for (const [index, method] of Object.values(OPERATOR_METHOD).entries()) {
+        const request = {
+          requestId: `bad-credential-${index}`,
+          method,
+          params: {},
+        };
+        const mcp = await operatorRequest(running.socketPath, MCP_TOKEN, request);
+        const wrong = await operatorRequest(running.socketPath, "wrong-operator-token", {
+          ...request,
+          requestId: `wrong-credential-${index}`,
+        });
+
+        expect(mcp).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED,
+        });
+        expect(wrong).toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED,
+        });
+      }
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("refuses to start when the dedicated operator credential is absent or is the MCP token", async () => {
+    const running = await makeStartedOperator();
+    try {
+      await expect(
+        startOperatorSocket(
+          running.daemon,
+          tempDir("acp-operator-mcp-only-"),
+          { token: MCP_TOKEN, peerId: "cli:test-owner", actor: TEST_OWNER.actor },
+          { mcpToken: MCP_TOKEN },
+        ),
+      ).rejects.toThrow(/dedicated credential distinct from ACP_MCP_TOKEN/);
+      await expect(
+        startOperatorSocket(
+          running.daemon,
+          tempDir("acp-operator-no-token-"),
+          { token: "", peerId: "cli:test-owner", actor: TEST_OWNER.actor },
+          { mcpToken: MCP_TOKEN },
+        ),
+      ).rejects.toThrow(/ACP_OPERATOR_TOKEN is required/);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("denies an authenticated non-owner even when the request claims the allowlisted actor", async () => {
+    const running = await makeStartedOperator({ operatorActor: "authenticated-non-owner" });
+    try {
+      const result = await operatorRequest(running.socketPath, OPERATOR_TOKEN, {
+        requestId: "forged-repair",
+        method: "repair.execute",
+        params: {
+          operationId: "prune_orphan_worktrees",
+          parameters: {},
+          owner: true,
+          actor: TEST_OWNER.actor,
+        },
+        idempotencyKey: "forged-repair-once",
+      });
+
+      expect(result).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+      });
+      expect(running.harness.cp.audit.byKind("INGRESS_REFUSED")).toHaveLength(1);
+      expect(running.harness.cp.audit.byKind("INGRESS_ADMITTED")).toHaveLength(0);
+      expect(running.harness.cp.audit.byKind("REPAIR_EXECUTED")).toHaveLength(0);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("mints and admits the exact owner receipt in the daemon before executing repair", async () => {
+    const running = await makeStartedOperator();
+    try {
+      await registerFixtureProject(running.harness);
+      await running.harness.cp.worktrees.create(running.harness.repoPath, "HEAD", "operator-owner-orphan");
+      const client = createOperatorClient({ socketPath: running.socketPath, token: OPERATOR_TOKEN });
+      const code = await dispatch(client, "repair", ["execute", "prune_orphan_worktrees"], true);
+
+      expect(code).toBe(0);
+      expect(running.harness.cp.audit.byKind("INGRESS_ADMITTED")).toHaveLength(1);
+      expect(running.harness.cp.audit.byKind("OWNER_APPROVAL_INGRESS")).toHaveLength(1);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("mints and admits the owner receipt through a child-process --owner invocation", async () => {
+    const running = await makeStartedOperator();
+    const isolatedHome = tempDir("acp-operator-owner-cli-home-");
+    try {
+      await registerFixtureProject(running.harness);
+      await running.harness.cp.worktrees.create(running.harness.repoPath, "HEAD", "operator-owner-cli-orphan");
+      const cli = await new Promise<{ error: Error | null; stdout: string; stderr: string }>((resolve) => {
+        execFileCallback(
+          process.execPath,
+          [
+            join(process.cwd(), "node_modules/tsx/dist/cli.mjs"),
+            join(process.cwd(), "src/cli/agentctl.ts"),
+            "repair",
+            "execute",
+            "prune_orphan_worktrees",
+            "--owner",
+          ],
+          {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              HOME: isolatedHome,
+              ACP_OPERATOR_SOCKET: running.socketPath,
+              ACP_OPERATOR_TOKEN: OPERATOR_TOKEN,
+            },
+            encoding: "utf8",
+            maxBuffer: 2 * 1024 * 1024,
+          },
+          (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+        );
+      });
+
+      expect(cli.error).toBeNull();
+      expect(cli.stderr).toBe("");
+      expect(JSON.parse(cli.stdout) as { operationId?: unknown; authorizedBy?: unknown }).toMatchObject({
+        operationId: "prune_orphan_worktrees",
+        authorizedBy: "OWNER",
+      });
+      expect(running.harness.cp.audit.byKind("INGRESS_ADMITTED")).toHaveLength(1);
+      expect(running.harness.cp.audit.byKind("OWNER_APPROVAL_INGRESS")).toHaveLength(1);
+      expect(running.harness.cp.audit.byKind("REPAIR_EXECUTED")).toHaveLength(1);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("keeps the CLI an explicit socket client with no ControlPlane or capability issuance path", () => {
+    const source = readFileSync(new URL("../../src/cli/agentctl.ts", import.meta.url), "utf8");
+    const daemonSource = readFileSync(new URL("../../src/daemon/agentcpd.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/new ControlPlane\s*\(/);
+    expect(source).not.toMatch(/ControlPlane/);
+    expect(source).not.toMatch(/new Db\s*\(|writeFileSync|mkdirSync|IngressGuard/);
+    expect(source).not.toMatch(/ACP_MCP_TOKEN|ACP_OWNER_ACTOR/);
+    expect(source).toMatch(/createOperatorClient/);
+    expect(source).toMatch(/no direct database fallback/);
+    // Capability issuance remains a daemon composition concern; the client only serializes
+    // plain operator requests and can never obtain the private completion/evidence tokens.
+    expect(source).not.toMatch(/issueCompletionAuthorities|issueEvidenceWriters|daemonFinalizationAuthorities/);
+    expect(daemonSource).toMatch(/operator = await startOperatorSocket\(/);
+    expect(daemonSource).toMatch(/ACP_OPERATOR_TOKEN is required/);
+    expect(daemonSource).not.toMatch(/ACP_OPERATOR_TOKEN[^\n]*\|\|\s*mcpToken/);
+    expect(daemonSource).toMatch(/await operator\?\.close\(\)/);
+  });
+});
