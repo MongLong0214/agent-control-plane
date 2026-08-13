@@ -2,7 +2,7 @@ import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
-import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
+import { PROJECT_MANIFEST_SCHEMA_ID, manifestDigest, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { Daemon, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
@@ -14,6 +14,7 @@ import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
+import type { ManagedManifestWrite } from "../../src/registry/project-registry.ts";
 import { commitAll, gitSync, makeRepo, tempDir, writeFiles } from "./fixtures.ts";
 
 /** The single allowlisted owner identity of the fixture deployment. */
@@ -139,7 +140,12 @@ export const registerFixtureProject = async (
   manifestOverrides: Partial<ProjectManifest> = {},
 ): Promise<{ projectId: string; repositoryId: string; identity: string }> => {
   const manifest = fixtureManifest(projectId, manifestOverrides);
-  const project = harness.cp.projects.register({ projectId, name: "fixture", manifest });
+  const project = harness.cp.projects.register({
+    projectId,
+    name: "fixture",
+    manifest,
+    authorization: harness.cp.manifestAuthorizationForTests(manifest),
+  });
   if (!project.allowed) throw new Error(`project registration failed: ${project.message}`);
 
   const repository = await harness.cp.repositories.register({
@@ -155,6 +161,23 @@ export const registerFixtureProject = async (
     projectId,
     repositoryId: repository.value.repositoryId,
     identity: repository.value.identity,
+  };
+};
+
+/** Managed activation proof for tests that complete a dedicated contract-change run. */
+export const manifestAuthorizationForRun = (
+  harness: Harness,
+  projectId: string,
+  manifest: ProjectManifest,
+  runId: string,
+): ManagedManifestWrite => {
+  const run = harness.cp.runs.require(runId);
+  return {
+    projectId,
+    runId,
+    sessionId: run.ownerSessionId,
+    bindingGeneration: run.ownerBindingGeneration,
+    expectedManifestDigest: manifestDigest(manifest),
   };
 };
 

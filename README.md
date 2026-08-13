@@ -32,7 +32,7 @@ These are the product, not optional policies. Their normative text is in PRD §4
 
 | Invariant | What must remain true |
 |---|---|
-| CP-HI-01 — Managed Write Guard | A project-affecting write needs a valid managed-run identity; a caller's label is not authority. |
+| CP-HI-01 — Managed Write Guard | ACP-owned manifest activation, worktree lifecycle, and GitHub writes pass the Guard; agent source writes are bounded by the assigned disposable worktree, live claim, session/task receipt, and runtime adapter (individual file syscalls are not all Guard API calls). |
 | CP-HI-02 — Single Runtime Authority | Project actors cannot independently complete a run, publish an authoritative gate, or merge. |
 | CP-HI-03 — Candidate Contract Pinning | Verification is bound to the approved contract digest and frozen candidate, not a mutable replacement. |
 | CP-HI-04 — Independent Quality Role | A blind reviewer cannot be a producer for the same run, and the final CEO role is separate. |

@@ -2,8 +2,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { sha256 } from "../core/digest.ts";
-import { fail } from "../core/errors.ts";
+import { type Decision, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { WriteOperation, type GuardRequest, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
+import { canonical } from "../guard/workspace-probe.ts";
 
 const exec = promisify(execFile);
 
@@ -14,6 +16,40 @@ export interface GitResult {
   stderr: string;
   exitCode: number;
 }
+
+/** Complete authorization carried by each ACP-owned Git mutation. */
+export interface GuardedGitEffect {
+  readonly guard: ManagedWriteGuard;
+  readonly request: GuardRequest;
+}
+
+const authorizeGitMutation = async (
+  authorization: GuardedGitEffect | undefined,
+  expectedTarget: string,
+  cwd: string,
+  effect: () => Promise<GitResult>,
+): Promise<Decision<void>> => {
+  if (!authorization) {
+    return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "Git worktree mutation requires guard authorization", {
+      expectedTarget,
+    });
+  }
+  if (authorization.request.operation !== WriteOperation.GIT_WORKTREE) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "Git worktree API requires a GIT_WORKTREE authorization", {
+      operation: authorization.request.operation,
+    });
+  }
+  if (!authorization.request.targetPath || canonical(authorization.request.targetPath) !== canonical(expectedTarget)) {
+    return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "Git mutation target does not match the guard request", {
+      expectedTarget: canonical(expectedTarget),
+      authorizedTarget: authorization.request.targetPath ?? null,
+    });
+  }
+  const authorized = await authorization.guard.authorize(authorization.request, async () => {
+    await effect();
+  });
+  return authorized;
+};
 
 /**
  * argv-only git invocation. There is no shell in the path, so no interpolation,
@@ -132,12 +168,27 @@ export const addWorktree = async (
   cwd: string,
   path: string,
   ref: string,
-): Promise<void> => {
-  await git(cwd, ["worktree", "add", "--detach", path, ref]);
+  authorization?: GuardedGitEffect,
+): Promise<Decision<void>> => {
+  return authorizeGitMutation(
+    authorization,
+    path,
+    cwd,
+    () => git(cwd, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, ref]),
+  );
 };
 
-export const removeWorktree = async (cwd: string, path: string): Promise<void> => {
-  await git(cwd, ["worktree", "remove", "--force", path], { allowFailure: true });
+export const removeWorktree = async (
+  cwd: string,
+  path: string,
+  authorization?: GuardedGitEffect,
+): Promise<Decision<void>> => {
+  return authorizeGitMutation(
+    authorization,
+    path,
+    cwd,
+    () => git(cwd, ["worktree", "remove", "--force", path], { allowFailure: true }),
+  );
 };
 
 export const listWorktrees = async (cwd: string): Promise<Array<{ path: string; head: string }>> => {
@@ -152,6 +203,14 @@ export const listWorktrees = async (cwd: string): Promise<Array<{ path: string; 
   return entries;
 };
 
-export const pruneWorktrees = async (cwd: string): Promise<void> => {
-  await git(cwd, ["worktree", "prune"], { allowFailure: true });
+export const pruneWorktrees = async (
+  cwd: string,
+  authorization?: GuardedGitEffect,
+): Promise<Decision<void>> => {
+  return authorizeGitMutation(
+    authorization,
+    cwd,
+    cwd,
+    () => git(cwd, ["worktree", "prune"], { allowFailure: true }),
+  );
 };

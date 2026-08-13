@@ -164,10 +164,14 @@ them rather than assuming a permissive default.
   one identity, `cli:isaac`**, which is what let the GUARDED run clear its gate. There is no
   `telegram` or `buzz` identity, so an owner decision arriving over either channel is still
   refused, and only the owner can supply one — #245 stays open for that reason alone.
-- **A managed write needs a live claim.** Burning a guard grant requires the run to hold a
-  `HELD`, unexpired claim on that repository under the run's current owner generation; the
-  claim's lease is extended at that moment. A worker that writes without claiming is refused
-  with `WRITE_PATH_NOT_CLAIMED`.
+- **ACP-owned source-facing writes are claimed and fenced.** Burning a Guard grant for a
+  source mutation or verification worktree requires the run to hold a `HELD`, unexpired
+  claim on that repository under the run's current owner generation; the claim's lease is
+  extended at that moment. Manifest mutations instead carry a project/run/session/generation
+  proof and exact digest (or the composition-root bootstrap proof), while stranded-worktree
+  repair uses the doctor-only repair proof. Agent source-file syscalls are not individually
+  routed through the Guard API: the runtime adapter and sandbox confine them to the assigned
+  disposable worktree and the active claim/session/task receipt.
 - **Post-merge verification needs declared checks.** `postMergeVerify` uses the pinned
   manifest's `ciWorkflows` / `postMergeCommands`; a caller-supplied name that the manifest
   does not declare, or an empty declared set, is refused with

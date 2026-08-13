@@ -696,6 +696,35 @@ CREATE TABLE IF NOT EXISTS verification_results (
 );
 
 -- ---------------------------------------------------------------------------
+-- verification_worktrees  (PRD §17.4 durable ownership record)
+--   Lifecycle: one row is written before a disposable verification checkout is
+--   materialised and remains attributable until its teardown has completed.
+--   Repair must treat CREATING/ACTIVE/DESTROYING rows whose pinned owner is live
+--   as live, rather than inferring ownership from task execution receipts.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS verification_worktrees (
+  worktree_id               TEXT PRIMARY KEY,
+  run_id                    TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  command_id                TEXT NOT NULL,
+  candidate_snapshot_digest TEXT NOT NULL,
+  repository_identity       TEXT NOT NULL,
+  repository_checkout_path  TEXT NOT NULL,
+  worktree_path             TEXT NOT NULL UNIQUE,
+  head                      TEXT NOT NULL,
+  owner_session_id          TEXT NOT NULL REFERENCES sessions(session_id),
+  owner_binding_generation  INTEGER NOT NULL,
+  owner_role_key            TEXT NOT NULL,
+  state                     TEXT NOT NULL
+                              CHECK (state IN ('CREATING','ACTIVE','DESTROYING','DESTROYED','FAILED')),
+  created_at                TEXT NOT NULL,
+  active_at                 TEXT,
+  ended_at                  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS verification_worktrees_live
+  ON verification_worktrees(repository_identity, state, worktree_id);
+
+-- ---------------------------------------------------------------------------
 -- capacity_snapshots  (PRD §14.3)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS capacity_snapshots (

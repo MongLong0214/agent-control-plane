@@ -9,6 +9,8 @@ import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow } from "../domain/types.ts";
+import type { ClaimRegistry } from "../claims/claim-registry.ts";
+import { WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   type CandidateSnapshot,
@@ -18,7 +20,7 @@ import {
 } from "../snapshot/candidate-snapshot.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 import { type SandboxEnforcement, runSandboxed } from "./sandbox.ts";
-import type { WorktreeManager } from "./worktree.ts";
+import type { WorktreeAuthorization, WorktreeManager } from "./worktree.ts";
 
 export interface CiCheck {
   commandId: string;
@@ -126,6 +128,8 @@ export class VerificationEngine {
     private readonly evidenceWriter: EvidenceWriter<"VERIFICATION">,
     private readonly repositories: RepositoryRegistry,
     private readonly worktrees: WorktreeManager,
+    private readonly claims: ClaimRegistry,
+    private readonly guard: ManagedWriteGuard,
     private readonly telemetry: Telemetry,
   ) {}
 
@@ -339,7 +343,17 @@ export class VerificationEngine {
       }
 
       if (command.evidenceMode !== "TRUSTED_CI") {
-        results.push(await this.runLocal(runId, snapshotDigest, command, repo.identity, record.checkoutPath, repo.candidateHead));
+        const claim = this.ensureVerificationClaim(run, repo.identity);
+        if (!claim.allowed) return claim as Decision<VerificationReport>;
+        results.push(await this.runLocal(
+          run,
+          snapshotDigest,
+          command,
+          repo.identity,
+          record.checkoutPath,
+          repo.candidateHead,
+          repo.sourceBranch ?? null,
+        ));
       }
       if (command.evidenceMode !== "LOCAL_COMMAND") {
         results.push(await this.collectCi(runId, snapshotDigest, command, repo.identity, repo.candidateHead));
@@ -477,23 +491,68 @@ export class VerificationEngine {
   }
 
   private async runLocal(
-    runId: string,
+    run: RunRow,
     snapshotDigest: string,
     command: VerificationCommand,
     identity: string,
     checkoutPath: string,
     head: string,
+    sourceBranch: string | null,
   ): Promise<VerificationResultRecord> {
+    const runId = run.runId;
     const worktreeId = `verify-${runId}-${command.id}-${head.slice(0, 8)}-${randomUUID().replaceAll("-", "")}`;
-    const outcome = await this.worktrees.withWorktree(checkoutPath, head, worktreeId, (worktree) =>
-      runSandboxed({
+    const path = this.worktrees.pathFor(worktreeId);
+    const authorization = this.worktreeAuthorization(
+      run,
+      identity,
+      checkoutPath,
+      path,
+      sourceBranch,
+    );
+    this.recordVerificationWorktree({
+      worktreeId,
+      runId,
+      commandId: command.id,
+      candidateSnapshotDigest: snapshotDigest,
+      repositoryIdentity: identity,
+      repositoryCheckoutPath: checkoutPath,
+      worktreePath: path,
+      head,
+      ownerSessionId: run.ownerSessionId,
+      ownerBindingGeneration: run.ownerBindingGeneration,
+      ownerRoleKey: run.ownerRoleKey,
+    });
+
+    let worktree: Awaited<ReturnType<WorktreeManager["create"]>> | null = null;
+    let outcome: Awaited<ReturnType<typeof runSandboxed>> | null = null;
+    try {
+      worktree = await this.worktrees.create(checkoutPath, head, worktreeId, authorization);
+      this.updateVerificationWorktree(worktreeId, "ACTIVE", "active_at");
+      outcome = await runSandboxed({
         command,
         worktreePath: worktree.path,
         // §33.3 — the control plane's own secret store and state must be unreadable to a
         // candidate, as must every other checkout on this machine.
         denyReadPaths: this.denyReadPaths(checkoutPath),
-      }),
-    );
+      });
+    } finally {
+      if (worktree) {
+        this.updateVerificationWorktree(worktreeId, "DESTROYING");
+        try {
+          await this.worktrees.destroy(checkoutPath, worktree.path, authorization);
+          this.updateVerificationWorktree(worktreeId, "DESTROYED", "ended_at");
+        } catch (error) {
+          // Keep DESTROYING durable: repair must see that teardown was interrupted and
+          // re-evaluate ownership before touching the path.
+          throw error;
+        }
+      } else {
+        this.updateVerificationWorktree(worktreeId, "FAILED", "ended_at");
+      }
+    }
+    if (!outcome) {
+      throw new Error("verification sandbox did not produce an outcome");
+    }
     const memoryFailure = memoryEvidenceReason(outcome.peakRssMb, command.maxMemoryMb);
     const passingMemoryFailure = outcome.status === "PASS" ? memoryFailure : null;
 
@@ -601,6 +660,119 @@ export class VerificationEngine {
     };
     this.writeResultRow(runId, snapshotDigest, record);
     return record;
+  }
+
+  private ensureVerificationClaim(
+    run: RunRow,
+    repositoryIdentity: string,
+  ): Decision<void> {
+    const existing = this.claims.heldByRun(run.runId).some(
+      (claim) => claim.repositoryIdentity === repositoryIdentity,
+    );
+    if (existing) return allow(ReasonCode.OK, undefined);
+    if (!run.ownerSessionId || run.ownerBindingGeneration == null || !run.ownerRoleKey) {
+      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "verification worktree requires a pinned run owner", {
+        runId: run.runId,
+        repositoryIdentity,
+      });
+    }
+    const acquired = this.claims.acquire({
+      runId: run.runId,
+      ownerSessionId: run.ownerSessionId,
+      ownerBindingGeneration: run.ownerBindingGeneration,
+      ownerRoleKey: run.ownerRoleKey,
+      repositoryIdentity,
+      branch: null,
+      // ClaimRegistry stores repository-relative paths as non-empty components; this
+      // run-specific coordination path is only the worktree-lifecycle lease, not an
+      // assertion about candidate files or the branch a later GitHub write will target.
+      declaredPaths: [`__verification_worktree__/${run.runId}`],
+    });
+    if (!acquired.allowed) return acquired as Decision<void>;
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  private worktreeAuthorization(
+    run: RunRow,
+    repositoryIdentity: string,
+    checkoutPath: string,
+    path: string,
+    sourceBranch: string | null,
+  ): WorktreeAuthorization {
+    const common = {
+      guard: this.guard,
+      request: {
+        operation: WriteOperation.GIT_WORKTREE,
+        repositoryIdentity,
+        targetWorktreeId: checkoutPath,
+        targetBranch: sourceBranch,
+        runId: run.runId,
+        sessionId: run.ownerSessionId,
+        bindingGeneration: run.ownerBindingGeneration,
+        claimedClassification: "MANAGED" as const,
+        actor: "verification-engine",
+      },
+    };
+    return {
+      add: { ...common, request: { ...common.request, targetPath: path } },
+      remove: { ...common, request: { ...common.request, targetPath: path } },
+      cleanup: { ...common, request: { ...common.request, targetPath: path } },
+      prune: { ...common, request: { ...common.request, targetPath: checkoutPath } },
+    };
+  }
+
+  private recordVerificationWorktree(input: {
+    worktreeId: string;
+    runId: string;
+    commandId: string;
+    candidateSnapshotDigest: string;
+    repositoryIdentity: string;
+    repositoryCheckoutPath: string;
+    worktreePath: string;
+    head: string;
+    ownerSessionId: string | null;
+    ownerBindingGeneration: number | null;
+    ownerRoleKey: string | null;
+  }): void {
+    if (!input.ownerSessionId || input.ownerBindingGeneration == null || !input.ownerRoleKey) {
+      throw new Error("verification worktree requires a pinned run owner");
+    }
+    this.db.run(
+      `INSERT INTO verification_worktrees
+         (worktree_id, run_id, command_id, candidate_snapshot_digest, repository_identity,
+          repository_checkout_path, worktree_path, head, owner_session_id,
+          owner_binding_generation, owner_role_key, state, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CREATING', ?)`,
+      [
+        input.worktreeId,
+        input.runId,
+        input.commandId,
+        input.candidateSnapshotDigest,
+        input.repositoryIdentity,
+        input.repositoryCheckoutPath,
+        input.worktreePath,
+        input.head,
+        input.ownerSessionId,
+        input.ownerBindingGeneration,
+        input.ownerRoleKey,
+        this.clock.nowIso(),
+      ],
+    );
+  }
+
+  private updateVerificationWorktree(
+    worktreeId: string,
+    state: "ACTIVE" | "DESTROYING" | "DESTROYED" | "FAILED",
+    timestampColumn?: "active_at" | "ended_at",
+  ): void {
+    if (timestampColumn) {
+      this.db.run(
+        `UPDATE verification_worktrees SET state = ?, ${timestampColumn} = ? WHERE worktree_id = ?`,
+        [state, this.clock.nowIso(), worktreeId],
+      );
+      return;
+    }
+    this.db.run(`UPDATE verification_worktrees SET state = ? WHERE worktree_id = ?`, [state, worktreeId]);
   }
 
   private buildReport(

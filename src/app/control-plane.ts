@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 
 import { type Clock, systemClock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
+import { manifestDigest, type ProjectManifest } from "../contracts/manifest.ts";
 import { CapacityMonitor, type CapacityOptions } from "../capacity/capacity-monitor.ts";
 import { ClaimRegistry } from "../claims/claim-registry.ts";
 import { ContinuityKernel } from "../continuity/continuity-kernel.ts";
@@ -16,10 +17,15 @@ import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
-import { ManagedWriteGuard, type DaemonFinalizerAuthority } from "../guard/managed-write-guard.ts";
+import {
+  ManagedWriteGuard,
+  type BootstrapManifestAuthority,
+  type DaemonFinalizerAuthority,
+  type RepairWorktreeAuthority,
+} from "../guard/managed-write-guard.ts";
 import { type WorkspaceProbe, realWorkspaceProbe } from "../guard/workspace-probe.ts";
 import { Outbox } from "../outbox/outbox.ts";
-import { ProjectRegistry } from "../registry/project-registry.ts";
+import { ProjectRegistry, type ManagedManifestWrite } from "../registry/project-registry.ts";
 import { RepositoryRegistry } from "../registry/repository-registry.ts";
 import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review.ts";
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
@@ -170,6 +176,8 @@ export class ControlPlane {
   readonly #completionAuthorities: CompletionAuthoritySet;
   /** The daemon's one non-forgeable admission to post-CEO GitHub writes. */
   readonly #daemonFinalizerAuthority: DaemonFinalizerAuthority;
+  readonly #repairWorktreeAuthority: RepairWorktreeAuthority;
+  readonly #bootstrapManifestAuthority: BootstrapManifestAuthority;
 
   /**
    * The capabilities, for a caller that constructed this control plane *as a fixture*.
@@ -200,6 +208,21 @@ export class ControlPlane {
       );
     }
     return this.#evidenceWriters;
+  }
+
+  /** Fixture-only proof for the initial manifest before a managed bootstrap run exists. */
+  manifestAuthorizationForTests(manifest: ProjectManifest): ManagedManifestWrite {
+    if (!this.config.allowTestEvidenceWriters) {
+      fail(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "bootstrap manifest authorization is not available to this deployment", {});
+    }
+    return {
+      projectId: manifest.projectId,
+      runId: null,
+      sessionId: null,
+      bindingGeneration: null,
+      expectedManifestDigest: manifestDigest(manifest),
+      bootstrapManifestAuthority: this.#bootstrapManifestAuthority,
+    };
   }
 
   /**
@@ -265,8 +288,10 @@ export class ControlPlane {
     // Claim before any request-facing service is assembled. A second component cannot mint
     // itself a daemon identity after it has obtained the composition root.
     this.#daemonFinalizerAuthority = this.guard.claimDaemonFinalizerAuthority();
+    this.#repairWorktreeAuthority = this.guard.claimRepairWorktreeAuthority();
+    this.#bootstrapManifestAuthority = this.guard.claimBootstrapManifestAuthority();
 
-    this.projects = new ProjectRegistry(this.db, this.clock, this.audit);
+    this.projects = new ProjectRegistry(this.db, this.clock, this.audit, this.guard);
     this.repositories = new RepositoryRegistry(this.db, this.clock, this.audit);
     this.sessions = new SessionRegistry(this.db, this.clock, this.audit);
     this.bindings = new BindingRegistry(this.db, this.clock, this.audit, this.sessions, this.outbox);
@@ -306,7 +331,7 @@ export class ControlPlane {
     this.#completionAuthorities = this.runs.issueCompletionAuthorities();
     this.verification = new VerificationEngine(
       this.db, this.clock, this.audit, this.artifacts, this.#evidenceWriters.VERIFICATION,
-      this.repositories, this.worktrees, this.telemetry,
+      this.repositories, this.worktrees, this.claims, this.guard, this.telemetry,
     );
     this.review = new BlindReviewGate(
       this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
@@ -371,7 +396,10 @@ export class ControlPlane {
     // denying the parent would stop a verification command from reading its own worktree.
     this.verification.setDenyReadPaths([config.secretsDir, config.databasePath]);
 
-    this.repair = new RepairService(this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees, this.repositories);
+    this.repair = new RepairService(
+      this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees,
+      this.repositories, this.guard, this.#repairWorktreeAuthority,
+    );
     this.doctor = new Doctor(
       this.db, this.clock, this.audit, this.projects, this.repositories, this.sessions,
       this.bindings, this.runs, this.tasks, this.claims, this.capacity, this.providers, this.continuity,

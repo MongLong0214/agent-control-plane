@@ -989,7 +989,8 @@ type ManagedWriteScope =
 /**
  * A workdir is an input location, never a blanket write grant. Keep this check beside the
  * sandbox profile so a malformed or cross-checkout authorisation cannot widen the profile
- * before the guard sees it.
+ * before the guard sees it. The task receipt and assigned worktree are the authority;
+ * caller-selected workdir is deliberately not used as the write boundary.
  */
 const managedWriteScope = (request: InvocationRequest): ManagedWriteScope => {
   if (request.readOnly || request.isolation) {
@@ -1002,15 +1003,25 @@ const managedWriteScope = (request: InvocationRequest): ManagedWriteScope => {
     };
   }
   try {
-    const workdir = canonical(request.workdir);
     const targetPath = canonical(request.managedWrite.targetPath);
-    if (!isWithin(workdir, targetPath)) {
+    const assignedWorktreeId = canonical(request.managedWrite.assignedWorktreeId);
+    if (!request.managedWrite.taskId || !request.managedWrite.taskReceiptId) {
       return {
         allowed: false,
-        reason: "WRITE_TARGET_OUTSIDE_RUN_SCOPE: authorised write target is outside invocation workdir",
+        reason: "WRITE_REQUIRES_MANAGED_RUN: writable runtime invocation lacks a task receipt",
       };
     }
-    return { allowed: true, targetPath, write: { ...request.managedWrite, targetPath } };
+    if (!isWithin(assignedWorktreeId, targetPath)) {
+      return {
+        allowed: false,
+        reason: "WRITE_TARGET_OUTSIDE_RUN_SCOPE: authorised write target is outside the assigned worktree",
+      };
+    }
+    return {
+      allowed: true,
+      targetPath,
+      write: { ...request.managedWrite, targetPath, assignedWorktreeId },
+    };
   } catch (error) {
     return {
       allowed: false,
@@ -1135,8 +1146,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     // The prompt goes over stdin rather than as a positional argument: several of the
     // CLI's options are variadic, and a trailing positional is liable to be swallowed by
     // whichever flag precedes it.
-    const execute = (writablePaths: readonly string[]) => runCli(this.#binary, args, {
-      cwd: request.workdir,
+    const execute = (writablePaths: readonly string[], cwd = request.workdir) => runCli(this.#binary, args, {
+      cwd,
       timeoutMs: request.timeoutMs,
       stdin: request.prompt,
       environmentAllowlist: this.#environmentAllowlist,
@@ -1167,7 +1178,10 @@ export class ClaudeCliAdapter implements ProviderAdapter {
           "WRITE_REQUIRES_MANAGED_RUN: this runtime has no guard-backed local-write broker",
         );
       }
-      const authorised = await this.#managedWriteBroker.authorize(scope.write, () => execute([scope.targetPath]));
+      const authorised = await this.#managedWriteBroker.authorize(
+        scope.write,
+        () => execute([scope.targetPath], scope.write.assignedWorktreeId),
+      );
       if (!authorised.allowed) {
         return refusedInvocation(
           request,
@@ -1415,8 +1429,8 @@ export class CodexCliAdapter implements ProviderAdapter {
       ? `${request.systemPrompt}\n\n---\n\n${request.prompt}`
       : request.prompt;
 
-    const execute = (writablePaths: readonly string[]) => runCli(this.#binary, [...args, prompt], {
-      cwd: request.workdir,
+    const execute = (writablePaths: readonly string[], cwd = request.workdir) => runCli(this.#binary, [...args, prompt], {
+      cwd,
       timeoutMs: request.timeoutMs,
       environmentAllowlist: this.#environmentAllowlist,
       denyReadPaths: this.#denyReadPaths,
@@ -1442,7 +1456,10 @@ export class CodexCliAdapter implements ProviderAdapter {
           "WRITE_REQUIRES_MANAGED_RUN: this runtime has no guard-backed local-write broker",
         );
       }
-      const authorised = await this.#managedWriteBroker.authorize(scope.write, () => execute([scope.targetPath]));
+      const authorised = await this.#managedWriteBroker.authorize(
+        scope.write,
+        () => execute([scope.targetPath], scope.write.assignedWorktreeId),
+      );
       if (!authorised.allowed) {
         rmSync(scratch, { recursive: true, force: true });
         return refusedInvocation(

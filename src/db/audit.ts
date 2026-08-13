@@ -186,7 +186,7 @@ const AUDIT_EVIDENCE_KEYS: ReadonlySet<string> = new Set([
   "retryNotBefore", "risk", "role", "runsRepointed", "runtimeHealth", "scope", "sensorHealth", "severity",
   "source", "satisfied", "lastError",
   "startedAt", "status", "statuses", "takeover", "target", "targetBranch", "targetPath", "targetWorktreeId",
-  "taskCount", "taskId", "threshold", "timer", "to", "toGeneration", "toSessionId", "trigger",
+  "taskCount", "taskId", "taskReceiptId", "assignedWorktreeId", "claimedPath", "overlap", "candidates", "liveWorktreeIds", "liveWorktreeIdsByRepository", "worktreePath", "threshold", "timer", "to", "toGeneration", "toSessionId", "trigger",
   "triggeredScopes", "uncovered", "verdict", "viaRunKind", "worktreeId", "ok",
 ]);
 

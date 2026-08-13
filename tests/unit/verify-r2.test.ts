@@ -9,6 +9,7 @@ import { cleanupTempDirs, commitAll, gitSync, makeRepo, tempDir, writeFiles } fr
 import { assertPortableManifest } from "../../src/contracts/manifest.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { allow } from "../../src/core/errors.ts";
 import { ExecutionMode, RunKind, SessionLifecycle } from "../../src/domain/types.ts";
 import {
   buildCandidateSnapshot,
@@ -17,6 +18,8 @@ import {
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { buildSandboxEnvironment, memoryLimitForPlatform, runSandboxed } from "../../src/verify/sandbox.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
+import { WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
+import type { WorktreeAuthorization } from "../../src/verify/worktree.ts";
 
 afterEach(cleanupTempDirs);
 
@@ -29,6 +32,37 @@ const contract = {
   priority: "NORMAL" as const,
   humanGate: [],
   references: [],
+};
+
+const testWorktreeAuthorization = (
+  manager: WorktreeManager,
+  repositoryPath: string,
+  worktreeId: string,
+): WorktreeAuthorization => {
+  const path = manager.pathFor(worktreeId);
+  const guard = {
+    authorize: async (_request: unknown, effect: (context: { grant: object }) => Promise<void> | void) => {
+      const value = await effect({ grant: {} });
+      return allow(ReasonCode.WRITE_ALLOWED, value);
+    },
+  } as unknown as ManagedWriteGuard;
+  const common = {
+    guard,
+    request: {
+      operation: WriteOperation.GIT_WORKTREE,
+      repositoryIdentity: "test-repository",
+      targetWorktreeId: repositoryPath,
+      runId: "test-run",
+      sessionId: "test-session",
+      bindingGeneration: 1,
+    },
+  };
+  return {
+    add: { ...common, request: { ...common.request, targetPath: path } },
+    remove: { ...common, request: { ...common.request, targetPath: path } },
+    cleanup: { ...common, request: { ...common.request, targetPath: path } },
+    prune: { ...common, request: { ...common.request, targetPath: repositoryPath } },
+  };
 };
 
 type SandboxTest = () => void | Promise<void>;
@@ -49,7 +83,12 @@ const frozenPinnedCandidate = async (options: {
   const harness = makeHarness();
   options.beforeRun?.(harness.repoPath);
   const manifest = options.manifest ?? fixtureManifest("verify-r2-project");
-  const project = harness.cp.projects.register({ projectId: manifest.projectId, name: "verify-r2", manifest });
+  const project = harness.cp.projects.register({
+    projectId: manifest.projectId,
+    name: "verify-r2",
+    manifest,
+    authorization: harness.cp.manifestAuthorizationForTests(manifest),
+  });
   if (!project.allowed) throw new Error(project.message);
   const repository = await harness.cp.repositories.register({
     checkoutPath: harness.repoPath,
@@ -436,23 +475,24 @@ exec /bin/ps "$@"
     const outside = tempDir("acp-outside-");
     writeFileSync(join(outside, "sentinel"), "keep");
     const manager = new WorktreeManager(root);
-    await expect(manager.create(repo, "HEAD", "../../outside")).rejects.toMatchObject({ reasonCode: ReasonCode.INVALID_ARGUMENT });
+    await expect(manager.create(repo, "HEAD", "../../outside", {})).rejects.toMatchObject({ reasonCode: ReasonCode.INVALID_ARGUMENT });
     expect(readdirSync(outside)).toContain("sentinel");
   });
 
   it("#234 rejects a colliding live worktree instead of destroying its owner", async () => {
     const repo = makeRepo();
     const manager = new WorktreeManager(tempDir("acp-worktrees-"));
+    const authorization = testWorktreeAuthorization(manager, repo, "same");
     let enter!: () => void;
     let release!: () => void;
     const entered = new Promise<void>((resolveEntered) => { enter = resolveEntered; });
     const held = new Promise<void>((resolveRelease) => { release = resolveRelease; });
-    const first = manager.withWorktree(repo, "HEAD", "same", async () => {
+    const first = manager.withWorktree(repo, "HEAD", "same", authorization, async () => {
       enter();
       await held;
     });
     await entered;
-    await expect(manager.withWorktree(repo, "HEAD", "same", async () => undefined)).rejects.toMatchObject({ reasonCode: ReasonCode.CONFLICT });
+    await expect(manager.withWorktree(repo, "HEAD", "same", authorization, async () => undefined)).rejects.toMatchObject({ reasonCode: ReasonCode.CONFLICT });
     release();
     await first;
   });

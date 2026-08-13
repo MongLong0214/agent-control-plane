@@ -8,11 +8,23 @@ import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind } from "../domain/types.ts";
+import { TERMINAL_RUN_STATES } from "../domain/run-state.ts";
 import { isClean, tryRevParse } from "../git/git.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
-import type { WorktreeManager } from "../verify/worktree.ts";
+import {
+  type RepairWorktreeAuthority,
+  type ManagedWriteGuard,
+  WriteOperation,
+} from "../guard/managed-write-guard.ts";
+import type { WorktreeAuthorization, WorktreeManager } from "../verify/worktree.ts";
+import { canonical } from "../guard/workspace-probe.ts";
 
 export type RepairAuthorization = "HERMES" | "OWNER";
+
+// Orphan pruning is destructive, so an unfamiliar future run state is retained by
+// default. The run-state machine is the single authority for deciding which states
+// are terminal and can release a verification tree.
+const VERIFICATION_WORKTREE_OWNER_RELEASE_STATES = TERMINAL_RUN_STATES;
 
 /** The exact admitted ingress operation used for owner-authorised repair. */
 export const REPAIR_OWNER_APPROVAL_OPERATION = "repair_execute";
@@ -120,10 +132,10 @@ export class RepairService {
       id: "prune_orphan_worktrees",
       risk: "HIGH",
       authorization: "OWNER",
-      description: "Remove verification worktrees that no live execution references",
+      description: "Remove verification worktrees with no live task or durable owner reference",
       expectedEffect: "disk is reclaimed and git worktree metadata is pruned",
       undo: "none — uncommitted work inside a pruned worktree is lost",
-      preconditions: ["no running execution references the worktree"],
+      preconditions: ["no running task execution or live durable verification owner references the worktree"],
     },
     clear_repository_drift: {
       id: "clear_repository_drift",
@@ -144,6 +156,8 @@ export class RepairService {
     private readonly claims: ClaimRegistry,
     private readonly worktrees: WorktreeManager,
     private readonly repositories: RepositoryRegistry,
+    private readonly guard: ManagedWriteGuard,
+    private readonly repairAuthority: RepairWorktreeAuthority,
   ) {}
 
   #ownerAuthority: OwnerAuthorityPort | null = null;
@@ -327,7 +341,7 @@ export class RepairService {
         };
       }
       case "prune_orphan_worktrees": {
-        const live = new Set(
+        const taskLive = new Set(
           this.db
             .all<{ worktree_id: string | null }>(
               `SELECT worktree_id FROM task_executions WHERE status = 'RUNNING' AND worktree_id IS NOT NULL`,
@@ -335,17 +349,39 @@ export class RepairService {
             .map((row) => row.worktree_id!)
             .filter(Boolean),
         );
-        const candidates: Array<{ checkoutPath: string; worktreeId: string }> = [];
+        const candidates: Array<{ identity: string; checkoutPath: string; worktreeId: string }> = [];
         const probeFailures: Array<{ identity: string; error: string }> = [];
+        const liveByRepository = new Map<string, Set<string>>();
         for (const repository of this.repositories.list()) {
           try {
-            const orphans = await this.worktrees.orphans(repository.checkoutPath, live);
-            candidates.push(...orphans.map((worktreeId) => ({ checkoutPath: repository.checkoutPath, worktreeId })));
+            const live = new Set([
+              ...taskLive,
+              ...this.liveVerificationWorktreeIds(repository.identity),
+            ]);
+            liveByRepository.set(repository.identity, live);
+            const orphans = await this.worktrees.orphans(
+              repository.checkoutPath,
+              live,
+              (worktreeId) =>
+                live.has(worktreeId) || this.liveVerificationWorktreeIds(repository.identity).has(worktreeId),
+            );
+            candidates.push(...orphans.map((worktreeId) => ({
+              identity: repository.identity,
+              checkoutPath: repository.checkoutPath,
+              worktreeId,
+            })));
           } catch (err) {
             probeFailures.push({ identity: repository.identity, error: safeErrorMessage(err) });
           }
         }
-        const evidence = { liveWorktreeIds: [...live], candidates, probeFailures };
+        const evidence = {
+          liveWorktreeIds: [...new Set([...liveByRepository.values()].flatMap((ids) => [...ids]))],
+          liveWorktreeIdsByRepository: Object.fromEntries(
+            [...liveByRepository.entries()].map(([identity, ids]) => [identity, [...ids]]),
+          ),
+          candidates,
+          probeFailures,
+        };
         return {
           preconditions: [checked(
             operation.preconditions[0]!,
@@ -356,7 +392,12 @@ export class RepairService {
             if (dryRun) return { changes: candidates.length, evidence };
             let changes = 0;
             for (const candidate of candidates) {
-              await this.worktrees.destroy(candidate.checkoutPath, candidate.worktreeId);
+              const path = this.worktrees.pathFor(candidate.worktreeId);
+              await this.worktrees.destroy(
+                candidate.checkoutPath,
+                path,
+                this.repairWorktreeAuthorization(candidate.identity, candidate.checkoutPath, path),
+              );
               changes += 1;
             }
             return { changes, evidence };
@@ -401,6 +442,70 @@ export class RepairService {
       default:
         throw new Error(`missing repair plan for ${operation.id}`);
     }
+  }
+
+  private repairWorktreeAuthorization(
+    repositoryIdentity: string,
+    checkoutPath: string,
+    path: string,
+  ): WorktreeAuthorization {
+    const common = {
+      guard: this.guard,
+      request: {
+        operation: WriteOperation.GIT_WORKTREE,
+        repositoryIdentity,
+        targetWorktreeId: canonical(checkoutPath),
+        targetBranch: null,
+        runId: null,
+        sessionId: null,
+        bindingGeneration: null,
+        claimedClassification: "MANAGED" as const,
+        actor: "doctor-repair",
+        repairWorktreeAuthority: this.repairAuthority,
+      },
+    };
+    return {
+      remove: { ...common, request: { ...common.request, targetPath: path } },
+      cleanup: { ...common, request: { ...common.request, targetPath: path } },
+      prune: { ...common, request: { ...common.request, targetPath: checkoutPath } },
+    };
+  }
+
+  /**
+   * A verification checkout is live while its durable record names the current run owner
+   * tuple and that owner has not reached a terminal run state. This deliberately retains
+   * BLOCKED, AWAITING_HUMAN, review, approval, merge, and revision states: source-write
+   * admission may pause there, but the owner has not released the verification tree.
+   *
+   * The predicate is queried again immediately before orphan pruning so a concurrent
+   * owner repair cannot turn a just-created or still-tearing-down tree into a candidate
+   * between the initial list and the destructive effect.
+   */
+  private liveVerificationWorktreeIds(repositoryIdentity: string): Set<string> {
+    return new Set(
+      this.db
+        .all<{ worktree_id: string }>(
+          `SELECT v.worktree_id
+             FROM verification_worktrees v
+             JOIN runs r ON r.run_id = v.run_id
+             JOIN assignments a
+               ON a.role_key = v.owner_role_key
+              AND a.session_id = v.owner_session_id
+              AND a.binding_generation = v.owner_binding_generation
+              AND a.status = 'ACTIVE'
+              AND (a.run_id = r.run_id OR (a.role = 'PRIMARY_CTO' AND a.project_id = r.project_id))
+             JOIN sessions s ON s.session_id = v.owner_session_id
+            WHERE v.repository_identity = ?
+              AND v.state IN ('CREATING','ACTIVE','DESTROYING')
+              AND r.state NOT IN (${VERIFICATION_WORKTREE_OWNER_RELEASE_STATES.map(() => "?").join(", ")})
+              AND r.owner_session_id = v.owner_session_id
+              AND r.owner_binding_generation = v.owner_binding_generation
+              AND r.owner_role_key = v.owner_role_key
+              AND s.lifecycle IN ('STARTING','READY','DRAINING')`,
+          [repositoryIdentity, ...VERIFICATION_WORKTREE_OWNER_RELEASE_STATES],
+        )
+        .map((row) => row.worktree_id),
+    );
   }
 }
 

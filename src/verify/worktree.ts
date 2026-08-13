@@ -1,10 +1,20 @@
 import { existsSync, lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { fail } from "../core/errors.ts";
+import { type Decision, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { git, listWorktrees, pruneWorktrees, removeWorktree, revParse, treeOf } from "../git/git.ts";
+import {
+  addWorktree,
+  type GuardedGitEffect,
+  git,
+  listWorktrees,
+  pruneWorktrees,
+  removeWorktree,
+  revParse,
+  treeOf,
+} from "../git/git.ts";
+import { WriteOperation } from "../guard/managed-write-guard.ts";
 import { canonical, isWithin } from "../guard/workspace-probe.ts";
 
 export interface Worktree {
@@ -13,6 +23,19 @@ export interface Worktree {
   repositoryPath: string;
   head: string;
 }
+
+/** One complete guard request per Git or local cleanup effect. */
+export interface WorktreeAuthorization {
+  readonly add?: GuardedGitEffect;
+  readonly remove?: GuardedGitEffect;
+  readonly prune?: GuardedGitEffect;
+  readonly cleanup?: GuardedGitEffect;
+}
+
+const requireAllowed = <T>(decision: Decision<T>): T => {
+  if (!decision.allowed) return fail(decision.reasonCode, decision.message, decision.evidence);
+  return decision.value;
+};
 
 /**
  * Disposable worktrees for verification (PRD §17.4).
@@ -32,7 +55,12 @@ export class WorktreeManager {
     this.rootPath = canonical(root);
   }
 
-  async create(repositoryPath: string, head: string, worktreeId: string): Promise<Worktree> {
+  async create(
+    repositoryPath: string,
+    head: string,
+    worktreeId: string,
+    authorization: WorktreeAuthorization,
+  ): Promise<Worktree> {
     const path = this.managedPath(worktreeId);
     const known = await listWorktrees(repositoryPath);
     if (existsSync(path) || known.some((entry) => canonical(entry.path) === path)) {
@@ -52,10 +80,7 @@ export class WorktreeManager {
       // `worktree add` performs a checkout, which normally invokes a repository-local
       // post-checkout hook as the control-plane user. Candidate-controlled hooks therefore
       // must be disabled before Git has a chance to materialise any verification input.
-      await git(repositoryPath, [
-        "-c", "core.hooksPath=/dev/null",
-        "worktree", "add", "--detach", path, expectedHead,
-      ]);
+      requireAllowed(await addWorktree(repositoryPath, path, expectedHead, authorization.add));
 
       const [materializedHead, materializedTree, status] = await Promise.all([
         revParse(path, "HEAD"),
@@ -85,14 +110,17 @@ export class WorktreeManager {
       // available for a later command. The path was just proven to be under our root.
       const after = await listWorktrees(repositoryPath);
       if (after.some((entry) => canonical(entry.path) === path)) {
-        await removeWorktree(repositoryPath, path);
-        await pruneWorktrees(repositoryPath);
+        requireAllowed(await removeWorktree(repositoryPath, path, authorization.remove));
       }
+      if (existsSync(path)) {
+        requireAllowed(await this.cleanup(path, authorization.cleanup));
+      }
+      requireAllowed(await pruneWorktrees(repositoryPath, authorization.prune));
       throw error;
     }
   }
 
-  async destroy(repositoryPath: string, path: string): Promise<void> {
+  async destroy(repositoryPath: string, path: string, authorization: WorktreeAuthorization): Promise<void> {
     const managedPath = this.managedPathFromPath(path);
     const before = await listWorktrees(repositoryPath);
     if (!before.some((entry) => canonical(entry.path) === managedPath)) {
@@ -101,7 +129,7 @@ export class WorktreeManager {
         repositoryPath: canonical(repositoryPath),
       });
     }
-    await removeWorktree(repositoryPath, path);
+    requireAllowed(await removeWorktree(repositoryPath, managedPath, authorization.remove));
     const remaining = await listWorktrees(repositoryPath);
     if (remaining.some((entry) => canonical(entry.path) === managedPath)) {
       fail(ReasonCode.ISOLATION_LOST, "git did not remove the managed worktree", {
@@ -116,35 +144,52 @@ export class WorktreeManager {
           path: managedPath,
         });
       }
-      rmSync(managedPath, { recursive: true, force: false });
+      requireAllowed(await this.cleanup(managedPath, authorization.cleanup));
     }
-    await pruneWorktrees(repositoryPath);
+    requireAllowed(await pruneWorktrees(repositoryPath, authorization.prune));
   }
 
   async withWorktree<T>(
     repositoryPath: string,
     head: string,
     worktreeId: string,
+    authorization: WorktreeAuthorization,
     fn: (worktree: Worktree) => Promise<T>,
   ): Promise<T> {
-    const worktree = await this.create(repositoryPath, head, worktreeId);
+    const worktree = await this.create(repositoryPath, head, worktreeId, authorization);
     try {
       return await fn(worktree);
     } finally {
-      await this.destroy(repositoryPath, worktree.path);
+      await this.destroy(repositoryPath, worktree.path, authorization);
     }
+  }
+
+  /** The exact path a caller must bind into its GIT_WORKTREE request. */
+  pathFor(worktreeId: string): string {
+    return this.managedPath(worktreeId);
   }
 
   /**
    * Worktrees under the managed root that git still knows about. The doctor reports
    * these; it deliberately does not delete them (CP-S44 — detect, do not auto-remove).
    */
-  async orphans(repositoryPath: string, liveIds: ReadonlySet<string>): Promise<string[]> {
+  async orphans(
+    repositoryPath: string,
+    liveIds: ReadonlySet<string>,
+    isLive?: (worktreeId: string) => boolean | Promise<boolean>,
+  ): Promise<string[]> {
     const known = await listWorktrees(repositoryPath);
-    return known
+    const candidates = known
       .map((w) => canonical(w.path))
       .filter((path) => isWithin(this.rootPath, path) && path !== this.rootPath)
-      .filter((path) => !liveIds.has(path.slice(this.rootPath.length + 1)));
+      .map((path) => path.slice(this.rootPath.length + 1))
+      .filter((worktreeId) => !liveIds.has(worktreeId));
+    if (!isLive) return candidates;
+    const stillOrphaned: string[] = [];
+    for (const worktreeId of candidates) {
+      if (!(await isLive(worktreeId))) stillOrphaned.push(worktreeId);
+    }
+    return stillOrphaned;
   }
 
   private managedPath(worktreeId: string): string {
@@ -165,5 +210,30 @@ export class WorktreeManager {
       });
     }
     return resolved;
+  }
+
+  /** Guarded local cleanup is a first-class effect, including when Git removed its record. */
+  async cleanup(path: string, authorization: GuardedGitEffect | undefined): Promise<Decision<void>> {
+    if (!authorization) {
+      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "local worktree cleanup requires guard authorization", { path });
+    }
+    if (authorization.request.operation !== WriteOperation.GIT_WORKTREE) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "local worktree cleanup requires a GIT_WORKTREE authorization", {
+        operation: authorization.request.operation,
+      });
+    }
+    if (!authorization.request.targetPath || canonical(authorization.request.targetPath) !== canonical(path)) {
+      return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "local cleanup target does not match the guard request", {
+        path,
+        authorizedTarget: authorization.request.targetPath ?? null,
+      });
+    }
+    return authorization.guard.authorize(authorization.request, () => {
+      const stat = lstatSync(path);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        fail(ReasonCode.ISOLATION_LOST, "managed worktree path changed before cleanup", { path });
+      }
+      rmSync(path, { recursive: true, force: false });
+    });
   }
 }

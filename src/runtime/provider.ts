@@ -1,5 +1,5 @@
-import type { Decision } from "../core/errors.ts";
-import type { ReasonCode } from "../core/reason-codes.ts";
+import { deny, type Decision } from "../core/errors.ts";
+import { ReasonCode } from "../core/reason-codes.ts";
 import type { ManagedWriteGuard, WriteOperation } from "../guard/managed-write-guard.ts";
 
 /**
@@ -11,6 +11,12 @@ export interface ManagedInvocationWrite {
   operation: WriteOperation;
   /** Absolute target the provider process may mutate for this one invocation. */
   targetPath: string;
+  /** The task whose worker receipt authorises this invocation. */
+  taskId: string;
+  /** Durable task_executions receipt for this particular worker attempt. */
+  taskReceiptId: string;
+  /** Canonical disposable worktree bound to the task receipt. */
+  assignedWorktreeId: string;
   repositoryIdentity?: string | null;
   targetBranch?: string | null;
   targetWorktreeId?: string | null;
@@ -34,8 +40,10 @@ export interface ManagedInvocationWriteBroker {
 
 /**
  * Production composition of the local-runtime boundary with CP-HI-01. The guard keeps
- * the grant in flight while the provider process runs, so revocation, claims and the
- * source-read fence are rechecked immediately around the actual side effect.
+ * the grant in flight while the provider process is launched and runs, so revocation,
+ * claims and the source-read fence are rechecked around that invocation. The sandbox and
+ * assigned-worktree boundary constrain the process's individual file writes; those syscalls
+ * are not each separate Guard API calls.
  */
 export class GuardedInvocationWriteBroker implements ManagedInvocationWriteBroker {
   constructor(private readonly guard: ManagedWriteGuard) {}
@@ -44,17 +52,33 @@ export class GuardedInvocationWriteBroker implements ManagedInvocationWriteBroke
     write: ManagedInvocationWrite,
     effect: () => T | Promise<T>,
   ): Promise<Decision<T>> {
+    const missing = [
+      ["taskId", write.taskId],
+      ["taskReceiptId", write.taskReceiptId],
+      ["assignedWorktreeId", write.assignedWorktreeId],
+    ].filter(([, value]) => typeof value !== "string" || value.trim().length === 0).map(([name]) => name);
+    if (missing.length > 0) {
+      return Promise.resolve(deny(
+        ReasonCode.WRITE_REQUIRES_MANAGED_RUN,
+        "writable runtime invocation must name its task receipt and assigned worktree",
+        { missing },
+      ));
+    }
     return this.guard.authorize(
       {
         operation: write.operation,
         targetPath: write.targetPath,
         repositoryIdentity: write.repositoryIdentity ?? null,
         targetBranch: write.targetBranch ?? null,
-        targetWorktreeId: write.targetWorktreeId ?? null,
+        // The binding, rather than a caller-selected worktree label, is authoritative.
+        targetWorktreeId: write.assignedWorktreeId,
+        assignedWorktreeId: write.assignedWorktreeId,
+        taskId: write.taskId,
+        taskReceiptId: write.taskReceiptId,
         runId: write.runId,
         sessionId: write.sessionId,
         bindingGeneration: write.bindingGeneration,
-        actor: write.actor ?? "runtime-cli",
+        actor: "runtime-cli",
       },
       () => effect(),
     );
