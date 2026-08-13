@@ -1,0 +1,153 @@
+{
+  "verdict": "BLOCK",
+  "filesExamined": [
+    "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
+    "docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md",
+    "docs/adr/ADR-0002-invariants-as-types-and-constraints.md",
+    "docs/adr/ADR-0004-verification-sandbox-isolation.md",
+    "docs/ACCEPTANCE.md",
+    "src/verify/sandbox.ts",
+    "src/verify/verification-engine.ts",
+    "src/verify/worktree.ts",
+    "src/snapshot/candidate-snapshot.ts",
+    "src/contracts/manifest.ts",
+    "src/contracts/verification-command.ts",
+    "src/git/git.ts",
+    "src/db/schema.sql",
+    "src/db/artifacts.ts",
+    "src/run/candidate-pipeline.ts",
+    "src/run/run-engine.ts",
+    "src/ceo/production-gate.ts",
+    "src/github/github-kernel.ts",
+    "src/app/control-plane.ts",
+    "src/guard/workspace-probe.ts",
+    "src/registry/project-registry.ts",
+    "src/registry/repository-registry.ts",
+    "src/mcp/cto-server.ts",
+    "src/review/blind-review.ts",
+    "src/core/digest.ts",
+    "src/db/audit.ts",
+    "src/domain/types.ts",
+    "tests/unit/verify-r2.test.ts",
+    "tests/helpers/harness.ts",
+    "deploy/com.agentcontrolplane.agentcpd.plist",
+    "evidence/review/verify.json"
+  ],
+  "omittedItems": [
+    "Runtime confirmation that this host's git invokes post-checkout on `worktree add` (not executed; other agents are mutating the tree). Finding 1 is grounded in git's documented hook contract plus the missing disable in src/git/git.ts.",
+    "Measurement of Darwin RLIMIT_NPROC=1, RLIMIT_CPU, and the 100ms RSS sampler under load.",
+    "Live GitHub Actions TRUSTED_CI against a real check-run (src/github/github-kernel.ts ciEvidenceSource was read only).",
+    "Linux confinement (sandbox-exec absent → refuse path only; no alternative backend).",
+    "tests/integration/pipeline.test.ts and tests/e2e/real-project.test.ts beyond grep of expectedInputs."
+  ],
+  "findings": [
+    {
+      "severity": "BLOCKER",
+      "category": "invariant-violation",
+      "file": "src/verify/worktree.ts",
+      "line": 41,
+      "summary": "A repo-local post-checkout hook runs unsandboxed and can make verification PASS a different tree than the frozen SHA.",
+      "detail": "CP-HI-06 / §16.2 / §17.4 require evidence for the exact frozen candidate. Verification materializes that SHA with `git worktree add --detach` (src/git/git.ts:136) from WorktreeManager.create (src/verify/worktree.ts:41), then sandboxes only the inner command (src/verify/verification-engine.ts:366). git() sets HOME to the daemon home and GIT_CONFIG_NOSYSTEM=1 but never `core.hooksPath` (src/git/git.ts:49-56). Git runs post-checkout on `worktree add`. Sequence: (1) producer writes an executable `.git/hooks/post-checkout` in the registered checkout that rewrites the new worktree (e.g. replace verify.js with process.exit(0)) and exits 0; (2) freeze records SHA A; (3) addWorktree checks out A then the hook mutates the disposable worktree; (4) the sandboxed argv runs the mutated tree and PASSes; (5) verifySnapshotFreshness re-reads the source checkout, not the disposable worktree (src/verify/verification-engine.ts:281-288, 326-336; src/snapshot/candidate-snapshot.ts:141-178), so HEAD/tree/base/clean still match A; (6) the worktree is destroyed; merge publishes SHA A. RLIMIT_NPROC=1 does not apply to the daemon's git child. No test would fail if hooks stayed enabled.",
+      "suggestedFix": "Invoke every control-plane git mutation that materializes a worktree as `git -c core.hooksPath=/var/empty worktree add --detach …` (and the same for other hook-firing git verbs). After add, re-read `HEAD^{tree}` in the new worktree and refuse unless it equals the frozen treeDigest. Add a regression that installs a post-checkout hook rewriting the command and expects ERROR/SNAPSHOT_STALE, not PASS."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-violation",
+      "file": "src/verify/verification-engine.ts",
+      "line": 224,
+      "summary": "Unpinned runs take the producer-supplied command set; a later attempt can replace a real suite with exit 0 and still PASS.",
+      "detail": "CP-HI-03 is enforced only when `runs.pinned_manifest_digest` is set (src/verify/verification-engine.ts:165-223): commands are then derived from that digest and a weaker caller set is denied. Dispatch pins `project.activeManifestDigest` only if one exists (src/run/run-engine.ts:266-268, 314). Project.register may store a null manifest (src/registry/project-registry.ts:47-56). Projectless and TEMPORARY §17.5 runs also remain unpinned. Then verify requires `runScoped: true` and executes `options.commands` unchanged (src/verify/verification-engine.ts:224-230). CandidatePipeline.resolveCommands returns caller argv whenever the pin is null (src/run/candidate-pipeline.ts:536-540). MCP submitResult forwards `runScopedCommands` (src/mcp/cto-server.ts:176-177). Sequence: create/dispatch a project or temporary run with no active manifest; submit `{id:test, argv:[node,-e,process.exit(1)], required:true}` → FAIL; resubmit `{id:test, argv:[node,-e,process.exit(0)], required:true}` → PASS, completeness 1/1, production corroboration accepts. Nothing stores a command digest on the run. #160 only covers the pinned path and would still pass if this else-branch stayed.",
+      "suggestedFix": "Refuse to dispatch a project-scoped run unless a manifest can be pinned. For §17.5, parse and pin the run-scoped command set (or its digest) on first verify, immutably, the same way `runs_pinned_manifest_immutable` works. Reject a later command set that does not match."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "correctness",
+      "file": "src/verify/sandbox.ts",
+      "line": 345,
+      "summary": "On Darwin a command that exits before `ps` can snapshot the leader cannot PASS, even when it did the right work.",
+      "detail": "After spawn, runSandboxed awaits `processIdentity(child.pid)` (src/verify/sandbox.ts:241) before the first RSS sample (323). `memoryLimitObserved` requires `peakRssMb !== null && identity !== null` (345-348). `memoryEvidenceUnavailable` is then true on Darwin whenever identity is missing (347-348), so exit 0 becomes ERROR + SANDBOX_RESOURCE_LIMIT_UNAVAILABLE (355, 393-394). Sequence: argv that execs and exits within one `ps` round-trip (true, a tiny node -e); leader is gone when lstart is sampled; identity is null; group RSS is empty; PASS is impossible. This is the fail-closed twin of #247: memory evidence was made mandatory, then tied to a racy identity read. tests/unit/verify-r2.test.ts:#348 hides it with `setTimeout(..., 500)`. No test asserts that an immediately-exiting successful command PASSes, so deleting the identity conjunct would not go red.",
+      "suggestedFix": "Treat a clean, already-reaped group with a recorded RSS sample as observed. Require identity only for signalling. Add a Darwin test that `node -e process.exit(0)` can PASS, and keep the ERROR path for a true missing sample."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "prd-conformance",
+      "file": "src/verify/verification-engine.ts",
+      "line": 491,
+      "summary": "§17.7 counts only required commands, but the production gate demands expectedInputs === result row count, so a legal optional command cannot be published.",
+      "detail": "verificationCommandSchema allows `required: false` (src/contracts/verification-command.ts:20). buildReport sets expectedInputs to the required subset (src/verify/verification-engine.ts:491-495) and ignores optional failures when deciding PASS (505-516). ProductionGate.corroborateVerification then requires `report.expectedInputs === report.results.length === rows.length` (src/ceo/production-gate.ts:657-664). Sequence: pinned profile contains required A and optional B; both exit 0; engine status PASS with expectedInputs=1 and results.length=2; review can accept; CEO publication returns VERIFICATION_INCOMPLETE. The inverse all-optional set (expectedInputs=0, N>0 results) also PASSes the engine and is then unpublishable. Schema feature vs gate are contradictory. No verify-r2 test uses required:false, so deleting either check would not fail that file.",
+      "suggestedFix": "Pick one rule. Either forbid required:false at the schema, or make corroboration compare only required (commandId, source) pairs and treat extra optional rows as non-authoritative."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-violation",
+      "file": "src/verify/verification-engine.ts",
+      "line": 307,
+      "summary": "Two snapshot repositories sharing a role cause only the first identity to be executed; the other is still bound to the PASS.",
+      "detail": "run_repositories does not unique repository_role (src/db/schema.sql:368-378). create() inserts whatever roles the caller supplies (src/run/run-engine.ts:153-160). For each command the engine does `snapshot.repositories.find(r => r.repositoryRole === command.repositoryRole)` (src/verify/verification-engine.ts:307) after repositories were sorted by identity (src/snapshot/candidate-snapshot.ts:100). Sequence: run participates in github:acme/aaa and github:acme/zzz, both role primary; one LOCAL_COMMAND for primary; only aaa is worktree'd and sandboxed; zzz is in the snapshot and the production packet's changedRepositories; expectedInputs=1; PASS. §17.7 lists Missing Repo as blocking success. CP-S25's two-repo freeze is otherwise implemented. No test creates two same-role participants.",
+      "suggestedFix": "Unique (run_id, repository_role) or run the command once per matching repository and count each as an expected input. Refuse a snapshot that maps one role to two identities."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "security",
+      "file": "src/verify/sandbox.ts",
+      "line": 449,
+      "summary": "Read confinement is a partial deny list; Node can still read host git/GitHub credential files via passwd homedir.",
+      "detail": "ADR-0004 and Integration §15 require that a candidate command cannot read authority credentials. The seatbelt profile is `(allow default)` plus deny-by-subpath (src/verify/sandbox.ts:497-505). sensitiveReadPaths covers ~/.ssh, ~/.git-credentials, ~/.config/gh, ~/.agent-control-plane, Keychains files, etc. (449-473) but not ~/.config/git/credentials (XDG git store) or ~/Library/Application Support/GitHub CLI. HOME in the child is the scratch dir (414-416), but Node `os.userInfo().homedir` is the passwd home, not HOME. Sequence: pinned argv `node verify.js`; the committed script does fs.readFileSync(path.join(os.userInfo().homedir, '.config/git/credentials')); seatbelt allows the read; hex-encode the bytes so putEvidence's credential heuristic does not refuse (src/db/artifacts.ts:266-272); exit 0; PASS. RLIMIT_NPROC=1 does not help: no spawn. #163 only tests buildSandboxEnvironment name filtering and would still pass if these paths stayed readable. CP-HI-05's daemon store in secretsDir is denied; this is the remaining §17.4/CP-S27 hole.",
+      "suggestedFix": "Deny the rest of the well-known credential locations (XDG git, GitHub CLI application-support, docker/config.json). Better: keep (allow default) only for exec/dyld, and default-deny file-read* outside worktree, scratch, and an enumerated system set. Add a test that userInfo().homedir credential paths are unreadable and that a successful read is ERROR, not PASS."
+    },
+    {
+      "severity": "MINOR",
+      "category": "evidence",
+      "file": "src/verify/verification-engine.ts",
+      "line": 573,
+      "summary": "verification_results is overwritten with INSERT OR REPLACE and has no immutability trigger.",
+      "detail": "run_artifacts is append-only (src/db/schema.sql:511-534) and VERIFICATION writes need the issued capability. The per-command table that both review and the production gate corroborate (src/review/blind-review.ts:982-991; src/ceo/production-gate.ts:605-608) is UNIQUE(snapshot, command, repo, source) with INSERT OR REPLACE (src/verify/verification-engine.ts:573-582) and no BEFORE UPDATE/DELETE trigger (src/db/schema.sql:568-585). A same-process second verify() or a raw SQL client can replace PASS/FAIL under a digest that already has an immutable artifact. Corroboration then fail-closes if the latest artifact and rows diverge, so this is not by itself a PASS forge. It is not the DB enforcement ADR-0002 claims for exact evidence.",
+      "suggestedFix": "Insert-only rows keyed by (snapshot, command, repo, source, attempt) or reject REPLACE when a VERIFICATION artifact for that digest already exists."
+    },
+    {
+      "severity": "MINOR",
+      "category": "correctness",
+      "file": "src/ceo/production-gate.ts",
+      "line": 768,
+      "summary": "CEO freshness is a second, unsanitized git implementation that can follow GIT_DIR and user status.* config.",
+      "detail": "verifySnapshotFreshness uses git() with a constructed env (PATH, HOME, GIT_CONFIG_NOSYSTEM only). ProductionGate.revalidateCandidateFreshness calls execFileSync(\"git\", [\"-C\", checkoutPath, …]) with the process environment (src/ceo/production-gate.ts:768-773). Inherited GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR retarget every -C probe; ~/.gitconfig status.showUntrackedFiles=no hides dirt that src/git/git.ts:81-82 would also see only because it still uses the real HOME. launchd sets only BUZZ_RELAY_URL and otherwise inherits (deploy/com.agentcontrolplane.agentcpd.plist:47-53). Default LaunchAgent env usually has no GIT_DIR, so this is not the default-path bypass. It is still two freshness implementations, one of which is not the isolated helper.",
+      "suggestedFix": "Call verifySnapshotFreshness from the production gate (or git() with the same sanitized env). Do not duplicate rev-parse/status with inherited env."
+    },
+    {
+      "severity": "MINOR",
+      "category": "test-integrity",
+      "file": "tests/unit/verify-r2.test.ts",
+      "line": 315,
+      "summary": "#313 would still pass if Darwin/Linux memory enforcement in runSandboxed were deleted.",
+      "detail": "The test only asserts memoryLimitForPlatform(\"darwin\")===\"observed\" and (\"linux\")===\"hard\" (tests/unit/verify-r2.test.ts:315-318). That helper is a one-line ternary (src/verify/sandbox.ts:137-139). Removing its use when building resourceArgs (212-217) and the PASS gate (345-356) leaves #313 green. The live RSS-kill case is #348, Darwin-only (sandboxIt). Linux RLIMIT_AS therefore has no executing regression on the project's Darwin CI. Same class as the 26 hollow tests named in ACCEPTANCE.md.",
+      "suggestedFix": "On non-Darwin, run a child that raises RLIMIT_AS above the wrapper value and expect SANDBOX_RESOURCE_LIMIT_EXCEEDED / memoryLimit:\"hard\". Keep #313 only as a unit of the classifier if the sandbox test exists."
+    },
+    {
+      "severity": "MINOR",
+      "category": "security",
+      "file": "src/verify/sandbox.ts",
+      "line": 568,
+      "summary": "Seatbelt paths are interpolated with quote() that does not escape SBPL metacharacters.",
+      "detail": "quote() only backslash-escapes `\"` and `\\\\` (src/verify/sandbox.ts:568). denyReadPaths includes every registered checkoutPath (src/verify/verification-engine.ts:587-592). A checkout whose resolved path contains `)` or a newline can close `(subpath \"…\")` early. Most such strings make sandbox-exec reject the profile, which is ERROR (fail-closed), not PASS. I could not exhibit a default-path parse that yields a passing unconfined command, so this is not graded as a demonstrated invariant bypass.",
+      "suggestedFix": "Reject any interpolated path that is not `^[A-Za-z0-9._/ -]+$` after realpath, or generate the profile from a tempfile and pass it with sandbox-exec -f so paths are not spliced into SBPL."
+    },
+    {
+      "severity": "INFO",
+      "category": "evidence",
+      "file": "src/verify/sandbox.ts",
+      "line": 373,
+      "summary": "enforcement.secretsStripped and processGroupKill are typed true even on refused/unconfined outcomes.",
+      "detail": "SandboxEnforcement declares those fields as the literal true (src/verify/sandbox.ts:45-48). refused() still emits secretsStripped:true and processGroupKill:true with resourceLimitsEnforced:false (552-563). A PASS from a real run does construct the env and uses process groups; the bits are not a silent PASS of an unconfined command. They are not evidence a reader can use to tell those mechanisms fired.",
+      "suggestedFix": "Record booleans from what actually happened (env constructed; killKnownGroup succeeded) and never hard-code true on the refuse path."
+    },
+    {
+      "severity": "INFO",
+      "category": "prd-conformance",
+      "file": "src/verify/sandbox.ts",
+      "line": 137,
+      "summary": "#247 item 6 (Darwin memory is observed, not RLIMIT_AS) holds; the residual hole is the 100ms sample gap, not a fake observation.",
+      "detail": "Issue #247 and ACCEPTANCE.md record that setrlimit(RLIMIT_AS) is accepted and ignored on Darwin, so a hard limit refused every verification. Current code passes address_space=0 on Darwin (src/verify/sandbox.ts:212-217, 100-106), samples group RSS every 100ms (143, 277-327), and will not PASS with peakRssMb===null (347-355, 381-383). That fixes the earlier 'observed but no sample' hole. A process can still spike above maxMemoryMb between samples and exit 0 with memoryLimit:\"observed\". That is a resource-limit residual, not CP-HI-03. I agree with the trade-off given the recorded mechanism. Revisit when verification can run in a VM/container.",
+      "suggestedFix": "Keep memoryLimit in the evidence. If a tighter bound is required before public release, run each attempt in a job that the kernel actually accounts, rather than pretending RLIMIT_AS works on Darwin."
+    }
+  ]
+}

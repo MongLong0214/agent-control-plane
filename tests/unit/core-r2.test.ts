@@ -2,8 +2,11 @@ import { afterAll, describe, expect, it } from "vitest";
 import { join } from "node:path";
 
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
+import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ArtifactKind } from "../../src/domain/types.ts";
+import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
+import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { MessageKind } from "../../src/outbox/envelope.ts";
 import {
   CANDIDATE_SNAPSHOT_SCHEMA_ID,
@@ -12,6 +15,7 @@ import {
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { Db } from "../../src/db/database.ts";
 import { cleanupTempDirs, makeCore, makeRepo, seedRun, tempDir } from "../helpers/fixtures.ts";
+import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -284,6 +288,20 @@ describe("round-2 database and evidence regressions", () => {
     const { db, artifacts, runId, digest } = candidateRun();
     const evidence = verificationFor(runId, digest);
     const writer = artifacts.issueEvidenceWriters().VERIFICATION;
+
+    // MCP factories reduce the composition root to operation-only ports before a handler is
+    // built. An accidental return of the root would put Db back within a tool's reach.
+    const harness = makeHarness();
+    const hermesPort = createHermesMcpPort(harness.cp);
+    const ctoPort = createCtoMcpPort(harness.cp);
+    for (const port of [hermesPort, ctoPort]) {
+      expect(Object.hasOwn(port, "db")).toBe(false);
+      expect(Object.hasOwn(port, "runs")).toBe(false);
+      expect(Object.hasOwn(port.mutation, "db")).toBe(false);
+    }
+    const authenticate = () => allow(ReasonCode.OK, { actor: "port-only-test" });
+    expect(createHermesServer(hermesPort, authenticate)).toBeDefined();
+    expect(createCtoServer(ctoPort, authenticate)).toBeDefined();
 
     // A tool handler may hold Db, but not the native connection that could replace the marker
     // function or drop this trigger before issuing the SQL below.

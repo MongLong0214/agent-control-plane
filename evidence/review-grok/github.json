@@ -1,0 +1,5 @@
+{
+  "verdict": "ERROR",
+  "error": "Unexpected non-whitespace character after JSON at position 87 (line 6 column 2)",
+  "stderr": ""
+}

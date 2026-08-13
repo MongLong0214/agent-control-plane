@@ -215,36 +215,50 @@ describe("round 2 doctor regressions", () => {
     expect(harness.cp.audit.byKind("DOCTOR_REPORT").at(-1)?.evidence).toMatchObject({ status: "BLOCKED" });
   });
 
-  it("#335: watchdog reclaims an aged crashed candidate attempt and records its exact finding", async () => {
+  it("#335: watchdog reclaims a crashed attempt on its persisted deadline and records its exact finding", async () => {
     const { harness, run } = await createDispatchedRun();
-    const startedAt = harness.clock.nowIso();
+    const startedAt = new Date(harness.clock.now().getTime() - 30 * 60 * 1000).toISOString();
+    const deadlineAt = new Date(harness.clock.now().getTime() + 60_000).toISOString();
     harness.cp.db.run(
       `INSERT INTO candidate_pipeline_attempts
-         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, released_at)
-       VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, NULL)`,
+         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
+       VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, ?, NULL)`,
       [
         run.runId,
         "attempt_crashed",
         run.ownerSessionId,
         run.ownerBindingGeneration,
         startedAt,
+        deadlineAt,
       ],
     );
-    harness.clock.advance(30 * 60 * 1000 + 1);
 
+    // A legacy started_at sweep would reclaim this old row immediately. The row's own
+    // deadline is authoritative until it passes, even if the watchdog's policy later moves.
+    const beforeDeadline = await harness.cp.watchdog.tick();
+    expect(beforeDeadline.overdue).not.toContainEqual(expect.objectContaining({
+      kind: "candidate_pipeline_attempt",
+      id: "attempt_crashed",
+    }));
+    expect(harness.cp.db.get<{ state: string }>(
+      `SELECT state FROM candidate_pipeline_attempts WHERE run_id = ?`,
+      [run.runId],
+    )).toEqual({ state: "RUNNING" });
+
+    harness.clock.advance(60_000);
     const tick = await harness.cp.watchdog.tick();
     const report = tick.reports.find((candidate) => candidate.scope === "run" && candidate.target === run.runId);
 
     expect(tick.overdue).toContainEqual({
       kind: "candidate_pipeline_attempt",
       id: "attempt_crashed",
-      ageMs: 30 * 60 * 1000 + 1,
+      ageMs: 31 * 60 * 1000,
     });
     expect(
       report?.findings.find((finding) => finding.code === ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE),
     ).toMatchObject({
       blocking: true,
-      observedEvidence: { attemptId: "attempt_crashed", reclaimed: true },
+      observedEvidence: { attemptId: "attempt_crashed", deadlineAt, reclaimed: true },
     });
     expect(
       harness.cp.db.get<{ state: string; released_at: string | null }>(

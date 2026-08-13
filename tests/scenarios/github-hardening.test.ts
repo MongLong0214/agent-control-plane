@@ -2,11 +2,13 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ExecutionMode, SessionLifecycle } from "../../src/domain/types.ts";
 import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { GATE_CHECK_NAME, NO_HUMAN_GATE_DIGEST, type GatePayload } from "../../src/github/github-kernel.ts";
+import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
-import { type Harness, driveToReviewedCandidate, makeHarness } from "../helpers/harness.ts";
+import { type Harness, driveToReviewedCandidate, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -25,6 +27,25 @@ interface Fixture {
   workBranch: string;
   payload: GatePayload;
 }
+
+interface OwnerAuthorityFixture {
+  harness: Harness;
+  github: FakeGitHub;
+  runId: string;
+  identity: string;
+  caller: { ownerSessionId: string; ownerBindingGeneration: number };
+}
+
+const OWNER_AUTHORITY_CONTRACT: TaskContract = {
+  goal: "owner-authority regression",
+  why: "exercise owner fencing before GitHub effects",
+  scope: [],
+  nonGoals: [],
+  acceptance: ["owner check runs"],
+  priority: "NORMAL",
+  humanGate: [],
+  references: [],
+};
 
 /** Model GitHub's post-merge pull re-read: its target ref advances to the merge SHA. */
 const reflectMergedBase = (github: FakeGitHub): void => {
@@ -101,6 +122,36 @@ const setup = async (options: { declareChecks?: boolean } = {}): Promise<Fixture
   };
 };
 
+/**
+ * Ownership is checked before any candidate or GitHub predicate. Keeping this fixture small
+ * means the regression proves that exact check rather than accidentally relying on unrelated
+ * verification setup.
+ */
+const setupOwnerAuthorisedRun = async (): Promise<OwnerAuthorityFixture> => {
+  const github = new FakeGitHub();
+  const harness = makeHarness({ githubClient: github });
+  const { projectId, repositoryId, identity } = await registerFixtureProject(harness, "owner-authority");
+  const created = harness.cp.runs.create({
+    projectId,
+    executionMode: ExecutionMode.STANDARD,
+    contract: OWNER_AUTHORITY_CONTRACT,
+    repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+  });
+  if (!created.allowed) throw new Error(created.message);
+  const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+  if (!dispatched.allowed) throw new Error(dispatched.message);
+  return {
+    harness,
+    github,
+    runId: dispatched.value.runId,
+    identity,
+    caller: {
+      ownerSessionId: dispatched.value.ownerSessionId!,
+      ownerBindingGeneration: dispatched.value.ownerBindingGeneration!,
+    },
+  };
+};
+
 const openPull = async (fixture: Fixture, head = fixture.workBranch, exactHeadSha = fixture.head) => {
   const prepared = await fixture.harness.cp.github.prPrepare({
     runId: fixture.runId,
@@ -142,6 +193,17 @@ const mergeInput = (fixture: Fixture, pullNumber: number) => ({
   ownerSessionId: fixture.caller.ownerSessionId,
   ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
 });
+
+/** A live, unrelated identity makes an ownership denial prove the owner check actually ran. */
+const unrelatedCaller = (fixture: Pick<OwnerAuthorityFixture, "harness" | "caller">) => {
+  const session = fixture.harness.cp.sessions.create({ provider: "scripted", model: "unrelated-github-caller" });
+  const ready = fixture.harness.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "ownership regression");
+  if (!ready.allowed) throw new Error(ready.message);
+  return {
+    ownerSessionId: session.sessionId,
+    ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
+  };
+};
 
 describe("a production gate asserts evidence that exists (§24.4, CP-HI-06)", () => {
   it("refuses a payload whose verification digest resolves to nothing", async () => {
@@ -456,14 +518,16 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
 
 describe("release tags and issue projection are owner-authorised (CP-HI-01)", () => {
   it("refuses an issue projection from a session that does not own the run", async () => {
-    const fixture = await setup();
+    const fixture = await setupOwnerAuthorisedRun();
+    const caller = unrelatedCaller(fixture);
     const refused = await fixture.harness.cp.github.issueProject(
       fixture.runId,
       fixture.identity,
       [{ id: "T001", title: "first", body: "body" }],
-      { ownerSessionId: "ses_someone_else", ownerBindingGeneration: 1 },
+      caller,
     );
     expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
     expect(fixture.github.issues).toHaveLength(0);
   });
 
@@ -480,15 +544,17 @@ describe("release tags and issue projection are owner-authorised (CP-HI-01)", ()
   });
 
   it("refuses a release tag from a session that does not own the run", async () => {
-    const fixture = await setup();
+    const fixture = await setupOwnerAuthorisedRun();
+    const caller = unrelatedCaller(fixture);
     const refused = await fixture.harness.cp.github.releaseTag(
       fixture.runId,
       fixture.identity,
       "1.0.0",
       "1".repeat(40),
-      { ownerSessionId: "ses_someone_else", ownerBindingGeneration: 1 },
+      caller,
     );
     expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.RUN_OWNER_REVOKED);
     expect(fixture.github.tags.size).toBe(0);
   });
 });

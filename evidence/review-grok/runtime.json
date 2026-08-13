@@ -1,0 +1,157 @@
+{
+  "verdict": "BLOCK",
+  "filesExamined": [
+    "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
+    "docs/ACCEPTANCE.md",
+    "docs/adr/ADR-0001-runtime-and-persistence.md",
+    "docs/adr/ADR-0002-invariants-as-types-and-constraints.md",
+    "src/domain/run-state.ts",
+    "src/run/run-engine.ts",
+    "src/run/task-graph.ts",
+    "src/run/candidate-pipeline.ts",
+    "src/ceo/production-gate.ts",
+    "src/ceo/owner-authority.ts",
+    "src/db/schema.sql",
+    "src/db/database.ts",
+    "src/db/artifacts.ts",
+    "src/claims/claim-registry.ts",
+    "src/session/binding-registry.ts",
+    "src/mcp/hermes-server.ts",
+    "src/mcp/cto-server.ts",
+    "src/mcp/shared.ts",
+    "src/cli/agentctl.ts",
+    "src/app/control-plane.ts",
+    "src/daemon/agentcpd.ts",
+    "src/ingress/ingress-guard.ts",
+    "src/ingress/telegram.ts",
+    "src/bootstrap/activation.ts",
+    "src/github/github-kernel.ts",
+    "src/guard/managed-write-guard.ts",
+    "src/cto/cto-lifecycle.ts",
+    "tests/unit/run-gate-r2.test.ts",
+    "tests/unit/runtime-hardening.test.ts",
+    "tests/unit/cto-registry-r2.test.ts",
+    "tests/unit/ops-r2.test.ts",
+    "tests/scenarios/registry-cto.test.ts",
+    "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts",
+    "tests/e2e/real-project.test.ts",
+    "evidence/review/runtime.json"
+  ],
+  "omittedItems": [
+    "Did not execute the test suite (forbidden; concurrent edits).",
+    "ADR-0003 through ADR-0008 were not read in full.",
+    "GitHub issue #247 body was only retrieved through item 5; later items were taken from docs/ACCEPTANCE.md rather than the live issue.",
+    "CommitLore context for src/run and src/ceo is unavailable (index has no baseline; notes unfetched).",
+    "GitHub kernel merge/execute beyond the human-gate predicate, and claim-registry conflict indexes beyond acquire/release, were not fully traced."
+  ],
+  "findings": [
+    {
+      "severity": "BLOCKER",
+      "category": "invariant-violation",
+      "file": "src/run/run-engine.ts",
+      "line": 420,
+      "summary": "COMPLETED is authorized by a caller-supplied string, not by the production gate",
+      "detail": "CP-HI-02 and ADR-0002 say only the production gate (or bootstrap activation) may complete a run. transition() accepts any legal §29 edge and treats CompletionAuthority as the literal \"production-gate\" | \"bootstrap-activation\". Sequence: transition(runId, READY_FOR_CEO_REVIEW, \"pretend\") from ACTIVE, then transition(runId, COMPLETED, \"done\", {}, \"production-gate\"). No packet, verification, blind review, CEO session, continuity check, or human gate is consulted. The database trigger only checks topology plus a connection-local marker that RunEngine raises for every transition it applies, so SQLite does not close this. The in-process TCB is the same one they built unforgeable EvidenceWriter tokens to constrain. tests/unit/cto-registry-r2.test.ts:104 already uses this string to mark a GUARDED CONTRACT_CHANGE COMPLETED with no gate. tests/unit/runtime-hardening.test.ts \"runtime#1\" only omits the fifth argument, so it still passes if every submitCeoDecision evidence check is deleted.",
+      "suggestedFix": "Replace the string with a capability issued once to ProductionGate (and BootstrapActivation), the way evidence writers are issued. Refuse COMPLETED unless the same transaction already wrote a current PRODUCTION_READY_PACKET or a finalized bootstrap activation. Add a test that transition(..., \"production-gate\") is denied when that packet is absent."
+    },
+    {
+      "severity": "BLOCKER",
+      "category": "product-function",
+      "file": "src/cli/agentctl.ts",
+      "line": 134,
+      "summary": "No shipped interface can satisfy a §21 human gate",
+      "detail": "recordOwnerDecision refuses anything but an admitOwnerApproval receipt (production-gate.ts:977). agentctl owner approve — the PRD §28.4 / T038 operator command — passes only the deprecated owner: {channel, actor} tuple and never mints a receipt, so it is denied with OWNER_AUTHORITY_NOT_DELEGABLE. Hermes owner_decision_submit is hard-denied (hermes-server.ts:159). TelegramIngress.admit returns untrusted text and never calls admitOwnerApproval. Buzz has no owner-decision path. The only working composer is test code (e2e/real-project.test.ts:364 and run-gate-r2 helpers). A GUARDED run whose contract lists a gate therefore cannot be confirmed on a real deployment: CEO CONFIRM dies on HUMAN_GATE_UNSATISFIED. This is the fail-closed choice that broke the product; #247 recorded other trade-offs and missed this one.",
+      "suggestedFix": "Make agentctl owner approve construct the owner_decision_submit payload, admit it through IngressGuard on channel cli with the OS user as actor, and pass the receipt into recordOwnerDecision. Wire the same composer for Telegram/Buzz text that names an approve/reject. Add a test that the CLI path, not a hand-built guard, clears humanGateStatus."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-violation",
+      "file": "src/ceo/production-gate.ts",
+      "line": 1117,
+      "summary": "An owner decision with a null candidate digest satisfies every later snapshot",
+      "detail": "recordOwnerDecision stores runs.current_candidate_digest, which is null before freeze (production-gate.ts:1033). humanGateStatus skips a decision only when candidateSnapshotDigest != null AND it differs from the current candidate, so a null-bound approval is never stale. promoteCandidate (run-engine.ts:653) supersedes only rows whose digest is non-null, so those approvals also survive invalidation. Sequence: recordOwnerDecision(\"public release\", approved) before freeze; later freeze any candidate; humanGateStatus.satisfied is true for that candidate and every successor. The GUARDED e2e depends on this order (real-project.test.ts:376 then 391). The rest of the gate binds verification, review, and the packet to one digest (CP-HI-06); the owner cheque does not.",
+      "suggestedFix": "Refuse owner decisions when there is no current candidate, or re-bind them to the digest present at confirmation and require a new receipt if the candidate moved. Ignore null-digest approvals in humanGateStatus. Change the GUARDED e2e to approve after freeze."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-violation",
+      "file": "src/ceo/production-gate.ts",
+      "line": 1100,
+      "summary": "§21 owner triggers are documentation; an empty contract skips the owner",
+      "detail": "HUMAN_GATE_TRIGGERS (production-gate.ts:126) is never read. humanGateStatus returns required:false / satisfied:true when the task contract's humanGate array is empty. Hermes run_create takes that array with a default of [] (hermes-server.ts:26) and GUARDED mode does not force a non-empty gate. Sequence: Hermes creates a GUARDED run for a public release or destructive migration with humanGate:[]; pipeline publishes a packet; CEO CONFIRM succeeds with no owner receipt. CP-HI-07 says owner authority cannot be substituted; omission by Hermes is substitution. The control plane cannot classify a diff, but it can refuse GUARDED / the named §21 classes unless the contract lists a gate.",
+      "suggestedFix": "Treat GUARDED (and any contract whose goal/scope matches the §21 list, if you keep classification on Hermes) as humanGate.required with a non-empty item list. Fail create() or buildPacket when executionMode is GUARDED and humanGate is empty. Drive HUMAN_GATE_TRIGGERS from the same check so the exported list is not dead."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "correctness",
+      "file": "src/run/task-graph.ts",
+      "line": 75,
+      "summary": "AWAITING_HUMAN is not sealed, so a published packet's completeness claim can be falsified",
+      "detail": "CLOSED_TO_NEW_TASKS includes READY_FOR_CEO_REVIEW / COMPLETED / FAILED / CANCELLED but not AWAITING_HUMAN, despite the comment that a packet's completeness claim must not be invalidated after the fact (§34.3). Sequence: buildPacket → READY_FOR_CEO_REVIEW; CEO OWNER_DECISION_REQUIRED → AWAITING_HUMAN; CTO plan_submit adds tasks (cto-server.ts:128). The stored packet still claims the graph was complete. Owner resume then returns the run to ACTIVE with extra PENDING work. Not a false COMPLETED by itself, but it is exactly the post-packet mutation the seal was written to prevent.",
+      "suggestedFix": "Add AWAITING_HUMAN (and BLOCKED, if a packet can exist there) to CLOSED_TO_NEW_TASKS. Regression: after OWNER_DECISION_REQUIRED, plan_submit must be denied."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "test-integrity",
+      "file": "tests/unit/runtime-hardening.test.ts",
+      "line": 547,
+      "summary": "The COMPLETED-authority test still passes if the production gate is deleted",
+      "detail": "\"refuses a COMPLETED transition that no completion authority carries\" calls transition(COMPLETED) without the fifth argument and expects COMPLETION_AUTHORITY_DENIED. It never asks submitCeoDecision or buildPacket to enforce evidence. Delete every CONFIRM predicate in ProductionGate and this test stays green. The same file's CEO-session tests would still catch an unbound session id, but they would not catch a COMPLETED write that skipped the gate. Combined with cto-registry-r2.test.ts:104, the suite treats the forgeable string as the invariant.",
+      "suggestedFix": "Add a negative test that transition(runId, COMPLETED, reason, {}, \"production-gate\") is denied unless a current, non-superseded PRODUCTION_READY_PACKET exists for that run, and that deleting submitCeoDecision's evidence checks turns an existing CONFIRM test red."
+    },
+    {
+      "severity": "MAJOR",
+      "category": "invariant-violation",
+      "file": "src/github/github-kernel.ts",
+      "line": 978,
+      "summary": "Merge treats any historical owner approval as still valid",
+      "detail": "Production-gate confirmation uses the latest decision per item (production-gate.ts:1123). merge_evaluate only asks whether some APPROVAL row has kind OWNER_DECISION and approved===true (github-kernel.ts:977). Sequence: owner approves, then recordOwnerDecision(approved:false) for the same item; CEO CONFIRM is correctly refused; if the run is already COMPLETED, or a later merge path does not re-enter submitCeoDecision, merge_evaluate still reports humanGateSatisfied. That is a second, weaker §21 check sitting next to the one the gate claims is authoritative.",
+      "suggestedFix": "Call ProductionGate.humanGateStatus (or the same latest-decision reduction) from merge_evaluate and refuse when required && !satisfied. Add a test that an explicit rejection after an approval blocks merge."
+    },
+    {
+      "severity": "MINOR",
+      "category": "correctness",
+      "file": "src/run/candidate-pipeline.ts",
+      "line": 537,
+      "summary": "A dangling pinned-manifest digest fails open to caller-supplied commands",
+      "detail": "resolveCommands uses the pinned manifest only when projects.manifest(digest) returns a document. If the pin is set and the row is missing, it returns the CTO's runScopedCommands. pinManifest (run-engine.ts:750) writes any digest without checking the manifests table. Sequence: pinManifest(runId, \"sha256:\"+\"0\".repeat(64)) while QUEUED; dispatch keeps that pin via COALESCE; submitResult({runScopedCommands:[...]}) is judged against the caller's list, not the dispatch contract (CP-HI-03). Production dispatch usually pins a real project digest, so the blast radius is the public pinManifest / missing-manifest path, not the happy path.",
+      "suggestedFix": "If pinnedManifestDigest is set and the manifest cannot be loaded, deny with CANDIDATE_CANNOT_WEAKEN_CONTRACT (or EVIDENCE_MISSING). Make pinManifest refuse a digest that is not already in manifests."
+    },
+    {
+      "severity": "MINOR",
+      "category": "test-integrity",
+      "file": "tests/unit/run-gate-r2.test.ts",
+      "line": 398,
+      "summary": "#145 never reads the incomplete activation artifact it inserts",
+      "detail": "The test puts a skeletal BOOTSTRAP_ACTIVATION_RESULT and expects BOOTSTRAP_ACTIVATION_INCOMPLETE. submitCeoDecision for bootstrap calls finalizeBootstrapActivationConfirm, which looks for REPO_FACTORY_RESULT, HANDOFF, DOCTOR_REPORT and a PASS review — not that artifact. validateBootstrapActivation (production-gate.ts:813) would inspect it and is never called. Inserting nothing yields the same reason code. The test proves a bootstrap CONFIRM without factory/handoff/review is refused; it does not prove an incomplete activation result is validated.",
+      "suggestedFix": "Either delete the unused validateBootstrapActivation or call it from finalize/submitCeoDecision and rewrite #145 so a complete-looking factory+handoff+review with a lying activation result is the thing that fails."
+    },
+    {
+      "severity": "MINOR",
+      "category": "concurrency",
+      "file": "src/ceo/production-gate.ts",
+      "line": 515,
+      "summary": "CEO CONFIRM re-reads git freshness outside the completion transaction",
+      "detail": "#141 correctly refuses a commit that lands before submitCeoDecision is called. revalidateCandidateFreshness runs via execFileSync before the db.tx that writes COMPLETED (515 then 536). A commit that lands in that window is not observed; the source-read lease from buildPacket has already been released. Same residual class as the #247 merge expected-base window. Not a deterministic bypass, so not a BLOCKER.",
+      "suggestedFix": "Hold a source-read lease across the freshness probe and the COMPLETED write, or re-probe HEAD inside the transaction immediately before applyRunStateTransition and fail closed on drift."
+    },
+    {
+      "severity": "MINOR",
+      "category": "product-function",
+      "file": "src/ceo/production-gate.ts",
+      "line": 1170,
+      "summary": "A blocking escalation can be opened over MCP and cannot be resolved over any shipped interface",
+      "detail": "CTO escalation_open can move a run ACTIVE → BLOCKED (cto-server.ts:186). resolveEscalation exists only as an in-process method and is not registered on Hermes or the CLI. BLOCKED → CANCELLED is still legal via run_cancel, so the run is not immortal, but the documented resume (CEO answers, run returns to ACTIVE) cannot happen in production. resolveEscalation also unblocks any BLOCKED run, including one checkpointed by project suspend (cto-lifecycle.ts:622), because it does not check that an escalation is open.",
+      "suggestedFix": "Add a Hermes tool that resolves an open escalation using the authenticated CEO peer, require a stored CTO_ESCALATION for that run, and refuse to resume a suspend-checkpointed run through this path."
+    },
+    {
+      "severity": "INFO",
+      "category": "observation",
+      "file": "src/run/task-graph.ts",
+      "line": 401,
+      "summary": "Completeness is vacuously true for an empty graph and treats CANCELLED as success",
+      "detail": "completeness() allows a run with zero tasks, and counts CANCELLED alongside SUCCEEDED as a terminal success. cancelAll is not on MCP and RunEngine.cancel also CANCELS the run, so this is not a shipped bypass. It does mean a CTO can result_submit with no receipts and still reach verify/review; quality then rests entirely on those later gates.",
+      "suggestedFix": "If a STANDARD/GUARDED run is required to have produced work, deny completeness when tasks===0. Keep CANCELLED as non-success unless the run itself is CANCELLED."
+    }
+  ]
+}
