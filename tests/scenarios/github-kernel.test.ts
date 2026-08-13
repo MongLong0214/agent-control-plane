@@ -12,7 +12,7 @@ import {
 } from "../../src/github/github-kernel.ts";
 import { classifyBranch, validateBranchContract } from "../../src/github/branch-contract.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
-import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
+import { candidateSnapshotDigest, type CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
@@ -188,9 +188,12 @@ const gatePayload = (fixture: Fixture, head = fixture.head): GatePayload => ({
  * an actual ancestry fact to prove rather than a branch-name-only fixture.
  */
 const setupLineageFixture = async (input: {
-  workBranch: "release/1.2.0" | "hotfix/H1-fix";
-  baseBranch: "main" | "dev";
-  sourceBranch: "dev" | "main";
+  workBranch: string;
+  baseBranch: string;
+  /** The branch the fixture actually cuts from; freeze independently records the required origin. */
+  sourceBranch: string;
+  /** Other active releases, needed to prove hotfix propagation against more than one release. */
+  activeReleases?: readonly string[];
   /** Advance the required source separately to prove a candidate was cut from the wrong branch. */
   divergentBranch?: "dev" | "main";
 }): Promise<Fixture> => {
@@ -199,9 +202,20 @@ const setupLineageFixture = async (input: {
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
 
-  // `main` begins at the fixture root. Move only the required source before cutting the
-  // candidate so release→main and hotfix→dev exercise a real source/target divergence.
+  // `main` begins at the fixture root. Create the parent branches that the matrix needs;
+  // every later candidate is still cut by real git from the selected source branch.
   gitSync(harness.repoPath, ["branch", "main"]);
+  const requiredBranches = new Set([
+    input.sourceBranch,
+    input.baseBranch,
+    ...(input.activeReleases ?? []),
+  ]);
+  for (const branch of requiredBranches) {
+    if (branch === "main" || branch === "dev") continue;
+    if (!gitSync(harness.repoPath, ["branch", "--list", branch]).trim()) {
+      gitSync(harness.repoPath, ["branch", branch, "dev"]);
+    }
+  }
   if (input.divergentBranch && input.divergentBranch !== input.sourceBranch) {
     gitSync(harness.repoPath, ["checkout", "-q", input.divergentBranch]);
     writeFiles(harness.repoPath, {
@@ -218,8 +232,9 @@ const setupLineageFixture = async (input: {
     baseBranch: input.baseBranch,
     reviewedPaths: ["LINEAGE.md", "src/app.js"],
   });
-  github.setBranch("dev", gitSync(harness.repoPath, ["rev-parse", "dev"]));
-  github.setBranch("main", gitSync(harness.repoPath, ["rev-parse", "main"]));
+  for (const branch of new Set(["dev", "main", input.sourceBranch, input.baseBranch, ...(input.activeReleases ?? [])])) {
+    github.setBranch(branch, gitSync(harness.repoPath, ["rev-parse", branch]));
+  }
   github.setBranch(driven.workBranch, driven.candidateHead);
 
   const claimed = harness.cp.claims.acquire({
@@ -465,12 +480,128 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
     expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
   });
 
-  it("#382: release cut from dev may prepare and merge into main", async () => {
+  const lineageMatrix: ReadonlyArray<{
+    name: string;
+    workBranch: string;
+    sourceBranch: string;
+    baseBranch: string;
+    declaredParent?: string;
+    activeReleases?: readonly string[];
+  }> = [
+    { name: "feature → dev", workBranch: "feature/F1-thing", sourceBranch: "dev", baseBranch: "dev" },
+    {
+      name: "task → feature",
+      workBranch: "task/T1-feature",
+      sourceBranch: "feature/F1-parent",
+      baseBranch: "feature/F1-parent",
+      declaredParent: "feature/F1-parent",
+    },
+    {
+      name: "task → dev",
+      workBranch: "task/T1-dev",
+      sourceBranch: "dev",
+      baseBranch: "dev",
+      declaredParent: "dev",
+    },
+    {
+      name: "task → release",
+      workBranch: "task/T1-release",
+      sourceBranch: "release/1.2.0",
+      baseBranch: "release/1.2.0",
+      declaredParent: "release/1.2.0",
+      activeReleases: ["release/1.2.0"],
+    },
+    { name: "release → main", workBranch: "release/1.2.0", sourceBranch: "dev", baseBranch: "main" },
+    { name: "release → dev", workBranch: "release/1.2.0", sourceBranch: "dev", baseBranch: "dev" },
+    { name: "hotfix → main", workBranch: "hotfix/H1-main", sourceBranch: "main", baseBranch: "main" },
+    { name: "hotfix → dev", workBranch: "hotfix/H1-dev", sourceBranch: "main", baseBranch: "dev" },
+    {
+      name: "hotfix → active release/1.2.0",
+      workBranch: "hotfix/H1-release-one",
+      sourceBranch: "main",
+      baseBranch: "release/1.2.0",
+      activeReleases: ["release/1.2.0", "release/2.0.0"],
+    },
+    {
+      name: "hotfix → active release/2.0.0",
+      workBranch: "hotfix/H1-release-two",
+      sourceBranch: "main",
+      baseBranch: "release/2.0.0",
+      activeReleases: ["release/1.2.0", "release/2.0.0"],
+    },
+  ];
+
+  for (const scenario of lineageMatrix) {
+    it(`#382: ${scenario.name} prepares and merges with the frozen origin and target`, async () => {
+      const fixture = await setupLineageFixture(scenario);
+      const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
+      if (!gate.allowed) throw new Error(`${gate.reasonCode}: ${gate.message}`);
+      const prepared = await fixture.harness.cp.github.prPrepare({
+        runId: fixture.runId,
+        repositoryIdentity: fixture.identity,
+        head: fixture.workBranch,
+        base: scenario.baseBranch,
+        title: `${scenario.name} candidate`,
+        body: "",
+        ...(scenario.declaredParent ? { declaredParent: scenario.declaredParent } : {}),
+        ownerSessionId: fixture.ownerSessionId,
+        ownerBindingGeneration: fixture.ownerBindingGeneration,
+        exactHeadSha: fixture.head,
+      });
+      expect(prepared.allowed).toBe(true);
+      if (!prepared.allowed) return;
+
+      const frozen = fixture.harness.cp.artifacts.latestForSnapshot<{
+        repositories: Array<{ identity: string; sourceBranch?: string | null; sourceHead?: string | null }>;
+      }>(fixture.runId, "CANDIDATE_SNAPSHOT", fixture.payload.candidateSnapshotDigest);
+      const source = frozen?.content.repositories.find((repository) => repository.identity === fixture.identity);
+      expect(source).toMatchObject({ sourceBranch: scenario.sourceBranch });
+      expect(source?.sourceHead).toMatch(/^[0-9a-f]{40}$/);
+
+      const receipt = fixture.harness.cp.db.get<{ response_json: string }>(
+        `SELECT response_json FROM github_receipts
+          WHERE operation = 'pr_prepare' AND run_id = ? AND repository_identity = ?`,
+        [fixture.runId, fixture.identity],
+      );
+      const intent = JSON.parse(receipt!.response_json) as { intent: Record<string, unknown> };
+      expect(intent.intent).toMatchObject({
+        base: scenario.baseBranch,
+        candidateSnapshotDigest: fixture.payload.candidateSnapshotDigest,
+        sourceBranch: scenario.sourceBranch,
+        sourceHead: source?.sourceHead,
+      });
+      expect(fixture.github.pulls.find((pull) => pull.number === prepared.value.pullNumber)).toMatchObject({
+        head: { ref: scenario.workBranch, sha: fixture.head },
+        base: { ref: scenario.baseBranch, sha: fixture.base },
+      });
+
+      const merged = await fixture.harness.cp.github.mergeExecute(
+        mergeInput(fixture, prepared.value.pullNumber),
+      );
+      expect(merged.allowed).toBe(true);
+      expect(fixture.github.mergeCount).toBe(1);
+    });
+  }
+
+  it("#382: a source ref advancing after freeze does not replace the frozen origin", async () => {
     const fixture = await setupLineageFixture({
       workBranch: "release/1.2.0",
       sourceBranch: "dev",
       baseBranch: "main",
     });
+    const frozen = fixture.harness.cp.artifacts.latestForSnapshot<{
+      repositories: Array<{ identity: string; sourceBranch?: string | null; sourceHead?: string | null }>;
+    }>(fixture.runId, "CANDIDATE_SNAPSHOT", fixture.payload.candidateSnapshotDigest);
+    const source = frozen?.content.repositories.find((repository) => repository.identity === fixture.identity);
+    if (!source?.sourceHead) throw new Error("fixture did not freeze a source head");
+
+    gitSync(fixture.harness.repoPath, ["checkout", "-q", "dev"]);
+    writeFiles(fixture.harness.repoPath, { "POST_FREEZE.md": "advance dev after freeze\n" });
+    const advancedSourceHead = commitAll(fixture.harness.repoPath, "advance source after freeze");
+    gitSync(fixture.harness.repoPath, ["checkout", "-q", fixture.workBranch]);
+    fixture.github.setBranch("dev", advancedSourceHead);
+    expect(advancedSourceHead).not.toBe(source.sourceHead);
+
     const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
     if (!gate.allowed) throw new Error(`${gate.reasonCode}: ${gate.message}`);
     const prepared = await fixture.harness.cp.github.prPrepare({
@@ -478,7 +609,7 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
       repositoryIdentity: fixture.identity,
       head: fixture.workBranch,
       base: "main",
-      title: "release candidate",
+      title: "release candidate with advanced source ref",
       body: "",
       ownerSessionId: fixture.ownerSessionId,
       ownerBindingGeneration: fixture.ownerBindingGeneration,
@@ -487,42 +618,41 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
     expect(prepared.allowed).toBe(true);
     if (!prepared.allowed) return;
 
-    const merged = await fixture.harness.cp.github.mergeExecute({
-      ...mergeInput(fixture, prepared.value.pullNumber),
-      expectedBaseSha: fixture.base,
-    });
+    const receipt = fixture.harness.cp.db.get<{ response_json: string }>(
+      `SELECT response_json FROM github_receipts
+        WHERE operation = 'pr_prepare' AND run_id = ? AND repository_identity = ?`,
+      [fixture.runId, fixture.identity],
+    );
+    const intent = JSON.parse(receipt!.response_json) as { intent: { sourceHead: string } };
+    expect(intent.intent.sourceHead).toBe(source.sourceHead);
+
+    const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, prepared.value.pullNumber));
     expect(merged.allowed).toBe(true);
-    expect(fixture.github.mergeCount).toBe(1);
   });
 
-  it("#382: hotfix cut from main may prepare and merge into dev", async () => {
-    const fixture = await setupLineageFixture({
-      workBranch: "hotfix/H1-fix",
-      sourceBranch: "main",
-      baseBranch: "dev",
-    });
-    const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
-    if (!gate.allowed) throw new Error(`${gate.reasonCode}: ${gate.message}`);
-    const prepared = await fixture.harness.cp.github.prPrepare({
-      runId: fixture.runId,
-      repositoryIdentity: fixture.identity,
-      head: fixture.workBranch,
-      base: "dev",
-      title: "hotfix candidate",
-      body: "",
-      ownerSessionId: fixture.ownerSessionId,
-      ownerBindingGeneration: fixture.ownerBindingGeneration,
-      exactHeadSha: fixture.head,
-    });
-    expect(prepared.allowed).toBe(true);
-    if (!prepared.allowed) return;
+  it("#382: a candidate without a frozen source fails closed before PR creation", async () => {
+    const fixture = await setup();
+    const original = fixture.harness.cp.artifacts.latestForSnapshot<CandidateSnapshot>(
+      fixture.runId,
+      "CANDIDATE_SNAPSHOT",
+      fixture.payload.candidateSnapshotDigest,
+    );
+    if (!original) throw new Error("fixture did not produce a candidate snapshot");
+    const detached: CandidateSnapshot = {
+      ...original.content,
+      repositories: original.content.repositories.map((repository) => ({
+        ...repository,
+        sourceBranch: null,
+        sourceHead: null,
+      })),
+    };
+    const detachedDigest = candidateSnapshotDigest(detached);
+    fixture.harness.cp.artifacts.put(fixture.runId, "CANDIDATE_SNAPSHOT", detached, detachedDigest);
+    fixture.harness.cp.runs.promoteCandidate(fixture.runId, detachedDigest);
 
-    const merged = await fixture.harness.cp.github.mergeExecute({
-      ...mergeInput(fixture, prepared.value.pullNumber),
-      expectedBaseSha: fixture.base,
-    });
-    expect(merged.allowed).toBe(true);
-    expect(fixture.github.mergeCount).toBe(1);
+    const refused = await fixture.harness.cp.github.prPrepare(prepareInput(fixture));
+    expect(refused.reasonCode).toBe(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION);
+    expect(fixture.github.pulls).toHaveLength(0);
   });
 
   it("#382: a release cut from main cannot use its main target to masquerade as a dev cut", async () => {
@@ -1096,8 +1226,9 @@ describe("crash and acknowledgement recovery", () => {
       base: preparedInput.base,
       exactHeadSha: preparedInput.exactHeadSha,
       expectedBaseSha: prFixture.base,
-      sourceBase: "dev",
-      sourceBaseSha: prFixture.base,
+      candidateSnapshotDigest: prFixture.payload.candidateSnapshotDigest,
+      sourceBranch: "dev",
+      sourceHead: prFixture.base,
       title: preparedInput.title,
       body: prBody,
       declaredParent: null,
