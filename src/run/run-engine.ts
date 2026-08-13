@@ -4,6 +4,7 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { newRunId } from "../core/ids.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { deriveHumanGate } from "../ceo/human-gate.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db, RunStateTransitionAuthority } from "../db/database.ts";
@@ -161,6 +162,12 @@ export class RunEngine {
 
   create(input: CreateRunInput): Decision<RunRow> {
     const kind = input.kind ?? RunKind.STANDARD_WORK;
+    const humanGate = deriveHumanGate({
+      executionMode: input.executionMode,
+      goal: input.contract.goal,
+      scope: input.contract.scope,
+      declaredItems: input.contract.humanGate,
+    });
     if (input.projectId && !this.projects.get(input.projectId)) {
       return deny(ReasonCode.NOT_FOUND, "unknown project", { projectId: input.projectId });
     }
@@ -177,7 +184,7 @@ export class RunEngine {
         [
           runId, input.projectId ?? null, kind, input.executionMode,
           input.priority ?? input.contract.priority, input.contract.goal, contractDigest,
-          input.contract.humanGate.length > 0 ? 1 : 0, now,
+          humanGate.required ? 1 : 0, now,
         ],
       );
 
@@ -201,7 +208,8 @@ export class RunEngine {
           executionMode: input.executionMode,
           priority: input.priority ?? input.contract.priority,
           contractDigest,
-          humanGate: input.contract.humanGate,
+          humanGate: humanGate.items,
+          humanGateRequired: humanGate.required,
         },
       });
 
@@ -704,8 +712,10 @@ export class RunEngine {
       this.db.run(
         `UPDATE run_artifacts SET superseded = 1
           WHERE run_id = ?
-            AND candidate_snapshot_digest IS NOT NULL
-            AND candidate_snapshot_digest <> ?
+            AND (
+              (candidate_snapshot_digest IS NOT NULL AND candidate_snapshot_digest <> ?)
+              OR (kind = 'APPROVAL' AND candidate_snapshot_digest IS NULL)
+            )
             AND superseded = 0`,
         [runId, candidateSnapshotDigest],
       );

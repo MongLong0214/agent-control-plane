@@ -14,7 +14,7 @@ import {
   makeHarness,
   registerFixtureProject,
 } from "../helpers/harness.ts";
-import type { TaskContract } from "../../src/run/run-engine.ts";
+import type { CompletionAuthority, TaskContract } from "../../src/run/run-engine.ts";
 import type { HandoffAcknowledgement, HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 
 afterAll(cleanupTempDirs);
@@ -187,6 +187,30 @@ describe("a CEO decision comes from the session that holds the role (CP-HI-07)",
     expect(confirmed.allowed).toBe(true);
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
   });
+
+  it("#376 refuses a CEO confirmation without the production packet that the gate must publish", async () => {
+    const harness = makeHarness();
+    const driven = await driveToReviewedCandidate(harness);
+    await harness.cp.continuity.evaluate("test missing packet");
+    const ready = harness.cp.runs.transition(
+      driven.runId,
+      RunState.READY_FOR_CEO_REVIEW,
+      "pretend a packet was published",
+    );
+    if (!ready.allowed) throw new Error(ready.message);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+
+    const refused = harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceo.sessionId,
+      rationale: "a completion token must only be exercised by a real gate decision",
+    });
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+  });
 });
 
 describe("an owner decision needs an owner (§21)", () => {
@@ -222,6 +246,8 @@ describe("an owner decision needs an owner (§21)", () => {
   it("records the real actor, not a generic 'owner', when the identity checks out", async () => {
     const harness = makeHarness();
     const { runId } = await activeRun(harness);
+    const frozen = await harness.cp.pipeline.freeze(runId);
+    if (!frozen.allowed) throw new Error(frozen.message);
     const recorded = harness.cp.ceo.recordOwnerDecision({
       runId,
       item: "public release",
@@ -544,12 +570,19 @@ describe("a switchover holds its barrier until the ack (§10.1)", () => {
 });
 
 describe("round-2 review: completion, claims and post-merge coverage", () => {
-  it("refuses a COMPLETED transition that no completion authority carries (runtime#1)", async () => {
+  it("refuses a caller-forged completion authority (runtime#1)", async () => {
     const harness = makeHarness();
     const { runId } = await activeRun(harness);
     harness.cp.runs.transition(runId, RunState.READY_FOR_CEO_REVIEW, "pretend");
 
-    const refused = harness.cp.runs.transition(runId, RunState.COMPLETED, "just say it is done");
+    const forgedAuthority = "production-gate" as unknown as CompletionAuthority;
+    const refused = harness.cp.runs.transition(
+      runId,
+      RunState.COMPLETED,
+      "just say it is done",
+      {},
+      forgedAuthority,
+    );
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.COMPLETION_AUTHORITY_DENIED);
     expect(harness.cp.runs.require(runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);

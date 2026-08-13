@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 
+import { deriveHumanGate } from "./human-gate.ts";
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
@@ -123,18 +124,7 @@ export type NotificationKind = (typeof NotificationKind)[keyof typeof Notificati
 export const OWNER_DECISION_OPERATION = "owner_decision_submit";
 
 /** PRD §21 — the owner-only gate list. */
-export const HUMAN_GATE_TRIGGERS: readonly string[] = [
-  "irreversible production action",
-  "destructive data migration or delete",
-  "security or permission boundary expansion",
-  "public api or protocol breaking change",
-  "core product direction change",
-  "significant new cost or paid plan change",
-  "project decommission",
-  "capacity-driven project suspend",
-  "quality gate reduction exception",
-  "undelegated public release",
-];
+export { HUMAN_GATE_TRIGGERS } from "./human-gate.ts";
 
 export class ProductionGate {
   #continuity: ContinuityGate | null = null;
@@ -319,6 +309,13 @@ export class ProductionGate {
     }
 
     const humanGate = this.humanGateStatus(input.runId);
+    if (humanGate.required && humanGate.items.length === 0) {
+      return deny(
+        ReasonCode.HUMAN_GATE_REQUIRED,
+        "run requires an owner gate but its contract names no owner decision item",
+        { runId: input.runId, executionMode: run.executionMode },
+      );
+    }
 
     const packet: ProductionReadyPacket = {
       runId: input.runId,
@@ -910,10 +907,27 @@ export class ProductionGate {
         });
   }
 
-  private humanGateDefinition(runId: string): { items: string[]; digest: string } {
-    const contract = this.artifacts.latest<{ humanGate?: string[] }>(runId, ArtifactKind.TASK_CONTRACT);
-    const items = contract?.content.humanGate ?? [];
-    return { items, digest: digestOf(items) };
+  private humanGateDefinition(runId: string): { required: boolean; items: string[]; digest: string } {
+    const run = this.runs.get(runId);
+    const contract = this.artifacts.latest<{ humanGate?: unknown; scope?: unknown }>(
+      runId,
+      ArtifactKind.TASK_CONTRACT,
+    );
+    const declaredItems = Array.isArray(contract?.content.humanGate)
+      ? contract.content.humanGate.filter((item): item is string => typeof item === "string")
+      : [];
+    const scope = Array.isArray(contract?.content.scope)
+      ? contract.content.scope.filter((item): item is string => typeof item === "string")
+      : [];
+    const definition = run
+      ? deriveHumanGate({
+          executionMode: run.executionMode,
+          goal: run.goal,
+          scope,
+          declaredItems,
+        })
+      : { required: declaredItems.length > 0, items: declaredItems };
+    return { ...definition, digest: digestOf(definition.items) };
   }
 
   /** The reviewer identity in the packet must match a real binding, and be independent. */
@@ -1035,6 +1049,13 @@ export class ProductionGate {
       return this.db.tx(() => {
       const fresh = this.runs.require(input.runId);
       const candidateSnapshotDigest = this.runs.currentCandidate(input.runId);
+      if (!candidateSnapshotDigest) {
+        return deny(
+          ReasonCode.EVIDENCE_STALE,
+          "owner decision requires the run's current frozen candidate",
+          { runId: input.runId },
+        );
+      }
       this.artifacts.put(input.runId, ArtifactKind.APPROVAL, {
         kind: "OWNER_DECISION",
         item: input.item,
@@ -1101,9 +1122,11 @@ export class ProductionGate {
   humanGateStatus(runId: string): { required: boolean; items: string[]; satisfied: boolean } {
     const gate = this.humanGateDefinition(runId);
     const { items } = gate;
-    if (items.length === 0) return { required: false, items: [], satisfied: true };
+    if (!gate.required) return { required: false, items: [], satisfied: true };
+    if (items.length === 0) return { required: true, items: [], satisfied: false };
 
     const currentCandidate = this.runs.currentCandidate(runId);
+    if (!currentCandidate) return { required: true, items, satisfied: false };
     const latestDecision = new Map<string, boolean>();
     for (const artifact of this.artifacts.list<{
       kind?: string;
@@ -1114,11 +1137,13 @@ export class ProductionGate {
     }>(runId, ArtifactKind.APPROVAL)) {
       const decision = artifact.content;
       if (
+        artifact.superseded ||
         decision.kind !== "OWNER_DECISION" ||
         !decision.item ||
         typeof decision.approved !== "boolean" ||
         decision.humanGateDigest !== gate.digest ||
-        (decision.candidateSnapshotDigest != null && decision.candidateSnapshotDigest !== currentCandidate)
+        artifact.candidateSnapshotDigest !== currentCandidate ||
+        decision.candidateSnapshotDigest !== currentCandidate
       ) {
         continue;
       }
