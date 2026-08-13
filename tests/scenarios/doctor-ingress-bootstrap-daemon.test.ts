@@ -286,15 +286,16 @@ describe("doctor (CP-S43 – CP-S45)", () => {
     const harness = makeHarness();
     await registerFixtureProject(harness);
 
-    const worktree = await harness.cp.worktrees.create(harness.repoPath, "HEAD", "orphan-1");
-    expect(existsSync(worktree.path)).toBe(true);
+    const worktreePath = join(harness.root, "worktrees", "orphan-1");
+    gitSync(harness.repoPath, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", worktreePath, "HEAD"]);
+    expect(existsSync(worktreePath)).toBe(true);
 
     const report = await harness.cp.doctor.run("system");
     const finding = report.findings.find((f) => f.code === "ORPHAN_WORKTREE");
     expect(finding).toBeDefined();
     expect(finding?.blocking).toBe(false);
     // Diagnosis does not mutate: the worktree is still there.
-    expect(existsSync(worktree.path)).toBe(true);
+    expect(existsSync(worktreePath)).toBe(true);
   });
 
   it("CP-S45: aggregation from findings to status is deterministic", () => {

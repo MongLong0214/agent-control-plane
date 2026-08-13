@@ -12,7 +12,7 @@ import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { Doctor, DoctorReport } from "../doctor/doctor.ts";
 import type { ProductionGate } from "../ceo/production-gate.ts";
-import type { ProjectRegistry } from "../registry/project-registry.ts";
+import type { ManagedManifestWrite, ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
@@ -222,19 +222,27 @@ export class BootstrapActivation {
 
     // 2. Register the project and activate the approved manifest digest.
     const projectId = run.projectId ?? input.approvedManifest.projectId;
+    const manifestAuthorization: ManagedManifestWrite = {
+      projectId,
+      runId: input.runId,
+      sessionId: run.ownerSessionId,
+      bindingGeneration: run.ownerBindingGeneration,
+      expectedManifestDigest: approvedDigest,
+    };
     const existing = this.projects.get(projectId);
     if (!existing) {
       const registered = this.projects.register({
         projectId,
         name: input.projectName,
         manifest: input.approvedManifest,
+        authorization: manifestAuthorization,
       });
       if (!registered.allowed) return registered as Decision<ACPBootstrapActivationResult>;
     } else {
       const activated = this.projects.activateManifest(projectId, input.approvedManifest, {
         runKind: RunKind.PROJECT_BOOTSTRAP,
         runId: input.runId,
-      });
+      }, manifestAuthorization);
       if (!activated.allowed) return activated as Decision<ACPBootstrapActivationResult>;
     }
 

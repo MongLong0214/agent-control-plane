@@ -276,10 +276,14 @@ describe("round-2 run and production-gate regressions", () => {
       repositories: [{ repositoryId: fixture.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
     });
     if (!created.allowed) throw new Error(created.message);
-    const stored = fixture.harness.cp.projects.storeManifest({
+    const revisedManifest = {
       ...fixture.harness.cp.projects.activeManifest(fixture.projectId)!.manifest,
       postMergeCommands: ["verify"],
-    });
+    };
+    const stored = fixture.harness.cp.projects.storeManifest(
+      revisedManifest,
+      fixture.harness.cp.manifestAuthorizationForTests(revisedManifest),
+    );
     if (!stored.allowed) throw new Error(stored.message);
     const pin = stored.value;
     expect(fixture.harness.cp.runs.pinManifest(created.value.runId, pin).allowed).toBe(true);

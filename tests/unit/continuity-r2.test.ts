@@ -198,7 +198,13 @@ const prepareCapacityReviewedRun = async (plane: ReturnType<typeof makePlane>) =
   const repoPath = makeRepo({ "src/app.js": "module.exports = () => 1;\n" });
   gpt.setCapacity(healthy("gpt", clock));
   claude.setCapacity(healthy("claude", clock));
-  const project = cp.projects.register({ projectId, name: projectId, manifest: fixtureManifest(projectId) });
+  const manifest = fixtureManifest(projectId);
+  const project = cp.projects.register({
+    projectId,
+    name: projectId,
+    manifest,
+    authorization: cp.manifestAuthorizationForTests(manifest),
+  });
   if (!project.allowed) throw new Error(project.message);
   const repository = await cp.repositories.register({
     checkoutPath: repoPath,
@@ -347,7 +353,13 @@ const startWorkerWithMeasuredReserve = async (input: {
   // bucket rather than reusing dispatch capacity as a lease.
   claude.setCapacity(healthy("claude", clock));
   const projectId = "worker-reserve-input-project";
-  const project = cp.projects.register({ projectId, name: projectId, manifest: fixtureManifest(projectId) });
+  const manifest = fixtureManifest(projectId);
+  const project = cp.projects.register({
+    projectId,
+    name: projectId,
+    manifest,
+    authorization: cp.manifestAuthorizationForTests(manifest),
+  });
   if (!project.allowed) throw new Error(project.message);
   const created = cp.runs.create({
     projectId,
@@ -538,10 +550,12 @@ describe("round-2 capacity and runtime regressions", () => {
     // not evaluate continuity, this next dispatch would get past this exact reason code.
     plane.gpt.setCapacity(healthy("gpt", plane.clock));
     plane.claude.setCapacity(healthy("claude", plane.clock));
+    const manifest = fixtureManifest("failure-continuity-project");
     const project = plane.cp.projects.register({
       projectId: "failure-continuity-project",
       name: "failure continuity",
-      manifest: fixtureManifest("failure-continuity-project"),
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
     });
     if (!project.allowed) throw new Error(project.message);
     const created = plane.cp.runs.create({
@@ -617,10 +631,12 @@ describe("round-2 capacity and runtime regressions", () => {
     attachRoutablePorts(plane.cp);
 
     const projectId = "p0-06-reviewer-failover";
+    const manifest = fixtureManifest(projectId);
     const project = plane.cp.projects.register({
       projectId,
       name: "P0 continuity reviewer failover",
-      manifest: fixtureManifest(projectId),
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
     });
     if (!project.allowed) throw new Error(project.message);
     const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
@@ -695,10 +711,12 @@ describe("round-2 capacity and runtime regressions", () => {
     attachRoutablePorts(plane.cp);
 
     const projectId = "p0-06-cto-takeover";
+    const manifest = fixtureManifest(projectId);
     const project = plane.cp.projects.register({
       projectId,
       name: "P0 continuity CTO takeover",
-      manifest: fixtureManifest(projectId),
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
     });
     if (!project.allowed) throw new Error(project.message);
 
@@ -853,10 +871,12 @@ describe("round-2 capacity and runtime regressions", () => {
     attachRoutablePorts(plane.cp);
 
     const projectId = "p0-06-restore-cto";
+    const manifest = fixtureManifest(projectId);
     const project = plane.cp.projects.register({
       projectId,
       name: "P0 continuity CTO restore",
-      manifest: fixtureManifest(projectId),
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
     });
     if (!project.allowed) throw new Error(project.message);
     const actingSession = plane.cp.sessions.create({ provider: "gpt", model: "acting-cto" });
@@ -898,10 +918,12 @@ describe("round-2 capacity and runtime regressions", () => {
     attachRoutablePorts(plane.cp);
 
     const projectId = "p0-06-survival";
+    const manifest = fixtureManifest(projectId);
     const project = plane.cp.projects.register({
       projectId,
       name: "P0 continuity survival",
-      manifest: fixtureManifest(projectId),
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
     });
     if (!project.allowed) throw new Error(project.message);
     const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
@@ -1596,10 +1618,12 @@ describe("round-2 continuity and persistence regressions", () => {
   it("#63 changes and verifies the binding before reporting restoration", async () => {
     const plane = makePlane();
     const projectId = "restore-project";
+    const manifest = fixtureManifest(projectId);
     const registered = plane.cp.projects.register({
       projectId,
       name: projectId,
-      manifest: fixtureManifest(projectId),
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
     });
     if (!registered.allowed) throw new Error(registered.message);
     const session = plane.cp.sessions.create({ provider: "gpt", model: "test" });

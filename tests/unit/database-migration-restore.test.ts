@@ -175,7 +175,8 @@ describe("versioned SQLite migration", () => {
       expect(receipts.map((entry) => [entry.version, entry.migration_id])).toEqual([
         [12, "v12-migration-ledger-and-invariant-replay"],
         [13, "v13-finalization-state-machine"],
-        [SCHEMA_VERSION, "v14-baseline-evidence-ledger"],
+        [14, "v14-baseline-evidence-ledger"],
+        [SCHEMA_VERSION, "v15-durable-verification-worktree-ownership"],
       ]);
       expect(receipts).toEqual([
         expect.objectContaining({
@@ -185,6 +186,12 @@ describe("versioned SQLite migration", () => {
         }),
         expect.objectContaining({
           version: 13,
+          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          backup_file: null,
+          backup_checksum: null,
+        }),
+        expect.objectContaining({
+          version: 14,
           checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
           backup_file: null,
           backup_checksum: null,

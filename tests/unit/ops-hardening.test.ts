@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { symlinkSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
@@ -22,7 +23,7 @@ import {
   createHermesServer,
   type HermesMcpPort,
 } from "../../src/mcp/hermes-server.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
   type Harness,
@@ -234,7 +235,10 @@ describe("a destructive repair needs a real owner (§25.7)", () => {
   it("accepts the destructive repair once the owner identity checks out", async () => {
     const harness = makeHarness();
     await registerFixtureProject(harness);
-    await harness.cp.worktrees.create(harness.repoPath, "HEAD", "owner-approved-orphan");
+    gitSync(harness.repoPath, [
+      "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach",
+      join(harness.root, "worktrees", "owner-approved-orphan"), "HEAD",
+    ]);
     const approval = {
       runId: null,
       operation: REPAIR_OWNER_APPROVAL_OPERATION,
@@ -272,6 +276,76 @@ describe("a destructive repair needs a real owner (§25.7)", () => {
     expect(allowed.allowed).toBe(true);
     if (!allowed.allowed) return;
     expect(allowed.value.authorizedBy).toBe("OWNER");
+  });
+
+  it("keeps a live verification worktree out of a concurrent owner prune", async () => {
+    const harness = makeHarness();
+    const { identity, run } = await activeRun(harness, "verification-live-project");
+    const liveId = "live-verification";
+    const orphanId = "stranded-verification";
+    const livePath = harness.cp.worktrees.pathFor(liveId);
+    const orphanPath = harness.cp.worktrees.pathFor(orphanId);
+    for (const path of [livePath, orphanPath]) {
+      gitSync(harness.repoPath, [
+        "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, "HEAD",
+      ]);
+    }
+    harness.cp.db.run(
+      `INSERT INTO verification_worktrees
+         (worktree_id, run_id, command_id, candidate_snapshot_digest, repository_identity,
+          repository_checkout_path, worktree_path, head, owner_session_id,
+          owner_binding_generation, owner_role_key, state, created_at, active_at)
+       VALUES (?, ?, 'verify', 'sha256:verification-live', ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`,
+      [
+        liveId,
+        run.runId,
+        identity,
+        harness.repoPath,
+        livePath,
+        gitSync(harness.repoPath, ["rev-parse", "HEAD"]),
+        run.ownerSessionId,
+        run.ownerBindingGeneration,
+        run.ownerRoleKey,
+        harness.clock.nowIso(),
+        harness.clock.nowIso(),
+      ],
+    );
+
+    const approval = {
+      runId: null,
+      operation: REPAIR_OWNER_APPROVAL_OPERATION,
+      parameters: { operationId: "prune_orphan_worktrees", parameters: {}, dryRun: false },
+      idempotencyKey: "repair-live-verification",
+      approved: true,
+    };
+    const ingress = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+      cli: { allowedActors: [TEST_OWNER.actor] },
+    });
+    const admitted = ingress.admitOwnerApproval({
+      channel: TEST_OWNER.channel,
+      actor: TEST_OWNER.actor,
+      nonce: `repair:${digestOf(approval)}`,
+      payload: ownerApprovalPayload(approval),
+    }, approval);
+    expect(admitted.allowed).toBe(true);
+    if (!admitted.allowed) return;
+
+    const repaired = await harness.cp.repair.execute({
+      operationId: "prune_orphan_worktrees",
+      parameters: {},
+      authorizedBy: "OWNER",
+      ownerApproval: admitted.value,
+      dryRun: false,
+    });
+    expect(repaired.allowed).toBe(true);
+    if (!repaired.allowed) return;
+    expect(repaired.value.changes).toBe(1);
+    expect(existsSync(livePath)).toBe(true);
+    expect(existsSync(orphanPath)).toBe(false);
+    expect(repaired.value.preconditionsChecked[0]?.evidence).toMatchObject({
+      liveWorktreeIdsByRepository: { [identity]: expect.arrayContaining([liveId]) },
+      candidates: [{ worktreeId: orphanId }],
+    });
   });
 });
 

@@ -813,10 +813,11 @@ describe("baseline boundary contracts", () => {
     expect(parseRepoFactoryResult(result).allowed).toBe(true);
     expect(parseRepoFactoryResult({ ...result, unversionedExtra: true }).allowed).toBe(false);
     expect(parseRepoFactoryResult({ ...result, schema: "repo-factory.result.v3" }).allowed).toBe(false);
-    expect(SCHEMA_VERSION).toBe(14);
+    expect(SCHEMA_VERSION).toBe(15);
     expect(migrationChainFrom(12).map((migration) => migration.id)).toEqual([
       "v13-finalization-state-machine",
       "v14-baseline-evidence-ledger",
+      "v15-durable-verification-worktree-ownership",
     ]);
   });
 
@@ -828,7 +829,7 @@ describe("baseline boundary contracts", () => {
     try {
       raw.exec("DROP TRIGGER baseline_records_immutable; DROP TRIGGER baseline_records_no_delete; DROP TABLE baseline_records;");
       raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
-      raw.prepare("DELETE FROM schema_migrations WHERE version = ?").run(14);
+      raw.prepare("DELETE FROM schema_migrations WHERE version >= ?").run(14);
       const v13 = migrationChainFrom(12).find((migration) => migration.toVersion === 13)!;
       raw.function("acp_schema_migration_authorized", () => 1);
       raw.prepare(
@@ -861,7 +862,7 @@ describe("baseline boundary contracts", () => {
 
     const migrated = new Db(databasePath);
     try {
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(14);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(15);
       expect(
         migrated.get<{ migration_id: string; checksum: string }>(
           "SELECT migration_id, checksum FROM schema_migrations WHERE version = 14",
@@ -873,6 +874,11 @@ describe("baseline boundary contracts", () => {
       expect(
         migrated.get<{ n: number }>(
           "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'baseline_records'",
+        ),
+      ).toEqual({ n: 1 });
+      expect(
+        migrated.get<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'verification_worktrees'",
         ),
       ).toEqual({ n: 1 });
       const triggers = migrated.all<{ name: string; sql: string }>(
@@ -925,7 +931,7 @@ describe("baseline boundary contracts", () => {
     try {
       raw.exec("DROP TRIGGER baseline_records_immutable; DROP TRIGGER baseline_records_no_delete; DROP TABLE baseline_records;");
       raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
-      raw.prepare("DELETE FROM schema_migrations WHERE version = ?").run(14);
+      raw.prepare("DELETE FROM schema_migrations WHERE version >= ?").run(14);
       const v13 = migrationChainFrom(12).find((migration) => migration.toVersion === 13)!;
       raw.function("acp_schema_migration_authorized", () => 1);
       raw.prepare(
@@ -967,7 +973,7 @@ describe("baseline boundary contracts", () => {
 
     const migrated = new Db(databasePath);
     try {
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(14);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(15);
       expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 14"))
         .toEqual({ migration_id: "v14-baseline-evidence-ledger" });
       expect(

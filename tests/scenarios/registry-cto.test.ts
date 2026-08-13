@@ -13,6 +13,7 @@ import {
   finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
+  manifestAuthorizationForRun,
   ownerDecisionReceipt,
   registerFixtureProject,
 } from "../helpers/harness.ts";
@@ -78,6 +79,7 @@ describe("registry authority (CP-S04, CP-S05, CP-S26)", () => {
       projectId,
       name: "fixture",
       manifest: fixtureManifest(projectId),
+      authorization: harness.cp.manifestAuthorizationForTests(fixtureManifest(projectId)),
     });
     expect(project.reasonCode).toBe(ReasonCode.OK);
     if (!project.allowed || !project.value.activeManifestDigest) {
@@ -352,7 +354,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
       ...manifest,
       repositories: [{ role: "primary", remote: "/Users/example/projects/x", manifestRoot: "." }],
     };
-    const stored = harness.cp.projects.storeManifest(broken);
+    const stored = harness.cp.projects.storeManifest(broken, harness.cp.manifestAuthorizationForTests(broken));
     expect(stored.allowed).toBe(false);
     expect(stored.reasonCode).toBe(ReasonCode.MANIFEST_NOT_PORTABLE);
   });
@@ -365,7 +367,7 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     const refused = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "STANDARD_WORK",
       runId: null,
-    });
+    }, harness.cp.manifestAuthorizationForTests(revised));
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN);
 
@@ -374,11 +376,11 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     const unbacked = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",
       runId: null,
-    });
+    }, harness.cp.manifestAuthorizationForTests(revised));
     expect(unbacked.allowed).toBe(false);
     expect(unbacked.reasonCode).toBe(ReasonCode.CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN);
 
-    const revisedDigest = harness.cp.projects.storeManifest(revised);
+    const revisedDigest = harness.cp.projects.storeManifest(revised, harness.cp.manifestAuthorizationForTests(revised));
     if (!revisedDigest.allowed) throw new Error(revisedDigest.message);
     const finalized = await finalizeNoRepositoryRun(
       harness,
@@ -411,13 +413,34 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     const unknownRun = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",
       runId: "run_does_not_exist",
-    });
+    }, harness.cp.manifestAuthorizationForTests(revised));
     expect(unknownRun.allowed).toBe(false);
 
+    const consumedBeforeActivation = harness.cp.audit.byKind("MANAGED_WRITE_GUARD_CONSUMED").length;
     const allowed = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",
       runId,
-    });
+    }, manifestAuthorizationForRun(harness, projectId, revised, runId));
     expect(allowed.allowed).toBe(true);
+    const activationGrants = harness.cp.audit
+      .byKind("MANAGED_WRITE_GUARD_CONSUMED")
+      .slice(consumedBeforeActivation);
+    expect(activationGrants).toHaveLength(2);
+    expect(activationGrants.map((event) => event.evidence)).toEqual([
+      expect.objectContaining({
+        operation: "MANIFEST_CHANGE",
+        projectId,
+        resolvedPath: null,
+        targetBranch: null,
+        targetWorktreeId: null,
+      }),
+      expect.objectContaining({
+        operation: "MANIFEST_CHANGE",
+        projectId,
+        resolvedPath: null,
+        targetBranch: null,
+        targetWorktreeId: null,
+      }),
+    ]);
   });
 });

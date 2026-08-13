@@ -46,6 +46,7 @@ const makeMultiProviderHarness = ({ forwardDispatchTarget = true }: { forwardDis
     secretsDir: join(root, "secrets"),
     clock,
     adapters: [gpt, claude, grok],
+    allowTestEvidenceWriters: true,
     ctoPreference: { provider: "claude", model: "opus", effort: null },
     reviewer: {
       preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
@@ -95,6 +96,7 @@ const registerProject = async (harness: ReturnType<typeof makeMultiProviderHarne
     projectId: "cont-project",
     name: "cont",
     manifest,
+    authorization: harness.cp.manifestAuthorizationForTests(manifest),
   });
   if (!project.allowed) throw new Error(project.message);
   const repository = await harness.cp.repositories.register({

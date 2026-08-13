@@ -112,7 +112,7 @@ describe("the dispatch-time contract pin is immutable (CP-HI-03)", () => {
       ...harness.cp.projects.activeManifest(projectId)!.manifest,
       postMergeCommands: ["verify"],
     };
-    const stored = harness.cp.projects.storeManifest(revised);
+    const stored = harness.cp.projects.storeManifest(revised, harness.cp.manifestAuthorizationForTests(revised));
     if (!stored.allowed) throw new Error(stored.message);
 
     const refused = harness.cp.runs.pinManifest(runId, stored.value);

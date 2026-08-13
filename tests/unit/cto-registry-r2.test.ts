@@ -12,6 +12,7 @@ import {
   finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
+  manifestAuthorizationForRun,
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -217,14 +218,14 @@ describe("round-2 registry regressions", () => {
     const { projectId } = await registerFixtureProject(harness);
     const manifestA = { ...fixtureManifest(projectId), postMergeCommands: ["verify"] };
     const manifestB = { ...fixtureManifest(projectId), postMergeCommands: ["other"] };
-    const storedA = harness.cp.projects.storeManifest(manifestA);
+    const storedA = harness.cp.projects.storeManifest(manifestA, harness.cp.manifestAuthorizationForTests(manifestA));
     if (!storedA.allowed) throw new Error(storedA.message);
     const runId = await completeContractChangeWithGrant(harness, projectId, storedA.value);
 
     const refused = harness.cp.projects.activateManifest(projectId, manifestB, {
       runKind: "CONTRACT_CHANGE",
       runId,
-    });
+    }, manifestAuthorizationForRun(harness, projectId, manifestB, runId));
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.MANIFEST_ACTIVATION_EVIDENCE_MISSING);
   });
@@ -233,14 +234,14 @@ describe("round-2 registry regressions", () => {
     const harness = makeHarness();
     const { projectId, repositoryId } = await registerFixtureProject(harness);
     const revised = { ...fixtureManifest(projectId), postMergeCommands: ["verify"] };
-    const stored = harness.cp.projects.storeManifest(revised);
+    const stored = harness.cp.projects.storeManifest(revised, harness.cp.manifestAuthorizationForTests(revised));
     if (!stored.allowed) throw new Error(stored.message);
     const runId = await completeContractChangeWithGrant(harness, projectId, stored.value);
 
     const activated = harness.cp.projects.activateManifest(projectId, revised, {
       runKind: "CONTRACT_CHANGE",
       runId,
-    });
+    }, manifestAuthorizationForRun(harness, projectId, revised, runId));
     expect(activated.allowed).toBe(true);
     const repository = harness.cp.repositories.byId(repositoryId)!;
     expect(repository.activeManifestDigest).toBe(stored.value);

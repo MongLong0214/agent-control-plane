@@ -10,7 +10,7 @@ import { OPERATOR_METHOD } from "../../src/daemon/daemon.ts";
 import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   makeStartedOperator,
   TEST_OWNER,
@@ -267,7 +267,10 @@ describe("authenticated operator socket (#393/#405)", () => {
     const running = await makeStartedOperator();
     try {
       await registerFixtureProject(running.harness);
-      await running.harness.cp.worktrees.create(running.harness.repoPath, "HEAD", "operator-owner-orphan");
+      gitSync(running.harness.repoPath, [
+        "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach",
+        join(running.harness.root, "worktrees", "operator-owner-orphan"), "HEAD",
+      ]);
       const client = createOperatorClient({ socketPath: running.socketPath, token: OPERATOR_TOKEN });
       const code = await dispatch(client, "repair", ["execute", "prune_orphan_worktrees"], true);
 
@@ -284,7 +287,10 @@ describe("authenticated operator socket (#393/#405)", () => {
     const isolatedHome = tempDir("acp-operator-owner-cli-home-");
     try {
       await registerFixtureProject(running.harness);
-      await running.harness.cp.worktrees.create(running.harness.repoPath, "HEAD", "operator-owner-cli-orphan");
+      gitSync(running.harness.repoPath, [
+        "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach",
+        join(running.harness.root, "worktrees", "operator-owner-cli-orphan"), "HEAD",
+      ]);
       const cli = await new Promise<{ error: Error | null; stdout: string; stderr: string }>((resolve) => {
         execFileCallback(
           process.execPath,

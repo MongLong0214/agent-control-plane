@@ -224,7 +224,12 @@ const twoRepositoryApprovedFixture = async () => {
     }],
     ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW) }],
   });
-  const project = harness.cp.projects.register({ projectId, name: "two", manifest });
+  const project = harness.cp.projects.register({
+    projectId,
+    name: "two",
+    manifest,
+    authorization: harness.cp.manifestAuthorizationForTests(manifest),
+  });
   if (!project.allowed) throw new Error(project.message);
   const first = await harness.cp.repositories.register({
     checkoutPath: harness.repoPath,

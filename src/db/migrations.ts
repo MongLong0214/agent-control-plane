@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -208,7 +208,40 @@ const v14: SchemaMigration = {
   checksum: () => sha256(`v14-baseline-evidence-ledger\n${BASELINE_RECORDS_DDL}`),
 };
 
-export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13, v14]);
+const VERIFICATION_WORKTREES_DDL = `
+  CREATE TABLE IF NOT EXISTS verification_worktrees (
+    worktree_id               TEXT PRIMARY KEY,
+    run_id                    TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    command_id                TEXT NOT NULL,
+    candidate_snapshot_digest TEXT NOT NULL,
+    repository_identity       TEXT NOT NULL,
+    repository_checkout_path  TEXT NOT NULL,
+    worktree_path             TEXT NOT NULL UNIQUE,
+    head                      TEXT NOT NULL,
+    owner_session_id          TEXT NOT NULL REFERENCES sessions(session_id),
+    owner_binding_generation  INTEGER NOT NULL,
+    owner_role_key            TEXT NOT NULL,
+    state                     TEXT NOT NULL
+                                CHECK (state IN ('CREATING','ACTIVE','DESTROYING','DESTROYED','FAILED')),
+    created_at                TEXT NOT NULL,
+    active_at                 TEXT,
+    ended_at                  TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS verification_worktrees_live
+    ON verification_worktrees(repository_identity, state, worktree_id);
+`;
+
+/** v15 makes verification worktree ownership durable before Git materialises the tree. */
+const v15: SchemaMigration = {
+  id: "v15-durable-verification-worktree-ownership",
+  fromVersion: 14,
+  toVersion: 15,
+  apply: (raw) => raw.exec(VERIFICATION_WORKTREES_DDL),
+  checksum: () => sha256(`v15-durable-verification-worktree-ownership\n${VERIFICATION_WORKTREES_DDL}`),
+};
+
+export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13, v14, v15]);
 
 const REQUIRED_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
   { name: "runs_state_transition_authority_guard", sentinel: "RUN_STATE_TRANSITION_AUTHORITY_DENIED" },

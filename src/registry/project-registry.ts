@@ -10,6 +10,12 @@ import {
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { type Activity, type Availability, Role } from "../domain/types.ts";
+import {
+  type BootstrapManifestAuthority,
+  type GuardRequest,
+  type ManagedWriteGuard,
+  WriteOperation,
+} from "../guard/managed-write-guard.ts";
 
 export interface ProjectRecord {
   projectId: string;
@@ -22,6 +28,17 @@ export interface ProjectRecord {
   createdAt: string;
 }
 
+/** Exact proof required for every persisted or activated manifest mutation. */
+export interface ManagedManifestWrite {
+  projectId: string;
+  runId: string | null;
+  sessionId: string | null;
+  bindingGeneration: number | null;
+  expectedManifestDigest: string;
+  /** Present only for an explicitly fixture/bootstrap registration before a run exists. */
+  bootstrapManifestAuthority?: BootstrapManifestAuthority | null;
+}
+
 /**
  * PRD §9.1 — a project record carries identity and an activation reference. It is not
  * a copy of the manifest: the portable contract lives in `manifests`, addressed by its
@@ -32,12 +49,14 @@ export class ProjectRegistry {
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
+    private readonly guard: ManagedWriteGuard,
   ) {}
 
   register(input: {
     name: string;
     projectId?: string;
     manifest?: ProjectManifest | null;
+    authorization?: ManagedManifestWrite;
   }): Decision<ProjectRecord> {
     const projectId = input.projectId ?? newProjectId();
     if (this.db.get(`SELECT 1 FROM projects WHERE project_id = ?`, [projectId])) {
@@ -46,7 +65,13 @@ export class ProjectRegistry {
 
     let digest: string | null = null;
     if (input.manifest) {
-      const stored = this.storeManifest(input.manifest);
+      if (input.manifest.projectId !== projectId) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "registered project and manifest identities differ", {
+          projectId,
+          manifestProjectId: input.manifest.projectId,
+        });
+      }
+      const stored = this.storeManifest(input.manifest, input.authorization!);
       if (!stored.allowed) return stored as Decision<ProjectRecord>;
       digest = stored.value;
     }
@@ -68,11 +93,13 @@ export class ProjectRegistry {
    * checked here so an absolute path or a session id can never reach the registry
    * (Integration §10.2, CP-S04).
    */
-  storeManifest(manifest: ProjectManifest): Decision<string> {
+  storeManifest(manifest: ProjectManifest, authorization: ManagedManifestWrite): Decision<string> {
     const portable = assertPortableManifest(manifest);
     if (!portable.allowed) return portable as Decision<string>;
 
     const digest = manifestDigest(portable.value);
+    const authorized = this.authorizeManifestWrite(portable.value, authorization);
+    if (!authorized.allowed) return authorized as Decision<string>;
     if (!this.db.get(`SELECT 1 FROM manifests WHERE digest = ?`, [digest])) {
       this.db.run(
         `INSERT INTO manifests (digest, schema_id, content_json, created_at) VALUES (?, ?, ?, ?)`,
@@ -106,6 +133,7 @@ export class ProjectRegistry {
     projectId: string,
     manifest: ProjectManifest,
     via: { runKind: string; runId: string | null },
+    authorization: ManagedManifestWrite,
   ): Decision<string> {
     const project = this.get(projectId);
     if (!project) return deny(ReasonCode.NOT_FOUND, "unknown project", { projectId });
@@ -118,7 +146,24 @@ export class ProjectRegistry {
       );
     }
 
-    const stored = this.storeManifest(manifest);
+    if (!authorization || authorization.projectId !== projectId || authorization.runId !== via.runId) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "manifest activation proof does not bind this project and run", {
+        projectId,
+        viaRunId: via.runId,
+        authorizedProjectId: authorization?.projectId ?? null,
+        authorizedRunId: authorization?.runId ?? null,
+      });
+    }
+
+    // Authorise the activation effect before storing the candidate. Activation has a
+    // distinct grant from the manifest-store effect, and a rejected activation must not
+    // leave even the new manifest row behind as a side effect.
+    const portable = assertPortableManifest(manifest);
+    if (!portable.allowed) return portable as Decision<string>;
+    const activationAuthorized = this.authorizeManifestWrite(portable.value, authorization);
+    if (!activationAuthorized.allowed) return activationAuthorized as Decision<string>;
+
+    const stored = this.storeManifest(portable.value, authorization);
     if (!stored.allowed) return stored;
     if (project.activeManifestDigest === stored.value) return stored;
 
@@ -215,6 +260,42 @@ export class ProjectRegistry {
       evidence: { ownerApproved },
     });
     return allow(ReasonCode.OK, undefined);
+  }
+
+  private authorizeManifestWrite(
+    manifest: ProjectManifest,
+    authorization: ManagedManifestWrite,
+  ): Decision<void> {
+    if (!authorization) {
+      return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "manifest mutation requires managed authorization", {});
+    }
+    const digest = manifestDigest(manifest);
+    if (
+      authorization.projectId !== manifest.projectId ||
+      authorization.expectedManifestDigest !== digest
+    ) {
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "manifest authorization does not bind the exact project digest", {
+        projectId: manifest.projectId,
+        authorizedProjectId: authorization.projectId,
+        expectedManifestDigest: authorization.expectedManifestDigest,
+        calculatedManifestDigest: digest,
+      });
+    }
+    const request: GuardRequest = {
+      operation: WriteOperation.MANIFEST_CHANGE,
+      projectId: authorization.projectId,
+      runId: authorization.runId,
+      sessionId: authorization.sessionId,
+      bindingGeneration: authorization.bindingGeneration,
+      claimedClassification: "MANAGED",
+      actor: "project-registry",
+      bootstrapManifestAuthority: authorization.bootstrapManifestAuthority ?? null,
+    };
+    const evaluated = this.guard.evaluate(request);
+    if (!evaluated.allowed) return evaluated as Decision<void>;
+    const consumed = this.guard.consume(evaluated.value.grantId);
+    if (!consumed.allowed) return consumed as Decision<void>;
+    return allow(ReasonCode.WRITE_ALLOWED, undefined);
   }
 
   private activationGrant(

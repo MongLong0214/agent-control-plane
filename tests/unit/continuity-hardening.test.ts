@@ -63,6 +63,7 @@ const makePlane = () => {
     secretsDir: join(root, "secrets"),
     clock,
     adapters: [gpt, claude],
+    allowTestEvidenceWriters: true,
     ctoPreference: { provider: "claude", model: "opus", effort: null },
     reviewer: {
       preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
@@ -217,6 +218,7 @@ describe("completion requires a current continuity mode (§15.6)", () => {
       projectId: "cont-hard",
       name: "cont-hard",
       manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
     });
     if (!project.allowed) throw new Error(project.message);
     for (const adapter of [plane.gpt, plane.claude]) {

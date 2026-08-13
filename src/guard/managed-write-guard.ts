@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, constants as fsConstants, fstatSync, openSync, statSync, type Stats } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { isoPlus } from "../core/clock.ts";
@@ -13,7 +13,7 @@ import { type WorkspaceProbe, isWithin } from "./workspace-probe.ts";
 
 /**
  * Operations that mutate project-natured state. PRD §4 CP-HI-01 enumerates these
- * exactly: git file mutation, commit/branch/tag, GitHub PR/issue/release/ruleset write,
+ * exactly: git file mutation, commit/branch/tag/worktree, GitHub PR/issue/release/ruleset write,
  * manifest/verification-contract change, programmatic merge.
  */
 export const WriteOperation = {
@@ -21,6 +21,8 @@ export const WriteOperation = {
   GIT_COMMIT: "GIT_COMMIT",
   GIT_BRANCH: "GIT_BRANCH",
   GIT_TAG: "GIT_TAG",
+  /** Local Git worktree add/remove/prune and the managed path cleanup around it. */
+  GIT_WORKTREE: "GIT_WORKTREE",
   GITHUB_PR: "GITHUB_PR",
   GITHUB_ISSUE: "GITHUB_ISSUE",
   GITHUB_RELEASE: "GITHUB_RELEASE",
@@ -58,6 +60,7 @@ const OPERATION_CLASS: Readonly<Record<WriteOperation, OperationClass>> = {
   [WriteOperation.GIT_COMMIT]: "GIT_LOCAL",
   [WriteOperation.GIT_BRANCH]: "GIT_LOCAL",
   [WriteOperation.GIT_TAG]: "GIT_LOCAL",
+  [WriteOperation.GIT_WORKTREE]: "GIT_LOCAL",
   [WriteOperation.GITHUB_PR]: "REMOTE",
   [WriteOperation.GITHUB_ISSUE]: "REMOTE",
   [WriteOperation.GITHUB_RELEASE]: "REMOTE",
@@ -72,6 +75,7 @@ const SOURCE_MUTATIONS: ReadonlySet<WriteOperation> = new Set([
   WriteOperation.GIT_COMMIT,
   WriteOperation.GIT_BRANCH,
   WriteOperation.GIT_TAG,
+  WriteOperation.GIT_WORKTREE,
   WriteOperation.GITHUB_RELEASE,
   WriteOperation.MANIFEST_CHANGE,
   WriteOperation.VERIFICATION_CONTRACT_CHANGE,
@@ -89,6 +93,7 @@ const ACTIVE_SOURCE_OPERATIONS: ReadonlySet<WriteOperation> = new Set([
   WriteOperation.GIT_COMMIT,
   WriteOperation.GIT_BRANCH,
   WriteOperation.GIT_TAG,
+  WriteOperation.GIT_WORKTREE,
   WriteOperation.MANIFEST_CHANGE,
   WriteOperation.VERIFICATION_CONTRACT_CHANGE,
 ]);
@@ -111,6 +116,8 @@ const WRITER_ROLES: ReadonlySet<string> = new Set<string>([
  * string. The guard still rechecks the pinned owner, generation, target and claims below.
  */
 const DAEMON_FINALIZER_MINT = Symbol("acp.daemon-finalizer-write-authority");
+const REPAIR_WORKTREE_MINT = Symbol("acp.repair-worktree-write-authority");
+const BOOTSTRAP_MANIFEST_MINT = Symbol("acp.bootstrap-manifest-write-authority");
 
 class DaemonFinalizerAuthorityToken {
   readonly #mint: symbol;
@@ -132,6 +139,46 @@ class DaemonFinalizerAuthorityToken {
 /** Opaque capability accepted only for the fenced post-approval GitHub write set. */
 export type DaemonFinalizerAuthority = DaemonFinalizerAuthorityToken;
 
+/** Opaque capability held only by the doctor repair composition path. */
+class RepairWorktreeAuthorityToken {
+  readonly #mint: symbol;
+  readonly #guard: ManagedWriteGuard;
+
+  constructor(mint: symbol, guard: ManagedWriteGuard) {
+    if (mint !== REPAIR_WORKTREE_MINT) {
+      fail(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "repair worktree authority cannot be constructed externally", {});
+    }
+    this.#mint = mint;
+    this.#guard = guard;
+  }
+
+  static belongsTo(value: unknown, guard: ManagedWriteGuard): value is RepairWorktreeAuthority {
+    return value instanceof RepairWorktreeAuthorityToken && value.#mint === REPAIR_WORKTREE_MINT && value.#guard === guard;
+  }
+}
+
+export type RepairWorktreeAuthority = RepairWorktreeAuthorityToken;
+
+/** Opaque bootstrap-only capability for registering a manifest before a run exists. */
+class BootstrapManifestAuthorityToken {
+  readonly #mint: symbol;
+  readonly #guard: ManagedWriteGuard;
+
+  constructor(mint: symbol, guard: ManagedWriteGuard) {
+    if (mint !== BOOTSTRAP_MANIFEST_MINT) {
+      fail(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "bootstrap manifest authority cannot be constructed externally", {});
+    }
+    this.#mint = mint;
+    this.#guard = guard;
+  }
+
+  static belongsTo(value: unknown, guard: ManagedWriteGuard): value is BootstrapManifestAuthority {
+    return value instanceof BootstrapManifestAuthorityToken && value.#mint === BOOTSTRAP_MANIFEST_MINT && value.#guard === guard;
+  }
+}
+
+export type BootstrapManifestAuthority = BootstrapManifestAuthorityToken;
+
 export interface GuardRequest {
   operation: GuardOperation;
   /** Absolute filesystem target. Relative paths are refused — see `decide`. */
@@ -146,15 +193,27 @@ export interface GuardRequest {
   targetBranch?: string | null;
   /** Absolute canonical registered checkout path when the operation mutates a worktree. */
   targetWorktreeId?: string | null;
+  /** Project identity for a manifest mutation, which has no filesystem target. */
+  projectId?: string | null;
   /** Managed run identity claimed by the caller. */
   runId?: string | null;
   sessionId?: string | null;
   bindingGeneration?: number | null;
+  /** Worker task identity required by the local runtime write boundary. */
+  taskId?: string | null;
+  /** Durable task_executions receipt for the worker attempt. */
+  taskReceiptId?: string | null;
+  /** Canonical worktree bound to that receipt. */
+  assignedWorktreeId?: string | null;
   /** Free-form classification supplied by Hermes; recorded, never trusted (§4 CP-HI-01). */
   claimedClassification?: "DIRECT" | "MANAGED" | null;
   actor?: string | null;
   /** Opaque daemon-held capability; ignored unless the run is in a finalization state. */
   daemonFinalizerAuthority?: DaemonFinalizerAuthority | null;
+  /** Only the composition root may authorize a runless initial manifest registration. */
+  bootstrapManifestAuthority?: BootstrapManifestAuthority | null;
+  /** Only the doctor repair path may destroy a stranded worktree outside a run. */
+  repairWorktreeAuthority?: RepairWorktreeAuthority | null;
 }
 
 export interface GuardGrant {
@@ -169,6 +228,10 @@ export interface GuardGrant {
   resolvedPath: string | null;
   targetBranch: string | null;
   targetWorktreeId: string | null;
+  taskId: string | null;
+  taskReceiptId: string | null;
+  assignedWorktreeId: string | null;
+  projectId: string | null;
   issuedAt: string;
   expiresAt: string;
 }
@@ -203,6 +266,18 @@ interface TargetResource {
   relativePath: string | null;
 }
 
+interface TaskReceiptRow {
+  execution_id: string;
+  run_id: string;
+  task_id: string;
+  owner_binding_generation: number;
+  worker_session_id: string;
+  status: string;
+  worktree_id: string | null;
+  repository_identity: string | null;
+  repository_checkout_path: string | null;
+}
+
 interface HeldGrant {
   facts: Readonly<GuardGrant>;
   request: Readonly<GuardRequest>;
@@ -231,6 +306,35 @@ interface FilesystemFence {
   targetIdentity: NodeIdentity | null;
   targetExisted: boolean;
 }
+
+/** Canonical repository-relative paths for the concrete effect fence. */
+const normalizeRelativePath = (value: string): string => {
+  const parts: string[] = [];
+  for (const part of value.replaceAll("\\", "/").split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0) parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join("/") || ".";
+};
+
+const relativePathContains = (parent: string, child: string): boolean =>
+  parent === "." || child === parent || child.startsWith(`${parent}/`);
+
+const relativePathOverlap = (
+  declared: string,
+  target: string,
+): "exact" | "target-under-claim" | "claim-under-target" | null => {
+  const claim = normalizeRelativePath(declared);
+  const touched = normalizeRelativePath(target);
+  if (claim === touched) return "exact";
+  if (relativePathContains(claim, touched)) return "target-under-claim";
+  if (relativePathContains(touched, claim)) return "claim-under-target";
+  return null;
+};
 
 interface SourceReadLease {
   leaseId: string;
@@ -274,9 +378,11 @@ const isMissingPath = (error: unknown): boolean =>
 /**
  * CP-HI-01 Managed Write Guard.
  *
- * The guard inspects the operation and the resolved target itself. Hermes' own
- * DIRECT/MANAGED judgement arrives as `claimedClassification`, is written to the audit
- * record, and never influences the decision.
+ * The guard inspects the operation and its applicable resolved target or project identity.
+ * Hermes' own DIRECT/MANAGED judgement arrives as `claimedClassification`, is written to
+ * the audit record, and never influences the decision. Agent source-file syscalls are not
+ * individually routed through this API; their boundary is the assigned worktree, claim,
+ * session/task receipt, and runtime adapter.
  */
 export class ManagedWriteGuard {
   readonly #grants = new Map<string, HeldGrant>();
@@ -286,6 +392,8 @@ export class ManagedWriteGuard {
   readonly #sourceReadLeasesByRepository = new Map<string, Set<string>>();
   readonly #directWriteRoots: readonly string[];
   #daemonFinalizerAuthorityClaimed = false;
+  #repairWorktreeAuthorityClaimed = false;
+  #bootstrapManifestAuthorityClaimed = false;
 
   constructor(
     private readonly db: Db,
@@ -323,6 +431,22 @@ export class ManagedWriteGuard {
     return DaemonFinalizerAuthorityToken.belongsTo(value, this);
   }
 
+  claimRepairWorktreeAuthority(): RepairWorktreeAuthority {
+    if (this.#repairWorktreeAuthorityClaimed) {
+      fail(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "repair worktree authority was already issued for this guard", {});
+    }
+    this.#repairWorktreeAuthorityClaimed = true;
+    return new RepairWorktreeAuthorityToken(REPAIR_WORKTREE_MINT, this);
+  }
+
+  claimBootstrapManifestAuthority(): BootstrapManifestAuthority {
+    if (this.#bootstrapManifestAuthorityClaimed) {
+      fail(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "bootstrap manifest authority was already issued for this guard", {});
+    }
+    this.#bootstrapManifestAuthorityClaimed = true;
+    return new BootstrapManifestAuthorityToken(BOOTSTRAP_MANIFEST_MINT, this);
+  }
+
   evaluate(request: GuardRequest): Decision<GuardGrant> {
     const decision = this.decide(request);
     const exposed = decision.allowed
@@ -341,6 +465,10 @@ export class ManagedWriteGuard {
         repositoryIdentity: request.repositoryIdentity ?? null,
         targetBranch: request.targetBranch ?? null,
         targetWorktreeId: request.targetWorktreeId ?? null,
+        taskId: request.taskId ?? null,
+        taskReceiptId: request.taskReceiptId ?? null,
+        assignedWorktreeId: request.assignedWorktreeId ?? null,
+        projectId: request.projectId ?? null,
         claimedClassification: request.claimedClassification ?? null,
         allowed: exposed.allowed,
         grantId: exposed.allowed ? exposed.value.grantId : null,
@@ -619,6 +747,10 @@ export class ManagedWriteGuard {
       repositoryIdentity: facts.repositoryIdentity,
       targetBranch: facts.targetBranch,
       targetWorktreeId: facts.targetWorktreeId,
+      taskId: facts.taskId,
+      taskReceiptId: facts.taskReceiptId,
+      assignedWorktreeId: facts.assignedWorktreeId,
+      projectId: facts.projectId,
       runId: facts.runId,
       sessionId: facts.sessionId,
       bindingGeneration: facts.bindingGeneration,
@@ -628,6 +760,8 @@ export class ManagedWriteGuard {
       // it here would let the first guard pass but make the fenced settle phase deny after
       // GitHub had already accepted the write.
       daemonFinalizerAuthority: request.daemonFinalizerAuthority ?? null,
+      bootstrapManifestAuthority: request.bootstrapManifestAuthority ?? null,
+      repairWorktreeAuthority: request.repairWorktreeAuthority ?? null,
     });
     this.#grants.set(facts.grantId, { facts, request: snapshot });
     return allow(decision.reasonCode, this.publicGrant(facts), decision.evidence);
@@ -743,6 +877,10 @@ export class ManagedWriteGuard {
       resolvedPath: grant.resolvedPath,
       targetBranch: grant.targetBranch,
       targetWorktreeId: grant.targetWorktreeId,
+      taskId: grant.taskId,
+      taskReceiptId: grant.taskReceiptId,
+      assignedWorktreeId: grant.assignedWorktreeId,
+      projectId: grant.projectId,
     };
   }
 
@@ -797,12 +935,18 @@ export class ManagedWriteGuard {
       );
 
     const required: ClaimRow[] = [];
+    if (grant.operation === WriteOperation.GIT_WORKTREE) {
+      const repository = query("1 = 1", []);
+      const identity = grant.repositoryIdentity;
+      if (repository.length === 0 || !identity) return this.claimMissing(grant, "repository", identity ?? "");
+      return allow(ReasonCode.OK, repository);
+    }
     if (grant.targetBranch) {
       const branch = query("c.branch = ?", [grant.targetBranch]);
       if (branch.length === 0) return this.claimMissing(grant, "branch", grant.targetBranch);
       required.push(...branch);
     }
-    if (grant.targetWorktreeId) {
+    if (grant.targetWorktreeId && !grant.assignedWorktreeId) {
       const worktree = query("c.worktree_id = ?", [grant.targetWorktreeId]);
       if (worktree.length === 0) return this.claimMissing(grant, "worktree", grant.targetWorktreeId);
       required.push(...worktree);
@@ -853,15 +997,21 @@ export class ManagedWriteGuard {
       [grant.repositoryIdentity],
     );
     if (!repository) return null;
-    const checkout = this.probe.canonical(repository.checkout_path);
+    const checkout = grant.assignedWorktreeId
+      ? this.probe.canonical(grant.assignedWorktreeId)
+      : this.probe.canonical(repository.checkout_path);
     return isWithin(checkout, grant.resolvedPath)
-      ? grant.resolvedPath.slice(checkout.length + 1)
+      ? grant.resolvedPath.slice(checkout.length + 1) || "."
       : null;
   }
 
   private captureFilesystemFence(held: HeldGrant): Decision<FilesystemFence | null> {
     const operation = held.facts.operation as WriteOperation;
-    if (READ_OPERATIONS.has(operation) || OPERATION_CLASS[operation] !== "FILESYSTEM") {
+    if (
+      READ_OPERATIONS.has(operation) ||
+      operation === WriteOperation.MANIFEST_CHANGE ||
+      (OPERATION_CLASS[operation] !== "FILESYSTEM" && operation !== WriteOperation.GIT_WORKTREE)
+    ) {
       return allow(ReasonCode.OK, null);
     }
     if (!held.request.targetPath || !held.facts.resolvedPath) {
@@ -941,6 +1091,7 @@ export class ManagedWriteGuard {
     phase: "before effect" | "after effect" = "before effect",
   ): Decision<void> {
     if (!fence) return allow(ReasonCode.OK, undefined);
+    const operation = held.facts.operation as WriteOperation;
     try {
       if (!this.sameNode(this.nodeIdentity(fstatSync(fence.parentFd)), fence.parent)) {
         return this.fenceLost(held, "the held parent directory changed");
@@ -962,7 +1113,15 @@ export class ManagedWriteGuard {
             return this.fenceLost(held, "the target inode changed during the effect");
           }
         } catch (error) {
-          if (isMissingPath(error)) return this.fenceLost(held, "the fenced target was removed");
+          if (isMissingPath(error)) {
+            // Worktree removal and the guarded local cleanup intentionally delete the
+            // target. The held descriptor still proves that the original inode was the
+            // one affected; a missing path after this specific operation is success.
+            if (operation === WriteOperation.GIT_WORKTREE && phase === "after effect") {
+              return allow(ReasonCode.OK, undefined);
+            }
+            return this.fenceLost(held, "the fenced target was removed");
+          }
           throw error;
         } finally {
           if (currentTargetFd != null) closeSync(currentTargetFd);
@@ -1076,6 +1235,10 @@ export class ManagedWriteGuard {
         resolvedPath: grant.resolvedPath,
         targetBranch: grant.targetBranch,
         targetWorktreeId: grant.targetWorktreeId,
+        taskId: grant.taskId,
+        taskReceiptId: grant.taskReceiptId,
+        assignedWorktreeId: grant.assignedWorktreeId,
+        projectId: grant.projectId,
       },
     });
   }
@@ -1156,8 +1319,58 @@ export class ManagedWriteGuard {
         { operation, targetWorktreeId: request.targetWorktreeId },
       );
     }
-    if (operationClass === "FILESYSTEM" && !request.targetPath) {
+    if (
+      request.assignedWorktreeId !== undefined &&
+      request.assignedWorktreeId !== null &&
+      !request.assignedWorktreeId.trim()
+    ) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "assigned worktree id must not be empty", { operation });
+    }
+    if (request.assignedWorktreeId && !isAbsolute(request.assignedWorktreeId)) {
+      return deny(
+        ReasonCode.INVALID_ARGUMENT,
+        "assigned worktree id must be an absolute canonical worktree path",
+        { operation, assignedWorktreeId: request.assignedWorktreeId },
+      );
+    }
+    const taskBoundRuntimeWrite =
+      operation === WriteOperation.FILE_MUTATION &&
+      (request.actor === "runtime-cli" ||
+        request.taskId != null ||
+        request.taskReceiptId != null ||
+        request.assignedWorktreeId != null);
+    if (taskBoundRuntimeWrite) {
+      const missing = [
+        ["taskId", request.taskId],
+        ["taskReceiptId", request.taskReceiptId],
+        ["assignedWorktreeId", request.assignedWorktreeId],
+      ].filter(([, value]) => typeof value !== "string" || value.trim().length === 0).map(([name]) => name);
+      if (missing.length > 0) {
+        return deny(
+          ReasonCode.WRITE_REQUIRES_MANAGED_RUN,
+          "runtime file mutation must name its task receipt and assigned worktree",
+          { operation, missing },
+        );
+      }
+    }
+    if (operationClass === "FILESYSTEM" && operation !== WriteOperation.MANIFEST_CHANGE && !request.targetPath) {
       return deny(ReasonCode.INVALID_ARGUMENT, `${operation} requires a target path`, { operation });
+    }
+    if (
+      operation === WriteOperation.MANIFEST_CHANGE &&
+      !request.projectId &&
+      (request.runId != null || request.sessionId != null || request.bindingGeneration != null)
+    ) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "MANIFEST_CHANGE requires a project identity", { operation });
+    }
+    if (operation === WriteOperation.GIT_WORKTREE) {
+      if (!request.targetPath || !request.repositoryIdentity || !request.targetWorktreeId) {
+        return deny(
+          ReasonCode.INVALID_ARGUMENT,
+          "GIT_WORKTREE requires a target path, repository identity and registered target worktree",
+          { operation },
+        );
+      }
     }
     if (operationClass === "REMOTE" && !request.repositoryIdentity) {
       return deny(ReasonCode.INVALID_ARGUMENT, `${operation} requires a repository identity`, { operation });
@@ -1224,6 +1437,85 @@ export class ManagedWriteGuard {
       });
     }
 
+    const runlessBootstrapManifest =
+      operation === WriteOperation.MANIFEST_CHANGE &&
+      !request.runId &&
+      !request.sessionId &&
+      request.bindingGeneration == null &&
+      BootstrapManifestAuthorityToken.belongsTo(request.bootstrapManifestAuthority, this);
+    if (runlessBootstrapManifest) {
+      if (!request.projectId) {
+        return deny(ReasonCode.INVALID_ARGUMENT, "MANIFEST_CHANGE requires a project identity", { operation });
+      }
+      const issuedAt = this.clock.nowIso();
+      return allow(ReasonCode.WRITE_ALLOWED, {
+        grantId: `grant_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        classification: "MANAGED",
+        operation,
+        runId: null,
+        sessionId: null,
+        roleKey: null,
+        bindingGeneration: null,
+        repositoryIdentity: null,
+        resolvedPath: null,
+        targetBranch: null,
+        targetWorktreeId: null,
+        taskId: null,
+        taskReceiptId: null,
+        assignedWorktreeId: null,
+        projectId: request.projectId ?? null,
+        issuedAt,
+        expiresAt: isoPlus(issuedAt, GRANT_TTL_MS),
+      }, { projectNatured: true, bootstrap: true });
+    }
+
+    const runlessRepairWorktree =
+      operation === WriteOperation.GIT_WORKTREE &&
+      !request.runId &&
+      !request.sessionId &&
+      request.bindingGeneration == null &&
+      RepairWorktreeAuthorityToken.belongsTo(request.repairWorktreeAuthority, this);
+    if (runlessRepairWorktree) {
+      const repository = request.repositoryIdentity
+        ? this.db.get<{ checkout_path: string }>(
+            `SELECT checkout_path FROM repositories WHERE identity = ?`,
+            [request.repositoryIdentity],
+          )
+        : null;
+      if (!repository || !request.targetWorktreeId || this.probe.canonical(request.targetWorktreeId) !== this.probe.canonical(repository.checkout_path)) {
+        return deny(
+          ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+          "repair worktree authority must name a registered repository checkout",
+          {
+            repositoryIdentity: request.repositoryIdentity ?? null,
+            targetWorktreeId: request.targetWorktreeId ?? null,
+          },
+        );
+      }
+      const lease = this.sourceReadLeaseConflict(operation, request.repositoryIdentity!);
+      if (lease) return lease as Decision<GuardGrant>;
+      const issuedAt = this.clock.nowIso();
+      return allow(ReasonCode.WRITE_ALLOWED, {
+        grantId: `grant_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        classification: "MANAGED",
+        operation,
+        runId: null,
+        sessionId: null,
+        roleKey: null,
+        bindingGeneration: null,
+        repositoryIdentity: request.repositoryIdentity ?? null,
+        resolvedPath,
+        targetBranch: request.targetBranch ?? null,
+        targetWorktreeId: this.probe.canonical(request.targetWorktreeId),
+        taskId: null,
+        taskReceiptId: null,
+        assignedWorktreeId: null,
+        projectId: null,
+        issuedAt,
+        expiresAt: isoPlus(issuedAt, GRANT_TTL_MS),
+      }, { projectNatured: true, repair: true });
+    }
+
     if (!request.runId || !request.sessionId || request.bindingGeneration == null) {
       return deny(
         ReasonCode.WRITE_REQUIRES_MANAGED_RUN,
@@ -1240,10 +1532,60 @@ export class ManagedWriteGuard {
     if (!run) {
       return deny(ReasonCode.WRITE_REQUIRES_MANAGED_RUN, "run does not exist", { runId: request.runId });
     }
+
+    const taskReceipt = taskBoundRuntimeWrite
+      ? this.authorizeTaskReceipt(run, request, resolvedPath)
+      : allow(ReasonCode.OK, null);
+    if (!taskReceipt.allowed) return taskReceipt as Decision<GuardGrant>;
+
+    if (operation === WriteOperation.MANIFEST_CHANGE) {
+      const project = this.authorizeManifestProject(run, request.projectId!);
+      if (!project.allowed) return project as Decision<GuardGrant>;
+      if (
+        run.state !== RunState.ACTIVE &&
+        run.state !== RunState.READY_FOR_CEO_REVIEW &&
+        run.state !== RunState.COMPLETED
+      ) {
+        return deny(
+          ReasonCode.WRITE_RUN_NOT_ACTIVE,
+          `MANIFEST_CHANGE is not admitted while ${run.state}`,
+          { runId: run.run_id, state: run.state, operation },
+        );
+      }
+      const identity = this.authorizeSession(run, request);
+      if (!identity.allowed) return identity as Decision<GuardGrant>;
+      const issuedAt = this.clock.nowIso();
+      return allow(ReasonCode.WRITE_ALLOWED, {
+        grantId: `grant_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        classification: "MANAGED",
+        operation,
+        runId: run.run_id,
+        sessionId: request.sessionId!,
+        roleKey: identity.value.roleKey,
+        bindingGeneration: identity.value.generation,
+        repositoryIdentity: null,
+        resolvedPath: null,
+        targetBranch: null,
+        targetWorktreeId: null,
+        taskId: null,
+        taskReceiptId: null,
+        assignedWorktreeId: null,
+        projectId: request.projectId!,
+        issuedAt,
+        expiresAt: isoPlus(issuedAt, GRANT_TTL_MS),
+      }, { projectNatured: true, role: identity.value.role });
+    }
     // Validate the concrete repository/path before state admission. A closed run must not
     // turn an out-of-scope remote target into an apparently well-formed request merely
     // because the state refusal happens first.
-    const target = this.authorizeTarget({ run, request, operation, resolvedPath, toplevel });
+    const target = this.authorizeTarget({
+      run,
+      request,
+      operation,
+      resolvedPath,
+      toplevel,
+      taskReceipt: taskReceipt.value,
+    });
     if (!target.allowed) return target as Decision<GuardGrant>;
     const daemonFinalizationWrite =
       DAEMON_FINALIZATION_OPERATIONS.has(operation) &&
@@ -1313,6 +1655,12 @@ export class ManagedWriteGuard {
         resolvedPath,
         targetBranch: resources.value.branch,
         targetWorktreeId: resources.value.worktreeId,
+        taskId: request.taskId ?? null,
+        taskReceiptId: request.taskReceiptId ?? null,
+        assignedWorktreeId: request.assignedWorktreeId
+          ? this.probe.canonical(request.assignedWorktreeId)
+          : null,
+        projectId: null,
         issuedAt,
         expiresAt: isoPlus(issuedAt, GRANT_TTL_MS),
       },
@@ -1342,6 +1690,10 @@ export class ManagedWriteGuard {
         resolvedPath,
         targetBranch: null,
         targetWorktreeId: null,
+        taskId: null,
+        taskReceiptId: null,
+        assignedWorktreeId: null,
+        projectId: null,
         issuedAt,
         expiresAt: isoPlus(issuedAt, GRANT_TTL_MS),
       },
@@ -1446,6 +1798,144 @@ export class ManagedWriteGuard {
     });
   }
 
+  private authorizeManifestProject(run: RunAuthRow, projectId: string): Decision<void> {
+    if (!projectId.trim()) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "manifest project identity must not be empty", { runId: run.run_id });
+    }
+    if (run.project_id !== null && run.project_id !== projectId) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "manifest project is outside the run scope", {
+        runId: run.run_id,
+        runProjectId: run.project_id,
+        projectId,
+      });
+    }
+    // Bootstrap runs intentionally have no project_id until activation. The managed
+    // manifest proof still names the exact project; the bootstrap run is not itself the
+    // authority, only the bound session/generation tuple is.
+    return allow(ReasonCode.OK, undefined);
+  }
+
+  /**
+   * A provider write is bound to one durable worker attempt, not merely to a session and
+   * an arbitrary path. The receipt's worktree is checked again on every guard evaluation,
+   * including the post-effect revalidation.
+   */
+  private authorizeTaskReceipt(
+    run: RunAuthRow,
+    request: GuardRequest,
+    resolvedPath: string | null,
+  ): Decision<TaskReceiptRow> {
+    if (!request.taskId || !request.taskReceiptId || !request.assignedWorktreeId) {
+      return deny(
+        ReasonCode.WRITE_REQUIRES_MANAGED_RUN,
+        "runtime file mutation must name a task receipt and assigned worktree",
+        { runId: run.run_id, taskId: request.taskId ?? null, taskReceiptId: request.taskReceiptId ?? null },
+      );
+    }
+    const receipt = this.db.get<TaskReceiptRow>(
+      `SELECT e.execution_id, e.run_id, e.task_id, e.owner_binding_generation,
+              e.worker_session_id, e.status, e.worktree_id,
+              r.identity AS repository_identity, r.checkout_path AS repository_checkout_path
+         FROM task_executions e
+         LEFT JOIN repositories r ON r.repository_id = e.repository_id
+        WHERE e.execution_id = ? AND e.run_id = ? AND e.task_id = ?`,
+      [request.taskReceiptId, run.run_id, request.taskId],
+    );
+    if (!receipt) {
+      return deny(ReasonCode.TASK_RECEIPT_MISSING, "task execution receipt is not attached to this run and task", {
+        runId: run.run_id,
+        taskId: request.taskId,
+        taskReceiptId: request.taskReceiptId,
+      });
+    }
+    if (receipt.status !== "RUNNING") {
+      return deny(ReasonCode.TASK_RECEIPT_MISSING, "task execution receipt is not live", {
+        taskReceiptId: receipt.execution_id,
+        status: receipt.status,
+      });
+    }
+    if (
+      receipt.worker_session_id !== request.sessionId ||
+      receipt.owner_binding_generation !== run.owner_binding_generation ||
+      receipt.owner_binding_generation !== request.bindingGeneration
+    ) {
+      return deny(ReasonCode.WRITE_BINDING_GENERATION_STALE, "task receipt is bound to a stale worker generation", {
+        taskReceiptId: receipt.execution_id,
+        receiptSessionId: receipt.worker_session_id,
+        requestSessionId: request.sessionId,
+        receiptGeneration: receipt.owner_binding_generation,
+        runOwnerGeneration: run.owner_binding_generation,
+        requestGeneration: request.bindingGeneration,
+      });
+    }
+    const workerBinding = this.db.get<{ binding_generation: number }>(
+      `SELECT binding_generation FROM assignments
+        WHERE run_id = ? AND task_id = ? AND session_id = ? AND role = 'WORKER' AND status = 'ACTIVE'`,
+      [run.run_id, request.taskId, request.sessionId],
+    );
+    if (!workerBinding || workerBinding.binding_generation !== request.bindingGeneration) {
+      return deny(ReasonCode.BINDING_REVOKED, "task receipt's worker binding is not active", {
+        runId: run.run_id,
+        taskId: request.taskId,
+        sessionId: request.sessionId,
+        requestGeneration: request.bindingGeneration,
+        currentGeneration: workerBinding?.binding_generation ?? null,
+      });
+    }
+    if (!receipt.worktree_id || !receipt.repository_identity || !receipt.repository_checkout_path) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "task receipt has no repository worktree binding", {
+        taskReceiptId: receipt.execution_id,
+      });
+    }
+
+    const assigned = this.probe.canonical(request.assignedWorktreeId);
+    const receiptWorktree = this.probe.canonical(receipt.worktree_id);
+    if (assigned !== receiptWorktree) {
+      return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "request worktree differs from the task receipt binding", {
+        taskReceiptId: receipt.execution_id,
+        requestedWorktree: assigned,
+        receiptWorktree,
+      });
+    }
+    if (request.targetWorktreeId && this.probe.canonical(request.targetWorktreeId) !== assigned) {
+      return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "request target worktree differs from its assigned worktree", {
+        taskReceiptId: receipt.execution_id,
+        targetWorktreeId: request.targetWorktreeId,
+        assignedWorktreeId: assigned,
+      });
+    }
+    const worktree = this.probe.probeWorktree(assigned);
+    if (worktree.status === "ERROR") {
+      return deny(ReasonCode.PROBE_FAILED, "could not verify the task's assigned worktree", {
+        taskReceiptId: receipt.execution_id,
+        assignedWorktreeId: assigned,
+        reason: worktree.reason,
+      });
+    }
+    if (worktree.status !== "INSIDE" || this.probe.canonical(worktree.toplevel) !== assigned) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "task receipt is not bound to a live Git worktree", {
+        taskReceiptId: receipt.execution_id,
+        assignedWorktreeId: assigned,
+        observedWorktree: worktree.status === "INSIDE" ? this.probe.canonical(worktree.toplevel) : null,
+      });
+    }
+    if (!resolvedPath || !isWithin(assigned, resolvedPath)) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "write target is outside the task's assigned worktree", {
+        taskReceiptId: receipt.execution_id,
+        assignedWorktreeId: assigned,
+        resolvedPath,
+      });
+    }
+    if (request.repositoryIdentity && request.repositoryIdentity !== receipt.repository_identity) {
+      return deny(ReasonCode.REPOSITORY_IDENTITY_MISMATCH, "task receipt repository differs from the request", {
+        taskReceiptId: receipt.execution_id,
+        requestedRepository: request.repositoryIdentity,
+        receiptRepository: receipt.repository_identity,
+      });
+    }
+    return allow(ReasonCode.OK, receipt);
+  }
+
   /** Binds the operation to exactly one repository participating in the run. */
   private authorizeTarget(input: {
     run: RunAuthRow;
@@ -1453,6 +1943,7 @@ export class ManagedWriteGuard {
     operation: WriteOperation;
     resolvedPath: string | null;
     toplevel: string | null;
+    taskReceipt: TaskReceiptRow | null;
   }): Decision<ParticipantRow> {
     const participants = this.db
       .all<ParticipantRow & { work_branch: string | null; worktree_id: string | null }>(
@@ -1476,6 +1967,73 @@ export class ManagedWriteGuard {
           participants: participants.map((participant) => participant.identity),
         },
       );
+    }
+
+    if (input.operation === WriteOperation.FILE_MUTATION && input.taskReceipt) {
+      const receiptParticipant = participants.find(
+        (participant) => participant.identity === input.taskReceipt!.repository_identity,
+      );
+      if (!receiptParticipant) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "task receipt repository does not participate in this run", {
+          runId: input.run.run_id,
+          repositoryIdentity: input.taskReceipt.repository_identity,
+        });
+      }
+      const assigned = this.probe.canonical(input.request.assignedWorktreeId!);
+      if (input.toplevel !== assigned || !input.resolvedPath || !isWithin(assigned, input.resolvedPath)) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "file mutation target is outside its assigned worktree", {
+          runId: input.run.run_id,
+          assignedWorktreeId: assigned,
+          resolvedPath: input.resolvedPath,
+          observedWorktree: input.toplevel,
+        });
+      }
+      if (byIdentity && byIdentity.identity !== receiptParticipant.identity) {
+        return deny(ReasonCode.REPOSITORY_IDENTITY_MISMATCH, "request repository differs from task receipt repository", {
+          requestedRepository: byIdentity.identity,
+          receiptRepository: receiptParticipant.identity,
+        });
+      }
+      return allow(ReasonCode.OK, receiptParticipant);
+    }
+
+    if (input.operation === WriteOperation.GIT_WORKTREE) {
+      if (!byIdentity) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "GIT_WORKTREE must name a participating repository", {
+          runId: input.run.run_id,
+          identity: input.request.repositoryIdentity ?? null,
+        });
+      }
+      if (
+        !input.request.targetWorktreeId ||
+        this.probe.canonical(input.request.targetWorktreeId) !== byIdentity.checkout_path
+      ) {
+        return deny(
+          ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
+          "GIT_WORKTREE must bind to the repository's canonical registered checkout",
+          {
+            runId: input.run.run_id,
+            identity: byIdentity.identity,
+            targetWorktreeId: input.request.targetWorktreeId ?? null,
+            registeredWorktreeId: byIdentity.checkout_path,
+          },
+        );
+      }
+      // A disposable verification worktree is intentionally not itself registered. If
+      // the path is an existing registered checkout, however, the identity still has to
+      // agree with that checkout rather than using the lifecycle exception as an escape.
+      if (
+        input.toplevel &&
+        participants.some((participant) => participant.checkout_path === input.toplevel) &&
+        input.toplevel !== byIdentity.checkout_path
+      ) {
+        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "GIT_WORKTREE target belongs to another registered repository", {
+          runId: input.run.run_id,
+          identity: byIdentity.identity,
+          targetWorktree: input.toplevel,
+        });
+      }
+      return allow(ReasonCode.OK, byIdentity);
     }
 
     if (!input.resolvedPath) {
@@ -1529,7 +2087,7 @@ export class ManagedWriteGuard {
     toplevel: string | null;
   }): Decision<TargetResource> {
     const checkout = input.toplevel ?? input.participant.checkout_path;
-    const canReadLocalBranch = input.operationClass !== "REMOTE";
+    const canReadLocalBranch = input.operationClass !== "REMOTE" && input.operation !== WriteOperation.GIT_WORKTREE;
     const observedBranch = canReadLocalBranch ? this.probe.currentBranch(checkout) : null;
     const branchMustBeDeclared = input.operation === WriteOperation.GIT_BRANCH;
     if (branchMustBeDeclared && !input.request.targetBranch) {
@@ -1558,7 +2116,13 @@ export class ManagedWriteGuard {
     // The repository registry's canonical checkout path is the worktree identity. A
     // basename is caller-independent only by accident: arbitrary strings can otherwise
     // describe the same checkout (#357).
-    const actualWorktree = input.toplevel ? input.participant.checkout_path : null;
+    const assignedWorktree = input.request.assignedWorktreeId
+      ? this.probe.canonical(input.request.assignedWorktreeId)
+      : null;
+    const actualWorktree =
+      input.operation === WriteOperation.GIT_WORKTREE
+        ? input.participant.checkout_path
+        : assignedWorktree ?? (input.toplevel ? input.participant.checkout_path : null);
     const declaredWorktree = input.request.targetWorktreeId
       ? this.probe.canonical(input.request.targetWorktreeId)
       : null;
@@ -1587,9 +2151,10 @@ export class ManagedWriteGuard {
       );
     }
 
+    const relativeRoot = assignedWorktree ?? input.participant.checkout_path;
     const relativePath =
-      input.resolvedPath && isWithin(input.participant.checkout_path, input.resolvedPath)
-        ? input.resolvedPath.slice(input.participant.checkout_path.length + 1)
+      input.resolvedPath && isWithin(relativeRoot, input.resolvedPath)
+        ? input.resolvedPath.slice(relativeRoot.length + 1) || "."
         : null;
     return allow(ReasonCode.OK, { branch, worktreeId, worktreeIsRelevant, relativePath });
   }
@@ -1649,15 +2214,31 @@ export class ManagedWriteGuard {
           source: "declared or Git-resolved target branch",
         });
       }
-      if (resource.relativePath && claim.declared_path === resource.relativePath) {
-        return deny(ReasonCode.WRITE_PATH_NOT_CLAIMED, "exact path is claimed by another run", {
+      const canonicalClaimPath = claim.declared_path
+        ? this.canonicalRelativeClaimPath(participant.checkout_path, claim.declared_path)
+        : null;
+      const overlap = resource.relativePath && canonicalClaimPath
+        ? relativePathOverlap(canonicalClaimPath, resource.relativePath)
+        : null;
+      if (overlap) {
+        return deny(ReasonCode.WRITE_PATH_NOT_CLAIMED, "target path overlaps a path claimed by another run", {
           path: resource.relativePath,
+          claimedPath: canonicalClaimPath,
+          overlap,
           heldBy: claim.run_id,
           claimId: claim.claim_id,
         });
       }
     }
     return null;
+  }
+
+  private canonicalRelativeClaimPath(checkoutPath: string, declaredPath: string): string {
+    const checkout = this.probe.canonical(checkoutPath);
+    const resolved = this.probe.canonical(join(checkout, declaredPath));
+    return isWithin(checkout, resolved)
+      ? resolved.slice(checkout.length + 1) || "."
+      : normalizeRelativePath(declaredPath);
   }
 
   private hasHeldWorktreeClaim(repositoryIdentity: string): boolean {

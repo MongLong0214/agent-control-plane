@@ -2,16 +2,22 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
+import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode, RunKind, SessionLifecycle } from "../../src/domain/types.ts";
+import { ExecutionMode, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { digestOf } from "../../src/core/digest.ts";
+import { REPAIR_OWNER_APPROVAL_OPERATION } from "../../src/doctor/repair.ts";
+import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { buildCandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
 import { runSandboxed, sensitiveReadPaths } from "../../src/verify/sandbox.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
-import { makeHarness } from "../helpers/harness.ts";
-import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
+import { WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
+import type { WorktreeAuthorization } from "../../src/verify/worktree.ts";
+import { makeHarness, TEST_OWNER } from "../helpers/harness.ts";
+import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
 
@@ -27,6 +33,37 @@ const contract = {
 };
 
 type SandboxTest = () => void | Promise<void>;
+
+const testWorktreeAuthorization = (
+  manager: WorktreeManager,
+  repositoryPath: string,
+  worktreeId: string,
+): WorktreeAuthorization => {
+  const path = manager.pathFor(worktreeId);
+  const guard = {
+    authorize: async (_request: unknown, effect: (context: { grant: object }) => Promise<void> | void) => {
+      const value = await effect({ grant: {} });
+      return allow(ReasonCode.WRITE_ALLOWED, value);
+    },
+  } as unknown as ManagedWriteGuard;
+  const common = {
+    guard,
+    request: {
+      operation: WriteOperation.GIT_WORKTREE,
+      repositoryIdentity: "test-repository",
+      targetWorktreeId: repositoryPath,
+      runId: "test-run",
+      sessionId: "test-session",
+      bindingGeneration: 1,
+    },
+  };
+  return {
+    add: { ...common, request: { ...common.request, targetPath: path } },
+    remove: { ...common, request: { ...common.request, targetPath: path } },
+    cleanup: { ...common, request: { ...common.request, targetPath: path } },
+    prune: { ...common, request: { ...common.request, targetPath: repositoryPath } },
+  };
+};
 
 const sandboxIt = (name: string, fn: SandboxTest): void => {
   if (process.platform === "darwin") it(name, fn);
@@ -95,9 +132,10 @@ describe("verification hardening findings", () => {
     chmodSync(hook, 0o700);
 
     const manager = new WorktreeManager(tempDir("acp-worktrees-"));
+    const authorization = testWorktreeAuthorization(manager, repository, "hook-disabled");
     let materialisationError: unknown = null;
     try {
-      await manager.withWorktree(repository, "HEAD", "hook-disabled", async (worktree) => {
+      await manager.withWorktree(repository, "HEAD", "hook-disabled", authorization, async (worktree) => {
         expect(existsSync(sentinel)).toBe(false);
         expect(readFileSync(join(worktree.path, "verify.js"), "utf8")).toBe("process.exit(1);\n");
       });
@@ -151,6 +189,118 @@ describe("verification hardening findings", () => {
         ["sha256:replacement", "[]", run.runId],
       ),
     ).toThrow(/PINNED_RUN_SCOPED_COMMANDS_IMMUTABLE/);
+  });
+
+  it("keeps a live verification worktree through an ACTIVE -> BLOCKED owner transition", async () => {
+    const { harness, run, snapshot } = await temporaryCandidate();
+    const orphanId = "verification-orphan-before-repair";
+    const orphanPath = harness.cp.worktrees.pathFor(orphanId);
+    gitSync(harness.repoPath, [
+      "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", orphanPath, "HEAD",
+    ]);
+
+    let releaseCreate!: () => void;
+    const createPaused = new Promise<void>((resolve) => { releaseCreate = resolve; });
+    let createdResolve!: (worktree: { worktreeId: string; path: string }) => void;
+    const created = new Promise<{ worktreeId: string; path: string }>((resolve) => { createdResolve = resolve; });
+    const realCreate = harness.cp.worktrees.create.bind(harness.cp.worktrees);
+    vi.spyOn(harness.cp.worktrees, "create").mockImplementation(async (...args) => {
+      const worktree = await realCreate(...args);
+      createdResolve(worktree);
+      await createPaused;
+      return worktree;
+    });
+
+    const verification = harness.cp.verification.verify({
+      runId: run.runId,
+      snapshot,
+      commands: [parseVerificationCommand({
+        id: "live-record",
+        argv: ["node", "-e", "setTimeout(() => process.exit(0), 250)"],
+        timeoutSeconds: 5,
+      })],
+      contractDigest: snapshot.contractDigest,
+      runScoped: true,
+    });
+    let ownerPaused = false;
+
+    try {
+      const worktree = await created;
+      const durable = harness.cp.db.get<{
+        state: string;
+        worktree_path: string;
+        owner_session_id: string;
+        repository_identity: string;
+      }>(
+        `SELECT state, worktree_path, owner_session_id, repository_identity
+           FROM verification_worktrees WHERE worktree_id = ?`,
+        [worktree.worktreeId],
+      );
+      expect(durable).toMatchObject({ state: "CREATING", worktree_path: worktree.path, owner_session_id: run.ownerSessionId });
+
+      const blocked = harness.cp.runs.transition(
+        run.runId,
+        RunState.BLOCKED,
+        "owner pauses while the verification tree is still live",
+      );
+      expect(blocked).toMatchObject({ allowed: true });
+      if (!blocked.allowed) return;
+      expect(blocked.value.state).toBe(RunState.BLOCKED);
+      ownerPaused = true;
+
+      const approval = {
+        runId: null,
+        operation: REPAIR_OWNER_APPROVAL_OPERATION,
+        parameters: { operationId: "prune_orphan_worktrees", parameters: {}, dryRun: false },
+        idempotencyKey: "repair-live-record",
+        approved: true,
+      };
+      const ingress = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+        cli: { allowedActors: [TEST_OWNER.actor] },
+      });
+      const admitted = ingress.admitOwnerApproval({
+        channel: TEST_OWNER.channel,
+        actor: TEST_OWNER.actor,
+        nonce: `repair:${digestOf(approval)}`,
+        payload: ownerApprovalPayload(approval),
+      }, approval);
+      expect(admitted.allowed).toBe(true);
+      if (!admitted.allowed) return;
+
+      const repaired = await harness.cp.repair.execute({
+        operationId: "prune_orphan_worktrees",
+        parameters: {},
+        authorizedBy: "OWNER",
+        ownerApproval: admitted.value,
+        dryRun: false,
+      });
+      expect(repaired.allowed).toBe(true);
+      if (!repaired.allowed) return;
+      expect(repaired.value.changes).toBe(1);
+      expect(repaired.value.preconditionsChecked[0]?.evidence).toMatchObject({
+        liveWorktreeIdsByRepository: {
+          [durable!.repository_identity]: expect.arrayContaining([worktree.worktreeId]),
+        },
+        candidates: [{ worktreeId: orphanId }],
+      });
+      expect(existsSync(worktree.path)).toBe(true);
+      expect(existsSync(orphanPath)).toBe(false);
+    } finally {
+      if (ownerPaused) {
+        const resumed = harness.cp.runs.transition(
+          run.runId,
+          RunState.ACTIVE,
+          "owner resumes so verification can perform its guarded teardown",
+        );
+        if (!resumed.allowed) throw new Error(resumed.message);
+      }
+      releaseCreate();
+    }
+
+    await verification;
+    expect(harness.cp.db.get<{ state: string }>(
+      "SELECT state FROM verification_worktrees WHERE worktree_id = (SELECT worktree_id FROM verification_worktrees ORDER BY created_at DESC LIMIT 1)",
+    )?.state).toBe("DESTROYED");
   });
 
   sandboxIt("#367 accepts a clean immediately exiting command when it obtains an RSS sample", async () => {

@@ -735,7 +735,7 @@ describe("a merge needs a live claim (§24.3, CP-HI-01)", () => {
     if (!published.allowed) throw new Error(published.message);
     const pullNumber = await openPull(fixture);
 
-    fixture.harness.cp.db.run(`UPDATE resource_claims SET branch = 'feature/other' WHERE run_id = ?`, [
+    fixture.harness.cp.db.run(`UPDATE resource_claims SET branch = 'feature/other' WHERE run_id = ? AND branch IS NOT NULL`, [
       fixture.runId,
     ]);
 

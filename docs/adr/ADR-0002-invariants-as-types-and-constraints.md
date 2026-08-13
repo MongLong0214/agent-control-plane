@@ -16,7 +16,7 @@ Each hard invariant is enforced at the lowest layer that can actually see the vi
 
 | Invariant | Enforcement point |
 |---|---|
-| CP-HI-01 managed write | `ManagedWriteGuard` inspects operation + resolved target path |
+| CP-HI-01 managed write | `ManagedWriteGuard` inspects each ACP-owned operation plus its resolved path or project identity; runtime adapters/sandbox and claims bind agent source-file writes to the assigned worktree rather than routing every syscall through the Guard |
 | CP-HI-02 single authority | only `agentcpd` code paths can transition a run to COMPLETED |
 | CP-HI-03 contract pinning | `runs.pinned_manifest_digest` + digest comparison before verification |
 | CP-HI-04 reviewer independence | producer-session query at binding time, checked again at packet time |
