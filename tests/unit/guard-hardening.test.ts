@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { symlinkSync } from "node:fs";
 
 import { isoPlus } from "../../src/core/clock.ts";
@@ -13,6 +13,7 @@ import { addWorktree, pruneWorktrees } from "../../src/git/git.ts";
 import {
   ManagedWriteGuard,
   ReadOperation,
+  WorktreeAction,
   WriteOperation,
 } from "../../src/guard/managed-write-guard.ts";
 import {
@@ -83,6 +84,35 @@ const ownBranchClaim = (
       seeded.generation,
       clock.nowIso(),
       isoPlus(clock.nowIso(), 3_600_000),
+    ],
+  );
+};
+
+/** Mirrors the durable row the verification engine writes before it creates a tree. */
+const recordVerificationTree = (
+  db: ReturnType<typeof makeCore>["db"],
+  clock: ReturnType<typeof makeCore>["clock"],
+  seeded: ReturnType<typeof seedRun>,
+  repositoryPath: string,
+  treePath: string,
+  worktreeId: string,
+) => {
+  db.run(
+    `INSERT INTO verification_worktrees
+       (worktree_id, run_id, command_id, candidate_snapshot_digest, repository_identity,
+        repository_checkout_path, worktree_path, head, owner_session_id,
+        owner_binding_generation, owner_role_key, state, created_at)
+     VALUES (?, ?, 'guard-test', 'sha256:guard-test', ?, ?, ?, 'head', ?, ?, ?, 'CREATING', ?)`,
+    [
+      worktreeId,
+      seeded.runId,
+      seeded.identity,
+      canonical(repositoryPath),
+      canonical(treePath),
+      seeded.sessionId,
+      seeded.generation,
+      seeded.roleKey,
+      clock.nowIso(),
     ],
   );
 };
@@ -186,7 +216,8 @@ describe("P0-12 guarded worktree and source fences", () => {
         targetPath: path,
         repositoryIdentity: seeded.identity,
         targetBranch: "dev",
-        targetWorktreeId: canonical(repo),
+        targetWorktreeId: canonical(path),
+        worktreeAction: WorktreeAction.ADD,
         runId: seeded.runId,
         sessionId: seeded.sessionId,
         bindingGeneration: seeded.generation,
@@ -201,15 +232,16 @@ describe("P0-12 guarded worktree and source fences", () => {
   });
 
   it("routes real verification worktree add, remove, prune, and cleanup through consumed grants", async () => {
-    const { guard, audit, seeded, repo } = setup();
+    const { guard, audit, db, clock, seeded, repo } = setup();
     const manager = new WorktreeManager(tempDir("acp-guarded-worktrees-"));
     const path = manager.pathFor("real-guarded-worktree");
+    recordVerificationTree(db, clock, seeded, repo, path, "real-guarded-worktree");
     const common = {
       guard,
       request: {
         operation: WriteOperation.GIT_WORKTREE,
         repositoryIdentity: seeded.identity,
-        targetWorktreeId: canonical(repo),
+        targetWorktreeId: canonical(path),
         targetBranch: "dev",
         runId: seeded.runId,
         sessionId: seeded.sessionId,
@@ -218,10 +250,10 @@ describe("P0-12 guarded worktree and source fences", () => {
       },
     };
     const authorization: WorktreeAuthorization = {
-      add: { ...common, request: { ...common.request, targetPath: path } },
-      remove: { ...common, request: { ...common.request, targetPath: path } },
-      cleanup: { ...common, request: { ...common.request, targetPath: path } },
-      prune: { ...common, request: { ...common.request, targetPath: canonical(repo) } },
+      add: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.ADD } },
+      remove: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.REMOVE } },
+      cleanup: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.CLEANUP } },
+      prune: { ...common, request: { ...common.request, targetPath: canonical(repo), worktreeAction: WorktreeAction.PRUNE } },
     };
 
     await manager.create(repo, "HEAD", "real-guarded-worktree", authorization);
@@ -233,22 +265,27 @@ describe("P0-12 guarded worktree and source fences", () => {
     mkdirSync(cleanupPath);
     await manager.cleanup(cleanupPath, {
       ...authorization.cleanup!,
-      request: { ...authorization.cleanup!.request, targetPath: cleanupPath },
+      request: {
+        ...authorization.cleanup!.request,
+        targetPath: cleanupPath,
+        targetWorktreeId: cleanupPath,
+        worktreeAction: WorktreeAction.CLEANUP,
+      },
     });
     expect(existsSync(cleanupPath)).toBe(false);
 
     const consumed = audit.byKind("MANAGED_WRITE_GUARD_CONSUMED").map((event) => event.evidence);
-    const assertConsumed = (targetPath: string): void => {
+    const assertConsumed = (targetPath: string, targetWorktreeId = path): void => {
       expect(consumed).toContainEqual(expect.objectContaining({
         operation: WriteOperation.GIT_WORKTREE,
         targetBranch: "dev",
-        targetWorktreeId: canonical(repo),
+        targetWorktreeId: canonical(targetWorktreeId),
         resolvedPath: canonical(targetPath),
       }));
     };
     assertConsumed(path); // add (and remove, which uses the same canonical target)
-    assertConsumed(repo); // prune
-    assertConsumed(cleanupPath); // local cleanup
+    assertConsumed(repo); // prune (executed from source checkout, bound to the disposable tree)
+    assertConsumed(cleanupPath, cleanupPath); // local cleanup
     expect(consumed.filter((entry) => entry.operation === WriteOperation.GIT_WORKTREE)).toHaveLength(4);
   });
 
@@ -256,12 +293,13 @@ describe("P0-12 guarded worktree and source fences", () => {
     const { guard, db, clock, seeded, repo } = setup();
     const manager = new WorktreeManager(tempDir("acp-denied-worktrees-"));
     const path = manager.pathFor("denied-remove");
+    recordVerificationTree(db, clock, seeded, repo, path, "denied-remove");
     const common = {
       guard,
       request: {
         operation: WriteOperation.GIT_WORKTREE,
         repositoryIdentity: seeded.identity,
-        targetWorktreeId: canonical(repo),
+        targetWorktreeId: canonical(path),
         targetBranch: "dev",
         runId: seeded.runId,
         sessionId: seeded.sessionId,
@@ -270,10 +308,10 @@ describe("P0-12 guarded worktree and source fences", () => {
       },
     };
     const authorization: WorktreeAuthorization = {
-      add: { ...common, request: { ...common.request, targetPath: path } },
-      remove: { ...common, request: { ...common.request, targetPath: path } },
-      cleanup: { ...common, request: { ...common.request, targetPath: path } },
-      prune: { ...common, request: { ...common.request, targetPath: canonical(repo) } },
+      add: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.ADD } },
+      remove: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.REMOVE } },
+      cleanup: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.CLEANUP } },
+      prune: { ...common, request: { ...common.request, targetPath: canonical(repo), worktreeAction: WorktreeAction.PRUNE } },
     };
 
     await manager.create(repo, "HEAD", "denied-remove", authorization);
@@ -290,7 +328,12 @@ describe("P0-12 guarded worktree and source fences", () => {
     mkdirSync(cleanupPath);
     const cleanup = await manager.cleanup(cleanupPath, {
       ...authorization.cleanup!,
-      request: { ...authorization.cleanup!.request, targetPath: cleanupPath },
+      request: {
+        ...authorization.cleanup!.request,
+        targetPath: cleanupPath,
+        targetWorktreeId: cleanupPath,
+        worktreeAction: WorktreeAction.CLEANUP,
+      },
     });
     expect(cleanup.allowed).toBe(false);
     expect(cleanup.reasonCode).toBe(ReasonCode.WRITE_PATH_NOT_CLAIMED);
@@ -303,15 +346,17 @@ describe("P0-12 guarded worktree and source fences", () => {
   });
 
   it("denies a GIT_WORKTREE write while a source-read lease is held", () => {
-    const { guard, seeded, repo } = setup();
+    const { guard, seeded } = setup();
     const lease = guard.acquireSourceReadLease(seeded.runId, [seeded.identity]);
     expect(lease.allowed).toBe(true);
+    const path = join(tempDir("acp-source-lease-worktree-"), "candidate");
     const decision = guard.evaluate({
       operation: WriteOperation.GIT_WORKTREE,
-      targetPath: join(tempDir("acp-source-lease-worktree-"), "candidate"),
+      targetPath: path,
       repositoryIdentity: seeded.identity,
       targetBranch: "dev",
-      targetWorktreeId: canonical(repo),
+      targetWorktreeId: path,
+      worktreeAction: WorktreeAction.ADD,
       runId: seeded.runId,
       sessionId: seeded.sessionId,
       bindingGeneration: seeded.generation,
@@ -322,20 +367,346 @@ describe("P0-12 guarded worktree and source fences", () => {
   });
 
   it("denies a GIT_WORKTREE write when the run is not ACTIVE", () => {
-    const { guard, seeded, repo, db } = setup();
+    const { guard, seeded, db } = setup();
     transitionSeededRun(db, seeded.runId, RunState.BLOCKED);
+    const path = join(tempDir("acp-inactive-worktree-"), "candidate");
     const decision = guard.evaluate({
       operation: WriteOperation.GIT_WORKTREE,
-      targetPath: join(tempDir("acp-inactive-worktree-"), "candidate"),
+      targetPath: path,
       repositoryIdentity: seeded.identity,
       targetBranch: "dev",
-      targetWorktreeId: canonical(repo),
+      targetWorktreeId: path,
+      worktreeAction: WorktreeAction.ADD,
       runId: seeded.runId,
       sessionId: seeded.sessionId,
       bindingGeneration: seeded.generation,
     });
     expect(decision.allowed).toBe(false);
     expect(decision.reasonCode).toBe(ReasonCode.WRITE_RUN_NOT_ACTIVE);
+  });
+
+  it("treats a detached verification tree as its own exact worktree resource", () => {
+    const { guard, db, clock, seeded } = setup();
+    const tree = join(tempDir("acp-exact-verification-tree-"), "candidate");
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, worktree_id, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('other-verification-tree', ?, ?, 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [seeded.identity, canonical(tree), seeded.sessionId, clock.nowIso(), isoPlus(clock.nowIso(), 3_600_000)],
+    );
+
+    const decision = guard.evaluate({
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath: tree,
+      targetWorktreeId: tree,
+      worktreeAction: WorktreeAction.ADD,
+      repositoryIdentity: seeded.identity,
+      targetBranch: null,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    });
+
+    // Deleting the tree-identity comparison in claimConflict makes this admission pass.
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CLAIM_WORKTREE_CONFLICT);
+  });
+
+  it("serializes two attempts on the same not-yet-materialized verification tree", async () => {
+    const { guard, seeded } = setup();
+    const tree = join(tempDir("acp-inflight-verification-tree-"), "candidate");
+    const request = {
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath: tree,
+      targetWorktreeId: tree,
+      worktreeAction: WorktreeAction.ADD,
+      repositoryIdentity: seeded.identity,
+      targetBranch: null,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    };
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const enteredEffect = new Promise<void>((resolve) => { entered = resolve; });
+    const first = guard.authorize(request, async () => {
+      entered();
+      await held;
+    });
+    await enteredEffect;
+
+    const second = await guard.authorize(request, () => undefined);
+    // Removing target-key serialization lets both pre-materialisation attempts proceed.
+    expect(second.allowed).toBe(false);
+    expect(second.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+
+    release();
+    expect((await first).allowed).toBe(true);
+  });
+
+  it("admits a detached verification tree despite another run's branch claim", () => {
+    const { guard, db, clock, seeded } = setup();
+    const tree = join(tempDir("acp-detached-verification-tree-"), "candidate");
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('other-branch-for-detached-tree', ?, 'task/other', 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [seeded.identity, seeded.sessionId, clock.nowIso(), isoPlus(clock.nowIso(), 3_600_000)],
+    );
+
+    const decision = guard.evaluate({
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath: tree,
+      targetWorktreeId: tree,
+      worktreeAction: WorktreeAction.ADD,
+      repositoryIdentity: seeded.identity,
+      targetBranch: null,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    });
+
+    // Restoring the generic null-branch fail-closed check makes this a branch conflict.
+    expect(decision.allowed).toBe(true);
+    if (decision.allowed) expect(decision.value.targetWorktreeId).toBe(canonical(tree));
+  });
+
+  it("refuses a GIT_WORKTREE request whose effect and disposable-tree identity differ", () => {
+    const { guard, seeded } = setup();
+    const target = join(tempDir("acp-worktree-effect-target-"), "candidate");
+    const claimedTree = join(tempDir("acp-worktree-effect-identity-"), "candidate");
+    const decision = guard.evaluate({
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath: target,
+      targetWorktreeId: claimedTree,
+      worktreeAction: WorktreeAction.ADD,
+      repositoryIdentity: seeded.identity,
+      targetBranch: null,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH);
+  });
+
+  it.each([
+    {
+      name: "inside another run's checkout",
+      target: (repo: string) => join(repo, "src"),
+      overlap: "target-within-claimed-worktree",
+    },
+    {
+      name: "around another run's checkout",
+      target: (repo: string) => dirname(repo),
+      overlap: "claimed-worktree-within-target",
+    },
+  ])("refuses a GIT_WORKTREE target $name", ({ target, overlap }) => {
+    const { guard, db, clock, seeded, repo } = setup();
+    const targetPath = target(repo);
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, worktree_id, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES (?, ?, ?, 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [
+        `checkout-containment-${overlap}`,
+        seeded.identity,
+        canonical(repo),
+        seeded.sessionId,
+        clock.nowIso(),
+        isoPlus(clock.nowIso(), 3_600_000),
+      ],
+    );
+
+    const decision = guard.evaluate({
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath,
+      targetWorktreeId: targetPath,
+      worktreeAction: WorktreeAction.ADD,
+      repositoryIdentity: seeded.identity,
+      targetBranch: null,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    });
+
+    // Removing canonical claimed-worktree containment makes this request pass.
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CLAIM_WORKTREE_CONFLICT);
+    expect(decision.evidence).toMatchObject({ overlap });
+  });
+
+  it("refuses cleanup before it can rmSync a path inside another run's claimed checkout", async () => {
+    const { guard, db, clock, seeded, repo } = setup();
+    const targetPath = join(repo, "src");
+    mkdirSync(targetPath);
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, worktree_id, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('cleanup-checkout-holder', ?, ?, 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [
+        seeded.identity,
+        canonical(repo),
+        seeded.sessionId,
+        clock.nowIso(),
+        isoPlus(clock.nowIso(), 3_600_000),
+      ],
+    );
+    // This manager root deliberately contains the fixture checkout, so the test reaches
+    // WorktreeManager.cleanup's real rmSync effect if the guard ever grants it.
+    const manager = new WorktreeManager(repo);
+    const decision = await manager.cleanup(targetPath, {
+      guard,
+      request: {
+        operation: WriteOperation.GIT_WORKTREE,
+        targetPath,
+        targetWorktreeId: targetPath,
+        worktreeAction: WorktreeAction.CLEANUP,
+        repositoryIdentity: seeded.identity,
+        targetBranch: null,
+        runId: seeded.runId,
+        sessionId: seeded.sessionId,
+        bindingGeneration: seeded.generation,
+      },
+    });
+
+    // Deleting the checkout-containment check both admits cleanup and removes `src`.
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CLAIM_WORKTREE_CONFLICT);
+    expect(existsSync(targetPath)).toBe(true);
+  });
+
+  it("refuses a GIT_WORKTREE cleanup that overlaps another run's declared checkout path", async () => {
+    const { guard, db, clock, seeded, repo } = setup();
+    const targetPath = join(repo, "src");
+    mkdirSync(targetPath);
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, declared_path, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('cleanup-path-holder', ?, 'src', 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [
+        seeded.identity,
+        seeded.sessionId,
+        clock.nowIso(),
+        isoPlus(clock.nowIso(), 3_600_000),
+      ],
+    );
+    const manager = new WorktreeManager(repo);
+    const decision = await manager.cleanup(targetPath, {
+      guard,
+      request: {
+        operation: WriteOperation.GIT_WORKTREE,
+        targetPath,
+        targetWorktreeId: targetPath,
+        worktreeAction: WorktreeAction.CLEANUP,
+        repositoryIdentity: seeded.identity,
+        targetBranch: null,
+        runId: seeded.runId,
+        sessionId: seeded.sessionId,
+        bindingGeneration: seeded.generation,
+      },
+    });
+
+    // Restoring GIT_WORKTREE's old null relativePath admits the rmSync effect.
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_PATH_NOT_CLAIMED);
+    expect(existsSync(targetPath)).toBe(true);
+  });
+
+  it("refuses a checkout-shaped GIT_WORKTREE grant with an arbitrary disposable tree", async () => {
+    const { guard, db, clock, seeded, repo } = setup();
+    const fakeTree = join(tempDir("acp-arbitrary-prune-tree-"), "fake");
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, worktree_id, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('arbitrary-prune-checkout-holder', ?, ?, 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [
+        seeded.identity,
+        canonical(repo),
+        seeded.sessionId,
+        clock.nowIso(),
+        isoPlus(clock.nowIso(), 3_600_000),
+      ],
+    );
+    let effectInvoked = false;
+    const decision = await guard.authorize({
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath: repo,
+      targetWorktreeId: fakeTree,
+      worktreeAction: WorktreeAction.PRUNE,
+      repositoryIdentity: seeded.identity,
+      targetBranch: null,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    }, () => {
+      effectInvoked = true;
+    });
+
+    // Removing durable lifecycle ownership makes this checkout-shaped request proceed.
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH);
+    expect(effectInvoked).toBe(false);
+  });
+
+  it("refuses a checkout-shaped GIT_WORKTREE effect that is not a prune", () => {
+    const { guard, seeded, repo } = setup();
+    const fakeTree = join(tempDir("acp-non-prune-checkout-tree-"), "fake");
+    const decision = guard.evaluate({
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath: repo,
+      targetWorktreeId: fakeTree,
+      worktreeAction: WorktreeAction.ADD,
+      repositoryIdentity: seeded.identity,
+      targetBranch: null,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    });
+
+    // Allowing every lifecycle action to use the source checkout makes this pass.
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH);
+  });
+
+  it("does not settle a missing checkout target as a successful prune", async () => {
+    const { guard, db, clock, seeded, repo } = setup();
+    const tree = join(tempDir("acp-prune-missing-target-tree-"), "tree");
+    recordVerificationTree(db, clock, seeded, repo, tree, "missing-target-tree");
+    let effectInvoked = false;
+    const decision = await guard.authorize({
+      operation: WriteOperation.GIT_WORKTREE,
+      targetPath: repo,
+      targetWorktreeId: tree,
+      worktreeAction: WorktreeAction.PRUNE,
+      repositoryIdentity: seeded.identity,
+      targetBranch: null,
+      runId: seeded.runId,
+      sessionId: seeded.sessionId,
+      bindingGeneration: seeded.generation,
+    }, () => {
+      effectInvoked = true;
+      rmSync(repo, { recursive: true, force: false });
+    });
+
+    // Restoring generic GIT_WORKTREE missing-target success turns this into an allow.
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.WRITE_EFFECT_FENCE_LOST);
+    expect(effectInvoked).toBe(true);
   });
 
   it.each([

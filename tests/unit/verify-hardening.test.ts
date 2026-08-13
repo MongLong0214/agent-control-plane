@@ -7,16 +7,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { ArtifactKind, ExecutionMode, RunKind, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../../src/doctor/repair.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
-import { buildCandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
+import { buildCandidateSnapshot, candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import { runSandboxed, sensitiveReadPaths } from "../../src/verify/sandbox.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
-import { WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
+import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../../src/guard/managed-write-guard.ts";
 import type { WorktreeAuthorization } from "../../src/verify/worktree.ts";
-import { makeHarness, TEST_OWNER } from "../helpers/harness.ts";
+import { fixtureManifest, makeHarness, TEST_OWNER } from "../helpers/harness.ts";
 import { cleanupTempDirs, gitSync, makeRepo, tempDir } from "../helpers/fixtures.ts";
 
 afterEach(cleanupTempDirs);
@@ -51,17 +51,17 @@ const testWorktreeAuthorization = (
     request: {
       operation: WriteOperation.GIT_WORKTREE,
       repositoryIdentity: "test-repository",
-      targetWorktreeId: repositoryPath,
+      targetWorktreeId: path,
       runId: "test-run",
       sessionId: "test-session",
       bindingGeneration: 1,
     },
   };
   return {
-    add: { ...common, request: { ...common.request, targetPath: path } },
-    remove: { ...common, request: { ...common.request, targetPath: path } },
-    cleanup: { ...common, request: { ...common.request, targetPath: path } },
-    prune: { ...common, request: { ...common.request, targetPath: repositoryPath } },
+    add: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.ADD } },
+    remove: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.REMOVE } },
+    cleanup: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.CLEANUP } },
+    prune: { ...common, request: { ...common.request, targetPath: repositoryPath, worktreeAction: WorktreeAction.PRUNE } },
   };
 };
 
@@ -102,6 +102,90 @@ const temporaryCandidate = async () => {
   if (!frozen.allowed) throw new Error(frozen.message);
 
   return { harness, run: dispatched.value, snapshot: frozen.value };
+};
+
+/** Two active runs on different branches of one registered repository. */
+const concurrentProjectCandidates = async () => {
+  const harness = makeHarness();
+  const manifest = fixtureManifest("verification-concurrency", {
+    verificationProfiles: { simple: ["parallel"], standard: ["parallel"], guarded: ["parallel"] },
+    verificationCommands: [{
+      id: "parallel",
+      argv: ["node", "-e", "setTimeout(() => process.exit(0), 300)"],
+      repositoryRole: "primary",
+      cwd: ".",
+      timeoutSeconds: 5,
+      envAllowlist: [],
+      network: "deny",
+      networkAllowlist: [],
+      required: true,
+      evidenceMode: "LOCAL_COMMAND",
+      maxOutputBytes: 1_048_576,
+      maxMemoryMb: 2048,
+    }],
+  });
+  const project = harness.cp.projects.register({
+    projectId: manifest.projectId,
+    name: "verification concurrency",
+    manifest,
+    authorization: harness.cp.manifestAuthorizationForTests(manifest),
+  });
+  if (!project.allowed) throw new Error(project.message);
+  const repository = await harness.cp.repositories.register({
+    checkoutPath: harness.repoPath,
+    projectId: manifest.projectId,
+    repositoryRole: "primary",
+    activeManifestDigest: project.value.activeManifestDigest,
+    identity: "github:acme/fixture",
+  });
+  if (!repository.allowed) throw new Error(repository.message);
+
+  const createRun = async () => {
+    const created = harness.cp.runs.create({
+      projectId: manifest.projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract,
+      repositories: [{ repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const dispatched = await harness.cp.runs.dispatch(created.value.runId);
+    if (!dispatched.allowed) throw new Error(dispatched.message);
+    return dispatched.value;
+  };
+
+  const runA = await createRun();
+  const runB = await createRun();
+  const head = gitSync(harness.repoPath, ["rev-parse", "HEAD"]);
+  gitSync(harness.repoPath, ["branch", "task/verify-concurrent-a", head]);
+  gitSync(harness.repoPath, ["branch", "task/verify-concurrent-b", head]);
+  const snapshotFor = (runId: string, sourceBranch: string | null) => buildCandidateSnapshot({
+    runId,
+    contractDigest: runA.contractDigest,
+    repositories: [{
+      identity: repository.value.identity,
+      repositoryRole: "primary",
+      checkoutPath: repository.value.checkoutPath,
+      baseBranch: "dev",
+      candidateRef: head,
+      sourceBranch,
+      sourceHead: sourceBranch ? head : null,
+      manifestDigest: project.value.activeManifestDigest,
+    }],
+  }, harness.clock);
+  const storeSnapshot = (snapshot: Awaited<ReturnType<typeof snapshotFor>>) => {
+    const digest = candidateSnapshotDigest(snapshot);
+    harness.cp.artifacts.put(snapshot.runId, ArtifactKind.CANDIDATE_SNAPSHOT, snapshot, digest);
+    harness.cp.runs.promoteCandidate(snapshot.runId, digest);
+  };
+  return {
+    harness,
+    manifest,
+    repository: repository.value,
+    runA,
+    runB,
+    snapshotFor,
+    storeSnapshot,
+  };
 };
 
 const withPsShim = async <T>(script: string, fn: () => Promise<T>): Promise<T> => {
@@ -189,6 +273,86 @@ describe("verification hardening findings", () => {
         ["sha256:replacement", "[]", run.runId],
       ),
     ).toThrow(/PINNED_RUN_SCOPED_COMMANDS_IMMUTABLE/);
+  });
+
+  it("lets different-branch verifications obtain distinct disposable worktrees while a checkout claim is held", async () => {
+    const { harness, manifest, repository, runA, runB, snapshotFor, storeSnapshot } = await concurrentProjectCandidates();
+    const claim = harness.cp.claims.acquire({
+      runId: runA.runId,
+      ownerSessionId: runA.ownerSessionId!,
+      ownerBindingGeneration: runA.ownerBindingGeneration!,
+      ownerRoleKey: runA.ownerRoleKey!,
+      repositoryIdentity: repository.identity,
+      branch: "task/verify-concurrent-a",
+      // The checkout remains the only worktree identity ClaimRegistry accepts. It must
+      // not make a distinct disposable verification tree appear to be this checkout.
+      worktreeId: repository.checkoutPath,
+    });
+    expect(claim.allowed).toBe(true);
+    const secondClaim = harness.cp.claims.acquire({
+      runId: runB.runId,
+      ownerSessionId: runB.ownerSessionId!,
+      ownerBindingGeneration: runB.ownerBindingGeneration!,
+      ownerRoleKey: runB.ownerRoleKey!,
+      repositoryIdentity: repository.identity,
+      branch: "task/verify-concurrent-b",
+    });
+    expect(secondClaim.allowed).toBe(true);
+
+    const [snapshotA, snapshotB] = await Promise.all([
+      snapshotFor(runA.runId, "task/verify-concurrent-a"),
+      snapshotFor(runB.runId, "task/verify-concurrent-b"),
+    ]);
+    storeSnapshot(snapshotA);
+    storeSnapshot(snapshotB);
+    const command = parseVerificationCommand(manifest.verificationCommands[0]!);
+    const results = await Promise.allSettled([
+      harness.cp.verification.verify({
+        runId: runA.runId,
+        snapshot: snapshotA,
+        commands: [command],
+        contractDigest: runA.contractDigest,
+      }),
+      harness.cp.verification.verify({
+        runId: runB.runId,
+        snapshot: snapshotB,
+        commands: [command],
+        contractDigest: runB.contractDigest,
+      }),
+    ]);
+
+    expect(results).toEqual([
+      expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ allowed: true }) }),
+      expect.objectContaining({ status: "fulfilled", value: expect.objectContaining({ allowed: true }) }),
+    ]);
+  });
+
+  it("lets a detached verification obtain a tree while another run holds a branch claim", async () => {
+    const { harness, manifest, repository, runA, runB, snapshotFor, storeSnapshot } = await concurrentProjectCandidates();
+    const held = harness.cp.claims.acquire({
+      runId: runA.runId,
+      ownerSessionId: runA.ownerSessionId!,
+      ownerBindingGeneration: runA.ownerBindingGeneration!,
+      ownerRoleKey: runA.ownerRoleKey!,
+      repositoryIdentity: repository.identity,
+      branch: "task/other-run",
+    });
+    expect(held.allowed).toBe(true);
+
+    const detached = await snapshotFor(runB.runId, null);
+    expect(detached.repositories[0]?.sourceBranch).toBeNull();
+    storeSnapshot(detached);
+    const create = vi.spyOn(harness.cp.worktrees, "create");
+    const result = await harness.cp.verification.verify({
+      runId: runB.runId,
+      snapshot: detached,
+      commands: [parseVerificationCommand(manifest.verificationCommands[0]!)],
+      contractDigest: runB.contractDigest,
+    });
+
+    // Restoring null-branch-as-undeterminable makes guard admission fail before create.
+    expect(result.allowed).toBe(true);
+    expect(create).toHaveBeenCalledOnce();
   });
 
   it("keeps a live verification worktree through an ACTIVE -> BLOCKED owner transition", async () => {

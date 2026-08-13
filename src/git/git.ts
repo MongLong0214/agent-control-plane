@@ -4,7 +4,12 @@ import { promisify } from "node:util";
 import { sha256 } from "../core/digest.ts";
 import { type Decision, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import { WriteOperation, type GuardRequest, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
+import {
+  WorktreeAction,
+  WriteOperation,
+  type GuardRequest,
+  type ManagedWriteGuard,
+} from "../guard/managed-write-guard.ts";
 import { canonical } from "../guard/workspace-probe.ts";
 
 const exec = promisify(execFile);
@@ -26,6 +31,7 @@ export interface GuardedGitEffect {
 const authorizeGitMutation = async (
   authorization: GuardedGitEffect | undefined,
   expectedTarget: string,
+  expectedAction: WorktreeAction,
   cwd: string,
   effect: () => Promise<GitResult>,
 ): Promise<Decision<void>> => {
@@ -37,6 +43,12 @@ const authorizeGitMutation = async (
   if (authorization.request.operation !== WriteOperation.GIT_WORKTREE) {
     return deny(ReasonCode.INVALID_ARGUMENT, "Git worktree API requires a GIT_WORKTREE authorization", {
       operation: authorization.request.operation,
+    });
+  }
+  if (authorization.request.worktreeAction !== expectedAction) {
+    return deny(ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH, "Git mutation action does not match the guard request", {
+      expectedAction,
+      authorizedAction: authorization.request.worktreeAction ?? null,
     });
   }
   if (!authorization.request.targetPath || canonical(authorization.request.targetPath) !== canonical(expectedTarget)) {
@@ -173,6 +185,7 @@ export const addWorktree = async (
   return authorizeGitMutation(
     authorization,
     path,
+    WorktreeAction.ADD,
     cwd,
     () => git(cwd, ["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", path, ref]),
   );
@@ -186,6 +199,7 @@ export const removeWorktree = async (
   return authorizeGitMutation(
     authorization,
     path,
+    WorktreeAction.REMOVE,
     cwd,
     () => git(cwd, ["worktree", "remove", "--force", path], { allowFailure: true }),
   );
@@ -210,6 +224,7 @@ export const pruneWorktrees = async (
   return authorizeGitMutation(
     authorization,
     cwd,
+    WorktreeAction.PRUNE,
     cwd,
     () => git(cwd, ["worktree", "prune"], { allowFailure: true }),
   );

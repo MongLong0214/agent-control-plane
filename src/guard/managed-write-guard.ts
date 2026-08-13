@@ -35,6 +35,17 @@ export const WriteOperation = {
 } as const;
 export type WriteOperation = (typeof WriteOperation)[keyof typeof WriteOperation];
 
+/** The concrete effect in a disposable-worktree lifecycle. */
+export const WorktreeAction = {
+  ADD: "ADD",
+  REMOVE: "REMOVE",
+  PRUNE: "PRUNE",
+  CLEANUP: "CLEANUP",
+} as const;
+export type WorktreeAction = (typeof WorktreeAction)[keyof typeof WorktreeAction];
+
+const WORKTREE_ACTIONS: ReadonlySet<WorktreeAction> = new Set(Object.values(WorktreeAction));
+
 export const ReadOperation = {
   FILE_READ: "FILE_READ",
   GIT_READ: "GIT_READ",
@@ -191,8 +202,16 @@ export interface GuardRequest {
    * ref a command or GitHub request will change.
    */
   targetBranch?: string | null;
-  /** Absolute canonical registered checkout path when the operation mutates a worktree. */
+  /**
+   * Absolute canonical worktree identity. For GIT_WORKTREE this is the disposable tree
+   * being created or removed; other local writes use the registered checkout identity.
+   */
   targetWorktreeId?: string | null;
+  /**
+   * The lifecycle effect for a disposable worktree. Only a tracked PRUNE may execute
+   * from the registered source checkout rather than the disposable tree itself.
+   */
+  worktreeAction?: WorktreeAction | null;
   /** Project identity for a manifest mutation, which has no filesystem target. */
   projectId?: string | null;
   /** Managed run identity claimed by the caller. */
@@ -228,6 +247,7 @@ export interface GuardGrant {
   resolvedPath: string | null;
   targetBranch: string | null;
   targetWorktreeId: string | null;
+  worktreeAction: WorktreeAction | null;
   taskId: string | null;
   taskReceiptId: string | null;
   assignedWorktreeId: string | null;
@@ -260,7 +280,16 @@ interface ParticipantRow {
 
 interface TargetResource {
   branch: string | null;
+  /** A detached worktree add/remove does not mutate or select a branch. */
+  branchIsRelevant: boolean;
+  /** Registered checkout used for claim containment and repository-relative paths. */
+  checkoutWorktreeId: string;
+  /** Canonical filesystem path the concrete effect reaches. */
+  effectPath: string | null;
+  /** Filesystem target that claims protect; PRUNE retains its disposable-tree target. */
+  claimPath: string | null;
   worktreeId: string | null;
+  worktreeAction: WorktreeAction | null;
   /** A remote write does not reach a local checkout, so it cannot name one. */
   worktreeIsRelevant: boolean;
   relativePath: string | null;
@@ -465,6 +494,7 @@ export class ManagedWriteGuard {
         repositoryIdentity: request.repositoryIdentity ?? null,
         targetBranch: request.targetBranch ?? null,
         targetWorktreeId: request.targetWorktreeId ?? null,
+        worktreeAction: request.worktreeAction ?? null,
         taskId: request.taskId ?? null,
         taskReceiptId: request.taskReceiptId ?? null,
         assignedWorktreeId: request.assignedWorktreeId ?? null,
@@ -747,6 +777,7 @@ export class ManagedWriteGuard {
       repositoryIdentity: facts.repositoryIdentity,
       targetBranch: facts.targetBranch,
       targetWorktreeId: facts.targetWorktreeId,
+      worktreeAction: facts.worktreeAction,
       taskId: facts.taskId,
       taskReceiptId: facts.taskReceiptId,
       assignedWorktreeId: facts.assignedWorktreeId,
@@ -877,6 +908,7 @@ export class ManagedWriteGuard {
       resolvedPath: grant.resolvedPath,
       targetBranch: grant.targetBranch,
       targetWorktreeId: grant.targetWorktreeId,
+      worktreeAction: grant.worktreeAction,
       taskId: grant.taskId,
       taskReceiptId: grant.taskReceiptId,
       assignedWorktreeId: grant.assignedWorktreeId,
@@ -1114,10 +1146,20 @@ export class ManagedWriteGuard {
           }
         } catch (error) {
           if (isMissingPath(error)) {
-            // Worktree removal and the guarded local cleanup intentionally delete the
-            // target. The held descriptor still proves that the original inode was the
-            // one affected; a missing path after this specific operation is success.
-            if (operation === WriteOperation.GIT_WORKTREE && phase === "after effect") {
+            // Only a remove/cleanup grant for its own disposable tree may intentionally
+            // leave the target absent. A prune-shaped checkout grant must never turn an
+            // unrelated deletion into success merely because the target disappeared.
+            const disposesOwnTarget =
+              operation === WriteOperation.GIT_WORKTREE &&
+              phase === "after effect" &&
+              (held.request.worktreeAction === WorktreeAction.REMOVE ||
+                held.request.worktreeAction === WorktreeAction.CLEANUP) &&
+              held.facts.targetWorktreeId === held.facts.resolvedPath;
+            const repairDisposal =
+              operation === WriteOperation.GIT_WORKTREE &&
+              phase === "after effect" &&
+              RepairWorktreeAuthorityToken.belongsTo(held.request.repairWorktreeAuthority, this);
+            if (disposesOwnTarget || repairDisposal) {
               return allow(ReasonCode.OK, undefined);
             }
             return this.fenceLost(held, "the fenced target was removed");
@@ -1194,6 +1236,12 @@ export class ManagedWriteGuard {
         ? JSON.stringify([grant.repositoryIdentity, operation, grant.targetBranch])
         : null;
     }
+    if (operation === WriteOperation.GIT_WORKTREE && grant.targetWorktreeId) {
+      // `prune` executes from the repository checkout, but it belongs to the lifecycle of
+      // one disposable tree. Keying it by that tree preserves both exact-tree exclusion
+      // and independent verification worktrees' concurrency.
+      return JSON.stringify([grant.repositoryIdentity, grant.targetWorktreeId]);
+    }
     if (!grant.resolvedPath) return null;
     return JSON.stringify([grant.repositoryIdentity, grant.resolvedPath]);
   }
@@ -1235,6 +1283,7 @@ export class ManagedWriteGuard {
         resolvedPath: grant.resolvedPath,
         targetBranch: grant.targetBranch,
         targetWorktreeId: grant.targetWorktreeId,
+        worktreeAction: grant.worktreeAction,
         taskId: grant.taskId,
         taskReceiptId: grant.taskReceiptId,
         assignedWorktreeId: grant.assignedWorktreeId,
@@ -1315,9 +1364,19 @@ export class ManagedWriteGuard {
     if (request.targetWorktreeId && !isAbsolute(request.targetWorktreeId)) {
       return deny(
         ReasonCode.INVALID_ARGUMENT,
-        "target worktree id must be the absolute canonical checkout path",
+        "target worktree id must be an absolute canonical worktree path",
         { operation, targetWorktreeId: request.targetWorktreeId },
       );
+    }
+    if (
+      request.worktreeAction !== undefined &&
+      request.worktreeAction !== null &&
+      !WORKTREE_ACTIONS.has(request.worktreeAction)
+    ) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "unknown GIT_WORKTREE lifecycle action", {
+        operation,
+        worktreeAction: request.worktreeAction,
+      });
     }
     if (
       request.assignedWorktreeId !== undefined &&
@@ -1364,10 +1423,10 @@ export class ManagedWriteGuard {
       return deny(ReasonCode.INVALID_ARGUMENT, "MANIFEST_CHANGE requires a project identity", { operation });
     }
     if (operation === WriteOperation.GIT_WORKTREE) {
-      if (!request.targetPath || !request.repositoryIdentity || !request.targetWorktreeId) {
+      if (!request.targetPath || !request.repositoryIdentity || !request.targetWorktreeId || !request.worktreeAction) {
         return deny(
           ReasonCode.INVALID_ARGUMENT,
-          "GIT_WORKTREE requires a target path, repository identity and registered target worktree",
+          "GIT_WORKTREE requires a target path, repository identity, disposable tree and lifecycle action",
           { operation },
         );
       }
@@ -1460,6 +1519,7 @@ export class ManagedWriteGuard {
         resolvedPath: null,
         targetBranch: null,
         targetWorktreeId: null,
+        worktreeAction: null,
         taskId: null,
         taskReceiptId: null,
         assignedWorktreeId: null,
@@ -1507,6 +1567,7 @@ export class ManagedWriteGuard {
         resolvedPath,
         targetBranch: request.targetBranch ?? null,
         targetWorktreeId: this.probe.canonical(request.targetWorktreeId),
+        worktreeAction: request.worktreeAction ?? null,
         taskId: null,
         taskReceiptId: null,
         assignedWorktreeId: null,
@@ -1567,6 +1628,7 @@ export class ManagedWriteGuard {
         resolvedPath: null,
         targetBranch: null,
         targetWorktreeId: null,
+        worktreeAction: null,
         taskId: null,
         taskReceiptId: null,
         assignedWorktreeId: null,
@@ -1655,6 +1717,7 @@ export class ManagedWriteGuard {
         resolvedPath,
         targetBranch: resources.value.branch,
         targetWorktreeId: resources.value.worktreeId,
+        worktreeAction: resources.value.worktreeAction,
         taskId: request.taskId ?? null,
         taskReceiptId: request.taskReceiptId ?? null,
         assignedWorktreeId: request.assignedWorktreeId
@@ -1690,6 +1753,7 @@ export class ManagedWriteGuard {
         resolvedPath,
         targetBranch: null,
         targetWorktreeId: null,
+        worktreeAction: null,
         taskId: null,
         taskReceiptId: null,
         assignedWorktreeId: null,
@@ -2004,34 +2068,68 @@ export class ManagedWriteGuard {
           identity: input.request.repositoryIdentity ?? null,
         });
       }
+      const targetWorktree = input.request.targetWorktreeId
+        ? this.probe.canonical(input.request.targetWorktreeId)
+        : null;
+      const action = input.request.worktreeAction;
+      // Add/remove/cleanup name the disposable tree itself. Prune runs from the registered
+      // checkout, but only for a durable verification tree owned by this same run. This
+      // keeps the repository checkout and disposable tree as separate facts rather than
+      // letting an arbitrary tree identity borrow checkout authority.
+      const expectedEffectPath = action === WorktreeAction.PRUNE
+        ? byIdentity.checkout_path
+        : targetWorktree;
       if (
-        !input.request.targetWorktreeId ||
-        this.probe.canonical(input.request.targetWorktreeId) !== byIdentity.checkout_path
+        !targetWorktree ||
+        !input.resolvedPath ||
+        !action ||
+        input.resolvedPath !== expectedEffectPath
       ) {
         return deny(
           ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
-          "GIT_WORKTREE must bind to the repository's canonical registered checkout",
+          "GIT_WORKTREE effect does not match its disposable-tree lifecycle action",
           {
             runId: input.run.run_id,
             identity: byIdentity.identity,
+            targetPath: input.resolvedPath,
             targetWorktreeId: input.request.targetWorktreeId ?? null,
-            registeredWorktreeId: byIdentity.checkout_path,
+            worktreeAction: action ?? null,
+            repositoryCheckoutPath: byIdentity.checkout_path,
+          },
+        );
+      }
+      if (
+        action === WorktreeAction.PRUNE &&
+        !this.ownsVerificationWorktree(input.run.run_id, byIdentity, targetWorktree)
+      ) {
+        return deny(
+          ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
+          "GIT_WORKTREE prune must name this run's live disposable verification tree",
+          {
+            runId: input.run.run_id,
+            repositoryIdentity: byIdentity.identity,
+            repositoryCheckoutPath: byIdentity.checkout_path,
+            targetWorktreeId: targetWorktree,
           },
         );
       }
       // A disposable verification worktree is intentionally not itself registered. If
-      // the path is an existing registered checkout, however, the identity still has to
-      // agree with that checkout rather than using the lifecycle exception as an escape.
+      // the requested effect instead resolves inside a *different* registered checkout,
+      // repository identity cannot be borrowed to reach it.
       if (
         input.toplevel &&
         participants.some((participant) => participant.checkout_path === input.toplevel) &&
         input.toplevel !== byIdentity.checkout_path
       ) {
-        return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "GIT_WORKTREE target belongs to another registered repository", {
-          runId: input.run.run_id,
-          identity: byIdentity.identity,
-          targetWorktree: input.toplevel,
-        });
+        return deny(
+          ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+          "GIT_WORKTREE target belongs to another registered repository",
+          {
+            runId: input.run.run_id,
+            identity: byIdentity.identity,
+            targetWorktree: input.toplevel,
+          },
+        );
       }
       return allow(ReasonCode.OK, byIdentity);
     }
@@ -2078,6 +2176,30 @@ export class ManagedWriteGuard {
     return allow(ReasonCode.OK, owner);
   }
 
+  /** A source-checkout prune may only service a tree durably attributed to this run. */
+  private ownsVerificationWorktree(
+    runId: string,
+    participant: ParticipantRow,
+    targetWorktreeId: string,
+  ): boolean {
+    const rows = this.db.all<{
+      repository_checkout_path: string;
+      worktree_path: string;
+    }>(
+      `SELECT repository_checkout_path, worktree_path
+         FROM verification_worktrees
+        WHERE run_id = ?
+          AND repository_identity = ?
+          AND state IN ('CREATING', 'ACTIVE', 'DESTROYING')`,
+      [runId, participant.identity],
+    );
+    return rows.some(
+      (row) =>
+        this.probe.canonical(row.repository_checkout_path) === participant.checkout_path &&
+        this.probe.canonical(row.worktree_path) === targetWorktreeId,
+    );
+  }
+
   private authorizeResources(input: {
     request: GuardRequest;
     operation: WriteOperation;
@@ -2113,20 +2235,29 @@ export class ManagedWriteGuard {
     }
 
     const branch = input.request.targetBranch ?? observedBranch;
-    // The repository registry's canonical checkout path is the worktree identity. A
-    // basename is caller-independent only by accident: arbitrary strings can otherwise
-    // describe the same checkout (#357).
+    // `git worktree add --detach <sha>` materialises an exact commit without selecting
+    // or changing a branch. A source-branch label is provenance for the candidate, not
+    // the resource this mutation reaches, so it must not collide with branch claims.
+    const branchIsRelevant = input.operation !== WriteOperation.GIT_WORKTREE;
+    // The registered checkout remains a separate filesystem fact for §23.2 containment.
+    // A GIT_WORKTREE's resource identity is instead the disposable tree, so separate
+    // verification trees can coexist even when their source checkout is claimed.
     const assignedWorktree = input.request.assignedWorktreeId
       ? this.probe.canonical(input.request.assignedWorktreeId)
       : null;
-    const actualWorktree =
-      input.operation === WriteOperation.GIT_WORKTREE
-        ? input.participant.checkout_path
-        : assignedWorktree ?? (input.toplevel ? input.participant.checkout_path : null);
     const declaredWorktree = input.request.targetWorktreeId
       ? this.probe.canonical(input.request.targetWorktreeId)
       : null;
-    if (declaredWorktree && input.toplevel && declaredWorktree !== actualWorktree) {
+    const actualWorktree =
+      input.operation === WriteOperation.GIT_WORKTREE
+        ? declaredWorktree
+        : assignedWorktree ?? (input.toplevel ? input.participant.checkout_path : null);
+    if (
+      input.operation !== WriteOperation.GIT_WORKTREE &&
+      declaredWorktree &&
+      input.toplevel &&
+      declaredWorktree !== actualWorktree
+    ) {
       return deny(
         ReasonCode.WRITE_TARGET_RESOURCE_MISMATCH,
         "declared worktree does not match the resolved target work tree",
@@ -2151,12 +2282,29 @@ export class ManagedWriteGuard {
       );
     }
 
-    const relativeRoot = assignedWorktree ?? input.participant.checkout_path;
+    const relativeRoot = input.operation === WriteOperation.GIT_WORKTREE
+      ? input.participant.checkout_path
+      : assignedWorktree ?? input.participant.checkout_path;
+    const claimPath = input.operation === WriteOperation.GIT_WORKTREE
+      ? declaredWorktree
+      : input.resolvedPath;
     const relativePath =
-      input.resolvedPath && isWithin(relativeRoot, input.resolvedPath)
-        ? input.resolvedPath.slice(relativeRoot.length + 1) || "."
+      claimPath && isWithin(relativeRoot, claimPath)
+        ? claimPath.slice(relativeRoot.length + 1) || "."
         : null;
-    return allow(ReasonCode.OK, { branch, worktreeId, worktreeIsRelevant, relativePath });
+    return allow(ReasonCode.OK, {
+      branch,
+      branchIsRelevant,
+      checkoutWorktreeId: input.participant.checkout_path,
+      effectPath: input.resolvedPath,
+      claimPath,
+      worktreeId,
+      worktreeAction: input.operation === WriteOperation.GIT_WORKTREE
+        ? input.request.worktreeAction ?? null
+        : null,
+      worktreeIsRelevant,
+      relativePath,
+    });
   }
 
   /** §23.2 hard rejects against the resource this operation actually names or reaches. */
@@ -2181,7 +2329,7 @@ export class ManagedWriteGuard {
 
     const undeterminable = held.filter(
       (claim) =>
-        (claim.branch !== null && resource.branch === null) ||
+        (resource.branchIsRelevant && claim.branch !== null && resource.branch === null) ||
         (resource.worktreeIsRelevant && claim.worktree_id !== null && resource.worktreeId === null),
     );
     if (undeterminable.length > 0) {
@@ -2198,15 +2346,20 @@ export class ManagedWriteGuard {
     }
 
     for (const claim of held) {
-      if (claim.worktree_id && resource.worktreeId === claim.worktree_id) {
-        return deny(ReasonCode.CLAIM_WORKTREE_CONFLICT, "worktree is claimed by another run", {
-          worktreeId: claim.worktree_id,
+      const worktreeOverlap = claim.worktree_id && resource.claimPath
+        ? this.worktreePathOverlap(claim.worktree_id, resource.claimPath)
+        : null;
+      if (worktreeOverlap) {
+        return deny(ReasonCode.CLAIM_WORKTREE_CONFLICT, "target overlaps a worktree claimed by another run", {
+          worktreeId: this.probe.canonical(claim.worktree_id!),
+          targetPath: resource.claimPath,
+          overlap: worktreeOverlap,
           heldBy: claim.run_id,
           claimId: claim.claim_id,
-          source: "resolved target work tree",
+          source: "canonical claimed-worktree containment",
         });
       }
-      if (claim.branch && resource.branch === claim.branch) {
+      if (resource.branchIsRelevant && claim.branch && resource.branch === claim.branch) {
         return deny(ReasonCode.CLAIM_BRANCH_CONFLICT, "branch is claimed by another run", {
           branch: claim.branch,
           heldBy: claim.run_id,
@@ -2215,7 +2368,7 @@ export class ManagedWriteGuard {
         });
       }
       const canonicalClaimPath = claim.declared_path
-        ? this.canonicalRelativeClaimPath(participant.checkout_path, claim.declared_path)
+        ? this.canonicalRelativeClaimPath(resource.checkoutWorktreeId, claim.declared_path)
         : null;
       const overlap = resource.relativePath && canonicalClaimPath
         ? relativePathOverlap(canonicalClaimPath, resource.relativePath)
@@ -2230,6 +2383,20 @@ export class ManagedWriteGuard {
         });
       }
     }
+    return null;
+  }
+
+  /** Exact and enclosing checkout collisions are hard §23.2 conflicts in either direction. */
+  private worktreePathOverlap(claimedWorktree: string, effectPath: string):
+    | "exact"
+    | "target-within-claimed-worktree"
+    | "claimed-worktree-within-target"
+    | null {
+    const claimed = this.probe.canonical(claimedWorktree);
+    const target = this.probe.canonical(effectPath);
+    if (claimed === target) return "exact";
+    if (isWithin(claimed, target)) return "target-within-claimed-worktree";
+    if (isWithin(target, claimed)) return "claimed-worktree-within-target";
     return null;
   }
 

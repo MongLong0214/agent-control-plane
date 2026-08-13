@@ -10,7 +10,7 @@ import type { ArtifactStore, EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import { ArtifactKind, type RunRow } from "../domain/types.ts";
 import type { ClaimRegistry } from "../claims/claim-registry.ts";
-import { WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
+import { WorktreeAction, WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   type CandidateSnapshot,
@@ -704,7 +704,10 @@ export class VerificationEngine {
       request: {
         operation: WriteOperation.GIT_WORKTREE,
         repositoryIdentity,
-        targetWorktreeId: checkoutPath,
+        // This is the disposable tree being created, not the registered source checkout.
+        // Repository identity supplies the claim scope; using the checkout here would make
+        // every concurrent verification of the same repository collide by construction.
+        targetWorktreeId: path,
         targetBranch: sourceBranch,
         runId: run.runId,
         sessionId: run.ownerSessionId,
@@ -714,10 +717,10 @@ export class VerificationEngine {
       },
     };
     return {
-      add: { ...common, request: { ...common.request, targetPath: path } },
-      remove: { ...common, request: { ...common.request, targetPath: path } },
-      cleanup: { ...common, request: { ...common.request, targetPath: path } },
-      prune: { ...common, request: { ...common.request, targetPath: checkoutPath } },
+      add: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.ADD } },
+      remove: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.REMOVE } },
+      cleanup: { ...common, request: { ...common.request, targetPath: path, worktreeAction: WorktreeAction.CLEANUP } },
+      prune: { ...common, request: { ...common.request, targetPath: checkoutPath, worktreeAction: WorktreeAction.PRUNE } },
     };
   }
 
