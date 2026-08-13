@@ -7,8 +7,8 @@
   },
   "directWriteRefused": "WRITE_REQUIRES_MANAGED_RUN",
   "dispatch": {
-    "runId": "run_818cfdb2af0d47858a5df121",
-    "ownerSessionId": "ses_cto_7bcc89915dec40a1bd1f",
+    "runId": "run_93c469c16c6d4008999a4d2a",
+    "ownerSessionId": "ses_cto_b438e4770d0143018143",
     "ownerBindingGeneration": 1,
     "pinnedManifestDigest": "sha256:905a5dd1724e0b086562cc693a5e5b3065532a70875a055d132c80403d307ae9",
     "activityAfterCto": "ACTIVE"
@@ -16,7 +16,7 @@
   "ctoPlan": {
     "provider": "claude",
     "model": "sonnet",
-    "durationMs": 61434,
+    "durationMs": 80011,
     "parsed": true
   },
   "humanGateRefusedNonOwner": "INGRESS_ACTOR_NOT_ALLOWLISTED",
@@ -27,7 +27,8 @@
     },
     "items": [
       "owner approval before a guarded change is published"
-    ]
+    ],
+    "via": "admitted cli ingress receipt"
   },
   "verification": {
     "status": "PASS",
@@ -38,16 +39,16 @@
         "commandId": "reason-codes",
         "source": "local",
         "status": "PASS",
-        "exactHead": "e2c10c78bda9b9ccc12e24e5b3d5e1a9fc50b27e"
+        "exactHead": "43e56229e457e3f226fc4ebe6890a9f51add58c5"
       }
     ],
-    "digest": "sha256:53908415566c096ad0010d09f3a2be558f69f22ff3cb9881e4c9ee55f60d9517"
+    "digest": "sha256:8ace4e336f49b722734def221f5ab021bcfb362360e6eb885cf94914ec2d7ad6"
   },
   "blindReview": {
     "verdict": "PASS",
     "provider": "claude",
     "model": "sonnet",
-    "reviewerSessionId": "ses_review_e7557cd31a234415b72c",
+    "reviewerSessionId": "ses_review_03dc687c74d94269b7e6",
     "reviewerGeneration": 1,
     "coveredFiles": [
       "github:MongLong0214/agent-control-plane:src/core/reason-codes.ts"
@@ -65,10 +66,10 @@
       "candidate checkout paths"
     ]
   },
-  "candidateSnapshotDigest": "sha256:7c77b15f2deca2f7fab661058c44d85142738c470268dda1b31beb00b347b513",
+  "candidateSnapshotDigest": "sha256:f8aebf9befbfda347b90e0aa137b0b6a3755860547114f92c974c1c4f7bc48a0",
   "ceoConfirm": {
     "state": "COMPLETED",
-    "sessionId": "ses_5763fe8d0954448bb5d869b8"
+    "sessionId": "ses_c126bab0a5994ab1ba8e9f2b"
   },
   "doctor": {
     "scope": "project",
@@ -82,23 +83,23 @@
         "blocking": false,
         "confidence": "MEDIUM",
         "observedEvidence": {
-          "sessionId": "ses_cto_7bcc89915dec40a1bd1f"
+          "sessionId": "ses_cto_b438e4770d0143018143"
         },
         "recommendedAction": "reconnect the CTO session to Buzz"
       }
     ],
-    "ranAt": "2026-08-12T21:34:09.172Z"
+    "ranAt": "2026-08-13T01:33:39.414Z"
   },
   "telemetry": {
     "run": [
       {
         "metricId": 10,
-        "at": "2026-08-12T21:34:09.171Z",
+        "at": "2026-08-13T01:33:39.414Z",
         "scope": "run",
         "name": "outcome",
-        "runId": "run_818cfdb2af0d47858a5df121",
+        "runId": "run_93c469c16c6d4008999a4d2a",
         "taskId": null,
-        "value": 129248,
+        "value": 139336,
         "text": "COMPLETED",
         "dims": {
           "mode": "GUARDED",
@@ -111,12 +112,12 @@
     "task": [
       {
         "metricId": 4,
-        "at": "2026-08-12T21:33:01.541Z",
+        "at": "2026-08-13T01:32:44.842Z",
         "scope": "task",
         "name": "execution",
-        "runId": "run_818cfdb2af0d47858a5df121",
-        "taskId": "task_4d423c5feaf2471e917d593b",
-        "value": 113,
+        "runId": "run_93c469c16c6d4008999a4d2a",
+        "taskId": "task_e48ead1e753e488aa8c2290f",
+        "value": 89,
         "text": "SUCCEEDED",
         "dims": {
           "category": "implementation",
@@ -128,12 +129,12 @@
       },
       {
         "metricId": 5,
-        "at": "2026-08-12T21:33:01.542Z",
+        "at": "2026-08-13T01:32:44.843Z",
         "scope": "task",
         "name": "execution",
-        "runId": "run_818cfdb2af0d47858a5df121",
-        "taskId": "task_45c5b0d92bd8446faa76aa51",
-        "value": 1,
+        "runId": "run_93c469c16c6d4008999a4d2a",
+        "taskId": "task_f4550b8cc2bc471d96485955",
+        "value": 0,
         "text": "SUCCEEDED",
         "dims": {
           "category": "test",
@@ -147,10 +148,10 @@
     "quality": [
       {
         "metricId": 6,
-        "at": "2026-08-12T21:33:02.033Z",
+        "at": "2026-08-13T01:32:45.234Z",
         "scope": "quality",
         "name": "verification",
-        "runId": "run_818cfdb2af0d47858a5df121",
+        "runId": "run_93c469c16c6d4008999a4d2a",
         "taskId": null,
         "value": null,
         "text": "PASS",
@@ -162,10 +163,10 @@
       },
       {
         "metricId": 7,
-        "at": "2026-08-12T21:34:09.053Z",
+        "at": "2026-08-13T01:33:39.226Z",
         "scope": "quality",
         "name": "blind_review",
-        "runId": "run_818cfdb2af0d47858a5df121",
+        "runId": "run_93c469c16c6d4008999a4d2a",
         "taskId": null,
         "value": null,
         "text": "PASS",
@@ -178,10 +179,10 @@
       },
       {
         "metricId": 11,
-        "at": "2026-08-12T21:34:09.172Z",
+        "at": "2026-08-13T01:33:39.414Z",
         "scope": "quality",
         "name": "ceo_outcome",
-        "runId": "run_818cfdb2af0d47858a5df121",
+        "runId": "run_93c469c16c6d4008999a4d2a",
         "taskId": null,
         "value": null,
         "text": "CONFIRM",
@@ -227,6 +228,10 @@
       "reasonCode": null
     },
     {
+      "kind": "OWNER_APPROVAL_INGRESS",
+      "reasonCode": null
+    },
+    {
       "kind": "OWNER_DECISION",
       "reasonCode": null
     },
@@ -251,12 +256,20 @@
       "reasonCode": "REVIEW_PASS"
     },
     {
+      "kind": "SOURCE_READ_LEASE_ACQUIRED",
+      "reasonCode": "OK"
+    },
+    {
       "kind": "RUN_TRANSITION",
       "reasonCode": null
     },
     {
       "kind": "CEO_NOTIFICATION",
       "reasonCode": null
+    },
+    {
+      "kind": "SOURCE_READ_LEASE_RELEASED",
+      "reasonCode": "OK"
     },
     {
       "kind": "CLAIM_RELEASED",
