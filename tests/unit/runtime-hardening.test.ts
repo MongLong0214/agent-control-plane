@@ -188,6 +188,35 @@ describe("a CEO decision comes from the session that holds the role (CP-HI-07)",
     expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.COMPLETED);
   });
 
+  it("#375 refuses final confirmation when work appears after the packet", async () => {
+    const { harness, driven } = await readyForReview();
+    // TaskGraph owns normal admission denial. This models a missed admission path and proves
+    // that a durable packet alone cannot remain a completion claim after its graph changes.
+    harness.cp.db.run(
+      `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+       VALUES (?, ?, ?, 'implementation', 'PENDING', '{}', ?, ?)`,
+      [
+        "task_post_packet",
+        driven.runId,
+        "work admitted after packet publication",
+        harness.clock.nowIso(),
+        harness.clock.nowIso(),
+      ],
+    );
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO))!;
+
+    const refused = harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId,
+      decision: "CONFIRM",
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceo.sessionId,
+      rationale: "the packet is no longer complete",
+    });
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.TASK_RESULT_COUNT_MISMATCH);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+  });
+
   it("#376 refuses a CEO confirmation without the production packet that the gate must publish", async () => {
     const harness = makeHarness();
     const driven = await driveToReviewedCandidate(harness);
