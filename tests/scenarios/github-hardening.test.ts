@@ -1,14 +1,20 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { digestOf } from "../../src/core/digest.ts";
+import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, SessionLifecycle } from "../../src/domain/types.ts";
 import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { GATE_CHECK_NAME, NO_HUMAN_GATE_DIGEST, type GatePayload } from "../../src/github/github-kernel.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
-import { cleanupTempDirs, makeRepo, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
-import { type Harness, driveToReviewedCandidate, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import {
+  type Harness,
+  driveToReviewedCandidate,
+  makeHarness,
+  ownerDecisionReceipt,
+  registerFixtureProject,
+} from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -70,21 +76,105 @@ const reflectMergedBase = (github: FakeGitHub): void => {
   };
 };
 
-const setup = async (options: { declareChecks?: boolean } = {}): Promise<Fixture> => {
+const setup = async (options: { declareChecks?: boolean; humanGate?: readonly string[] } = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
-  Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
 
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-thing",
+    humanGate: options.humanGate,
     manifestOverrides: options.declareChecks === false ? {} : { ciWorkflows: CI_WORKFLOWS },
   });
 
   github.setBranch("dev", driven.baseHead);
   github.setBranch("main", "c".repeat(40));
   github.setBranch(driven.workBranch, driven.candidateHead);
+
+  const claimed = harness.cp.claims.acquire({
+    runId: driven.runId,
+    ownerSessionId: driven.ownerSessionId,
+    ownerBindingGeneration: driven.ownerBindingGeneration,
+    ownerRoleKey: harness.cp.runs.require(driven.runId).ownerRoleKey!,
+    repositoryIdentity: driven.identity,
+    branch: driven.workBranch,
+  });
+  if (!claimed.allowed) throw new Error(claimed.message);
+
+  return {
+    harness,
+    github,
+    runId: driven.runId,
+    identity: driven.identity,
+    caller: {
+      ownerSessionId: driven.ownerSessionId,
+      ownerBindingGeneration: driven.ownerBindingGeneration,
+    },
+    head: driven.candidateHead,
+    base: driven.baseHead,
+    workBranch: driven.workBranch,
+    payload: {
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      contractDigest: driven.contractDigest,
+      verificationDigest: driven.verificationDigest,
+      blindReviewDigest: driven.blindReviewDigest,
+      humanGateDigest: NO_HUMAN_GATE_DIGEST,
+      bindingGeneration: driven.ownerBindingGeneration,
+      exactHead: driven.candidateHead,
+      timestamp: "2026-08-12T00:00:00.000Z",
+    },
+  };
+};
+
+/**
+ * Post-merge trust verifies the workflow file at the merged SHA. Point the fake merge at
+ * the candidate's real local commit so that read is an actual git proof rather than a mock
+ * return value, while retaining the fake's first-parent API proof.
+ */
+const reflectMergeToCandidate = (github: FakeGitHub, candidateHead: string, evaluatedBase: string): void => {
+  const request = github.request.bind(github);
+  github.request = async <T>(
+    method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+    path: string,
+    body?: unknown,
+  ) => {
+    const response = await request<T>(method, path, body);
+    if (method !== "PUT" || !/\/pulls\/\d+\/merge$/.test(path) || !response || typeof response !== "object") {
+      return response;
+    }
+    const merge = response as { merged?: unknown };
+    const pullNumber = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
+    const pull = github.pulls.find((entry) => entry.number === pullNumber);
+    if (merge.merged !== true || !pull) return response;
+    pull.base.sha = candidateHead;
+    (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = candidateHead;
+    github.commitParents.set(candidateHead, [evaluatedBase, candidateHead]);
+    github.setBranch(pull.base.ref, candidateHead);
+    return { ...(response as object), sha: candidateHead } as T;
+  };
+};
+
+const setupTrustedPostMergeFixture = async (): Promise<Fixture> => {
+  const workflow = "name: project-ci\non: [push]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node verify.js\n";
+  const github = new FakeGitHub();
+  reflectMergedBase(github);
+  const harness = makeHarness({ githubClient: github });
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+  writeFiles(harness.repoPath, { ".github/workflows/ci.yml": workflow });
+  commitAll(harness.repoPath, "add approved CI workflow");
+
+  const driven = await driveToReviewedCandidate(harness, {
+    workBranch: "feature/F1-thing",
+    manifestOverrides: {
+      ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: sha256(workflow) }],
+    },
+  });
+  github.setBranch("dev", driven.baseHead);
+  github.setBranch("main", "c".repeat(40));
+  github.setBranch(driven.workBranch, driven.candidateHead);
+  reflectMergeToCandidate(github, driven.candidateHead, driven.baseHead);
 
   const claimed = harness.cp.claims.acquire({
     runId: driven.runId,
@@ -194,6 +284,39 @@ const mergeInput = (fixture: Fixture, pullNumber: number) => ({
   ownerBindingGeneration: fixture.caller.ownerBindingGeneration,
 });
 
+/**
+ * Model the durable artifact that the owner-decision writer persists after ingress
+ * admitted an exact decision. The kernel must reject an identical-looking row if its
+ * candidate binding or receipt is missing, because APPROVAL is not an evidence kind.
+ */
+const putOwnerDecision = (
+  fixture: Fixture,
+  items: readonly string[],
+  input: { item: string; approved: boolean; note: string; candidateSnapshotDigest?: string; receipt?: boolean },
+): string => {
+  const receipt = ownerDecisionReceipt(
+    fixture.harness,
+    fixture.runId,
+    input.item,
+    input.approved,
+    input.note,
+  );
+  return fixture.harness.cp.artifacts.put(
+    fixture.runId,
+    "APPROVAL",
+    {
+      kind: "OWNER_DECISION",
+      item: input.item,
+      approved: input.approved,
+      note: input.note,
+      humanGateDigest: digestOf(items),
+      candidateSnapshotDigest: input.candidateSnapshotDigest ?? fixture.payload.candidateSnapshotDigest,
+      ...(input.receipt === false ? {} : { receipt }),
+    },
+    input.candidateSnapshotDigest ?? fixture.payload.candidateSnapshotDigest,
+  ).digest;
+};
+
 /** A live, unrelated identity makes an ownership denial prove the owner check actually ran. */
 const unrelatedCaller = (fixture: Pick<OwnerAuthorityFixture, "harness" | "caller">) => {
   const session = fixture.harness.cp.sessions.create({ provider: "scripted", model: "unrelated-github-caller" });
@@ -274,6 +397,63 @@ describe("a production gate asserts evidence that exists (§24.4, CP-HI-06)", ()
     const fixture = await setup();
     const published = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
     expect(published.allowed).toBe(true);
+  });
+});
+
+describe("the GitHub merge boundary re-checks the durable human gate (CP-HI-07, #381)", () => {
+  it("requires each current item, an admitted receipt and the current candidate; a later rejection revokes merge", async () => {
+    const items = ["irreversible production action", "undelegated public release"] as const;
+    const fixture = await setup({ humanGate: items });
+    const staleCandidate = `sha256:${"a".repeat(64)}`;
+
+    // Both rows look like approvals, but one has no receipt and the other is bound to an
+    // earlier candidate. Neither can clear the gate for the candidate being merged.
+    const bare = putOwnerDecision(fixture, items, {
+      item: items[0],
+      approved: true,
+      note: "approve without durable receipt",
+      receipt: false,
+    });
+    putOwnerDecision(fixture, items, {
+      item: items[1],
+      approved: true,
+      note: "approval for prior candidate",
+      candidateSnapshotDigest: staleCandidate,
+    });
+    const incomplete = await fixture.harness.cp.github.gatePublish(
+      { ...fixture.payload, humanGateDigest: bare },
+      fixture.identity,
+    );
+    expect(incomplete.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(fixture.github.checkRuns).toHaveLength(0);
+
+    const first = putOwnerDecision(fixture, items, {
+      item: items[0],
+      approved: true,
+      note: "approve production action",
+    });
+    putOwnerDecision(fixture, items, {
+      item: items[1],
+      approved: true,
+      note: "approve release",
+    });
+    const published = await fixture.harness.cp.github.gatePublish(
+      { ...fixture.payload, humanGateDigest: first },
+      fixture.identity,
+    );
+    if (!published.allowed) throw new Error(`${published.reasonCode}: ${published.message}`);
+    const pullNumber = await openPull(fixture);
+
+    // Later decisions win. The gate check remains a historical projection, but merge must
+    // refuse once an authenticated owner withdraws one of the approvals.
+    putOwnerDecision(fixture, items, {
+      item: items[1],
+      approved: false,
+      note: "withdraw release approval",
+    });
+    const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(refused.reasonCode).toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+    expect(fixture.github.mergeCount).toBe(0);
   });
 });
 
@@ -513,6 +693,79 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
     expect(refused.evidence["failed"]).toEqual([
       { name: "project-ci", conclusion: "incomplete:in_progress" },
     ]);
+  });
+
+  it("#387/#388: paginates flooded gate and post-merge lists, then accepts a fully proven Actions workflow", async () => {
+    const fixture = await setupTrustedPostMergeFixture();
+    const pages: string[] = [];
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ) => {
+      if (method === "GET" && /\/check-suites\/71$/.test(path)) {
+        return { head_sha: fixture.head, app: { slug: "github-actions" } } as T;
+      }
+      if (method === "GET" && /\/actions\/runs\/81$/.test(path)) {
+        return {
+          head_sha: fixture.head,
+          path: ".github/workflows/ci.yml",
+          status: "completed",
+          conclusion: "success",
+        } as T;
+      }
+      if (method === "GET" && /\/commits\/[^/]+\/check-runs/.test(path)) {
+        pages.push(path);
+        const head = /\/commits\/([^/]+)\/check-runs/.exec(path)?.[1]!;
+        const page = Number(new URL(path, "https://github.test").searchParams.get("page") ?? "1");
+        // Deliberately model a provider that gives the complete commit list despite a
+        // check_name filter. Client-side paging and filtering must still find the trusted
+        // result, not make a first page of unrelated checks a denial-of-service switch.
+        const all = fixture.github.checkRuns.filter((check) => check.head_sha === head);
+        return { check_runs: all.slice((page - 1) * 100, page * 100) } as T;
+      }
+      return request<T>(method, path, body);
+    };
+
+    for (let index = 0; index < 100; index += 1) {
+      fixture.github.checkRuns.push({
+        id: 10_000 + index,
+        name: `unrelated-${index}`,
+        head_sha: fixture.head,
+        conclusion: "success",
+        status: "completed",
+        app: { slug: "github-actions" },
+        completed_at: "2026-08-12T00:00:00.000Z",
+      });
+    }
+
+    const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
+    if (!gate.allowed) throw new Error(`${gate.reasonCode}: ${gate.message}`);
+    const pullNumber = await openPull(fixture);
+    const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    if (!merged.allowed) throw new Error(`${merged.reasonCode}: ${merged.message}`);
+    expect(merged.value.mergeCommitSha).toBe(fixture.head);
+
+    fixture.github.checkRuns.push({
+      id: 20_001,
+      name: "project-ci",
+      head_sha: merged.value.mergeCommitSha,
+      conclusion: "success",
+      status: "completed",
+      app: { slug: "github-actions" },
+      check_suite: { id: 71 },
+      details_url: "https://github.test/acme/fixture/actions/runs/81/job/9",
+      completed_at: "2026-08-12T00:00:00.000Z",
+    } as never);
+
+    const verified = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      merged.value.mergeCommitSha,
+    );
+    expect(verified).toMatchObject({ allowed: true, value: { checks: [{ name: "project-ci", conclusion: "success" }] } });
+    expect(pages.some((path) => new URL(path, "https://github.test").searchParams.get("page") === "2")).toBe(true);
   });
 });
 

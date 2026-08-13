@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { digestOf } from "../core/digest.ts";
 import { IngressGuard, ownerApprovalPayload } from "../ingress/ingress-guard.ts";
@@ -8,6 +9,7 @@ import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
 import { isAcpError } from "../core/errors.ts";
 import type { RunState } from "../domain/types.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
+import { executeConfirmedMerge } from "../github/confirmed-merge-operation.ts";
 
 /**
  * PRD §28.4 — the minimal operator CLI.
@@ -25,6 +27,10 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl continuity status              continuity mode and role coverage plan
   agentctl outbox retry                   reset delivery attempts on pending messages
   agentctl owner approve <runId> <item>   record an owner decision for a human gate
+  agentctl github merge <runId> <repo> <head> <title> [humanGateDigest]
+                                        publish the gate, prepare and merge a CEO-confirmed candidate
+  agentctl github post-merge <runId> <repo> <mergeSha>
+                                        verify configured checks after the merge's CI completes
   agentctl repair list                    show the repair operation allowlist
   agentctl repair dry-run <op> [k=v...]   evaluate a repair without changing anything
   agentctl repair execute <op> [k=v...]   execute a repair (owner-risk ops need --owner)
@@ -35,7 +41,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl daemon status                  daemon lock and health
 `;
 
-const main = async (argv: string[]): Promise<number> => {
+export const main = async (argv: string[]): Promise<number> => {
   const [command, ...rest] = argv;
   if (!command || command === "help" || command === "--help") {
     process.stdout.write(USAGE);
@@ -60,7 +66,7 @@ const main = async (argv: string[]): Promise<number> => {
   }
 };
 
-const dispatch = async (
+export const dispatch = async (
   cp: ControlPlane,
   command: string,
   args: string[],
@@ -174,6 +180,40 @@ const dispatch = async (
       return decision.allowed ? 0 : 1;
     },
 
+    github: async () => {
+      const [sub, ...params] = args;
+      if (sub === "merge") {
+        const decision = await executeConfirmedMerge(
+          {
+            github: cp.github,
+            runs: cp.runs,
+            artifacts: cp.artifacts,
+            projects: cp.projects,
+            clock: cp.clock,
+          },
+          {
+            runId: required(params[0], "runId"),
+            repositoryIdentity: required(params[1], "repositoryIdentity"),
+            head: required(params[2], "head"),
+            title: required(params[3], "title"),
+            ...(params[4] ? { humanGateDigest: params[4] } : {}),
+          },
+        );
+        print(decision);
+        return decision.allowed ? 0 : 1;
+      }
+      if (sub === "post-merge") {
+        const decision = await cp.github.postMergeVerify(
+          required(params[0], "runId"),
+          required(params[1], "repositoryIdentity"),
+          required(params[2], "mergeCommitSha"),
+        );
+        print(decision);
+        return decision.allowed ? 0 : 1;
+      }
+      return fail(`unknown github subcommand: ${sub ?? ""}`);
+    },
+
     repair: async () => {
       const [sub, operationId, ...params] = args;
       if (sub === "list") {
@@ -267,12 +307,14 @@ const required = (value: string | undefined, name: string): string => {
   return value;
 };
 
-main(process.argv.slice(2))
-  .then((code) => process.exit(code))
-  .catch((err: unknown) => {
-    const body = isAcpError(err)
-      ? { reasonCode: err.reasonCode, message: err.message, evidence: err.evidence }
-      : { message: (err as Error).message };
-    process.stderr.write(`${JSON.stringify(body, null, 2)}\n`);
-    process.exit(1);
-  });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  void main(process.argv.slice(2))
+    .then((code) => process.exit(code))
+    .catch((err: unknown) => {
+      const body = isAcpError(err)
+        ? { reasonCode: err.reasonCode, message: err.message, evidence: err.evidence }
+        : { message: (err as Error).message };
+      process.stderr.write(`${JSON.stringify(body, null, 2)}\n`);
+      process.exit(1);
+    });
+}

@@ -1,3 +1,5 @@
+import { realpathSync } from "node:fs";
+
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
@@ -11,7 +13,7 @@ import {
 import { classifyBranch, validateBranchContract } from "../../src/github/branch-contract.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, commitAll, gitSync, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
   type Harness,
@@ -103,7 +105,6 @@ const reflectMergedBase = (github: FakeGitHub): void => {
 const setup = async (): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
-  Object.assign(github, { supportsAtomicExpectedBase: true });
   const harness = makeHarness({ githubClient: github });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
   harness.cp.verification.attachCi({
@@ -180,6 +181,84 @@ const gatePayload = (fixture: Fixture, head = fixture.head): GatePayload => ({
   ...fixture.payload,
   exactHead: head,
 });
+
+/**
+ * Build the two branch classes whose legal source and legal PR target deliberately differ.
+ * The source branch receives its own commit before the candidate is cut, so the kernel has
+ * an actual ancestry fact to prove rather than a branch-name-only fixture.
+ */
+const setupLineageFixture = async (input: {
+  workBranch: "release/1.2.0" | "hotfix/H1-fix";
+  baseBranch: "main" | "dev";
+  sourceBranch: "dev" | "main";
+  /** Advance the required source separately to prove a candidate was cut from the wrong branch. */
+  divergentBranch?: "dev" | "main";
+}): Promise<Fixture> => {
+  const github = new FakeGitHub();
+  reflectMergedBase(github);
+  const harness = makeHarness({ githubClient: github });
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
+
+  // `main` begins at the fixture root. Move only the required source before cutting the
+  // candidate so release→main and hotfix→dev exercise a real source/target divergence.
+  gitSync(harness.repoPath, ["branch", "main"]);
+  if (input.divergentBranch && input.divergentBranch !== input.sourceBranch) {
+    gitSync(harness.repoPath, ["checkout", "-q", input.divergentBranch]);
+    writeFiles(harness.repoPath, {
+      "LINEAGE.md": `required source ${input.divergentBranch} advanced separately\n`,
+    });
+    commitAll(harness.repoPath, `advance required source ${input.divergentBranch}`);
+  }
+  gitSync(harness.repoPath, ["checkout", "-q", input.sourceBranch]);
+  writeFiles(harness.repoPath, { "LINEAGE.md": `cut ${input.workBranch} from ${input.sourceBranch}\n` });
+  commitAll(harness.repoPath, `advance ${input.sourceBranch} before cut`);
+
+  const driven = await driveToReviewedCandidate(harness, {
+    workBranch: input.workBranch,
+    baseBranch: input.baseBranch,
+    reviewedPaths: ["LINEAGE.md", "src/app.js"],
+  });
+  github.setBranch("dev", gitSync(harness.repoPath, ["rev-parse", "dev"]));
+  github.setBranch("main", gitSync(harness.repoPath, ["rev-parse", "main"]));
+  github.setBranch(driven.workBranch, driven.candidateHead);
+
+  const claimed = harness.cp.claims.acquire({
+    runId: driven.runId,
+    ownerSessionId: driven.ownerSessionId,
+    ownerBindingGeneration: driven.ownerBindingGeneration,
+    ownerRoleKey: harness.cp.runs.require(driven.runId).ownerRoleKey!,
+    repositoryIdentity: driven.identity,
+    branch: driven.workBranch,
+  });
+  if (!claimed.allowed) throw new Error(claimed.message);
+
+  return {
+    harness,
+    github,
+    runId: driven.runId,
+    identity: driven.identity,
+    ownerSessionId: driven.ownerSessionId,
+    ownerBindingGeneration: driven.ownerBindingGeneration,
+    caller: {
+      ownerSessionId: driven.ownerSessionId,
+      ownerBindingGeneration: driven.ownerBindingGeneration,
+    },
+    head: driven.candidateHead,
+    base: driven.baseHead,
+    workBranch: driven.workBranch,
+    payload: {
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      contractDigest: driven.contractDigest,
+      verificationDigest: driven.verificationDigest,
+      blindReviewDigest: driven.blindReviewDigest,
+      humanGateDigest: NO_HUMAN_GATE_DIGEST,
+      bindingGeneration: driven.ownerBindingGeneration,
+      exactHead: driven.candidateHead,
+      timestamp: "2026-08-12T00:00:00.000Z",
+    },
+  };
+};
 
 /** Release tags require historical merge and post-merge evidence the feature-to-dev fixture cannot produce. */
 const recordAcceptedReleaseMerge = (fixture: Fixture, commit: string, pullNumber: number): void => {
@@ -386,6 +465,93 @@ describe("branch contract (CP-S36, RF-S10, RF-S11)", () => {
     expect(refused.reasonCode).toBe(ReasonCode.SNAPSHOT_STALE);
   });
 
+  it("#382: release cut from dev may prepare and merge into main", async () => {
+    const fixture = await setupLineageFixture({
+      workBranch: "release/1.2.0",
+      sourceBranch: "dev",
+      baseBranch: "main",
+    });
+    const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
+    if (!gate.allowed) throw new Error(`${gate.reasonCode}: ${gate.message}`);
+    const prepared = await fixture.harness.cp.github.prPrepare({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      head: fixture.workBranch,
+      base: "main",
+      title: "release candidate",
+      body: "",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+      exactHeadSha: fixture.head,
+    });
+    expect(prepared.allowed).toBe(true);
+    if (!prepared.allowed) return;
+
+    const merged = await fixture.harness.cp.github.mergeExecute({
+      ...mergeInput(fixture, prepared.value.pullNumber),
+      expectedBaseSha: fixture.base,
+    });
+    expect(merged.allowed).toBe(true);
+    expect(fixture.github.mergeCount).toBe(1);
+  });
+
+  it("#382: hotfix cut from main may prepare and merge into dev", async () => {
+    const fixture = await setupLineageFixture({
+      workBranch: "hotfix/H1-fix",
+      sourceBranch: "main",
+      baseBranch: "dev",
+    });
+    const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.identity);
+    if (!gate.allowed) throw new Error(`${gate.reasonCode}: ${gate.message}`);
+    const prepared = await fixture.harness.cp.github.prPrepare({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      head: fixture.workBranch,
+      base: "dev",
+      title: "hotfix candidate",
+      body: "",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+      exactHeadSha: fixture.head,
+    });
+    expect(prepared.allowed).toBe(true);
+    if (!prepared.allowed) return;
+
+    const merged = await fixture.harness.cp.github.mergeExecute({
+      ...mergeInput(fixture, prepared.value.pullNumber),
+      expectedBaseSha: fixture.base,
+    });
+    expect(merged.allowed).toBe(true);
+    expect(fixture.github.mergeCount).toBe(1);
+  });
+
+  it("#382: a release cut from main cannot use its main target to masquerade as a dev cut", async () => {
+    const fixture = await setupLineageFixture({
+      workBranch: "release/1.2.0",
+      sourceBranch: "main",
+      baseBranch: "main",
+      divergentBranch: "dev",
+    });
+
+    const refused = await fixture.harness.cp.github.prPrepare({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      head: fixture.workBranch,
+      base: "main",
+      title: "misbased release candidate",
+      body: "",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+      exactHeadSha: fixture.head,
+    });
+
+    // If the merge-base proof is deleted, the required branch name still looks correct and
+    // this formerly accepted main target would create a PR. The failure proves ancestry,
+    // rather than target naming, is the enforcement.
+    expect(refused.reasonCode).toBe(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION);
+    expect(fixture.github.pulls).toHaveLength(0);
+  });
+
   it("refuses a PR when the project contract requires issue linkage and none is supplied", async () => {
     const fixture = await setup();
     const refused = await fixture.harness.cp.github.prPrepare({
@@ -443,6 +609,24 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
 
     const rejections = fixture.harness.cp.audit.byKind("GATE_REJECTED");
     expect(rejections.length).toBeGreaterThan(0);
+  });
+
+  it("#388: a copied trusted payload digest from an untrusted app slug cannot approve a merge", async () => {
+    const published = await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
+    if (!published.allowed) throw new Error(published.message);
+    const prepared = await fixture.harness.cp.github.prPrepare(prepareInput(fixture));
+    if (!prepared.allowed) throw new Error(prepared.message);
+
+    // Keep the exact recorded check id and summary: creator provenance is the sole
+    // changed fact, so deleting that predicate makes this test incorrectly pass.
+    fixture.github.checkRuns.find((check) => check.id === published.value.checkRunId)!.app = { slug: "candidate-ci" };
+    const refused = await fixture.harness.cp.github.mergeEvaluate(mergeInput(fixture, prepared.value.pullNumber));
+    expect(refused.allowed).toBe(false);
+    expect(
+      fixture.harness.cp.audit
+        .byKind("GATE_REJECTED")
+        .some((event) => event.reasonCode === ReasonCode.GATE_CREATOR_UNTRUSTED),
+    ).toBe(true);
   });
 
   it("CP-S35: a gate whose payload the daemon did record, but under a different head, is refused", async () => {
@@ -702,6 +886,15 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
 
     const releaseCommit = "r".repeat(40);
     recordAcceptedReleaseMerge(fixture, releaseCommit, 1200);
+    const releaseClaim = fixture.harness.cp.claims.acquire({
+      runId: fixture.runId,
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+      ownerRoleKey: fixture.harness.cp.runs.require(fixture.runId).ownerRoleKey!,
+      repositoryIdentity: fixture.identity,
+      branch: "release/1.0.0",
+    });
+    if (!releaseClaim.allowed) throw new Error(releaseClaim.message);
     const tagged = await fixture.harness.cp.github.releaseTag(
       fixture.runId,
       fixture.identity,
@@ -753,6 +946,44 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
 });
 
 describe("issue projection", () => {
+  it("#385: finds a marker past GitHub's first issue page and patches it instead of posting a duplicate", async () => {
+    const fixture = await setup();
+    for (let number = 1; number <= 100; number += 1) {
+      fixture.github.issues.push({ number, title: `noise ${number}`, body: "unrelated" });
+    }
+    fixture.github.issues.push({
+      number: 101,
+      title: "stale ticket",
+      body: "<!-- acp-ticket:T001 -->\nold body",
+    });
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ) => {
+      if (method === "GET" && /\/issues\?/.test(path)) {
+        const page = Number(new URL(path, "https://github.test").searchParams.get("page") ?? "1");
+        return fixture.github.issues.slice((page - 1) * 100, page * 100) as T;
+      }
+      return request<T>(method, path, body);
+    };
+
+    const projected = await fixture.harness.cp.github.issueProject(
+      fixture.runId,
+      fixture.identity,
+      [{ id: "T001", title: "current ticket", body: "current body" }],
+      fixture.caller,
+    );
+    expect(projected).toMatchObject({ allowed: true, value: { created: 0, updated: 1 } });
+    expect(fixture.github.calls.filter((call) => call.method === "PATCH" && /\/issues\/101$/.test(call.path))).toHaveLength(1);
+    expect(fixture.github.calls.filter((call) => call.method === "POST" && /\/issues$/.test(call.path))).toHaveLength(0);
+    expect(fixture.github.issues.find((issue) => issue.number === 101)).toMatchObject({
+      title: "current ticket",
+      body: "<!-- acp-ticket:T001 -->\ncurrent body",
+    });
+  });
+
   it("syncs idempotently by marker rather than creating duplicates", async () => {
     const fixture = await setup();
     const tickets = [{ id: "T001", title: "first", body: "do the thing" }];
@@ -866,6 +1097,7 @@ describe("crash and acknowledgement recovery", () => {
       exactHeadSha: preparedInput.exactHeadSha,
       expectedBaseSha: prFixture.base,
       sourceBase: "dev",
+      sourceBaseSha: prFixture.base,
       title: preparedInput.title,
       body: prBody,
       declaredParent: null,
@@ -1160,7 +1392,7 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
     expect(fixture.harness.cp.audit.byKind("MANAGED_WRITE_GUARD")).toHaveLength(guardEventsBefore + 1);
   });
 
-  it("a successful merge leaves a consumed guard grant, proving mediation", async () => {
+  it("a successful merge names its branch and checkout in each consumed guard grant", async () => {
     const fixture = await setup();
     const published = await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
     if (!published.allowed) throw new Error(published.message);
@@ -1191,12 +1423,14 @@ describe("the kernel is on the guard's write path (CP-HI-01)", () => {
 
     // Every remote write the kernel performed burned a guard grant: the guard is on the
     // path, not merely available to be called.
-    const consumed = fixture.harness.cp.audit
-      .byKind("MANAGED_WRITE_GUARD_CONSUMED")
-      .map((e) => e.evidence["operation"]);
-    expect(consumed).toContain("PROGRAMMATIC_MERGE");
-    expect(consumed).toContain("GITHUB_PR");
-    expect(consumed).toContain("GITHUB_CHECK_RUN");
+    const consumed = fixture.harness.cp.audit.byKind("MANAGED_WRITE_GUARD_CONSUMED");
+    for (const operation of ["PROGRAMMATIC_MERGE", "GITHUB_PR", "GITHUB_CHECK_RUN"]) {
+      const grant = consumed.find((event) => event.evidence["operation"] === operation);
+      expect(grant?.evidence).toMatchObject({
+        targetBranch: fixture.workBranch,
+        resolvedPath: realpathSync(fixture.harness.repoPath),
+      });
+    }
   });
 
   it("a gate publish for a run with no pinned owner is refused", async () => {

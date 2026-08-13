@@ -7,7 +7,7 @@ import type { BranchProfile, ProjectManifest } from "../contracts/manifest.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { ArtifactStore } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
-import { fileAt, mergeBase } from "../git/git.ts";
+import { fileAt, mergeBase, revParse } from "../git/git.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -16,8 +16,10 @@ import type { ReviewPacket } from "../review/blind-review.ts";
 import type { CandidateSnapshot } from "../snapshot/candidate-snapshot.ts";
 import { EVIDENCE_PRODUCERS } from "../db/artifacts.ts";
 import { WriteOperation, type ManagedWriteGuard } from "../guard/managed-write-guard.ts";
-import { hotfixPropagationTargets, validateBranchContract } from "./branch-contract.ts";
+import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
+import { OWNER_DECISION_OPERATION } from "../ceo/production-gate.ts";
+import type { OwnerApprovalReceipt, OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 
 export const GATE_CHECK_NAME = "acp-production-gate";
 
@@ -30,8 +32,6 @@ export const NO_HUMAN_GATE_DIGEST = digestOf({ humanGate: "NOT_REQUIRED" });
 export const PROJECT_CHECK_NAME = "project-ci";
 
 export interface GitHubClient {
-  /** True only for a provider/queue that atomically rejects an unexpected base SHA. */
-  readonly supportsAtomicExpectedBase?: boolean;
   request<T>(
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
     path: string,
@@ -129,7 +129,35 @@ interface PreparedPrIntent {
   exactHeadSha: string;
   expectedBaseSha: string;
   sourceBase: string;
+  /** Immutable commit resolved from the required source branch when this candidate was prepared. */
+  sourceBaseSha: string;
   declaredParent: string | null;
+}
+
+interface GitHubWriteTarget {
+  /** The concrete branch whose claim fences this remote write. */
+  targetBranch: string;
+  /** Registered local checkout used by the guard to bind remote writes to this repository. */
+  targetPath: string;
+}
+
+interface OwnerDecisionContent {
+  kind?: string;
+  item?: string;
+  approved?: boolean;
+  note?: string;
+  humanGateDigest?: string;
+  candidateSnapshotDigest?: string | null;
+  /** Durable ingress proof; `recordOwnerDecision` must persist this exact receipt. */
+  receipt?: OwnerApprovalReceipt;
+}
+
+interface CurrentHumanGate {
+  required: boolean;
+  items: string[];
+  satisfied: boolean;
+  /** A current, authenticated decision artifact named by a gate payload. */
+  payloadDigest: string | null;
 }
 
 interface CheckRun {
@@ -161,6 +189,11 @@ export class GitHubKernel {
    * because GitHub has already accepted it but the first caller has not reread it yet.
    */
   private readonly inFlightReservations = new Set<string>();
+  /**
+   * Owner authority remains outside the kernel. The kernel only accepts a durable decision
+   * whose ingress receipt this authority can still corroborate (CP-HI-07).
+   */
+  private ownerAuthority: OwnerAuthorityPort | null = null;
 
   constructor(
     private readonly db: Db,
@@ -175,6 +208,10 @@ export class GitHubKernel {
     private readonly client?: GitHubClient,
   ) {}
 
+  attach(ports: { ownerAuthority?: OwnerAuthorityPort }): void {
+    if (ports.ownerAuthority) this.ownerAuthority = ports.ownerAuthority;
+  }
+
   /**
    * CP-HI-01 — every external write this kernel performs goes through the guard, and the
    * API call is performed inside the guard's fenced authorisation lifecycle. Without this
@@ -188,6 +225,7 @@ export class GitHubKernel {
     operation: WriteOperation,
     runId: string,
     repositoryIdentity: string,
+    target: GitHubWriteTarget,
     caller?: { ownerSessionId: string; ownerBindingGeneration: number },
     effect?: () => T | Promise<T>,
   ): Promise<Decision<T>> {
@@ -209,6 +247,8 @@ export class GitHubKernel {
     return this.guard.authorize({
       operation,
       repositoryIdentity,
+      targetBranch: target.targetBranch,
+      targetPath: target.targetPath,
       runId,
       sessionId,
       bindingGeneration: generation,
@@ -260,9 +300,15 @@ export class GitHubKernel {
 
     const profile = this.branchProfile(input.runId);
     if (!profile.allowed) return profile as Decision<{ pullNumber: number; url: string }>;
-    const lineage = await this.assertFrozenSourceLineage(
+    // The candidate snapshot's base is the PR *target*. It cannot prove the branch this
+    // source was cut from: release/* may target main although it must originate at dev, and
+    // hotfix/* may target dev/release although it must originate at main. Resolve the required
+    // origin from the pinned branch contract and prove it against commit ancestry instead.
+    const lineage = await this.assertSourceLineageAtPrepare(
       input.repositoryIdentity,
-      candidate.value.baseHead,
+      input.head,
+      profile.value,
+      input.declaredParent ?? null,
       candidate.value.candidateHead,
     );
     if (!lineage.allowed) return lineage as Decision<{ pullNumber: number; url: string }>;
@@ -274,7 +320,7 @@ export class GitHubKernel {
       profile: profile.value,
       declaredParent: input.declaredParent ?? null,
       activeReleases: releases.value,
-      sourceBase: candidate.value.baseBranch,
+      sourceBase: lineage.value.sourceBase,
     });
     if (!contract.allowed) return contract as Decision<{ pullNumber: number; url: string }>;
 
@@ -293,7 +339,8 @@ export class GitHubKernel {
       base: input.base,
       exactHeadSha: input.exactHeadSha,
       expectedBaseSha: candidate.value.baseHead,
-      sourceBase: candidate.value.baseBranch,
+      sourceBase: lineage.value.sourceBase,
+      sourceBaseSha: lineage.value.sourceBaseSha,
       title: input.title,
       body: prBody,
       declaredParent: input.declaredParent ?? null,
@@ -405,10 +452,13 @@ export class GitHubKernel {
         requestDigest,
       });
       if (!reserved.allowed) return reserved as Decision<{ pullNumber: number; url: string }>;
+      const target = this.writeTarget(input.runId, input.repositoryIdentity, input.head);
+      if (!target.allowed) return target as Decision<{ pullNumber: number; url: string }>;
       const created = await this.mediate(
         WriteOperation.GITHUB_PR,
         input.runId,
         input.repositoryIdentity,
+        target.value,
         input,
         () => this.api().request<PullRequest>("POST", `/repos/${owner}/${repo}/pulls`, {
           title: input.title,
@@ -558,11 +608,9 @@ export class GitHubKernel {
           return deny(ReasonCode.RESOURCE_COLLISION, "gate publication is in flight", { idempotencyKey });
         }
         const creator = this.credentials.creatorIdentity();
-        const checks = await this.api().request<{ check_runs: CheckRun[] }>(
-          "GET",
-          `/repos/${owner}/${repo}/commits/${payload.exactHead}/check-runs?check_name=${GATE_CHECK_NAME}`,
-        );
-        const observed = (checks.check_runs ?? []).filter((check) =>
+        const checks = await this.listCheckRuns(repositoryIdentity, payload.exactHead, GATE_CHECK_NAME);
+        if (!checks.allowed) return checks as Decision<{ checkRunId: number }>;
+        const observed = checks.value.filter((check) =>
           check.name === GATE_CHECK_NAME && check.head_sha === payload.exactHead,
         );
         const matches = observed.filter((check) =>
@@ -609,6 +657,8 @@ export class GitHubKernel {
       );
     }
 
+    const target = this.writeTargetForRun(payload.runId, repositoryIdentity);
+    if (!target.allowed) return target as Decision<{ checkRunId: number }>;
     const reserved = this.reserveReceipt({
       idempotencyKey,
       operation: "gate_publish",
@@ -625,6 +675,7 @@ export class GitHubKernel {
       WriteOperation.GITHUB_CHECK_RUN,
       payload.runId,
       repositoryIdentity,
+      target.value,
       undefined,
       () => this.api().request<CheckRun>("POST", `/repos/${owner}/${repo}/check-runs`, {
         name: GATE_CHECK_NAME,
@@ -667,11 +718,9 @@ export class GitHubKernel {
     } catch {
       // Some GitHub-compatible providers do not expose the singular endpoint. Their
       // commit-scoped listing still proves the exact id and every bound field.
-      const checks = await this.api().request<{ check_runs: CheckRun[] }>(
-        "GET",
-        `/repos/${owner}/${repo}/commits/${payload.exactHead}/check-runs?check_name=${GATE_CHECK_NAME}`,
-      );
-      reread = (checks.check_runs ?? []).find((check) => check.id === checkRunId);
+      const checks = await this.listCheckRuns(repositoryIdentity, payload.exactHead, GATE_CHECK_NAME);
+      if (!checks.allowed) return checks as Decision<{ checkRunId: number }>;
+      reread = checks.value.find((check) => check.id === checkRunId);
     }
     const creator = this.credentials.creatorIdentity();
     const observedDigest = /payloadDigest=(sha256:[0-9a-f]{64})/.exec(reread?.output?.summary ?? "")?.[1];
@@ -818,20 +867,12 @@ export class GitHubKernel {
     }
 
     if (run.humanGateRequired) {
-      const approval = this.artifacts.byDigest<{ kind?: string; approved?: boolean }>(payload.humanGateDigest);
-      if (
-        !approval ||
-        approval.runId !== payload.runId ||
-        approval.kind !== "APPROVAL" ||
-        approval.content.kind !== "OWNER_DECISION" ||
-        approval.content.approved !== true
-      ) {
-        return deny(
-          ReasonCode.HUMAN_GATE_UNSATISFIED,
-          "run requires an owner decision and the gate payload does not name one",
-          { runId: payload.runId, digest: payload.humanGateDigest },
-        );
-      }
+      const humanGate = this.assertCurrentHumanGate(
+        payload.runId,
+        current,
+        payload.humanGateDigest,
+      );
+      if (!humanGate.allowed) return humanGate as Decision<void>;
     } else if (payload.humanGateDigest !== NO_HUMAN_GATE_DIGEST) {
       return deny(
         ReasonCode.GATE_EVIDENCE_NOT_BACKED,
@@ -969,21 +1010,15 @@ export class GitHubKernel {
     if (!contract.allowed) {
       return deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, contract.message, contract.evidence);
     }
+    const lineage = await this.assertPreparedSourceLineage(
+      input.repositoryIdentity,
+      prepared.value,
+      input.exactHeadSha,
+    );
+    if (!lineage.allowed) return lineage as Decision<{ predicates: Record<string, boolean> }>;
 
     const gate = await this.verifyGate(input.repositoryIdentity, pull.head.sha, input.runId);
     if (!gate.allowed) return gate as Decision<{ predicates: Record<string, boolean> }>;
-
-    const run = this.runs.get(input.runId);
-    if (run?.humanGateRequired) {
-      const humanGate = this.artifacts
-        .list<{ kind?: string; approved?: boolean }>(input.runId, "APPROVAL")
-        .some((a) => a.content.kind === "OWNER_DECISION" && a.content.approved === true);
-      if (!humanGate) {
-        return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "run requires an owner decision", {
-          runId: input.runId,
-        });
-      }
-    }
 
     // The gate payload was checked against local evidence when it was published; at merge
     // time that evidence must still be the run's current evidence.
@@ -1097,15 +1132,9 @@ export class GitHubKernel {
     head: string,
     runId: string,
   ): Promise<Decision<GatePayload>> {
-    const slug = this.slug(repositoryIdentity);
-    if (!slug.allowed) return slug as Decision<GatePayload>;
-    const { owner, repo } = slug.value;
-
-    const checks = await this.api().request<{ check_runs: CheckRun[] }>(
-      "GET",
-      `/repos/${owner}/${repo}/commits/${head}/check-runs?check_name=${GATE_CHECK_NAME}`,
-    );
-    const candidates = checks.check_runs ?? [];
+    const checks = await this.listCheckRuns(repositoryIdentity, head, GATE_CHECK_NAME);
+    if (!checks.allowed) return checks as Decision<GatePayload>;
+    const candidates = checks.value;
     if (candidates.length === 0) {
       return deny(ReasonCode.MERGE_GATE_MISSING, "no production gate on this head", {
         repositoryIdentity,
@@ -1388,6 +1417,9 @@ export class GitHubKernel {
       });
     }
 
+    const target = this.writeTarget(input.runId, input.repositoryIdentity, preflight.head.ref);
+    if (!target.allowed) return target as Decision<{ mergeCommitSha: string; replayed: boolean }>;
+
     const reserved = this.reserveReceipt({
       idempotencyKey,
       operation: "merge_execute",
@@ -1407,6 +1439,7 @@ export class GitHubKernel {
       WriteOperation.PROGRAMMATIC_MERGE,
       input.runId,
       input.repositoryIdentity,
+      target.value,
       input,
       () => this.api().request<{ sha: string; merged: boolean }>(
         "PUT",
@@ -1715,12 +1748,17 @@ export class GitHubKernel {
       return allow(ReasonCode.OK, { checks: cached.checks });
     }
 
-    const response = await this.api().request<{ check_runs: CheckRun[] }>(
-      "GET",
-      `/repos/${owner}/${repo}/commits/${mergeCommitSha}/check-runs`,
-    );
+    // Filter by the declared name server-side, then paginate. An unrelated check flood must
+    // not hide the one trusted check we are required to assess, while same-name duplicates
+    // remain an explicit ambiguous refusal below.
+    const checksByName = new Map<string, CheckRun[]>();
+    for (const name of effective) {
+      const listed = await this.listCheckRuns(repositoryIdentity, mergeCommitSha, name);
+      if (!listed.allowed) return listed as Decision<{ checks: Array<{ name: string; conclusion: string }> }>;
+      checksByName.set(name, listed.value);
+    }
     const observed = await Promise.all(effective.map(async (name) => {
-      const matching = (response.check_runs ?? []).filter((check) => check.name === name);
+      const matching = checksByName.get(name)!.filter((check) => check.name === name);
       if (matching.length === 0) return { name, conclusion: "missing" };
       // Same-name checks are ambiguous provenance. Selecting whichever one happens to
       // appear first would let a candidate workflow hide beside the required workflow.
@@ -1930,6 +1968,9 @@ export class GitHubKernel {
     // not happen: releasing it destroys no evidence and lets this attempt reserve afresh.
     if (prior) this.releaseReservation(idempotencyKey, requestDigest);
 
+    const tagTarget = this.writeTarget(runId, repositoryIdentity, merge.sourceBranch);
+    if (!tagTarget.allowed) return tagTarget as Decision<{ tag: string; sha: string }>;
+
     const reserved = this.reserveReceipt({
       idempotencyKey,
       operation: "release_tag",
@@ -1946,6 +1987,7 @@ export class GitHubKernel {
       WriteOperation.GITHUB_RELEASE,
       runId,
       repositoryIdentity,
+      tagTarget.value,
       caller,
       () => this.api().request("POST", `/repos/${owner}/${repo}/git/refs`, {
         ref: `refs/tags/${tag}`,
@@ -1990,10 +2032,13 @@ export class GitHubKernel {
           commitSha,
         });
       }
+      const deleteTarget = this.writeTarget(runId, repositoryIdentity, sourceBranch);
+      if (!deleteTarget.allowed) return deleteTarget as Decision<{ tag: string; sha: string }>;
       const deleted = await this.mediate(
         WriteOperation.GITHUB_RELEASE,
         runId,
         repositoryIdentity,
+        deleteTarget.value,
         caller,
         () => this.api().request(
           "DELETE",
@@ -2128,15 +2173,16 @@ export class GitHubKernel {
       return deny(ReasonCode.RESOURCE_COLLISION, "issue projection is in flight", { idempotencyKey });
     }
 
-    const existing = await this.api().request<Array<{ number: number; body: string | null }>>(
-      "GET",
-      `/repos/${owner}/${repo}/issues?state=all&per_page=100`,
-    );
+    const existing = await this.listIssues(repositoryIdentity);
+    if (!existing.allowed) return existing as Decision<{ created: number; updated: number }>;
     const byMarker = new Map<string, number>();
-    for (const issue of existing) {
+    for (const issue of existing.value) {
       const marker = this.ticketMarker(issue.body);
       if (marker) byMarker.set(marker, issue.number);
     }
+
+    const target = tickets.length > 0 ? this.writeTargetForRun(runId, repositoryIdentity) : null;
+    if (target && !target.allowed) return target as Decision<{ created: number; updated: number }>;
 
     // The reservation is claimed before the first PATCH or POST, so a crash between the
     // write and its reread leaves a reconcilable PENDING row rather than an unrecorded
@@ -2169,6 +2215,7 @@ export class GitHubKernel {
             WriteOperation.GITHUB_ISSUE,
             runId,
             repositoryIdentity,
+            target!.value,
             caller,
             () => this.api().request("PATCH", `/repos/${owner}/${repo}/issues/${number}`, {
               title: ticket.title,
@@ -2180,6 +2227,7 @@ export class GitHubKernel {
             WriteOperation.GITHUB_ISSUE,
             runId,
             repositoryIdentity,
+            target!.value,
             caller,
             () => this.api().request("POST", `/repos/${owner}/${repo}/issues`, {
               title: ticket.title,
@@ -2209,12 +2257,10 @@ export class GitHubKernel {
 
     // §16.2 — the PATCH and POST acknowledgements are not evidence. Re-read the issues and
     // require every projected ticket to be present with the marker, title and body sent.
-    const reread = await this.api().request<Array<{ number: number; title?: string; body: string | null }>>(
-      "GET",
-      `/repos/${owner}/${repo}/issues?state=all&per_page=100`,
-    );
+    const reread = await this.listIssues(repositoryIdentity);
+    if (!reread.allowed) return reread as Decision<{ created: number; updated: number }>;
     const projected = new Map<string, { number: number; title?: string; body: string | null }>();
-    for (const issue of reread) {
+    for (const issue of reread.value) {
       const marker = this.ticketMarker(issue.body);
       if (marker) projected.set(marker, issue);
     }
@@ -2467,25 +2513,238 @@ export class GitHubKernel {
     return `${body.trimEnd()}\n\n${markers.join("\n")}`;
   }
 
-  private async assertFrozenSourceLineage(
+  /**
+   * Resolve the resource declaration every remote write gives the managed-write guard.
+   *
+   * A repository identity alone is not enough for an operation that can race another run:
+   * the guard must know both the local checkout whose registration it is validating and the
+   * branch whose claim owns the remote mutation. Callers that cannot name one fail closed.
+   */
+  private writeTarget(
+    runId: string,
     repositoryIdentity: string,
-    baseHead: string,
+    targetBranch: string | null | undefined,
+  ): Decision<GitHubWriteTarget> {
+    if (!targetBranch?.trim()) {
+      return deny(ReasonCode.MERGE_CLAIM_INVALID, "GitHub write has no concrete target branch", {
+        runId,
+        repositoryIdentity,
+      });
+    }
+    const repository = this.repositories.byIdentity(repositoryIdentity);
+    if (!repository) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "GitHub write has no registered checkout", {
+        runId,
+        repositoryIdentity,
+      });
+    }
+    return allow(ReasonCode.OK, { targetBranch, targetPath: repository.checkoutPath });
+  }
+
+  /**
+   * Some projections do not carry a branch in their external payload. They still have to
+   * name the one branch the run holds for this repository; guessing from a checkout or
+   * accepting an unscoped issue/tag write would defeat the guard's resource fence.
+   */
+  private writeTargetForRun(runId: string, repositoryIdentity: string): Decision<GitHubWriteTarget> {
+    const participant = this.runs.repositoriesOf(runId).find((entry) => entry.identity === repositoryIdentity);
+    if (!participant) {
+      return deny(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE, "repository does not participate in this run", {
+        runId,
+        repositoryIdentity,
+      });
+    }
+    if (participant.workBranch) return this.writeTarget(runId, repositoryIdentity, participant.workBranch);
+
+    const claims = this.db.all<{ branch: string }>(
+      `SELECT branch FROM resource_claims
+        WHERE run_id = ? AND repository_identity = ? AND status = 'HELD'
+          AND expires_at > ? AND branch IS NOT NULL
+        ORDER BY acquired_at, claim_id`,
+      [runId, repositoryIdentity, this.clock.nowIso()],
+    );
+    const branches = [...new Set(claims.map((claim) => claim.branch))];
+    if (branches.length !== 1) {
+      return deny(ReasonCode.MERGE_CLAIM_INVALID, "GitHub write cannot resolve one claimed branch", {
+        runId,
+        repositoryIdentity,
+        branches,
+      });
+    }
+    return this.writeTarget(runId, repositoryIdentity, branches[0]!);
+  }
+
+  /**
+   * The frozen PR target is not source lineage. Resolve the required source branch and record
+   * its exact commit alongside the prepare receipt, after proving the candidate descends from
+   * that commit. This admits release→main and hotfix→dev/release without accepting a
+   * caller-supplied target name as proof of ancestry.
+   */
+  private async assertSourceLineageAtPrepare(
+    repositoryIdentity: string,
+    head: string,
+    profile: BranchProfile,
+    declaredParent: string | null,
+    candidateHead: string,
+  ): Promise<Decision<{ sourceBase: string; sourceBaseSha: string }>> {
+    const sourceBase = requiredBaseFor(head, profile, declaredParent);
+    if (!sourceBase) {
+      return deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "branch class has no required source lineage", {
+        repositoryIdentity,
+        head,
+      });
+    }
+    const repository = this.repositories.byIdentity(repositoryIdentity);
+    if (!repository) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "candidate repository has no local checkout for source lineage proof", {
+        repositoryIdentity,
+      });
+    }
+    let sourceBaseSha: string;
+    try {
+      sourceBaseSha = await revParse(repository.checkoutPath, sourceBase);
+    } catch (error) {
+      return deny(ReasonCode.PROBE_FAILED, "could not resolve the required source branch for lineage proof", {
+        repositoryIdentity,
+        sourceBase,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const observed = await mergeBase(repository.checkoutPath, sourceBaseSha, candidateHead);
+    return observed === sourceBaseSha
+      ? allow(ReasonCode.OK, { sourceBase, sourceBaseSha })
+      : deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "candidate does not descend from the required source", {
+          repositoryIdentity,
+          sourceBase,
+          expectedSourceBaseHead: sourceBaseSha,
+          mergeBase: observed,
+        });
+  }
+
+  /** Re-check the immutable prepare receipt against the exact candidate before a merge. */
+  private async assertPreparedSourceLineage(
+    repositoryIdentity: string,
+    prepared: PreparedPrIntent,
     candidateHead: string,
   ): Promise<Decision<void>> {
     const repository = this.repositories.byIdentity(repositoryIdentity);
     if (!repository) {
-      return deny(ReasonCode.EVIDENCE_MISSING, "candidate repository has no local checkout for lineage proof", {
+      return deny(ReasonCode.EVIDENCE_MISSING, "candidate repository has no local checkout for source lineage proof", {
         repositoryIdentity,
       });
     }
-    const observed = await mergeBase(repository.checkoutPath, baseHead, candidateHead);
-    return observed === baseHead
+    const observed = await mergeBase(repository.checkoutPath, prepared.sourceBaseSha, candidateHead);
+    return observed === prepared.sourceBaseSha
       ? allow(ReasonCode.OK, undefined)
-      : deny(ReasonCode.PR_BRANCH_CONTRACT_VIOLATION, "candidate does not descend from its frozen required base", {
+      : deny(ReasonCode.MERGE_BRANCH_PROFILE_UNSATISFIED, "candidate no longer descends from prepared source lineage", {
           repositoryIdentity,
-          expectedBaseHead: baseHead,
+          sourceBase: prepared.sourceBase,
+          expectedSourceBaseHead: prepared.sourceBaseSha,
           mergeBase: observed,
         });
+  }
+
+  /**
+   * CP-HI-07 at the GitHub boundary. `APPROVAL` is not evidence-writer protected, so a
+   * stored boolean cannot be treated as owner authority. Every latest decision must carry
+   * the admitted ingress receipt that produced it, be for this exact candidate and human-gate
+   * definition, and still be accepted by OwnerAuthority when the gate is published or merged.
+   */
+  private assertCurrentHumanGate(
+    runId: string,
+    candidateSnapshotDigest: string,
+    namedDecisionDigest: string,
+  ): Decision<CurrentHumanGate> {
+    const run = this.runs.get(runId);
+    if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId });
+
+    const contract = this.artifacts.latest<{ humanGate?: unknown }>(runId, "TASK_CONTRACT");
+    const items = Array.isArray(contract?.content.humanGate) && contract.content.humanGate.every(
+      (item): item is string => typeof item === "string" && item.length > 0,
+    )
+      ? [...contract.content.humanGate]
+      : [];
+    const required = run.humanGateRequired;
+    if (!required) {
+      return allow(ReasonCode.OK, { required: false, items: [], satisfied: true, payloadDigest: null });
+    }
+    if (items.length === 0) {
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "run requires a human gate with no durable gate items", {
+        runId,
+      });
+    }
+    const authority = this.ownerAuthority;
+    if (!authority) {
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "GitHub kernel has no owner-authority verifier", {
+        runId,
+      });
+    }
+
+    const definitionDigest = digestOf(items);
+    const latest = new Map<string, { approved: boolean; digest: string }>();
+    for (const artifact of this.artifacts.list<OwnerDecisionContent>(runId, "APPROVAL")) {
+      const decision = artifact.content;
+      if (
+        artifact.superseded ||
+        artifact.candidateSnapshotDigest !== candidateSnapshotDigest ||
+        decision.kind !== "OWNER_DECISION" ||
+        !decision.item ||
+        !items.includes(decision.item) ||
+        typeof decision.approved !== "boolean" ||
+        typeof decision.note !== "string" ||
+        decision.humanGateDigest !== definitionDigest ||
+        decision.candidateSnapshotDigest !== candidateSnapshotDigest ||
+        !decision.receipt
+      ) {
+        continue;
+      }
+
+      const receipt = decision.receipt;
+      if (
+        receipt.runId !== runId ||
+        receipt.operation !== OWNER_DECISION_OPERATION ||
+        receipt.approved !== decision.approved ||
+        receipt.parameterDigest !== digestOf({
+          item: decision.item,
+          approved: decision.approved,
+          note: decision.note,
+        })
+      ) {
+        continue;
+      }
+      const admitted = authority.assertApproval(receipt);
+      if (!admitted.allowed) continue;
+
+      // ArtifactStore.list is durable creation order (then rowid). A later authenticated
+      // rejection therefore revokes the earlier yes for this same candidate and gate item.
+      latest.set(decision.item, { approved: decision.approved, digest: artifact.digest });
+    }
+
+    const satisfied = items.every((item) => latest.get(item)?.approved === true);
+    if (!satisfied) {
+      return deny(ReasonCode.HUMAN_GATE_UNSATISFIED, "every current human-gate item needs an authenticated approval", {
+        runId,
+        candidateSnapshotDigest,
+        items,
+        decisions: items.map((item) => ({ item, approved: latest.get(item)?.approved ?? null })),
+      });
+    }
+    const named = [...latest.values()].some((decision) =>
+      decision.approved && decision.digest === namedDecisionDigest,
+    );
+    if (!named) {
+      return deny(
+        ReasonCode.HUMAN_GATE_UNSATISFIED,
+        "gate payload does not name a current authenticated owner decision",
+        { runId, candidateSnapshotDigest, digest: namedDecisionDigest },
+      );
+    }
+    return allow(ReasonCode.OK, {
+      required: true,
+      items,
+      satisfied: true,
+      payloadDigest: namedDecisionDigest,
+    });
   }
 
   private hasPrLinkage(body: string | null | undefined, linkedIssues: readonly number[]): boolean {
@@ -2525,6 +2784,7 @@ export class GitHubKernel {
       typeof intent.exactHeadSha !== "string" ||
       typeof intent.expectedBaseSha !== "string" ||
       typeof intent.sourceBase !== "string" ||
+      typeof intent.sourceBaseSha !== "string" ||
       (intent.declaredParent !== null && typeof intent.declaredParent !== "string")
     ) {
       return deny(ReasonCode.EVIDENCE_MISSING, "pull request has no immutable prepare contract", {
@@ -2539,6 +2799,7 @@ export class GitHubKernel {
       exactHeadSha: intent.exactHeadSha,
       expectedBaseSha: intent.expectedBaseSha,
       sourceBase: intent.sourceBase,
+      sourceBaseSha: intent.sourceBaseSha,
       declaredParent: intent.declaredParent,
     });
   }
@@ -2650,6 +2911,75 @@ export class GitHubKernel {
       if (branches.length < 100) return allow(ReasonCode.OK, [...new Set(names)].sort());
     }
     return deny(ReasonCode.PROBE_FAILED, "release branch enumeration exceeded pagination bound", {
+      repositoryIdentity,
+    });
+  }
+
+  /** GitHub's list endpoint defaults to 30; never let a first page decide a merge gate. */
+  private async listCheckRuns(
+    repositoryIdentity: string,
+    head: string,
+    checkName?: string,
+  ): Promise<Decision<CheckRun[]>> {
+    const slug = this.slug(repositoryIdentity);
+    if (!slug.allowed) return slug as Decision<CheckRun[]>;
+    const { owner, repo } = slug.value;
+    const all: CheckRun[] = [];
+    for (let page = 1; page <= 10_000; page += 1) {
+      const query = new URLSearchParams({ per_page: "100", page: String(page) });
+      if (checkName) query.set("check_name", checkName);
+      let response: { check_runs?: CheckRun[] };
+      try {
+        response = await this.api().request<{ check_runs?: CheckRun[] }>(
+          "GET",
+          `/repos/${owner}/${repo}/commits/${encodeURIComponent(head)}/check-runs?${query.toString()}`,
+        );
+      } catch (error) {
+        return deny(ReasonCode.PROBE_FAILED, "could not enumerate GitHub check runs", {
+          repositoryIdentity,
+          head,
+          checkName: checkName ?? null,
+          page,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      const checks = response.check_runs ?? [];
+      all.push(...checks);
+      if (checks.length < 100) return allow(ReasonCode.OK, all);
+    }
+    return deny(ReasonCode.PROBE_FAILED, "GitHub check-run enumeration exceeded pagination bound", {
+      repositoryIdentity,
+      head,
+      checkName: checkName ?? null,
+    });
+  }
+
+  /** Marker idempotency is correct only if the scan covers every issue GitHub can return. */
+  private async listIssues(
+    repositoryIdentity: string,
+  ): Promise<Decision<Array<{ number: number; title?: string; body: string | null }>>> {
+    const slug = this.slug(repositoryIdentity);
+    if (!slug.allowed) return slug as Decision<Array<{ number: number; title?: string; body: string | null }>>;
+    const { owner, repo } = slug.value;
+    const all: Array<{ number: number; title?: string; body: string | null }> = [];
+    for (let page = 1; page <= 10_000; page += 1) {
+      let issues: Array<{ number: number; title?: string; body: string | null }>;
+      try {
+        issues = await this.api().request<Array<{ number: number; title?: string; body: string | null }>>(
+          "GET",
+          `/repos/${owner}/${repo}/issues?state=all&per_page=100&page=${page}`,
+        );
+      } catch (error) {
+        return deny(ReasonCode.PROBE_FAILED, "could not enumerate GitHub issues for projection", {
+          repositoryIdentity,
+          page,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      all.push(...issues);
+      if (issues.length < 100) return allow(ReasonCode.OK, all);
+    }
+    return deny(ReasonCode.PROBE_FAILED, "GitHub issue enumeration exceeded pagination bound", {
       repositoryIdentity,
     });
   }

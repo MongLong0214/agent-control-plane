@@ -332,6 +332,9 @@ export class ControlPlane {
       continuity: { mode: () => this.continuity.mode() },
     });
     this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? []);
+    // The GitHub kernel re-checks every durable owner decision against this verifier at
+    // publication and merge time; an APPROVAL row alone is never human authority.
+    this.github.attach({ ownerAuthority: this.ownerAuthority });
     this.cto.attach({ ownerAuthority: this.ownerAuthority });
     this.repair.attach({ ownerAuthority: this.ownerAuthority });
     this.ceo.attach({
