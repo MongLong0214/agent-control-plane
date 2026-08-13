@@ -19,8 +19,8 @@ import {
 } from "../ingress/ingress-guard.ts";
 import { Role, SessionLifecycle, type RoleBinding } from "../domain/types.ts";
 import { Daemon } from "./daemon.ts";
-import { createCtoServer } from "../mcp/cto-server.ts";
-import { createHermesServer } from "../mcp/hermes-server.ts";
+import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
+import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
@@ -61,13 +61,18 @@ export const startLocalMcpListeners = async (
 
   const hermesPath = join(stateDir, "hermes.mcp.sock");
   const ctoPath = join(stateDir, "cto.mcp.sock");
+  // Server handlers receive these function-only ports, never the composition root. The
+  // transport still needs `cp` to authenticate a socket, but a tool cannot turn that into
+  // raw database access or evidence-write authority (#352).
+  const hermesPort = createHermesMcpPort(cp);
+  const ctoPort = createCtoMcpPort(cp);
   const hermes = await startMcpSocket(
     hermesPath,
     token,
     cp,
     [Role.CEO],
     handshakeTimeoutMs,
-    (auth) => createHermesServer(cp, auth),
+    (auth) => createHermesServer(hermesPort, auth),
   );
   let cto: Server;
   try {
@@ -77,7 +82,7 @@ export const startLocalMcpListeners = async (
       cp,
       [Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO],
       handshakeTimeoutMs,
-      (auth) => createCtoServer(cp, auth),
+      (auth) => createCtoServer(ctoPort, auth),
     );
   } catch (err) {
     await closeSocketServer(hermes);

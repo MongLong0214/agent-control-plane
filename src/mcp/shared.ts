@@ -1,6 +1,7 @@
-import type { ControlPlane } from "../app/control-plane.ts";
+import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import type { Db } from "../db/database.ts";
 
 const MCP_RESERVATION_TTL_MS = 60_000;
 
@@ -27,6 +28,16 @@ export interface AuthenticatedMcpPeer {
  * It must fail after a session respawn, because the old incarnation is no longer a peer.
  */
 export type McpPeerAuthenticator = () => Decision<AuthenticatedMcpPeer>;
+
+/**
+ * The only database-shaped dependency MCP needs: it is consumed while the port is built,
+ * never retained by a tool handler. Keeping this structural lets non-production callers
+ * exercise idempotency without exposing a composition root to a server (#352).
+ */
+export interface McpMutationSource {
+  readonly db: Db;
+  readonly clock: Clock;
+}
 
 export const authenticateMcpPeer = (
   authenticate: McpPeerAuthenticator,
@@ -85,13 +96,35 @@ export const guarded = async (fn: () => Promise<ToolResult> | ToolResult): Promi
   }
 };
 
+/** A sealed operation, rather than a database facade, for MCP mutation idempotency. */
+export interface McpMutationPort {
+  execute(
+    peer: AuthenticatedMcpPeer,
+    idempotencyKey: string,
+    handler: () => Promise<ToolResult> | ToolResult,
+  ): Promise<ToolResult>;
+}
+
+/**
+ * Captures the raw persistence dependencies in this module's closure. A tool handler receives
+ * only `execute`, so it cannot turn idempotency bookkeeping into arbitrary SQL authority.
+ */
+export const createMcpMutationPort = (source: McpMutationSource): McpMutationPort =>
+  Object.freeze({
+    execute: (
+      peer: AuthenticatedMcpPeer,
+      idempotencyKey: string,
+      handler: () => Promise<ToolResult> | ToolResult,
+    ): Promise<ToolResult> => idempotentMcpMutation(source, peer, idempotencyKey, handler),
+  });
+
 /**
  * Reserves a mutation key before executing it. A completed retry returns exactly the
  * durable first response. A failed in-process execution releases its reservation, while
  * an abandoned process reservation becomes retryable only after a bounded recovery delay.
  */
 export const idempotentMcpMutation = async (
-  cp: Pick<ControlPlane, "db" | "clock">,
+  source: McpMutationSource,
   peer: AuthenticatedMcpPeer,
   idempotencyKey: string,
   execute: () => Promise<ToolResult> | ToolResult,
@@ -100,9 +133,9 @@ export const idempotentMcpMutation = async (
     return respond(deny(ReasonCode.INVALID_ARGUMENT, "MCP mutation requires an idempotency key"));
   }
 
-  const receivedAt = cp.clock.nowIso();
-  const reservation = cp.db.tx(() => {
-    const existing = cp.db.get<{ actor: string; received_at: string; result_json: string | null }>(
+  const receivedAt = source.clock.nowIso();
+  const reservation = source.db.tx(() => {
+    const existing = source.db.get<{ actor: string; received_at: string; result_json: string | null }>(
       `SELECT actor, received_at, result_json FROM inbound_messages WHERE channel = 'mcp' AND nonce = ?`,
       [idempotencyKey],
     );
@@ -112,7 +145,7 @@ export const idempotentMcpMutation = async (
         !existing.result_json &&
         reservationExpired(existing.received_at, receivedAt)
       ) {
-        cp.db.run(
+        source.db.run(
           `UPDATE inbound_messages SET received_at = ?
             WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND result_json IS NULL`,
           [receivedAt, idempotencyKey, peer.actor],
@@ -121,7 +154,7 @@ export const idempotentMcpMutation = async (
       }
       return { existing };
     }
-    cp.db.run(
+    source.db.run(
       `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('mcp', ?, ?, ?)`,
       [idempotencyKey, peer.actor, receivedAt],
     );
@@ -150,14 +183,14 @@ export const idempotentMcpMutation = async (
   } catch (error) {
     // A thrown handler has no durable response for a retry to replay. Removing only this
     // peer's unfinished row keeps a separate peer from taking its key while unblocking it.
-    cp.db.run(
+    source.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = 'mcp' AND nonce = ? AND actor = ? AND result_json IS NULL`,
       [idempotencyKey, peer.actor],
     );
     throw error;
   }
-  cp.db.run(
+  source.db.run(
     `UPDATE inbound_messages SET result_json = ? WHERE channel = 'mcp' AND nonce = ? AND actor = ?`,
     [JSON.stringify(result), idempotencyKey, peer.actor],
   );

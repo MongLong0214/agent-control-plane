@@ -754,6 +754,8 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(pending.reasonCode).toBe(ReasonCode.BOOTSTRAP_ACTIVATION_INCOMPLETE);
     const handoffId = pending.evidence["pendingHandoffId"] as string;
     const primaryCto = harness.cp.bindings.activePrimaryCto("bootstrap-project")!;
+    // #330: this is a real READY session, so HANDOFF_ACK_REQUIRED proves recipient ownership
+    // rather than an earlier unknown-session refusal.
     const unrelated = harness.cp.sessions.create({ provider: "scripted", model: "unrelated-cto" });
     harness.cp.sessions.transition(unrelated.sessionId, SessionLifecycle.READY, "unrelated handoff caller");
     const wrongAck = harness.cp.bootstrap.acknowledgeActivationHandoff(handoffId, unrelated.sessionId);

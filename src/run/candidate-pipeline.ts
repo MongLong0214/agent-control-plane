@@ -60,8 +60,8 @@ export type PipelineOutcome =
 
 /**
  * A durable submission lease that a watchdog reclaimed after its holder disappeared.
- * `deadlineAt` is derived from the current lease lifetime until the schema owns it as a
- * column; exposing it here keeps the watchdog from duplicating lease policy.
+ * `deadlineAt` is the deadline persisted when the lease was acquired. Recovery must honor
+ * that fact rather than reconstructing a potentially changed policy from `startedAt` (#335).
  */
 export interface ReclaimedCandidatePipelineAttempt {
   runId: string;
@@ -367,12 +367,13 @@ export class CandidatePipeline {
   /** Durable, per-run fence for the whole asynchronous verification/review attempt. */
   private acquireAttempt(input: SubmitResultInput, attemptId: string): Decision<void> {
     return this.db.tx(() => {
-      const now = this.clock.nowIso();
-      const staleBefore = new Date(this.clock.now().getTime() - ATTEMPT_LEASE_TTL_MS).toISOString();
+      const acquiredAt = this.clock.now();
+      const startedAt = acquiredAt.toISOString();
+      const deadlineAt = new Date(acquiredAt.getTime() + ATTEMPT_LEASE_TTL_MS).toISOString();
       const inserted = this.db.run(
         `INSERT INTO candidate_pipeline_attempts
-           (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, released_at)
-         VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, NULL)
+           (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
+         VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, ?, NULL)
          ON CONFLICT(run_id) DO UPDATE SET
            attempt_id = excluded.attempt_id,
            owner_session_id = excluded.owner_session_id,
@@ -380,11 +381,12 @@ export class CandidatePipeline {
            candidate_digest = NULL,
            state = 'RUNNING',
            started_at = excluded.started_at,
+           deadline_at = excluded.deadline_at,
            released_at = NULL
          WHERE candidate_pipeline_attempts.state = 'RELEASED'
             OR (candidate_pipeline_attempts.state = 'RUNNING'
-                AND candidate_pipeline_attempts.started_at < ?)`,
-        [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, now, staleBefore],
+                AND candidate_pipeline_attempts.deadline_at <= ?)`,
+        [input.runId, attemptId, input.ownerSessionId, input.ownerBindingGeneration, startedAt, deadlineAt, startedAt],
       );
       if (inserted.changes === 1) return allow(ReasonCode.OK, undefined);
       const current = this.db.get<{
@@ -393,8 +395,9 @@ export class CandidatePipeline {
         owner_binding_generation: number;
         candidate_digest: string | null;
         state: string;
+        deadline_at: string;
       }>(
-        `SELECT attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state
+        `SELECT attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, deadline_at
            FROM candidate_pipeline_attempts WHERE run_id = ?`,
         [input.runId],
       );
@@ -417,25 +420,25 @@ export class CandidatePipeline {
     return this.db.tx(() => {
       const now = this.clock.now();
       const releasedAt = now.toISOString();
-      const staleBefore = new Date(now.getTime() - ATTEMPT_LEASE_TTL_MS).toISOString();
       const stale = this.db.all<{
         run_id: string;
         attempt_id: string;
         started_at: string;
+        deadline_at: string;
       }>(
-        `SELECT run_id, attempt_id, started_at
+        `SELECT run_id, attempt_id, started_at, deadline_at
            FROM candidate_pipeline_attempts
-          WHERE state = 'RUNNING' AND started_at < ?
-          ORDER BY started_at, run_id`,
-        [staleBefore],
+          WHERE state = 'RUNNING' AND deadline_at <= ?
+          ORDER BY deadline_at, run_id`,
+        [releasedAt],
       );
       const reclaimed: ReclaimedCandidatePipelineAttempt[] = [];
       for (const attempt of stale) {
         const released = this.db.run(
           `UPDATE candidate_pipeline_attempts
               SET state = 'RELEASED', released_at = ?
-            WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND started_at < ?`,
-          [releasedAt, attempt.run_id, attempt.attempt_id, staleBefore],
+            WHERE run_id = ? AND attempt_id = ? AND state = 'RUNNING' AND deadline_at <= ?`,
+          [releasedAt, attempt.run_id, attempt.attempt_id, releasedAt],
         );
         if (released.changes !== 1) continue;
         const startedAt = new Date(attempt.started_at).getTime();
@@ -443,7 +446,7 @@ export class CandidatePipeline {
           runId: attempt.run_id,
           attemptId: attempt.attempt_id,
           startedAt: attempt.started_at,
-          deadlineAt: new Date(startedAt + ATTEMPT_LEASE_TTL_MS).toISOString(),
+          deadlineAt: attempt.deadline_at,
           ageMs: now.getTime() - startedAt,
         });
       }

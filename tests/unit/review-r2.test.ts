@@ -464,7 +464,7 @@ describe("round-2 blind-review regressions", () => {
     expect(result.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
   });
 
-  it("#335 reclaims an aged crashed submission lease", async () => {
+  it("#335 reclaims a crashed submission lease only after its persisted deadline", async () => {
     const setup = await prepareReviewedInputs();
     setup.harness.cp.verification.verify = async () => allow(ReasonCode.OK, setup.verification);
     setup.harness.scripted.script({
@@ -472,20 +472,26 @@ describe("round-2 blind-review regressions", () => {
       text: reviewerPass([`${setup.identity}:src/app.js`]),
     });
     const startedAt = new Date(setup.harness.clock.now().getTime() - 31 * 60 * 1000).toISOString();
+    const deadlineAt = new Date(setup.harness.clock.now().getTime() + 60_000).toISOString();
     setup.harness.cp.db.run(
       `INSERT INTO candidate_pipeline_attempts
-         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, released_at)
-       VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, NULL)`,
-      [setup.run.runId, "attempt_crashed", "session-crashed", 1, startedAt],
+         (run_id, attempt_id, owner_session_id, owner_binding_generation, candidate_digest, state, started_at, deadline_at, released_at)
+       VALUES (?, ?, ?, ?, NULL, 'RUNNING', ?, ?, NULL)`,
+      [setup.run.runId, "attempt_crashed", "session-crashed", 1, startedAt, deadlineAt],
     );
 
+    // The old started_at policy would reclaim here. The persisted deadline is the lease fact
+    // that survives a daemon restart, so a policy change cannot shorten this holder's lease.
+    expect(setup.harness.cp.pipeline.reclaimExpiredAttempts()).toEqual([]);
+    setup.harness.clock.advance(60_000);
     const reclaimed = setup.harness.cp.pipeline.reclaimExpiredAttempts();
 
     expect(reclaimed).toEqual([expect.objectContaining({
       runId: setup.run.runId,
       attemptId: "attempt_crashed",
       startedAt,
-      ageMs: 31 * 60 * 1000,
+      deadlineAt,
+      ageMs: 32 * 60 * 1000,
     })]);
     expect(setup.harness.cp.db.get<{ state: string; released_at: string | null }>(
       `SELECT state, released_at FROM candidate_pipeline_attempts WHERE run_id = ?`,

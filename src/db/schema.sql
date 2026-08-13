@@ -311,8 +311,16 @@ CREATE TABLE IF NOT EXISTS candidate_pipeline_attempts (
   candidate_digest         TEXT,
   state                    TEXT NOT NULL CHECK (state IN ('RUNNING','RELEASED')),
   started_at               TEXT NOT NULL,
+  -- A lease is reclaimable by the fact persisted at acquisition, not by a watchdog's
+  -- later reconstruction of policy from started_at (#335).
+  deadline_at              TEXT NOT NULL,
   released_at              TEXT
 );
+
+-- The watchdog reads only expired RUNNING leases, so recovery stays a deadline probe rather
+-- than a full attempt-history scan as the table grows (#335).
+CREATE INDEX IF NOT EXISTS candidate_pipeline_attempts_running_deadline
+  ON candidate_pipeline_attempts(state, deadline_at);
 
 -- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
 -- while this guard rejects topology bypasses even from a raw SQLite caller.
