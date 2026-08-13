@@ -17,16 +17,23 @@ import {
   IngressGuard,
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
+import { Role, SessionLifecycle, type RoleBinding } from "../domain/types.ts";
 import { Daemon } from "./daemon.ts";
 import { createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesServer } from "../mcp/hermes-server.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
+const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
 
 export interface LocalMcpListeners {
   socketPaths: readonly string[];
   close(): Promise<void>;
+}
+
+/** Tests shorten the deadline without weakening the daemon's production default. */
+export interface LocalMcpListenerOptions {
+  handshakeTimeoutMs?: number;
 }
 
 /** A daemon-owned local hop from the authenticated Buzz relay to SessionRegistry. */
@@ -44,15 +51,34 @@ export const startLocalMcpListeners = async (
   cp: ControlPlane,
   stateDir: string,
   token: string,
+  options: LocalMcpListenerOptions = {},
 ): Promise<LocalMcpListeners> => {
   if (token.length === 0) throw new Error("ACP_MCP_TOKEN must be configured to expose MCP");
+  const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS;
+  if (!Number.isInteger(handshakeTimeoutMs) || handshakeTimeoutMs <= 0) {
+    throw new Error("MCP handshake timeout must be a positive integer");
+  }
 
   const hermesPath = join(stateDir, "hermes.mcp.sock");
   const ctoPath = join(stateDir, "cto.mcp.sock");
-  const hermes = await startMcpSocket(hermesPath, token, cp, (auth) => createHermesServer(cp, auth));
+  const hermes = await startMcpSocket(
+    hermesPath,
+    token,
+    cp,
+    [Role.CEO],
+    handshakeTimeoutMs,
+    (auth) => createHermesServer(cp, auth),
+  );
   let cto: Server;
   try {
-    cto = await startMcpSocket(ctoPath, token, cp, (auth) => createCtoServer(cp, auth));
+    cto = await startMcpSocket(
+      ctoPath,
+      token,
+      cp,
+      [Role.PRIMARY_CTO, Role.BOOTSTRAP_CTO],
+      handshakeTimeoutMs,
+      (auth) => createCtoServer(cp, auth),
+    );
   } catch (err) {
     await closeSocketServer(hermes);
     if (existsSync(hermesPath)) unlinkSync(hermesPath);
@@ -119,20 +145,22 @@ const startMcpSocket = async (
   path: string,
   token: string,
   cp: ControlPlane,
+  expectedRoles: readonly Role[],
+  handshakeTimeoutMs: number,
   factory: (authenticate: McpPeerAuthenticator) => ReturnType<typeof createHermesServer>,
 ): Promise<Server> => {
   removeStaleSocket(path);
   const server = createServer((socket) => {
-    void authenticateSocket(socket, token).then(async (accepted) => {
+    void authenticateSocket(socket, token, handshakeTimeoutMs).then(async (accepted) => {
       if (!accepted) return;
       // One server per authenticated connection: the peer identity belongs to the
       // transport, so it can never be re-declared by a tool argument (§21, §27.3).
-      const opening = cp.sessions.verifySecret(accepted.credential.sessionId, accepted.credential.sessionSecret);
+      const opening = authenticateSocketPeer(cp, accepted.credential, expectedRoles);
       if (!opening.allowed) {
-        socket.destroy();
+        endWithDecision(socket, opening);
         return;
       }
-      const mcp = factory(peerAuthenticator(cp, accepted.credential, opening.value.incarnation));
+      const mcp = factory(peerAuthenticator(cp, accepted.credential, opening.value));
       try {
         await mcp.connect(accepted.transport);
       } catch (err) {
@@ -253,13 +281,72 @@ interface AcceptedConnection {
   credential: PeerCredential;
 }
 
-const authenticateSocket = (socket: Socket, token: string): Promise<AcceptedConnection | null> =>
+interface BoundSocketPeer {
+  binding: RoleBinding;
+  sessionIncarnation: string;
+}
+
+/**
+ * The socket name is an authority boundary, not just an API catalogue. Capturing the
+ * exact binding here lets request authentication reject a connection after failover.
+ */
+const authenticateSocketPeer = (
+  cp: ControlPlane,
+  credential: PeerCredential,
+  expectedRoles: readonly Role[],
+): Decision<BoundSocketPeer> => {
+  const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
+  if (!session.allowed) return session as Decision<BoundSocketPeer>;
+  if (session.value.lifecycle !== SessionLifecycle.READY) {
+    return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "peer session is not READY", {
+      sessionId: credential.sessionId,
+      lifecycle: session.value.lifecycle,
+    });
+  }
+
+  const candidate = cp.bindings
+    .bySession(credential.sessionId)
+    .find((binding) => binding.status === "ACTIVE" && expectedRoles.includes(binding.role));
+  if (!candidate) {
+    return deny(ReasonCode.BINDING_GENERATION_STALE, "session does not hold this socket's current role", {
+      sessionId: credential.sessionId,
+      expectedRoles,
+    });
+  }
+  const authenticated = cp.bindings.authenticateBoundSession({
+    roleKey: candidate.roleKey,
+    sessionId: credential.sessionId,
+    sessionSecret: credential.sessionSecret,
+    bindingGeneration: candidate.bindingGeneration,
+  });
+  if (!authenticated.allowed) return authenticated as Decision<BoundSocketPeer>;
+  if (authenticated.value.sessionIncarnation !== session.value.incarnation) {
+    return deny(ReasonCode.BINDING_GENERATION_STALE, "role binding belongs to a previous session incarnation", {
+      roleKey: authenticated.value.roleKey,
+      sessionId: credential.sessionId,
+      bindingIncarnation: authenticated.value.sessionIncarnation,
+      sessionIncarnation: session.value.incarnation,
+    });
+  }
+  return allow(ReasonCode.OK, {
+    binding: authenticated.value,
+    sessionIncarnation: session.value.incarnation,
+  });
+};
+
+const authenticateSocket = (
+  socket: Socket,
+  token: string,
+  handshakeTimeoutMs: number,
+): Promise<AcceptedConnection | null> =>
   new Promise((resolveTransport) => {
     let buffer = Buffer.alloc(0);
     let settled = false;
+    let timeout: NodeJS.Timeout | null = null;
     const finish = (transport: AcceptedConnection | null): void => {
       if (settled) return;
       settled = true;
+      if (timeout) clearTimeout(timeout);
       socket.removeListener("data", receive);
       socket.removeListener("error", transportError);
       socket.removeListener("close", transportClosed);
@@ -300,6 +387,8 @@ const authenticateSocket = (socket: Socket, token: string): Promise<AcceptedConn
     socket.on("data", receive);
     socket.once("error", transportError);
     socket.once("close", transportClosed);
+    timeout = setTimeout(() => reject(), handshakeTimeoutMs);
+    timeout.unref();
   });
 
 /**
@@ -322,14 +411,14 @@ interface PeerCredential {
 }
 
 const peerAuthenticator =
-  (cp: ControlPlane, credential: PeerCredential, incarnation: string): McpPeerAuthenticator =>
+  (cp: ControlPlane, credential: PeerCredential, opening: BoundSocketPeer): McpPeerAuthenticator =>
   () => {
     const session = cp.sessions.verifySecret(credential.sessionId, credential.sessionSecret);
     if (!session.allowed) return session as Decision<AuthenticatedMcpPeer>;
-    if (session.value.incarnation !== incarnation) {
+    if (session.value.incarnation !== opening.sessionIncarnation) {
       return deny(ReasonCode.MCP_PEER_UNAUTHENTICATED, "session was respawned since this connection authenticated", {
         sessionId: credential.sessionId,
-        handshake: incarnation,
+        handshake: opening.sessionIncarnation,
         current: session.value.incarnation,
       });
     }
@@ -338,10 +427,25 @@ const peerAuthenticator =
         sessionId: credential.sessionId,
       });
     }
+    const bound = cp.bindings.authenticateBoundSession({
+      roleKey: opening.binding.roleKey,
+      sessionId: credential.sessionId,
+      sessionSecret: credential.sessionSecret,
+      bindingGeneration: opening.binding.bindingGeneration,
+    });
+    if (!bound.allowed) return bound as Decision<AuthenticatedMcpPeer>;
+    if (bound.value.sessionIncarnation !== opening.sessionIncarnation) {
+      return deny(ReasonCode.BINDING_GENERATION_STALE, "socket binding no longer matches this session incarnation", {
+        roleKey: opening.binding.roleKey,
+        sessionId: credential.sessionId,
+        handshake: opening.sessionIncarnation,
+        binding: bound.value.sessionIncarnation,
+      });
+    }
     return allow(ReasonCode.OK, {
       actor: credential.sessionId,
       sessionId: credential.sessionId,
-      sessionIncarnation: incarnation,
+      sessionIncarnation: opening.sessionIncarnation,
     });
   };
 
