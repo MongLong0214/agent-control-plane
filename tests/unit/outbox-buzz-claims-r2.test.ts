@@ -45,6 +45,69 @@ const thrown = (fn: () => unknown): unknown => {
 };
 
 describe("round-2 outbox fencing", () => {
+  it("#378 delivers only the exact pending HANDOFF_PACKAGE to its unbound incoming session", () => {
+    const { core, seeded } = seededCore();
+    const incoming = core.sessions.create({ provider: "claude", model: "incoming-cto" });
+    expect(core.sessions.transition(incoming.sessionId, SessionLifecycle.READY, "incoming handoff recipient").allowed)
+      .toBe(true);
+    const handoffId = "hof_delivery_path";
+    core.db.run(
+      `INSERT INTO handoffs (handoff_id, project_id, kind, from_session_id, from_generation,
+                             to_session_id, package_json, digest, status, created_at)
+       VALUES (?, ?, 'HANDOFF', ?, ?, ?, '{}', 'sha256:handoff', 'PENDING', ?)`,
+      [
+        handoffId,
+        seeded.projectId,
+        seeded.sessionId,
+        seeded.generation,
+        incoming.sessionId,
+        core.clock.nowIso(),
+      ],
+    );
+
+    const handoff = core.outbox.enqueue({
+      idempotencyKey: `handoff:${handoffId}`,
+      roleKey: seeded.roleKey,
+      bindingGeneration: seeded.generation,
+      targetSessionId: incoming.sessionId,
+      kind: MessageKind.HANDOFF_PACKAGE,
+      payload: { handoffId },
+    });
+    expect(handoff.allowed).toBe(true);
+    if (!handoff.allowed) return;
+
+    // A pending handoff does not turn the incoming session into a general recipient.
+    const forged = core.outbox.enqueue({
+      idempotencyKey: "handoff:forged",
+      roleKey: seeded.roleKey,
+      bindingGeneration: seeded.generation,
+      targetSessionId: incoming.sessionId,
+      kind: MessageKind.HANDOFF_PACKAGE,
+      payload: { handoffId: "forged" },
+    });
+    expect(forged.allowed).toBe(false);
+    expect(forged.reasonCode).toBe(ReasonCode.OUTBOX_TARGET_NOT_CURRENT);
+
+    const claimed = core.outbox.claimDeliverable();
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]?.messageId).toBe(handoff.value.messageId);
+    expect(core.outbox.markSent(handoff.value.messageId, claimed[0]!.claimToken).allowed).toBe(true);
+    expect(core.outbox.get(handoff.value.messageId)?.status).toBe("SENT");
+  });
+
+  it("#379 keeps an active DRAINING recipient deliverable so it can finish in-flight work", () => {
+    const { core, seeded } = seededCore();
+    const message = enqueue(core, seeded, "outbox:draining-recipient");
+    expect(message.allowed).toBe(true);
+    if (!message.allowed) return;
+
+    expect(core.sessions.transition(seeded.sessionId, SessionLifecycle.DRAINING, "replacement requested").allowed)
+      .toBe(true);
+    const claimed = core.outbox.claimDeliverable();
+    expect(claimed).toHaveLength(1);
+    expect(core.outbox.markSent(message.value.messageId, claimed[0]!.claimToken).allowed).toBe(true);
+  });
+
   it("#48 fences an in-flight old-generation claim during failover", () => {
     const { core, seeded } = seededCore();
     const message = enqueue(core, seeded, "outbox:failover");

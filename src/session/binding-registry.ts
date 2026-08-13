@@ -7,7 +7,7 @@ import type { Db } from "../db/database.ts";
 import {
   PRODUCER_ROLES,
   ROLE_SCOPE,
-  type Role,
+  Role,
   type RoleBinding,
   SessionLifecycle,
   roleKeyFor,
@@ -491,14 +491,61 @@ export class BindingRegistry {
     }
     set.add(run.owner_session_id);
 
-    // Sessions that actually executed a task for this run.
-    for (const row of this.db.all<{ worker_session_id: string | null }>(
-      `SELECT DISTINCT worker_session_id FROM task_executions WHERE run_id = ?`,
-      [runId],
-    )) {
-      if (row.worker_session_id) set.add(row.worker_session_id);
-    }
+    const workers = this.workerProducerHistory(runId);
+    if (!workers.allowed) return workers;
+    for (const sessionId of workers.value) set.add(sessionId);
     return allow(ReasonCode.OK, set);
+  }
+
+  /**
+   * CP-HI-04 worker provenance supplements the immutable WORKER bindings already in the
+   * producer set with execution rows, rather than trusting a caller to fill
+   * `worker_session_id`. A null receipt can still identify the worker through its durable
+   * process id; if it has neither that match nor a task-scoped WORKER binding, reviewer
+   * admission must fail closed rather than treating the run as producer-free.
+   */
+  private workerProducerHistory(runId: string): Decision<Set<string>> {
+    const workers = new Set<string>();
+    const executions = this.db.all<{
+      execution_id: string;
+      task_id: string;
+      worker_session_id: string | null;
+      worker_process_id: number | null;
+    }>(
+      `SELECT execution_id, task_id, worker_session_id, worker_process_id
+         FROM task_executions WHERE run_id = ?`,
+      [runId],
+    );
+
+    for (const execution of executions) {
+      const boundWorkers = this.db.all<{ session_id: string }>(
+        `SELECT DISTINCT session_id FROM assignments
+          WHERE role = ? AND task_id = ?`,
+        [Role.WORKER, execution.task_id],
+      );
+      const processWorkers = execution.worker_process_id === null
+        ? []
+        : this.db.all<{ session_id: string }>(
+            `SELECT DISTINCT session_id FROM sessions WHERE os_pid = ?`,
+            [execution.worker_process_id],
+          );
+      for (const binding of boundWorkers) workers.add(binding.session_id);
+      for (const processWorker of processWorkers) workers.add(processWorker.session_id);
+      if (execution.worker_session_id) workers.add(execution.worker_session_id);
+
+      if (!execution.worker_session_id && boundWorkers.length === 0 && processWorkers.length === 0) {
+        return deny(
+          ReasonCode.PRODUCER_HISTORY_UNAVAILABLE,
+          "worker execution has no recorded worker session, process identity, or task-scoped WORKER binding",
+          {
+            runId,
+            executionId: execution.execution_id,
+            taskId: execution.task_id,
+          },
+        );
+      }
+    }
+    return allow(ReasonCode.OK, workers);
   }
 
   assertReviewerIndependence(runId: string, sessionId: string): Decision<void> {

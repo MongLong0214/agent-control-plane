@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { PRODUCER_ROLES, ROLE_CLASS, Role } from "../../src/domain/types.ts";
+import { PRODUCER_ROLES, ROLE_CLASS, Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { cleanupTempDirs, makeCore, makeRepo, seedRun } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -46,6 +46,97 @@ describe("CP-HI-04 role classification is exhaustive", () => {
     ).toBe(true);
 
     const refused = bindings.assertReviewerIndependence(seeded.runId, s);
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
+  });
+});
+
+describe("#380 — worker execution provenance is fail-closed", () => {
+  const recordAnonymousWorkerExecution = (
+    db: ReturnType<typeof makeCore>["db"],
+    clock: ReturnType<typeof makeCore>["clock"],
+    runId: string,
+    taskId: string,
+    workerProcessId: number | null = null,
+  ) => {
+    db.run(
+      `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+       VALUES (?, ?, 'worker task', 'implementation', 'READY', '{}', ?, ?)`,
+      [taskId, runId, clock.nowIso(), clock.nowIso()],
+    );
+    db.run(
+      `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
+                                    worker_session_id, worker_process_id, provider, model, started_at, status)
+       VALUES (?, ?, ?, 1, 1, NULL, ?, 'scripted', 'worker', ?, 'RUNNING')`,
+      [`${taskId}#1`, runId, taskId, workerProcessId, clock.nowIso()],
+    );
+  };
+
+  it("refuses reviewer admission when an execution omitted every durable worker identity", () => {
+    const { db, clock, bindings, seeded, session } = setup();
+    db.run(`UPDATE runs SET dispatched_at = ? WHERE run_id = ?`, [clock.nowIso(), seeded.runId]);
+    recordAnonymousWorkerExecution(db, clock, seeded.runId, "tsk_anonymous_worker");
+
+    const reviewer = session("ses_reviewer_after_anonymous_work");
+    const refused = bindings.bind({
+      role: Role.BLIND_REVIEWER,
+      sessionId: reviewer,
+      runId: seeded.runId,
+      projectId: seeded.projectId,
+    });
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.PRODUCER_HISTORY_UNAVAILABLE);
+  });
+
+  it("refuses the bound worker as reviewer even when an older receipt omitted workerSessionId", () => {
+    const { db, clock, bindings, seeded, session } = setup();
+    db.run(`UPDATE runs SET dispatched_at = ? WHERE run_id = ?`, [clock.nowIso(), seeded.runId]);
+    const taskId = "tsk_bound_worker";
+    recordAnonymousWorkerExecution(db, clock, seeded.runId, taskId);
+    const worker = session("ses_worker_from_bound_history");
+    const workerBinding = bindings.bind({
+      role: Role.WORKER,
+      sessionId: worker,
+      taskId,
+      runId: seeded.runId,
+      projectId: seeded.projectId,
+    });
+    expect(workerBinding.allowed).toBe(true);
+
+    const refused = bindings.bind({
+      role: Role.BLIND_REVIEWER,
+      sessionId: worker,
+      runId: seeded.runId,
+      projectId: seeded.projectId,
+    });
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
+  });
+
+  it("refuses W as reviewer when the null receipt durably identifies W by process id", () => {
+    const { db, clock, sessions, bindings, seeded } = setup();
+    db.run(`UPDATE runs SET dispatched_at = ? WHERE run_id = ?`, [clock.nowIso(), seeded.runId]);
+    const worker = sessions.create({
+      provider: "scripted",
+      model: "worker",
+      sessionId: "ses_worker_process_identity",
+      osPid: 424_242,
+    });
+    expect(sessions.transition(worker.sessionId, SessionLifecycle.READY, "worker session ready").allowed).toBe(true);
+    recordAnonymousWorkerExecution(
+      db,
+      clock,
+      seeded.runId,
+      "tsk_worker_process_identity",
+      worker.osPid,
+    );
+
+    const refused = bindings.bind({
+      role: Role.BLIND_REVIEWER,
+      sessionId: worker.sessionId,
+      runId: seeded.runId,
+      projectId: seeded.projectId,
+    });
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.REVIEWER_SESSION_IS_PRODUCER);
   });

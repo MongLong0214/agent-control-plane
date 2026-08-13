@@ -1,8 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
-import { makeCore, makeRepo, seedRun } from "../helpers/fixtures.ts";
+import type { HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
+import { cleanupTempDirs, makeCore, makeRepo, seedRun } from "../helpers/fixtures.ts";
+import { makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+
+afterAll(cleanupTempDirs);
+
+const COMPLETE_HANDOFF: HandoffPackage = {
+  projectStatus: "ACTIVE/HEALTHY",
+  activeManifestDigest: null,
+  recentDecisions: [],
+  openBlockers: [],
+  queuedWork: [],
+  repositoryFacts: [],
+  knownRisks: [],
+  recommendedNextAction: "continue",
+};
 
 const readySession = (core: ReturnType<typeof makeCore>, sessionId: string) => {
   const session = core.sessions.create({ provider: "scripted", model: "test", sessionId });
@@ -187,6 +202,53 @@ describe("binding fencing mechanisms", () => {
     const refused = core.sessions.verifySecret(session.sessionId, "forged");
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.SESSION_SECRET_INVALID);
+  });
+
+  it("#378 wires real session-secret authentication and delivery for a normal handoff", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const incumbent = await harness.cp.cto.ensurePrimaryCto(projectId, "handoff setup");
+    expect(incumbent.allowed).toBe(true);
+
+    const create = harness.cp.sessions.create.bind(harness.cp.sessions);
+    let incomingSecret: string | null = null;
+    const captureIncoming = vi.spyOn(harness.cp.sessions, "create").mockImplementation((input) => {
+      const incoming = create(input);
+      incomingSecret = incoming.sessionSecret;
+      return incoming;
+    });
+    const prepared = await harness.cp.cto.prepareSwitchover(projectId, COMPLETE_HANDOFF);
+    captureIncoming.mockRestore();
+    expect(prepared.allowed).toBe(true);
+    if (!prepared.allowed || !incomingSecret) return;
+
+    const envelope = harness.cp.outbox.byIdempotencyKey(`handoff:${prepared.value.handoffId}`);
+    expect(envelope).not.toBeNull();
+    const delivery = harness.cp.outbox.claimDeliverable();
+    expect(delivery).toHaveLength(1);
+    expect(harness.cp.outbox.markSent(envelope!.messageId, delivery[0]!.claimToken).allowed).toBe(true);
+
+    const acknowledgement = (sessionSecret: string) => ({
+      sessionId: prepared.value.incomingSessionId,
+      sessionIncarnation: harness.cp.sessions.require(prepared.value.incomingSessionId).incarnation,
+      bindingGeneration: envelope!.bindingGeneration,
+      messageId: envelope!.messageId,
+      payloadDigest: envelope!.payloadDigest,
+      sessionSecret,
+    });
+    const forged = harness.cp.cto.acknowledgeHandoff(
+      prepared.value.handoffId,
+      acknowledgement("forged-secret"),
+    );
+    expect(forged.allowed).toBe(false);
+    expect(forged.reasonCode).toBe(ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED);
+
+    const acknowledged = harness.cp.cto.acknowledgeHandoff(
+      prepared.value.handoffId,
+      acknowledgement(incomingSecret),
+    );
+    expect(acknowledged.allowed).toBe(true);
+    expect(harness.cp.bindings.activePrimaryCto(projectId)?.sessionId).toBe(prepared.value.incomingSessionId);
   });
 
   it("refuses a switch whose expected current generation is stale", () => {

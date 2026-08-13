@@ -9,7 +9,7 @@ import { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import { CtoLifecycle, type CtoPreference } from "../cto/cto-lifecycle.ts";
 import { ProductionGate } from "../ceo/production-gate.ts";
 import { AuditLog } from "../db/audit.ts";
-import { fail } from "../core/errors.ts";
+import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
@@ -332,7 +332,39 @@ export class ControlPlane {
       continuity: { mode: () => this.continuity.mode() },
     });
     this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? []);
-    this.cto.attach({ ownerAuthority: this.ownerAuthority });
+    this.cto.attach({
+      ownerAuthority: this.ownerAuthority,
+      // §10.1's recipient is intentionally unbound until this acknowledgement switches
+      // generations. The session secret is therefore the authentication proof here; the
+      // lifecycle validates the delivered envelope and incarnation before it switches.
+      handoffAuthentication: {
+        verifyHandoffAcknowledgement: (acknowledgement) => {
+          const session = this.sessions.verifySecret(
+            acknowledgement.sessionId,
+            acknowledgement.sessionSecret,
+          );
+          if (!session.allowed) {
+            return deny(
+              ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED,
+              "handoff acknowledgement session secret did not authenticate its recipient",
+              { sessionId: acknowledgement.sessionId, authenticationReason: session.reasonCode },
+            );
+          }
+          if (session.value.incarnation !== acknowledgement.sessionIncarnation) {
+            return deny(
+              ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED,
+              "handoff acknowledgement belongs to a stale session incarnation",
+              {
+                sessionId: acknowledgement.sessionId,
+                acknowledgementIncarnation: acknowledgement.sessionIncarnation,
+                currentIncarnation: session.value.incarnation,
+              },
+            );
+          }
+          return allow(ReasonCode.OK, undefined);
+        },
+      },
+    });
     this.repair.attach({ ownerAuthority: this.ownerAuthority });
     this.ceo.attach({
       ownerAuthority: this.ownerAuthority,
