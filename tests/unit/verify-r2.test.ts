@@ -1,4 +1,4 @@
-import { readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -189,6 +189,65 @@ describe("round-2 verification isolation and candidate freshness", () => {
     }
   });
 
+  sandboxIt("#164 returns the child-cleanup failure when reaping cannot be proved", async () => {
+    const repo = makeRepo();
+    const shimDirectory = tempDir("acp-ps-shim-");
+    const shim = join(shimDirectory, "ps");
+    const observed = join(shimDirectory, "group-reap-observed");
+    writeFileSync(
+      shim,
+      `#!/bin/sh
+if [ "$1" = "-o" ] && [ "$2" = "pid=" ] && [ "$3" = "-g" ]; then
+  : > ${JSON.stringify(observed)}
+  printf '99999\\n'
+  exit 0
+fi
+exec /bin/ps "$@"
+`,
+    );
+    chmodSync(shim, 0o700);
+
+    const previousPath = process.env.PATH;
+    try {
+      // The process cap deliberately prevents a real escaped child. This makes only the
+      // post-run proof unavailable, so the assertion exercises the fail-closed evidence gate.
+      process.env.PATH = `${shimDirectory}:${previousPath ?? ""}`;
+      const outcome = await runSandboxed({
+        command: parseVerificationCommand({ id: "unreaped", argv: ["node", "-e", "process.exit(0)"] }),
+        worktreePath: repo,
+      });
+      expect(existsSync(observed)).toBe(true);
+      expect(outcome).toMatchObject({
+        status: "ERROR",
+        reasonCode: ReasonCode.SANDBOX_CHILD_CLEANUP_FAILED,
+        enforcement: { childContainmentEnforced: false },
+      });
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  sandboxIt("#166/#233 turns hard CPU exhaustion into a resource-limit error", async () => {
+    const repo = makeRepo();
+    const outcome = await runSandboxed({
+      command: parseVerificationCommand({
+        id: "cpu-limit",
+        argv: ["node", "-e", "while(1){}"],
+        maxCpuSeconds: 1,
+        timeoutSeconds: 3,
+        maxMemoryMb: 256,
+      }),
+      worktreePath: repo,
+    });
+    expect(outcome).toMatchObject({
+      status: "ERROR",
+      signal: "SIGXCPU",
+      reasonCode: ReasonCode.SANDBOX_RESOURCE_LIMIT_EXCEEDED,
+      enforcement: { resourceLimitsEnforced: true, childContainmentEnforced: true },
+    });
+  });
+
   it("#165 treats a deleted frozen base branch as snapshot drift", async () => {
     const repo = makeRepo({ "a.txt": "base\n" });
     gitSync(repo, ["checkout", "-q", "-b", "task/base-delete"]);
@@ -249,7 +308,8 @@ describe("round-2 verification isolation and candidate freshness", () => {
     expect(normal.peakRssMb).toBeTypeOf("number");
   });
 
-  it("#348/#349 selects Linux hard memory enforcement", () => {
+  it("#313/#348/#349 states the Darwin and Linux memory enforcement split", () => {
+    expect(memoryLimitForPlatform("darwin")).toBe("observed");
     expect(memoryLimitForPlatform("linux")).toBe("hard");
   });
 
@@ -344,7 +404,16 @@ describe("round-2 verification isolation and candidate freshness", () => {
       commands: manifest.verificationCommands,
       contractDigest: snapshot.contractDigest,
     });
-    expect(refused).toMatchObject({ allowed: false, reasonCode: ReasonCode.VERIFICATION_REPOSITORY_UNTRUSTED });
+    expect(refused).toEqual({
+      allowed: false,
+      reasonCode: ReasonCode.VERIFICATION_REPOSITORY_UNTRUSTED,
+      message: "repository is not owner-trusted",
+      evidence: {
+        runId: run.runId,
+        identity: "github:acme/fixture",
+        trustClass: "UNTRUSTED",
+      },
+    });
 
     const temporaryHarness = makeHarness();
     const temporaryPath = makeRepo();
@@ -387,7 +456,7 @@ describe("round-2 verification isolation and candidate freshness", () => {
       contractDigest: dispatched.value.contractDigest,
       runScoped: true,
     });
-    expect(crossRun).toMatchObject({
+    expect(crossRun).toEqual({
       allowed: false,
       reasonCode: ReasonCode.VERIFICATION_GAP,
       message: "temporary repository is bound to a different run",
