@@ -15,6 +15,9 @@ export const verificationCommandSchema = z
     cwd: z.string().default("."),
     timeoutSeconds: z.number().int().positive().max(24 * 3600).default(1200),
     envAllowlist: z.array(z.string()).default([]),
+    // `allowlist` is retained in the wire union solely to return an explicit migration
+    // error for old manifests. Seatbelt cannot enforce a destination allowlist, so it is
+    // not a production-supported network contract until a proxy/firewall backend exists.
     network: z.enum(["deny", "allowlist", "allow"]).default("deny"),
     networkAllowlist: z.array(z.string()).default([]),
     // §17.7's authoritative input count has no optional-evidence counterpart at the
@@ -54,10 +57,17 @@ export const verificationCommandSchema = z
         path: ["cwd"],
       });
     }
-    if (cmd.network === "allowlist" && cmd.networkAllowlist.length === 0) {
+    if (cmd.network === "allowlist") {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "network=allowlist requires a non-empty networkAllowlist",
+        message: "network=allowlist is not production-supported: no runtime backend can enforce it",
+        path: ["network"],
+      });
+    }
+    if (cmd.network !== "allowlist" && cmd.networkAllowlist.length > 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "networkAllowlist is unsupported unless a future enforceable network backend is installed",
         path: ["networkAllowlist"],
       });
     }

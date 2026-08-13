@@ -61,6 +61,8 @@ mutation:
 ```bash
 node dist/cli/agentctl.js help
 node dist/cli/agentctl.js daemon status
+node dist/cli/agentctl.js project register my-project /abs/path/to/checkout
+node dist/cli/agentctl.js doctor
 ```
 
 For a disposable local experiment, set a fresh local MCP token and start the daemon in the
@@ -94,6 +96,67 @@ appeared with status `passed`. Behavioural coverage and production-entry-point c
 not measured, so this report is not proof that a requirement is met in the running system.
 `node scripts/ssot-report.mjs` reconciles the tracked review findings and declared work items
 with GitHub issues; it does not certify the semantic correctness of a code change.
+
+- a verification command that needs no installed dependencies (this repo's
+  `scripts/verify-reason-codes.mjs` is one — it checks the reason-code contract with
+  nothing but Node),
+- `evidenceMode: "TRUSTED_CI"`, letting CI do the dependency-heavy work and having the
+  control plane accept the result only at the exact candidate head from an approved
+  workflow digest.
+
+`network: "allowlist"` is not a supported workaround: the manifest schema rejects it
+until a proxy or firewall backend can enforce destination policy.
+
+## Persistence
+
+21 tables: the eleven PRD §30.1 names plus ten additions, each justified inline in
+[`src/db/schema.sql`](src/db/schema.sql) by the independent lifecycle, integrity constraint
+or query it exists for — §40 requires exactly that justification. `tasks` and
+`task_dependencies` are separate from `task_executions` because a task node outlives its
+attempts and the DAG is queried in both directions; `verification_results` exists because
+the completeness gate *counts* rows and a JSON blob cannot be counted or uniquely
+constrained; `handoffs` is project-scoped and a replacement happens precisely when the run
+count is zero, so it cannot live in `run_artifacts`.
+
+Event sourcing, an audit hash chain, a generic policy DSL, distributed consensus and a
+cloud database are all deliberately absent (§30.4).
+
+## Provider capacity
+
+Capacity is collected through each provider CLI's interactive `/usage` surface. The
+collectors accept only explicit remaining-quota readings and fail closed on a trust prompt,
+activity-only output, timeout, or parser failure; a daemon JSON mirror is not an operator
+input. There is no `UNKNOWN` route.
+See [docs/capacity-source.md](docs/capacity-source.md).
+
+## Known boundaries
+
+- **Production gate publishing needs a GitHub App.** GitHub does not permit personal
+  access tokens to create check runs, so `acp-production-gate` requires an App
+  installation with `checks:write`. The kernel's predicate logic is verified against a
+  modelled GitHub API, including that a same-named check from any other creator is
+  refused.
+- **Buzz delivery is unverified live.** The transport is implemented over the `buzz` CLI
+  but `BUZZ_PRIVATE_KEY` is not configured in this environment, so delivery has only been
+  exercised through the in-memory transport.
+- Strong isolation for untrusted repositories, a web dashboard, REST/GraphQL and
+  automatic Level 6 routing promotion are backlog (PRD §43).
+
+## Where the remaining work lives
+
+The GitHub issue tracker is the single source of truth. Every finding from both independent
+review rounds, every PRD §42 acceptance item that a build cannot satisfy, every deployment
+prerequisite and every deliberate trade-off is an issue, labelled by severity, round and
+area. `node scripts/ssot-report.mjs` reconciles the tracker against `evidence/review/`,
+`evidence/review-round1/` and the declared work items, and exits non-zero if anything is
+missing. See [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) for the query table and the current
+verdict.
+
+## Documents
+
+- [Ticket DAG](docs/tickets/tickets.json) — 44 atomic tickets across 7 milestones
+- [ADRs](docs/adr/) — the eight decisions that shape the implementation
+- [Traceability](evidence/traceability.md) — requirement → scenario → executable test
 
 ## Public-repository posture
 

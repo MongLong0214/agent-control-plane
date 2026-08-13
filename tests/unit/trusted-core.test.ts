@@ -640,16 +640,30 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(safe.TZ).toBe("Etc/UTC");
   });
 
-  it("refuses network=allowlist rather than pretending to enforce it", async () => {
+  it("rejects network=allowlist at the contract and retains a runtime stop for legacy objects", async () => {
     const repo = makeRepo();
-    const outcome = await runSandboxed({
-      command: parseVerificationCommand({
+    expect(() => parseVerificationCommand({
+      id: "net",
+      argv: ["node", "-e", "console.log(1)"],
+      network: "allowlist",
+      networkAllowlist: ["registry.npmjs.org"],
+      timeoutSeconds: 30,
+    })).toThrow(/not production-supported/);
+
+    // The runtime boundary remains a second line of defence for a legacy object that
+    // reached it without the public schema parser. Removing either check makes this
+    // regression fail rather than allowing a falsely-described network policy.
+    const legacyCommand = {
+      ...parseVerificationCommand({
         id: "net",
         argv: ["node", "-e", "console.log(1)"],
-        network: "allowlist",
-        networkAllowlist: ["registry.npmjs.org"],
         timeoutSeconds: 30,
       }),
+      network: "allowlist" as const,
+      networkAllowlist: ["registry.npmjs.org"],
+    };
+    const outcome = await runSandboxed({
+      command: legacyCommand,
       worktreePath: repo,
     });
     expect(outcome.status).toBe("ERROR");

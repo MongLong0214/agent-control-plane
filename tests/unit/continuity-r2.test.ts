@@ -1454,7 +1454,7 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(result).toBe("UNAVAILABLE");
   });
 
-  it("#132 refuses to falsely attest reviewer isolation when Codex cannot remove tools", async () => {
+  it("#132 refuses an isolated Codex answer without a freshly proved provider session", async () => {
     const clock = new ManualClock("2026-08-12T00:00:00.000Z");
     const packetRoot = tempDir("acp-reviewer-packet-");
     const adapter = new CodexCliAdapter({
@@ -1481,7 +1481,7 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(result.ok).toBe(false);
     expect(result.isolationAttested).toBe(false);
     expect(result.isolationReasonCode).toBe(ReasonCode.ISOLATION_LOST);
-    expect(result.error).toContain("tools:none");
+    expect(result.error).toContain("freshly proved provider session");
   });
 });
 

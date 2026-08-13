@@ -10,8 +10,13 @@ import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
 import { BlindReviewGate, __testing } from "../../src/review/blind-review.ts";
 import { CandidatePipeline } from "../../src/run/candidate-pipeline.ts";
 import { canonical } from "../../src/guard/workspace-probe.ts";
-import { ClaudeCliAdapter, CodexCliAdapter, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
-import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
+import { ClaudeCliAdapter, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
+import {
+  ProviderSessionProvisionError,
+  type InvocationRequest,
+  type InvocationResult,
+  type SessionSpec,
+} from "../../src/runtime/provider.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import type { CandidateSnapshot } from "../../src/snapshot/candidate-snapshot.ts";
@@ -232,6 +237,45 @@ class HealthyProbeClaudeAdapter extends ClaudeCliAdapter {
     };
   }
 }
+
+/** A production-eligible test adapter used only to prove the gate's fail-closed policy. */
+class IsolationUnsupportedGptAdapter extends TestProductionAdapter {
+  readonly supportsReviewerIsolation = false;
+}
+
+/** Simulates a real GPT reviewer whose packet/profile/provider-id proof cannot be made. */
+class ProviderIdentityFailureGptAdapter extends TestProductionAdapter {
+  readonly supportsReviewerIsolation = true;
+  readonly requiresReviewerProviderSessionProof = true;
+
+  override async startSession(_spec: SessionSpec): Promise<never> {
+    throw new ProviderSessionProvisionError(
+      ReasonCode.ISOLATION_LOST,
+      "live reviewer isolation proof is unavailable",
+    );
+  }
+}
+
+const gateWithReviewerPreferences = (
+  setup: Awaited<ReturnType<typeof prepareReviewedInputs>>,
+  preferred: TestProductionAdapter,
+  fallback: TestProductionAdapter,
+) => new BlindReviewGate(
+  setup.harness.cp.clock,
+  setup.harness.cp.db,
+  setup.harness.cp.audit,
+  setup.harness.cp.artifacts,
+  setup.harness.cp.evidenceWritersForTests().BLIND_REVIEW,
+  setup.harness.cp.sessions,
+  setup.harness.cp.bindings,
+  setup.harness.cp.providers,
+  setup.harness.cp.repositories,
+  setup.harness.cp.telemetry,
+  {
+    preferred: { provider: preferred.provider, model: "gpt-5.6-sol", effort: "xhigh" },
+    fallbacks: [{ provider: fallback.provider, model: "opus", effort: null }],
+  },
+);
 
 describe("round-2 blind-review regressions", () => {
   it("#125 rejects a caller-fabricated PASS verification report", async () => {
@@ -484,18 +528,9 @@ describe("round-2 blind-review regressions", () => {
     await first;
   });
 
-  it("#333 skips a preferred adapter that cannot attest reviewer isolation", async () => {
+  it("#333 does not lower mandatory GPT review to Claude when GPT lacks isolation", async () => {
     const setup = await prepareReviewedInputs();
-    const preferred = new CodexCliAdapter({
-      clock: setup.harness.clock,
-      capacityFile: join(setup.harness.root, "gpt-capacity.json"),
-      binary: "codex-not-used-by-reviewer-capability-test",
-    });
-    let probes = 0;
-    preferred.probeRuntime = async () => {
-      probes += 1;
-      return "HEALTHY";
-    };
+    const preferred = new IsolationUnsupportedGptAdapter(setup.harness.clock, "gpt");
     const fallback = new TestProductionAdapter(setup.harness.clock, "claude");
     fallback.script({
       match: /Candidate review/,
@@ -504,28 +539,77 @@ describe("round-2 blind-review regressions", () => {
     setup.harness.cp.providers.register(preferred);
     setup.harness.cp.providers.register(fallback);
 
-    const gate = new BlindReviewGate(
-      setup.harness.cp.clock,
-      setup.harness.cp.db,
-      setup.harness.cp.audit,
-      setup.harness.cp.artifacts,
-      setup.harness.cp.evidenceWritersForTests().BLIND_REVIEW,
-      setup.harness.cp.sessions,
-      setup.harness.cp.bindings,
-      setup.harness.cp.providers,
-      setup.harness.cp.repositories,
-      setup.harness.cp.telemetry,
-      {
-        preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
-        fallbacks: [{ provider: "claude", model: "opus", effort: null }],
-      },
-    );
+    const gate = gateWithReviewerPreferences(setup, preferred, fallback);
     const result = await invokeGate(gate, setup);
 
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
+    expect(fallback.invocations).toHaveLength(0);
+    expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
+  });
+
+  it("does not call an absent GPT adapter an outage and silently use Claude", async () => {
+    const setup = await prepareReviewedInputs();
+    const absentPreferred = new TestProductionAdapter(setup.harness.clock, "gpt");
+    const fallback = new TestProductionAdapter(setup.harness.clock, "claude");
+    fallback.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    // Register only Claude. A missing GPT adapter has no live health/capacity measurement.
+    setup.harness.cp.providers.register(fallback);
+
+    const result = await invokeGate(gateWithReviewerPreferences(setup, absentPreferred, fallback), setup);
+
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.ISOLATION_LOST });
+    expect(fallback.invocations).toHaveLength(0);
+    // Removing the preferred-adapter refusal turns this into a deceptively successful
+    // Claude review even though no GPT unavailability was ever measured.
+  });
+
+  it("falls back to Claude only after GPT is actually unavailable and records why", async () => {
+    const setup = await prepareReviewedInputs();
+    const preferred = new TestProductionAdapter(setup.harness.clock, "gpt");
+    preferred.setRuntimeHealth("UNAVAILABLE");
+    const fallback = new TestProductionAdapter(setup.harness.clock, "claude");
+    fallback.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    setup.harness.cp.providers.register(preferred);
+    setup.harness.cp.providers.register(fallback);
+
+    const result = await invokeGate(gateWithReviewerPreferences(setup, preferred, fallback), setup);
+
     expect(result.allowed).toBe(true);
-    expect(result.reasonCode).toBe(ReasonCode.REVIEW_PASS);
     expect(result.allowed && result.value.provider).toBe("claude");
-    expect(probes).toBe(0);
+    expect(preferred.invocations).toHaveLength(0);
+    expect(fallback.invocations).toHaveLength(1);
+    expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toEqual([
+      expect.objectContaining({
+        runId: setup.run.runId,
+        evidence: expect.objectContaining({ from: "gpt", provider: "claude", reason: "runtime unavailable" }),
+      }),
+    ]);
+  });
+
+  it("does not fall back when GPT provider-session isolation proof fails", async () => {
+    const setup = await prepareReviewedInputs();
+    const preferred = new ProviderIdentityFailureGptAdapter(setup.harness.clock, "gpt");
+    const fallback = new TestProductionAdapter(setup.harness.clock, "claude");
+    fallback.script({
+      match: /Candidate review/,
+      text: reviewerPass([`${setup.identity}:src/app.js`]),
+    });
+    setup.harness.cp.providers.register(preferred);
+    setup.harness.cp.providers.register(fallback);
+
+    const result = await invokeGate(gateWithReviewerPreferences(setup, preferred, fallback), setup);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
+    expect(fallback.invocations).toHaveLength(0);
+    expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
   });
 
   it("#360 refuses a reviewer rather than attest an unbounded provider network", async () => {
@@ -804,6 +888,11 @@ describe("round-2 blind-review regressions", () => {
     expect(prompt).toContain("outputDigest");
     expect(prompt).toContain("reasonCode");
     expect(prompt).toContain("gaps");
+    expect(prompt).toMatch(/Packet digest: sha256:[a-f0-9]{64}/);
+    expect(prompt).toContain("Required coverage:");
+    expect(prompt).toContain(`${setup.identity}:src/app.js`);
+    // Removing the packet digest or coverage manifest leaves a reviewer able to return a
+    // syntactically valid PASS without seeing the complete packet commitment.
   });
 
   it("#135 range-splits an oversized single-file patch", () => {
