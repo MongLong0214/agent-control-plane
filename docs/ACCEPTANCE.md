@@ -168,6 +168,26 @@ rejected until a proxy/firewall backend can enforce destination policy; a manife
 advertise an allowlist that seatbelt cannot apply. This repository uses the first for local
 verification (`scripts/verify-reason-codes.mjs`) and the third for its typecheck.
 
+**P1-15's execution boundary is confinement, not argv inspection.** Verification commands are
+candidate-supplied code by design. The executable allowlist is defence in depth: it refuses a
+contract that declares `sh`, `env`, `arch` or another non-build executable, but it cannot stop an
+allowlisted interpreter such as `node`, `npm`, `npx` or `vitest` from execing a shell. The seatbelt
+profile and resource wrapper are the boundary. `tests/unit/handoff-p1-boundaries.test.ts` execs
+`/bin/sh` out of an allowlisted `node` and records the actual kernel result for production-layout
+state reads, writes outside the worktree, network, fork under `RLIMIT_NPROC`, `SIGXCPU` and the
+observed RSS breach. `tests/unit/trusted-core.test.ts` carries the same property for the default
+wrapper, where the fork limit means the shell is never reached at all. Provider-only reviewer
+egress remains the named macOS residual in [#419](STATUS.md).
+
+Candidate containment is proved independently of the original process group. The trusted wrapper
+stops the forked candidate before `exec`, records its pid and `ps` start-time identity in the
+scratch rendezvous, and the supervisor releases and later reaps that exact pid as well as the
+original group. This covers a same-process `setsid()` followed by wrapper death; the regression is
+`#164 tracks a same-process setsid escape after it kills the wrapper` in
+`tests/unit/verify-r2.test.ts`. If the identity handshake, direct pid reap, or group reap cannot
+be proved, `enforcement.childContainmentEnforced` is `false`,
+`enforcement.childContainmentReason` names the gap, and the outcome cannot claim a contained pass.
+
 ## Operating requirements the hardening pass introduced
 
 These are configuration facts an operator has to satisfy; the code fails closed without
@@ -219,8 +239,8 @@ words:
 
 - **Memory is bounded by observation where the kernel will not honour a hard limit.** Darwin
   accepts `setrlimit(RLIMIT_AS, …)` and then ignores it, so an uninstallable hard limit meant
-  *no verification could ever PASS* — not caution, an inability to verify anything. CPU and
-  process-count limits are hard requirements everywhere and still fail closed; memory falls
+  *no verification could ever PASS* — not caution, an inability to verify anything. CPU is a
+  hard requirement everywhere and still fails closed; memory falls
   back to RSS observation, and the outcome records which mechanism was in force
   (`enforcement.memoryLimit: "hard" | "observed"`, `src/verify/sandbox.ts`). A reader of the
   evidence can tell the difference, which is the part that matters. Revisit when verification

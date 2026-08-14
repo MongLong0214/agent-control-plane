@@ -57,6 +57,10 @@ export interface GitHubKernelOptions {
 /**
  * Process-local GitHub App HTTPS transport. The credential store mints and retains the
  * installation token internally; this client can receive only decoded API responses.
+ *
+ * Requests do not invoke `gh`: the installation token is consumed by
+ * `TrustedCredentialStore` inside this process and is never placed in a child environment
+ * (CP-HI-05).
  */
 export class GitHubAppClient implements GitHubClient {
   constructor(private readonly credentials: TrustedCredentialStore) {}
@@ -1130,56 +1134,67 @@ export class GitHubKernel {
    * question, and held under the generation the owner currently has.
    */
   private assertClaim(runId: string, repositoryIdentity: string, branch: string): Decision<void> {
-    const rows = this.db.all<{
-      claim_id: string;
-      branch: string | null;
-      status: string;
-      expires_at: string;
-      owner_binding_generation: number;
-    }>(
-      `SELECT claim_id, branch, status, expires_at, owner_binding_generation
-         FROM resource_claims
-        WHERE run_id = ? AND repository_identity = ?`,
-      [runId, repositoryIdentity],
-    );
-    if (rows.length === 0) {
-      return deny(ReasonCode.MERGE_CLAIM_INVALID, "no resource claim exists for this repository", {
-        runId,
-        repositoryIdentity,
-      });
-    }
+    return this.db.tx(() => {
+      // The partial unique index treats only HELD rows as occupying a resource. Mark
+      // overdue rows before the guard reads them so the decision and the index agree in
+      // the same transaction, including the exact expiry boundary.
+      const nowIso = this.clock.nowIso();
+      this.db.run(
+        `UPDATE resource_claims SET status = 'EXPIRED'
+          WHERE status = 'HELD' AND expires_at <= ?`,
+        [nowIso],
+      );
+      const rows = this.db.all<{
+        claim_id: string;
+        branch: string | null;
+        status: string;
+        expires_at: string;
+        owner_binding_generation: number;
+      }>(
+        `SELECT claim_id, branch, status, expires_at, owner_binding_generation
+           FROM resource_claims
+          WHERE run_id = ? AND repository_identity = ?`,
+        [runId, repositoryIdentity],
+      );
+      if (rows.length === 0) {
+        return deny(ReasonCode.MERGE_CLAIM_INVALID, "no resource claim exists for this repository", {
+          runId,
+          repositoryIdentity,
+        });
+      }
 
-    const run = this.runs.get(runId);
-    const now = new Date(this.clock.nowIso()).getTime();
-    const onBranch = rows.filter((r) => r.branch === branch);
-    if (onBranch.length === 0) {
-      return deny(ReasonCode.MERGE_CLAIM_INVALID, "no claim covers the branch being merged", {
-        runId,
-        repositoryIdentity,
-        branch,
-        claimed: rows.map((r) => r.branch),
-      });
-    }
-    const valid = onBranch.find(
-      (r) =>
-        r.status === "HELD" &&
-        new Date(r.expires_at).getTime() > now &&
-        r.owner_binding_generation === run?.ownerBindingGeneration,
-    );
-    if (!valid) {
-      return deny(ReasonCode.MERGE_CLAIM_INVALID, "the claim on this branch is not currently valid", {
-        runId,
-        repositoryIdentity,
-        branch,
-        observed: onBranch.map((r) => ({
-          status: r.status,
-          expiresAt: r.expires_at,
-          generation: r.owner_binding_generation,
-        })),
-        ownerGeneration: run?.ownerBindingGeneration ?? null,
-      });
-    }
-    return allow(ReasonCode.OK, undefined);
+      const run = this.runs.get(runId);
+      const now = new Date(nowIso).getTime();
+      const onBranch = rows.filter((r) => r.branch === branch);
+      if (onBranch.length === 0) {
+        return deny(ReasonCode.MERGE_CLAIM_INVALID, "no claim covers the branch being merged", {
+          runId,
+          repositoryIdentity,
+          branch,
+          claimed: rows.map((r) => r.branch),
+        });
+      }
+      const valid = onBranch.find(
+        (r) =>
+          r.status === "HELD" &&
+          new Date(r.expires_at).getTime() > now &&
+          r.owner_binding_generation === run?.ownerBindingGeneration,
+      );
+      if (!valid) {
+        return deny(ReasonCode.MERGE_CLAIM_INVALID, "the claim on this branch is not currently valid", {
+          runId,
+          repositoryIdentity,
+          branch,
+          observed: onBranch.map((r) => ({
+            status: r.status,
+            expiresAt: r.expires_at,
+            generation: r.owner_binding_generation,
+          })),
+          ownerGeneration: run?.ownerBindingGeneration ?? null,
+        });
+      }
+      return allow(ReasonCode.OK, undefined);
+    });
   }
 
   /** §24.7 — repositories merge in declared order; a pending predecessor blocks. */

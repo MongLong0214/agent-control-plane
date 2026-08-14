@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 
@@ -15,7 +15,7 @@ import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
-import { ensurePrivateDirectory } from "../db/state-preflight.ts";
+import { databaseSidecarPaths, ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import {
   ManagedWriteGuard,
@@ -74,6 +74,8 @@ export interface ControlPlaneConfig {
   githubAppEnvFile?: string;
   /** Launcher-provided path override for the App private key. */
   githubAppPrivateKeyPath?: string;
+  /** Neutral, daemon-managed runtime root for CTO/continuity sessions. */
+  runtimeRoot?: string;
   ctoPreference?: CtoPreference;
   reviewer?: { preferred: ReviewerPreference; fallbacks: ReviewerPreference[] };
   capacity?: CapacityOptions;
@@ -123,6 +125,7 @@ export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): C
   ...(process.env["ACP_GITHUB_APP_PRIVATE_KEY_PATH"]
     ? { githubAppPrivateKeyPath: process.env["ACP_GITHUB_APP_PRIVATE_KEY_PATH"] }
     : {}),
+  runtimeRoot: join(root, "runtime"),
   // §21 — owner identities are declared out of band, one per line as `channel:actor` in
   // `<root>/owner-identities`. An absent or empty file means this deployment has no owner,
   // so no human gate can be satisfied; that is the safe reading, not a permissive one.
@@ -146,6 +149,24 @@ export const readOwnerIdentities = (file: string): OwnerIdentity[] => {
       return [{ channel: line.slice(0, at), actor: line.slice(at + 1) }];
     });
 };
+
+/**
+ * Paths below the production state root that verification must not read.
+ *
+ * The state root is derived from the database location, so backups, manifests, capacity
+ * readings, secrets, locks and runtime files are covered without a hand-maintained filename
+ * list. The database family is also named explicitly: SQLite's WAL, shared-memory and
+ * rollback-journal files are siblings of the database rather than children of it.
+ */
+export const controlPlaneStateDenyReadPaths = (
+  databasePath: string,
+  additionalRoots: readonly string[] = [],
+): string[] => [
+  dirname(databasePath),
+  databasePath,
+  ...databaseSidecarPaths(databasePath),
+  ...additionalRoots,
+];
 
 /**
  * Composition root.
@@ -302,6 +323,8 @@ export class ControlPlane {
       ...(config.githubAppEnvFile ? { appEnvFile: config.githubAppEnvFile } : {}),
       ...(config.githubAppPrivateKeyPath ? { privateKeyPath: config.githubAppPrivateKeyPath } : {}),
     });
+    const runtimeRoot = config.runtimeRoot ?? join(dirname(config.databasePath), "runtime");
+    ensurePrivateDirectory(runtimeRoot);
     this.db = new Db(config.databasePath);
     this.audit = new AuditLog(this.db, this.clock);
     this.artifacts = new ArtifactStore(this.db, this.clock);
@@ -395,7 +418,7 @@ export class ControlPlane {
     });
     this.continuity = new ContinuityKernel(
       this.db, this.clock, this.audit, this.capacity, this.providers,
-      this.projects, this.runs, this.sessions, this.bindings, this.telemetry,
+      this.projects, this.runs, this.sessions, this.bindings, this.telemetry, runtimeRoot,
     );
     this.capacity.attach({
       providerFailureContinuity: {
@@ -406,6 +429,7 @@ export class ControlPlane {
       this.db, this.clock, this.audit, this.projects, this.sessions, this.bindings,
       this.providers, this.outbox, this.runs,
       config.ctoPreference ?? { provider: "claude", model: "opus", effort: null },
+      runtimeRoot,
     );
     this.ceo = new ProductionGate(
       this.db, this.clock, this.audit, this.artifacts,
@@ -437,13 +461,21 @@ export class ControlPlane {
     this.verification.attachCi(this.github.ciEvidenceSource());
     this.verification.attachManifests((digest) => this.projects.manifest(digest));
     this.verification.attachRuns((runId) => this.runs.get(runId));
-    // The database *file*, not its directory: the worktree root lives beside it, and
-    // denying the parent would stop a verification command from reading its own worktree.
-    this.verification.setDenyReadPaths([
+    // Production lays the disposable worktrees below the state root. The sandbox denies
+    // that encompassing root and then explicitly re-allows only the current worktree, so
+    // the root's other children remain unreadable. The database family is derived from the
+    // same path for SQLite's WAL, shared-memory and rollback-journal siblings.
+    this.verification.setDenyReadPaths(controlPlaneStateDenyReadPaths(config.databasePath, [
+      // The production defaults are already below dirname(databasePath). Keep explicit
+      // non-default roots denied as well, so customizing a deployment cannot weaken the
+      // previous secret/capacity boundary or leave a sibling managed worktree readable.
+      config.worktreeRoot,
+      config.capacityDir,
       config.secretsDir,
-      config.databasePath,
+      runtimeRoot,
+      // The App private key and its env file: added after this lane was branched.
       ...this.credentials.sensitivePaths(),
-    ]);
+    ]));
 
     this.repair = new RepairService(
       this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees,

@@ -334,6 +334,7 @@ export class Db {
       assertLoadBearingInvariants(this.#raw, {
         includeMigrationLedger: true,
         includeBaselineLedger: migration.toVersion >= 14,
+        schemaVersion: migration.toVersion,
       });
       this.recordMigrationReceipt({
         version: migration.toVersion,

@@ -1,9 +1,13 @@
+import { join } from "node:path";
+
 import type { Clock } from "../../src/core/clock.ts";
 import { sha256 } from "../../src/core/digest.ts";
 import type {
   InvocationRequest,
   InvocationResult,
   ReviewerEgressRecord,
+  SessionHandle,
+  SessionSpec,
 } from "../../src/runtime/provider.ts";
 import { REVIEWER_PROVIDER_ENDPOINTS } from "../../src/runtime/provider.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
@@ -23,6 +27,16 @@ export class TestProductionAdapter extends ScriptedAdapter {
 
   constructor(clock: Clock, provider = "scripted") {
     super(clock, provider);
+  }
+
+  /**
+   * The provider may allocate a concrete workdir below the requested managed root. Keeping
+   * those values different makes lifecycle tests prove that the returned routing fact, not
+   * the request echo, is what gets persisted.
+   */
+  override async startSession(spec: SessionSpec): Promise<SessionHandle> {
+    const handle = await super.startSession(spec);
+    return { ...handle, workdir: join(spec.workdir, "provider-returned-workdir") };
   }
 
   /**

@@ -418,6 +418,74 @@ describe("round-2 outbox fencing", () => {
   });
 });
 
+describe("claim-registry expiry sweeps", () => {
+  it("P1-03 heldByRun expires a stale row before returning claims", () => {
+    const { core, seeded } = seededCore();
+    const claims = new ClaimRegistry(core.db, core.clock, core.audit, core.bindings);
+    core.db.run(`UPDATE resource_claims SET expires_at = ? WHERE run_id = ?`, [core.clock.nowIso(), seeded.runId]);
+
+    expect(claims.heldByRun(seeded.runId)).toEqual([]);
+    expect(core.db.get<{ status: string }>(`SELECT status FROM resource_claims WHERE run_id = ?`, [seeded.runId]))
+      .toEqual({ status: "EXPIRED" });
+  });
+
+  it("P1-03 held expires stale rows before listing the registry", () => {
+    const { core, seeded } = seededCore();
+    const claims = new ClaimRegistry(core.db, core.clock, core.audit, core.bindings);
+    core.db.run(`UPDATE resource_claims SET expires_at = ? WHERE run_id = ?`, [core.clock.nowIso(), seeded.runId]);
+
+    expect(claims.held()).toEqual([]);
+    expect(core.db.get<{ status: string }>(`SELECT status FROM resource_claims WHERE run_id = ?`, [seeded.runId]))
+      .toEqual({ status: "EXPIRED" });
+  });
+
+  it("P1-03 advisoryOverlaps expires a stale advisory row before evaluating overlap", () => {
+    const { core, seeded } = seededCore();
+    const otherRunId = "run_advisory_expired";
+    core.db.run(
+      `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal,
+                         contract_digest, created_at)
+       VALUES (?, ?, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', 'expired advisory', 'sha256:c', ?)`,
+      [otherRunId, seeded.projectId, core.clock.nowIso()],
+    );
+    core.db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, declared_path, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('expired_advisory', ?, 'src/other/file.ts', ?, ?, ?, ?, ?, 'HELD')`,
+      [
+        seeded.identity,
+        otherRunId,
+        seeded.sessionId,
+        seeded.generation,
+        core.clock.nowIso(),
+        core.clock.nowIso(),
+      ],
+    );
+    const claims = new ClaimRegistry(core.db, core.clock, core.audit, core.bindings);
+
+    expect(claims.advisoryOverlaps(seeded.identity, seeded.runId, ["src/other/request.ts"])).toEqual([]);
+    expect(core.db.get<{ status: string }>(`SELECT status FROM resource_claims WHERE claim_id = 'expired_advisory'`))
+      .toEqual({ status: "EXPIRED" });
+  });
+
+  it("P1-03 release expires a stale row before checking whether it is held", () => {
+    const { core, seeded } = seededCore();
+    const claims = new ClaimRegistry(core.db, core.clock, core.audit, core.bindings);
+    const claimId = core.db.get<{ claim_id: string }>(
+      `SELECT claim_id FROM resource_claims WHERE run_id = ?`,
+      [seeded.runId],
+    )!.claim_id;
+    core.db.run(`UPDATE resource_claims SET expires_at = ? WHERE claim_id = ?`, [core.clock.nowIso(), claimId]);
+
+    const released = claims.release(claimId, seeded.runId);
+    expect(released.allowed).toBe(false);
+    expect(released.reasonCode).toBe(ReasonCode.CLAIM_NOT_HELD);
+    expect(core.db.get<{ status: string }>(`SELECT status FROM resource_claims WHERE claim_id = ?`, [claimId]))
+      .toEqual({ status: "EXPIRED" });
+  });
+});
+
 describe("round-2 Buzz transport and authority", () => {
   it("#123/#216 writes and closes the real CLI child's stdin", async () => {
     const root = tempDir("acp-buzz-cli-");

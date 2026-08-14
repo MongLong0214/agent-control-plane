@@ -35,7 +35,10 @@ class ProductionTestAdapter implements ProviderAdapter {
   get defaultModels(): Readonly<Record<string, string>> { return this.#scripted.defaultModels; }
   setCapacity(reading: CapacityReading | null): void { this.#scripted.setCapacity(reading); }
   setRuntimeHealth(health: "HEALTHY" | "DEGRADED" | "UNAVAILABLE"): void { this.#scripted.setRuntimeHealth(health); }
-  startSession(spec: SessionSpec): Promise<SessionHandle> { return this.#scripted.startSession(spec); }
+  async startSession(spec: SessionSpec): Promise<SessionHandle> {
+    const handle = await this.#scripted.startSession(spec);
+    return { ...handle, workdir: join(spec.workdir, "provider-returned-workdir") };
+  }
   stopSession(handle: SessionHandle): Promise<void> {
     return this.#scripted.stopSession(handle);
   }
@@ -423,5 +426,12 @@ describe("failover produces a routable session (§15.7)", () => {
     expect(after.sessionId).not.toBe(before.sessionId);
     expect(after.bindingGeneration).toBe(before.bindingGeneration + 1);
     expect(probed).toEqual([after.sessionId]);
+    const provisioned = plane.cp.sessions.require(after.sessionId);
+    expect(provisioned.workdir).toBe(join(plane.root, "runtime", "provider-returned-workdir"));
+    expect(provisioned.workdir).not.toBe(process.cwd());
+    expect(() => plane.cp.db.run(
+      `UPDATE sessions SET workdir = ? WHERE session_id = ?`,
+      [join(plane.root, "another-runtime"), provisioned.sessionId],
+    )).toThrow("SESSION_WORKDIR_IMMUTABLE");
   });
 });

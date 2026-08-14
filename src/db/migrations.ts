@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -241,9 +241,42 @@ const v15: SchemaMigration = {
   checksum: () => sha256(`v15-durable-verification-worktree-ownership\n${VERIFICATION_WORKTREES_DDL}`),
 };
 
-export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13, v14, v15]);
+const SESSION_WORKDIR_DDL = `
+  CREATE TRIGGER IF NOT EXISTS sessions_workdir_immutable
+  BEFORE UPDATE OF workdir ON sessions
+  WHEN OLD.workdir IS NOT NULL
+    AND (NEW.workdir IS NULL OR NEW.workdir <> OLD.workdir)
+  BEGIN
+    SELECT RAISE(ABORT, 'SESSION_WORKDIR_IMMUTABLE');
+  END;
+`;
 
-const REQUIRED_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
+/**
+ * v16 makes the workdir recorded for a provisioned session an immutable routing fact.
+ *
+ * Written against v14 on a branch that predates v15, and renumbered on landing rather than
+ * merged into it: a migration's version is its position in an ordered chain that databases
+ * have already walked, so two migrations cannot share one number and the earlier-landed
+ * chain is the one that must not move.
+ */
+const v16: SchemaMigration = {
+  id: "v16-session-workdir-immutability",
+  fromVersion: 15,
+  toVersion: 16,
+  apply: (raw) => raw.exec(SESSION_WORKDIR_DDL),
+  checksum: () => sha256(`v16-session-workdir-immutability\n${SESSION_WORKDIR_DDL}`),
+};
+
+export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13, v14, v15, v16]);
+
+interface RequiredTrigger {
+  name: string;
+  sentinel: string;
+  /** The schema version whose migration made this trigger load-bearing. */
+  introducedIn?: number;
+}
+
+const REQUIRED_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "runs_state_transition_authority_guard", sentinel: "RUN_STATE_TRANSITION_AUTHORITY_DENIED" },
   { name: "tasks_run_work_sealed", sentinel: "TASK_INSERT_RUN_SEALED" },
   { name: "run_artifacts_evidence_authority_guard", sentinel: "EVIDENCE_WRITE_AUTHORITY_DENIED" },
@@ -251,6 +284,7 @@ const REQUIRED_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
   { name: "run_artifacts_no_delete", sentinel: "ARTIFACT_IMMUTABLE" },
   { name: "github_receipts_immutable", sentinel: "GITHUB_RECEIPT_IMMUTABLE" },
   { name: "github_receipts_no_delete", sentinel: "GITHUB_RECEIPT_IMMUTABLE" },
+  { name: "sessions_workdir_immutable", sentinel: "SESSION_WORKDIR_IMMUTABLE", introducedIn: 16 },
 ];
 
 /**
@@ -265,7 +299,7 @@ const REQUIRED_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
  * `tests/unit/schema-trigger-coverage.test.ts` now reconciles the two mechanically, so this
  * list cannot fall behind schema.sql again.
  */
-const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
+const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "manifests_immutable", sentinel: "MANIFEST_IMMUTABLE" },
   { name: "sessions_incarnation_immutable", sentinel: "SESSION_INCARNATION_IMMUTABLE" },
   { name: "sessions_secret_hash_immutable", sentinel: "SESSION_SECRET_HASH_IMMUTABLE" },
@@ -288,13 +322,13 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }
   { name: "audit_events_no_delete", sentinel: "AUDIT_APPEND_ONLY" },
 ];
 
-const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
+const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "schema_migrations_insert_authority", sentinel: "SCHEMA_MIGRATION_AUTHORITY_DENIED" },
   { name: "schema_migrations_immutable", sentinel: "SCHEMA_MIGRATION_RECEIPT_IMMUTABLE" },
   { name: "schema_migrations_no_delete", sentinel: "SCHEMA_MIGRATION_RECEIPT_IMMUTABLE" },
 ];
 
-const REQUIRED_BASELINE_LEDGER_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
+const REQUIRED_BASELINE_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "baseline_records_immutable", sentinel: "BASELINE_RECORD_IMMUTABLE" },
   { name: "baseline_records_no_delete", sentinel: "BASELINE_RECORD_IMMUTABLE" },
 ];
@@ -302,12 +336,15 @@ const REQUIRED_BASELINE_LEDGER_TRIGGERS: ReadonlyArray<{ name: string; sentinel:
 /**
  * Names alone are not enough: a same-named no-op trigger would make a corrupt database look
  * healthy. The embedded denial marker proves that each load-bearing guard still has its
- * intended enforcement body.
+ * intended enforcement body. Historical backups are checked against the registry as it
+ * existed at their recorded schema version, so a v11 image is not rejected merely because
+ * a later migration added another load-bearing trigger.
  */
 export const assertLoadBearingInvariants = (
   raw: Database.Database,
-  options: { includeMigrationLedger: boolean; includeBaselineLedger?: boolean },
+  options: { includeMigrationLedger: boolean; includeBaselineLedger?: boolean; schemaVersion?: number },
 ): void => {
+  const schemaVersion = options.schemaVersion ?? SCHEMA_VERSION;
   const expected = [
     ...REQUIRED_SCHEMA_TRIGGERS,
     ...(options.includeMigrationLedger
@@ -316,6 +353,7 @@ export const assertLoadBearingInvariants = (
     ...(options.includeBaselineLedger ? REQUIRED_BASELINE_LEDGER_TRIGGERS : []),
   ];
   for (const trigger of expected) {
+    if (trigger.introducedIn !== undefined && trigger.introducedIn > schemaVersion) continue;
     const row = raw
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
       .get(trigger.name) as { sql?: string | null } | undefined;

@@ -813,15 +813,16 @@ describe("baseline boundary contracts", () => {
     expect(parseRepoFactoryResult(result).allowed).toBe(true);
     expect(parseRepoFactoryResult({ ...result, unversionedExtra: true }).allowed).toBe(false);
     expect(parseRepoFactoryResult({ ...result, schema: "repo-factory.result.v3" }).allowed).toBe(false);
-    expect(SCHEMA_VERSION).toBe(15);
+    expect(SCHEMA_VERSION).toBe(16);
     expect(migrationChainFrom(12).map((migration) => migration.id)).toEqual([
       "v13-finalization-state-machine",
       "v14-baseline-evidence-ledger",
       "v15-durable-verification-worktree-ownership",
+      "v16-session-workdir-immutability",
     ]);
   });
 
-  it("opens a v13 database through production construction and applies v14", () => {
+  it("opens a v13 database through production construction and applies the rest of the chain", () => {
     const harness = makeHarness();
     const databasePath = harness.cp.config.databasePath;
     harness.cp.close();
@@ -862,13 +863,25 @@ describe("baseline boundary contracts", () => {
 
     const migrated = new Db(databasePath);
     try {
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(15);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(
         migrated.get<{ migration_id: string; checksum: string }>(
           "SELECT migration_id, checksum FROM schema_migrations WHERE version = 14",
         ),
       ).toEqual({
         migration_id: "v14-baseline-evidence-ledger",
+        checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      });
+      expect(migrated.get<{ migration_id: string; checksum: string }>(
+        "SELECT migration_id, checksum FROM schema_migrations WHERE version = 15",
+      )).toEqual({
+        migration_id: "v15-durable-verification-worktree-ownership",
+        checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      });
+      expect(migrated.get<{ migration_id: string; checksum: string }>(
+        "SELECT migration_id, checksum FROM schema_migrations WHERE version = 16",
+      )).toEqual({
+        migration_id: "v16-session-workdir-immutability",
         checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
       expect(
@@ -965,6 +978,8 @@ describe("baseline boundary contracts", () => {
         .toEqual({ n: 0 });
       expect(restored.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 14").get())
         .toEqual({ n: 0 });
+      expect(restored.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 15").get())
+        .toEqual({ n: 0 });
       expect(restored.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 13").get())
         .toEqual({ n: 1 });
     } finally {
@@ -973,9 +988,13 @@ describe("baseline boundary contracts", () => {
 
     const migrated = new Db(databasePath);
     try {
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(15);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
       expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 14"))
         .toEqual({ migration_id: "v14-baseline-evidence-ledger" });
+      expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 15"))
+        .toEqual({ migration_id: "v15-durable-verification-worktree-ownership" });
+      expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 16"))
+        .toEqual({ migration_id: "v16-session-workdir-immutability" });
       expect(
         migrated.get<{ backup_file: string | null; backup_checksum: string | null }>(
           "SELECT backup_file, backup_checksum FROM schema_migrations WHERE version = 14",

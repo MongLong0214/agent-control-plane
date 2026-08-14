@@ -1,4 +1,6 @@
-import { chmodSync } from "node:fs";
+import { generateKeyPairSync } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
@@ -19,6 +21,41 @@ import {
 } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
+
+/** App permissions the credential store requires before it will use an installation token. */
+const TOKEN_BOUNDARY_APP_PERMISSIONS = {
+  checks: "write",
+  contents: "write",
+  issues: "write",
+  merge_queues: "write",
+  metadata: "read",
+  pull_requests: "write",
+  statuses: "write",
+};
+
+/** A private, owner-shaped App credential pair for the P1-14 token-boundary test. */
+const makeAppFilesForTokenBoundary = (): { root: string; envFile: string } => {
+  const root = tempDir("acp-token-boundary-");
+  const credentials = join(root, "credentials");
+  mkdirSync(credentials, { mode: 0o700 });
+  chmodSync(credentials, 0o700);
+  const envFile = join(credentials, "github-app.env");
+  const privateKeyPath = join(credentials, "github-app.private-key.pem");
+  const keyPair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  writeFileSync(privateKeyPath, keyPair.privateKey.export({ type: "pkcs1", format: "pem" }), { mode: 0o600 });
+  writeFileSync(
+    envFile,
+    [
+      "GITHUB_APP_ID=4586878",
+      "GITHUB_APP_INSTALLATION_ID=153553922",
+      `GITHUB_APP_PRIVATE_KEY_PATH=${privateKeyPath}`,
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+  chmodSync(envFile, 0o600);
+  chmodSync(privateKeyPath, 0o600);
+  return { root, envFile };
+};
 
 const PROFILE = {
   longLived: ["main", "dev"],
@@ -217,6 +254,69 @@ describe("round-two GitHub hardening", () => {
     expect(api).not.toEqual(expect.arrayContaining(["load", "withToken", "run"]));
   });
 
+  it("P1-14: a GitHub request needs no executable on PATH, so no child can carry the token", async () => {
+    // The surface test above only proves method *names*. Putting `GH_TOKEN` back on a `gh`
+    // child inside `githubApi` keeps every one of those names and still passes it — which is
+    // the exact defect P1-14 filed. These two assertions observe the boundary instead.
+    //
+    // First, statically: the module cannot spawn anything, because it never imports the means
+    // to. This is what fails the moment a `gh` child comes back, whatever it is named.
+    const source = readFileSync(
+      new URL("../../src/github/credential-store.ts", import.meta.url),
+      "utf8",
+    );
+    // Every form, because the point is that this module cannot spawn at all — and you
+    // cannot spawn without importing the means to. A single-quoted import, a bare
+    // "child_process", a dynamic import and a require all count; so does an absolute
+    // /usr/bin/gh, which still needs one of these to run.
+    for (const form of [
+      /from\s+['"]node:child_process['"]/,
+      /from\s+['"]child_process['"]/,
+      /import\s*\(\s*['"](?:node:)?child_process['"]\s*\)/,
+      /require\s*\(\s*['"](?:node:)?child_process['"]\s*\)/,
+      /createRequire/,
+    ]) {
+      expect(source).not.toMatch(form);
+    }
+    expect(source).not.toMatch(/GH_TOKEN\s*[:=]/);
+
+    // Second, behaviourally: with nothing on PATH there is no `gh` to find, and the request
+    // still succeeds — because it is made in this process.
+    const files = makeAppFilesForTokenBoundary();
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/app")) {
+        return new Response(
+          JSON.stringify({ slug: "acp-production-gate", permissions: TOKEN_BOUNDARY_APP_PERMISSIONS }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/access_tokens")) {
+        return new Response(JSON.stringify({
+          token: "installation-token-boundary",
+          expires_at: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
+        }), { status: 201 });
+      }
+      return new Response(JSON.stringify({ login: "app[bot]" }), { status: 200 });
+    };
+
+    const previousPath = process.env["PATH"];
+    process.env["PATH"] = "";
+    try {
+      const store = new TrustedCredentialStore(join(files.root, "secrets"), {
+        appEnvFile: files.envFile,
+        fetch,
+      });
+      const result = await store.githubApi({ method: "GET", path: "/user" });
+      expect(result.allowed).toBe(true);
+      // And the token itself never leaves the store.
+      expect(JSON.stringify(result)).not.toContain("installation-token-boundary");
+    } finally {
+      if (previousPath === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = previousPath;
+    }
+  });
+
   it("#191: rejects a fixture credential after its daemon directory becomes group-readable", async () => {
     const directory = tempDir("credential-mode-");
     const store = new TrustedCredentialStore(directory);
@@ -322,6 +422,52 @@ describe("round-two GitHub hardening", () => {
       residualRace: "base-may-move-between-preflight-and-merge",
       proof: "merge-commit-first-parent",
     });
+  });
+
+  it("handoff P1-03: the GitHub guard expires a claim before the partial index is reused", async () => {
+    const fixture = await ready();
+    const gate = await fixture.harness.cp.github.gatePublish(fixture.payload, fixture.driven.identity);
+    if (!gate.allowed) throw new Error(gate.message);
+    const prepared = await fixture.harness.cp.github.prPrepare(fixture.input);
+    if (!prepared.allowed) throw new Error(prepared.message);
+
+    fixture.harness.clock.advance(2 * 60 * 60 * 1000);
+    const refused = await fixture.harness.cp.github.mergeEvaluate({
+      runId: fixture.driven.runId,
+      repositoryIdentity: fixture.driven.identity,
+      pullNumber: prepared.value.pullNumber,
+      exactHeadSha: fixture.driven.candidateHead,
+      expectedBaseSha: fixture.driven.baseHead,
+      mergeStrategy: "merge_commit",
+      ownerSessionId: fixture.driven.ownerSessionId,
+      ownerBindingGeneration: fixture.driven.ownerBindingGeneration,
+    });
+    expect(refused.reasonCode).toBe(ReasonCode.MERGE_CLAIM_INVALID);
+    expect(
+      fixture.harness.cp.db.get<{ status: string }>(
+        `SELECT status FROM resource_claims WHERE run_id = ? AND branch = ?`,
+        [fixture.driven.runId, fixture.driven.workBranch],
+      ),
+    ).toEqual({ status: "EXPIRED" });
+
+    const now = fixture.harness.clock.nowIso();
+    const reclaimedUntil = new Date(new Date(now).getTime() + 60 * 60 * 1000).toISOString();
+    expect(() => fixture.harness.cp.db.run(
+      `INSERT INTO resource_claims
+         (claim_id, repository_identity, branch, run_id, owner_session_id,
+          owner_binding_generation, acquired_at, expires_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'HELD')`,
+      [
+        "claim_reclaimed_after_expiry",
+        fixture.driven.identity,
+        fixture.driven.workBranch,
+        fixture.driven.runId,
+        fixture.driven.ownerSessionId,
+        fixture.driven.ownerBindingGeneration,
+        now,
+        reclaimedUntil,
+      ],
+    )).not.toThrow();
   });
 
   it("#384: does not advertise an atomic expected-base capability the REST merge endpoint cannot honor", () => {
