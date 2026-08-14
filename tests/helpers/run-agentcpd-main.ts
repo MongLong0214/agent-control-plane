@@ -20,6 +20,8 @@ class StartupTelegramTransport implements TelegramBotTransport {
   polls = 0;
   promptObserved = false;
   approvalSent = false;
+  /** Replies the router produced for an inbound message, as opposed to prompts it initiated. */
+  routedReplies = 0;
   private nextMessageId = 1;
   private updates: TelegramUpdate[] = [];
 
@@ -33,6 +35,11 @@ class StartupTelegramTransport implements TelegramBotTransport {
     return updates;
   }
 
+  /** Queues one inbound update for the next poll. */
+  enqueue(update: TelegramUpdate): void {
+    this.updates.push(update);
+  }
+
   async sendMessage(input: {
     chatId: string;
     text: string;
@@ -40,6 +47,10 @@ class StartupTelegramTransport implements TelegramBotTransport {
     correlationId: string;
   }): Promise<{ messageId: number }> {
     const messageId = this.nextMessageId++;
+    // correlationIdFor() stamps a routed reply as telegram:<update_id>:<message_id>. Owner
+    // prompts use telegram:owner-gate:/owner-prompt:, so the numeric shape is what marks a
+    // reply the router produced for an inbound update rather than one it initiated.
+    if (/^telegram:\d+:/.test(input.correlationId)) this.routedReplies += 1;
     if (input.replyToMessageId !== undefined) {
       this.approvalSent = true;
     } else if (this.expectPromptFlow && input.text.startsWith("OWNER DECISION REQUIRED")) {
@@ -205,12 +216,32 @@ try {
         process.stdout.write("startup test owner approval cleared gate\n");
       }
       if (expectTelegram) {
-        const deadline = Date.now() + 5_000;
-        while (startupTransport.polls === 0 && Date.now() < deadline) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 1));
+        // A polling cycle only shows the loop is turning. Seeding a real owner message and
+        // requiring the router's reply is what shows an inbound update is carried through
+        // routing — without it this passed even if route() never ran.
+        startupTransport.enqueue({
+          update_id: 800,
+          message: {
+            message_id: 801,
+            date: 1_700_000_000,
+            text: "startup routing probe",
+            from: { id: 424242 },
+            chat: { id: -100999 },
+          },
+        });
+        const deadline = Date.now() + 15_000;
+        while (
+          (startupTransport.polls === 0 || startupTransport.routedReplies === 0) &&
+          Date.now() < deadline
+        ) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
         }
         if (startupTransport.polls === 0) throw new Error("Telegram startup test observed no polling cycle");
+        if (startupTransport.routedReplies === 0) {
+          throw new Error("Telegram startup test polled but never routed an inbound message");
+        }
         process.stdout.write("startup test Telegram poll observed\n");
+        process.stdout.write("startup test Telegram inbound routed\n");
       }
       await shutdown("STARTUP_TEST");
     },
