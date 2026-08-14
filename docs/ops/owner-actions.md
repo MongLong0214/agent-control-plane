@@ -48,7 +48,11 @@ one — CP-HI-04 is about role separation within a run, which the directory alre
 
 ### Where it applies
 
-Nowhere — as of `9e970f2` the launcher derives it:
+**Precondition: this machine has no daemon installed.** No launcher, no `acp` plist, no
+`agentcpd` process — checked, not assumed. Installing it is a separate step owned by the CTO,
+and authenticating does not depend on it. Do the login; the daemon comes after.
+
+Once a daemon exists, nothing further is needed — as of `9e970f2` the launcher derives it:
 
     export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_STATE_DIR/reviewer/claude}"
 
@@ -63,16 +67,26 @@ effect. If the daemon is running from an older launcher, reinstall it first:
 
 ### Verification — exits 0 when done
 
-    test -s "$HOME/.agent-control-plane/reviewer/claude/.credentials.json" \
-      && grep -q 'ACP_CLAUDE_REVIEWER_CONFIG_DIR' "$HOME/.agent-control-plane/agentcpd-launch.sh" \
-      && echo "reviewer credential scope ready"
+The owner's half, which is all that is being asked for here:
 
-The real proof is a lifecycle that gets past the reviewer. That is longer and can be run once
-the above passes:
+    test -s "$HOME/.agent-control-plane/reviewer/claude/.credentials.json" \
+      && echo "reviewer credential present"
+
+**Do not include the launcher in this check.** An earlier version of this document did, and on
+a machine with no daemon that fails whatever the owner does — reporting "cannot determine" in
+the shape of "did not work". That fold is the subject of #444, and this document produced it.
+
+The launcher condition belongs to the daemon install and is checked there:
+
+    grep -q 'ACP_CLAUDE_REVIEWER_CONFIG_DIR' "$HOME/.agent-control-plane/agentcpd-launch.sh"
+
+The real proof is a lifecycle that gets past the reviewer:
 
     ACP_COMPONENT_INTEGRATION=1 pnpm test:e2e
 
-It currently stops at `EVIDENCE_MISSING`; success is any stage beyond it.
+It currently stops at `EVIDENCE_MISSING`; success is any stage beyond it. Note this runs
+without a daemon and against a temporary state root, so it demonstrates the pipeline and
+cannot itself accumulate the observation window — see below.
 
 ---
 
@@ -136,3 +150,21 @@ than copied from a document written before them.
 
 `docs/ACCEPTANCE.md` carries the window start, duration, three project names and five zero
 counts with the telemetry queries that produced them.
+
+---
+
+## Why the observation window needs a daemon, and the e2e cannot stand in
+
+`tests/e2e/real-component-integration.test.ts:123` creates its state root with `tempDir()`, so
+every run writes a fresh `state.sqlite` and discards it. Running it thirty times produces thirty
+databases, not thirty counted lifecycles.
+
+#241 requires thirty lifecycles read back out of `telemetry_metrics`, which means one persistent
+deployment. So the order is:
+
+1. Owner: authenticate the reviewer credential (above).
+2. CTO: install and start the daemon — not yet done on this machine, and not something to run
+   on the owner's behalf without having exercised it first.
+3. Then the window can start and its start time recorded in `docs/ACCEPTANCE.md`.
+
+Step 2 is mine and is the current blocker on the window, not the credential.
