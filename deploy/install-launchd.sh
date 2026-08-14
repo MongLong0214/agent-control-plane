@@ -173,6 +173,7 @@ write_launcher() {
     printf '#!/bin/bash\nset -euo pipefail\n'
     printf 'ACP_NODE_PATH=%q\n' "$node_path"
     printf 'ACP_APP_ROOT=%q\n' "$app_root"
+    printf 'ACP_STATE_DIR=%q\n' "$state_dir"
     printf 'ACP_KEYCHAIN_SERVICE=%q\n' "$keychain_service"
     printf 'ACP_BUZZ_KEYCHAIN_SERVICE=%q\n' "$buzz_keychain_service"
     printf 'ACP_BUZZ_KEYCHAIN_ACCOUNT=%q\n' "$buzz_keychain_account"
@@ -259,6 +260,15 @@ for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_
   optional_keychain_value "$optional"
 done
 buzz_key_from_desktop_secrets
+
+# Reviewer credential scopes are paths, not secrets, so they are derived rather than fetched
+# from the Keychain. A blind reviewer must not read the ordinary provider config tree — it can
+# hold producer conversations — and under `tools: "none"` it cannot spawn `security` to reach
+# the Keychain at all, so the credential has to live in a directory it is allowed to read.
+# Deriving the default means the operator authenticates into a known path instead of also
+# having to publish where it is; an explicit value still wins.
+export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_STATE_DIR/reviewer/claude}"
+export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_STATE_DIR/reviewer/codex}"
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"
 EOF
