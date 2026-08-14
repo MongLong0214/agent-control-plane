@@ -10,6 +10,7 @@ import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/cont
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { ClaudeCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask } from "../helpers/harness.ts";
@@ -29,6 +30,8 @@ import { bindWorkerForTask } from "../helpers/harness.ts";
  */
 const ENABLED = process.env["ACP_COMPONENT_INTEGRATION"] === "1";
 const REAL_PROJECT = resolve(process.env["ACP_COMPONENT_INTEGRATION_PROJECT"] ?? process.cwd());
+/** The long-lived branch the manifest contract names, in one place. */
+const MANIFEST_DEFAULT_BRANCH = "main";
 const REVIEWER_MODEL = process.env["ACP_COMPONENT_INTEGRATION_MODEL"] ?? "sonnet";
 
 /**
@@ -70,8 +73,8 @@ const manifestFor = (projectId: string): ProjectManifest => ({
   projectId,
   repositories: [{ role: "primary", remote: "github:MongLong0214/agent-control-plane", manifestRoot: "." }],
   branchProfile: {
-    longLived: ["main", "dev"],
-    defaultBranch: "main",
+    longLived: [MANIFEST_DEFAULT_BRANCH, "dev"],
+    defaultBranch: MANIFEST_DEFAULT_BRANCH,
     updateStrategy: "rebase_before_review",
     mergeStrategy: "merge_commit",
     releaseTagPolicy: "semver",
@@ -132,10 +135,28 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       // scope violation an independent reviewer should refuse.
       writeFileSync(join(checkout, ".git", "info", "exclude"), "node_modules\n");
       symlinkSync(join(REAL_PROJECT, "node_modules"), join(checkout, "node_modules"), "dir");
-      // The clone already sits on the project's real default branch.
-      expect(gitSync(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
+      // Check the clone onto the branch the manifest's contract names, rather than inheriting
+      // whatever the source happens to be on. It previously asserted the inherited branch was
+      // "main", so the suite could not run from any feature branch — including in CI, where
+      // every change arrives on one. Combined with being opt-in, that is why it drifted until
+      // it failed at its first step. The branch contract still wants a real long-lived branch,
+      // so this checks one out instead of relaxing the contract to match the runner.
+      gitSync(checkout, ["checkout", "--quiet", MANIFEST_DEFAULT_BRANCH]);
+      expect(gitSync(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(MANIFEST_DEFAULT_BRANCH);
+
+      // The host's own declaration, read once: it authorises the owner and it names the actor
+      // who may author a capacity observation. Inventing a second actor here would make the
+      // observation prove itself rather than the deployment.
+      const ownerIdentities = readOwnerIdentities(
+        join(process.env["HOME"] ?? "", ".agent-control-plane", "owner-identities"),
+      );
+      const cliOwner = ownerIdentities.find((identity) => identity.channel === "cli");
+      if (!cliOwner) throw new Error("no cli owner identity is declared on this host");
 
       const cp = new ControlPlane({
+        // The initial manifest predates any run, so there is no run-scoped authorization to
+        // sign it with. manifestAuthorizationForTests is the intended bootstrap proof.
+        allowTestEvidenceWriters: true,
         databasePath: join(root, "state.sqlite"),
         worktreeRoot: join(root, "worktrees"),
         capacityDir: join(root, "capacity"),
@@ -150,9 +171,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         // The host's own declaration authorises the owner, not a list this test invented:
         // an empty or absent file means the deployment has no owner and the gate cannot be
         // cleared, which is the safe reading of §21.
-        ownerIdentities: readOwnerIdentities(
-          join(process.env["HOME"] ?? "", ".agent-control-plane", "owner-identities"),
-        ),
+        ownerIdentities: ownerIdentities,
         ctoPreference: { provider: "claude", model: REVIEWER_MODEL, effort: null },
         reviewer: {
           preferred: { provider: "claude", model: REVIEWER_MODEL, effort: null },
@@ -179,17 +198,52 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         }),
       );
 
+      // Writing the file is not enough: the monitor only holds a reading once a refresh has
+      // read it, and in production that is the daemon's sensor tick. This test drives
+      // components directly, so nothing ticked and dispatch refused
+      // CAPACITY_UNKNOWN_NOT_ROUTABLE — the sensor had no reading rather than a bad one.
+      // The collector runs for real here and cannot read quota on this host: the Claude CLI's
+      // interactive /usage output carries no parseable window, so the reading comes back
+      // sensorHealth ERROR and overwrites the seeded file. That is #424's exact scenario, and
+      // the operator observation is the mechanism built for it — an authenticated reading that
+      // outlives a collector which cannot see quota. Supplying one is what a real operator
+      // does via `agentctl capacity observe`, not a way around the sensor.
+      await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["claude"]);
+      const observed = await cp.capacity.observe({
+        provider: "claude",
+        observedAt: new Date().toISOString(),
+        actor: cliOwner.actor,
+        source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+        runtimeHealth: "HEALTHY",
+        buckets: [{
+          id: "owner-observed-window",
+          remainingPercent: 75,
+          resetAt: null,
+          capabilities: ["ceo", "cto", "worker", "blind-review"],
+        }],
+      });
+      if (!observed.allowed) {
+        throw new Error(`capacity observation refused: ${observed.reasonCode} ${observed.message}`);
+      }
+      expect(
+        cp.capacity.current("claude")?.allocationAdmission,
+        "claude capacity is not routable, so no run can be dispatched",
+      ).toBe("OPEN");
+
       const evidence: Record<string, unknown> = {};
 
       // --- manual registration, no Repo Factory ----------------------------
       const projectId = "agent-control-plane";
+      const initialManifest = manifestFor(projectId);
       const project = cp.projects.register({
         projectId,
         name: "agent-control-plane",
-        manifest: manifestFor(projectId),
+        manifest: initialManifest,
+        authorization: cp.manifestAuthorizationForTests(initialManifest),
       });
-      expect(project.allowed).toBe(true);
-      if (!project.allowed) return;
+      if (!project.allowed) {
+        throw new Error(`registration refused: ${project.reasonCode} ${project.message}`);
+      }
 
       const repository = await cp.repositories.register({
         checkoutPath: checkout,
@@ -228,7 +282,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         executionMode: ExecutionMode[MODE],
         contract: CONTRACT,
         repositories: [
-          { repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: "main" },
+          { repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: MANIFEST_DEFAULT_BRANCH },
         ],
       });
       expect(created.allowed).toBe(true);
