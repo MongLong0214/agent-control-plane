@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
+import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
@@ -60,7 +61,7 @@ export const OPERATOR_METHOD = {
   REPAIR_DRY_RUN: "repair.dry-run",
   REPAIR_EXECUTE: "repair.execute",
   CAPACITY_SHOW: "capacity.show",
-  CAPACITY_SET: "capacity.set",
+  CAPACITY_OBSERVE: "capacity.observe",
   PROJECT_LIST: "project.list",
   PROJECT_REGISTER: "project.register",
   DAEMON_STATUS: "daemon.status",
@@ -75,7 +76,7 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.OWNER_APPROVE,
   OPERATOR_METHOD.REPAIR_DRY_RUN,
   OPERATOR_METHOD.REPAIR_EXECUTE,
-  OPERATOR_METHOD.CAPACITY_SET,
+  OPERATOR_METHOD.CAPACITY_OBSERVE,
   OPERATOR_METHOD.PROJECT_REGISTER,
 ]);
 
@@ -331,8 +332,8 @@ export class Daemon {
         case OPERATOR_METHOD.CAPACITY_SHOW:
           return allow(ReasonCode.OK, { providers: this.cp.capacity.all() });
 
-        case OPERATOR_METHOD.CAPACITY_SET:
-          return this.setCapacity(request.params);
+        case OPERATOR_METHOD.CAPACITY_OBSERVE:
+          return this.observeCapacity(request.params, peer);
 
         case OPERATOR_METHOD.PROJECT_LIST:
           return allow(
@@ -487,34 +488,38 @@ export class Daemon {
     );
   }
 
-  private setCapacity(params: Record<string, unknown>): Decision<unknown> {
+  private async observeCapacity(
+    params: Record<string, unknown>,
+    peer: AuthenticatedOperatorPeer,
+  ): Promise<Decision<unknown>> {
     const provider = requiredOperatorString(params, "provider");
     if (!provider.allowed) return provider;
-    let payload: unknown = params["payload"];
-    if (typeof payload === "string") {
-      try {
-        payload = JSON.parse(payload) as unknown;
-      } catch {
-        return deny(ReasonCode.INVALID_ARGUMENT, "capacity payload is not valid JSON", { provider: provider.value });
-      }
-    }
+    const payload = params["payload"];
     if (!isPlainRecord(payload)) return invalidOperatorParam("payload", payload);
-
-    const body = {
-      ...payload,
+    if (!this.cp.providers.has(provider.value)) {
+      return deny(ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE, "capacity observation provider is not registered", {
+        provider: provider.value,
+      });
+    }
+    // The operator reports quota, not executable liveness. Preserve that distinction by
+    // obtaining runtime health from the registered adapter before the observation enters
+    // capacity admission; a failed liveness probe makes the persisted reading non-routable.
+    let runtimeHealth: "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
+    try {
+      runtimeHealth = await this.cp.providers.require(provider.value).probeRuntime();
+    } catch {
+      runtimeHealth = "UNAVAILABLE";
+    }
+    return this.cp.capacity.observe({
       provider: provider.value,
-      observedAt: this.cp.clock.nowIso(),
-      // The operator publishes quota facts; runtime health remains daemon-observed.
-      runtimeHealth: "UNKNOWN",
-    };
-    const directory = this.cp.config.capacityDir;
-    const file = capacitySensorFile(directory, provider.value);
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    chmodSync(directory, 0o700);
-    const temporary = join(directory, `.${provider.value}.${process.pid}.${randomUUID()}.json`);
-    writeFileSync(temporary, JSON.stringify(body, null, 2), { mode: 0o600 });
-    renameSync(temporary, file);
-    return allow(ReasonCode.OK, { wrote: file, body });
+      observedAt: payload["observedAt"],
+      buckets: payload["buckets"],
+      runtimeHealth,
+      actor: peer.actor,
+      // This is derived from the authenticated daemon entry point, never accepted from
+      // the request payload where a caller could claim a different provenance surface.
+      source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+    });
   }
 
   private async registerProject(params: Record<string, unknown>): Promise<Decision<unknown>> {
@@ -960,10 +965,13 @@ export class Daemon {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     chmodSync(directory, 0o700);
 
-    for (const adapter of this.cp.providers.production()) {
-      const reading = await adapter.probeCapacity();
-      const file = capacitySensorFile(directory, adapter.provider);
-      const temporary = join(directory, `.${adapter.provider}.${process.pid}.${randomUUID()}.json`);
+    // The mirror must be a by-product of the monitor's persisted reading, not a parallel
+    // probe. Otherwise a periodic collector ERROR could be written to disk while an older
+    // operator observation remained routable in the database.
+    const readings = await this.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT);
+    for (const reading of readings) {
+      const file = capacitySensorFile(directory, reading.provider);
+      const temporary = join(directory, `.${reading.provider}.${process.pid}.${randomUUID()}.json`);
       writeFileSync(temporary, JSON.stringify(reading, null, 2), { mode: 0o600 });
       renameSync(temporary, file);
     }

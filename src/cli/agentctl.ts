@@ -31,7 +31,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl repair list                    show the repair operation allowlist
   agentctl repair dry-run <op> [k=v...]   evaluate a repair without changing anything
   agentctl repair execute <op> [k=v...]   execute a repair (owner-risk ops need --owner)
-  agentctl capacity set <provider> <json> write the structured local capacity file
+  agentctl capacity observe <provider> <json> record a short-lived, authenticated quota observation
   agentctl capacity show                  current provider capacity and admission
   agentctl project register <name> <path> register a project and its primary repository
   agentctl project list                   list projects with derived activity
@@ -59,7 +59,7 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "owner.approve",
   "repair.dry-run",
   "repair.execute",
-  "capacity.set",
+  "capacity.observe",
   "project.register",
 ]);
 
@@ -223,7 +223,7 @@ export const dispatch = async (
 
   if (command === "capacity") {
     if (args[0] === "show") return call("capacity.show");
-    if (args[0] === "set") {
+    if (args[0] === "observe") {
       const provider = required(args[1], "provider");
       const payload = required(args.slice(2).join(" "), "json");
       let parsed: unknown;
@@ -232,7 +232,7 @@ export const dispatch = async (
       } catch {
         return fail("json must be valid JSON");
       }
-      return call("capacity.set", { provider, payload: parsed });
+      return call("capacity.observe", { provider, payload: parsed });
     }
     return fail(`unknown capacity subcommand: ${args[0] ?? ""}`);
   }

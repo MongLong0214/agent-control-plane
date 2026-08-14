@@ -6,7 +6,7 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
-import { RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
+import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ContinuityMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ContinuityKernel } from "../../src/continuity/continuity-kernel.ts";
 import type {
@@ -127,6 +127,9 @@ describe("capacity routability (§14.3 — no UNKNOWN routing)", () => {
 });
 
 describe("capacity sensor honesty (§14.2)", () => {
+  /** Synthetic fixture value only — it is not a real provider quota claim. */
+  const FIXTURE_OBSERVED_REMAINING_PERCENT = 74;
+
   const capacityFile = (body: unknown): string => {
     const dir = tempDir("acp-capfile-");
     mkdirSync(dir, { recursive: true });
@@ -208,6 +211,50 @@ describe("capacity sensor honesty (§14.2)", () => {
     expect(admission).toMatchObject({ allowed: false, reasonCode: ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE });
     // If the exception catch/persist step is removed, refresh throws or retains OPEN;
     // either outcome breaks this test instead of routing on the old quota.
+  });
+
+  it("a collector ERROR replaces a stale operator observation instead of falling back to it", async () => {
+    const { cp, clock, gpt } = makePlane();
+    const observed = await cp.capacity.observe({
+      provider: "gpt",
+      observedAt: clock.nowIso(),
+      runtimeHealth: "HEALTHY",
+      actor: "fixture-operator",
+      // Only the daemon-stamped surface is accepted; a caller-chosen source is refused.
+      source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+      buckets: [{
+        id: "fixture-window",
+        remainingPercent: FIXTURE_OBSERVED_REMAINING_PERCENT,
+        resetAt: null,
+        capabilities: FULL,
+      }],
+    });
+    expect(observed).toMatchObject({ allowed: true, value: { allocationAdmission: "OPEN" } });
+
+    // Make the prior human observation stale before the collector reports its own error.
+    // The synthetic fixture error is the newer durable fact and must be the only current one.
+    clock.advance(15 * 60 * 1000 + 1);
+    gpt.setCapacity({
+      provider: "gpt",
+      sensorHealth: "ERROR",
+      runtimeHealth: "HEALTHY",
+      observedAt: clock.nowIso(),
+      source: "fixture-collector-error",
+      error: "synthetic fixture collector error",
+      buckets: [],
+    });
+    await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["gpt"]);
+
+    const current = cp.capacity.current("gpt")!;
+    // Removing the collector-error persist path leaves the old observation in place and
+    // fails these source/provenance assertions as well as the immediate suspension check.
+    expect(current).toMatchObject({
+      sensorHealth: "ERROR",
+      allocationAdmission: "SUSPENDED",
+      source: "fixture-collector-error",
+    });
+    expect(current.operatorObservation).toBeUndefined();
+    expect(cp.capacity.isRoutableFor(current, "cto")).toBe(false);
   });
 });
 

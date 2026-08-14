@@ -3,10 +3,35 @@ import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
-import type { CapacityReading, ProviderRegistry } from "../runtime/provider.ts";
+import type { CapacityBucket, CapacityReading, ProviderRegistry } from "../runtime/provider.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 
 export type AllocationAdmission = "OPEN" | "CONSERVE" | "SUSPENDED";
+
+/**
+ * The daemon, not a caller-supplied JSON field, names the operator surface that carried
+ * an observation. Keeping this distinct from a collector source lets admission use a
+ * current human observation without mistaking an arbitrary local file for one.
+ */
+export const AGENTCTL_CAPACITY_OBSERVATION_SOURCE = "agentctl capacity observe";
+
+const OPERATOR_OBSERVATION_SOURCE_PREFIX = "operator-observation:v1:";
+
+export interface OperatorObservationProvenance {
+  /** Authenticated operator identity supplied by the daemon socket binding. */
+  actor: string;
+  /** Named surface through which the operator supplied the reading. */
+  source: string;
+}
+
+/** A human-read quota observation before it enters the normal capacity-reading path. */
+export interface OperatorCapacityObservation {
+  provider: string;
+  observedAt: string;
+  buckets: CapacityBucket[];
+  runtimeHealth: CapacityReading["runtimeHealth"];
+  provenance: OperatorObservationProvenance;
+}
 
 /** §14.3 — a bucket is routable only when its remaining quota is a usable number. */
 const isRoutableBucket = (
@@ -25,6 +50,17 @@ export interface ProviderCapacity extends CapacityReading {
   ageMs: number;
   /** Buckets whose remaining quota is unknown. §14.3 forbids routing against these. */
   unknownBuckets: string[];
+  /** Present only for a daemon-authenticated operator observation. */
+  operatorObservation?: OperatorObservationProvenance;
+  /**
+   * The collector reading this one was kept in place of, when a probe failed while an
+   * unexpired operator observation was current.
+   *
+   * It exists so that preserving the observation for *admission* cannot also hide the probe
+   * failure from anything that reports sensor health. A doctor that showed a healthy sensor
+   * because a human had typed a number would be presenting a probe failure as a pass.
+   */
+  supersededCollectorError?: { source: string; error: string | null };
 }
 
 /** PRD §14.2 — the six points at which a refresh is mandatory. */
@@ -57,6 +93,118 @@ const DEFAULTS = {
   criticalPercent: 10,
   exhaustedPercent: 2,
   maxClockSkewMs: 60_000,
+};
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+};
+
+const runtimeHealthIsValid = (value: unknown): value is CapacityReading["runtimeHealth"] =>
+  value === "HEALTHY" || value === "DEGRADED" || value === "UNAVAILABLE" || value === "UNKNOWN";
+
+const parseObservationBuckets = (value: unknown): CapacityBucket[] | null => {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const ids = new Set<string>();
+  const buckets: CapacityBucket[] = [];
+  for (const candidate of value) {
+    if (!isPlainRecord(candidate)) return null;
+    const id = candidate["id"];
+    const remainingPercent = candidate["remainingPercent"];
+    const resetAt = candidate["resetAt"];
+    const capabilities = candidate["capabilities"];
+    if (typeof id !== "string" || id.trim().length === 0 || ids.has(id)) return null;
+    if (
+      remainingPercent !== null &&
+      (typeof remainingPercent !== "number" || !Number.isFinite(remainingPercent) || remainingPercent < 0 || remainingPercent > 100)
+    ) {
+      return null;
+    }
+    if (
+      resetAt !== null &&
+      (typeof resetAt !== "string" || !Number.isFinite(new Date(resetAt).getTime()))
+    ) {
+      return null;
+    }
+    if (
+      !Array.isArray(capabilities) ||
+      capabilities.length === 0 ||
+      capabilities.some((capability) => typeof capability !== "string" || capability.trim().length === 0)
+    ) {
+      return null;
+    }
+    ids.add(id);
+    buckets.push({
+      id,
+      remainingPercent,
+      resetAt,
+      capabilities: [...capabilities] as string[],
+    });
+  }
+  return buckets;
+};
+
+const parseOperatorObservation = (input: unknown): Decision<OperatorCapacityObservation> => {
+  if (!isPlainRecord(input)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "capacity observation must be an object", {});
+  }
+  const provider = input["provider"];
+  const observedAt = input["observedAt"];
+  const actor = input["actor"];
+  const source = input["source"];
+  const runtimeHealth = input["runtimeHealth"];
+  if (typeof actor !== "string" || actor.trim().length === 0 || typeof source !== "string" || source.trim().length === 0) {
+    return deny(
+      ReasonCode.CAPACITY_OBSERVATION_PROVENANCE_REQUIRED,
+      "capacity observation requires an authenticated actor and named source",
+      {},
+    );
+  }
+  if (typeof provider !== "string" || provider.trim().length === 0) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "capacity observation provider is invalid", {});
+  }
+  if (typeof observedAt !== "string" || !Number.isFinite(new Date(observedAt).getTime())) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "capacity observation observedAt is invalid", { provider });
+  }
+  if (!runtimeHealthIsValid(runtimeHealth)) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "capacity observation runtimeHealth is invalid", { provider });
+  }
+  const buckets = parseObservationBuckets(input["buckets"]);
+  if (!buckets) {
+    return deny(
+      ReasonCode.INVALID_ARGUMENT,
+      "capacity observation requires non-empty, well-formed quota buckets",
+      { provider },
+    );
+  }
+  return allow(ReasonCode.OK, {
+    provider,
+    observedAt,
+    buckets,
+    runtimeHealth,
+    provenance: { actor: actor.trim(), source: source.trim() },
+  });
+};
+
+const storedOperatorObservationSource = (provenance: OperatorObservationProvenance): string =>
+  `${OPERATOR_OBSERVATION_SOURCE_PREFIX}${encodeURIComponent(JSON.stringify(provenance))}`;
+
+const operatorObservationFromSource = (source: string): OperatorObservationProvenance | null => {
+  if (!source.startsWith(OPERATOR_OBSERVATION_SOURCE_PREFIX)) return null;
+  try {
+    const parsed: unknown = JSON.parse(decodeURIComponent(source.slice(OPERATOR_OBSERVATION_SOURCE_PREFIX.length)));
+    if (
+      isPlainRecord(parsed) &&
+      typeof parsed["actor"] === "string" && parsed["actor"].trim().length > 0 &&
+      typeof parsed["source"] === "string" && parsed["source"].trim().length > 0
+    ) {
+      return { actor: parsed["actor"], source: parsed["source"] };
+    }
+  } catch {
+    // A malformed stored provenance marker is never treated as an operator observation.
+  }
+  return null;
 };
 
 export interface DynamicReserveDemand {
@@ -161,9 +309,49 @@ export class CapacityMonitor {
             error: error instanceof Error ? error.message : "capacity collector threw a non-error value",
           };
         }
-        const enriched = this.enrich(reading);
-        this.persist(enriched);
+        // A collector ERROR means the sensor could not read quota — it is the absence of
+        // information, not information. On a host whose `/usage` surface is not automatable
+        // that is the answer *every* time, and the daemon asks every four minutes
+        // (`Daemon.refreshCapacitySensors`, again via `ContinuityKernel.evaluate`). Letting
+        // it persist over an operator observation that has not yet expired would erase the
+        // only reading this deployment can obtain, seconds after it was recorded.
+        //
+        // This is not a favourable-reading fallback: a *successful* collector reading always
+        // wins, because a measurement is better evidence than a recollection, and the
+        // observation still expires on the same stale-grace rule with nothing to renew it.
+        const preserved = this.observationOutlivingError(reading);
+        const enriched = preserved ?? this.record(reading);
         readings.push(enriched);
+
+        if (preserved) {
+          // The collector still failed, and that has to stay visible: a silent preservation
+          // would make a permanently broken sensor look like a working one for as long as
+          // somebody kept refreshing the observation.
+          this.telemetry.record({
+            scope: "capacity",
+            name: "collector_error_over_observation",
+            text: preserved.allocationAdmission,
+            dims: {
+              provider: reading.provider,
+              collectorSource: reading.source,
+              collectorError: reading.error ?? null,
+              observationAgeMs: preserved.ageMs,
+              observedBy: preserved.operatorObservation?.actor ?? null,
+            },
+          });
+          this.audit.record({
+            kind: "CAPACITY_PROBE",
+            reasonCode: ReasonCode.PROBE_FAILED,
+            evidence: {
+              provider: reading.provider,
+              outcome: "collector error did not replace a current operator observation",
+              collectorError: reading.error ?? null,
+              observationAgeMs: preserved.ageMs,
+              staleGraceMs: this.#options.staleGraceMs,
+            },
+          });
+          continue;
+        }
 
         this.telemetry.record({
           scope: "capacity",
@@ -209,6 +397,99 @@ export class CapacityMonitor {
         );
       }
     }
+  }
+
+  /**
+   * Records a quota reading an authenticated human saw on their own provider surface.
+   *
+   * It deliberately creates the same `CapacityReading` a collector would, and sends it
+   * through `record()` below, so admission cannot treat the two differently.
+   *
+   * The `source` must be the daemon's own constant. That is what makes this method unable
+   * to mint a routable reading on its own: the actor and the surface are stamped by
+   * `Daemon.observeCapacity` from the authenticated socket peer after it has probed runtime
+   * health itself, and a caller that supplies its own `source` — the shape a local JSON file
+   * would take — is refused here rather than trusted to have been well-behaved.
+   */
+  async observe(input: unknown): Promise<Decision<ProviderCapacity>> {
+    const parsed = parseOperatorObservation(input);
+    if (!parsed.allowed) return parsed;
+    const observation = parsed.value;
+    if (observation.provenance.source !== AGENTCTL_CAPACITY_OBSERVATION_SOURCE) {
+      return deny(
+        ReasonCode.CAPACITY_OBSERVATION_PROVENANCE_REQUIRED,
+        "capacity observation source must be stamped by the daemon operator surface",
+        { provider: observation.provider, source: observation.provenance.source },
+      );
+    }
+    if (!this.providers.has(observation.provider)) {
+      return deny(
+        ReasonCode.CAPACITY_UNKNOWN_NOT_ROUTABLE,
+        "capacity observation provider is not registered",
+        { provider: observation.provider },
+      );
+    }
+    const reading: CapacityReading = {
+      provider: observation.provider,
+      sensorHealth: "HEALTHY",
+      runtimeHealth: observation.runtimeHealth,
+      observedAt: observation.observedAt,
+      buckets: observation.buckets,
+      source: observation.provenance.source,
+    };
+    const enriched = this.record(reading, storedOperatorObservationSource(observation.provenance));
+
+    // A refusal used to stand here for an observation older than the newest stored reading,
+    // on the reasoning that `current()` is MAX(observed_at) so such a row would be written
+    // and never read. It was removed: `docs/capacity-source.md` instructs the operator to
+    // submit the *provider-reported* observedAt, which is necessarily in the past, while the
+    // collectors stamp an ERROR every four minutes — so the documented, honest input was
+    // rejected, with the very reason code #424 was filed under. When new code refuses the
+    // documented path, the new code is what is wrong.
+    //
+    // The underlying concern is real and still unaddressed: selection is purely
+    // MAX(observed_at), so a valid observation can be shadowed by a newer ERROR. Fixing that
+    // belongs in selection — a receipt time distinct from the observed time, or a preference
+    // for a live observation within its window — not in a refusal at the write boundary.
+
+    const recorded: ProviderCapacity = { ...enriched, operatorObservation: observation.provenance };
+    this.telemetry.record({
+      scope: "capacity",
+      name: "operator_observation",
+      text: recorded.allocationAdmission,
+      dims: {
+        provider: recorded.provider,
+        sensorHealth: recorded.sensorHealth,
+        runtimeHealth: recorded.runtimeHealth,
+        source: observation.provenance.source,
+      },
+    });
+    // An observation changes an input to the coverage judgement, so the judgement is
+    // recomputed here rather than left for whoever asks next. This is the same rule the
+    // refresh path states for a failed probe, in the opposite direction: on this host every
+    // provider is SUSPENDED, which makes every required role uncoverable, which is
+    // NO_VALID_COVERAGE and therefore SURVIVAL — and `RunEngine.dispatch` reads that stored
+    // mode before it ever looks at capacity. Without this the observation makes capacity
+    // routable while dispatch keeps refusing against a mode nothing has revisited.
+    if (this.#providerFailureContinuity) {
+      await this.#providerFailureContinuity.evaluate(
+        `capacity observation recorded for ${recorded.provider}`,
+      );
+    }
+
+    this.audit.record({
+      kind: "CAPACITY_OPERATOR_OBSERVATION",
+      reasonCode: ReasonCode.OK,
+      actor: observation.provenance.actor,
+      evidence: {
+        provider: recorded.provider,
+        observedAt: recorded.observedAt,
+        source: observation.provenance.source,
+        runtimeHealth: recorded.runtimeHealth,
+        sensorHealth: recorded.sensorHealth,
+      },
+    });
+    return allow(ReasonCode.OK, recorded);
   }
 
   /**
@@ -274,6 +555,18 @@ export class CapacityMonitor {
       );
     }
 
+    // §14.2 says this gate refreshes, so it refreshes — always, including when the newest
+    // reading is an operator observation. An earlier version skipped the probe while an
+    // observation was current, which made every allocation gate a cache: a collector that
+    // had come back and now reported exhaustion could not refuse the run, and a collector
+    // that had started working could not be noticed until some unrelated timer called
+    // `refresh()`.
+    //
+    // Skipping is no longer needed for the reason it was introduced. `refresh` itself is
+    // what protects an unexpired observation from a collector that cannot read quota, so
+    // probing here costs a failed probe and changes nothing — while a probe that *succeeds*
+    // is a live measurement, and a live measurement is exactly what this gate exists to ask
+    // for.
     const readings = await this.refresh(trigger, [target.provider]);
 
     const production = readings.filter((r) => this.providers.require(r.provider).isProduction);
@@ -420,12 +713,13 @@ export class CapacityMonitor {
     );
     if (rows.length === 0) return null;
     const first = rows[0]!;
-    return this.enrich({
+    const operatorObservation = operatorObservationFromSource(first.source);
+    const enriched = this.enrich({
       provider,
       sensorHealth: first.sensor_health,
       runtimeHealth: first.runtime_health,
       observedAt: first.observed_at,
-      source: first.source,
+      source: operatorObservation?.source ?? first.source,
       buckets: rows.map((row) => ({
         id: row.bucket_id,
         remainingPercent: row.remaining_percent,
@@ -433,6 +727,7 @@ export class CapacityMonitor {
         capabilities: JSON.parse(row.capabilities_json) as string[],
       })),
     });
+    return operatorObservation ? { ...enriched, operatorObservation } : enriched;
   }
 
   all(): ProviderCapacity[] {
@@ -671,7 +966,34 @@ export class CapacityMonitor {
     return { ...reading, allocationAdmission: admission, advisoryState, ageMs, unknownBuckets };
   }
 
-  private persist(reading: CapacityReading): void {
+  /**
+   * The stored operator observation that a failed collector reading must not overwrite, or
+   * null when the reading should be persisted normally.
+   *
+   * Returns null once the observation is past its stale grace: at that point it is no more
+   * informative than the ERROR, and the ERROR is the honest record of what the sensor did.
+   * Both suspend, so nothing becomes routable either way — this only decides which reason
+   * the operator is shown.
+   */
+  private observationOutlivingError(reading: CapacityReading): ProviderCapacity | null {
+    if (reading.sensorHealth !== "ERROR") return null;
+    const current = this.current(reading.provider);
+    if (!current?.operatorObservation) return null;
+    if (current.ageMs > this.#options.staleGraceMs) return null;
+    return {
+      ...current,
+      supersededCollectorError: { source: reading.source, error: reading.error ?? null },
+    };
+  }
+
+  /** One shared enrichment/persistence path for collectors and operator observations. */
+  private record(reading: CapacityReading, persistedSource = reading.source): ProviderCapacity {
+    const enriched = this.enrich(reading);
+    this.persist(enriched, persistedSource);
+    return enriched;
+  }
+
+  private persist(reading: CapacityReading, persistedSource = reading.source): void {
     // A reading is one atomic observation. Re-observing at the same instant must
     // replace the whole bucket set — leaving a bucket behind from a previous
     // observation would let a shrunken or failed sensor read as healthy.
@@ -691,7 +1013,7 @@ export class CapacityMonitor {
             `${reading.provider}:${bucket.id}:${reading.observedAt}`,
             reading.provider, bucket.id, bucket.remainingPercent, bucket.resetAt,
             JSON.stringify(bucket.capabilities), reading.sensorHealth, reading.runtimeHealth,
-            admission, reading.observedAt, reading.source,
+            admission, reading.observedAt, persistedSource,
           ],
         );
       }
@@ -705,7 +1027,7 @@ export class CapacityMonitor {
           [
             `${reading.provider}:__none__:${reading.observedAt}`,
             reading.provider, reading.sensorHealth, reading.runtimeHealth,
-            reading.observedAt, reading.source,
+            reading.observedAt, persistedSource,
           ],
         );
       }

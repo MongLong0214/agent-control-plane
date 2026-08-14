@@ -436,7 +436,12 @@ export class Doctor {
     const findings: Finding[] = [];
     const readings = await this.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT);
     for (const reading of readings) {
-      if (reading.sensorHealth === "ERROR") {
+      // A preserved operator observation keeps the provider *routable* through a collector
+      // that cannot read quota — but the collector still failed, and CP-HI-08 does not allow
+      // a probe failure to be displayed as a pass. So the sensor finding is raised for the
+      // observation-preserved case too, off the collector error the reading carries.
+      const collectorFailed = reading.sensorHealth === "ERROR" || reading.supersededCollectorError !== undefined;
+      if (collectorFailed) {
         findings.push({
           code: "CAPACITY_SENSOR_FAILED",
           severity: "ERROR",
@@ -444,11 +449,20 @@ export class Doctor {
           blocking: false,
           confidence: "HIGH",
           observedEvidence: {
-            error: reading.error ?? null,
-            source: reading.source,
+            error: reading.supersededCollectorError?.error ?? reading.error ?? null,
+            source: reading.supersededCollectorError?.source ?? reading.source,
             runtimeHealth: reading.runtimeHealth,
+            ...(reading.supersededCollectorError
+              ? {
+                // Said plainly, because "sensor failed" and "provider still routable" read
+                // as a contradiction unless the reason is on the record.
+                routableFrom: "operator observation",
+                observedBy: reading.operatorObservation?.actor ?? null,
+                observationAgeMs: reading.ageMs,
+              }
+              : {}),
           },
-          recommendedAction: "restore the structured local capacity file or a supported usage source",
+          recommendedAction: "restore a supported usage source; the operator observation expires and will not renew itself",
         });
       }
       if (reading.advisoryState === "EXHAUSTED" || reading.advisoryState === "CRITICAL") {

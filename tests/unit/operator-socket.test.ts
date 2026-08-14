@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { execFile as execFileCallback } from "node:child_process";
 import { createConnection } from "node:net";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -78,6 +78,24 @@ const createQueuedRun = async (harness: Harness): Promise<string> => {
 };
 
 describe("authenticated operator socket (#393/#405)", () => {
+  it("removes capacity set instead of retaining a command that only writes an ignored file", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const code = await dispatch(
+        createOperatorClient({ socketPath: join(tempDir("acp-capacity-set-removed-"), "operator.sock") }),
+        "capacity",
+        ["set", "scripted", "{}"],
+        false,
+      );
+      // Reinstating either the CLI branch or daemon method makes this return a socket result
+      // rather than the usage error, and reintroduces the ignored-file false-success path.
+      expect(code).toBe(2);
+      expect(Object.values(OPERATOR_METHOD)).not.toContain("capacity.set");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   it("routes a CLI-shaped mutation through the lock-held daemon and opens a 0600 socket", async () => {
     const running = await makeStartedOperator();
     try {
