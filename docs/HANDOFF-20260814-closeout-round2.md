@@ -4,8 +4,9 @@ Written while everything below is still verified rather than remembered. Four la
 carry finished work that **must not be merged as-is**: every one of them came back
 `DO NOT MERGE` from a blind review, and the findings were reproduced, not taken on trust.
 
-**`main` = `8819c56`** · CI **red** on that commit (see §6, it is the trace step, not the
-suite) · previous commit `effe657` was green.
+**`main` = `7626d7e`** · CI **green** —
+[run 31769735438](https://github.com/MongLong0214/agent-control-plane/actions/runs/31769735438).
+All green claims in this document are CI runs; local results are diagnosis only.
 
 Authority: `docs/review/AGENT_CONTROL_PLANE_v1.0_FINAL_IMPLEMENTATION_CLOSEOUT_REVIEW.md`
 plus the owner-supplied `ACP_PRODUCTION_GATE_FINAL_A_TO_Z_REVIEW_20260814`, whose findings
@@ -33,12 +34,14 @@ reverted. **Use `git status --porcelain` and copy `??` entries explicitly.**
 
 ## 2. Lane branches — all green locally, none mergeable
 
-| branch | SHA | tests (`umask 022`) | verdict |
+Each lane has an open PR so that CI, not a local run, judges it.
+
+| branch | PR | CI | remaining |
 |---|---|---|---|
-| `terra10/buzzcli` | `24bdb92` | 740 | blockers fixed, wants a confirming round |
-| `terra10/capacityobs` | `ac32f16` | 728 | **2 BLOCKERs open** |
-| `terra10/verifysec` | `2b1d709` | 745 | 2 MAJORs open |
-| `terra10/telegram` | `b94f573` | 768 | **2 BLOCKERs open** |
+| `terra10/buzzcli` | [#433](https://github.com/MongLong0214/agent-control-plane/pull/433) | **green** | wants a confirming blind round |
+| `terra10/capacityobs` | [#434](https://github.com/MongLong0214/agent-control-plane/pull/434) | **green** | 2 findings below still open |
+| `terra10/verifysec` | [#435](https://github.com/MongLong0214/agent-control-plane/pull/435) | red — §6b only | §6b sampling fix |
+| `terra10/telegram` | [#436](https://github.com/MongLong0214/agent-control-plane/pull/436) | inherits §6b | rebased onto verifysec |
 
 `terra10/telegram` is stacked on `terra10/verifysec`; merging telegram carries both. Its
 migration is **v17** (written against v14; v15 and v16 landed while it sat unmerged).
@@ -49,23 +52,27 @@ migration is **v17** (written against v14; v15 and v16 landed while it sat unmer
 
 ### capacityobs — do not merge
 
-1. **BLOCKER — the fix does not fix #424's premise.** `RunEngine.dispatch` refuses
-   `SURVIVAL` at `run-engine.ts:261`, and only reaches capacity at `:311`. On this host
-   continuity enters SURVIVAL after a `capacity_sensor` tick because CEO coverage is
-   missing, so an operator observation makes capacity `OPEN` and the run still cannot
-   dispatch. **Verified by reading the ordering.** #424 has two independent causes and only
-   the capacity one is addressed — consider splitting the issue.
+1. **FIXED — dispatch on a plane already in SURVIVAL.** Enumerating the inputs first changed
+   the answer, and both the reviewer's framing and mine had been wrong. SURVIVAL is
+   `NO_VALID_COVERAGE`, which requires **every** required role uncovered — it is not caused by
+   CEO specifically, but by every provider being SUSPENDED so no role is coverable. The
+   judgement is correct and so is dispatch refusing it. The real defect was that `mode()`
+   reads a stored row written only by `evaluate()`, and `observe()` never triggered one —
+   `refresh()` already does exactly this, with a comment saying SURVIVAL must not remain
+   stale. A missing edge, not a wrong judgement, and no hole punched in the gate. The test the
+   reviewer said did not exist — observe → dispatch on a plane that has actually entered
+   SURVIVAL — now exists and fails without the edge.
 2. **BLOCKER — live runtime health is discarded.** `observationOutlivingError` treats every
    collector ERROR as "no quota information", but an ERROR reading also carries
    `runtimeHealth`. A runtime that has become UNAVAILABLE is dropped and allocation proceeds
    against the observation's frozen `HEALTHY`.
-3. **Regression introduced this round.** The older-than-newest refusal added to stop
-   `observe` succeeding while changing nothing now rejects the *documented* input:
-   `docs/capacity-source.md` tells the operator to submit the provider-reported `observedAt`,
-   which is necessarily in the past, while collectors stamp ERROR every four minutes. The
-   honest workflow fails with `CAPACITY_UNKNOWN_NOT_ROUTABLE` — the code #424 was filed
-   under. Needs a different mechanism (receipt time distinct from observed time, or
-   selection that is not purely `MAX(observed_at)`).
+3. **REVERTED.** The older-than-newest refusal rejected the documented input, because
+   `docs/capacity-source.md` tells the operator to submit the provider-reported `observedAt`
+   — necessarily in the past — while collectors stamp an ERROR every four minutes. When new
+   code refuses the documented path, the new code is wrong. The underlying concern stands and
+   is unaddressed: selection is purely `MAX(observed_at)`, so a valid observation can be
+   shadowed by a newer ERROR. Fix that in **selection** (a receipt time distinct from the
+   observed time), not with a refusal at the write boundary.
 4. MAJOR — operator JSON may attach any capability to any provider; `observe` never
    intersects with the adapter's real capability map.
 5. MAJOR — `supersededCollectorError` exists only on the in-memory `refresh()` return.
@@ -75,14 +82,14 @@ migration is **v17** (written against v14; v15 and v16 landed while it sat unmer
 
 ### telegram — do not merge
 
-1. **BLOCKER — owner authority does not stick.** `assertConsumedApproval` calls
+1. **FIXED — owner authority does not stick.** `assertConsumedApproval` calls
    `assertApproval` first, which requires the `inbound_messages` replay row. That row is a
    24h TTL cache pruned on the next successful admit. So a correctly admitted **and
    consumed** approval stops satisfying the human gate once any later Telegram message
    arrives after the TTL — and GitHub merge re-reads that gate. The durable
    `OWNER_APPROVAL_CONSUMED` audit row is thrown away by the check that should be trusting
    it.
-2. **BLOCKER — one undeliverable prompt wedges the owner channel.** `pollOnce` delivers
+2. **FIXED — one undeliverable prompt wedges the owner channel.** `pollOnce` delivers
    owner-gate prompts before `getUpdates`, and a denied `sendOwnerPromptIfNeeded` or a
    `TelegramDeliveryError` throws, skipping the inbound batch entirely. A single parked run
    whose prompt cannot be sent stops all inbound owner commands.
@@ -105,12 +112,12 @@ had begun inheriting `process.env.PATH`; restored to the fixed system list).
 
 Still open:
 
-1. MAJOR — P1-06 is not enforced. `CtoLifecycle.spawn` persists `handle.workdir ??
+1. FIXED — P1-06 containment. `CtoLifecycle.spawn` persists `handle.workdir ??
    managedRuntimeRoot`, so whatever the adapter returns wins with no containment check, and
    Hermes still *spawns* the CEO process with `cwd: process.cwd()` (only the recorded
    workdir was corrected). The workdir trigger is `BEFORE UPDATE`, so an INSERT writes a
    permanent routing fact.
-2. MAJOR — the P1-14 lock is a source grep for `from "node:child_process"`. A single-quoted
+2. FIXED — the P1-14 lock was a source grep for `from "node:child_process"`. A single-quoted
    import, a dynamic import, or an absolute `/usr/bin/gh` defeats it, and an empty `PATH`
    does not hide an absolute path.
 3. MINOR — `writeTargetForRun` filters expired `HELD` rows without expiring them, so the
