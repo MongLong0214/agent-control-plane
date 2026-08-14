@@ -2015,6 +2015,11 @@ const safeParse = (text: string): Record<string, unknown> | null => {
 /** Real seatbelt probes exposed only for regression tests; production uses `runCli`. */
 export const __testing = Object.freeze({
   reviewerProfile,
+  // #419: the positive reachability probe had nothing behind it — hardcoding
+  // `allowedEndpoint` to a 200 left the whole suite green. Exposed for the same reason
+  // probeNoTools and probeDeniedTranscriptPaths are: the boundary is only worth what a test
+  // can show it refusing.
+  probeProviderOnlyNetwork,
   reviewerSandboxArgs,
   composeReviewerProfile,
   probeNoTools,
