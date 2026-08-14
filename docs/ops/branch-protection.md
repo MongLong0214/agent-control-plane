@@ -47,7 +47,9 @@ cat > /tmp/acp-ruleset.json <<'JSON'
       "type": "required_status_checks",
       "parameters": {
         "strict_required_status_checks_policy": true,
-        "required_status_checks": [{ "context": "verify" }]
+        "required_status_checks": [
+          { "context": "verify", "integration_id": 15368 }
+        ]
       }
     }
   ]
@@ -123,9 +125,46 @@ That is the contract the closeout asks for, and it is also the exit evidence Wav
 `node scripts/ssot-report.mjs` needs `GH_TOKEN` in Actions and fails without it — a required check
 that cannot pass blocks every merge, including the one that would fix it.
 
+## Pinning the check to its App, and why `verify` goes first
+
+A required check named only by its context can be satisfied by **any** integration that reports
+that name. `integration_id` pins the source, and without it the protection is a name match rather
+than a provenance check:
+
+| context | source | App id |
+| --- | --- | --- |
+| `verify` | GitHub Actions | `15368` |
+| `acp-production-gate` | ACP production gate App | `4586878` |
+
+ACP's own `verifyGate()` already refuses a same-named check from an untrusted creator — that is
+proven, and a forged gate was rejected live. But that verifier only runs on ACP's merge path. The
+whole point of branch protection is the *other* paths: a human merge in the GitHub UI, another
+automation with write access, a direct push. Those never reach `verifyGate()`, so the pinning has
+to be GitHub's.
+
 ## Still outstanding for Wave 0 / P0-14
 
-Branch protection is necessary but not sufficient for the trusted GitHub gate. The review's P0-14
-also requires the production gate check to come from a GitHub **App** with `checks:write`, its
-creator identity pinned, and `acp-production-gate` added alongside `verify` as a required check. That
-is tracked as #242 and needs the App installed first — this document covers only the protection half.
+The App half is no longer outstanding. `acp-production-gate` (App `4586878`) is installed
+(installation `153553922`) with `checks/contents/pull_requests/statuses/issues/merge_queues` write
+and `metadata` read, and a live gate → merge → post-merge sequence is captured in
+`evidence/p0-14-live-gate-merge-postmerge.json`, with the forged/missing/stale refusals in
+`evidence/p0-14-live-gate-refusals.json`. #242 is closed.
+
+**Register the two required checks in order, not together.**
+
+1. `verify` first, as soon as `main` CI is green. This is safe immediately: every push already
+   produces it.
+2. `acp-production-gate` **only once the daemon finalizer publishes a gate as a matter of course.**
+   Requiring it before then blocks every merge that is not a completed ACP run — including the
+   merge that would fix whatever stopped the daemon publishing. That is the same trap the section
+   above describes for a check that cannot pass.
+
+The residual after both are registered is recorded on #247: GitHub's merge API fences the head but
+accepts no expected base, so an out-of-order base is detected after the merge rather than prevented.
+
+Two repository-scope items remain owner actions, because an installation's repository set can only
+be changed with a user-to-server token:
+
+- `acp-production-gate` is installed on **one** repository (`repository_selection: selected`,
+  `total_count: 1`). #240's ordered two-repository merge cannot run until a second is added.
+- `dev` is currently unprotected; the ruleset above covers both refs and applies to it too.
