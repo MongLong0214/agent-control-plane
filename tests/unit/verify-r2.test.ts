@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -295,35 +295,18 @@ describe("round-2 verification isolation and candidate freshness", () => {
     expect(result).toMatchObject({ childPid: expect.any(Number), spawnError: null });
     if (result === null || result.childPid === null) return;
 
-    // Temporary CI diagnostics (#461). Locally this test cannot fail — the platform reaps the
-    // detached child even when ACP signals nothing at all, proved by returning early from
-    // killKnownTargets. CI is the only environment where the fence is actually exercised, so
-    // the state it observed has to be captured there rather than reasoned about here.
-    const psLine = (pid: number): string => {
-      try {
-        return execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,sess=,stat=,command=", "-p", String(pid)], {
-          encoding: "utf8",
-        }).trim();
-      } catch (error) {
-        return `ps failed: ${(error as NodeJS.ErrnoException).code ?? String(error)}`;
-      }
-    };
-    console.error("[#461] outcome.enforcement=", JSON.stringify(outcome.enforcement));
-    console.error("[#461] child at assert time:", psLine(result.childPid));
-    console.error("[#461] this process:", psLine(process.pid));
-
     let childIsAlive = false;
     try {
-      // 12s, not 1s. The reap is asynchronous, and 40 attempts at 25ms gave the fence one
-      // second to finish — enough on an idle machine and not enough on a loaded CI runner.
-      // That produced `expected true to be false` on four unrelated branches today, none of
-      // which touched the sandbox (#461), and each passed on re-run.
+      // 12s, not 1s. This was widened on the theory that the reap was merely slow on a loaded
+      // runner. That theory was wrong: a CI probe caught a surviving child reading
+      // `ppid=1 pgid=<own pid> stat=S<s` — its own session and process group, reparented to
+      // init. `setsid(2)` put it outside the candidate's group entirely, so a group kill can
+      // never reach it and no deadline helps (#461).
       //
-      // This does not weaken the assertion: an unreaped child still fails it, just later. The
-      // probe is `sleep 30`, so a fence that never fires is still caught well inside the
-      // child's own lifetime. The cost of the old deadline was not a missed defect but a
-      // signal nobody could trust — a red build stopped meaning anything, which is worse than
-      // a slow one.
+      // The wider window stays because it costs nothing and cannot mask anything — an
+      // unreachable child still fails this assertion, just later, and the probe is `sleep 30`.
+      // It is not the fix, and this comment says so rather than leaving a plausible wrong
+      // explanation in place for the next reader to inherit.
       for (let attempt = 0; attempt < 480; attempt += 1) {
         try {
           process.kill(result.childPid, 0);
@@ -334,13 +317,6 @@ describe("round-2 verification isolation and candidate freshness", () => {
           break;
         }
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
-      }
-      // Record the final sample whatever the outcome. The first probe printed only from a run
-      // where this passed, which is precisely the run that carries no information — the
-      // question is what the fence looked like when the child *survived*.
-      if (childIsAlive) {
-        console.error("[#461] SURVIVED:", psLine(result.childPid));
-        console.error("[#461] enforcement at failure:", JSON.stringify(outcome.enforcement));
       }
       expect(childIsAlive).toBe(false);
     } finally {
