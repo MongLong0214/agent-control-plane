@@ -182,9 +182,37 @@ instead of running the suite twice.
 
 ---
 
+## 6b. The one CI failure left on `terra10/verifysec`
+
+`#348/#349` and `P1-15 records the observed RSS breach` fail **only on the GitHub runner**,
+and only in which refusal they report — the run is refused either way.
+
+On Darwin there is no enforceable hard RSS limit, so the sandbox *samples* `groupRssMb` and
+declares a breach when a sample exceeds the cap (`src/verify/sandbox.ts:572-596`). On a
+loaded runner the deliberately memory-abusive child exits before any sample lands, so:
+
+- `memoryLimitExceeded` stays false — nothing observed the peak
+- the candidate identity is never captured, so `childCleanupUnavailable` is true
+- the reported reason becomes `SANDBOX_CHILD_CLEANUP_FAILED` instead of
+  `SANDBOX_RESOURCE_LIMIT_EXCEEDED`
+
+The precedence was already corrected this round so an *exceeded* limit outranks an
+unobservable child (`isolationLost` still outranks both). That is not enough here, because on
+the runner the limit is never observed as exceeded in the first place.
+
+**The fix is in sampling, not in the reason codes or the test.** The sampler needs at least
+one prompt sample after spawn and one final read before the child is reaped, so a
+fast-dying child still yields a peak. Do not make the test accept either reason — that
+would turn a measurement gap into a passing claim, and the point of this test is that the
+breach was *observed*.
+
+Everything else on that lane passes on CI; this is the only remaining failure.
+
 ## 7. Next actions, in order
 
-1. **Restore green `main`** — the trace step above.
+0. **`main` is green** — [run 31769735438](https://github.com/MongLong0214/agent-control-plane/actions/runs/31769735438). The
+   crash was `pool: "threads"` running a native addon beside sandboxed children; it is
+   `pool: "forks"` now, and the suite runs once with `trace` consuming its JSON.
 2. **capacityobs**: decide whether #424 splits. The capacity half is done; the SURVIVAL half
    is untouched and is what actually blocks dispatch on this host. Then the runtime-health
    and older-than-newest defects.
