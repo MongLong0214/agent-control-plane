@@ -24,8 +24,13 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm build
-      - run: pnpm test
+      # One suite run, not two. `trace` needs a JSON reporter pass; it used to obtain that by
+      # running the whole suite a second time, which doubled a suite that spawns real
+      # sandboxed children and failed on the runner while the first run passed.
+      - run: pnpm test -- --reporter=default --reporter=json --outputFile.json=evidence/local/ci-vitest-results.json
       - run: pnpm trace
+        env:
+          ACP_VITEST_RESULTS: evidence/local/ci-vitest-results.json
       - run: node scripts/ssot-report.mjs
         env:
           GH_TOKEN: ${{ github.token }}

@@ -6,8 +6,8 @@
   "testRun": {
     "reporter": "vitest-json",
     "success": true,
-    "total": 655,
-    "passed": 654,
+    "total": 722,
+    "passed": 721,
     "failed": 0,
     "pending": 1
   },
@@ -917,7 +917,7 @@
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
-          "title": "gate_publish refuses when the trusted credential is absent"
+          "title": "gate_publish reports the missing App env file when the credential is absent"
         }
       ],
       "status": "DECLARATION_COVERED"
@@ -979,7 +979,7 @@
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
-          "title": "gate_publish refuses when the trusted credential is absent"
+          "title": "gate_publish reports the missing App env file when the credential is absent"
         }
       ],
       "status": "DECLARATION_COVERED"

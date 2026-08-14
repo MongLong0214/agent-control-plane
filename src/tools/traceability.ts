@@ -393,8 +393,28 @@ export const parseVitestJsonReport = (text: string): VitestJsonReport => {
   };
 };
 
-/** Runs an isolated, current Vitest JSON reporter pass. The regular test gate remains separate. */
+/**
+ * The current Vitest JSON result set.
+ *
+ * Prefers a result file the caller already produced (`ACP_VITEST_RESULTS`). CI runs the whole
+ * suite once for the test gate and then ran it a second time here purely to obtain a JSON
+ * reporter pass — two full runs of a suite that starts real sandboxed child processes, whose
+ * second run failed on the runner while the first passed. Reusing the first run's output is
+ * both cheaper and the only way the traceability report describes the same execution the
+ * gate actually judged.
+ *
+ * Falling back to running Vitest keeps `pnpm trace` usable on its own.
+ */
 const runVitestJson = (root: string): VitestJsonReport => {
+  const supplied = process.env["ACP_VITEST_RESULTS"];
+  if (supplied) {
+    const suppliedPath = isAbsolute(supplied) ? supplied : join(root, supplied);
+    if (!existsSync(suppliedPath)) {
+      throw new Error(`ACP_VITEST_RESULTS points at a missing file: ${suppliedPath}`);
+    }
+    return parseVitestJsonReport(readFileSync(suppliedPath, "utf8"));
+  }
+
   const evidenceDir = join(root, "evidence", "local");
   const outputPath = join(evidenceDir, `traceability-vitest-${process.pid}.json`);
   const vitestEntrypoint = join(root, "node_modules", "vitest", "vitest.mjs");
