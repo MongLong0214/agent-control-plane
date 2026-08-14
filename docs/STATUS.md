@@ -29,11 +29,14 @@ its required live record:
 - A deployable, observed launchd installation: [issue](https://github.com/MongLong0214/agent-control-plane/issues/400).
 - The required real-world observation window: [issue](https://github.com/MongLong0214/agent-control-plane/issues/241).
 - Owner-only channel configuration that only the owner can provide: [issue](https://github.com/MongLong0214/agent-control-plane/issues/245).
-- Positive proof that a reviewer can reach only its provider endpoint on macOS: [residual](https://github.com/MongLong0214/agent-control-plane/issues/419).
+- Deployment-level observation that a configured reviewer can reach only its provider endpoint on macOS: [residual](https://github.com/MongLong0214/agent-control-plane/issues/419).
 
-The last residual is intentional fail-closed behavior, not an attestation: real reviewer
-invocations refuse when provider-only egress cannot be positively proven. That is safer than
-claiming isolation the host cannot show.
+The runtime now has a fail-closed provider-egress path: each isolated reviewer receives a
+daemon-generated provider allowlist, a kernel-enforced loopback proxy route, and fresh
+allow/deny/direct-socket probes whose JSONL is bound to `BLIND_REVIEW` evidence. It still does
+not make a general live-acceptance claim for an unconfigured deployment: missing or failed
+infrastructure refuses review, and the outstanding deployment-level observation remains owed.
+See [reviewer egress](reviewer-egress.md).
 
 ## Milestones
 

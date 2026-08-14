@@ -6,6 +6,7 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { CodexCliAdapter, __testing } from "../../src/runtime/cli-adapters.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterEach(() => __testing.setRunCli(null));
 afterAll(cleanupTempDirs);
@@ -51,6 +52,7 @@ describe("Codex provider-issued reviewer sessions", () => {
         // Isolation is covered by the live probe regressions; this stub supplies only the
         // already-admitted runCli result needed to exercise provider-session identity.
         isolationEnforced: true,
+        egressEvidence: testReviewerEgressEvidence("gpt"),
       };
     });
 

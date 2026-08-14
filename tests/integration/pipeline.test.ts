@@ -16,6 +16,7 @@ import {
   reviewerPass,
   reviewerRevise,
 } from "../helpers/harness.ts";
+import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -470,6 +471,7 @@ describe("one safe project run, end to end", () => {
         provider: "scripted",
         model: "scripted-reviewer",
         effort: null,
+        egressEvidence: testReviewerEgressEvidence("scripted"),
         inputManifest: {
           contract: true,
           snapshotManifest: true,

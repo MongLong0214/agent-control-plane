@@ -95,6 +95,85 @@ export const ProviderId = {
 } as const;
 export type ProviderId = (typeof ProviderId)[keyof typeof ProviderId];
 
+/**
+ * The only provider hostnames a packet-only reviewer may ask the daemon to route.
+ *
+ * This lives beside the provider identity contract rather than in the owner-supplied
+ * proxy allowlist: the latter is infrastructure, while this map is the daemon's policy.
+ * A deployment may replace the map through `ReviewerEgressConfig.providerEndpoints`,
+ * but an omitted provider never falls through to another provider's hosts.
+ */
+export const REVIEWER_PROVIDER_ENDPOINTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  gpt: Object.freeze(["api.openai.com"]),
+  claude: Object.freeze(["api.anthropic.com"]),
+  grok: Object.freeze(["api.x.ai"]),
+});
+
+/**
+ * Real public endpoints used only to prove that the proxy refuses a destination outside
+ * the selected provider policy. The runtime chooses one not present in that invocation's
+ * generated allowlist; `.invalid` is deliberately not an attestation target because a
+ * resolver can reject it without the proxy applying the allowlist at all.
+ */
+export const REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS: readonly string[] = Object.freeze([
+  "api.openai.com",
+  "api.anthropic.com",
+  "api.x.ai",
+  "example.com",
+  "www.iana.org",
+]);
+
+/**
+ * Owner-provided egress infrastructure. These are paths, not policy: the daemon writes a
+ * fresh allowlist from `REVIEWER_PROVIDER_ENDPOINTS` (or the explicitly configured map)
+ * for every isolated reviewer invocation.
+ */
+export interface ReviewerEgressConfig {
+  /** Seatbelt profile that blocks remote TCP/UDP except the local proxy port. */
+  profilePath: string;
+  /** Owner-provided CONNECT allowlist proxy implementation. */
+  proxyPath: string;
+  /** Daemon-private parent for per-invocation allowlists and JSONL logs. */
+  runtimeDir: string;
+  /** The loopback port granted by the seatbelt profile. Defaults to 18443. */
+  port?: number;
+  /** Interpreter used to launch `proxyPath`. Defaults to /usr/bin/python3 on macOS. */
+  pythonBinary?: string;
+  /** Optional complete replacement for the compiled provider endpoint map. */
+  providerEndpoints?: Readonly<Record<string, readonly string[]>>;
+}
+
+export interface ReviewerEgressProbe {
+  host: string;
+  /** Whether the direct socket stripped or replaced HTTPS_PROXY before it connected. */
+  proxyMode?: "unset" | "override";
+  connected?: boolean;
+  denied?: boolean;
+  blocked?: boolean;
+  statusCode?: number | null;
+  errorCode?: string | null;
+}
+
+/**
+ * Verbatim proxy evidence for one confined provider process. `jsonl` is copied only after
+ * the daemon has stopped its proxy, so the bytes in a BLIND_REVIEW artifact are immutable
+ * evidence for that invocation rather than a pointer to a mutable host log.
+ */
+export interface ReviewerEgressRecord {
+  provider: string;
+  allowedEndpoints: string[];
+  /** sha256 of the exact generated `allowlist.txt` bytes passed to the proxy process. */
+  allowlistDigest: string;
+  proxyPort: number;
+  phase: "session-bootstrap" | "reviewer-invocation";
+  jsonl: string;
+  probes: {
+    allowedEndpoint: ReviewerEgressProbe;
+    deniedEndpoint: ReviewerEgressProbe;
+    directSocket: ReviewerEgressProbe[];
+  };
+}
+
 export interface InvocationRequest {
   prompt: string;
   systemPrompt?: string;
@@ -166,6 +245,11 @@ export interface InvocationResult {
    * than reducing every failed isolation setup to a provider error string.
    */
   isolationReasonCode?: typeof ReasonCode.ISOLATION_LOST;
+  /**
+   * Non-empty only for an invocation whose provider-only boundary was actively measured.
+   * The blind-review gate copies these immutable JSONL records into its evidence artifact.
+   */
+  egressEvidence?: ReviewerEgressRecord[];
   /**
    * The adapter accepted and applied the requested effort through a provider-supported
    * invocation setting. Used only by adapters that can make this a measured fact.

@@ -32,7 +32,13 @@ import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
 import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter } from "../runtime/cli-adapters.ts";
-import { GuardedInvocationWriteBroker, type ProviderAdapter, ProviderRegistry } from "../runtime/provider.ts";
+import {
+  GuardedInvocationWriteBroker,
+  type ProviderAdapter,
+  ProviderRegistry,
+  REVIEWER_PROVIDER_ENDPOINTS,
+  type ReviewerEgressConfig,
+} from "../runtime/provider.ts";
 import { BindingRegistry } from "../session/binding-registry.ts";
 import { SessionRegistry } from "../session/session-registry.ts";
 import { Telemetry } from "../telemetry/telemetry.ts";
@@ -67,6 +73,11 @@ export interface ControlPlaneConfig {
   ctoPreference?: CtoPreference;
   reviewer?: { preferred: ReviewerPreference; fallbacks: ReviewerPreference[] };
   capacity?: CapacityOptions;
+  /**
+   * Paths for daemon-owned, provider-only blind-review egress. The endpoint policy itself
+   * lives in `src/runtime/provider.ts`; this points only at owner-provided infrastructure.
+   */
+  reviewerEgress?: ReviewerEgressConfig;
   /** Adapters to register. Real CLI adapters are registered unless replaced. */
   adapters?: ProviderAdapter[];
   /**
@@ -91,6 +102,12 @@ export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): C
   worktreeRoot: join(root, "worktrees"),
   capacityDir: join(root, "capacity"),
   secretsDir: join(root, "secrets"),
+  reviewerEgress: {
+    profilePath: join(root, "egress", "reviewer.sb"),
+    proxyPath: join(root, "egress", "allowlist-proxy.py"),
+    runtimeDir: join(root, "egress", "runs"),
+    port: 18_443,
+  },
   // §21 — owner identities are declared out of band, one per line as `channel:actor` in
   // `<root>/owner-identities`. An absent or empty file means this deployment has no owner,
   // so no human gate can be satisfied; that is the safe reading, not a permissive one.
@@ -340,6 +357,7 @@ export class ControlPlane {
         preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
         fallbacks: [{ provider: "claude", model: "opus", effort: null }],
       },
+      config.reviewerEgress?.providerEndpoints ?? REVIEWER_PROVIDER_ENDPOINTS,
     );
     this.capacity = new CapacityMonitor(
       this.db, this.clock, this.audit, this.providers, this.telemetry, config.capacity,
@@ -505,6 +523,7 @@ export class ControlPlane {
         denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
         managedWriteBroker,
         providerCredentialDir: process.env["ACP_CLAUDE_REVIEWER_CONFIG_DIR"],
+        reviewerEgress: this.config.reviewerEgress,
       }),
       new CodexCliAdapter({
         clock: this.clock,
@@ -516,6 +535,7 @@ export class ControlPlane {
         // ordinary ~/.codex tree is intentionally never repurposed as a blind-review
         // credential scope because it can contain producer conversations.
         providerCredentialDir: process.env["ACP_CODEX_REVIEWER_HOME"],
+        reviewerEgress: this.config.reviewerEgress,
       }),
       new GrokCliAdapter({
         clock: this.clock,

@@ -30,6 +30,7 @@ import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.t
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import { cleanupTempDirs, commitAll, makeRepo, tempDir } from "../helpers/fixtures.ts";
 import { bindWorkerForTask, fixtureManifest, reviewerPass } from "../helpers/harness.ts";
+import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -57,7 +58,9 @@ class ProductionTestAdapter implements ProviderAdapter {
     const result = await this.#scripted.invoke(request);
     // This test-owned adapter does not perform I/O, so an isolated reviewer request is
     // packet-only by construction. Production adapters still have to attest their boundary.
-    return request.isolation ? { ...result, isolationAttested: true } : result;
+    return request.isolation
+      ? { ...result, isolationAttested: true, egressEvidence: testReviewerEgressEvidence(this.provider) }
+      : result;
   }
   script(...responses: ScriptedResponse[]): this {
     this.#scripted.script(...responses);
@@ -1358,7 +1361,7 @@ describe("round-2 capacity and runtime regressions", () => {
     });
   });
 
-  it("#360 refuses reviewer attestation when a live non-provider egress probe succeeds", async () => {
+  it("#360 refuses reviewer attestation when daemon-owned egress is not configured", async () => {
     const clock = new ManualClock("2026-08-12T00:00:00.000Z");
     const packetRoot = tempDir("acp-reviewer-packet-");
     const hostHome = tempDir("acp-reviewer-home-");
@@ -1408,19 +1411,16 @@ describe("round-2 capacity and runtime regressions", () => {
         },
       });
 
-      // The profile's filesystem and process probes run first, then a child under the same
-      // profile reaches a listener which is not the provider. `allow default` therefore is
-      // not a provider-only boundary, and the adapter must refuse before this reviewer stub
-      // can run. Deleting that live egress probe would make this assertion flip to a false
-      // attestation.
+      // A reviewer cannot fall back to an allow-default profile if the egress lease is not
+      // configured; lack of infrastructure is a boundary loss, not a best-effort warning.
       expect(result.ok).toBe(false);
       expect(result.isolationAttested).toBe(false);
       expect(result.isolationReasonCode).toBe(ReasonCode.ISOLATION_LOST);
-      expect(result.error).toContain("provider-only network probe reached a non-provider endpoint");
+      expect(result.error).toContain("REVIEWER_EGRESS_CONFIG_MISSING");
     });
   });
 
-  it("#354 returns ISOLATION_LOST when the reviewer profile cannot be applied", async () => {
+  it("#354 returns ISOLATION_LOST when reviewer egress infrastructure is absent", async () => {
     const clock = new ManualClock("2026-08-12T00:00:00.000Z");
     const packetRoot = tempDir("acp-reviewer-profile-failure-");
     const adapter = new ClaudeCliAdapter({
@@ -1437,8 +1437,8 @@ describe("round-2 capacity and runtime regressions", () => {
       correlationId: "reviewer-profile-not-applied",
       isolation: {
         packetRoot,
-        // `spawn` rejects a seatbelt argv that contains NUL. The adapter must turn that
-        // unusable profile into an unattested isolation result, not an uncaught exception.
+        // The malformed deny path is immaterial: egress setup occurs before any reviewer
+        // child can be spawned, and absent infrastructure must fail closed first.
         denyReadPaths: ["/tmp/acp-profile\u0000cannot-apply"],
         emptyEnvironment: true,
         network: "provider-only",
@@ -1449,7 +1449,7 @@ describe("round-2 capacity and runtime regressions", () => {
     expect(result.ok).toBe(false);
     expect(result.isolationAttested).toBe(false);
     expect(result.isolationReasonCode).toBe(ReasonCode.ISOLATION_LOST);
-    expect(result.error).toContain("null bytes");
+    expect(result.error).toContain("REVIEWER_EGRESS_CONFIG_MISSING");
   });
 
   it("#59 rejects replacement and keeps scripted adapters out of the production registry", () => {

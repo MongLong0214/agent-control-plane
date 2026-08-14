@@ -21,6 +21,7 @@ import type { VerificationReport } from "../../src/verify/verification-engine.ts
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import { TEST_OWNER, bindCeo, bindWorker, makeHarness, registerFixtureProject } from "../helpers/harness.ts";
+import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -127,6 +128,7 @@ const evidenceReadyRun = async (
     provider: "scripted",
     model: "reviewer",
     effort: null,
+    egressEvidence: testReviewerEgressEvidence("scripted"),
     inputManifest: {
       contract: true,
       snapshotManifest: true,

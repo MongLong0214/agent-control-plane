@@ -1,5 +1,11 @@
 import type { Clock } from "../../src/core/clock.ts";
-import type { InvocationRequest, InvocationResult } from "../../src/runtime/provider.ts";
+import { sha256 } from "../../src/core/digest.ts";
+import type {
+  InvocationRequest,
+  InvocationResult,
+  ReviewerEgressRecord,
+} from "../../src/runtime/provider.ts";
+import { REVIEWER_PROVIDER_ENDPOINTS } from "../../src/runtime/provider.ts";
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 
 /**
@@ -32,6 +38,40 @@ export class TestProductionAdapter extends ScriptedAdapter {
    */
   override async invoke(request: InvocationRequest): Promise<InvocationResult> {
     const result = await super.invoke(request);
-    return request.isolation ? { ...result, isolationAttested: true } : result;
+    return request.isolation
+      ? { ...result, isolationAttested: true, egressEvidence: testReviewerEgressEvidence(this.provider) }
+      : result;
   }
 }
+
+/**
+ * Deterministic evidence used only by test doubles which do no I/O at all. Production
+ * adapters may never use this: they must populate the same shape from a live proxy lease.
+ */
+export const testReviewerEgressEvidence = (provider: string): ReviewerEgressRecord[] => {
+  const allowedHost = REVIEWER_PROVIDER_ENDPOINTS[provider]?.[0] ??
+    `${provider.replace(/[^a-z0-9-]/gi, "").toLowerCase() || "reviewer"}.provider.test`;
+  const deniedHost = allowedHost === "api.openai.com" ? "api.anthropic.com" : "api.openai.com";
+  const port = 18_443;
+  const allowlistDigest = sha256(`${allowedHost}\n`);
+  return [{
+    provider,
+    allowedEndpoints: [allowedHost],
+    allowlistDigest,
+    proxyPort: port,
+    phase: "reviewer-invocation",
+    jsonl: [
+      JSON.stringify({ t: 1, verdict: "START", port, pid: 1, allowlistDigest }),
+      JSON.stringify({ t: 2, verdict: "ALLOW", host: allowedHost, port: 443 }),
+      JSON.stringify({ t: 3, verdict: "DENY", host: deniedHost, port: 443 }),
+    ].join("\n") + "\n",
+    probes: {
+      allowedEndpoint: { host: allowedHost, connected: true, statusCode: 200 },
+      deniedEndpoint: { host: deniedHost, denied: true, statusCode: 403 },
+      directSocket: [
+        { host: allowedHost, proxyMode: "unset", connected: false, blocked: true, errorCode: "EPERM" },
+        { host: allowedHost, proxyMode: "override", connected: false, blocked: true, errorCode: "EPERM" },
+      ],
+    },
+  }];
+};

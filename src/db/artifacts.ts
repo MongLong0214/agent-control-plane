@@ -535,6 +535,38 @@ const verificationEvidenceSchema = z
   })
   .strict();
 
+const reviewerEgressProbeSchema = z
+  .object({
+    host: z.string().min(1),
+    proxyMode: z.enum(["unset", "override"]).optional(),
+    connected: z.boolean().optional(),
+    denied: z.boolean().optional(),
+    blocked: z.boolean().optional(),
+    statusCode: z.number().int().nullable().optional(),
+    errorCode: z.string().nullable().optional(),
+  })
+  .strict();
+
+const reviewerEgressRecordSchema = z
+  .object({
+    provider: z.string().min(1),
+    allowedEndpoints: z.array(z.string().min(1)).min(1),
+    allowlistDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+    proxyPort: z.number().int().min(1).max(65_535),
+    phase: z.enum(["session-bootstrap", "reviewer-invocation"]),
+    // The proxy writes these exact JSONL bytes. The review gate validates every line and
+    // ArtifactStore rejects a credential-bearing value rather than redacting evidence.
+    jsonl: z.string().min(1),
+    probes: z
+      .object({
+        allowedEndpoint: reviewerEgressProbeSchema,
+        deniedEndpoint: reviewerEgressProbeSchema,
+        directSocket: z.array(reviewerEgressProbeSchema).min(1),
+      })
+      .strict(),
+  })
+  .strict();
+
 const blindReviewEvidenceSchema = z
   .object({
     runId: z.string().min(1),
@@ -547,6 +579,7 @@ const blindReviewEvidenceSchema = z
     provider: z.string().min(1),
     model: z.string().min(1),
     effort: z.string().nullable(),
+    egressEvidence: z.array(reviewerEgressRecordSchema).min(1),
     inputManifest: z
       .object({
         contract: z.boolean(),
