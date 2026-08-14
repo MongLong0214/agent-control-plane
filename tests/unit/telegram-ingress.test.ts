@@ -13,7 +13,7 @@ import {
 import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { digestOf } from "../../src/core/digest.ts";
-import { Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { BuzzAdapter } from "../../src/buzz/buzz-adapter.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import {
@@ -895,6 +895,34 @@ describe("Telegram startup configuration", () => {
     // failure belongs to the update being processed while a prompt failure does not.
     transport.failOwnerGateSends = true;
 
+    // The signal must name a run that really has a current candidate. With a synthetic id,
+    // prepareOwnerPrompt denies EVIDENCE_STALE before reaching transport.sendMessage — so
+    // failOwnerGateSends was never read and this test passed on the deny path instead of on
+    // the delivery failure it names. The candidate is promoted through the production API
+    // rather than written into the row, so the fixture cannot drift from what a real run has.
+    const parked = harness.cp.runs.create({
+      projectId: registered.projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: {
+        goal: "parked run whose owner-gate prompt cannot be delivered",
+        why: "P0-10 regression fixture",
+        scope: ["telegram"],
+        nonGoals: [],
+        acceptance: ["the owner control path survives a prompt delivery failure"],
+        priority: "NORMAL",
+        humanGate: [],
+        references: [],
+      },
+      repositories: [
+        { repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" },
+      ],
+    });
+    if (!parked.allowed) throw new Error(parked.message);
+    const parkedRunId = parked.value.runId;
+    const parkedCandidate = `sha256:${"a".repeat(64)}`;
+    harness.cp.runs.promoteCandidate(parkedRunId, parkedCandidate);
+    expect(harness.cp.runs.currentCandidate(parkedRunId)).toBe(parkedCandidate);
+
     const errors: unknown[] = [];
     const listener = await startDaemonTelegramListener(
       harness.cp,
@@ -905,9 +933,9 @@ describe("Telegram startup configuration", () => {
         start: false,
         ownerGateSignals: () => [{
           signalId: "sig-undeliverable",
-          runId: "run_undeliverable",
+          runId: parkedRunId,
           items: ["owner confirms"],
-          candidateSnapshotDigest: `sha256:${"a".repeat(64)}`,
+          candidateSnapshotDigest: parkedCandidate,
         }],
         onError: (error: unknown) => { errors.push(error); },
       },
