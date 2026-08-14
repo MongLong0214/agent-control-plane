@@ -335,6 +335,13 @@ describe("round-2 verification isolation and candidate freshness", () => {
         }
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
       }
+      // Record the final sample whatever the outcome. The first probe printed only from a run
+      // where this passed, which is precisely the run that carries no information — the
+      // question is what the fence looked like when the child *survived*.
+      if (childIsAlive) {
+        console.error("[#461] SURVIVED:", psLine(result.childPid));
+        console.error("[#461] enforcement at failure:", JSON.stringify(outcome.enforcement));
+      }
       expect(childIsAlive).toBe(false);
     } finally {
       // A failed containment assertion must not leave the escaped probe behind.
