@@ -209,7 +209,12 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     }
   });
 
-  const runLockLossCase = async (sourceLine: 157 | 259, label: string): Promise<void> => {
+  // These identify a specific `authorityHeld()` call site by its line number in
+// hermes-bootstrap.ts, so any edit above one silently retargets it. When that happens the
+// failure reads "expected true to be false" — indistinguishable from the fence itself
+// regressing — which is how a brittle mechanism turns a source edit into a false alarm about
+// the product. Recorded as a finding; updated here rather than redesigned.
+const runLockLossCase = async (sourceLine: 158 | 266, label: string): Promise<void> => {
     const harness = makeHarness();
     const stateDir = tempDir(`hb-l-${label.slice(0, 2)}-`);
     const launchedPath = join(stateDir, "runtime-launched");
@@ -246,11 +251,11 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
   };
 
   it("refuses when the daemon lock is lost at the first post-launch fence", async () => {
-    await runLockLossCase(157, "first-fence");
+    await runLockLossCase(158, "first-fence");
   });
 
   it("refuses when the daemon lock is lost at the pre-constitution fence", async () => {
-    await runLockLossCase(259, "constitution-fence");
+    await runLockLossCase(266, "constitution-fence");
   });
 
   it("does not launch Hermes after losing the lock when the bootstrap door opens", async () => {
@@ -262,7 +267,7 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     expect(acquired.allowed).toBe(true);
     const authorityHeld = (): boolean => {
       const stack = new Error().stack ?? "";
-      if (stack.split("\n").some((frame) => frame.includes("hermes-bootstrap.ts:170:"))) {
+      if (stack.split("\n").some((frame) => frame.includes("hermes-bootstrap.ts:171:"))) {
         lock.release();
       }
       return lock.held();
