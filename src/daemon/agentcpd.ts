@@ -1081,7 +1081,7 @@ class SocketTransport implements Transport {
   };
 }
 
-/** The actor allowlist is deployment configuration, never a relay-supplied claim. */
+/** The channel-identity allowlist is deployment configuration, never a relay-supplied claim. */
 const configuredBuzzActorIngressPolicy = (): IngressPolicy | null => {
   const secret = process.env["ACP_BUZZ_INGRESS_SECRET"]?.trim() ?? "";
   const allowedActors = (process.env["ACP_BUZZ_ALLOWED_ACTORS"] ?? "")

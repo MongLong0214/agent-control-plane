@@ -159,6 +159,7 @@ verdict.
 - [Ticket DAG](docs/tickets/tickets.json) — 44 atomic tickets across 7 milestones
 - [ADRs](docs/adr/) — the eight decisions that shape the implementation
 - [Traceability](evidence/traceability.md) — requirement → scenario → executable test
+- [Terminology](docs/TERMINOLOGY.md) — the SSOT for the contested words, enforced by `pnpm terminology`
 
 ## Public-repository posture
 

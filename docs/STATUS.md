@@ -82,3 +82,11 @@ entry-point coverage are not measured. It does not prove live provider, GitHub, 
 launchd, or operator behavior. `node scripts/ssot-report.mjs` checks tracker linkage and
 recorded disposition consistency; it cannot determine from arbitrary code text that a semantic
 defect has truly been fixed. Run both, then read the linked evidence before making a status claim.
+
+`pnpm terminology` checks the vocabulary contract in [docs/TERMINOLOGY.md](TERMINOLOGY.md), which
+is the SSOT for what the contested words mean — most importantly that `session` is a *replaceable
+model runtime*, and that the long-lived counterpart holding a transcript is a **conversational
+actor**. It checks collocations rather than words, because every contested word has legitimate
+uses here; it therefore catches the confusions the decision was written to prevent, not every
+possible misuse. One rule (`buzz-actor-qualified`) is staged: counted and held at a baseline, not
+yet failing, because the rename it demands touches files that unmerged lanes are editing.
