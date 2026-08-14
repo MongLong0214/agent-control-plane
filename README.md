@@ -154,10 +154,13 @@ See [docs/capacity-source.md](docs/capacity-source.md).
   refused.
 - **Buzz delivery is verified live for the transport; the #243 acceptance is not complete.**
   A fenced envelope reaches the relay, the returning identity is admitted through the signed
-  production ingress while a different actor is refused by the allowlist, and the doctor's
+  production ingress while a different actor is refused, and the doctor's
   `CTO_BUZZ_NOT_CONNECTED` clears for a connected project CTO
-  ([evidence](evidence/p0-09-buzz-live-delivery.json)). That record is `PARTIAL`: #243 also
-  requires a `HEALTHY` doctor, which this deployment does not yet reach.
+  ([evidence](evidence/p0-09-buzz-live-delivery.json)). The refusal is `IngressGuard`'s, on the
+  real code path — but against an allowlist the capture generates rather than the deployment's
+  configured policy, so it shows the guard enforces a list and not that `agentcpd` would refuse
+  that actor (#440). That record is `PARTIAL`: #243 also requires a `HEALTHY` doctor, which this
+  deployment does not yet reach.
 - Strong isolation for untrusted repositories, a web dashboard, REST/GraphQL and
   automatic Level 6 routing promotion are backlog (PRD §43).
 
