@@ -134,11 +134,16 @@ const CTO_CAPABILITY = "cto";
 
 export interface ContinuityGate {
   mode(): ContinuityMode;
+  /** How long ago coverage was actually computed. A verdict older than this is not evidence. */
+  modeAgeMs?(): number;
   /** Refuses completion in SURVIVAL *and* when the stored mode is stale (§15.6). */
   assertCompletionAllowed?(runId: string): Decision<void>;
   /** Re-computes coverage. Callers in an async context must do this before completing. */
   evaluate?(reason: string): Promise<unknown>;
 }
+
+/** §15.6's freshness window, the same one `assertCompletionAllowed` applies by default. */
+const CONTINUITY_MODE_MAX_AGE_MS = 5 * 60 * 1000;
 
 export class RunEngine {
   /**
@@ -259,11 +264,26 @@ export class RunEngine {
     }
 
     if (this.#continuity?.mode() === ContinuityMode.SURVIVAL) {
-      return deny(
-        ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
-        "continuity is in SURVIVAL; new work is not dispatched",
-        { runId },
-      );
+      // A stored SURVIVAL is a verdict someone computed earlier, not a fact about now.
+      // `assertCompletionAllowed` already refuses to act on a stale one (§15.6); this path
+      // did not, and the asymmetry mattered here more than there: refusing at this point
+      // returns before `refreshForDispatch` below, which is the only thing that would have
+      // produced fresh evidence. So a SURVIVAL computed on one four-minute tick refused
+      // every dispatch until the next one, with nothing in between able to revise it.
+      //
+      // Re-evaluate rather than ignore. A SURVIVAL that is still true after a fresh
+      // computation still refuses — this removes a stale verdict, not the gate.
+      const ageMs = this.#continuity.modeAgeMs?.() ?? 0;
+      if (ageMs > CONTINUITY_MODE_MAX_AGE_MS && this.#continuity.evaluate) {
+        await this.#continuity.evaluate(`dispatch found a ${Math.round(ageMs / 1000)}s-old SURVIVAL verdict`);
+      }
+      if (this.#continuity.mode() === ContinuityMode.SURVIVAL) {
+        return deny(
+          ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
+          "continuity is in SURVIVAL; new work is not dispatched",
+          { runId, modeAgeMs: this.#continuity.modeAgeMs?.() ?? null },
+        );
+      }
     }
 
     if (run.projectId) {

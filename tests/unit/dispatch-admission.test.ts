@@ -411,6 +411,94 @@ describe("dispatch admission is asked about the allocation it will make", () => 
     }
   });
 
+  it("#424 does not refuse dispatch on a SURVIVAL verdict nothing has revisited", async () => {
+    // §15.6's rule already existed on the completion path: a mode computed before the
+    // providers changed is not evidence. Dispatch lacked it, and the omission mattered more
+    // here — refusing at run-engine.ts:261 returns before `refreshForDispatch`, which is the
+    // only call that would have produced a newer verdict. So one tick's SURVIVAL refused
+    // every dispatch until the next tick, with nothing able to revise it in between.
+    const running = await makeStartedOperator();
+    try {
+      const { harness } = running;
+      harness.scripted.setCapacity({
+        provider: "scripted",
+        sensorHealth: "ERROR",
+        runtimeHealth: "HEALTHY",
+        observedAt: harness.clock.nowIso(),
+        source: "fixture-collector-error",
+        error: "synthetic fixture collector could not expose quota",
+        buckets: [],
+      });
+      await harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
+      await harness.cp.continuity.evaluate("collectors failing");
+      expect(harness.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
+
+      // Capacity recovers, but nothing re-evaluates coverage — exactly the gap between two
+      // four-minute daemon ticks.
+      harness.scripted.setCapacity({
+        provider: "scripted",
+        sensorHealth: "HEALTHY",
+        runtimeHealth: "HEALTHY",
+        observedAt: harness.clock.nowIso(),
+        source: "recovered-collector",
+        buckets: [{
+          id: "recovered",
+          remainingPercent: 80,
+          resetAt: null,
+          capabilities: ["ceo", "cto", "worker", "blind-review"],
+        }],
+      });
+      // Persist the recovered reading the way the daemon's sensor timer does — but do not
+      // re-evaluate coverage. That is precisely the state between two ticks: capacity is
+      // current, the continuity verdict is not.
+      await harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
+      expect(harness.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
+
+      // Past §15.6's freshness window, so the stored SURVIVAL is no longer evidence.
+      harness.clock.advance(6 * 60 * 1000);
+
+      const { projectId, repositoryId } = await registerFixtureProject(harness, "stale-survival");
+      const dispatched = await harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId));
+      expect(
+        dispatched.allowed,
+        `mode=${harness.cp.continuity.mode()} ageMs=${harness.cp.continuity.modeAgeMs()} reason=${dispatched.reasonCode}`,
+      ).toBe(true);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("#424 still refuses dispatch when a fresh evaluation says SURVIVAL", async () => {
+    // The other half: re-evaluating is not the same as ignoring. When coverage is genuinely
+    // gone, a fresh verdict says SURVIVAL and dispatch is still refused.
+    const running = await makeStartedOperator();
+    try {
+      const { harness } = running;
+      harness.scripted.setCapacity({
+        provider: "scripted",
+        sensorHealth: "ERROR",
+        runtimeHealth: "HEALTHY",
+        observedAt: harness.clock.nowIso(),
+        source: "fixture-collector-error",
+        error: "synthetic fixture collector could not expose quota",
+        buckets: [],
+      });
+      await harness.cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["scripted"]);
+      await harness.cp.continuity.evaluate("collectors failing");
+      expect(harness.cp.continuity.mode()).toBe(ContinuityMode.SURVIVAL);
+      harness.clock.advance(6 * 60 * 1000);
+
+      const { projectId, repositoryId } = await registerFixtureProject(harness, "real-survival");
+      await expect(harness.cp.runs.dispatch(createQueuedCtoRun(harness, projectId, repositoryId)))
+        .resolves.toMatchObject({
+          allowed: false,
+          reasonCode: ReasonCode.CONTINUITY_SURVIVAL_NO_COMPLETION,
+        });
+    } finally {
+      await running.close();
+    }
+  });
+
   it("#424 refuses an observation whose source the daemon did not stamp", async () => {
     const harness = makeHarness();
     const wellFormed = fixtureOperatorObservation(harness.clock.nowIso());

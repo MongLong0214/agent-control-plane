@@ -479,7 +479,13 @@ export class ControlPlane {
       // The target has to survive the port: dropping it here is what made every dispatch
       // ask "is any provider healthy?" instead of "is the one this run will use healthy?".
       capacity: { refreshForDispatch: (target) => this.capacity.refreshForDispatch(target) },
-      continuity: { mode: () => this.continuity.mode() },
+      continuity: {
+        mode: () => this.continuity.mode(),
+        // Dispatch needs the age too: §15.6's rule is that a verdict computed before the
+        // providers changed is not evidence, and `evaluate` is how it gets a current one.
+        modeAgeMs: () => this.continuity.modeAgeMs(),
+        evaluate: (reason) => this.continuity.evaluate(reason),
+      },
     });
     this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? []);
     // The GitHub kernel binds the production gate's single human-gate predicate to its
@@ -534,7 +540,9 @@ export class ControlPlane {
       sourceReadLeases: this.guard,
       continuity: {
         mode: () => this.continuity.mode(),
+        modeAgeMs: () => this.continuity.modeAgeMs(),
         assertCompletionAllowed: (runId) => this.continuity.assertCompletionAllowed(runId),
+        evaluate: (reason) => this.continuity.evaluate(reason),
       },
     });
     this.pipeline.attach({
