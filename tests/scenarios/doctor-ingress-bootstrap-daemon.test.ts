@@ -168,6 +168,39 @@ socket.on("data", (chunk) => {
 socket.on("error", () => process.exit(3));
 `;
 
+// Keep the write end open after receiving the credential. This makes the test prove that
+// bootstrap completion waits for the runtime to consume the response, rather than merely
+// for the daemon to flush it into the socket buffer.
+const DELAYED_SECRET_RUNTIME = String.raw`
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const net = require("node:net");
+const secretPath = process.argv[1];
+const delayMs = Number(process.argv[2]);
+const bootstrapSocket = process.env.ACP_HERMES_BOOTSTRAP_SOCKET;
+const token = process.env.ACP_HERMES_BOOTSTRAP_TOKEN;
+const runtimeNonce = "runtime-delayed-secret-nonce-123";
+const runtimeProof = crypto.createHmac("sha256", token).update(runtimeNonce).digest("hex");
+const socket = net.createConnection({ path: bootstrapSocket, allowHalfOpen: true }, () => {
+  socket.write(JSON.stringify({ runtimeNonce, runtimeProof }) + "\n");
+});
+let received = "";
+socket.setEncoding("utf8");
+socket.on("data", (chunk) => {
+  received += chunk;
+  const boundary = received.indexOf("\n");
+  if (boundary === -1) return;
+  const response = JSON.parse(received.slice(0, boundary));
+  if (!response.ok) process.exit(2);
+  setTimeout(() => {
+    fs.writeFileSync(secretPath, response.sessionSecret, { mode: 0o600 });
+    socket.end();
+  }, delayMs);
+});
+socket.once("close", () => process.exit(0));
+socket.once("error", () => process.exit(3));
+`;
+
 describe("Hermes CEO bootstrap authority", () => {
   it("refuses to constitute authority when the daemon lock fence is not held", async () => {
     const harness = makeHarness();
@@ -249,6 +282,58 @@ describe("Hermes CEO bootstrap authority", () => {
         .toEqual([1]);
     } finally {
       verifySecret.mockRestore();
+      await authority.close();
+      harness.cp.close();
+    }
+  });
+
+  it("waits for the runtime to consume its delivered secret before reporting bootstrap success", async () => {
+    const harness = makeHarness();
+    // Keep the owner-only Unix socket below macOS's AF_UNIX pathname limit.
+    const stateDir = tempDir("hb-d-");
+    const secretPath = join(stateDir, "runtime-secret");
+    const authority = createHermesBootstrapAuthority(harness.cp, {
+      stateDir,
+      mcpSocketPath: join(stateDir, "hermes.mcp.sock"),
+      mcpToken: "deployment-mcp-token",
+      runtimeTimeoutMs: 5_000,
+    });
+
+    try {
+      const result = await authority.bootstrap({
+        command: [process.execPath, "-e", DELAYED_SECRET_RUNTIME, secretPath, "75"],
+      });
+
+      expect(result.allowed).toBe(true);
+      expect(readFileSync(secretPath, "utf8").length).toBeGreaterThan(20);
+    } finally {
+      await authority.close();
+      harness.cp.close();
+    }
+  });
+
+  it("revokes a provisional CEO when the runtime never completes credential delivery", async () => {
+    const harness = makeHarness();
+    const stateDir = tempDir("hb-r-");
+    const authority = createHermesBootstrapAuthority(harness.cp, {
+      stateDir,
+      mcpSocketPath: join(stateDir, "hermes.mcp.sock"),
+      mcpToken: "deployment-mcp-token",
+      runtimeTimeoutMs: 1_000,
+    });
+
+    try {
+      const result = await authority.bootstrap({
+        command: [process.execPath, "-e", DELAYED_SECRET_RUNTIME, join(stateDir, "runtime-secret"), "2000"],
+      });
+
+      expect(result.allowed).toBe(false);
+      expect(result.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED);
+      expect(harness.cp.bindings.active(roleKeyFor(Role.CEO))).toBeNull();
+      const history = harness.cp.bindings.history(roleKeyFor(Role.CEO));
+      expect(history).toMatchObject([{ bindingGeneration: 1, status: "REVOKED" }]);
+      expect(harness.cp.sessions.get(history[0]!.sessionId)?.lifecycle).toBe(SessionLifecycle.ERROR);
+    } finally {
       await authority.close();
       harness.cp.close();
     }
