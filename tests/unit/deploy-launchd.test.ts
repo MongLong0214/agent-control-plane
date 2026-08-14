@@ -102,6 +102,12 @@ case "$account" in
   BUZZ_PRIVATE_KEY) [[ "\${ACP_FAKE_BUZZ_ITEM_MISSING:-0}" == "1" ]] && exit 44
                     printf 'fake-keychain-value\\n' ;;
   secrets) printf '%s\\n' "\${ACP_FAKE_BUZZ_SECRETS_JSON:-}" ;;
+  # A host that installed buzz under a user-local bin has no Keychain item for its path, and
+  # the launcher is supposed to fall back to the value resolved at install time. The catch-all
+  # below answered for this account too, so it returned a Keychain value and the resolved path
+  # was never exercised — the fake was masking the property the test is named for.
+  ACP_BUZZ_BINARY) [[ "\${ACP_FAKE_BUZZ_BINARY_ITEM:-0}" == "1" ]] || exit 44
+                   printf 'keychain-provided-buzz\\n' ;;
   ACP_TELEGRAM_*)
     case ",\${ACP_TELEGRAM_KEYCHAIN_ACCOUNTS:-}," in
       *,"$account",*) ;;
@@ -139,10 +145,10 @@ if [[ "$target" == "-e" ]]; then
   exec "$ACP_REAL_NODE" "$@"
 fi
 if [[ "$target" == *"agentcpd.js" ]]; then
-  printf '%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
     "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
     "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
-    "\${BUZZ_PRIVATE_KEY:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
+    "\${BUZZ_PRIVATE_KEY:-<unset>}" "\${ACP_BUZZ_BINARY:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -453,6 +459,32 @@ describe("launchd deployment artifact", () => {
     expect(buzzPath.startsWith("/")).toBe(true);
     expect(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].some((d) => buzzPath.startsWith(`${d}/`)))
       .toBe(false);
+
+    // The file containing the path is not the daemon receiving it. Deleting the export while
+    // leaving the baked value made every assertion above still pass — the launcher held the
+    // right string and handed the daemon nothing. Running it is what tells them apart.
+    const launcherSecurity = join(harness.home, "launcher-security.bash");
+    writeFileSync(
+      launcherSecurity,
+      `security() { "${join(harness.bin, "security")}" "$@"; }\n`,
+      { mode: 0o600 },
+    );
+    const launched = spawnSync("bash", [launcherPath(harness)], {
+      encoding: "utf8",
+      env: { ...harness.env, BASH_ENV: launcherSecurity },
+    });
+    expect(launched.status, launched.stderr).toBe(0);
+
+    // What the daemon actually received, rather than what the file contains. The two differ:
+    // deleting the ACP_BUZZ_BINARY export leaves every assertion above passing, because the
+    // resolved path is still baked in as ACP_RESOLVED_BUZZ_BINARY.
+    //
+    // This asserts only that the value is not a Keychain answer. Asserting it equals buzzPath
+    // fails — the launcher exports nothing here even though ACP_RESOLVED_BUZZ_BINARY is baked,
+    // and I could not account for that in three attempts, so it is filed rather than guessed at.
+    const [, , , , , , , resolvedBuzz] =
+      readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    expect(resolvedBuzz).not.toBe("fake-keychain-value");
   });
 
   it("#423 leaves BUZZ_PRIVATE_KEY unset rather than guessing when neither source has it", () => {
