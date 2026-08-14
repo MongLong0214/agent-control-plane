@@ -230,7 +230,42 @@ for (const key of keys) {
 // partial output looks like a verdict.
 const results = [];
 for (const key of keys) results.push(await run(key, AREAS[key]));
-writeFileSync(join(outDir, "summary.json"), JSON.stringify({ reviewer: "grok", results }, null, 2));
+
+/**
+ * The summary is derived from the per-area files on disk, never from this run's in-memory
+ * results alone.
+ *
+ * Writing `results` directly meant a partial re-run — `grok-review.mjs binding github
+ * summary` — rewrote the whole summary while only knowing about the areas it had just run,
+ * and recorded every other area as ERROR/0. That is how `evidence/review-grok/summary.json`
+ * came to report guard and review as "did not run" when `guard.json` held REVISE with 8
+ * findings and `review.json` held BLOCK with 8. Sixteen findings, including a BLOCK, read as
+ * nothing having happened.
+ *
+ * That is the CP-HI-08 failure this product exists to prevent, in its own evidence tree, and
+ * pointing the wrong way: not a failure dressed as a pass, but real findings dressed as an
+ * absence. So the summary reads what the reviews actually said, and refuses to write at all
+ * if a freshly produced result disagrees with the file it just wrote.
+ */
+const summaryFromDisk = Object.keys(AREAS).map((key) => {
+  const path = join(outDir, `${key}.json`);
+  if (!existsSync(path)) return { key, verdict: "NOT_RUN", findings: 0 };
+  const report = JSON.parse(readFileSync(path, "utf8"));
+  const fresh = results.find((r) => r.key === key);
+  const verdict = report.verdict ?? "ERROR";
+  const findings = (report.findings ?? []).length;
+  if (fresh && (fresh.verdict !== verdict || fresh.findings !== findings)) {
+    console.error(
+      `refusing to write summary: ${key} was just recorded as ${fresh.verdict}/${fresh.findings} but ${key}.json says ${verdict}/${findings}`,
+    );
+    process.exit(3);
+  }
+  return { key, verdict, findings, ...(fresh ? { seconds: fresh.seconds } : {}) };
+});
+writeFileSync(
+  join(outDir, "summary.json"),
+  JSON.stringify({ reviewer: "grok", results: summaryFromDisk }, null, 2),
+);
 const blocked = results.filter((r) => r.verdict !== "PASS");
 console.log(`\n${results.length} areas reviewed by grok; ${blocked.length} not PASS`);
 if (existsSync(join(outDir, "guard.cost"))) {

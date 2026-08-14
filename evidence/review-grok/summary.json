@@ -3,8 +3,8 @@
   "results": [
     {
       "key": "guard",
-      "verdict": "ERROR",
-      "findings": 0,
+      "verdict": "REVISE",
+      "findings": 8,
       "seconds": 764
     },
     {
@@ -15,8 +15,8 @@
     },
     {
       "key": "review",
-      "verdict": "ERROR",
-      "findings": 0,
+      "verdict": "BLOCK",
+      "findings": 8,
       "seconds": 817
     },
     {
