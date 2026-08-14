@@ -11,7 +11,7 @@ import type { SessionRecord, SessionRegistry } from "../session/session-registry
 
 export interface IngressRequest {
   channel: "telegram" | "buzz" | "mcp" | "cli";
-  /** Channel-scoped actor id: telegram user id, buzz actor pubkey, mcp peer. */
+  /** Channel identity: telegram user id, buzz channel pubkey, mcp peer. Not a role. */
   actor: string;
   /** Telegram chat id, buzz channel, or null. */
   conversation?: string | null;
@@ -136,7 +136,7 @@ export class IngressGuard {
   }
 
   /**
-   * Whether an actor is allowlisted on a channel. The owner authority checks (§21) reuse
+   * Whether a channel identity is allowlisted. The owner authority checks (§21) reuse
    * this so "the owner said so" means an identity the deployment configured, not a
    * caller-supplied claim.
    */
@@ -159,7 +159,7 @@ export class IngressGuard {
       return this.refuse(
         request,
         ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
-        "actor is not on the allowlist",
+        "channel identity is not on the allowlist",
       );
     }
 

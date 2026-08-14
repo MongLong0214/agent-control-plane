@@ -72,7 +72,7 @@ export class OwnerAuthority implements OwnerAuthorityPort {
     if (!this.isAllowedActor(receipt.channel, receipt.actor)) {
       return deny(
         ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
-        "the owner approval receipt names an actor that is not an allowlisted owner",
+        "the owner approval receipt names a channel identity that is not an allowlisted owner",
         { channel: receipt.channel, actor: receipt.actor },
       );
     }

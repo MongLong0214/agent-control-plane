@@ -22,6 +22,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
       - run: pnpm lint
+      - run: pnpm terminology
       - run: pnpm typecheck
       - run: pnpm build
       # One suite run, not two. `trace` needs a JSON reporter pass; it used to obtain that by
