@@ -297,7 +297,17 @@ describe("round-2 verification isolation and candidate freshness", () => {
 
     let childIsAlive = false;
     try {
-      for (let attempt = 0; attempt < 40; attempt += 1) {
+      // 12s, not 1s. The reap is asynchronous, and 40 attempts at 25ms gave the fence one
+      // second to finish — enough on an idle machine and not enough on a loaded CI runner.
+      // That produced `expected true to be false` on four unrelated branches today, none of
+      // which touched the sandbox (#461), and each passed on re-run.
+      //
+      // This does not weaken the assertion: an unreaped child still fails it, just later. The
+      // probe is `sleep 30`, so a fence that never fires is still caught well inside the
+      // child's own lifetime. The cost of the old deadline was not a missed defect but a
+      // signal nobody could trust — a red build stopped meaning anything, which is worse than
+      // a slow one.
+      for (let attempt = 0; attempt < 480; attempt += 1) {
         try {
           process.kill(result.childPid, 0);
           childIsAlive = true;
