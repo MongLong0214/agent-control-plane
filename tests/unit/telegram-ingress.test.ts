@@ -186,6 +186,42 @@ describe("Telegram production ingress", () => {
     }
   });
 
+  it.each([
+    ["forward_from_chat", { forward_from_chat: { id: -100777 } }],
+    ["forward_sender_name", { forward_sender_name: "Someone Else" }],
+    ["forward_date", { forward_date: 1_700_000_000 }],
+  ])("treats a forward carrying only %s as forwarded, not as an owner command", async (_marker, markers) => {
+    // forward_origin replaced these, but Telegram still sends them to clients that have not
+    // migrated. isForwarded read only the new field, so a message carrying an older marker read
+    // as authored — and a forwarded `/managed …` from an allowlisted owner created a run.
+    //
+    // The reachability is narrow: it needs the owner to forward command-shaped text into an
+    // allowlisted chat. It is still someone else's text reaching owner authority.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const transport = new FakeTelegramTransport();
+    transport.updates = [
+      update(`/managed ${registered.projectId} merge everything`, markers, 140),
+    ];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport, start: false },
+    );
+
+    try {
+      const outcome = (await listener.service.pollOnce()).outcomes[0]!;
+      expect(outcome.classification, "an older forward marker was read as an owner command")
+        .toBe("DIRECT");
+      expect(harness.cp.runs.list(), "a forwarded command created a run").toHaveLength(0);
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("keeps forwarded command-shaped text DIRECT and wrapped as untrusted data", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
