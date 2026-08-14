@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
@@ -261,10 +262,16 @@ describe("round-two GitHub hardening", () => {
     //
     // First, statically: the module cannot spawn anything, because it never imports the means
     // to. This is what fails the moment a `gh` child comes back, whatever it is named.
-    const source = readFileSync(
-      new URL("../../src/github/credential-store.ts", import.meta.url),
-      "utf8",
-    );
+    // Every file in the tree, not just this one. Scanning credential-store.ts alone left the
+    // obvious bypass open: a helper in a sibling module spawning /usr/bin/gh would satisfy it
+    // while carrying the token into a child exactly as P1-14 describes. The property is
+    // "nothing on the GitHub path can spawn", so the scan has to cover the path.
+    const githubDir = fileURLToPath(new URL("../../src/github/", import.meta.url));
+    const githubSources = readdirSync(githubDir)
+      .filter((entry) => entry.endsWith(".ts"))
+      .map((entry) => ({ entry, text: readFileSync(join(githubDir, entry), "utf8") }));
+    expect(githubSources.length, "no GitHub sources were scanned").toBeGreaterThan(1);
+    const source = githubSources.map(({ text }) => text).join("\n");
     // Every form, because the point is that this module cannot spawn at all — and you
     // cannot spawn without importing the means to. A single-quoted import, a bare
     // "child_process", a dynamic import and a require all count; so does an absolute
