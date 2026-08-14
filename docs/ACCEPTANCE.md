@@ -139,10 +139,27 @@ remaining-quota/reset statements. A trust prompt, activity-only screen, timeout,
 failure is persisted as an error and suspends new allocation; the daemon's JSON mirror is
 diagnostic output, not an owner-maintained capacity input. See `docs/capacity-source.md`.
 
-**Buzz delivery is unverified live.** `BUZZ_PRIVATE_KEY` is not configured here, so the CLI
-transport has not been exercised against the relay; delivery is covered through the
-in-memory transport only (#243). Every one of the three real runs ended in a `DEGRADED`
-doctor for precisely this reason.
+**Buzz delivery is verified live; #243 is not closed** (#423 is). A fenced envelope was
+enqueued, drained by `BuzzAdapter.deliverPending` over `BuzzCliTransport`, and read back off
+the relay carrying its `bindingGeneration`. The acknowledgement runs through the production
+ingress — `IngressGuard.admit` → `BuzzActorIngress.bindActor` → `SessionRegistry.bindBuzzActor`
+— with the deployment's allowlist naming exactly one actor, so the refusal of a different
+actor is the guard's (`INGRESS_ACTOR_NOT_ALLOWLISTED`) rather than the absence of a row. An
+earlier version of this capture supplied its own `isAllowedActor` and bound the actor
+directly; its "different actor refused" was true for any input and proved nothing.
+
+The doctor's `CTO_BUZZ_NOT_CONNECTED` is shown present before the connect and absent after,
+for a project-scoped `PRIMARY_CTO` on a control plane wired to the real transport. But #243's
+done-when is a **HEALTHY** doctor, and the fixture project has unrelated blocking findings,
+so `evidence/p0-09-buzz-live-delivery.json` records `result: PARTIAL` and names #243 as not
+closed. A green record for a claim nobody checked is the thing this file exists to prevent.
+
+Two production gaps found with it, both fixed: the launchd launcher pinned `PATH` to the
+system directories, so a `buzz` installed under a user-local bin was reachable from the
+installing shell and invisible to the daemon — it now bakes in the absolute path resolved at
+install time. And the CLI payload was cast rather than checked, so a row matching by name
+while omitting `channel_id` produced an undefined address that `available()` reported as
+usable.
 
 **A verification worktree has no installed dependencies.** A disposable worktree contains
 only committed files and, under `network: "deny"`, cannot fetch anything. A project needs a

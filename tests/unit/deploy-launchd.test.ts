@@ -96,6 +96,11 @@ printf '%s\\n' "$*" >> "$ACP_SECURITY_LOG"
 case "$*" in
   *" -a ACP_MCP_TOKEN") printf 'mcp-provisioned-token\\n' ;;
   *" -a ACP_OPERATOR_TOKEN") printf 'operator-provisioned-token\\n' ;;
+  # A host where the Buzz desktop app owns the relay identity has no dedicated
+  # BUZZ_PRIVATE_KEY item at all — the lookup fails, exactly as it does live.
+  *" -a BUZZ_PRIVATE_KEY") [[ "\${ACP_FAKE_BUZZ_ITEM_MISSING:-0}" == "1" ]] && exit 44
+                           printf 'fake-keychain-value\\n' ;;
+  *"-s buzz-desktop -a secrets"*) printf '%s\\n' "\${ACP_FAKE_BUZZ_SECRETS_JSON:-}" ;;
   *) printf 'fake-keychain-value\\n' ;;
 esac
 `,
@@ -116,8 +121,19 @@ if [[ "$target" == *"render-launchd-plist.mjs" ]]; then
   fi
   exec "$ACP_REAL_NODE" "$@"
 fi
+if [[ "$target" == "-e" ]]; then
+  exec "$ACP_REAL_NODE" "$@"
+fi
 if [[ "$target" == *"agentcpd.js" ]]; then
-  printf '%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" >> "$ACP_LAUNCHER_ENV_LOG"
+  printf '%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" "\${BUZZ_PRIVATE_KEY:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
+  # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
+  # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
+  # exported the key too eagerly would look fine here and put the real daemon in a launchd
+  # restart loop.
+  if [[ -n "\${BUZZ_PRIVATE_KEY:-}" && ( -z "\${ACP_BUZZ_INGRESS_SECRET:-}" || -z "\${ACP_BUZZ_ALLOWED_ACTORS:-}" ) ]]; then
+    echo "Buzz transport requires ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS" >&2
+    exit 70
+  fi
   exit 0
 fi
 exit 90
@@ -272,6 +288,107 @@ describe("launchd deployment artifact", () => {
     expect(mcpToken).toBe("mcp-provisioned-token");
     expect(operatorToken).toBe("operator-provisioned-token");
     expect(operatorToken).not.toBe(mcpToken);
+  });
+
+  it("#423 takes BUZZ_PRIVATE_KEY from the desktop store when it has no item of its own", () => {
+    const harness = makeHarness();
+    // The live host's shape: the Buzz desktop app owns every identity's secret in one JSON
+    // object, and there is no BUZZ_PRIVATE_KEY item to find. Before this, the daemon simply
+    // started without the credential and reported a healthy channel it could not open.
+    harness.env["ACP_FAKE_BUZZ_ITEM_MISSING"] = "1";
+    harness.env["ACP_FAKE_BUZZ_SECRETS_JSON"] = JSON.stringify({
+      identity: "relay-credential-from-desktop-store",
+      other: "not-this-one",
+    });
+    // The daemon only accepts a Buzz credential alongside its ingress pair.
+    harness.env["ACP_BUZZ_INGRESS_SECRET"] = "ingress-secret";
+    harness.env["ACP_BUZZ_ALLOWED_ACTORS"] = "actor-one";
+
+    expect(
+      runInstaller(
+        installer,
+        ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+        harness,
+      ).status,
+    ).toBe(0);
+
+    const launcherSecurity = join(harness.home, "launcher-security.bash");
+    writeFileSync(launcherSecurity, `security() { "${join(harness.bin, "security")}" "$@"; }\n`, {
+      mode: 0o600,
+    });
+    const launcherEnv: NodeJS.ProcessEnv = { ...harness.env, BASH_ENV: launcherSecurity };
+    delete launcherEnv["BUZZ_PRIVATE_KEY"];
+
+    expect(spawnSync("bash", [launcherPath(harness)], { encoding: "utf8", env: launcherEnv }).status)
+      .toBe(0);
+
+    const [, , buzzKey] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    expect(buzzKey).toBe("relay-credential-from-desktop-store");
+  });
+
+  it("#423 gives the daemon an absolute path to the Buzz CLI its own PATH cannot reach", () => {
+    const harness = makeHarness();
+    // The launcher pins PATH to the system directories. A `buzz` installed under a user-local
+    // bin — which is where it is on this host — is then unreachable to the daemon while being
+    // perfectly reachable from the shell that installed it, so a live capture run by hand
+    // succeeds and production silently has no transport at all.
+    const userLocalBin = join(harness.home, "user-local-bin");
+    mkdirSync(userLocalBin, { recursive: true });
+    const buzzPath = join(userLocalBin, "buzz");
+    writeFileSync(buzzPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(buzzPath, 0o755);
+    harness.env["PATH"] = `${userLocalBin}:${harness.env["PATH"] ?? ""}`;
+    harness.env["ACP_BUZZ_INGRESS_SECRET"] = "ingress-secret";
+    harness.env["ACP_BUZZ_ALLOWED_ACTORS"] = "actor-one";
+    harness.env["ACP_FAKE_BUZZ_ITEM_MISSING"] = "1";
+    harness.env["ACP_FAKE_BUZZ_SECRETS_JSON"] = JSON.stringify({ identity: "relay-credential" });
+
+    expect(
+      runInstaller(
+        installer,
+        ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+        harness,
+      ).status,
+    ).toBe(0);
+
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    // Baked in at install time, while the installing shell's PATH was still visible.
+    expect(launcher).toContain(buzzPath);
+    // And it must be an absolute path the launchd PATH does not have to find.
+    expect(buzzPath.startsWith("/")).toBe(true);
+    expect(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].some((d) => buzzPath.startsWith(`${d}/`)))
+      .toBe(false);
+  });
+
+  it("#423 leaves BUZZ_PRIVATE_KEY unset rather than guessing when neither source has it", () => {
+    const harness = makeHarness();
+    harness.env["ACP_FAKE_BUZZ_ITEM_MISSING"] = "1";
+    // The desktop store exists but holds nothing under the identity key.
+    harness.env["ACP_FAKE_BUZZ_SECRETS_JSON"] = JSON.stringify({ other: "not-this-one" });
+
+    expect(
+      runInstaller(
+        installer,
+        ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+        harness,
+      ).status,
+    ).toBe(0);
+
+    const launcherSecurity = join(harness.home, "launcher-security.bash");
+    writeFileSync(launcherSecurity, `security() { "${join(harness.bin, "security")}" "$@"; }\n`, {
+      mode: 0o600,
+    });
+    const launcherEnv: NodeJS.ProcessEnv = { ...harness.env, BASH_ENV: launcherSecurity };
+    delete launcherEnv["BUZZ_PRIVATE_KEY"];
+
+    // Absent is the correct outcome: the daemon must start, and `available()` refuses.
+    const launched = spawnSync("bash", [launcherPath(harness)], {
+      encoding: "utf8",
+      env: launcherEnv,
+    });
+    expect(launched.status).toBe(0);
+    const [, , buzzKey] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    expect(buzzKey).toBe("<unset>");
   });
 
   it("waits for the old daemon lock during upgrade before rendering the replacement", () => {

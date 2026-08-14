@@ -86,8 +86,9 @@ installation and reboot have not yet been accepted; that work is tracked in
 ## Current limits and evidence
 
 The repository does not claim live acceptance for any path that has not been observed. In
-particular, it does not claim a real GitHub App gate publication, a live Buzz or Telegram
-round trip, a launchd installation, or the PRD observation window. The links, blockers, and
+particular, it does not claim a live Telegram round trip, a launchd installation, or the
+PRD observation window. The GitHub App gate publication and the Buzz round trip have been
+observed, and each is recorded in `evidence/`. The links, blockers, and
 milestones are maintained in [current status](docs/STATUS.md).
 
 `pnpm trace` writes [traceability evidence](evidence/traceability.md) from the PRD and a
@@ -138,9 +139,12 @@ See [docs/capacity-source.md](docs/capacity-source.md).
   installation with `checks:write`. The kernel's predicate logic is verified against a
   modelled GitHub API, including that a same-named check from any other creator is
   refused.
-- **Buzz delivery is unverified live.** The transport is implemented over the `buzz` CLI
-  but `BUZZ_PRIVATE_KEY` is not configured in this environment, so delivery has only been
-  exercised through the in-memory transport.
+- **Buzz delivery is verified live for the transport; the #243 acceptance is not complete.**
+  A fenced envelope reaches the relay, the returning identity is admitted through the signed
+  production ingress while a different actor is refused by the allowlist, and the doctor's
+  `CTO_BUZZ_NOT_CONNECTED` clears for a connected project CTO
+  ([evidence](evidence/p0-09-buzz-live-delivery.json)). That record is `PARTIAL`: #243 also
+  requires a `HEALTHY` doctor, which this deployment does not yet reach.
 - Strong isolation for untrusted repositories, a web dashboard, REST/GraphQL and
   automatic Level 6 routing promotion are backlog (PRD §43).
 

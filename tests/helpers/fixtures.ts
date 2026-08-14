@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ManualClock, isoPlus } from "../../src/core/clock.ts";
+import { ManualClock, isoPlus, type Clock } from "../../src/core/clock.ts";
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { newAssignmentId, newRepositoryId, newRunId, newSessionId } from "../../src/core/ids.ts";
@@ -29,9 +29,15 @@ export interface CoreHarness {
   telemetry: Telemetry;
 }
 
-export const makeCore = (): CoreHarness => {
+/**
+ * `clock` exists for live acceptance captures. A capture performs real external writes, so a
+ * deterministic domain clock would stamp evidence that disagrees with the timestamps the
+ * remote system records — an artefact whose chronology cannot be reconstructed later.
+ * Tests keep the deterministic default.
+ */
+export const makeCore = (options: { clock?: ManualClock | Clock } = {}): CoreHarness => {
   const db = makeDb();
-  const clock = new ManualClock();
+  const clock = (options.clock ?? new ManualClock()) as ManualClock;
   const audit = new AuditLog(db, clock);
   const outbox = new Outbox(db, clock, audit);
   const sessions = new SessionRegistry(db, clock, audit);
