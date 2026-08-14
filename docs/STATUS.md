@@ -64,6 +64,20 @@ Named here because a green suite otherwise reads as coverage of them.
   (`.github/workflows/ci.yml`). So the Linux enforcement path has never executed here, and
   could regress to unlimited without any test failing. CP-HI-08 is behaviourally verified on
   Darwin only.
+- **Descendant containment has an observation window, and a miss leaves no trace.**
+  `fence_descendants` in the sandbox wrapper (`src/verify/sandbox.ts`) contains every descendant
+  it observes: it records each child's pid while still in the candidate's tree, and kills a
+  `setsid` escapee by its own group. What it cannot do is contain a descendant it never saw. A
+  child created and reparented inside the scan's ~20ms settling window is never entered in
+  `known`, and after reparenting there is no residue — `ppid` is 1 and the parent's kernel child
+  list holds nothing. So containment is attested from an empty known-set, which means "no
+  descendant existed" and "the scan did not see one" produce the same result.
+
+  This is measured, not hypothetical: `#164 fences a detached descendant` fails intermittently
+  on CI for exactly this reason (#461), and passes locally because the scan wins the race there.
+  Widening the window narrows the race; nothing closes it from inside the wrapper, and sandbox
+  membership is not an alternative boundary — a detached child provably survives sandbox exit.
+
 - **The full-vertical e2e is off by default.** `tests/e2e/real-component-integration.test.ts`
   is `describe.runIf(ACP_COMPONENT_INTEGRATION=1)` — it is the only test that drives SIMPLE,
   STANDARD and GUARDED through a real cloned repository and a live adapter, and it is the
