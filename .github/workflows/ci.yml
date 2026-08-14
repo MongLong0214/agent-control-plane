@@ -26,8 +26,9 @@ jobs:
       - run: pnpm build
       # One suite run, not two. `trace` needs a JSON reporter pass; it used to obtain that by
       # running the whole suite a second time, which doubled a suite that spawns real
-      # sandboxed children and failed on the runner while the first run passed.
-      - run: pnpm test -- --reporter=default --reporter=json --outputFile.json=evidence/local/ci-vitest-results.json
+      # sandboxed children. The JSON reporter is configured in vitest.config.ts under CI, so
+      # this stays a plain `pnpm test`.
+      - run: pnpm test
       - run: pnpm trace
         env:
           ACP_VITEST_RESULTS: evidence/local/ci-vitest-results.json
