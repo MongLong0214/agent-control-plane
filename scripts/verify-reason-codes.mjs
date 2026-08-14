@@ -98,6 +98,32 @@ for (const code of PUBLISHED) {
   if (!seen.has(code)) failures.push(`published reason code ${code} is missing`);
 }
 
+/**
+ * A staleness verdict must be classifiable as one. STALENESS_REASON_CODES exists so a caller
+ * can tell "the comparison was against a different generation" from "the thing is wrong" —
+ * those need opposite responses, and folding them cost real time in both directions (#448).
+ *
+ * A new `_STALE` code that nobody adds to the set is the quiet way that distinction erodes:
+ * the code reads as staleness to a human and as an ordinary denial to every caller.
+ */
+const stalenessBody = /export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set\(\[([\s\S]*?)\n\]\);/.exec(source);
+if (!stalenessBody) {
+  console.error("verify-reason-codes: could not locate STALENESS_REASON_CODES");
+  process.exit(1);
+}
+const classified = new Set(
+  [...stalenessBody[1].matchAll(/ReasonCode\.([A-Z0-9_]+)/g)].map((m) => m[1]),
+);
+for (const { key } of entries) {
+  if (!/_STALE$|^OUTBOX_STALE_/.test(key)) continue;
+  if (!classified.has(key)) {
+    failures.push(
+      `${key} names a staleness verdict but is absent from STALENESS_REASON_CODES; ` +
+        "add it, or rename the code if it reports a failure rather than a generation mismatch",
+    );
+  }
+}
+
 if (failures.length > 0) {
   console.error(`verify-reason-codes: ${failures.length} problem(s)`);
   for (const failure of failures) console.error(`  - ${failure}`);
