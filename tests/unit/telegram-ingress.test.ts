@@ -994,6 +994,66 @@ describe("Telegram startup configuration", () => {
     })).toThrow(/owner-identities/);
   });
 
+  it("prompts every allowlisted chat, not only the first", async () => {
+    // A prompt record is keyed by chat and reply message id, so a prompt sent to chat A cannot
+    // be resolved by a reply in chat B — that reply is refused OWNER_AUTHORITY_NOT_DELEGABLE.
+    // With only allowedChatIds[0] prompted, an owner reading in their second allowlisted chat
+    // had no way to answer at all: no prompt arrived there, and answering anyway was refused.
+    const secondChat = "-100888";
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+
+    const parked = harness.cp.runs.create({
+      projectId: registered.projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: {
+        goal: "a run whose owner gate must reach both chats",
+        why: "#442 regression fixture",
+        scope: ["telegram"],
+        nonGoals: [],
+        acceptance: ["every allowlisted chat receives the prompt"],
+        priority: "NORMAL",
+        humanGate: [],
+        references: [],
+      },
+      repositories: [
+        { repositoryId: registered.repositoryId, repositoryRole: "primary", baseBranch: "dev" },
+      ],
+    });
+    if (!parked.allowed) throw new Error(parked.message);
+    harness.cp.runs.promoteCandidate(parked.value.runId, `sha256:${"b".repeat(64)}`);
+
+    const transport = new FakeTelegramTransport();
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, allowedChatIds: [CHAT_ID, secondChat], defaultProjectId: registered.projectId },
+      daemonStub,
+      {
+        transport,
+        start: false,
+        ownerGateSignals: () => [{
+          signalId: "sig-two-chats",
+          runId: parked.value.runId,
+          items: ["owner confirms"],
+          candidateSnapshotDigest: `sha256:${"b".repeat(64)}`,
+        }],
+      },
+    );
+
+    try {
+      await listener.service.pollOnce();
+      const prompted = transport.sent
+        .filter((m) => m.correlationId.startsWith("telegram:owner-gate:"))
+        .map((m) => m.chatId);
+      expect(prompted, "the second allowlisted chat never received the prompt")
+        .toEqual(expect.arrayContaining([CHAT_ID, secondChat]));
+    } finally {
+      await listener.close();
+    }
+  }, 30_000);
+
   it("P0-10 keeps receiving when an owner-gate prompt cannot be delivered", async () => {
     // One parked run whose prompt cannot be sent must not cost the owner their control path.
     // Before this, deliverOwnerGatePrompts ran first and threw, so getUpdates never ran and

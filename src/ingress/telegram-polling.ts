@@ -520,25 +520,38 @@ export class TelegramLongPollService {
    */
   private async deliverOwnerGatePrompts(): Promise<void> {
     const signals = this.options.ownerGateSignals?.() ?? [];
-    const chatId = this.options.allowedChatIds?.[0];
-    if (!chatId) return;
+    // Every allowlisted chat, not only the first. A prompt record is keyed by chat and reply
+    // message id, so a prompt sent to chat A cannot be resolved by a reply in chat B — that
+    // reply is refused OWNER_AUTHORITY_NOT_DELEGABLE. With only allowedChatIds[0] prompted,
+    // an owner reading in their second allowlisted chat had no way to answer at all.
+    //
+    // The correlation id already digests chatId, so per-chat prompts were anticipated here;
+    // the index was the shortcut. Sending to each chat gives every one a record its own reply
+    // can resolve.
+    const chatIds = this.options.allowedChatIds ?? [];
+    if (chatIds.length === 0) return;
 
     for (const signal of signals) {
       for (const item of uniquePromptItems(signal.items)) {
-        try {
-          const delivered = await this.sendOwnerPromptIfNeeded({
-            runId: signal.runId,
-            items: [item],
-            chatId,
-            correlationId: `telegram:owner-gate:${signal.signalId}:${digestOf({ item, chatId })}`,
-          });
-          if (!delivered.allowed) {
-            this.options.onError?.(
-              new Error(`owner gate prompt not delivered: ${delivered.reasonCode}: ${delivered.message}`),
-            );
+        for (const chatId of chatIds) {
+          try {
+            const delivered = await this.sendOwnerPromptIfNeeded({
+              runId: signal.runId,
+              items: [item],
+              chatId,
+              correlationId: `telegram:owner-gate:${signal.signalId}:${digestOf({ item, chatId })}`,
+            });
+            if (!delivered.allowed) {
+              this.options.onError?.(
+                new Error(`owner gate prompt not delivered: ${delivered.reasonCode}: ${delivered.message}`),
+              );
+            }
+          } catch (error) {
+            // One unreachable chat must not stop the others: the owner may be reading in any
+            // of them, and losing every prompt because one failed is the outcome this whole
+            // path exists to avoid.
+            this.options.onError?.(error);
           }
-        } catch (error) {
-          this.options.onError?.(error);
         }
       }
     }
