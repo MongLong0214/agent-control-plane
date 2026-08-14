@@ -14,9 +14,10 @@ import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
-import { BuzzAdapter } from "../../src/buzz/buzz-adapter.ts";
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import {
+  bindCeo,
   driveToReviewedCandidate,
   makeHarness,
   TEST_OWNER,
@@ -90,7 +91,60 @@ const telegramConfig = {
 const daemonStub = { finalizeApprovedRun: async (_runId: string): Promise<void> => undefined };
 
 describe("Telegram production ingress", () => {
-  it("bootstraps through the daemon-owned Telegram factory and reaches Buzz dispatch", async () => {
+  it("the daemon itself delivers the queued dispatch over Buzz", async () => {
+    // The claim the previous test used to make by calling deliverPending() itself. Deleting
+    // the daemon's entire buzz_delivery timer left all 820 tests passing, so CTO dispatch
+    // could have stopped reaching Buzz with nothing to notice. This drives a real daemon and
+    // waits for its own timer.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    // The startup doctor refuses dispatch resume without these; makeStartedOperator does the
+    // same two steps before starting a daemon.
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    bindCeo(harness);
+    const registered = await registerFixtureProject(harness);
+    const transport = new FakeTelegramTransport();
+    transport.updates = [update(`/managed ${registered.projectId} implement the requested change`)];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      { transport, start: false },
+    );
+
+    const daemon = new Daemon(harness.cp, {
+      stateDir: tempDir("acp-buzz-delivery-"),
+      buzz: harness.buzzAdapter,
+      deliveryIntervalMs: 10,
+    });
+
+    try {
+      const cycle = await listener.service.pollOnce();
+      const runId = cycle.outcomes[0]?.runId;
+      expect(runId).toBeTruthy();
+      const pending = harness.cp.outbox
+        .listByRun(runId!)
+        .filter((message) => message.kind === "RUN_DISPATCH");
+      expect(pending).toHaveLength(1);
+      expect(harness.buzz.sent).toHaveLength(0);
+
+      const started = await daemon.start();
+      expect(started.allowed).toBe(true);
+
+      const deadline = Date.now() + 10_000;
+      while (harness.buzz.sent.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(harness.buzz.sent, "the daemon never delivered the queued dispatch").toHaveLength(1);
+      expect(harness.buzz.sent[0]?.content).toContain(runId!);
+    } finally {
+      await daemon.stop();
+      await listener.close();
+    }
+  }, 30_000);
+
+  it("bootstraps through the daemon-owned Telegram factory and queues a Buzz dispatch", async () => {
     const agentcpdSource = readFileSync(
       fileURLToPath(new URL("../../src/daemon/agentcpd.ts", import.meta.url)),
       "utf8",
@@ -123,19 +177,10 @@ describe("Telegram production ingress", () => {
       expect(dispatch).toHaveLength(1);
       expect(dispatch[0]?.status).toBe("PENDING");
 
-      const buzz = new BuzzAdapter(
-        harness.cp.db,
-        harness.cp.clock,
-        harness.cp.audit,
-        harness.cp.sessions,
-        harness.cp.bindings,
-        harness.cp.outbox,
-        harness.buzz,
-      );
-      const delivered = await buzz.deliverPending();
-      expect(delivered.delivered).toEqual([dispatch[0]!.messageId]);
-      expect(harness.buzz.sent).toHaveLength(1);
-      expect(harness.buzz.sent[0]?.content).toContain(run.runId);
+      // Delivery is deliberately not exercised here. Constructing a BuzzAdapter and calling
+      // deliverPending() proved that this test can deliver, not that anything in production
+      // does — the daemon's timer would have been deletable with the suite still green.
+      // That claim now lives in its own test below, driven by a real daemon.
     } finally {
       await listener.close();
     }
