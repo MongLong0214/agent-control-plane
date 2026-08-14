@@ -136,6 +136,11 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       expect(gitSync(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
 
       const cp = new ControlPlane({
+        // The initial manifest predates any run, so there is no run-scoped authorization to
+        // sign it with. manifestAuthorizationForTests is the intended bootstrap proof and is
+        // refused unless a deployment opts in — which is why this path drifted while the
+        // suite was opt-in and unrun.
+        allowTestEvidenceWriters: true,
         databasePath: join(root, "state.sqlite"),
         worktreeRoot: join(root, "worktrees"),
         capacityDir: join(root, "capacity"),
@@ -183,11 +188,16 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
 
       // --- manual registration, no Repo Factory ----------------------------
       const projectId = "agent-control-plane";
+      const initialManifest = manifestFor(projectId);
       const project = cp.projects.register({
         projectId,
         name: "agent-control-plane",
-        manifest: manifestFor(projectId),
+        manifest: initialManifest,
+        authorization: cp.manifestAuthorizationForTests(initialManifest),
       });
+      if (!project.allowed) {
+        throw new Error(`registration refused: ${project.reasonCode} ${project.message}`);
+      }
       expect(project.allowed).toBe(true);
       if (!project.allowed) return;
 
