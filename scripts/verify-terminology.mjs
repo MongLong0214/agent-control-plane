@@ -54,7 +54,6 @@ const RULES = [
   },
   {
     id: "buzz-actor-qualified",
-    // Staged, not enforced yet — see STAGED below.
     pattern: /\bbuzz\s+actor\b(?!_id)/i,
     says: "the transport-qualified `Buzz actor`",
     instead: "`Buzz channel identity`",
@@ -99,24 +98,32 @@ const RULES = [
 ];
 
 /**
- * Rules that are written and counted but do not yet fail the build.
+ * Rules written and counted but not yet failing the build. Empty, and the mechanism is kept
+ * rather than deleted.
  *
- * `buzz-actor-qualified` has 20 hits, and every file holding one is under simultaneous
- * modification by an unmerged lane (buzzcli, verifysec, telegram). Renaming on main today
- * buys no safety and costs four rebases on branches a round from merging. The rule ships
- * now so the count is visible and cannot drift upward unnoticed; it moves out of this set
- * in the follow-up that does the rename, once those lanes are in.
- *
- * Staging is recorded here rather than by deleting the rule, because a deleted rule leaves
- * no trace that the decision was ever made.
+ * `buzz-actor-qualified` lived here while buzzcli, verifysec and telegram were all editing
+ * the files holding its 20 occurrences: renaming then bought no safety and cost three
+ * rebases. Those lanes have merged, the 17 occurrences in this repository's own prose are
+ * renamed, and the rule now enforces. The three in `docs/prd/` and `docs/review/` are
+ * vendored quotations and are exempt by path, not waived by staging.
  */
-const STAGED = new Set(["buzz-actor-qualified"]);
-const STAGED_BASELINE = { "buzz-actor-qualified": 20 };
+const STAGED = new Set();
+const STAGED_BASELINE = {};
 
 const SCAN_ROOTS = ["src", "docs"];
 const SCAN_EXTENSIONS = new Set([".ts", ".tsx", ".md", ".sql"]);
 // The contract itself quotes every banned usage in order to ban it.
 const EXEMPT_FILES = new Set(["docs/TERMINOLOGY.md"]);
+
+/**
+ * Vendored external documents. The decision fixes what *this repository* writes; it cannot
+ * retroactively edit a normative input. Rewriting a term inside a quoted PRD would make the
+ * vendored copy disagree with its source, which is a worse failure than the word.
+ *
+ * Same principle keeps `actor` in INGRESS_ACTOR_NOT_ALLOWLISTED: a published contract
+ * outranks a rename.
+ */
+const EXEMPT_PREFIXES = ["docs/prd/", "docs/review/"];
 
 const walk = (dir, out = []) => {
   for (const entry of readdirSync(dir)) {
@@ -144,6 +151,7 @@ let scannedLines = 0;
 for (const file of files) {
   const rel = relative(repoRoot, file);
   if (EXEMPT_FILES.has(rel)) continue;
+  if (EXEMPT_PREFIXES.some((prefix) => rel.startsWith(prefix))) continue;
   const lines = readFileSync(file, "utf8").split("\n");
   scannedLines += lines.length;
   lines.forEach((line, index) => {

@@ -290,7 +290,7 @@ export const startBuzzActorIngressListener = async (
   policy: IngressPolicy,
 ): Promise<LocalBuzzActorIngress> => {
   if (!policy.secret || policy.secret.trim().length === 0) {
-    throw new Error("Buzz actor ingress requires a non-empty signing secret");
+    throw new Error("Buzz channel identity ingress requires a non-empty signing secret");
   }
 
   const guard = new IngressGuard(cp.db, cp.clock, cp.audit, { buzz: policy });
@@ -643,7 +643,7 @@ const serveBuzzActorBinding = (socket: Socket, ingress: BuzzActorIngress): void 
   const receive = (chunk: Buffer): void => {
     buffer = Buffer.concat([buffer, chunk]);
     if (buffer.length > MAX_MCP_LINE_BYTES) {
-      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz actor ingress message exceeds local transport limit"));
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz channel identity ingress message exceeds local transport limit"));
     }
     const boundary = buffer.indexOf(0x0a);
     if (boundary === -1) return;
@@ -651,17 +651,17 @@ const serveBuzzActorBinding = (socket: Socket, ingress: BuzzActorIngress): void 
     // This endpoint accepts exactly one relay envelope per connection. Ignoring a second
     // line would make its replay and ordering semantics impossible to reason about.
     if (buffer.subarray(boundary + 1).length > 0) {
-      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz actor ingress accepts one envelope per connection"));
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz channel identity ingress accepts one envelope per connection"));
     }
     let value: unknown;
     try {
       value = JSON.parse(line) as unknown;
     } catch {
-      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz actor ingress message is not JSON"));
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz channel identity ingress message is not JSON"));
     }
     const input = presentedBuzzActorBinding(value);
     if (!input) {
-      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz actor ingress message is incomplete"));
+      return finish(deny(ReasonCode.INVALID_ARGUMENT, "Buzz channel identity ingress message is incomplete"));
     }
     finish(ingress.bindActor(input));
   };

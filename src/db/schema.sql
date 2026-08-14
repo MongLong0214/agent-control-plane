@@ -132,7 +132,7 @@ BEGIN
   SELECT RAISE(ABORT, 'SESSION_SECRET_HASH_IMMUTABLE');
 END;
 
--- Only one *live* session may speak as a given Buzz actor. Two live sessions holding the
+-- Only one *live* session may speak as a given Buzz channel identity. Two live sessions holding the
 -- same actor id would make inbound resolution ambiguous, which is how an actor could be
 -- routed onto a role it never held. Terminal sessions are excluded so a respawn can
 -- re-register the actor the stopped incarnation used.

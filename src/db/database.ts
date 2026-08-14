@@ -677,7 +677,7 @@ const INDEX_CODES: Array<[RegExp, ReasonCode, string]> = [
   [/resource_claims\.branch/, ReasonCode.CLAIM_BRANCH_CONFLICT, "branch already claimed by another holder"],
   [/resource_claims\.declared_path/, ReasonCode.CLAIM_PATH_CONFLICT, "declared write path already claimed by another holder"],
   [/outbox\.idempotency_key/, ReasonCode.OUTBOX_DUPLICATE_SUPPRESSED, "outbox idempotency key already used"],
-  [/sessions\.buzz_actor_id/, ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "buzz actor identity is already bound to a live session"],
+  [/sessions\.buzz_actor_id/, ReasonCode.SESSION_BUZZ_ACTOR_ALREADY_BOUND, "buzz channel identity identity is already bound to a live session"],
   [/github_receipts\.idempotency_key/, ReasonCode.MERGE_IDEMPOTENT_REPLAY, "github operation already executed"],
   [/capacity_snapshots\./, ReasonCode.CONFLICT, "duplicate capacity snapshot"],
   [/verification_results\./, ReasonCode.CONFLICT, "duplicate verification result for this candidate"],

@@ -295,7 +295,7 @@ export class InMemoryBuzzTransport implements BuzzTransport {
 /**
  * PRD §27.2, §27.5.
  *
- * Buzz is a transport, not an authority. An inbound Buzz actor is mapped to an *active
+ * Buzz is a transport, not an authority. An inbound Buzz channel identity is mapped to an *active
  * role binding* before it can act; a display name grants nothing. Outbound delivery
  * only ever carries fenced envelopes whose generation is still current.
  */
@@ -336,7 +336,7 @@ export class BuzzAdapter {
   }
 
   /**
-   * §27.2 — resolve an inbound Buzz actor to the role it currently holds.
+   * §27.2 — resolve an inbound Buzz channel identity to the role it currently holds.
    *
    * Resolution goes through `sessions.buzz_actor_id`, which only an authenticated writer can
    * set (`SessionRegistry.bindBuzzActor`). A delivery channel or display name is never

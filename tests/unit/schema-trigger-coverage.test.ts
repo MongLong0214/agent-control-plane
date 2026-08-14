@@ -67,8 +67,13 @@ describe("every schema trigger is load-bearing and checked", () => {
       fileURLToPath(new URL("../../src/db/migrations.ts", import.meta.url)),
       "utf8",
     );
+    // Parse the arrays, not the file. A bare /name: "(\w+)"/ sweep over migrations.ts counts
+    // any such string anywhere — including one left behind in a comment or an unrelated
+    // literal — so a trigger could be dropped from every required list and still look listed.
+    const arrays = [...migrations.matchAll(/REQUIRED_\w*TRIGGERS[^=]*=\s*\[([\s\S]*?)\n\];/g)];
+    expect(arrays.length, "no REQUIRED_*TRIGGERS arrays found in migrations.ts").toBeGreaterThan(0);
     const required = new Set(
-      [...migrations.matchAll(/name: "(\w+)"/g)].map((m) => m[1]!),
+      arrays.flatMap((a) => [...a[1]!.matchAll(/\bname:\s*"(\w+)"/g)].map((m) => m[1]!)),
     );
     const unlisted = triggersInSchema.filter((t) => !required.has(t));
     expect(
