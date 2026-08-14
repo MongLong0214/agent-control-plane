@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS manifests (
   CHECK (digest LIKE 'sha256:%')
 );
 
+-- CP-HI-03 — an approved contract cannot be edited after approval; verification pins this digest.
 CREATE TRIGGER IF NOT EXISTS manifests_immutable
 BEFORE UPDATE ON manifests
 BEGIN
@@ -109,6 +110,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   stopped_at     TEXT
 );
 
+-- CP-HI-02 — incarnation is the session's identity; rewriting it re-points every receipt that named it.
 -- §30.2 #3 — session incarnation is immutable for the life of the session row.
 CREATE TRIGGER IF NOT EXISTS sessions_incarnation_immutable
 BEFORE UPDATE OF incarnation ON sessions
@@ -117,6 +119,7 @@ BEGIN
   SELECT RAISE(ABORT, 'SESSION_INCARNATION_IMMUTABLE');
 END;
 
+-- CP-HI-02 — a rotated secret would let a second peer inherit an established session's authority.
 -- An issued session secret cannot be rotated in place or cleared: the peer that holds
 -- the plaintext is the only thing that proves an MCP caller is this session, so a
 -- rewritable hash would let a local caller mint itself a new credential for an existing
@@ -137,6 +140,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS sessions_buzz_actor
   ON sessions(buzz_actor_id)
   WHERE buzz_actor_id IS NOT NULL AND lifecycle IN ('STARTING','READY','DRAINING');
 
+-- CP-HI-02 — channel identity is write-once, so allowlist membership cannot be moved onto a live session.
 -- An actor binding is write-once. If it could be rewritten, one authenticated write would
 -- be enough to later re-point an authenticated actor identity at a different session and
 -- inherit whatever role that session holds.
@@ -181,6 +185,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS assignments_active_role_key
 CREATE UNIQUE INDEX IF NOT EXISTS assignments_active_primary_cto
   ON assignments(project_id) WHERE role = 'PRIMARY_CTO' AND status = 'ACTIVE';
 
+-- CP-HI-04 — fencing generations only advance; a lowered one revives a superseded role holder.
 -- §30.2 #4 — binding generation is monotonic per role key.
 CREATE TRIGGER IF NOT EXISTS assignments_generation_monotonic
 BEFORE INSERT ON assignments
@@ -190,6 +195,7 @@ BEGIN
   SELECT RAISE(ABORT, 'BINDING_GENERATION_NOT_MONOTONIC');
 END;
 
+-- CP-HI-04 — the identity columns of a binding are fixed once written.
 -- INSERT-only monotonicity is not enough: lowering binding_generation, or moving a low
 -- generation into another role's history via role_key, would reactivate stale authority.
 CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable
@@ -207,6 +213,7 @@ BEGIN
   SELECT RAISE(ABORT, 'BINDING_IDENTITY_IMMUTABLE');
 END;
 
+-- CP-HI-04 — revocation is terminal; re-activating a revoked binding defeats fencing.
 -- Revocation advances a fencing generation. Re-activating an old row would make stale
 -- authority current again after every newer generation has been revoked.
 CREATE TRIGGER IF NOT EXISTS assignments_revocation_terminal
@@ -216,6 +223,7 @@ BEGIN
   SELECT RAISE(ABORT, 'BINDING_REVOKED_TERMINAL');
 END;
 
+-- CP-HI-04 — the ACTIVE row for a role key is always its newest generation.
 -- Defence in depth over the monotonic insertion trigger: an ACTIVE row is always the
 -- newest generation for its logical role endpoint.
 CREATE TRIGGER IF NOT EXISTS assignments_active_generation_current
@@ -231,6 +239,7 @@ BEGIN
   SELECT RAISE(ABORT, 'BINDING_REVOKED_TERMINAL');
 END;
 
+-- CP-HI-04 — refuses an insert that would sit behind a live binding, closing the INSERT side of the same rule.
 CREATE TRIGGER IF NOT EXISTS assignments_active_generation_insert_guard
 BEFORE INSERT ON assignments
 WHEN EXISTS (
@@ -352,6 +361,7 @@ CREATE TABLE IF NOT EXISTS finalization_attempts (
 CREATE INDEX IF NOT EXISTS finalization_attempts_running_deadline
   ON finalization_attempts(state, deadline_at);
 
+-- CP-HI-02 — §29's state machine is enforced in the database, not only in the service that usually writes it.
 -- §29 is a persisted state machine. The service owns authority/evidence/outbox work,
 -- while this guard rejects topology bypasses even from a raw SQLite caller.
 CREATE TRIGGER IF NOT EXISTS runs_state_transition_guard
@@ -372,6 +382,7 @@ BEGIN
   SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
 END;
 
+-- CP-HI-02 — a legal edge still requires daemon authority; the connection marker proves it.
 -- A legal edge is not, by itself, authority to take it. The marker is connection-local and
 -- scoped to one run and target state while Db.applyRunStateTransition writes the audit proof
 -- and outbox envelope in the same transaction; a raw UPDATE cannot manufacture that fact.
@@ -404,6 +415,7 @@ BEGIN
   SELECT RAISE(ABORT, 'PINNED_MANIFEST_IMMUTABLE');
 END;
 
+-- CP-HI-03 — a candidate cannot alter the commands that will judge it.
 -- The temporary-repository path has no project manifest at dispatch time. Its command
 -- contract may be filled once by VerificationEngine, but never changed after a result
 -- reveals that the first suite failed.
@@ -463,6 +475,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS tasks_run ON tasks(run_id, state);
 
+-- CP-HI-02 — task admission closes when the run seals; late work cannot join a run being completed.
 -- §34.3 — task admission is closed as soon as a packet exists, while an owner is deciding
 -- on that packet, or after the run ends. TaskGraph returns the same denial at its public
 -- admission point; this trigger protects direct SQL writers and cross-connection races.
@@ -519,6 +532,7 @@ CREATE TABLE IF NOT EXISTS task_executions (
 
 CREATE INDEX IF NOT EXISTS task_executions_open ON task_executions(status, started_at);
 
+-- CP-HI-04 — an execution names a real bound worker rather than an arbitrary session.
 -- A caller cannot fabricate a receipt for an arbitrary session. At insertion the named
 -- session must hold the active, canonical WORKER:<taskId> binding and be ready to work.
 -- TaskGraph performs the same check for an explainable denial; this is the durable backstop
@@ -539,6 +553,7 @@ BEGIN
   SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_BINDING_REQUIRED');
 END;
 
+-- CP-HI-04 — recorded producer identity is historical provenance and cannot be rewritten.
 -- The identity recorded at admission is historical provenance. Rewriting its task, run,
 -- or worker afterwards would turn a valid receipt into a claim for someone else's work.
 CREATE TRIGGER IF NOT EXISTS task_executions_worker_identity_immutable
@@ -579,6 +594,7 @@ CREATE TABLE IF NOT EXISTS run_artifacts (
   UNIQUE (run_id, kind, digest, candidate_snapshot_digest)
 );
 
+-- CP-HI-06 — evidence binds the exact candidate snapshot; metadata alone cannot make it look bound.
 -- A raw insert must not make evidence appear bound merely by filling a metadata column.
 -- SQLite can verify the evidence envelope's declared candidate and that the run owns a
 -- snapshot with that binding; ArtifactStore additionally validates the snapshot schema
@@ -600,6 +616,7 @@ BEGIN
   SELECT RAISE(ABORT, 'EVIDENCE_CANDIDATE_MISMATCH');
 END;
 
+-- CP-HI-06 — evidence requires the producer label *and* the authority marker, so raw SQL cannot forge it.
 -- A matching candidate and the expected producer label are necessary evidence facts, but
 -- neither identifies who wrote the row. Only ArtifactStore can hold the connection-local
 -- marker carried by an issued writer capability, which closes direct Db.run insertions (#70).
@@ -619,6 +636,7 @@ BEGIN
   SELECT RAISE(ABORT, 'EVIDENCE_WRITE_AUTHORITY_DENIED');
 END;
 
+-- CP-HI-06 — content-addressed evidence is append-only but for the one-way staleness mark.
 -- Evidence is append-only except for one one-way staleness mark. Every metadata field,
 -- including row identity and timestamp, participates in authority and must stay fixed.
 CREATE TRIGGER IF NOT EXISTS run_artifacts_content_immutable
@@ -638,6 +656,7 @@ BEGIN
   SELECT RAISE(ABORT, 'ARTIFACT_IMMUTABLE');
 END;
 
+-- CP-HI-08 — deleting evidence would make a failed or stale run indistinguishable from one with none.
 CREATE TRIGGER IF NOT EXISTS run_artifacts_no_delete
 BEFORE DELETE ON run_artifacts
 BEGIN
@@ -838,6 +857,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   CHECK (next_attempt_at IS NULL OR retry_eligible = 1)
 );
 
+-- CP-HI-05 — the fingerprint is the replay identity of an external write; rewriting it enables a double send.
 CREATE TRIGGER IF NOT EXISTS outbox_request_fingerprint_immutable
 BEFORE UPDATE OF request_fingerprint ON outbox
 WHEN NEW.request_fingerprint <> OLD.request_fingerprint
@@ -908,6 +928,7 @@ CREATE TABLE IF NOT EXISTS github_receipts (
 
 CREATE INDEX IF NOT EXISTS github_receipts_run ON github_receipts(run_id, operation);
 
+-- CP-HI-05 — the receipt is the replay marker for a credentialed write.
 -- An external-write receipt is the replay marker. Rewriting or deleting it would turn a
 -- completed side effect into an apparently new operation.
 -- A receipt is reserved PENDING *before* the external call and completed once, after the
@@ -933,6 +954,7 @@ BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_IMMUTABLE');
 END;
 
+-- CP-HI-05 — an APPLIED row must descend from a reservation, so a write cannot mint its own proof.
 -- A direct APPLIED row would make it possible to perform a write and create its replay
 -- marker only afterwards. Writes that this kernel originates must first reserve PENDING.
 -- `pr_prepare` may record a pre-existing pull request, which is an observation rather
@@ -948,6 +970,7 @@ BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_PROTOCOL_VIOLATION');
 END;
 
+-- CP-HI-05 — completion proves a reread and closes exactly one unfinished reservation.
 -- Completion has to prove a reread and move exactly one unfinished reservation forward.
 -- The immutable trigger above prevents every other edit; this trigger gives malformed
 -- completion attempts their own stable denial rather than treating them as generic edits.
@@ -965,6 +988,7 @@ BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_PROTOCOL_VIOLATION');
 END;
 
+-- CP-HI-05 — erasing a receipt would let the same external write replay as new.
 -- A PENDING reservation records an *intent* whose external write demonstrably did not
 -- happen, so releasing it destroys no evidence and lets the operation be retried. An
 -- APPLIED receipt is the record of something that did happen and can never be removed.
@@ -993,12 +1017,14 @@ CREATE TABLE IF NOT EXISTS audit_events (
   evidence_json TEXT NOT NULL
 );
 
+-- CP-HI-08 — §40 explainability depends on the audit trail never being rewritten.
 CREATE TRIGGER IF NOT EXISTS audit_events_append_only
 BEFORE UPDATE ON audit_events
 BEGIN
   SELECT RAISE(ABORT, 'AUDIT_APPEND_ONLY');
 END;
 
+-- CP-HI-08 — erasing a denial or takeover destroys exactly what explainability needs.
 -- Append-only means no deletes either: erasing a denial or a takeover record would
 -- destroy exactly the evidence §40 requires for explainability.
 CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
@@ -1027,12 +1053,14 @@ CREATE TABLE IF NOT EXISTS baseline_records (
   UNIQUE (run_id, record_kind, payload_digest)
 );
 
+-- CP-HI-06 — a baseline is the comparison point; editing it silently redefines what counts as regression.
 CREATE TRIGGER IF NOT EXISTS baseline_records_immutable
 BEFORE UPDATE ON baseline_records
 BEGIN
   SELECT RAISE(ABORT, 'BASELINE_RECORD_IMMUTABLE');
 END;
 
+-- CP-HI-08 — a missing baseline must not read as a clean comparison.
 CREATE TRIGGER IF NOT EXISTS baseline_records_no_delete
 BEFORE DELETE ON baseline_records
 BEGIN
