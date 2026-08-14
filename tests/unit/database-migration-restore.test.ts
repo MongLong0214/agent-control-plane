@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, ControlPlane } from "../../src/app/control-plane.ts";
 import { defaultBackupDirectory, restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
+import { schemaDdl } from "../../src/db/migrations.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -310,6 +311,16 @@ const asV14Fixture = (path: string): void => {
     raw.exec(V11_SCHEMA);
     raw.exec(V14_FIXTURE_SHAPE);
     raw.exec(V14_LEDGER_DDL);
+    // A real database at v14 reached it either by bootstrap from the full DDL or through the
+    // v12 migration, whose whole job is `exec(schemaDdl())` — so it carries every trigger
+    // schema.sql declared at the time. Assembling this fixture from V11_SCHEMA plus deltas
+    // skipped that replay, which made it unrepresentative in exactly the way that matters
+    // here. Replay the current DDL, then drop the triggers introduced after v14 so the
+    // fixture is a v14 database rather than a current one wearing a v14 version number.
+    raw.exec(schemaDdl());
+    for (const introducedAfterV14 of ["sessions_workdir_immutable"]) {
+      raw.exec(`DROP TRIGGER IF EXISTS ${introducedAfterV14}`);
+    }
     raw.function("acp_schema_migration_authorized", () => 1);
     const insertReceipt = raw.prepare(
       "INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (?, ?, ?, ?)",
