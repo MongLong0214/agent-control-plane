@@ -67,7 +67,7 @@ interface BootstrapDoor {
   socketPath: string;
   /** Read once by the daemon to construct the child environment; never persisted. */
   runtimeToken(): string;
-  waitForProof(): Promise<Decision<HermesBootstrapCredential>>;
+  proofConsumed(): boolean; waitForProof(): Promise<Decision<HermesBootstrapCredential>>;
   close(): Promise<void>;
 }
 
@@ -183,16 +183,16 @@ export const createHermesBootstrapAuthority = (
           resolveTimeout(
             deny(
               ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED,
-              "Hermes runtime did not present its one-time possession proof",
+              "Hermes runtime did not complete its one-time bootstrap exchange",
               { timeoutMs },
             ),
           );
         }, timeoutMs);
         timer.unref();
       });
-      const childFailure = childLifecycleFailure(child);
+      const childFailure = childLifecycleFailure(child, door.proofConsumed);
       const proof = await Promise.race([door.waitForProof(), timeout, childFailure]);
-      if (!proof.allowed) return proof;
+      if (!proof.allowed) return rollbackFailedBootstrap(cp, roleKey, child, proof);
 
       succeeded = true;
       return allow(ReasonCode.OK, {
@@ -367,6 +367,7 @@ const openBootstrapDoor = async (
   let server: Server | null = null;
   let stopped = false;
   let resolved = false;
+  let proofConsumed = false;
   const sockets = new Set<Socket>();
   let resolveProof!: (decision: Decision<HermesBootstrapCredential>) => void;
   const proof = new Promise<Decision<HermesBootstrapCredential>>((resolveDecision) => {
@@ -398,7 +399,7 @@ const openBootstrapDoor = async (
   const candidate = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
-    serveBootstrapProof(socket, () => token, onProof, (decision) => {
+    serveBootstrapProof(socket, () => token, () => { proofConsumed = true; }, onProof, (decision) => {
       settle(decision);
     }, stopAccepting);
   });
@@ -417,6 +418,7 @@ const openBootstrapDoor = async (
       handedOff = true;
       return token;
     },
+    proofConsumed: () => proofConsumed,
     waitForProof: () => proof,
     close: async () => {
       stopAccepting();
@@ -429,12 +431,14 @@ const openBootstrapDoor = async (
 const serveBootstrapProof = (
   socket: Socket,
   readToken: () => string | null,
+  markProofConsumed: () => void,
   onProof: (proof: RuntimeProof) => Promise<Decision<HermesBootstrapCredential>>,
   settle: (decision: Decision<HermesBootstrapCredential>) => void,
   stopAccepting: () => void,
 ): void => {
   let buffer = Buffer.alloc(0);
   let settled = false;
+  let responseDecision: Decision<HermesBootstrapCredential> | null = null;
   const timeout = setTimeout(
     () => finishWire(deny(ReasonCode.HERMES_BOOTSTRAP_PROOF_INVALID, "bootstrap proof timed out", {})),
     5_000,
@@ -463,9 +467,21 @@ const serveBootstrapProof = (
           message: decision.message,
           evidence: decision.evidence,
     };
-    socket.end(`${JSON.stringify(body)}\n`, () => {
-      if (settleOverall) settle(decision as Decision<HermesBootstrapCredential>);
-    });
+    if (settleOverall) {
+      responseDecision = decision as Decision<HermesBootstrapCredential>;
+      // `end` merely puts the credential into the kernel's socket buffer. Wait until the
+      // runtime completes its side of this one-time exchange before exposing a successful
+      // bootstrap result; otherwise a caller can observe success before the runtime has
+      // consumed the secret it was given.
+      socket.once("close", (hadError) => {
+        const completed = responseDecision;
+        if (!completed) return;
+        settle(hadError
+          ? deny(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED, "runtime disconnected during bootstrap credential delivery", {})
+          : completed);
+      });
+    }
+    socket.end(`${JSON.stringify(body)}\n`);
   };
 
   const refuse = (reasonCode: typeof ReasonCode.HERMES_BOOTSTRAP_PROOF_INVALID, message: string): void =>
@@ -490,6 +506,7 @@ const serveBootstrapProof = (
     if (!proof || !token || !proofMatches(token, proof)) {
       return refuse(ReasonCode.HERMES_BOOTSTRAP_PROOF_INVALID, "runtime possession proof was refused");
     }
+    markProofConsumed();
 
     // Consume the opaque token and close the listening path before constituting authority.
     // The connected socket remains available for the one response below.
@@ -500,6 +517,10 @@ const serveBootstrapProof = (
   };
   socket.on("data", receive);
   socket.once("error", () => {
+    if (responseDecision) {
+      settle(deny(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED, "runtime disconnected during bootstrap credential delivery", {}));
+      return;
+    }
     if (!settled) {
       settled = true;
       clearTimeout(timeout);
@@ -562,9 +583,13 @@ const spawnHermesRuntime = (
   return child;
 };
 
-const childLifecycleFailure = (child: ChildProcess): Promise<Decision<HermesBootstrapCredential>> =>
+const childLifecycleFailure = (
+  child: ChildProcess,
+  proofConsumed: () => boolean,
+): Promise<Decision<HermesBootstrapCredential>> =>
   new Promise((resolveFailure) => {
     child.once("error", (error) => {
+      if (proofConsumed()) return;
       resolveFailure(
         deny(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED, "could not launch the Hermes runtime", {
           error: safeError(error),
@@ -572,6 +597,7 @@ const childLifecycleFailure = (child: ChildProcess): Promise<Decision<HermesBoot
       );
     });
     child.once("exit", (code, signal) => {
+      if (proofConsumed()) return;
       resolveFailure(
         deny(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED, "Hermes runtime exited before bootstrap proof", {
           code,
@@ -588,6 +614,26 @@ const stopChild = (child: ChildProcess | null): void => {
   } catch {
     /* the child may have exited between the check and the signal */
   }
+};
+
+/** A failed response completion must not leave the newly minted CEO binding live. */
+const rollbackFailedBootstrap = <T>(
+  cp: ControlPlane,
+  roleKey: string,
+  child: ChildProcess | null,
+  failure: Decision<T>,
+): Decision<T> => {
+  if (!child?.pid) return failure;
+  const binding = cp.bindings.active(roleKey);
+  const session = binding ? cp.sessions.get(binding.sessionId) : null;
+  // Bootstrap prechecks make an active CEO from another process impossible here. Keep
+  // this tuple check nevertheless so a future concurrency change cannot revoke it.
+  if (!binding || !session || session.osPid !== child.pid) return failure;
+  const revoked = cp.bindings.revoke(roleKey, "Hermes bootstrap credential delivery failed");
+  if (revoked.allowed && session.lifecycle === SessionLifecycle.READY) {
+    cp.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "Hermes bootstrap credential delivery failed");
+  }
+  return failure;
 };
 
 const listenBootstrapSocket = (server: Server, socketPath: string): Promise<void> =>
