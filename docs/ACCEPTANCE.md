@@ -143,10 +143,18 @@ diagnostic output, not an owner-maintained capacity input. See `docs/capacity-so
 enqueued, drained by `BuzzAdapter.deliverPending` over `BuzzCliTransport`, and read back off
 the relay carrying its `bindingGeneration`. The acknowledgement runs through the production
 ingress — `IngressGuard.admit` → `BuzzActorIngress.bindActor` → `SessionRegistry.bindBuzzActor`
-— with the deployment's allowlist naming exactly one actor, so the refusal of a different
-actor is the guard's (`INGRESS_ACTOR_NOT_ALLOWLISTED`) rather than the absence of a row. An
-earlier version of this capture supplied its own `isAllowedActor` and bound the actor
-directly; its "different actor refused" was true for any input and proved nothing.
+— so the refusal of a different actor is the guard's (`INGRESS_ACTOR_NOT_ALLOWLISTED`) rather
+than the absence of a row.
+
+**The allowlist is the capture's, not the deployment's.** `scripts/capture-buzz-live.ts:252-254`
+generates the ingress secret with `randomBytes(32)` and sets `allowedActors: [landed.pubkey]`.
+So what this demonstrates is that `IngressGuard` refuses an actor outside the list it was given
+— real enforcement on the real code path — and not that `agentcpd`'s configured policy would
+refuse that actor. An earlier version was weaker still: it supplied its own `isAllowedActor` and
+bound the actor directly, so "different actor refused" was true for any input.
+
+Closing #243 needs a capture routed through `configuredBuzzActorIngressPolicy` rather than one
+the script constructs (#440).
 
 The doctor's `CTO_BUZZ_NOT_CONNECTED` is shown present before the connect and absent after,
 for a project-scoped `PRIMARY_CTO` on a control plane wired to the real transport. But #243's
