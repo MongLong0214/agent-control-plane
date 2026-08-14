@@ -513,6 +513,43 @@ exec /bin/ps "$@"
     expect(outcome.peakRssMb).toBeTypeOf("number");
   });
 
+  sandboxIt("#367 refuses a run whose `ps -o lstart=` never answers", async () => {
+    // The neighbouring test fails `ps -o lstart=` exactly once, establishing that a transient
+    // race is tolerated. A blind reviewer read that as having weakened #367 — that it no longer
+    // showed a command could PASS while identity was generally unavailable.
+    //
+    // Measured: such a run does not PASS. It returns ERROR / SANDBOX_CHILD_CLEANUP_FAILED with
+    // resourceLimitsEnforced false, which is the right direction and was pinned by nothing.
+    //
+    // What this does NOT pin, and the name avoids claiming: the identity branch itself.
+    // Disabling `markContainmentLost("candidate identity was not captured…")` leaves this
+    // outcome byte-identical, because a `ps` broken for the whole run already fails the cleanup
+    // path upstream. So this guards the fail-closed result, not the reason for it, and the
+    // identity branch stays uncovered — recorded on #443 rather than papered over.
+    const repository = makeRepo();
+    const outcome = await withPsShim(
+      `#!/bin/sh
+if [ "$1" = "-o" ] && [ "$2" = "lstart=" ]; then
+  exit 1
+fi
+exec /bin/ps "$@"
+`,
+      () => runSandboxed({
+        command: parseVerificationCommand({
+          id: "identity-gone",
+          argv: ["node", "-e", "setTimeout(() => process.exit(0), 1500)"],
+          timeoutSeconds: 5,
+        }),
+        worktreePath: repository,
+      }),
+    );
+    expect(outcome.status, "a run whose `ps -o lstart=` never answered must not PASS").not.toBe("PASS");
+    // Only the refusal is asserted. `resourceLimitsEnforced` is false here and true on the CI
+    // runner for the same input — a real platform difference in the same area as #461, not a
+    // property this test established. Asserting it locally would have made the suite depend on
+    // where it ran, which is the failure `local-green-is-not-CI-green` already cost a day to.
+  });
+
   sandboxIt("#367 still refuses a passing command when no RSS sample exists", async () => {
     const repository = makeRepo();
     const outcome = await withPsShim(
