@@ -308,9 +308,9 @@ describe("round-2 verification isolation and candidate freshness", () => {
         return `ps failed: ${(error as NodeJS.ErrnoException).code ?? String(error)}`;
       }
     };
-    console.log("[#461] outcome.enforcement=", JSON.stringify(outcome.enforcement));
-    console.log("[#461] child at assert time:", psLine(result.childPid));
-    console.log("[#461] this process:", psLine(process.pid));
+    console.error("[#461] outcome.enforcement=", JSON.stringify(outcome.enforcement));
+    console.error("[#461] child at assert time:", psLine(result.childPid));
+    console.error("[#461] this process:", psLine(process.pid));
 
     let childIsAlive = false;
     try {
