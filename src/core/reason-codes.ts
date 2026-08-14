@@ -270,3 +270,43 @@ export type ReasonCode = (typeof ReasonCode)[keyof typeof ReasonCode];
 const ALL: ReadonlySet<string> = new Set(Object.values(ReasonCode));
 
 export const isReasonCode = (value: string): value is ReasonCode => ALL.has(value);
+
+/**
+ * Reason codes that report a *staleness* verdict rather than a failure.
+ *
+ * The distinction is the point, not the label. A failure means the thing under test is wrong
+ * and should be fixed. A staleness verdict means the two sides of a comparison came from
+ * different generations, so nothing was established either way — the answer is re-derived, not
+ * repaired.
+ *
+ * Folding the two costs real time in both directions, and both happened here. A stale trust
+ * receipt reported as INVALID sent someone auditing a receipt that was fine. Stale evidence
+ * reported as nothing at all let a wrong number read as current. See #448 for the eleven
+ * observed cases and `docs/TERMINOLOGY.md` §6 for the rename that blinded a monitor.
+ *
+ * This is a classification over existing codes, not a new set. Widening `Decision<T>` to carry
+ * a third state was measured and rejected: `.allowed` is read 1557 times, 356 of those as
+ * `if (!x.allowed)`, so a third state would compile everywhere and silently fold at every one
+ * of them — the exact defect the rule exists to prevent, with the compiler unable to help.
+ * Asking the question of a code is cheap and changes no call site that does not want it.
+ */
+export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
+  ReasonCode.BINDING_GENERATION_STALE,
+  ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
+  ReasonCode.CAPACITY_PROBE_STALE,
+  ReasonCode.CAPACITY_SENSOR_FILE_STALE,
+  ReasonCode.EVIDENCE_STALE,
+  ReasonCode.FINALIZATION_ATTEMPT_STALE,
+  ReasonCode.MERGE_BASE_STALE,
+  ReasonCode.MERGE_HEAD_STALE,
+  ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+  ReasonCode.SNAPSHOT_STALE,
+  ReasonCode.WRITE_BINDING_GENERATION_STALE,
+]);
+
+/**
+ * Whether a denial reports staleness. A caller that acts on this must re-derive rather than
+ * repair; a caller that ignores it behaves exactly as before.
+ */
+export const isStalenessReasonCode = (code: ReasonCode): boolean =>
+  STALENESS_REASON_CODES.has(code);
