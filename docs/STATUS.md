@@ -137,3 +137,5 @@ actor**. It checks collocations rather than words, because every contested word 
 uses here; it therefore catches the confusions the decision was written to prevent, not every
 possible misuse. One rule (`buzz-actor-qualified`) is staged: counted and held at a baseline, not
 yet failing, because the rename it demands touches files that unmerged lanes are editing.
+
+<!-- protection proof: this line is removed in the same PR series -->
