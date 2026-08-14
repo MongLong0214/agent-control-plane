@@ -10,7 +10,7 @@ import type { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { REVIEWER_PROVIDER_ENDPOINTS } from "../../src/runtime/provider.ts";
 import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";
-import type { GitHubClient } from "../../src/github/github-kernel.ts";
+import type { GitHubClient, GitHubKernelOptions } from "../../src/github/github-kernel.ts";
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
@@ -40,6 +40,12 @@ export interface Harness {
 export const makeHarness = (
   options: {
     githubClient?: GitHubClient;
+    githubKernelOptions?: GitHubKernelOptions;
+    /** A caller-owned checkout, used only by live acceptance captures. */
+    repoPath?: string;
+    /** Owner-provisioned App credential paths for a live acceptance capture. */
+    githubAppEnvFile?: string;
+    githubAppPrivateKeyPath?: string;
     ownerIdentities?: readonly OwnerIdentity[];
     allowTestEvidenceWriters?: boolean;
   } = {},
@@ -48,7 +54,7 @@ export const makeHarness = (
   const clock = new ManualClock("2026-08-12T00:00:00.000Z");
   const scripted = new TestProductionAdapter(clock);
 
-  const repoPath = makeRepo({
+  const repoPath = options.repoPath ?? makeRepo({
     "README.md": "# fixture project\n",
     "src/app.js": "module.exports = () => 1;\n",
     // The verification command is a real process the sandbox actually executes.
@@ -86,6 +92,9 @@ console.log('verification ok');`,
       fallbacks: [],
     },
     ...(options.githubClient ? { githubClient: options.githubClient } : {}),
+    ...(options.githubKernelOptions ? { githubKernelOptions: options.githubKernelOptions } : {}),
+    ...(options.githubAppEnvFile ? { githubAppEnvFile: options.githubAppEnvFile } : {}),
+    ...(options.githubAppPrivateKeyPath ? { githubAppPrivateKeyPath: options.githubAppPrivateKeyPath } : {}),
   });
 
   // A route for the roles the control plane binds. The daemon wires the real CLI
@@ -150,6 +159,7 @@ export const registerFixtureProject = async (
   harness: Harness,
   projectId = "fixture-project",
   manifestOverrides: Partial<ProjectManifest> = {},
+  options: { identity?: string } = {},
 ): Promise<{ projectId: string; repositoryId: string; identity: string }> => {
   const manifest = fixtureManifest(projectId, manifestOverrides);
   const project = harness.cp.projects.register({
@@ -165,7 +175,7 @@ export const registerFixtureProject = async (
     projectId,
     repositoryRole: "primary",
     activeManifestDigest: project.value.activeManifestDigest,
-    identity: "github:acme/fixture",
+    identity: options.identity ?? "github:acme/fixture",
   });
   if (!repository.allowed) throw new Error(`repository registration failed: ${repository.message}`);
 
@@ -346,6 +356,8 @@ export const driveToReviewedCandidate = async (
     humanGate?: readonly string[];
     /** Extra candidate-relative paths the scripted blind reviewer must attest to. */
     reviewedPaths?: readonly string[];
+    /** Explicit GitHub identity for a disposable live repository. */
+    repositoryIdentity?: string;
     manifestOverrides?: Partial<ProjectManifest>;
   } = {},
 ): Promise<{
@@ -368,6 +380,7 @@ export const driveToReviewedCandidate = async (
     harness,
     options.projectId ?? "fixture-project",
     options.manifestOverrides ?? {},
+    ...(options.repositoryIdentity ? [{ identity: options.repositoryIdentity }] : []),
   );
   bindCeo(harness);
 

@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "commitlore inject --hook-input # commitlore-inject-hook"
+          }
+        ]
+      }
+    ]
+  }
+}

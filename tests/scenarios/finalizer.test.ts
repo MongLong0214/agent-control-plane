@@ -25,7 +25,7 @@ const WORKFLOW_PATH = ".github/workflows/ci.yml";
 const WORKFLOW = "name: project-ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node verify.js\n";
 type HttpMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
-/** GitHub's pull reread must show the target ref at the merge SHA for the kernel proof. */
+/** GitHub's merged pull retains its base snapshot; the target ref is reread separately. */
 const reflectMergedBase = (github: FakeGitHub): void => {
   const request = github.request.bind(github);
   github.request = async <T>(
@@ -41,7 +41,6 @@ const reflectMergedBase = (github: FakeGitHub): void => {
     const number = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
     const pull = github.pulls.find((entry) => entry.number === number);
     if (merged.merged !== true || typeof merged.sha !== "string" || !pull) return response;
-    pull.base.sha = merged.sha;
     pull.merge_commit_sha = merged.sha;
     github.setBranch(pull.base.ref, merged.sha);
     return response;

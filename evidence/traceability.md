@@ -5,7 +5,7 @@ scenario label resolves to an executable Vitest leaf that appears with status `p
 this fresh JSON-reporter result set. Behavioural coverage and production-entry-point coverage
 are not measured, so this report is not proof that a requirement is met in the running system.
 
-- Vitest result set: 642/643 passed; 0 failed; 1 pending
+- Vitest result set: 654/655 passed; 0 failed; 1 pending
 - Requirements: 22 (declaration coverage 22, gaps 0)
 - Scenarios: 59 (passed declarations 59)
 - Missing scenarios: none

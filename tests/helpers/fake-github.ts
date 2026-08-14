@@ -47,6 +47,8 @@ export class FakeGitHub implements GitHubClient {
   nextMergeSha: string | null = null;
   /** Synchronous hook used to model Actions publishing its exact-merge check before a reread. */
   onMerge: ((input: { mergeSha: string; pull: FakePull }) => void) | null = null;
+  /** Immutable workflow bytes served by the Contents API when a local checkout lacks a remote merge object. */
+  workflowFiles = new Map<string, string>();
   readonly calls: Array<{ method: string; path: string; body?: unknown }> = [];
   mergeCount = 0;
   #nextId = 100;
@@ -106,7 +108,10 @@ export class FakeGitHub implements GitHubClient {
       const firstParent = this.driftBaseTo ?? pull.base.sha;
       this.driftBaseTo = null;
       this.commitParents.set(mergeSha, [firstParent, pull.head.sha]);
-      this.markContains(pull.base.ref, mergeSha);
+      // GitHub's merged-PR resource retains the base snapshot it was opened against;
+      // the separate target ref is the mutable source of truth after a merge.
+      pull.merge_commit_sha = mergeSha;
+      this.setBranch(pull.base.ref, mergeSha);
       this.onMerge?.({ mergeSha, pull });
       return { merged: true, sha: mergeSha } as unknown as T;
     }
@@ -154,11 +159,32 @@ export class FakeGitHub implements GitHubClient {
       return { sha, parents: parents.map((p) => ({ sha: p })) } as unknown as T;
     }
 
+    if (method === "GET" && /\/contents\//.test(path)) {
+      const parsed = new URL(path, "https://github.test");
+      const marker = "/contents/";
+      const index = parsed.pathname.indexOf(marker);
+      const workflowPath = index >= 0 ? decodeURIComponent(parsed.pathname.slice(index + marker.length)) : "";
+      const head = parsed.searchParams.get("ref") ?? "";
+      const content = this.workflowFiles.get(`${head}:${workflowPath}`);
+      if (content === undefined) throw new Error(`no workflow file at ${head}:${workflowPath}`);
+      return {
+        type: "file",
+        encoding: "base64",
+        content: Buffer.from(content, "utf8").toString("base64"),
+      } as unknown as T;
+    }
+
     // --- refs and tags -----------------------------------------------------
     if (method === "GET" && /\/git\/ref\/tags\//.test(path)) {
       const tag = /\/git\/ref\/tags\/(.+)$/.exec(path)![1]!;
       const sha = this.tags.get(tag);
       if (!sha) throw new Error("404 tag not found");
+      return { object: { sha } } as unknown as T;
+    }
+    if (method === "GET" && /\/git\/ref\/heads\//.test(path)) {
+      const ref = decodeURIComponent(/\/git\/ref\/heads\/(.+)$/.exec(path)![1]!);
+      const sha = this.#heads.get(ref);
+      if (!sha) throw new Error(`404 branch not found: ${ref}`);
       return { object: { sha } } as unknown as T;
     }
     if (method === "POST" && /\/git\/refs$/.test(path)) {
@@ -245,6 +271,10 @@ export class FakeGitHub implements GitHubClient {
       app: { slug: "github-actions" },
       completed_at: "2026-08-12T00:00:00.000Z",
     });
+  }
+
+  setWorkflowFile(headSha: string, path: string, content: string): void {
+    this.workflowFiles.set(`${headSha}:${path}`, content);
   }
 
   /** Add a check with the complete suite → Actions run provenance chain the kernel requires. */

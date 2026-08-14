@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "commitlore": {
+      "command": "commitlore",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

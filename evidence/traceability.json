@@ -6,8 +6,8 @@
   "testRun": {
     "reporter": "vitest-json",
     "success": true,
-    "total": 643,
-    "passed": 642,
+    "total": 655,
+    "passed": 654,
     "failed": 0,
     "pending": 1
   },

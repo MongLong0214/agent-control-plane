@@ -4,7 +4,12 @@ import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, SessionLifecycle } from "../../src/domain/types.ts";
 import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
-import { GATE_CHECK_NAME, NO_HUMAN_GATE_DIGEST, type GatePayload } from "../../src/github/github-kernel.ts";
+import {
+  GATE_CHECK_NAME,
+  NO_HUMAN_GATE_DIGEST,
+  type GatePayload,
+  type GitHubKernelOptions,
+} from "../../src/github/github-kernel.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { cleanupTempDirs, commitAll, makeRepo, tempDir, writeFiles } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
@@ -55,7 +60,7 @@ const OWNER_AUTHORITY_CONTRACT: TaskContract = {
   references: [],
 };
 
-/** Model GitHub's post-merge pull re-read: its target ref advances to the merge SHA. */
+/** Model GitHub's merged-PR snapshot plus its separately reread target ref. */
 const reflectMergedBase = (github: FakeGitHub): void => {
   const request = github.request.bind(github);
   github.request = async <T>(
@@ -71,7 +76,6 @@ const reflectMergedBase = (github: FakeGitHub): void => {
     const pullNumber = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
     const pull = github.pulls.find((entry) => entry.number === pullNumber);
     if (merge.merged !== true || typeof merge.sha !== "string" || !pull) return response;
-    pull.base.sha = merge.sha;
     (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = merge.sha;
     github.setBranch(pull.base.ref, merge.sha);
     return response;
@@ -160,7 +164,12 @@ const setup = async (options: {
  * the candidate's real local commit so that read is an actual git proof rather than a mock
  * return value, while retaining the fake's first-parent API proof.
  */
-const reflectMergeToCandidate = (github: FakeGitHub, candidateHead: string, evaluatedBase: string): void => {
+const reflectMergeToCandidate = (
+  github: FakeGitHub,
+  candidateHead: string,
+  evaluatedBase: string,
+  mergeSha = candidateHead,
+): void => {
   const request = github.request.bind(github);
   github.request = async <T>(
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
@@ -175,33 +184,39 @@ const reflectMergeToCandidate = (github: FakeGitHub, candidateHead: string, eval
     const pullNumber = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
     const pull = github.pulls.find((entry) => entry.number === pullNumber);
     if (merge.merged !== true || !pull) return response;
-    pull.base.sha = candidateHead;
-    (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = candidateHead;
-    github.commitParents.set(candidateHead, [evaluatedBase, candidateHead]);
-    github.setBranch(pull.base.ref, candidateHead);
-    return { ...(response as object), sha: candidateHead } as T;
+    (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = mergeSha;
+    github.commitParents.set(mergeSha, [evaluatedBase, candidateHead]);
+    github.setBranch(pull.base.ref, mergeSha);
+    return { ...(response as object), sha: mergeSha } as T;
   };
 };
 
-const setupTrustedPostMergeFixture = async (): Promise<Fixture> => {
-  const workflow = "name: project-ci\non: [push]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node verify.js\n";
+const APPROVED_WORKFLOW = "name: project-ci\non: [push]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: node verify.js\n";
+
+const setupTrustedPostMergeFixture = async (options: {
+  githubKernelOptions?: GitHubKernelOptions;
+  remoteMergeSha?: string;
+} = {}): Promise<Fixture> => {
   const github = new FakeGitHub();
   reflectMergedBase(github);
-  const harness = makeHarness({ githubClient: github });
+  const harness = makeHarness({
+    githubClient: github,
+    ...(options.githubKernelOptions ? { githubKernelOptions: options.githubKernelOptions } : {}),
+  });
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
-  writeFiles(harness.repoPath, { ".github/workflows/ci.yml": workflow });
+  writeFiles(harness.repoPath, { ".github/workflows/ci.yml": APPROVED_WORKFLOW });
   commitAll(harness.repoPath, "add approved CI workflow");
 
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-thing",
     manifestOverrides: {
-      ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: sha256(workflow) }],
+      ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: sha256(APPROVED_WORKFLOW) }],
     },
   });
   github.setBranch("dev", driven.baseHead);
   github.setBranch("main", "c".repeat(40));
   github.setBranch(driven.workBranch, driven.candidateHead);
-  reflectMergeToCandidate(github, driven.candidateHead, driven.baseHead);
+  reflectMergeToCandidate(github, driven.candidateHead, driven.baseHead, options.remoteMergeSha);
 
   const claimed = harness.cp.claims.acquire({
     runId: driven.runId,
@@ -651,6 +666,19 @@ describe("a gate is only an approval when GitHub says it passed (§24.5)", () =>
     expect(refused.allowed).toBe(false);
   });
 
+  it("never treats the neutral smoke-check conclusion as a passing gate", async () => {
+    const { fixture, pullNumber } = await publishedFixture();
+    fixture.github.checkRuns.find((c) => c.name === GATE_CHECK_NAME)!.conclusion = "neutral";
+
+    const refused = await fixture.harness.cp.github.mergeEvaluate(mergeInput(fixture, pullNumber));
+    expect(refused.allowed).toBe(false);
+    expect(
+      fixture.harness.cp.audit
+        .byKind("GATE_REJECTED")
+        .some((event) => event.reasonCode === ReasonCode.MERGE_GATE_MISSING),
+    ).toBe(true);
+  });
+
   it("refuses a gate check with no creator evidence at all", async () => {
     const { fixture, pullNumber } = await publishedFixture();
     fixture.github.checkRuns.find((c) => c.name === GATE_CHECK_NAME)!.app = null;
@@ -783,6 +811,22 @@ describe("the merge must land on the evaluated base (§24.6)", () => {
       .repositoriesOf(fixture.runId)
       .find((r) => r.identity === fixture.identity)!;
     expect(repository.mergeState).toBe("FAILED");
+  });
+
+  it("proves the target ref after a merged PR retains its original base snapshot", async () => {
+    const { fixture, pullNumber } = await readyToMerge();
+    const originalBase = fixture.github.pulls.find((pull) => pull.number === pullNumber)!.base.sha;
+
+    const merged = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+
+    if (!merged.allowed) throw new Error(`${merged.reasonCode}: ${merged.message}`);
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    expect(pull.base.sha).toBe(originalBase);
+    expect(pull.merge_commit_sha).toBe(merged.value.mergeCommitSha);
+    expect(fixture.github.calls).toContainEqual(expect.objectContaining({
+      method: "GET",
+      path: "/repos/acme/fixture/git/ref/heads/dev",
+    }));
   });
 
   it("keeps the repository pending until exact post-merge verification completes", async () => {
@@ -929,6 +973,71 @@ describe("post-merge verification cannot be made vacuous (§24.7)", () => {
     expect(verified).toMatchObject({ allowed: true, value: { checks: [{ name: "project-ci", conclusion: "success" }] } });
     expect(pages.some((path) => new URL(path, "https://github.test").searchParams.get("page") === "2")).toBe(true);
   });
+
+  it("waits for Actions to publish a just-merged exact-SHA check", async () => {
+    let sleeps = 0;
+    const fixture = await setupTrustedPostMergeFixture({
+      githubKernelOptions: {
+        postMergePollAttempts: 2,
+        postMergePollIntervalMs: 1,
+        sleep: async () => {
+          sleeps += 1;
+        },
+      },
+    });
+    let observations = 0;
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ) => {
+      if (method === "GET" && /\/commits\/[^/]+\/check-runs/.test(path) && path.includes("check_name=project-ci")) {
+        observations += 1;
+        if (observations === 2) {
+          fixture.github.setTrustedPostMergeCheck(
+            fixture.head,
+            "project-ci",
+            ".github/workflows/ci.yml",
+          );
+        }
+      }
+      return request<T>(method, path, body);
+    };
+
+    const mergeSha = await mergeForReal(fixture);
+    expect(mergeSha).toBe(fixture.head);
+    const verified = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      mergeSha,
+    );
+
+    expect(verified).toMatchObject({ allowed: true, value: { checks: [{ name: "project-ci", conclusion: "success" }] } });
+    expect(observations).toBe(2);
+    expect(sleeps).toBe(1);
+  });
+
+  it("reads the approved workflow remotely at the immutable merge SHA when the checkout lags", async () => {
+    const remoteMergeSha = "f".repeat(40);
+    const fixture = await setupTrustedPostMergeFixture({ remoteMergeSha });
+    fixture.github.setWorkflowFile(remoteMergeSha, ".github/workflows/ci.yml", APPROVED_WORKFLOW);
+
+    const mergeSha = await mergeForReal(fixture);
+    expect(mergeSha).toBe(remoteMergeSha);
+    fixture.github.setTrustedPostMergeCheck(mergeSha, "project-ci", ".github/workflows/ci.yml");
+    const verified = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      mergeSha,
+    );
+
+    expect(verified).toMatchObject({ allowed: true, value: { checks: [{ name: "project-ci", conclusion: "success" }] } });
+    expect(fixture.github.calls).toContainEqual(expect.objectContaining({
+      method: "GET",
+      path: expect.stringContaining(`/contents/.github/workflows/ci.yml?ref=${remoteMergeSha}`),
+    }));
+  });
 });
 
 describe("release tags and issue projection are owner-authorised (CP-HI-01)", () => {
@@ -978,15 +1087,15 @@ describe("the trusted credential has no read surface (CP-HI-05)", () => {
   it("exposes only the fixed credential-store API", () => {
     const store = new TrustedCredentialStore(tempDir("credential-surface-"));
     expect(Object.getOwnPropertyNames(Object.getPrototypeOf(store)).sort()).toEqual([
-      "assertInstallTarget",
+      "authenticate",
+      "availability",
       "available",
       "constructor",
       "creatorIdentity",
       "githubApi",
       "install",
-      "load",
-      "metadataOk",
       "permissionsOk",
+      "sensitivePaths",
     ]);
   });
 });

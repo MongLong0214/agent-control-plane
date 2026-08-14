@@ -76,7 +76,7 @@ interface Fixture {
   payload: GatePayload;
 }
 
-/** Model GitHub's post-merge pull re-read: its target ref advances to the merge SHA. */
+/** Model GitHub's merged-PR snapshot plus its separately reread target ref. */
 const reflectMergedBase = (github: FakeGitHub): void => {
   const request = github.request.bind(github);
   github.request = async <T>(
@@ -92,7 +92,6 @@ const reflectMergedBase = (github: FakeGitHub): void => {
     const pullNumber = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
     const pull = github.pulls.find((entry) => entry.number === pullNumber);
     if (merge.merged !== true || typeof merge.sha !== "string" || !pull) return response;
-    pull.base.sha = merge.sha;
     (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = merge.sha;
     github.setBranch(pull.base.ref, merge.sha);
     return response;
@@ -870,7 +869,7 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
     expect(fixture.github.mergeCount).toBe(0);
   });
 
-  it("gate_publish refuses when the trusted credential is absent", async () => {
+  it("gate_publish reports the missing App env file when the credential is absent", async () => {
     const github = new FakeGitHub();
     const bare = makeHarness({ githubClient: github });
     const refused = await bare.cp.github.gatePublish(
@@ -878,7 +877,7 @@ describe("production gate provenance (CP-S35, CP-S37)", () => {
       "github:acme/fixture",
     );
     expect(refused.allowed).toBe(false);
-    expect(refused.reasonCode).toBe(ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE);
+    expect(refused.reasonCode).toBe(ReasonCode.GITHUB_APP_ENV_FILE_MISSING);
   });
 });
 
@@ -1857,15 +1856,15 @@ describe("trusted credential boundary (CP-HI-05)", () => {
     // The store exposes the creator identity but never the token itself.
     expect(fixture.harness.cp.credentials.creatorIdentity()).toBe("acp-trusted-app");
     expect(Object.getOwnPropertyNames(Object.getPrototypeOf(fixture.harness.cp.credentials)).sort()).toEqual([
-      "assertInstallTarget",
+      "authenticate",
+      "availability",
       "available",
       "constructor",
       "creatorIdentity",
       "githubApi",
       "install",
-      "load",
-      "metadataOk",
       "permissionsOk",
+      "sensitivePaths",
     ]);
 
     await fixture.harness.cp.github.gatePublish(gatePayload(fixture), fixture.identity);
