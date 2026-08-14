@@ -129,6 +129,9 @@ describe("agentcpd main Telegram startup composition", () => {
     expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
     expect(result.stdout).toContain("Telegram ingress started");
     expect(result.stdout).toContain("startup test Telegram poll observed");
+    // Polling alone shows the loop turning. This is what shows an inbound update reaches the
+    // router: without it the test passed even when route() never ran.
+    expect(result.stdout).toContain("startup test Telegram inbound routed");
   }, 40_000);
 
   it("emits and resolves an owner prompt through main without a test-side send", async () => {
