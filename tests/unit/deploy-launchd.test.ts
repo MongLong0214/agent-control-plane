@@ -395,6 +395,32 @@ describe("launchd deployment artifact", () => {
     expect(buzzKey).toBe("relay-credential-from-desktop-store");
   });
 
+  it("derives reviewer credential scopes the daemon can read without the Keychain", () => {
+    // Under `tools: "none"` a reviewer cannot spawn `security`, so its credential has to live
+    // in a directory it is allowed to read rather than in the login Keychain. These are paths,
+    // not secrets, so they are derived rather than fetched — the operator authenticates into a
+    // known location instead of also having to publish where it is.
+    //
+    // The launcher previously exported neither, so a deployment that set
+    // ACP_CLAUDE_REVIEWER_CONFIG_DIR in a shell would have seen the daemon ignore it.
+    const harness = makeHarness();
+    const installed = runInstaller(
+      installer,
+      ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+    );
+    expect(installed.status).toBe(0);
+
+    const launcher = readFileSync(launcherPath(harness), "utf8");
+    expect(launcher).toContain("ACP_STATE_DIR=");
+    expect(launcher).toContain(
+      'export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_STATE_DIR/reviewer/claude}"',
+    );
+    expect(launcher).toContain(
+      'export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_STATE_DIR/reviewer/codex}"',
+    );
+  });
+
   it("#423 gives the daemon an absolute path to the Buzz CLI its own PATH cannot reach", () => {
     const harness = makeHarness();
     // The launcher pins PATH to the system directories. A `buzz` installed under a user-local
