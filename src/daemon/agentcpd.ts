@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
-import { ControlPlane, defaultConfig } from "../app/control-plane.ts";
+import { ControlPlane, defaultConfig, type ControlPlaneConfig } from "../app/control-plane.ts";
 import {
   createHermesBootstrapAuthority,
   type HermesBootstrapAuthority,
@@ -21,6 +21,13 @@ import {
   IngressGuard,
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
+import {
+  configuredTelegramLongPollConfig,
+  startTelegramLongPollListener,
+  type TelegramBotTransport,
+  type TelegramLongPollStartOptions,
+  type TelegramLongPollListener,
+} from "../ingress/telegram-polling.ts";
 import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/types.ts";
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
@@ -1098,13 +1105,51 @@ const configuredBuzzActorIngressPolicy = (): IngressPolicy | null => {
 };
 
 /**
+ * The daemon's Telegram composition root. Tests may replace only the external transport; the
+ * guard, sealed Hermes port, CEO receipt callback, durable response reader and poll service are
+ * still assembled by the same factory `main` uses.
+ */
+export type DaemonTelegramStartOptions = Omit<TelegramLongPollStartOptions, "onCeoApproved"> & {
+  transport?: TelegramBotTransport;
+};
+
+export const startDaemonTelegramListener = (
+  cp: ControlPlane,
+  config: Parameters<typeof startTelegramLongPollListener>[1],
+  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown> },
+  options: DaemonTelegramStartOptions = {},
+): Promise<TelegramLongPollListener> =>
+  startTelegramLongPollListener(cp, config, {
+    ...options,
+    onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
+  });
+
+export interface AgentcpdMainOptions {
+  /** Test-only composition override; production calls `main()` without options. */
+  config?: ControlPlaneConfig;
+  /** Test-only transport/lifecycle seam; production uses the real Bot API and stays alive. */
+  telegramStartOptions?: DaemonTelegramStartOptions;
+  /** Allows a composition test to inspect the lock-held composition before shutting down. */
+  waitForShutdown?: (
+    shutdown: (signal: string) => Promise<void>,
+    context: AgentcpdMainContext,
+  ) => Promise<void>;
+}
+
+export interface AgentcpdMainContext {
+  cp: ControlPlane;
+  daemon: Daemon;
+  telegram: TelegramLongPollListener | null;
+}
+
+/**
  * `agentcpd` — the single local runtime authority (PRD §33.1).
  *
  * Intended to run under a process supervisor (`launchd` on macOS). The daemon owns the
  * single-instance lock, restart reconciliation, the watchdog timer and Buzz delivery.
  */
-export const main = async (): Promise<void> => {
-  const config = defaultConfig();
+export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => {
+  const config = options.config ?? defaultConfig();
   const stateDir = dirname(config.databasePath);
   const buzzActorIngressPolicy = configuredBuzzActorIngressPolicy();
   if (process.env["BUZZ_PRIVATE_KEY"] && !buzzActorIngressPolicy) {
@@ -1129,6 +1174,7 @@ export const main = async (): Promise<void> => {
   if (!operatorActor) {
     throw new Error("ACP_OPERATOR_ACTOR or USER is required to establish the operator peer identity");
   }
+  const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   const cp = new ControlPlane(config);
 
   let sessionLaunch: LocalSessionLaunchChannel;
@@ -1176,6 +1222,7 @@ export const main = async (): Promise<void> => {
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
   let operator: LocalOperatorListener | null = null;
   let hermesBootstrap: HermesBootstrapAuthority | null = null;
+  let telegram: TelegramLongPollListener | null = null;
   try {
     hermesBootstrap = createHermesBootstrapAuthority(cp, {
       stateDir,
@@ -1202,7 +1249,21 @@ export const main = async (): Promise<void> => {
     if (buzzActorIngressPolicy) {
       buzzActorIngress = await startBuzzActorIngressListener(cp, stateDir, buzzActorIngressPolicy);
     }
+    if (telegramConfig) {
+      const telegramStartOptions = options.telegramStartOptions ?? {};
+      telegram = await startDaemonTelegramListener(cp, telegramConfig, daemon, {
+        ...telegramStartOptions,
+        onError: (error) => {
+          process.stderr.write(`telegram ingress error: ${error instanceof Error ? error.message : String(error)}\n`);
+          telegramStartOptions.onError?.(error);
+        },
+      });
+      process.stdout.write("Telegram ingress started\n");
+    } else {
+      process.stderr.write("Telegram ingress not configured; continuing without Telegram ingress\n");
+    }
   } catch (err) {
+    await telegram?.close();
     await operator?.close();
     await hermesBootstrap?.close();
     await listeners?.close();
@@ -1216,6 +1277,7 @@ export const main = async (): Promise<void> => {
 
   const shutdown = async (signal: string): Promise<void> => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
+    await telegram?.close();
     await buzzActorIngress?.close();
     await operator?.close();
     await hermesBootstrap?.close();
@@ -1226,12 +1288,18 @@ export const main = async (): Promise<void> => {
     process.exit(0);
   };
 
+  const context: AgentcpdMainContext = { cp, daemon, telegram };
+
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
 
   // Keep the process alive; work arrives through authenticated local MCP sockets or timers.
-  setInterval(() => daemon.writeHealth(null), 30_000).unref();
-  await new Promise<void>(() => undefined);
+  if (options.waitForShutdown) {
+    await options.waitForShutdown(shutdown, context);
+  } else {
+    setInterval(() => daemon.writeHealth(null), 30_000).unref();
+    await new Promise<void>(() => undefined);
+  }
 };
 
 const waitForBackoff = async (seconds: number): Promise<void> => {

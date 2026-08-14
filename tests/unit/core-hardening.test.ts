@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import { chmodSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 
@@ -12,6 +13,7 @@ import {
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { EvidenceWriter } from "../../src/db/artifacts.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
+import { schemaDdl } from "../../src/db/migrations.ts";
 import { redact } from "../../src/db/audit.ts";
 import { WorktreeManager } from "../../src/verify/worktree.ts";
 import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
@@ -133,6 +135,29 @@ describe("append-only really means append-only", () => {
     const { db, audit } = makeCore();
     audit.record({ kind: "TEST", evidence: {} });
     expect(() => db.run(`DELETE FROM audit_events`)).toThrowError(/AUDIT_APPEND_ONLY/);
+  });
+});
+
+describe("Telegram owner prompt records are immutable", () => {
+  it("refuses direct UPDATE and DELETE of a persisted prompt", () => {
+    const raw = new Database(":memory:");
+    try {
+      raw.exec(schemaDdl());
+      raw.prepare(
+        `INSERT INTO telegram_owner_prompts
+           (chat_id, message_id, correlation_id, run_id, candidate_snapshot_digest, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run("owner-chat", 42, "telegram:prompt:42", "run_prompt", "sha256:shown", "2026-08-14T00:00:00.000Z");
+
+      expect(() => raw.prepare(
+        "UPDATE telegram_owner_prompts SET candidate_snapshot_digest = 'sha256:rewritten'",
+      ).run()).toThrowError(/TELEGRAM_PROMPT_IMMUTABLE/);
+      expect(() => raw.prepare("DELETE FROM telegram_owner_prompts").run()).toThrowError(
+        /TELEGRAM_PROMPT_IMMUTABLE/,
+      );
+    } finally {
+      raw.close();
+    }
   });
 });
 

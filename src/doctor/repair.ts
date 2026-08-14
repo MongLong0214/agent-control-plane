@@ -179,6 +179,7 @@ export class RepairService {
         allowlist: Object.keys(this.operations),
       });
     }
+    let ownerReceipt: OwnerApprovalReceipt | null = null;
     if (operation.authorization === "OWNER") {
       if (request.authorizedBy !== "OWNER" || !request.ownerApproval) {
         return deny(
@@ -206,6 +207,7 @@ export class RepairService {
         );
       }
       if (!admitted.allowed) return admitted as Decision<RepairReceipt>;
+      ownerReceipt = request.ownerApproval;
     }
 
     const plan = await this.plan(operation, request);
@@ -221,6 +223,11 @@ export class RepairService {
         operationId: operation.id,
         preconditions: plan.preconditions,
       });
+    }
+
+    if (ownerReceipt) {
+      const consumed = this.#ownerAuthority!.consumeApproval(ownerReceipt, null);
+      if (!consumed.allowed) return consumed as Decision<RepairReceipt>;
     }
 
     const outcome = await plan.perform(request.dryRun);

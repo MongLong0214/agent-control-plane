@@ -32,10 +32,14 @@ export interface IngressPolicy {
   /** Shared secret for signature verification, when the channel supports it. */
   secret?: string | null;
   nonceTtlMs?: number;
+  /** Telegram may resume a durable in-flight update after a process crash. */
+  recoverInFlight?: boolean;
 }
 
 export interface OwnerApprovalIngress {
   runId: string | null;
+  /** Candidate current when this owner approval was minted; null only for non-run operations. */
+  candidateSnapshotDigest: string | null;
   operation: string;
   parameters: unknown;
   idempotencyKey: string;
@@ -56,6 +60,7 @@ export interface BuzzActorBindingIngress {
 export const ownerApprovalPayload = (input: OwnerApprovalIngress): Record<string, unknown> => ({
   type: "OWNER_APPROVAL",
   runId: input.runId,
+  candidateSnapshotDigest: input.candidateSnapshotDigest,
   operation: input.operation,
   parameterDigest: digestOf(input.parameters),
   idempotencyKey: input.idempotencyKey,
@@ -195,6 +200,19 @@ export class IngressGuard {
       [request.channel, request.nonce],
     );
     if (seen) {
+      if (policy.recoverInFlight && isRecoverableIngressResult(seen.result_json)) {
+        this.audit.record({
+          kind: "INGRESS_RECOVERY",
+          actor: request.actor,
+          reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+          evidence: { channel: request.channel, nonce: request.nonce },
+        });
+        return allow(
+          ReasonCode.UNTRUSTED_CONTENT_IS_DATA,
+          { payload: request.payload, untrusted: true },
+          { recovered: true },
+        );
+      }
       // §27.1 / CP-S49 — a replay is idempotently ignored, not re-executed.
       this.audit.record({
         kind: "INGRESS_REPLAY",
@@ -246,6 +264,24 @@ export class IngressGuard {
         { channel: request.channel, actor: request.actor, operation: input.operation },
       );
     }
+    // Keep the receipt's candidate claim sourced from the admitted envelope shape. If the
+    // payload constructor ever drops this field, input-only data must not become evidence.
+    const payloadCandidate =
+      request.payload && typeof request.payload === "object" && !Array.isArray(request.payload)
+        ? (request.payload as Record<string, unknown>)["candidateSnapshotDigest"]
+        : undefined;
+    if (payloadCandidate !== input.candidateSnapshotDigest) {
+      return deny(
+        ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE,
+        "owner ingress payload does not bind the candidate approved by the owner",
+        {
+          channel: request.channel,
+          actor: request.actor,
+          operation: input.operation,
+          candidateSnapshotDigest: input.candidateSnapshotDigest,
+        },
+      );
+    }
     const admitted = this.admit(request);
     if (!admitted.allowed) return admitted as Decision<OwnerApprovalReceipt>;
 
@@ -254,6 +290,7 @@ export class IngressGuard {
       actor: request.actor,
       inboundNonce: request.nonce,
       runId: input.runId,
+      candidateSnapshotDigest: input.candidateSnapshotDigest,
       operation: input.operation,
       parameterDigest: digestOf(input.parameters),
       idempotencyKey: input.idempotencyKey,
@@ -265,7 +302,7 @@ export class IngressGuard {
       runId: receipt.runId,
       evidence: { receiptDigest: digestOf(receipt) },
     });
-    return allow(ReasonCode.OK, receipt);
+    return allow(ReasonCode.OK, receipt, admitted.evidence);
   }
 
   recordResult(channel: string, nonce: string, result: unknown): void {
@@ -274,6 +311,46 @@ export class IngressGuard {
       channel,
       nonce,
     ]);
+  }
+
+  /**
+   * Conditional result transition used by Telegram's durable reply protocol. The database
+   * transaction makes two pollers race on the reservation rather than both calling Telegram;
+   * completion is only allowed from PENDING, so APPLIED cannot be rewritten.
+   */
+  recordResultIf(
+    channel: string,
+    nonce: string,
+    result: unknown,
+    expected: "AVAILABLE" | "PENDING",
+  ): Decision<void> {
+    return this.db.tx(() => {
+      const current = this.db.get<{ result_json: string | null }>(
+        `SELECT result_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [channel, nonce],
+      );
+      if (!current) {
+        return deny(ReasonCode.NOT_FOUND, "cannot transition a missing ingress result", { channel, nonce });
+      }
+      const deliveryStatus = resultDeliveryStatus(current.result_json);
+      const allowed = expected === "PENDING"
+        ? deliveryStatus === "PENDING"
+        : deliveryStatus !== "PENDING" && deliveryStatus !== "APPLIED";
+      if (!allowed) {
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          `ingress result is not ${expected.toLowerCase()} for transition`,
+          { channel, nonce, deliveryStatus },
+        );
+      }
+      const updated = this.db.run(
+        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`,
+        [JSON.stringify(result), channel, nonce],
+      );
+      return updated.changes === 1
+        ? allow(ReasonCode.OK, undefined)
+        : deny(ReasonCode.RESOURCE_COLLISION, "ingress result transition raced another writer", { channel, nonce });
+    });
   }
 
   private refuse(
@@ -301,6 +378,38 @@ export class IngressGuard {
     ]);
   }
 }
+
+/**
+ * A Telegram row with no terminal response is an unfinished workflow, not a completed replay.
+ * The marker is deliberately narrow: a malformed or already-sent result remains a replay and
+ * cannot be promoted back into an executable request.
+ */
+const isRecoverableIngressResult = (resultJson: string | null): boolean => {
+  if (!resultJson) return true;
+  try {
+    const value = JSON.parse(resultJson) as {
+      kind?: unknown;
+      phase?: unknown;
+      sent?: unknown;
+    };
+    if (value.kind === "TELEGRAM_WORKFLOW") {
+      return value.phase === "ADMITTED" || value.phase === "CREATED" || value.phase === "DISPATCHED" || value.sent === false;
+    }
+    return value.sent === false;
+  } catch {
+    return false;
+  }
+};
+
+const resultDeliveryStatus = (resultJson: string | null): string | null => {
+  if (!resultJson) return null;
+  try {
+    const value = JSON.parse(resultJson) as { deliveryStatus?: unknown };
+    return typeof value.deliveryStatus === "string" ? value.deliveryStatus : null;
+  } catch {
+    return null;
+  }
+};
 
 /**
  * The production write path for §27.2 Buzz identity binding.

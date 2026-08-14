@@ -93,14 +93,28 @@ esac
 set -euo pipefail
 printf '%s\\n' "$*" >> "$ACP_SECURITY_LOG"
 [[ "\${1:-}" == "find-generic-password" ]] || exit 64
-case "$*" in
-  *" -a ACP_MCP_TOKEN") printf 'mcp-provisioned-token\\n' ;;
-  *" -a ACP_OPERATOR_TOKEN") printf 'operator-provisioned-token\\n' ;;
+account="\${6:-}"
+case "$account" in
+  ACP_MCP_TOKEN) printf 'mcp-provisioned-token\\n' ;;
+  ACP_OPERATOR_TOKEN) printf 'operator-provisioned-token\\n' ;;
   # A host where the Buzz desktop app owns the relay identity has no dedicated
   # BUZZ_PRIVATE_KEY item at all — the lookup fails, exactly as it does live.
-  *" -a BUZZ_PRIVATE_KEY") [[ "\${ACP_FAKE_BUZZ_ITEM_MISSING:-0}" == "1" ]] && exit 44
-                           printf 'fake-keychain-value\\n' ;;
-  *"-s buzz-desktop -a secrets"*) printf '%s\\n' "\${ACP_FAKE_BUZZ_SECRETS_JSON:-}" ;;
+  BUZZ_PRIVATE_KEY) [[ "\${ACP_FAKE_BUZZ_ITEM_MISSING:-0}" == "1" ]] && exit 44
+                    printf 'fake-keychain-value\\n' ;;
+  secrets) printf '%s\\n' "\${ACP_FAKE_BUZZ_SECRETS_JSON:-}" ;;
+  ACP_TELEGRAM_*)
+    case ",\${ACP_TELEGRAM_KEYCHAIN_ACCOUNTS:-}," in
+      *,"$account",*) ;;
+      *) exit 44 ;;
+    esac
+    case "$account" in
+      ACP_TELEGRAM_BOT_TOKEN) printf 'telegram-bot-token\\n' ;;
+      ACP_TELEGRAM_OWNER_ID) printf '424242\\n' ;;
+      ACP_TELEGRAM_CHAT_ID) printf -- '-100999\\n' ;;
+      ACP_TELEGRAM_WEBHOOK_SECRET) printf 'telegram-webhook-secret\\n' ;;
+      *) printf 'telegram-test-value\\n' ;;
+    esac
+    ;;
   *) printf 'fake-keychain-value\\n' ;;
 esac
 `,
@@ -125,7 +139,10 @@ if [[ "$target" == "-e" ]]; then
   exec "$ACP_REAL_NODE" "$@"
 fi
 if [[ "$target" == *"agentcpd.js" ]]; then
-  printf '%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" "\${BUZZ_PRIVATE_KEY:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
+  printf '%s|%s|%s|%s|%s|%s|%s\\n' "$ACP_MCP_TOKEN" "$ACP_OPERATOR_TOKEN" \
+    "\${ACP_TELEGRAM_BOT_TOKEN-}" "\${ACP_TELEGRAM_OWNER_ID-}" \
+    "\${ACP_TELEGRAM_CHAT_ID-}" "\${ACP_TELEGRAM_WEBHOOK_SECRET-}" \
+    "\${BUZZ_PRIVATE_KEY:-<unset>}" >> "$ACP_LAUNCHER_ENV_LOG"
   # Mirrors the real precondition in src/daemon/agentcpd.ts: a Buzz credential without the
   # ingress pair is a startup error, not a degraded mode. Without this, a launcher that
   # exported the key too eagerly would look fine here and put the real daemon in a launchd
@@ -200,6 +217,7 @@ const assertRenderedPlist = (harness: InstallerHarness): void => {
   expect(plist).toContain(`<key>HOME</key>`);
   expect(plist).not.toContain("__ACP_");
   expect(plist).not.toContain("ACP_MCP_TOKEN");
+  expect(plist).not.toContain("ACP_TELEGRAM_BOT_TOKEN");
 };
 
 const filesUnder = (directory: string): string[] => {
@@ -237,6 +255,7 @@ describe("launchd deployment artifact", () => {
     expect(plist).not.toContain("__ACP_");
     expect(plist).not.toContain("REPLACE_WITH_");
     expect(plist).not.toContain("ACP_MCP_TOKEN");
+    expect(plist).not.toContain("ACP_TELEGRAM_BOT_TOKEN");
   });
 
   it("installs through fake launchctl/security and observes the rendered job", () => {
@@ -275,7 +294,12 @@ describe("launchd deployment artifact", () => {
       { mode: 0o600 },
     );
 
-    const launcherEnv: NodeJS.ProcessEnv = { ...harness.env, BASH_ENV: launcherSecurity };
+    const launcherEnv: NodeJS.ProcessEnv = {
+      ...harness.env,
+      BASH_ENV: launcherSecurity,
+      ACP_TELEGRAM_KEYCHAIN_ACCOUNTS:
+        "ACP_TELEGRAM_BOT_TOKEN,ACP_TELEGRAM_OWNER_ID,ACP_TELEGRAM_CHAT_ID,ACP_TELEGRAM_WEBHOOK_SECRET",
+    };
     delete launcherEnv["ACP_MCP_TOKEN"];
     delete launcherEnv["ACP_OPERATOR_TOKEN"];
     const launched = spawnSync("bash", [launcherPath(harness)], {
@@ -284,10 +308,55 @@ describe("launchd deployment artifact", () => {
     });
 
     expect(launched.status).toBe(0);
-    const [mcpToken, operatorToken] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    const [mcpToken, operatorToken, telegramToken, telegramOwner, telegramChat, telegramSecret] =
+      readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
     expect(mcpToken).toBe("mcp-provisioned-token");
     expect(operatorToken).toBe("operator-provisioned-token");
     expect(operatorToken).not.toBe(mcpToken);
+    expect(telegramToken).toBe("telegram-bot-token");
+    expect(telegramOwner).toBe("424242");
+    expect(telegramChat).toBe("-100999");
+    expect(telegramSecret).toBe("telegram-webhook-secret");
+  });
+
+  it("starts cleanly and omits Telegram variables when the Keychain has none", () => {
+    const harness = makeHarness();
+    const installed = runInstaller(
+      installer,
+      ["install", "--app-root", root, "--node", harness.node, "--keychain-service", "test-service"],
+      harness,
+    );
+
+    expect(installed.status).toBe(0);
+    const launcherSecurity = join(harness.home, "launcher-security.bash");
+    writeFileSync(
+      launcherSecurity,
+      `security() { "${join(harness.bin, "security")}" "$@"; }\n`,
+      { mode: 0o600 },
+    );
+    const launcherEnv: NodeJS.ProcessEnv = {
+      ...harness.env,
+      BASH_ENV: launcherSecurity,
+      ACP_TELEGRAM_KEYCHAIN_ACCOUNTS: "",
+      ACP_TELEGRAM_BOT_TOKEN: "inherited-token-must-not-survive",
+      ACP_TELEGRAM_OWNER_ID: "inherited-owner-must-not-survive",
+      ACP_TELEGRAM_CHAT_ID: "inherited-chat-must-not-survive",
+      ACP_TELEGRAM_WEBHOOK_SECRET: "inherited-secret-must-not-survive",
+    };
+    delete launcherEnv["ACP_MCP_TOKEN"];
+    delete launcherEnv["ACP_OPERATOR_TOKEN"];
+    const launched = spawnSync("bash", [launcherPath(harness)], {
+      encoding: "utf8",
+      env: launcherEnv,
+    });
+
+    expect(launched.status).toBe(0);
+    const [, , telegramToken, telegramOwner, telegramChat, telegramSecret] =
+      readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    expect(telegramToken).toBe("");
+    expect(telegramOwner).toBe("");
+    expect(telegramChat).toBe("");
+    expect(telegramSecret).toBe("");
   });
 
   it("#423 takes BUZZ_PRIVATE_KEY from the desktop store when it has no item of its own", () => {
@@ -322,7 +391,7 @@ describe("launchd deployment artifact", () => {
     expect(spawnSync("bash", [launcherPath(harness)], { encoding: "utf8", env: launcherEnv }).status)
       .toBe(0);
 
-    const [, , buzzKey] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    const [, , , , , , buzzKey] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
     expect(buzzKey).toBe("relay-credential-from-desktop-store");
   });
 
@@ -387,7 +456,7 @@ describe("launchd deployment artifact", () => {
       env: launcherEnv,
     });
     expect(launched.status).toBe(0);
-    const [, , buzzKey] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
+    const [, , , , , , buzzKey] = readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
     expect(buzzKey).toBe("<unset>");
   });
 

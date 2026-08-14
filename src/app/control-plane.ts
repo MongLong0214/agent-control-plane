@@ -519,7 +519,7 @@ export class ControlPlane {
         evaluate: (reason) => this.continuity.evaluate(reason),
       },
     });
-    this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? []);
+    this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? [], this.clock);
     // The GitHub kernel binds the production gate's single human-gate predicate to its
     // payload. It never reinterprets APPROVAL artifacts or ingress receipts itself.
     this.github.attach({

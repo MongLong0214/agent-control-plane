@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -267,7 +267,50 @@ const v16: SchemaMigration = {
   checksum: () => sha256(`v16-session-workdir-immutability\n${SESSION_WORKDIR_DDL}`),
 };
 
-export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13, v14, v15, v16]);
+const TELEGRAM_OWNER_PROMPTS_DDL = `
+  CREATE TABLE IF NOT EXISTS telegram_owner_prompts (
+    chat_id                    TEXT NOT NULL,
+    message_id                 INTEGER NOT NULL CHECK (message_id > 0),
+    correlation_id             TEXT NOT NULL,
+    run_id                     TEXT NOT NULL,
+    candidate_snapshot_digest  TEXT NOT NULL CHECK (candidate_snapshot_digest LIKE 'sha256:%'),
+    created_at                 TEXT NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS telegram_owner_prompts_run
+    ON telegram_owner_prompts(run_id, created_at);
+
+  CREATE TRIGGER IF NOT EXISTS telegram_owner_prompts_immutable
+  BEFORE UPDATE ON telegram_owner_prompts
+  BEGIN
+    SELECT RAISE(ABORT, 'TELEGRAM_PROMPT_IMMUTABLE');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS telegram_owner_prompts_no_delete
+  BEFORE DELETE ON telegram_owner_prompts
+  BEGIN
+    SELECT RAISE(ABORT, 'TELEGRAM_PROMPT_IMMUTABLE');
+  END;
+
+`;
+
+/**
+ * v17 persists the candidate shown by each Telegram owner gate prompt.
+ *
+ * Written against v14, and renumbered twice on the way in — this lane and the workdir lane
+ * were both cut before v15 landed. The chain is ordered and databases have already walked
+ * it, so a migration takes the next free number rather than the one it was written against.
+ */
+const v17: SchemaMigration = {
+  id: "v17-telegram-owner-prompts",
+  fromVersion: 16,
+  toVersion: 17,
+  apply: (raw) => raw.exec(TELEGRAM_OWNER_PROMPTS_DDL),
+  checksum: () => sha256(`v17-telegram-owner-prompts\n${TELEGRAM_OWNER_PROMPTS_DDL}`),
+};
+
+export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13, v14, v15, v16, v17]);
 
 interface RequiredTrigger {
   name: string;
@@ -333,6 +376,11 @@ const REQUIRED_BASELINE_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "baseline_records_no_delete", sentinel: "BASELINE_RECORD_IMMUTABLE" },
 ];
 
+const REQUIRED_TELEGRAM_OWNER_PROMPT_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  { name: "telegram_owner_prompts_immutable", sentinel: "TELEGRAM_PROMPT_IMMUTABLE" },
+  { name: "telegram_owner_prompts_no_delete", sentinel: "TELEGRAM_PROMPT_IMMUTABLE" },
+];
+
 /**
  * Names alone are not enough: a same-named no-op trigger would make a corrupt database look
  * healthy. The embedded denial marker proves that each load-bearing guard still has its
@@ -342,7 +390,12 @@ const REQUIRED_BASELINE_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
  */
 export const assertLoadBearingInvariants = (
   raw: Database.Database,
-  options: { includeMigrationLedger: boolean; includeBaselineLedger?: boolean; schemaVersion?: number },
+  options: {
+    includeMigrationLedger: boolean;
+    includeBaselineLedger?: boolean;
+    includeTelegramOwnerPrompts?: boolean;
+    schemaVersion?: number;
+  },
 ): void => {
   const schemaVersion = options.schemaVersion ?? SCHEMA_VERSION;
   const expected = [
@@ -351,6 +404,7 @@ export const assertLoadBearingInvariants = (
       ? [...REQUIRED_TRIGGERS, ...REQUIRED_LEDGER_TRIGGERS]
       : REQUIRED_TRIGGERS),
     ...(options.includeBaselineLedger ? REQUIRED_BASELINE_LEDGER_TRIGGERS : []),
+    ...(options.includeTelegramOwnerPrompts ? REQUIRED_TELEGRAM_OWNER_PROMPT_TRIGGERS : []),
   ];
   for (const trigger of expected) {
     if (trigger.introducedIn !== undefined && trigger.introducedIn > schemaVersion) continue;

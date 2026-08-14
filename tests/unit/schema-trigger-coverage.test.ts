@@ -59,6 +59,24 @@ describe("every schema trigger is load-bearing and checked", () => {
     }
   });
 
+  it("carries every schema.sql trigger in the required list", () => {
+    // The reconciliation this file exists for. Without it the required list is only checked
+    // against itself: a new trigger added by a migration would be created, annotated, and
+    // still absent from the list that makes its disappearance an error.
+    const migrations = readFileSync(
+      fileURLToPath(new URL("../../src/db/migrations.ts", import.meta.url)),
+      "utf8",
+    );
+    const required = new Set(
+      [...migrations.matchAll(/name: "(\w+)"/g)].map((m) => m[1]!),
+    );
+    const unlisted = triggersInSchema.filter((t) => !required.has(t));
+    expect(
+      unlisted,
+      `declared in schema.sql but absent from the required-trigger lists: ${unlisted.join(", ")}`,
+    ).toEqual([]);
+  });
+
   it("refuses to open a database whose load-bearing trigger was dropped", () => {
     // The property under test is that the *check* fires, so this drops one of the twenty that
     // had no existence check. Before REQUIRED_SCHEMA_TRIGGERS, reopening this succeeded.

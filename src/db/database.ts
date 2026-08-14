@@ -252,7 +252,11 @@ export class Db {
       return;
     }
     if (version === SCHEMA_VERSION) {
-      assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true, includeBaselineLedger: true });
+      assertLoadBearingInvariants(this.#raw, {
+        includeMigrationLedger: true,
+        includeBaselineLedger: true,
+        includeTelegramOwnerPrompts: true,
+      });
       assertMigrationLedgerAt(this.#raw, version);
       return;
     }
@@ -264,7 +268,11 @@ export class Db {
     try {
       this.#raw.exec(schemaDdl());
       installMigrationLedger(this.#raw);
-      assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true, includeBaselineLedger: true });
+      assertLoadBearingInvariants(this.#raw, {
+        includeMigrationLedger: true,
+        includeBaselineLedger: true,
+        includeTelegramOwnerPrompts: true,
+      });
       this.recordMigrationReceipt({
         version: SCHEMA_VERSION,
         migrationId: `bootstrap-v${SCHEMA_VERSION}`,
@@ -281,7 +289,11 @@ export class Db {
       }
       throw error;
     }
-    assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true, includeBaselineLedger: true });
+    assertLoadBearingInvariants(this.#raw, {
+      includeMigrationLedger: true,
+      includeBaselineLedger: true,
+      includeTelegramOwnerPrompts: true,
+    });
     assertMigrationLedgerAt(this.#raw, SCHEMA_VERSION);
   }
 
@@ -297,7 +309,11 @@ export class Db {
         this.applyMigration(migration, migration.fromVersion === fromVersion ? backup : null);
         this.options.afterMigration?.(migration);
       }
-      assertLoadBearingInvariants(this.#raw, { includeMigrationLedger: true, includeBaselineLedger: true });
+      assertLoadBearingInvariants(this.#raw, {
+        includeMigrationLedger: true,
+        includeBaselineLedger: true,
+        includeTelegramOwnerPrompts: true,
+      });
       assertMigrationLedgerAt(this.#raw, SCHEMA_VERSION);
       pruneAutomaticBackups(this.file, this.options.backupRetention ?? DEFAULT_BACKUP_RETENTION);
     } catch (error) {
@@ -335,6 +351,7 @@ export class Db {
         includeMigrationLedger: true,
         includeBaselineLedger: migration.toVersion >= 14,
         schemaVersion: migration.toVersion,
+        includeTelegramOwnerPrompts: migration.toVersion >= 17,
       });
       this.recordMigrationReceipt({
         version: migration.toVersion,

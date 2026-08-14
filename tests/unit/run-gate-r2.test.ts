@@ -185,6 +185,7 @@ const ownerDecisionReceipt = (
   });
   const approval = {
     runId,
+    candidateSnapshotDigest: harness.cp.runs.currentCandidate(runId),
     operation: "owner_decision_submit",
     parameters: { item, approved, note },
     idempotencyKey: `owner-decision:${digestOf({ runId, item, approved, note })}`,
@@ -480,6 +481,89 @@ describe("round-2 run and production-gate regressions", () => {
     });
   });
 
+  it("#P1-18 consumes an admitted owner receipt on direct reuse", async () => {
+    const fixture = await evidenceReadyRun(["public release"]);
+    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "approve once");
+    const first = fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "approve once",
+      receipt,
+    });
+    expect(first.allowed).toBe(true);
+
+    const reused = fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "approve once",
+      receipt,
+    });
+    expect(reused.allowed).toBe(false);
+    expect(reused.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(1);
+    expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)).toHaveLength(1);
+  });
+
+  it("#P1-18 refuses first presentation after the receipt's candidate moved", async () => {
+    const fixture = await evidenceReadyRun(["public release"]);
+    expect(ownerApprovalPayload({
+      runId: fixture.runId,
+      candidateSnapshotDigest: fixture.digest,
+      operation: "owner_decision_submit",
+      parameters: { item: "public release", approved: true, note: "candidate A" },
+      idempotencyKey: "payload-binding-probe",
+      approved: true,
+    })).toMatchObject({ candidateSnapshotDigest: fixture.digest });
+    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "candidate A");
+    const candidateB = digestOf({ revisedFrom: fixture.digest, revision: 2 });
+    fixture.harness.cp.runs.promoteCandidate(fixture.runId, candidateB);
+
+    const presentedOnB = fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "candidate A",
+      receipt,
+    });
+    expect(presentedOnB.allowed).toBe(false);
+    expect(presentedOnB.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+    expect(fixture.harness.cp.artifacts.list(fixture.runId, ArtifactKind.APPROVAL)).toHaveLength(0);
+    // This is the first-use assertion: the stale receipt was refused before the existing
+    // single-use consumption record could be written.
+    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
+  });
+
+  it("#P1-18 refuses an admitted receipt replayed onto a revised candidate", async () => {
+    const fixture = await evidenceReadyRun(["public release"]);
+    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "candidate A");
+    const first = fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "candidate A",
+      receipt,
+    });
+    expect(first.allowed).toBe(true);
+
+    const candidateB = digestOf({ revisedFrom: fixture.digest, revision: 1 });
+    fixture.harness.cp.runs.promoteCandidate(fixture.runId, candidateB);
+    expect(fixture.harness.cp.runs.currentCandidate(fixture.runId)).toBe(candidateB);
+
+    const replayedOnB = fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId,
+      item: "public release",
+      approved: true,
+      note: "candidate A",
+      receipt,
+    });
+    expect(replayedOnB.allowed).toBe(false);
+    expect(replayedOnB.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(false);
+    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(1);
+  });
+
   it("#381 ignores owner-decision-shaped rows without an admitted, parameter-bound receipt", async () => {
     const absent = await evidenceReadyRun(["public release"]);
     absent.harness.cp.artifacts.put(absent.runId, ArtifactKind.APPROVAL, {
@@ -532,6 +616,53 @@ describe("round-2 run and production-gate regressions", () => {
       receipt: receiptForOtherParameters,
     }, mismatched.digest);
     expect(mismatched.harness.cp.ceo.humanGateStatus(mismatched.runId).satisfied).toBe(false);
+  });
+
+  it("requires an admitted owner receipt to be consumed before a directly retained decision can satisfy a gate", async () => {
+    const fixture = await evidenceReadyRun(["public release"]);
+    const note = "admitted but never consumed";
+    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, note);
+
+    // This is an exact receipt from admitted ingress, but it bypasses recordOwnerDecision(),
+    // so no authorising write has consumed it for the candidate.
+    fixture.harness.cp.artifacts.put(fixture.runId, ArtifactKind.APPROVAL, {
+      kind: "OWNER_DECISION",
+      item: "public release",
+      approved: true,
+      note,
+      at: fixture.harness.clock.nowIso(),
+      humanGateDigest: digestOf(["public release"]),
+      candidateSnapshotDigest: fixture.digest,
+      receipt,
+    }, fixture.digest);
+
+    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(false);
+    expect(fixture.harness.cp.ceo.currentHumanGateDecisionDigest(fixture.runId).reasonCode)
+      .toBe(ReasonCode.HUMAN_GATE_UNSATISFIED);
+  });
+
+  it("P1-18 keeps a consumed owner approval after the ingress replay window is pruned", async () => {
+    // The defect: assertConsumedApproval called assertApproval first, which answers from
+    // `inbound_messages` — a replay-protection cache with a 24h TTL that is pruned on the
+    // next successful admit. A correctly admitted *and consumed* approval therefore stopped
+    // satisfying the gate once any later message arrived after the window. GitHub merge
+    // re-reads this gate, so an approved run silently became unapproved.
+    const fixture = await evidenceReadyRun(["public release"]);
+    const receipt = ownerDecisionReceipt(fixture.harness, fixture.runId, "public release", true, "yes");
+
+    expect(fixture.harness.cp.ceo.recordOwnerDecision({
+      runId: fixture.runId, item: "public release", approved: true, note: "yes", receipt,
+    }).allowed).toBe(true);
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(true);
+    expect(fixture.harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(1);
+
+    // Exactly what the TTL prune does: drop the replay row for this receipt's nonce. The
+    // durable consumption event stays, because that is the record of what the owner decided.
+    fixture.harness.cp.db.run("DELETE FROM inbound_messages");
+
+    expect(fixture.harness.cp.ceo.humanGateStatus(fixture.runId).satisfied).toBe(true);
+    expect(fixture.harness.cp.ceo.currentHumanGateDecisionDigest(fixture.runId).allowed).toBe(true);
   });
 
   it("#374 fails closed when a GUARDED run omits every owner decision item", async () => {

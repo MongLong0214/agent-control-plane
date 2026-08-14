@@ -411,6 +411,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         const receiptFor = (item: string, actor: string) => {
           const approval = {
             runId,
+            candidateSnapshotDigest: cp.runs.currentCandidate(runId),
             operation: "owner_decision_submit",
             parameters: { item, approved: true, note: "reviewed the contract and the declared scope" },
             idempotencyKey: `owner-decision:${item}:${actor}`,

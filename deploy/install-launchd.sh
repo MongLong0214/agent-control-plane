@@ -15,8 +15,9 @@ Usage:
   deploy/install-launchd.sh rollback --database-backup PATH
 
 The job always uses $HOME/.agent-control-plane because that is agentcpd's configured
-state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required) and optional
-Buzz variables as generic-password Keychain items under the selected service.
+state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required),
+optional Buzz variables, and optional Telegram variables as generic-password Keychain items under the
+selected service. Telegram is disabled when none of its variables are present and refuses a partial set.
 
 BUZZ_PRIVATE_KEY has a second source. When no such item exists under the selected service,
 the launcher falls back to the Buzz desktop app's own store, whose layout is a JSON object
@@ -197,7 +198,9 @@ required_keychain_value() {
 
 optional_keychain_value() {
   local account="$1" value=""
+  unset "$account"
   value="$(security find-generic-password -w -s "$ACP_KEYCHAIN_SERVICE" -a "$account" 2>/dev/null)" || return 0
+  [[ -n "$value" ]] || return 0
   printf -v "$account" '%s' "$value"
   export "$account"
 }
@@ -248,7 +251,11 @@ buzz_key_from_desktop_secrets() {
 
 export ACP_MCP_TOKEN="$(required_keychain_value ACP_MCP_TOKEN)"
 export ACP_OPERATOR_TOKEN="$(required_keychain_value ACP_OPERATOR_TOKEN)"
-for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_BUZZ_ALLOWED_ACTORS BUZZ_RELAY_URL ACP_BUZZ_BINARY ACP_BUZZ_CHANNEL; do
+for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_BUZZ_ALLOWED_ACTORS BUZZ_RELAY_URL ACP_BUZZ_BINARY ACP_BUZZ_CHANNEL \
+  ACP_TELEGRAM_BOT_TOKEN ACP_TELEGRAM_OWNER_ID ACP_TELEGRAM_ALLOWED_OWNER_IDS \
+  ACP_TELEGRAM_CHAT_ID ACP_TELEGRAM_ALLOWED_CHAT_IDS ACP_TELEGRAM_WEBHOOK_SECRET \
+  ACP_TELEGRAM_POLL_TIMEOUT_SECONDS ACP_TELEGRAM_RETRY_DELAY_MS \
+  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL; do
   optional_keychain_value "$optional"
 done
 buzz_key_from_desktop_secrets

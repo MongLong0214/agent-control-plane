@@ -403,7 +403,7 @@ describe("versioned SQLite migration", () => {
       // v14 → v15 (verification worktree ownership) → v16 (workdir immutability): the
       // fixture must walk the whole chain, not stop at the version this lane was written on.
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(16);
+      expect(SCHEMA_VERSION).toBe(17);
       migrated.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, workdir, created_at, updated_at)
          VALUES ('v14-workdir-session', 'inc-1', 'fixture', 'fixture', 'READY', ?, ?, ?)`,
@@ -447,7 +447,8 @@ describe("versioned SQLite migration", () => {
         [13, "v13-finalization-state-machine"],
         [14, "v14-baseline-evidence-ledger"],
         [15, "v15-durable-verification-worktree-ownership"],
-        [SCHEMA_VERSION, "v16-session-workdir-immutability"],
+        [16, "v16-session-workdir-immutability"],
+        [SCHEMA_VERSION, "v17-telegram-owner-prompts"],
       ]);
       expect(receipts).toEqual([
         expect.objectContaining({
@@ -469,6 +470,12 @@ describe("versioned SQLite migration", () => {
         }),
         expect.objectContaining({
           version: 15,
+          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          backup_file: null,
+          backup_checksum: null,
+        }),
+        expect.objectContaining({
+          version: 16,
           checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
           backup_file: null,
           backup_checksum: null,
@@ -562,6 +569,25 @@ describe("versioned SQLite migration", () => {
     }
 
     expect(() => new Db(path)).toThrowError(/missing a load-bearing schema invariant/);
+  });
+
+  it("refuses a same-version database with either Telegram owner prompt immutability trigger deleted", () => {
+    for (const trigger of ["telegram_owner_prompts_immutable", "telegram_owner_prompts_no_delete"]) {
+      const path = join(tempDir(`acp-current-${trigger}-`), "state.sqlite");
+      const created = new Db(path);
+      created.close();
+      const raw = new Database(path);
+      try {
+        raw.exec(`DROP TRIGGER ${trigger}`);
+      } finally {
+        raw.close();
+      }
+
+      expect(() => {
+        const reopened = new Db(path);
+        reopened.close();
+      }).toThrowError(/missing a load-bearing schema invariant/);
+    }
   });
 
   it("restores the original v11 database when a fault is injected after a migration commits", () => {

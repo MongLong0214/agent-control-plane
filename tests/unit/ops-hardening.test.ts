@@ -241,6 +241,7 @@ describe("a destructive repair needs a real owner (§25.7)", () => {
     ]);
     const approval = {
       runId: null,
+      candidateSnapshotDigest: null,
       operation: REPAIR_OWNER_APPROVAL_OPERATION,
       parameters: { operationId: "prune_orphan_worktrees", parameters: {}, dryRun: true },
       idempotencyKey: "repair-test-owner",
@@ -313,6 +314,8 @@ describe("a destructive repair needs a real owner (§25.7)", () => {
 
     const approval = {
       runId: null,
+      // Non-run operation, so there is no candidate to bind (ingress-guard.ts:41).
+      candidateSnapshotDigest: null,
       operation: REPAIR_OWNER_APPROVAL_OPERATION,
       parameters: { operationId: "prune_orphan_worktrees", parameters: {}, dryRun: false },
       idempotencyKey: "repair-live-verification",
