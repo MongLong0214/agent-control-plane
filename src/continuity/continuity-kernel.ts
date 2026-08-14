@@ -1,6 +1,10 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { isWithin } from "../guard/workspace-probe.ts";
 import {
   type DispatchCapacityTarget,
   type ProviderCapacity,
@@ -9,6 +13,7 @@ import {
 } from "../capacity/capacity-monitor.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
@@ -101,7 +106,10 @@ export class ContinuityKernel {
     private readonly sessions: SessionRegistry,
     private readonly bindings: BindingRegistry,
     private readonly telemetry: Telemetry,
-  ) {}
+    private readonly managedRuntimeRoot = join(tmpdir(), "agent-control-plane-runtime"),
+  ) {
+    ensurePrivateDirectory(this.managedRuntimeRoot);
+  }
 
   mode(): ContinuityMode {
     const row = this.db.get<{ mode: ContinuityMode }>(`SELECT mode FROM continuity_state WHERE id = 1`);
@@ -600,7 +608,7 @@ export class ContinuityKernel {
       handle = await adapter.startSession({
         model,
         effort: role === Role.BLIND_REVIEWER ? "xhigh" : null,
-        workdir: process.cwd(),
+        workdir: this.managedRuntimeRoot,
         purpose,
       });
     } catch (err) {
@@ -617,7 +625,13 @@ export class ContinuityKernel {
       sessionId: `ses_cont_${handle.externalSessionId.replace(/-/g, "").slice(0, 18)}`,
       incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
       osPid: handle.pid,
-      workdir: handle.workdir ?? process.cwd(),
+      // Same containment rule as CtoLifecycle: an adapter's reported workdir is persisted
+      // only when it is inside the managed root, because the immutability trigger makes it
+      // permanent.
+      workdir: handle.workdir && (handle.workdir === this.managedRuntimeRoot
+        || isWithin(this.managedRuntimeRoot, handle.workdir))
+        ? handle.workdir
+        : this.managedRuntimeRoot,
     });
     const connected = await buzz.connect(session.sessionId, purpose);
     if (!connected.allowed) {

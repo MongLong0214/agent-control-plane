@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
+import { join } from "node:path";
 
 import { type HandoffAcknowledgement, type HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -116,6 +117,37 @@ const completeContractChangeWithGrant = async (
 };
 
 describe("round-2 CTO lifecycle regressions", () => {
+  it("handoff P1-06 provisions the CTO in the managed runtime root and persists it", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "managed runtime test");
+    if (!bound.allowed) throw new Error(bound.message);
+
+    const session = harness.cp.sessions.require(bound.value.sessionId);
+    expect(session.workdir).toBe(join(harness.root, "runtime", "provider-returned-workdir"));
+    expect(session.workdir).not.toBe(process.cwd());
+  });
+
+  it("P1-06 refuses to persist a workdir the adapter reports outside the managed root", async () => {
+    // The test above proves the *returned* value is persisted rather than the request echo,
+    // but its adapter returns a path under the managed root, so it says nothing about a
+    // provider that reports somewhere else. `sessions_workdir_immutable` is BEFORE UPDATE:
+    // whatever lands here can never be corrected, so an adapter echoing its own cwd would pin
+    // the session to it permanently.
+    const harness = makeHarness();
+    const escaped = process.cwd();
+    const original = harness.scripted.startSession.bind(harness.scripted);
+    harness.scripted.startSession = async (spec) => ({ ...(await original(spec)), workdir: escaped });
+
+    const { projectId } = await registerFixtureProject(harness);
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "escaping adapter workdir");
+    if (!bound.allowed) throw new Error(bound.message);
+
+    const session = harness.cp.sessions.require(bound.value.sessionId);
+    expect(session.workdir).not.toBe(escaped);
+    expect(session.workdir).toBe(join(harness.root, "runtime"));
+  });
+
   it("#147 refuses an incomplete handoff without leaving the healthy CTO draining", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);

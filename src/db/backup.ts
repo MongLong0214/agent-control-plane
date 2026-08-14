@@ -264,6 +264,7 @@ const validateBackup = (backupPath: string): BackupManifest => {
     assertLoadBearingInvariants(raw, {
       includeMigrationLedger: version >= 12,
       includeBaselineLedger: version >= 14,
+      schemaVersion: version,
     });
     if (version >= 12) assertMigrationLedgerAt(raw, version);
   } finally {

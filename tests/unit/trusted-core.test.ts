@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { join } from "node:path";
-import { writeFileSync } from "node:fs";
+import { chmodSync, writeFileSync } from "node:fs";
 
 import { isoPlus } from "../../src/core/clock.ts";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
@@ -19,7 +19,11 @@ import {
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { parseVerificationCommand } from "../../src/contracts/verification-command.ts";
 import { assertPortableManifest, PROJECT_MANIFEST_SCHEMA_ID } from "../../src/contracts/manifest.ts";
-import { buildSandboxEnvironment, runSandboxed } from "../../src/verify/sandbox.ts";
+import {
+  __testing as sandboxTesting,
+  buildSandboxEnvironment,
+  runSandboxed,
+} from "../../src/verify/sandbox.ts";
 import {
   cleanupTempDirs,
   commitAll,
@@ -708,6 +712,40 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(JSON.parse(outcome.stdout)).toEqual({ event: "error", errno: "EPERM" });
   });
 
+  it("does not hand the daemon's own PATH to the candidate", async () => {
+    // A directory the daemon can reach must not become a directory the candidate resolves
+    // binaries out of. The sandbox PATH is a fixed system list plus this runtime and the
+    // worktree; inheriting `process.env.PATH` would make a user-writable entry on the
+    // daemon's PATH — an nvm prefix, ~/bin, whatever launchd supplied — part of the
+    // candidate's search path.
+    const repo = makeRepo();
+    const plantedDir = tempDir("acp-planted-path-");
+    writeFileSync(join(plantedDir, "planted-tool"), "#!/bin/sh\necho planted\n", { mode: 0o755 });
+    chmodSync(join(plantedDir, "planted-tool"), 0o755);
+
+    writeFileSync(
+      join(repo, "path.js"),
+      `console.log(JSON.stringify({ path: process.env.PATH ?? "" }));`,
+    );
+
+    const previous = process.env["PATH"];
+    process.env["PATH"] = `${plantedDir}:${previous ?? ""}`;
+    let outcome;
+    try {
+      outcome = await runSandboxed({
+        command: parseVerificationCommand({ id: "path", argv: ["node", "path.js"], timeoutSeconds: 60 }),
+        worktreePath: repo,
+      });
+    } finally {
+      if (previous === undefined) delete process.env["PATH"];
+      else process.env["PATH"] = previous;
+    }
+
+    const seen = (JSON.parse(outcome.stdout) as { path: string }).path;
+    expect(seen).not.toContain(plantedDir);
+    expect(seen.split(":")).toContain("/usr/bin");
+  });
+
   it("confines writes to the worktree", async () => {
     const repo = makeRepo();
     writeFileSync(
@@ -740,10 +778,10 @@ describe("verification sandbox (PRD §17.4)", () => {
        setInterval(() => {}, 1000);`,
     );
     const started = Date.now();
-    const outcome = await runSandboxed({
+    const outcome = await sandboxTesting.withProcessCountLimitDisabled(() => runSandboxed({
       command: parseVerificationCommand({ id: "hang", argv: ["node", "hang.js"], timeoutSeconds: 2 }),
       worktreePath: repo,
-    });
+    }));
     expect(outcome.status).toBe("TIMEOUT");
     expect(outcome.reasonCode).toBe(ReasonCode.VERIFICATION_TIMEOUT);
     const child = JSON.parse(outcome.stdout) as { childPid: number | null };

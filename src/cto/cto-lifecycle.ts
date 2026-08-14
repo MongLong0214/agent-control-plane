@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { isWithin } from "../guard/workspace-probe.ts";
 import type { OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
+import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
@@ -100,6 +104,15 @@ export interface CtoPreference {
  * acknowledged the handoff — so there is never a window in which a project has two
  * CTOs, or none while work is in flight.
  */
+/**
+ * The workdir to persist for a provisioned session: the adapter's, when it is inside the
+ * managed runtime root, and the root itself otherwise.
+ */
+const containedWorkdir = (reported: string | null | undefined, managedRoot: string): string => {
+  if (!reported) return managedRoot;
+  return reported === managedRoot || isWithin(managedRoot, reported) ? reported : managedRoot;
+};
+
 export class CtoLifecycle {
   #buzz: BuzzConnector | null = null;
   #readiness: ReadinessProbe | null = null;
@@ -118,7 +131,10 @@ export class CtoLifecycle {
     private readonly outbox: Outbox,
     private readonly runs: RunEngine,
     private readonly preference: CtoPreference,
-  ) {}
+    private readonly managedRuntimeRoot = join(tmpdir(), "agent-control-plane-runtime"),
+  ) {
+    ensurePrivateDirectory(this.managedRuntimeRoot);
+  }
 
   attach(ports: {
     buzz?: BuzzConnector;
@@ -809,7 +825,7 @@ export class CtoLifecycle {
     const handle = await adapter.startSession({
       model: this.preference.model,
       effort: this.preference.effort,
-      workdir: process.cwd(),
+      workdir: this.managedRuntimeRoot,
       purpose,
     });
     const session = this.sessions.create({
@@ -819,6 +835,12 @@ export class CtoLifecycle {
       sessionId: `ses_cto_${handle.externalSessionId.replace(/-/g, "").slice(0, 20)}`,
       incarnation: `${handle.externalSessionId}#${this.clock.nowIso()}`,
       osPid: handle.pid,
+      // The adapter's answer is accepted only if it is inside the root this daemon manages.
+      // `sessions_workdir_immutable` is BEFORE UPDATE, so whatever is written here becomes a
+      // permanent routing fact — an adapter that echoes its own cwd would pin the session to
+      // it forever. The shipped adapters echo `spec.workdir`; that is caller courtesy, and
+      // this is the check that does not depend on it.
+      workdir: containedWorkdir(handle.workdir, this.managedRuntimeRoot),
     });
 
     // `SessionRegistry.create` is intentionally the only issuer of the plaintext secret.

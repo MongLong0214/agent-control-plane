@@ -59,6 +59,14 @@ export class ClaimRegistry {
     private readonly bindings: BindingRegistry,
   ) {}
 
+  /** Every claim read uses the same lease boundary as acquisition. */
+  private readAfterExpirySweep<T>(read: () => T): T {
+    return this.db.tx(() => {
+      this.expireOverdue();
+      return read();
+    });
+  }
+
   acquire(request: ClaimRequest): Decision<ClaimRecord[]> {
     return this.db.tx(() => {
       this.expireOverdue();
@@ -271,6 +279,7 @@ export class ClaimRegistry {
     // One transaction: read, authorise, update, record. §30.3 — a release that is decided
     // on one snapshot and applied to another can free a claim another writer just took.
     return this.db.tx(() => {
+      this.expireOverdue();
       const row = this.db.get<{ status: string; run_id: string }>(
         `SELECT status, run_id FROM resource_claims WHERE claim_id = ?`,
         [claimId],
@@ -322,15 +331,15 @@ export class ClaimRegistry {
   }
 
   heldByRun(runId: string): ClaimRecord[] {
-    return this.db
+    return this.readAfterExpirySweep(() => this.db
       .all<RawClaim>(`SELECT * FROM resource_claims WHERE run_id = ? AND status = 'HELD'`, [runId])
-      .map(hydrate);
+      .map(hydrate));
   }
 
   held(): ClaimRecord[] {
-    return this.db
+    return this.readAfterExpirySweep(() => this.db
       .all<RawClaim>(`SELECT * FROM resource_claims WHERE status = 'HELD' ORDER BY acquired_at`)
-      .map(hydrate);
+      .map(hydrate));
   }
 
   overdue(): ClaimRecord[] {
@@ -351,22 +360,24 @@ export class ClaimRegistry {
     runId: string,
     paths: readonly string[],
   ): Array<{ path: string; otherRun: string; otherPath: string }> {
-    const others = this.db.all<{ run_id: string; declared_path: string }>(
-      `SELECT run_id, declared_path FROM resource_claims
-        WHERE status = 'HELD' AND repository_identity = ? AND run_id <> ? AND declared_path IS NOT NULL`,
-      [repositoryIdentity, runId],
-    );
-    const overlaps: Array<{ path: string; otherRun: string; otherPath: string }> = [];
-    for (const path of paths.map(normalizePath)) {
-      if (!path) continue;
-      for (const other of others) {
-        if (other.declared_path === path) continue; // that is a hard reject, not advice
-        if (sharesDirectory(path, other.declared_path)) {
-          overlaps.push({ path, otherRun: other.run_id, otherPath: other.declared_path });
+    return this.readAfterExpirySweep(() => {
+      const others = this.db.all<{ run_id: string; declared_path: string }>(
+        `SELECT run_id, declared_path FROM resource_claims
+          WHERE status = 'HELD' AND repository_identity = ? AND run_id <> ? AND declared_path IS NOT NULL`,
+        [repositoryIdentity, runId],
+      );
+      const overlaps: Array<{ path: string; otherRun: string; otherPath: string }> = [];
+      for (const path of paths.map(normalizePath)) {
+        if (!path) continue;
+        for (const other of others) {
+          if (other.declared_path === path) continue; // that is a hard reject, not advice
+          if (sharesDirectory(path, other.declared_path)) {
+            overlaps.push({ path, otherRun: other.run_id, otherPath: other.declared_path });
+          }
         }
       }
-    }
-    return overlaps;
+      return overlaps;
+    });
   }
 }
 

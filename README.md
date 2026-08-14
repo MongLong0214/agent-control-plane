@@ -110,6 +110,19 @@ reviewers are a separate daemon-owned boundary: they use an enforced provider CO
 per-invocation allowlists, and measured evidence as documented in
 [reviewer egress](docs/reviewer-egress.md).
 
+Verification commands are candidate-supplied code by design. The executable allowlist is
+defence in depth: it refuses a contract that directly declares `sh`, `env`, `arch` or another
+non-build executable, but it is not the code-execution boundary. `node`, `npm`, `npx` and
+`vitest` are general-purpose interpreters and can exec a shell after they start. The boundary
+is the seatbelt/resource sandbox: the candidate runs in its assigned worktree and scratch,
+named host credential paths are denied, network is denied when declared, and the original process
+group plus the candidate's captured pid/start-time identity and resource limits are checked before
+a run can pass. The inside-shell regression proof is in
+[`tests/unit/handoff-p1-boundaries.test.ts`](tests/unit/handoff-p1-boundaries.test.ts), which execs
+a real shell out of an allowlisted interpreter and records the actual kernel result for state
+reads, outside writes, network, fork, CPU and RSS. Provider-only
+egress for reviewer processes remains an explicitly named macOS residual ([#419](docs/STATUS.md)).
+
 ## Persistence
 
 21 tables: the eleven PRD §30.1 names plus ten additions, each justified inline in

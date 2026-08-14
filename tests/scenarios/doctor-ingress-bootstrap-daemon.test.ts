@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -264,6 +264,15 @@ describe("Hermes CEO bootstrap authority", () => {
       expect(harness.cp.sessions.get(result.value.sessionId)?.lifecycle).toBe(SessionLifecycle.READY);
       expect(harness.cp.bindings.history(roleKeyFor(Role.CEO)).map((binding) => binding.bindingGeneration))
         .toEqual([1]);
+
+      // P1-06: the constituted CEO records the managed runtime root, not the daemon's cwd.
+      // Under launchd that cwd is wherever the job happened to start, and the workdir
+      // immutability trigger is UPDATE-only — so a cwd written here would be permanent.
+      const ceoWorkdir = harness.cp.sessions.get(result.value.sessionId)?.workdir ?? null;
+      const managedRuntimeRoot = harness.cp.config.runtimeRoot
+        ?? join(dirname(harness.cp.config.databasePath), "runtime");
+      expect(ceoWorkdir).toBe(managedRuntimeRoot);
+      expect(ceoWorkdir).not.toBe(process.cwd());
 
       const rerun = await authority.bootstrap({
         command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath],

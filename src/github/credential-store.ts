@@ -12,6 +12,84 @@ import { ensurePrivateDirectory, inspectPrivatePath } from "../db/state-prefligh
  * exchange. Existing kernel fixtures need only a creator identity because they supply a
  * modelled GitHub client.
  */
+/** The deadline retained from the former fixed `gh` request. */
+export const GITHUB_API_DEADLINE_MS = 120_000;
+/** A GitHub response is evidence/input, not an unbounded process stream. */
+export const GITHUB_API_RESPONSE_LIMIT_BYTES = 32 * 1024 * 1024;
+
+type BoundedResponseBody =
+  | { tooLarge: false; text: string }
+  | { tooLarge: true };
+
+/**
+ * Read at most the permitted response size. The stream is cancelled on the first chunk
+ * that crosses the boundary, so a hostile endpoint cannot first materialise an arbitrary
+ * body and only then have it sliced down to the advertised limit.
+ */
+const readBoundedResponseBody = async (
+  response: Response,
+  limit: number,
+  signal: AbortSignal,
+): Promise<BoundedResponseBody> => {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null) {
+    const declaredLength = Number.parseInt(contentLength, 10);
+    if (Number.isSafeInteger(declaredLength) && declaredLength > limit) return { tooLarge: true };
+  }
+
+  if (response.body === null) return { tooLarge: false, text: "" };
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  const readWithDeadline = async () => {
+    if (signal.aborted) throw signal.reason ?? new Error("GitHub response body read aborted");
+
+    let onAbort: (() => void) | null = null;
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => {
+        // A mocked or non-fetch Response is not required to wire AbortSignal into its
+        // stream. Cancel explicitly so the body-read deadline covers that case too.
+        void reader.cancel(signal.reason).catch(() => undefined);
+        reject(signal.reason ?? new Error("GitHub response body read aborted"));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([reader.read(), aborted]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+  };
+
+  try {
+    while (true) {
+      const next = await readWithDeadline();
+      if (next.done) break;
+      const chunk = next.value;
+      if (total + chunk.byteLength > limit) {
+        try {
+          await reader.cancel("GitHub response exceeded the byte limit");
+        } catch {
+          // The refusal is still valid if the remote has already closed the stream.
+        }
+        return { tooLarge: true };
+      }
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // An abort can reject an in-flight read while the underlying stream is cancelling.
+    }
+  }
+
+  return { tooLarge: false, text: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total).toString("utf8") };
+};
+
 export interface TrustedCredential {
   token: string;
   creatorIdentity: string;
@@ -443,9 +521,24 @@ export class TrustedCredentialStore {
       return deny(input.failureCode, input.failureMessage, { operation: input.method });
     }
 
+    // `response.text()` would buffer whatever the endpoint sends. The bound is kept here,
+    // not at the caller, because by the time a caller sees the string the memory is already
+    // committed — and this transport is reachable from the finalizer, which runs unattended.
     let body: string;
     try {
-      body = await response.text();
+      const bounded = await readBoundedResponseBody(
+        response,
+        GITHUB_API_RESPONSE_LIMIT_BYTES,
+        AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      );
+      if (bounded.tooLarge) {
+        return deny(input.failureCode, input.failureMessage, {
+          operation: input.method,
+          status: response.status,
+          limit: GITHUB_API_RESPONSE_LIMIT_BYTES,
+        });
+      }
+      body = bounded.text;
     } catch {
       return deny(input.failureCode, input.failureMessage, { operation: input.method, status: response.status });
     }

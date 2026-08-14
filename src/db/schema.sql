@@ -152,6 +152,19 @@ BEGIN
   SELECT RAISE(ABORT, 'SESSION_BUZZ_ACTOR_IMMUTABLE');
 END;
 
+-- A runtime's workdir is a durable fact used when a session is routed again. Once a
+-- provisioned session records it, callers may not rewrite or clear it behind the runtime's
+-- back; a new process gets a new session row instead.
+-- CP-HI-01 — a session's managed workdir is fixed at admission; a moved root would put
+-- agent writes outside the boundary the Guard was told to enforce.
+CREATE TRIGGER IF NOT EXISTS sessions_workdir_immutable
+BEFORE UPDATE OF workdir ON sessions
+WHEN OLD.workdir IS NOT NULL
+  AND (NEW.workdir IS NULL OR NEW.workdir <> OLD.workdir)
+BEGIN
+  SELECT RAISE(ABORT, 'SESSION_WORKDIR_IMMUTABLE');
+END;
+
 -- ---------------------------------------------------------------------------
 -- assignments  (PRD §9.4 role binding)
 --   role_key is the logical endpoint: 'CEO', 'PRIMARY_CTO:<projectId>',

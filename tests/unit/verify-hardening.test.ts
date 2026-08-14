@@ -483,9 +483,11 @@ describe("verification hardening findings", () => {
 
   sandboxIt("#367 treats recorded RSS as sufficient when the leader identity races away", async () => {
     const repository = makeRepo();
+    const failLeaderIdentityOnce = join(tempDir("acp-ps-lstart-once-"), "failed");
     const outcome = await withPsShim(
       `#!/bin/sh
-if [ "$1" = "-o" ] && [ "$2" = "lstart=" ]; then
+if [ "$1" = "-o" ] && [ "$2" = "lstart=" ] && [ ! -e ${JSON.stringify(failLeaderIdentityOnce)} ]; then
+  : > ${JSON.stringify(failLeaderIdentityOnce)}
   exit 1
 fi
 exec /bin/ps "$@"

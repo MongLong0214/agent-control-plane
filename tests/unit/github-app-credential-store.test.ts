@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
+import { GITHUB_API_RESPONSE_LIMIT_BYTES, TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { runtimeEnvironment } from "../../src/runtime/cli-adapters.ts";
 
 /** This file owns its temporary directories so its cleanup cannot race another suite's fixtures. */
@@ -217,6 +217,88 @@ describe("GitHub App credential store", () => {
     expect(result.reasonCode).toBe(ReasonCode.GITHUB_APP_TOKEN_EXCHANGE_FAILED);
     expect(result.message).toContain("installation-token exchange failed");
     expect(JSON.stringify(result)).not.toContain("installation token rejected");
+  });
+
+  it("refuses an oversized API response instead of buffering it", async () => {
+    const files = makeAppFiles();
+    // One byte over the limit, delivered in chunks. The finalizer calls this transport
+    // unattended, so an endpoint that streams without end must be cut off rather than
+    // buffered until the daemon dies.
+    const chunk = new Uint8Array(1024 * 1024);
+    const atLimit = Math.ceil(GITHUB_API_RESPONSE_LIMIT_BYTES / chunk.byteLength);
+    // Three times the limit, so "stopped at the boundary" and "drained the stream" are far
+    // apart and the assertion cannot pass by accident.
+    const chunksNeeded = atLimit * 3;
+    let pushed = 0;
+
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/app")) {
+        return new Response(JSON.stringify({ slug: "acp-production-gate", permissions: appPermissions }), { status: 200 });
+      }
+      if (url.includes("/access_tokens")) {
+        return new Response(JSON.stringify({
+          token: "installation-token-oversized",
+          expires_at: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
+        }), { status: 201 });
+      }
+      // Deliberately declares no content-length, so the refusal has to come from counting
+      // bytes as they arrive rather than from trusting a header.
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (pushed >= chunksNeeded) return controller.close();
+            pushed += 1;
+            controller.enqueue(chunk);
+          },
+        }),
+        { status: 200 },
+      );
+    };
+
+    const store = new TrustedCredentialStore(join(files.root, "secrets"), {
+      appEnvFile: files.envFile,
+      fetch,
+    });
+
+    const result = await store.githubApi({ method: "GET", path: "/user" });
+    if (result.allowed) throw new Error("expected an oversized response to be refused");
+    expect(result.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(result.evidence).toMatchObject({ limit: GITHUB_API_RESPONSE_LIMIT_BYTES });
+    // Stopped at the boundary rather than draining the stream: the refusal is what bounds
+    // the memory, so a version that read everything and then measured would fail here even
+    // though it returned the same reason code.
+    // Bounded near the limit, not at the stream's length. A couple of chunks beyond the
+    // boundary are the stream's own read-ahead, not bytes the transport accepted.
+    expect(pushed * chunk.byteLength).toBeLessThan(GITHUB_API_RESPONSE_LIMIT_BYTES * 2);
+    expect(pushed).toBeLessThan(chunksNeeded);
+  });
+
+  it("returns a response that sits just inside the limit", async () => {
+    const files = makeAppFiles();
+    const body = "x".repeat(1024);
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/app")) {
+        return new Response(JSON.stringify({ slug: "acp-production-gate", permissions: appPermissions }), { status: 200 });
+      }
+      if (url.includes("/access_tokens")) {
+        return new Response(JSON.stringify({
+          token: "installation-token-small",
+          expires_at: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
+        }), { status: 201 });
+      }
+      return new Response(body, { status: 200 });
+    };
+    const store = new TrustedCredentialStore(join(files.root, "secrets"), {
+      appEnvFile: files.envFile,
+      fetch,
+    });
+
+    const result = await store.githubApi({ method: "GET", path: "/user" });
+    expect(result.allowed).toBe(true);
+    if (!result.allowed) return;
+    expect(result.value.body).toBe(body);
   });
 
   it("requires every owner-approved merge permission and rejects a broader App", async () => {

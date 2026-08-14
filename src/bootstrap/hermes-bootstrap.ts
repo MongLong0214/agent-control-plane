@@ -8,7 +8,7 @@ import {
   type Stats,
 } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
@@ -269,11 +269,15 @@ const constituteHermesAuthority = async (
     );
   }
 
+  // The managed runtime root, not `process.cwd()`. Under launchd the daemon's cwd is
+  // wherever the job happened to start, which is not a routing fact anyone chose — and the
+  // workdir immutability trigger makes whatever lands here permanent, so a cwd recorded once
+  // could never be corrected. P1-06 moved the CTO and continuity sites; this is the last one.
   const created = cp.sessions.create({
     provider: "hermes",
     model: request.model,
     osPid: child.pid ?? null,
-    workdir: process.cwd(),
+    workdir: cp.config.runtimeRoot ?? join(dirname(cp.config.databasePath), "runtime"),
   });
   if (!created.sessionSecret) {
     return failSession(
@@ -574,7 +578,11 @@ const spawnHermesRuntime = (
     ACP_MCP_TOKEN: options.mcpToken,
   };
   const child = spawn(command[0]!, command.slice(1), {
-    cwd: process.cwd(),
+    // The daemon's state root, not `process.cwd()`. Under launchd the cwd is wherever the job
+    // happened to start — often `/`, sometimes a checkout nobody chose — and it becomes the
+    // CEO runtime's working directory for the life of the process. Recording the managed
+    // workdir while spawning into an arbitrary one describes a placement that never happened.
+    cwd: stateDir,
     env: environment,
     stdio: "ignore",
     detached: true,
