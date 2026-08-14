@@ -222,6 +222,38 @@ describe("Telegram production ingress", () => {
     }
   });
 
+  it("does not tell the owner Hermes received a message Hermes never saw", async () => {
+    // The reply used to open "DIRECT acknowledged by Hermes". The default directHandler is a
+    // pure function that formats a string — nothing is dispatched and Hermes is not involved.
+    // Naming an actor that did not receive it is how an owner concludes a request is in
+    // motion; the reply was the only thing that looked like progress.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    await registerFixtureProject(harness);
+    const transport = new FakeTelegramTransport();
+    transport.updates = [update("just a note, not a command", {}, 150)];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport, start: false },
+    );
+
+    try {
+      const outcome = (await listener.service.pollOnce()).outcomes[0]!;
+      expect(outcome.classification).toBe("DIRECT");
+      const reply = transport.sent[0]?.text ?? "";
+      expect(reply, "the reply names an actor that never received the message")
+        .not.toContain("acknowledged by Hermes");
+      // And it still says what did happen, so the correction does not just remove information.
+      expect(reply).toContain("no run created");
+      expect(harness.cp.runs.list()).toHaveLength(0);
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("keeps forwarded command-shaped text DIRECT and wrapped as untrusted data", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],

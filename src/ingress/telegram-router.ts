@@ -477,7 +477,15 @@ export class TelegramHermesRouter {
           true,
           false,
           classified.value,
-          this.replyFor(update, `DIRECT acknowledged by Hermes\n${directText}`),
+          // Not "acknowledged by Hermes". The default directHandler is a pure function that
+          // formats a string; nothing is dispatched and Hermes never sees the message. Naming
+          // an actor that did not receive it tells the owner a request is in motion when it is
+          // not — the reply was the only thing that looked like progress.
+          //
+          // A deployment may inject a directHandler that does reach somewhere, so the prefix
+          // states only what the router itself knows: the message arrived and created no run.
+          // Anything about who handled it belongs to the handler's own text.
+          this.replyFor(update, `DIRECT received; no run created\n${directText}`),
           ReasonCode.OK,
         );
       }
