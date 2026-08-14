@@ -1,0 +1,15 @@
+name: p0-14-forged-gate
+
+on:
+  push:
+    branches:
+      - feature/p0-14-forged-20260814-090734-33303
+
+permissions:
+  contents: read
+
+jobs:
+  acp-production-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: test -n "$GITHUB_SHA"
