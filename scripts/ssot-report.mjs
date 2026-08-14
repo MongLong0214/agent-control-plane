@@ -12,6 +12,17 @@
  *   5. an issue whose recorded disposition is FIXED / STALE / NOT APPLICABLE is not still open
  *   6. required public documents and their status sections exist
  *
+ * Exit codes distinguish three outcomes, because two of them need opposite responses:
+ *
+ *   0  reconciled — tracker and repository agree
+ *   1  unreconciled — they disagree, and the disagreement is listed
+ *   2  undetermined — GitHub could not be reached, so nothing was compared
+ *
+ * 1 and 2 are both failures to CI and that is correct. The difference is what a reader is told
+ * to do: 1 means fix something, 2 means look again. Reporting 2 as 1 sends someone hunting a
+ * disagreement that may not exist, which is what an HTTP 504 did to a documentation-only PR
+ * (#444).
+ *
  * `--issues-file` is a fixture seam for this gate's own regression checks; normal CI and
  * operator use must query GitHub directly.
  *
@@ -49,10 +60,17 @@ const listIssues = () => {
     const stderr =
       error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "").trim() : "";
     console.error(
-      "SSOT reconciliation cannot run: GitHub issues could not be listed. Set GH_TOKEN (in GitHub Actions, use GH_TOKEN: ${{ github.token }}) or authenticate gh locally.",
+      "SSOT reconciliation UNDETERMINED: GitHub issues could not be listed. Set GH_TOKEN (in GitHub Actions, use GH_TOKEN: ${{ github.token }}) or authenticate gh locally.",
     );
     if (stderr) console.error(stderr);
-    process.exit(1);
+    // Exit 2, not 1. Unreachable is not the same answer as unreconciled: one says the tracker
+    // and the repository disagree, the other says nobody could look. Reporting the second as
+    // the first sends someone hunting a disagreement that may not exist — which is what
+    // happened when an HTTP 504 failed a documentation-only PR (#444).
+    //
+    // 1 stays "reconciliation ran and found problems". CI treats both as failure, which is
+    // correct; the difference is what a reader is told to do about it.
+    process.exit(2);
   }
 };
 
