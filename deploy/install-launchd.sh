@@ -212,10 +212,6 @@ optional_keychain_value() {
 # `BUZZ_PRIVATE_KEY` account exists, so the daemon does not start with a silently absent
 # credential — `BuzzCliTransport.available()` returns false without it and the doctor then
 # reports CTO_BUZZ_NOT_CONNECTED with nothing to point at.
-# A Keychain-provided ACP_BUZZ_BINARY wins; otherwise use the path resolved at install time.
-if [[ -z "${ACP_BUZZ_BINARY:-}" && -n "${ACP_RESOLVED_BUZZ_BINARY:-}" ]]; then
-  export ACP_BUZZ_BINARY="$ACP_RESOLVED_BUZZ_BINARY"
-fi
 buzz_key_from_desktop_secrets() {
   [[ -n "${BUZZ_PRIVATE_KEY:-}" ]] && return 0
   # agentcpd refuses to start when BUZZ_PRIVATE_KEY is present without its ingress pair,
@@ -269,6 +265,17 @@ buzz_key_from_desktop_secrets
 # having to publish where it is; an explicit value still wins.
 export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_STATE_DIR/reviewer/claude}"
 export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_STATE_DIR/reviewer/codex}"
+
+# A Keychain-provided ACP_BUZZ_BINARY wins; otherwise the path resolved at install time.
+#
+# This runs after the optional loop, not before. optional_keychain_value unsets each account
+# before looking it up — deliberately, so a token inherited from the invoking shell cannot pass
+# for a Keychain value — which also destroyed a resolved path exported earlier. The daemon then
+# fell back to bare `buzz`, unreachable from its pinned PATH: the #423 failure the absolute path
+# exists to prevent, reintroduced by a later line.
+if [[ -z "${ACP_BUZZ_BINARY:-}" && -n "${ACP_RESOLVED_BUZZ_BINARY:-}" ]]; then
+  export ACP_BUZZ_BINARY="$ACP_RESOLVED_BUZZ_BINARY"
+fi
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"
 EOF
