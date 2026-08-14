@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { ControlPlane, readOwnerIdentities } from "../../src/app/control-plane.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -176,7 +177,9 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
             // for #419 — see ~/.agent-control-plane/egress/README.md.
             reviewerEgress: {
               profilePath: join(EGRESS_ROOT, "reviewer.sb"),
-              proxyPath: join(EGRESS_ROOT, "allowlist-proxy.py"),
+              // The vendored proxy, not the host copy: reviewer-egress.ts requires a
+              // handshake, and a script outside the tree cannot be held to it.
+              proxyPath: fileURLToPath(new URL("../../deploy/egress/allowlist-proxy.py", import.meta.url)),
               runtimeDir: join(root, "egress-runtime"),
             },
           }),
