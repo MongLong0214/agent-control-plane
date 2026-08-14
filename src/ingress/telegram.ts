@@ -26,6 +26,10 @@ export interface TelegramUpdate {
     reply_to_message_id?: number;
     forward_origin?: { type: string };
     forward_from?: { id: number };
+    /** Pre-`forward_origin` markers. Still delivered; see isForwarded. */
+    forward_from_chat?: { id: number };
+    forward_sender_name?: string;
+    forward_date?: number;
   };
 }
 
@@ -152,7 +156,22 @@ export class TelegramIngress {
   /** Telegram forwards are data even when their text happens to look like a command. */
   isForwarded(update: TelegramUpdate): boolean {
     const message = update.message;
-    return Boolean(message?.forward_origin ?? message?.forward_from);
+    if (!message) return false;
+    // Every marker Bot API has used, not only the current one. `forward_origin` replaced the
+    // older fields, but Telegram still sends those to clients that have not migrated, and a
+    // message carrying only them read as authored here — so a forwarded `/managed …` was
+    // parsed as a live owner command and created a run.
+    //
+    // Failing toward "forwarded" is the safe direction: a forward misread as authored carries
+    // someone else's text into owner authority, while an authored message misread as forwarded
+    // is refused and can be resent.
+    return Boolean(
+      message.forward_origin ??
+        message.forward_from ??
+        message.forward_from_chat ??
+        message.forward_sender_name ??
+        message.forward_date,
+    );
   }
 
   /** The durable replay key used by the guard and downstream idempotency surfaces. */
