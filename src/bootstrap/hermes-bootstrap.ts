@@ -16,6 +16,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import {
   assertPrivatePath,
+  ensurePrivateDirectory,
   PRIVATE_FILE_MODE,
 } from "../db/state-preflight.ts";
 
@@ -170,12 +171,18 @@ export const createHermesBootstrapAuthority = (
       if (options.authorityHeld && !options.authorityHeld()) {
         return deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock was lost before Hermes runtime launch", {});
       }
+      // createDaemon already ensures this, but the bootstrap must not depend on having been
+      // reached through that path: spawning into a directory that does not exist fails with an
+      // errno nobody will connect to a workdir decision.
+      const runtimeRoot = managedRuntimeRoot(cp);
+      ensurePrivateDirectory(runtimeRoot);
       child = spawnHermesRuntime(
         request.command,
         door.socketPath,
         door.runtimeToken(),
         options,
         options.stateDir,
+        runtimeRoot,
       );
 
       const timeout = new Promise<Decision<HermesBootstrapCredential>>((resolveTimeout) => {
@@ -277,7 +284,7 @@ const constituteHermesAuthority = async (
     provider: "hermes",
     model: request.model,
     osPid: child.pid ?? null,
-    workdir: cp.config.runtimeRoot ?? join(dirname(cp.config.databasePath), "runtime"),
+    workdir: managedRuntimeRoot(cp),
   });
   if (!created.sessionSecret) {
     return failSession(
@@ -555,12 +562,25 @@ const proofMatches = (token: string, proof: RuntimeProof): boolean => {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 };
 
+/**
+ * The managed runtime root, resolved identically wherever it is needed.
+ *
+ * P1-06 moved the recorded workdir off `process.cwd()`, but the spawn kept using the state
+ * directory — so the session row named `<state>/runtime` while the process actually started in
+ * `<state>`, the directory holding `state.sqlite`, the credentials and the sockets. Recording a
+ * placement that did not happen is the defect P1-06 was filed for; using a different wrong
+ * directory does not close it. Both now read this.
+ */
+const managedRuntimeRoot = (cp: ControlPlane): string =>
+  cp.config.runtimeRoot ?? join(dirname(cp.config.databasePath), "runtime");
+
 const spawnHermesRuntime = (
   command: readonly string[],
   socketPath: string,
   token: string,
   options: HermesBootstrapAuthorityOptions,
   stateDir: string,
+  runtimeRoot: string,
 ): ChildProcess => {
   // The token is never a command-line argument. It is available only in the child process's
   // private environment, while the session secret is sent later over the consumed socket.
@@ -578,11 +598,12 @@ const spawnHermesRuntime = (
     ACP_MCP_TOKEN: options.mcpToken,
   };
   const child = spawn(command[0]!, command.slice(1), {
-    // The daemon's state root, not `process.cwd()`. Under launchd the cwd is wherever the job
-    // happened to start — often `/`, sometimes a checkout nobody chose — and it becomes the
-    // CEO runtime's working directory for the life of the process. Recording the managed
-    // workdir while spawning into an arbitrary one describes a placement that never happened.
-    cwd: stateDir,
+    // The managed runtime root — the same value the session row records. Under launchd the
+    // cwd is wherever the job happened to start, often `/`, and it becomes the CEO runtime's
+    // working directory for the life of the process. It was previously the state directory,
+    // which is where `state.sqlite` and the credentials live: not arbitrary, but not what was
+    // recorded either, and a recorded placement that never happened is the P1-06 defect.
+    cwd: runtimeRoot,
     env: environment,
     stdio: "ignore",
     detached: true,

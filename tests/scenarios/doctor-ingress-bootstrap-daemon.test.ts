@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -147,6 +147,9 @@ const invalid = process.argv[3] === "invalid";
 const bootstrapSocket = process.env.ACP_HERMES_BOOTSTRAP_SOCKET;
 const token = process.env.ACP_HERMES_BOOTSTRAP_TOKEN;
 fs.writeFileSync(modePath, String(fs.statSync(bootstrapSocket).mode & 0o777));
+// The directory the CEO runtime actually started in, so the recorded workdir can be
+// checked against reality rather than against itself.
+fs.writeFileSync(modePath + ".cwd", process.cwd());
 const runtimeNonce = "runtime-possession-nonce-123";
 const runtimeProof = invalid
   ? "0".repeat(64)
@@ -273,6 +276,13 @@ describe("Hermes CEO bootstrap authority", () => {
         ?? join(dirname(harness.cp.config.databasePath), "runtime");
       expect(ceoWorkdir).toBe(managedRuntimeRoot);
       expect(ceoWorkdir).not.toBe(process.cwd());
+
+      // The row said `<state>/runtime` while the process was spawned into `<state>` — the
+      // directory holding state.sqlite, the credentials and the sockets. Asserting only the
+      // row compared the record against itself, so the discrepancy was invisible.
+      const spawnedCwd = realpathSync(readFileSync(`${modePath}.cwd`, "utf8").trim());
+      expect(spawnedCwd, "the CEO runtime did not start in the workdir its session row records")
+        .toBe(realpathSync(managedRuntimeRoot));
 
       const rerun = await authority.bootstrap({
         command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath],
