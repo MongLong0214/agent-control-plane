@@ -54,6 +54,26 @@ are not an approval to ignore their residual risk. They explain why a constraine
 made and what would cause it to be revisited. The open P0 queue and the independent review
 remain the governing evidence for release readiness.
 
+## Paths this repository does not verify
+
+Named here because a green suite otherwise reads as coverage of them.
+
+- **The Linux hard-memory path is unverified.** `memoryLimitForPlatform("linux") === "hard"`
+  is asserted as a pure function return (`tests/unit/verify-r2.test.ts`), and every sandbox
+  and resource-limit test is `sandboxIt`, which runs only on Darwin. CI is macos-15 only
+  (`.github/workflows/ci.yml`). So the Linux enforcement path has never executed here, and
+  could regress to unlimited without any test failing. CP-HI-08 is behaviourally verified on
+  Darwin only.
+- **The full-vertical e2e is off by default.** `tests/e2e/real-component-integration.test.ts`
+  is `describe.runIf(ACP_COMPONENT_INTEGRATION=1)` — it is the only test that drives SIMPLE,
+  STANDARD and GUARDED through a real cloned repository and a live adapter, and it is the
+  `1 pending` that `pnpm trace` reports. `pnpm test` stays green if that path breaks.
+  `evidence/e2e-real-project-*.json` records manual runs; CI does not catch a regression.
+- **`pnpm trace` run on its own still executes the suite twice.** CI passes
+  `ACP_VITEST_RESULTS` so the suite runs once, but a bare `pnpm trace` falls back to spawning
+  its own Vitest pass (`src/tools/traceability.ts`). That fallback is what crashed under
+  `pool: "threads"`; it is safe under `forks`, but it is still a second full run.
+
 ## What the automated checks mean
 
 `pnpm trace` establishes that labelled scenario declarations executed and passed in the current

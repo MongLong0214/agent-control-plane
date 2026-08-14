@@ -331,6 +331,46 @@ describe("authenticated operator socket (#393/#405)", () => {
     }
   });
 
+  it("CP-HI-02: the real CLI opens no state when there is no daemon to answer it", async () => {
+    // The neighbouring process test runs with a daemon listening, so it proves the CLI does
+    // not open state on the *happy* path. This is the path a direct-database fallback would
+    // be written for: nothing is listening, and the tempting thing is to read the database.
+    //
+    // It is behavioural on purpose. The source-text assertions below are defence in depth and
+    // a renamed import or a re-exported factory walks straight past them; a process that
+    // creates a state directory cannot hide from this one.
+    const isolatedHome = tempDir("acp-operator-nodaemon-home-");
+    const socketPath = join(tempDir("acp-operator-nodaemon-"), "absent.operator.sock");
+
+    const cli = await execFile(
+      process.execPath,
+      [
+        join(process.cwd(), "node_modules/tsx/dist/cli.mjs"),
+        join(process.cwd(), "src/cli/agentctl.ts"),
+        "run",
+        "cancel",
+        "run_does_not_exist",
+        "no",
+        "daemon",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          HOME: isolatedHome,
+          ACP_OPERATOR_SOCKET: socketPath,
+          ACP_OPERATOR_TOKEN: OPERATOR_TOKEN,
+        },
+        maxBuffer: 2 * 1024 * 1024,
+      },
+    ).catch((error: { stdout?: string; stderr?: string; code?: number }) => error);
+
+    const combined = `${cli.stdout ?? ""}${cli.stderr ?? ""}`;
+    expect(combined).toMatch(/no direct database fallback|DAEMON_LOCK_LOST/);
+    // The property that matters: no daemon, and still no state of its own.
+    expect(existsSync(join(isolatedHome, ".agent-control-plane"))).toBe(false);
+  });
+
   it("keeps the CLI an explicit socket client with no ControlPlane or capability issuance path", () => {
     const source = readFileSync(new URL("../../src/cli/agentctl.ts", import.meta.url), "utf8");
     const daemonSource = readFileSync(new URL("../../src/daemon/agentcpd.ts", import.meta.url), "utf8");

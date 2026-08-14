@@ -415,6 +415,12 @@ const runVitestJson = (root: string): VitestJsonReport => {
     return parseVitestJsonReport(readFileSync(suppliedPath, "utf8"));
   }
 
+  // Say so. CI supplies ACP_VITEST_RESULTS precisely to avoid this second full run; a bare
+  // `pnpm trace` re-runs a suite that starts real sandboxed children, which is slow and was
+  // where the worker crash surfaced before `pool: "forks"`.
+  console.warn(
+    "pnpm trace: no ACP_VITEST_RESULTS supplied — running the whole suite a second time to obtain a JSON reporter pass",
+  );
   const evidenceDir = join(root, "evidence", "local");
   const outputPath = join(evidenceDir, `traceability-vitest-${process.pid}.json`);
   const vitestEntrypoint = join(root, "node_modules", "vitest", "vitest.mjs");
