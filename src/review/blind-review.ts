@@ -1135,15 +1135,7 @@ export class BlindReviewGate {
         diff: true,
         verificationEvidence: true,
         projectContext: false,
-        // §18.3 — these are logical inputs the gate never serializes into a reviewer
-        // prompt. Filesystem confinement is attested separately by the runtime; do not
-        // turn this manifest into a static, unmeasured sandbox claim.
-        withheld: [
-          "worker reasoning",
-          "CTO reasoning",
-          "chat history",
-          "producer self-assessment",
-        ],
+        withheld: [...LOGICAL_WITHHELD_INPUTS],
         binaryArtifacts: input.binaryArtifacts,
       },
       coveredRepositories: [
@@ -1561,6 +1553,48 @@ const isReviewFinding = (value: unknown): value is ReviewFinding => {
 };
 
 const normalizeCoverageKey = (key: string): string => key.replace(/^\.\//, "").trim();
+
+/**
+ * §18.3 — logical inputs the gate never serialises into a reviewer prompt.
+ *
+ * These are true structurally: none is a field of `BlindReviewRequest`, so `buildPrompt`
+ * has nothing to serialise them from. That is why they can be asserted without measuring
+ * anything.
+ *
+ * Sandbox facts are the opposite: filesystem, network and tool confinement are properties of
+ * a seatbelt profile, and stating them here would be a claim about something this list cannot
+ * see. #360 was filed because the manifest had drifted into exactly that — advertising
+ * `network: "provider-only"` and `tools: "none"` that the profile did not implement.
+ * `reviewerWithheldIsLogicalOnly` fails if a sandbox-domain term is added back.
+ */
+export const LOGICAL_WITHHELD_INPUTS = Object.freeze([
+  "worker reasoning",
+  "CTO reasoning",
+  "chat history",
+  "producer self-assessment",
+] as const);
+
+/** Terms naming a runtime boundary rather than a prompt input. */
+const SANDBOX_DOMAIN_TERMS = [
+  "network",
+  "filesystem",
+  "file system",
+  "tools",
+  "socket",
+  "path",
+  "egress",
+  "process",
+  "sandbox",
+];
+
+/**
+ * True when every withheld entry is a logical prompt input. A sandbox term here would be an
+ * unmeasured claim: this manifest is built from the request, and cannot observe a profile.
+ */
+export const reviewerWithheldIsLogicalOnly = (withheld: readonly string[]): boolean =>
+  withheld.every(
+    (entry) => !SANDBOX_DOMAIN_TERMS.some((term) => entry.toLowerCase().includes(term)),
+  );
 
 const splitCoverageKey = (key: string): { identity: string; path: string } | null => {
   const separator = key.lastIndexOf(":");
