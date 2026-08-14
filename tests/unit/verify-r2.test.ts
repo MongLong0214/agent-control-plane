@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -294,6 +294,23 @@ describe("round-2 verification isolation and candidate freshness", () => {
     });
     expect(result).toMatchObject({ childPid: expect.any(Number), spawnError: null });
     if (result === null || result.childPid === null) return;
+
+    // Temporary CI diagnostics (#461). Locally this test cannot fail — the platform reaps the
+    // detached child even when ACP signals nothing at all, proved by returning early from
+    // killKnownTargets. CI is the only environment where the fence is actually exercised, so
+    // the state it observed has to be captured there rather than reasoned about here.
+    const psLine = (pid: number): string => {
+      try {
+        return execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,sess=,stat=,command=", "-p", String(pid)], {
+          encoding: "utf8",
+        }).trim();
+      } catch (error) {
+        return `ps failed: ${(error as NodeJS.ErrnoException).code ?? String(error)}`;
+      }
+    };
+    console.log("[#461] outcome.enforcement=", JSON.stringify(outcome.enforcement));
+    console.log("[#461] child at assert time:", psLine(result.childPid));
+    console.log("[#461] this process:", psLine(process.pid));
 
     let childIsAlive = false;
     try {
