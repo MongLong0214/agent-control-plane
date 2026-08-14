@@ -253,6 +253,41 @@ const REQUIRED_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
   { name: "github_receipts_no_delete", sentinel: "GITHUB_RECEIPT_IMMUTABLE" },
 ];
 
+/**
+ * The rest of schema.sql's triggers. Splitting them out of REQUIRED_TRIGGERS records why the
+ * original seven were listed and these twenty were not: the first list was assembled by hand
+ * around the guards someone had reason to worry about, and nothing ever reconciled it against
+ * the schema. A rule-inventory sweep found the gap — 20 of 29 triggers had no existence check,
+ * so dropping one during a migration rewrite failed nothing. Most tests enter through the
+ * application path, which never notices that the database-layer backstop is gone; the loss
+ * would surface only when someone tried the raw-SQL bypass the trigger exists to refuse.
+ *
+ * `tests/unit/schema-trigger-coverage.test.ts` now reconciles the two mechanically, so this
+ * list cannot fall behind schema.sql again.
+ */
+const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
+  { name: "manifests_immutable", sentinel: "MANIFEST_IMMUTABLE" },
+  { name: "sessions_incarnation_immutable", sentinel: "SESSION_INCARNATION_IMMUTABLE" },
+  { name: "sessions_secret_hash_immutable", sentinel: "SESSION_SECRET_HASH_IMMUTABLE" },
+  { name: "sessions_buzz_actor_immutable", sentinel: "SESSION_BUZZ_ACTOR_IMMUTABLE" },
+  { name: "assignments_generation_monotonic", sentinel: "BINDING_GENERATION_NOT_MONOTONIC" },
+  { name: "assignments_generation_immutable", sentinel: "BINDING_IDENTITY_IMMUTABLE" },
+  { name: "assignments_revocation_terminal", sentinel: "BINDING_REVOKED_TERMINAL" },
+  { name: "assignments_active_generation_current", sentinel: "BINDING_REVOKED_TERMINAL" },
+  { name: "assignments_active_generation_insert_guard", sentinel: "BINDING_REVOKED_TERMINAL" },
+  { name: "runs_state_transition_guard", sentinel: "RUN_STATE_TRANSITION_ILLEGAL" },
+  { name: "runs_pinned_manifest_immutable", sentinel: "PINNED_MANIFEST_IMMUTABLE" },
+  { name: "runs_pinned_run_scoped_commands_immutable", sentinel: "PINNED_RUN_SCOPED_COMMANDS_IMMUTABLE" },
+  { name: "task_executions_worker_binding_required", sentinel: "TASK_EXECUTION_WORKER_BINDING_REQUIRED" },
+  { name: "task_executions_worker_identity_immutable", sentinel: "TASK_EXECUTION_WORKER_IDENTITY_IMMUTABLE" },
+  { name: "run_artifacts_evidence_candidate_guard", sentinel: "EVIDENCE_CANDIDATE_MISMATCH" },
+  { name: "outbox_request_fingerprint_immutable", sentinel: "OUTBOX_REQUEST_FINGERPRINT_IMMUTABLE" },
+  { name: "github_receipts_applied_requires_reservation", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
+  { name: "github_receipts_pending_completion", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
+  { name: "audit_events_append_only", sentinel: "AUDIT_APPEND_ONLY" },
+  { name: "audit_events_no_delete", sentinel: "AUDIT_APPEND_ONLY" },
+];
+
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<{ name: string; sentinel: string }> = [
   { name: "schema_migrations_insert_authority", sentinel: "SCHEMA_MIGRATION_AUTHORITY_DENIED" },
   { name: "schema_migrations_immutable", sentinel: "SCHEMA_MIGRATION_RECEIPT_IMMUTABLE" },
@@ -274,6 +309,7 @@ export const assertLoadBearingInvariants = (
   options: { includeMigrationLedger: boolean; includeBaselineLedger?: boolean },
 ): void => {
   const expected = [
+    ...REQUIRED_SCHEMA_TRIGGERS,
     ...(options.includeMigrationLedger
       ? [...REQUIRED_TRIGGERS, ...REQUIRED_LEDGER_TRIGGERS]
       : REQUIRED_TRIGGERS),
