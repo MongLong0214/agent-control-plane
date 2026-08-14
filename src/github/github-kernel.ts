@@ -1423,7 +1423,21 @@ export class GitHubKernel {
             this.githubMergeMethod(input.mergeStrategy),
           );
           if (!proof.allowed) {
-            this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, pull.merge_commit_sha, proof);
+            if (
+              proof.reasonCode === ReasonCode.MERGE_BASE_STALE ||
+              proof.reasonCode === ReasonCode.EVIDENCE_MISSING ||
+              proof.reasonCode === ReasonCode.PROBE_FAILED
+            ) {
+              this.recordPendingMergeProofFailure(
+                input,
+                mergeRepositoryId,
+                idempotencyKey,
+                pull.merge_commit_sha,
+                proof,
+              );
+            } else {
+              this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, pull.merge_commit_sha, proof);
+            }
             return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
           }
           const finalized = this.finalizeReservedReceipt({
@@ -1625,16 +1639,18 @@ export class GitHubKernel {
         "GET",
         `/repos/${owner}/${repo}/pulls/${input.pullNumber}`,
       );
-    } catch (error) {
+      if (!postflight) throw new Error("postflight pull read returned no value");
+    } catch {
       const unproven = deny(
-        ReasonCode.MERGE_BASE_STALE,
+        ReasonCode.PROBE_FAILED,
         "merged pull request could not be re-read for base proof",
         {
+          pullNumber: input.pullNumber,
           mergeCommitSha,
-          error: error instanceof Error ? error.message : String(error),
+          phase: "postflight-pull",
         },
       );
-      this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, unproven);
+      this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, unproven);
       return unproven as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
     const proof = await this.assertExecutedMergeProof(
@@ -1647,7 +1663,15 @@ export class GitHubKernel {
       method,
     );
     if (!proof.allowed) {
-      this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, proof);
+      if (
+        proof.reasonCode === ReasonCode.MERGE_BASE_STALE ||
+        proof.reasonCode === ReasonCode.EVIDENCE_MISSING ||
+        proof.reasonCode === ReasonCode.PROBE_FAILED
+      ) {
+        this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, proof);
+      } else {
+        this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, proof);
+      }
       return proof as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
 
@@ -1723,13 +1747,31 @@ export class GitHubKernel {
   ): Promise<Decision<void>> {
     const preparedBase = this.assertPreparedBaseRef(pull, prepared, "after-put");
     if (!preparedBase.allowed) return preparedBase;
-    if (pull.merged !== true || pull.merge_commit_sha !== mergeCommitSha) {
+    if (pull.merged !== true) {
+      return deny(ReasonCode.MERGE_BASE_STALE, "pull no longer reports the acknowledged merge", {
+        pullNumber: pull.number,
+        baseRef: pull.base.ref,
+        expected: true,
+        observed: pull.merged,
+      });
+    }
+    const observedMergeCommitSha =
+      typeof pull.merge_commit_sha === "string" && pull.merge_commit_sha.trim() !== ""
+        ? pull.merge_commit_sha
+        : null;
+    if (!observedMergeCommitSha) {
+      return deny(ReasonCode.EVIDENCE_MISSING, "merged pull has no usable merge commit sha", {
+        pullNumber: pull.number,
+        baseRef: pull.base.ref,
+        phase: "postflight-pull",
+      });
+    }
+    if (observedMergeCommitSha !== mergeCommitSha) {
       return deny(ReasonCode.MERGE_BASE_STALE, "merged pull does not name the acknowledged merge commit", {
         pullNumber: pull.number,
         baseRef: pull.base.ref,
         expected: mergeCommitSha,
-        merged: pull.merged,
-        mergeCommitSha: pull.merge_commit_sha ?? null,
+        observed: observedMergeCommitSha,
       });
     }
     if (pull.base.sha !== expectedBaseSha) {
@@ -1746,12 +1788,30 @@ export class GitHubKernel {
         "GET",
         `/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(pull.base.ref)}`,
       );
-      targetHead = typeof target.object?.sha === "string" ? target.object.sha : null;
+      if (!target) {
+        return deny(ReasonCode.PROBE_FAILED, "merged target ref returned no value", {
+          pullNumber: pull.number,
+          baseRef: pull.base.ref,
+          phase: "postflight-target-ref",
+          observed: null,
+        });
+      }
+      targetHead =
+        typeof target.object?.sha === "string" && target.object.sha.trim() !== ""
+          ? target.object.sha
+          : null;
+      if (!targetHead) {
+        return deny(ReasonCode.EVIDENCE_MISSING, "merged target ref has no usable commit sha", {
+          pullNumber: pull.number,
+          baseRef: pull.base.ref,
+          phase: "postflight-target-ref",
+        });
+      }
     } catch {
-      return deny(ReasonCode.MERGE_BASE_STALE, "merged target ref could not be re-read", {
+      return deny(ReasonCode.PROBE_FAILED, "merged target ref could not be re-read", {
         pullNumber: pull.number,
         baseRef: pull.base.ref,
-        expected: mergeCommitSha,
+        phase: "postflight-target-ref",
       });
     }
     if (targetHead !== mergeCommitSha) {
@@ -1779,6 +1839,7 @@ export class GitHubKernel {
   ): Promise<Decision<void>> {
     const walked: string[] = [];
     let sha = mergeCommitSha;
+    let observedFirstParent: string | null = null;
     for (let hop = 0; hop < 64; hop += 1) {
       const commit = await this.api()
         .request<{ sha: string; parents: Array<{ sha: string }> }>(
@@ -1787,12 +1848,14 @@ export class GitHubKernel {
         )
         .catch(() => null);
       if (!commit) {
-        return deny(ReasonCode.MERGE_BASE_STALE, "merge commit could not be re-read", {
+        return deny(ReasonCode.PROBE_FAILED, "merge commit could not be re-read", {
           mergeCommitSha,
           at: sha,
+          phase: "postflight-first-parent",
         });
       }
       const first = commit.parents[0]?.sha ?? null;
+      if (hop === 0) observedFirstParent = first;
       walked.push(sha);
       if (first === expectedBaseSha) return allow(ReasonCode.OK, undefined);
       if (method !== "rebase" || !first) break;
@@ -1801,7 +1864,7 @@ export class GitHubKernel {
     return deny(
       ReasonCode.MERGE_BASE_STALE,
       "the merge did not land on the base the run's evidence was bound to",
-      { mergeCommitSha, expectedBaseSha, walked },
+      { mergeCommitSha, expected: expectedBaseSha, observed: observedFirstParent, walked },
     );
   }
 
@@ -3001,7 +3064,7 @@ export class GitHubKernel {
     this.inFlightReservations.delete(idempotencyKey);
   }
 
-  private recordMergeProofFailure(
+  private recordPendingMergeProofFailure(
     input: MergeInput,
     repositoryId: string,
     idempotencyKey: string,
@@ -3020,6 +3083,16 @@ export class GitHubKernel {
         detail: failure.allowed ? "merge proof was not established" : failure.message,
       },
     });
+  }
+
+  private recordMergeProofFailure(
+    input: MergeInput,
+    repositoryId: string,
+    idempotencyKey: string,
+    mergeCommitSha: string,
+    failure: Decision<unknown>,
+  ): void {
+    this.recordPendingMergeProofFailure(input, repositoryId, idempotencyKey, mergeCommitSha, failure);
     this.rollbackPrepare(input.runId, input.repositoryIdentity, mergeCommitSha, "halt");
   }
 
