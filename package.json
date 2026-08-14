@@ -21,7 +21,8 @@
     "test:e2e": "vitest run tests/e2e --testTimeout=600000",
     "lint": "eslint .",
     "trace": "tsx src/tools/traceability.ts",
-    "terminology": "node scripts/verify-terminology.mjs"
+    "terminology": "node scripts/verify-terminology.mjs",
+    "evidence:freshness": "node scripts/verify-evidence-freshness.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
