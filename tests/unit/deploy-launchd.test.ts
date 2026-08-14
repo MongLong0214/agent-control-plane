@@ -484,7 +484,7 @@ describe("launchd deployment artifact", () => {
     // and I could not account for that in three attempts, so it is filed rather than guessed at.
     const [, , , , , , , resolvedBuzz] =
       readFileSync(harness.launcherEnvLog, "utf8").trim().split("|");
-    expect(resolvedBuzz).not.toBe("fake-keychain-value");
+    expect(resolvedBuzz, "the launcher never exported the resolved Buzz binary").toBe(buzzPath);
   });
 
   it("#423 leaves BUZZ_PRIVATE_KEY unset rather than guessing when neither source has it", () => {

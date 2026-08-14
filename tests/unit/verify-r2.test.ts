@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -295,6 +295,23 @@ describe("round-2 verification isolation and candidate freshness", () => {
     expect(result).toMatchObject({ childPid: expect.any(Number), spawnError: null });
     if (result === null || result.childPid === null) return;
 
+    // Temporary CI diagnostics (#461). Locally this test cannot fail — the platform reaps the
+    // detached child even when ACP signals nothing at all, proved by returning early from
+    // killKnownTargets. CI is the only environment where the fence is actually exercised, so
+    // the state it observed has to be captured there rather than reasoned about here.
+    const psLine = (pid: number): string => {
+      try {
+        return execFileSync("/bin/ps", ["-o", "pid=,ppid=,pgid=,sess=,stat=,command=", "-p", String(pid)], {
+          encoding: "utf8",
+        }).trim();
+      } catch (error) {
+        return `ps failed: ${(error as NodeJS.ErrnoException).code ?? String(error)}`;
+      }
+    };
+    console.error("[#461] outcome.enforcement=", JSON.stringify(outcome.enforcement));
+    console.error("[#461] child at assert time:", psLine(result.childPid));
+    console.error("[#461] this process:", psLine(process.pid));
+
     let childIsAlive = false;
     try {
       // 12s, not 1s. The reap is asynchronous, and 40 attempts at 25ms gave the fence one
@@ -317,6 +334,13 @@ describe("round-2 verification isolation and candidate freshness", () => {
           break;
         }
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+      }
+      // Record the final sample whatever the outcome. The first probe printed only from a run
+      // where this passed, which is precisely the run that carries no information — the
+      // question is what the fence looked like when the child *survived*.
+      if (childIsAlive) {
+        console.error("[#461] SURVIVED:", psLine(result.childPid));
+        console.error("[#461] enforcement at failure:", JSON.stringify(outcome.enforcement));
       }
       expect(childIsAlive).toBe(false);
     } finally {
