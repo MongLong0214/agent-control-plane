@@ -595,7 +595,7 @@ describe("verification sandbox (PRD §17.4)", () => {
   it("#329 denies an attempted credential-store read made inside the command", async () => {
     const repo = makeRepo();
     const secrets = tempDir("acp-secrets-");
-    const credentialPath = join(secrets, "github-authority.token");
+    const credentialPath = join(secrets, "github-app.private-key.pem");
     writeFileSync(credentialPath, "ghp_secret_value_here");
     writeFileSync(
       join(repo, "peek.js"),

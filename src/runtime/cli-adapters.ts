@@ -734,6 +734,7 @@ const AUTHORITY_ENV = [
   /GITHUB.*TOKEN/i,
   /^GH_TOKEN$/i,
   /^GITHUB_/i,
+  /^ACP_GITHUB_/i,
   /^BUZZ_/i,
   /^TELEGRAM_/i,
   /^ACP_TRUSTED_/i,

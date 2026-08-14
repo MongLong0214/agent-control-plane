@@ -42,12 +42,23 @@ export interface GitHubClient {
 }
 
 /**
- * `gh api` with the trusted token injected into the child environment only.
- *
- * The token never reaches any other process: the daemon is the sole caller and the
- * child is a single short-lived API request (CP-HI-05).
+ * Waiting is only for an expected CI result to appear after a successful merge. It never
+ * turns a failed, untrusted, or ambiguous result into a retryable one.
  */
-export class GhCliClient implements GitHubClient {
+export interface GitHubKernelOptions {
+  /** Number of exact-check observations before a missing/incomplete result is final. */
+  postMergePollAttempts?: number;
+  /** Delay between observations; production supplies a non-zero bounded value. */
+  postMergePollIntervalMs?: number;
+  /** Test seam for the bounded wait. */
+  sleep?: (milliseconds: number) => Promise<void>;
+}
+
+/**
+ * Process-local GitHub App HTTPS transport. The credential store mints and retains the
+ * installation token internally; this client can receive only decoded API responses.
+ */
+export class GitHubAppClient implements GitHubClient {
   constructor(private readonly credentials: TrustedCredentialStore) {}
 
   async request<T>(
@@ -61,13 +72,8 @@ export class GhCliClient implements GitHubClient {
       ...(body !== undefined ? { input: JSON.stringify(body) } : {}),
     });
     if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
-    if (result.value.exitCode !== 0) {
-      throw new Error(
-        `gh api ${method} ${path} exited ${result.value.exitCode}: ${result.value.stderr.trim().slice(0, 2000)}`,
-      );
-    }
-    const stdout = result.value.stdout.trim();
-    return (stdout ? JSON.parse(stdout) : null) as T;
+    const responseBody = result.value.body.trim();
+    return (responseBody ? JSON.parse(responseBody) : null) as T;
   }
 }
 
@@ -184,6 +190,11 @@ interface CheckRun {
   completed_at?: string | null;
 }
 
+interface ObservedPostMergeCheck {
+  name: string;
+  conclusion: string;
+}
+
 /**
  * PRD §24 — the sole writer of programmatic merges and production gates.
  *
@@ -202,6 +213,10 @@ export class GitHubKernel {
   private readonly inFlightReservations = new Set<string>();
   /** `ProductionGate.humanGateStatus` is the sole human-gate predicate. */
   private humanGateStatusPort: HumanGateStatusPort | null = null;
+  private readonly client: GitHubClient | undefined;
+  private readonly postMergePollAttempts: number;
+  private readonly postMergePollIntervalMs: number;
+  private readonly sleep: (milliseconds: number) => Promise<void>;
 
   constructor(
     private readonly db: Db,
@@ -213,8 +228,14 @@ export class GitHubKernel {
     private readonly runs: RunEngine,
     private readonly projects: ProjectRegistry,
     private readonly guard: ManagedWriteGuard,
-    private readonly client?: GitHubClient,
-  ) {}
+    client?: GitHubClient,
+    options: GitHubKernelOptions = {},
+  ) {
+    this.client = client;
+    this.postMergePollAttempts = Math.max(1, Math.floor(options.postMergePollAttempts ?? 1));
+    this.postMergePollIntervalMs = Math.max(0, Math.floor(options.postMergePollIntervalMs ?? 0));
+    this.sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  }
 
   attach(ports: { humanGateStatus?: HumanGateStatusPort }): void {
     if (ports.humanGateStatus) this.humanGateStatusPort = ports.humanGateStatus;
@@ -301,7 +322,7 @@ export class GitHubKernel {
   }
 
   private api(): GitHubClient {
-    return this.client ?? new GhCliClient(this.credentials);
+    return this.client ?? new GitHubAppClient(this.credentials);
   }
 
   private slug(identity: string): Decision<{ owner: string; repo: string }> {
@@ -643,13 +664,8 @@ export class GitHubKernel {
     repositoryIdentity: string,
     daemonFinalizerAuthority?: DaemonFinalizerAuthority,
   ): Promise<Decision<{ checkRunId: number }>> {
-    if (!this.credentials.available()) {
-      return deny(
-        ReasonCode.TRUSTED_CREDENTIAL_UNAVAILABLE,
-        "no trusted credential; the production gate cannot be published",
-        { repositoryIdentity },
-      );
-    }
+    const credential = await this.credentials.authenticate();
+    if (!credential.allowed) return credential as Decision<{ checkRunId: number }>;
 
     // CP-HI-06 — the gate is an assertion that specific evidence exists. Publishing it
     // without checking that evidence would make the assertion self-issued: a caller could
@@ -673,9 +689,16 @@ export class GitHubKernel {
         if (this.inFlightReservations.has(idempotencyKey)) {
           return deny(ReasonCode.RESOURCE_COLLISION, "gate publication is in flight", { idempotencyKey });
         }
-        const creator = this.credentials.creatorIdentity();
         const checks = await this.listCheckRuns(repositoryIdentity, payload.exactHead, GATE_CHECK_NAME);
         if (!checks.allowed) return checks as Decision<{ checkRunId: number }>;
+        const creator = this.credentials.creatorIdentity();
+        if (!creator) {
+          return deny(
+            ReasonCode.GITHUB_APP_IDENTITY_UNVERIFIED,
+            "GitHub App creator identity was not retained after authentication",
+            {},
+          );
+        }
         const observed = checks.value.filter((check) =>
           check.name === GATE_CHECK_NAME && check.head_sha === payload.exactHead,
         );
@@ -1669,8 +1692,10 @@ export class GitHubKernel {
   }
 
   /**
-   * GitHub's PUT acknowledgement is only a claim. The subsequent pull re-read proves both
-   * which ref received the write and that that ref still points at the acknowledged commit.
+   * GitHub's PUT acknowledgement is only a claim. A merged pull retains its *original*
+   * `base.sha` in GitHub's API, so it cannot prove the mutable target ref advanced. Re-read
+   * that ref itself, while retaining the pull's immutable base snapshot and first-parent
+   * lineage checks. This makes a concurrent target advance a safe refusal, not a false pass.
    */
   private async assertExecutedMergeProof(
     owner: string,
@@ -1683,12 +1708,43 @@ export class GitHubKernel {
   ): Promise<Decision<void>> {
     const preparedBase = this.assertPreparedBaseRef(pull, prepared, "after-put");
     if (!preparedBase.allowed) return preparedBase;
-    if (pull.base.sha !== mergeCommitSha) {
-      return deny(ReasonCode.MERGE_BASE_STALE, "prepared base ref does not point at the merge commit", {
+    if (pull.merged !== true || pull.merge_commit_sha !== mergeCommitSha) {
+      return deny(ReasonCode.MERGE_BASE_STALE, "merged pull does not name the acknowledged merge commit", {
         pullNumber: pull.number,
         baseRef: pull.base.ref,
         expected: mergeCommitSha,
+        merged: pull.merged,
+        mergeCommitSha: pull.merge_commit_sha ?? null,
+      });
+    }
+    if (pull.base.sha !== expectedBaseSha) {
+      return deny(ReasonCode.MERGE_BASE_STALE, "merged pull no longer carries the prepared base snapshot", {
+        pullNumber: pull.number,
+        baseRef: pull.base.ref,
+        expected: expectedBaseSha,
         observed: pull.base.sha,
+      });
+    }
+    let targetHead: string | null = null;
+    try {
+      const target = await this.api().request<{ object?: { sha?: string } }>(
+        "GET",
+        `/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(pull.base.ref)}`,
+      );
+      targetHead = typeof target.object?.sha === "string" ? target.object.sha : null;
+    } catch {
+      return deny(ReasonCode.MERGE_BASE_STALE, "merged target ref could not be re-read", {
+        pullNumber: pull.number,
+        baseRef: pull.base.ref,
+        expected: mergeCommitSha,
+      });
+    }
+    if (targetHead !== mergeCommitSha) {
+      return deny(ReasonCode.MERGE_BASE_STALE, "prepared target ref does not point at the merge commit", {
+        pullNumber: pull.number,
+        baseRef: pull.base.ref,
+        expected: mergeCommitSha,
+        observed: targetHead,
       });
     }
     return this.assertMergedOntoBase(owner, repo, mergeCommitSha, expectedBaseSha, method);
@@ -1824,27 +1880,16 @@ export class GitHubKernel {
     );
     if (!finalization.allowed) return finalization as Decision<{ checks: Array<{ name: string; conclusion: string }> }>;
 
-    // Filter by the declared name server-side, then paginate. An unrelated check flood must
-    // not hide the one trusted check we are required to assess, while same-name duplicates
-    // remain an explicit ambiguous refusal below.
-    const checksByName = new Map<string, CheckRun[]>();
-    for (const name of effective) {
-      const listed = await this.listCheckRuns(repositoryIdentity, mergeCommitSha, name);
-      if (!listed.allowed) return listed as Decision<{ checks: Array<{ name: string; conclusion: string }> }>;
-      checksByName.set(name, listed.value);
+    const observedResult = await this.waitForPostMergeChecks(
+      runId,
+      repositoryIdentity,
+      mergeCommitSha,
+      effective,
+    );
+    if (!observedResult.allowed) {
+      return observedResult as Decision<{ checks: Array<{ name: string; conclusion: string }> }>;
     }
-    const observed = await Promise.all(effective.map(async (name) => {
-      const matching = checksByName.get(name)!.filter((check) => check.name === name);
-      if (matching.length === 0) return { name, conclusion: "missing" };
-      // Same-name checks are ambiguous provenance. Selecting whichever one happens to
-      // appear first would let a candidate workflow hide beside the required workflow.
-      if (matching.length !== 1) return { name, conclusion: "ambiguous" };
-      const check = matching[0]!;
-      if (check.status !== "completed") return { name, conclusion: `incomplete:${check.status}` };
-      if (check.conclusion !== "success") return { name, conclusion: check.conclusion ?? "missing" };
-      const trusted = await this.assertTrustedWorkflowCheck(runId, repositoryIdentity, mergeCommitSha, check);
-      return { name, conclusion: trusted.allowed ? "success" : "untrusted" };
-    }));
+    const observed = observedResult.value;
     const failed = observed.filter((c) => c.conclusion !== "success");
 
     this.writeReceipt({
@@ -1878,6 +1923,67 @@ export class GitHubKernel {
     }
     this.setMergeState(runId, repositoryIdentity, "MERGED");
     return allow(ReasonCode.OK, { checks: observed });
+  }
+
+  /**
+   * GitHub Actions normally begins after the merge API returns. Keep the finalizer in this
+   * exact-SHA proof step until a bounded observation sees a terminal answer. Only absence
+   * and incompleteness are transient; all other failures are immediate and load-bearing.
+   */
+  private async waitForPostMergeChecks(
+    runId: string,
+    repositoryIdentity: string,
+    mergeCommitSha: string,
+    effective: readonly string[],
+  ): Promise<Decision<ObservedPostMergeCheck[]>> {
+    let observed: ObservedPostMergeCheck[] = [];
+    for (let attempt = 1; attempt <= this.postMergePollAttempts; attempt += 1) {
+      const inspected = await this.observePostMergeChecks(
+        runId,
+        repositoryIdentity,
+        mergeCommitSha,
+        effective,
+      );
+      if (!inspected.allowed) return inspected;
+      observed = inspected.value;
+      const failed = observed.filter((check) => check.conclusion !== "success");
+      const transientOnly = failed.length > 0 && failed.every((check) =>
+        check.conclusion === "missing" || check.conclusion.startsWith("incomplete:"),
+      );
+      if (!transientOnly || attempt === this.postMergePollAttempts) return allow(ReasonCode.OK, observed);
+      await this.sleep(this.postMergePollIntervalMs);
+    }
+    return allow(ReasonCode.OK, observed);
+  }
+
+  /** Read one exact-SHA observation without accepting a name-only or unverifiable check. */
+  private async observePostMergeChecks(
+    runId: string,
+    repositoryIdentity: string,
+    mergeCommitSha: string,
+    effective: readonly string[],
+  ): Promise<Decision<ObservedPostMergeCheck[]>> {
+    // Filter by the declared name server-side, then paginate. An unrelated check flood must
+    // not hide the one trusted check we are required to assess, while same-name duplicates
+    // remain an explicit ambiguous refusal below.
+    const checksByName = new Map<string, CheckRun[]>();
+    for (const name of effective) {
+      const listed = await this.listCheckRuns(repositoryIdentity, mergeCommitSha, name);
+      if (!listed.allowed) return listed as Decision<ObservedPostMergeCheck[]>;
+      checksByName.set(name, listed.value);
+    }
+    return allow(ReasonCode.OK, await Promise.all(effective.map(async (name) => {
+      const matching = checksByName.get(name)!.filter((check) => check.name === name);
+      if (matching.length === 0) return { name, conclusion: "missing" };
+      // Same-name checks are ambiguous provenance. Selecting whichever one happens to
+      // appear first would let a candidate workflow hide beside the required workflow.
+      if (matching.length !== 1) return { name, conclusion: "ambiguous" };
+      const check = matching[0]!;
+      if (check.status !== "completed") return { name, conclusion: `incomplete:${check.status}` };
+      if (check.conclusion !== "success") return { name, conclusion: check.conclusion ?? "missing" };
+      const trusted = await this.assertTrustedWorkflowCheck(runId, repositoryIdentity, mergeCommitSha, check);
+      return { name, conclusion: trusted.allowed ? "success" : "untrusted" };
+    })));
   }
 
   /** The post-merge checks the run's pinned manifest declares (§24.7). */
@@ -2482,9 +2588,15 @@ export class GitHubKernel {
           runPath: run.path ?? null,
         });
       }
-      const repository = this.repositories.byIdentity(repositoryIdentity);
-      const content = repository ? await fileAt(repository.checkoutPath, head, workflow.path) : null;
-      const workflowDigest = content === null ? "unknown" : sha256(content);
+      const content = await this.workflowContentAtExactHead(
+        repositoryIdentity,
+        owner,
+        repo,
+        head,
+        workflow.path,
+      );
+      if (!content.allowed) return content as Decision<{ workflowDigest: string }>;
+      const workflowDigest = sha256(content.value);
       return workflowDigest === workflow.approvedDigest
         ? allow(ReasonCode.OK, { workflowDigest })
         : deny(ReasonCode.VERIFICATION_CI_WORKFLOW_DIGEST_MISMATCH, "Actions workflow differs from pinned approval", {
@@ -2497,6 +2609,44 @@ export class GitHubKernel {
         checkRunId: check.id,
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+  }
+
+  /**
+   * A local checkout intentionally lags a remote merge. Prefer its exact object when it is
+   * present, then read the same immutable file from GitHub at the merge SHA rather than
+   * mistaking an absent local object for a different workflow.
+   */
+  private async workflowContentAtExactHead(
+    repositoryIdentity: string,
+    owner: string,
+    repo: string,
+    head: string,
+    path: string,
+  ): Promise<Decision<string>> {
+    const repository = this.repositories.byIdentity(repositoryIdentity);
+    const local = repository ? await fileAt(repository.checkoutPath, head, path) : null;
+    if (local !== null) return allow(ReasonCode.OK, local);
+    const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+    try {
+      const remote = await this.api().request<{ type?: string; encoding?: string; content?: string }>(
+        "GET",
+        `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodeURIComponent(head)}`,
+      );
+      if (remote.type !== "file" || remote.encoding !== "base64" || typeof remote.content !== "string") {
+        return deny(
+          ReasonCode.PROBE_FAILED,
+          "GitHub did not return the exact workflow file for post-merge provenance",
+          { repositoryIdentity, head, path },
+        );
+      }
+      return allow(ReasonCode.OK, Buffer.from(remote.content.replace(/\s/g, ""), "base64").toString("utf8"));
+    } catch {
+      return deny(
+        ReasonCode.PROBE_FAILED,
+        "could not read the exact workflow file for post-merge provenance",
+        { repositoryIdentity, head, path },
+      );
     }
   }
 

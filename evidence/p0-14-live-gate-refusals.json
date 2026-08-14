@@ -1,0 +1,57 @@
+{
+  "capture": "P0-14 live gate refusal checks",
+  "method": "For each refusal, Daemon.start invoked the finalizer to create the disposable PR. A capture-only GitHub client rejected only gate check-run publication before it reached GitHub, so no merge API call was available. mergeEvaluate then read live GitHub state.",
+  "untrustedSameName": {
+    "pullNumber": 430,
+    "candidateHead": "74132f6ecdfc511bd8dee1a066dd74e230ebfb63",
+    "observedCheck": {
+      "checkRunId": 94632897373,
+      "name": "acp-production-gate",
+      "headSha": "74132f6ecdfc511bd8dee1a066dd74e230ebfb63",
+      "status": "completed",
+      "conclusion": "success",
+      "appSlug": "github-actions"
+    },
+    "mergeEvaluate": "GATE_PAYLOAD_PROVENANCE_INVALID",
+    "pullMerged": false
+  },
+  "missing": {
+    "pullNumber": 431,
+    "candidateHead": "f3b1bcf256b1bf85bc7f5e110bdeef00574eb471",
+    "sameNamedChecks": [],
+    "mergeEvaluate": "MERGE_GATE_MISSING",
+    "pullMerged": false
+  },
+  "stale": {
+    "priorTrustedAppGate": {
+      "checkRunId": 94632113610,
+      "headSha": "f2c5d925acd75c5d2852b28c4021b6ba37b42596",
+      "conclusion": "success",
+      "appSlug": "acp-production-gate"
+    },
+    "currentCandidate": {
+      "pullNumber": 432,
+      "headSha": "2c4de95600047174ef38da1aab9720d89445a957",
+      "sameNamedChecks": [],
+      "mergeEvaluate": "MERGE_GATE_MISSING",
+      "pullMerged": false
+    },
+    "proof": "The trusted App check was on a different head and was not reused for the current candidate."
+  },
+  "createdAndRemoved": {
+    "pullRequests": [
+      { "number": 430, "outcome": "CLOSED" },
+      { "number": 431, "outcome": "CLOSED" },
+      { "number": 432, "outcome": "CLOSED" }
+    ],
+    "branches": [
+      "acp/p0-14-forge-base-20260814-090734-33303",
+      "feature/p0-14-forged-20260814-090734-33303",
+      "acp/p0-14-clean-base-20260814-090734-33303",
+      "feature/p0-14-missing-20260814-090734-33303",
+      "feature/p0-14-stale-20260814-090734-33303"
+    ],
+    "verification": "All listed remote refs were absent after deletion."
+  },
+  "secrets": "none; no JWT, installation token, private key, or credential-file contents are present"
+}

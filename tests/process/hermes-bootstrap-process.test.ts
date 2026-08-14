@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -286,16 +287,27 @@ describe("fresh-install Hermes bootstrap process acceptance", () => {
     }
 
     const stateDir = join(home, ".agent-control-plane");
-    // A real daemon preflight also requires the independently provisioned GitHub gate
+    // A real daemon preflight also requires the independently provisioned GitHub App
     // credential before startup. This is deployment configuration, not CP state or a
     // fixture/database shortcut; the Hermes CEO state below is still genuinely empty.
     const secretsDir = join(stateDir, "secrets");
+    const credentialsDir = join(stateDir, "credentials");
+    const appEnvFile = join(credentialsDir, "github-app.env");
+    const appPrivateKey = join(credentialsDir, "github-app.private-key.pem");
     mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(secretsDir, "github-authority.token"), "fake-github-token\n", { mode: 0o600 });
-    writeFileSync(join(secretsDir, "github-authority.identity"), "process-owner\n", { mode: 0o600 });
+    mkdirSync(credentialsDir, { recursive: true, mode: 0o700 });
+    const appKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+      .privateKey.export({ type: "pkcs1", format: "pem" });
+    writeFileSync(appPrivateKey, appKey, { mode: 0o600 });
+    writeFileSync(appEnvFile, [
+      "GITHUB_APP_ID=4586878",
+      "GITHUB_APP_INSTALLATION_ID=153553922",
+      `GITHUB_APP_PRIVATE_KEY_PATH=${appPrivateKey}`,
+    ].join("\n"), { mode: 0o600 });
     chmodSync(secretsDir, 0o700);
-    chmodSync(join(secretsDir, "github-authority.token"), 0o600);
-    chmodSync(join(secretsDir, "github-authority.identity"), 0o600);
+    chmodSync(credentialsDir, 0o700);
+    chmodSync(appEnvFile, 0o600);
+    chmodSync(appPrivateKey, 0o600);
     const pidPath = join(root, "hermes-runtime.pid");
     const continuePath = join(root, "continue-mcp");
     const secretPath = join(root, "runtime-secret");

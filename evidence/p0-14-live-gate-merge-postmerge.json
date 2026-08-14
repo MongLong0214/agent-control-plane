@@ -1,0 +1,55 @@
+{
+  "capture": "P0-14 live GitHub App gate, daemon finalizer merge, and exact post-merge verification",
+  "app": {
+    "slug": "acp-production-gate",
+    "appId": 4586878,
+    "installationId": 153553922
+  },
+  "successfulSequence": {
+    "runId": "run_ec79bb7660ea41e58c60575d",
+    "gatePublish": {
+      "checkRunId": 94632113610,
+      "headSha": "f2c5d925acd75c5d2852b28c4021b6ba37b42596",
+      "conclusion": "success",
+      "appSlug": "acp-production-gate",
+      "payloadDigest": "sha256:e1de1f1acaa00ac64ccebfa236fcf48c0c04953a6a4bcce75f8c5afb0e97617a",
+      "receiptVerified": true
+    },
+    "mergeExecute": {
+      "pullNumber": 429,
+      "mergeSha": "25c8ab3e3074e090c6047b70b297bea3841f359d",
+      "performedBy": "Daemon.start -> resumeApprovedRuns -> Daemon.finalizeApprovedRun",
+      "receiptVerified": true
+    },
+    "postMergeVerify": {
+      "mergeSha": "25c8ab3e3074e090c6047b70b297bea3841f359d",
+      "workflowPath": ".github/workflows/p0-14-live-post-merge.yml",
+      "checkName": "verify",
+      "actionsWorkflowRunId": 31756131029,
+      "actionsCheckRunId": 94632132421,
+      "conclusion": "success",
+      "receiptVerified": true
+    }
+  },
+  "findingFixedDuringCapture": {
+    "pullNumber": 428,
+    "mergeSha": "6555e18d8e7c81220b1135909cfa12fb8afd1be8",
+    "observed": "GitHub retained the original prepared base SHA in the merged pull resource.",
+    "oldResult": "MERGE_BASE_STALE after the real merge",
+    "replacementProof": "merged PR names the merge SHA, exact target ref equals that SHA, and first-parent lineage reaches the prepared base"
+  },
+  "createdAndRemoved": {
+    "pullRequests": [
+      { "number": 428, "outcome": "MERGED" },
+      { "number": 429, "outcome": "MERGED" }
+    ],
+    "branches": [
+      "acp/p0-14-live-20260814-085734-77184",
+      "feature/p0-14-live-20260814-085734-77184",
+      "acp/p0-14-live-20260814-090409-98629",
+      "feature/p0-14-live-20260814-090409-98629"
+    ],
+    "verification": "All listed remote refs were absent after deletion."
+  },
+  "secrets": "none; this record contains only public App identifiers, branch/commit identifiers, check identifiers, and conclusions"
+}

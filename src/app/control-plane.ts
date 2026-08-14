@@ -38,7 +38,7 @@ import { SessionRegistry } from "../session/session-registry.ts";
 import { Telemetry } from "../telemetry/telemetry.ts";
 import { VerificationEngine } from "../verify/verification-engine.ts";
 import { WorktreeManager } from "../verify/worktree.ts";
-import { GitHubKernel, type GitHubClient } from "../github/github-kernel.ts";
+import { GitHubKernel, type GitHubClient, type GitHubKernelOptions } from "../github/github-kernel.ts";
 import { OwnerAuthority, type OwnerIdentity } from "../ceo/owner-authority.ts";
 import { TrustedCredentialStore } from "../github/credential-store.ts";
 import { Doctor } from "../doctor/doctor.ts";
@@ -64,6 +64,10 @@ export interface ControlPlaneConfig {
   capacityDir: string;
   /** Directory holding the trusted GitHub credential. Daemon-only (CP-HI-05). */
   secretsDir: string;
+  /** Owner-provisioned App metadata, parsed rather than sourced by the daemon. */
+  githubAppEnvFile?: string;
+  /** Launcher-provided path override for the App private key. */
+  githubAppPrivateKeyPath?: string;
   ctoPreference?: CtoPreference;
   reviewer?: { preferred: ReviewerPreference; fallbacks: ReviewerPreference[] };
   capacity?: CapacityOptions;
@@ -83,6 +87,11 @@ export interface ControlPlaneConfig {
    * Git metadata exists.
    */
   directWriteRoots?: readonly string[];
+  /**
+   * Bounded post-merge observation controls. Production defaults are deliberately
+   * non-zero; fixtures provide a short deterministic seam.
+   */
+  githubKernelOptions?: GitHubKernelOptions;
   githubClient?: GitHubClient;
 }
 
@@ -91,6 +100,12 @@ export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): C
   worktreeRoot: join(root, "worktrees"),
   capacityDir: join(root, "capacity"),
   secretsDir: join(root, "secrets"),
+  githubAppEnvFile: process.env["ACP_GITHUB_APP_ENV_FILE"] ?? join(root, "credentials", "github-app.env"),
+  // The env file is the source of the key path. launchd supplies this override only to
+  // bind production to its fixed owner-provisioned credential file.
+  ...(process.env["ACP_GITHUB_APP_PRIVATE_KEY_PATH"]
+    ? { githubAppPrivateKeyPath: process.env["ACP_GITHUB_APP_PRIVATE_KEY_PATH"] }
+    : {}),
   // §21 — owner identities are declared out of band, one per line as `channel:actor` in
   // `<root>/owner-identities`. An absent or empty file means this deployment has no owner,
   // so no human gate can be satisfied; that is the safe reading, not a permissive one.
@@ -266,6 +281,10 @@ export class ControlPlane {
     // closes direct credential/capacity entry points before they can create a permissive dir.
     ensurePrivateDirectory(config.secretsDir);
     ensurePrivateDirectory(config.capacityDir);
+    this.credentials = new TrustedCredentialStore(config.secretsDir, {
+      ...(config.githubAppEnvFile ? { appEnvFile: config.githubAppEnvFile } : {}),
+      ...(config.githubAppPrivateKeyPath ? { privateKeyPath: config.githubAppPrivateKeyPath } : {}),
+    });
     this.db = new Db(config.databasePath);
     this.audit = new AuditLog(this.db, this.clock);
     this.artifacts = new ArtifactStore(this.db, this.clock);
@@ -383,18 +402,30 @@ export class ControlPlane {
       this.telemetry, this.guard,
     );
 
-    this.credentials = new TrustedCredentialStore(config.secretsDir);
+    const githubKernelOptions = config.githubKernelOptions ?? (config.githubClient
+      ? {}
+      : {
+          // A successful merge starts GitHub Actions asynchronously. Fifteen minutes is
+          // enough for dispatch and a normal project-ci job, while remaining bounded.
+          postMergePollAttempts: 60,
+          postMergePollIntervalMs: 15_000,
+        });
     this.github = new GitHubKernel(
       this.db, this.clock, this.audit, this.artifacts, this.credentials,
       this.repositories, this.runs, this.projects, this.guard,
-      ...(config.githubClient ? [config.githubClient] : []),
+      config.githubClient,
+      githubKernelOptions,
     );
     this.verification.attachCi(this.github.ciEvidenceSource());
     this.verification.attachManifests((digest) => this.projects.manifest(digest));
     this.verification.attachRuns((runId) => this.runs.get(runId));
     // The database *file*, not its directory: the worktree root lives beside it, and
     // denying the parent would stop a verification command from reading its own worktree.
-    this.verification.setDenyReadPaths([config.secretsDir, config.databasePath]);
+    this.verification.setDenyReadPaths([
+      config.secretsDir,
+      config.databasePath,
+      ...this.credentials.sensitivePaths(),
+    ]);
 
     this.repair = new RepairService(
       this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees,
@@ -496,13 +527,14 @@ export class ControlPlane {
   }
 
   private defaultAdapters(): ProviderAdapter[] {
+    const credentialDenyPaths = this.credentials.sensitivePaths();
     const managedWriteBroker = new GuardedInvocationWriteBroker(this.guard);
     return [
       new ClaudeCliAdapter({
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "claude.json"),
         environmentAllowlist: [],
-        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
+        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
         managedWriteBroker,
         providerCredentialDir: process.env["ACP_CLAUDE_REVIEWER_CONFIG_DIR"],
       }),
@@ -510,7 +542,7 @@ export class ControlPlane {
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "gpt.json"),
         environmentAllowlist: [],
-        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
+        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
         managedWriteBroker,
         // A reviewer can only use this deployment-provisioned dedicated CODEX_HOME. The
         // ordinary ~/.codex tree is intentionally never repurposed as a blind-review
@@ -521,7 +553,7 @@ export class ControlPlane {
         clock: this.clock,
         capacityFile: join(this.config.capacityDir, "grok.json"),
         environmentAllowlist: [],
-        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir],
+        denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
         providerCredentialDir: process.env["ACP_GROK_CREDENTIAL_DIR"],
       }),
     ];

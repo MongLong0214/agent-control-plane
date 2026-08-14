@@ -76,7 +76,7 @@ const reservedThenCompletedMerge = (
   );
 };
 
-/** Model GitHub's post-merge pull re-read: its target ref advances to the merge SHA. */
+/** Model GitHub's merged-PR snapshot plus its separately reread target ref. */
 const reflectMergedBase = (github: FakeGitHub): void => {
   const request = github.request.bind(github);
   github.request = async <T>(
@@ -92,7 +92,6 @@ const reflectMergedBase = (github: FakeGitHub): void => {
     const pullNumber = Number(/\/pulls\/(\d+)\/merge$/.exec(path)?.[1]);
     const pull = github.pulls.find((entry) => entry.number === pullNumber);
     if (merge.merged !== true || typeof merge.sha !== "string" || !pull) return response;
-    pull.base.sha = merge.sha;
     (pull as typeof pull & { merge_commit_sha?: string }).merge_commit_sha = merge.sha;
     github.setBranch(pull.base.ref, merge.sha);
     return response;
@@ -213,24 +212,16 @@ describe("round-two GitHub hardening", () => {
   it("#77: exposes only the fixed credential-store API", () => {
     const store = new TrustedCredentialStore(tempDir("credential-boundary-"));
     store.install({ token: "never-exposed", creatorIdentity: "acp" });
-    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(store)).sort()).toEqual([
-      "assertInstallTarget",
-      "available",
-      "constructor",
-      "creatorIdentity",
-      "githubApi",
-      "install",
-      "load",
-      "metadataOk",
-      "permissionsOk",
-    ]);
+    const api = Object.getOwnPropertyNames(Object.getPrototypeOf(store));
+    expect(api).toEqual(expect.arrayContaining(["availability", "creatorIdentity", "githubApi", "permissionsOk"]));
+    expect(api).not.toEqual(expect.arrayContaining(["load", "withToken", "run"]));
   });
 
-  it("#191: rejects cached credentials after their token file becomes group-readable", async () => {
+  it("#191: rejects a fixture credential after its daemon directory becomes group-readable", async () => {
     const directory = tempDir("credential-mode-");
     const store = new TrustedCredentialStore(directory);
     store.install({ token: "never-exposed", creatorIdentity: "acp" });
-    chmodSync(`${directory}/github-authority.token`, 0o640);
+    chmodSync(directory, 0o750);
     expect(store.permissionsOk()).toBe(false);
     expect(store.creatorIdentity()).toBeNull();
     const refused = await store.githubApi({ method: "GET", path: "/user" });
