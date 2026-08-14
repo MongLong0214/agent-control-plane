@@ -7,7 +7,7 @@ import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
-import type { AuditLog } from "../db/audit.ts";
+import { credentialBearingField, type AuditLog } from "../db/audit.ts";
 import { EVIDENCE_PRODUCERS, type ArtifactStore, type EvidenceWriter } from "../db/artifacts.ts";
 import type { Db } from "../db/database.ts";
 import {
@@ -24,9 +24,12 @@ import { canonical } from "../guard/workspace-probe.ts";
 import type { RepositoryRegistry } from "../registry/repository-registry.ts";
 import {
   ProviderSessionProvisionError,
+  REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS,
+  REVIEWER_PROVIDER_ENDPOINTS,
   type InvocationRequest,
   type InvocationResult,
   type ProviderRegistry,
+  type ReviewerEgressRecord,
 } from "../runtime/provider.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
 import type { SessionRegistry } from "../session/session-registry.ts";
@@ -64,6 +67,8 @@ export interface ReviewPacket {
   provider: string;
   model: string;
   effort: string | null;
+  /** Verbatim proxy JSONL plus per-invocation probes, covered by this packet's digest. */
+  egressEvidence: ReviewerEgressRecord[];
   inputManifest: {
     contract: boolean;
     snapshotManifest: boolean;
@@ -188,6 +193,8 @@ export class BlindReviewGate {
       preferred: ReviewerPreference;
       fallbacks: ReviewerPreference[];
     },
+    /** The same daemon-owned endpoint policy supplied to production CLI adapters. */
+    private readonly reviewerEgressEndpoints: Readonly<Record<string, readonly string[]>> = REVIEWER_PROVIDER_ENDPOINTS,
   ) {}
 
   /** Closed by the production composition root once the capacity monitor exists. */
@@ -279,6 +286,7 @@ export class BlindReviewGate {
         providerSessionId: outcome.value.providerSessionId,
         expected,
         binaryArtifacts,
+        egressEvidence: outcome.value.egressEvidence,
       });
 
       // §18.4 / CP-HI-04 — re-check independence at packet time: a session can join the
@@ -328,6 +336,8 @@ export class BlindReviewGate {
           omittedItems: validated.omittedItems,
           chunked,
           findings: validated.findings.length,
+          egressRecords: validated.egressEvidence.length,
+          egressProviders: [...new Set(validated.egressEvidence.map((record) => record.provider))],
           // The final reviewer is the packet authority. Persist the distinct chunk
           // reviewers too, because they are the sessions that actually saw the diff.
           chunkReviewerSessions: outcome.value.chunkReviewers.map((chunkReviewer) => ({
@@ -704,7 +714,7 @@ export class BlindReviewGate {
     runId: string,
     reviewer: ReviewerBinding,
     result: InvocationResult,
-  ): Decision<void> {
+  ): Decision<ReviewerEgressRecord[]> {
     // Only an explicit attestation counts. Anything else — including an adapter that
     // simply omits the field — is an unprovable isolation claim, which §18.3 treats as a
     // lost boundary rather than a benign default.
@@ -723,7 +733,30 @@ export class BlindReviewGate {
           reviewerSessionId: reviewer.sessionId,
         });
       }
-      return allow(ReasonCode.OK, undefined);
+      const egress = result.egressEvidence;
+      if (!egress || egress.length === 0) {
+        return deny(ReasonCode.ISOLATION_LOST, "reviewer adapter did not bind proxy JSONL evidence", {
+          runId,
+          provider: reviewer.preference.provider,
+          reviewerSessionId: reviewer.sessionId,
+        });
+      }
+      for (const record of egress) {
+        const invalid = reviewerEgressRecordProblem(
+          record,
+          reviewer.preference.provider,
+          this.reviewerEgressEndpoints,
+        );
+        if (invalid) {
+          return deny(ReasonCode.ISOLATION_LOST, "reviewer egress evidence is incomplete or unsafe", {
+            runId,
+            provider: reviewer.preference.provider,
+            reviewerSessionId: reviewer.sessionId,
+            problem: invalid,
+          });
+        }
+      }
+      return allow(ReasonCode.OK, egress);
     }
     return deny(ReasonCode.ISOLATION_LOST, "reviewer adapter did not attest packet-only isolation", {
       runId,
@@ -779,6 +812,7 @@ export class BlindReviewGate {
       providerSessionId: result.providerSessionId!,
       reviewer,
       chunkReviewers: [],
+      egressEvidence: isolation.value,
     });
   }
 
@@ -812,6 +846,7 @@ export class BlindReviewGate {
     const findings: ReviewFinding[] = [];
     const omitted: string[] = [];
     const chunkReviewers: ChunkReviewerEvidence[] = [];
+    const egressEvidence: ReviewerEgressRecord[] = [];
     let worst: ReviewVerdict = "PASS";
 
     for (const [index, chunk] of chunks.entries()) {
@@ -843,6 +878,7 @@ export class BlindReviewGate {
       ));
       const isolation = this.assertIsolationAttested(request.runId, reviewer, result);
       if (!isolation.allowed) return isolation as Decision<ReviewOutcome>;
+      egressEvidence.push(...isolation.value);
       // The chunk reviewers are the only reviewers that received the candidate diff.
       // Verify the provider's session attestation for each one before accepting any of
       // their coverage or findings; checking only the final reducer reviewer proves the
@@ -919,6 +955,7 @@ export class BlindReviewGate {
     if (!finalIsolation.allowed) {
       return finalIsolation as Decision<ReviewOutcome>;
     }
+    egressEvidence.push(...finalIsolation.value);
 
     if (!finalResult.ok) {
       return deny(ReasonCode.EVIDENCE_MISSING, "final chunked reviewer did not complete", {
@@ -961,6 +998,7 @@ export class BlindReviewGate {
       providerSessionId: finalResult.providerSessionId!,
       reviewer: finalReviewer.value,
       chunkReviewers,
+      egressEvidence,
     });
   }
 
@@ -1077,6 +1115,7 @@ export class BlindReviewGate {
     providerSessionId: string | null;
     expected: Array<{ identity: string; path: string }>;
     binaryArtifacts: Array<{ repository: string; path: string; digest: string; method: "git-binary-patch" }>;
+    egressEvidence: ReviewerEgressRecord[];
   }): ReviewPacket {
     return {
       runId: input.request.runId,
@@ -1089,6 +1128,7 @@ export class BlindReviewGate {
       provider: input.reviewer.preference.provider,
       model: input.reviewer.preference.model,
       effort: input.reviewer.preference.effort,
+      egressEvidence: input.egressEvidence,
       inputManifest: {
         contract: true,
         snapshotManifest: true,
@@ -1341,6 +1381,8 @@ interface ReviewOutcome {
   reviewer: ReviewerBinding;
   /** Durable audit evidence for the fresh sessions that saw individual diff chunks. */
   chunkReviewers: ChunkReviewerEvidence[];
+  /** Every provider process whose proxy record is bound into the authoritative packet. */
+  egressEvidence: ReviewerEgressRecord[];
 }
 
 interface ChunkReviewerEvidence {
@@ -1393,6 +1435,112 @@ const REVIEW_SEVERITIES = new Set<ReviewFinding["severity"]>(["INFO", "MINOR", "
 const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+
+/**
+ * The runtime constructs this record only after the live proxy probes pass. The gate still
+ * validates its durable shape instead of treating an adapter's `isolationAttested` boolean
+ * as sufficient: the review artifact must visibly contain an ALLOW, DENY, direct-socket
+ * refusal, timestamps, and no credential-shaped content.
+ */
+const normalizeEgressEndpoint = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const endpoint = value.trim().toLowerCase().replace(/\.$/, "");
+  if (
+    endpoint.length > 253 ||
+    !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}$/.test(endpoint)
+  ) return null;
+  return endpoint;
+};
+
+const sameEndpointSet = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((endpoint) => right.includes(endpoint));
+
+const reviewerEgressRecordProblem = (
+  record: ReviewerEgressRecord,
+  provider: string,
+  endpointPolicy: Readonly<Record<string, readonly string[]>>,
+): string | null => {
+  if (record.provider !== provider) return "provider-mismatch";
+  if (!Array.isArray(record.allowedEndpoints) || record.allowedEndpoints.length === 0) return "allowlist-missing";
+  const configured = endpointPolicy[provider];
+  if (!configured || configured.length === 0) return "provider-policy-missing";
+  const expectedEndpoints = [...new Set(configured.map(normalizeEgressEndpoint))];
+  const allowedEndpoints = record.allowedEndpoints.map(normalizeEgressEndpoint);
+  if (
+    expectedEndpoints.some((endpoint) => endpoint === null) ||
+    allowedEndpoints.some((endpoint) => endpoint === null) ||
+    new Set(allowedEndpoints).size !== allowedEndpoints.length
+  ) return "allowlist-invalid";
+  const expected = expectedEndpoints as string[];
+  const allowedList = allowedEndpoints as string[];
+  // `allowlist.txt` is exactly one normalized hostname per line. The durable record must
+  // name the same daemon-owned policy rather than an adapter-chosen plausible-looking host.
+  if (!sameEndpointSet(allowedList, expected)) return "allowlist-policy-mismatch";
+  if (record.allowedEndpoints.some((endpoint, index) => endpoint !== allowedList[index])) return "allowlist-not-canonical";
+  if (record.allowlistDigest !== sha256(`${record.allowedEndpoints.join("\n")}\n`)) return "allowlist-digest-mismatch";
+  if (!Number.isInteger(record.proxyPort) || record.proxyPort < 1 || record.proxyPort > 65_535) return "proxy-port-invalid";
+  if (record.phase !== "session-bootstrap" && record.phase !== "reviewer-invocation") return "phase-invalid";
+  if (!record.jsonl || credentialBearingField({ egress: record.jsonl })) return "proxy-log-unsafe";
+  const events = record.jsonl
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        return isPlainRecord(parsed) ? parsed : null;
+      } catch {
+        return null;
+      }
+    });
+  if (events.length === 0 || events.some((event) => event === null)) return "proxy-log-not-jsonl";
+  const jsonl = events as Record<string, unknown>[];
+  const sameHost = (event: Record<string, unknown>, host: string): boolean =>
+    typeof event["host"] === "string" && event["host"].toLowerCase() === host.toLowerCase();
+  const samePort = (event: Record<string, unknown>): boolean => String(event["port"]) === "443";
+  const stamped = (event: Record<string, unknown>): boolean => typeof event["t"] === "number";
+  const allowed = record.probes?.allowedEndpoint;
+  const denied = record.probes?.deniedEndpoint;
+  const direct = record.probes?.directSocket;
+  if (
+    !allowed ||
+    !denied ||
+    !Array.isArray(direct) ||
+    !isPlainRecord(allowed) ||
+    !isPlainRecord(denied) ||
+    direct.some((probe) => !isPlainRecord(probe))
+  ) return "probe-shape-missing";
+  if (allowed.connected !== true || allowed.statusCode !== 200 || !allowedList.includes(allowed.host)) return "allow-probe-missing";
+  if (
+    denied.denied !== true ||
+    denied.statusCode !== 403 ||
+    allowedList.includes(denied.host) ||
+    !REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS.includes(denied.host)
+  ) return "real-deny-probe-missing";
+  const modes = new Set(direct.map((probe) => probe.proxyMode));
+  if (
+    !modes.has("unset") ||
+    !modes.has("override") ||
+    direct.some((probe) => probe.blocked !== true || probe.connected === true)
+  ) return "direct-socket-probe-missing";
+  if (!jsonl.some((event) =>
+    event["verdict"] === "START" &&
+    stamped(event) &&
+    Number(event["port"]) === record.proxyPort &&
+    event["allowlistDigest"] === record.allowlistDigest,
+  )) return "allowlist-binding-missing";
+  if (jsonl.some((event) => {
+    if (event["verdict"] !== "ALLOW") return false;
+    const host = typeof event["host"] === "string" ? event["host"].toLowerCase() : null;
+    return host === null || !allowedList.includes(host);
+  })) return "unexpected-allow-jsonl";
+  if (!jsonl.some((event) => event["verdict"] === "ALLOW" && stamped(event) && samePort(event) && sameHost(event, allowed.host))) {
+    return "allow-jsonl-missing";
+  }
+  if (!jsonl.some((event) => event["verdict"] === "DENY" && stamped(event) && samePort(event) && sameHost(event, denied.host))) {
+    return "deny-jsonl-missing";
+  }
+  return null;
+};
 
 const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
   Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));

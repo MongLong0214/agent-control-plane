@@ -104,8 +104,10 @@ with GitHub issues; it does not certify the semantic correctness of a code chang
   control plane accept the result only at the exact candidate head from an approved
   workflow digest.
 
-`network: "allowlist"` is not a supported workaround: the manifest schema rejects it
-until a proxy or firewall backend can enforce destination policy.
+`network: "allowlist"` remains unsupported in project manifests. Packet-only blind
+reviewers are a separate daemon-owned boundary: they use an enforced provider CONNECT proxy,
+per-invocation allowlists, and measured evidence as documented in
+[reviewer egress](docs/reviewer-egress.md).
 
 ## Persistence
 

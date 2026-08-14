@@ -7,6 +7,7 @@ import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } 
 import { Daemon, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import type { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
+import { REVIEWER_PROVIDER_ENDPOINTS } from "../../src/runtime/provider.ts";
 import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
@@ -64,6 +65,17 @@ console.log('verification ok');`,
     clock,
     adapters: [scripted],
     allowNonProductionAdapters: true,
+    // Test-only adapters do no I/O, but their deterministic egress evidence still has to
+    // be checked against a policy the same way a real provider record is.
+    reviewerEgress: {
+      profilePath: join(root, "test-reviewer.sb"),
+      proxyPath: join(root, "test-allowlist-proxy.py"),
+      runtimeDir: join(root, "test-egress-runs"),
+      providerEndpoints: {
+        ...REVIEWER_PROVIDER_ENDPOINTS,
+        scripted: ["scripted.provider.test"],
+      },
+    },
     // §21 — the fixture deployment has exactly one owner identity.
     ownerIdentities: options.ownerIdentities ?? [TEST_OWNER],
     // A fixture writes evidence directly in a few places; the daemon never unlocks this.

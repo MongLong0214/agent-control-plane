@@ -1,13 +1,14 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { chmodSync, existsSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { chmodSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { allow } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { sha256 } from "../../src/core/digest.ts";
+import { artifactDigestMatches } from "../../src/db/artifacts.ts";
 import { ExecutionMode, Role, roleKeyFor } from "../../src/domain/types.ts";
-import { BlindReviewGate, __testing } from "../../src/review/blind-review.ts";
+import { BlindReviewGate, __testing, type ReviewPacket } from "../../src/review/blind-review.ts";
 import { CandidatePipeline } from "../../src/run/candidate-pipeline.ts";
 import { canonical } from "../../src/guard/workspace-probe.ts";
 import { ClaudeCliAdapter, reviewerEnvironment } from "../../src/runtime/cli-adapters.ts";
@@ -30,7 +31,7 @@ import {
   registerFixtureProject,
   reviewerPass,
 } from "../helpers/harness.ts";
-import { TestProductionAdapter } from "../helpers/production-adapter.ts";
+import { TestProductionAdapter, testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -199,11 +200,6 @@ process.exitCode = isRuntimeProbe || denied ? 0 : 1;
   return binary;
 };
 
-const seatbeltCanApply = (): boolean =>
-  process.platform === "darwin" &&
-  existsSync("/usr/bin/sandbox-exec") &&
-  spawnSync("/usr/bin/sandbox-exec", ["-p", "(version 1)\n(allow default)", "/usr/bin/true"]).status === 0;
-
 const invokeGate = (
   gate: BlindReviewGate,
   setup: Awaited<ReturnType<typeof prepareReviewedInputs>>,
@@ -234,6 +230,7 @@ class HealthyProbeClaudeAdapter extends ClaudeCliAdapter {
       error: "model did not answer",
       providerSessionId: request.externalSessionId ?? null,
       isolationAttested: request.isolation !== undefined,
+      ...(request.isolation ? { egressEvidence: testReviewerEgressEvidence(this.provider) } : {}),
     };
   }
 }
@@ -612,7 +609,7 @@ describe("round-2 blind-review regressions", () => {
     expect(setup.harness.cp.audit.byKind("BLIND_REVIEW_FALLBACK")).toHaveLength(0);
   });
 
-  it("#360 refuses a reviewer rather than attest an unbounded provider network", async () => {
+  it("#360 refuses a reviewer when daemon-owned egress is not configured", async () => {
     const setup = await prepareReviewedInputs();
     const claude = new ClaudeCliAdapter({
       clock: setup.harness.clock,
@@ -623,7 +620,6 @@ describe("round-2 blind-review regressions", () => {
         [`${setup.identity}:src/app.js`],
       ),
     });
-    const canApplySeatbelt = seatbeltCanApply();
     const direct = await claude.invoke({
       prompt: "Review this packet only.",
       workdir: setup.harness.root,
@@ -659,17 +655,14 @@ describe("round-2 blind-review regressions", () => {
 
     const result = await invokeGate(gate, setup);
 
-    // The active probe must fail closed whether seatbelt is unavailable or, as on macOS,
-    // its allow-default profile can reach a non-provider endpoint. If the adapter merely
-    // flips an attestation boolean again, both assertions turn into false passes.
+    // The reviewer must never fall back to the old allow-default-only profile. Its absence
+    // is an isolation loss rather than permission to run a broad-network reviewer.
     expect(direct).toMatchObject({
       ok: false,
       isolationAttested: false,
       isolationReasonCode: ReasonCode.ISOLATION_LOST,
     });
-    if (canApplySeatbelt) {
-      expect(direct.error).toContain("provider-only network probe reached a non-provider endpoint");
-    }
+    expect(direct.error).toContain("REVIEWER_EGRESS_CONFIG_MISSING");
     expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.ISOLATION_LOST });
   });
 
@@ -857,6 +850,185 @@ describe("round-2 blind-review regressions", () => {
       tools: "none",
     }));
     expect(invocation.isolation?.denyReadPaths).toContain(canonical(setup.harness.repoPath));
+  });
+
+  it("#419 rejects an attestation that is missing this invocation's proxy JSONL evidence", async () => {
+    const setup = await prepareReviewedInputs();
+    const originalInvoke = setup.harness.scripted.invoke.bind(setup.harness.scripted);
+    setup.harness.scripted.invoke = async (request) => {
+      const result = await originalInvoke(request);
+      if (!request.isolation) return result;
+      const { egressEvidence: _discarded, ...withoutEgress } = result;
+      return { ...withoutEgress, isolationAttested: true };
+    };
+
+    const result = await directReview(setup);
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
+    // Removing the gate's non-empty egress-evidence check makes this a false PASS.
+  });
+
+  it("#419 treats a durable unexpected proxy ALLOW as ISOLATION_LOST", async () => {
+    const setup = await prepareReviewedInputs();
+    const originalInvoke = setup.harness.scripted.invoke.bind(setup.harness.scripted);
+    setup.harness.scripted.invoke = async (request) => {
+      const result = await originalInvoke(request);
+      if (!request.isolation || !result.egressEvidence) return result;
+      return {
+        ...result,
+        egressEvidence: result.egressEvidence.map((record) => ({
+          ...record,
+          jsonl: `${record.jsonl}${JSON.stringify({ t: 4, verdict: "ALLOW", host: "evil.example", port: 443 })}\n`,
+        })),
+      };
+    };
+
+    const result = await directReview(setup);
+
+    expect(result).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.ISOLATION_LOST,
+      evidence: { problem: "unexpected-allow-jsonl" },
+    });
+    // Deleting reviewerEgressRecordProblem's all-ALLOW allowlist check turns this into a
+    // false PASS, so the exact problem assertion guards the independent artifact reader.
+  });
+
+  it("#419 refuses an adapter-selected allowlist that differs from daemon policy", async () => {
+    const setup = await prepareReviewedInputs();
+    const originalInvoke = setup.harness.scripted.invoke.bind(setup.harness.scripted);
+    setup.harness.scripted.invoke = async (request) => {
+      const result = await originalInvoke(request);
+      if (!request.isolation) return result;
+      const allowedHost = "evil.example";
+      const allowlistDigest = sha256(`${allowedHost}\n`);
+      return {
+        ...result,
+        egressEvidence: [{
+          provider: "scripted",
+          allowedEndpoints: [allowedHost],
+          allowlistDigest,
+          proxyPort: 18_443,
+          phase: "reviewer-invocation",
+          jsonl: [
+            JSON.stringify({ t: 1, verdict: "START", port: 18_443, pid: 1, allowlistDigest }),
+            JSON.stringify({ t: 2, verdict: "ALLOW", host: allowedHost, port: 443 }),
+            JSON.stringify({ t: 3, verdict: "DENY", host: "api.openai.com", port: 443 }),
+          ].join("\n") + "\n",
+          probes: {
+            allowedEndpoint: { host: allowedHost, connected: true, statusCode: 200 },
+            deniedEndpoint: { host: "api.openai.com", denied: true, statusCode: 403 },
+            directSocket: [
+              { host: allowedHost, proxyMode: "unset", connected: false, blocked: true, errorCode: "EPERM" },
+              { host: allowedHost, proxyMode: "override", connected: false, blocked: true, errorCode: "EPERM" },
+            ],
+          },
+        }],
+      };
+    };
+
+    const result = await directReview(setup);
+
+    expect(result).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.ISOLATION_LOST,
+      evidence: { problem: "allowlist-policy-mismatch" },
+    });
+    // Removing the exact daemon-policy comparison makes this internally consistent forged
+    // JSONL pass, which is the gate-shape failure the attestation must prevent.
+  });
+
+  it("#419 rejects a durable record whose proxy START digest is not the generated allowlist", async () => {
+    const setup = await prepareReviewedInputs();
+    const originalInvoke = setup.harness.scripted.invoke.bind(setup.harness.scripted);
+    setup.harness.scripted.invoke = async (request) => {
+      const result = await originalInvoke(request);
+      if (!request.isolation || !result.egressEvidence) return result;
+      return {
+        ...result,
+        egressEvidence: result.egressEvidence.map((record) => ({
+          ...record,
+          jsonl: record.jsonl.replace(record.allowlistDigest, `sha256:${"0".repeat(64)}`),
+        })),
+      };
+    };
+
+    const result = await directReview(setup);
+
+    expect(result).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.ISOLATION_LOST,
+      evidence: { problem: "allowlist-binding-missing" },
+    });
+    // Deleting the START-digest comparison leaves all other probe lines consistent and
+    // makes this forged binding pass through the independent reader.
+  });
+
+  it("#419 rejects .invalid as durable deny evidence", async () => {
+    const setup = await prepareReviewedInputs();
+    const originalInvoke = setup.harness.scripted.invoke.bind(setup.harness.scripted);
+    setup.harness.scripted.invoke = async (request) => {
+      const result = await originalInvoke(request);
+      if (!request.isolation || !result.egressEvidence) return result;
+      return {
+        ...result,
+        egressEvidence: result.egressEvidence.map((record) => ({
+          ...record,
+          jsonl: record.jsonl.replace("api.openai.com", "acp-deny.invalid"),
+          probes: {
+            ...record.probes,
+            deniedEndpoint: { host: "acp-deny.invalid", denied: true, statusCode: 403 },
+          },
+        })),
+      };
+    };
+
+    const result = await directReview(setup);
+
+    expect(result).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.ISOLATION_LOST,
+      evidence: { problem: "real-deny-probe-missing" },
+    });
+    // Deleting the controlled-real-host check lets a resolver-only .invalid denial stand
+    // in for provider-only reachability evidence.
+  });
+
+  it("#419 stores verbatim egress JSONL inside the snapshot-bound BLIND_REVIEW digest", async () => {
+    const setup = await prepareReviewedInputs();
+    const result = await directReview(setup);
+    expect(result.allowed).toBe(true);
+    const artifact = setup.harness.cp.artifacts.latest<ReviewPacket>(setup.run.runId, "BLIND_REVIEW");
+    if (!artifact) throw new Error("blind-review evidence was not stored");
+
+    expect(artifact.content.egressEvidence).toHaveLength(1);
+    expect(artifact.content.egressEvidence[0]?.jsonl).toContain('"verdict":"ALLOW"');
+    expect(artifact.content.egressEvidence[0]?.jsonl).toContain('"verdict":"DENY"');
+    expect(artifactDigestMatches(artifact)).toBe(true);
+    const record = artifact.content.egressEvidence[0];
+    if (!record) throw new Error("blind-review egress record was not stored");
+    const { allowlistDigest: _discardedDigest, ...unboundRecord } = record;
+    expect(() => setup.harness.cp.artifacts.putEvidence(
+      setup.harness.cp.evidenceWritersForTests().BLIND_REVIEW,
+      setup.run.runId,
+      "BLIND_REVIEW",
+      { ...artifact.content, egressEvidence: [unboundRecord] },
+      artifact.candidateSnapshotDigest!,
+    )).toThrow("BLIND_REVIEW has an invalid evidence envelope");
+    const tampered = {
+      ...artifact,
+      content: {
+        ...artifact.content,
+        egressEvidence: artifact.content.egressEvidence.map((record, index) => index === 0
+          ? { ...record, jsonl: `${record.jsonl}{"t":4,"verdict":"ALLOW","host":"tampered.test","port":443}\n` }
+          : record),
+      },
+    };
+    expect(artifactDigestMatches(tampered)).toBe(false);
+    // Removing the artifact schema's required allowlist digest makes the unbound-record
+    // refusal pass; weakening the snapshot-bound digest makes the JSONL mutation assertion
+    // flip.
   });
 
   it("#360 rejects an adapter that contradicts its isolation attestation", async () => {

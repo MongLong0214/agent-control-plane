@@ -46,6 +46,12 @@ The default local state root is `~/.agent-control-plane`, including the SQLite s
 worktrees, capacity records, and secrets directory. Treat it as sensitive local state; do
 not place it in a project checkout or commit it.
 
+Packet-only blind review additionally needs the owner-provided Seatbelt profile and CONNECT
+proxy under `~/.agent-control-plane/egress/`. The daemon generates a separate allowlist and
+JSONL log for each reviewer invocation; it refuses blind review if that infrastructure cannot
+be measured. See [reviewer egress](reviewer-egress.md) for the required files, endpoint
+ownership, lifetime, and evidence record.
+
 The intended authority model is that `agentcpd` is the only authoritative writer. The
 current direct `agentctl` composition root is still tracked as an authority-boundary P0, so
 do not use CLI mutation commands as a production substitute for daemon RPC. Read

@@ -1,8 +1,10 @@
 # Security posture and reporting
 
 Agent Control Plane is not production-ready. Do not rely on this repository as a complete
-security boundary for untrusted repositories, unattended deployment, or provider-only
-reviewer egress. Current security-relevant blockers and residuals are visible in the
+security boundary for untrusted repositories or unattended deployment. Packet-only blind
+reviewer egress has a measured, fail-closed provider-proxy boundary; its scope and remaining
+deployment evidence requirement are documented in [reviewer egress](reviewer-egress.md).
+Current security-relevant blockers and residuals are visible in the
 [open P0 tracker](https://github.com/MongLong0214/agent-control-plane/issues?q=is%3Aissue%20state%3Aopen%20label%3AP0)
 and [status page](STATUS.md).
 

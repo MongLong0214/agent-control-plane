@@ -11,7 +11,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -32,10 +31,20 @@ import {
   type InvocationResult,
   type ProviderAdapter,
   ProviderSessionProvisionError,
+  REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS,
+  type ReviewerEgressConfig,
+  type ReviewerEgressProbe,
+  type ReviewerEgressRecord,
   type SessionHandle,
   type SessionSpec,
   extractJson,
 } from "./provider.ts";
+import {
+  acquireReviewerEgress,
+  ReviewerEgressError,
+  type EgressProbes,
+  type ReviewerEgressLease,
+} from "./reviewer-egress.ts";
 
 export interface CliAdapterOptions {
   clock: Clock;
@@ -68,6 +77,12 @@ export interface CliAdapterOptions {
   usageCollector?: UsageCollector;
   /** Observations beyond this lead are not valid freshness evidence. */
   maxClockSkewMs?: number;
+  /**
+   * Daemon-owned provider-only reviewer egress. The adapter never reads an owner's
+   * allowlist directly: this configuration only points at the profile/proxy and the
+   * runtime generates a fresh provider-specific allowlist for each invocation.
+   */
+  reviewerEgress?: ReviewerEgressConfig;
 }
 
 const DEFAULT_FRESHNESS_MS = 15 * 60 * 1000;
@@ -236,6 +251,54 @@ const sanctionedSettingsFile = (scratch: string): string => {
   return file;
 };
 
+/**
+ * macOS rejects nested `sandbox-exec` applications, so the owner egress profile and the
+ * generated packet profile are composed into one per-invocation file. The resulting child
+ * still has the required `sandbox-exec -f … env HTTPS_PROXY=…` shape; its rules are the
+ * union of the independently checked owner boundary and the packet-only denials.
+ */
+const reviewerSandboxArgs = (
+  profile: string,
+  file: string,
+  args: readonly string[],
+  egress?: ReviewerEgressLease,
+  composedProfilePath?: string,
+): string[] => {
+  if (!egress) return ["-p", profile, file, ...args];
+  if (!composedProfilePath) {
+    throw new Error("reviewer egress invocation is missing its composed Seatbelt profile");
+  }
+  return [
+      "-f",
+      composedProfilePath,
+      "/usr/bin/env",
+      `HTTPS_PROXY=${egress.proxyUrl}`,
+      file,
+      ...args,
+    ];
+};
+
+/**
+ * Seatbelt profiles are conjunctions, but `sandbox-exec` cannot apply one profile from
+ * inside another on current macOS. Keep the owner profile's bytes intact and append only
+ * the generated profile's rules after stripping its duplicate header/default declaration.
+ */
+const composeReviewerProfile = (ownerProfileText: string, packetProfile: string): string => {
+  const ownerProfile = ownerProfileText.trimEnd();
+  const packetRules = packetProfile
+    .split("\n")
+    .filter((line) => !/^\s*\(version\s+1\)\s*$/.test(line) && !/^\s*\(allow\s+default\)\s*$/.test(line));
+  return `${ownerProfile}\n${packetRules.join("\n")}\n`;
+};
+
+const killChildTree = (child: ReturnType<typeof spawn>): void => {
+  try {
+    process.kill(-(child.pid ?? 0), "SIGKILL");
+  } catch {
+    child.kill("SIGKILL");
+  }
+};
+
 const productionRunCli = async (
   file: string,
   args: readonly string[],
@@ -257,6 +320,12 @@ const productionRunCli = async (
     reviewerEnvironment?: NodeJS.ProcessEnv;
     /** Extra provider runtime executables required by a reviewed invocation. */
     reviewerExecutablePaths?: readonly string[];
+    /** Daemon-owned egress infrastructure for this packet-only reviewer process. */
+    reviewerEgress?: ReviewerEgressConfig;
+    /** Provider whose compiled endpoint set generates the proxy allowlist. */
+    reviewerProvider?: string;
+    /** Handshake and verdict processes produce separately labelled JSONL records. */
+    reviewerEgressPhase?: ReviewerEgressRecord["phase"];
   },
 ): Promise<{
   stdout: string;
@@ -264,6 +333,7 @@ const productionRunCli = async (
   exitCode: number | null;
   timedOut: boolean;
   isolationEnforced: boolean;
+  egressEvidence?: ReviewerEgressRecord[];
 }> => {
   const scratch = mkdtempSync(join(tmpdir(), "acp-runtime-"));
   if (!existsSync("/usr/bin/sandbox-exec")) {
@@ -276,130 +346,217 @@ const productionRunCli = async (
       isolationEnforced: false,
     };
   }
-  let workdir: string;
+  let egress: ReviewerEgressLease | null = null;
+  const abandonEgress = async (): Promise<void> => {
+    const active = egress;
+    egress = null;
+    if (active) await active.abandon();
+  };
   try {
-    workdir = realpathSync(options.cwd);
+    const workdir = realpathSync(options.cwd);
     if (options.isolation) {
       assertReviewerIsolation(workdir, options.isolation, options.reviewerCredentialPaths ?? []);
     }
-  } catch (err) {
+    const isolated = options.isolation !== undefined;
+    if (isolated) {
+      if (!options.reviewerProvider) {
+        throw new ReviewerEgressError(
+          "REVIEWER_EGRESS_CONFIG_MISSING",
+          "packet-only reviewer invocation did not name its provider for egress policy generation",
+        );
+      }
+      egress = await acquireReviewerEgress(options.reviewerEgress, options.reviewerProvider);
+    }
+
+    const environment: NodeJS.ProcessEnv = isolated
+      ? { ...(options.reviewerEnvironment ?? reviewerEnvironment(workdir, options.reviewerConfigDirectory)) }
+      : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch), options.providerCredentialDir);
+    if (egress) {
+      // The child receives only the loopback proxy route. Do not let a caller-supplied
+      // environment retain an alternate proxy, no-proxy escape hatch, or credentials.
+      delete environment.HTTP_PROXY;
+      delete environment.http_proxy;
+      delete environment.HTTPS_PROXY;
+      delete environment.https_proxy;
+      delete environment.ALL_PROXY;
+      delete environment.all_proxy;
+      delete environment.NO_PROXY;
+      delete environment.no_proxy;
+      environment.HTTPS_PROXY = egress.proxyUrl;
+    }
+    const profile = isolated
+      ? reviewerProfile(
+          workdir,
+          options.isolation!.denyReadPaths,
+          file,
+          options.reviewerCredentialPaths ?? [],
+          options.reviewerExecutablePaths ?? [],
+          egress?.port,
+        )
+      : runtimeProfile(
+          workdir,
+          realpathSync(scratch),
+          options.denyReadPaths ?? [],
+          options.writablePaths ?? [],
+          options.providerCredentialDir,
+        );
+    const composedProfilePath = isolated && egress
+      ? join(scratch, "reviewer-composed.sb")
+      : undefined;
+    if (composedProfilePath && egress) {
+      writeFileSync(composedProfilePath, composeReviewerProfile(egress.profileText, profile), { mode: 0o600 });
+    }
+
+    // sandbox-exec accepting a profile only says its syntax parsed. A reviewer may attest
+    // isolation only after live probes prove the requested transcript, no-tools and the
+    // three egress facts on this invocation. In particular, a cached proxy health check or
+    // an allow-default profile is not evidence that the boundary actually bit.
+    let egressProbes: EgressProbes | null = null;
+    if (isolated) {
+      const isolation = await proveReviewerIsolation(
+        profile,
+        workdir,
+        environment,
+        options.isolation!,
+        args,
+        options.timeoutMs,
+        egress!,
+        composedProfilePath,
+      );
+      if (!isolation.enforced) {
+        await abandonEgress();
+        rmSync(scratch, { recursive: true, force: true });
+        return {
+          stdout: "",
+          stderr: isolation.reason,
+          exitCode: null,
+          timedOut: false,
+          isolationEnforced: false,
+        };
+      }
+      if (!isolation.egressProbes) {
+        await abandonEgress();
+        rmSync(scratch, { recursive: true, force: true });
+        return {
+          stdout: "",
+          stderr: "REVIEWER_EGRESS_LOG_INVALID: provider-only probes did not return evidence",
+          exitCode: null,
+          timedOut: false,
+          isolationEnforced: false,
+        };
+      }
+      egressProbes = isolation.egressProbes;
+    }
+
+    const execution = await new Promise<{
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+      timedOut: boolean;
+      egressLost: boolean;
+    }>((resolve) => {
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn("/usr/bin/sandbox-exec", reviewerSandboxArgs(
+          profile,
+          file,
+          args,
+          egress ?? undefined,
+          composedProfilePath,
+        ), {
+          cwd: workdir,
+          env: environment,
+          detached: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (error) {
+        resolve({ stdout: "", stderr: error instanceof Error ? error.message : String(error), exitCode: null, timedOut: false, egressLost: false });
+        return;
+      }
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      let egressLost = false;
+      let settled = false;
+      const stopWatchingEgress = egress?.onDeath(() => {
+        egressLost = true;
+        killChildTree(child);
+      });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        killChildTree(child);
+      }, options.timeoutMs);
+      const finish = (exitCode: number | null): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        stopWatchingEgress?.();
+        resolve({ stdout, stderr, exitCode, timedOut, egressLost });
+      };
+      child.stdout?.on("data", (buffer: Buffer) => (stdout += buffer.toString("utf8")));
+      child.stderr?.on("data", (buffer: Buffer) => (stderr += buffer.toString("utf8")));
+      if (options.stdin !== undefined) child.stdin?.write(options.stdin);
+      child.stdin?.end();
+      child.on("error", (error) => {
+        stderr += error.message;
+        finish(null);
+      });
+      child.on("close", (code) => finish(code));
+    });
+
+    if (!isolated) {
+      rmSync(scratch, { recursive: true, force: true });
+      return { ...execution, isolationEnforced: false };
+    }
+    if (execution.egressLost || !egressProbes) {
+      await abandonEgress();
+      rmSync(scratch, { recursive: true, force: true });
+      return {
+        ...execution,
+        stderr: execution.egressLost
+          ? "REVIEWER_EGRESS_PROXY_DIED: reviewer process was stopped when its egress proxy died"
+          : "REVIEWER_EGRESS_LOG_INVALID: reviewer egress probes were not retained",
+        isolationEnforced: false,
+      };
+    }
+
+    const activeEgress = egress;
+    egress = null;
+    if (!activeEgress) {
+      rmSync(scratch, { recursive: true, force: true });
+      return {
+        ...execution,
+        stderr: "REVIEWER_EGRESS_LOG_INVALID: reviewer egress lease disappeared before evidence capture",
+        isolationEnforced: false,
+      };
+    }
+    try {
+      const evidence = await activeEgress.finalise(options.reviewerEgressPhase ?? "reviewer-invocation", egressProbes);
+      rmSync(scratch, { recursive: true, force: true });
+      return {
+        ...execution,
+        isolationEnforced: true,
+        egressEvidence: [evidence],
+      };
+    } catch (error) {
+      rmSync(scratch, { recursive: true, force: true });
+      return {
+        ...execution,
+        stderr: error instanceof Error ? error.message : String(error),
+        isolationEnforced: false,
+      };
+    }
+  } catch (error) {
+    await abandonEgress();
     rmSync(scratch, { recursive: true, force: true });
     return {
       stdout: "",
-      stderr: (err as Error).message,
+      stderr: error instanceof Error ? error.message : String(error),
       exitCode: null,
       timedOut: false,
       isolationEnforced: false,
     };
   }
-  const isolated = options.isolation !== undefined;
-  const environment = isolated
-    ? (options.reviewerEnvironment ?? reviewerEnvironment(workdir, options.reviewerConfigDirectory))
-    : runtimeEnvironment(options.environmentAllowlist ?? [], realpathSync(scratch), options.providerCredentialDir);
-  const profile = isolated
-    ? reviewerProfile(
-        workdir,
-        options.isolation!.denyReadPaths,
-        file,
-        options.reviewerCredentialPaths ?? [],
-        options.reviewerExecutablePaths ?? [],
-      )
-    : runtimeProfile(
-        workdir,
-        realpathSync(scratch),
-        options.denyReadPaths ?? [],
-        options.writablePaths ?? [],
-        options.providerCredentialDir,
-      );
-
-  // sandbox-exec accepting a profile only says its syntax parsed. A reviewer may attest
-  // isolation only after live probes prove the requested transcript, no-tools and network
-  // boundaries. In particular, an allow-default profile paired with `/usr/bin/true` is not
-  // evidence that a denied path or egress rule actually bites.
-  let isolationEnforced = false;
-  if (isolated) {
-    const isolation = await proveReviewerIsolation(
-      profile,
-      workdir,
-      environment,
-      options.isolation!,
-      args,
-      options.timeoutMs,
-    );
-    if (!isolation.enforced) {
-      rmSync(scratch, { recursive: true, force: true });
-      return {
-        stdout: "",
-        stderr: isolation.reason,
-        exitCode: null,
-        timedOut: false,
-        isolationEnforced: false,
-      };
-    }
-    isolationEnforced = true;
-  }
-
-  return new Promise((resolve) => {
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn("/usr/bin/sandbox-exec", [
-        "-p",
-        profile,
-        file,
-        ...args,
-      ], {
-        cwd: workdir,
-        env: environment,
-        detached: true,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err) {
-      rmSync(scratch, { recursive: true, force: true });
-      resolve({
-        stdout: "",
-        stderr: (err as Error).message,
-        exitCode: null,
-        timedOut: false,
-        isolationEnforced: false,
-      });
-      return;
-    }
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    child.stdout?.on("data", (b: Buffer) => (stdout += b.toString("utf8")));
-    child.stderr?.on("data", (b: Buffer) => (stderr += b.toString("utf8")));
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        process.kill(-(child.pid ?? 0), "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
-    }, options.timeoutMs);
-    if (options.stdin !== undefined) {
-      child.stdin?.write(options.stdin);
-      child.stdin?.end();
-    } else {
-      child.stdin?.end();
-    }
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      rmSync(scratch, { recursive: true, force: true });
-      resolve({ stdout, stderr: stderr + err.message, exitCode: null, timedOut, isolationEnforced: false });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      rmSync(scratch, { recursive: true, force: true });
-      resolve({
-        stdout,
-        stderr,
-        exitCode: code,
-        timedOut,
-        isolationEnforced,
-      });
-    });
-  });
 };
 
 // The production path always uses productionRunCli. This narrow test-only seam lets the
@@ -422,11 +579,13 @@ const runProfileCommand = async (
   file: string,
   args: readonly string[],
   timeoutMs: number,
+  egress?: ReviewerEgressLease,
+  composedProfilePath?: string,
 ): Promise<ProfileCommandResult> =>
   new Promise((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("/usr/bin/sandbox-exec", ["-p", profile, file, ...args], {
+      child = spawn("/usr/bin/sandbox-exec", reviewerSandboxArgs(profile, file, args, egress, composedProfilePath), {
         cwd,
         env: environment,
         detached: true,
@@ -468,11 +627,22 @@ const profileAccepted = async (
   cwd: string,
   environment: NodeJS.ProcessEnv,
   timeoutMs: number,
+  egress?: ReviewerEgressLease,
+  composedProfilePath?: string,
 ): Promise<{ accepted: boolean; stderr: string; exitCode: number | null; timedOut: boolean }> => {
   // Reviewer profiles deny arbitrary process execution. `process.execPath` is the one
   // runtime executable they explicitly permit, so it is the meaningful syntax/liveness
   // probe rather than `/usr/bin/true`, which the no-tools profile should refuse.
-  const result = await runProfileCommand(profile, cwd, environment, process.execPath, ["-e", "process.exit(0)"], timeoutMs);
+  const result = await runProfileCommand(
+    profile,
+    cwd,
+    environment,
+    process.execPath,
+    ["-e", "process.exit(0)"],
+    timeoutMs,
+    egress,
+    composedProfilePath,
+  );
   return {
     accepted: result.exitCode === 0 && !result.timedOut,
     stderr: result.stderr,
@@ -481,7 +651,9 @@ const profileAccepted = async (
   };
 };
 
-type IsolationProbe = { enforced: true } | { enforced: false; reason: string };
+type IsolationProbe =
+  | { enforced: true; egressProbes?: EgressProbes }
+  | { enforced: false; reason: string };
 
 const reviewerToolContractPresent = (args: readonly string[]): boolean => {
   const mode = args.indexOf("--permission-mode");
@@ -521,6 +693,8 @@ const probeDeniedTranscriptPaths = async (
   packetRoot: string,
   denyReadPaths: readonly string[],
   timeoutMs: number,
+  egress?: ReviewerEgressLease,
+  composedProfilePath?: string,
 ): Promise<IsolationProbe> => {
   const paths = [...new Set([...denyReadPaths, ...reviewerTranscriptRoots()].map(resolvePath))]
     .filter((path) => path && path !== packetRoot && !path.startsWith(`${packetRoot}/`));
@@ -555,6 +729,8 @@ const probeDeniedTranscriptPaths = async (
       process.execPath,
       ["-e", source, target.path, target.kind],
       timeoutMs,
+      egress,
+      composedProfilePath,
     );
     const observation = parseProbe(result.stdout);
     if (result.exitCode !== 0 || result.timedOut || observation?.["denied"] !== true) {
@@ -575,11 +751,22 @@ const probeNoTools = async (
   environment: NodeJS.ProcessEnv,
   packetRoot: string,
   timeoutMs: number,
+  egress?: ReviewerEgressLease,
+  composedProfilePath?: string,
 ): Promise<IsolationProbe> => {
   // A model-facing denylist alone cannot stop a malicious Bash tool. The actual profile
   // denies all process execution except the provider and Node runtimes, so prove a shell
   // cannot start under this very profile.
-  const shell = await runProfileCommand(profile, cwd, environment, "/bin/sh", ["-c", "exit 0"], timeoutMs);
+  const shell = await runProfileCommand(
+    profile,
+    cwd,
+    environment,
+    "/bin/sh",
+    ["-c", "exit 0"],
+    timeoutMs,
+    egress,
+    composedProfilePath,
+  );
   if (shell.exitCode === 0 || shell.timedOut) {
     return { enforced: false, reason: "reviewer no-tools probe could execute a shell" };
   }
@@ -601,6 +788,8 @@ const probeNoTools = async (
     process.execPath,
     ["-e", source, writeTarget],
     timeoutMs,
+    egress,
+    composedProfilePath,
   );
   const observation = parseProbe(write.stdout);
   const escapedWrite = existsSync(writeTarget);
@@ -614,67 +803,132 @@ const probeNoTools = async (
 };
 
 /**
- * Seatbelt has no safe provider-host allowlist here: `(deny network*)` blocks the model
- * call entirely, while allow-default permits arbitrary egress. Rather than turn either
- * fact into an attestation, actively demonstrate that a non-provider loopback endpoint is
- * reachable and fail closed. A future egress proxy may replace this probe with positive
- * provider-route evidence; until then no reviewer process is launched under this contract.
+ * Proves the provider-only network boundary under the exact composed profile that will run
+ * the reviewer. The proxy returns 200 only after it has opened the allowlisted remote host;
+ * it must return 403 for a real public host outside the generated provider allowlist. Direct Node sockets
+ * explicitly remove/override HTTPS_PROXY and must still receive the seatbelt errno.
  */
 const probeProviderOnlyNetwork = async (
   profile: string,
   cwd: string,
   environment: NodeJS.ProcessEnv,
   timeoutMs: number,
-): Promise<IsolationProbe> =>
-  new Promise((resolve) => {
-    const server = createServer((socket) => socket.end());
-    let finished = false;
-    const finish = (result: IsolationProbe): void => {
-      if (finished) return;
-      finished = true;
-      server.close(() => resolve(result));
+  egress: ReviewerEgressLease,
+  composedProfilePath: string | undefined,
+): Promise<IsolationProbe> => {
+  const proxySource = [
+    "const net = require('node:net');",
+    "const [proxyHost, proxyPort, target] = process.argv.slice(1);",
+    "let done = false;",
+    "const finish = (value) => { if (done) return; done = true; process.stdout.write(JSON.stringify(value)); process.exit(0); };",
+    "const socket = net.connect({ host: proxyHost, port: Number(proxyPort) });",
+    "socket.setTimeout(3000, () => { socket.destroy(); finish({ connected: false, timeout: true }); });",
+    "socket.once('connect', () => socket.write(`CONNECT ${target}:443 HTTP/1.1\\r\\nHost: ${target}:443\\r\\n\\r\\n`));",
+    "let response = '';",
+    "socket.on('data', (chunk) => {",
+    "  response += chunk.toString('latin1');",
+    "  if (!response.includes('\\r\\n\\r\\n')) return;",
+    "  const statusCode = Number(/^HTTP\\/1\\.[01]\\s+(\\d{3})/.exec(response)?.[1] || 0);",
+    "  socket.destroy(); finish({ connected: statusCode === 200, statusCode });",
+    "});",
+    "socket.once('error', (error) => finish({ connected: false, errorCode: error && error.code }));",
+  ].join("\n");
+  const directSource = [
+    "const net = require('node:net');",
+    "const [proxyMode, target] = process.argv.slice(1);",
+    "if (proxyMode === 'unset') delete process.env.HTTPS_PROXY;",
+    "else process.env.HTTPS_PROXY = 'http://127.0.0.1:1';",
+    "let done = false;",
+    "const finish = (value) => { if (done) return; done = true; process.stdout.write(JSON.stringify(value)); process.exit(0); };",
+    "const socket = net.connect({ host: target, port: 443 });",
+    "socket.setTimeout(3000, () => { socket.destroy(); finish({ connected: false, timeout: true }); });",
+    "socket.once('connect', () => { socket.destroy(); finish({ connected: true }); });",
+    "socket.once('error', (error) => finish({ connected: false, errorCode: error && error.code }));",
+  ].join("\n");
+  const proxyProbe = async (target: string): Promise<ReviewerEgressProbe | null> => {
+    const result = await runProfileCommand(
+      profile,
+      cwd,
+      environment,
+      process.execPath,
+      ["-e", proxySource, "127.0.0.1", String(egress.port), target],
+      timeoutMs,
+      egress,
+      composedProfilePath,
+    );
+    const observation = parseProbe(result.stdout);
+    if (!observation || result.exitCode !== 0 || result.timedOut) return null;
+    return {
+      host: target,
+      connected: observation["connected"] === true,
+      statusCode: typeof observation["statusCode"] === "number" ? observation["statusCode"] : null,
+      errorCode: typeof observation["errorCode"] === "string" ? observation["errorCode"] : null,
     };
-    server.once("error", (error) => finish({
+  };
+  const directProbe = async (proxyMode: "unset" | "override", target: string): Promise<ReviewerEgressProbe | null> => {
+    const result = await runProfileCommand(
+      profile,
+      cwd,
+      environment,
+      process.execPath,
+      ["-e", directSource, proxyMode, target],
+      timeoutMs,
+      egress,
+      composedProfilePath,
+    );
+    const observation = parseProbe(result.stdout);
+    if (!observation || result.exitCode !== 0 || result.timedOut) return null;
+    const errorCode = typeof observation["errorCode"] === "string" ? observation["errorCode"] : null;
+    return {
+      host: target,
+      proxyMode,
+      connected: observation["connected"] === true,
+      blocked: observation["connected"] !== true && (errorCode === "EPERM" || errorCode === "EACCES"),
+      errorCode,
+    };
+  };
+
+  const providerHost = egress.allowedEndpoints[0];
+  if (!providerHost) return { enforced: false, reason: "reviewer egress has no provider endpoint to probe" };
+  const allowedEndpoint = await proxyProbe(providerHost);
+  if (!allowedEndpoint || allowedEndpoint.connected !== true || allowedEndpoint.statusCode !== 200) {
+    return { enforced: false, reason: `allowlisted provider endpoint probe did not reach ${providerHost}` };
+  }
+  // A syntactically impossible `.invalid` name only proves that DNS or a proxy rejected
+  // nonsense. Pick a real external endpoint instead, so an open proxy cannot satisfy this
+  // attestation merely by special-casing `.invalid`.
+  const generatedAllowlist = new Set(egress.allowedEndpoints.map((host) => host.toLowerCase()));
+  const nonAllowlistedHost = REVIEWER_EGRESS_DENY_PROBE_ENDPOINTS.find(
+    (host) => !generatedAllowlist.has(host),
+  );
+  if (!nonAllowlistedHost) {
+    return { enforced: false, reason: "reviewer egress has no real non-allowlisted endpoint to probe" };
+  }
+  const deniedEndpoint = await proxyProbe(nonAllowlistedHost);
+  if (!deniedEndpoint || deniedEndpoint.statusCode !== 403) {
+    return { enforced: false, reason: `non-allowlisted endpoint probe was not refused for ${nonAllowlistedHost}` };
+  }
+  deniedEndpoint.denied = true;
+
+  const directSocket = await Promise.all([
+    directProbe("unset", providerHost),
+    directProbe("override", providerHost),
+  ]);
+  if (directSocket.some((probe) => !probe || probe.blocked !== true || probe.connected === true)) {
+    return {
       enforced: false,
-      reason: `could not start provider-only network probe: ${error.message}`,
-    }));
-    server.listen(0, "127.0.0.1", async () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        finish({ enforced: false, reason: "provider-only network probe has no TCP address" });
-        return;
-      }
-      const source = [
-        "const net = require('node:net');",
-        "const socket = net.connect({ host: '127.0.0.1', port: Number(process.argv[1]) });",
-        "let done = false;",
-        "const finish = (value) => { if (done) return; done = true; process.stdout.write(JSON.stringify(value)); process.exit(0); };",
-        "socket.once('connect', () => finish({ connected: true }));",
-        "socket.once('error', (error) => finish({ connected: false, code: error && error.code }));",
-        "setTimeout(() => finish({ connected: false, timeout: true }), 1000);",
-      ].join("\n");
-      const result = await runProfileCommand(
-        profile,
-        cwd,
-        environment,
-        process.execPath,
-        ["-e", source, String(address.port)],
-        timeoutMs,
-      );
-      const observation = parseProbe(result.stdout);
-      if (observation?.["connected"] === true) {
-        finish({
-          enforced: false,
-          reason: "provider-only network probe reached a non-provider endpoint; refusing false isolation attestation",
-        });
-        return;
-      }
-      finish({
-        enforced: false,
-        reason: "provider-only network cannot be proven by the available seatbelt mechanism",
-      });
-    });
-  });
+      reason: "direct-socket probe remained reachable after unsetting or overriding HTTPS_PROXY",
+    };
+  }
+  return {
+    enforced: true,
+    egressProbes: {
+      allowedEndpoint,
+      deniedEndpoint,
+      directSocket: directSocket as ReviewerEgressProbe[],
+    },
+  };
+};
 
 const proveReviewerIsolation = async (
   profile: string,
@@ -683,11 +937,13 @@ const proveReviewerIsolation = async (
   isolation: NonNullable<InvocationRequest["isolation"]>,
   args: readonly string[],
   timeoutMs: number,
+  egress: ReviewerEgressLease,
+  composedProfilePath: string | undefined,
 ): Promise<IsolationProbe> => {
   if (!reviewerToolContractPresent(args)) {
     return { enforced: false, reason: "reviewer no-tools CLI contract is incomplete" };
   }
-  const profileCheck = await profileAccepted(profile, cwd, environment, timeoutMs);
+  const profileCheck = await profileAccepted(profile, cwd, environment, timeoutMs, egress, composedProfilePath);
   if (!profileCheck.accepted) {
     return {
       enforced: false,
@@ -701,11 +957,13 @@ const proveReviewerIsolation = async (
     cwd,
     isolation.denyReadPaths,
     timeoutMs,
+    egress,
+    composedProfilePath,
   );
   if (!transcripts.enforced) return transcripts;
-  const tools = await probeNoTools(profile, cwd, environment, cwd, timeoutMs);
+  const tools = await probeNoTools(profile, cwd, environment, cwd, timeoutMs, egress, composedProfilePath);
   if (!tools.enforced) return tools;
-  return probeProviderOnlyNetwork(profile, cwd, environment, timeoutMs);
+  return probeProviderOnlyNetwork(profile, cwd, environment, timeoutMs, egress, composedProfilePath);
 };
 
 const assertReviewerIsolation = (
@@ -923,9 +1181,10 @@ const runtimeProfile = (
  * attestation. The profile also permits only the provider executable and Node runtime to
  * exec; a shell probe confirms that a model cannot turn `Bash` into host process access.
  *
- * There is intentionally no broad `(deny network*)`: it blocks the provider call itself.
- * `proveReviewerIsolation` tests the resulting profile against a live non-provider endpoint
- * and fails closed rather than claiming the requested provider-only policy held.
+ * When a daemon-owned egress lease is present, this packet profile repeats the owner's
+ * remote-TCP/UDP denies and loopback exception. It is composed with independently
+ * validated owner-profile bytes before launch, so either missing rule fails the live
+ * probes instead of expanding a reviewer's network reach.
  */
 const reviewerProfile = (
   packetRoot: string,
@@ -933,6 +1192,7 @@ const reviewerProfile = (
   executable: string,
   credentialPaths: readonly string[],
   additionalExecutables: readonly string[] = [],
+  egressPort?: number,
 ): string => {
   const lines = ["(version 1)", "(allow default)"];
   const sensitive = [
@@ -945,6 +1205,14 @@ const reviewerProfile = (
     if (resolved && resolved !== packetRoot && !resolved.startsWith(`${packetRoot}/`)) {
       lines.push(`(deny file-read* (subpath ${quote(resolved)}))`);
     }
+  }
+  if (egressPort !== undefined) {
+    lines.push(
+      "(deny network-outbound (remote tcp))",
+      "(deny network-outbound (remote udp))",
+      `(allow network-outbound (remote tcp "localhost:${egressPort}"))`,
+      "(allow network-outbound (remote unix-socket))",
+    );
   }
   // `sandbox-exec` evaluates this profile for the initial exec too. The resolved provider
   // binary and Node are the only executables it may start; all arbitrary tools are denied.
@@ -1075,6 +1343,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   readonly #environmentAllowlist: readonly string[];
   readonly #denyReadPaths: readonly string[];
   readonly #providerCredentialDir: string | undefined;
+  readonly #reviewerEgress: ReviewerEgressConfig | undefined;
   readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
   readonly #usageCollector: UsageCollector;
 
@@ -1087,6 +1356,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     this.#environmentAllowlist = options.environmentAllowlist ?? [];
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
     this.#providerCredentialDir = options.providerCredentialDir;
+    this.#reviewerEgress = options.reviewerEgress;
     this.#managedWriteBroker = options.managedWriteBroker;
     this.#usageCollector = options.usageCollector ?? new ClaudeUsageCollector({
       clock: this.#clock,
@@ -1159,6 +1429,9 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       reviewerConfigDirectory: request.isolation
         ? this.#providerCredentialDir
         : undefined,
+      reviewerEgress: request.isolation ? this.#reviewerEgress : undefined,
+      reviewerProvider: request.isolation ? this.provider : undefined,
+      reviewerEgressPhase: request.isolation ? "reviewer-invocation" : undefined,
     });
 
     let result: Awaited<ReturnType<typeof runCli>>;
@@ -1197,21 +1470,30 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     const envelope = safeParse(result.stdout);
     const text =
       typeof envelope?.["result"] === "string" ? (envelope["result"] as string) : result.stdout;
+    const isolationSucceeded = request.isolation === undefined || result.isolationEnforced;
 
     return {
-      ok: result.exitCode === 0 && !result.timedOut,
+      // A provider answer produced after a failed packet boundary is not a successful
+      // invocation. Keeping `ok` false matches the attestation result and prevents a
+      // caller that forgets the separate field from treating it as usable evidence.
+      ok: result.exitCode === 0 && !result.timedOut && isolationSucceeded,
       text,
       json: extractJson(text),
       provider: this.provider,
       model: request.model ?? this.defaultModels.cto,
       durationMs: Date.now() - started,
       exitCode: result.exitCode,
-      error: result.timedOut ? "timeout" : result.exitCode === 0 ? null : result.stderr.slice(0, 2000),
+      error: result.timedOut
+        ? "timeout"
+        : result.exitCode === 0 && isolationSucceeded
+          ? null
+          : result.stderr.slice(0, 2000),
       providerSessionId:
         typeof envelope?.["session_id"] === "string" ? (envelope["session_id"] as string) : null,
       isolationAttested: request.isolation !== undefined && result.isolationEnforced,
       isolationReasonCode:
         request.isolation !== undefined && !result.isolationEnforced ? ReasonCode.ISOLATION_LOST : undefined,
+      egressEvidence: result.egressEvidence,
     };
   }
 
@@ -1367,8 +1649,14 @@ export class CodexCliAdapter implements ProviderAdapter {
   readonly #environmentAllowlist: readonly string[];
   readonly #denyReadPaths: readonly string[];
   readonly #providerCredentialDir: string | undefined;
+  readonly #reviewerEgress: ReviewerEgressConfig | undefined;
   readonly #managedWriteBroker: ManagedInvocationWriteBroker | undefined;
-  readonly #reviewerSessions = new Map<string, { workdir: string; model: string; effort: string | null }>();
+  readonly #reviewerSessions = new Map<string, {
+    workdir: string;
+    model: string;
+    effort: string | null;
+    bootstrapEgressEvidence: ReviewerEgressRecord[];
+  }>();
   readonly #usageCollector: UsageCollector;
 
   constructor(options: CliAdapterOptions) {
@@ -1380,6 +1668,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#environmentAllowlist = options.environmentAllowlist ?? [];
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
     this.#providerCredentialDir = options.providerCredentialDir;
+    this.#reviewerEgress = options.reviewerEgress;
     this.#managedWriteBroker = options.managedWriteBroker;
     this.#usageCollector = options.usageCollector ?? new CodexUsageCollector({
       clock: this.#clock,
@@ -1538,8 +1827,11 @@ export class CodexCliAdapter implements ProviderAdapter {
       reviewerCredentialPaths: credentialPaths,
       reviewerEnvironment: codexReviewerEnvironment(spec.workdir, this.#providerCredentialDir),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),
+      reviewerEgress: this.#reviewerEgress,
+      reviewerProvider: this.provider,
+      reviewerEgressPhase: "session-bootstrap",
     });
-    if (!result.isolationEnforced) {
+    if (!result.isolationEnforced || !result.egressEvidence || result.egressEvidence.length === 0) {
       throw new ProviderSessionProvisionError(
         ReasonCode.ISOLATION_LOST,
         result.stderr || "Codex reviewer isolation proof did not complete",
@@ -1562,6 +1854,7 @@ export class CodexCliAdapter implements ProviderAdapter {
       workdir: spec.workdir,
       model: spec.model,
       effort: spec.effort ?? null,
+      bootstrapEgressEvidence: result.egressEvidence,
     });
     return {
       externalSessionId: providerSessionId,
@@ -1604,11 +1897,14 @@ export class CodexCliAdapter implements ProviderAdapter {
       reviewerCredentialPaths: codexCredentialPaths(this.#providerCredentialDir),
       reviewerEnvironment: codexReviewerEnvironment(request.workdir, this.#providerCredentialDir),
       reviewerExecutablePaths: codexReviewerExecutables(this.#binary),
+      reviewerEgress: this.#reviewerEgress,
+      reviewerProvider: this.provider,
+      reviewerEgressPhase: "reviewer-invocation",
     });
     const observedSessionId = codexThreadId(result.stdout);
     const sessionMatches = !observedSessionId || observedSessionId === expectedSessionId;
     const text = codexLastAgentMessage(result.stdout) ?? result.stdout;
-    const enforced = result.isolationEnforced && sessionMatches;
+    const enforced = result.isolationEnforced && sessionMatches && Boolean(result.egressEvidence?.length);
     return {
       ok: result.exitCode === 0 && !result.timedOut && enforced,
       text,
@@ -1628,6 +1924,9 @@ export class CodexCliAdapter implements ProviderAdapter {
       isolationAttested: enforced,
       isolationReasonCode: enforced ? undefined : ReasonCode.ISOLATION_LOST,
       effortAttested: enforced && request.effort !== undefined,
+      egressEvidence: enforced
+        ? [...constituted.bootstrapEgressEvidence, ...(result.egressEvidence ?? [])]
+        : undefined,
     };
   }
 }
@@ -1715,6 +2014,8 @@ const safeParse = (text: string): Record<string, unknown> | null => {
 /** Real seatbelt probes exposed only for regression tests; production uses `runCli`. */
 export const __testing = Object.freeze({
   reviewerProfile,
+  reviewerSandboxArgs,
+  composeReviewerProfile,
   probeNoTools,
   probeDeniedTranscriptPaths,
   reviewerToolContractPresent,

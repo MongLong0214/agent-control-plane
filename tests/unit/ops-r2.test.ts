@@ -27,6 +27,7 @@ import {
   makeHarness,
   type Harness,
 } from "../helpers/harness.ts";
+import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -133,6 +134,7 @@ const recordBootstrapBlindReview = (harness: Harness, runId: string): string => 
     provider: reviewer.provider,
     model: reviewer.model,
     effort: reviewer.effort,
+    egressEvidence: testReviewerEgressEvidence(reviewer.provider),
     inputManifest: {
       contract: true,
       snapshotManifest: true,
