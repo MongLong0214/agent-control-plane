@@ -920,12 +920,15 @@ CREATE TABLE IF NOT EXISTS telegram_owner_prompts (
 CREATE INDEX IF NOT EXISTS telegram_owner_prompts_run
   ON telegram_owner_prompts(run_id, created_at);
 
+-- CP-HI-07 — an owner prompt is the record of what the owner was actually asked; rewriting it
+-- would let a decision be attributed to a question that was never put.
 CREATE TRIGGER IF NOT EXISTS telegram_owner_prompts_immutable
 BEFORE UPDATE ON telegram_owner_prompts
 BEGIN
   SELECT RAISE(ABORT, 'TELEGRAM_PROMPT_IMMUTABLE');
 END;
 
+-- CP-HI-08 — a deleted prompt would make an unanswered gate indistinguishable from one never raised.
 CREATE TRIGGER IF NOT EXISTS telegram_owner_prompts_no_delete
 BEFORE DELETE ON telegram_owner_prompts
 BEGIN
