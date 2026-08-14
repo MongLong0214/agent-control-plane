@@ -143,7 +143,7 @@ export interface ContinuityGate {
 }
 
 /** §15.6's freshness window, the same one `assertCompletionAllowed` applies by default. */
-const CONTINUITY_MODE_MAX_AGE_MS = 5 * 60 * 1000;
+export const CONTINUITY_MODE_MAX_AGE_MS = 5 * 60 * 1000;
 
 export class RunEngine {
   /**

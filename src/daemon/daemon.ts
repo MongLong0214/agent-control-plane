@@ -6,8 +6,9 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
+import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
 import type { DoctorScope } from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
@@ -22,6 +23,36 @@ import {
   type FinalizationResult,
 } from "./finalizer.ts";
 import { SingleInstanceLock } from "./single-instance.ts";
+
+/**
+ * How often the sensor tick refreshes capacity and re-evaluates continuity.
+ *
+ * This must stay below CONTINUITY_MODE_MAX_AGE_MS. Dispatch re-evaluates a SURVIVAL verdict
+ * older than that window, so a tick slower than the window would let dispatch act on a verdict
+ * the tick was supposed to have refreshed — and the two were independent literals in different
+ * files, meaning a change to either silently changed what the other meant (#454).
+ *
+ * `assertContinuityFreshnessOrdering` below fails at startup if the relationship is broken,
+ * because a comment saying "keep these in step" is not a thing that keeps them in step.
+ */
+const DEFAULT_CAPACITY_REFRESH_MS = 4 * 60_000;
+
+/**
+ * Refuses a configuration where the tick cannot keep the verdict fresh.
+ *
+ * Called at start rather than trusted: the two values live in different files, and the failure
+ * it prevents is silent — dispatch acting on a SURVIVAL verdict the tick was supposed to have
+ * refreshed, with nothing anywhere reporting a contradiction.
+ */
+const assertContinuityFreshnessOrdering = (refreshMs: number): void => {
+  if (refreshMs >= CONTINUITY_MODE_MAX_AGE_MS) {
+    throw acpError(
+      ReasonCode.INVALID_ARGUMENT,
+      "capacity refresh interval must be shorter than the continuity freshness window",
+      { refreshMs, continuityWindowMs: CONTINUITY_MODE_MAX_AGE_MS },
+    );
+  }
+};
 
 export interface DaemonOptions {
   stateDir: string;
@@ -905,7 +936,8 @@ export class Daemon {
     const deliveryMs = this.options.deliveryIntervalMs ?? 5_000;
     // The monitor's default freshness window is five minutes. Polling just inside that
     // boundary keeps the local sensor current without turning it into a per-minute dashboard.
-    const capacityRefreshMs = this.options.capacityRefreshIntervalMs ?? 4 * 60_000;
+    const capacityRefreshMs = this.options.capacityRefreshIntervalMs ?? DEFAULT_CAPACITY_REFRESH_MS;
+    assertContinuityFreshnessOrdering(capacityRefreshMs);
 
     const watchdog = setInterval(() => {
       void this.runPeriodic("watchdog", async () => {
