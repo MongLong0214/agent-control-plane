@@ -91,6 +91,18 @@ const history = (db: SqliteHandle) => ({
 });
 
 /** Builds a v11 database from the checked-in prior-release SQL, never from current Db code. */
+/**
+ * A historical database file as the daemon would have left it: mode 0600.
+ *
+ * SQLite creates a new file at 0666 & ~umask, so a developer running under `umask 077` gets
+ * 0600 by accident and CI under `umask 022` gets 0644 — and production correctly refuses to
+ * open it. The mode is set explicitly here so the fixture means the same thing on both, and
+ * so that the `0600` check being exercised is production's, not the shell's.
+ */
+const asPrivateStateFile = (path: string): void => {
+  chmodSync(path, 0o600);
+};
+
 const asV11Fixture = (path: string, seed = false): ReturnType<typeof history> | undefined => {
   const raw = new Database(path);
   try {
@@ -102,9 +114,12 @@ const asV11Fixture = (path: string, seed = false): ReturnType<typeof history> | 
       seedHistory(raw);
     }
     raw.pragma("user_version = 11");
-    return seed ? history(raw) : undefined;
-  } finally {
+    const result = seed ? history(raw) : undefined;
     raw.close();
+    asPrivateStateFile(path);
+    return result;
+  } finally {
+    try { raw.close(); } catch { /* already closed on the success path */ }
   }
 };
 

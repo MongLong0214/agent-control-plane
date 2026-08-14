@@ -443,15 +443,30 @@ time.sleep(0.05)
     const lease = await acquireReviewerEgress({ ...fixture.config, proxyPath: dyingProxy }, "claude");
     let deathObserved = false;
     lease.onDeath(() => { deathObserved = true; });
-    await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    // Poll rather than sleep a fixed 150ms. The proxy exits ~50ms after start, but on a
+    // loaded runner the exit event can land well outside a hard-coded window — which is how
+    // this passed locally and failed in CI. The deadline still bounds the test; what it no
+    // longer does is assume a particular machine speed.
+    const deathDeadline = Date.now() + 10_000;
+    while (!lease.died() && Date.now() < deathDeadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
 
-    expect(lease.died()).toBe(true);
-    expect(deathObserved).toBe(true);
-    await expect(lease.finalise("reviewer-invocation", {
-      allowedEndpoint: { host: "api.anthropic.com" },
-      deniedEndpoint: { host: "denied.provider.test" },
-      directSocket: [],
-    })).rejects.toMatchObject({ failureCode: "REVIEWER_EGRESS_PROXY_DIED" });
+    // The lease owns a proxy on a fixed port, and only `finalise`/`abandon` releases it.
+    // An assertion that throws before either would leak that proxy and make the *next*
+    // test in this file wait on a port it can never get — which is how one timing-sensitive
+    // failure here turned into a second, unrelated-looking 60s timeout in CI.
+    try {
+      expect(lease.died()).toBe(true);
+      expect(deathObserved).toBe(true);
+      await expect(lease.finalise("reviewer-invocation", {
+        allowedEndpoint: { host: "api.anthropic.com" },
+        deniedEndpoint: { host: "denied.provider.test" },
+        directSocket: [],
+      })).rejects.toMatchObject({ failureCode: "REVIEWER_EGRESS_PROXY_DIED" });
+    } finally {
+      await lease.abandon().catch(() => undefined);
+    }
     // Removing the process exit listener leaves the lease apparently healthy and this
     // death/finalisation assertion fails instead of silently reusing a dead boundary.
   });
