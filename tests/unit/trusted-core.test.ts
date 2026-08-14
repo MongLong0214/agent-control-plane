@@ -785,9 +785,17 @@ describe("verification sandbox (PRD §17.4)", () => {
     expect(outcome.status).toBe("TIMEOUT");
     expect(outcome.reasonCode).toBe(ReasonCode.VERIFICATION_TIMEOUT);
     const child = JSON.parse(outcome.stdout) as { childPid: number | null };
-    if (child.childPid !== null) {
-      expect(() => process.kill(child.childPid!, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
-    }
+    // The reaping claim is the whole point, so a run where no child started must fail rather
+    // than skip. Guarding the assertion on childPid !== null meant a platform that refused
+    // the spawn would report this test as passing while proving nothing — and ACCEPTANCE.md
+    // cites this file as confinement evidence. Measured: the child does start here.
+    expect(
+      child.childPid,
+      "no in-group child started, so nothing about reaping was exercised",
+    ).not.toBeNull();
+    expect(() => process.kill(child.childPid!, 0)).toThrow(
+      expect.objectContaining({ code: "ESRCH" }),
+    );
     expect(Date.now() - started).toBeLessThan(20_000);
   });
 
