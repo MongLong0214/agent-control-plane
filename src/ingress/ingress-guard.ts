@@ -430,7 +430,7 @@ export class BuzzActorIngress {
     if (!this.guard.requiresSignature("buzz")) {
       return deny(
         ReasonCode.INGRESS_SIGNATURE_INVALID,
-        "buzz actor binding requires a signed ingress policy",
+        "buzz channel identity binding requires a signed ingress policy",
       );
     }
     if (
@@ -441,7 +441,7 @@ export class BuzzActorIngress {
     ) {
       return deny(
         ReasonCode.INVALID_ARGUMENT,
-        "buzz actor binding requires an actor, session proof, and nonce",
+        "buzz channel identity binding requires an actor, session proof, and nonce",
       );
     }
 

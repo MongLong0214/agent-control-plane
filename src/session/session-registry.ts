@@ -17,7 +17,7 @@ export interface SessionRecord {
   effort: string | null;
   lifecycle: SessionLifecycle;
   buzzAddress: string | null;
-  /** §27.2 — the authenticated Buzz actor identity this session speaks as, if bound. */
+  /** §27.2 — the authenticated Buzz channel identity identity this session speaks as, if bound. */
   buzzActorId: string | null;
   osPid: number | null;
   workdir: string | null;
@@ -27,7 +27,7 @@ export interface SessionRecord {
 }
 
 /**
- * The authority that can vouch for a Buzz actor identity.
+ * The authority that can vouch for a Buzz channel identity identity.
  *
  * `IngressGuard.isAllowedActor` satisfies this structurally, which is deliberate: the only
  * thing in the deployment that knows which Buzz actors are authenticated is the ingress
@@ -229,7 +229,7 @@ export class SessionRegistry {
   }
 
   /**
-   * §27.2, finding #214 — binds the Buzz actor identity an inbound message may be resolved
+   * §27.2, finding #214 — binds the Buzz channel identity identity an inbound message may be resolved
    * through.
    *
    * Two independent proofs are required because either alone is forgeable. The session
@@ -251,7 +251,7 @@ export class SessionRegistry {
     if (actorId.length === 0 || !authenticator.isAllowedActor("buzz", actorId)) {
       return deny(
         ReasonCode.SESSION_BUZZ_ACTOR_NOT_AUTHENTICATED,
-        "buzz actor identity is not authenticated by the deployment's ingress policy",
+        "buzz channel identity identity is not authenticated by the deployment's ingress policy",
         { sessionId: input.sessionId, buzzActorId: actorId },
       );
     }
@@ -277,7 +277,7 @@ export class SessionRegistry {
       if (changes !== 1) {
         return deny(
           ReasonCode.SESSION_BUZZ_ACTOR_IMMUTABLE,
-          "session already speaks as a different buzz actor identity",
+          "session already speaks as a different buzz channel identity identity",
           { sessionId: input.sessionId, buzzActorId: actorId },
         );
       }

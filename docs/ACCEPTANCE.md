@@ -358,7 +358,7 @@ narrowing. Spot-checking confirmed the round-2 findings were accurate rather tha
 
 The 14 open round-1 majors are the other thing to know about the queue: each one restates a
 round-2 major in the same area — #207 and #119 are the same daemon MCP finding, #209 and
-#112 the same worker-liveness finding, #214 and #124 the same Buzz actor finding, #226/#150,
+#112 the same worker-liveness finding, #214 and #124 the same Buzz channel identity finding, #226/#150,
 #227/#156, #176/#54, #182/#55. Six of them already carry a second comment pointing at the
 round-2 issue that fixes them. They should be closed against those, not worked twice.
 
