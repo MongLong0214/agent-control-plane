@@ -765,6 +765,12 @@ export class BlindReviewGate {
       packetRoot: reviewer.workdir,
       isolationAttested: result.isolationAttested,
       isolationReasonCode: result.isolationReasonCode ?? null,
+      // Which probe refused, not merely that one did. proveReviewerIsolation names the failing
+      // probe and runCli puts that text in `error`; this deny recorded only the code, so every
+      // failure read identically as ISOLATION_LOST. A fail-closed path that cannot say why is
+      // expensive in exactly the way #419 has been — the boundary was working and the reason it
+      // refused was unreadable from the evidence it left behind.
+      isolationDetail: result.error ?? null,
     });
   }
 
