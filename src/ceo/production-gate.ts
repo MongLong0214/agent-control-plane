@@ -1071,6 +1071,15 @@ export class ProductionGate {
    * process can be reached by an untrusted request path, so only an admitted receipt that
    * binds this exact operation proves non-delegable owner authority (CP-HI-07).
    */
+  /**
+   * `requireLiveAdmission` separates two different questions that share this shape check.
+   *
+   * Recording a decision must prove the receipt is admitted *now* — that is the moment the
+   * owner's authority is being exercised. Re-reading a retained artifact must not: admission
+   * happened when the decision was consumed, and `assertApproval` answers from
+   * `inbound_messages`, a 24h replay cache. Asking it again later makes an approved run
+   * become unapproved when the cache is pruned, which is the P1-18 defect.
+   */
   private assertOwnerDecisionReceipt(input: {
     runId: string;
     item: string;
@@ -1078,6 +1087,7 @@ export class ProductionGate {
     note: string;
     receipt?: unknown;
     owner?: { channel: string; actor: string };
+    requireLiveAdmission?: boolean;
   }): Decision<OwnerApprovalReceipt> {
     const authority = this.#ownerAuthority;
     if (!authority) {
@@ -1114,8 +1124,10 @@ export class ProductionGate {
         { runId: input.runId, operation: receipt.operation },
       );
     }
-    const authorised = authority.assertApproval(receipt);
-    if (!authorised.allowed) return authorised as Decision<OwnerApprovalReceipt>;
+    if (input.requireLiveAdmission !== false) {
+      const authorised = authority.assertApproval(receipt);
+      if (!authorised.allowed) return authorised as Decision<OwnerApprovalReceipt>;
+    }
     return allow(ReasonCode.OK, receipt);
   }
 
@@ -1134,83 +1146,93 @@ export class ProductionGate {
     /** @deprecated Identity alone is never authority; use an admitted receipt. */
     owner?: { channel: string; actor: string };
   }): Decision<void> {
+    // Preserve the established authority-first denial ordering: an invalid or non-owner
+    // receipt is refused before candidate freshness is even considered. The same receipt is
+    // re-checked by consumeApproval inside the candidate transaction below.
     const admittedReceipt = this.assertOwnerDecisionReceipt(input);
     if (!admittedReceipt.allowed) return admittedReceipt as Decision<void>;
     const receipt = admittedReceipt.value;
-    const actor = `${receipt.channel}:${receipt.actor}`;
     const run = this.runs.get(input.runId);
     if (!run) return deny(ReasonCode.NOT_FOUND, "unknown run", { runId: input.runId });
-    const gate = this.humanGateDefinition(input.runId);
 
     try {
       return this.db.tx(() => {
-      const fresh = this.runs.require(input.runId);
-      const candidateSnapshotDigest = this.runs.currentCandidate(input.runId);
-      if (!candidateSnapshotDigest) {
-        return deny(
-          ReasonCode.EVIDENCE_STALE,
-          "owner decision requires the run's current frozen candidate",
-          { runId: input.runId },
-        );
-      }
-      this.artifacts.put(input.runId, ArtifactKind.APPROVAL, {
-        kind: "OWNER_DECISION",
-        item: input.item,
-        approved: input.approved,
-        note: input.note,
-        at: this.clock.nowIso(),
-        humanGateDigest: gate.digest,
-        candidateSnapshotDigest,
-        // The receipt is part of the durable decision, not a one-time ingress check. A
-        // later consumer must be able to re-admit the exact operation and parameters.
-        receipt,
-      }, candidateSnapshotDigest);
-      this.audit.record({
-        kind: "OWNER_DECISION",
-        runId: input.runId,
-        actor,
-        evidence: { item: input.item, approved: input.approved, candidateSnapshotDigest, humanGateDigest: gate.digest },
-      });
+        const fresh = this.runs.require(input.runId);
+        const candidateSnapshotDigest = this.runs.currentCandidate(input.runId);
+        if (!candidateSnapshotDigest) {
+          return deny(
+            ReasonCode.EVIDENCE_STALE,
+            "owner decision requires the run's current frozen candidate",
+            { runId: input.runId },
+          );
+        }
 
-      const status = this.humanGateStatus(input.runId);
-      if (fresh.state !== RunState.AWAITING_HUMAN || !status.satisfied) {
-        return allow(ReasonCode.OK, undefined);
-      }
+        // Validate and consume while the same write transaction holds the current candidate
+        // stable. This is the receipt's candidate binding: a later revision cannot inherit an
+        // approval first consumed for the previous snapshot.
+        const consumed = this.#ownerAuthority!.consumeApproval(receipt, candidateSnapshotDigest);
+        if (!consumed.allowed) return consumed;
 
-      const binding = fresh.ownerRoleKey ? this.bindings.active(fresh.ownerRoleKey) : null;
-      if (
-        !binding ||
-        binding.sessionId !== fresh.ownerSessionId ||
-        binding.bindingGeneration !== fresh.ownerBindingGeneration
-      ) {
-        throw acpError(ReasonCode.RUN_OWNER_NOT_PINNED, "cannot resume without the current run owner", {
-          runId: input.runId,
-          roleKey: fresh.ownerRoleKey,
-        });
-      }
-      const transition = this.runs.transition(
-        input.runId,
-        RunState.ACTIVE,
-        "required owner decisions recorded",
-        { candidateSnapshotDigest, humanGateDigest: gate.digest },
-      );
-      if (!transition.allowed) {
-        throw acpError(transition.reasonCode, transition.message, transition.evidence);
-      }
-      this.outbox.enqueue({
-        idempotencyKey: `owner-decision-resume:${input.runId}:${candidateSnapshotDigest ?? "none"}:${gate.digest}`,
-        roleKey: binding.roleKey,
-        bindingGeneration: binding.bindingGeneration,
-        targetSessionId: binding.sessionId,
-        runId: input.runId,
-        kind: MessageKind.RUN_DISPATCH,
-        payload: {
-          runId: input.runId,
-          reason: "OWNER_DECISION_RECORDED",
+        const actor = `${receipt.channel}:${receipt.actor}`;
+        const gate = this.humanGateDefinition(input.runId);
+        this.artifacts.put(input.runId, ArtifactKind.APPROVAL, {
+          kind: "OWNER_DECISION",
+          item: input.item,
+          approved: input.approved,
+          note: input.note,
+          at: this.clock.nowIso(),
+          humanGateDigest: gate.digest,
           candidateSnapshotDigest,
-          humanGate: status,
-        },
-      });
+          // The receipt is part of the durable decision, not a one-time ingress check. A
+          // later consumer must be able to re-admit the exact operation and parameters.
+          receipt,
+        }, candidateSnapshotDigest);
+        this.audit.record({
+          kind: "OWNER_DECISION",
+          runId: input.runId,
+          actor,
+          evidence: { item: input.item, approved: input.approved, candidateSnapshotDigest, humanGateDigest: gate.digest },
+        });
+
+        const status = this.humanGateStatus(input.runId);
+        if (fresh.state !== RunState.AWAITING_HUMAN || !status.satisfied) {
+          return allow(ReasonCode.OK, undefined);
+        }
+
+        const binding = fresh.ownerRoleKey ? this.bindings.active(fresh.ownerRoleKey) : null;
+        if (
+          !binding ||
+          binding.sessionId !== fresh.ownerSessionId ||
+          binding.bindingGeneration !== fresh.ownerBindingGeneration
+        ) {
+          throw acpError(ReasonCode.RUN_OWNER_NOT_PINNED, "cannot resume without the current run owner", {
+            runId: input.runId,
+            roleKey: fresh.ownerRoleKey,
+          });
+        }
+        const transition = this.runs.transition(
+          input.runId,
+          RunState.ACTIVE,
+          "required owner decisions recorded",
+          { candidateSnapshotDigest, humanGateDigest: gate.digest },
+        );
+        if (!transition.allowed) {
+          throw acpError(transition.reasonCode, transition.message, transition.evidence);
+        }
+        this.outbox.enqueue({
+          idempotencyKey: `owner-decision-resume:${input.runId}:${candidateSnapshotDigest}:${gate.digest}`,
+          roleKey: binding.roleKey,
+          bindingGeneration: binding.bindingGeneration,
+          targetSessionId: binding.sessionId,
+          runId: input.runId,
+          kind: MessageKind.RUN_DISPATCH,
+          payload: {
+            runId: input.runId,
+            reason: "OWNER_DECISION_RECORDED",
+            candidateSnapshotDigest,
+            humanGate: status,
+          },
+        });
         return allow(ReasonCode.OK, undefined);
       });
     } catch (error) {
@@ -1261,8 +1283,16 @@ export class ProductionGate {
         approved: decision.approved,
         note: decision.note,
         receipt: decision.receipt,
+        // Retained read: authority comes from the consumption record below, not from a
+        // replay cache that has since been pruned.
+        requireLiveAdmission: false,
       });
       if (!retainedReceipt.allowed) continue;
+      const candidateBinding = this.#ownerAuthority.assertConsumedApproval(
+        retainedReceipt.value,
+        currentCandidate,
+      );
+      if (!candidateBinding.allowed) continue;
       // ArtifactStore.list is durable creation order (then rowid), so assignment makes
       // a later explicit rejection revoke an earlier approval for the same gate item.
       latestDecision.set(decision.item, decision.approved);
@@ -1322,8 +1352,14 @@ export class ProductionGate {
         approved: decision.approved,
         note: decision.note,
         receipt: decision.receipt,
+        // Retained read: authority comes from the consumption record below, not from a
+        // replay cache that has since been pruned.
+        requireLiveAdmission: false,
       });
-      if (retainedReceipt.allowed) {
+      if (retainedReceipt.allowed && this.#ownerAuthority.assertConsumedApproval(
+        retainedReceipt.value,
+        candidateSnapshotDigest,
+      ).allowed) {
         latest.set(decision.item, { approved: decision.approved, digest: artifact.digest });
       }
     }
@@ -1479,6 +1515,7 @@ const isOwnerApprovalReceipt = (value: unknown): value is OwnerApprovalReceipt =
   typeof value.actor === "string" &&
   typeof value.inboundNonce === "string" &&
   (typeof value.runId === "string" || value.runId === null) &&
+  (typeof value.candidateSnapshotDigest === "string" || value.candidateSnapshotDigest === null) &&
   typeof value.operation === "string" &&
   typeof value.parameterDigest === "string" &&
   typeof value.idempotencyKey === "string" &&

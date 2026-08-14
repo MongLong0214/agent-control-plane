@@ -374,8 +374,12 @@ export class Daemon {
     if (typeof note !== "string") return invalidOperatorParam("note", note);
     const approved = request.params["approved"] ?? true;
     if (typeof approved !== "boolean") return invalidOperatorParam("approved", approved);
+    // Mint the receipt against the candidate the operator is actually answering for. The
+    // receipt is then stale if the run moves before the CEO presents it.
+    const candidateSnapshotDigest = this.cp.runs.currentCandidate(runId.value);
     const approval = {
       runId: runId.value,
+      candidateSnapshotDigest,
       operation: "owner_decision_submit",
       parameters: { item: item.value, approved, note },
       idempotencyKey:
@@ -428,8 +432,11 @@ export class Daemon {
       });
     }
 
+    const repairRunId = (runId as string | null | undefined) ?? null;
+    const candidateSnapshotDigest = repairRunId ? this.cp.runs.currentCandidate(repairRunId) : null;
     const approval = {
-      runId: (runId as string | null | undefined) ?? null,
+      runId: repairRunId,
+      candidateSnapshotDigest,
       operation: REPAIR_OWNER_APPROVAL_OPERATION,
       parameters: {
         operationId: operationId.value,
@@ -442,7 +449,7 @@ export class Daemon {
           operationId: operationId.value,
           parameters: parameters.value,
           dryRun,
-          runId: runId ?? null,
+          runId: repairRunId,
           peerId: peer.peerId,
           incarnation: peer.incarnation,
         })}`,
@@ -456,13 +463,20 @@ export class Daemon {
       authorizedBy,
       ownerApproval: admitted.value,
       dryRun,
-      runId: (runId as string | null | undefined) ?? null,
+      runId: repairRunId,
     });
   }
 
   private admitCliOwnerApproval(
     actor: string,
-    approval: { runId: string | null; operation: string; parameters: unknown; idempotencyKey: string; approved: boolean },
+    approval: {
+      runId: string | null;
+      candidateSnapshotDigest: string | null;
+      operation: string;
+      parameters: unknown;
+      idempotencyKey: string;
+      approved: boolean;
+    },
     nonce: string,
   ): Decision<OwnerApprovalReceipt> {
     const allowedActors = (this.cp.config.ownerIdentities ?? [])

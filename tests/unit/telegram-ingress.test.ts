@@ -1,0 +1,927 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+import { startDaemonTelegramListener } from "../../src/daemon/agentcpd.ts";
+import { TelegramInterruption } from "../../src/ingress/telegram-router.ts";
+import {
+  configuredTelegramLongPollConfig,
+  TelegramDeliveryError,
+  type TelegramBotTransport,
+} from "../../src/ingress/telegram-polling.ts";
+import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { digestOf } from "../../src/core/digest.ts";
+import { Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
+import { BuzzAdapter } from "../../src/buzz/buzz-adapter.ts";
+import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import {
+  driveToReviewedCandidate,
+  makeHarness,
+  TEST_OWNER,
+  registerFixtureProject,
+} from "../helpers/harness.ts";
+
+afterAll(cleanupTempDirs);
+
+const SECRET = "telegram-configured-secret";
+const OWNER_ID = "424242";
+const CHAT_ID = "-100999";
+let nextFakeTelegramMessageId = 1_000;
+
+const update = (text: string, over: Record<string, unknown> = {}, updateId = 100): TelegramUpdate => ({
+  update_id: updateId,
+  message: {
+    message_id: 7,
+    date: 1_700_000_000,
+    text,
+    from: { id: Number(OWNER_ID), username: "owner" },
+    chat: { id: Number(CHAT_ID) },
+    ...over,
+  },
+});
+
+class FakeTelegramTransport implements TelegramBotTransport {
+  readonly sent: Array<{
+    chatId: string;
+    text: string;
+    replyToMessageId?: number;
+    correlationId: string;
+  }> = [];
+  readonly offsets: Array<number | undefined> = [];
+  updates: TelegramUpdate[] = [];
+  failSends = 0;
+  /** Fails only owner-gate prompt sends, leaving the reply path working. */
+  failOwnerGateSends = false;
+
+  async getUpdates(options: { offset?: number; timeoutSeconds: number }): Promise<readonly TelegramUpdate[]> {
+    this.offsets.push(options.offset);
+    return this.updates;
+  }
+
+  async sendMessage(input: {
+    chatId: string;
+    text: string;
+    replyToMessageId?: number;
+    correlationId: string;
+  }): Promise<{ messageId: number }> {
+    if (this.failOwnerGateSends && input.correlationId.startsWith("telegram:owner-gate:")) {
+      throw new TelegramDeliveryError("simulated owner-gate prompt delivery failure", false);
+    }
+    if (this.failSends > 0) {
+      this.failSends -= 1;
+      throw new TelegramDeliveryError("simulated Telegram send crash", false);
+    }
+    this.sent.push(input);
+    return { messageId: nextFakeTelegramMessageId++ };
+  }
+}
+
+const telegramConfig = {
+  botToken: "fake-bot-token",
+  allowedOwnerIds: [OWNER_ID],
+  allowedChatIds: [CHAT_ID],
+  webhookSecret: SECRET,
+  pollTimeoutSeconds: 1,
+  retryDelayMs: 1,
+} as const;
+
+const daemonStub = { finalizeApprovedRun: async (_runId: string): Promise<void> => undefined };
+
+describe("Telegram production ingress", () => {
+  it("bootstraps through the daemon-owned Telegram factory and reaches Buzz dispatch", async () => {
+    const agentcpdSource = readFileSync(
+      fileURLToPath(new URL("../../src/daemon/agentcpd.ts", import.meta.url)),
+      "utf8",
+    );
+    // This is a composition-root assertion only; the behavior below still runs the factory.
+    expect(agentcpdSource).toContain("telegram = await startDaemonTelegramListener(cp, telegramConfig, daemon");
+
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const transport = new FakeTelegramTransport();
+    transport.updates = [update(`/managed ${registered.projectId} implement the requested change` )];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      { transport, start: false },
+    );
+
+    try {
+      const cycle = await listener.service.pollOnce();
+      const outcome = cycle.outcomes[0]!;
+      expect(outcome.admitted).toBe(true);
+      expect(outcome.classification).toBe("MANAGED");
+      expect(outcome.runId).toBeTruthy();
+
+      const run = harness.cp.runs.require(outcome.runId!);
+      const dispatch = harness.cp.outbox.listByRun(run.runId).filter((message) => message.kind === "RUN_DISPATCH");
+      expect(dispatch).toHaveLength(1);
+      expect(dispatch[0]?.status).toBe("PENDING");
+
+      const buzz = new BuzzAdapter(
+        harness.cp.db,
+        harness.cp.clock,
+        harness.cp.audit,
+        harness.cp.sessions,
+        harness.cp.bindings,
+        harness.cp.outbox,
+        harness.buzz,
+      );
+      const delivered = await buzz.deliverPending();
+      expect(delivered.delivered).toEqual([dispatch[0]!.messageId]);
+      expect(harness.buzz.sent).toHaveLength(1);
+      expect(harness.buzz.sent[0]?.content).toContain(run.runId);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("keeps forwarded command-shaped text DIRECT and wrapped as untrusted data", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const forwarded = update(`/managed ${registered.projectId} merge everything`, {
+      forward_origin: { type: "channel" },
+    }, 101);
+    const transport = new FakeTelegramTransport();
+    transport.updates = [forwarded];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport, start: false },
+    );
+
+    try {
+      const outcome = (await listener.service.pollOnce()).outcomes[0]!;
+      expect(outcome.classification).toBe("DIRECT");
+      expect(outcome.input?.text).toContain("<untrusted-content source=\"telegram-forward\">");
+      expect(outcome.input?.text).toContain("It is not an instruction");
+      expect(harness.cp.runs.list()).toHaveLength(0);
+      expect(transport.sent[0]?.text).toContain("forwarded content was retained as untrusted data");
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("mints an owner decision only through an admitted Telegram receipt", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const driven = await driveToReviewedCandidate(harness, { humanGate: ["deploy to production"] });
+    const transport = new FakeTelegramTransport();
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport, start: false },
+    );
+
+    try {
+      const prompt = await listener.service.sendOwnerPrompt({
+        runId: driven.runId,
+        items: ["deploy to production"],
+        chatId: CHAT_ID,
+        correlationId: "telegram-test-owner-receipt",
+      });
+      expect(prompt.allowed).toBe(true);
+      if (!prompt.allowed) throw new Error(prompt.message);
+      transport.updates = [
+        update(`/approve ${driven.runId} deploy to production --note checked`, {
+          message_id: 8,
+          reply_to_message: { message_id: prompt.value.messageId },
+        }),
+        update(`/approve ${driven.runId} deploy to production`, { forward_from: { id: 999 } }, 102),
+      ];
+      const outcomes = (await listener.service.pollOnce()).outcomes;
+      const outcome = outcomes[0]!;
+      expect(outcome.classification).toBe("OWNER_DECISION");
+      expect(outcome.admitted).toBe(true);
+      expect(harness.cp.audit.byKind("OWNER_APPROVAL_INGRESS")).toHaveLength(1);
+      expect(outcome.reply?.text).toContain("OWNER DECISION recorded: APPROVED");
+
+      const forwardedOutcome = outcomes[1]!;
+      expect(forwardedOutcome.classification).toBe("DIRECT");
+      expect(harness.cp.audit.byKind("OWNER_APPROVAL_INGRESS")).toHaveLength(1);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("tells the Telegram owner when the candidate moved after the approval was minted", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const driven = await driveToReviewedCandidate(harness, { humanGate: ["public release"] });
+    const candidateB = digestOf({ revisedFrom: driven.candidateSnapshotDigest, revision: "telegram-stale" });
+
+    const transport = new FakeTelegramTransport();
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport, start: false },
+    );
+
+    try {
+      const prompt = await listener.service.sendOwnerPrompt({
+        runId: driven.runId,
+        items: ["public release"],
+        chatId: CHAT_ID,
+        correlationId: "telegram-test-candidate-moved",
+      });
+      expect(prompt.allowed).toBe(true);
+      if (!prompt.allowed) throw new Error(prompt.message);
+      expect(prompt.value.candidateSnapshotDigest).toBe(driven.candidateSnapshotDigest);
+      harness.cp.runs.promoteCandidate(driven.runId, candidateB);
+      transport.updates = [update(`/approve ${driven.runId} public release`, {
+        message_id: 8,
+        reply_to_message: { message_id: prompt.value.messageId },
+      }, 103)];
+      const outcome = (await listener.service.pollOnce()).outcomes[0]!;
+      expect(outcome.admitted).toBe(true);
+      expect(outcome.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+      expect(outcome.reply?.text).toContain("candidate moved");
+      expect(harness.cp.artifacts.list(driven.runId, "APPROVAL")).toHaveLength(0);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("binds a Telegram reply to prompt candidate A after candidate B is promoted", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const driven = await driveToReviewedCandidate(harness, { humanGate: ["public release"] });
+    await harness.cp.continuity.evaluate("telegram prompt candidate A");
+    const packet = harness.cp.ceo.buildPacket({
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      approval: {
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        resultSummary: "candidate verified",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: driven.ownerSessionId,
+        approvedByGeneration: driven.ownerBindingGeneration,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    expect(packet.allowed).toBe(true);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
+    expect(ceo).toBeTruthy();
+    const requested = harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId,
+      decision: "OWNER_DECISION_REQUIRED",
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceo!.sessionId,
+      rationale: "owner must decide on candidate A",
+    });
+    expect(requested.allowed).toBe(true);
+
+    const originalCurrentCandidate = harness.cp.runs.currentCandidate.bind(harness.cp.runs);
+    let currentCandidateReads = 0;
+    vi.spyOn(harness.cp.runs, "currentCandidate").mockImplementation((runId) => {
+      currentCandidateReads += 1;
+      return originalCurrentCandidate(runId);
+    });
+    const transport = new FakeTelegramTransport();
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport, start: false, ownerGateSignals: () => [] },
+    );
+
+    try {
+      const prompt = await listener.service.sendOwnerPrompt({
+        runId: driven.runId,
+        items: ["public release"],
+        chatId: CHAT_ID,
+        correlationId: "telegram-test-prompt-A",
+      });
+      expect(prompt.allowed).toBe(true);
+      if (!prompt.allowed) throw new Error(prompt.message);
+      expect(prompt.value.candidateSnapshotDigest).toBe(driven.candidateSnapshotDigest);
+      expect(harness.cp.db.get<{ candidate_snapshot_digest: string }>(
+        `SELECT candidate_snapshot_digest FROM telegram_owner_prompts
+          WHERE chat_id = ? AND message_id = ?`,
+        [CHAT_ID, prompt.value.messageId],
+      )).toEqual({ candidate_snapshot_digest: driven.candidateSnapshotDigest });
+
+      currentCandidateReads = 0;
+      const candidateB = digestOf({ revisedFrom: driven.candidateSnapshotDigest, revision: "telegram-prompt-A" });
+      harness.cp.runs.promoteCandidate(driven.runId, candidateB);
+      transport.updates = [update(`/approve ${driven.runId} public release`, {
+        message_id: 9,
+        reply_to_message: { message_id: prompt.value.messageId },
+      }, 104)];
+
+      const outcome = (await listener.service.pollOnce()).outcomes[0]!;
+      expect(outcome.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+      expect(outcome.reply?.text).toContain("candidate moved");
+      expect(harness.cp.artifacts.list(driven.runId, "APPROVAL")
+        .filter((artifact) => artifact.candidateSnapshotDigest === candidateB)).toHaveLength(0);
+      expect(harness.cp.artifacts.list<{ kind?: string }>(driven.runId, "APPROVAL")
+        .filter((artifact) => artifact.content.kind === "OWNER_DECISION")).toHaveLength(0);
+      expect(harness.cp.audit.byKind("OWNER_APPROVAL_CONSUMED")).toHaveLength(0);
+      // The reply resolves the durable prompt record; it never samples the current candidate.
+      expect(currentCandidateReads).toBe(0);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("emits one production prompt per item across polls and restart, then re-prompts a new candidate", async () => {
+    const gateItem = "public release";
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const driven = await driveToReviewedCandidate(harness, { humanGate: [gateItem] });
+    await harness.cp.continuity.evaluate("telegram production prompt idempotency");
+    const packet = harness.cp.ceo.buildPacket({
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      approval: {
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        resultSummary: "candidate verified",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: driven.ownerSessionId,
+        approvedByGeneration: driven.ownerBindingGeneration,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    expect(packet.allowed).toBe(true);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
+    expect(ceo).toBeTruthy();
+    const parked = harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId,
+      decision: "OWNER_DECISION_REQUIRED",
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceo!.sessionId,
+      rationale: "owner must decide on the production candidate",
+    });
+    expect(parked.allowed).toBe(true);
+
+    const firstTransport = new FakeTelegramTransport();
+    const firstListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: firstTransport, start: false },
+    );
+    let promptA: { messageId: number; candidateSnapshotDigest: string } | null = null;
+    try {
+      await firstListener.service.pollOnce();
+      expect(firstTransport.sent).toHaveLength(1);
+      const promptRow = harness.cp.db.get<{ message_id: number; candidate_snapshot_digest: string }>(
+        `SELECT message_id, candidate_snapshot_digest FROM telegram_owner_prompts
+          WHERE run_id = ? ORDER BY created_at ASC LIMIT 1`,
+        [driven.runId],
+      );
+      expect(promptRow).toBeTruthy();
+      promptA = promptRow
+        ? { messageId: promptRow.message_id, candidateSnapshotDigest: promptRow.candidate_snapshot_digest }
+        : null;
+      const reservation = harness.cp.db.get<{ result_json: string }>(
+        `SELECT result_json FROM inbound_messages
+          WHERE channel = 'telegram-owner-prompt'`,
+      );
+      expect(reservation).toBeTruthy();
+      expect(JSON.parse(reservation!.result_json)).toMatchObject({
+        kind: "TELEGRAM_OWNER_PROMPT",
+        status: "APPLIED",
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      });
+      await firstListener.service.pollOnce();
+      expect(firstTransport.sent).toHaveLength(1);
+    } finally {
+      await firstListener.close();
+    }
+    expect(promptA?.candidateSnapshotDigest).toBe(driven.candidateSnapshotDigest);
+
+    const restartTransport = new FakeTelegramTransport();
+    const restarted = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: restartTransport, start: false },
+    );
+    try {
+      await restarted.service.pollOnce();
+      expect(restartTransport.sent).toHaveLength(0);
+    } finally {
+      await restarted.close();
+    }
+
+    const candidateB = digestOf({ revisedFrom: driven.candidateSnapshotDigest, revision: "telegram-new-prompt" });
+    harness.cp.runs.promoteCandidate(driven.runId, candidateB);
+    const changedTransport = new FakeTelegramTransport();
+    const changed = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: changedTransport, start: false },
+    );
+    try {
+      changedTransport.updates = [update(`/approve ${driven.runId} ${gateItem}`, {
+        message_id: 12,
+        reply_to_message: { message_id: promptA!.messageId },
+      }, 106)];
+      const outcome = (await changed.service.pollOnce()).outcomes[0]!;
+      // By content, not by position. pollOnce now receives before it sends prompts, so the
+      // reply to this update is the first send and the re-prompt follows it. What the test
+      // means is that the new candidate was prompted during this poll, which is what this
+      // asserts; the old index assumed a send order that outbound-first happened to produce.
+      expect(changedTransport.sent.some((message) => message.text.includes(candidateB))).toBe(true);
+      expect(outcome.reasonCode).toBe(ReasonCode.EVIDENCE_STALE);
+      expect(outcome.reply?.text).toContain("candidate moved");
+    } finally {
+      await changed.close();
+    }
+    expect(harness.cp.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM telegram_owner_prompts
+        WHERE run_id = ? AND candidate_snapshot_digest = ?`,
+      [driven.runId, candidateB],
+    )?.n).toBe(1);
+  });
+
+  it("refuses a Telegram approval that cannot resolve to a recorded prompt", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const driven = await driveToReviewedCandidate(harness, { humanGate: ["public release"] });
+    const transport = new FakeTelegramTransport();
+    transport.updates = [update(`/approve ${driven.runId} public release`, {
+      message_id: 10,
+      reply_to_message: { message_id: 999_999 },
+    }, 105)];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport, start: false },
+    );
+
+    try {
+      const outcome = (await listener.service.pollOnce()).outcomes[0]!;
+      expect(outcome.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+      expect(outcome.reply?.text).toContain("does not identify a recorded gate prompt");
+      expect(harness.cp.audit.byKind("OWNER_APPROVAL_INGRESS")).toHaveLength(0);
+      expect(harness.cp.artifacts.list(driven.runId, "APPROVAL")).toHaveLength(0);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("does not send a second response or rerun Hermes when an update is replayed", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const firstTransport = new FakeTelegramTransport();
+    const firstUpdate = update(`/managed ${registered.projectId} inspect the project`, {}, 200);
+    firstTransport.updates = [firstUpdate];
+    const firstListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: firstTransport, start: false },
+    );
+    try {
+      await firstListener.service.pollOnce();
+    } finally {
+      await firstListener.close();
+    }
+    expect(firstTransport.sent).toHaveLength(1);
+    const stored = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:200"],
+    );
+    expect(stored?.result_json).toContain("telegram:200:7");
+    expect(stored?.result_json).toContain("\"sent\":true");
+
+    // A restarted poller starts without an in-memory offset. The durable ingress nonce and
+    // stored sent response suppress the replay, rather than creating a second run or reply.
+    const secondTransport = new FakeTelegramTransport();
+    secondTransport.updates = [firstUpdate];
+    const secondListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: secondTransport, start: false },
+    );
+    try {
+      const replay = (await secondListener.service.pollOnce()).outcomes[0]!;
+      expect(replay.replayed).toBe(true);
+      expect(replay.reply).toBeNull();
+      expect(secondTransport.sent).toHaveLength(0);
+      expect(harness.cp.runs.list()).toHaveLength(1);
+    } finally {
+      await secondListener.close();
+    }
+  });
+
+  it("crashes after admission, Hermes create, dispatch, and before reply, then resumes exactly once", async () => {
+    const interruptionPoints = ["after-admission", "after-hermes-create", "after-dispatch"] as const;
+
+    for (const point of interruptionPoints) {
+      const harness = makeHarness({
+        ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+      });
+      const registered = await registerFixtureProject(harness);
+      const firstTransport = new FakeTelegramTransport();
+      const firstUpdate = update(`/managed ${registered.projectId} inspect the project`, {}, 300);
+      firstTransport.updates = [firstUpdate];
+      let interrupted = false;
+      const firstListener = await startDaemonTelegramListener(
+        harness.cp,
+        telegramConfig,
+        daemonStub,
+        {
+          transport: firstTransport,
+          start: false,
+          onInterrupt: async (actualPoint) => {
+            if (!interrupted && actualPoint === point) {
+              interrupted = true;
+              throw new TelegramInterruption(actualPoint);
+            }
+          },
+        },
+      );
+
+      try {
+        await expect(firstListener.service.pollOnce()).rejects.toMatchObject({ point });
+      } finally {
+        await firstListener.close();
+      }
+
+      const secondTransport = new FakeTelegramTransport();
+      secondTransport.updates = [firstUpdate];
+      const secondListener = await startDaemonTelegramListener(
+        harness.cp,
+        telegramConfig,
+        daemonStub,
+        { transport: secondTransport, start: false },
+      );
+      try {
+        const resumed = await secondListener.service.pollOnce();
+        expect(resumed.outcomes[0]?.admitted).toBe(true);
+        expect(resumed.outcomes[0]?.reply).toBeTruthy();
+      } finally {
+        await secondListener.close();
+      }
+
+      const runs = harness.cp.runs.list();
+      expect(runs).toHaveLength(1);
+      const dispatches = harness.cp.outbox.listByRun(runs[0]!.runId)
+        .filter((message) => message.kind === "RUN_DISPATCH");
+      expect(dispatches).toHaveLength(1);
+      expect(secondTransport.sent).toHaveLength(1);
+    }
+
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const firstTransport = new FakeTelegramTransport();
+    const firstUpdate = update(`/managed ${registered.projectId} inspect the project`, {}, 301);
+    firstTransport.updates = [firstUpdate];
+    firstTransport.failSends = 1;
+    const firstListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: firstTransport, start: false },
+    );
+    try {
+      await expect(firstListener.service.pollOnce()).rejects.toThrow("simulated Telegram send crash");
+    } finally {
+      await firstListener.close();
+    }
+
+    const pending = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:301"],
+    );
+    expect(pending?.result_json).toContain('"sent":false');
+
+    const secondTransport = new FakeTelegramTransport();
+    secondTransport.updates = [firstUpdate];
+    const secondListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: secondTransport, start: false },
+    );
+    try {
+      const resumed = await secondListener.service.pollOnce();
+      expect(resumed.outcomes[0]?.replayed).toBe(true);
+      expect(resumed.outcomes[0]?.reply).toBeTruthy();
+    } finally {
+      await secondListener.close();
+    }
+
+    const runs = harness.cp.runs.list();
+    expect(runs).toHaveLength(1);
+    expect(harness.cp.outbox.listByRun(runs[0]!.runId).filter((message) => message.kind === "RUN_DISPATCH"))
+      .toHaveLength(1);
+    expect(firstTransport.sent.length + secondTransport.sent.length).toBe(1);
+    const completed = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:301"],
+    );
+    expect(completed?.result_json).toContain('"sent":true');
+  });
+
+  it("does not resend when Telegram accepts a reply before the completion checkpoint", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const firstTransport = new FakeTelegramTransport();
+    const firstUpdate = update(`/managed ${registered.projectId} inspect the project`, {}, 302);
+    firstTransport.updates = [firstUpdate];
+    const firstListener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      {
+        transport: firstTransport,
+        start: false,
+        onInterrupt: async (point) => {
+          if (point === "after-reply-send") throw new TelegramInterruption(point);
+        },
+      },
+    );
+
+    try {
+      await expect(firstListener.service.pollOnce()).rejects.toMatchObject({ point: "after-reply-send" });
+    } finally {
+      await firstListener.close();
+    }
+    expect(firstTransport.sent).toHaveLength(1);
+    const pending = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:302"],
+    );
+    expect(pending?.result_json).toContain('"deliveryStatus":"PENDING"');
+    expect(pending?.result_json).toContain('"sent":false');
+
+    const secondTransport = new FakeTelegramTransport();
+    secondTransport.updates = [firstUpdate];
+    const secondListener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      { transport: secondTransport, start: false },
+    );
+    try {
+      const resumed = (await secondListener.service.pollOnce()).outcomes[0]!;
+      expect(resumed.replayed).toBe(true);
+      expect(resumed.reply).toBeNull();
+    } finally {
+      await secondListener.close();
+    }
+    expect(secondTransport.sent).toHaveLength(0);
+    expect(firstTransport.sent.length + secondTransport.sent.length).toBe(1);
+  });
+
+  it("clears a human gate only through the real owner receipt path", async () => {
+    const gateItem = "owner confirms the production scope";
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const driven = await driveToReviewedCandidate(harness, { humanGate: [gateItem] });
+    await harness.cp.continuity.evaluate("owner receipt path test");
+
+    const packet = harness.cp.ceo.buildPacket({
+      runId: driven.runId,
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      approval: {
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        resultSummary: "candidate verified",
+        recommendation: "merge",
+        residualRisk: [],
+        approvedBySessionId: driven.ownerSessionId,
+        approvedByGeneration: driven.ownerBindingGeneration,
+        approvedAt: harness.clock.nowIso(),
+      },
+    });
+    expect(packet.allowed, packet.allowed ? undefined : `${packet.reasonCode}: ${packet.message}`).toBe(true);
+    const ceo = harness.cp.bindings.active(roleKeyFor(Role.CEO));
+    expect(ceo).toBeTruthy();
+    const parked = harness.cp.ceo.submitCeoDecision({
+      runId: driven.runId,
+      decision: "OWNER_DECISION_REQUIRED",
+      candidateSnapshotDigest: driven.candidateSnapshotDigest,
+      ceoSessionId: ceo!.sessionId,
+      rationale: "the configured owner must approve the production scope",
+    });
+    expect(parked.allowed).toBe(true);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.AWAITING_HUMAN);
+
+    const forgedReceipt = harness.cp.ceo.recordOwnerDecision({
+      runId: driven.runId,
+      item: gateItem,
+      approved: true,
+      note: "forged",
+      receipt: {
+        channel: "telegram",
+        actor: OWNER_ID,
+        inboundNonce: "update:forged",
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        operation: "owner_decision_submit",
+        parameterDigest: digestOf({ item: gateItem, approved: true, note: "forged" }),
+        idempotencyKey: "forged-receipt",
+        approved: true,
+      },
+    });
+    expect(forgedReceipt.allowed).toBe(false);
+    expect(forgedReceipt.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+
+    const nonOwnerTransport = new FakeTelegramTransport();
+    nonOwnerTransport.updates = [update(`/approve ${driven.runId} ${gateItem}`, { from: { id: 999 } }, 401)];
+    const nonOwnerListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: nonOwnerTransport, start: false, ownerGateSignals: () => [] },
+    );
+    try {
+      const refused = (await nonOwnerListener.service.pollOnce()).outcomes[0]!;
+      expect(refused.admitted).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED);
+      expect(nonOwnerTransport.sent).toHaveLength(0);
+    } finally {
+      await nonOwnerListener.close();
+    }
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.AWAITING_HUMAN);
+
+    const ownerTransport = new FakeTelegramTransport();
+    const ownerListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: ownerTransport, start: false, ownerGateSignals: () => [] },
+    );
+    let ownerUpdate: TelegramUpdate | null = null;
+    try {
+      const prompt = await ownerListener.service.sendOwnerPrompt({
+        runId: driven.runId,
+        items: [gateItem],
+        chatId: CHAT_ID,
+        correlationId: "telegram-test-human-gate",
+      });
+      expect(prompt.allowed).toBe(true);
+      if (!prompt.allowed) throw new Error(prompt.message);
+      ownerUpdate = update(`/approve ${driven.runId} ${gateItem} --note checked`, {
+        message_id: 8,
+        reply_to_message: { message_id: prompt.value.messageId },
+      }, 402);
+      ownerTransport.updates = [ownerUpdate];
+      const approved = (await ownerListener.service.pollOnce()).outcomes[0]!;
+      expect(approved.classification).toBe("OWNER_DECISION");
+      expect(approved.admitted).toBe(true);
+      expect(approved.reply?.text).toContain("OWNER DECISION recorded: APPROVED");
+    } finally {
+      await ownerListener.close();
+    }
+    expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.ACTIVE);
+    expect(harness.cp.ceo.humanGateStatus(driven.runId)).toMatchObject({ required: true, satisfied: true });
+    expect(harness.cp.audit.byKind("OWNER_APPROVAL_INGRESS")).toHaveLength(1);
+    expect(harness.cp.audit.byKind("OWNER_DECISION")).toHaveLength(1);
+
+    const replayTransport = new FakeTelegramTransport();
+    replayTransport.updates = [ownerUpdate!];
+    const replayListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: replayTransport, start: false, ownerGateSignals: () => [] },
+    );
+    try {
+      const replay = (await replayListener.service.pollOnce()).outcomes[0]!;
+      expect(replay.replayed).toBe(true);
+      expect(replay.admitted).toBe(false);
+      expect(replay.reasonCode).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
+      expect(replayTransport.sent).toHaveLength(0);
+    } finally {
+      await replayListener.close();
+    }
+    expect(harness.cp.audit.byKind("OWNER_APPROVAL_INGRESS")).toHaveLength(1);
+    expect(harness.cp.audit.byKind("OWNER_DECISION")).toHaveLength(1);
+  });
+
+  it("refuses non-allowlisted actors and chats without replying", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const transport = new FakeTelegramTransport();
+    transport.updates = [
+      update("hello", { from: { id: 111 } }, 201),
+      update("hello", { chat: { id: -1 } }, 202),
+    ];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport, start: false },
+    );
+
+    try {
+      const cycle = await listener.service.pollOnce();
+      expect(cycle.outcomes.map((outcome) => outcome.reasonCode)).toEqual([
+        ReasonCode.INGRESS_ACTOR_NOT_ALLOWLISTED,
+        ReasonCode.INGRESS_CHAT_NOT_ALLOWLISTED,
+      ]);
+      expect(transport.sent).toHaveLength(0);
+      expect(harness.cp.audit.byKind("INGRESS_REFUSED")).toHaveLength(2);
+    } finally {
+      await listener.close();
+    }
+  });
+});
+
+describe("Telegram startup configuration", () => {
+  it("treats a deployment with no Telegram variables as an absent optional ingress", () => {
+    const ownerIdentities = [{ channel: "telegram", actor: OWNER_ID }];
+    expect(configuredTelegramLongPollConfig(ownerIdentities, {})).toBeNull();
+    expect(() => configuredTelegramLongPollConfig(ownerIdentities, {
+      ACP_TELEGRAM_BOT_TOKEN: "bot-token",
+    })).toThrow(/OWNER_ID.*CHAT_ID.*WEBHOOK_SECRET/);
+    expect(() => configuredTelegramLongPollConfig(ownerIdentities, {
+      ACP_TELEGRAM_BOT_TOKEN: "bot-token",
+      ACP_TELEGRAM_OWNER_ID: OWNER_ID,
+    })).toThrow(/CHAT_ID.*WEBHOOK_SECRET/);
+    expect(() => configuredTelegramLongPollConfig(ownerIdentities, {
+      ACP_TELEGRAM_BOT_TOKEN: "bot-token",
+      ACP_TELEGRAM_OWNER_ID: OWNER_ID,
+      ACP_TELEGRAM_CHAT_ID: CHAT_ID,
+    })).toThrow(/WEBHOOK_SECRET/);
+  });
+
+  it("requires the numeric Telegram owner to be declared as a configured owner identity", () => {
+    expect(() => configuredTelegramLongPollConfig([], {
+      ACP_TELEGRAM_BOT_TOKEN: "bot-token",
+      ACP_TELEGRAM_OWNER_ID: OWNER_ID,
+      ACP_TELEGRAM_CHAT_ID: CHAT_ID,
+      ACP_TELEGRAM_WEBHOOK_SECRET: SECRET,
+    })).toThrow(/owner-identities/);
+  });
+
+  it("P0-10 keeps receiving when an owner-gate prompt cannot be delivered", async () => {
+    // One parked run whose prompt cannot be sent must not cost the owner their control path.
+    // Before this, deliverOwnerGatePrompts ran first and threw, so getUpdates never ran and
+    // every inbound command stopped — including the reply that would resolve that very run.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const transport = new FakeTelegramTransport();
+    transport.updates = [update(`/managed ${registered.projectId} implement the requested change`)];
+    // Only the owner-gate prompt fails. The reply path is left working, because a reply
+    // failure belongs to the update being processed while a prompt failure does not.
+    transport.failOwnerGateSends = true;
+
+    const errors: unknown[] = [];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      {
+        transport,
+        start: false,
+        ownerGateSignals: () => [{
+          signalId: "sig-undeliverable",
+          runId: "run_undeliverable",
+          items: ["owner confirms"],
+          candidateSnapshotDigest: `sha256:${"a".repeat(64)}`,
+        }],
+        onError: (error: unknown) => { errors.push(error); },
+      },
+    );
+
+    try {
+      // The inbound batch is still received and routed, and pollOnce does not throw.
+      const cycle = await listener.service.pollOnce();
+      expect(cycle.outcomes).toHaveLength(1);
+      expect(cycle.outcomes[0]?.admitted).toBe(true);
+      // The delivery failure is surfaced rather than swallowed.
+      expect(errors.length).toBeGreaterThan(0);
+    } finally {
+      await listener.close();
+    }
+  });
+});

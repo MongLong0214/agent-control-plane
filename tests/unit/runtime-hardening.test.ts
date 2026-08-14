@@ -86,6 +86,7 @@ const ownerDecisionReceipt = (
   });
   const approval = {
     runId,
+    candidateSnapshotDigest: harness.cp.runs.currentCandidate(runId),
     operation: "owner_decision_submit",
     parameters: { item, approved, note },
     idempotencyKey: `owner-decision:${digestOf({ runId, item, approved, note, actor })}`,

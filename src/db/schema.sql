@@ -902,6 +902,37 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
 CREATE INDEX IF NOT EXISTS inbound_received ON inbound_messages(received_at);
 
 -- ---------------------------------------------------------------------------
+-- telegram_owner_prompts
+--   Lifecycle: an owner-facing Telegram gate prompt and the candidate it showed.
+--   Integrity: a reply can resolve only through the exact chat/message pair; the
+--   candidate binding is immutable once Telegram has accepted the prompt.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS telegram_owner_prompts (
+  chat_id                    TEXT NOT NULL,
+  message_id                 INTEGER NOT NULL CHECK (message_id > 0),
+  correlation_id             TEXT NOT NULL,
+  run_id                     TEXT NOT NULL,
+  candidate_snapshot_digest  TEXT NOT NULL CHECK (candidate_snapshot_digest LIKE 'sha256:%'),
+  created_at                 TEXT NOT NULL,
+  PRIMARY KEY (chat_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS telegram_owner_prompts_run
+  ON telegram_owner_prompts(run_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS telegram_owner_prompts_immutable
+BEFORE UPDATE ON telegram_owner_prompts
+BEGIN
+  SELECT RAISE(ABORT, 'TELEGRAM_PROMPT_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS telegram_owner_prompts_no_delete
+BEFORE DELETE ON telegram_owner_prompts
+BEGIN
+  SELECT RAISE(ABORT, 'TELEGRAM_PROMPT_IMMUTABLE');
+END;
+
+-- ---------------------------------------------------------------------------
 -- github_receipts  (PRD §24.6 idempotent receipt, Integration §13.3)
 --   Lifecycle: external side effects outlive the run that produced them.
 --   Integrity: idempotency key uniqueness is what prevents a duplicate merge.

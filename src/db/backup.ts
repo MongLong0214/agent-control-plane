@@ -265,6 +265,8 @@ const validateBackup = (backupPath: string): BackupManifest => {
       includeMigrationLedger: version >= 12,
       includeBaselineLedger: version >= 14,
       schemaVersion: version,
+      // The prompt triggers arrive with v17, so a v16 image is not rejected for lacking them.
+      includeTelegramOwnerPrompts: version >= 17,
     });
     if (version >= 12) assertMigrationLedgerAt(raw, version);
   } finally {
