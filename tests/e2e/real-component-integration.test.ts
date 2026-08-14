@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { ControlPlane, readOwnerIdentities } from "../../src/app/control-plane.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -32,6 +33,8 @@ const ENABLED = process.env["ACP_COMPONENT_INTEGRATION"] === "1";
 const REAL_PROJECT = resolve(process.env["ACP_COMPONENT_INTEGRATION_PROJECT"] ?? process.cwd());
 /** The long-lived branch the manifest contract names, in one place. */
 const MANIFEST_DEFAULT_BRANCH = "main";
+/** The owner-provisioned reviewer egress infrastructure this host declares. */
+const EGRESS_ROOT = join(process.env["HOME"] ?? "", ".agent-control-plane", "egress");
 const REVIEWER_MODEL = process.env["ACP_COMPONENT_INTEGRATION_MODEL"] ?? "sonnet";
 
 /**
@@ -166,6 +169,19 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           new ClaudeCliAdapter({
             clock: systemClock,
             capacityFile: join(root, "capacity", "claude.json"),
+            // Supplying `adapters` replaces the ones ControlPlane builds, and those are where
+            // it passes config.reviewerEgress. So a custom adapter silently opts out of egress
+            // configuration: acquireReviewerEgress then fails REVIEWER_EGRESS_CONFIG_MISSING,
+            // which surfaced only as ISOLATION_LOST and read like a failing boundary rather
+            // than an absent one. The infrastructure below is the owner's, built and proved
+            // for #419 — see ~/.agent-control-plane/egress/README.md.
+            reviewerEgress: {
+              profilePath: join(EGRESS_ROOT, "reviewer.sb"),
+              // The vendored proxy, not the host copy: reviewer-egress.ts requires a
+              // handshake, and a script outside the tree cannot be held to it.
+              proxyPath: fileURLToPath(new URL("../../deploy/egress/allowlist-proxy.py", import.meta.url)),
+              runtimeDir: join(root, "egress-runtime"),
+            },
           }),
         ],
         // The host's own declaration authorises the owner, not a list this test invented:
