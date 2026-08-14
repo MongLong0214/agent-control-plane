@@ -30,6 +30,8 @@ import { bindWorkerForTask } from "../helpers/harness.ts";
  */
 const ENABLED = process.env["ACP_COMPONENT_INTEGRATION"] === "1";
 const REAL_PROJECT = resolve(process.env["ACP_COMPONENT_INTEGRATION_PROJECT"] ?? process.cwd());
+/** The long-lived branch the manifest contract names, in one place. */
+const MANIFEST_DEFAULT_BRANCH = "main";
 const REVIEWER_MODEL = process.env["ACP_COMPONENT_INTEGRATION_MODEL"] ?? "sonnet";
 
 /**
@@ -71,8 +73,8 @@ const manifestFor = (projectId: string): ProjectManifest => ({
   projectId,
   repositories: [{ role: "primary", remote: "github:MongLong0214/agent-control-plane", manifestRoot: "." }],
   branchProfile: {
-    longLived: ["main", "dev"],
-    defaultBranch: "main",
+    longLived: [MANIFEST_DEFAULT_BRANCH, "dev"],
+    defaultBranch: MANIFEST_DEFAULT_BRANCH,
     updateStrategy: "rebase_before_review",
     mergeStrategy: "merge_commit",
     releaseTagPolicy: "semver",
@@ -133,8 +135,14 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       // scope violation an independent reviewer should refuse.
       writeFileSync(join(checkout, ".git", "info", "exclude"), "node_modules\n");
       symlinkSync(join(REAL_PROJECT, "node_modules"), join(checkout, "node_modules"), "dir");
-      // The clone already sits on the project's real default branch.
-      expect(gitSync(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
+      // Check the clone onto the branch the manifest's contract names, rather than inheriting
+      // whatever the source happens to be on. It previously asserted the inherited branch was
+      // "main", so the suite could not run from any feature branch — including in CI, where
+      // every change arrives on one. Combined with being opt-in, that is why it drifted until
+      // it failed at its first step. The branch contract still wants a real long-lived branch,
+      // so this checks one out instead of relaxing the contract to match the runner.
+      gitSync(checkout, ["checkout", "--quiet", MANIFEST_DEFAULT_BRANCH]);
+      expect(gitSync(checkout, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(MANIFEST_DEFAULT_BRANCH);
 
       // The host's own declaration, read once: it authorises the owner and it names the actor
       // who may author a capacity observation. Inventing a second actor here would make the
@@ -274,7 +282,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         executionMode: ExecutionMode[MODE],
         contract: CONTRACT,
         repositories: [
-          { repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: "main" },
+          { repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: MANIFEST_DEFAULT_BRANCH },
         ],
       });
       expect(created.allowed).toBe(true);
