@@ -74,6 +74,32 @@ Named here because a green suite otherwise reads as coverage of them.
   its own Vitest pass (`src/tools/traceability.ts`). That fallback is what crashed under
   `pool: "threads"`; it is safe under `forks`, but it is still a second full run.
 
+## Which gate each open item closes
+
+The release gate structure is parallel (`parallel-phase-gates-v2`): a legacy branch (L0–L5) and
+this repository's branch (A0–A3) run independently, joined by a requirement on both. The join
+carries `no_cross_predecessor_between_terminal_t6_and_acp_complete`, which is the contract that
+**neither branch waits on the other**. Nothing here is sequenced behind T6.
+
+Issues carry an `acp-gate:*` label. This table is the durable half — a label answers "which
+gate", but not "what would close it", and that second question is the one that gets asked later.
+
+| gate | meaning | open items |
+|---|---|---|
+| **A0** | Merged to main; implementation completion *not* claimed | #440 #441 #442 #443 (residuals from the merged lanes) · #397 #402 #403 (P1s whose fix landed in `c5ec3d3`; disposition unverified — see below) |
+| **A1** | Generation-bound comparison guards | #448 (design, nine observed cases) · #444 |
+| **A2** | Kernel attestation, surface equivalence, ingress uniqueness | #449 `conversational_actor` schema · #450 peercred minimal · #451 destination exactly-once |
+| **A3** | ACP implementation complete | #243 #240 #241 #392 #419 #360 #358 #406 #400 #408 |
+
+A0's phrasing is deliberate and worth keeping: seven lanes merged today, and that is a fact about
+main, not a claim about completeness. The two are separable and were conflated before.
+
+**#397, #402 and #403 are listed under A0 with their disposition unverified on purpose.** They are
+open, and the commit that merged as `c5ec3d3` is titled *"close P1-14, P1-15, P1-06"*. Either the
+queue is stale or the titles overclaim, and this document should not assert which before it has
+been reproduced at HEAD. That ambiguity is #408's subject, and recording it as unresolved is more
+useful than guessing.
+
 ## What the automated checks mean
 
 `pnpm trace` establishes that labelled scenario declarations executed and passed in the current
