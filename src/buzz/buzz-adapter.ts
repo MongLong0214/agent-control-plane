@@ -19,14 +19,102 @@ export interface BuzzTransport {
   /** Resolve or create the address a session is reachable at. */
   openChannel(purpose: string): Promise<string>;
   send(channel: string, content: string): Promise<void>;
-  available(): Promise<boolean>;
+  /**
+   * Whether this transport can actually be used. Given a purpose it must answer for that
+   * purpose — "the binary runs" and "the relay has rooms" are not the same question, and
+   * answering the easier one is how #423 shipped.
+   */
+  available(purpose?: string): Promise<boolean>;
 }
+
+/**
+ * A channel as the installed CLI reports it. `buzz channels list` and `buzz channels get`
+ * both key the identity as `channel_id`; there is no `id` field. Captured from the
+ * installed CLI against the live relay — see `tests/fixtures/buzz-cli/`.
+ */
+interface BuzzCliChannel {
+  channel_id: string;
+  name?: string;
+  description?: string;
+  created_at?: number;
+}
+
+/** A message as `buzz messages get` reports it. There is no `messages list` subcommand. */
+export interface BuzzCliMessage {
+  id: string;
+  content: string;
+  pubkey: string;
+  created_at: number;
+  kind: number;
+  tags: string[][];
+}
+
+/**
+ * The CLI writes errors as JSON on stderr and exits non-zero, so a non-zero exit is already
+ * an exception here. This guards the other direction: a zero exit whose stdout is not the
+ * payload we expect must not be read as an empty channel list, which `available()` would
+ * then report as a healthy-but-empty relay.
+ */
+const parseJson = (stdout: string, what: string): unknown => {
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    throw new Error(`buzz ${what} returned unparseable output: ${stdout.trim().slice(0, 200)}`);
+  }
+};
+
+/**
+ * A channel is only a channel once it carries the identity this adapter will send to.
+ *
+ * Parsing to `as BuzzCliChannel` was a cast, not a check: a row that matched by name while
+ * omitting `channel_id` produced `undefined`, `available()` reported the transport usable,
+ * and the undefined address reached delivery — which is #423's original defect wearing the
+ * new field name. Validating here is what makes the cast honest.
+ */
+const asChannel = (value: unknown, what: string): BuzzCliChannel => {
+  if (
+    typeof value !== "object" || value === null ||
+    typeof (value as { channel_id?: unknown }).channel_id !== "string" ||
+    (value as { channel_id: string }).channel_id.length === 0
+  ) {
+    throw new Error(`buzz ${what} returned a channel without a channel_id`);
+  }
+  return value as BuzzCliChannel;
+};
+
+const asChannelList = (value: unknown, what: string): BuzzCliChannel[] => {
+  if (!Array.isArray(value)) throw new Error(`buzz ${what} did not return a list of channels`);
+  return value.map((entry) => asChannel(entry, what));
+};
+
+/**
+ * The subject of a purpose: the last `:` segment. A purpose is `role:subject` — the callers
+ * build `primary-cto:${projectId}` (`cto-lifecycle.ts:852`), `continuity:${role}`, and so
+ * on — so the subject is the part that could name a room, and the role prefix never is.
+ *
+ * Two narrower rules than the obvious one, both for the same reason. Substring matching was
+ * tried and dropped: on a shared relay `commitlore-x` contains `commitlore`, so a purpose
+ * could resolve to somebody else's room. Matching *any* segment was then tried and dropped
+ * too: `primary-cto:prj_7` would match a room literally named `primary-cto`, which is a
+ * plausible room name on a relay whose members talk about their agents, and every project
+ * would deliver into it.
+ */
+const purposeSubject = (purpose: string): string | null => {
+  const segments = purpose.split(":").filter((s) => s.length > 0);
+  return segments.length > 0 ? segments[segments.length - 1]! : null;
+};
 
 /**
  * Real transport over the `buzz` CLI.
  *
  * The relay credential lives in the daemon's environment and is never forwarded to an
  * agent session or a verification subprocess (§33.3).
+ *
+ * Every argv here is pinned by `tests/unit/buzz-cli-surface.test.ts` against the surface
+ * the installed CLI actually exposes. The previous implementation passed `--json` to
+ * `channels list`, which that CLI rejects outright, and read `id` from a payload that
+ * carries `channel_id` — neither of which any modelled test could see, because the tests
+ * replace this class with a double.
  */
 export class BuzzCliTransport implements BuzzTransport {
   constructor(
@@ -34,27 +122,109 @@ export class BuzzCliTransport implements BuzzTransport {
     private readonly defaultChannel: string | null = null,
   ) {}
 
-  async available(): Promise<boolean> {
+  /**
+   * Proves this transport can open the channel it is about to use — not that the binary is
+   * installed, and not that the relay has rooms in it.
+   *
+   * `--help` succeeds with no relay, no credential and no network, which is how the old
+   * check reported a healthy channel right up until the first `openChannel` failed at
+   * dispatch time. Answering "some channel exists" has the same defect in a new form: no
+   * production purpose is named after a room — they are all `role:projectId` — so a relay
+   * full of other people's rooms would still report healthy and still fail at connect.
+   *
+   * So `available` asks the same question `openChannel` will, for the same purpose. Called
+   * without one it can only prove the authenticated round-trip, and it says so by requiring
+   * a bound `defaultChannel` before claiming more.
+   */
+  async available(purpose?: string): Promise<boolean> {
     if (!process.env["BUZZ_PRIVATE_KEY"]) return false;
     try {
-      await exec(this.binary, ["--help"], { timeout: 10_000 });
-      return true;
+      if (purpose !== undefined) {
+        await this.openChannel(purpose);
+        return true;
+      }
+      if (this.defaultChannel) {
+        await this.#requireChannel(this.defaultChannel);
+        return true;
+      }
+      // No purpose and no bound channel: nothing here can name a channel to open, so
+      // claiming the transport is usable would be the #423 defect again.
+      return false;
     } catch {
       return false;
     }
   }
 
+  /**
+   * Resolves the channel a purpose is reachable at, refusing rather than guessing.
+   *
+   * A configured `defaultChannel` is verified to exist before it is returned: an address
+   * that does not resolve is a connect-time failure, not a delivery-time one.
+   */
   async openChannel(purpose: string): Promise<string> {
-    if (this.defaultChannel) return this.defaultChannel;
-    const { stdout } = await exec(this.binary, ["channels", "list", "--json"], {
+    if (this.defaultChannel) return (await this.#requireChannel(this.defaultChannel)).channel_id;
+
+    const channels = await this.#listChannels();
+    const subject = purposeSubject(purpose);
+    const match = subject === null
+      ? undefined
+      : channels.find((c) => c.name === subject);
+    // Falling back to `channels[0]` was tried and dropped: an unmatched purpose would
+    // deliver a fenced envelope into whichever room the relay happened to list first.
+    //
+    // Name resolution is a convenience for a relay whose rooms are named after projects.
+    // Production purposes carry a project *id* (`cto:prj_…`, `cto-lifecycle.ts:852`), which
+    // will not match a human room name — so a deployment binds `ACP_BUZZ_CHANNEL` and takes
+    // the verified default-channel path above. Refusing here is what makes that visible at
+    // connect time instead of delivering somewhere arbitrary.
+    if (!match) {
+      throw new Error(
+        `no buzz channel matches purpose ${purpose}` +
+          ` (available: ${channels.map((c) => c.name ?? "?").join(", ")};` +
+          ` set ACP_BUZZ_CHANNEL to bind one explicitly)`,
+      );
+    }
+    return match.channel_id;
+  }
+
+  /** `messages get` — the CLI has no `messages list`. Used to read a delivery back. */
+  async readBack(channel: string, limit = 10): Promise<BuzzCliMessage[]> {
+    const { stdout } = await exec(
+      this.binary,
+      ["messages", "get", "--channel", channel, "--limit", String(limit)],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+    const messages = parseJson(stdout, "messages get");
+    if (!Array.isArray(messages)) throw new Error("buzz messages get did not return a list");
+    return messages as BuzzCliMessage[];
+  }
+
+  async #listChannels(): Promise<BuzzCliChannel[]> {
+    // No `--json`: the installed CLI rejects the flag and already emits JSON without it.
+    const { stdout } = await exec(this.binary, ["channels", "list"], {
       encoding: "utf8",
       timeout: 30_000,
     });
-    const channels = JSON.parse(stdout) as Array<{ id: string; name?: string }>;
-    const match = channels.find((c) => c.name && purpose.includes(c.name));
-    const chosen = match ?? channels[0];
-    if (!chosen) throw new Error("no buzz channel available");
-    return chosen.id;
+    return asChannelList(parseJson(stdout, "channels list"), "channels list");
+  }
+
+  /**
+   * Resolves a channel id and proves the relay answered about *that* channel.
+   *
+   * The identity check is the point: `channels get` takes a `--channel` argument the relay
+   * is free to interpret, and a configured value that resolves to a different room must be
+   * a refusal rather than a silent redirect of every envelope this daemon sends.
+   */
+  async #requireChannel(channelId: string): Promise<BuzzCliChannel> {
+    const { stdout } = await exec(this.binary, ["channels", "get", "--channel", channelId], {
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    const channel = asChannel(parseJson(stdout, "channels get"), "channels get");
+    if (channel.channel_id !== channelId) {
+      throw new Error(`buzz channel ${channelId} resolved to ${channel.channel_id}`);
+    }
+    return channel;
   }
 
   async send(channel: string, content: string): Promise<void> {
@@ -107,7 +277,7 @@ export class InMemoryBuzzTransport implements BuzzTransport {
     this.#available = available;
   }
 
-  async available(): Promise<boolean> {
+  async available(_purpose?: string): Promise<boolean> {
     return this.#available;
   }
 
@@ -141,7 +311,7 @@ export class BuzzAdapter {
   ) {}
 
   async connect(sessionId: string, purpose: string): Promise<Decision<string>> {
-    if (!(await this.transport.available())) {
+    if (!(await this.transport.available(purpose))) {
       return deny(ReasonCode.PROBE_FAILED, "buzz transport is not available", { sessionId, purpose });
     }
     try {

@@ -1,0 +1,38 @@
+[
+  {
+    "id": "7860f7e28a97035eba7d8b5df58c14867eaf13e62461a8df576c558e1b6d6f78",
+    "pubkey": "cc2186309e44af0d2f1852494c21b07c692e6bb4b94747c7f3960459aa974155",
+    "created_at": 1786255054,
+    "kind": 9,
+    "tags": [
+      [
+        "h",
+        "83da5c36-7be5-4df7-9887-19ec44d7fb0a"
+      ],
+      [
+        "e",
+        "f140d196e5b6f3044f33c5e480b3584d1399ee2374de895e775d4cd2057ec229",
+        "",
+        "reply"
+      ]
+    ],
+    "content": "<redacted: captured body replaced, shape preserved>"
+  },
+  {
+    "id": "456e3087338b43d8474d1593232e6759aafd29b7562d1e00d7d9f183685500d5",
+    "pubkey": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4",
+    "created_at": 1786256653,
+    "kind": 9,
+    "tags": [
+      [
+        "h",
+        "83da5c36-7be5-4df7-9887-19ec44d7fb0a"
+      ],
+      [
+        "p",
+        "cc2186309e44af0d2f1852494c21b07c692e6bb4b94747c7f3960459aa974155"
+      ]
+    ],
+    "content": "<redacted: captured body replaced, shape preserved>"
+  }
+]

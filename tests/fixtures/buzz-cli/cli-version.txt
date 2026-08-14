@@ -1,0 +1,5 @@
+The CLI exposes no --version. Identified by content digest instead.
+path:   /Users/isaac/.local/bin/buzz
+sha256: 909c7eb4c4e5f4978d404cb98ad176d2ea4f76253b56c06ae8f802b78295a5bb
+mtime:  Aug 13 19:27:55 2026
+captured: 2026-08-14

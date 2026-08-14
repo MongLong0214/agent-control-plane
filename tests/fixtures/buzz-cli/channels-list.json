@@ -1,0 +1,26 @@
+[
+  {
+    "channel_id": "8983b055-69dc-4c7b-a16c-13bc6894e3a3",
+    "created_at": 1786253478,
+    "description": "원일 ↔ CEO 직통 — 프로젝트 외 논의",
+    "name": "ceo"
+  },
+  {
+    "channel_id": "6dcb2a67-b130-4c3c-8280-c32756a1c26a",
+    "created_at": 1786248566,
+    "description": "CEO ↔ CTO 작업 채널 — logic-pro-mcp",
+    "name": "logic-pro-mcp"
+  },
+  {
+    "channel_id": "83da5c36-7be5-4df7-9887-19ec44d7fb0a",
+    "created_at": 1786248566,
+    "description": "CEO ↔ CTO 작업 채널 — agent-operator-score",
+    "name": "agent-operator-score"
+  },
+  {
+    "channel_id": "1bbe342c-2da6-4134-81dc-4042eddf7f25",
+    "created_at": 1786248566,
+    "description": "CEO ↔ CTO 작업 채널 — commitlore",
+    "name": "commitlore"
+  }
+]

@@ -1,0 +1,86 @@
+{
+  "capture": "P0-09/#243 live Buzz delivery and ACK against the production relay",
+  "capturedAt": "2026-08-14T03:11:03.237Z",
+  "relay": "https://isaac-macmini.tailb41ff5.ts.net:3000",
+  "cliPath": "/Users/isaac/.local/bin/buzz",
+  "surface": {
+    "channelsListArgv": [
+      "channels",
+      "list"
+    ],
+    "jsonFlagRejected": true,
+    "identityField": "channel_id",
+    "hasIdField": false,
+    "availableWithoutPurposeOrBoundChannel": false
+  },
+  "channelResolution": {
+    "createdChannel": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "availableForResolvablePurpose": true,
+    "availableForUnresolvablePurpose": false,
+    "resolvedByPurpose": "cto:acp-verify-2026-08-14T03-11-03",
+    "resolvedTo": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "unmatchedPurposeRefused": "no buzz channel matches purpose cto:acp-verify-2026-08-14T03-11-03-not-a-real-room (available: acp-verify-2026-08-14T03-11-03, ceo, logic-pro-mcp, agent-operator-score, commitlore; set ACP_BUZZ_CHANNEL to bind one explicitly)"
+  },
+  "clockCoherence": {
+    "relayCreatedAt": "2026-08-14T03:11:03.000Z",
+    "captureClockSkewSeconds": 0,
+    "envelopeExpiresAt": "2026-08-14T03:41:03.462Z",
+    "envelopeExpiresAfterRelayReceipt": true
+  },
+  "delivery": {
+    "messageId": "msg_57834783d32346a8896e139a",
+    "outboxStatus": "SENT",
+    "relayEventId": "65fb882f481f059268c6d892b4e9fb7ca1eb0ccd55346881bec4b324e93cccd7",
+    "relayPubkey": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4",
+    "fenceOnRelay": {
+      "roleKey": "CEO",
+      "bindingGeneration": 1,
+      "targetSessionId": "ses_3267e32596f2428db8faf684"
+    },
+    "envelopeBytesOnRelay": 413,
+    "readBackArgv": [
+      "messages",
+      "get",
+      "--channel",
+      "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+      "--limit",
+      "10"
+    ]
+  },
+  "acknowledgement": {
+    "path": "IngressGuard.admit -> BuzzActorIngress.bindActor -> SessionRegistry.bindBuzzActor",
+    "actorFromRelay": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4",
+    "resolvedRole": "CEO",
+    "resolvedGeneration": 1,
+    "resolvedStatus": "ACTIVE",
+    "differentActor": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddcadead",
+    "differentActorReasonCode": "INGRESS_ACTOR_NOT_ALLOWLISTED",
+    "differentActorMessage": "actor is not on the allowlist",
+    "differentActorResolvedTo": null,
+    "sessionLifecycle": "READY"
+  },
+  "doctor": {
+    "projectId": "buzz-live-doctor",
+    "ctoSessionId": "ses_e479b1775cd543e69223581b",
+    "buzzAddress": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "ctoBuzzNotConnectedBeforeConnect": true,
+    "ctoBuzzNotConnectedAfterConnect": false,
+    "statusBeforeConnect": "BLOCKED",
+    "statusAfterConnect": "BLOCKED",
+    "remainingFindingCodes": [
+      "CAPACITY_SENSOR_FILE_MISSING",
+      "CEO_ROLE_UNBOUND",
+      "HOST_MEMORY_PRESSURE",
+      "TRUSTED_GATE_CREDENTIAL_MISSING"
+    ]
+  },
+  "closes": {
+    "P0-09/#423": "transport matched to the installed CLI, argv and field names pinned",
+    "#243": "NOT CLOSED — delivery and acknowledgement proven; the done-when also requires a HEALTHY doctor"
+  },
+  "result": "PARTIAL",
+  "cleanup": {
+    "channel": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "deleted": true
+  }
+}

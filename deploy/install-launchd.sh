@@ -17,6 +17,11 @@ Usage:
 The job always uses $HOME/.agent-control-plane because that is agentcpd's configured
 state root. Secrets never go in the plist: store ACP_MCP_TOKEN and ACP_OPERATOR_TOKEN (both required) and optional
 Buzz variables as generic-password Keychain items under the selected service.
+
+BUZZ_PRIVATE_KEY has a second source. When no such item exists under the selected service,
+the launcher falls back to the Buzz desktop app's own store, whose layout is a JSON object
+keyed by identity rather than one item per variable. Point it elsewhere with
+ACP_BUZZ_KEYCHAIN_SERVICE, ACP_BUZZ_KEYCHAIN_ACCOUNT, and ACP_BUZZ_KEYCHAIN_IDENTITY.
 EOF
 }
 
@@ -32,6 +37,11 @@ shift || true
 app_root="$DEFAULT_APP_ROOT"
 node_path="${ACP_NODE_PATH:-}"
 keychain_service="com.agentcontrolplane.agentcpd"
+# Where the Buzz desktop app keeps relay identities when the operator has not exported a
+# dedicated BUZZ_PRIVATE_KEY item. Overridable because it is that app's layout, not ours.
+buzz_keychain_service="${ACP_BUZZ_KEYCHAIN_SERVICE:-buzz-desktop}"
+buzz_keychain_account="${ACP_BUZZ_KEYCHAIN_ACCOUNT:-secrets}"
+buzz_keychain_identity="${ACP_BUZZ_KEYCHAIN_IDENTITY:-identity}"
 database_backup=""
 no_start=0
 
@@ -143,6 +153,18 @@ snapshot_current_deployment() {
   chmod 700 "$snapshot/agentcpd-launch.sh"
 }
 
+# The launcher runs under launchd with a fixed PATH that does not include a user-local bin
+# directory, so a `buzz` installed at ~/.local/bin is invisible to the daemon even though it
+# is on the installing shell's PATH. Resolve it here, while that PATH is still available, and
+# bake in the absolute path — otherwise the transport reports unavailable in production for a
+# reason nothing in the daemon's own logs can explain.
+resolve_buzz_binary() {
+  local found=""
+  found="$(command -v buzz 2>/dev/null || true)"
+  [[ -n "$found" && -x "$found" ]] || return 0
+  printf '%s' "$found"
+}
+
 write_launcher() {
   local temporary="$state_dir/.agentcpd-launch.$$.tmp"
   umask 077
@@ -151,6 +173,14 @@ write_launcher() {
     printf 'ACP_NODE_PATH=%q\n' "$node_path"
     printf 'ACP_APP_ROOT=%q\n' "$app_root"
     printf 'ACP_KEYCHAIN_SERVICE=%q\n' "$keychain_service"
+    printf 'ACP_BUZZ_KEYCHAIN_SERVICE=%q\n' "$buzz_keychain_service"
+    printf 'ACP_BUZZ_KEYCHAIN_ACCOUNT=%q\n' "$buzz_keychain_account"
+    printf 'ACP_BUZZ_KEYCHAIN_IDENTITY=%q\n' "$buzz_keychain_identity"
+    local resolved_buzz=""
+    resolved_buzz="$(resolve_buzz_binary)"
+    if [[ -n "$resolved_buzz" ]]; then
+      printf 'ACP_RESOLVED_BUZZ_BINARY=%q\n' "$resolved_buzz"
+    fi
     printf 'ACP_HOME=%q\n' "$home_dir"
     cat <<'EOF'
 export HOME="$ACP_HOME"
@@ -172,11 +202,56 @@ optional_keychain_value() {
   export "$account"
 }
 
+# The Buzz relay credential is not stored as its own Keychain item on a host where the Buzz
+# desktop app owns it: that app keeps every identity's secret inside one `buzz-desktop` /
+# `secrets` JSON object, keyed by identity name. Read it from there when no dedicated
+# `BUZZ_PRIVATE_KEY` account exists, so the daemon does not start with a silently absent
+# credential — `BuzzCliTransport.available()` returns false without it and the doctor then
+# reports CTO_BUZZ_NOT_CONNECTED with nothing to point at.
+# A Keychain-provided ACP_BUZZ_BINARY wins; otherwise use the path resolved at install time.
+if [[ -z "${ACP_BUZZ_BINARY:-}" && -n "${ACP_RESOLVED_BUZZ_BINARY:-}" ]]; then
+  export ACP_BUZZ_BINARY="$ACP_RESOLVED_BUZZ_BINARY"
+fi
+buzz_key_from_desktop_secrets() {
+  [[ -n "${BUZZ_PRIVATE_KEY:-}" ]] && return 0
+  # agentcpd refuses to start when BUZZ_PRIVATE_KEY is present without its ingress pair,
+  # because a transport that can receive but cannot authenticate an actor is worse than no
+  # transport. Supplying the key here without them would turn a daemon that runs DEGRADED
+  # into one that exits on every launchd restart, so this fallback stays out of the way
+  # until the deployment has the whole set.
+  if [[ -z "${ACP_BUZZ_INGRESS_SECRET:-}" || -z "${ACP_BUZZ_ALLOWED_ACTORS:-}" ]]; then
+    printf 'agentcpd launcher: skipping the Buzz desktop credential — ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS are not both configured\n' >&2
+    return 0
+  fi
+  local blob=""
+  blob="$(security find-generic-password -w -s "$ACP_BUZZ_KEYCHAIN_SERVICE" -a "$ACP_BUZZ_KEYCHAIN_ACCOUNT" 2>/dev/null)" || return 0
+  local extracted=""
+  # The identity key travels in the environment, not in argv. `node -e` argv indexing is a
+  # runtime detail — the launcher runs whatever binary --node was pointed at — and picking
+  # the wrong index here would silently select a *different* identity's secret rather than
+  # fail, which is the one outcome worse than having no credential.
+  extracted="$(
+    printf '%s' "$blob" | ACP_BUZZ_IDENTITY_KEY="$ACP_BUZZ_KEYCHAIN_IDENTITY" "$ACP_NODE_PATH" -e '
+      let raw = "";
+      process.stdin.on("data", (c) => { raw += c; });
+      process.stdin.on("end", () => {
+        try {
+          const value = JSON.parse(raw)[process.env.ACP_BUZZ_IDENTITY_KEY];
+          if (typeof value === "string" && value.length > 0) process.stdout.write(value);
+        } catch { /* not the JSON shape we expect: leave the credential unset */ }
+      });
+    ' 2>/dev/null
+  )" || return 0
+  [[ -n "$extracted" ]] || return 0
+  export BUZZ_PRIVATE_KEY="$extracted"
+}
+
 export ACP_MCP_TOKEN="$(required_keychain_value ACP_MCP_TOKEN)"
 export ACP_OPERATOR_TOKEN="$(required_keychain_value ACP_OPERATOR_TOKEN)"
 for optional in ACP_OPERATOR_ACTOR BUZZ_PRIVATE_KEY ACP_BUZZ_INGRESS_SECRET ACP_BUZZ_ALLOWED_ACTORS BUZZ_RELAY_URL ACP_BUZZ_BINARY ACP_BUZZ_CHANNEL; do
   optional_keychain_value "$optional"
 done
+buzz_key_from_desktop_secrets
 
 exec "$ACP_NODE_PATH" "$ACP_APP_ROOT/dist/daemon/agentcpd.js"
 EOF

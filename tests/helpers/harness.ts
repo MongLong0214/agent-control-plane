@@ -8,7 +8,7 @@ import { Daemon, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.
 import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import type { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import { REVIEWER_PROVIDER_ENDPOINTS } from "../../src/runtime/provider.ts";
-import { BuzzAdapter, InMemoryBuzzTransport } from "../../src/buzz/buzz-adapter.ts";
+import { BuzzAdapter, InMemoryBuzzTransport, type BuzzTransport } from "../../src/buzz/buzz-adapter.ts";
 import { TestProductionAdapter } from "./production-adapter.ts";
 import type { GitHubClient, GitHubKernelOptions } from "../../src/github/github-kernel.ts";
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
@@ -30,6 +30,8 @@ export interface Harness {
   repoPath: string;
   root: string;
   buzz: InMemoryBuzzTransport;
+  /** The adapter the control plane is wired to, whichever transport it holds. */
+  buzzAdapter: BuzzAdapter;
 }
 
 /**
@@ -48,10 +50,21 @@ export const makeHarness = (
     githubAppPrivateKeyPath?: string;
     ownerIdentities?: readonly OwnerIdentity[];
     allowTestEvidenceWriters?: boolean;
+    /**
+     * Replaces the in-memory route. Live acceptance captures pass the real CLI transport so
+     * "connected" means a channel on the relay rather than an entry in an array.
+     */
+    buzzTransport?: BuzzTransport;
+    /**
+     * Live acceptance captures pass the system clock. A capture writes to a real remote,
+     * and evidence stamped from a deterministic clock disagrees with the timestamps that
+     * remote records — see the P1-01 finding on the P0-14 gate canary.
+     */
+    clock?: ManualClock;
   } = {},
 ): Harness => {
   const root = tempDir("acp-harness-");
-  const clock = new ManualClock("2026-08-12T00:00:00.000Z");
+  const clock = options.clock ?? new ManualClock("2026-08-12T00:00:00.000Z");
   const scripted = new TestProductionAdapter(clock);
 
   const repoPath = options.repoPath ?? makeRepo({
@@ -101,7 +114,7 @@ console.log('verification ok');`,
   // transport; the fixture wires an in-memory one so "connected" means something.
   const buzz = new InMemoryBuzzTransport();
   const adapter = new BuzzAdapter(
-    cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, buzz,
+    cp.db, cp.clock, cp.audit, cp.sessions, cp.bindings, cp.outbox, options.buzzTransport ?? buzz,
   );
   cp.cto.attach({
     buzz: {
@@ -113,7 +126,7 @@ console.log('verification ok');`,
     buzz: { connect: (sessionId, purpose) => adapter.connect(sessionId, purpose) },
   });
 
-  return { cp, clock, scripted, repoPath, root, buzz };
+  return { cp, clock, scripted, repoPath, root, buzz, buzzAdapter: adapter };
 };
 
 export const fixtureManifest = (
