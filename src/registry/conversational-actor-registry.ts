@@ -47,8 +47,13 @@ interface ActorRow {
   retired_at: string | null;
 }
 
-interface RegisteredActorRow extends ActorRow {
-  actor_generation: number;
+interface ActiveActorSetRow {
+  registry_set_generation: number;
+  actor_id: string | null;
+  actor_generation: number | null;
+  kind: Role | null;
+  current_session_id: string | null;
+  current_session_incarnation: string | null;
 }
 
 /**
@@ -217,23 +222,34 @@ export class ConversationalActorRegistry {
   }
 
   activeSet(): ActiveActorSet {
-    const registrySetGeneration = this.registrySetGeneration();
-    const actors = this.db.all<RegisteredActorRow>(
-      `SELECT r.actor_id, r.actor_generation, a.kind,
-              a.current_session_id, a.current_session_incarnation, a.retired_at
-         FROM conversational_actor_registrations r
-         JOIN conversational_actors a ON a.actor_id = r.actor_id
-        WHERE r.registration_state = 'REGISTERED'
+    const rows = this.db.all<ActiveActorSetRow>(
+      `SELECT s.registry_set_generation, r.actor_id, r.actor_generation, a.kind,
+              a.current_session_id, a.current_session_incarnation
+         FROM conversational_actor_registry_state s
+         LEFT JOIN conversational_actor_registrations r
+           ON r.registration_state = 'REGISTERED'
+         LEFT JOIN conversational_actors a ON a.actor_id = r.actor_id
+        WHERE s.registry_id = 1
         ORDER BY r.actor_id, r.actor_generation`,
-    ).map((row): RegisteredConversationalActor => ({
-      actorId: row.actor_id,
-      actorGeneration: row.actor_generation,
-      kind: row.kind,
-      registrationState: "REGISTERED",
-      attachmentState: row.current_session_id === null ? "DETACHED" : "ATTACHED",
-      currentSessionId: row.current_session_id,
-      currentSessionIncarnation: row.current_session_incarnation,
-    }));
+    );
+    const registrySetGeneration = rows[0]?.registry_set_generation ??
+      fail(ReasonCode.INTERNAL_ERROR, "registered actor set generation is missing", {});
+    const actors = rows.flatMap((row): RegisteredConversationalActor[] => {
+      if (row.actor_id === null) return [];
+      const actorGeneration = row.actor_generation ??
+        fail(ReasonCode.INTERNAL_ERROR, "registered actor set member is incomplete", {});
+      const kind = row.kind ??
+        fail(ReasonCode.INTERNAL_ERROR, "registered actor set member is incomplete", {});
+      return [{
+        actorId: row.actor_id,
+        actorGeneration,
+        kind,
+        registrationState: "REGISTERED",
+        attachmentState: row.current_session_id === null ? "DETACHED" : "ATTACHED",
+        currentSessionId: row.current_session_id,
+        currentSessionIncarnation: row.current_session_incarnation,
+      }];
+    });
     return { registrySetGeneration, actors };
   }
 

@@ -61,6 +61,67 @@ describe("conversational actor registration authority (L5)", () => {
     expect(forbiddenEffectCounts(harness)).toEqual(before);
   });
 
+  it("returns the registry generation and active members from one SQLite snapshot", () => {
+    const harness = makeHarness();
+    const actorId = "actor:snapshot-cto";
+    harness.cp.db.run(
+      `INSERT INTO conversational_actors (actor_id, kind, created_at)
+       VALUES (?, 'PRIMARY_CTO', ?)`,
+      [actorId, harness.clock.nowIso()],
+    );
+
+    const writer = new Database(harness.cp.db.file);
+    writer.pragma("foreign_keys = ON");
+    const commitMembership = writer.transaction(() => {
+      writer.prepare(
+        `INSERT INTO conversational_actor_registrations
+           (actor_id, actor_generation, registration_state, registered_at)
+         VALUES (?, 1, 'REGISTERED', ?)`,
+      ).run(actorId, harness.clock.nowIso());
+      writer.prepare(
+        `UPDATE conversational_actor_registry_state
+            SET registry_set_generation = registry_set_generation + 1
+          WHERE registry_id = 1`,
+      ).run();
+    });
+
+    const originalAll = harness.cp.db.all;
+    let membershipCommits = 0;
+    harness.cp.db.all = <T>(sql: string, params: unknown[] = []): T[] => {
+      if (membershipCommits !== 0) throw new Error("activeSet issued more than one row query");
+      commitMembership();
+      membershipCommits += 1;
+      return originalAll.call(harness.cp.db, sql, params) as T[];
+    };
+
+    try {
+      const activeSet = harness.cp.actors.activeSet();
+      expect(membershipCommits).toBe(1);
+      expect(writer.prepare(
+        `SELECT s.registry_set_generation, COUNT(r.actor_id) AS active_members
+           FROM conversational_actor_registry_state s
+           LEFT JOIN conversational_actor_registrations r
+             ON r.registration_state = 'REGISTERED'
+          WHERE s.registry_id = 1`,
+      ).get()).toEqual({ registry_set_generation: 1, active_members: 1 });
+      expect(activeSet).toEqual({
+        registrySetGeneration: 1,
+        actors: [{
+          actorId,
+          actorGeneration: 1,
+          kind: "PRIMARY_CTO",
+          registrationState: "REGISTERED",
+          attachmentState: "DETACHED",
+          currentSessionId: null,
+          currentSessionIncarnation: null,
+        }],
+      });
+    } finally {
+      harness.cp.db.all = originalAll;
+      writer.close();
+    }
+  });
+
   it("rejects a stale expected set generation with re-derive semantics and no writes", () => {
     const harness = makeHarness();
     for (const actorId of ["actor:first-cto", "actor:second-cto"]) {
