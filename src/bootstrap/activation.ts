@@ -879,20 +879,28 @@ export class BootstrapActivation {
       });
     }
 
-    const missingCi = input.approvedManifest.ciWorkflows.flatMap((workflow) =>
-      result.repositories.flatMap((repository) => {
-        const expectedHead = heads.get(repository.identity);
-        const found = result.ciEvidence.some(
-          (evidence) =>
-            evidence.repositoryIdentity === repository.identity &&
-            evidence.checkName === workflow.checkName &&
-            evidence.head === expectedHead &&
-            evidence.conclusion === "PASS" &&
-            (workflow.approvedDigest === null || evidence.workflowDigest === workflow.approvedDigest),
-        );
-        return found ? [] : [{ repositoryIdentity: repository.identity, checkName: workflow.checkName }];
-      }),
-    );
+    // Resolved through the workflow's own role, the same way required verification commands are
+    // resolved just above (#512). The cross product this replaces demanded every declared check
+    // on every repository, which no multi-repository manifest can satisfy: one `approvedDigest`
+    // cannot match a different workflow file in each participant. A role naming no registered
+    // repository stays missing rather than silently dropping out.
+    const missingCi = input.approvedManifest.ciWorkflows.flatMap((workflow): Array<{
+      repositoryIdentity: string | null;
+      checkName: string;
+    }> => {
+      const repository = result.repositories.find((candidate) => candidate.role === workflow.repositoryRole);
+      if (!repository) return [{ repositoryIdentity: null, checkName: workflow.checkName }];
+      const expectedHead = heads.get(repository.identity);
+      const found = result.ciEvidence.some(
+        (evidence) =>
+          evidence.repositoryIdentity === repository.identity &&
+          evidence.checkName === workflow.checkName &&
+          evidence.head === expectedHead &&
+          evidence.conclusion === "PASS" &&
+          (workflow.approvedDigest === null || evidence.workflowDigest === workflow.approvedDigest),
+      );
+      return found ? [] : [{ repositoryIdentity: repository.identity, checkName: workflow.checkName }];
+    });
     if (missingCi.length > 0) {
       return deny(ReasonCode.VERIFICATION_GAP, "required bootstrap CI evidence is missing or not PASS", {
         missingCi,

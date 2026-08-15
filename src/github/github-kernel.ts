@@ -1992,7 +1992,7 @@ export class GitHubKernel {
 
     // The required set comes from the project contract, not the caller: a caller-supplied
     // empty list would make this a vacuous PASS for any commit (§24.7).
-    const declared = this.declaredPostMergeChecks(runId);
+    const declared = this.declaredPostMergeChecks(runId, repositoryIdentity);
     const undeclared = requiredChecks.filter((name) => !declared.includes(name));
     if (undeclared.length > 0) {
       return deny(
@@ -2170,13 +2170,40 @@ export class GitHubKernel {
     })));
   }
 
-  /** The post-merge checks the run's pinned manifest declares (§24.7). */
-  private declaredPostMergeChecks(runId: string): string[] {
+  /**
+   * The post-merge checks the run's pinned manifest declares for one repository (§24.7).
+   *
+   * Scoped to the repository rather than the run (#512). A workflow entry names the repository
+   * it lives in, and its `approvedDigest` is later compared against the file read from that
+   * repository — so returning every entry for every participant required each one to carry a
+   * byte-identical workflow file. `postMergeCommands` carry no role and stay run-wide.
+   */
+  private declaredPostMergeChecks(runId: string, repositoryIdentity: string): string[] {
     const run = this.runs.get(runId);
     const manifest = run?.pinnedManifestDigest ? this.projects.manifest(run.pinnedManifestDigest) : null;
-    const fromWorkflows = (manifest?.ciWorkflows ?? []).map((w) => w.checkName);
+    const role = this.repositoryRoleInRun(runId, repositoryIdentity);
+    const fromWorkflows = (manifest?.ciWorkflows ?? [])
+      .filter((w) => w.repositoryRole === role)
+      .map((w) => w.checkName);
     const fromCommands = manifest?.postMergeCommands ?? [];
     return [...new Set([...fromWorkflows, ...fromCommands])];
+  }
+
+  /**
+   * The role this repository holds in this run, or null when it holds none.
+   *
+   * Read from `run_repositories` rather than `repositories`: the role is a property of the
+   * repository's participation in a run, and a repository absent from the run must resolve to
+   * nothing rather than to whatever role it happened to be registered with elsewhere.
+   */
+  private repositoryRoleInRun(runId: string, repositoryIdentity: string): string | null {
+    const row = this.db.get<{ repository_role: string }>(
+      `SELECT rr.repository_role FROM run_repositories rr
+         JOIN repositories r ON r.repository_id = rr.repository_id
+        WHERE rr.run_id = ? AND r.identity = ?`,
+      [runId, repositoryIdentity],
+    );
+    return row?.repository_role ?? null;
   }
 
   /**
@@ -2770,7 +2797,12 @@ export class GitHubKernel {
   ): Promise<Decision<{ workflowDigest: string }>> {
     const manifest = this.pinnedManifest(runId);
     if (!manifest.allowed) return manifest as Decision<{ workflowDigest: string }>;
-    const workflow = manifest.value.ciWorkflows.find((entry) => entry.checkName === check.name);
+    // Matched on role as well as name (#512): the digest below is read from this repository, so
+    // an entry belonging to a different participant must not be the one it is compared against.
+    const role = this.repositoryRoleInRun(runId, repositoryIdentity);
+    const workflow = manifest.value.ciWorkflows.find(
+      (entry) => entry.checkName === check.name && entry.repositoryRole === role,
+    );
     if (!workflow?.approvedDigest || check.head_sha !== head || check.app?.slug !== "github-actions") {
       return deny(ReasonCode.GATE_CREATOR_UNTRUSTED, "check has no approved Actions workflow provenance", {
         checkRunId: check.id,

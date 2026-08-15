@@ -26,7 +26,7 @@ import {
 afterAll(cleanupTempDirs);
 
 const CI_WORKFLOWS = [
-  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null },
+  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, repositoryRole: "primary" },
 ];
 
 interface Fixture {
@@ -210,7 +210,7 @@ const setupTrustedPostMergeFixture = async (options: {
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-thing",
     manifestOverrides: {
-      ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: sha256(APPROVED_WORKFLOW) }],
+      ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: sha256(APPROVED_WORKFLOW), repositoryRole: "primary" }],
     },
   });
   github.setBranch("dev", driven.baseHead);
@@ -1157,8 +1157,8 @@ describe("round-2 review: post-merge coverage and receipts", () => {
       workBranch: "feature/F1-thing",
       manifestOverrides: {
         ciWorkflows: [
-          { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null },
-          { path: ".github/workflows/sec.yml", checkName: "security", approvedDigest: null },
+          { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, repositoryRole: "primary" },
+          { path: ".github/workflows/sec.yml", checkName: "security", approvedDigest: null, repositoryRole: "primary" },
         ],
       },
     });

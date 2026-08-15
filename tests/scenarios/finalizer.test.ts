@@ -60,7 +60,7 @@ const approvedFixture = async (options: { confirm?: boolean } = {}) => {
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-finalizer",
     manifestOverrides: {
-      ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW) }],
+      ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), repositoryRole: "primary" }],
     },
   });
   github.setBranch("dev", driven.baseHead);
@@ -178,8 +178,18 @@ const recordExistingReleaseTag = (
   github.tags.set("1.2.3", commit);
 };
 
-/** A two-repository version of the real candidate/packet path, used to prove merge ordering. */
-const twoRepositoryApprovedFixture = async () => {
+/**
+ * A two-repository version of the real candidate/packet path, used to prove merge ordering.
+ *
+ * `workflows` lets the two repositories carry *different* CI workflow files. That is the normal
+ * case in the field and the one #512 could not express: a single manifest entry's
+ * `approvedDigest` was compared against whichever file the repository under verification held,
+ * so two participants agreed only when their workflows were byte-identical.
+ */
+const twoRepositoryApprovedFixture = async (
+  workflows: { first: string; second: string } = { first: WORKFLOW, second: WORKFLOW },
+  checkNames: { first: string; second: string } = { first: "project-ci", second: "project-ci" },
+) => {
   const firstGitHub = new FakeGitHub();
   const secondGitHub = new FakeGitHub();
   reflectMergedBase(firstGitHub);
@@ -196,8 +206,8 @@ const twoRepositoryApprovedFixture = async () => {
     "src/app.js": "module.exports = () => 1;\n",
     "verify.js": "process.exit(0);\n",
   });
-  for (const path of [harness.repoPath, secondPath]) {
-    writeFiles(path, { [WORKFLOW_PATH]: WORKFLOW });
+  for (const [path, workflow] of [[harness.repoPath, workflows.first], [secondPath, workflows.second]] as const) {
+    writeFiles(path, { [WORKFLOW_PATH]: workflow });
     commitAll(path, "add trusted project CI workflow");
   }
 
@@ -221,7 +231,14 @@ const twoRepositoryApprovedFixture = async () => {
       maxOutputBytes: 1_048_576,
       maxMemoryMb: 2048,
     }],
-    ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW) }],
+    // One entry per participating repository (#512). Both checkouts were given the same
+    // workflow above, but a single entry no longer covers both: an entry names the repository
+    // whose file its digest is compared against, and a repository declaring no check is denied
+    // rather than exempted.
+    ciWorkflows: [
+      { path: WORKFLOW_PATH, checkName: checkNames.first, approvedDigest: sha256(workflows.first), repositoryRole: "first" },
+      { path: WORKFLOW_PATH, checkName: checkNames.second, approvedDigest: sha256(workflows.second), repositoryRole: "second" },
+    ],
   });
   const project = harness.cp.projects.register({
     projectId,
@@ -329,11 +346,11 @@ const twoRepositoryApprovedFixture = async () => {
   const order: string[] = [];
   firstGitHub.onMerge = ({ mergeSha }) => {
     order.push("first-merge");
-    firstGitHub.setTrustedPostMergeCheck(mergeSha, "project-ci", WORKFLOW_PATH);
+    firstGitHub.setTrustedPostMergeCheck(mergeSha, checkNames.first, WORKFLOW_PATH);
   };
   secondGitHub.onMerge = ({ mergeSha }) => {
     order.push("second-merge");
-    secondGitHub.setTrustedPostMergeCheck(mergeSha, "project-ci", WORKFLOW_PATH);
+    secondGitHub.setTrustedPostMergeCheck(mergeSha, checkNames.second, WORKFLOW_PATH);
   };
   const firstRequest = firstGitHub.request.bind(firstGitHub);
   firstGitHub.request = async <T>(method: HttpMethod, path: string, body?: unknown) => {
@@ -342,7 +359,7 @@ const twoRepositoryApprovedFixture = async () => {
       firstGitHub.mergeCount > 0 &&
       method === "GET" &&
       path.includes(`/commits/${byIdentity.get("github:acme/first")!.candidateHead}/check-runs`) &&
-      path.includes("check_name=project-ci") &&
+      path.includes(`check_name=${checkNames.first}`) &&
       !order.includes("first-post-merge-pass")
     ) {
       order.push("first-post-merge-pass");
@@ -600,6 +617,70 @@ describe("daemon-owned approved-run finalization", () => {
     expect(secondGitHub.mergeCount).toBe(1);
     expect(order.indexOf("first-merge")).toBeLessThan(order.indexOf("first-post-merge-pass"));
     expect(order.indexOf("first-post-merge-pass")).toBeLessThan(order.indexOf("second-merge"));
+    await daemon.stop();
+  });
+
+  it("verifies each repository against its own approved workflow rather than the first declared one", async () => {
+    // #512 — the two repositories carry different CI workflows, which is the ordinary case and
+    // the one the manifest could not describe. `ciWorkflows` had no `repositoryRole`, so an
+    // entry was resolved by check name alone and the *second* repository's workflow file was
+    // measured against the *first* repository's approved digest.
+    //
+    // None of that was visible while every fixture gave both repositories identical workflow
+    // files: identical files make the wrong digest the right one by accident. Making them
+    // differ is the whole mutation.
+    //
+    // The assertion is `merge_state` for both repositories rather than a reason code, because
+    // the failure this guards is not a refusal — it is the second repository merging and then
+    // being marked FAILED by a verification that measured it against another repository's
+    // contract, after the irreversible write had already happened.
+    const secondWorkflow = WORKFLOW.replace("node verify.js", "node verify.js --second");
+    expect(secondWorkflow).not.toBe(WORKFLOW);
+    const { harness, firstGitHub, secondGitHub, runId } = await twoRepositoryApprovedFixture({
+      first: WORKFLOW,
+      second: secondWorkflow,
+    });
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-finalizer-two-distinct-") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    expect(firstGitHub.mergeCount).toBe(1);
+    expect(secondGitHub.mergeCount).toBe(1);
+    expect(
+      harness.cp.runs.repositoriesOf(runId).map((repository) => repository.mergeState),
+      "a repository was verified against a workflow digest belonging to a different repository",
+    ).toEqual(["MERGED", "MERGED"]);
+    expect(harness.cp.runs.require(runId).state).toBe(RunState.COMPLETED);
+    await daemon.stop();
+  });
+
+  it("requires of each repository only the checks its own role declares", async () => {
+    // The second layer of the same #512 change, and a distinct property from the one above:
+    // that one is about which *workflow file* a check is measured against, this one is about
+    // which *checks are required at all*.
+    //
+    // `declaredPostMergeChecks` took only a run id, so the union of every declared check name
+    // was demanded of every participant. Two repositories with differently-named CI — which is
+    // what separate repositories normally have — each ended up required to produce the other's
+    // check, and neither can. The previous test cannot see this because both its repositories
+    // name their check `project-ci`, making the union identical to each part.
+    const { harness, firstGitHub, secondGitHub, runId } = await twoRepositoryApprovedFixture(
+      { first: WORKFLOW, second: WORKFLOW },
+      { first: "first-ci", second: "second-ci" },
+    );
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-finalizer-two-names-") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    expect(firstGitHub.mergeCount).toBe(1);
+    expect(secondGitHub.mergeCount).toBe(1);
+    expect(
+      harness.cp.runs.repositoriesOf(runId).map((repository) => repository.mergeState),
+      "a repository was required to produce a check declared for a different repository",
+    ).toEqual(["MERGED", "MERGED"]);
+    expect(harness.cp.runs.require(runId).state).toBe(RunState.COMPLETED);
     await daemon.stop();
   });
 
