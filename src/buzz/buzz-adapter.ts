@@ -428,7 +428,21 @@ const classifyTransportFailure = (error: unknown): {
   error: string;
 } => {
   const message = error instanceof Error ? error.message : String(error);
-  if (/timed out|econn|enotfound|network|temporar|unavailable/i.test(message)) {
+  // #451 — a timeout is the one transport failure where the outcome is genuinely unknown. The
+  // frame may already be at the far end: `send` returning late says nothing about whether it
+  // arrived. Retrying then delivers the same envelope twice, which is the destination
+  // exactly-once gap this issue names.
+  //
+  // The other patterns here are different in kind. A refused connection, an unresolved host or
+  // an unavailable service failed *before* anything left, so retrying is safe. Grouping the
+  // timeout with them collapsed "I do not know" into "it did not happen" — the same fold as
+  // A1 (#448), where an unknown is reported as a definite answer.
+  //
+  // `unknown_observed` already existed for exactly this and the timeout was not in it.
+  if (/timed out|timeout|etimedout/i.test(message)) {
+    return { failureClass: "unknown_observed", retryable: false, error: message };
+  }
+  if (/econn|enotfound|network|temporar|unavailable/i.test(message)) {
     return { failureClass: "transient", retryable: true, error: message };
   }
   if (/auth|permission|forbidden|credential/i.test(message)) {
