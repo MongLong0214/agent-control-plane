@@ -386,11 +386,12 @@ export class ContinuityKernel {
       taskId: scope.taskId ?? null,
       mode: assignment.reason === "preferred" ? "PREFERRED" : "FALLBACK",
       reason: `continuity failover: ${reason}`,
-      // #493 — a conversation survives its runtime restarting, not its provider changing. The
-      // transcript belongs to the provider's session, so a Claude counterpart replaced by GPT is
-      // a different counterpart however similar its role; only a same-provider replacement is
-      // the same conversation continuing on a new runtime. The PRD scenarios say this directly —
-      // P0-06 expects a GPT-bound CEO to be replaced by a *fresh Claude generation*.
+      // #493 — a conversation survives its runtime restarting, not its provider changing. What a
+      // conversational actor accumulates cannot be carried to another provider, so a Claude
+      // counterpart replaced by GPT is a different counterpart however similar its role; only a
+      // same-provider replacement is the same actor continuing on a new runtime. The PRD
+      // scenarios say this directly — P0-06 expects a GPT-bound CEO to be replaced by a
+      // *fresh Claude generation*.
       conversation: sameProviderReplacement ? "SURVIVED" : "REPLACED",
       // The synchronous check above gives a useful early refusal, while this fence makes
       // the final revoke-and-rebind atomic with the generation that plan observed.
