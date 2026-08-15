@@ -507,16 +507,29 @@ ${CONVERSATIONAL_ACTOR_DDL}
   BEFORE INSERT ON task_executions
   WHEN NOT EXISTS (
     SELECT 1 FROM assignments a
-      JOIN sessions s ON s.session_id = a.session_id
+      JOIN conversational_actors c ON c.actor_id = a.actor_id
+      JOIN sessions s ON s.session_id = c.current_session_id
      WHERE a.role = 'WORKER'
        AND a.role_key = 'WORKER:' || NEW.task_id
        AND a.task_id = NEW.task_id
-       AND a.session_id = NEW.worker_session_id
+       AND c.current_session_id = NEW.worker_session_id
        AND a.status = 'ACTIVE'
        AND s.lifecycle = 'READY'
   )
   BEGIN
     SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_BINDING_REQUIRED');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS conversational_actors_runtime_ready
+  BEFORE UPDATE OF current_session_id ON conversational_actors
+  WHEN NEW.current_session_id IS NOT NULL
+   AND NEW.current_session_id IS NOT OLD.current_session_id
+   AND NOT EXISTS (
+     SELECT 1 FROM sessions
+      WHERE session_id = NEW.current_session_id AND lifecycle = 'READY'
+   )
+  BEGIN
+    SELECT RAISE(ABORT, 'ACTOR_RUNTIME_NOT_READY');
   END;
 
   CREATE TRIGGER IF NOT EXISTS conversational_actors_retirement_terminal
@@ -617,6 +630,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "sessions_secret_hash_immutable", sentinel: "SESSION_SECRET_HASH_IMMUTABLE" },
   { name: "sessions_buzz_actor_immutable", sentinel: "SESSION_BUZZ_ACTOR_IMMUTABLE" },
   { name: "conversational_actors_retirement_terminal", sentinel: "ACTOR_RETIREMENT_TERMINAL", introducedIn: 18 },
+  { name: "conversational_actors_runtime_ready", sentinel: "ACTOR_RUNTIME_NOT_READY", introducedIn: 18 },
   { name: "assignments_generation_monotonic", sentinel: "BINDING_GENERATION_NOT_MONOTONIC" },
   { name: "assignments_generation_immutable", sentinel: "BINDING_IDENTITY_IMMUTABLE" },
   { name: "assignments_revocation_terminal", sentinel: "BINDING_REVOKED_TERMINAL" },

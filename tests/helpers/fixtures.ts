@@ -135,11 +135,21 @@ export interface SeededRun {
  * assignment against a synthetic session id does not also have to seed a `sessions` row it does
  * not care about. Tests exercising the actor's live runtime set it explicitly.
  */
-export const seedActor = (db: { run: (sql: string, params?: unknown[]) => unknown }, kind: string): string => {
+export const seedActor = (
+  db: { run: (sql: string, params?: unknown[]) => unknown },
+  kind: string,
+  sessionId?: string,
+  incarnation = "inc-1",
+): string => {
   const actorId = `actor:${newAssignmentId()}`;
+  // #493 — the actor holds the live runtime, and `task_executions_worker_binding_required` now
+  // asks the actor rather than the binding. A seeded actor with no runtime therefore refuses the
+  // worker's own executions, so callers that exercise that path pass the session.
   db.run(
-    `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, ?, 't')`,
-    [actorId, kind],
+    `INSERT INTO conversational_actors
+       (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+     VALUES (?, ?, ?, ?, 't')`,
+    [actorId, kind, sessionId ?? null, sessionId ? incarnation : null],
   );
   return actorId;
 };

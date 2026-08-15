@@ -365,8 +365,11 @@ export class BindingRegistry {
             WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
               AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
           [
+            // Both sides are identity: the new row's own binding-time runtime, and the outgoing
+            // binding's. `current.sessionId` is the live view and would fail to match the tuple
+            // the run actually holds (#493).
             input.sessionId, generation, session.incarnation, roleKey,
-            current.sessionId, current.bindingGeneration, current.roleKey, ...LIVE_RUN_STATES,
+            current.boundSessionId, current.bindingGeneration, current.roleKey, ...LIVE_RUN_STATES,
           ],
         ).changes;
         for (const affected of affectedRuns) {
@@ -458,7 +461,12 @@ export class BindingRegistry {
 
   active(roleKey: string): RoleBinding | null {
     const row = this.db.get<RawAssignment>(
-      `SELECT * FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+      `SELECT a.*,
+              c.current_session_id AS live_session_id,
+              c.current_session_incarnation AS live_session_incarnation
+         FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.role_key = ? AND a.status = 'ACTIVE'`,
       [roleKey],
     );
     return row ? hydrate(row) : null;
@@ -470,7 +478,12 @@ export class BindingRegistry {
 
   activePrimaryCto(projectId: string): RoleBinding | null {
     const row = this.db.get<RawAssignment>(
-      `SELECT * FROM assignments WHERE project_id = ? AND role = 'PRIMARY_CTO' AND status = 'ACTIVE'`,
+      `SELECT a.*,
+              c.current_session_id AS live_session_id,
+              c.current_session_incarnation AS live_session_incarnation
+         FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.project_id = ? AND a.role = 'PRIMARY_CTO' AND a.status = 'ACTIVE'`,
       [projectId],
     );
     return row ? hydrate(row) : null;
@@ -479,7 +492,12 @@ export class BindingRegistry {
   byRun(runId: string): RoleBinding[] {
     return this.db
       .all<RawAssignment>(
-        `SELECT * FROM assignments WHERE run_id = ?
+        `SELECT a.*,
+              c.current_session_id AS live_session_id,
+              c.current_session_incarnation AS live_session_incarnation
+         FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+        WHERE a.run_id = ?
             OR task_id IN (SELECT task_id FROM tasks WHERE run_id = ?)
           ORDER BY created_at`,
         [runId, runId],
@@ -807,6 +825,9 @@ interface RawAssignment {
   mode: "PREFERRED" | "FALLBACK";
   status: "ACTIVE" | "REVOKED";
   created_at: string;
+  /** Joined from the actor; null only where a binding's actor has no runtime yet. */
+  live_session_id: string | null;
+  live_session_incarnation: string | null;
 }
 
 const hydrate = (row: RawAssignment): RoleBinding => ({
@@ -816,8 +837,12 @@ const hydrate = (row: RawAssignment): RoleBinding => ({
   projectId: row.project_id,
   runId: row.run_id,
   taskId: row.task_id,
-  sessionId: row.session_id,
-  sessionIncarnation: row.session_incarnation,
+  // The live runtime, resolved through the actor. COALESCE covers an actor that has not been
+  // given a runtime yet; the binding's own value is the correct answer there.
+  sessionId: row.live_session_id ?? row.session_id,
+  sessionIncarnation: row.live_session_incarnation ?? row.session_incarnation,
+  boundSessionId: row.session_id,
+  boundSessionIncarnation: row.session_incarnation,
   bindingGeneration: row.binding_generation,
   mode: row.mode,
   status: row.status,

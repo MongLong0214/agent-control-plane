@@ -48,11 +48,11 @@ const BASELINE = {
   "CP-HI-01": 10,
   "CP-HI-02": 7,
   "CP-HI-03": 10,
-  "CP-HI-04": 30,
+  "CP-HI-04": 32,
   "CP-HI-05": 10,
   "CP-HI-06": 16,
   "CP-HI-07": 7,
-  "CP-HI-08": 17,
+  "CP-HI-08": 20,
 };
 
 const INVARIANT = /CP-HI-0[1-8]/g;

@@ -421,3 +421,54 @@ describe("failover moves the runtime without retiring the counterpart (CP-HI-08,
     expect(orphan.allowed).toBe(false);
   });
 });
+
+/**
+ * CP-HI-08 — the worker guard's dependency has to stay enforced, not become conventional (#493).
+ *
+ * `task_executions_worker_binding_required` used to rest on `assignments.session_id`, which
+ * `assignments_generation_immutable` holds still. #493 moved it onto
+ * `conversational_actors.current_session_id`, which is mutable — so the guard would have traded
+ * an enforced dependency for a convention, and a convention is exactly what CP-HI-08 exists to
+ * catch. `conversational_actors_runtime_ready` is what keeps it enforced.
+ *
+ * Written because the mutation table said so: deleting that trigger left every other test green.
+ */
+describe("an actor's runtime can only ever be a READY session (CP-HI-08, #493)", () => {
+  it("refuses to repoint an actor at a session that is not ready", () => {
+    const { db, bindings, seeded } = setup();
+    db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES ('ses_draining', 'inc-draining', 'scripted', 'm', 'DRAINING', 't', 't')`,
+    );
+    const roleKey = `PRIMARY_CTO:${seeded.projectId}`;
+    const actor = db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+      [bindings.require(roleKey).assignmentId],
+    );
+    // The raw-SQL bypass the trigger exists for. Going through switchTo would be refused earlier
+    // by SESSION_NOT_READY, which proves the service layer and not the database backstop.
+    expect(() =>
+      db.run(`UPDATE conversational_actors SET current_session_id = ? WHERE actor_id = ?`, [
+        "ses_draining",
+        actor!.actor_id,
+      ]),
+    ).toThrow(/ACTOR_RUNTIME_NOT_READY/);
+  });
+
+  it("allows the move when the incoming session is ready", () => {
+    // The converse: a guard that refused every move would block failover itself, which is the
+    // opposite failure and would not be caught by the refusal test alone.
+    const { db, bindings, seeded, session } = setup();
+    const ready = session("ses_ready_runtime");
+    const roleKey = `PRIMARY_CTO:${seeded.projectId}`;
+    const actor = db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+      [bindings.require(roleKey).assignmentId],
+    );
+    db.run(`UPDATE conversational_actors SET current_session_id = ? WHERE actor_id = ?`, [
+      ready,
+      actor!.actor_id,
+    ]);
+    expect(bindings.require(roleKey).sessionId).toBe(ready);
+  });
+});

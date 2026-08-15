@@ -368,6 +368,15 @@ export class ContinuityKernel {
       });
     }
 
+    const outgoingRuntime = current ? this.sessions.get(current.sessionId) : null;
+    const incomingRuntime = this.sessions.get(provisioned.value.sessionId);
+    const sameProviderReplacement =
+      outgoingRuntime !== null &&
+      incomingRuntime !== null &&
+      outgoingRuntime !== undefined &&
+      incomingRuntime !== undefined &&
+      outgoingRuntime.provider === incomingRuntime.provider;
+
     const switched = this.bindings.switchTo({
       roleKey,
       role,
@@ -377,8 +386,12 @@ export class ContinuityKernel {
       taskId: scope.taskId ?? null,
       mode: assignment.reason === "preferred" ? "PREFERRED" : "FALLBACK",
       reason: `continuity failover: ${reason}`,
-      // #493 — the session died and a replacement was provisioned: the runtime went, the counterpart did not.
-      conversation: "SURVIVED",
+      // #493 — a conversation survives its runtime restarting, not its provider changing. The
+      // transcript belongs to the provider's session, so a Claude counterpart replaced by GPT is
+      // a different counterpart however similar its role; only a same-provider replacement is
+      // the same conversation continuing on a new runtime. The PRD scenarios say this directly —
+      // P0-06 expects a GPT-bound CEO to be replaced by a *fresh Claude generation*.
+      conversation: sameProviderReplacement ? "SURVIVED" : "REPLACED",
       // The synchronous check above gives a useful early refusal, while this fence makes
       // the final revoke-and-rebind atomic with the generation that plan observed.
       expectedCurrentGeneration: expected?.bindingGeneration,
@@ -461,8 +474,13 @@ export class ContinuityKernel {
         taskId: current.taskId,
         mode: "PREFERRED",
         reason: "continuity restoration",
-        // #493 — same continuity path — a runtime is being replaced under a living counterpart.
-        conversation: "SURVIVED",
+        // #493 — restoration moves a role back to its preferred provider, so by definition the
+        // provider changes and the counterpart is a new one. Same rule as the failover path
+        // above, and here it always resolves the same way.
+        conversation:
+          session && this.sessions.get(provisioned.value.sessionId)?.provider === session.provider
+            ? "SURVIVED"
+            : "REPLACED",
       });
       if (!switched.allowed) {
         this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "restoration rejected");

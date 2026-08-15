@@ -13,7 +13,7 @@ import {
   type ManagedInvocationWrite,
   type ManagedInvocationWriteBroker,
 } from "../../src/runtime/provider.ts";
-import { cleanupTempDirs, gitSync, makeCore, makeRepo, seedRun, tempDir , seedActor} from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, makeCore, makeRepo, seedActor, seedRun, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -77,7 +77,7 @@ describe("CP-HI-01 local runtime write broker", () => {
       `INSERT INTO assignments (assignment_id, role_key, role, run_id, task_id, actor_id, session_id,
                                 session_incarnation, binding_generation, mode, status, created_at)
        VALUES (?, ?, 'WORKER', ?, ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
-      [newAssignmentId(), `WORKER:${taskId}`, seeded.runId, taskId, seedActor(core.db, "WORKER"), seeded.sessionId, now],
+      [newAssignmentId(), `WORKER:${taskId}`, seeded.runId, taskId, seedActor(core.db, "WORKER", seeded.sessionId), seeded.sessionId, now],
     );
     core.db.run(
       `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,

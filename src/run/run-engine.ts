@@ -551,6 +551,10 @@ export class RunEngine {
     return allow(ReasonCode.OK, {
       assignmentId: "pinned-run-owner",
       roleKey: active.role_key,
+      // A pinned owner is an identity record, so both views resolve to the pinned tuple: this
+      // synthesises the binding the run named, not whatever is live now.
+      boundSessionId: run.ownerSessionId ?? active.session_id,
+      boundSessionIncarnation: run.ownerSessionIncarnation ?? active.session_incarnation,
       role: run.kind === RunKind.PROJECT_BOOTSTRAP ? Role.BOOTSTRAP_CTO : Role.PRIMARY_CTO,
       projectId: null,
       runId: run.kind === RunKind.PROJECT_BOOTSTRAP ? run.runId : null,
@@ -822,7 +826,10 @@ export class RunEngine {
         `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
                          owner_session_incarnation = ?, owner_role_key = ?
           WHERE run_id = ?`,
-        [binding.sessionId, binding.bindingGeneration, binding.sessionIncarnation, binding.roleKey, runId],
+        // #493 — the owner pin is an identity, so it uses the binding-time runtime the composite
+        // foreign key resolves against. `binding.sessionId` is the live routing answer and would
+        // name a tuple `assignments` does not hold.
+        [binding.boundSessionId, binding.bindingGeneration, binding.boundSessionIncarnation, binding.roleKey, runId],
       );
       this.tasks.abandonStaleExecutions(runId, binding.bindingGeneration, "owner generation superseded");
       this.audit.record({
