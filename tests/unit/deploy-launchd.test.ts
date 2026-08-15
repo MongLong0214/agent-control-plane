@@ -420,10 +420,10 @@ describe("launchd deployment artifact", () => {
     const launcher = readFileSync(launcherPath(harness), "utf8");
     expect(launcher).toContain("ACP_STATE_DIR=");
     expect(launcher).toContain(
-      'export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_STATE_DIR/reviewer/claude}"',
+      'export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_REVIEWER_ROOT/claude}"',
     );
     expect(launcher).toContain(
-      'export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_STATE_DIR/reviewer/codex}"',
+      'export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_REVIEWER_ROOT/codex}"',
     );
   });
 

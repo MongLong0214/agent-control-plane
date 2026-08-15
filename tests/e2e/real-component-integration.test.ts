@@ -171,7 +171,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
             capacityFile: join(root, "capacity", "gpt.json"),
             // The reviewer scope holds auth.json and nothing else. ~/.codex carries producer
             // conversation state, which is exactly what a blind reviewer must not read.
-            providerCredentialDir: join(process.env["HOME"] ?? "", ".agent-control-plane", "reviewer", "codex"),
+            providerCredentialDir: join(process.env["HOME"] ?? "", ".acp-reviewer", "codex"),
             reviewerEgress: {
               profilePath: join(EGRESS_ROOT, "reviewer.sb"),
               proxyPath: fileURLToPath(new URL("../../deploy/egress/allowlist-proxy.py", import.meta.url)),

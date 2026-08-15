@@ -263,8 +263,14 @@ buzz_key_from_desktop_secrets
 # the Keychain at all, so the credential has to live in a directory it is allowed to read.
 # Deriving the default means the operator authenticates into a known path instead of also
 # having to publish where it is; an explicit value still wins.
-export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_STATE_DIR/reviewer/claude}"
-export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_STATE_DIR/reviewer/codex}"
+# Outside $ACP_STATE_DIR on purpose. The reviewer seatbelt denies the daemon state tree, so a
+# credential placed inside it is unreadable by the process that needs it — measured as
+# `failed to read CODEX_HOME ...: Operation not permitted`. The deny is correct; the location
+# was wrong. Widening the profile to reach into daemon state would trade the boundary for the
+# convenience of one path.
+export ACP_REVIEWER_ROOT="${ACP_REVIEWER_ROOT:-$ACP_HOME/.acp-reviewer}"
+export ACP_CLAUDE_REVIEWER_CONFIG_DIR="${ACP_CLAUDE_REVIEWER_CONFIG_DIR:-$ACP_REVIEWER_ROOT/claude}"
+export ACP_CODEX_REVIEWER_HOME="${ACP_CODEX_REVIEWER_HOME:-$ACP_REVIEWER_ROOT/codex}"
 
 # A Keychain-provided ACP_BUZZ_BINARY wins; otherwise the path resolved at install time.
 #
