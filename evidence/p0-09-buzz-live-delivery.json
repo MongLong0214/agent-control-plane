@@ -1,6 +1,6 @@
 {
   "capture": "P0-09/#243 live Buzz delivery and ACK against the production relay",
-  "capturedAt": "2026-08-14T03:11:03.237Z",
+  "capturedAt": "2026-08-15T09:08:13.192Z",
   "relay": "https://isaac-macmini.tailb41ff5.ts.net:3000",
   "cliPath": "/Users/isaac/.local/bin/buzz",
   "surface": {
@@ -14,35 +14,35 @@
     "availableWithoutPurposeOrBoundChannel": false
   },
   "channelResolution": {
-    "createdChannel": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "createdChannel": "7d1c6964-9ee8-4b67-84dd-56865d76d340",
     "availableForResolvablePurpose": true,
     "availableForUnresolvablePurpose": false,
-    "resolvedByPurpose": "cto:acp-verify-2026-08-14T03-11-03",
-    "resolvedTo": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
-    "unmatchedPurposeRefused": "no buzz channel matches purpose cto:acp-verify-2026-08-14T03-11-03-not-a-real-room (available: acp-verify-2026-08-14T03-11-03, ceo, logic-pro-mcp, agent-operator-score, commitlore; set ACP_BUZZ_CHANNEL to bind one explicitly)"
+    "resolvedByPurpose": "cto:acp-verify-2026-08-15T09-08-13",
+    "resolvedTo": "7d1c6964-9ee8-4b67-84dd-56865d76d340",
+    "unmatchedPurposeRefused": "no buzz channel matches purpose cto:acp-verify-2026-08-15T09-08-13-not-a-real-room (available: acp-verify-2026-08-15T09-08-13, repo-factory, ceo, logic-pro-mcp, agent-operator-score, commitlore; set ACP_BUZZ_CHANNEL to bind one explicitly)"
   },
   "clockCoherence": {
-    "relayCreatedAt": "2026-08-14T03:11:03.000Z",
+    "relayCreatedAt": "2026-08-15T09:08:13.000Z",
     "captureClockSkewSeconds": 0,
-    "envelopeExpiresAt": "2026-08-14T03:41:03.462Z",
+    "envelopeExpiresAt": "2026-08-15T09:38:13.416Z",
     "envelopeExpiresAfterRelayReceipt": true
   },
   "delivery": {
-    "messageId": "msg_57834783d32346a8896e139a",
+    "messageId": "msg_bf0dfd5b32e34feca853b5ed",
     "outboxStatus": "SENT",
-    "relayEventId": "65fb882f481f059268c6d892b4e9fb7ca1eb0ccd55346881bec4b324e93cccd7",
+    "relayEventId": "08e24ecdc78d7e988530469ee722e68288338c2bf5b42624f80240d8a738ca95",
     "relayPubkey": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4",
     "fenceOnRelay": {
       "roleKey": "CEO",
       "bindingGeneration": 1,
-      "targetSessionId": "ses_3267e32596f2428db8faf684"
+      "targetSessionId": "ses_962b205126e647f994c12a8a"
     },
     "envelopeBytesOnRelay": 413,
     "readBackArgv": [
       "messages",
       "get",
       "--channel",
-      "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+      "7d1c6964-9ee8-4b67-84dd-56865d76d340",
       "--limit",
       "10"
     ]
@@ -55,14 +55,14 @@
     "resolvedStatus": "ACTIVE",
     "differentActor": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddcadead",
     "differentActorReasonCode": "INGRESS_ACTOR_NOT_ALLOWLISTED",
-    "differentActorMessage": "actor is not on the allowlist",
+    "differentActorMessage": "channel identity is not on the allowlist",
     "differentActorResolvedTo": null,
     "sessionLifecycle": "READY"
   },
   "doctor": {
     "projectId": "buzz-live-doctor",
-    "ctoSessionId": "ses_e479b1775cd543e69223581b",
-    "buzzAddress": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "ctoSessionId": "ses_12356acf5fd7407f9274c17d",
+    "buzzAddress": "7d1c6964-9ee8-4b67-84dd-56865d76d340",
     "ctoBuzzNotConnectedBeforeConnect": true,
     "ctoBuzzNotConnectedAfterConnect": false,
     "statusBeforeConnect": "BLOCKED",
@@ -71,6 +71,7 @@
       "CAPACITY_SENSOR_FILE_MISSING",
       "CEO_ROLE_UNBOUND",
       "HOST_MEMORY_PRESSURE",
+      "HOST_SWAP_PRESSURE",
       "TRUSTED_GATE_CREDENTIAL_MISSING"
     ]
   },
@@ -80,7 +81,7 @@
   },
   "result": "PARTIAL",
   "cleanup": {
-    "channel": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "channel": "7d1c6964-9ee8-4b67-84dd-56865d76d340",
     "deleted": true
   }
 }
