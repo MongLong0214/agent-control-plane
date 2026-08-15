@@ -230,6 +230,24 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           ],
         }),
       );
+      // The reviewer is gpt, and capacity is per provider. Seeding only claude left review
+      // refused CAPACITY_UNKNOWN_NOT_ROUTABLE: dispatch had a routable provider and the
+      // reviewer did not.
+      writeFileSync(
+        join(root, "capacity", "gpt.json"),
+        JSON.stringify({
+          observedAt: new Date().toISOString(),
+          runtimeHealth: "HEALTHY",
+          buckets: [
+            {
+              id: "rolling-5h",
+              remainingPercent: 75,
+              resetAt: null,
+              capabilities: ["ceo", "cto", "blind-review", "worker"],
+            },
+          ],
+        }),
+      );
 
       // Writing the file is not enough: the monitor only holds a reading once a refresh has
       // read it, and in production that is the daemon's sensor tick. This test drives
@@ -241,7 +259,7 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       // the operator observation is the mechanism built for it — an authenticated reading that
       // outlives a collector which cannot see quota. Supplying one is what a real operator
       // does via `agentctl capacity observe`, not a way around the sensor.
-      await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["claude"]);
+      await cp.capacity.refresh(RefreshTrigger.DOCTOR_CAPACITY_REPORT, ["claude", "gpt"]);
       const observed = await cp.capacity.observe({
         provider: "claude",
         observedAt: new Date().toISOString(),
@@ -257,6 +275,24 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       });
       if (!observed.allowed) {
         throw new Error(`capacity observation refused: ${observed.reasonCode} ${observed.message}`);
+      }
+      // The same operator observation for the reviewer's provider. Its collector cannot read
+      // quota here either, so the authenticated reading is what makes review routable.
+      const observedGpt = await cp.capacity.observe({
+        provider: "gpt",
+        observedAt: new Date().toISOString(),
+        actor: cliOwner.actor,
+        source: AGENTCTL_CAPACITY_OBSERVATION_SOURCE,
+        runtimeHealth: "HEALTHY",
+        buckets: [{
+          id: "owner-observed-window",
+          remainingPercent: 75,
+          resetAt: null,
+          capabilities: ["ceo", "cto", "worker", "blind-review"],
+        }],
+      });
+      if (!observedGpt.allowed) {
+        throw new Error(`gpt capacity observation refused: ${observedGpt.reasonCode} ${observedGpt.message}`);
       }
       expect(
         cp.capacity.current("claude")?.allocationAdmission,
