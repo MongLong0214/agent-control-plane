@@ -1388,6 +1388,19 @@ describe("merge target proof (#350)", () => {
     return pr.value.pullNumber;
   };
 
+  const expectPendingMergeProof = (fixture: Fixture): void => {
+    expect(
+      fixture.harness.cp.db.get<{ status: string; verified: number }>(
+        `SELECT status, verified FROM github_receipts WHERE operation = 'merge_execute'`,
+      ),
+    ).toEqual({ status: "PENDING", verified: 0 });
+    expect(
+      fixture.harness.cp.db.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM github_receipts WHERE operation = 'rollback_prepare'`,
+      )?.count,
+    ).toBe(0);
+  };
+
   it("blocks a same-SHA PR base retarget in preflight before GitHub merges", async () => {
     const fixture = await setup();
     const pullNumber = await openPreparedPull(fixture);
@@ -1453,7 +1466,7 @@ describe("merge target proof (#350)", () => {
     ).toBe("FAILED");
   });
 
-  it("requires the prepared base ref itself to point at the acknowledged merge commit", async () => {
+  it("keeps a known unequal target generation pending without another merge", async () => {
     const fixture = await setup();
     const pullNumber = await openPreparedPull(fixture);
     const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
@@ -1473,13 +1486,566 @@ describe("merge target proof (#350)", () => {
       return response;
     };
 
-    const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    const input = mergeInput(fixture, pullNumber);
+    const refused = await fixture.harness.cp.github.mergeExecute(input);
     expect(refused.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    if (refused.allowed) throw new Error("expected unequal target proof to be denied");
+    expect(refused.evidence).toMatchObject({ expected: pull.merge_commit_sha, observed: fixture.base });
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+
+    const reconciled = await fixture.harness.cp.github.mergeExecute(input);
+    expect(reconciled.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("reports a missing postflight merge SHA as evidence missing", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      const response = await request<T>(method, path, body);
+      if (method === "PUT" && path.endsWith("/merge")) pull.merge_commit_sha = null;
+      return response;
+    };
+
+    const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(refused.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(refused.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("reports a missing target-ref SHA as evidence missing", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (method === "GET" && path.includes("/git/ref/heads/dev")) return { object: {} } as T;
+      return request<T>(method, path, body);
+    };
+
+    const refused = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(refused.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(refused.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("reconciles a failed postflight pull probe without repeating the merge", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    let failPostflightPull = false;
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (failPostflightPull && method === "GET" && path.endsWith(`/pulls/${pullNumber}`)) {
+        failPostflightPull = false;
+        throw new Error("sensitive transport detail");
+      }
+      const response = await request<T>(method, path, body);
+      if (method === "PUT" && path.endsWith("/merge")) failPostflightPull = true;
+      return response;
+    };
+
+    const input = mergeInput(fixture, pullNumber);
+    const unavailable = await fixture.harness.cp.github.mergeExecute(input);
+    expect(unavailable.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    if (unavailable.allowed) throw new Error("expected failed postflight pull probe to be denied");
+    expect(unavailable.evidence).toMatchObject({ phase: "postflight-pull", pullNumber });
+    expect(unavailable.evidence).not.toHaveProperty("error");
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+
+    const reconciled = await fixture.harness.cp.github.mergeExecute(input);
+    expect(reconciled.reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(1);
+    expect(
+      fixture.harness.cp.db.get<{ status: string; verified: number }>(
+        `SELECT status, verified FROM github_receipts WHERE operation = 'merge_execute'`,
+      ),
+    ).toEqual({ status: "APPLIED", verified: 1 });
+  });
+
+  it("treats a null postflight pull read as a probe failure", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    let nullPostflightPull = false;
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (nullPostflightPull && method === "GET" && path.endsWith(`/pulls/${pullNumber}`)) {
+        nullPostflightPull = false;
+        return null as T;
+      }
+      const response = await request<T>(method, path, body);
+      if (method === "PUT" && path.endsWith("/merge")) nullPostflightPull = true;
+      return response;
+    };
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unavailable.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    if (unavailable.allowed) throw new Error("expected null postflight pull read to be denied");
+    expect(unavailable.evidence).toMatchObject({ phase: "postflight-pull", pullNumber });
+    expect(unavailable.evidence).not.toHaveProperty("error");
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it.each([
+    { label: "exception", outcome: "exception" as const },
+    { label: "null", outcome: "null" as const },
+  ])("keeps a PENDING replay whose pull probe returns $label reconcilable", async ({ outcome }) => {
+      const fixture = await setup();
+      const pullNumber = await openPreparedPull(fixture);
+      const request = fixture.github.request.bind(fixture.github);
+      let seedPending = true;
+      let failReplayPull = false;
+      fixture.github.request = async <T>(
+        method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+        path: string,
+        body?: unknown,
+      ): Promise<T> => {
+        if (failReplayPull && method === "GET" && path.endsWith(`/pulls/${pullNumber}`)) {
+          failReplayPull = false;
+          if (outcome === "exception") throw new Error("sensitive reconciliation transport detail");
+          return null as T;
+        }
+        if (seedPending && method === "GET" && path.includes("/git/ref/heads/dev")) {
+          seedPending = false;
+          failReplayPull = true;
+          return { object: {} } as T;
+        }
+        return request<T>(method, path, body);
+      };
+
+      const input = mergeInput(fixture, pullNumber);
+      const pending = await fixture.harness.cp.github.mergeExecute(input);
+      expect(pending.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+      expectPendingMergeProof(fixture);
+
+      const unavailable = await fixture.harness.cp.github.mergeExecute(input);
+      expect(unavailable.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+      if (unavailable.allowed) throw new Error("expected replay pull probe to be denied");
+      expect(unavailable.evidence).toMatchObject({ phase: "reconcile-pull", pullNumber });
+      expect(unavailable.evidence).not.toHaveProperty("error");
+      expect(fixture.github.mergeCount).toBe(1);
+      expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(1);
+      expectPendingMergeProof(fixture);
+      expect(fixture.harness.cp.audit.byKind("MERGE_BASE_DRIFT").at(-1)?.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+
+      const reconciled = await fixture.harness.cp.github.mergeExecute(input);
+      expect(reconciled.reasonCode).toBe(ReasonCode.MERGE_IDEMPOTENT_REPLAY);
+      expect(fixture.github.mergeCount).toBe(1);
+      expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(1);
+      expect(
+        fixture.harness.cp.db.get<{ status: string; verified: number }>(
+          `SELECT status, verified FROM github_receipts WHERE operation = 'merge_execute'`,
+        ),
+      ).toEqual({ status: "APPLIED", verified: 1 });
+  });
+
+  it.each([
+    { label: "missing", merged: undefined },
+    { label: "nonboolean", merged: "yes" },
+  ])("keeps replay merged=$label as missing evidence without another PUT", async ({ merged }) => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    let seedPending = true;
+    let alterReplayPull = false;
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (alterReplayPull && method === "GET" && path.endsWith(`/pulls/${pullNumber}`)) {
+        alterReplayPull = false;
+        const response = await request<T>(method, path, body);
+        const unreadable = { ...(response as object), merged };
+        if (merged === undefined) delete unreadable.merged;
+        return unreadable as T;
+      }
+      if (seedPending && method === "GET" && path.includes("/git/ref/heads/dev")) {
+        seedPending = false;
+        alterReplayPull = true;
+        return { object: {} } as T;
+      }
+      return request<T>(method, path, body);
+    };
+
+    const input = mergeInput(fixture, pullNumber);
+    const pending = await fixture.harness.cp.github.mergeExecute(input);
+    expect(pending.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    const unavailable = await fixture.harness.cp.github.mergeExecute(input);
+    expect(unavailable.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(1);
+    expectPendingMergeProof(fixture);
+    expect(fixture.harness.cp.audit.byKind("MERGE_BASE_DRIFT").at(-1)?.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+  });
+
+  it.each([
+    { label: "missing merge SHA", field: "merge" as const, value: undefined, reasonCode: ReasonCode.EVIDENCE_MISSING },
+    { label: "blank merge SHA", field: "merge" as const, value: "  ", reasonCode: ReasonCode.EVIDENCE_MISSING },
+    { label: "missing head SHA", field: "head" as const, value: undefined, reasonCode: ReasonCode.EVIDENCE_MISSING },
+    { label: "blank head SHA", field: "head" as const, value: "  ", reasonCode: ReasonCode.EVIDENCE_MISSING },
+    { label: "unequal head SHA", field: "head" as const, value: "7".repeat(40), reasonCode: ReasonCode.MERGE_HEAD_STALE },
+  ])("classifies PENDING replay $label without collision or another PUT", async ({ field, value, reasonCode }) => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    let seedPending = true;
+    let alterReplayPull = false;
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (alterReplayPull && method === "GET" && path.endsWith(`/pulls/${pullNumber}`)) {
+        alterReplayPull = false;
+        const response = await request<T>(method, path, body);
+        const observed = { ...(response as object) } as {
+          merge_commit_sha?: unknown;
+          head?: { ref?: unknown; sha?: unknown };
+        };
+        if (field === "merge") {
+          observed.merge_commit_sha = value;
+          if (value === undefined) delete observed.merge_commit_sha;
+        } else {
+          observed.head = { ...(observed.head ?? {}), sha: value };
+          if (value === undefined) delete observed.head.sha;
+        }
+        return observed as T;
+      }
+      if (seedPending && method === "GET" && path.includes("/git/ref/heads/dev")) {
+        seedPending = false;
+        alterReplayPull = true;
+        return { object: {} } as T;
+      }
+      return request<T>(method, path, body);
+    };
+
+    const input = mergeInput(fixture, pullNumber);
+    const pending = await fixture.harness.cp.github.mergeExecute(input);
+    expect(pending.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    const unavailable = await fixture.harness.cp.github.mergeExecute(input);
+    expect(unavailable.reasonCode).toBe(reasonCode);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.RESOURCE_COLLISION);
+    if (!unavailable.allowed && reasonCode === ReasonCode.MERGE_HEAD_STALE) {
+      expect(unavailable.evidence).toMatchObject({ expected: fixture.head, observed: value });
+    }
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("keeps a PENDING merge with no prepared contract and does not prepare a halt", async () => {
+    const fixture = await setup();
+    const pullNumber = 999;
+    const input = mergeInput(fixture, pullNumber);
+    const mergeCommitSha = "merge-without-prepare".padEnd(40, "0");
+    fixture.github.pulls.push({
+      number: pullNumber,
+      head: { ref: fixture.workBranch, sha: fixture.head },
+      base: { ref: "dev", sha: fixture.base },
+      merged: true,
+      state: "closed",
+      html_url: "https://github.test/pull/999",
+      merge_commit_sha: mergeCommitSha,
+    });
+    fixture.github.commitParents.set(mergeCommitSha, [fixture.base, fixture.head]);
+    fixture.github.setBranch("dev", mergeCommitSha);
+    const idempotencyKey = `merge_execute:${fixture.identity}:${pullNumber}`;
+    reservePendingReceipt(fixture, {
+      receiptId: "rcp_merge_without_prepare",
+      idempotencyKey,
+      operation: "merge_execute",
+      resourceType: "merge",
+      resourceIdentity: `acme/fixture#${pullNumber}`,
+      beforeStateDigest: digestOf({ head: fixture.head, base: fixture.base }),
+      requestDigest: digestOf({
+        runId: input.runId,
+        repositoryIdentity: input.repositoryIdentity,
+        pullNumber: input.pullNumber,
+        exactHeadSha: input.exactHeadSha,
+        expectedBaseSha: input.expectedBaseSha,
+        mergeStrategy: input.mergeStrategy,
+        ownerBindingGeneration: input.ownerBindingGeneration,
+      }),
+    });
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(input);
+    expect(unavailable.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(0);
+    expectPendingMergeProof(fixture);
+    expect(fixture.harness.cp.audit.byKind("MERGE_BASE_DRIFT").at(-1)?.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+  });
+
+  it("reclaims a PENDING receipt only after a fresh pull read reports merged=false", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    let putAttempts = 0;
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (method === "PUT" && path.endsWith("/merge") && ++putAttempts === 1) return {} as T;
+      return request<T>(method, path, body);
+    };
+
+    const input = mergeInput(fixture, pullNumber);
+    const pending = await fixture.harness.cp.github.mergeExecute(input);
+    expect(pending.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(fixture.github.mergeCount).toBe(0);
+    expectPendingMergeProof(fixture);
+
+    const retried = await fixture.harness.cp.github.mergeExecute(input);
+    expect(retried.reasonCode).toBe(ReasonCode.OK);
+    expect(putAttempts).toBe(2);
     expect(fixture.github.mergeCount).toBe(1);
     expect(
-      fixture.harness.cp.runs.repositoriesOf(fixture.runId).find((entry) => entry.identity === fixture.identity)
-        ?.mergeState,
-    ).toBe("FAILED");
+      fixture.harness.cp.db.get<{ status: string; verified: number }>(
+        `SELECT status, verified FROM github_receipts WHERE operation = 'merge_execute'`,
+      ),
+    ).toEqual({ status: "APPLIED", verified: 1 });
+  });
+
+  it.each([
+    { label: "missing", merged: undefined },
+    { label: "nonboolean", merged: "yes" },
+  ])("treats after-PUT merged=$label as missing evidence", async ({ merged }) => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      const response = await request<T>(method, path, body);
+      if (method === "PUT" && path.endsWith("/merge")) {
+        const observed = pull as unknown as { merged?: unknown };
+        observed.merged = merged;
+        if (merged === undefined) delete observed.merged;
+      }
+      return response;
+    };
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unavailable.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it.each([
+    { label: "missing", field: "ref", value: undefined, reasonCode: ReasonCode.EVIDENCE_MISSING },
+    { label: "blank", field: "ref", value: "  ", reasonCode: ReasonCode.EVIDENCE_MISSING },
+    { label: "unequal", field: "ref", value: "other", reasonCode: ReasonCode.MERGE_BASE_STALE },
+    { label: "missing", field: "sha", value: undefined, reasonCode: ReasonCode.EVIDENCE_MISSING },
+    { label: "blank", field: "sha", value: "  ", reasonCode: ReasonCode.EVIDENCE_MISSING },
+    { label: "unequal", field: "sha", value: "7".repeat(40), reasonCode: ReasonCode.MERGE_BASE_STALE },
+  ])("classifies after-PUT base $field=$label without unbound staleness", async ({ field, value, reasonCode }) => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      const response = await request<T>(method, path, body);
+      if (method === "PUT" && path.endsWith("/merge")) {
+        const base = pull.base as unknown as { ref?: unknown; sha?: unknown };
+        base[field as "ref" | "sha"] = value;
+        if (value === undefined) delete base[field as "ref" | "sha"];
+      }
+      return response;
+    };
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unavailable.reasonCode).toBe(reasonCode);
+    if (unavailable.allowed) throw new Error("expected after-PUT base proof to be denied");
+    if (reasonCode === ReasonCode.MERGE_BASE_STALE) {
+      expect(unavailable.evidence).toMatchObject({
+        expected: field === "ref" ? "dev" : fixture.base,
+        observed: value,
+      });
+    }
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("treats an unreadable target ref as a probe failure", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (method === "GET" && path.includes("/git/ref/heads/dev")) {
+        throw new Error("sensitive target transport detail");
+      }
+      return request<T>(method, path, body);
+    };
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unavailable.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    if (unavailable.allowed) throw new Error("expected unreadable target ref to be denied");
+    expect(unavailable.evidence).toMatchObject({ phase: "postflight-target-ref", baseRef: "dev" });
+    expect(unavailable.evidence).not.toHaveProperty("error");
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("treats a null target-ref read as a probe failure", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (method === "GET" && path.includes("/git/ref/heads/dev")) return null as T;
+      return request<T>(method, path, body);
+    };
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unavailable.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    if (unavailable.allowed) throw new Error("expected null target-ref read to be denied");
+    expect(unavailable.evidence).toMatchObject({
+      phase: "postflight-target-ref",
+      baseRef: "dev",
+      observed: null,
+    });
+    expect(unavailable.evidence).not.toHaveProperty("error");
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("reports an established first-parent mismatch with explicit generations", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const observed = "7".repeat(40);
+    fixture.github.driftBaseTo = observed;
+
+    const stale = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(stale.reasonCode).toBe(ReasonCode.MERGE_BASE_STALE);
+    if (stale.allowed) throw new Error("expected first-parent mismatch to be denied");
+    expect(stale.evidence).toMatchObject({ expected: fixture.base, observed });
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("treats an unreadable first-parent commit as a probe failure", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (method === "GET" && /\/commits\/[^/]+$/.test(path)) {
+        throw new Error("sensitive first-parent transport detail");
+      }
+      return request<T>(method, path, body);
+    };
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unavailable.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    if (unavailable.allowed) throw new Error("expected unreadable first-parent commit to be denied");
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    expect(unavailable.evidence).toMatchObject({
+      phase: "postflight-first-parent",
+      mergeCommitSha: pull.merge_commit_sha,
+    });
+    expect(unavailable.evidence).not.toHaveProperty("error");
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it("treats a null first-parent commit read as a probe failure", async () => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (method === "GET" && /\/commits\/[^/]+$/.test(path)) return null as T;
+      return request<T>(method, path, body);
+    };
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unavailable.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    if (unavailable.allowed) throw new Error("expected null first-parent commit read to be denied");
+    const pull = fixture.github.pulls.find((entry) => entry.number === pullNumber)!;
+    expect(unavailable.evidence).toMatchObject({
+      phase: "postflight-first-parent",
+      mergeCommitSha: pull.merge_commit_sha,
+    });
+    expect(unavailable.evidence).not.toHaveProperty("error");
+    expect(fixture.github.mergeCount).toBe(1);
+    expectPendingMergeProof(fixture);
+  });
+
+  it.each([
+    { label: "missing parents", commit: { sha: "merge-proof" } },
+    { label: "empty parents", commit: { sha: "merge-proof", parents: [] } },
+    { label: "blank first-parent SHA", commit: { sha: "merge-proof", parents: [{ sha: "  " }] } },
+  ])("treats $label as missing first-parent evidence", async ({ commit }) => {
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (method === "GET" && /\/commits\/[^/]+$/.test(path)) return commit as T;
+      return request<T>(method, path, body);
+    };
+
+    const unavailable = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(unavailable.reasonCode).toBe(ReasonCode.EVIDENCE_MISSING);
+    expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
+    expect(fixture.github.mergeCount).toBe(1);
+    expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(1);
+    expectPendingMergeProof(fixture);
   });
 
   it("sends a pinned rebase strategy to GitHub as rebase", async () => {
