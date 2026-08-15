@@ -16,8 +16,8 @@ import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
 import { BuzzAdapter, BuzzCliTransport } from "../src/buzz/buzz-adapter.ts";
-import { randomBytes } from "node:crypto";
 
+import { configuredBuzzActorIngressPolicy } from "../src/daemon/agentcpd.ts";
 import { ManualClock } from "../src/core/clock.ts";
 import { newRunId } from "../src/core/ids.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../src/domain/types.ts";
@@ -249,10 +249,31 @@ try {
   // Here the deployment's ingress policy names exactly one allowed actor, the binding is
   // HMAC-signed, and the refusal below is the guard's, on an actor that is otherwise
   // well-formed and correctly signed.
-  const ingressSecret = randomBytes(32).toString("hex");
-  const guard = new IngressGuard(core.db, core.clock, core.audit, {
-    buzz: { allowedActors: [landed.pubkey], secret: ingressSecret },
-  });
+  // #243 — the deployment's policy, not one this script builds. The previous version generated
+  // its own secret and allowlisted the identity it had just landed, which proved that
+  // `IngressGuard` enforces whatever list it is handed. That was never the question. The
+  // question is whether `agentcpd`'s configured policy would refuse the actor, and only the
+  // policy `agentcpd` actually reads can answer it.
+  const policy = configuredBuzzActorIngressPolicy();
+  if (!policy) {
+    throw new Error(
+      "ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS are not configured, so there is no " +
+        "deployment policy to capture. Configure them as agentcpd runs and re-run; a policy " +
+        "invented here would prove nothing (#243).",
+    );
+  }
+  if (!policy.allowedActors.includes(landed.pubkey)) {
+    // Refusing rather than adding it. Amending the allowlist here would make the capture pass
+    // against a policy the deployment does not hold, which is the failure this whole item is
+    // about.
+    throw new Error(
+      `the configured allowlist does not contain the relay identity this capture landed ` +
+        `(${landed.pubkey}). Add it to ACP_BUZZ_ALLOWED_ACTORS in the deployment configuration ` +
+        `and re-run.`,
+    );
+  }
+  const ingressSecret = policy.secret;
+  const guard = new IngressGuard(core.db, core.clock, core.audit, { buzz: policy });
   const actorIngress = new BuzzActorIngress(guard, core.sessions);
 
   const bindThrough = (actor: string, nonce: string) => {
