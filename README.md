@@ -87,9 +87,11 @@ installation and reboot have not yet been accepted; that work is tracked in
 
 The repository does not claim live acceptance for any path that has not been observed. In
 particular, it does not claim a live Telegram round trip, a launchd installation, or the
-PRD observation window. The GitHub App gate publication and the Buzz round trip have been
-observed, and each is recorded in `evidence/`. The links, blockers, and
-milestones are maintained in [current status](docs/STATUS.md).
+PRD observation window. The GitHub App gate publication has been observed. The Buzz round trip
+has been observed **at the transport**, against an allowlist the capture generates rather than
+the deployment's configured policy — so it is recorded `PARTIAL`, not as a completed acceptance
+(#440, #243; the boundary is stated in full below). Each is recorded in `evidence/`. The links,
+blockers, and milestones are maintained in [current status](docs/STATUS.md).
 
 `pnpm trace` writes [traceability evidence](evidence/traceability.md) from the PRD and a
 fresh Vitest JSON result set. Its value is declaration coverage: a labelled executable leaf
