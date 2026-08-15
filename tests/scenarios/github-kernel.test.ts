@@ -996,6 +996,49 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     expect(rollback.allowed).toBe(true);
   });
 
+  it("a merged repository blocks dependents while its post-merge is pending (#512)", async () => {
+    // CP-S40 above proves the *failure* direction. This is the pending one, and it was open:
+    // a merged-but-unverified repository returned `allowed`, folding "not known yet" into
+    // "fine" — the CP-HI-08 shape, and the same fold as a delivery timeout recorded as a
+    // non-delivery (#451).
+    //
+    // Correct ordering already came from the finalizer awaiting each postMergeVerify in a
+    // sequential loop. That is one caller's property. Measured: deleting the whole gate left
+    // the finalizer's two-repository test green, because it observes the order the merges
+    // happened in and would observe the same order with no gate at all.
+    //
+    // The converse — that a verified post-merge *releases* dependents — is not asserted here,
+    // and cannot be: this file's fixture declares `approvedDigest: null`, so a post-merge check
+    // is always `untrusted` and no trusted pass is reachable. It is covered instead by
+    // finalizer.test.ts's two-repository case, which merges the second repository only after the
+    // first verifies; that test would fail outright if this gate never released.
+    const fixture = await setup();
+    const pullNumber = await prepared(fixture);
+    const merged = await fixture.harness.cp.github.mergeExecute({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      pullNumber,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
+      mergeStrategy: "merge_commit",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+    });
+    if (!merged.allowed) throw new Error(merged.message);
+
+    // Merged, and nothing has verified it. Nothing has failed either — the answer is simply
+    // not in yet, and that must not read as permission.
+    const whilePending = fixture.harness.cp.github.dependentMergeBlocked(
+      fixture.runId,
+      fixture.identity,
+    );
+    expect(
+      whilePending.allowed,
+      "a dependent was released while an earlier repository was merged and unverified",
+    ).toBe(false);
+    expect(whilePending.reasonCode).toBe(ReasonCode.DEPENDENT_MERGE_BLOCKED);
+  });
+
   it("post-merge verification treats a missing check as a failure, not a pass", async () => {
     const fixture = await setup();
     const pullNumber = await prepared(fixture);

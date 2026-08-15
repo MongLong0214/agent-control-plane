@@ -2179,7 +2179,28 @@ export class GitHubKernel {
     return [...new Set([...fromWorkflows, ...fromCommands])];
   }
 
-  /** §24.7 — a repository whose post-merge check failed blocks its dependents. */
+  /**
+   * §24.7 — a repository blocks its dependents until its own post-merge verification has
+   * answered, and blocks them permanently if the answer was a failure.
+   *
+   * The pending half was added deliberately (#512). Before it, a merged-but-unverified
+   * repository returned `allowed`, which folded "the answer is not known yet" into "the answer
+   * was fine" — the CP-HI-08 shape, and the same fold as a read failure reported as a stale
+   * base or a delivery timeout recorded as a non-delivery.
+   *
+   * The cost of that fold is unusually high here. Releasing a dependent while the first
+   * repository is still verifying means two irreversible external writes have happened before
+   * anything checked the first, and learning the answer afterwards is too late.
+   *
+   * Correct sequencing already exists in the finalizer, which awaits each `postMergeVerify`
+   * before the next merge. That is one caller's property, not the kernel's: anything else
+   * reaching `mergeExecute` — a capture script, a future concurrent finalizer — got no
+   * protection at all. This makes the guard a real second layer rather than a name.
+   *
+   * `merge_state` is the discriminator because only `postMergeVerify` ever writes it: MERGED
+   * means verified, FAILED means it answered badly, and PENDING with a merge receipt present
+   * means the merge happened and nothing has answered yet.
+   */
   dependentMergeBlocked(runId: string, repositoryIdentity: string): Decision<void> {
     const failed = this.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM audit_events
@@ -2191,6 +2212,26 @@ export class GitHubKernel {
         ReasonCode.DEPENDENT_MERGE_BLOCKED,
         "an earlier repository in this run failed post-merge verification",
         { runId, repositoryIdentity },
+      );
+    }
+
+    const unverified = this.db.get<{ identity: string }>(
+      `SELECT r.identity AS identity
+         FROM github_receipts g
+         JOIN repositories r ON r.identity = g.repository_identity
+         JOIN run_repositories rr ON rr.run_id = g.run_id AND rr.repository_id = r.repository_id
+        WHERE g.run_id = ?
+          AND g.operation = 'merge_execute'
+          AND g.status = 'APPLIED'
+          AND rr.merge_state = 'PENDING'
+        LIMIT 1`,
+      [runId],
+    );
+    if (unverified) {
+      return deny(
+        ReasonCode.DEPENDENT_MERGE_BLOCKED,
+        "an earlier repository in this run is merged and its post-merge verification has not answered",
+        { runId, repositoryIdentity, awaiting: unverified.identity },
       );
     }
     return allow(ReasonCode.OK, undefined);

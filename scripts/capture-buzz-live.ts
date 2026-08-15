@@ -44,6 +44,23 @@ const record: Record<string, unknown> = {
   capturedAt: new Date().toISOString(),
   relay: process.env["BUZZ_RELAY_URL"] ?? "(default)",
   cliPath: execFileSync("which", [binary], { encoding: "utf8" }).trim(),
+  // What this capture did and did not measure. Written into the record because a reader who
+  // finds a `doctor` block here will otherwise take it for a statement about the deployment,
+  // and three separate readings did exactly that: a `TRUSTED_GATE_CREDENTIAL_MISSING` finding
+  // was read as the host lacking a GitHub App credential, which it has.
+  //
+  // The mix is deliberate. The transport, relay and ingress policy have to be the real ones or
+  // the capture proves nothing; the control plane does not, and making it real would mean a
+  // delivery capture reading and writing deployment state.
+  measured: {
+    relay: "production",
+    transport: "installed buzz CLI",
+    ingressPolicy: "the deployment's, via configuredBuzzActorIngressPolicy()",
+    controlPlane: "in-memory test fixture (makeCore) — not the deployment",
+    doctorScope:
+      "the fixture control plane, so its findings describe that core and not this host; " +
+      "deployment health belongs to #512, which brings a daemon up",
+  },
 };
 
 /**
