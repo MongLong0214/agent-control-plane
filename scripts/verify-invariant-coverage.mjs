@@ -22,6 +22,12 @@
  * one direction only: an invariant no test names cannot have a test that fails when it breaks.
  * That is worth catching on its own, and it is checkable today.
  *
+ * **It also under-reports, and that was measured.** CP-HI-02 showed 1 test here while four of its
+ * six triggers were genuinely mutation-proved — the tests assert the trigger's *sentinel*
+ * (`SESSION_INCARNATION_IMMUTABLE`) rather than the invariant's name. So a low count is a place to
+ * look, not a verdict, and the sweep that follows it has to be a mutation. Two of those six were
+ * in fact uncovered, which is why the number was worth chasing even though it was wrong.
+ *
  * ## Ratchet, not audit
  *
  * Bringing every site under a named test is not a v1 prerequisite; it is an unbounded condition,

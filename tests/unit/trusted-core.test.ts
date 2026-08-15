@@ -125,6 +125,42 @@ describe("database hard constraints (PRD §30.2)", () => {
     ).toThrowError(/SESSION_INCARNATION_IMMUTABLE/);
   });
 
+  /**
+   * CP-HI-02 — the two session-identity guards that sat next to the incarnation one above with
+   * no test of their own.
+   *
+   * Found by mutation while sweeping CP-HI-02: neutering both left all 866 tests green. A grep
+   * for their sentinels looked like coverage and was not — the only hits were in
+   * `tests/fixtures/schema-v11.sql`, which is a copy of the old schema rather than a test.
+   *
+   * That is the same shape as #494 and #498, and the same reason `docs/CONTRIBUTING.md` asks for
+   * a mutation rather than a reading.
+   */
+  it("keeps a session's secret hash immutable (CP-HI-02)", () => {
+    // A rotated secret would let a second peer inherit an established session's authority, which
+    // is Single Runtime Authority defeated at the point it is cheapest to defeat.
+    const { db, clock } = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db, clock, repoPath: repo });
+    db.run(`UPDATE sessions SET session_secret_hash = 'sha256:first' WHERE session_id = ?`, [seeded.sessionId]);
+    expect(() =>
+      db.run(`UPDATE sessions SET session_secret_hash = 'sha256:second' WHERE session_id = ?`, [seeded.sessionId]),
+    ).toThrowError(/SESSION_SECRET_HASH_IMMUTABLE/);
+  });
+
+  it("keeps a session's channel identity write-once (CP-HI-02)", () => {
+    // Channel identity is write-once so allowlist membership cannot be moved onto a live
+    // session — otherwise an allowlisted identity could be re-pointed at a session that never
+    // earned it.
+    const { db, clock } = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db, clock, repoPath: repo });
+    db.run(`UPDATE sessions SET buzz_actor_id = 'buzz:first' WHERE session_id = ?`, [seeded.sessionId]);
+    expect(() =>
+      db.run(`UPDATE sessions SET buzz_actor_id = 'buzz:second' WHERE session_id = ?`, [seeded.sessionId]),
+    ).toThrowError(/SESSION_BUZZ_ACTOR_IMMUTABLE/);
+  });
+
   it("rejects a second holder of the same branch, worktree or exact path", () => {
     const { db, clock } = makeCore();
     const repo = makeRepo();
