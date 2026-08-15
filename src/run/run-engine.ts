@@ -214,9 +214,35 @@ export class RunEngine {
         ],
       );
 
+      // §10.2 — a repository joins this run under a role the project contract declares (#530).
+      //
+      // `RepositoryRegistry.register` stores whatever role it is handed; it holds checkout paths
+      // and deliberately does not read the contract. That left no door where an undeclared role
+      // met the manifest, and the failure surfaced far downstream: with per-repository CI
+      // declarations (#526) such a repository merges, and only then does its post-merge
+      // verification find no declared check for its role and deny. A refusal that arrives after
+      // an irreversible external write is not a refusal.
+      //
+      // This is the last point where refusing is still free. Registration is only the fact that a
+      // repository exists; `runs.create` is the decision that it participates, and it is where
+      // the run's repository set becomes fixed — nothing can join afterwards. So it is both the
+      // earliest place the role means anything and the last place it costs nothing to reject.
+      const declaredRoles = input.projectId
+        ? this.projects.activeManifest(input.projectId)?.manifest.repositories.map((entry) => entry.role)
+        : undefined;
       for (const repo of input.repositories ?? []) {
         const record = this.repositories.byId(repo.repositoryId);
         if (!record) fail(ReasonCode.NOT_FOUND, "unknown repository", repo);
+        // Only when there is an active manifest to check against. A project without one has
+        // declared no roles at all, and refusing there would block the bootstrap runs whose whole
+        // purpose is to produce the manifest that would answer this question.
+        if (declaredRoles && !declaredRoles.includes(repo.repositoryRole)) {
+          fail(ReasonCode.COVERAGE_INCOMPLETE, "repository role is not declared by the project manifest", {
+            repositoryId: repo.repositoryId,
+            repositoryRole: repo.repositoryRole,
+            declaredRoles,
+          });
+        }
         this.db.run(
           `INSERT INTO run_repositories (run_id, repository_id, repository_role, base_branch, merge_order)
            VALUES (?, ?, ?, ?, ?)`,
