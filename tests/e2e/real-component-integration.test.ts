@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { ControlPlane, readOwnerIdentities } from "../../src/app/control-plane.ts";
 import { systemClock } from "../../src/core/clock.ts";
+import { Daemon } from "../../src/daemon/daemon.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
@@ -645,6 +646,35 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           "a dependent was blocked before any repository had merged",
         ).toBe(true);
         evidence["dependentGate"] = { beforeAnyMerge: beforeAnyMerge.reasonCode };
+
+        // The merge itself goes through the production entry point. `finalizeApprovedRun` is
+        // what the daemon calls on a CEO-approved run, and it already walks the participants in
+        // `merge_order`, awaiting each post-merge before the next merge.
+        //
+        // The refusal that gate produces is *not* asserted here, and cannot usefully be: the
+        // finalizer never attempts the second merge early, so there is no moment in this path
+        // where a well-behaved caller is refused. That property is proved against the kernel in
+        // github-kernel.test.ts (#521), where the moment can be constructed. What this run
+        // proves is the end-to-end consequence — both repositories merged, in the declared
+        // order, each with its own post-merge verification.
+        const daemon = new Daemon(cp, { stateDir: tempDir("acp-two-repo-finalizer-") });
+        const finalized = await daemon.finalizeApprovedRun(runId);
+        expect(
+          finalized.allowed,
+          `finalization refused: ${finalized.allowed ? "" : `${finalized.reasonCode} ${finalized.message}`}`,
+        ).toBe(true);
+
+        const settled = cp.runs.repositoriesOf(runId);
+        evidence["mergeSequence"] = settled.map((entry) => ({
+          identity: entry.identity,
+          mergeOrder: entry.mergeOrder,
+          mergeState: entry.mergeState,
+        }));
+        expect(
+          settled.map((entry) => entry.mergeState),
+          "both participants must reach MERGED — a repository left PENDING means its post-merge never answered",
+        ).toEqual(["MERGED", "MERGED"]);
+        await daemon.stop();
       }
       evidence["doctor"] = await cp.doctor.run("project", projectId);
       evidence["telemetry"] = {
