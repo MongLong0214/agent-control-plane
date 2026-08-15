@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -177,5 +178,58 @@ describe("the rest of the withheld list is enforced, not just declared (#360)", 
     } finally {
       server.close();
     }
+  });
+});
+
+/**
+ * The per-user temp allowance, and the boundary that still holds around it (#489).
+ *
+ * Codex's in-process app-server writes into the per-user temp directory and ignores `TMPDIR`, so
+ * it cannot be redirected — the narrow form was attempted first and failed. The allowance is only
+ * safe because ACP no longer allocates there: packet roots and verification scratch moved to
+ * `acpScratchDir`, which `scratch-root.test.ts` keeps outside this tree.
+ *
+ * These assert the kernel, not the profile text. A test that grepped for the allow line would
+ * pass with the deny above it deleted.
+ */
+describe("the reviewer may write to the per-user temp directory and nowhere new (#489)", () => {
+  const home = tempDir("reviewer-home-3");
+  const packetRoot = tempDir("reviewer-packet-3");
+
+  const writeUnderSandbox = (target: string) =>
+    spawnSync(
+      "/usr/bin/sandbox-exec",
+      [
+        "-p",
+        buildProfile(home, packetRoot),
+        process.execPath,
+        "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(target)}, "x")`,
+      ],
+      { encoding: "utf8", env: { ...process.env, HOME: home } },
+    );
+
+  it("permits a write into the per-user temp directory", () => {
+    // Removing the allowance turns this red, and codex stops initialising for the same reason:
+    // the app-server's first write is the one this covers.
+    const result = writeUnderSandbox(join(realpathSync(tmpdir()), `acp-489-${process.pid}.tmp`));
+    expect(result.status, `sandbox-exec refused the per-user temp write: ${result.stderr}`).toBe(0);
+  });
+
+  it("still refuses a write into daemon state", () => {
+    // What the profile actually protects, and what the no-tools probe now targets for the same
+    // reason: the packet's sibling directory was only ever incidentally refused.
+    const result = writeUnderSandbox(
+      join(realpathSync(homedir()), ".agent-control-plane", `acp-489-escape-${process.pid}.txt`),
+    );
+    expect(result.status, "the reviewer wrote into daemon state").not.toBe(0);
+  });
+
+  it("does not open the sibling per-user cache directory", () => {
+    // `…/C` was measured as unnecessary. Opening the `<hash>` parent would have covered both,
+    // which is why the parent was not used.
+    const cache = join(dirname(realpathSync(tmpdir())), "C");
+    const result = writeUnderSandbox(join(cache, `acp-489-${process.pid}.tmp`));
+    expect(result.status, "the reviewer wrote into the per-user cache directory").not.toBe(0);
   });
 });
