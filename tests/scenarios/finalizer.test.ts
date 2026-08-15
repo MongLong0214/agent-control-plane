@@ -60,7 +60,7 @@ const approvedFixture = async (options: { confirm?: boolean } = {}) => {
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-finalizer",
     manifestOverrides: {
-      ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), repositoryRole: "primary" }],
+      ciWorkflows: [{ path: WORKFLOW_PATH, checkName: "project-ci", approvedDigest: sha256(WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
     },
   });
   github.setBranch("dev", driven.baseHead);
@@ -236,8 +236,8 @@ const twoRepositoryApprovedFixture = async (
     // whose file its digest is compared against, and a repository declaring no check is denied
     // rather than exempted.
     ciWorkflows: [
-      { path: WORKFLOW_PATH, checkName: checkNames.first, approvedDigest: sha256(workflows.first), repositoryRole: "first" },
-      { path: WORKFLOW_PATH, checkName: checkNames.second, approvedDigest: sha256(workflows.second), repositoryRole: "second" },
+      { path: WORKFLOW_PATH, checkName: checkNames.first, approvedDigest: sha256(workflows.first), unapprovedFirstActivation: false, repositoryRole: "first" },
+      { path: WORKFLOW_PATH, checkName: checkNames.second, approvedDigest: sha256(workflows.second), unapprovedFirstActivation: false, repositoryRole: "second" },
     ],
   });
   const project = harness.cp.projects.register({

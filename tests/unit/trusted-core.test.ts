@@ -537,6 +537,44 @@ describe("portable project manifest (Integration §10.2)", () => {
     const broken = { ...base, verificationProfiles: { simple: ["nope"], standard: [], guarded: [] } };
     expect(assertPortableManifest(broken).allowed).toBe(false);
   });
+
+  it("#527: a CI workflow states either an approved digest or that it has none, never neither", () => {
+    // The ambiguity this removes lived in one value: bootstrap activation read a null digest as
+    // "accept any workflow" and post-merge verification read the same null as "trust nothing",
+    // so a manifest could activate cleanly and then never be able to merge. Neither reader was
+    // wrong on its own; the value was carrying both meanings with nothing marking the transition.
+    //
+    // Refusing the ambiguous manifest here is what makes the two readers agree, so this is the
+    // enforcement — not the branches in activation and the GitHub kernel that consume it.
+    const workflow = { path: ".github/workflows/ci.yml", checkName: "ci", repositoryRole: "primary" };
+
+    const silent = { ...base, ciWorkflows: [{ ...workflow, approvedDigest: null, unapprovedFirstActivation: false }] };
+    expect(
+      assertPortableManifest(silent).allowed,
+      "a workflow with no digest and no reason for having none is the shape #527 is about",
+    ).toBe(false);
+
+    const contradictory = {
+      ...base,
+      ciWorkflows: [{ ...workflow, approvedDigest: "sha256:abc", unapprovedFirstActivation: true }],
+    };
+    expect(
+      assertPortableManifest(contradictory).allowed,
+      "claiming an approved digest and no approval at once is the same ambiguity spelled differently",
+    ).toBe(false);
+
+    const approved = {
+      ...base,
+      ciWorkflows: [{ ...workflow, approvedDigest: "sha256:abc", unapprovedFirstActivation: false }],
+    };
+    expect(assertPortableManifest(approved).allowed).toBe(true);
+
+    const firstActivation = { ...base, ciWorkflows: [{ ...workflow, approvedDigest: null, unapprovedFirstActivation: true }] };
+    expect(
+      assertPortableManifest(firstActivation).allowed,
+      "a first activation has no digest to state and must still be able to say so",
+    ).toBe(true);
+  });
 });
 
 describe("candidate snapshot (PRD §16)", () => {

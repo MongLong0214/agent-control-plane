@@ -897,7 +897,9 @@ export class BootstrapActivation {
           evidence.checkName === workflow.checkName &&
           evidence.head === expectedHead &&
           evidence.conclusion === "PASS" &&
-          (workflow.approvedDigest === null || evidence.workflowDigest === workflow.approvedDigest),
+          // The first activation has no approved digest to compare against and says so, rather
+          // than saying nothing and being read as "any workflow will do" (#527).
+          (workflow.unapprovedFirstActivation || evidence.workflowDigest === workflow.approvedDigest),
       );
       return found ? [] : [{ repositoryIdentity: repository.identity, checkName: workflow.checkName }];
     });

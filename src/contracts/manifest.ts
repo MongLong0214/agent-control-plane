@@ -77,7 +77,29 @@ export const projectManifestSchema = z
              * (Integration §14.4); without this the evidence cannot be trusted and is
              * reported missing rather than accepted.
              */
-            approvedDigest: z.string().nullable().default(null),
+            approvedDigest: z.string().min(1).nullable().default(null),
+            /**
+             * Says that this workflow has not been approved yet because the project is being
+             * activated for the first time (#527).
+             *
+             * `null` used to carry this meaning implicitly, and carried a second one at the same
+             * time: bootstrap activation read it as *accept any workflow*, post-merge
+             * verification read it as *trust nothing*. A manifest that activated cleanly could
+             * therefore never merge, and neither layer was wrong on its own — the fault was one
+             * value standing for both "not approved yet" and "anything is fine", with nothing
+             * marking the transition between them.
+             *
+             * This flag says only the first. A first activation has no approved digest to state,
+             * so it says so; post-merge still refuses, because an unapproved workflow producing
+             * trusted CI is the thing §14.4 exists to prevent. The refusal is loud — an operator
+             * has to declare the digest — and a loud refusal is the correct trade against
+             * silently trusting whatever workflow happens to be at the merge commit.
+             *
+             * The `superRefine` below makes the two fields express exactly one state each, so
+             * `approvedDigest: null` alone no longer parses at all. That is deliberate: the
+             * ambiguity is removed where it was introduced rather than patched at each reader.
+             */
+            unapprovedFirstActivation: z.boolean().default(false),
           })
           .strict(),
       )
@@ -112,6 +134,17 @@ export const projectManifestSchema = z
       }
     }
     for (const workflow of manifest.ciWorkflows) {
+      // Exactly one of the two states, never both and never neither (#527). "No digest and no
+      // reason for there being no digest" is the shape that let one null mean two things.
+      if ((workflow.approvedDigest === null) !== workflow.unapprovedFirstActivation) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: workflow.approvedDigest === null
+            ? `ciWorkflow '${workflow.checkName}' has no approvedDigest and does not declare unapprovedFirstActivation`
+            : `ciWorkflow '${workflow.checkName}' declares unapprovedFirstActivation together with an approvedDigest`,
+          path: ["ciWorkflows"],
+        });
+      }
       if (!roles.has(workflow.repositoryRole)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

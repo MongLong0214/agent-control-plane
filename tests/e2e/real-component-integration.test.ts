@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ControlPlane, readOwnerIdentities } from "../../src/app/control-plane.ts";
+import { sha256 } from "../../src/core/digest.ts";
 import { systemClock } from "../../src/core/clock.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -48,6 +49,15 @@ const SECOND_IDENTITY = process.env["ACP_COMPONENT_INTEGRATION_SECOND_IDENTITY"]
 const TWO_REPOSITORIES = Boolean(SECOND_PROJECT && SECOND_IDENTITY);
 /** The long-lived branch the manifest contract names, in one place. */
 const MANIFEST_DEFAULT_BRANCH = "main";
+/**
+ * The workflow whose digest this run's manifest approves.
+ *
+ * Read from the real checkout rather than written as a constant (#527): the digest has to be the
+ * one the file actually hashes to at the merge commit, and a literal here would be a second copy
+ * of the workflow that drifts the first time CI changes. The run does not modify this file, so
+ * its content at HEAD is its content at the merge commit.
+ */
+const CI_WORKFLOW_PATH = ".github/workflows/ci.yml";
 /** The owner-provisioned reviewer egress infrastructure this host declares. */
 const EGRESS_ROOT = join(process.env["HOME"] ?? "", ".agent-control-plane", "egress");
 const REVIEWER_MODEL = process.env["ACP_COMPONENT_INTEGRATION_MODEL"] ?? "sonnet";
@@ -127,7 +137,13 @@ const manifestFor = (projectId: string): ProjectManifest => ({
     },
   ],
   postMergeCommands: [],
-  ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, repositoryRole: "primary" }],
+  ciWorkflows: [{
+    path: CI_WORKFLOW_PATH,
+    checkName: "project-ci",
+    approvedDigest: sha256(readFileSync(join(REAL_PROJECT, CI_WORKFLOW_PATH), "utf8")),
+    repositoryRole: "primary",
+    unapprovedFirstActivation: false,
+  }],
   commitlore: { mode: "preferred" },
 });
 

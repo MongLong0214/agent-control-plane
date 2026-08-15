@@ -49,7 +49,7 @@ const PROFILE = {
 
 /** The check the fixture project declares as its post-merge requirement (§24.7). */
 const CI_WORKFLOWS = [
-  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, repositoryRole: "primary" },
+  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, unapprovedFirstActivation: true, repositoryRole: "primary" },
 ];
 
 const TRUSTED_CI_COMMANDS = [
@@ -996,6 +996,48 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     expect(rollback.allowed).toBe(true);
   });
 
+  it("#527: an unapproved workflow's check is refused as unapproved, not as bad provenance", async () => {
+    // The fixture manifest declares `unapprovedFirstActivation`, and the check below is given
+    // *correct* Actions provenance — right head, right app, real suite and run. Valid provenance
+    // is deliberately not enough: a workflow nobody approved must not produce TRUSTED_CI, which
+    // is what §14.4 exists for.
+    //
+    // What this pins is the stated cause. The refusal itself was already held by the digest
+    // check, and upstream of both by the manifest schema, which now refuses to describe this
+    // state ambiguously at all. But the refusal used to arrive as "no approved Actions workflow
+    // provenance", which describes a check somebody may have staged. The cause here is the
+    // opposite: the provenance is fine and the manifest never stated a digest. An operator
+    // reading the wrong cause goes looking for an attacker instead of recording a digest.
+    const fixture = await setup();
+    const pullNumber = await prepared(fixture);
+    const merged = await fixture.harness.cp.github.mergeExecute({
+      runId: fixture.runId,
+      repositoryIdentity: fixture.identity,
+      pullNumber,
+      exactHeadSha: fixture.head,
+      expectedBaseSha: fixture.base,
+      mergeStrategy: "merge_commit",
+      ownerSessionId: fixture.ownerSessionId,
+      ownerBindingGeneration: fixture.ownerBindingGeneration,
+    });
+    if (!merged.allowed) throw new Error(merged.message);
+
+    fixture.github.setTrustedPostMergeCheck(merged.value.mergeCommitSha, "project-ci", ".github/workflows/ci.yml");
+    const verified = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      merged.value.mergeCommitSha,
+      ["project-ci"],
+    );
+    expect(verified.allowed).toBe(false);
+    expect(verified.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+    expect(
+      (verified.evidence["failed"] as ReadonlyArray<{ name: string; conclusion: string }>)
+        .map((check) => check.conclusion),
+      "an unapproved workflow was accepted, or was refused as though its provenance were forged",
+    ).toEqual(["unapproved"]);
+  });
+
   it("a merged repository blocks dependents while its post-merge is pending (#512)", async () => {
     // CP-S40 above proves the *failure* direction. This is the pending one, and it was open:
     // a merged-but-unverified repository returned `allowed`, folding "not known yet" into
@@ -1008,7 +1050,7 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     // happened in and would observe the same order with no gate at all.
     //
     // The converse — that a verified post-merge *releases* dependents — is not asserted here,
-    // and cannot be: this file's fixture declares `approvedDigest: null`, so a post-merge check
+    // and cannot be: this file's fixture declares `approvedDigest: null, unapprovedFirstActivation: true`, so a post-merge check
     // is always `untrusted` and no trusted pass is reachable. It is covered instead by
     // finalizer.test.ts's two-repository case, which merges the second repository only after the
     // first verifies; that test would fail outright if this gate never released.

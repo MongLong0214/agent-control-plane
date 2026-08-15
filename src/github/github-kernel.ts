@@ -2166,7 +2166,18 @@ export class GitHubKernel {
       if (check.status !== "completed") return { name, conclusion: `incomplete:${check.status}` };
       if (check.conclusion !== "success") return { name, conclusion: check.conclusion ?? "missing" };
       const trusted = await this.assertTrustedWorkflowCheck(runId, repositoryIdentity, mergeCommitSha, check);
-      return { name, conclusion: trusted.allowed ? "success" : "untrusted" };
+      if (trusted.allowed) return { name, conclusion: "success" };
+      // "untrusted" says a check could not be believed and not why, which for the two causes
+      // here points in opposite directions: bad provenance is a check somebody may have staged,
+      // while an unapproved workflow is a manifest that never recorded a digest (#527). Both are
+      // refusals; only one of them is anybody's fault. Carrying the distinction into the
+      // conclusion is what puts it in the receipt and in the deny evidence an operator reads.
+      return {
+        name,
+        conclusion: trusted.reasonCode === ReasonCode.VERIFICATION_CI_WORKFLOW_NOT_APPROVED
+          ? "unapproved"
+          : "untrusted",
+      };
     })));
   }
 
@@ -2803,6 +2814,18 @@ export class GitHubKernel {
     const workflow = manifest.value.ciWorkflows.find(
       (entry) => entry.checkName === check.name && entry.repositoryRole === role,
     );
+    // An unapproved first-activation workflow is refused here, and refused by name (#527). The
+    // old code reached the same verdict through `!approvedDigest` and reported it as missing
+    // provenance, which describes a candidate-controlled check rather than a manifest that
+    // never stated a digest. Same answer, wrong cause — and the wrong cause is what an operator
+    // acts on.
+    if (workflow?.unapprovedFirstActivation) {
+      return deny(
+        ReasonCode.VERIFICATION_CI_WORKFLOW_NOT_APPROVED,
+        "the pinned manifest declares this workflow unapproved, so its checks cannot be trusted CI",
+        { checkRunId: check.id, checkName: check.name, path: workflow.path },
+      );
+    }
     if (!workflow?.approvedDigest || check.head_sha !== head || check.app?.slug !== "github-actions") {
       return deny(ReasonCode.GATE_CREATOR_UNTRUSTED, "check has no approved Actions workflow provenance", {
         checkRunId: check.id,

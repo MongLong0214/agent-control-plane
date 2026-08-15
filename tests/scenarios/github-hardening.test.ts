@@ -26,7 +26,7 @@ import {
 afterAll(cleanupTempDirs);
 
 const CI_WORKFLOWS = [
-  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, repositoryRole: "primary" },
+  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, unapprovedFirstActivation: true, repositoryRole: "primary" },
 ];
 
 interface Fixture {
@@ -210,7 +210,7 @@ const setupTrustedPostMergeFixture = async (options: {
   const driven = await driveToReviewedCandidate(harness, {
     workBranch: "feature/F1-thing",
     manifestOverrides: {
-      ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: sha256(APPROVED_WORKFLOW), repositoryRole: "primary" }],
+      ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: sha256(APPROVED_WORKFLOW), unapprovedFirstActivation: false, repositoryRole: "primary" }],
     },
   });
   github.setBranch("dev", driven.baseHead);
@@ -1157,8 +1157,8 @@ describe("round-2 review: post-merge coverage and receipts", () => {
       workBranch: "feature/F1-thing",
       manifestOverrides: {
         ciWorkflows: [
-          { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, repositoryRole: "primary" },
-          { path: ".github/workflows/sec.yml", checkName: "security", approvedDigest: null, repositoryRole: "primary" },
+          { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, unapprovedFirstActivation: true, repositoryRole: "primary" },
+          { path: ".github/workflows/sec.yml", checkName: "security", approvedDigest: null, unapprovedFirstActivation: true, repositoryRole: "primary" },
         ],
       },
     });
@@ -1213,8 +1213,11 @@ describe("round-2 review: post-merge coverage and receipts", () => {
     );
     expect(narrowed.allowed).toBe(false);
     expect(narrowed.reasonCode).toBe(ReasonCode.POST_MERGE_VERIFICATION_FAILED);
+    // `project-ci` reads `unapproved` rather than `untrusted` because this fixture's manifest
+    // declares it unapproved (#527); the point of this test is the `security` row beside it,
+    // which the caller did not name and is required anyway.
     expect(narrowed.evidence["failed"]).toEqual([
-      { name: "project-ci", conclusion: "untrusted" },
+      { name: "project-ci", conclusion: "unapproved" },
       { name: "security", conclusion: "missing" },
     ]);
   });
