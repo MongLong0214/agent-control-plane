@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, ControlPlane } from "../../src/app/control-plane.ts";
 import { defaultBackupDirectory, restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
-import { schemaDdl } from "../../src/db/migrations.ts";
+import { schemaDdl , replayDdlWithoutPostV12Columns} from "../../src/db/migrations.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -317,7 +317,9 @@ const asV14Fixture = (path: string): void => {
     // skipped that replay, which made it unrepresentative in exactly the way that matters
     // here. Replay the current DDL, then drop the triggers introduced after v14 so the
     // fixture is a v14 database rather than a current one wearing a v14 version number.
-    raw.exec(schemaDdl());
+    // Same drift the v12 replay hits: schema.sql now names actor_id, which no pre-v18
+    // database has. Build the fixture from the replay that withholds post-v12 columns.
+    raw.exec(replayDdlWithoutPostV12Columns());
     for (const introducedAfterV14 of ["sessions_workdir_immutable"]) {
       raw.exec(`DROP TRIGGER IF EXISTS ${introducedAfterV14}`);
     }
@@ -403,7 +405,7 @@ describe("versioned SQLite migration", () => {
       // v14 → v15 (verification worktree ownership) → v16 (workdir immutability): the
       // fixture must walk the whole chain, not stop at the version this lane was written on.
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(17);
+      expect(SCHEMA_VERSION).toBe(18);
       migrated.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, workdir, created_at, updated_at)
          VALUES ('v14-workdir-session', 'inc-1', 'fixture', 'fixture', 'READY', ?, ?, ?)`,
@@ -448,7 +450,7 @@ describe("versioned SQLite migration", () => {
         [14, "v14-baseline-evidence-ledger"],
         [15, "v15-durable-verification-worktree-ownership"],
         [16, "v16-session-workdir-immutability"],
-        [SCHEMA_VERSION, "v17-telegram-owner-prompts"],
+        [SCHEMA_VERSION, "v18-conversational-actor"],
       ]);
       expect(receipts).toEqual([
         expect.objectContaining({

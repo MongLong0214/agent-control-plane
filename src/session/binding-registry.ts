@@ -159,13 +159,15 @@ export class BindingRegistry {
 
       const generation = this.nextGeneration(roleKey);
       const assignmentId = newAssignmentId();
+      const actorId = this.mintActor(input.role, input.sessionId, session.incarnation);
       this.db.run(
         `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id,
-                                  session_id, session_incarnation, binding_generation, mode, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
+                                  actor_id, session_id, session_incarnation, binding_generation,
+                                  mode, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
         [
           assignmentId, roleKey, input.role, input.projectId ?? null, input.runId ?? null,
-          input.taskId ?? null, input.sessionId, session.incarnation, generation,
+          input.taskId ?? null, actorId, input.sessionId, session.incarnation, generation,
           input.mode ?? "PREFERRED", this.clock.nowIso(),
         ],
       );
@@ -247,13 +249,20 @@ export class BindingRegistry {
       }
 
       const generation = this.nextGeneration(roleKey);
+      // #449 mints a new actor here unconditionally, which preserves exactly the behaviour that
+      // existed before the entity was introduced. Reusing the outgoing binding's actor when only
+      // the runtime was replaced — so failover stops rotating the generation — is the *next*
+      // step, and it needs the caller to say whether the conversation survived. Minting here
+      // keeps the schema change behaviour-neutral rather than smuggling the semantic change in.
+      const actorId = this.mintActor(input.role, input.sessionId, session.incarnation);
       this.db.run(
         `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id,
-                                  session_id, session_incarnation, binding_generation, mode, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
+                                  actor_id, session_id, session_incarnation, binding_generation,
+                                  mode, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)`,
         [
           newAssignmentId(), roleKey, input.role, input.projectId ?? null, input.runId ?? null,
-          input.taskId ?? null, input.sessionId, session.incarnation, generation,
+          input.taskId ?? null, actorId, input.sessionId, session.incarnation, generation,
           input.mode ?? "PREFERRED", this.clock.nowIso(),
         ],
       );
@@ -676,6 +685,24 @@ export class BindingRegistry {
         roleKey,
       ])
       .map(hydrate);
+  }
+
+  /**
+   * Creates the conversational actor a binding names (#449).
+   *
+   * The actor holds the live runtime pointer, so failover can replace the session without
+   * touching the binding. `assignments.session_id` keeps recording the runtime at binding time,
+   * which is why the composite owner tuple — and the FK from `runs` onto it — still resolves.
+   */
+  private mintActor(role: string, sessionId: string, incarnation: string): string {
+    const actorId = `actor:${newAssignmentId()}`;
+    this.db.run(
+      `INSERT INTO conversational_actors
+         (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [actorId, role, sessionId, incarnation, this.clock.nowIso()],
+    );
+    return actorId;
   }
 
   private nextGeneration(roleKey: string): number {

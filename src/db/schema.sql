@@ -166,6 +166,39 @@ BEGIN
 END;
 
 -- ---------------------------------------------------------------------------
+-- conversational_actors  (#449)
+--   The long-lived counterpart that owns a transcript. A session is a replaceable model
+--   runtime; the actor is what survives replacing one. Failover moves current_session_id
+--   here and leaves the binding — and therefore binding_generation — alone.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS conversational_actors (
+  actor_id                    TEXT PRIMARY KEY,
+  kind                        TEXT NOT NULL
+                                CHECK (kind IN ('CEO','BOOTSTRAP_CTO','PRIMARY_CTO',
+                                                'BLIND_REVIEWER','WORKER',
+                                                'OPTIONAL_ADVERSARIAL_REVIEWER')),
+  current_session_id          TEXT REFERENCES sessions(session_id),
+  current_session_incarnation TEXT,
+  created_at                  TEXT NOT NULL,
+  retired_at                  TEXT,
+  retired_reason              TEXT,
+  CHECK ((current_session_id IS NULL) = (current_session_incarnation IS NULL)),
+  CHECK ((retired_at IS NULL) = (retired_reason IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS conversational_actors_session
+  ON conversational_actors(current_session_id);
+
+-- CP-HI-04 — retirement is terminal, for the same reason revocation is: an actor brought back
+-- after its bindings were fenced would make superseded authority current again.
+CREATE TRIGGER IF NOT EXISTS conversational_actors_retirement_terminal
+BEFORE UPDATE ON conversational_actors
+WHEN OLD.retired_at IS NOT NULL AND NEW.retired_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_RETIREMENT_TERMINAL');
+END;
+
+-- ---------------------------------------------------------------------------
 -- assignments  (PRD §9.4 role binding)
 --   role_key is the logical endpoint: 'CEO', 'PRIMARY_CTO:<projectId>',
 --   'BLIND_REVIEWER:<runId>', 'WORKER:<taskId>', 'BOOTSTRAP_CTO:<runId>'.
@@ -179,6 +212,10 @@ CREATE TABLE IF NOT EXISTS assignments (
   project_id         TEXT REFERENCES projects(project_id) ON DELETE CASCADE,
   run_id             TEXT,
   task_id            TEXT,
+  actor_id           TEXT NOT NULL REFERENCES conversational_actors(actor_id),
+  -- The runtime at binding time, not the live one. #449 moved the live pointer to
+  -- conversational_actors.current_session_id; this stays immutable so assignments_owner_tuple
+  -- and the composite FK from runs keep identifying one binding row.
   session_id         TEXT NOT NULL REFERENCES sessions(session_id),
   session_incarnation TEXT NOT NULL,
   binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
@@ -212,10 +249,11 @@ END;
 -- INSERT-only monotonicity is not enough: lowering binding_generation, or moving a low
 -- generation into another role's history via role_key, would reactivate stale authority.
 CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable
-BEFORE UPDATE OF binding_generation, role_key, session_id, session_incarnation,
+BEFORE UPDATE OF binding_generation, role_key, actor_id, session_id, session_incarnation,
                  role, project_id, run_id, task_id ON assignments
 WHEN NEW.binding_generation <> OLD.binding_generation
   OR NEW.role_key <> OLD.role_key
+  OR NEW.actor_id <> OLD.actor_id
   OR NEW.session_id <> OLD.session_id
   OR NEW.session_incarnation <> OLD.session_incarnation
   OR NEW.role <> OLD.role
@@ -272,6 +310,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS assignments_owner_tuple
 
 CREATE INDEX IF NOT EXISTS assignments_session ON assignments(session_id, status);
 CREATE INDEX IF NOT EXISTS assignments_run ON assignments(run_id);
+CREATE INDEX IF NOT EXISTS assignments_actor ON assignments(actor_id, status);
 
 -- ---------------------------------------------------------------------------
 -- runs  (PRD §11, §29)
