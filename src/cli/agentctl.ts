@@ -35,6 +35,9 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl capacity show                  current provider capacity and admission
   agentctl project register <name> <path> register a project and its primary repository
   agentctl project list                   list projects with derived activity
+  agentctl actor register <id> <generation> <expected-set-generation>
+  agentctl actor list                     list registered conversational actors
+  agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
   agentctl bootstrap hermes -- <command>  launch Hermes and establish CEO generation 1
   agentctl daemon status                  daemon lock (read-only local inspection)
 `;
@@ -61,6 +64,8 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "repair.execute",
   "capacity.observe",
   "project.register",
+  "actor.register",
+  "actor.unregister",
 ]);
 
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
@@ -249,6 +254,35 @@ export const dispatch = async (
     return fail(`unknown project subcommand: ${args[0] ?? ""}`);
   }
 
+  if (command === "actor") {
+    const [sub, actorId, actorGeneration, expectedRegistrySetGeneration, ...reason] = args;
+    if (sub === "list") return call("actor.list");
+    if (sub === "register") {
+      return call("actor.register", {
+        actorId: required(actorId, "actorId"),
+        actorGeneration: requiredInteger(actorGeneration, "actorGeneration", 1),
+        expectedRegistrySetGeneration: requiredInteger(
+          expectedRegistrySetGeneration,
+          "expectedRegistrySetGeneration",
+          0,
+        ),
+      });
+    }
+    if (sub === "unregister") {
+      return call("actor.unregister", {
+        actorId: required(actorId, "actorId"),
+        actorGeneration: requiredInteger(actorGeneration, "actorGeneration", 1),
+        expectedRegistrySetGeneration: requiredInteger(
+          expectedRegistrySetGeneration,
+          "expectedRegistrySetGeneration",
+          0,
+        ),
+        reason: required(reason.join(" "), "reason"),
+      });
+    }
+    return fail(`unknown actor subcommand: ${sub ?? ""}`);
+  }
+
   if (command === "daemon" && args[0] === "status") return call("daemon.status");
   return fail(`unknown command: ${command}`);
 };
@@ -339,6 +373,14 @@ const fail = (message: string): number => {
 const required = (value: string | undefined, name: string): string => {
   if (!value) throw new Error(`missing required argument: ${name}`);
   return value;
+};
+
+const requiredInteger = (value: string | undefined, name: string, minimum: number): number => {
+  const parsed = Number(required(value, name));
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+    throw new Error(`${name} must be an integer greater than or equal to ${minimum}`);
+  }
+  return parsed;
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { sha256 } from "../core/digest.ts";
+import { acpScratchDir } from "../core/scratch-root.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
   isVerificationCommandRefused,
@@ -326,7 +327,7 @@ export const runSandboxed = async (request: SandboxRequest): Promise<SandboxOutc
   const { command, worktreePath } = request;
   const startedAt = new Date().toISOString();
   const startedMs = Date.now();
-  const scratch = mkdtempSync(join(tmpdir(), "acp-sbx-"));
+  const scratch = acpScratchDir("acp-sbx-");
 
   const mechanism: SandboxEnforcement["mechanism"] = seatbeltAvailable() ? "seatbelt" : "none";
 

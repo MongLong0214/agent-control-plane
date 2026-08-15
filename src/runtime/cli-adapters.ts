@@ -4,7 +4,6 @@ import {
   constants,
   existsSync,
   lstatSync,
-  mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -15,6 +14,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
+import { acpScratchDir } from "../core/scratch-root.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
   ClaudeUsageCollector,
@@ -335,7 +335,7 @@ const productionRunCli = async (
   isolationEnforced: boolean;
   egressEvidence?: ReviewerEgressRecord[];
 }> => {
-  const scratch = mkdtempSync(join(tmpdir(), "acp-runtime-"));
+  const scratch = acpScratchDir("acp-runtime-");
   if (!existsSync("/usr/bin/sandbox-exec")) {
     rmSync(scratch, { recursive: true, force: true });
     return {
@@ -771,7 +771,17 @@ const probeNoTools = async (
     return { enforced: false, reason: "reviewer no-tools probe could execute a shell" };
   }
 
-  const writeTarget = join(dirname(packetRoot), `.acp-review-write-probe-${randomUUID()}`);
+  // #489 — the probe targets daemon state rather than the packet's sibling directory.
+  //
+  // It used to write to `dirname(packetRoot)`, which proved refusal only because packets happened
+  // to live in the per-user temp directory. That was incidental: the profile never named the
+  // packet's parent, it named daemon state, credential trees and transcripts. Once codex forced
+  // the per-user temp directory open, the old target became writable and the probe reported the
+  // boundary gone — correctly, for a property nobody had chosen to protect.
+  //
+  // This asserts what the profile actually promises. It is also stable against where packets are
+  // allocated, which is what made the old form fragile.
+  const writeTarget = join(homedir(), ".agent-control-plane", `.acp-review-write-probe-${randomUUID()}`);
   const source = [
     "const fs = require('node:fs');",
     "try {",
@@ -1238,6 +1248,24 @@ const reviewerProfile = (
     '(allow file-write* (subpath "/dev"))',
     '(allow file-write-data (literal "/dev/null"))',
   );
+  // #489 — codex's in-process app-server writes into the per-user temp directory and cannot
+  // initialise without it. A dedicated scratch directory with `TMPDIR` pointed at it was tried
+  // first and codex ignored it, so the narrow form was attempted before this one, and the
+  // allowance was bisected: `…/T` is sufficient, `…/C` and the `<hash>` parent stay denied.
+  //
+  // This is only safe because ACP no longer allocates there. Packet roots, reviewer scratch and
+  // verification scratch moved to `acpScratchDir` for exactly this reason — while they lived in
+  // the per-user temp directory, opening it let a reviewer write into every other run's packet,
+  // and the no-tools probe caught precisely that.
+  //
+  // What remains is a shared directory whose other occupants are not ours. Reads were already
+  // permitted there — the profile is `(allow default)` for reads — so this adds no
+  // confidentiality surface; every read deny and `(deny process-exec*)` are untouched.
+  //
+  // The path is resolved deliberately: seatbelt matches resolved paths and `/var` is a symlink to
+  // `/private/var`, so an allowance written from `TMPDIR` silently fails to match.
+  const perUserTemp = resolvePath(tmpdir());
+  if (perUserTemp) lines.push(`(allow file-write* (subpath ${quote(perUserTemp)}))`);
   return lines.join("\n");
 };
 
@@ -1394,7 +1422,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       request.model ?? this.defaultModels.cto,
     ];
     // Hooks and plugins are the operator's, not this run's; see `sanctionedSettingsFile`.
-    args.push("--settings", sanctionedSettingsFile(mkdtempSync(join(tmpdir(), "acp-settings-"))));
+    args.push("--settings", sanctionedSettingsFile(acpScratchDir("acp-settings-")));
     // Make the invocation *be* the constituted session, so the identity the independence
     // check was performed against is the identity that produces the answer.
     if (request.externalSessionId) args.push("--session-id", request.externalSessionId);
@@ -1702,7 +1730,7 @@ export class CodexCliAdapter implements ProviderAdapter {
     if (request.isolation) {
       return this.invokePacketReviewer(request, started);
     }
-    const scratch = mkdtempSync(join(tmpdir(), "acp-codex-"));
+    const scratch = acpScratchDir("acp-codex-");
     const lastMessage = join(scratch, "last-message.txt");
     const model = request.model ?? this.defaultModels.reviewer;
 

@@ -27,6 +27,7 @@ import { type WorkspaceProbe, realWorkspaceProbe } from "../guard/workspace-prob
 import { Outbox } from "../outbox/outbox.ts";
 import { ProjectRegistry, type ManagedManifestWrite } from "../registry/project-registry.ts";
 import { RepositoryRegistry } from "../registry/repository-registry.ts";
+import { ConversationalActorRegistry } from "../registry/conversational-actor-registry.ts";
 import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review.ts";
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
@@ -187,6 +188,7 @@ export class ControlPlane {
   readonly repositories: RepositoryRegistry;
   readonly sessions: SessionRegistry;
   readonly bindings: BindingRegistry;
+  readonly actors: ConversationalActorRegistry;
   readonly claims: ClaimRegistry;
   readonly providers: ProviderRegistry;
   readonly worktrees: WorktreeManager;
@@ -354,6 +356,7 @@ export class ControlPlane {
     this.repositories = new RepositoryRegistry(this.db, this.clock, this.audit);
     this.sessions = new SessionRegistry(this.db, this.clock, this.audit);
     this.bindings = new BindingRegistry(this.db, this.clock, this.audit, this.sessions, this.outbox);
+    this.actors = new ConversationalActorRegistry(this.db, this.clock);
     this.claims = new ClaimRegistry(this.db, this.clock, this.audit, this.bindings);
 
     this.providers = new ProviderRegistry();
