@@ -550,6 +550,47 @@ exec /bin/ps "$@"
     // where it ran, which is the failure `local-green-is-not-CI-green` already cost a day to.
   });
 
+  /**
+   * CP-HI-08 — the identity branch must be the thing that reports the loss, not merely a run
+   * that happens to fail closed for some other reason (#498).
+   *
+   * The test above deliberately does not pin this, and says so: with `ps` broken for the whole
+   * run, the cleanup path upstream already fails, so disabling
+   * `markContainmentLost("… could not be fenced by start time")` leaves its outcome
+   * byte-identical. That is a layered defence whose layers cannot be told apart, which
+   * `docs/CONTRIBUTING.md` now forbids.
+   *
+   * `childContainmentReason` is the discriminator, because `markContainmentLost` keeps the
+   * *first* reason (`??=`) and identity capture runs during candidate observation, before any
+   * cleanup. So asserting the reason — not just that containment was lost — binds this test to
+   * the identity layer alone.
+   */
+  sandboxIt("#498 names the identity branch as the reason containment was lost", async () => {
+    const repository = makeRepo();
+    const outcome = await withPsShim(
+      `#!/bin/sh
+if [ "$1" = "-o" ] && [ "$2" = "lstart=" ]; then
+  exit 1
+fi
+exec /bin/ps "$@"
+`,
+      () => runSandboxed({
+        command: parseVerificationCommand({
+          id: "identity-branch-reason",
+          argv: ["node", "-e", "setTimeout(() => process.exit(0), 1500)"],
+          timeoutSeconds: 5,
+        }),
+        worktreePath: repository,
+      }),
+    );
+
+    expect(outcome.enforcement.childContainmentEnforced).toBe(false);
+    expect(
+      outcome.enforcement.childContainmentReason,
+      "containment was lost, but not for the identity reason — the identity layer is unproved",
+    ).toMatch(/could not be fenced by start time/);
+  });
+
   sandboxIt("#367 still refuses a passing command when no RSS sample exists", async () => {
     const repository = makeRepo();
     const outcome = await withPsShim(
