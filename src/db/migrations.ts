@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -584,6 +584,37 @@ const v18: SchemaMigration = {
   checksum: () => sha256(`v18-conversational-actor\n${V18_DDL}`),
 };
 
+/**
+ * v19 records the start time of a session's OS process (#505).
+ *
+ * `os_pid` was resolved back to a session inside `assertReviewerIndependence` without ever being
+ * verified. Pids are reused, so that lookup could name the wrong session — and the direction that
+ * matters is the one where the real producer stops matching and is admitted as its own blind
+ * reviewer. CP-HI-04 is what stops the referee playing, and it rested on an unverified integer.
+ *
+ * Additive: existing rows carry NULL, which the matcher treats as unverifiable rather than as a
+ * match. That is the fail-closed direction — an unverifiable pid resolves to nothing.
+ */
+const V19_DDL = `
+  ALTER TABLE sessions ADD COLUMN os_process_started_at TEXT;
+`;
+
+const v19: SchemaMigration = {
+  id: "v19-session-process-identity",
+  fromVersion: 18,
+  toVersion: 19,
+  apply: (raw) => {
+    // The mirror of the v12/v13 replay drift. Those replay the *live* schema.sql, so a database
+    // reconstructed part-way along the chain already has this column from the CREATE TABLE — and
+    // a bare ALTER then fails with `duplicate column name`. Adding it only when absent keeps both
+    // routes working: a genuine v18 file gains the column, a replayed one already had it.
+    const present = (raw.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>)
+      .some((column) => column.name === "os_process_started_at");
+    if (!present) raw.exec(V19_DDL);
+  },
+  checksum: () => sha256(`v19-session-process-identity\n${V19_DDL}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -592,6 +623,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v16,
   v17,
   v18,
+  v19,
 ]);
 
 interface RequiredTrigger {

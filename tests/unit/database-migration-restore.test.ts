@@ -405,7 +405,7 @@ describe("versioned SQLite migration", () => {
       // v14 → v15 (verification worktree ownership) → v16 (workdir immutability): the
       // fixture must walk the whole chain, not stop at the version this lane was written on.
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(18);
+      expect(SCHEMA_VERSION).toBe(19);
       migrated.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, workdir, created_at, updated_at)
          VALUES ('v14-workdir-session', 'inc-1', 'fixture', 'fixture', 'READY', ?, ?, ?)`,
@@ -451,7 +451,8 @@ describe("versioned SQLite migration", () => {
         [15, "v15-durable-verification-worktree-ownership"],
         [16, "v16-session-workdir-immutability"],
         [17, "v17-telegram-owner-prompts"],
-        [SCHEMA_VERSION, "v18-conversational-actor"],
+        [18, "v18-conversational-actor"],
+        [SCHEMA_VERSION, "v19-session-process-identity"],
       ]);
       expect(receipts).toEqual([
         expect.objectContaining({
@@ -485,6 +486,12 @@ describe("versioned SQLite migration", () => {
         }),
         expect.objectContaining({
           version: 17,
+          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          backup_file: null,
+          backup_checksum: null,
+        }),
+        expect.objectContaining({
+          version: 18,
           checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
           backup_file: null,
           backup_checksum: null,

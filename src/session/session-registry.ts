@@ -3,6 +3,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail, isAcpError } from "../core/errors.ts";
 import { newSessionId } from "../core/ids.ts";
+import { processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -96,22 +97,26 @@ export class SessionRegistry {
     if (sessionSecret) {
       this.db.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, effort, lifecycle,
-                               buzz_address, os_pid, workdir, session_secret_hash, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?, ?)`,
+                               buzz_address, os_pid, os_process_started_at, workdir,
+                               session_secret_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?, ?, ?)`,
         [
           sessionId, incarnation, input.provider, input.model, input.effort ?? null,
-          input.buzzAddress ?? null, input.osPid ?? null, input.workdir ?? null,
+          input.buzzAddress ?? null, input.osPid ?? null, processStartedAt(input.osPid),
+          input.workdir ?? null,
           hashSessionSecret(sessionSecret).toString("hex"), now, now,
         ],
       );
     } else {
       this.db.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, effort, lifecycle,
-                               buzz_address, os_pid, workdir, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?)`,
+                               buzz_address, os_pid, os_process_started_at, workdir,
+                               created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'STARTING', ?, ?, ?, ?, ?, ?)`,
         [
           sessionId, incarnation, input.provider, input.model, input.effort ?? null,
-          input.buzzAddress ?? null, input.osPid ?? null, input.workdir ?? null, now, now,
+          input.buzzAddress ?? null, input.osPid ?? null, processStartedAt(input.osPid),
+          input.workdir ?? null, now, now,
         ],
       );
     }
@@ -221,11 +226,12 @@ export class SessionRegistry {
   }
 
   setPid(sessionId: string, pid: number | null): void {
-    this.db.run(`UPDATE sessions SET os_pid = ?, updated_at = ? WHERE session_id = ?`, [
-      pid,
-      this.clock.nowIso(),
-      sessionId,
-    ]);
+    // #505 — the start time is captured with the pid, not later. Capturing it separately would
+    // leave a window where the row names a pid nothing has identified.
+    this.db.run(
+      `UPDATE sessions SET os_pid = ?, os_process_started_at = ?, updated_at = ? WHERE session_id = ?`,
+      [pid, processStartedAt(pid), this.clock.nowIso(), sessionId],
+    );
   }
 
   /**

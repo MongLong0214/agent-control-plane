@@ -54,7 +54,7 @@ const BASELINE = {
   "CP-HI-01": 10,
   "CP-HI-02": 7,
   "CP-HI-03": 10,
-  "CP-HI-04": 32,
+  "CP-HI-04": 34,
   "CP-HI-05": 10,
   "CP-HI-06": 16,
   "CP-HI-07": 7,

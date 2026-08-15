@@ -1,6 +1,7 @@
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { newAssignmentId } from "../core/ids.ts";
+import { processStartedAt } from "../core/process-identity.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -624,11 +625,19 @@ export class BindingRegistry {
           WHERE role = ? AND task_id = ?`,
         [Role.WORKER, execution.task_id],
       );
-      const processWorkers = execution.worker_process_id === null
+      // #505 — a pid alone does not identify a process. Pids are reused, and resolving one to a
+      // session here decides who counts as a producer: if the real producer stops matching, it
+      // can be admitted as its own blind reviewer, which is CP-HI-04 defeated. Matching the
+      // recorded start time as well makes a reused pid resolve to nothing instead of to the
+      // wrong session — unverifiable is the fail-closed answer, not a match.
+      const workerProcessIdentity =
+        execution.worker_process_id === null ? null : processStartedAt(execution.worker_process_id);
+      const processWorkers = execution.worker_process_id === null || workerProcessIdentity === null
         ? []
         : this.db.all<{ session_id: string }>(
-            `SELECT DISTINCT session_id FROM sessions WHERE os_pid = ?`,
-            [execution.worker_process_id],
+            `SELECT DISTINCT session_id FROM sessions
+              WHERE os_pid = ? AND os_process_started_at = ?`,
+            [execution.worker_process_id, workerProcessIdentity],
           );
       for (const binding of boundWorkers) workers.add(binding.session_id);
       for (const processWorker of processWorkers) workers.add(processWorker.session_id);

@@ -3,7 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PRODUCER_ROLES, ROLE_CLASS, Role, SessionLifecycle } from "../../src/domain/types.ts";
-import { cleanupTempDirs, makeCore, makeRepo, seedRun } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, makeCore, makeRepo, seedActor, seedRun } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -470,5 +470,82 @@ describe("an actor's runtime can only ever be a READY session (CP-HI-08, #493)",
       actor!.actor_id,
     ]);
     expect(bindings.require(roleKey).sessionId).toBe(ready);
+  });
+});
+
+/**
+ * A reused pid must not make an innocent session look like a producer (#505).
+ *
+ * `sessions.os_pid` was resolved back to a session inside `assertReviewerIndependence` with
+ * nothing verifying it. Pids are reused, so that lookup could name a session that never touched
+ * the run — which then gets refused as its blind reviewer. A guard that refuses correct work is
+ * a bug, not safety, the same shape as the worker-binding guard fixed in #493.
+ *
+ * Note this is *not* a CP-HI-04 hole: `task_executions.worker_session_id` is NOT NULL, so the
+ * real producer is always named directly and cannot be missed. The pid path only ever adds.
+ *
+ * The first draft of this test asserted its own SQL rather than driving the registry, and passed
+ * with the fix mutated away. This one goes through `bind`.
+ */
+describe("a reused pid does not make an innocent session a producer (#505)", () => {
+  const reviewerAfterReusedPid = () => {
+    const core = setup();
+    const producer = core.session("ses_real_producer");
+    const innocent = core.session("ses_innocent_reviewer");
+    // The innocent session carries the same pid the execution recorded, with a start time that
+    // belongs to no live process — the shape a reused pid leaves behind.
+    core.db.run(`UPDATE sessions SET os_pid = ?, os_process_started_at = ? WHERE session_id = ?`, [
+      process.pid,
+      "Thu Jan  1 00:00:00 1970",
+      innocent,
+    ]);
+    // Producer history is reconstructed from the dispatched owner tuple, so the run has to have
+    // been dispatched for the check to reach the pid lookup at all.
+    core.db.run(`UPDATE runs SET dispatched_at = 't' WHERE run_id = ?`, [core.seeded.runId]);
+    core.db.run(
+      `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+       VALUES ('tsk_reuse', ?, 'work', 'implementation', 'READY', '{}', 't', 't')`,
+      [core.seeded.runId],
+    );
+    const actorId = seedActor(core.db, "WORKER", producer);
+    core.db.run(
+      `INSERT INTO assignments (assignment_id, role_key, role, run_id, task_id, actor_id, session_id,
+                                session_incarnation, binding_generation, mode, status, created_at)
+       VALUES ('asg_reuse', 'WORKER:tsk_reuse', 'WORKER', ?, 'tsk_reuse', ?, ?, ?, 1, 'PREFERRED', 'ACTIVE', 't')`,
+      [core.seeded.runId, actorId, producer, `inc-${producer}`],
+    );
+    core.db.run(
+      `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
+                                    worker_session_id, worker_process_id, provider, model,
+                                    status, started_at)
+       VALUES ('exe_reuse', ?, 'tsk_reuse', 1, 1, ?, ?, 'scripted', 'm', 'RUNNING', 't')`,
+      [core.seeded.runId, producer, process.pid],
+    );
+    return { ...core, innocent };
+  };
+
+  it("admits a blind reviewer that only shares a recycled pid with the execution", () => {
+    const { bindings, seeded, innocent } = reviewerAfterReusedPid();
+    const decision = bindings.bind({
+      role: Role.BLIND_REVIEWER,
+      sessionId: innocent,
+      runId: seeded.runId,
+    });
+    expect(
+      decision.allowed,
+      `refused a reviewer that never produced: ${decision.allowed ? "" : decision.reasonCode}`,
+    ).toBe(true);
+  });
+
+  it("still refuses the session that actually produced the work", () => {
+    // The converse. A matcher that resolved nothing would pass the test above while removing the
+    // independence guard entirely, which is the failure that matters.
+    const { bindings, seeded } = reviewerAfterReusedPid();
+    const decision = bindings.bind({
+      role: Role.BLIND_REVIEWER,
+      sessionId: "ses_real_producer",
+      runId: seeded.runId,
+    });
+    expect(decision.allowed).toBe(false);
   });
 });
