@@ -99,7 +99,17 @@ const CONTRACT: TaskContract = {
 const manifestFor = (projectId: string): ProjectManifest => ({
   schema: PROJECT_MANIFEST_SCHEMA_ID,
   projectId,
-  repositories: [{ role: "primary", remote: "github:MongLong0214/agent-control-plane", manifestRoot: "." }],
+  repositories: [
+    { role: "primary", remote: "github:MongLong0214/agent-control-plane", manifestRoot: "." },
+    // The manifest has to describe the second participant, not just the run (#512). The
+    // repository registry does not check a registered role against the manifest, so a missing
+    // declaration here does not fail at registration — it fails much later, when the secondary's
+    // post-merge verification finds no declared check and denies with
+    // POST_MERGE_CHECKS_NOT_DECLARED, after that repository has already been merged.
+    ...(TWO_REPOSITORIES
+      ? [{ role: "secondary", remote: SECOND_IDENTITY!, manifestRoot: "." }]
+      : []),
+  ],
   branchProfile: {
     longLived: [MANIFEST_DEFAULT_BRANCH, "dev"],
     defaultBranch: MANIFEST_DEFAULT_BRANCH,
@@ -137,13 +147,30 @@ const manifestFor = (projectId: string): ProjectManifest => ({
     },
   ],
   postMergeCommands: [],
-  ciWorkflows: [{
-    path: CI_WORKFLOW_PATH,
-    checkName: "project-ci",
-    approvedDigest: sha256(readFileSync(join(REAL_PROJECT, CI_WORKFLOW_PATH), "utf8")),
-    repositoryRole: "primary",
-    unapprovedFirstActivation: false,
-  }],
+  ciWorkflows: [
+    {
+      path: CI_WORKFLOW_PATH,
+      // GitHub names a check run after the **job**, not the workflow. This repository's workflow
+      // is `name: project-ci` with job `verify`, and the check run it produces is `verify` — so
+      // the workflow name was never going to match. It was invisible because the unapproved-digest
+      // refusal (#527) fired first: one unpassable condition hiding another.
+      checkName: "verify",
+      approvedDigest: sha256(readFileSync(join(REAL_PROJECT, CI_WORKFLOW_PATH), "utf8")),
+      repositoryRole: "primary",
+      unapprovedFirstActivation: false,
+    },
+    // Each repository declares its own, because each has its own workflow file and its own digest
+    // (#512). The disposable acceptance repositories name their job `project-ci`.
+    ...(TWO_REPOSITORIES
+      ? [{
+        path: CI_WORKFLOW_PATH,
+        checkName: "project-ci",
+        approvedDigest: sha256(readFileSync(join(resolve(SECOND_PROJECT!), CI_WORKFLOW_PATH), "utf8")),
+        repositoryRole: "secondary",
+        unapprovedFirstActivation: false,
+      }]
+      : []),
+  ],
   commitlore: { mode: "preferred" },
 });
 
