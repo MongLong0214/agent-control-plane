@@ -813,7 +813,7 @@ describe("baseline boundary contracts", () => {
     expect(parseRepoFactoryResult(result).allowed).toBe(true);
     expect(parseRepoFactoryResult({ ...result, unversionedExtra: true }).allowed).toBe(false);
     expect(parseRepoFactoryResult({ ...result, schema: "repo-factory.result.v3" }).allowed).toBe(false);
-    expect(SCHEMA_VERSION).toBe(18);
+    expect(SCHEMA_VERSION).toBe(19);
     expect(migrationChainFrom(12).map((migration) => migration.id)).toEqual([
       "v13-finalization-state-machine",
       "v14-baseline-evidence-ledger",
@@ -821,6 +821,7 @@ describe("baseline boundary contracts", () => {
       "v16-session-workdir-immutability",
       "v17-telegram-owner-prompts",
       "v18-conversational-actor",
+      "v19-session-process-identity",
     ]);
   });
 
@@ -874,9 +875,9 @@ describe("baseline boundary contracts", () => {
         checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
       expect(migrated.get<{ migration_id: string; checksum: string }>(
-        "SELECT migration_id, checksum FROM schema_migrations WHERE version = 18",
+        "SELECT migration_id, checksum FROM schema_migrations WHERE version = 19",
       )).toEqual({
-        migration_id: "v18-conversational-actor",
+        migration_id: "v19-session-process-identity",
         checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
       expect(migrated.get<{ migration_id: string; checksum: string }>(
@@ -1001,6 +1002,8 @@ describe("baseline boundary contracts", () => {
         .toEqual({ migration_id: "v17-telegram-owner-prompts" });
       expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 18"))
         .toEqual({ migration_id: "v18-conversational-actor" });
+      expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 19"))
+        .toEqual({ migration_id: "v19-session-process-identity" });
       expect(
         migrated.get<{ backup_file: string | null; backup_checksum: string | null }>(
           "SELECT backup_file, backup_checksum FROM schema_migrations WHERE version = 14",

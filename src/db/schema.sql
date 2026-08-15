@@ -104,6 +104,11 @@ CREATE TABLE IF NOT EXISTS sessions (
   -- handshake while keeping credentials out of durable state (§31.5).
   session_secret_hash TEXT,
   os_pid         INTEGER,
+  -- CP-HI-04 — a pid alone does not identify a process. Pids are reused, and this column is
+  -- resolved back to a session inside assertReviewerIndependence, so a reused pid could hide a
+  -- producer and let it review its own run (#505). The start time makes the pair unique for as
+  -- long as the process lives.
+  os_process_started_at TEXT,
   workdir        TEXT,
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL,
