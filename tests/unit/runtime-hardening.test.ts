@@ -15,6 +15,7 @@ import {
   makeHarness,
   registerFixtureProject,
 } from "../helpers/harness.ts";
+import type { ProjectManifest } from "../../src/contracts/manifest.ts";
 import type { CompletionAuthority, TaskContract } from "../../src/run/run-engine.ts";
 import type { HandoffAcknowledgement, HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
 
@@ -55,8 +56,12 @@ const deliveredAck = (
   };
 };
 
-const activeRun = async (harness: Harness, projectId = "fixture-project") => {
-  const registered = await registerFixtureProject(harness, projectId);
+const activeRun = async (
+  harness: Harness,
+  projectId = "fixture-project",
+  manifestOverrides: Partial<ProjectManifest> = {},
+) => {
+  const registered = await registerFixtureProject(harness, projectId, manifestOverrides);
   bindCeo(harness);
   const created = harness.cp.runs.create({
     projectId: registered.projectId,
@@ -101,6 +106,75 @@ const ownerDecisionReceipt = (
   if (!admitted.allowed) throw new Error(admitted.message);
   return admitted.value;
 };
+
+describe("a repository joins a run under a role its project declares (#530)", () => {
+  it("refuses at run creation, not after the repository has been merged", async () => {
+    // The registry stores whatever role it is handed — it holds checkout paths and does not read
+    // the contract — so an undeclared role was accepted at registration and stayed invisible.
+    // With per-repository CI declarations (#526) it surfaced at post-merge verification, which
+    // finds no declared check for the unknown role and denies. By then the repository has been
+    // merged: an irreversible external write, and then a refusal.
+    //
+    // What this pins is *where* the refusal happens. `runs.create` fixes the run's repository set
+    // and nothing can join afterwards, so it is simultaneously the first point at which the role
+    // means anything and the last point at which rejecting it is free.
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const registered = await harness.cp.repositories.register({
+      checkoutPath: makeRepo({ "src/app.js": "module.exports = () => 1;\n" }),
+      projectId,
+      repositoryRole: "secondary",
+      identity: "github:acme/undeclared",
+    });
+    expect(
+      registered.allowed,
+      "registration is only the fact that a repository exists; it is not where this is caught",
+    ).toBe(true);
+    if (!registered.allowed) return;
+
+    // The refusal is a throw rather than a denial because it happens inside the creating
+    // transaction, which is the stronger outcome: the run row and its repository rows roll back
+    // together, so there is no half-created run naming a role the contract never declared.
+    let caught: unknown;
+    try {
+      harness.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{
+          repositoryId: registered.value.repositoryId,
+          repositoryRole: "secondary",
+          baseBranch: "dev",
+        }],
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(
+      isAcpError(caught),
+      "an undeclared role entered a run, and nothing will refuse it until that repository merges",
+    ).toBe(true);
+    if (!isAcpError(caught)) return;
+    expect(caught.reasonCode).toBe(ReasonCode.COVERAGE_INCOMPLETE);
+    expect(caught.evidence["declaredRoles"]).toEqual(["primary"]);
+    expect(
+      harness.cp.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM run_repositories`)?.n,
+      "the aborted run left repository rows behind",
+    ).toBe(0);
+  });
+
+  it("still creates runs for a project that has no manifest to check against", async () => {
+    // The converse, and the reason this cannot simply demand a declared role: a bootstrap run
+    // exists to produce the manifest that would answer the question. Refusing there would make
+    // the first run of any project impossible.
+    const harness = makeHarness();
+    const created = harness.cp.runs.create({
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+    });
+    expect(created.allowed).toBe(true);
+  });
+});
 
 describe("the dispatch-time contract pin is immutable (CP-HI-03)", () => {
   it("refuses to repoint a run's pinned manifest", async () => {
@@ -357,7 +431,15 @@ describe("an owner decision needs an owner (§21)", () => {
 describe("task executions belong to the run that drives them (§25.2)", () => {
   const twoRuns = async () => {
     const harness = makeHarness();
-    const first = await activeRun(harness, "project-a");
+    // The project has to declare the secondary role, because the second repository below joins a
+    // run under it (#530). Registration alone never checked that, so this fixture used to work
+    // against a manifest naming only `primary` — which is the gap, not a property of this test.
+    const first = await activeRun(harness, "project-a", {
+      repositories: [
+        { role: "primary", remote: "github:acme/fixture", manifestRoot: "." },
+        { role: "secondary", remote: "github:acme/second", manifestRoot: "." },
+      ],
+    });
 
     const secondRepo = makeRepo({ "src/app.js": "module.exports = () => 1;\n" });
     const registered = await harness.cp.repositories.register({
