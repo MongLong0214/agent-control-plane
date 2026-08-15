@@ -1,6 +1,6 @@
 {
   "capture": "P0-09/#243 live Buzz delivery and ACK against the production relay",
-  "capturedAt": "2026-08-15T08:07:35.952Z",
+  "capturedAt": "2026-08-15T09:08:13.192Z",
   "relay": "https://isaac-macmini.tailb41ff5.ts.net:3000",
   "cliPath": "/Users/isaac/.local/bin/buzz",
   "surface": {
@@ -14,43 +14,74 @@
     "availableWithoutPurposeOrBoundChannel": false
   },
   "channelResolution": {
-    "createdChannel": "549c699c-554e-430b-8527-67f92caa25ab",
+    "createdChannel": "7d1c6964-9ee8-4b67-84dd-56865d76d340",
     "availableForResolvablePurpose": true,
     "availableForUnresolvablePurpose": false,
-    "resolvedByPurpose": "cto:acp-verify-2026-08-15T08-07-35",
-    "resolvedTo": "549c699c-554e-430b-8527-67f92caa25ab",
-    "unmatchedPurposeRefused": "no buzz channel matches purpose cto:acp-verify-2026-08-15T08-07-35-not-a-real-room (available: acp-verify-2026-08-15T08-07-35, repo-factory, ceo, logic-pro-mcp, agent-operator-score, commitlore; set ACP_BUZZ_CHANNEL to bind one explicitly)"
+    "resolvedByPurpose": "cto:acp-verify-2026-08-15T09-08-13",
+    "resolvedTo": "7d1c6964-9ee8-4b67-84dd-56865d76d340",
+    "unmatchedPurposeRefused": "no buzz channel matches purpose cto:acp-verify-2026-08-15T09-08-13-not-a-real-room (available: acp-verify-2026-08-15T09-08-13, repo-factory, ceo, logic-pro-mcp, agent-operator-score, commitlore; set ACP_BUZZ_CHANNEL to bind one explicitly)"
   },
   "clockCoherence": {
-    "relayCreatedAt": "2026-08-15T08:07:36.000Z",
-    "captureClockSkewSeconds": 1,
-    "envelopeExpiresAt": "2026-08-15T08:37:36.175Z",
+    "relayCreatedAt": "2026-08-15T09:08:13.000Z",
+    "captureClockSkewSeconds": 0,
+    "envelopeExpiresAt": "2026-08-15T09:38:13.416Z",
     "envelopeExpiresAfterRelayReceipt": true
   },
   "delivery": {
-    "messageId": "msg_2c2d524b203f4a53a00dc446",
+    "messageId": "msg_bf0dfd5b32e34feca853b5ed",
     "outboxStatus": "SENT",
-    "relayEventId": "1fe54f1ca84373bd3820c8b91d92c9ea6a3fb1d79076d580b1bbec355640f525",
+    "relayEventId": "08e24ecdc78d7e988530469ee722e68288338c2bf5b42624f80240d8a738ca95",
     "relayPubkey": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4",
     "fenceOnRelay": {
       "roleKey": "CEO",
       "bindingGeneration": 1,
-      "targetSessionId": "ses_7e259959253a421a9fa4c6a1"
+      "targetSessionId": "ses_962b205126e647f994c12a8a"
     },
     "envelopeBytesOnRelay": 413,
     "readBackArgv": [
       "messages",
       "get",
       "--channel",
-      "549c699c-554e-430b-8527-67f92caa25ab",
+      "7d1c6964-9ee8-4b67-84dd-56865d76d340",
       "--limit",
       "10"
     ]
   },
-  "result": "FAIL",
-  "error": "ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS must be configured together",
+  "acknowledgement": {
+    "path": "IngressGuard.admit -> BuzzActorIngress.bindActor -> SessionRegistry.bindBuzzActor",
+    "actorFromRelay": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4",
+    "resolvedRole": "CEO",
+    "resolvedGeneration": 1,
+    "resolvedStatus": "ACTIVE",
+    "differentActor": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddcadead",
+    "differentActorReasonCode": "INGRESS_ACTOR_NOT_ALLOWLISTED",
+    "differentActorMessage": "channel identity is not on the allowlist",
+    "differentActorResolvedTo": null,
+    "sessionLifecycle": "READY"
+  },
+  "doctor": {
+    "projectId": "buzz-live-doctor",
+    "ctoSessionId": "ses_12356acf5fd7407f9274c17d",
+    "buzzAddress": "7d1c6964-9ee8-4b67-84dd-56865d76d340",
+    "ctoBuzzNotConnectedBeforeConnect": true,
+    "ctoBuzzNotConnectedAfterConnect": false,
+    "statusBeforeConnect": "BLOCKED",
+    "statusAfterConnect": "BLOCKED",
+    "remainingFindingCodes": [
+      "CAPACITY_SENSOR_FILE_MISSING",
+      "CEO_ROLE_UNBOUND",
+      "HOST_MEMORY_PRESSURE",
+      "HOST_SWAP_PRESSURE",
+      "TRUSTED_GATE_CREDENTIAL_MISSING"
+    ]
+  },
+  "closes": {
+    "P0-09/#423": "transport matched to the installed CLI, argv and field names pinned",
+    "#243": "NOT CLOSED — delivery and acknowledgement proven; the done-when also requires a HEALTHY doctor"
+  },
+  "result": "PARTIAL",
   "cleanup": {
-    "channel": "549c699c-554e-430b-8527-67f92caa25ab",
+    "channel": "7d1c6964-9ee8-4b67-84dd-56865d76d340",
     "deleted": true
   }
 }
