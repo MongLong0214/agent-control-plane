@@ -1089,7 +1089,15 @@ class SocketTransport implements Transport {
 }
 
 /** The channel-identity allowlist is deployment configuration, never a relay-supplied claim. */
-const configuredBuzzActorIngressPolicy = (): IngressPolicy | null => {
+/**
+ * The deployment's Buzz ingress policy, read from the environment `agentcpd` runs under.
+ *
+ * Exported so `scripts/capture-buzz-live.ts` can prove the refusal is *this* policy's rather than
+ * one the capture constructed (#243). A capture that builds its own allowlist shows that
+ * `IngressGuard` enforces a list, which was never in doubt — it does not show that the deployment
+ * would refuse the actor.
+ */
+export const configuredBuzzActorIngressPolicy = (): IngressPolicy | null => {
   const secret = process.env["ACP_BUZZ_INGRESS_SECRET"]?.trim() ?? "";
   const allowedActors = (process.env["ACP_BUZZ_ALLOWED_ACTORS"] ?? "")
     .split(",")
