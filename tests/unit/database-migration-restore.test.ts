@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, ControlPlane } from "../../src/app/control-plane.ts";
 import { defaultBackupDirectory, restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
-import { schemaDdl , replayDdlWithoutPostV12Columns} from "../../src/db/migrations.ts";
+import { replayDdlWithoutPostV12Columns } from "../../src/db/migrations.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -450,6 +450,7 @@ describe("versioned SQLite migration", () => {
         [14, "v14-baseline-evidence-ledger"],
         [15, "v15-durable-verification-worktree-ownership"],
         [16, "v16-session-workdir-immutability"],
+        [17, "v17-telegram-owner-prompts"],
         [SCHEMA_VERSION, "v18-conversational-actor"],
       ]);
       expect(receipts).toEqual([
@@ -478,6 +479,12 @@ describe("versioned SQLite migration", () => {
         }),
         expect.objectContaining({
           version: 16,
+          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          backup_file: null,
+          backup_checksum: null,
+        }),
+        expect.objectContaining({
+          version: 17,
           checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
           backup_file: null,
           backup_checksum: null,

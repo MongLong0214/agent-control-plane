@@ -415,6 +415,7 @@ describe("outbox fencing (PRD §15.7, §27.5)", () => {
         seeded.roleKey,
         seeded.projectId,
         seeded.runId,
+        seedActor(db, "PRIMARY_CTO"),
         seeded.sessionId,
         clock.nowIso(),
       ],

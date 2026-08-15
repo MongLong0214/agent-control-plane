@@ -813,13 +813,14 @@ describe("baseline boundary contracts", () => {
     expect(parseRepoFactoryResult(result).allowed).toBe(true);
     expect(parseRepoFactoryResult({ ...result, unversionedExtra: true }).allowed).toBe(false);
     expect(parseRepoFactoryResult({ ...result, schema: "repo-factory.result.v3" }).allowed).toBe(false);
-    expect(SCHEMA_VERSION).toBe(17);
+    expect(SCHEMA_VERSION).toBe(18);
     expect(migrationChainFrom(12).map((migration) => migration.id)).toEqual([
       "v13-finalization-state-machine",
       "v14-baseline-evidence-ledger",
       "v15-durable-verification-worktree-ownership",
       "v16-session-workdir-immutability",
       "v17-telegram-owner-prompts",
+      "v18-conversational-actor",
     ]);
   });
 
@@ -873,9 +874,9 @@ describe("baseline boundary contracts", () => {
         checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
       expect(migrated.get<{ migration_id: string; checksum: string }>(
-        "SELECT migration_id, checksum FROM schema_migrations WHERE version = 17",
+        "SELECT migration_id, checksum FROM schema_migrations WHERE version = 18",
       )).toEqual({
-        migration_id: "v17-telegram-owner-prompts",
+        migration_id: "v18-conversational-actor",
         checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
       expect(migrated.get<{ migration_id: string; checksum: string }>(
@@ -998,6 +999,8 @@ describe("baseline boundary contracts", () => {
         .toEqual({ migration_id: "v16-session-workdir-immutability" });
       expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 17"))
         .toEqual({ migration_id: "v17-telegram-owner-prompts" });
+      expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 18"))
+        .toEqual({ migration_id: "v18-conversational-actor" });
       expect(
         migrated.get<{ backup_file: string | null; backup_checksum: string | null }>(
           "SELECT backup_file, backup_checksum FROM schema_migrations WHERE version = 14",

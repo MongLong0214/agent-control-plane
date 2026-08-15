@@ -96,13 +96,13 @@ export const installMigrationLedger = (raw: Database.Database): void => {
  * The general rule this encodes: an object in schema.sql that references a column introduced
  * after v12 must be excluded here and created by the migration that introduces the column.
  */
-const V12_REPLAY_EXCLUDES = [
+const REPLAY_EXCLUDES_NEEDING_POST_V12_COLUMNS = [
   /CREATE INDEX IF NOT EXISTS assignments_actor[^;]*;/,
   /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
 ];
 
 export const replayDdlWithoutPostV12Columns = (): string =>
-  V12_REPLAY_EXCLUDES.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdl());
+  REPLAY_EXCLUDES_NEEDING_POST_V12_COLUMNS.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdl());
 
 const v12: SchemaMigration = {
   id: "v12-migration-ledger-and-invariant-replay",
@@ -189,7 +189,11 @@ const v13: SchemaMigration = {
 
     // Re-run the current idempotent DDL after the rebuild. The three dropped triggers are
     // recreated with the finalization edges and the new task-sealing states.
-    raw.exec(schemaDdl());
+    //
+    // Same forward drift as the v12 replay, and the reason the pinned v11 fixture kept failing
+    // after three fixes aimed at v18: this replays the live schema.sql while `assignments`
+    // still has no `actor_id`, five migrations before v18 adds it.
+    raw.exec(replayDdlWithoutPostV12Columns());
   },
   checksum: () => migrationChecksum("v13-finalization-state-machine"),
 };
