@@ -21,16 +21,24 @@ document is not made obsolete by a reassuring README sentence.
 
 ## Live work that is still owed
 
-No document or generated test report is evidence for the following until the linked work has
-its required live record:
+No document or generated test report is evidence for a live path until that path has its own
+live record.
 
-- A GitHub App production-gate publication and merge path: [issue](https://github.com/MongLong0214/agent-control-plane/issues/242).
-- A live Buzz delivery and acknowledgement: [issue](https://github.com/MongLong0214/agent-control-plane/issues/243).
-- A real Telegram owner ingress and response path: [issue](https://github.com/MongLong0214/agent-control-plane/issues/392) and [follow-up](https://github.com/MongLong0214/agent-control-plane/issues/406).
-- A deployable, observed launchd installation: [issue](https://github.com/MongLong0214/agent-control-plane/issues/400).
-- The required real-world observation window: [issue](https://github.com/MongLong0214/agent-control-plane/issues/241).
-- Owner-only channel configuration that only the owner can provide: [issue](https://github.com/MongLong0214/agent-control-plane/issues/245).
-- Deployment-level observation that a configured reviewer can reach only its provider endpoint on macOS: [residual](https://github.com/MongLong0214/agent-control-plane/issues/419).
+This list used to enumerate specific issues. Six of the eight had been closed while the section
+still called them owed — the page avoided copying *counts* from a point in time and then carried
+*states* from one instead, which is the same defect wearing different clothes. So the enumeration
+is delegated, like the counts above:
+
+- **[Open live-evidence work](https://github.com/MongLong0214/agent-control-plane/issues?q=is%3Aissue%20state%3Aopen%20label%3Alive-evidence)** — the label is the list.
+- `node scripts/verify-evidence-freshness.mjs` — which live evidence still describes *this* tree,
+  and which describes an earlier one. It reports STALE rather than failing, because evidence
+  going stale is a fact about the tree moving, not a fault to be fixed by editing the file.
+
+**A closed prerequisite is not a live observation.** The issues that opened a path are closed once
+the path exists; whether it has been *exercised* is a separate question with its own issue. The
+Telegram round-trip is the clearest case — its two prerequisite issues are closed, and
+[#510](https://github.com/MongLong0214/agent-control-plane/issues/510) records that the round-trip
+has still never been observed. Read the freshness report before treating any live claim as current.
 
 The runtime now has a fail-closed provider-egress path: each isolated reviewer receives a
 daemon-generated provider allowlist, a kernel-enforced loopback proxy route, and fresh
