@@ -24,7 +24,7 @@ import {
   candidateSnapshotDigest,
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
-import { cleanupTempDirs, makeCore, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, makeCore, tempDir , seedActor} from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -167,9 +167,10 @@ describe("binding identity is immutable once written", () => {
     const now = clock.nowIso();
     db.run(`INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
             VALUES ('session_1', 'inc-1', 'test', 'test', 'READY', ?, ?)`, [now, now]);
-    db.run(`INSERT INTO assignments (assignment_id, role_key, role, session_id, session_incarnation,
+    db.run(`INSERT INTO assignments (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
                                      binding_generation, mode, status, created_at)
-            VALUES ('assignment_1', 'CEO', 'CEO', 'session_1', 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`, [now]);
+            VALUES ('assignment_1', 'CEO', 'CEO', ?, 'session_1', 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
+           [seedActor(db, "CEO"), now]);
 
     // Lowering the generation would reactivate stale authority.
     expect(() =>

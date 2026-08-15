@@ -33,6 +33,7 @@ import {
   seedRun,
   tempDir,
   writeFiles,
+  seedActor,
 } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -91,10 +92,10 @@ describe("database hard constraints (PRD §30.2)", () => {
 
     expect(() =>
       db.run(
-        `INSERT INTO assignments (assignment_id, role_key, role, project_id, session_id,
+        `INSERT INTO assignments (assignment_id, role_key, role, project_id, actor_id, session_id,
                                   session_incarnation, binding_generation, mode, status, created_at)
-         VALUES (?, ?, 'PRIMARY_CTO', ?, 'ses_second', 'inc-2', 2, 'PREFERRED', 'ACTIVE', ?)`,
-        [newAssignmentId(), `PRIMARY_CTO:other-key`, seeded.projectId, clock.nowIso()],
+         VALUES (?, ?, 'PRIMARY_CTO', ?, ?, 'ses_second', 'inc-2', 2, 'PREFERRED', 'ACTIVE', ?)`,
+        [newAssignmentId(), `PRIMARY_CTO:other-key`, seeded.projectId, seedActor(db, "PRIMARY_CTO"), clock.nowIso()],
       ),
     ).toThrowError(/active primary CTO/);
   });
@@ -107,10 +108,10 @@ describe("database hard constraints (PRD §30.2)", () => {
     db.run(`UPDATE assignments SET status = 'REVOKED' WHERE role_key = ?`, [seeded.roleKey]);
     expect(() =>
       db.run(
-        `INSERT INTO assignments (assignment_id, role_key, role, project_id, session_id,
+        `INSERT INTO assignments (assignment_id, role_key, role, project_id, actor_id, session_id,
                                   session_incarnation, binding_generation, mode, status, created_at)
-         VALUES (?, ?, 'PRIMARY_CTO', ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
-        [newAssignmentId(), seeded.roleKey, seeded.projectId, seeded.sessionId, clock.nowIso()],
+         VALUES (?, ?, 'PRIMARY_CTO', ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
+        [newAssignmentId(), seeded.roleKey, seeded.projectId, seedActor(db, "PRIMARY_CTO"), seeded.sessionId, clock.nowIso()],
       ),
     ).toThrowError(/BINDING_GENERATION_NOT_MONOTONIC/);
   });
@@ -406,14 +407,15 @@ describe("outbox fencing (PRD §15.7, §27.5)", () => {
     // generation cannot be reactivated.
     db.run(`UPDATE assignments SET status = 'REVOKED' WHERE role_key = ?`, [seeded.roleKey]);
     db.run(
-      `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, session_id,
+      `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, actor_id, session_id,
                                 session_incarnation, binding_generation, mode, status, created_at)
-       VALUES (?, ?, 'PRIMARY_CTO', ?, ?, ?, 'inc-1', 2, 'PREFERRED', 'ACTIVE', ?)`,
+       VALUES (?, ?, 'PRIMARY_CTO', ?, ?, ?, ?, 'inc-1', 2, 'PREFERRED', 'ACTIVE', ?)`,
       [
         newAssignmentId(),
         seeded.roleKey,
         seeded.projectId,
         seeded.runId,
+        seedActor(db, "PRIMARY_CTO"),
         seeded.sessionId,
         clock.nowIso(),
       ],

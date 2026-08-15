@@ -127,6 +127,23 @@ export interface SeededRun {
   projectId: string;
 }
 
+
+/**
+ * Creates a conversational actor for a raw-SQL binding insert (#449).
+ *
+ * The runtime pointer is left NULL — the CHECK allows both-null — so a test that seeds an
+ * assignment against a synthetic session id does not also have to seed a `sessions` row it does
+ * not care about. Tests exercising the actor's live runtime set it explicitly.
+ */
+export const seedActor = (db: { run: (sql: string, params?: unknown[]) => unknown }, kind: string): string => {
+  const actorId = `actor:${newAssignmentId()}`;
+  db.run(
+    `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, ?, 't')`,
+    [actorId, kind],
+  );
+  return actorId;
+};
+
 export const seedRun = (options: SeedRunOptions): SeededRun => {
   const { db, clock } = options;
   const now = clock.nowIso();
@@ -152,13 +169,23 @@ export const seedRun = (options: SeedRunOptions): SeededRun => {
      VALUES (?, 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
     [sessionId, now, now],
   );
-  // The binding comes first: a run's owner tuple has a composite foreign key onto the
-  // assignment it names (§30.2), so a run cannot be seeded before the binding exists.
+  // The actor comes first, then the binding: a binding names an actor (#449), and a run's owner
+  // tuple has a composite foreign key onto the assignment it names (§30.2), so neither a run nor
+  // a binding can be seeded before what it references exists.
+  const actorId = `actor:${newAssignmentId()}`;
   db.run(
-    `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, session_id,
-                              session_incarnation, binding_generation, mode, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
-    [newAssignmentId(), roleKey, options.role ?? "PRIMARY_CTO", projectId, runId, sessionId, now],
+    `INSERT INTO conversational_actors
+       (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+     VALUES (?, ?, ?, 'inc-1', ?)`,
+    [actorId, options.role ?? "PRIMARY_CTO", sessionId, now],
+  );
+  db.run(
+    `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, actor_id,
+                              session_id, session_incarnation, binding_generation, mode, status,
+                              created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
+    [newAssignmentId(), roleKey, options.role ?? "PRIMARY_CTO", projectId, runId, actorId,
+     sessionId, now],
   );
   db.run(
     `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal,
