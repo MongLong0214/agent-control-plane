@@ -64,6 +64,38 @@ The acceptance criterion is a table, because it is checkable:
 
 A defence whose layers cannot be told apart is one defence wearing two names.
 
+#### Known exception: candidate containment
+
+The primary fence in the trusted wrapper (`fence_descendants`) is **unproved**, and stays that
+way deliberately. Removing its kill leaves every test green; the TypeScript identity reap is a
+secondary backstop that satisfies each end-to-end assertion on its own.
+
+Three end-to-end designs and three function-level designs were measured before this was written:
+
+- **end-to-end cannot separate them.** A descendant cannot be forked (`RLIMIT_NPROC` refuses it
+  by design), and the TypeScript kill always lands inside the wrapper's one-second wait loop, so
+  the fence's failure never becomes observable. The third design passed even with *both* layers
+  deleted — it was watching the process exit on its own, and would have shipped as false coverage.
+- **function-level cannot separate them either.** The fence can be called directly, but its
+  process discovery assumes the wrapper's own fork topology and does not find processes created
+  outside it. With its kill removed it still reported success, because it had discovered nothing
+  to reap.
+- **a seam was rejected, not overlooked.** Isolating the primary would need a way to disable the
+  secondary. A switch that turns containment off exists in the production path too, and
+  containment that can be disabled is eventually run disabled. The cost of satisfying the rule
+  would create the failure the rule is written against.
+
+So this pair is exempt, and the exemption is a decision rather than an omission.
+
+**This exception expires.** It holds only while the fence's process discovery is bound to the
+wrapper's own fork topology. That is a design fact, not a law: if discovery is ever changed to
+accept an arbitrary set of pids, the function-level test becomes possible and this exemption is
+void. Whoever makes that change can lift this, and should.
+
+What restores the rule here is therefore a change to how the fence discovers processes — not
+another test.
+
+
 ### Find the enforcement, not the line number
 
 An issue body is a fact about the moment it was written. Its line numbers, and its statement
