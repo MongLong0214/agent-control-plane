@@ -9,7 +9,7 @@ import { systemClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
-import { ClaudeCliAdapter } from "../../src/runtime/cli-adapters.ts";
+import { ClaudeCliAdapter, CodexCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -166,6 +166,18 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         secretsDir: join(root, "secrets"),
         clock: systemClock,
         adapters: [
+          new CodexCliAdapter({
+            clock: systemClock,
+            capacityFile: join(root, "capacity", "gpt.json"),
+            // The reviewer scope holds auth.json and nothing else. ~/.codex carries producer
+            // conversation state, which is exactly what a blind reviewer must not read.
+            providerCredentialDir: join(process.env["HOME"] ?? "", ".agent-control-plane", "reviewer", "codex"),
+            reviewerEgress: {
+              profilePath: join(EGRESS_ROOT, "reviewer.sb"),
+              proxyPath: fileURLToPath(new URL("../../deploy/egress/allowlist-proxy.py", import.meta.url)),
+              runtimeDir: join(root, "egress-runtime"),
+            },
+          }),
           new ClaudeCliAdapter({
             clock: systemClock,
             capacityFile: join(root, "capacity", "claude.json"),
@@ -189,8 +201,13 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         // cleared, which is the safe reading of §21.
         ownerIdentities: ownerIdentities,
         ctoPreference: { provider: "claude", model: REVIEWER_MODEL, effort: null },
+        // Codex, not Claude. Only two of the three adapters declare
+        // supportsReviewerIsolation, and the Claude one needs an interactive OAuth login that
+        // cannot be completed away from the machine. Codex has a real credential already, and
+        // requiresReviewerProviderSessionProof is true — a stricter reviewer contract, not a
+        // looser one. The Claude path stays available and is not the default.
         reviewer: {
-          preferred: { provider: "claude", model: REVIEWER_MODEL, effort: null },
+          preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: null },
           fallbacks: [],
         },
       });
