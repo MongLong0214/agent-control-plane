@@ -223,6 +223,55 @@ BEGIN
 END;
 
 -- ---------------------------------------------------------------------------
+-- conversational_actor_registrations  (L5 canonical active-set authority)
+--   Registration binds an existing first-class actor identity to a caller-owned actor
+--   generation. It neither creates an actor nor starts or assigns a runtime.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS conversational_actor_registry_state (
+  registry_id             INTEGER PRIMARY KEY CHECK (registry_id = 1),
+  registry_set_generation INTEGER NOT NULL CHECK (registry_set_generation >= 0)
+);
+
+INSERT OR IGNORE INTO conversational_actor_registry_state
+  (registry_id, registry_set_generation) VALUES (1, 0);
+
+CREATE TABLE IF NOT EXISTS conversational_actor_registrations (
+  actor_id           TEXT NOT NULL REFERENCES conversational_actors(actor_id),
+  actor_generation   INTEGER NOT NULL CHECK (actor_generation > 0),
+  registration_state TEXT NOT NULL CHECK (registration_state IN ('REGISTERED','RETIRED')),
+  registered_at      TEXT NOT NULL,
+  retired_at         TEXT,
+  retired_reason     TEXT,
+  PRIMARY KEY (actor_id, actor_generation),
+  CHECK ((retired_at IS NULL) = (retired_reason IS NULL)),
+  CHECK ((registration_state = 'REGISTERED') = (retired_at IS NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS conversational_actor_registrations_active_actor
+  ON conversational_actor_registrations(actor_id)
+  WHERE registration_state = 'REGISTERED';
+
+-- CP-HI-04 — registration generations only advance; reusing an older generation would
+-- make superseded actor membership current again.
+CREATE TRIGGER IF NOT EXISTS conversational_actor_registration_generation_monotonic
+BEFORE INSERT ON conversational_actor_registrations
+WHEN NEW.actor_generation <= COALESCE(
+  (SELECT MAX(actor_generation) FROM conversational_actor_registrations
+    WHERE actor_id = NEW.actor_id), 0)
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_REGISTRATION_GENERATION_NOT_MONOTONIC');
+END;
+
+-- CP-HI-04 — registration retirement is terminal; reactivation would bypass the fencing
+-- generation required for a new membership decision.
+CREATE TRIGGER IF NOT EXISTS conversational_actor_registration_retirement_terminal
+BEFORE UPDATE OF registration_state ON conversational_actor_registrations
+WHEN OLD.registration_state = 'RETIRED' AND NEW.registration_state <> 'RETIRED'
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_REGISTRATION_RETIREMENT_TERMINAL');
+END;
+
+-- ---------------------------------------------------------------------------
 -- assignments  (PRD §9.4 role binding)
 --   role_key is the logical endpoint: 'CEO', 'PRIMARY_CTO:<projectId>',
 --   'BLIND_REVIEWER:<runId>', 'WORKER:<taskId>', 'BOOTSTRAP_CTO:<runId>'.

@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -90,19 +90,22 @@ export const installMigrationLedger = (raw: Database.Database): void => {
  *
  * #449 is the first change to add a column to an existing table, which is why this was latent
  * until now. The two actor-dependent objects are withheld from the replay and created by v18,
- * which is the migration that adds the column they need. A fresh install never goes through
- * here — it applies schema.sql whole — so it still gets both.
+ * which is the migration that adds the column they need. v20 adds a different failure mode:
+ * replaying the live DDL at v12 creates its whole new tables early, so the ordered v20
+ * `CREATE TABLE` statements later abort with "already exists". A fresh install never goes
+ * through here — it applies schema.sql whole — so it still gets all current objects.
  *
- * The general rule this encodes: an object in schema.sql that references a column introduced
- * after v12 must be excluded here and created by the migration that introduces the column.
+ * The general rule this encodes: an object in schema.sql introduced by a migration after v12
+ * must be excluded here and created by the migration that owns it.
  */
-const REPLAY_EXCLUDES_NEEDING_POST_V12_COLUMNS = [
+const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /CREATE INDEX IF NOT EXISTS assignments_actor[^;]*;/,
   /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
+  /-- ---------------------------------------------------------------------------\n-- conversational_actor_registrations[\s\S]*?(?=-- ---------------------------------------------------------------------------\n-- assignments)/,
 ];
 
 export const replayDdlWithoutPostV12Columns = (): string =>
-  REPLAY_EXCLUDES_NEEDING_POST_V12_COLUMNS.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdl());
+  REPLAY_EXCLUDES_INTRODUCED_AFTER_V12.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdl());
 
 const v12: SchemaMigration = {
   id: "v12-migration-ledger-and-invariant-replay",
@@ -615,6 +618,57 @@ const v19: SchemaMigration = {
   checksum: () => sha256(`v19-session-process-identity\n${V19_DDL}`),
 };
 
+const V20_CONVERSATIONAL_ACTOR_REGISTRY_DDL = `
+  CREATE TABLE conversational_actor_registry_state (
+    registry_id             INTEGER PRIMARY KEY CHECK (registry_id = 1),
+    registry_set_generation INTEGER NOT NULL CHECK (registry_set_generation >= 0)
+  );
+
+  INSERT INTO conversational_actor_registry_state
+    (registry_id, registry_set_generation) VALUES (1, 0);
+
+  CREATE TABLE conversational_actor_registrations (
+    actor_id           TEXT NOT NULL REFERENCES conversational_actors(actor_id),
+    actor_generation   INTEGER NOT NULL CHECK (actor_generation > 0),
+    registration_state TEXT NOT NULL CHECK (registration_state IN ('REGISTERED','RETIRED')),
+    registered_at      TEXT NOT NULL,
+    retired_at         TEXT,
+    retired_reason     TEXT,
+    PRIMARY KEY (actor_id, actor_generation),
+    CHECK ((retired_at IS NULL) = (retired_reason IS NULL)),
+    CHECK ((registration_state = 'REGISTERED') = (retired_at IS NULL))
+  );
+
+  CREATE UNIQUE INDEX conversational_actor_registrations_active_actor
+    ON conversational_actor_registrations(actor_id)
+    WHERE registration_state = 'REGISTERED';
+
+  CREATE TRIGGER conversational_actor_registration_generation_monotonic
+  BEFORE INSERT ON conversational_actor_registrations
+  WHEN NEW.actor_generation <= COALESCE(
+    (SELECT MAX(actor_generation) FROM conversational_actor_registrations
+      WHERE actor_id = NEW.actor_id), 0)
+  BEGIN
+    SELECT RAISE(ABORT, 'ACTOR_REGISTRATION_GENERATION_NOT_MONOTONIC');
+  END;
+
+  CREATE TRIGGER conversational_actor_registration_retirement_terminal
+  BEFORE UPDATE OF registration_state ON conversational_actor_registrations
+  WHEN OLD.registration_state = 'RETIRED' AND NEW.registration_state <> 'RETIRED'
+  BEGIN
+    SELECT RAISE(ABORT, 'ACTOR_REGISTRATION_RETIREMENT_TERMINAL');
+  END;
+`;
+
+/** v20 adds an empty canonical actor-registration set; existing actors are not auto-registered. */
+const v20: SchemaMigration = {
+  id: "v20-conversational-actor-registry",
+  fromVersion: 19,
+  toVersion: 20,
+  apply: (raw) => raw.exec(V20_CONVERSATIONAL_ACTOR_REGISTRY_DDL),
+  checksum: () => sha256(`v20-conversational-actor-registry\n${V20_CONVERSATIONAL_ACTOR_REGISTRY_DDL}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -624,6 +678,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v17,
   v18,
   v19,
+  v20,
 ]);
 
 interface RequiredTrigger {
@@ -663,6 +718,8 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "sessions_buzz_actor_immutable", sentinel: "SESSION_BUZZ_ACTOR_IMMUTABLE" },
   { name: "conversational_actors_retirement_terminal", sentinel: "ACTOR_RETIREMENT_TERMINAL", introducedIn: 18 },
   { name: "conversational_actors_runtime_ready", sentinel: "ACTOR_RUNTIME_NOT_READY", introducedIn: 18 },
+  { name: "conversational_actor_registration_generation_monotonic", sentinel: "ACTOR_REGISTRATION_GENERATION_NOT_MONOTONIC", introducedIn: 20 },
+  { name: "conversational_actor_registration_retirement_terminal", sentinel: "ACTOR_REGISTRATION_RETIREMENT_TERMINAL", introducedIn: 20 },
   { name: "assignments_generation_monotonic", sentinel: "BINDING_GENERATION_NOT_MONOTONIC" },
   { name: "assignments_generation_immutable", sentinel: "BINDING_IDENTITY_IMMUTABLE" },
   { name: "assignments_revocation_terminal", sentinel: "BINDING_REVOKED_TERMINAL" },
