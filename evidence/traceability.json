@@ -6,10 +6,10 @@
   "testRun": {
     "reporter": "vitest-json",
     "success": true,
-    "total": 722,
-    "passed": 721,
+    "total": 903,
+    "passed": 901,
     "failed": 0,
-    "pending": 1
+    "pending": 2
   },
   "summary": {
     "requirements": 22,
@@ -994,6 +994,10 @@
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "#527: an unapproved workflow's check is refused as unapproved, not as bad provenance"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
           "title": "post-merge verification treats a missing check as a failure, not a pass"
         }
       ],
@@ -1009,6 +1013,10 @@
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "#527: an unapproved workflow's check is refused as unapproved, not as bad provenance"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
           "title": "post-merge verification treats a missing check as a failure, not a pass"
         }
       ],
@@ -1021,6 +1029,14 @@
         {
           "file": "tests/scenarios/github-kernel.test.ts",
           "title": "CP-S40: a failed post-merge check blocks dependent merges and a rollback plan is prepared"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "#527: an unapproved workflow's check is refused as unapproved, not as bad provenance"
+        },
+        {
+          "file": "tests/scenarios/github-kernel.test.ts",
+          "title": "a merged repository blocks dependents while its post-merge is pending (#512)"
         },
         {
           "file": "tests/scenarios/github-kernel.test.ts",
