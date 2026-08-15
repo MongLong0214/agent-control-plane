@@ -191,7 +191,7 @@ export class BuzzCliTransport implements BuzzTransport {
   async readBack(channel: string, limit = 10): Promise<BuzzCliMessage[]> {
     const { stdout } = await exec(
       this.binary,
-      ["messages", "get", "--channel", channel, "--limit", String(limit)],
+      BUZZ_CLI_INVOCATIONS.messagesGet(channel, limit),
       { encoding: "utf8", timeout: 30_000 },
     );
     const messages = parseJson(stdout, "messages get");
@@ -201,7 +201,7 @@ export class BuzzCliTransport implements BuzzTransport {
 
   async #listChannels(): Promise<BuzzCliChannel[]> {
     // No `--json`: the installed CLI rejects the flag and already emits JSON without it.
-    const { stdout } = await exec(this.binary, ["channels", "list"], {
+    const { stdout } = await exec(this.binary, BUZZ_CLI_INVOCATIONS.channelsList(), {
       encoding: "utf8",
       timeout: 30_000,
     });
@@ -216,7 +216,7 @@ export class BuzzCliTransport implements BuzzTransport {
    * a refusal rather than a silent redirect of every envelope this daemon sends.
    */
   async #requireChannel(channelId: string): Promise<BuzzCliChannel> {
-    const { stdout } = await exec(this.binary, ["channels", "get", "--channel", channelId], {
+    const { stdout } = await exec(this.binary, BUZZ_CLI_INVOCATIONS.channelsGet(channelId), {
       encoding: "utf8",
       timeout: 30_000,
     });
@@ -231,7 +231,7 @@ export class BuzzCliTransport implements BuzzTransport {
     await new Promise<void>((resolve, reject) => {
       const child = spawn(
         this.binary,
-        ["messages", "send", "--channel", channel, "--content", "-"],
+        BUZZ_CLI_INVOCATIONS.messagesSend(channel),
         { stdio: ["pipe", "ignore", "pipe"] },
       );
       let settled = false;
@@ -299,6 +299,27 @@ export class InMemoryBuzzTransport implements BuzzTransport {
  * role binding* before it can act; a display name grants nothing. Outbound delivery
  * only ever carries fenced envelopes whose generation is still current.
  */
+/**
+ * Every buzz CLI invocation this adapter makes, in one place (#520).
+ *
+ * The CLI has no `--version`, so a contract mismatch cannot be detected at startup — it surfaces
+ * as an argument-parse error inside whatever operation was running. #423 was exactly that. These
+ * are named here so `scripts/verify-buzz-cli-contract.mjs` can check each one against the
+ * installed CLI's declared options rather than against someone's memory of them.
+ *
+ * The builders return the real argv the adapter passes, so the check exercises the same values
+ * the transport does. A table that merely described the calls would drift from them silently,
+ * which is the failure this exists to prevent.
+ */
+export const BUZZ_CLI_INVOCATIONS = {
+  channelsList: () => ["channels", "list"],
+  channelsGet: (channelId: string) => ["channels", "get", "--channel", channelId],
+  messagesGet: (channel: string, limit: number) =>
+    ["messages", "get", "--channel", channel, "--limit", String(limit)],
+  messagesSend: (channel: string) =>
+    ["messages", "send", "--channel", channel, "--content", "-"],
+} as const;
+
 export class BuzzAdapter {
   constructor(
     private readonly db: Db,
