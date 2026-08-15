@@ -63,3 +63,23 @@ The acceptance criterion is a table, because it is checkable:
 | remove layer B only | some named test fails |
 
 A defence whose layers cannot be told apart is one defence wearing two names.
+
+### Find the enforcement, not the line number
+
+An issue body is a fact about the moment it was written. Its line numbers, and its statement
+that something is still broken, were true then. The code has moved since.
+
+So when working a tracked finding, locate each item by **the enforcement it names**, not by its
+recorded path and line. Whether it is still broken then comes out of the code rather than out of
+the issue.
+
+This is not a small correction. The #443 sweep of tests cited as proof found that five of six recorded items had
+already been repaired, and every line number in the list had drifted. Working the list literally
+would have produced five fixes to things that were already fixed, and a green run to go with
+them. The sixth — a genuine gap, now #498 — was found because the sweep went looking for the
+enforcement rather than the line.
+
+The same rule explains a disagreement worth recording: a test named as the top priority was read
+from the issue by one reviewer and from `main` by another, and only the second saw that it had
+been fixed. When an issue and the code disagree, the code is the fact.
+

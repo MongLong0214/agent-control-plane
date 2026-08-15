@@ -26,6 +26,7 @@ jobs:
       # Reports, never fails: stale evidence is a fact to see, and a check that fails on a
       # true statement gets switched off. --strict exists for when a release wants a gate.
       - run: pnpm evidence:freshness
+      - run: pnpm invariants
       - run: pnpm typecheck
       - run: pnpm build
       # One suite run, not two. `trace` needs a JSON reporter pass; it used to obtain that by
