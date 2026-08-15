@@ -996,7 +996,7 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     expect(rollback.allowed).toBe(true);
   });
 
-  it("a merged repository blocks dependents while its post-merge is pending, not only when it fails (#512)", async () => {
+  it("a merged repository blocks dependents while its post-merge is pending (#512)", async () => {
     // CP-S40 above proves the *failure* direction. This is the pending one, and it was open:
     // a merged-but-unverified repository returned `allowed`, folding "not known yet" into
     // "fine" — the CP-HI-08 shape, and the same fold as a delivery timeout recorded as a
@@ -1005,10 +1005,13 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
     // Correct ordering already came from the finalizer awaiting each postMergeVerify in a
     // sequential loop. That is one caller's property. Measured: deleting the whole gate left
     // the finalizer's two-repository test green, because it observes the order the merges
-    // happened in and would observe the same order with no gate at all. Two merges landing in
-    // sequence is what a system with no gate produces on a fast day.
+    // happened in and would observe the same order with no gate at all.
     //
-    // So this test exists to make the kernel a second layer rather than a name.
+    // The converse — that a verified post-merge *releases* dependents — is not asserted here,
+    // and cannot be: this file's fixture declares `approvedDigest: null`, so a post-merge check
+    // is always `untrusted` and no trusted pass is reachable. It is covered instead by
+    // finalizer.test.ts's two-repository case, which merges the second repository only after the
+    // first verifies; that test would fail outright if this gate never released.
     const fixture = await setup();
     const pullNumber = await prepared(fixture);
     const merged = await fixture.harness.cp.github.mergeExecute({
@@ -1034,21 +1037,6 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
       "a dependent was released while an earlier repository was merged and unverified",
     ).toBe(false);
     expect(whilePending.reasonCode).toBe(ReasonCode.DEPENDENT_MERGE_BLOCKED);
-
-    // The converse, so this cannot pass by blocking forever — which would stall every
-    // multi-repository run and is the opposite failure.
-    fixture.github.setTrustedPostMergeCheck(merged.value.mergeCommitSha, "project-ci", CI_WORKFLOWS[0]!.path);
-    const verified = await fixture.harness.cp.github.postMergeVerify(
-      fixture.runId,
-      fixture.identity,
-      merged.value.mergeCommitSha,
-      ["project-ci"],
-    );
-    expect(verified.allowed).toBe(true);
-    expect(
-      fixture.harness.cp.github.dependentMergeBlocked(fixture.runId, fixture.identity).allowed,
-      "a verified post-merge did not release dependents",
-    ).toBe(true);
   });
 
   it("post-merge verification treats a missing check as a failure, not a pass", async () => {
