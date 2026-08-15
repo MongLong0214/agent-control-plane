@@ -54,16 +54,30 @@ const makeDocumentRoot = () => {
 };
 
 describe("SSOT report entry point", () => {
-  it("fails an OPEN #45 fixture with a recorded disposition and passes it when CLOSED", () => {
+  it("#535: does not read an open issue's prose as a disposition", () => {
+    // This asserted the opposite until #535: an OPEN issue whose text began with FIXED / STALE /
+    // NOT APPLICABLE was reported as "recorded as resolved but still open".
+    //
+    // Measured across all 534 issues before removing it — machine marker: 0 users; prose fallback:
+    // 5 matches, every one a false positive; genuine catches: 0. The matches were sentences
+    // *about* those words ("Fixed the synthetic chain; the pinned file still failed"), and one of
+    // them was cited during the day as the rule working. It was not.
+    //
+    // The cost was real: a comment on #533 beginning "Fixed in #534 — …", prose about a different
+    // PR, was taken as #533's disposition and turned `main` red.
+    //
+    // So this test now pins the absence. Restoring the rule makes it fail, which is the point —
+    // the numbers above live in the script's header so that reviving it is a decision someone
+    // makes against evidence rather than a rediscovery of a plausible-looking check.
     const open = runIssueFixture("OPEN");
-    expect(open.status).toBe(1);
-    expect(`${open.stdout}\n${open.stderr}`).toContain(
-      "issue #45 is OPEN but its recorded disposition is FIXED",
-    );
-    expect(`${open.stdout}\n${open.stderr}`).toContain(
-      "Code-fixed OPEN issues without a recorded disposition are not detectable",
-    );
+    expect(
+      `${open.stdout}\n${open.stderr}`,
+      "an open issue's prose was read as its disposition again",
+    ).not.toContain("recorded disposition");
+    expect(open.status).toBe(0);
+    expect(open.stdout).toContain("SSOT reconciled");
 
+    // Closing it changes nothing, because resolution is no longer inferred from text at all.
     const closed = runIssueFixture("CLOSED");
     expect(closed.status).toBe(0);
     expect(closed.stdout).toContain("SSOT reconciled");

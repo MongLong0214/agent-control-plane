@@ -216,33 +216,37 @@ for (const marker of workMarkers.keys()) {
 }
 
 /**
- * A top-level disposition is the tracker record that the finding is resolved. The comment
- * template written by close-with-evidence.mjs starts with `**Fixed.**`; newer automation may
- * use the machine marker. Do not treat prose such as "this other issue is fixed" as a disposition.
- * This detects an OPEN issue with a recorded disposition. It cannot infer from source text that
- * an OPEN issue with no disposition has been fixed; code state and tracker state are separate inputs.
+ * The "recorded disposition" rule was removed here (#535).
+ *
+ * It flagged an OPEN issue whose text recorded a FIXED / STALE / NOT APPLICABLE disposition. Two
+ * mechanisms fed it: a machine marker, and a fallback that read any line *beginning* with one of
+ * those words. Measured across all 534 issues before deleting it:
+ *
+ *   machine marker `<!-- acp-resolution:… -->`   0 issues
+ *   heading fallback                             5 issues, every one a false positive
+ *   genuine catches                              0
+ *
+ * The five were prose discussing the words — "STALE stays advisory unless `--strict`",
+ * "## STALE does not fail the build", "Fixed the synthetic chain; the pinned file still failed".
+ * That last one was cited during the day as the rule working; it was not. Its own header told it
+ * not to read prose as a disposition, and the fallback did that and only that.
+ *
+ * It stayed quiet only because the rule fires on OPEN issues and all five were closed, which made
+ * it a landmine rather than a check: a comment on #533 beginning "Fixed in #534 — …" — prose about
+ * a different PR — was recorded as #533's disposition and turned `main` red.
+ *
+ * Keeping the marker alone was rejected: it has zero users, and a mechanism with no consumer will
+ * accept whatever the first person puts in it while carrying the authority of looking machine-read.
+ *
+ * **If the problem this aimed at is ever actually observed** — an issue recorded as resolved but
+ * left open — the answer is a marker something already writes, not inference from prose formatting.
+ * The numbers are here so that is a decision rather than a rediscovery.
  */
-const resolutionOf = (issue) => {
-  const text = [issue.body ?? "", ...(issue.comments ?? []).map((comment) => comment.body ?? "")].join("\n");
-  const marker = /<!-- acp-resolution:(FIXED|STALE|NOT_APPLICABLE) -->/i.exec(text);
-  if (marker) return marker[1].replace("_", " ").toUpperCase();
-  const heading = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?(FIXED|STALE|NOT[\s-]+APPLICABLE)(?:\*\*)?(?=[\s.:!]|$)/im.exec(text);
-  return heading ? heading[1].replace(/[-\s]+/g, " ").toUpperCase() : null;
-};
-
-const openResolvedIssues = issues
-  .map((issue) => ({ issue, resolution: resolutionOf(issue) }))
-  .filter(({ issue, resolution }) => issue.state === "OPEN" && resolution !== null);
-for (const { issue, resolution } of openResolvedIssues) {
-  problems.push(
-    `issue #${issue.number} is OPEN but its recorded disposition is ${resolution}; close it or correct the disposition`,
-  );
-}
 
 const detectability = {
-  openIssueWithRecordedDisposition: true,
+  openIssueWithRecordedDisposition: false,
   codeFixedOpenIssueWithoutDisposition: false,
-  note: "Code-fixed OPEN issues without a recorded disposition are not detectable from this report.",
+  note: "Issue resolution is not inferred from issue text; closing an issue is the record (#535).",
 };
 
 const openReview = [...reviewMarkers.values()].flat().filter((issue) => issue.state === "OPEN").length;
@@ -259,10 +263,6 @@ if (asJson) {
         publicDocuments,
         statusSections,
         detectability,
-        openResolvedIssues: openResolvedIssues.map(({ issue, resolution }) => ({
-          number: issue.number,
-          resolution,
-        })),
         problems,
       },
       null,
@@ -279,7 +279,6 @@ if (asJson) {
   console.log(`\ndeclared work items: ${workRows.length}, open: ${openWork}`);
   for (const row of workRows) console.log(`  #${row.number ?? "??"} ${row.state.padEnd(7)} ${row.id}`);
   console.log(`\nopen review issues: ${openReview}`);
-  console.log(`recorded resolved issues still open: ${openResolvedIssues.length}`);
   console.log(
     `public documents: ${publicDocuments.filter((document) => document.present).length}/${publicDocuments.length} present`,
   );
