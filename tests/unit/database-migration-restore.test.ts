@@ -293,6 +293,18 @@ const asV11Fixture = (path: string, seed = false): ReturnType<typeof history> | 
       // inserting its own evidence. This fixture-only registration is never exposed by Db.
       raw.function("acp_evidence_write_authorized", () => 1);
       seedHistory(raw);
+      raw.prepare(
+        `INSERT INTO sessions
+           (session_id, incarnation, provider, model, lifecycle, created_at, updated_at, stopped_at)
+         VALUES ('session_history', 'inc-history', 'fixture', 'fixture', 'STOPPED', ?, ?, ?)`,
+      ).run(NOW, NOW, NOW);
+      raw.prepare(
+        `INSERT INTO assignments
+           (assignment_id, role_key, role, session_id, session_incarnation,
+            binding_generation, mode, status, created_at, revoked_at, revoked_reason)
+         VALUES ('assignment_history', 'CEO', 'CEO', 'session_history', 'inc-history',
+                 1, 'PREFERRED', 'REVOKED', ?, ?, 'fixture retirement')`,
+      ).run(NOW, NOW);
     }
     raw.pragma("user_version = 11");
     const result = seed ? history(raw) : undefined;
@@ -312,13 +324,10 @@ const asV14Fixture = (path: string): void => {
     raw.exec(V14_FIXTURE_SHAPE);
     raw.exec(V14_LEDGER_DDL);
     // A real database at v14 reached it either by bootstrap from the full DDL or through the
-    // v12 migration, whose whole job is `exec(schemaDdl())` — so it carries every trigger
-    // schema.sql declared at the time. Assembling this fixture from V11_SCHEMA plus deltas
-    // skipped that replay, which made it unrepresentative in exactly the way that matters
-    // here. Replay the current DDL, then drop the triggers introduced after v14 so the
-    // fixture is a v14 database rather than a current one wearing a v14 version number.
-    // Same drift the v12 replay hits: schema.sql now names actor_id, which no pre-v18
-    // database has. Build the fixture from the replay that withholds post-v12 columns.
+    // v12 migration, whose replay carries every object available by then. Assembling this
+    // fixture from V11_SCHEMA plus deltas skipped that replay, which made it unrepresentative
+    // in exactly the way that matters here. Use the migration replay boundary, then drop the
+    // v16 trigger so this remains a v14 database rather than a current one wearing v14.
     raw.exec(replayDdlWithoutPostV12Columns());
     for (const introducedAfterV14 of ["sessions_workdir_immutable"]) {
       raw.exec(`DROP TRIGGER IF EXISTS ${introducedAfterV14}`);
@@ -383,6 +392,16 @@ const assertFourLoadBearingOperations = (db: Db): void => {
   ).toBe(ReasonCode.RUN_TRANSITION_ILLEGAL);
 };
 
+const assertEmptyActorRegistry = (db: Db): void => {
+  expect(db.get<{ registry_id: number; registry_set_generation: number }>(
+    `SELECT registry_id, registry_set_generation
+       FROM conversational_actor_registry_state`,
+  )).toEqual({ registry_id: 1, registry_set_generation: 0 });
+  expect(db.get<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM conversational_actor_registrations",
+  )).toEqual({ n: 0 });
+};
+
 describe("versioned SQLite migration", () => {
   it("upgrades a genuine v14 fixture through the whole chain and enforces workdir immutability", () => {
     const path = join(tempDir("acp-v14-migration-"), "state.sqlite");
@@ -396,16 +415,24 @@ describe("versioned SQLite migration", () => {
           .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name = 'sessions_workdir_immutable'")
           .get() as { n: number }).n,
       ).toBe(0);
+      expect(
+        before.prepare(
+          `SELECT name FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN ('conversational_actor_registry_state', 'conversational_actor_registrations')`,
+        ).all(),
+      ).toEqual([]);
     } finally {
       before.close();
     }
 
     const migrated = new Db(path);
     try {
-      // v14 → v15 (verification worktree ownership) → v16 (workdir immutability): the
-      // fixture must walk the whole chain, not stop at the version this lane was written on.
+      // The fixture must walk the whole ordered chain through v20, not stop at the version
+      // the original workdir lane was written on.
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(19);
+      expect(SCHEMA_VERSION).toBe(20);
+      assertEmptyActorRegistry(migrated);
       migrated.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, workdir, created_at, updated_at)
          VALUES ('v14-workdir-session', 'inc-1', 'fixture', 'fixture', 'READY', ?, ?, ?)`,
@@ -417,6 +444,15 @@ describe("versioned SQLite migration", () => {
       )).toThrowError(/SESSION_WORKDIR_IMMUTABLE/);
     } finally {
       migrated.close();
+    }
+
+    // A same-version open validates the v20 guards and singleton; it does not replay or
+    // mutate the registration history.
+    const reopened = new Db(path);
+    try {
+      assertEmptyActorRegistry(reopened);
+    } finally {
+      reopened.close();
     }
 
     const raw = new Database(path);
@@ -452,7 +488,8 @@ describe("versioned SQLite migration", () => {
         [16, "v16-session-workdir-immutability"],
         [17, "v17-telegram-owner-prompts"],
         [18, "v18-conversational-actor"],
-        [SCHEMA_VERSION, "v19-session-process-identity"],
+        [19, "v19-session-process-identity"],
+        [SCHEMA_VERSION, "v20-conversational-actor-registry"],
       ]);
       expect(receipts).toEqual([
         expect.objectContaining({
@@ -497,6 +534,12 @@ describe("versioned SQLite migration", () => {
           backup_checksum: null,
         }),
         expect.objectContaining({
+          version: 19,
+          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+          backup_file: null,
+          backup_checksum: null,
+        }),
+        expect.objectContaining({
           version: SCHEMA_VERSION,
           checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
           backup_file: null,
@@ -505,6 +548,23 @@ describe("versioned SQLite migration", () => {
       ]);
       expect(receipts[0]?.backup_file).toBeTruthy();
       expect(existsSync(receipts[0]!.backup_file!)).toBe(true);
+      expect(migrated.get<{
+        assignment_actor_id: string;
+        actor_id: string;
+        kind: string;
+        retired_reason: string | null;
+      }>(
+        `SELECT a.actor_id AS assignment_actor_id, c.actor_id, c.kind, c.retired_reason
+           FROM assignments a
+           JOIN conversational_actors c ON c.actor_id = a.actor_id
+          WHERE a.assignment_id = 'assignment_history'`,
+      )).toEqual({
+        assignment_actor_id: "actor:assignment_history",
+        actor_id: "actor:assignment_history",
+        kind: "CEO",
+        retired_reason: "fixture retirement",
+      });
+      assertEmptyActorRegistry(migrated);
 
       // Four database-level guard rails are exercised after the actual migration, not on a
       // fresh test database. Removing any required trigger makes one negative operation pass.
