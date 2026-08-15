@@ -49,7 +49,10 @@ const setup = (options: { probeFailsOnRepo?: boolean; probeErrorsFor?: string[] 
     ? fakeWorkspaceProbe([repo], { errorFor })
     : realWorkspaceProbe;
   const guard = new ManagedWriteGuard(core.db, probe, core.audit, core.clock);
-  return { ...core, repo, seeded, guard };
+  // #358 asks whether an expired row still occupies the coordination slot, which only the
+  // registry's acquire path can answer — the guard's evaluate cannot see the unique index.
+  const claims = new ClaimRegistry(core.db, core.clock, core.audit, core.bindings);
+  return { ...core, repo, seeded, guard, claims };
 };
 
 const otherRun = (
@@ -969,6 +972,40 @@ describe("guard enforces the §23.2 claim rejects, not only exact paths", () => 
     expect(guard.evaluate(managedRequest(seeded, { targetPath: join(repo, "src/app.ts") })).allowed).toBe(
       true,
     );
+  });
+
+  it("an expired lease is reclaimable, not just ignorable (#358)", () => {
+    // The half the review named and the assertion above cannot make. Ignoring an expired row in
+    // `evaluate` is only correct if the row has also stopped occupying the coordination slot:
+    // §30.2's partial unique indexes key on status = 'HELD' alone, with no clock. If the guard
+    // treats the row as gone while SQLite still reserves it, nobody can write *and* nobody can
+    // take the branch — the run holding it cannot even re-acquire.
+    //
+    // So this asks for the slot rather than for permission. The test above would pass with the
+    // occupant still blocking every acquire, which is exactly what the review said about it.
+    const { claims, db, clock, seeded } = setup();
+    otherRun(db, clock, seeded.projectId);
+    db.run(
+      `INSERT INTO resource_claims (claim_id, repository_identity, branch, run_id,
+                                    owner_session_id, owner_binding_generation, acquired_at,
+                                    expires_at, status)
+       VALUES ('cb_expired', ?, 'dev', 'run_other', ?, 1, ?, ?, 'HELD')`,
+      [seeded.identity, seeded.sessionId, clock.nowIso(), clock.nowIso()],
+    );
+
+    const reclaimed = claims.acquire({
+      runId: seeded.runId,
+      ownerSessionId: seeded.sessionId,
+      ownerBindingGeneration: seeded.generation,
+      ownerRoleKey: seeded.roleKey,
+      repositoryIdentity: seeded.identity,
+      branch: "dev",
+    });
+
+    expect(
+      reclaimed.allowed,
+      `the expired row still occupies the branch slot: ${reclaimed.allowed ? "" : reclaimed.reasonCode}`,
+    ).toBe(true);
   });
 });
 
