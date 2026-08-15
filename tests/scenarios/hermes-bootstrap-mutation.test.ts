@@ -367,6 +367,7 @@ const runLockLossCase = async (sourceLine: 158 | 266, label: string): Promise<vo
       return harness.cp.bindings.switchTo({
         ...input,
         reason: "mutation test forced a generation-2 bootstrap bind",
+        conversation: "REPLACED",
       });
     });
     const authority = createHermesBootstrapAuthority(

@@ -188,9 +188,21 @@ export class BindingRegistry {
    * §15.7 atomic failover. Activating the new generation, revoking the old one and
    * fencing the outbox all happen in one transaction; a crash between them would leave
    * messages addressed to a revoked generation.
+   *
+   * `conversation` says whether the counterpart survived (#493). It is required and has no
+   * default, because a default is a guess and either guess is wrong for half the call sites:
+   * `continuity-kernel` provisions a replacement after a session dies — the runtime went, the
+   * counterpart did not — while a `cto-lifecycle` handoff is a different CTO genuinely taking
+   * the role. Inferring it from provider and model would be the control plane guessing at
+   * identity, which is the thing `conversational_actors` exists to stop.
    */
   switchTo(
-    input: BindInput & { reason: string; takeover?: boolean; expectedCurrentGeneration?: number },
+    input: BindInput & {
+      reason: string;
+      conversation: "SURVIVED" | "REPLACED";
+      takeover?: boolean;
+      expectedCurrentGeneration?: number;
+    },
   ): Decision<RoleBinding> {
     return this.db.tx(() => {
       const key = this.resolveRoleKey(input);
@@ -217,7 +229,10 @@ export class BindingRegistry {
       // those runs would be pinned to a revoked generation: the old session is refused
       // because its generation is gone, and the new one because the run still names the
       // old tuple. Either drain first, or ask for an explicit takeover.
-      if (current) {
+      // A surviving conversation strands nothing: the binding is not replaced, so live runs stay
+      // pinned to the same tuple and the same generation. The guard below exists because a *new*
+      // generation would leave them owned by a revoked one — a condition this path cannot create.
+      if (current && input.conversation === "REPLACED") {
         const orphaned = this.liveRunsOwnedBy(current);
         if (orphaned.length > 0 && !input.takeover) {
           return deny(
@@ -238,6 +253,62 @@ export class BindingRegistry {
       if (input.role === "BLIND_REVIEWER" && input.runId) {
         const independence = this.assertReviewerIndependence(input.runId, input.sessionId);
         if (!independence.allowed) return independence as Decision<RoleBinding>;
+      }
+
+      // #493 — the counterpart survived, so only its runtime moves. The binding is not
+      // rewritten, which is why `binding_generation` cannot advance here: there is no new row
+      // to carry a generation. Holding a generation across a rewrite would have meant weakening
+      // `assignments_generation_monotonic`, and weakening a fencing guard to implement failover
+      // is the wrong direction.
+      if (input.conversation === "SURVIVED") {
+        if (!current) {
+          return deny(
+            ReasonCode.NOT_FOUND,
+            "no active binding to carry a surviving conversation",
+            { roleKey },
+          );
+        }
+        // `RoleBinding` deliberately does not carry the actor: #449 kept the binding's shape
+        // and put the live runtime pointer on the actor, so this reads it where it lives.
+        const owner = this.db.get<{ actor_id: string }>(
+          `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+          [current.assignmentId],
+        );
+        if (!owner) {
+          return deny(ReasonCode.NOT_FOUND, "the active binding has no actor", {
+            roleKey,
+            assignmentId: current.assignmentId,
+          });
+        }
+        const moved = this.db.run(
+          `UPDATE conversational_actors
+              SET current_session_id = ?, current_session_incarnation = ?
+            WHERE actor_id = ? AND retired_at IS NULL`,
+          [input.sessionId, session.incarnation, owner.actor_id],
+        );
+        // A retired or missing actor cannot take a new runtime. Reporting success here would
+        // leave a live binding pointing at an actor that never moved — CP-HI-08's shape — and
+        // the transaction rolls back rather than leaving the pointer indeterminate.
+        if (moved.changes !== 1) {
+          return deny(
+            ReasonCode.CONFLICT,
+            "the conversational actor could not take the incoming runtime",
+            { roleKey, actorId: owner.actor_id, sessionId: input.sessionId },
+          );
+        }
+        this.audit.record({
+          kind: "BINDING_RUNTIME_MOVED",
+          roleKey,
+          sessionId: input.sessionId,
+          projectId: input.projectId ?? null,
+          runId: input.runId ?? null,
+          evidence: {
+            actorId: owner.actor_id,
+            generation: current.bindingGeneration,
+            reason: input.reason,
+          },
+        });
+        return allow(ReasonCode.OK, this.require(roleKey));
       }
 
       if (current) {

@@ -620,6 +620,7 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
       sessionId: session.sessionId,
       projectId,
       reason: "test switch",
+      conversation: "REPLACED",
     });
 
     // The message was retargeted onto the new generation, so nothing remains addressed

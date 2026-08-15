@@ -73,6 +73,7 @@ describe("#45 — producer history survives a Primary CTO takeover", () => {
       sessionId: successor.sessionId,
       projectId,
       reason: "emergency replacement",
+      conversation: "REPLACED",
       takeover: true,
     });
     expect(takeover.allowed).toBe(true);
@@ -138,6 +139,7 @@ describe("#46 — takeover respects the full owner binding tuple", () => {
       role: Role.CEO,
       sessionId: incoming.sessionId,
       reason: "unrelated CEO failover",
+      conversation: "REPLACED",
       takeover: true,
     });
     expect(switched.allowed).toBe(true);
@@ -185,6 +187,7 @@ describe("#50 / #172 — only READY sessions can become active bindings", () => 
       role: Role.CEO,
       sessionId: starting.sessionId,
       reason: "forged readiness",
+      conversation: "REPLACED",
       takeover: true,
       allowStarting: true,
     } as unknown as Parameters<typeof core.bindings.switchTo>[0]);
@@ -261,6 +264,7 @@ describe("binding fencing mechanisms", () => {
       role: Role.CEO,
       sessionId: incoming.sessionId,
       reason: "stale plan",
+      conversation: "REPLACED",
       expectedCurrentGeneration: 0,
     });
     expect(refused.allowed).toBe(false);
@@ -305,6 +309,7 @@ describe("binding fencing mechanisms", () => {
         role: Role.CEO,
         sessionId: successor.sessionId,
         reason: "normal replacement",
+        conversation: "REPLACED",
       }).allowed,
     ).toBe(true);
     const stale = core.bindings.authenticateBoundSession({

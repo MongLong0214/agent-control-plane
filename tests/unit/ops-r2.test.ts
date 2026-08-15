@@ -276,6 +276,7 @@ describe("round-2 ops regressions", () => {
       role: Role.CEO,
       sessionId: createdCeo.sessionId,
       reason: "live wiring test CEO",
+      conversation: "REPLACED",
     });
     if (!switched.allowed) throw new Error(switched.message);
     await harness.cp.continuity.evaluate("live CEO-to-daemon wiring");

@@ -1718,6 +1718,7 @@ describe("round-2 continuity and persistence regressions", () => {
       role: Role.CEO,
       sessionId: concurrent.sessionId,
       reason: "newer failover",
+      conversation: "REPLACED",
       takeover: true,
     });
     expect(switched.allowed).toBe(true);
@@ -1742,6 +1743,7 @@ describe("round-2 continuity and persistence regressions", () => {
       const concurrent = plane.cp.sessions.create({ provider: "gpt", model: "concurrent" });
       plane.cp.sessions.transition(concurrent.sessionId, SessionLifecycle.READY, "concurrent");
       const newer = originalSwitch({
+        conversation: "REPLACED",
         role: Role.CEO,
         sessionId: concurrent.sessionId,
         reason: "newer failover",

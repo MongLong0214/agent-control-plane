@@ -377,6 +377,8 @@ export class ContinuityKernel {
       taskId: scope.taskId ?? null,
       mode: assignment.reason === "preferred" ? "PREFERRED" : "FALLBACK",
       reason: `continuity failover: ${reason}`,
+      // #493 — the session died and a replacement was provisioned: the runtime went, the counterpart did not.
+      conversation: "SURVIVED",
       // The synchronous check above gives a useful early refusal, while this fence makes
       // the final revoke-and-rebind atomic with the generation that plan observed.
       expectedCurrentGeneration: expected?.bindingGeneration,
@@ -459,6 +461,8 @@ export class ContinuityKernel {
         taskId: current.taskId,
         mode: "PREFERRED",
         reason: "continuity restoration",
+        // #493 — same continuity path — a runtime is being replaced under a living counterpart.
+        conversation: "SURVIVED",
       });
       if (!switched.allowed) {
         this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "restoration rejected");

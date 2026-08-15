@@ -122,6 +122,7 @@ describe("round-2 outbox fencing", () => {
       projectId: seeded.projectId,
       sessionId: successor.sessionId,
       reason: "test failover",
+      conversation: "REPLACED",
       takeover: true,
     });
 
@@ -274,6 +275,7 @@ describe("round-2 outbox fencing", () => {
       projectId: seeded.projectId,
       sessionId: successor.sessionId,
       reason: "test retarget",
+      conversation: "REPLACED",
       takeover: true,
     });
     expect(switched.reasonCode).toBe(ReasonCode.OK);
