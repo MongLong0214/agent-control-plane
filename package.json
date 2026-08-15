@@ -22,7 +22,8 @@
     "lint": "eslint .",
     "trace": "tsx src/tools/traceability.ts",
     "terminology": "node scripts/verify-terminology.mjs",
-    "evidence:freshness": "node scripts/verify-evidence-freshness.mjs"
+    "evidence:freshness": "node scripts/verify-evidence-freshness.mjs",
+    "invariants": "node scripts/verify-invariant-coverage.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
