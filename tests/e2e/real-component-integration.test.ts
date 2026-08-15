@@ -31,6 +31,20 @@ import { bindWorkerForTask } from "../helpers/harness.ts";
  */
 const ENABLED = process.env["ACP_COMPONENT_INTEGRATION"] === "1";
 const REAL_PROJECT = resolve(process.env["ACP_COMPONENT_INTEGRATION_PROJECT"] ?? process.cwd());
+/**
+ * A second participating repository, for the multi-repository merge sequence (#512, #240).
+ *
+ * Optional and off by default. #240 needs two repositories merging in declared order with the
+ * first's post-merge verification gating the second, and a run's repository set is fixed at
+ * `runs.create` — so the second has to be present from the start rather than appended after the
+ * CEO confirmation. Guarding it keeps the single-repository path, which is what has been run
+ * until now, exactly as it was.
+ *
+ * Set both to a checkout path and its `github:owner/repo` identity.
+ */
+const SECOND_PROJECT = process.env["ACP_COMPONENT_INTEGRATION_SECOND_PROJECT"];
+const SECOND_IDENTITY = process.env["ACP_COMPONENT_INTEGRATION_SECOND_IDENTITY"];
+const TWO_REPOSITORIES = Boolean(SECOND_PROJECT && SECOND_IDENTITY);
 /** The long-lived branch the manifest contract names, in one place. */
 const MANIFEST_DEFAULT_BRANCH = "main";
 /** The owner-provisioned reviewer egress infrastructure this host declares. */
@@ -323,6 +337,25 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       });
       expect(repository.allowed).toBe(true);
       if (!repository.allowed) return;
+
+      // #512 — the second participant, when one is configured. Registered here rather than later
+      // because `runs.create` below writes `run_repositories`, and a repository absent from that
+      // call can never be part of the run's merge order.
+      let secondRepositoryId: string | null = null;
+      if (TWO_REPOSITORIES) {
+        const secondCheckout = join(root, "project-2");
+        execFileSync("git", ["clone", "--local", "--quiet", resolve(SECOND_PROJECT!), secondCheckout]);
+        const second = await cp.repositories.register({
+          checkoutPath: secondCheckout,
+          projectId,
+          repositoryRole: "secondary",
+          activeManifestDigest: project.value.activeManifestDigest,
+          identity: SECOND_IDENTITY!,
+        });
+        expect(second.allowed, `second repository refused: ${second.allowed ? "" : second.message}`).toBe(true);
+        if (!second.allowed) return;
+        secondRepositoryId = second.value.repositoryId;
+      }
       evidence["registration"] = {
         projectId,
         activeManifestDigest: project.value.activeManifestDigest,
@@ -351,7 +384,13 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         executionMode: ExecutionMode[MODE],
         contract: CONTRACT,
         repositories: [
-          { repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: MANIFEST_DEFAULT_BRANCH },
+          // `mergeOrder` is explicit even for the single-repository case: the default of 0 is
+          // the same value the first participant would take, and writing it makes the ordering
+          // this run is asserting visible at the point it is decided.
+          { repositoryId: repository.value.repositoryId, repositoryRole: "primary", baseBranch: MANIFEST_DEFAULT_BRANCH, mergeOrder: 0 },
+          ...(secondRepositoryId
+            ? [{ repositoryId: secondRepositoryId, repositoryRole: "secondary", baseBranch: MANIFEST_DEFAULT_BRANCH, mergeOrder: 1 }]
+            : []),
         ],
       });
       expect(created.allowed).toBe(true);
@@ -576,6 +615,37 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       expect(cp.runs.require(runId).state).toBe(RunState.CEO_APPROVED);
 
       evidence["ceoConfirm"] = { state: cp.runs.require(runId).state, sessionId: hermes.sessionId };
+
+      // #512 / #240 — the ordering claim, asserted where it is decidable.
+      //
+      // The kernel gate is what this checks, not the finalizer's sequential loop. Measured on
+      // #521: deleting the gate entirely left the finalizer's two-repository test green, because
+      // that test observes the order the merges happened in and would observe the same order
+      // with no gate at all. Two merges landing in sequence is what a system with no gate
+      // produces on a fast day.
+      //
+      // So the assertion is a *refusal*: with the first repository merged and its post-merge
+      // verification not yet answered, a merge of the second must be denied and say why.
+      if (secondRepositoryId) {
+        const ordered = cp.runs.repositoriesOf(runId);
+        evidence["mergeOrder"] = ordered.map((entry) => ({
+          identity: entry.identity,
+          mergeOrder: entry.mergeOrder,
+          mergeState: entry.mergeState,
+        }));
+        expect(
+          ordered.map((entry) => entry.mergeOrder),
+          "the run did not record a distinct merge order for each participant",
+        ).toEqual([0, 1]);
+
+        // Before any merge, nothing is pending and nothing is blocked.
+        const beforeAnyMerge = cp.github.dependentMergeBlocked(runId, SECOND_IDENTITY!);
+        expect(
+          beforeAnyMerge.allowed,
+          "a dependent was blocked before any repository had merged",
+        ).toBe(true);
+        evidence["dependentGate"] = { beforeAnyMerge: beforeAnyMerge.reasonCode };
+      }
       evidence["doctor"] = await cp.doctor.run("project", projectId);
       evidence["telemetry"] = {
         run: cp.telemetry.query("run"),
