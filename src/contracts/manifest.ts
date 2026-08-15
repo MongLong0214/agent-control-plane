@@ -57,6 +57,21 @@ export const projectManifestSchema = z
             path: z.string().min(1),
             checkName: z.string().min(1),
             /**
+             * The repository this workflow belongs to, mirroring `verificationCommands` (#512).
+             *
+             * Without it a declared check was required on every participating repository, and a
+             * single `approvedDigest` was compared against a *different* file in each one — so
+             * two repositories could satisfy one entry only by carrying byte-identical workflow
+             * files. Invisible with one repository, unsatisfiable with two.
+             *
+             * Defaults to `primary`: every manifest written before this field existed described
+             * a run with one repository, and that repository is the primary, so the default
+             * leaves their behaviour unchanged. A secondary that declares nothing does not
+             * thereby become exempt — `postMergeVerify` denies on an empty effective set, which
+             * is the fail-closed direction.
+             */
+            repositoryRole: z.string().min(1).default("primary"),
+            /**
              * Digest of the workflow file the contract approved. A CI result counts as
              * TRUSTED_CI only when the workflow that produced it still matches
              * (Integration §14.4); without this the evidence cannot be trusted and is
@@ -93,6 +108,15 @@ export const projectManifestSchema = z
           code: z.ZodIssueCode.custom,
           message: `verificationCommand '${cmd.id}' targets unknown repositoryRole '${cmd.repositoryRole}'`,
           path: ["verificationCommands"],
+        });
+      }
+    }
+    for (const workflow of manifest.ciWorkflows) {
+      if (!roles.has(workflow.repositoryRole)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `ciWorkflow '${workflow.checkName}' targets unknown repositoryRole '${workflow.repositoryRole}'`,
+          path: ["ciWorkflows"],
         });
       }
     }

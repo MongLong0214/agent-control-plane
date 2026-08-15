@@ -115,6 +115,31 @@ then — kernel proof stacks on top of it rather than replacing it, because the 
 questions. Neither is this an argument that #450 should be closed; that is an owner roadmap item and
 the decision belongs to the owner.
 
+#### Known gap: the bootstrap activation half of `repositoryRole` is unproven
+
+`ciWorkflows` entries carry a `repositoryRole` (#512), and three sites consume it. Two are proven by
+mutation: `declaredPostMergeChecks` and `assertTrustedWorkflowCheck` each go red in
+`tests/scenarios/finalizer.test.ts` when the role is dropped from them.
+
+The third, `validateFactoryProvenance`'s `missingCi` in `src/bootstrap/activation.ts`, is not. The
+input that separates the two behaviours needs a **two-repository bootstrap activation**: a manifest
+declaring a check for one role only, and a factory result covering both repositories. Nothing
+smaller reaches it — a role the manifest does not declare is refused by manifest validation, and a
+role the factory result does not cover is refused earlier with `COVERAGE_INCOMPLETE`. Building it
+means a bootstrap plan whose `githubOperations` cover both repositories, receipts matching that plan
+exactly, local bindings for both, and a candidate snapshot for both. That fixture does not exist,
+and no test exercises multi-repository bootstrap at all.
+
+So this one rests on a correctness argument rather than a verified one: the change makes activation
+resolve a workflow through its own role, the same way required verification commands are resolved
+eight lines above it, and the cross product it replaces cannot be satisfied by any two repositories
+whose CI differs. That reasoning is exactly what this document says not to trust on its own, which
+is why it is recorded here instead of left implicit.
+
+**This gap expires** when a two-repository bootstrap fixture exists — whoever builds one for any
+reason should point this mutation at it. Until then the activation site is unverified, and green
+there proves the single-repository path only.
+
 
 
 ### What went wrong while building these checks

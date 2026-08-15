@@ -49,7 +49,7 @@ const PROFILE = {
 
 /** The check the fixture project declares as its post-merge requirement (§24.7). */
 const CI_WORKFLOWS = [
-  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null },
+  { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, repositoryRole: "primary" },
 ];
 
 const TRUSTED_CI_COMMANDS = [

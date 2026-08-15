@@ -612,7 +612,7 @@ exec /bin/ps "$@"
     const manifest = fixtureManifest("path-contract");
     manifest.repositories[0]!.remote = "/etc/passwd";
     manifest.repositories[0]!.manifestRoot = "../../outside";
-    manifest.ciWorkflows = [{ path: "C:\\private\\ci.yml", checkName: "ci", approvedDigest: null }];
+    manifest.ciWorkflows = [{ path: "C:\\private\\ci.yml", checkName: "ci", approvedDigest: null, repositoryRole: "primary" }];
     manifest.verificationCommands[0]!.argv = ["node", "../../outside.js"];
     expect(assertPortableManifest(manifest)).toMatchObject({ allowed: false, reasonCode: ReasonCode.MANIFEST_NOT_PORTABLE });
   });

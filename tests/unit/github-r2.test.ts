@@ -137,7 +137,7 @@ const reflectMergedBase = (github: FakeGitHub): void => {
 };
 
 const ready = async (
-  ciWorkflows: Array<{ path: string; checkName: string; approvedDigest: string | null }> = [],
+  ciWorkflows: Array<{ path: string; checkName: string; approvedDigest: string | null; repositoryRole: string }> = [],
   options: { preclaimReleaseBranch?: string } = {},
 ) => {
   const github = new FakeGitHub();
@@ -386,7 +386,9 @@ describe("round-two GitHub hardening", () => {
   });
 
   it("#78/#83: a same-name github-actions check without suite and Actions-run provenance is not CI evidence", async () => {
-    const fixture = await ready([{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: "sha256:approved" }]);
+    const fixture = await ready([
+      { path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: "sha256:approved", repositoryRole: "primary" },
+    ]);
     fixture.github.checkRuns.push({
       id: 17,
       name: "project-ci",

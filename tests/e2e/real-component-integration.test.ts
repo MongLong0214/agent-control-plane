@@ -127,7 +127,7 @@ const manifestFor = (projectId: string): ProjectManifest => ({
     },
   ],
   postMergeCommands: [],
-  ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null }],
+  ciWorkflows: [{ path: ".github/workflows/ci.yml", checkName: "project-ci", approvedDigest: null, repositoryRole: "primary" }],
   commitlore: { mode: "preferred" },
 });
 
