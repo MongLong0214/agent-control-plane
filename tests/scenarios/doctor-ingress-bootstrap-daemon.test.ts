@@ -27,7 +27,7 @@ import {
   candidateSnapshotDigest,
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
-import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, tempDir , seedActor} from "../helpers/fixtures.ts";
 import {
   type Harness,
   bindCeo,
@@ -1059,6 +1059,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
       [
         `BLIND_REVIEWER:${created.value.runId}`,
         created.value.runId,
+        seedActor(harness.cp.db, "BLIND_REVIEWER"),
         session.sessionId,
         session.incarnation,
         harness.clock.nowIso(),
