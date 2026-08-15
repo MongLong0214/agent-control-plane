@@ -117,6 +117,30 @@ the decision belongs to the owner.
 
 
 
+### What went wrong while building these checks
+
+Three of the checks in `scripts/` nearly shipped with the exact defect they were written to
+catch. They are recorded because the next person writing one will meet the same three.
+
+**A check that never runs.** The invariant-coverage step was added to a workflow filename that
+does not exist. The script would have sat in the repository, passing by never executing, and its
+absence would have looked like success. Verify the file you edited is the one CI runs —
+`grep` the workflow for a step you know executes.
+
+**A check that measures a proxy and reports it as the thing.** That same script counts invariant
+*identifiers* in tests, while tests actually assert a trigger's *sentinel*. It reported CP-HI-02
+at one test when four of its six triggers were genuinely proved. The proxy was usable for
+ranking and useless as a measure, and nothing in the output said so until it was measured.
+
+**A check that skips what it cannot parse.** The mutation sweep first neutered each trigger's
+`WHEN` clause, which throws on triggers that have none. Had that exception been swallowed to keep
+the sweep going, the unhandled shapes would have been skipped silently and the result reported as
+"all clean". Replacing `SELECT RAISE(ABORT, 'X');` with `SELECT 1;` handles every shape.
+
+The common thread is that all three report success for something they did not examine. A check
+is a claim about what it looked at, and the dangerous failure is not a wrong answer but a
+confident answer about nothing.
+
 ### Find the enforcement, not the line number
 
 An issue body is a fact about the moment it was written. Its line numbers, and its statement
