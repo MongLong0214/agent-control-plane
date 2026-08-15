@@ -1,6 +1,6 @@
 {
   "capture": "P0-09/#243 live Buzz delivery and ACK against the production relay",
-  "capturedAt": "2026-08-14T03:11:03.237Z",
+  "capturedAt": "2026-08-15T08:07:35.952Z",
   "relay": "https://isaac-macmini.tailb41ff5.ts.net:3000",
   "cliPath": "/Users/isaac/.local/bin/buzz",
   "surface": {
@@ -14,73 +14,43 @@
     "availableWithoutPurposeOrBoundChannel": false
   },
   "channelResolution": {
-    "createdChannel": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "createdChannel": "549c699c-554e-430b-8527-67f92caa25ab",
     "availableForResolvablePurpose": true,
     "availableForUnresolvablePurpose": false,
-    "resolvedByPurpose": "cto:acp-verify-2026-08-14T03-11-03",
-    "resolvedTo": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
-    "unmatchedPurposeRefused": "no buzz channel matches purpose cto:acp-verify-2026-08-14T03-11-03-not-a-real-room (available: acp-verify-2026-08-14T03-11-03, ceo, logic-pro-mcp, agent-operator-score, commitlore; set ACP_BUZZ_CHANNEL to bind one explicitly)"
+    "resolvedByPurpose": "cto:acp-verify-2026-08-15T08-07-35",
+    "resolvedTo": "549c699c-554e-430b-8527-67f92caa25ab",
+    "unmatchedPurposeRefused": "no buzz channel matches purpose cto:acp-verify-2026-08-15T08-07-35-not-a-real-room (available: acp-verify-2026-08-15T08-07-35, repo-factory, ceo, logic-pro-mcp, agent-operator-score, commitlore; set ACP_BUZZ_CHANNEL to bind one explicitly)"
   },
   "clockCoherence": {
-    "relayCreatedAt": "2026-08-14T03:11:03.000Z",
-    "captureClockSkewSeconds": 0,
-    "envelopeExpiresAt": "2026-08-14T03:41:03.462Z",
+    "relayCreatedAt": "2026-08-15T08:07:36.000Z",
+    "captureClockSkewSeconds": 1,
+    "envelopeExpiresAt": "2026-08-15T08:37:36.175Z",
     "envelopeExpiresAfterRelayReceipt": true
   },
   "delivery": {
-    "messageId": "msg_57834783d32346a8896e139a",
+    "messageId": "msg_2c2d524b203f4a53a00dc446",
     "outboxStatus": "SENT",
-    "relayEventId": "65fb882f481f059268c6d892b4e9fb7ca1eb0ccd55346881bec4b324e93cccd7",
+    "relayEventId": "1fe54f1ca84373bd3820c8b91d92c9ea6a3fb1d79076d580b1bbec355640f525",
     "relayPubkey": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4",
     "fenceOnRelay": {
       "roleKey": "CEO",
       "bindingGeneration": 1,
-      "targetSessionId": "ses_3267e32596f2428db8faf684"
+      "targetSessionId": "ses_7e259959253a421a9fa4c6a1"
     },
     "envelopeBytesOnRelay": 413,
     "readBackArgv": [
       "messages",
       "get",
       "--channel",
-      "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+      "549c699c-554e-430b-8527-67f92caa25ab",
       "--limit",
       "10"
     ]
   },
-  "acknowledgement": {
-    "path": "IngressGuard.admit -> BuzzActorIngress.bindActor -> SessionRegistry.bindBuzzActor",
-    "actorFromRelay": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddca98c4",
-    "resolvedRole": "CEO",
-    "resolvedGeneration": 1,
-    "resolvedStatus": "ACTIVE",
-    "differentActor": "d046238dd1422955898205bd60507992cb101a1ea2ecfa6e52fd00d5ddcadead",
-    "differentActorReasonCode": "INGRESS_ACTOR_NOT_ALLOWLISTED",
-    "differentActorMessage": "actor is not on the allowlist",
-    "differentActorResolvedTo": null,
-    "sessionLifecycle": "READY"
-  },
-  "doctor": {
-    "projectId": "buzz-live-doctor",
-    "ctoSessionId": "ses_e479b1775cd543e69223581b",
-    "buzzAddress": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
-    "ctoBuzzNotConnectedBeforeConnect": true,
-    "ctoBuzzNotConnectedAfterConnect": false,
-    "statusBeforeConnect": "BLOCKED",
-    "statusAfterConnect": "BLOCKED",
-    "remainingFindingCodes": [
-      "CAPACITY_SENSOR_FILE_MISSING",
-      "CEO_ROLE_UNBOUND",
-      "HOST_MEMORY_PRESSURE",
-      "TRUSTED_GATE_CREDENTIAL_MISSING"
-    ]
-  },
-  "closes": {
-    "P0-09/#423": "transport matched to the installed CLI, argv and field names pinned",
-    "#243": "NOT CLOSED — delivery and acknowledgement proven; the done-when also requires a HEALTHY doctor"
-  },
-  "result": "PARTIAL",
+  "result": "FAIL",
+  "error": "ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS must be configured together",
   "cleanup": {
-    "channel": "46ec4bb3-19d6-4339-827b-5e2295de42eb",
+    "channel": "549c699c-554e-430b-8527-67f92caa25ab",
     "deleted": true
   }
 }
