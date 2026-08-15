@@ -137,7 +137,15 @@ ranking and useless as a measure, and nothing in the output said so until it was
 the sweep going, the unhandled shapes would have been skipped silently and the result reported as
 "all clean". Replacing `SELECT RAISE(ABORT, 'X');` with `SELECT 1;` handles every shape.
 
-The common thread is that all three report success for something they did not examine. A check
+**A mutation of the wrong site.** Deleting an enforcement is only a test of that enforcement if
+the line deleted is the one the path executes. A helper called from several places will happily
+stay green when the wrong caller is edited, and that green looks exactly like a coverage gap —
+the reviewer-isolation deny was mutated at a probe's call site and the seatbelt test passed,
+which briefly read as the boundary being unproved. It was not; the profile builds its deny list
+somewhere else. **An invalid mutation is an invalid observation**, so establish which site the
+path actually runs before drawing anything from a green result.
+
+The common thread is that all four report success for something they did not examine. A check
 is a claim about what it looked at, and the dangerous failure is not a wrong answer but a
 confident answer about nothing.
 
