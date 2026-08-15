@@ -95,6 +95,9 @@ export const OPERATOR_METHOD = {
   CAPACITY_OBSERVE: "capacity.observe",
   PROJECT_LIST: "project.list",
   PROJECT_REGISTER: "project.register",
+  ACTOR_LIST: "actor.list",
+  ACTOR_REGISTER: "actor.register",
+  ACTOR_UNREGISTER: "actor.unregister",
   DAEMON_STATUS: "daemon.status",
 } as const;
 
@@ -109,6 +112,8 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.REPAIR_EXECUTE,
   OPERATOR_METHOD.CAPACITY_OBSERVE,
   OPERATOR_METHOD.PROJECT_REGISTER,
+  OPERATOR_METHOD.ACTOR_REGISTER,
+  OPERATOR_METHOD.ACTOR_UNREGISTER,
 ]);
 
 export interface OperatorRequest {
@@ -377,6 +382,40 @@ export class Daemon {
 
         case OPERATOR_METHOD.PROJECT_REGISTER:
           return this.registerProject(request.params);
+
+        case OPERATOR_METHOD.ACTOR_LIST:
+          return allow(ReasonCode.OK, this.cp.actors.activeSet());
+
+        case OPERATOR_METHOD.ACTOR_REGISTER: {
+          const actorId = requiredOperatorString(request.params, "actorId");
+          if (!actorId.allowed) return actorId;
+          const actorGeneration = requiredOperatorInteger(request.params, "actorGeneration", 1);
+          if (!actorGeneration.allowed) return actorGeneration;
+          const expected = requiredOperatorInteger(request.params, "expectedRegistrySetGeneration", 0);
+          if (!expected.allowed) return expected;
+          return this.cp.actors.register({
+            actorId: actorId.value,
+            actorGeneration: actorGeneration.value,
+            expectedRegistrySetGeneration: expected.value,
+          });
+        }
+
+        case OPERATOR_METHOD.ACTOR_UNREGISTER: {
+          const actorId = requiredOperatorString(request.params, "actorId");
+          if (!actorId.allowed) return actorId;
+          const actorGeneration = requiredOperatorInteger(request.params, "actorGeneration", 1);
+          if (!actorGeneration.allowed) return actorGeneration;
+          const expected = requiredOperatorInteger(request.params, "expectedRegistrySetGeneration", 0);
+          if (!expected.allowed) return expected;
+          const reason = requiredOperatorString(request.params, "reason");
+          if (!reason.allowed) return reason;
+          return this.cp.actors.unregister({
+            actorId: actorId.value,
+            actorGeneration: actorGeneration.value,
+            expectedRegistrySetGeneration: expected.value,
+            reason: reason.value,
+          });
+        }
 
         case OPERATOR_METHOD.DAEMON_STATUS:
           return allow(ReasonCode.OK, {
@@ -1236,6 +1275,17 @@ const requiredOperatorString = (
 ): Decision<string> => {
   const value = params[name];
   return typeof value === "string" && value.length > 0
+    ? allow(ReasonCode.OK, value)
+    : invalidOperatorParam(name, value);
+};
+
+const requiredOperatorInteger = (
+  params: Record<string, unknown>,
+  name: string,
+  minimum: number,
+): Decision<number> => {
+  const value = params[name];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum
     ? allow(ReasonCode.OK, value)
     : invalidOperatorParam(name, value);
 };

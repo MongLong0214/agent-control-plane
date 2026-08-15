@@ -96,6 +96,44 @@ describe("authenticated operator socket (#393/#405)", () => {
     }
   });
 
+  it("maps actor register, list, and unregister commands onto the daemon operator methods", async () => {
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const request = vi.fn(async () => ({
+      allowed: true as const,
+      reasonCode: ReasonCode.OK,
+      evidence: {},
+      value: {},
+    }));
+    const client = { request };
+    try {
+      expect(await dispatch(client, "actor", ["register", "actor:cli-cto", "5", "0"], false)).toBe(0);
+      expect(await dispatch(client, "actor", ["list"], false)).toBe(0);
+      expect(await dispatch(
+        client,
+        "actor",
+        ["unregister", "actor:cli-cto", "5", "1", "owner", "rotation"],
+        false,
+      )).toBe(0);
+
+      expect(request.mock.calls).toEqual([
+        ["actor.register", {
+          actorId: "actor:cli-cto",
+          actorGeneration: 5,
+          expectedRegistrySetGeneration: 0,
+        }, undefined],
+        ["actor.list", {}, undefined],
+        ["actor.unregister", {
+          actorId: "actor:cli-cto",
+          actorGeneration: 5,
+          expectedRegistrySetGeneration: 1,
+          reason: "owner rotation",
+        }, undefined],
+      ]);
+    } finally {
+      stdout.mockRestore();
+    }
+  });
+
   it("routes a CLI-shaped mutation through the lock-held daemon and opens a 0600 socket", async () => {
     const running = await makeStartedOperator();
     try {
@@ -106,6 +144,50 @@ describe("authenticated operator socket (#393/#405)", () => {
       expect(code).toBe(0);
       expect(running.harness.cp.runs.get(runId)?.state).toBe("CANCELLED");
       expect(statSync(running.socketPath).mode & 0o777).toBe(0o600);
+    } finally {
+      await running.close();
+    }
+  });
+
+  it("registers, queries, and unregisters an actor through the authenticated daemon surface", async () => {
+    const running = await makeStartedOperator();
+    const actorId = "actor:operator-cto";
+    try {
+      running.harness.cp.db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at)
+         VALUES (?, 'PRIMARY_CTO', ?)`,
+        [actorId, running.harness.clock.nowIso()],
+      );
+
+      const registered = await running.daemon.handleOperatorRequest({
+        requestId: "actor-register",
+        method: "actor.register",
+        params: { actorId, actorGeneration: 7, expectedRegistrySetGeneration: 0 },
+        idempotencyKey: "actor-register-once",
+      }, running.peer);
+      const listed = await running.daemon.handleOperatorRequest({
+        requestId: "actor-list",
+        method: "actor.list",
+        params: {},
+      }, running.peer);
+      const unregistered = await running.daemon.handleOperatorRequest({
+        requestId: "actor-unregister",
+        method: "actor.unregister",
+        params: {
+          actorId,
+          actorGeneration: 7,
+          expectedRegistrySetGeneration: 1,
+          reason: "operator rotation",
+        },
+        idempotencyKey: "actor-unregister-once",
+      }, running.peer);
+
+      expect(registered).toMatchObject({ allowed: true, value: { registrySetGeneration: 1 } });
+      expect(listed).toMatchObject({
+        allowed: true,
+        value: { registrySetGeneration: 1, actors: [{ actorId, actorGeneration: 7 }] },
+      });
+      expect(unregistered).toMatchObject({ allowed: true, value: { registrySetGeneration: 2 } });
     } finally {
       await running.close();
     }

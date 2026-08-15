@@ -813,7 +813,7 @@ describe("baseline boundary contracts", () => {
     expect(parseRepoFactoryResult(result).allowed).toBe(true);
     expect(parseRepoFactoryResult({ ...result, unversionedExtra: true }).allowed).toBe(false);
     expect(parseRepoFactoryResult({ ...result, schema: "repo-factory.result.v3" }).allowed).toBe(false);
-    expect(SCHEMA_VERSION).toBe(19);
+    expect(SCHEMA_VERSION).toBe(20);
     expect(migrationChainFrom(12).map((migration) => migration.id)).toEqual([
       "v13-finalization-state-machine",
       "v14-baseline-evidence-ledger",
@@ -822,6 +822,7 @@ describe("baseline boundary contracts", () => {
       "v17-telegram-owner-prompts",
       "v18-conversational-actor",
       "v19-session-process-identity",
+      "v20-conversational-actor-registry",
     ]);
   });
 
@@ -833,6 +834,7 @@ describe("baseline boundary contracts", () => {
     try {
       raw.exec("DROP TRIGGER baseline_records_immutable; DROP TRIGGER baseline_records_no_delete; DROP TABLE baseline_records;");
       raw.exec("DROP TRIGGER telegram_owner_prompts_immutable; DROP TRIGGER telegram_owner_prompts_no_delete; DROP TABLE telegram_owner_prompts;");
+      raw.exec("DROP TRIGGER conversational_actor_registration_generation_monotonic; DROP TRIGGER conversational_actor_registration_retirement_terminal; DROP TABLE conversational_actor_registrations; DROP TABLE conversational_actor_registry_state;");
       raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
       raw.prepare("DELETE FROM schema_migrations WHERE version >= ?").run(14);
       const v13 = migrationChainFrom(12).find((migration) => migration.toVersion === 13)!;
@@ -878,6 +880,12 @@ describe("baseline boundary contracts", () => {
         "SELECT migration_id, checksum FROM schema_migrations WHERE version = 19",
       )).toEqual({
         migration_id: "v19-session-process-identity",
+        checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      });
+      expect(migrated.get<{ migration_id: string; checksum: string }>(
+        "SELECT migration_id, checksum FROM schema_migrations WHERE version = 20",
+      )).toEqual({
+        migration_id: "v20-conversational-actor-registry",
         checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
       expect(migrated.get<{ migration_id: string; checksum: string }>(
@@ -946,6 +954,7 @@ describe("baseline boundary contracts", () => {
     try {
       raw.exec("DROP TRIGGER baseline_records_immutable; DROP TRIGGER baseline_records_no_delete; DROP TABLE baseline_records;");
       raw.exec("DROP TRIGGER telegram_owner_prompts_immutable; DROP TRIGGER telegram_owner_prompts_no_delete; DROP TABLE telegram_owner_prompts;");
+      raw.exec("DROP TRIGGER conversational_actor_registration_generation_monotonic; DROP TRIGGER conversational_actor_registration_retirement_terminal; DROP TABLE conversational_actor_registrations; DROP TABLE conversational_actor_registry_state;");
       raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
       raw.prepare("DELETE FROM schema_migrations WHERE version >= ?").run(14);
       const v13 = migrationChainFrom(12).find((migration) => migration.toVersion === 13)!;
@@ -1004,6 +1013,8 @@ describe("baseline boundary contracts", () => {
         .toEqual({ migration_id: "v18-conversational-actor" });
       expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 19"))
         .toEqual({ migration_id: "v19-session-process-identity" });
+      expect(migrated.get<{ migration_id: string }>("SELECT migration_id FROM schema_migrations WHERE version = 20"))
+        .toEqual({ migration_id: "v20-conversational-actor-registry" });
       expect(
         migrated.get<{ backup_file: string | null; backup_checksum: string | null }>(
           "SELECT backup_file, backup_checksum FROM schema_migrations WHERE version = 14",
