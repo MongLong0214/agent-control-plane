@@ -95,6 +95,27 @@ void. Whoever makes that change can lift this, and should.
 What restores the rule here is therefore a change to how the fence discovers processes — not
 another test.
 
+#### Known gap: peer identity is registry-level, not kernel-level
+
+`sessions.os_pid` is verified against the process start time, so a reused pid resolves to nothing
+rather than to the wrong session (#505). That answers *is this pid still the process we recorded*.
+
+It does **not** answer *is the peer on this socket that process*. Only a kernel credential check
+(`LOCAL_PEERCRED`) does, and #450 tracks absorbing one. That absorption is not done: the source it
+names is not reachable from this checkout, and writing the C from scratch would be new native code
+wearing the word "absorb".
+
+The weaker property covers what #450 says it is for — rebinding after a daemon restart, and actors
+the daemon did not spawn are both registry questions. It would not stop an adversary, and #450
+records that it is not meant to: the socket is 0600, and the same UID reads the session secret
+anyway.
+
+**This gap expires** when `peercred.c` becomes reachable. The start-time pairing is not thrown away
+then — kernel proof stacks on top of it rather than replacing it, because the two answer different
+questions. Neither is this an argument that #450 should be closed; that is an owner roadmap item and
+the decision belongs to the owner.
+
+
 
 ### Find the enforcement, not the line number
 
