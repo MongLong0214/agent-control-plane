@@ -287,8 +287,8 @@ blind spot is exactly what a second round from the same reviewer cannot catch.
 
 1. **GPT-5.6 Sol, round 1** — nine areas, read-only sandbox, effort `xhigh` (`evidence/review-round1/`).
 2. **GPT-5.6 Sol, round 2** — same shape, fresh context, against the hardened code (`evidence/review/`).
-3. **Test-integrity audit** — every one of the 436 tests read with one question: *would this still
-   pass if the enforcement it names were deleted?* 26 would. Eight closed issues were **reopened**,
+3. **Test-integrity audit** — every one of the 436 tests **that existed when it ran**, read with
+   one question: *would this still pass if the enforcement it names were deleted?* 26 would. Eight closed issues were **reopened**,
    because the regression test they were closed against proves nothing (label `test-integrity`).
 4. **Edge-case audit** — the concurrency and lifecycle mechanisms the delegate waves added, read
    for the interleavings their own tests do not cover. 15 defects, 6 of them blocker-class
@@ -309,9 +309,14 @@ been run against a settled tree yet.
 | 1 | BLOCK in all 9 areas | 57 | 66 (+1 minor) | 57 / 52 / 1 | 0 / 14 / 0 |
 | 2 | BLOCK in all 9 areas | 63 | 64 (+1 minor) | 46 / 49 / 0 | 17 / 15 / 1 |
 
-252 review findings, 205 closed, 47 open — reconciled by `node scripts/ssot-report.mjs`,
-which reports 0 missing. On top of those: 26 `test-integrity`, 16 `edge-case` and 6 `grok-audit`
-issues, of which 8 are reopened closures. **112 issues open in total.**
+252 review findings. **When round 2 closed**, 205 of them were closed and 47 open, with 26
+`test-integrity`, 16 `edge-case` and 6 `grok-audit` issues on top — 8 of those being reopened
+closures, and 112 issues open in total.
+
+Those five figures describe that moment and are not maintained here. The current position is
+whatever `node scripts/ssot-report.mjs` prints, which reconciles every finding against its issue
+and reports what is missing; a number typed into this document cannot do that and should not
+pretend to (#448).
 
 The eight reopened ones matter more than their count suggests. Each had been closed against a
 named regression test, which is this project's own bar — and the audit showed the test would pass
