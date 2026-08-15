@@ -85,8 +85,15 @@ Three end-to-end designs and three function-level designs were measured before t
   containment that can be disabled is eventually run disabled. The cost of satisfying the rule
   would create the failure the rule is written against.
 
-So this pair is exempt, and the exemption is a decision rather than an omission. What restores
-the rule here is a change to how the fence discovers processes — not another test.
+So this pair is exempt, and the exemption is a decision rather than an omission.
+
+**This exception expires.** It holds only while the fence's process discovery is bound to the
+wrapper's own fork topology. That is a design fact, not a law: if discovery is ever changed to
+accept an arbitrary set of pids, the function-level test becomes possible and this exemption is
+void. Whoever makes that change can lift this, and should.
+
+What restores the rule here is therefore a change to how the fence discovers processes — not
+another test.
 
 
 ### Find the enforcement, not the line number
