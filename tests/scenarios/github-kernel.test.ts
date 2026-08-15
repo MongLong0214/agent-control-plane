@@ -386,6 +386,31 @@ const prepareInput = (fixture: Fixture) => ({
   exactHeadSha: fixture.head,
 });
 
+/**
+ * Asserts a denial carried none of the thrown transport detail into its evidence.
+ *
+ expectNoTransportDetail(unavailable.evidence, "sensitive");
+ * *spelling* rather than the boundary. Adding the same message under any other key — `cause`,
+ * `detail`, `reason` — satisfied every one of them. That is not hypothetical: I added a `cause`
+ * field to these exact denials while working on #533 and the whole suite stayed green, which is
+ * how the gap was found.
+ *
+ * The property is that the message does not reach durable evidence, so that is what gets
+ * asserted: every value, at any depth, regardless of what the key is called.
+ */
+const expectNoTransportDetail = (evidence: Record<string, unknown>, thrown: string): void => {
+  const seen = (value: unknown): boolean => {
+    if (typeof value === "string") return value.includes(thrown);
+    if (Array.isArray(value)) return value.some(seen);
+    if (value && typeof value === "object") return Object.values(value).some(seen);
+    return false;
+  };
+  expect(
+    seen(evidence),
+    `transport detail reached durable evidence: ${JSON.stringify(evidence)}`,
+  ).toBe(false);
+};
+
 const mergeInput = (fixture: Fixture, pullNumber: number) => ({
   runId: fixture.runId,
   repositoryIdentity: fixture.identity,
@@ -1653,7 +1678,7 @@ describe("merge target proof (#350)", () => {
     expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
     if (unavailable.allowed) throw new Error("expected failed postflight pull probe to be denied");
     expect(unavailable.evidence).toMatchObject({ phase: "postflight-pull", pullNumber });
-    expect(unavailable.evidence).not.toHaveProperty("error");
+    expectNoTransportDetail(unavailable.evidence, "sensitive transport detail");
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
 
@@ -1692,7 +1717,7 @@ describe("merge target proof (#350)", () => {
     expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
     if (unavailable.allowed) throw new Error("expected null postflight pull read to be denied");
     expect(unavailable.evidence).toMatchObject({ phase: "postflight-pull", pullNumber });
-    expect(unavailable.evidence).not.toHaveProperty("error");
+    expectNoTransportDetail(unavailable.evidence, "sensitive");
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
   });
@@ -1733,7 +1758,7 @@ describe("merge target proof (#350)", () => {
       expect(unavailable.reasonCode).toBe(ReasonCode.PROBE_FAILED);
       if (unavailable.allowed) throw new Error("expected replay pull probe to be denied");
       expect(unavailable.evidence).toMatchObject({ phase: "reconcile-pull", pullNumber });
-      expect(unavailable.evidence).not.toHaveProperty("error");
+      expectNoTransportDetail(unavailable.evidence, "sensitive reconciliation transport detail");
       expect(fixture.github.mergeCount).toBe(1);
       expect(fixture.github.calls.filter((call) => call.method === "PUT" && call.path.endsWith("/merge"))).toHaveLength(1);
       expectPendingMergeProof(fixture);
@@ -2006,7 +2031,7 @@ describe("merge target proof (#350)", () => {
     expect(unavailable.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
     if (unavailable.allowed) throw new Error("expected unreadable target ref to be denied");
     expect(unavailable.evidence).toMatchObject({ phase: "postflight-target-ref", baseRef: "dev" });
-    expect(unavailable.evidence).not.toHaveProperty("error");
+    expectNoTransportDetail(unavailable.evidence, "sensitive target transport detail");
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
   });
@@ -2033,7 +2058,7 @@ describe("merge target proof (#350)", () => {
       baseRef: "dev",
       observed: null,
     });
-    expect(unavailable.evidence).not.toHaveProperty("error");
+    expectNoTransportDetail(unavailable.evidence, "sensitive");
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
   });
@@ -2076,7 +2101,7 @@ describe("merge target proof (#350)", () => {
       phase: "postflight-first-parent",
       mergeCommitSha: pull.merge_commit_sha,
     });
-    expect(unavailable.evidence).not.toHaveProperty("error");
+    expectNoTransportDetail(unavailable.evidence, "sensitive first-parent transport detail");
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
   });
@@ -2103,7 +2128,7 @@ describe("merge target proof (#350)", () => {
       phase: "postflight-first-parent",
       mergeCommitSha: pull.merge_commit_sha,
     });
-    expect(unavailable.evidence).not.toHaveProperty("error");
+    expectNoTransportDetail(unavailable.evidence, "sensitive");
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
   });
