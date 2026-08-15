@@ -101,19 +101,24 @@ another test.
 rather than to the wrong session (#505). That answers *is this pid still the process we recorded*.
 
 It does **not** answer *is the peer on this socket that process*. Only a kernel credential check
-(`LOCAL_PEERCRED`) does, and #450 tracks absorbing one. That absorption is not done: the source it
+(`LOCAL_PEERCRED`) does, and #539 tracks absorbing one. That absorption is not done: the source it
 names is not reachable from this checkout, and writing the C from scratch would be new native code
 wearing the word "absorb".
 
-The weaker property covers what #450 says it is for — rebinding after a daemon restart, and actors
-the daemon did not spawn are both registry questions. It would not stop an adversary, and #450
-records that it is not meant to: the socket is 0600, and the same UID reads the session secret
-anyway.
+This pointed at #450 until that issue was closed on 2026-08-15 with the work unfinished. An expiry
+condition hanging off a closed ticket expires by accident — the same defect #538 fixed one layer
+down, where `STATUS.md` listed six closed issues as live work still owed.
+
+The weaker property covers what the absorption was for — rebinding after a daemon restart, and
+actors the daemon did not spawn are both registry questions. It would not stop an adversary, and
+#450 recorded that it was never meant to: the socket is 0600, and the same UID reads the session
+secret anyway.
 
 **This gap expires** when `peercred.c` becomes reachable. The start-time pairing is not thrown away
 then — kernel proof stacks on top of it rather than replacing it, because the two answer different
-questions. Neither is this an argument that #450 should be closed; that is an owner roadmap item and
-the decision belongs to the owner.
+questions. #450's closure is not being reversed here: that decision was the owner's. What does not
+follow from it is that the property now holds, so the remaining work is tracked in #539 and this
+paragraph points there.
 
 #### Known gap: the bootstrap activation half of `repositoryRole` is unproven
 
