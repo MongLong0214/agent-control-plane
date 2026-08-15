@@ -189,6 +189,25 @@ CREATE TABLE IF NOT EXISTS conversational_actors (
 CREATE INDEX IF NOT EXISTS conversational_actors_session
   ON conversational_actors(current_session_id);
 
+-- CP-HI-08 — an actor's runtime may only ever point at a READY session (#493).
+--
+-- task_executions_worker_binding_required used to rest on assignments.session_id, which is
+-- immutable under assignments_generation_immutable. After #493 it rests on this column, which is
+-- mutable — so the guard would have traded an enforced dependency for a conventional one, and a
+-- convention is what CP-HI-08 exists to catch. This makes it enforced again: nothing can repoint
+-- an actor at a session that is not ready to work, whatever writes it.
+CREATE TRIGGER IF NOT EXISTS conversational_actors_runtime_ready
+BEFORE UPDATE OF current_session_id ON conversational_actors
+WHEN NEW.current_session_id IS NOT NULL
+ AND NEW.current_session_id IS NOT OLD.current_session_id
+ AND NOT EXISTS (
+   SELECT 1 FROM sessions
+    WHERE session_id = NEW.current_session_id AND lifecycle = 'READY'
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_RUNTIME_NOT_READY');
+END;
+
 -- CP-HI-04 — retirement is terminal, for the same reason revocation is: an actor brought back
 -- after its bindings were fenced would make superseded authority current again.
 CREATE TRIGGER IF NOT EXISTS conversational_actors_retirement_terminal
@@ -586,18 +605,26 @@ CREATE INDEX IF NOT EXISTS task_executions_open ON task_executions(status, start
 
 -- CP-HI-04 — an execution names a real bound worker rather than an arbitrary session.
 -- A caller cannot fabricate a receipt for an arbitrary session. At insertion the named
--- session must hold the active, canonical WORKER:<taskId> binding and be ready to work.
+-- session must be the runtime currently serving the actor that holds the active, canonical
+-- WORKER:<taskId> binding, and be ready to work.
+--
+-- #493 — this asks about the *live* runtime, not the runtime at binding time. Resting on
+-- assignments.session_id meant that after a surviving failover the worker's own executions were
+-- refused, because that column still named the session that died. A guard that refuses correct
+-- work is a bug, not safety. `conversational_actors_runtime_ready` keeps the dependency enforced:
+-- current_session_id can only ever name a READY session.
 -- TaskGraph performs the same check for an explainable denial; this is the durable backstop
 -- for every raw SQL writer.
 CREATE TRIGGER IF NOT EXISTS task_executions_worker_binding_required
 BEFORE INSERT ON task_executions
 WHEN NOT EXISTS (
   SELECT 1 FROM assignments a
-    JOIN sessions s ON s.session_id = a.session_id
+    JOIN conversational_actors c ON c.actor_id = a.actor_id
+    JOIN sessions s ON s.session_id = c.current_session_id
    WHERE a.role = 'WORKER'
      AND a.role_key = 'WORKER:' || NEW.task_id
      AND a.task_id = NEW.task_id
-     AND a.session_id = NEW.worker_session_id
+     AND c.current_session_id = NEW.worker_session_id
      AND a.status = 'ACTIVE'
      AND s.lifecycle = 'READY'
 )

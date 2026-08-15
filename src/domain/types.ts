@@ -247,8 +247,23 @@ export interface RoleBinding {
   projectId: string | null;
   runId: string | null;
   taskId: string | null;
+  /**
+   * The runtime currently serving this binding's conversational actor (#493).
+   *
+   * This is the routing answer — who to talk to now — and it follows failover, because a
+   * surviving conversation moves its runtime without rewriting the binding. It is deliberately
+   * the field that keeps the plain name: a caller that wants "who is this role" and reaches for
+   * `sessionId` gets the live answer, and a caller that needed the identity instead is caught by
+   * the composite foreign key rather than silently addressing a dead session.
+   */
   sessionId: string;
   sessionIncarnation: string;
+  /**
+   * The runtime at binding time, which is what `assignments_owner_tuple` and the composite
+   * foreign key from `runs` resolve against. Pin run ownership from this, never from `sessionId`.
+   */
+  boundSessionId: string;
+  boundSessionIncarnation: string;
   bindingGeneration: number;
   mode: "PREFERRED" | "FALLBACK";
   status: "ACTIVE" | "REVOKED";

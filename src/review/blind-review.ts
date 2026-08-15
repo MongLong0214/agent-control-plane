@@ -529,6 +529,8 @@ export class BlindReviewGate {
             runId,
             mode: isPreferred ? "PREFERRED" : "FALLBACK",
             reason: `constituting ${purpose}`,
+            // #493 — a reviewer rebind is a different reviewer, and CP-HI-04 requires it to be.
+            conversation: "REPLACED",
           })
         : this.bindings.bind({
             roleKey,

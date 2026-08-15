@@ -490,6 +490,8 @@ export class CtoLifecycle {
         projectId: row.project_id,
         mode: "PREFERRED",
         reason: `handoff ${handoffId} acknowledged`,
+        // #493 — a handoff acknowledged by a different session is a different CTO taking the role.
+        conversation: "REPLACED",
       });
       if (!switched.allowed) return switched;
 
@@ -584,6 +586,8 @@ export class CtoLifecycle {
         projectId,
         mode: "FALLBACK",
         reason: `recovery takeover: ${reason}`,
+        // #493 — fallback promotion installs a different counterpart, not a new runtime for the same one.
+        conversation: "REPLACED",
         takeover: true,
       });
       if (!switched.allowed) return switched;

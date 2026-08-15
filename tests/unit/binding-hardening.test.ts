@@ -190,6 +190,7 @@ describe("a switch cannot orphan live runs", () => {
       sessionId: s,
       projectId: seeded.projectId,
       reason: "replacement",
+      conversation: "REPLACED",
     });
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS);
@@ -203,6 +204,7 @@ describe("a switch cannot orphan live runs", () => {
       sessionId: s,
       projectId: seeded.projectId,
       reason: "recovery",
+      conversation: "REPLACED",
       takeover: true,
     });
     expect(switched.allowed).toBe(true);
@@ -322,5 +324,151 @@ describe("an ACK from a revoked generation changes nothing", () => {
     expect(ack.allowed).toBe(false);
     expect(ack.reasonCode).toBe(ReasonCode.OUTBOX_EXPIRED);
     expect(core.outbox.get(message.value.messageId)?.status).not.toBe("ACKED");
+  });
+});
+
+/**
+ * CP-HI-08 — failover must not fence the counterpart the owner is mid-conversation with (#493).
+ *
+ * `assignments` bound a role to a session. A session is a replaceable model runtime, so
+ * recovering a crashed one wrote a new binding, which advanced `binding_generation` — and
+ * advancing that generation is how this system retires a superseded role holder. The effect was
+ * that a runtime crash silently retired the CTO.
+ *
+ * #449 built `conversational_actors` and moved the live runtime pointer onto it, deliberately
+ * without changing behaviour. This is the behaviour change, and the assertion whose absence was
+ * the whole defect is the first one below: the generation does **not** move.
+ */
+describe("failover moves the runtime without retiring the counterpart (CP-HI-08, #493)", () => {
+  const failoverSetup = () => {
+    const core = setup();
+    const incoming = core.session("ses_incoming");
+    const roleKey = `PRIMARY_CTO:${core.seeded.projectId}`;
+    const before = core.bindings.require(roleKey);
+    return { ...core, incoming, roleKey, before, projectId: core.seeded.projectId };
+  };
+
+  it("leaves binding_generation unchanged when the conversation survived", () => {
+    // The defect, stated directly. Before #493 this switch advanced the generation and the
+    // owner's CTO was fenced by its own recovery.
+    const { bindings, incoming, roleKey, before, projectId } = failoverSetup();
+    const switched = bindings.switchTo({
+      roleKey,
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: incoming,
+      reason: "runtime crashed and was replaced",
+      conversation: "SURVIVED",
+    });
+    expect(switched.allowed).toBe(true);
+    expect(bindings.require(roleKey).bindingGeneration).toBe(before.bindingGeneration);
+    expect(bindings.require(roleKey).assignmentId).toBe(before.assignmentId);
+  });
+
+  it("repoints the actor at the incoming runtime", () => {
+    // The other half: the generation holding is only correct if the runtime actually moved.
+    // Asserting one without the other would pass for a switch that did nothing at all.
+    const { bindings, db, incoming, roleKey, before, projectId } = failoverSetup();
+    bindings.switchTo({
+      roleKey,
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: incoming,
+      reason: "runtime crashed and was replaced",
+      conversation: "SURVIVED",
+    });
+    const actor = db.get<{ current_session_id: string }>(
+      `SELECT a.current_session_id FROM conversational_actors a
+         JOIN assignments b ON b.actor_id = a.actor_id
+        WHERE b.assignment_id = ?`,
+      [before.assignmentId],
+    );
+    expect(actor?.current_session_id).toBe(incoming);
+  });
+
+  it("still advances the generation when the counterpart was replaced", () => {
+    // The converse. A rule that never rotated would be a broken fence, not a fixed one — this
+    // is what keeps the change from being "failover stopped fencing".
+    const { bindings, incoming, roleKey, before, projectId } = failoverSetup();
+    const switched = bindings.switchTo({
+      roleKey,
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: incoming,
+      reason: "a different CTO acknowledged the handoff",
+      conversation: "REPLACED",
+      // The seeded run is live, and replacing the counterpart would strand it on a revoked
+      // generation — so this path requires an explicit takeover, exactly as before #493. The
+      // SURVIVED cases above need no such thing, which is the difference.
+      takeover: true,
+    });
+    expect(switched.allowed).toBe(true);
+    expect(bindings.require(roleKey).bindingGeneration).toBeGreaterThan(before.bindingGeneration);
+  });
+
+  it("refuses a surviving conversation with no active binding to carry it", () => {
+    // Nothing survived if nothing was bound. Reporting success here would leave the caller
+    // believing a counterpart continued when none existed.
+    const { bindings, incoming } = failoverSetup();
+    const orphan = bindings.switchTo({
+      roleKey: "PRIMARY_CTO:prj_absent",
+      role: Role.PRIMARY_CTO,
+      projectId: "prj_absent",
+      sessionId: incoming,
+      reason: "no binding here",
+      conversation: "SURVIVED",
+    });
+    expect(orphan.allowed).toBe(false);
+  });
+});
+
+/**
+ * CP-HI-08 — the worker guard's dependency has to stay enforced, not become conventional (#493).
+ *
+ * `task_executions_worker_binding_required` used to rest on `assignments.session_id`, which
+ * `assignments_generation_immutable` holds still. #493 moved it onto
+ * `conversational_actors.current_session_id`, which is mutable — so the guard would have traded
+ * an enforced dependency for a convention, and a convention is exactly what CP-HI-08 exists to
+ * catch. `conversational_actors_runtime_ready` is what keeps it enforced.
+ *
+ * Written because the mutation table said so: deleting that trigger left every other test green.
+ */
+describe("an actor's runtime can only ever be a READY session (CP-HI-08, #493)", () => {
+  it("refuses to repoint an actor at a session that is not ready", () => {
+    const { db, bindings, seeded } = setup();
+    db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES ('ses_draining', 'inc-draining', 'scripted', 'm', 'DRAINING', 't', 't')`,
+    );
+    const roleKey = `PRIMARY_CTO:${seeded.projectId}`;
+    const actor = db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+      [bindings.require(roleKey).assignmentId],
+    );
+    // The raw-SQL bypass the trigger exists for. Going through switchTo would be refused earlier
+    // by SESSION_NOT_READY, which proves the service layer and not the database backstop.
+    expect(() =>
+      db.run(`UPDATE conversational_actors SET current_session_id = ? WHERE actor_id = ?`, [
+        "ses_draining",
+        actor!.actor_id,
+      ]),
+    ).toThrow(/ACTOR_RUNTIME_NOT_READY/);
+  });
+
+  it("allows the move when the incoming session is ready", () => {
+    // The converse: a guard that refused every move would block failover itself, which is the
+    // opposite failure and would not be caught by the refusal test alone.
+    const { db, bindings, seeded, session } = setup();
+    const ready = session("ses_ready_runtime");
+    const roleKey = `PRIMARY_CTO:${seeded.projectId}`;
+    const actor = db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
+      [bindings.require(roleKey).assignmentId],
+    );
+    db.run(`UPDATE conversational_actors SET current_session_id = ? WHERE actor_id = ?`, [
+      ready,
+      actor!.actor_id,
+    ]);
+    expect(bindings.require(roleKey).sessionId).toBe(ready);
   });
 });

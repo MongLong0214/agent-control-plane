@@ -424,7 +424,13 @@ describe("failover produces a routable session (§15.7)", () => {
     expect(decision.allowed).toBe(true);
     const after = plane.cp.bindings.active(roleKeyFor(Role.CEO))!;
     expect(after.sessionId).not.toBe(before.sessionId);
-    expect(after.bindingGeneration).toBe(before.bindingGeneration + 1);
+    // #493 — both providers are healthy here, so the replacement lands on the same provider and
+    // this is one conversation continuing on a new runtime. The generation therefore holds: it
+    // is a fencing counter, and advancing it would retire the counterpart the owner is talking
+    // to, which is the defect #493 fixed. What this test is named for — that failover produces a
+    // routable session — is asserted above and below, and both still hold.
+    expect(after.bindingGeneration).toBe(before.bindingGeneration);
+    expect(after.boundSessionId).toBe(before.boundSessionId);
     expect(probed).toEqual([after.sessionId]);
     const provisioned = plane.cp.sessions.require(after.sessionId);
     expect(provisioned.workdir).toBe(join(plane.root, "runtime", "provider-returned-workdir"));

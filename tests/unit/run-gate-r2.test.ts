@@ -324,6 +324,7 @@ describe("round-2 run and production-gate regressions", () => {
       sessionId: replacement.sessionId,
       mode: "FALLBACK",
       reason: "test takeover",
+      conversation: "REPLACED",
       takeover: true,
     });
     expect(takeover.allowed).toBe(true);

@@ -528,6 +528,7 @@ describe("round 2 daemon regressions", () => {
             role: Role.CEO,
             sessionId: replacement.sessionId,
             reason: "test CEO replacement",
+            conversation: "REPLACED",
           });
           expect(switchResult.reasonCode).toBe(ReasonCode.OK);
           switched = true;
@@ -734,6 +735,7 @@ describe("round 2 daemon regressions", () => {
         projectId,
         sessionId: successor.sessionId,
         reason: "concurrent binding switch",
+        conversation: "REPLACED",
       }).allowed).toBe(true);
 
       const listeners = await startLocalMcpListeners(harness.cp, tempDir("acp-mcp-stale-handoff-"), "local-test-token");
