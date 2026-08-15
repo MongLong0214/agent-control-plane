@@ -523,12 +523,47 @@ ${CONVERSATIONAL_ACTOR_DDL}
   END;
 `;
 
+/**
+ * SQLite validates every trigger body when a table is dropped, so rebuilding `assignments`
+ * fails on any trigger that merely *names* it — including ones belonging to other tables, and
+ * including era-specific triggers that a genuine v11 file carries but current schema.sql does
+ * not. A hardcoded drop list only covers the names this version happens to know, which is why
+ * the v11 fixture still failed after the first pass.
+ *
+ * So the dependents are discovered from sqlite_master and restored from their own captured SQL.
+ * Triggers v18 redefines are excluded — those are recreated by V18_DDL in their new form, and
+ * restoring the captured copy would reinstate the pre-v18 body.
+ */
+const V18_REDEFINED_TRIGGERS = new Set([
+  "assignments_generation_monotonic",
+  "assignments_generation_immutable",
+  "assignments_revocation_terminal",
+  "assignments_active_generation_current",
+  "assignments_active_generation_insert_guard",
+  "task_executions_worker_binding_required",
+]);
+
 const v18: SchemaMigration = {
   id: "v18-conversational-actor",
   fromVersion: 17,
   toVersion: 18,
   foreignKeysOffDuringApply: true,
-  apply: (raw) => raw.exec(V18_DDL),
+  apply: (raw) => {
+    const dependents = raw
+      .prepare(
+        `SELECT name, sql FROM sqlite_master
+          WHERE type = 'trigger' AND sql LIKE '%assignments%'`,
+      )
+      .all() as Array<{ name: string; sql: string | null }>;
+    for (const trigger of dependents) raw.exec(`DROP TRIGGER IF EXISTS ${trigger.name}`);
+
+    raw.exec(V18_DDL);
+
+    for (const trigger of dependents) {
+      if (V18_REDEFINED_TRIGGERS.has(trigger.name) || !trigger.sql) continue;
+      raw.exec(trigger.sql);
+    }
+  },
   checksum: () => sha256(`v18-conversational-actor\n${V18_DDL}`),
 };
 
