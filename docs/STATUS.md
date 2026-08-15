@@ -10,6 +10,7 @@ Use these sources together:
 - [Open live-evidence work](https://github.com/MongLong0214/agent-control-plane/issues?q=is%3Aissue%20state%3Aopen%20label%3Alive-evidence)
 - [Tracker index](https://github.com/MongLong0214/agent-control-plane/issues/306)
 - `node scripts/ssot-report.mjs`, which fails when a tracked review finding or declared work item has no current issue
+- [Deliberate trade-offs](design-decisions.md) — why parts of the system are the way they are, each with the condition that would reopen it
 - `pnpm trace`, which regenerates declaration-coverage traceability evidence; behavioural
   coverage is not measured
 
