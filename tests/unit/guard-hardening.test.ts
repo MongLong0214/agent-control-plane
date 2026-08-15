@@ -29,6 +29,7 @@ import {
   tempDir,
   writeFiles,
   transitionSeededRun,
+  seedActor,
 } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 import { WorktreeManager, type WorktreeAuthorization } from "../../src/verify/worktree.ts";
@@ -807,10 +808,10 @@ describe("guard is role-aware (CP-HI-04)", () => {
       [reviewerSession, clock.nowIso(), clock.nowIso()],
     );
     db.run(
-      `INSERT INTO assignments (assignment_id, role_key, role, run_id, session_id,
+      `INSERT INTO assignments (assignment_id, role_key, role, run_id, actor_id, session_id,
                                 session_incarnation, binding_generation, mode, status, created_at)
-       VALUES (?, ?, 'BLIND_REVIEWER', ?, ?, 'inc-rev', 1, 'PREFERRED', 'ACTIVE', ?)`,
-      [newAssignmentId(), `BLIND_REVIEWER:${seeded.runId}`, seeded.runId, reviewerSession, clock.nowIso()],
+       VALUES (?, ?, 'BLIND_REVIEWER', ?, ?, ?, 'inc-rev', 1, 'PREFERRED', 'ACTIVE', ?)`,
+      [newAssignmentId(), `BLIND_REVIEWER:${seeded.runId}`, seeded.runId, seedActor(db, "BLIND_REVIEWER"), reviewerSession, clock.nowIso()],
     );
 
     const decision = guard.evaluate({

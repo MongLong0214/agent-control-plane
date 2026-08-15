@@ -14,7 +14,7 @@ import {
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
 import { Db } from "../../src/db/database.ts";
-import { cleanupTempDirs, makeCore, makeRepo, seedRun, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, makeCore, makeRepo, seedActor, seedRun, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -205,9 +205,10 @@ describe("round-2 database and evidence regressions", () => {
     db.run("INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at) VALUES ('s1', 'i1', 'x', 'x', 'READY', 't', 't')");
     db.run("INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at) VALUES ('s2', 'i2', 'x', 'x', 'READY', 't', 't')");
     db.run(
-      `INSERT INTO assignments (assignment_id, role_key, role, project_id, session_id, session_incarnation,
+      `INSERT INTO assignments (assignment_id, role_key, role, project_id, actor_id, session_id, session_incarnation,
                                binding_generation, mode, status, created_at)
-       VALUES ('a1', 'PRIMARY_CTO:p', 'PRIMARY_CTO', 'p', 's1', 'i1', 1, 'PREFERRED', 'ACTIVE', 't')`,
+       VALUES ('a1', 'PRIMARY_CTO:p', 'PRIMARY_CTO', 'p', ?, 's1', 'i1', 1, 'PREFERRED', 'ACTIVE', 't')`,
+      [seedActor(db, "PRIMARY_CTO")],
     );
 
     expect(() =>
@@ -224,10 +225,12 @@ describe("round-2 database and evidence regressions", () => {
     const { db } = makeCore();
     db.run("INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at) VALUES ('s', 'i', 'x', 'x', 'READY', 't', 't')");
     db.run(
-      "INSERT INTO assignments (assignment_id, role_key, role, session_id, session_incarnation, binding_generation, mode, status, created_at) VALUES ('a1', 'CEO', 'CEO', 's', 'i', 1, 'PREFERRED', 'REVOKED', 't')",
+      `INSERT INTO assignments (assignment_id, role_key, role, actor_id, session_id, session_incarnation, binding_generation, mode, status, created_at) VALUES ('a1', 'CEO', 'CEO', ?, 's', 'i', 1, 'PREFERRED', 'REVOKED', 't')`,
+      [seedActor(db, "CEO")],
     );
     db.run(
-      "INSERT INTO assignments (assignment_id, role_key, role, session_id, session_incarnation, binding_generation, mode, status, created_at) VALUES ('a2', 'CEO', 'CEO', 's', 'i', 2, 'PREFERRED', 'REVOKED', 't')",
+      `INSERT INTO assignments (assignment_id, role_key, role, actor_id, session_id, session_incarnation, binding_generation, mode, status, created_at) VALUES ('a2', 'CEO', 'CEO', ?, 's', 'i', 2, 'PREFERRED', 'REVOKED', 't')`,
+      [seedActor(db, "CEO")],
     );
 
     expect(() => db.run("UPDATE assignments SET status = 'ACTIVE' WHERE assignment_id = 'a1'")).toThrowError(

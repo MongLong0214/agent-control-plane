@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -81,12 +81,35 @@ export const installMigrationLedger = (raw: Database.Database): void => {
  * Any later column/check/table change must add another ordered entry here. Re-running
  * CREATE TABLE IF NOT EXISTS is deliberately not presented as a general migration path.
  */
+/**
+ * The v12 replay reads the *live* schema.sql, so it drifts forward as the schema evolves. That
+ * is fine for objects a v11 database can already satisfy, and it breaks for any object that
+ * depends on a column a later migration adds: `CREATE TABLE IF NOT EXISTS assignments` is a
+ * no-op against the existing v11 table, so a trigger naming `NEW.actor_id` is created against a
+ * table that has no such column and the whole chain aborts.
+ *
+ * #449 is the first change to add a column to an existing table, which is why this was latent
+ * until now. The two actor-dependent objects are withheld from the replay and created by v18,
+ * which is the migration that adds the column they need. A fresh install never goes through
+ * here — it applies schema.sql whole — so it still gets both.
+ *
+ * The general rule this encodes: an object in schema.sql that references a column introduced
+ * after v12 must be excluded here and created by the migration that introduces the column.
+ */
+const REPLAY_EXCLUDES_NEEDING_POST_V12_COLUMNS = [
+  /CREATE INDEX IF NOT EXISTS assignments_actor[^;]*;/,
+  /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
+];
+
+export const replayDdlWithoutPostV12Columns = (): string =>
+  REPLAY_EXCLUDES_NEEDING_POST_V12_COLUMNS.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdl());
+
 const v12: SchemaMigration = {
   id: "v12-migration-ledger-and-invariant-replay",
   fromVersion: 11,
   toVersion: 12,
   apply: (raw) => {
-    raw.exec(schemaDdl());
+    raw.exec(replayDdlWithoutPostV12Columns());
     installMigrationLedger(raw);
   },
   checksum: () => migrationChecksum("v12-migration-ledger-and-invariant-replay"),
@@ -166,7 +189,11 @@ const v13: SchemaMigration = {
 
     // Re-run the current idempotent DDL after the rebuild. The three dropped triggers are
     // recreated with the finalization edges and the new task-sealing states.
-    raw.exec(schemaDdl());
+    //
+    // Same forward drift as the v12 replay, and the reason the pinned v11 fixture kept failing
+    // after three fixes aimed at v18: this replays the live schema.sql while `assignments`
+    // still has no `actor_id`, five migrations before v18 adds it.
+    raw.exec(replayDdlWithoutPostV12Columns());
   },
   checksum: () => migrationChecksum("v13-finalization-state-machine"),
 };
@@ -310,7 +337,249 @@ const v17: SchemaMigration = {
   checksum: () => sha256(`v17-telegram-owner-prompts\n${TELEGRAM_OWNER_PROMPTS_DDL}`),
 };
 
-export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([v12, v13, v14, v15, v16, v17]);
+/**
+ * v18 separates the conversational actor from the model runtime serving it (#449).
+ *
+ * `assignments` bound a role to a session. A session is a replaceable runtime, so failover had
+ * to write a new binding, which advanced `binding_generation` — and rotating the generation is
+ * how this system fences a superseded role holder. The effect was that recovering a crashed
+ * runtime silently retired the CTO the owner was mid-conversation with.
+ *
+ * The live runtime pointer moves to `conversational_actors.current_session_id`, which failover
+ * updates in place. `binding_generation` then advances only when the actor itself is replaced,
+ * which is what it was always meant to mean.
+ *
+ * `assignments.session_id` is deliberately kept and stays immutable, demoted from identity to
+ * *the runtime at binding time*. That is the fact it always actually recorded, and keeping it
+ * is what leaves `assignments_owner_tuple` — and therefore the composite FK from `runs` — valid
+ * without rebuilding `runs`. The tuple identifies a binding row; it was never a live pointer.
+ *
+ * Backfill gives every existing binding its own actor rather than collapsing a role_key's
+ * history into one. Before v18 a new generation was written precisely because the runtime was
+ * replaced, and nothing observed whether the conversation survived it. One actor per row
+ * asserts nothing; one actor per role_key would assert a continuity no row records.
+ */
+const CONVERSATIONAL_ACTOR_DDL = `
+  CREATE TABLE IF NOT EXISTS conversational_actors (
+    actor_id                    TEXT PRIMARY KEY,
+    kind                        TEXT NOT NULL
+                                  CHECK (kind IN ('CEO','BOOTSTRAP_CTO','PRIMARY_CTO',
+                                                  'BLIND_REVIEWER','WORKER',
+                                                  'OPTIONAL_ADVERSARIAL_REVIEWER')),
+    current_session_id          TEXT REFERENCES sessions(session_id),
+    current_session_incarnation TEXT,
+    created_at                  TEXT NOT NULL,
+    retired_at                  TEXT,
+    retired_reason              TEXT,
+    CHECK ((current_session_id IS NULL) = (current_session_incarnation IS NULL)),
+    CHECK ((retired_at IS NULL) = (retired_reason IS NULL))
+  );
+
+  CREATE INDEX IF NOT EXISTS conversational_actors_session
+    ON conversational_actors(current_session_id);
+`;
+
+const V18_DDL = `
+  DROP TRIGGER IF EXISTS assignments_generation_monotonic;
+  DROP TRIGGER IF EXISTS assignments_generation_immutable;
+  DROP TRIGGER IF EXISTS assignments_revocation_terminal;
+  DROP TRIGGER IF EXISTS assignments_active_generation_current;
+  DROP TRIGGER IF EXISTS assignments_active_generation_insert_guard;
+  -- Not an assignments trigger, but it names the table, and SQLite validates every trigger
+  -- body when a table is dropped. Recreated verbatim after the rename.
+  DROP TRIGGER IF EXISTS task_executions_worker_binding_required;
+
+${CONVERSATIONAL_ACTOR_DDL}
+
+  INSERT INTO conversational_actors
+    (actor_id, kind, current_session_id, current_session_incarnation, created_at,
+     retired_at, retired_reason)
+  SELECT 'actor:' || assignment_id,
+         role,
+         session_id,
+         session_incarnation,
+         created_at,
+         revoked_at,
+         CASE WHEN revoked_at IS NULL THEN NULL
+              ELSE COALESCE(revoked_reason, 'BINDING_REVOKED') END
+    FROM assignments;
+
+  CREATE TABLE assignments_actor_migration (
+    assignment_id      TEXT PRIMARY KEY,
+    role_key           TEXT NOT NULL,
+    role               TEXT NOT NULL
+                         CHECK (role IN ('CEO','BOOTSTRAP_CTO','PRIMARY_CTO','BLIND_REVIEWER',
+                                         'WORKER','OPTIONAL_ADVERSARIAL_REVIEWER')),
+    project_id         TEXT REFERENCES projects(project_id) ON DELETE CASCADE,
+    run_id             TEXT,
+    task_id            TEXT,
+    actor_id           TEXT NOT NULL REFERENCES conversational_actors(actor_id),
+    session_id         TEXT NOT NULL REFERENCES sessions(session_id),
+    session_incarnation TEXT NOT NULL,
+    binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
+    mode               TEXT NOT NULL CHECK (mode IN ('PREFERRED','FALLBACK')),
+    status             TEXT NOT NULL CHECK (status IN ('ACTIVE','REVOKED')),
+    created_at         TEXT NOT NULL,
+    revoked_at         TEXT,
+    revoked_reason     TEXT
+  );
+
+  INSERT INTO assignments_actor_migration
+    (assignment_id, role_key, role, project_id, run_id, task_id, actor_id, session_id,
+     session_incarnation, binding_generation, mode, status, created_at, revoked_at,
+     revoked_reason)
+  SELECT assignment_id, role_key, role, project_id, run_id, task_id,
+         'actor:' || assignment_id,
+         session_id, session_incarnation, binding_generation, mode, status, created_at,
+         revoked_at, revoked_reason
+    FROM assignments;
+
+  DROP TABLE assignments;
+  ALTER TABLE assignments_actor_migration RENAME TO assignments;
+
+  CREATE UNIQUE INDEX IF NOT EXISTS assignments_active_role_key
+    ON assignments(role_key) WHERE status = 'ACTIVE';
+  CREATE UNIQUE INDEX IF NOT EXISTS assignments_active_primary_cto
+    ON assignments(project_id) WHERE role = 'PRIMARY_CTO' AND status = 'ACTIVE';
+  CREATE UNIQUE INDEX IF NOT EXISTS assignments_owner_tuple
+    ON assignments(role_key, binding_generation, session_id, session_incarnation);
+  CREATE INDEX IF NOT EXISTS assignments_session ON assignments(session_id, status);
+  CREATE INDEX IF NOT EXISTS assignments_run ON assignments(run_id);
+  CREATE INDEX IF NOT EXISTS assignments_actor ON assignments(actor_id, status);
+
+  CREATE TRIGGER IF NOT EXISTS assignments_generation_monotonic
+  BEFORE INSERT ON assignments
+  WHEN NEW.binding_generation <= COALESCE(
+    (SELECT MAX(binding_generation) FROM assignments WHERE role_key = NEW.role_key), 0)
+  BEGIN
+    SELECT RAISE(ABORT, 'BINDING_GENERATION_NOT_MONOTONIC');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable
+  BEFORE UPDATE OF binding_generation, role_key, actor_id, session_id, session_incarnation,
+                   role, project_id, run_id, task_id ON assignments
+  WHEN NEW.binding_generation <> OLD.binding_generation
+    OR NEW.role_key <> OLD.role_key
+    OR NEW.actor_id <> OLD.actor_id
+    OR NEW.session_id <> OLD.session_id
+    OR NEW.session_incarnation <> OLD.session_incarnation
+    OR NEW.role <> OLD.role
+    OR NEW.project_id IS NOT OLD.project_id
+    OR NEW.run_id IS NOT OLD.run_id
+    OR NEW.task_id IS NOT OLD.task_id
+  BEGIN
+    SELECT RAISE(ABORT, 'BINDING_IDENTITY_IMMUTABLE');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignments_revocation_terminal
+  BEFORE UPDATE OF status ON assignments
+  WHEN OLD.status = 'REVOKED' AND NEW.status <> 'REVOKED'
+  BEGIN
+    SELECT RAISE(ABORT, 'BINDING_REVOKED_TERMINAL');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignments_active_generation_current
+  BEFORE UPDATE OF status ON assignments
+  WHEN NEW.status = 'ACTIVE'
+   AND NEW.binding_generation < COALESCE(
+     (SELECT MAX(binding_generation)
+        FROM assignments
+       WHERE role_key = NEW.role_key AND assignment_id <> NEW.assignment_id),
+     0
+   )
+  BEGIN
+    SELECT RAISE(ABORT, 'BINDING_REVOKED_TERMINAL');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignments_active_generation_insert_guard
+  BEFORE INSERT ON assignments
+  WHEN EXISTS (
+    SELECT 1 FROM assignments
+     WHERE role_key = NEW.role_key
+       AND status = 'ACTIVE'
+       AND binding_generation < NEW.binding_generation
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'BINDING_REVOKED_TERMINAL');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS task_executions_worker_binding_required
+  BEFORE INSERT ON task_executions
+  WHEN NOT EXISTS (
+    SELECT 1 FROM assignments a
+      JOIN sessions s ON s.session_id = a.session_id
+     WHERE a.role = 'WORKER'
+       AND a.role_key = 'WORKER:' || NEW.task_id
+       AND a.task_id = NEW.task_id
+       AND a.session_id = NEW.worker_session_id
+       AND a.status = 'ACTIVE'
+       AND s.lifecycle = 'READY'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_BINDING_REQUIRED');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS conversational_actors_retirement_terminal
+  BEFORE UPDATE ON conversational_actors
+  WHEN OLD.retired_at IS NOT NULL AND NEW.retired_at IS NULL
+  BEGIN
+    SELECT RAISE(ABORT, 'ACTOR_RETIREMENT_TERMINAL');
+  END;
+`;
+
+/**
+ * SQLite validates every trigger body when a table is dropped, so rebuilding `assignments`
+ * fails on any trigger that merely *names* it — including ones belonging to other tables, and
+ * including era-specific triggers that a genuine v11 file carries but current schema.sql does
+ * not. A hardcoded drop list only covers the names this version happens to know, which is why
+ * the v11 fixture still failed after the first pass.
+ *
+ * So the dependents are discovered from sqlite_master and restored from their own captured SQL.
+ * Triggers v18 redefines are excluded — those are recreated by V18_DDL in their new form, and
+ * restoring the captured copy would reinstate the pre-v18 body.
+ */
+const V18_REDEFINED_TRIGGERS = new Set([
+  "assignments_generation_monotonic",
+  "assignments_generation_immutable",
+  "assignments_revocation_terminal",
+  "assignments_active_generation_current",
+  "assignments_active_generation_insert_guard",
+  "task_executions_worker_binding_required",
+]);
+
+const v18: SchemaMigration = {
+  id: "v18-conversational-actor",
+  fromVersion: 17,
+  toVersion: 18,
+  foreignKeysOffDuringApply: true,
+  apply: (raw) => {
+    const dependents = raw
+      .prepare(
+        `SELECT name, sql FROM sqlite_master
+          WHERE type = 'trigger' AND sql LIKE '%assignments%'`,
+      )
+      .all() as Array<{ name: string; sql: string | null }>;
+    for (const trigger of dependents) raw.exec(`DROP TRIGGER IF EXISTS ${trigger.name}`);
+
+    raw.exec(V18_DDL);
+
+    for (const trigger of dependents) {
+      if (V18_REDEFINED_TRIGGERS.has(trigger.name) || !trigger.sql) continue;
+      raw.exec(trigger.sql);
+    }
+  },
+  checksum: () => sha256(`v18-conversational-actor\n${V18_DDL}`),
+};
+
+export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
+  v12,
+  v13,
+  v14,
+  v15,
+  v16,
+  v17,
+  v18,
+]);
 
 interface RequiredTrigger {
   name: string;
@@ -347,6 +616,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "sessions_incarnation_immutable", sentinel: "SESSION_INCARNATION_IMMUTABLE" },
   { name: "sessions_secret_hash_immutable", sentinel: "SESSION_SECRET_HASH_IMMUTABLE" },
   { name: "sessions_buzz_actor_immutable", sentinel: "SESSION_BUZZ_ACTOR_IMMUTABLE" },
+  { name: "conversational_actors_retirement_terminal", sentinel: "ACTOR_RETIREMENT_TERMINAL", introducedIn: 18 },
   { name: "assignments_generation_monotonic", sentinel: "BINDING_GENERATION_NOT_MONOTONIC" },
   { name: "assignments_generation_immutable", sentinel: "BINDING_IDENTITY_IMMUTABLE" },
   { name: "assignments_revocation_terminal", sentinel: "BINDING_REVOKED_TERMINAL" },

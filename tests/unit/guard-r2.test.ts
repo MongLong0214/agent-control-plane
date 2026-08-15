@@ -12,7 +12,7 @@ import {
   makeCore,
   makeRepo,
   seedRun,
-  tempDir, transitionSeededRun } from "../helpers/fixtures.ts";
+  tempDir, transitionSeededRun , seedActor} from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -253,10 +253,10 @@ describe("round-two managed-write regressions", () => {
       [replacementSession, core.clock.nowIso(), core.clock.nowIso()],
     );
     core.db.run(
-      `INSERT INTO assignments (assignment_id, role_key, role, run_id, session_id,
+      `INSERT INTO assignments (assignment_id, role_key, role, run_id, actor_id, session_id,
                                 session_incarnation, binding_generation, mode, status, created_at)
-       VALUES (?, ?, 'BOOTSTRAP_CTO', ?, ?, 'inc-replacement', 1, 'PREFERRED', 'ACTIVE', ?)`,
-      [newAssignmentId(), replacementRole, replacementRun, replacementSession, core.clock.nowIso()],
+       VALUES (?, ?, 'BOOTSTRAP_CTO', ?, ?, ?, 'inc-replacement', 1, 'PREFERRED', 'ACTIVE', ?)`,
+      [newAssignmentId(), replacementRole, replacementRun, seedActor(core.db, "BOOTSTRAP_CTO"), replacementSession, core.clock.nowIso()],
     );
     core.db.run(
       `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal,

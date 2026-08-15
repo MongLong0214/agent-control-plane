@@ -27,7 +27,7 @@ import {
   candidateSnapshotDigest,
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
-import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, gitSync, tempDir , seedActor} from "../helpers/fixtures.ts";
 import {
   type Harness,
   bindCeo,
@@ -1053,12 +1053,13 @@ describe("Repo Factory boundary (CP-S52)", () => {
 
     // The same session later acted as this run's reviewer.
     harness.cp.db.run(
-      `INSERT INTO assignments (assignment_id, role_key, role, run_id, session_id, session_incarnation,
+      `INSERT INTO assignments (assignment_id, role_key, role, run_id, actor_id, session_id, session_incarnation,
                                 binding_generation, mode, status, created_at)
-       VALUES ('asg_rev', ?, 'BLIND_REVIEWER', ?, ?, ?, 1, 'PREFERRED', 'REVOKED', ?)`,
+       VALUES ('asg_rev', ?, 'BLIND_REVIEWER', ?, ?, ?, ?, 1, 'PREFERRED', 'REVOKED', ?)`,
       [
         `BLIND_REVIEWER:${created.value.runId}`,
         created.value.runId,
+        seedActor(harness.cp.db, "BLIND_REVIEWER"),
         session.sessionId,
         session.incarnation,
         harness.clock.nowIso(),
