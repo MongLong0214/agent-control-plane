@@ -1182,6 +1182,19 @@ const runtimeProfile = (
     lines.push(`(deny file-read* (subpath ${quote(path)}))`);
   }
   lines.push(
+    // Our own scratch is readable (#512). The loop above skips a sensitive path only when it sits
+    // *inside* `scratch`, and the real relation is the other way round: since #489 the scratch
+    // lives under `~/.agent-control-plane`, which `hostCredentialPaths` denies because it holds
+    // daemon authority. So the deny covered the directory this profile then grants writes to, and
+    // the profile said "write here, but never read what you wrote" about the same path. A live run
+    // died on exactly that — `stat` of a settings file we had just placed there.
+    //
+    // The skip-guard's existence says the author already intended scratch to be exempt; it was
+    // correct while scratch lived under the per-user temp directory and stopped matching when the
+    // directory moved. Restoring the intent by widening that guard would drop the read deny for
+    // the whole credential tree, so the exemption is stated for the one directory instead. SBPL
+    // takes the last matching rule, so this re-opens `scratch` and nothing above it.
+    `(allow file-read* (subpath ${quote(scratch)}))`,
     "(deny file-write*)",
     `(allow file-write* (subpath ${quote(scratch)}))`,
     // `workdir` is intentionally absent. A provider gets a writable checkout only when
@@ -2051,6 +2064,10 @@ const safeParse = (text: string): Record<string, unknown> | null => {
 
 /** Real seatbelt probes exposed only for regression tests; production uses `runCli`. */
 export const __testing = Object.freeze({
+  // #512: the profile granted writes to a directory whose reads it denied, because #489 moved
+  // scratch under a credential tree and the skip-guard's containment test points the other way.
+  // Exposed so a test can show the profile no longer contradicts itself about one path.
+  runtimeProfile,
   // #512/#489: the settings override is what keeps operator hooks — arbitrary shell commands —
   // out of a managed session. Exposed because a boundary is worth what a test can show it
   // refusing, and because it stopped being a file whose presence could be observed on disk.
