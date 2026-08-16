@@ -266,7 +266,15 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         // looser one. The Claude path stays available and is not the default.
         reviewer: {
           preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: null },
-          fallbacks: [],
+          // Production configures `[claude/opus]` here; this said `[]`, so the sentence above —
+          // "the Claude path stays available" — was true of the deployment and false of the test
+          // asserting it. A preferred reviewer that cannot constitute isolation had nothing to
+          // fall through to, and the run stopped at ISOLATION_LOST rather than exercising the
+          // fallback the deployment relies on.
+          //
+          // Matching production is the point of this acceptance: a bring-up that tests a weaker
+          // configuration than the one that ships proves the weaker configuration.
+          fallbacks: [{ provider: "claude", model: "opus", effort: null }],
         },
       });
 
