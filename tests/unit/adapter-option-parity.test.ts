@@ -24,6 +24,39 @@ afterAll(() => {
   for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
 });
 
+describe("the parity parser sees what it claims to see (#552)", () => {
+  // The first version of this check had three holes, and all three were invisible because both
+  // sides lost the same keys — the comparison agreed while seeing less than it reported. These are
+  // the exact inputs that exposed them, kept so a rewrite cannot quietly reintroduce any of them.
+  const keysFor = async (literal: string): Promise<Set<string> | null> => {
+    // The script is plain JS with no declarations; it is dependency-free by design (PRD §17.4),
+    // so it is imported for its behaviour rather than its types.
+    const module_ = (await import(
+      /* @vite-ignore */ "../../scripts/verify-adapter-option-parity.mjs" as string
+    )) as { optionKeys: (source: string, file: string, adapter: string) => Set<string> | null };
+    return module_.optionKeys(`new ClaudeCliAdapter(${literal});`, "fixture.ts", "ClaudeCliAdapter");
+  };
+
+  it("sees the first property", async () => {
+    // Was dropped by every object: the opening brace was consumed matching the nesting token, so
+    // the following key had no separator left to match.
+    expect([...(await keysFor("{ clock: c, capacityFile: f, denyReadPaths: [] }"))!].sort())
+      .toEqual(["capacityFile", "clock", "denyReadPaths"]);
+  });
+
+  it("sees shorthand properties", async () => {
+    // `{ clock, capacityFile }` has no colons at all.
+    expect([...(await keysFor("{ clock, capacityFile, reviewerEgress: { proxy: p } }"))!].sort())
+      .toEqual(["capacityFile", "clock", "reviewerEgress"]);
+  });
+
+  it("does not count keys nested inside another literal", async () => {
+    const keys = (await keysFor("{ clock: c, reviewerEgress: { profilePath: p, proxyPath: q } }"))!;
+    expect([...keys].sort()).toEqual(["clock", "reviewerEgress"]);
+    expect(keys.has("profilePath"), "a nested key was counted as an option of the adapter").toBe(false);
+  });
+});
+
 describe("the acceptance sets every adapter option the deployment sets (#552)", () => {
   it("passes against the tree as committed", () => {
     const result = spawnSync(process.execPath, [script], { cwd: repoRoot, encoding: "utf8" });

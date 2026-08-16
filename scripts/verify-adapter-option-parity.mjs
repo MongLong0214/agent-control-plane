@@ -35,6 +35,20 @@ const PRODUCTION = "src/app/control-plane.ts";
 const ACCEPTANCE = "tests/e2e/real-component-integration.test.ts";
 const ADAPTERS = ["ClaudeCliAdapter", "CodexCliAdapter"];
 
+/**
+ * Options the acceptance deliberately does not set, with the reason it cannot.
+ *
+ * An exemption is not the same as an omission, and the difference has to be visible: these are
+ * printed on success, so a reader sees what the run is *not* configured with rather than reading a
+ * green line as full parity. Adding an entry here is a claim someone signs.
+ */
+const DECLARED_EXEMPTIONS = {
+  managedWriteBroker:
+    "GuardedInvocationWriteBroker wraps the guard ControlPlane constructs, and these adapters are " +
+    "built before it exists. Absent, every managed write is refused WRITE_REQUIRES_MANAGED_RUN, so " +
+    "the acceptance cannot exercise the local-write path — fail-closed, and a real coverage gap.",
+};
+
 const fail = (message, detail) => {
   process.stdout.write(`verify-adapter-option-parity: ${message}\n`);
   if (detail) process.stdout.write(`${detail}\n`);
@@ -82,20 +96,34 @@ const stripNonCode = (source) => {
   return out.join("");
 };
 
-/** Top-level keys of the object literal passed to `new <adapter>({ … })`. */
-const optionKeys = (rawSource, file, adapter) => {
+/**
+ * Top-level keys of the object literal passed to `new <adapter>({ … })`.
+ *
+ * Segment-based rather than one regex over the whole body. The regex version dropped the first
+ * property of every object — the opening brace was consumed matching the nesting token, leaving
+ * nothing for the following key's separator to match — and it could not see shorthand at all.
+ * Both sides lost the same keys, so the comparison agreed by accident while seeing less than it
+ * reported. A fifth gap landing on a first or shorthand property would have passed.
+ *
+ * Throws on `...spread` at the top level instead of skipping it. A spread cannot be resolved by
+ * reading one file, and reporting keys as if it were absent is the failure this file exists to
+ * catch, one level in: the object would have been found, the braces would have balanced, and the
+ * answer would have been confidently short.
+ */
+export const optionKeys = (rawSource, file, adapter) => {
   const source = stripNonCode(rawSource);
   const opener = `new ${adapter}({`;
   const start = source.indexOf(opener);
   if (start === -1) return null;
 
-  let depth = 0;
-  let index = start + opener.length - 1;
+  // Start *inside* the brace so the first property is an ordinary segment like the rest.
+  let depth = 1;
+  let index = start + opener.length;
   const body = [];
-  for (; index < source.length; index += 1) {
+  for (; index < source.length && depth > 0; index += 1) {
     const character = source[index];
-    if (character === "{" || character === "[" || character === "(") depth += 1;
-    else if (character === "}" || character === "]" || character === ")") {
+    if ("{[(".includes(character)) depth += 1;
+    else if ("}])".includes(character)) {
       depth -= 1;
       if (depth === 0) break;
     }
@@ -103,18 +131,36 @@ const optionKeys = (rawSource, file, adapter) => {
   }
   if (depth !== 0) fail(`could not find the end of ${adapter}'s options in ${file}`);
 
-  // Only depth-1 identifiers immediately followed by a colon are this object's own keys; anything
-  // deeper belongs to a nested literal such as `reviewerEgress: { … }`.
-  const text = body.join("");
-  const keys = new Set();
+  // Split on commas that belong to this object, not to a nested literal or call.
+  const segments = [];
+  let current = "";
   let nesting = 0;
-  for (const match of text.matchAll(/[{}[\]()]|(?:^|[,{])\s*([A-Za-z_$][\w$]*)\s*:/g)) {
-    const [token, key] = match;
-    if (key === undefined) {
-      nesting += "{[(".includes(token) ? 1 : -1;
+  for (const character of body) {
+    if ("{[(".includes(character)) nesting += 1;
+    else if ("}])".includes(character)) nesting -= 1;
+    if (character === "," && nesting === 0) {
+      segments.push(current);
+      current = "";
       continue;
     }
-    if (nesting === 1) keys.add(key);
+    current += character;
+  }
+  segments.push(current);
+
+  const keys = new Set();
+  for (const segment of segments) {
+    const trimmed = segment.trim();
+    if (trimmed.length === 0) continue;
+    if (trimmed.startsWith("...")) {
+      fail(
+        `${adapter} in ${file} spreads into its options`,
+        "  A spread cannot be resolved from this file, so the key set is unknown rather than\n" +
+          "  smaller. Name the options explicitly, or teach this check how to resolve it.",
+      );
+    }
+    // `key:` and shorthand `key` both count; anything else is not a property of this object.
+    const match = /^([A-Za-z_$][\w$]*)\s*(?::|$)/.exec(trimmed);
+    if (match) keys.add(match[1]);
   }
   return keys;
 };
@@ -124,6 +170,7 @@ const production = read(PRODUCTION);
 const acceptance = read(ACCEPTANCE);
 
 const problems = [];
+const exempted = new Set();
 let compared = 0;
 for (const adapter of ADAPTERS) {
   const shipped = optionKeys(production, PRODUCTION, adapter);
@@ -131,7 +178,9 @@ for (const adapter of ADAPTERS) {
   if (!shipped) fail(`no ${adapter} construction found in ${PRODUCTION}`);
   if (!tested) fail(`no ${adapter} construction found in ${ACCEPTANCE}`);
   compared += 1;
-  const missing = [...shipped].filter((key) => !tested.has(key)).sort();
+  const absent = [...shipped].filter((key) => !tested.has(key)).sort();
+  const missing = absent.filter((key) => !(key in DECLARED_EXEMPTIONS));
+  for (const key of absent.filter((key) => key in DECLARED_EXEMPTIONS)) exempted.add(key);
   if (missing.length > 0) problems.push({ adapter, missing: missing.join(", ") });
 }
 
@@ -154,3 +203,6 @@ process.stdout.write(
   `verify-adapter-option-parity: ${compared} adapter(s) compared, acceptance sets every shipped option\n`,
 );
 process.stdout.write("Keys only; values are expected to differ and are not compared.\n");
+for (const key of [...exempted].sort()) {
+  process.stdout.write(`  not set, declared: ${key} — ${DECLARED_EXEMPTIONS[key]}\n`);
+}
