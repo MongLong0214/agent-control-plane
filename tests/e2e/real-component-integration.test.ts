@@ -58,6 +58,28 @@ const MANIFEST_DEFAULT_BRANCH = "main";
  * its content at HEAD is its content at the merge commit.
  */
 const CI_WORKFLOW_PATH = ".github/workflows/ci.yml";
+
+/** Matches what `ControlPlane` passes its adapters; the shipped value is the empty list. */
+const ACCEPTANCE_ENVIRONMENT_ALLOWLIST: readonly string[] = [];
+
+/**
+ * The read denials `ControlPlane` gives its adapters, for the paths this test can name.
+ *
+ * Supplying `adapters:` replaces the ones `ControlPlane` builds, so anything it would have passed
+ * has to be passed here — and a reviewer denied less than the deployment denies is a reviewer whose
+ * isolation this run cannot speak for.
+ *
+ * One shipped entry is **not** reproduced: `credentials.sensitivePaths()`, the GitHub App env file
+ * and private key. That is instance state of a store `ControlPlane` constructs, and these adapters
+ * are built before it exists. So this closes the shape of the difference and part of its content;
+ * the remainder is tracked rather than papered over, and `verify-adapter-option-parity` compares
+ * keys precisely because it cannot judge values like this one.
+ */
+const acceptanceDenyReadPaths = (root: string): readonly string[] => [
+  join(root, "state.sqlite"),
+  join(root, "secrets"),
+  join(root, "capacity"),
+];
 /** The owner-provisioned reviewer egress infrastructure this host declares. */
 const EGRESS_ROOT = join(process.env["HOME"] ?? "", ".agent-control-plane", "egress");
 const REVIEWER_MODEL = process.env["ACP_COMPONENT_INTEGRATION_MODEL"] ?? "sonnet";
@@ -227,6 +249,8 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           new CodexCliAdapter({
             clock: systemClock,
             capacityFile: join(root, "capacity", "gpt.json"),
+            environmentAllowlist: ACCEPTANCE_ENVIRONMENT_ALLOWLIST,
+            denyReadPaths: acceptanceDenyReadPaths(root),
             // The reviewer scope holds auth.json and nothing else. ~/.codex carries producer
             // conversation state, which is exactly what a blind reviewer must not read.
             providerCredentialDir: join(process.env["HOME"] ?? "", ".acp-reviewer", "codex"),
@@ -239,6 +263,8 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           new ClaudeCliAdapter({
             clock: systemClock,
             capacityFile: join(root, "capacity", "claude.json"),
+            environmentAllowlist: ACCEPTANCE_ENVIRONMENT_ALLOWLIST,
+            denyReadPaths: acceptanceDenyReadPaths(root),
             // The reviewer profile denies `~/.claude` — that is the producer's transcript store
             // and a blind reviewer must not read it (`reviewerTranscriptRoots`). So the reviewer
             // cannot use the host's ordinary Claude credentials and needs its own scoped identity,
