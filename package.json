@@ -26,7 +26,8 @@
     "invariants": "node scripts/verify-invariant-coverage.mjs",
     "buzz:contract": "tsx scripts/verify-buzz-cli-contract.ts",
     "release:version": "node scripts/verify-release-version.mjs",
-    "symbols": "node scripts/verify-enforcement-symbols.mjs"
+    "symbols": "node scripts/verify-enforcement-symbols.mjs",
+    "adapter:parity": "node scripts/verify-adapter-option-parity.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
