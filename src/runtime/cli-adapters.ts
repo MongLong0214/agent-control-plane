@@ -638,7 +638,7 @@ const profileAccepted = async (
   timeoutMs: number,
   egress?: ReviewerEgressLease,
   composedProfilePath?: string,
-): Promise<{ accepted: boolean; stderr: string; exitCode: number | null; timedOut: boolean }> => {
+): Promise<{ accepted: boolean; stderr: string; stdout: string; exitCode: number | null; timedOut: boolean }> => {
   // Reviewer profiles deny arbitrary process execution. `process.execPath` is the one
   // runtime executable they explicitly permit, so it is the meaningful syntax/liveness
   // probe rather than `/usr/bin/true`, which the no-tools profile should refuse.
@@ -655,6 +655,7 @@ const profileAccepted = async (
   return {
     accepted: result.exitCode === 0 && !result.timedOut,
     stderr: result.stderr,
+    stdout: result.stdout,
     exitCode: result.exitCode,
     timedOut: result.timedOut,
   };
@@ -966,7 +967,12 @@ const proveReviewerIsolation = async (
   if (!profileCheck.accepted) {
     return {
       enforced: false,
-      reason: profileCheck.stderr || "reviewer isolation profile was not accepted",
+      // Both streams, because a CLI that fails to start is not obliged to say so on stderr —
+      // `claude --print` reports "Not logged in" on **stdout** and exits 1, and this dropped
+      // stdout entirely. The reason then fell back to the generic sentence, so a precise cause
+      // the child had already printed was replaced by one that names nothing. The probe two
+      // functions down already reads `stderr || stdout`; this did not.
+      reason: profileCheck.stderr || profileCheck.stdout || "reviewer isolation profile was not accepted",
     };
   }
   const transcripts = await probeDeniedTranscriptPaths(
