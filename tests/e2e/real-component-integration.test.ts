@@ -239,6 +239,16 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
           new ClaudeCliAdapter({
             clock: systemClock,
             capacityFile: join(root, "capacity", "claude.json"),
+            // The reviewer profile denies `~/.claude` — that is the producer's transcript store
+            // and a blind reviewer must not read it (`reviewerTranscriptRoots`). So the reviewer
+            // cannot use the host's ordinary Claude credentials and needs its own scoped identity,
+            // which is the only thing `providerCredentialDir` sets: without it `CLAUDE_CONFIG_DIR`
+            // is never exported and the child reads the default directory the profile forbids.
+            //
+            // The codex adapter beside this one already passes its equivalent. This was missing,
+            // which is the same shape as the empty `fallbacks` fixed alongside it: a setting the
+            // deployment has and the test asserting it did not.
+            providerCredentialDir: join(process.env["HOME"] ?? "", ".agent-control-plane", "reviewer", "claude"),
             // Supplying `adapters` replaces the ones ControlPlane builds, and those are where
             // it passes config.reviewerEgress. So a custom adapter silently opts out of egress
             // configuration: acquireReviewerEgress then fails REVIEWER_EGRESS_CONFIG_MISSING,
