@@ -189,6 +189,22 @@ The common thread is that all four report success for something they did not exa
 is a claim about what it looked at, and the dangerous failure is not a wrong answer but a
 confident answer about nothing.
 
+**A passing suite is not evidence about infrastructure the suite does not use.** While localising a
+live `ISOLATION_LOST`, the owner-provisioned reviewer egress at `~/.agent-control-plane/egress/` was
+ruled out twice on bad grounds: first because the files exist, then because
+`tests/unit/reviewer-egress.test.ts` passes. The second is the worse error and was made while
+correcting the first. That suite calls `makeFixture()`, which builds **its own** proxy in a temporary
+directory — it never touches the owner's. Ten green tests said the mechanism works and said nothing
+about the deployment.
+
+Settling it took one probe that acquired a lease against the real profile and measured the round
+trip: allowlisted `200`, non-allowlisted `403`. That is what ruling something out costs.
+
+Exclusions deserve more suspicion than confirmations, and for a structural reason: a wrong
+confirmation gets caught at the next step that depends on it, while a wrong exclusion removes a
+place from the search and then becomes the grounds for excluding the next one. Both of the above
+were exclusions, and the first licensed the second.
+
 ### Find the enforcement, not the line number
 
 An issue body is a fact about the moment it was written. Its line numbers, and its statement
