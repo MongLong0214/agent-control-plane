@@ -244,12 +244,21 @@ export const readCapacityFile = (
  * REVIEW_UNAVAILABLE. Replacing the config directory is not an option — OAuth is bound to it
  * on this platform, and pointing it elsewhere answers "Not logged in" — so the settings are
  * overridden instead, which leaves authentication untouched.
+ *
+ * Passed inline rather than written to a file. As a file it has to live somewhere, and every
+ * available somewhere is wrong: the per-user temp directory is reachable by a reviewer whose
+ * profile must allow it (#489), and `~/.agent-control-plane` is on this sandbox's own deny list
+ * because it holds daemon authority — which is where #489 put it, so a live run handed the CLI a
+ * `--settings` path inside a directory the same sandbox forbade it to stat. The profile worked
+ * exactly as designed and we placed our file behind it.
+ *
+ * `--settings` accepts a JSON string as well as a path, so the file simply stops existing. That
+ * removes the placement question rather than answering it — no location, no permissions, no
+ * cleanup, no lifetime. Inline argv is safe here specifically because the value is a constant
+ * with no secret in it; a settings blob that ever carried one would have to go back to a file and
+ * the placement problem would come back with it.
  */
-const sanctionedSettingsFile = (scratch: string): string => {
-  const file = join(scratch, "acp-settings.json");
-  writeFileSync(file, JSON.stringify({ hooks: {}, enabledPlugins: {} }), { mode: 0o600 });
-  return file;
-};
+const sanctionedSettings = (): string => JSON.stringify({ hooks: {}, enabledPlugins: {} });
 
 /**
  * macOS rejects nested `sandbox-exec` applications, so the owner egress profile and the
@@ -1421,8 +1430,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       "--model",
       request.model ?? this.defaultModels.cto,
     ];
-    // Hooks and plugins are the operator's, not this run's; see `sanctionedSettingsFile`.
-    args.push("--settings", sanctionedSettingsFile(acpScratchDir("acp-settings-")));
+    // Hooks and plugins are the operator's, not this run's; see `sanctionedSettings`.
+    args.push("--settings", sanctionedSettings());
     // Make the invocation *be* the constituted session, so the identity the independence
     // check was performed against is the identity that produces the answer.
     if (request.externalSessionId) args.push("--session-id", request.externalSessionId);
@@ -2042,6 +2051,10 @@ const safeParse = (text: string): Record<string, unknown> | null => {
 
 /** Real seatbelt probes exposed only for regression tests; production uses `runCli`. */
 export const __testing = Object.freeze({
+  // #512/#489: the settings override is what keeps operator hooks — arbitrary shell commands —
+  // out of a managed session. Exposed because a boundary is worth what a test can show it
+  // refusing, and because it stopped being a file whose presence could be observed on disk.
+  sanctionedSettings,
   reviewerProfile,
   // #419: the positive reachability probe had nothing behind it — hardcoding
   // `allowedEndpoint` to a 200 left the whole suite green. Exposed for the same reason
