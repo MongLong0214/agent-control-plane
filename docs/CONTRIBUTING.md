@@ -114,11 +114,21 @@ actors the daemon did not spawn are both registry questions. It would not stop a
 #450 recorded that it was never meant to: the socket is 0600, and the same UID reads the session
 secret anyway.
 
-**This gap expires** when `peercred.c` becomes reachable. The start-time pairing is not thrown away
-then — kernel proof stacks on top of it rather than replacing it, because the two answer different
-questions. #450's closure is not being reversed here: that decision was the owner's. What does not
-follow from it is that the property now holds, so the remaining work is tracked in #539 and this
-paragraph points there.
+**This gap expires** when a kernel credential check actually answers the peer-identity question —
+not when the primitive exists. Those are two events, and the distance between them is deliberate:
+#539 delivers a boundary that **nothing calls**, and a new live call site is a RED mutant there
+rather than a deliverable. Wiring one needs a separately authorized ticket that does not exist yet.
+
+Stating the condition as "when `peercred.c` becomes reachable" was wrong for that reason. It would
+have marked this gap expired at a point where the property still does not hold, which is the failure
+this section exists to prevent, committed by the section itself. The word also collides: "reachable"
+there meant *the legacy source is available to port*, while the ticket uses *unreachable from live
+surfaces* to mean the opposite thing about call sites.
+
+The start-time pairing is not thrown away when that day comes — kernel proof stacks on top of it
+rather than replacing it, because the two answer different questions. #450's closure is not being
+reversed here: that decision was the owner's. What does not follow from it is that the property now
+holds, so the remaining work is tracked in #539 and this paragraph points there.
 
 #### Known gap: the bootstrap activation half of `repositoryRole` is unproven
 
