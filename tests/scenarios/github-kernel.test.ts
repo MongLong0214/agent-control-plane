@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
+import { acpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import {
@@ -1651,6 +1652,57 @@ describe("merge target proof (#350)", () => {
     expect(refused.reasonCode).not.toBe(ReasonCode.MERGE_BASE_STALE);
     expect(fixture.github.mergeCount).toBe(1);
     expectPendingMergeProof(fixture);
+  });
+
+  it("#533: an answered failure resolves the merge proof instead of leaving it reconcilable", async () => {
+    // The distinction this pins. `PROBE_FAILED` covered both "we were told 404" and "we heard
+    // nothing", and both kept the proof PENDING. An answered failure is an answer: leaving it
+    // reconcilable invites a retry against a far end that already decided.
+    //
+    // The discriminator is whether a response arrived at all, which the credential store already
+    // records as `status` and already sanitizes — it drops the body so no diagnostic path can
+    // preserve an echoed credential. So the classification travels as a number, never a message.
+    const fixture = await setup();
+    const pullNumber = await openPreparedPull(fixture);
+    const request = fixture.github.request.bind(fixture.github);
+    let failPostflightPull = false;
+    fixture.github.request = async <T>(
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
+      path: string,
+      body?: unknown,
+    ): Promise<T> => {
+      if (failPostflightPull && method === "GET" && path.endsWith(`/pulls/${pullNumber}`)) {
+        failPostflightPull = false;
+        // What the production client throws once the far end has answered: structured, carrying
+        // the status, and carrying no response body.
+        throw acpError(ReasonCode.GITHUB_APP_TOKEN_EXCHANGE_FAILED, "sensitive transport detail", {
+          operation: "GET",
+          status: 404,
+        });
+      }
+      const response = await request<T>(method, path, body);
+      if (method === "PUT" && path.endsWith("/merge")) failPostflightPull = true;
+      return response;
+    };
+
+    const answered = await fixture.harness.cp.github.mergeExecute(mergeInput(fixture, pullNumber));
+    expect(answered.allowed).toBe(false);
+    if (answered.allowed) return;
+    expect(answered.reasonCode).toBe(ReasonCode.PROBE_FAILED);
+    expect(answered.evidence["outcome"]).toBe("answered");
+    expect(answered.evidence["status"]).toBe(404);
+    expectNoTransportDetail(answered.evidence, "sensitive transport detail");
+
+    // The observable is the rollback, not the receipt's own status: both paths leave the
+    // `merge_execute` receipt PENDING, and `recordMergeProofFailure` differs by additionally
+    // preparing a halt. `expectPendingMergeProof` asserts that rollback is *absent* for an
+    // unheard failure, so its presence here is exactly the branch that separates them.
+    expect(
+      fixture.harness.cp.db.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM github_receipts WHERE operation = 'rollback_prepare'`,
+      )?.count,
+      "a failure the far end answered was left reconcilable, as though nothing had been heard",
+    ).toBe(1);
   });
 
   it("reconciles a failed postflight pull probe without repeating the merge", async () => {

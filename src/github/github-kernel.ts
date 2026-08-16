@@ -1,6 +1,6 @@
 import type { Clock } from "../core/clock.ts";
 import { digestOf, sha256 } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, allow, deny, fromErrorPayload, isAcpError } from "../core/errors.ts";
 import { parseGitHubIdentity } from "../core/ids.ts";
 import { isStalenessReasonCode, ReasonCode } from "../core/reason-codes.ts";
 import type { BranchProfile, ProjectManifest } from "../contracts/manifest.ts";
@@ -32,6 +32,32 @@ export const GATE_CHECK_NAME = "acp-production-gate";
  */
 export const NO_HUMAN_GATE_DIGEST = digestOf({ humanGate: "NOT_REQUIRED" });
 export const PROJECT_CHECK_NAME = "project-ci";
+
+/**
+ * Whether a failed GitHub call was *answered* or merely *unheard* (#533).
+ *
+ * `PROBE_FAILED` is read by exactly one branch — `keepsMergeProofPending` — which decides whether
+ * a merge whose proof did not complete stays PENDING and reconcilable, or is written FAILED.
+ * Keying that on "unknown" is right. What was wrong is what arrived labelled unknown: a 404 and a
+ * 403 are answers, a timeout is not, and all three were the same value.
+ *
+ * The discriminator already exists and is already sanitized. `credential-store.githubApi` records
+ * `status` when a response arrived and omits it when the transport threw before one did, and it
+ * deliberately drops the body so that no diagnostic path can preserve an echoed credential. A
+ * status code is a small integer with nowhere to hide a secret; a message is unbounded, which is
+ * why this classifies rather than forwarding one.
+ *
+ * Unrecognised throws classify as `unknown` on purpose. `GitHubClient` is an injectable interface
+ * and a test double may throw anything, so an exception this code cannot read is not evidence that
+ * the far end answered.
+ */
+export type TransportOutcome = "answered" | "unheard";
+
+export const transportOutcome = (error: unknown): { outcome: TransportOutcome; status?: number } => {
+  if (!isAcpError(error)) return { outcome: "unheard" };
+  const status = (error.evidence as { status?: unknown } | undefined)?.status;
+  return typeof status === "number" ? { outcome: "answered", status } : { outcome: "unheard" };
+};
 
 export interface GitHubClient {
   request<T>(
@@ -75,7 +101,15 @@ export class GitHubAppClient implements GitHubClient {
       path,
       ...(body !== undefined ? { input: JSON.stringify(body) } : {}),
     });
-    if (!result.allowed) throw new Error(`${result.reasonCode}: ${result.message}`);
+    // Throw the denial structurally rather than flattening it to a string (#533): the evidence
+    // carries `status` when a response arrived, and that is the only thing distinguishing an
+    // answer from silence. The message is the credential store's own controlled failure text —
+    // never a response body, which that layer drops before this one sees it.
+    if (!result.allowed) throw fromErrorPayload({
+      reasonCode: result.reasonCode,
+      message: result.message,
+      evidence: result.evidence,
+    });
     const responseBody = result.value.body.trim();
     return (responseBody ? JSON.parse(responseBody) : null) as T;
   }
@@ -1394,10 +1428,11 @@ export class GitHubKernel {
           );
           if (!observed || typeof observed !== "object") throw new Error("reconciliation pull returned no value");
           pull = observed as PullRequest;
-        } catch {
+        } catch (error) {
           const unavailable = deny(ReasonCode.PROBE_FAILED, "pending merge pull could not be re-read", {
             pullNumber: input.pullNumber,
             phase: "reconcile-pull",
+            ...transportOutcome(error),
           });
           this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, null, unavailable);
           return unavailable as Decision<{ mergeCommitSha: string; replayed: boolean }>;
@@ -1473,7 +1508,7 @@ export class GitHubKernel {
         }
         const prepared = this.preparedPrIntent(input.runId, input.repositoryIdentity, input.pullNumber);
         if (!prepared.allowed) {
-          if (this.keepsMergeProofPending(prepared.reasonCode)) {
+          if (this.keepsMergeProofPending(prepared)) {
             this.recordPendingMergeProofFailure(
               input,
               mergeRepositoryId,
@@ -1496,7 +1531,7 @@ export class GitHubKernel {
           this.githubMergeMethod(input.mergeStrategy),
         );
         if (!proof.allowed) {
-          if (this.keepsMergeProofPending(proof.reasonCode)) {
+          if (this.keepsMergeProofPending(proof)) {
             this.recordPendingMergeProofFailure(
               input,
               mergeRepositoryId,
@@ -1708,17 +1743,25 @@ export class GitHubKernel {
         `/repos/${owner}/${repo}/pulls/${input.pullNumber}`,
       );
       if (!postflight) throw new Error("postflight pull read returned no value");
-    } catch {
+    } catch (error) {
       const unproven = deny(
         ReasonCode.PROBE_FAILED,
         "merged pull request could not be re-read for base proof",
         {
+          ...transportOutcome(error),
           pullNumber: input.pullNumber,
           mergeCommitSha,
           phase: "postflight-pull",
         },
       );
-      this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, unproven);
+      // Consult the classification here too (#533). This site recorded PENDING unconditionally,
+      // so an answered failure stayed reconcilable even once the branches below started asking.
+      // A guard that only some paths reach is one path's property, not the kernel's.
+      if (this.keepsMergeProofPending(unproven)) {
+        this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, unproven);
+      } else {
+        this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, unproven);
+      }
       return unproven as Decision<{ mergeCommitSha: string; replayed: boolean }>;
     }
     const proof = await this.assertExecutedMergeProof(
@@ -1731,7 +1774,7 @@ export class GitHubKernel {
       method,
     );
     if (!proof.allowed) {
-      if (this.keepsMergeProofPending(proof.reasonCode)) {
+      if (this.keepsMergeProofPending(proof)) {
         this.recordPendingMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, proof);
       } else {
         this.recordMergeProofFailure(input, mergeRepositoryId, idempotencyKey, mergeCommitSha, proof);
@@ -1898,11 +1941,12 @@ export class GitHubKernel {
           phase: "postflight-target-ref",
         });
       }
-    } catch {
+    } catch (error) {
       return deny(ReasonCode.PROBE_FAILED, "merged target ref could not be re-read", {
         pullNumber: pull.number,
         baseRef: pull.base.ref,
         phase: "postflight-target-ref",
+        ...transportOutcome(error),
       });
     }
     if (targetHead !== mergeCommitSha) {
@@ -2921,11 +2965,11 @@ export class GitHubKernel {
         );
       }
       return allow(ReasonCode.OK, Buffer.from(remote.content.replace(/\s/g, ""), "base64").toString("utf8"));
-    } catch {
+    } catch (error) {
       return deny(
         ReasonCode.PROBE_FAILED,
         "could not read the exact workflow file for post-merge provenance",
-        { repositoryIdentity, head, path },
+        { repositoryIdentity, head, path, ...transportOutcome(error) },
       );
     }
   }
@@ -3266,7 +3310,28 @@ export class GitHubKernel {
     this.inFlightReservations.delete(idempotencyKey);
   }
 
-  private keepsMergeProofPending(reasonCode: ReasonCode): boolean {
+  /**
+   * An unfinished merge proof stays PENDING only while the outcome is genuinely unknown (#533).
+   *
+   * `PROBE_FAILED` used to mean both "we were told 404" and "we heard nothing", and both kept the
+   * proof reconcilable. An answered failure is an answer: leaving it pending invites a retry
+   * against a far end that already decided, and postpones a verdict that exists.
+   *
+   * The classification travels in the denial's evidence because these callers hold a `Decision`,
+   * not the exception — the classification is made at the `catch`, where the error still exists.
+   */
+  private keepsMergeProofPending(decision: Decision<unknown>): boolean {
+    if (decision.allowed) return false;
+    if (
+      decision.reasonCode === ReasonCode.PROBE_FAILED &&
+      (decision.evidence as { outcome?: unknown } | undefined)?.outcome === "answered"
+    ) {
+      return false;
+    }
+    return this.pendingReasonCode(decision.reasonCode);
+  }
+
+  private pendingReasonCode(reasonCode: ReasonCode): boolean {
     return (
       isStalenessReasonCode(reasonCode) ||
       reasonCode === ReasonCode.EVIDENCE_MISSING ||
