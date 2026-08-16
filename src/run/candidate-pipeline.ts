@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, type Evidence, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { commandsForMode, type BranchProfile } from "../contracts/manifest.ts";
 import type { VerificationCommand } from "../contracts/verification-command.ts";
@@ -57,7 +57,25 @@ export type PipelineOutcome =
    * reviewer isolation or a dead provider, so this is *not* a revision request: the run
    * waits, and continuity decides.
    */
-  | { stage: "REVIEW_UNAVAILABLE"; reasonCode: string; snapshotDigest: string }
+  | {
+      stage: "REVIEW_UNAVAILABLE";
+      reasonCode: string;
+      snapshotDigest: string;
+      /**
+       * Why assurance could not be constituted, not merely that it could not (#512).
+       *
+       * `ISOLATION_LOST` is returned from about twenty places across the reviewer path — adapter
+       * not registered, adapter cannot enforce, no fresh session attested, a named probe refused,
+       * egress evidence incomplete. Each of those denials already carries a distinct message and
+       * evidence, and `blind-review.ts` went to the trouble of recording *which probe* refused
+       * rather than only that one did. This stage dropped all of it and reported the code alone,
+       * so a live run failed with a verdict that named twenty possible causes and none of them.
+       *
+       * The audit event beside this one keeps the evidence, so the fact was durable — it just was
+       * not in the answer the caller received, which is where someone reads it.
+       */
+      detail: { message: string; evidence: Evidence };
+    }
   /** The source moved while the candidate was being judged; all its evidence is stale. */
   | { stage: "CANDIDATE_STALE"; reasonCode: string; snapshotDigest: string };
 
@@ -355,6 +373,7 @@ export class CandidatePipeline {
           stage: "REVIEW_UNAVAILABLE",
           reasonCode: reviewed.reasonCode,
           snapshotDigest,
+          detail: { message: reviewed.message, evidence: reviewed.evidence },
         });
       }
 

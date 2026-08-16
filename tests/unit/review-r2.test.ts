@@ -1183,6 +1183,14 @@ describe("round-2 blind-review regressions", () => {
       throw new Error(`expected REVIEW_UNAVAILABLE, received ${result.allowed ? result.value.stage : result.reasonCode}`);
     }
     expect(result.value.reasonCode).toBe(ReasonCode.ISOLATION_LOST);
+    // #512 — the code alone names about twenty possible causes across the reviewer path, so the
+    // stage carries the denial that produced it. A live run failed with exactly this code and
+    // nothing else, and the cause could not be localised from the answer the caller received.
+    expect(
+      result.value.detail.message,
+      "REVIEW_UNAVAILABLE reported a code with no statement of which check refused",
+    ).toBeTruthy();
+    expect(Object.keys(result.value.detail.evidence).length).toBeGreaterThan(0);
     expect(evaluations).toBe(1);
     expect(setup.harness.cp.audit.byKind("REVISION_RETURNED_TO_CTO")).toHaveLength(0);
   });
