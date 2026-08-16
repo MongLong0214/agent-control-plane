@@ -25,7 +25,8 @@
     "evidence:freshness": "node scripts/verify-evidence-freshness.mjs",
     "invariants": "node scripts/verify-invariant-coverage.mjs",
     "buzz:contract": "tsx scripts/verify-buzz-cli-contract.ts",
-    "release:version": "node scripts/verify-release-version.mjs"
+    "release:version": "node scripts/verify-release-version.mjs",
+    "symbols": "node scripts/verify-enforcement-symbols.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
