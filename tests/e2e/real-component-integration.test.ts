@@ -389,6 +389,16 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
       if (TWO_REPOSITORIES) {
         const secondCheckout = join(root, "project-2");
         execFileSync("git", ["clone", "--local", "--quiet", resolve(SECOND_PROJECT!), secondCheckout]);
+        // Same reason as the primary above, and it was missed here when the second repository was
+        // added: a `--local` clone points `origin` at the source *directory*, so the checkout says
+        // its remote is a filesystem path while the declared identity says `github:owner/repo`.
+        // The registry compares the two and refuses. Point the clone at the remote its source has.
+        const secondRemote = execFileSync(
+          "git",
+          ["-C", resolve(SECOND_PROJECT!), "remote", "get-url", "origin"],
+          { encoding: "utf8" },
+        ).trim();
+        execFileSync("git", ["-C", secondCheckout, "remote", "set-url", "origin", secondRemote]);
         const second = await cp.repositories.register({
           checkoutPath: secondCheckout,
           projectId,
