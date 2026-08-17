@@ -67,6 +67,21 @@ interface ScenarioRow {
 
 export interface TraceabilityReport {
   generatedFrom: string[];
+  /**
+   * The commit this report's counts were measured against.
+   *
+   * The rendered prose used to call its inputs "this fresh JSON-reporter result set" while the
+   * committed copy sat 15 tests behind the tree (#560) — a claim of currency that nothing kept
+   * true. Naming the commit makes the file self-describing instead: the counts stay meaningful
+   * because a reader can see which tree they belong to.
+   *
+   * Deliberately **not** one of `verify-evidence-freshness`'s `DIGEST_KEYS`, so this does not
+   * silently reclassify the file from report to evidence. That reclassification is a real
+   * option — the file does describe a tree — but it makes every commit touching `src/` stale it,
+   * so every such PR would have to carry a regenerated artifact. That is a workflow decision,
+   * and it is left open in #560 rather than smuggled in behind a key name.
+   */
+  measuredAt: string;
   testRun: {
     reporter: "vitest-json";
     success: boolean;
@@ -274,6 +289,21 @@ export const passedScenarioReferences = (
   return references;
 };
 
+/**
+ * The commit the counts describe. Falls back to a explicit marker rather than an empty string:
+ * "measured at (unknown)" is a readable admission, whereas a blank renders as a sentence that
+ * looks complete and says nothing.
+ */
+const measuredCommit = (): string => {
+  const head = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" });
+  const sha = head.status === 0 ? head.stdout.trim() : "";
+  if (!sha) return "(unknown — not a git checkout)";
+  const dirty = spawnSync("git", ["status", "--porcelain"], { encoding: "utf8" });
+  // A dirty tree matters here: the counts came from working-tree files, so naming only the
+  // commit would attribute them to a tree that does not contain what was measured.
+  return dirty.status === 0 && dirty.stdout.trim().length > 0 ? `${sha} (working tree modified)` : sha;
+};
+
 export const buildTraceabilityReport = (
   requirements: Iterable<Requirement>,
   scenarios: Map<string, string>,
@@ -318,6 +348,7 @@ export const buildTraceabilityReport = (
       "docs/prd/AGENT_CONTROL_PLANE_PRD_v1.3_FINAL.md",
       "docs/prd/REPO_FACTORY_CONTROL_PLANE_INTEGRATION_PRD_v1.1_FINAL.md",
     ],
+    measuredAt: measuredCommit(),
     testRun: {
       reporter: "vitest-json",
       success: vitest.success,
@@ -447,8 +478,13 @@ const markdownReport = (report: TraceabilityReport): string => [
   "",
   "Generated from the vendored SSOT PRDs. This report measures declaration coverage only: a",
   "scenario label resolves to an executable Vitest leaf that appears with status `passed` in",
-  "this fresh JSON-reporter result set. Behavioural coverage and production-entry-point coverage",
-  "are not measured, so this report is not proof that a requirement is met in the running system.",
+  "the JSON-reporter result set named below. Behavioural coverage and production-entry-point",
+  "coverage are not measured, so this report is not proof that a requirement is met in the",
+  "running system.",
+  "",
+  `Measured at \`${report.measuredAt}\`. The copy committed to the repository is only as current`,
+  "as its last regeneration — `pnpm trace` recomputes it, and CI recomputes it on every run, so",
+  "a reader comparing this file against a later tree should re-run rather than trust the counts.",
   "",
   `- Vitest result set: ${report.testRun.passed}/${report.testRun.total} passed; ${report.testRun.failed} failed; ${report.testRun.pending} pending`,
   `- Requirements: ${report.summary.requirements} (declaration coverage ${report.summary.requirementsWithDeclarationCoverage}, gaps ${report.summary.requirementsWithGaps})`,
