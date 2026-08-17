@@ -33,6 +33,29 @@ import { makeHarness, registerFixtureProject } from "../tests/helpers/harness.ts
 
 const out = process.argv[2] ?? "evidence/p0-09-buzz-live-delivery.json";
 const binary = process.env["ACP_BUZZ_BINARY"] ?? "buzz";
+
+/**
+ * The relay has to be named, not defaulted.
+ *
+ * `buzz --help` documents `BUZZ_RELAY_URL [default: http://localhost:3000]`, and the CLI inherits
+ * this process's environment, so leaving it unset does not mean "no relay" — it means localhost.
+ * A capture that ran that way and passed would have measured a loopback relay while its own
+ * `measured.relay` said `production`, because that field used to be a hardcoded string.
+ *
+ * The 2026-08-17 run is what surfaced it: `relay: "(default)"` next to `measured.relay:
+ * "production"` in one artifact, contradicting each other. It failed for an unrelated reason
+ * (`relay error 400: Client sent an HTTP request to an HTTPS server` — the loopback default
+ * against a TLS relay), so the contradiction never had to be believed. That was luck, not a check.
+ */
+const relayUrl = process.env["BUZZ_RELAY_URL"];
+if (!relayUrl) {
+  console.error(
+    "BUZZ_RELAY_URL is not set. The buzz CLI would fall back to http://localhost:3000 and this\n" +
+      "capture would describe a loopback relay while claiming a production one. Set it to the\n" +
+      "relay this capture is supposed to be about (docs/HANDOFF-20260814.md records the URL).",
+  );
+  process.exit(1);
+}
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const channelName = `acp-verify-${stamp.slice(0, 19)}`;
 
@@ -42,7 +65,7 @@ const cli = (...argv: string[]): string =>
 const record: Record<string, unknown> = {
   capture: "P0-09/#243 live Buzz delivery and ACK against the production relay",
   capturedAt: new Date().toISOString(),
-  relay: process.env["BUZZ_RELAY_URL"] ?? "(default)",
+  relay: relayUrl,
   cliPath: execFileSync("which", [binary], { encoding: "utf8" }).trim(),
   // What this capture did and did not measure. Written into the record because a reader who
   // finds a `doctor` block here will otherwise take it for a statement about the deployment,
@@ -53,7 +76,11 @@ const record: Record<string, unknown> = {
   // the capture proves nothing; the control plane does not, and making it real would mean a
   // delivery capture reading and writing deployment state.
   measured: {
-    relay: "production",
+    // Derived, never asserted. This block exists to stop a reader taking the capture for more
+    // than it measured — the comment above records three readings that did — so a field in it
+    // that states `production` regardless of which relay was contacted is the one thing here
+    // that must not be a literal.
+    relay: relayUrl,
     transport: "installed buzz CLI",
     ingressPolicy: "the deployment's, via configuredBuzzActorIngressPolicy()",
     controlPlane: "in-memory test fixture (makeCore) — not the deployment",
