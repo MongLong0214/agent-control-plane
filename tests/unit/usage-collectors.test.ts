@@ -88,16 +88,32 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     });
   });
 
+  /**
+   * The prompts arrive from a terminal, not from a string literal.
+   *
+   * This test used to inject `"Quick safety check: Is this a project you trust?"` — text as
+   * a reader sees it, with the spaces a TUI does not put there. A TUI positions each word
+   * with its own CSI sequence, and `stripTerminal` deletes those rather than replacing them,
+   * so the guard actually receives `Quicksafetycheck...`. The old fixture asserted an input
+   * the production path cannot produce, and passed for as long as the guard was unreachable.
+   *
+   * So the prompts below carry the cursor moves, and the assertion is that the refusal
+   * survives them.
+   */
+  const CHA = (column: number) => `[${column}G`;
+
   it("refuses live trust prompts from Claude and Grok rather than approving them", async () => {
     const claude = await new ClaudeUsageCollector({
       clock: clock(),
       binary: "unused-by-injected-terminal",
-      terminal: terminal("Quick safety check: Is this a project you trust? 1. Yes, I trust this folder"),
+      terminal: terminal(
+        `${CHA(3)}Quick${CHA(9)}safety${CHA(16)}check:${CHA(23)}Is this a project you trust?${CHA(3)}1. Yes, I trust this folder`,
+      ),
     }).collect();
     const grok = await new GrokUsageCollector({
       clock: clock(),
       binary: "unused-by-injected-terminal",
-      terminal: terminal("Do you trust the contents of this directory? Yes, proceed"),
+      terminal: terminal(`${CHA(3)}Do${CHA(6)}you${CHA(10)}trust${CHA(16)}the contents of this directory?`),
     }).collect();
 
     for (const reading of [claude, grok]) {
@@ -107,12 +123,48 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     }
   });
 
+  it("still refuses a trust prompt that arrives with its spaces intact", async () => {
+    // The other half. The patterns carry no spaces now, so a stream that *does* keep them —
+    // a plain pipe rather than a TUI — would stop matching if the candidate were not
+    // normalised too. Without this, fixing the terminal case would have broken the case the
+    // original fixture was written for, and nothing would have said so.
+    const claude = await new ClaudeUsageCollector({
+      clock: clock(),
+      binary: "unused-by-injected-terminal",
+      terminal: terminal("Quick safety check: Is this a project you trust? 1. Yes, I trust this folder"),
+    }).collect();
+
+    expect(claude.sensorHealth).toBe("ERROR");
+    expect(claude.error).toContain("trust or approval");
+  });
+
+  it("tells a CLI that never launched apart from one that showed the wrong screen", () => {
+    // The distinction #564 needed and did not have: three causes arrived as one sentence,
+    // and the one that was actually happening — a binary outside the daemon's PATH, so
+    // nothing started — reads nothing like "output contains no percentage".
+    const silent = parseUsageOutput("claude", "", clock().nowIso());
+    expect(silent.ok).toBe(false);
+    if (silent.ok) return;
+    expect(silent.error).toContain("produced no output");
+    expect(silent.error).toContain("PATH");
+
+    const wrongScreen = parseUsageOutput("claude", "Welcome back\nToken activity: 40%", clock().nowIso());
+    expect(wrongScreen.ok).toBe(false);
+    if (wrongScreen.ok) return;
+    expect(wrongScreen.error).toContain("no explicit remaining-quota percentage");
+    expect(wrongScreen.error).toContain("2 line(s)");
+  });
+
   it("mutation: removing remaining/left makes a percentage non-routable", () => {
     expect(parseUsageOutput("gpt", "5-hour limit: 62% remaining — resets in 1h", clock().nowIso()).ok).toBe(true);
-    expect(parseUsageOutput("gpt", "5-hour limit: 62% consumed — resets in 1h", clock().nowIso())).toEqual({
-      ok: false,
-      error: "interactive /usage output contains no explicit remaining-quota percentage",
-    });
+    // The point is `consumed` is not `remaining`, so this asserts the refusal and its reason
+    // rather than the whole sentence — the sentence now also reports how much was read, which
+    // is what separates this case from a CLI that never launched.
+    const consumed = parseUsageOutput("gpt", "5-hour limit: 62% consumed — resets in 1h", clock().nowIso());
+    expect(consumed.ok).toBe(false);
+    if (consumed.ok) return;
+    expect(consumed.error).toContain("no explicit remaining-quota percentage");
+    expect(consumed.error).toContain("1 line(s)");
   });
 
   it("mutation: malformed and duplicate windows refuse collection", () => {
@@ -124,6 +176,38 @@ rolling: 30% remaining
       ok: false,
       error: "interactive /usage output contains duplicate quota-window labels",
     });
+  });
+
+  it("waits for the CLI to be ready before typing, through a real pseudo-terminal", async () => {
+    // Reproduces what claude 2.1.233 does: the TUI drops anything typed before it has drawn.
+    // `expectProgram` writes the first step 100 ms after spawn, so without an input-less
+    // waiting step the capture is the banner and nothing else — which is exactly what every
+    // probe on the deployment host recorded (#564).
+    const root = tempDir("acp-usage-ready-");
+    const binary = join(root, "claude-ready-stub.mjs");
+    writeFileSync(binary, `#!${process.execPath}
+let ready = false;
+process.stdin.on("data", (chunk) => {
+  // Anything typed before the banner is dropped on the floor, as a TUI would.
+  if (!ready) return;
+  if (chunk.toString("utf8").includes("/usage")) {
+    process.stdout.write("5-hour limit: 77% remaining — resets in 2h\\n");
+  }
+});
+setTimeout(() => { ready = true; process.stdout.write("Claude Code v2.1.233\\n"); }, 900);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(binary, 0o700);
+
+    const reading = await new ClaudeUsageCollector({
+      clock: clock(),
+      binary,
+      timeoutMs: 8_000,
+      terminal: new ExpectUsageTerminal(),
+    }).collect();
+
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    expect(reading.buckets.map((b) => b.remainingPercent)).toEqual([77]);
   });
 
   it("uses a real pseudo-terminal to enter Codex /usage and navigate only its usage chooser", async () => {
