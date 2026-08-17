@@ -67,6 +67,36 @@ const channelName = `acp-verify-${stamp.slice(0, 19)}`;
 const cli = (...argv: string[]): string =>
   execFileSync(binary, argv, { encoding: "utf8", timeout: 30_000 });
 
+/**
+ * A call whose *rejection* is the observation — the #423 counterexample, where the point is
+ * that the installed CLI refuses an argv the adapter must therefore not build.
+ *
+ * `execFileSync` lets the child's stderr through to this process's stderr by default, so the
+ * caught, expected rejection still printed the CLI's error text mid-run:
+ *
+ *     {"error":"user_error","message":"error: unexpected argument '--json' found ...
+ *
+ * A reader watching the capture sees a CLI error and a stopped-looking run. On 2026-08-17 that
+ * is exactly what happened: the probe was read as the harness crashing on its own bad argv, and
+ * the conclusion drawn was that this capture had never been runnable. It had; this line is a
+ * `try`/`catch` that records `jsonFlagRejected` and continues.
+ *
+ * So the stderr is captured rather than inherited. The recorded fact is unchanged — deleting the
+ * probe to quiet it would throw away the evidence that the flag is refused.
+ */
+const cliRejects = (...argv: string[]): boolean => {
+  try {
+    execFileSync(binary, argv, {
+      encoding: "utf8",
+      timeout: 30_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return false;
+  } catch {
+    return true;
+  }
+};
+
 const record: Record<string, unknown> = {
   capture: "P0-09/#243 live Buzz delivery and ACK against the production relay",
   capturedAt: new Date().toISOString(),
@@ -121,14 +151,7 @@ try {
   }>;
   record["surface"] = {
     channelsListArgv: ["channels", "list"],
-    jsonFlagRejected: (() => {
-      try {
-        cli("channels", "list", "--json");
-        return false;
-      } catch {
-        return true;
-      }
-    })(),
+    jsonFlagRejected: cliRejects("channels", "list", "--json"),
     identityField: Object.keys(liveChannels[0] ?? {}).includes("channel_id")
       ? "channel_id"
       : "MISSING",
