@@ -292,5 +292,18 @@ if (asJson) {
 if (problems.length > 0) {
   console.error(`\n${problems.length} problem(s):`);
   for (const problem of problems) console.error(`  - ${problem}`);
+  // Where this runs is not where its subject lives. The gate reads repository-wide state — the
+  // GitHub issues — but CI runs it per pull request, so editing one issue turns *every* open PR
+  // red at once and the red appears on each PR's own check. On 2026-08-17 a work marker added
+  // while rewriting #559 did exactly that to two unrelated PRs, whose diffs touched neither
+  // issues nor this script.
+  //
+  // The enforcement is right and belongs here. What was missing is the check saying what it is
+  // about, so the next person does not read their diff for something that is not in it.
+  console.error(
+    "\nThese are facts about the repository's issues, not about any one pull request's diff.\n" +
+      "A PR can go red here without changing a line, because someone edited an issue. Fix the\n" +
+      "issue, or declare the marker; re-running this PR without that changes nothing.",
+  );
   process.exit(1);
 }
