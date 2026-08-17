@@ -6,8 +6,13 @@
  * back off the relay to prove it arrived intact. Nothing here is doubled — that is the whole
  * point, since #423 was two wrong assumptions that only a double could agree with.
  *
- * Usage (BUZZ_PRIVATE_KEY must be in the environment):
- *   node --experimental-strip-types scripts/capture-buzz-live.ts <out.json>
+ * Usage (BUZZ_PRIVATE_KEY and BUZZ_RELAY_URL must be in the environment):
+ *   npx tsx scripts/capture-buzz-live.ts <out.json>
+ *
+ * Not `node --experimental-strip-types`: strip-only mode rejects the parameter property in
+ * `BuzzCliTransport`'s constructor (`ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`), so the documented
+ * command stopped working when that class gained one. An operator following this comment met
+ * a syntax error before reaching anything this capture is about.
  *
  * Creates its own ephemeral channel and deletes it on the way out, so the capture never
  * writes into an owner room and leaves no room behind that a later purpose could resolve to.
