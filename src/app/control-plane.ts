@@ -32,7 +32,7 @@ import { BlindReviewGate, type ReviewerPreference } from "../review/blind-review
 import { CandidatePipeline } from "../run/candidate-pipeline.ts";
 import { type CompletionAuthority, type CompletionAuthoritySet, RunEngine } from "../run/run-engine.ts";
 import { TaskGraph } from "../run/task-graph.ts";
-import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter } from "../runtime/cli-adapters.ts";
+import { ClaudeCliAdapter, CodexCliAdapter, GrokCliAdapter, type CliAdapterOptions } from "../runtime/cli-adapters.ts";
 import {
   GuardedInvocationWriteBroker,
   type ProviderAdapter,
@@ -85,8 +85,27 @@ export interface ControlPlaneConfig {
    * lives in `src/runtime/provider.ts`; this points only at owner-provided infrastructure.
    */
   reviewerEgress?: ReviewerEgressConfig;
-  /** Adapters to register. Real CLI adapters are registered unless replaced. */
+  /**
+   * Adapters to register, *replacing* the real ones entirely. For test doubles.
+   *
+   * Prefer `adapterOptions` when the real adapters are wanted with something changed. Replacing
+   * them makes every option this class passes the caller's responsibility, and each omission is
+   * silent — four were found that way, three of them by a live run failing hundreds of seconds in
+   * (#552).
+   */
   adapters?: ProviderAdapter[];
+  /**
+   * Per-provider overrides applied *on top of* the options this class already passes (#552).
+   *
+   * The difference from `adapters` is the whole point: here the deployment's own configuration is
+   * the base, so a caller names only what differs and cannot silently drop the rest. When this
+   * class gains an option, every caller gets it.
+   */
+  adapterOptions?: {
+    claude?: Partial<CliAdapterOptions>;
+    gpt?: Partial<CliAdapterOptions>;
+    grok?: Partial<CliAdapterOptions>;
+  };
   /**
    * Permits binding a role to an adapter that fabricates responses. Off by default, so
    * a deterministic test double cannot become a production path by configuration
@@ -590,6 +609,10 @@ export class ControlPlane {
   private defaultAdapters(): ProviderAdapter[] {
     const credentialDenyPaths = this.credentials.sensitivePaths();
     const managedWriteBroker = new GuardedInvocationWriteBroker(this.guard);
+    // Spread after the defaults so an override wins for the keys it names and only those. The
+    // base is this deployment's configuration, which is what makes the caller unable to lose an
+    // option it never mentioned.
+    const overrides = this.config.adapterOptions ?? {};
     return [
       new ClaudeCliAdapter({
         clock: this.clock,
@@ -599,6 +622,7 @@ export class ControlPlane {
         managedWriteBroker,
         providerCredentialDir: process.env["ACP_CLAUDE_REVIEWER_CONFIG_DIR"],
         reviewerEgress: this.config.reviewerEgress,
+              ...overrides.claude,
       }),
       new CodexCliAdapter({
         clock: this.clock,
@@ -611,6 +635,7 @@ export class ControlPlane {
         // credential scope because it can contain producer conversations.
         providerCredentialDir: process.env["ACP_CODEX_REVIEWER_HOME"],
         reviewerEgress: this.config.reviewerEgress,
+              ...overrides.gpt,
       }),
       new GrokCliAdapter({
         clock: this.clock,
@@ -618,6 +643,7 @@ export class ControlPlane {
         environmentAllowlist: [],
         denyReadPaths: [this.config.databasePath, this.config.secretsDir, this.config.capacityDir, ...credentialDenyPaths],
         providerCredentialDir: process.env["ACP_GROK_CREDENTIAL_DIR"],
+              ...overrides.grok,
       }),
     ];
   }
