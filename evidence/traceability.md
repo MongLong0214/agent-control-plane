@@ -2,10 +2,15 @@
 
 Generated from the vendored SSOT PRDs. This report measures declaration coverage only: a
 scenario label resolves to an executable Vitest leaf that appears with status `passed` in
-this fresh JSON-reporter result set. Behavioural coverage and production-entry-point coverage
-are not measured, so this report is not proof that a requirement is met in the running system.
+the JSON-reporter result set named below. Behavioural coverage and production-entry-point
+coverage are not measured, so this report is not proof that a requirement is met in the
+running system.
 
-- Vitest result set: 901/903 passed; 0 failed; 2 pending
+Measured at `e0d13c482f97b13275a28d57aee8a8e3b232ecd4 (working tree modified)`. The copy committed to the repository is only as current
+as its last regeneration — `pnpm trace` recomputes it, and CI recomputes it on every run, so
+a reader comparing this file against a later tree should re-run rather than trust the counts.
+
+- Vitest result set: 916/918 passed; 0 failed; 2 pending
 - Requirements: 22 (declaration coverage 22, gaps 0)
 - Scenarios: 59 (passed declarations 59)
 - Missing scenarios: none
