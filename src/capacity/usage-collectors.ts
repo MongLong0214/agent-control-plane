@@ -359,7 +359,31 @@ export const parseUsageOutput = (
     });
   }
   if (buckets.length === 0) {
-    return { ok: false, error: "interactive /usage output contains no explicit remaining-quota percentage" };
+    // Three different failures used to arrive as this one sentence: a binary that never
+    // launched, a trust prompt that went unrecognised, and a real usage screen in an
+    // unexpected shape. On 2026-08-17 all three providers reported it at once and the
+    // cause was none of the things the sentence describes — `resolveExecutable` returns the
+    // bare name when PATH does not contain the CLI, so nothing ever started, and the empty
+    // stream reached this line as if it were output. A whole causal chain was built on the
+    // wrong reading of it (#564, #568).
+    //
+    // The distinguishing fact is whether anything was said at all. Line and character
+    // counts only: `docs/capacity-source.md` keeps raw terminal output out of the record and
+    // retains a digest instead, so the shape is reportable and the content is not.
+    if (lines.length === 0) {
+      return {
+        ok: false,
+        error:
+          "interactive CLI produced no output; the binary may not have launched " +
+          "(a CLI outside the daemon's PATH resolves to a bare name and never starts)",
+      };
+    }
+    return {
+      ok: false,
+      error:
+        `interactive /usage output contains no explicit remaining-quota percentage ` +
+        `(${lines.length} line(s) read); it was neither a quota screen nor a recognised prompt`,
+    };
   }
   const ids = new Set<string>();
   if (buckets.some((bucket) => ids.has(bucket.id) || (ids.add(bucket.id), false))) {
@@ -392,5 +416,30 @@ export const stripTerminal = (value: string): string =>
     .replace(/\r/g, "\n")
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
 
+/**
+ * Trust and approval prompts, matched against text with **all whitespace removed**.
+ *
+ * `stripTerminal` deletes CSI sequences rather than replacing them, which is right for the
+ * quota parser — a TUI that splits `42%` around a cursor move must not become `4 2%`. The
+ * consequence is that a TUI positioning each word with its own CHA sequence renders
+ * `Quick safety check` as `Quicksafetycheck` here. The previous patterns spelled those
+ * spaces literally, so on a real terminal they could not match: this guard was unreachable
+ * in production for the entire time it has existed.
+ *
+ * It looked covered. `usage-collectors.test.ts` injected `"Quick safety check: Is this a
+ * project you trust?"` — already-rendered text, with the spaces a terminal would not leave.
+ * The fixture asserted an input the production path cannot produce, which is why a passing
+ * suite said nothing about the guard.
+ *
+ * So the subject is normalised instead of the pattern: strip whitespace from the candidate
+ * and write the patterns without it. Spaced and unspaced text both match.
+ *
+ * A false positive here refuses a capacity reading, which is the safe direction — an ERROR
+ * is the absence of a reading, and `docs/capacity-source.md` already says an absence never
+ * beats an existing observation.
+ */
+const TRUST_OR_APPROVAL_PROMPT =
+  /(?:doyoutrust|yes,?proceed|yes,?itrust|quicksafetycheck|allow.*?(?:run|modify|execute)|approve.*?(?:command|tool))/i;
+
 const looksLikeTrustOrApprovalPrompt = (value: string): boolean =>
-  /(?:do you trust|yes,? proceed|yes,? i trust|quick safety check|allow .*?(?:run|modify|execute)|approve .*?(?:command|tool))/i.test(value);
+  TRUST_OR_APPROVAL_PROMPT.test(value.replace(/\s+/g, ""));
