@@ -21,6 +21,19 @@
 
 각 행: **확정된 뜻** / 그 단어를 쓰던 다른 용법은 **무엇으로 바꿔 부르는가**.
 
+### ACP (신설)
+
+| | |
+|---|---|
+| **확정** | **agent-control-plane** — 이 저장소. 문서·이슈·커밋에서 `ACP` 는 언제나 이것이다 |
+| **금지** | **Agent Client Protocol** 을 `ACP` 로 줄여 쓰지 않는다. 그건 에디터(VS Code·Zed·JetBrains)가 에이전트에 붙는 별개 프로토콜이고 이 저장소와 아무 관계가 없다 |
+| **대체어** | 그건 **Agent Client Protocol** 이라고 전부 적는다. `hermes acp` 하위명령이 그것이다 (`hermes --help`: *"Run Hermes Agent as an ACP (Agent Client Protocol) server"*) |
+| **왜** | 2026-08-17 에 실제로 오독을 낳았다. 프로세스 목록에 `buzz-acp --agent-command hermes --agent-args=acp` 가 떠 있어서 **CEO 가 컨트롤 플레인 위에서 도는 것처럼 보인다.** 아니다 — 그건 에디터 프로토콜 서버다. 두 ACP 가 같은 약어를 쓰는 한, 프로세스 목록은 확인이 아니라 오답의 출처다 |
+
+**지금 CEO 는 컨트롤 플레인 위에서 돌지 않는다.** 추론이 아니라 측정이다: `agentcpd` 는 설치만 되고 한 번도 로드된 적이 없으며(#564), 배포 DB 는 `sessions` 0 · `assignments` 0 이다. Role 을 쥔 대화 액터가 하나도 없다는 뜻이고, 위에서 돌고 있다면 있어야 한다. `~/.hermes/bridge/bridge-supervisor.sh` 에 `agent-control-plane` 이나 `agentcpd` 언급도 0건이다.
+
+`~/.hermes/bridge/ssot/STATUS.json` 은 `ACP_SINGLE_SSOT__HERMES_LEGACY_STATE_SUBORDINATE` 를 선언한다. **선언이 아직 사실이 아니고**, 이름 충돌이 그 간극을 가려 왔다. 그래서 P1·P3 는 증명 항목이 아니라 **그 선언을 사실로 만드는 경로**다.
+
 ### session
 
 | | |
