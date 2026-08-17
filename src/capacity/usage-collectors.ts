@@ -213,7 +213,20 @@ const CAPABILITIES: Readonly<Record<UsageProvider, readonly string[]>> = {
 const CLI: Readonly<Record<UsageProvider, { args: readonly string[]; steps: readonly UsageTerminalStep[] }>> = {
   claude: {
     args: ["--no-chrome", "--safe-mode"],
-    steps: [{ input: "/usage\r" }],
+    // The empty first step sends nothing and waits. `expectProgram` spawns, pauses 100 ms and
+    // then writes the next step, which is far sooner than this TUI can accept input — the
+    // keystrokes are dropped and the capture is the startup banner and nothing else. Measured
+    // against claude 2.1.233:
+    //
+    //   send at 100 ms          22 lines, 0 containing a percentage   (banner only)
+    //   send after the banner   49 lines, 4 containing a percentage   (the usage screen)
+    //
+    // A `waitFor` on the `/usage` step itself cannot express this: `expectProgram` emits the
+    // `send` first and the `expect` after it, so a step's `waitFor` gates the *next* step, not
+    // its own write. An input-less step is how that gap is spelled, and it is what
+    // `UsageTerminalStep.waitFor` already documents — "do not send the next step until this
+    // text appears".
+    steps: [{ input: "", waitFor: /Claude Code/ }, { input: "/usage\r" }],
   },
   gpt: {
     args: ["--no-alt-screen"],

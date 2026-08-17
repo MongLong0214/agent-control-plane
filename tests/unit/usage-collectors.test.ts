@@ -178,6 +178,38 @@ rolling: 30% remaining
     });
   });
 
+  it("waits for the CLI to be ready before typing, through a real pseudo-terminal", async () => {
+    // Reproduces what claude 2.1.233 does: the TUI drops anything typed before it has drawn.
+    // `expectProgram` writes the first step 100 ms after spawn, so without an input-less
+    // waiting step the capture is the banner and nothing else — which is exactly what every
+    // probe on the deployment host recorded (#564).
+    const root = tempDir("acp-usage-ready-");
+    const binary = join(root, "claude-ready-stub.mjs");
+    writeFileSync(binary, `#!${process.execPath}
+let ready = false;
+process.stdin.on("data", (chunk) => {
+  // Anything typed before the banner is dropped on the floor, as a TUI would.
+  if (!ready) return;
+  if (chunk.toString("utf8").includes("/usage")) {
+    process.stdout.write("5-hour limit: 77% remaining — resets in 2h\\n");
+  }
+});
+setTimeout(() => { ready = true; process.stdout.write("Claude Code v2.1.233\\n"); }, 900);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(binary, 0o700);
+
+    const reading = await new ClaudeUsageCollector({
+      clock: clock(),
+      binary,
+      timeoutMs: 8_000,
+      terminal: new ExpectUsageTerminal(),
+    }).collect();
+
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    expect(reading.buckets.map((b) => b.remainingPercent)).toEqual([77]);
+  });
+
   it("uses a real pseudo-terminal to enter Codex /usage and navigate only its usage chooser", async () => {
     const root = tempDir("acp-usage-pty-");
     const binary = join(root, "codex-usage-stub.mjs");
