@@ -27,7 +27,7 @@
     "buzz:contract": "tsx scripts/verify-buzz-cli-contract.ts",
     "release:version": "node scripts/verify-release-version.mjs",
     "symbols": "node scripts/verify-enforcement-symbols.mjs",
-    "adapter:parity": "node scripts/verify-adapter-option-parity.mjs"
+    "adapter:source": "node scripts/verify-acceptance-adapter-source.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

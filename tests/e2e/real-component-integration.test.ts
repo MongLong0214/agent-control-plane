@@ -11,7 +11,6 @@ import { Daemon } from "../../src/daemon/daemon.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PROJECT_MANIFEST_SCHEMA_ID, type ProjectManifest } from "../../src/contracts/manifest.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
-import { ClaudeCliAdapter, CodexCliAdapter } from "../../src/runtime/cli-adapters.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -59,27 +58,18 @@ const MANIFEST_DEFAULT_BRANCH = "main";
  */
 const CI_WORKFLOW_PATH = ".github/workflows/ci.yml";
 
-/** Matches what `ControlPlane` passes its adapters; the shipped value is the empty list. */
-const ACCEPTANCE_ENVIRONMENT_ALLOWLIST: readonly string[] = [];
-
 /**
- * The read denials `ControlPlane` gives its adapters, for the paths this test can name.
+ * The reviewer egress this host provisioned, for both providers.
  *
- * Supplying `adapters:` replaces the ones `ControlPlane` builds, so anything it would have passed
- * has to be passed here — and a reviewer denied less than the deployment denies is a reviewer whose
- * isolation this run cannot speak for.
- *
- * One shipped entry is **not** reproduced: `credentials.sensitivePaths()`, the GitHub App env file
- * and private key. That is instance state of a store `ControlPlane` constructs, and these adapters
- * are built before it exists. So this closes the shape of the difference and part of its content;
- * the remainder is tracked rather than papered over, and `verify-adapter-option-parity` compares
- * keys precisely because it cannot judge values like this one.
+ * The profile is the owner's; the proxy is the vendored one rather than the host copy, because
+ * `reviewer-egress.ts` requires a handshake and a script outside the tree cannot be held to it.
  */
-const acceptanceDenyReadPaths = (root: string): readonly string[] => [
-  join(root, "state.sqlite"),
-  join(root, "secrets"),
-  join(root, "capacity"),
-];
+const ACCEPTANCE_REVIEWER_EGRESS = (root: string) => ({
+  profilePath: join(EGRESS_ROOT, "reviewer.sb"),
+  proxyPath: fileURLToPath(new URL("../../deploy/egress/allowlist-proxy.py", import.meta.url)),
+  runtimeDir: join(root, "egress-runtime"),
+});
+
 /** The owner-provisioned reviewer egress infrastructure this host declares. */
 const EGRESS_ROOT = join(process.env["HOME"] ?? "", ".agent-control-plane", "egress");
 const REVIEWER_MODEL = process.env["ACP_COMPONENT_INTEGRATION_MODEL"] ?? "sonnet";
@@ -245,51 +235,25 @@ describe.runIf(ENABLED)("component integration: real project, verification, and 
         capacityDir: join(root, "capacity"),
         secretsDir: join(root, "secrets"),
         clock: systemClock,
-        adapters: [
-          new CodexCliAdapter({
-            clock: systemClock,
-            capacityFile: join(root, "capacity", "gpt.json"),
-            environmentAllowlist: ACCEPTANCE_ENVIRONMENT_ALLOWLIST,
-            denyReadPaths: acceptanceDenyReadPaths(root),
+        // Overrides, not replacements (#552). `adapters:` would discard every option
+        // ControlPlane passes and make each one this test's responsibility — four were lost that
+        // way, three of them found by a live run failing hundreds of seconds in. Naming only what
+        // differs means a future option arrives here automatically.
+        adapterOptions: {
+          gpt: {
             // The reviewer scope holds auth.json and nothing else. ~/.codex carries producer
             // conversation state, which is exactly what a blind reviewer must not read.
             providerCredentialDir: join(process.env["HOME"] ?? "", ".acp-reviewer", "codex"),
-            reviewerEgress: {
-              profilePath: join(EGRESS_ROOT, "reviewer.sb"),
-              proxyPath: fileURLToPath(new URL("../../deploy/egress/allowlist-proxy.py", import.meta.url)),
-              runtimeDir: join(root, "egress-runtime"),
-            },
-          }),
-          new ClaudeCliAdapter({
-            clock: systemClock,
-            capacityFile: join(root, "capacity", "claude.json"),
-            environmentAllowlist: ACCEPTANCE_ENVIRONMENT_ALLOWLIST,
-            denyReadPaths: acceptanceDenyReadPaths(root),
-            // The reviewer profile denies `~/.claude` — that is the producer's transcript store
-            // and a blind reviewer must not read it (`reviewerTranscriptRoots`). So the reviewer
-            // cannot use the host's ordinary Claude credentials and needs its own scoped identity,
-            // which is the only thing `providerCredentialDir` sets: without it `CLAUDE_CONFIG_DIR`
-            // is never exported and the child reads the default directory the profile forbids.
-            //
-            // The codex adapter beside this one already passes its equivalent. This was missing,
-            // which is the same shape as the empty `fallbacks` fixed alongside it: a setting the
-            // deployment has and the test asserting it did not.
+            reviewerEgress: ACCEPTANCE_REVIEWER_EGRESS(root),
+          },
+          claude: {
+            // The reviewer profile denies `~/.claude` — the producer's transcript store — so the
+            // reviewer needs its own scoped identity. `providerCredentialDir` is the only thing
+            // that exports CLAUDE_CONFIG_DIR.
             providerCredentialDir: join(process.env["HOME"] ?? "", ".agent-control-plane", "reviewer", "claude"),
-            // Supplying `adapters` replaces the ones ControlPlane builds, and those are where
-            // it passes config.reviewerEgress. So a custom adapter silently opts out of egress
-            // configuration: acquireReviewerEgress then fails REVIEWER_EGRESS_CONFIG_MISSING,
-            // which surfaced only as ISOLATION_LOST and read like a failing boundary rather
-            // than an absent one. The infrastructure below is the owner's, built and proved
-            // for #419 — see ~/.agent-control-plane/egress/README.md.
-            reviewerEgress: {
-              profilePath: join(EGRESS_ROOT, "reviewer.sb"),
-              // The vendored proxy, not the host copy: reviewer-egress.ts requires a
-              // handshake, and a script outside the tree cannot be held to it.
-              proxyPath: fileURLToPath(new URL("../../deploy/egress/allowlist-proxy.py", import.meta.url)),
-              runtimeDir: join(root, "egress-runtime"),
-            },
-          }),
-        ],
+            reviewerEgress: ACCEPTANCE_REVIEWER_EGRESS(root),
+          },
+        },
         // The host's own declaration authorises the owner, not a list this test invented:
         // an empty or absent file means the deployment has no owner and the gate cannot be
         // cleared, which is the safe reading of §21.
