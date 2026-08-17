@@ -328,10 +328,24 @@ try {
   // policy `agentcpd` actually reads can answer it.
   const policy = configuredBuzzActorIngressPolicy();
   if (!policy) {
+    // What this resolver reads is `process.env` — *this* process's environment, not the
+    // deployment's. The launcher (`~/.agent-control-plane/agentcpd-launch.sh`) exports both
+    // names from Keychain service `com.agentcontrolplane.agentcpd` before starting agentcpd,
+    // so a capture run from an ordinary shell sees nothing even when the deployment is fully
+    // configured — which is exactly what happened on 2026-08-17.
+    //
+    // The message used to say "are not configured", a claim about the deployment that this
+    // check has no standing to make. A red that is not a statement about its subject is the
+    // same defect as a green that is not, and it cost a day: the absence was read as the
+    // deployment lacking a policy, and the proposed remedy was to install a second one beside
+    // the one already there.
     throw new Error(
-      "ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS are not configured, so there is no " +
-        "deployment policy to capture. Configure them as agentcpd runs and re-run; a policy " +
-        "invented here would prove nothing (#243).",
+      "ACP_BUZZ_INGRESS_SECRET and ACP_BUZZ_ALLOWED_ACTORS are absent from this process's " +
+        "environment, so there is no policy for this capture to read. That is not the same as " +
+        "the deployment lacking one: agentcpd-launch.sh exports both from Keychain service " +
+        "com.agentcontrolplane.agentcpd, so check there before concluding anything is missing, " +
+        "and re-run this capture with the launcher's environment. A policy invented here would " +
+        "prove nothing (#243).",
     );
   }
   if (!policy.allowedActors.includes(landed.pubkey)) {
