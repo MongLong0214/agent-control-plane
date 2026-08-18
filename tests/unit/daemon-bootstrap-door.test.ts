@@ -50,7 +50,11 @@ const report = (status: DoctorReport["status"], findings: readonly Finding[]): D
  * The doctor is stubbed rather than driven into a real uncovered state: what is under test is
  * which branch `start()` takes for a given finding set, so the finding set has to be the input.
  */
-const makeDaemon = (statuses: readonly DoctorReport[], delayMsByCall: readonly number[] = []) => {
+const makeDaemon = (
+  statuses: readonly DoctorReport[],
+  delayMsByCall: readonly number[] = [],
+  daemonOptions: { bootstrapRecheckIntervalMs?: number } = {},
+) => {
   const harness = makeHarness();
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
   let call = 0;
@@ -61,7 +65,7 @@ const makeDaemon = (statuses: readonly DoctorReport[], delayMsByCall: readonly n
     return statuses[Math.min(index, statuses.length - 1)]!;
   });
   const stateDir = tempDir("acp-bootstrap-door-");
-  return { harness, daemon: new Daemon(harness.cp, { stateDir }), stateDir, doctor };
+  return { harness, daemon: new Daemon(harness.cp, { stateDir, ...daemonOptions }), stateDir, doctor };
 };
 
 /** A door that records its own lifecycle: the daemon must open exactly one and close it. */
@@ -263,7 +267,9 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
 
     expect((await observe(daemon)).allowed).toBe(true);
     expect((await starting).allowed).toBe(true);
-    expect(doctor).toHaveBeenCalledTimes(2);
+    // Three, not two: the park re-checks with the doctor alone, and the startup sweep is a
+    // separate pass that only runs once, on promotion.
+    expect(doctor).toHaveBeenCalledTimes(3);
     await daemon.stop();
   });
 
@@ -348,7 +354,8 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     expect((await observe(daemon)).allowed).toBe(true);
 
     expect((await starting).allowed).toBe(true);
-    expect(doctor).toHaveBeenCalledTimes(3);
+    // Two blocked re-checks, then the promoting one, then the startup sweep it triggers.
+    expect(doctor).toHaveBeenCalledTimes(4);
     await daemon.stop();
   });
 
@@ -433,6 +440,69 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     const retried = await daemon.handleOperatorRequest(approval, PEER);
     expect(retried.reasonCode).not.toBe(ReasonCode.DAEMON_BOOTSTRAP_MODE);
     expect(retried.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    await daemon.stop();
+  });
+
+  it("re-checks with the doctor alone instead of repeating the startup sweep", async () => {
+    const { harness, daemon } = makeDaemon([
+      report("BLOCKED", [COVERAGE]),
+      report("BLOCKED", [COVERAGE]),
+      report("HEALTHY", []),
+    ]);
+    // The sweep marks dead sessions ERROR, abandons orphaned executions and expires claims and
+    // outbox rows. A healthy daemon does that once at start; running it on every operator
+    // observation destroys state a started daemon would have kept.
+    const expireClaims = vi.spyOn(harness.cp.claims, "expireOverdue");
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+    expect(expireClaims).toHaveBeenCalledTimes(1);
+
+    expect((await observe(daemon)).allowed).toBe(true);
+    await vi.waitFor(() => expect(daemon.lock.held()).toBe(true));
+    expect(expireClaims).toHaveBeenCalledTimes(1);
+
+    expect((await observe(daemon, 91)).allowed).toBe(true);
+    expect((await starting).allowed).toBe(true);
+    // Exactly two: the entry pass and the promoting one.
+    expect(expireClaims).toHaveBeenCalledTimes(2);
+    await daemon.stop();
+  });
+
+  it("stops parking when the block drifts into one no observation can clear", async () => {
+    const { harness, daemon } = makeDaemon([
+      report("BLOCKED", [COVERAGE]),
+      report("ERROR", [finding("CTO_BINDING_POINTS_AT_DEAD_SESSION", "project:fixture")]),
+    ]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    // A session dying while parked raises a CRITICAL blocking finding the capacity door cannot
+    // answer. Without re-reading its own precondition the daemon waits forever on a door that
+    // cannot help, holding the lock, with the supervisor unable to restart it.
+    expect((await observe(daemon)).allowed).toBe(true);
+
+    const started = await starting;
+    expect(started.allowed).toBe(false);
+    expect(daemon.lock.held()).toBe(false);
+    expect(door.closed).toHaveLength(1);
+    expect(harness.cp.audit.byKind("DAEMON_BOOTSTRAP_ABANDONED")).toHaveLength(1);
+  });
+
+  it("re-reads its own sensors on an interval so the door is not the only way out", async () => {
+    const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])], [], {
+      bootstrapRecheckIntervalMs: 25,
+    });
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    // No observation is ever sent. A recovered automatic collector has to be noticed without a
+    // human: release-and-exit got that from the supervisor restarting the process, and a park
+    // that only wakes on the operator door would silently remove it.
+    const started = await starting;
+    expect(started.allowed).toBe(true);
     await daemon.stop();
   });
 

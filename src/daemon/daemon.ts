@@ -9,7 +9,7 @@ import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
-import type { DoctorScope } from "../doctor/doctor.ts";
+import type { DoctorScope, Finding } from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
@@ -63,6 +63,13 @@ export interface DaemonOptions {
   buzz?: BuzzAdapter;
   /** Consecutive start failures before the supervisor should back off harder. */
   crashLoopThreshold?: number;
+  /**
+   * How often a parked daemon re-reads its own sensors without being asked. The operator door
+   * must not be the only way out of a park: the block it exists for is the one an automatic
+   * collector can also clear, and release-and-exit used to get that re-read for free from the
+   * supervisor's restart.
+   */
+  bootstrapRecheckIntervalMs?: number;
 }
 
 /**
@@ -87,6 +94,8 @@ export interface ReconcileReport {
   resumedFinalizations: string[];
   doctorStatus: string;
   blockingFindings: BlockingFinding[];
+  /** Present when this start went through a bootstrap park, so the printed report says so. */
+  bootstrapParked?: boolean;
 }
 
 /** Methods exposed by the authenticated local operator socket. */
@@ -149,6 +158,11 @@ export const BOOTSTRAP_OPERATOR_METHODS: ReadonlySet<OperatorMethod> = new Set([
  * An empty list never parks: `start()` only consults this when the doctor blocked, so no
  * blocking findings means the status came from somewhere this door cannot reach.
  */
+export const blockingFindingsOf = (report: { findings: readonly Finding[] }): BlockingFinding[] =>
+  report.findings
+    .filter((finding) => finding.blocking)
+    .map((finding) => ({ code: finding.code, severity: finding.severity, scope: finding.scope }));
+
 export const canParkForBootstrap = (blockingFindings: readonly BlockingFinding[]): boolean =>
   blockingFindings.length > 0 &&
   blockingFindings.every(
@@ -851,9 +865,7 @@ export class Daemon {
       reclaimedFinalizationAttempts,
       resumedFinalizations: [],
       doctorStatus: report.status,
-      blockingFindings: report.findings
-        .filter((finding) => finding.blocking)
-        .map((finding) => ({ code: finding.code, severity: finding.severity, scope: finding.scope })),
+      blockingFindings: blockingFindingsOf(report),
     };
   }
 
@@ -1341,34 +1353,68 @@ export class Daemon {
       for (;;) {
         if (this.#bootstrapAbandoned) return null;
         if (this.#bootstrapSignal === consumed) {
-          await new Promise<void>((resolve) => {
-            this.#bootstrapWaiter = resolve;
-          });
+          await this.awaitBootstrapSignal();
           continue;
         }
         // Consume every signal outstanding at this moment, not one: the re-check below reads
         // current state, so two observations that arrived together are answered by one pass.
         consumed = this.#bootstrapSignal;
 
-        const rechecked = await this.reconcile();
-        // Re-read the latch on this side of the re-check too. `stop()` has already released the
-        // lock by the time it returns, so promoting on a report that arrived after it would
-        // start timers and resume runs with no lock held — the failure the park exists to
-        // prevent, reached through its success path instead of its sleep.
+        // The doctor alone, not `reconcile()`. That sweep expires claims and outbox messages,
+        // reclaims finalization leases, marks dead sessions ERROR and abandons orphaned
+        // executions — startup actions a healthy daemon performs exactly once. Repeating them
+        // on every operator observation destroys state a started daemon would have kept, and
+        // the park has neither the delivery timer nor the continuity coordinator that make
+        // those sweeps safe to act on.
+        const doctorReport = await this.cp.doctor.run("system");
         if (this.#bootstrapAbandoned) return null;
-        if (rechecked.doctorStatus !== "BLOCKED" && rechecked.doctorStatus !== "ERROR") {
+        const blockingFindings = blockingFindingsOf(doctorReport);
+
+        if (doctorReport.status !== "BLOCKED" && doctorReport.status !== "ERROR") {
+          const swept = await this.reconcile();
+          if (this.#bootstrapAbandoned) return null;
+          if (swept.doctorStatus === "BLOCKED" || swept.doctorStatus === "ERROR") {
+            this.#bootstrapBlocking = swept.blockingFindings;
+            this.writeHealth(swept);
+            continue;
+          }
           this.cp.audit.record({
             kind: "DAEMON_BOOTSTRAP_PROMOTED",
-            evidence: { pid: process.pid, doctorStatus: rechecked.doctorStatus },
+            evidence: { pid: process.pid, doctorStatus: swept.doctorStatus },
           });
           // Only here: an abandoned park is followed by stop(), which has already uninstalled.
           this.installContinuityCoordinator();
-          return rechecked;
+          // The entry pass mutated state too, and its counts are absent from this one. A
+          // report that shows only the promoting sweep says the start did less than it did.
+          return {
+            ...swept,
+            bootstrapParked: true,
+            expiredClaims: swept.expiredClaims + blocked.expiredClaims,
+            expiredMessages: swept.expiredMessages + blocked.expiredMessages,
+            orphanedExecutions: [...blocked.orphanedExecutions, ...swept.orphanedExecutions],
+            sessionsMarkedError: [...blocked.sessionsMarkedError, ...swept.sessionsMarkedError],
+            reclaimedFinalizationAttempts: [
+              ...blocked.reclaimedFinalizationAttempts,
+              ...swept.reclaimedFinalizationAttempts,
+            ],
+          };
         }
-        // Still blocked. An observation can land and leave coverage unroutable, which is
-        // exactly the case daemon.status has to keep reporting rather than resolving.
-        this.#bootstrapBlocking = rechecked.blockingFindings;
-        this.writeHealth(rechecked);
+
+        // Re-read the park's own precondition. A block can drift into one no observation can
+        // clear — a session dying while parked raises CTO_BINDING_POINTS_AT_DEAD_SESSION, which
+        // is CRITICAL and blocking — and without this the daemon waits forever on a door that
+        // cannot help, holding the lock, with the supervisor unable to restart it.
+        if (!canParkForBootstrap(blockingFindings)) {
+          this.cp.audit.record({
+            kind: "DAEMON_BOOTSTRAP_ABANDONED",
+            reasonCode: ReasonCode.DAEMON_BOOTSTRAP_MODE,
+            evidence: { pid: process.pid, blockingFindings },
+          });
+          return null;
+        }
+
+        this.#bootstrapBlocking = blockingFindings;
+        this.writeHealth(null);
       }
     } finally {
       this.#mode = "NORMAL";
@@ -1380,6 +1426,32 @@ export class Daemon {
       // real operator socket on the same path, and an abandoned park must not leave a
       // restricted listener behind a released lock.
       await door?.close();
+    }
+  }
+
+  /**
+   * Sleep until an observation arrives, or until the re-check interval expires — whichever is
+   * first. The timeout exists because the operator door must not be the only way out: the park
+   * only ever guards a capacity/coverage block, which is exactly what an automatic collector
+   * can also clear, and the release-and-exit path this replaces got that re-read for free from
+   * the supervisor restarting the process.
+   */
+  private async awaitBootstrapSignal(): Promise<void> {
+    const intervalMs = this.options.bootstrapRecheckIntervalMs ?? DEFAULT_CAPACITY_REFRESH_MS;
+    let timer: NodeJS.Timeout | null = null;
+    try {
+      await new Promise<void>((resolve) => {
+        this.#bootstrapWaiter = resolve;
+        timer = setTimeout(() => {
+          void this.refreshCapacitySensors()
+            .catch(() => undefined)
+            .finally(() => this.wakeBootstrap("OBSERVED"));
+        }, intervalMs);
+        // A parked daemon is waiting on a human or a collector, never on this timer.
+        timer.unref?.();
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
