@@ -1415,10 +1415,25 @@ export class ClaudeCliAdapter implements ProviderAdapter {
     this.#providerCredentialDir = options.providerCredentialDir;
     this.#reviewerEgress = options.reviewerEgress;
     this.#managedWriteBroker = options.managedWriteBroker;
+    // The capacity probe deliberately does *not* take `providerCredentialDir`.
+    //
+    // That option exists to keep the sandbox's keychain deny from being self-defeating: a
+    // session runs under seatbelt with the host keychain closed, so it needs a dedicated
+    // store to authenticate from (see the option's own documentation above). The probe has
+    // neither half of that problem — `ExpectUsageTerminal` spawns `/usr/bin/expect`
+    // directly, with no profile, so the keychain is reachable.
+    //
+    // Passing it anyway sets `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which switches the CLI from
+    // the keychain to a file store in that directory. No such store is populated, so every
+    // probe read an unauthenticated screen with no quota on it — 28 lines instead of 41,
+    // for months (#564). The setting solved a problem this path does not have and broke the
+    // one thing it does.
+    //
+    // Session isolation is untouched: `runtimeEnvironment` and the seatbelt profile still
+    // receive it, and no profile deny is relaxed.
     this.#usageCollector = options.usageCollector ?? new ClaudeUsageCollector({
       clock: this.#clock,
       binary: this.#binary,
-      providerCredentialDir: this.#providerCredentialDir,
     });
   }
 
@@ -1727,10 +1742,25 @@ export class CodexCliAdapter implements ProviderAdapter {
     this.#providerCredentialDir = options.providerCredentialDir;
     this.#reviewerEgress = options.reviewerEgress;
     this.#managedWriteBroker = options.managedWriteBroker;
+    // The capacity probe deliberately does *not* take `providerCredentialDir`.
+    //
+    // That option exists to keep the sandbox's keychain deny from being self-defeating: a
+    // session runs under seatbelt with the host keychain closed, so it needs a dedicated
+    // store to authenticate from (see the option's own documentation above). The probe has
+    // neither half of that problem — `ExpectUsageTerminal` spawns `/usr/bin/expect`
+    // directly, with no profile, so the keychain is reachable.
+    //
+    // Passing it anyway sets `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which switches the CLI from
+    // the keychain to a file store in that directory. No such store is populated, so every
+    // probe read an unauthenticated screen with no quota on it — 28 lines instead of 41,
+    // for months (#564). The setting solved a problem this path does not have and broke the
+    // one thing it does.
+    //
+    // Session isolation is untouched: `runtimeEnvironment` and the seatbelt profile still
+    // receive it, and no profile deny is relaxed.
     this.#usageCollector = options.usageCollector ?? new CodexUsageCollector({
       clock: this.#clock,
       binary: this.#binary,
-      providerCredentialDir: this.#providerCredentialDir,
     });
   }
 
@@ -2011,10 +2041,25 @@ export class GrokCliAdapter implements ProviderAdapter {
     this.#clock = options.clock;
     this.#denyReadPaths = [options.capacityFile, ...(options.denyReadPaths ?? [])];
     this.#providerCredentialDir = options.providerCredentialDir;
+    // The capacity probe deliberately does *not* take `providerCredentialDir`.
+    //
+    // That option exists to keep the sandbox's keychain deny from being self-defeating: a
+    // session runs under seatbelt with the host keychain closed, so it needs a dedicated
+    // store to authenticate from (see the option's own documentation above). The probe has
+    // neither half of that problem — `ExpectUsageTerminal` spawns `/usr/bin/expect`
+    // directly, with no profile, so the keychain is reachable.
+    //
+    // Passing it anyway sets `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which switches the CLI from
+    // the keychain to a file store in that directory. No such store is populated, so every
+    // probe read an unauthenticated screen with no quota on it — 28 lines instead of 41,
+    // for months (#564). The setting solved a problem this path does not have and broke the
+    // one thing it does.
+    //
+    // Session isolation is untouched: `runtimeEnvironment` and the seatbelt profile still
+    // receive it, and no profile deny is relaxed.
     this.#usageCollector = options.usageCollector ?? new GrokUsageCollector({
       clock: this.#clock,
       binary: this.#binary,
-      providerCredentialDir: this.#providerCredentialDir,
     });
   }
 
