@@ -1,20 +1,54 @@
 # Provider capacity source
 
-Capacity is normally observed from each provider CLI's interactive `/usage` surface. A
-reading becomes routable only when the collector has captured a fresh provider response
-containing an explicit remaining-quota percentage.
+Capacity is read from each provider's own account surface. A reading becomes routable only
+when the collector has captured a fresh provider response containing an explicit
+remaining-quota percentage.
 
-On hosts where that surface cannot expose quota non-interactively, an authenticated
-operator may record what they have just read themselves with `agentctl capacity observe`.
+No provider is read by driving a terminal any more. That mechanism reconstructed a rendered
+frame, and four adversarial rounds on the parser produced fifteen defects, most of them
+reporting *more* remaining quota than the screen stated — the direction that dispatches work
+the subscription cannot pay for. Each provider is now asked for its own numbers.
+
+Where a provider's surface cannot be reached — a credential that has expired, a CLI that
+predates the command, a host that is offline — an authenticated operator may record what they
+have just read themselves with `agentctl capacity observe`.
 This is an expiring observation, not a return to an owner-maintained quota file: the daemon
 records the authenticated actor, the fixed CLI surface name, the supplied observation time,
 and the reading through the same capacity enrichment and persistence path as a collector.
 
 ## Collection contract
 
-Each collector refresh starts a fresh pseudo-terminal session, enters the CLI, sends
-`/usage`, and parses only stable quota-window statements. The raw terminal output is not
+Each collector asks its provider once and refuses rather than guessing. Raw output is never
 persisted; its SHA-256 digest is retained in the reading source for audit correlation.
+
+| Provider | How it is read | Measured |
+|---|---|---|
+| Claude | `claude -p --output-format json --safe-mode --max-turns 1 "/usage"` | ~2s, `num_turns 0`, `total_cost_usd 0` |
+| Codex/GPT | `codex app-server --stdio` → `account/rateLimits/read` | ~2–3s, no model turn |
+| Grok | `GET cli-chat-proxy.grok.com/v1/billing?format=credits` | ~0.4s |
+
+Two of the three are the CLI doing what it already does with the credential it already holds,
+so nothing here handles a token. **Grok is the exception**, and deliberately so: `grok agent
+stdio` answers `-32601` for billing and no subcommand exits with it, so there is no
+CLI-mediated route. ACP borrows the subscription's bearer from the CLI's auth file for the
+length of one request. It is never stored, printed or forwarded, and it does not appear in the
+response body. That token expires — measured at six hours — and nothing here writes a refreshed
+one back, because that file belongs to the CLI and a second writer to a credential store is a
+worse problem than a stale reading. An expired credential is reported as exactly that.
+
+The HTTP surfaces underneath the Claude and Codex commands were rejected even though they
+return better-shaped data. Calling a vendor endpoint directly is the shape of metered access
+whether or not it bills that way, and it would put this code in the business of refreshing
+someone's subscription credential.
+
+`Daemon.start()` bounds the whole refresh. A provider that cannot answer promptly is a
+provider whose quota is unknown, which the doctor and the bootstrap park already handle —
+failing to read a quota is not the same event as failing to start.
+
+The pseudo-terminal path remains in the code, selectable by configuration, for a host whose
+CLI predates these surfaces. Nothing selects it by default and nothing falls back to it on
+failure: a fallback would hand a quota read to the source these replaced at exactly the moment
+the safer one could not answer.
 
 | Provider | Collector | Normalised capabilities |
 |---|---|---|
@@ -29,8 +63,9 @@ Grok is optional diversity only. It never advertises a critical continuity capab
 its absence does not degrade a required-role coverage plan.
 
 The collectors do not answer trust prompts, permission prompts, login prompts, or reset
-redemption prompts. Any such prompt is a failed observation. This prevents a capacity
-refresh from gaining authority merely to obtain a number.
+redemption prompts. Any such prompt is a failed observation. This prevents a capacity refresh
+from gaining authority merely to obtain a number. That property is why none of these surfaces
+takes a model turn: a read that can be made to think can be made to agree.
 
 The parser accepts an explicit shape such as a named usage window plus an explicit
 remaining percentage and reset horizon. A token-activity chart, plan label, or bare
@@ -72,15 +107,15 @@ An operator observation is labelled `STALE` after the configured freshness inter
 stale-grace limit (fifteen minutes by default). It is never renewed by reading a file.
 
 While a current operator observation is the newest reading, allocation uses that durable
-reading rather than launching another `/usage` session — once the daemon is dispatching. A
+reading rather than asking the provider again — once the daemon is dispatching. A
 parked daemon (below) allocates nothing, because it has not started its timers and its
 continuity coordinator is deliberately uninstalled.
 
 A later collector refresh that **succeeds** is authoritative and replaces the observation,
 including when its quota is lower — a measurement beats a recollection. A collector
 **`ERROR`** does not, while the observation is still inside its stale grace. That
-distinction is the whole point: an `ERROR` is the absence of a reading, not a reading, and
-on a host whose `/usage` surface needs human interaction it is the answer every time. The
+distinction is the whole point: an `ERROR` is the absence of a reading, not a reading, and on
+a host whose provider cannot be reached it is the answer every time. The
 daemon refreshes collectors every four minutes (`Daemon.refreshCapacitySensors`, and again
 through `ContinuityKernel.evaluate` once it is dispatching), so an observation an `ERROR`
 could overwrite would be
