@@ -155,6 +155,69 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(wrongScreen.error).toContain("2 line(s)");
   });
 
+  /**
+   * The layout measured on claude 2.1.233, at the default width and at a pinned 200 columns
+   * alike: the label, the bar-and-percentage and the reset arrive as three separate lines,
+   * and the TUI supplies no spaces of its own (#570). Reproduced here verbatim rather than
+   * tidied, because a tidied fixture is what let the trust guard sit unreachable for months.
+   */
+  const LIVE_USAGE_SHAPE = [
+    "Currentsession",
+    "\u2588 8%used",
+    "Resets3:00am(Asia/Seoul)",
+    "Currentweek(allmodels)",
+    "\u2588\u2588\u2588 41%used",
+    "ResetsAug18at9am(Asia/Seoul)",
+    "+5%weeklylimitspromothroughAug20",
+    "Currentweek(Fable)",
+    "\u2588 12%used",
+  ].join("\n");
+
+  it("reads every window on the screen, associating names across lines", () => {
+    const parsed = parseUsageOutput("claude", LIVE_USAGE_SHAPE, clock().nowIso());
+    expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
+    if (!parsed.ok) return;
+
+    // Three windows, not one. A single bucket would silently pick a quota and ignore the
+    // others, which admission cannot detect — it requires every applicable window.
+    expect(parsed.buckets.map((b) => b.id)).toEqual([
+      "currentsession",
+      "currentweek-allmodels",
+      "currentweek-fable",
+    ]);
+  });
+
+  it("derives remaining from used and records which side it came from", () => {
+    const parsed = parseUsageOutput("claude", LIVE_USAGE_SHAPE, clock().nowIso());
+    if (!parsed.ok) throw new Error(parsed.error);
+
+    expect(parsed.buckets.map((b) => b.remainingPercent)).toEqual([92, 59, 88]);
+    expect(parsed.buckets.every((b) => b.measuredAs === "used")).toBe(true);
+    // The reset stays null, and that is the current honest answer rather than an oversight.
+    // The screen states it as an absolute local time — `Resets3:00am(Asia/Seoul)` — and
+    // `normaliseResetAt` reads ISO timestamps and relative "resets in 1h 15m" only. Left
+    // unparsed on purpose: `docs/capacity-source.md` says a usable percentage with no
+    // machine-readable reset keeps `resetAt: null` and the worker reserve protects that
+    // window until a real horizon is observed. Guessing a zone-qualified wall-clock time
+    // would put a wrong horizon in evidence, which is worse than none.
+    expect(parsed.buckets[0]?.resetAt).toBeNull();
+  });
+
+  it("does not turn the promo line into a window", () => {
+    // `+5%weeklylimitspromothroughAug20` carries a percentage and no sense word. Treating it
+    // as quota would invent a window that modifies a denominator rather than stating one.
+    const parsed = parseUsageOutput("claude", LIVE_USAGE_SHAPE, clock().nowIso());
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect(parsed.buckets.map((b) => b.id).some((id) => id.includes("promo"))).toBe(false);
+  });
+
+  it("still refuses a percentage with no window above it", () => {
+    // The invariant that survives: a bare percentage is rejected rather than guessed, and
+    // accepting `used` does not weaken it.
+    const parsed = parseUsageOutput("claude", "\u2588 40%used", clock().nowIso());
+    expect(parsed.ok).toBe(false);
+  });
+
   it("mutation: removing remaining/left makes a percentage non-routable", () => {
     expect(parseUsageOutput("gpt", "5-hour limit: 62% remaining — resets in 1h", clock().nowIso()).ok).toBe(true);
     // The point is `consumed` is not `remaining`, so this asserts the refusal and its reason

@@ -152,6 +152,15 @@ const expectProgram = (steps: readonly UsageTerminalStep[], timeoutMs: number): 
   const seconds = Math.max(1, Math.ceil(timeoutMs / 1_000));
   const lines = [
     "log_user 1",
+    // The pty size is pinned because it is otherwise ambient — inherited from whatever
+    // terminal launched the daemon, and under launchd there is none. Measured on claude
+    // 2.1.233 (#570): at the default width one reset line arrives truncated to `ets …
+    // (Asia/Soul)` while another on the same screen reads `Resets … (Asia/Seoul)` intact.
+    // Width does not buy same-line layout — the label, bar and reset stay on separate lines
+    // at 200 columns too — so the only thing it changes is character fidelity, and wider is
+    // strictly better there. The spaces it costs are already irrelevant: the parser matches
+    // against a space-stripped copy because a TUI supplies no reliable ones at any width.
+    "set stty_init \"rows 60 cols 200\"",
     "set timeout 10",
     // `spawn` does not support a `--` sentinel. `argv` is supplied by Node as a Tcl
     // list, not interpolated shell text, so this remains an argument-vector launch.
@@ -348,29 +357,70 @@ export const parseUsageOutput = (
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter(Boolean);
   const buckets: CapacityBucket[] = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]!;
-    // Stable grammar accepted by all collectors: a named usage window plus an explicit
-    // percentage followed by remaining/left/available. A bare percentage is never quota.
-    const match = /^(?<window>[A-Za-z0-9][A-Za-z0-9 ._-]{0,80}?)\s*(?:limit|quota|usage)?\s*[:—-]\s*(?<remaining>\d{1,3}(?:\.\d+)?)%\s*(?:remaining|left|available)\b(?<tail>.*)$/i.exec(line);
-    if (!match?.groups) continue;
-    const window = match.groups["window"];
-    const remaining = match.groups["remaining"];
-    if (!window || !remaining) continue;
-    const remainingPercent = Number(remaining);
-    if (!Number.isFinite(remainingPercent) || remainingPercent < 0 || remainingPercent > 100) {
-      return { ok: false, error: `usage window '${window}' has an invalid remaining percentage` };
+  // Whitespace is not a reliable separator here. A TUI positions text with cursor moves and
+  // `stripTerminal` deletes those, so at some widths `Current week` arrives as `Currentweek`
+  // and `62% used` as `62%used`. Matching is done against a space-stripped copy for the same
+  // reason the trust guard is (#569); the original line is kept for the reset horizon.
+  const squeezed = lines.map((line) => line.replace(/\s+/g, ""));
+
+  /** A stated percentage plus the word that says which side of the quota it names. */
+  const SENSE = /(?<value>\d{1,3}(?:\.\d+)?)%(?<sense>used|remaining|left|available)\b/i;
+
+  /**
+   * The window a percentage belongs to is not always on its line. Measured on claude 2.1.233,
+   * at both the default width and a pinned 200 columns, the CLI emits the label, the bar and
+   * the reset as three separate lines (#570):
+   *
+   *     Currentweek(allmodels)
+   *     [bar]41%used
+   *     ResetsAug18at9am(Asia/Seoul)
+   *
+   * So a label is looked for on the line itself first — that is the older single-line form and
+   * still the one the tests pin — and only then backwards. Backwards search stops at the first
+   * line that already carries a percentage, because that line belongs to the previous window.
+   */
+  const windowFor = (index: number): string | null => {
+    const inline = /^(?<window>[A-Za-z0-9][A-Za-z0-9 ._()-]{0,80}?)\s*(?:limit|quota|usage)?\s*[:\u2014-]\s*(?=\d)/i.exec(lines[index]!);
+    if (inline?.groups?.["window"]) return inline.groups["window"];
+    for (let back = index - 1; back >= 0 && back >= index - 3; back -= 1) {
+      const candidate = squeezed[back]!;
+      if (SENSE.test(candidate)) return null;
+      if (/[A-Za-z]{3}/.test(candidate) && !/%/.test(candidate)) return lines[back]!;
     }
-    const resetText = [match.groups["tail"] ?? "", lines[index + 1] ?? ""]
-      .find((value) => /\breset(?:s|ting)?\b/i.test(value)) ?? "";
-    const resetAt = normaliseResetAt(resetText, observedAt);
+    return null;
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = SENSE.exec(squeezed[index]!);
+    if (!match?.groups) continue;
+    const window = windowFor(index);
+    // A percentage with no window is a bare percentage, which `docs/capacity-source.md`
+    // rejects rather than guesses. The promo line — `+5%weeklylimitspromothrough…` — has no
+    // sense word and never reaches here.
+    if (!window) continue;
+
+    const stated = Number(match.groups["value"]);
+    if (!Number.isFinite(stated) || stated < 0 || stated > 100) {
+      return { ok: false, error: `usage window '${window}' has an invalid percentage` };
+    }
+    // #570 — `used` is accepted and subtracted. The invariant refuses a chart, a plan label
+    // or a bare percentage; all three share a missing denominator. Here the window is named
+    // in the reading, so `100 - used` is arithmetic on a stated quantity. Applying a stricter
+    // rule to `used` than to `remaining` treats the same evidence differently over one word.
+    const measuredAs = /^used$/i.test(match.groups["sense"] ?? "") ? "used" as const : "remaining" as const;
+    const remainingPercent = measuredAs === "used" ? 100 - stated : stated;
+
+    const resetText = [lines[index] ?? "", lines[index + 1] ?? "", lines[index + 2] ?? ""]
+      .find((value) => /\breset(?:s|ting)?\b/i.test(value) || /reset/i.test(value.replace(/\s+/g, ""))) ?? "";
     buckets.push({
       id: normaliseBucketId(window),
       remainingPercent,
-      resetAt,
+      resetAt: normaliseResetAt(resetText, observedAt),
       capabilities: [...CAPABILITIES[provider]],
+      measuredAs,
     });
   }
+
   if (buckets.length === 0) {
     // Three different failures used to arrive as this one sentence: a binary that never
     // launched, a trust prompt that went unrecognised, and a real usage screen in an
