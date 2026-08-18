@@ -511,6 +511,21 @@ const parseFrameBuckets = (
   const windowFor = (index: number): string | null => {
     const inline = /^(?<window>[A-Za-z0-9][A-Za-z0-9 ._()-]{0,80}?)\s*(?:limit|quota|usage)?\s*[:\u2014-]\s*(?=\d)/i.exec(lines[index]!);
     if (inline?.groups?.["window"]) return inline.groups["window"];
+    // A line that carries words of its own before its figure names its own window, separator
+    // or not. `Fable 12% remaining` under a parent, and `Token activity last 12 months 40%
+    // used` starting a new section, are both this shape — and treating them as unlabelled made
+    // the first vanish into its parent and the second lend the parent's name to whatever came
+    // next. Bar glyphs are not words, so a redrawn bar keeps borrowing.
+    // Not on a reset line. `Resets Aug 18 at 9am — 3% left` reads as a window called "Resets
+    // Aug 18 at 9am" under this rule, and a horizon is not a quota window. The separator form
+    // above is unaffected: `5-hour limit: 62% remaining — resets in 1h 15m` names itself
+    // explicitly and is the measured single-line shape.
+    const labelled = /\breset(?:s|ting)?\b/i.test(lines[index]!)
+      ? null
+      : /^(?<window>[A-Za-z][A-Za-z0-9 ._()-]{0,80}?)\s+(?=\d{1,3}(?:\.\d+)?%)/.exec(lines[index]!);
+    if (labelled?.groups?.["window"] && /[A-Za-z]{3}/.test(labelled.groups["window"])) {
+      return labelled.groups["window"];
+    }
     for (let back = index - 1; back >= 0 && back >= index - 3; back -= 1) {
       const candidate = squeezed[back]!;
       // A line that already carries a percentage belonged to a window too. Returning null here
@@ -527,29 +542,38 @@ const parseFrameBuckets = (
 
   const named: CapacityBucket[] = [];
   const carriedBuckets: CapacityBucket[] = [];
-  // A figure with no label of its own may borrow the previous line's window, and only the
-  // previous line's — a line that borrowed cannot lend. Ending the run at "a line that stated
-  // no figure" was not enough: any run of sense-bearing lines kept a stale window alive across
-  // what is visually a new section, so a heading carrying its own percentage, or a row of bare
-  // percentages, walked the week window down to whatever appeared last. One hop keeps the two
-  // shapes this exists for — a redraw's stale bar and a child nested under its parent, both on
-  // the very next line — and reaches nothing further.
-  let lender: string | null = null;
+  // A figure with no words of its own borrows the window in force. That is a redraw's stale
+  // bar and its successors, which is why the borrow is not limited to one line: a bar redrawn
+  // three times leaves three figures, and dropping all but the first reports the *stalest* of
+  // them. Restricting the borrow by position was measured to do exactly that — 80 remaining
+  // for a window at 59, in the direction that dispatches work the quota cannot pay for.
+  //
+  // What ends a borrow is a line naming itself, which `windowFor` now recognises without a
+  // separator. A run of unlabelled figures under a real window can still walk that window
+  // down, and that is accepted: it withholds work rather than granting it.
+  let carried: string | null = null;
   for (let index = 0; index < lines.length; index += 1) {
     const own = windowFor(index);
-    // A reset is a horizon, not a quota statement. A leftover sense word on that line ("resets
-    // Aug 18 — 3% left") would otherwise be folded into the window above as a real constraint.
-    const isReset = /\breset(?:s|ting)?\b/i.test(lines[index] ?? "");
-    const window = own ?? (isReset ? null : lender);
+    if (own) carried = own;
+    // Does this line say anything of its own besides its figures? Bar glyphs and the sense
+    // tokens themselves do not count, so a redrawn bar stays borrowable while a promo, a
+    // heading or a reset does not. A line with its own words that could not be turned into a
+    // window name ends the borrow without starting one: it is somebody else's content, and
+    // letting the previous window reach past it is how an unrelated percentage replaced a
+    // real figure.
+    const bare = squeezed[index]!.replace(new RegExp(SENSE.source, "gi"), "");
+    if (!own && /[A-Za-z]{3}/.test(bare)) carried = null;
+    // No separate guard for a reset horizon borrowing a window: a reset line carries words of
+    // its own, so the rule above has already ended the borrow. A guard here passed every
+    // mutation, which is what an unreachable one does.
+    const window = own ?? carried;
 
     SENSE.lastIndex = 0;
-    let stated = false;
     let match: RegExpExecArray | null;
     // Every stated figure on the line, not the first. One line can carry both senses of the
     // same window, and taking whichever came first is a coin flip on which one is reported.
     while ((match = SENSE.exec(squeezed[index]!)) !== null) {
       if (!match.groups) continue;
-      stated = true;
       if (!window) continue;
       const value = Number(match.groups["value"]);
       if (!Number.isFinite(value) || value < 0 || value > 100) {
@@ -572,9 +596,6 @@ const parseFrameBuckets = (
         measuredAs,
       });
     }
-    // Only a line that resolved its own window lends to the next one. A carried figure is
-    // already a guess; letting it lend chains the guess.
-    lender = own && stated ? own : null;
   }
 
   // A figure with no label of its own is the same window measured again — a redraw that used

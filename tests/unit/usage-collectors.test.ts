@@ -286,15 +286,29 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(parsed.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(5);
   });
 
-  it("lets a window lend to the next line only, so a guess cannot chain", () => {
-    // A figure with no label of its own is folded into the window above by minimum, which is
-    // how a redraw's stale bar and a nested child are kept. Ending that run at "a line stating
-    // no figure" was not enough: any run of sense-bearing lines walked a stale window across
-    // what is visually a new section, and because the fold takes the minimum, the window ended
-    // up with whatever number appeared last — withholding work for a window it never described.
+  it("ends a borrow at a line with words of its own, and keeps it across a redrawn bar", () => {
+    // A figure with no words of its own borrows the window in force — that is a redraw's stale
+    // bar and its successors. Bounding that borrow by position was measured to report the
+    // *stalest* of a three-times-redrawn bar: 80 remaining for a window at 59, in the direction
+    // that dispatches work the quota cannot pay for. So the borrow is unbounded in length, and
+    // what ends it is content rather than distance.
     const now = clock().nowIso();
+    const CR = String.fromCharCode(13);
 
-    // A promo carries no sense word, so it never lent in the first place.
+    // Three redraws of one bar. Every figure belongs to the window above it.
+    const redrawn = parseUsageOutput(
+      "claude",
+      "Currentweek(allmodels)\n0%used" + CR + "20%used" + CR + "41%used",
+      now,
+    );
+    expect(redrawn.ok, redrawn.ok ? "" : redrawn.error).toBe(true);
+    if (!redrawn.ok) return;
+    expect(redrawn.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+    ]);
+
+    // A promo has words of its own and cannot be named, so it ends the borrow and the figure
+    // below it belongs to nothing.
     const promo = parseUsageOutput(
       "claude",
       ["Currentweek(allmodels)", "41%used", "+5%weeklylimitspromothroughAug20", "3% remaining"].join("\n"),
@@ -302,30 +316,22 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     );
     expect(promo.ok, promo.ok ? "" : promo.error).toBe(true);
     if (!promo.ok) return;
-    expect(promo.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+    expect(promo.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+    ]);
 
-    // A section heading that states its own percentage did lend, and the bare figure under it
-    // then lowered the week to 3.
-    const chained = parseUsageOutput(
+    // A section heading that states its own percentage names itself, so the figure under it is
+    // that section's, not the week's.
+    const sectioned = parseUsageOutput(
       "claude",
       ["Currentweek(allmodels)", "41%used", "Token activity last 12 months 40% used", "3% remaining"].join("\n"),
       now,
     );
-    expect(chained.ok, chained.ok ? "" : chained.error).toBe(true);
-    if (!chained.ok) return;
-    expect(chained.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+    expect(sectioned.ok, sectioned.ok ? "" : sectioned.error).toBe(true);
+    if (!sectioned.ok) return;
+    expect(sectioned.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
 
-    // A run of bare percentages did the same, at any distance.
-    const walked = parseUsageOutput(
-      "claude",
-      ["Currentweek(allmodels)", "41%used", "90% remaining", "80% remaining", "70% remaining", "3% remaining"].join("\n"),
-      now,
-    );
-    expect(walked.ok, walked.ok ? "" : walked.error).toBe(true);
-    if (!walked.ok) return;
-    expect(walked.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
-
-    // A reset line is a horizon, not a quota statement, even when it carries a sense word.
+    // A reset is a horizon. It neither borrows nor names a window, even carrying a sense word.
     const reset = parseUsageOutput(
       "claude",
       ["Currentweek(allmodels)", "41%used", "Resets Aug18 at 9am 3% left", "Currentweek(Fable)", "12%used"].join("\n"),
@@ -333,8 +339,23 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     );
     expect(reset.ok, reset.ok ? "" : reset.error).toBe(true);
     if (!reset.ok) return;
-    expect(reset.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
-    expect(reset.buckets.find((bucket) => bucket.id === "currentweek-fable")?.remainingPercent).toBe(88);
+    expect(reset.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+      ["currentweek-fable", 88],
+    ]);
+
+    // Accepted, and stated rather than left to be discovered: an unbroken run of *unlabelled*
+    // figures under a real window walks that window down to the last of them. Nothing observed
+    // draws that shape, and it withholds work rather than granting it — the one direction this
+    // parser is allowed to be wrong in.
+    const walked = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "90% remaining", "3% remaining"].join("\n"),
+      now,
+    );
+    expect(walked.ok, walked.ok ? "" : walked.error).toBe(true);
+    if (!walked.ok) return;
+    expect(walked.buckets[0]?.remainingPercent).toBe(3);
   });
 
   it("keeps the empty-stream cause distinct from a screen that stated no quota", () => {
@@ -391,7 +412,13 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     const nested = parseUsageOutput("claude", "Current week\nall models 41% remaining\nFable 12% remaining", now);
     expect(nested.ok, nested.ok ? "" : nested.error).toBe(true);
     if (!nested.ok) return;
-    expect(nested.buckets.map((bucket) => bucket.remainingPercent)).toEqual([12]);
+    // Both are real windows and both are kept, because a line with words of its own names
+    // itself. Admission needs every applicable bucket to clear the floor, so the child's 12
+    // governs — which is the constraint that used to be dropped entirely.
+    expect(nested.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["all-models", 41],
+      ["fable", 12],
+    ]);
 
     // Two labels then two figures: the nearer label took the other window's number and the
     // second figure was discarded, reporting 88 for a bar that said 41% used.
