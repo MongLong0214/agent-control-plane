@@ -352,7 +352,32 @@ export const parseUsageOutput = (
   if (looksLikeTrustOrApprovalPrompt(clean)) {
     return { ok: false, error: "interactive CLI requested trust or approval" };
   }
-  const lines = clean
+
+  /**
+   * Quota is read from the **current** frame, not from everything the terminal ever emitted.
+   *
+   * A TUI repaints. The capture holds every frame, so the same window arrives several times —
+   * and not identically: measured on claude 2.1.233, one repaint kept its spaces while another
+   * lost characters, so `Current week (all models)` normalised to `currentweek-allmodels` in
+   * one frame and `current-week-ll-model` in another. The duplicate-window refusal then fired
+   * on what was really one screen read three times (#564).
+   *
+   * The boundary is in the stream already: each repaint starts by homing the cursor, and the
+   * raw capture keeps those sequences (`ESC[H` x5 for three paints of this screen). It is
+   * `stripTerminal` that removes them, before anything can use them — the structure was being
+   * discarded a step too early rather than never being there.
+   *
+   * So the split happens on the raw text and only the last frame is read. Refusals still see
+   * the whole stream above: a trust prompt in an earlier frame is a failed observation no
+   * matter which frame is current, and narrowing that check would trade a safety property for
+   * a parsing convenience.
+   *
+   * Input with no frame markers — an injected fixture, a plain pipe — yields a single segment
+   * and is read whole, unchanged.
+   */
+  const frames = raw.split(/\u001B\[H/);
+  const current = stripTerminal(frames[frames.length - 1] ?? raw);
+  const lines = current
     .split("\n")
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter(Boolean);

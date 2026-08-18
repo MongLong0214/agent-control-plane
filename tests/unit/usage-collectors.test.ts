@@ -218,6 +218,36 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(parsed.ok).toBe(false);
   });
 
+  it("reads the current frame when the TUI has repainted", () => {
+    // A repaint is not a second screen. Measured on claude 2.1.233: the same three windows
+    // arrive three times, and not identically — one paint keeps its spaces, another loses
+    // characters, so `Current week (all models)` normalises two different ways and the
+    // duplicate-window refusal fires on one screen read twice (#564).
+    const ESC = "\u001B";
+    const damaged = ["Current session", "\u2588 8%used", "Current week (ll model)", "\u2588 41%used"].join("\n");
+    const current = ["Currentsession", "\u2588 8%used", "Currentweek(allmodels)", "\u2588 41%used"].join("\n");
+    const repainted = `${ESC}[H${damaged}${ESC}[H${current}`;
+
+    // Without frame awareness this is four windows, two of them the same quota under
+    // different ids — which is what the deployment recorded as a duplicate refusal.
+    const parsed = parseUsageOutput("claude", repainted, clock().nowIso());
+    expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.buckets.map((b) => b.id)).toEqual(["currentsession", "currentweek-allmodels"]);
+  });
+
+  it("still refuses a trust prompt raised in an earlier frame", () => {
+    // The refusal has to see the whole stream. A prompt that appeared and was repainted over
+    // is still a failed observation — narrowing the check to the current frame would trade a
+    // safety property for a parsing convenience.
+    const ESC = "\u001B";
+    const stream = `${ESC}[HQuick safety check: Is this a project you trust?${ESC}[HCurrentsession\n\u2588 8%used`;
+    const parsed = parseUsageOutput("claude", stream, clock().nowIso());
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.error).toContain("trust or approval");
+  });
+
   it("mutation: removing remaining/left makes a percentage non-routable", () => {
     expect(parseUsageOutput("gpt", "5-hour limit: 62% remaining — resets in 1h", clock().nowIso()).ok).toBe(true);
     // The point is `consumed` is not `remaining`, so this asserts the refusal and its reason
