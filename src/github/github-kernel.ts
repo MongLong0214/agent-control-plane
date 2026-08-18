@@ -23,6 +23,15 @@ import {
 import { hotfixPropagationTargets, requiredBaseFor, validateBranchContract } from "./branch-contract.ts";
 import type { TrustedCredentialStore } from "./credential-store.ts";
 
+/**
+ * The gate's GitHub-side correlator: run, candidate, and the payload digest that binds the rest.
+ *
+ * Deliberately reuses values already bound into the payload rather than inventing an identifier —
+ * a correlator with its own namespace would be one more thing that can disagree with the receipt.
+ */
+export const gateExternalId = (runId: string, candidateSnapshotDigest: string, payloadDigest: string): string =>
+  `acp:${runId}:${candidateSnapshotDigest}:${payloadDigest}`;
+
 export const GATE_CHECK_NAME = "acp-production-gate";
 
 /**
@@ -226,6 +235,7 @@ interface CheckRun {
   details_url?: string | null;
   output?: { title?: string | null; summary?: string | null; text?: string | null } | null;
   completed_at?: string | null;
+  external_id?: string | null;
 }
 
 interface ObservedPostMergeCheck {
@@ -816,6 +826,15 @@ export class GitHubKernel {
         head_sha: payload.exactHead,
         status: "completed",
         conclusion: "success",
+        // A correlator GitHub itself indexes. The payload digest already travels in `output.summary`
+        // and is verified on re-read, but only ACP can find a check run by it; `external_id` is
+        // queryable from the GitHub side, which is what a reconciliation after a daemon crash or a
+        // dispute about which run published a gate actually needs.
+        //
+        // Verified on re-read below rather than merely sent. A field written and never read back is
+        // decoration, and this file already carries the lesson: the gate does not trust its own POST
+        // response either.
+        external_id: gateExternalId(payload.runId, payload.candidateSnapshotDigest, payloadDigest),
         completed_at: this.clock.nowIso(),
         output: {
           title: "Agent Control Plane production gate",
@@ -862,6 +881,12 @@ export class GitHubKernel {
       !reread ||
       !creator ||
       reread.name !== GATE_CHECK_NAME ||
+      // Checked only when GitHub returned one. The correlator grants no authority — the digest
+      // does — so making publication depend on a field GitHub may stop echoing would put an
+      // availability risk on the merge path in exchange for nothing. If it comes back, it must
+      // be ours; if it does not, the digest comparison below is still what decides.
+      (typeof reread.external_id === "string" &&
+        reread.external_id !== gateExternalId(payload.runId, payload.candidateSnapshotDigest, payloadDigest)) ||
       reread.head_sha !== payload.exactHead ||
       reread.status !== "completed" ||
       reread.conclusion !== "success" ||
@@ -1308,6 +1333,43 @@ export class GitHubKernel {
             observedHead: check.head_sha,
             status: check.status,
             conclusion: check.conclusion,
+          },
+        });
+        continue;
+      }
+
+      // The correlator must match the one our own publication receipt implies. GitHub stores
+      // `external_id`, and a check run edited after publication can have it rewritten while the
+      // digest in `output.summary` still reads correctly. The digest is what grants authority, so
+      // a correlator that no longer derives from the receipt's payload means the run's GitHub side
+      // was rewritten — and this is the only place that would notice, since publication verifies
+      // its own POST and nothing re-reads the field afterwards.
+      //
+      // Derived from the stored receipt rather than from current state: recomputing from the live
+      // candidate would fold in a freshness judgement that belongs to the checks above.
+      const receiptForDigest = digest ? published.find((row) => row.after_state_digest === digest) : undefined;
+      const expectedExternalId = (() => {
+        if (!receiptForDigest || !digest) return null;
+        try {
+          const stored = JSON.parse(receiptForDigest.response_json) as { payload?: GatePayload };
+          return stored.payload
+            ? gateExternalId(stored.payload.runId, stored.payload.candidateSnapshotDigest, digest)
+            : null;
+        } catch {
+          return null;
+        }
+      })();
+      if (check.external_id && expectedExternalId && check.external_id !== expectedExternalId) {
+        this.audit.record({
+          kind: "GATE_REJECTED",
+          runId,
+          reasonCode: ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID,
+          evidence: {
+            repositoryIdentity,
+            head,
+            checkRunId: check.id,
+            observedExternalId: check.external_id,
+            expectedExternalId,
           },
         });
         continue;
