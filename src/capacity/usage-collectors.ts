@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -478,10 +478,15 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
             asked = true;
             send({ method: "initialized" });
             send({ method: "account/rateLimits/read", id: 1, params: {} });
+            // Anything already buffered was written before the request existed, so it cannot be
+            // the answer to it. Keeping it let a generous window that arrived alongside the
+            // handshake be taken as the reading, ahead of the real one.
+            buffer = "";
+            break;
           }
-          // Only after the read was actually sent. Otherwise a stray object carrying id 1 —
-          // a leftover log line, an interleaved server request — is taken as the answer.
-          if (id === 1 && asked) {
+          // A response, not a request: a server-originated message carrying a method is not
+          // the answer to anything this sent.
+          if (id === 1 && asked && !("method" in message)) {
             if (message.error) finish({ error: "account/rateLimits/read was refused" });
             else finish({ value: message.result });
           }
@@ -604,47 +609,73 @@ const GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=cred
  */
 const GROK_BEARER = /^[A-Za-z0-9._~+/=-]{20,4096}$/;
 
+/** A top-level entry the Grok CLI writes: one authenticated scope. */
+const GROK_SCOPE = /^https:\/\/auth\.x\.ai::/;
+
 /**
  * The bearer, wherever the CLI's auth file currently keeps it. Exported so the choice it makes
  * can be tested: a file can carry several `key` fields, and picking the wrong one sends a
  * request that fails for a reason nothing here would explain.
  */
 export const grokBearer = (authPath: string): string | null => {
-  // A regular file, opened without following a link. `~/.grok/auth.json` pointing at another
-  // JSON store — signing material, a second account, a copied secret file — was read and its
-  // first long `key` sent as the Authorization header to a third party. A FIFO there blocked
-  // `readFileSync` outside every timer this code has, which stalls the doctor's own capacity
-  // refresh and with it the daemon.
+  // Opened without following a link, and checked on the descriptor rather than the path. A
+  // symlinked `auth.json` sent another store's secret to a third party; `lstat` then
+  // `readFileSync(path)` is two lookups and the path can change between them.
+  let contents: string;
+  let handle: number | null = null;
   try {
-    const stats = lstatSync(authPath);
-    if (!stats.isFile()) return null;
+    // O_NONBLOCK so a FIFO at this path cannot block the open — that read sat outside every
+    // timer this code has, and the doctor's capacity refresh is not inside the startup budget.
+    handle = openSync(authPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    if (!fstatSync(handle).isFile()) return null;
+    contents = readFileSync(handle, "utf8");
   } catch {
     return null;
+  } finally {
+    if (handle !== null) {
+      try {
+        closeSync(handle);
+      } catch {
+        /* already closed */
+      }
+    }
   }
+
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(authPath, "utf8"));
+    parsed = JSON.parse(contents);
   } catch {
     return null;
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
 
-  // Every candidate, not the first. Taking the first long `key` in insertion order sent a
-  // `signing.key` instead of the credential beside it, and a test that only proved a *short*
-  // earlier key is skipped could not see that.
-  const candidates: string[] = [];
-  const walk = (value: unknown, depth: number): void => {
-    if (depth > 8 || !value || typeof value !== "object") return;
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      if (key === "key" && typeof nested === "string" && GROK_BEARER.test(nested)) candidates.push(nested);
-      else walk(nested, depth + 1);
-    }
-  };
-  walk(parsed, 0);
+  // The file must be the shape the Grok CLI writes: top-level scope keys, each holding its own
+  // credential. This is what actually stops another secrets store being read — a hard link
+  // passes every check about the *path*, because a hard link is the file. It does not pass a
+  // check about what the file says.
+  const scopes = Object.entries(parsed as Record<string, unknown>).filter(([name]) => GROK_SCOPE.test(name));
+  if (scopes.length === 0) return null;
 
-  // Ambiguity is refused rather than guessed. Two credential-shaped values mean this file is
-  // not the one this code was written for, and picking either sends a secret somewhere.
-  const unique = [...new Set(candidates)];
-  return unique.length === 1 ? unique[0]! : null;
+  // Several scopes is a normal state — the CLI's own migration leaves a legacy entry behind.
+  // Refusing on that was a dead sensor for a file the CLI writes and does not treat as corrupt.
+  // The live credential is the most recently created one.
+  const candidates = scopes
+    .map(([, entry]) => (entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null))
+    .filter((entry): entry is Record<string, unknown> => entry !== null)
+    .filter((entry) => typeof entry["key"] === "string" && GROK_BEARER.test(entry["key"]))
+    .map((entry) => ({
+      key: entry["key"] as string,
+      createdAt: typeof entry["create_time"] === "string" ? Date.parse(entry["create_time"]) : Number.NaN,
+    }));
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0]!.key;
+
+  const dated = candidates.filter((candidate) => Number.isFinite(candidate.createdAt));
+  // Undated or tied entries leave no way to say which is current, and sending the wrong one
+  // sends a secret to the wrong place.
+  if (dated.length !== candidates.length) return null;
+  const newest = dated.reduce((best, candidate) => (candidate.createdAt > best.createdAt ? candidate : best));
+  return dated.filter((candidate) => candidate.createdAt === newest.createdAt).length === 1 ? newest.key : null;
 };
 
 export class FetchGrokBillingProbe implements GrokBillingProbe {
