@@ -376,75 +376,34 @@ export const parseUsageOutput = (
    * and is read whole, unchanged.
    */
   const frames = raw.split(/\u001B\[H/);
-  const current = stripTerminal(frames[frames.length - 1] ?? raw);
-  const lines = current
-    .split("\n")
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-  const buckets: CapacityBucket[] = [];
-  // Whitespace is not a reliable separator here. A TUI positions text with cursor moves and
-  // `stripTerminal` deletes those, so at some widths `Current week` arrives as `Currentweek`
-  // and `62% used` as `62%used`. Matching is done against a space-stripped copy for the same
-  // reason the trust guard is (#569); the original line is kept for the reset horizon.
-  const squeezed = lines.map((line) => line.replace(/\s+/g, ""));
+  // The most complete paint, and among equally complete ones the most recent.
+  //
+  // Reading only the last frame assumed the final paint is a whole screen. It is not: the
+  // collector stops after two seconds of quiet, so a home followed by a partial repaint is a
+  // complete observation in which the tightest window is simply absent, and a trailing home
+  // leaves an empty frame that read as "the binary never launched". Reading *every* frame is
+  // the opposite error — a damaged repaint spells one window two ways, which is the duplicate
+  // refusal #573 was written for. Completeness picks the paint that lost the least, and the
+  // recency tie-break keeps a stale frame from beating an equally complete current one.
+  const readings = frames.map((frame) => {
+    const frameLines = stripTerminal(frame)
+      .split("\n")
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    return { lines: frameLines, parsed: parseFrameBuckets(frameLines, provider, observedAt) };
+  });
+  const invalid = readings.find((reading) => !reading.parsed.ok);
+  // An impossible percentage is a refusal about the reading, not about one frame: quietly
+  // using the frames around it would turn a malformed source into a partial success.
+  if (invalid && !invalid.parsed.ok) return invalid.parsed;
 
-  /** A stated percentage plus the word that says which side of the quota it names. */
-  const SENSE = /(?<value>\d{1,3}(?:\.\d+)?)%(?<sense>used|remaining|left|available)\b/i;
-
-  /**
-   * The window a percentage belongs to is not always on its line. Measured on claude 2.1.233,
-   * at both the default width and a pinned 200 columns, the CLI emits the label, the bar and
-   * the reset as three separate lines (#570):
-   *
-   *     Currentweek(allmodels)
-   *     [bar]41%used
-   *     ResetsAug18at9am(Asia/Seoul)
-   *
-   * So a label is looked for on the line itself first — that is the older single-line form and
-   * still the one the tests pin — and only then backwards. Backwards search stops at the first
-   * line that already carries a percentage, because that line belongs to the previous window.
-   */
-  const windowFor = (index: number): string | null => {
-    const inline = /^(?<window>[A-Za-z0-9][A-Za-z0-9 ._()-]{0,80}?)\s*(?:limit|quota|usage)?\s*[:\u2014-]\s*(?=\d)/i.exec(lines[index]!);
-    if (inline?.groups?.["window"]) return inline.groups["window"];
-    for (let back = index - 1; back >= 0 && back >= index - 3; back -= 1) {
-      const candidate = squeezed[back]!;
-      if (SENSE.test(candidate)) return null;
-      if (/[A-Za-z]{3}/.test(candidate) && !/%/.test(candidate)) return lines[back]!;
-    }
-    return null;
-  };
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const match = SENSE.exec(squeezed[index]!);
-    if (!match?.groups) continue;
-    const window = windowFor(index);
-    // A percentage with no window is a bare percentage, which `docs/capacity-source.md`
-    // rejects rather than guesses. The promo line — `+5%weeklylimitspromothrough…` — has no
-    // sense word and never reaches here.
-    if (!window) continue;
-
-    const stated = Number(match.groups["value"]);
-    if (!Number.isFinite(stated) || stated < 0 || stated > 100) {
-      return { ok: false, error: `usage window '${window}' has an invalid percentage` };
-    }
-    // #570 — `used` is accepted and subtracted. The invariant refuses a chart, a plan label
-    // or a bare percentage; all three share a missing denominator. Here the window is named
-    // in the reading, so `100 - used` is arithmetic on a stated quantity. Applying a stricter
-    // rule to `used` than to `remaining` treats the same evidence differently over one word.
-    const measuredAs = /^used$/i.test(match.groups["sense"] ?? "") ? "used" as const : "remaining" as const;
-    const remainingPercent = measuredAs === "used" ? 100 - stated : stated;
-
-    const resetText = [lines[index] ?? "", lines[index + 1] ?? "", lines[index + 2] ?? ""]
-      .find((value) => /\breset(?:s|ting)?\b/i.test(value) || /reset/i.test(value.replace(/\s+/g, ""))) ?? "";
-    buckets.push({
-      id: normaliseBucketId(window),
-      remainingPercent,
-      resetAt: normaliseResetAt(resetText, observedAt),
-      capabilities: [...CAPABILITIES[provider]],
-      measuredAs,
-    });
+  let chosen = readings[readings.length - 1] ?? { lines: [] as string[], parsed: { ok: true as const, buckets: [] } };
+  for (const reading of readings) {
+    if (!reading.parsed.ok || !chosen.parsed.ok) continue;
+    if (reading.parsed.buckets.length > chosen.parsed.buckets.length) chosen = reading;
   }
+  const lines = chosen.lines;
+  const buckets = chosen.parsed.ok ? chosen.parsed.buckets : [];
 
   if (buckets.length === 0) {
     // Three different failures used to arrive as this one sentence: a binary that never
@@ -495,6 +454,117 @@ const normaliseResetAt = (text: string, observedAt: string): string | null => {
   // A source may report a usable remaining percentage without a machine-readable reset.
   // Keep that fact, but do not manufacture a horizon for the dynamic reserve.
   return null;
+};
+
+/**
+ * One repaint's worth of lines, reduced to the buckets it states. Extracted so every frame can
+ * be read, and so the caller can keep the smallest reading of each window rather than the last.
+ */
+const parseFrameBuckets = (
+  lines: readonly string[],
+  provider: keyof typeof CAPABILITIES,
+  observedAt: string,
+): { ok: true; buckets: CapacityBucket[] } | { ok: false; error: string } => {
+  // Whitespace is not a reliable separator here. A TUI positions text with cursor moves and
+  // `stripTerminal` deletes those, so at some widths `Current week` arrives as `Currentweek`
+  // and `62% used` as `62%used`. Matching is done against a space-stripped copy for the same
+  // reason the trust guard is (#569); the original line is kept for the reset horizon.
+  const squeezed = lines.map((line) => line.replace(/\s+/g, ""));
+
+  /**
+   * A stated percentage plus the word that says which side of the quota it names.
+   *
+   * The trailing boundary is `(?![a-z])` rather than `\b`. Squeezing removed the spaces, so
+   * `41% used 80% remaining` arrives as `41%used80%remaining`, where `\b` fails between `d`
+   * and `8` — the first, tighter figure was skipped and the second was reported. A boundary
+   * that only refuses letters keeps `usedup` out while letting a digit follow.
+   */
+  const SENSE = /(?<value>\d{1,3}(?:\.\d+)?)%(?<sense>used|remaining|left|available)(?![a-z])/gi;
+
+  /**
+   * The window a percentage belongs to is not always on its line. Measured on claude 2.1.233,
+   * at both the default width and a pinned 200 columns, the CLI emits the label, the bar and
+   * the reset as three separate lines (#570):
+   *
+   *     Currentweek(allmodels)
+   *     [bar]41%used
+   *     ResetsAug18at9am(Asia/Seoul)
+   *
+   * So a label is looked for on the line itself first — that is the older single-line form and
+   * still the one the tests pin — and only then backwards.
+   */
+  const windowFor = (index: number): string | null => {
+    const inline = /^(?<window>[A-Za-z0-9][A-Za-z0-9 ._()-]{0,80}?)\s*(?:limit|quota|usage)?\s*[:\u2014-]\s*(?=\d)/i.exec(lines[index]!);
+    if (inline?.groups?.["window"]) return inline.groups["window"];
+    for (let back = index - 1; back >= 0 && back >= index - 3; back -= 1) {
+      const candidate = squeezed[back]!;
+      // A line that already carries a percentage belonged to a window too. Returning null here
+      // discarded the figure entirely, and the discarded one is often the tighter: a redraw
+      // that used \r leaves the stale bar above the fresh one, and a nested window sits under
+      // its parent. The caller carries the last window forward instead, which attributes the
+      // figure to a window that may be the parent — and then keeps the smaller of the two.
+      // Mis-labelling a real constraint is recoverable; dropping it is not.
+      if (new RegExp(SENSE.source, "i").test(candidate)) return null;
+      if (/[A-Za-z]{3}/.test(candidate) && !/%/.test(candidate)) return lines[back]!;
+    }
+    return null;
+  };
+
+  const named: CapacityBucket[] = [];
+  const carriedBuckets: CapacityBucket[] = [];
+  let carried: string | null = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const own = windowFor(index);
+    if (own) carried = own;
+    const window = own ?? carried;
+    if (!window) continue;
+
+    SENSE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    // Every stated figure on the line, not the first. One line can carry both senses of the
+    // same window, and taking whichever came first is a coin flip on which one is reported.
+    while ((match = SENSE.exec(squeezed[index]!)) !== null) {
+      if (!match.groups) continue;
+      const stated = Number(match.groups["value"]);
+      if (!Number.isFinite(stated) || stated < 0 || stated > 100) {
+        return { ok: false, error: `usage window '${window}' has an invalid percentage` };
+      }
+      // #570 — `used` is accepted and subtracted. The invariant refuses a chart, a plan label
+      // or a bare percentage; all three share a missing denominator. Here the window is named
+      // in the reading, so `100 - used` is arithmetic on a stated quantity. Applying a stricter
+      // rule to `used` than to `remaining` treats the same evidence differently over one word.
+      const measuredAs = /^used$/i.test(match.groups["sense"] ?? "") ? "used" as const : "remaining" as const;
+      const remainingPercent = measuredAs === "used" ? 100 - stated : stated;
+
+      const resetText = [lines[index] ?? "", lines[index + 1] ?? "", lines[index + 2] ?? ""]
+        .find((value) => /\breset(?:s|ting)?\b/i.test(value) || /reset/i.test(value.replace(/\s+/g, ""))) ?? "";
+      (own ? named : carriedBuckets).push({
+        id: normaliseBucketId(window),
+        remainingPercent,
+        resetAt: normaliseResetAt(resetText, observedAt),
+        capabilities: [...CAPABILITIES[provider]],
+        measuredAs,
+      });
+    }
+  }
+
+  // A figure with no label of its own is the same window measured again — a redraw that used
+  // \r leaves the stale bar above the fresh one, and a nested window sits under its parent.
+  // Dropping it discarded a real constraint, often the tighter one; folding it in by minimum
+  // keeps it. Two figures that each named themselves are a different thing and still refuse
+  // below, because a screen that labels one window twice with two numbers is ambiguous in a
+  // way this cannot resolve.
+  for (const extra of carriedBuckets) {
+    const target = named.find((bucket) => bucket.id === extra.id);
+    if (!target) {
+      named.push(extra);
+      continue;
+    }
+    if ((extra.remainingPercent ?? -1) < (target.remainingPercent ?? -1)) {
+      named[named.indexOf(target)] = extra;
+    }
+  }
+  return { ok: true, buckets: named };
 };
 
 export const stripTerminal = (value: string): string =>

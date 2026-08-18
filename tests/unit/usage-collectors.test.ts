@@ -236,6 +236,67 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(parsed.buckets.map((b) => b.id)).toEqual(["currentsession", "currentweek-allmodels"]);
   });
 
+  it("keeps a window the last paint dropped, and every reading that would lower it", () => {
+    // Every case below was measured against the merged parser and produced a remaining percent
+    // HIGHER than the screen stated. That is the only direction that matters: `isRoutableFor`
+    // admits a role when every applicable bucket clears the floor, so over-reporting dispatches
+    // work the quota cannot pay for, while under-reporting only withholds it.
+    const ESC = String.fromCharCode(27);
+    const HOME = ESC + "[H";
+    const CR = String.fromCharCode(13);
+    const now = clock().nowIso();
+
+    // The collector stops after two seconds of quiet, so a home plus a partial repaint is a
+    // complete observation. Reading only the last frame lost the week window entirely and left
+    // the session bucket at 92 to route on its own.
+    const partial = HOME + "Currentsession\n8%used\nCurrentweek(allmodels)\n95%used" + HOME + "Currentsession\n8%used";
+    const dropped = parseUsageOutput("claude", partial, now);
+    expect(dropped.ok, dropped.ok ? "" : dropped.error).toBe(true);
+    if (!dropped.ok) return;
+    expect(dropped.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentsession", 92],
+      ["currentweek-allmodels", 5],
+    ]);
+
+    // A trailing home leaves an empty final frame. That read as "the binary may not have
+    // launched", which is a false cause for a stream that had just stated a quota.
+    const trailing = parseUsageOutput("claude", "Currentweek(allmodels)\n41%used" + HOME, now);
+    expect(trailing.ok, trailing.ok ? "" : trailing.error).toBe(true);
+    if (!trailing.ok) return;
+    expect(trailing.buckets[0]?.remainingPercent).toBe(59);
+
+    // A TUI redrawing a bar in place emits the stale figure, CR, then the fresh one. Because
+    // `stripTerminal` turns CR into a newline, both survive as lines — and the first won.
+    const redrawn = parseUsageOutput("claude", "Currentweek(allmodels)\n0%used" + CR + "41%used", now);
+    expect(redrawn.ok, redrawn.ok ? "" : redrawn.error).toBe(true);
+    if (!redrawn.ok) return;
+    expect(redrawn.buckets[0]?.remainingPercent).toBe(59);
+
+    // A window nested under its parent was dropped, so routing saw the parent's 41 and never
+    // the child's 12 — the tighter constraint, and the one that should govern.
+    const nested = parseUsageOutput("claude", "Current week\nall models 41% remaining\nFable 12% remaining", now);
+    expect(nested.ok, nested.ok ? "" : nested.error).toBe(true);
+    if (!nested.ok) return;
+    expect(nested.buckets.map((bucket) => bucket.remainingPercent)).toEqual([12]);
+
+    // Two labels then two figures: the nearer label took the other window's number and the
+    // second figure was discarded, reporting 88 for a bar that said 41% used.
+    const interleaved = parseUsageOutput("claude", "Currentweek(Fable)\nCurrentweek(allmodels)\n12%used\n41%used", now);
+    expect(interleaved.ok, interleaved.ok ? "" : interleaved.error).toBe(true);
+    if (!interleaved.ok) return;
+    expect(interleaved.buckets.map((bucket) => bucket.remainingPercent)).toEqual([59]);
+  });
+
+  it("refuses a line that states both senses of one window rather than picking one", () => {
+    // Squeezing removed the spaces, so `41% used 80% remaining` arrived as one token and the
+    // old word boundary skipped `used` — reporting 80 for a window with 59 left. The two
+    // figures contradict each other, so neither is evidence.
+    const contradictory = parseUsageOutput("claude", "weekly: 41% used 80% remaining", clock().nowIso());
+    expect(contradictory.ok).toBe(false);
+    if (contradictory.ok) return;
+    expect(contradictory.error).toContain("duplicate quota-window labels");
+  });
+
   it("still refuses a trust prompt raised in an earlier frame", () => {
     // The refusal has to see the whole stream. A prompt that appeared and was repainted over
     // is still a failed observation — narrowing the check to the current frame would trade a
