@@ -91,10 +91,19 @@ The last push is expected to fail. If it succeeds, the ruleset is not matching `
 
 Only if rulesets are unavailable. Repeat for `dev`.
 
+`checks` with an `app_id`, not `contexts`. The two are not interchangeable: `contexts` names a
+check and accepts it from whatever reported it, which is the exact hole the section below
+describes — and this is the block someone copies. It read `"contexts": ["verify"]` until
+2026-08-18, so a deployment set up from the fallback path was protected by a name while the
+ruleset path next to it was pinned to an app.
+
 ```bash
 cat > /tmp/acp-protection.json <<'JSON'
 {
-  "required_status_checks": { "strict": true, "contexts": ["verify"] },
+  "required_status_checks": {
+    "strict": true,
+    "checks": [{ "context": "verify", "app_id": 15368 }]
+  },
   "enforce_admins": true,
   "required_pull_request_reviews": {
     "dismiss_stale_reviews": true,
