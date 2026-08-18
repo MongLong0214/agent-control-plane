@@ -15,6 +15,8 @@ import {
   parseNonInteractiveUsage,
   parseResetWallClock,
   CodexUsageCollector,
+  SpawnCodexRateLimitProbe,
+  type CodexRateLimitProbe,
   GrokUsageCollector,
   parseUsageOutput,
   ExpectUsageTerminal,
@@ -249,6 +251,158 @@ describe("non-interactive account usage (#582)", () => {
     expect(args).not.toContain("--bare");
     expect(args.join(" ")).not.toMatch(/token|key|credential/iu);
   });
+});
+
+describe("Codex account rate limits (#582)", () => {
+  // Captured live from `codex app-server --stdio` → account/rateLimits/read on this host.
+  const LIVE = {
+    rateLimits: {
+      limitId: "codex",
+      primary: { usedPercent: 100, windowDurationMins: 10080, resetsAt: 1787196559 },
+      secondary: null,
+      credits: { hasCredits: false, unlimited: false, balance: "0" },
+      planType: "pro",
+      rateLimitReachedType: "rate_limit_reached",
+    },
+  };
+
+  const probeReturning = (payload: unknown): CodexRateLimitProbe => ({ read: async () => payload });
+
+  it("states an exhausted account as exhausted, with the window it names", async () => {
+    const reading = await new CodexUsageCollector({
+      clock: clock(),
+      binary: "codex",
+      codexRateLimits: probeReturning(LIVE),
+    }).collect();
+
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    expect(reading.source).toMatch(/^account-rate-limits:gpt;/u);
+    expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 0]]);
+  });
+
+  it("reads the snapshot whether or not it is nested", async () => {
+    // This build nests it under `rateLimits`; earlier shapes state it at the top level.
+    const flat = await new CodexUsageCollector({
+      clock: clock(),
+      binary: "codex",
+      codexRateLimits: probeReturning(LIVE.rateLimits),
+    }).collect();
+    expect(flat.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 0]]);
+  });
+
+  it("lets a stated block outrank the percentage printed beside it", async () => {
+    // The account can report a healthy-looking percentage and a reached limit in one payload.
+    // Reading only the number dispatches into a block the account has already declared.
+    const reading = await new CodexUsageCollector({
+      clock: clock(),
+      binary: "codex",
+      codexRateLimits: probeReturning({
+        primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: 1787196559 },
+        rateLimitReachedType: "workspace_owner_credits_depleted",
+      }),
+    }).collect();
+
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["5h", 0]]);
+  });
+
+  it("treats an absent window as unknown rather than as unlimited", async () => {
+    // `primary: null` is what the app-server returns when the last turn carried no limit
+    // information — this machine's freshest session file has exactly that. Reading it as full
+    // quota is the failure this source replaces.
+    for (const payload of [{ primary: null }, {}, null, { primary: { usedPercent: "n/a" } }]) {
+      const reading = await new CodexUsageCollector({
+        clock: clock(),
+        binary: "codex",
+        codexRateLimits: probeReturning(payload),
+      }).collect();
+      expect(reading.sensorHealth, JSON.stringify(payload)).toBe("ERROR");
+      expect(reading.buckets).toEqual([]);
+    }
+  });
+
+  it("pins CODEX_HOME in the environment it spawns, not merely in what it passes along", async () => {
+    // The earlier version of this test injected a fake probe and asserted the *collector*
+    // handed the pinned home to it. That says nothing about whether the spawn uses it, and
+    // mutating the env construction left it green. This drives the real probe.
+    const root = tempDir("acp-codex-home-");
+    const binary = join(root, "codex-home-echo.mjs");
+    writeFileSync(
+      binary,
+      `#!${process.execPath}\n` +
+        `process.stdout.write(JSON.stringify({ id: 0, result: {} }) + "\\n");\n` +
+        `process.stdin.on("data", () => {\n` +
+        `  process.stdout.write(JSON.stringify({ id: 1, result: { primary: { usedPercent: 0, windowDurationMins: 60, resetsAt: 1 }, seen: process.env.CODEX_HOME } }) + "\\n");\n` +
+        `});\n` +
+        `setInterval(() => {}, 1000);\n`,
+    );
+    chmodSync(binary, 0o700);
+
+    const previous = process.env["CODEX_HOME"];
+    process.env["CODEX_HOME"] = "/inherited/wrong/home";
+    let seen: unknown;
+    try {
+      seen = await new SpawnCodexRateLimitProbe().read({
+        binary,
+        timeoutMs: 8_000,
+        codexHome: "/pinned/codex/home",
+      });
+    } finally {
+      if (previous === undefined) delete process.env["CODEX_HOME"];
+      else process.env["CODEX_HOME"] = previous;
+    }
+
+    expect((seen as { seen?: string }).seen).toBe("/pinned/codex/home");
+  });
+
+  it("notices a process that died even while a descendant still holds its pipe", async () => {
+    // `exit` fires when the process ends; `close` waits for the pipes, which a detached
+    // grandchild can hold open indefinitely. Listening on `close` turns a dead server into a
+    // full-timeout wait — the same shape as the hang this probe exists to avoid, arrived at
+    // from the other side.
+    const root = tempDir("acp-codex-orphan-");
+    const binary = join(root, "codex-orphan.mjs");
+    writeFileSync(
+      binary,
+      `#!${process.execPath}\n` +
+        `import { spawn } from "node:child_process";\n` +
+        `spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: ["ignore", "inherit", "ignore"], detached: true }).unref();\n` +
+        `process.exit(0);\n`,
+    );
+    chmodSync(binary, 0o700);
+
+    const started = Date.now();
+    const reading = await new CodexUsageCollector({ clock: clock(), binary, timeoutMs: 8_000 }).collect();
+    const elapsed = Date.now() - started;
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    // Fast, and named for what happened — not the timeout's message.
+    expect(elapsed).toBeLessThan(4_000);
+    expect(reading.error).toContain("exited before answering");
+  }, 20_000);
+
+  it("does not wait for a server that never exits", async () => {
+    // The measured hang: the answer arrives in about two seconds and the process then lives on.
+    // Awaiting exit or close is an unbounded wait inside `Daemon.start()`.
+    const root = tempDir("acp-codex-live-");
+    const binary = join(root, "codex-forever.mjs");
+    writeFileSync(
+      binary,
+      `#!${process.execPath}\n` +
+        `process.stdout.write(JSON.stringify({ id: 0, result: {} }) + "\\n");\n` +
+        `process.stdin.on("data", () => {\n` +
+        `  process.stdout.write(JSON.stringify({ id: 1, result: { primary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 1787196559 } } }) + "\\n");\n` +
+        `});\n` +
+        `setInterval(() => {}, 1000);\n`,
+    );
+    chmodSync(binary, 0o700);
+
+    const started = Date.now();
+    const reading = await new CodexUsageCollector({ clock: clock(), binary, timeoutMs: 8_000 }).collect();
+    expect(Date.now() - started).toBeLessThan(6_000);
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 60]]);
+  }, 20_000);
 });
 
 describe("interactive provider usage collectors", () => {
