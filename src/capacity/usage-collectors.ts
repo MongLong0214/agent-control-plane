@@ -568,8 +568,12 @@ export interface GrokBillingProbe {
 
 const GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 
-/** The bearer, wherever the CLI's auth file currently keeps it. */
-const grokBearer = (authPath: string): string | null => {
+/**
+ * The bearer, wherever the CLI's auth file currently keeps it. Exported so the choice it makes
+ * can be tested: a file can carry several `key` fields, and picking the wrong one sends a
+ * request that fails for a reason nothing here would explain.
+ */
+export const grokBearer = (authPath: string): string | null => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(authPath, "utf8"));

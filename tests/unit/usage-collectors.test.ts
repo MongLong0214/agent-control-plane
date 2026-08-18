@@ -18,6 +18,7 @@ import {
   SpawnCodexRateLimitProbe,
   type CodexRateLimitProbe,
   GrokUsageCollector,
+  grokBearer,
   type GrokBillingProbe,
   parseUsageOutput,
   ExpectUsageTerminal,
@@ -508,6 +509,61 @@ describe("Grok subscription billing (#582)", () => {
     expect(recorded).not.toContain(secret);
     expect(recorded).not.toContain("Bearer");
   });
+
+  it("reports a missing credential through the real probe, not an injected one", async () => {
+    // Every other test here injects a probe, which means the shipped one — the part that reads
+    // the auth file and makes the request — is never entered. This drives it, stopping before
+    // the network: no credential, no call. The same tests that pass with a fake probe would
+    // pass if the real one threw on its first line.
+    const reading = await new GrokUsageCollector({
+      clock: clock(),
+      binary: "grok",
+      grokAuthPath: join(tempDir("acp-grok-noauth-"), "absent.json"),
+    }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.error).toContain("no usable credential");
+    expect(reading.buckets).toEqual([]);
+  });
+
+  it("picks the credential, not the first field that happens to be called key", () => {
+    // The file carries several. A short one earlier in the object is an identifier, not a
+    // bearer, and choosing it sends a request that fails for a reason nothing here explains.
+    const root = tempDir("acp-grok-keys-");
+    const authPath = join(root, "auth.json");
+    const credential = "x".repeat(48);
+    writeFileSync(
+      authPath,
+      JSON.stringify({ meta: { key: "abc" }, entry: { oidc_client_id: "cli", key: credential } }),
+      { mode: 0o600 },
+    );
+
+    expect(grokBearer(authPath)).toBe(credential);
+    expect(grokBearer(join(root, "absent.json"))).toBeNull();
+  });
+
+  it("finds the bearer wherever the CLI's auth file nests it", async () => {
+    const root = tempDir("acp-grok-auth-");
+    const authPath = join(root, "auth.json");
+    // Nested the way the CLI writes it, and deliberately beside a short value that must not be
+    // mistaken for a credential.
+    writeFileSync(
+      authPath,
+      JSON.stringify({ version: 2, entry: { oidc_client_id: "short", key: "x".repeat(40) } }),
+      { mode: 0o600 },
+    );
+
+    // Reaching the network is the proof it got a bearer: without one it refuses before calling.
+    const reading = await new GrokUsageCollector({
+      clock: clock(),
+      binary: "grok",
+      timeoutMs: 1,
+      grokAuthPath: authPath,
+    }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.error, reading.error ?? "").not.toContain("no usable credential");
+  }, 20_000);
 
   it("says plainly that an expired credential is the CLI's to renew", async () => {
     const reading = await new GrokUsageCollector({
