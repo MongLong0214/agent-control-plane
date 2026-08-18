@@ -382,6 +382,20 @@ export const startOperatorSocket = async (
   };
 };
 
+/**
+ * The listener a parked daemon serves. It is the operator socket with the Hermes bootstrap
+ * extension withheld: `bootstrap.hermes` constitutes CEO (`hermes-bootstrap.ts`), which is not
+ * something a daemon that has not passed its startup doctor may hand out. Every other
+ * restriction is the daemon's — `BOOTSTRAP_OPERATOR_METHODS` decides what a parked daemon
+ * answers, so the transport never becomes a second, divergent opinion about what is admitted.
+ */
+export const startBootstrapOperatorDoor = (
+  daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
+  stateDir: string,
+  credential: LocalOperatorCredential,
+  options: Omit<LocalOperatorSocketOptions, "bootstrapHermes"> = {},
+): Promise<LocalOperatorListener> => startOperatorSocket(daemon, stateDir, credential, options);
+
 const startMcpSocket = async (
   path: string,
   token: string,
@@ -1213,7 +1227,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   const daemon = cp.createDaemon({ stateDir, buzz });
 
-  const started = await daemon.start();
+  const started = await daemon.start({
+    bootstrapDoor: () =>
+      startBootstrapOperatorDoor(
+        daemon,
+        stateDir,
+        { token: operatorToken, peerId: `cli:${operatorActor}`, actor: operatorActor },
+        { mcpToken },
+      ),
+  });
   if (!started.allowed) {
     process.stderr.write(`${JSON.stringify(started, null, 2)}\n`);
     process.stderr.write(

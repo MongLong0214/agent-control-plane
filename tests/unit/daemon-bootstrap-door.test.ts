@@ -1,0 +1,331 @@
+import { createConnection } from "node:net";
+
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import {
+  BOOTSTRAP_OPERATOR_METHODS,
+  canParkForBootstrap,
+  Daemon,
+  OPERATOR_METHOD,
+} from "../../src/daemon/daemon.ts";
+import { startBootstrapOperatorDoor } from "../../src/daemon/agentcpd.ts";
+import type { Decision } from "../../src/core/errors.ts";
+import type { AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
+import type { DoctorReport, Finding } from "../../src/doctor/doctor.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { makeHarness, TEST_MCP_TOKEN, TEST_OPERATOR_TOKEN } from "../helpers/harness.ts";
+
+afterAll(cleanupTempDirs);
+
+const PEER: AuthenticatedOperatorPeer = {
+  channel: "cli",
+  peerId: "cli:fixture-operator",
+  actor: "fixture-operator",
+  incarnation: "incarnation-1",
+};
+
+const finding = (code: string, scope: string): Finding => ({
+  code,
+  severity: "CRITICAL",
+  scope,
+  blocking: true,
+  confidence: "HIGH",
+  observedEvidence: {},
+  recommendedAction: "record a capacity observation",
+});
+
+const COVERAGE = finding("ROLE_COVERAGE_NO_VALID_COVERAGE", "continuity");
+const CREDENTIAL = finding("TRUSTED_GATE_CREDENTIAL_MISSING", "github");
+
+const report = (status: DoctorReport["status"], findings: readonly Finding[]): DoctorReport => ({
+  scope: "system",
+  target: null,
+  status,
+  findings: [...findings],
+  ranAt: "2026-08-12T00:00:00.000Z",
+});
+
+/**
+ * The doctor is stubbed rather than driven into a real uncovered state: what is under test is
+ * which branch `start()` takes for a given finding set, so the finding set has to be the input.
+ */
+const makeDaemon = (statuses: readonly DoctorReport[]) => {
+  const harness = makeHarness();
+  harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+  let call = 0;
+  const doctor = vi
+    .spyOn(harness.cp.doctor, "run")
+    .mockImplementation(async () => statuses[Math.min(call++, statuses.length - 1)]!);
+  const stateDir = tempDir("acp-bootstrap-door-");
+  return { harness, daemon: new Daemon(harness.cp, { stateDir }), stateDir, doctor };
+};
+
+/** A door that records its own lifecycle: the daemon must open exactly one and close it. */
+const recordingDoor = () => {
+  const opened: string[] = [];
+  const closed: string[] = [];
+  return {
+    opened,
+    closed,
+    open: async () => {
+      opened.push("open");
+      return { close: async () => void closed.push("close") };
+    },
+  };
+};
+
+const observe = (daemon: Daemon) =>
+  daemon.handleOperatorRequest(
+    {
+      requestId: "req-observe",
+      method: OPERATOR_METHOD.CAPACITY_OBSERVE,
+      params: {
+        provider: "scripted",
+        payload: {
+          observedAt: "2026-08-12T00:00:00.000Z",
+          buckets: [
+            {
+              id: "fixture-window",
+              remainingPercent: 90,
+              resetAt: null,
+              capabilities: ["ceo", "cto", "blind-review", "worker"],
+            },
+          ],
+        },
+      },
+    },
+    PEER,
+  );
+
+/** One request, one response, one connection — the operator protocol as the socket serves it. */
+const operatorLine = (socketPath: string, request: Record<string, unknown>): Promise<Record<string, unknown>> =>
+  new Promise((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    let received = "";
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("operator socket test timed out"));
+    }, 5_000);
+    socket.setEncoding("utf8");
+    socket.once("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      if (!received.includes("\n")) return;
+      clearTimeout(timeout);
+      socket.end();
+      resolve(JSON.parse(received.trim()) as Record<string, unknown>);
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+
+/** Narrows a decision at the point of use so a denial fails the test rather than the compiler. */
+const allowedValue = (decision: Decision<unknown>): unknown => {
+  if (!decision.allowed) throw new Error(`expected an allowed decision, got ${decision.reasonCode}`);
+  return decision.value;
+};
+
+const status = (daemon: Daemon) =>
+  daemon.handleOperatorRequest(
+    { requestId: "req-status", method: OPERATOR_METHOD.DAEMON_STATUS, params: {} },
+    PEER,
+  );
+
+describe("#568: the documented capacity remedy is reachable in the state that needs it", () => {
+  it("parks with the lock still held instead of releasing it and exiting", async () => {
+    const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])]);
+    const door = recordingDoor();
+
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    // The park is only useful if the door is reachable *while* it is parked, so the assertion
+    // has to happen before start() settles rather than after.
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    expect(daemon.lock.held()).toBe(true);
+    expect(allowedValue(await status(daemon))).toMatchObject({
+      mode: "BOOTSTRAP",
+      blockingFindings: [{ code: "ROLE_COVERAGE_NO_VALID_COVERAGE" }],
+    });
+
+    expect((await observe(daemon)).allowed).toBe(true);
+    const started = await starting;
+    expect(started.allowed).toBe(true);
+    // Closed before promotion returns: the real operator socket binds the same path.
+    expect(door.closed).toHaveLength(1);
+    expect(allowedValue(await status(daemon))).toMatchObject({ mode: "NORMAL", blockingFindings: [] });
+    await daemon.stop();
+  });
+
+  it("refuses every method the parked door does not exist for", async () => {
+    const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE])]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    // Owner approval is the human gate and repair execution is destructive. Reaching either in
+    // the state the doctor has just refused to pass is a larger loss than the door is a gain.
+    for (const method of [
+      OPERATOR_METHOD.OWNER_APPROVE,
+      OPERATOR_METHOD.REPAIR_EXECUTE,
+      OPERATOR_METHOD.RUN_CANCEL,
+      OPERATOR_METHOD.ACTOR_REGISTER,
+      OPERATOR_METHOD.DOCTOR_RUN,
+    ]) {
+      const refused = await daemon.handleOperatorRequest(
+        { requestId: `req-${method}`, method, params: {} },
+        PEER,
+      );
+      expect(refused.allowed).toBe(false);
+      expect(refused.reasonCode).toBe(ReasonCode.DAEMON_BOOTSTRAP_MODE);
+      expect(refused.evidence).toMatchObject({
+        mode: "BOOTSTRAP",
+        admittedMethods: ["capacity.observe", "daemon.status"],
+      });
+    }
+    expect([...BOOTSTRAP_OPERATOR_METHODS].sort()).toEqual(["capacity.observe", "daemon.status"]);
+
+    await daemon.stop();
+    await starting;
+  });
+
+  it("keeps release-and-exit for a blocking finding no observation could clear", async () => {
+    const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE, CREDENTIAL])]);
+    const door = recordingDoor();
+
+    const started = await daemon.start({ bootstrapDoor: door.open });
+
+    expect(started.allowed).toBe(false);
+    expect(started.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+    expect(door.opened).toHaveLength(0);
+    expect(daemon.lock.held()).toBe(false);
+  });
+
+  it("stays parked, and says so, when the reading lands but coverage is still unroutable", async () => {
+    const { daemon } = makeDaemon([
+      report("BLOCKED", [COVERAGE]),
+      report("BLOCKED", [COVERAGE]),
+      report("HEALTHY", []),
+    ]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    // A write that succeeds is not evidence that dispatch will resume: observeCapacity takes
+    // runtime health from the adapter, so a reading can persist and leave the role uncovered.
+    expect((await observe(daemon)).allowed).toBe(true);
+    await vi.waitFor(async () =>
+      expect(allowedValue(await status(daemon))).toMatchObject({
+        mode: "BOOTSTRAP",
+        blockingFindings: [{ code: "ROLE_COVERAGE_NO_VALID_COVERAGE" }],
+      }),
+    );
+
+    expect((await observe(daemon)).allowed).toBe(true);
+    expect((await starting).allowed).toBe(true);
+    await daemon.stop();
+  });
+
+  it("does not spend the park's wake-up on an observation that was refused", async () => {
+    const { daemon, doctor } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+    expect(doctor).toHaveBeenCalledTimes(1);
+
+    const refused = await daemon.handleOperatorRequest(
+      {
+        requestId: "req-unknown-provider",
+        method: OPERATOR_METHOD.CAPACITY_OBSERVE,
+        params: { provider: "not-registered", payload: { observedAt: "2026-08-12T00:00:00.000Z", buckets: [] } },
+      },
+      PEER,
+    );
+    expect(refused.allowed).toBe(false);
+
+    // Nothing was persisted, so nothing could have changed the doctor's mind. The re-check is
+    // counted rather than raced: waking here runs a second doctor pass, and every dependency in
+    // this fixture is a resolved mock, so one settled macrotask is enough for it to show up.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(doctor).toHaveBeenCalledTimes(1);
+
+    expect((await observe(daemon)).allowed).toBe(true);
+    expect((await starting).allowed).toBe(true);
+    expect(doctor).toHaveBeenCalledTimes(2);
+    await daemon.stop();
+  });
+
+  it("leaves the continuity coordinator uninstalled for as long as it is parked", async () => {
+    const { harness, daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])]);
+    // Install and uninstall both re-attach; they differ in *where* a provider failure is routed.
+    // So the test drives the attached callback rather than counting attachments.
+    const wired: { route: ((reason: string) => unknown) | null } = { route: null };
+    vi.spyOn(harness.cp.capacity, "attach").mockImplementation((wiring) => {
+      wired.route = wiring.providerFailureContinuity?.evaluate ?? wired.route;
+    });
+    const reconcileContinuity = vi.spyOn(daemon, "reconcileContinuity").mockResolvedValue(null);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    // A daemon that has not passed its doctor must not be moving bindings in response to
+    // capacity events. start() installs the coordinator before it reconciles, so the park has
+    // to take it back off rather than merely decline to add it.
+    // Without this the two assertions below would both hold for a route that was never wired.
+    expect(wired.route).not.toBeNull();
+    await wired.route?.("while parked");
+    expect(reconcileContinuity).not.toHaveBeenCalled();
+
+    expect((await observe(daemon)).allowed).toBe(true);
+    expect((await starting).allowed).toBe(true);
+    await wired.route?.("after promotion");
+    expect(reconcileContinuity).toHaveBeenCalledWith("after promotion");
+    await daemon.stop();
+  });
+
+  it("does not park when the caller supplies no door", async () => {
+    const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE])]);
+
+    const started = await daemon.start();
+
+    expect(started.allowed).toBe(false);
+    expect(started.reasonCode).toBe(ReasonCode.DOCTOR_BLOCKED);
+    expect(daemon.lock.held()).toBe(false);
+  });
+
+  it("withholds the Hermes bootstrap extension from the parked door", async () => {
+    const { daemon, stateDir } = makeDaemon([report("HEALTHY", [])]);
+    const listener = await startBootstrapOperatorDoor(
+      daemon,
+      stateDir,
+      { token: TEST_OPERATOR_TOKEN, peerId: "cli:fixture-operator", actor: "fixture-operator" },
+      { mcpToken: TEST_MCP_TOKEN },
+    );
+    try {
+      // bootstrap.hermes constitutes CEO, so the socket a parked daemon serves must not carry it.
+      const refused = await operatorLine(listener.socketPath, {
+        token: TEST_OPERATOR_TOKEN,
+        requestId: "req-hermes",
+        method: "bootstrap.hermes",
+        params: {},
+      });
+      expect(refused).toMatchObject({
+        allowed: false,
+        reasonCode: ReasonCode.OPERATOR_METHOD_NOT_ALLOWED,
+      });
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("is decided by the finding codes, not by how many there are", () => {
+    expect(canParkForBootstrap([COVERAGE])).toBe(true);
+    expect(canParkForBootstrap([COVERAGE, finding("CAPACITY_SENSOR_FAILED", "capacity")])).toBe(true);
+    expect(canParkForBootstrap([CREDENTIAL])).toBe(false);
+    expect(canParkForBootstrap([COVERAGE, CREDENTIAL])).toBe(false);
+    // A blocked doctor with no blocking finding is blocked for a reason this door cannot read.
+    expect(canParkForBootstrap([])).toBe(false);
+  });
+});

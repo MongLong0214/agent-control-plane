@@ -65,6 +65,17 @@ export interface DaemonOptions {
   crashLoopThreshold?: number;
 }
 
+/**
+ * The doctor finding, reduced to what a caller outside the daemon can act on. The daemon
+ * decides whether to park on the *codes* of the blocking findings, so they have to survive
+ * `reconcile()` rather than being collapsed into `doctorStatus` alone.
+ */
+export interface BlockingFinding {
+  code: string;
+  severity: string;
+  scope: string;
+}
+
 export interface ReconcileReport {
   activeBindings: number;
   resumedRuns: string[];
@@ -75,6 +86,7 @@ export interface ReconcileReport {
   reclaimedFinalizationAttempts: ReclaimedFinalizationAttempt[];
   resumedFinalizations: string[];
   doctorStatus: string;
+  blockingFindings: BlockingFinding[];
 }
 
 /** Methods exposed by the authenticated local operator socket. */
@@ -115,6 +127,50 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.ACTOR_REGISTER,
   OPERATOR_METHOD.ACTOR_UNREGISTER,
 ]);
+
+/**
+ * The method set a *parked* daemon admits, and nothing else. A parked daemon has not passed
+ * its startup doctor, so the full operator surface is not merely unnecessary here — it is
+ * unsafe: `OWNER_APPROVE` is the human gate, `REPAIR_EXECUTE` is destructive, and the socket's
+ * `bootstrap.hermes` extension constitutes CEO. The two admitted methods are the remedy
+ * (`capacity.observe`, which writes a reading and touches no dispatch, run or lock state) and
+ * the means to see that the remedy has not yet worked (`daemon.status`).
+ */
+export const BOOTSTRAP_OPERATOR_METHODS: ReadonlySet<OperatorMethod> = new Set([
+  OPERATOR_METHOD.CAPACITY_OBSERVE,
+  OPERATOR_METHOD.DAEMON_STATUS,
+]);
+
+/**
+ * Park only for what an operator's capacity observation could actually clear. A parked daemon
+ * is a weaker state than a stopped one, so it must not be reachable for a blocking finding
+ * that no reading can answer — those keep the release-and-exit path unchanged.
+ *
+ * An empty list never parks: `start()` only consults this when the doctor blocked, so no
+ * blocking findings means the status came from somewhere this door cannot reach.
+ */
+export const canParkForBootstrap = (blockingFindings: readonly BlockingFinding[]): boolean =>
+  blockingFindings.length > 0 &&
+  blockingFindings.every(
+    (finding) => finding.code.startsWith("ROLE_COVERAGE_") || finding.code.startsWith("CAPACITY_"),
+  );
+
+/**
+ * `BOOTSTRAP` is a daemon that holds its lock and serves the capacity door while its startup
+ * doctor still blocks dispatch. It is on the wire because `capacity.observe` returning OK is
+ * not on its own evidence that dispatch will resume — the reading may land and leave coverage
+ * unroutable, and an operator who cannot tell those apart has had the failure moved, not closed.
+ */
+export type DaemonMode = "NORMAL" | "BOOTSTRAP";
+
+/** A door the daemon can open while parked and must be able to close before promoting. */
+export interface BootstrapDoor {
+  close: () => Promise<void>;
+}
+
+export interface DaemonStartOptions {
+  bootstrapDoor?: () => Promise<BootstrapDoor>;
+}
 
 export interface OperatorRequest {
   requestId: string;
@@ -177,6 +233,9 @@ export class Daemon {
   readonly lock: SingleInstanceLock;
   #timers: NodeJS.Timeout[] = [];
   #startedAt: string | null = null;
+  #mode: DaemonMode = "NORMAL";
+  #bootstrapBlocking: BlockingFinding[] = [];
+  #bootstrapWaiters: Array<(reason: "OBSERVED" | "ABANDONED") => void> = [];
   #timerFailures = new Map<string, TimerFailure>();
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
@@ -270,6 +329,19 @@ export class Daemon {
         ReasonCode.DAEMON_LOCK_LOST,
         "agentcpd no longer holds the single-instance lock; operator request refused",
         { method: request.method },
+      );
+    }
+
+    if (this.#mode === "BOOTSTRAP" && !BOOTSTRAP_OPERATOR_METHODS.has(request.method)) {
+      return deny(
+        ReasonCode.DAEMON_BOOTSTRAP_MODE,
+        "agentcpd is parked in bootstrap mode and admits only the capacity observation door",
+        {
+          method: request.method,
+          mode: this.#mode,
+          admittedMethods: [...BOOTSTRAP_OPERATOR_METHODS].sort(),
+          blockingFindings: this.#bootstrapBlocking,
+        },
       );
     }
 
@@ -368,8 +440,13 @@ export class Daemon {
         case OPERATOR_METHOD.CAPACITY_SHOW:
           return allow(ReasonCode.OK, { providers: this.cp.capacity.all() });
 
-        case OPERATOR_METHOD.CAPACITY_OBSERVE:
-          return this.observeCapacity(request.params, peer);
+        case OPERATOR_METHOD.CAPACITY_OBSERVE: {
+          const observed = await this.observeCapacity(request.params, peer);
+          // Only a reading that was actually persisted can change the doctor's mind, so a
+          // denied observation must not consume the park's wake-up.
+          if (observed.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");
+          return observed;
+        }
 
         case OPERATOR_METHOD.PROJECT_LIST:
           return allow(
@@ -422,6 +499,10 @@ export class Daemon {
             lock: this.lock.read(),
             databasePath: this.cp.config.databasePath,
             health: readJson(join(this.options.stateDir, "health.json")),
+            mode: this.#mode,
+            admittedMethods:
+              this.#mode === "BOOTSTRAP" ? [...BOOTSTRAP_OPERATOR_METHODS].sort() : null,
+            blockingFindings: this.#mode === "BOOTSTRAP" ? this.#bootstrapBlocking : [],
           });
       }
     } catch (error) {
@@ -629,7 +710,12 @@ export class Daemon {
     return allow(ReasonCode.OK, { project: project.value, repository: repository.value });
   }
 
-  async start(): Promise<Decision<ReconcileReport>> {
+  /**
+   * `options.bootstrapDoor` is supplied by the process that owns socket plumbing, not built
+   * here: the daemon decides *whether* a parked door is admissible, the caller decides what a
+   * door is. Omitting it keeps the historical behaviour exactly — deny, release, exit.
+   */
+  async start(options: DaemonStartOptions = {}): Promise<Decision<ReconcileReport>> {
     const startedAt = this.cp.clock.nowIso();
     const acquired = this.lock.acquire(startedAt);
     if (!acquired.allowed) {
@@ -660,17 +746,31 @@ export class Daemon {
     try {
       this.installContinuityCoordinator();
       await this.refreshCapacitySensors();
-      const report = await this.reconcile();
+      let report = await this.reconcile();
       this.writeHealth(report);
 
       if (report.doctorStatus === "BLOCKED" || report.doctorStatus === "ERROR") {
         const reasonCode =
           report.doctorStatus === "BLOCKED" ? ReasonCode.DOCTOR_BLOCKED : ReasonCode.DOCTOR_ERROR;
-        this.recordStartupFailure(reasonCode, { reconcile: report });
-        this.uninstallContinuityCoordinator();
-        this.lock.release();
-        this.#startedAt = null;
-        return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
+
+        if (options.bootstrapDoor && canParkForBootstrap(report.blockingFindings)) {
+          const promoted = await this.parkForBootstrap(report, options.bootstrapDoor);
+          if (promoted) {
+            report = promoted;
+          } else {
+            this.recordStartupFailure(reasonCode, { reconcile: report });
+            this.uninstallContinuityCoordinator();
+            this.lock.release();
+            this.#startedAt = null;
+            return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
+          }
+        } else {
+          this.recordStartupFailure(reasonCode, { reconcile: report });
+          this.uninstallContinuityCoordinator();
+          this.lock.release();
+          this.#startedAt = null;
+          return deny(reasonCode, "startup doctor did not permit dispatch resume", { reconcile: report });
+        }
       }
 
       report.resumedRuns = await this.resumeQueuedRuns();
@@ -739,6 +839,9 @@ export class Daemon {
       reclaimedFinalizationAttempts,
       resumedFinalizations: [],
       doctorStatus: report.status,
+      blockingFindings: report.findings
+        .filter((finding) => finding.blocking)
+        .map((finding) => ({ code: finding.code, severity: finding.severity, scope: finding.scope })),
     };
   }
 
@@ -1069,6 +1172,8 @@ export class Daemon {
       startedAt: this.#startedAt,
       at: this.cp.clock.nowIso(),
       continuityMode: this.cp.continuity.mode(),
+      mode: this.#mode,
+      blockingFindings: this.#bootstrapBlocking,
       lockHeld: this.lock.held(),
       runs: {
         queued: this.cp.runs.list({ state: RunState.QUEUED }).length,
@@ -1183,7 +1288,81 @@ export class Daemon {
     return { failures, backoffSeconds: failures === 0 ? 0 : Math.min(300, 2 ** failures) };
   }
 
+  /**
+   * Hold the lock, serve only the capacity door, and re-run the doctor after each observation
+   * that lands. Returns the promoting report, or null if the park was abandoned.
+   *
+   * Parking rather than exiting is the whole point. The exit path increments the shared
+   * crash-loop record and a later attempt meets DAEMON_ALREADY_RUNNING, so an operator
+   * applying the documented remedy between two exits would be answering a daemon that then
+   * refuses to start for an unrelated reason. No release and no exit also means the invariant
+   * a live socket implies a held lock is preserved rather than restated: `executeOperatorRequest`
+   * still refuses everything when `lock.held()` is false, parked or not.
+   *
+   * The continuity coordinator stays uninstalled for the whole park. A parked daemon has not
+   * passed its doctor, so it must not be reacting to capacity events by moving bindings.
+   */
+  private async parkForBootstrap(
+    blocked: ReconcileReport,
+    open: () => Promise<BootstrapDoor>,
+  ): Promise<ReconcileReport | null> {
+    this.uninstallContinuityCoordinator();
+    this.#mode = "BOOTSTRAP";
+    this.#bootstrapBlocking = blocked.blockingFindings;
+    this.writeHealth(blocked);
+    this.cp.audit.record({
+      kind: "DAEMON_BOOTSTRAP_PARKED",
+      reasonCode: ReasonCode.DAEMON_BOOTSTRAP_MODE,
+      evidence: {
+        pid: process.pid,
+        blockingFindings: blocked.blockingFindings,
+        admittedMethods: [...BOOTSTRAP_OPERATOR_METHODS].sort(),
+      },
+    });
+
+    let door: BootstrapDoor | null = null;
+    try {
+      door = await open();
+      for (;;) {
+        const wake = await new Promise<"OBSERVED" | "ABANDONED">((resolve) => {
+          this.#bootstrapWaiters.push(resolve);
+        });
+        if (wake === "ABANDONED") return null;
+
+        const rechecked = await this.reconcile();
+        if (rechecked.doctorStatus !== "BLOCKED" && rechecked.doctorStatus !== "ERROR") {
+          this.cp.audit.record({
+            kind: "DAEMON_BOOTSTRAP_PROMOTED",
+            evidence: { pid: process.pid, doctorStatus: rechecked.doctorStatus },
+          });
+          // Only here: an abandoned park is followed by stop(), which has already uninstalled.
+          this.installContinuityCoordinator();
+          return rechecked;
+        }
+        // Still blocked. An observation can land and leave coverage unroutable, which is
+        // exactly the case daemon.status has to keep reporting rather than resolving.
+        this.#bootstrapBlocking = rechecked.blockingFindings;
+        this.writeHealth(rechecked);
+      }
+    } finally {
+      this.#mode = "NORMAL";
+      this.#bootstrapBlocking = [];
+      this.#bootstrapWaiters = [];
+      // The door closes before this returns, on both exits. The promoting caller opens the
+      // real operator socket on the same path, and an abandoned park must not leave a
+      // restricted listener behind a released lock.
+      await door?.close();
+    }
+  }
+
+  private wakeBootstrap(reason: "OBSERVED" | "ABANDONED"): void {
+    const waiters = this.#bootstrapWaiters;
+    this.#bootstrapWaiters = [];
+    for (const waiter of waiters) waiter(reason);
+  }
+
   async stop(): Promise<void> {
+    this.wakeBootstrap("ABANDONED");
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
     this.uninstallContinuityCoordinator();
