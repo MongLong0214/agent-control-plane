@@ -329,7 +329,14 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     );
     expect(sectioned.ok, sectioned.ok ? "" : sectioned.error).toBe(true);
     if (!sectioned.ok) return;
-    expect(sectioned.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+    // Asserted in full rather than by lookup: naming the section makes it a window, and the
+    // figure under it becomes that window's. Stated so it is visible — it lands at 3, which is
+    // above the exhaustion floor of 2, so it moves the provider to CONSERVE and does not make
+    // any role unroutable.
+    expect(sectioned.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+      ["token-activity-last-12-months", 3],
+    ]);
 
     // A reset is a horizon. It neither borrows nor names a window, even carrying a sense word.
     const reset = parseUsageOutput(
@@ -356,6 +363,76 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(walked.ok, walked.ok ? "" : walked.error).toBe(true);
     if (!walked.ok) return;
     expect(walked.buckets[0]?.remainingPercent).toBe(3);
+  });
+
+  it("takes the figure on the line that ends a borrow, and not the stale one before it", () => {
+    // Deciding whether a borrow survives BEFORE taking the line's own figures drops the figure
+    // on that very line — and that line is often the freshest. Every case here left the stale
+    // number standing, which is the over-reporting direction this whole change exists to close.
+    const now = clock().nowIso();
+    const CR = String.fromCharCode(13);
+
+    // A repaint whose bar and horizon share a row. `(Asia/Seoul)` is the live horizon spelling.
+    const withHorizon = parseUsageOutput(
+      "claude",
+      "Currentweek(allmodels)\n0%used" + CR + "41%used (Asia/Seoul)",
+      now,
+    );
+    expect(withHorizon.ok, withHorizon.ok ? "" : withHorizon.error).toBe(true);
+    if (!withHorizon.ok) return;
+    expect(withHorizon.buckets[0]?.remainingPercent).toBe(59);
+
+    // A unit after the figure. `min`, `hrs` and `UTC` are three letters; `am` and `pm` are two,
+    // which is why those never showed the fault.
+    for (const trailer of ["15min", "2hrs", "UTC"]) {
+      const united = parseUsageOutput(
+        "claude",
+        ["Currentweek(allmodels)", "80% remaining", `59% remaining ${trailer}`].join("\n"),
+        now,
+      );
+      expect(united.ok, united.ok ? "" : united.error).toBe(true);
+      if (!united.ok) return;
+      expect(united.buckets[0]?.remainingPercent, trailer).toBe(59);
+    }
+  });
+
+  it("does not turn a horizon into a quota window, in the spelling the CLI actually uses", () => {
+    // The exclusion was a word-boundary match, and the live reset has no boundary to find:
+    // `ResetsAug18at9am(Asia/Seoul)`. A horizon that trailed a percentage therefore became a
+    // window — every claude bucket advertises every capability, so that one lands on all four.
+    const now = clock().nowIso();
+    const glued = parseUsageOutput("claude", "ResetsAug18at9am 3% left", now);
+    expect(glued.ok).toBe(false);
+
+    const inSitu = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "Resets Aug18 at 9am 3% left", "Currentweek(Fable)", "12%used"].join("\n"),
+      now,
+    );
+    expect(inSitu.ok, inSitu.ok ? "" : inSitu.error).toBe(true);
+    if (!inSitu.ok) return;
+    expect(inSitu.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+      ["currentweek-fable", 88],
+    ]);
+  });
+
+  it("names a window whose figure is glued to it, because the spaces are what vanish", () => {
+    // The label form was added for `Fable 12% remaining` nested under its parent, and it
+    // required whitespace — so the one new same-line shape died exactly when the spaces did,
+    // and the child's constraint disappeared instead of being read.
+    const glued = parseUsageOutput(
+      "claude",
+      ["Current week", "all models 41% remaining", "Fable12%remaining"].join("\n"),
+      clock().nowIso(),
+    );
+    expect(glued.ok, glued.ok ? "" : glued.error).toBe(true);
+    if (!glued.ok) return;
+    // The name keeps its spaces where the paint had them, so one window is not two ids.
+    expect(glued.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["all-models", 41],
+      ["fable", 12],
+    ]);
   });
 
   it("keeps the empty-stream cause distinct from a screen that stated no quota", () => {

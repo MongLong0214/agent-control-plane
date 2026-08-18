@@ -489,12 +489,18 @@ const parseFrameBuckets = (
   /**
    * A stated percentage plus the word that says which side of the quota it names.
    *
-   * The trailing boundary is `(?![a-z])` rather than `\b`. Squeezing removed the spaces, so
-   * `41% used 80% remaining` arrives as `41%used80%remaining`, where `\b` fails between `d`
-   * and `8` — the first, tighter figure was skipped and the second was reported. A boundary
-   * that only refuses letters keeps `usedup` out while letting a digit follow.
+   * There is no trailing boundary at all. `\b` failed between `d` and `8` in the squeezed
+   * `41%used80%remaining`, skipping the tighter figure and reporting the looser one. Refusing a
+   * following letter fixed that and broke `59% remaining UTC`, which squeezes to
+   * `59%remainingUTC` — the figure vanished and the stale one before it stood.
+   *
+   * Squeezing destroys the word boundaries that would separate `remainingUTC` from `leftover`,
+   * so no rule here can tell them apart. Both are unobserved shapes, and they fail in opposite
+   * directions: dropping a real figure leaves a staler, higher one standing, while reading a
+   * spurious one can only add another candidate to a fold that keeps the minimum. So the
+   * permissive reading is the safe one.
    */
-  const SENSE = /(?<value>\d{1,3}(?:\.\d+)?)%(?<sense>used|remaining|left|available)(?![a-z])/gi;
+  const SENSE = /(?<value>\d{1,3}(?:\.\d+)?)%(?<sense>used|remaining|left|available)/gi;
 
   /**
    * The window a percentage belongs to is not always on its line. Measured on claude 2.1.233,
@@ -520,12 +526,19 @@ const parseFrameBuckets = (
     // Aug 18 at 9am" under this rule, and a horizon is not a quota window. The separator form
     // above is unaffected: `5-hour limit: 62% remaining — resets in 1h 15m` names itself
     // explicitly and is the measured single-line shape.
-    const labelled = /\breset(?:s|ting)?\b/i.test(lines[index]!)
-      ? null
-      : /^(?<window>[A-Za-z][A-Za-z0-9 ._()-]{0,80}?)\s+(?=\d{1,3}(?:\.\d+)?%)/.exec(lines[index]!);
-    if (labelled?.groups?.["window"] && /[A-Za-z]{3}/.test(labelled.groups["window"])) {
-      return labelled.groups["window"];
-    }
+    //
+    // The word-boundary spelling misses the live one. `ResetsAug18at9am(Asia/Seoul)` has no
+    // boundary between `s` and `A`, so `\breset\b` does not see it and that horizon became a
+    // quota window at whatever percentage trailed it. Matched without boundaries instead.
+    if (/reset/i.test(squeezed[index]!)) return null;
+    // Whitespace optional, and read from the original line so the name keeps its spaces.
+    // Requiring a space made the only new same-line form the one that dies exactly when the
+    // spaces do — and this parser exists because a TUI supplies no reliable ones at any width.
+    // Reading the squeezed copy instead would name the same window two ways depending on which
+    // paint kept its spaces, which is the misspelling problem in a new place.
+    const labelled = /^(?<window>[A-Za-z][A-Za-z0-9 ._()-]{0,80}?)\s*(?=\d{1,3}(?:\.\d+)?%)/.exec(lines[index]!);
+    const label = labelled?.groups?.["window"]?.trim();
+    if (label && /[A-Za-z]{3}/.test(label)) return label;
     for (let back = index - 1; back >= 0 && back >= index - 3; back -= 1) {
       const candidate = squeezed[back]!;
       // A line that already carries a percentage belonged to a window too. Returning null here
@@ -561,21 +574,26 @@ const parseFrameBuckets = (
     // window name ends the borrow without starting one: it is somebody else's content, and
     // letting the previous window reach past it is how an unrelated percentage replaced a
     // real figure.
-    const bare = squeezed[index]!.replace(new RegExp(SENSE.source, "gi"), "");
-    if (!own && /[A-Za-z]{3}/.test(bare)) carried = null;
-    // No separate guard for a reset horizon borrowing a window: a reset line carries words of
-    // its own, so the rule above has already ended the borrow. A guard here passed every
-    // mutation, which is what an unreachable one does.
-    const window = own ?? carried;
+    // A reset is a horizon, not a quota statement, so it may not borrow the window above it —
+    // `Resets Aug 18 at 9am — 3% left` would otherwise become a real constraint of 3. A line
+    // that named itself is unaffected: `5-hour limit: 62% remaining — resets in 1h 15m` is the
+    // measured single-line shape and states both. This guard was removed once as unreachable,
+    // which it was only because the borrow used to end before the figure was taken.
+    const window = own ?? (/reset/i.test(squeezed[index]!) ? null : carried);
 
-    SENSE.lastIndex = 0;
-    let match: RegExpExecArray | null;
     // Every stated figure on the line, not the first. One line can carry both senses of the
     // same window, and taking whichever came first is a coin flip on which one is reported.
-    while ((match = SENSE.exec(squeezed[index]!)) !== null) {
-      if (!match.groups) continue;
+    const figures: Array<{ value: number; sense: string }> = [];
+    SENSE.lastIndex = 0;
+    let found: RegExpExecArray | null;
+    while ((found = SENSE.exec(squeezed[index]!)) !== null) {
+      if (!found.groups) continue;
+      figures.push({ value: Number(found.groups["value"]), sense: found.groups["sense"] ?? "" });
+    }
+
+    for (const figure of figures) {
       if (!window) continue;
-      const value = Number(match.groups["value"]);
+      const value = figure.value;
       if (!Number.isFinite(value) || value < 0 || value > 100) {
         return { ok: false, error: `usage window '${window}' has an invalid percentage` };
       }
@@ -583,7 +601,7 @@ const parseFrameBuckets = (
       // or a bare percentage; all three share a missing denominator. Here the window is named
       // in the reading, so `100 - used` is arithmetic on a stated quantity. Applying a stricter
       // rule to `used` than to `remaining` treats the same evidence differently over one word.
-      const measuredAs = /^used$/i.test(match.groups["sense"] ?? "") ? "used" as const : "remaining" as const;
+      const measuredAs = /^used$/i.test(figure.sense) ? "used" as const : "remaining" as const;
       const remainingPercent = measuredAs === "used" ? 100 - value : value;
 
       const resetText = [lines[index] ?? "", lines[index + 1] ?? "", lines[index + 2] ?? ""]
@@ -596,6 +614,14 @@ const parseFrameBuckets = (
         measuredAs,
       });
     }
+
+    // Now decide whether the borrow survives this line — after its own figures were taken, not
+    // before. Deciding first drops the figure on the line that ends the borrow, and that line
+    // is often the freshest: a repaint whose bar and horizon share a row (`41%used
+    // (Asia/Seoul)`), or a figure with a unit after it (`59% remaining 15min`), left the
+    // *stale* number standing. Bar glyphs and the sense tokens themselves are not words.
+    const bare = squeezed[index]!.replace(new RegExp(SENSE.source, "gi"), "");
+    if (!own && /[A-Za-z]{3}/.test(bare)) carried = null;
   }
 
   // A figure with no label of its own is the same window measured again — a redraw that used
