@@ -39,7 +39,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor list                     list registered conversational actors
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
   agentctl bootstrap hermes -- <command>  launch Hermes and establish CEO generation 1
-  agentctl daemon status                  daemon lock (read-only local inspection)
+  agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
 
 export interface OperatorClientOptions {
@@ -92,19 +92,28 @@ export const main = async (argv: string[]): Promise<number> => {
   const owner = rest.includes("--owner");
   const args = rest.filter((arg) => arg !== "--owner");
 
-  // This is deliberately the one offline inspection: it reads lock metadata only and never
-  // opens SQLite. All state and every mutation use the operator socket below.
-  if (command === "daemon" && args[0] === "status") {
-    const lock = new SingleInstanceLock(join(config.databasePath, "..", "agentcpd.lock"));
-    print({ lock: lock.read(), databasePath: config.databasePath });
-    return 0;
-  }
-
   const client = createOperatorClient({
     socketPath:
       process.env["ACP_OPERATOR_SOCKET"] ?? join(config.databasePath, "..", "agentcpd.operator.sock"),
     token: process.env["ACP_OPERATOR_TOKEN"],
   });
+
+  // `daemon status` keeps its offline reading — it must answer when no daemon is running — but
+  // it asks the daemon first. A parked daemon is the one state where the lock file is actively
+  // misleading: it says a process holds the lock, and nothing in it says that process is
+  // serving only the capacity door. `mode` and the remaining blocking findings live on the
+  // socket method, so an inspection that never sends it cannot report the state this exists for.
+  if (command === "daemon" && args[0] === "status") {
+    const live = await client.request("daemon.status", {});
+    if (live.allowed) {
+      print(live.value);
+      return 0;
+    }
+    const lock = new SingleInstanceLock(join(config.databasePath, "..", "agentcpd.lock"));
+    print({ lock: lock.read(), databasePath: config.databasePath, daemonUnreachable: live.reasonCode });
+    return 0;
+  }
+
   return dispatch(client, command, args, owner);
 };
 

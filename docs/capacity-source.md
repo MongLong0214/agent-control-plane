@@ -18,9 +18,12 @@ persisted; its SHA-256 digest is retained in the reading source for audit correl
 
 | Provider | Collector | Normalised capabilities |
 |---|---|---|
-| Claude | `ClaudeUsageCollector` | `cto`, `ceo`, `blind-review`, `worker` |
-| Codex/GPT | `CodexUsageCollector` | `ceo`, `blind-review`, `worker`, `luna-worker` |
-| Grok | `GrokUsageCollector` | `adversarial-review` only |
+| Claude (`claude`) | `ClaudeUsageCollector` | `cto`, `ceo`, `blind-review`, `worker` |
+| Codex/GPT (`gpt`) | `CodexUsageCollector` | `ceo`, `blind-review`, `worker`, `luna-worker` |
+| Grok (`grok`) | `GrokUsageCollector` | `adversarial-review` only |
+
+The parenthesised value is the registered provider id, and it is what `<provider>` below
+must be. `codex` is not a registered id and is refused with `CAPACITY_UNKNOWN_NOT_ROUTABLE`.
 
 Grok is optional diversity only. It never advertises a critical continuity capability and
 its absence does not degrade a required-role coverage plan.
@@ -40,8 +43,14 @@ protects that window until a real reset horizon is observed.
 Use the daemon-owned command only after reading the provider's own usage surface:
 
 ```text
+export ACP_OPERATOR_TOKEN="<the daemon's operator credential>"
 agentctl capacity observe <provider> '<observation-json>'
 ```
+
+`agentctl` is a socket client with no database fallback, so the command needs the daemon's
+`ACP_OPERATOR_TOKEN`. Without it the request is refused with `OPERATOR_UNAUTHENTICATED`
+before it opens a connection. This is the operator credential, not `ACP_MCP_TOKEN`, which
+identifies no peer and is rejected here.
 
 The JSON must contain the provider-reported `observedAt` and non-empty `buckets`. Each
 bucket needs its provider window `id`, the reported `remainingPercent`, `resetAt` (or
@@ -63,7 +72,9 @@ An operator observation is labelled `STALE` after the configured freshness inter
 stale-grace limit (fifteen minutes by default). It is never renewed by reading a file.
 
 While a current operator observation is the newest reading, allocation uses that durable
-reading rather than launching another `/usage` session.
+reading rather than launching another `/usage` session — once the daemon is dispatching. A
+parked daemon (below) allocates nothing, because it has not started its timers and its
+continuity coordinator is deliberately uninstalled.
 
 A later collector refresh that **succeeds** is authoritative and replaces the observation,
 including when its quota is lower — a measurement beats a recollection. A collector
@@ -71,7 +82,8 @@ including when its quota is lower — a measurement beats a recollection. A coll
 distinction is the whole point: an `ERROR` is the absence of a reading, not a reading, and
 on a host whose `/usage` surface needs human interaction it is the answer every time. The
 daemon refreshes collectors every four minutes (`Daemon.refreshCapacitySensors`, and again
-through `ContinuityKernel.evaluate`), so an observation an `ERROR` could overwrite would be
+through `ContinuityKernel.evaluate` once it is dispatching), so an observation an `ERROR`
+could overwrite would be
 erased minutes after it was recorded and nothing would ever dispatch — which is the state
 #424 was filed about.
 
@@ -114,3 +126,45 @@ the collector refused to approve them. No installed CLI exposes remaining quota 
 non-interactively on this host. That is a platform residual: use a provenance-bearing,
 short-lived operator observation until a provider exposes an accepted machine-readable
 quota surface.
+
+## When the daemon has not started yet
+
+The host this fallback exists for is usually the host where the daemon cannot start: with no
+routable reading, every required role is uncovered, the startup doctor blocks on
+`ROLE_COVERAGE_NO_VALID_COVERAGE`, and dispatch does not resume. `agentctl` reaches the
+daemon only over its operator socket, so the remedy has to be reachable before the daemon is
+fully up.
+
+It is. On that block the daemon **parks** rather than exiting: it keeps its single-instance
+lock, leaves its timers and continuity coordinator off, and serves a restricted socket:
+
+```text
+admitted while parked    capacity.observe   daemon.status
+refused while parked     everything else, with reasonCode DAEMON_BOOTSTRAP_MODE
+```
+
+Each observation that lands re-runs the doctor. When it passes, the daemon promotes itself
+in place and opens its ordinary listeners — no restart, and no crash-loop increment for the
+capacity block itself.
+
+**A successful `capacity observe` is not evidence that dispatch resumed.** The daemon derives
+`runtimeHealth` from the adapter's liveness probe, so a reading can persist and still leave
+the role unroutable. Ask the daemon:
+
+```text
+agentctl daemon status
+```
+
+While parked that reports `mode: "BOOTSTRAP"`, the admitted method list, and the blocking
+findings that remain. When it reports `mode: "NORMAL"` the daemon is dispatching. If the
+socket cannot be reached at all the command falls back to the lock file and says so, which
+is not the same answer — a lock file records a live process, not a serving one.
+
+Two limits worth knowing before relying on this:
+
+- **The park only opens for a block an observation could clear.** If any blocking finding is
+  something else — a missing GitHub App credential raises `TRUSTED_GATE_CREDENTIAL_MISSING`,
+  which is also blocking — the daemon takes the ordinary release-and-exit path instead. Fix
+  that finding first; the capacity door would not have helped.
+- **A parked daemon still re-reads its own sensors** on the capacity refresh interval, so a
+  collector that recovers on its own promotes the daemon without anyone running a command.

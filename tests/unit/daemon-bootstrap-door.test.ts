@@ -1,4 +1,6 @@
+import { existsSync } from "node:fs";
 import { createConnection } from "node:net";
+import { join } from "node:path";
 
 import { afterAll, describe, expect, it, vi } from "vitest";
 
@@ -9,6 +11,7 @@ import {
   Daemon,
   OPERATOR_METHOD,
 } from "../../src/daemon/daemon.ts";
+import { createOperatorClient, dispatch, main as cliMain } from "../../src/cli/agentctl.ts";
 import { startBootstrapOperatorDoor } from "../../src/daemon/agentcpd.ts";
 import type { Decision } from "../../src/core/errors.ts";
 import type { AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
@@ -527,6 +530,75 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     expect(daemon.lock.held()).toBe(false);
     expect(door.closed).toHaveLength(1);
     expect(harness.cp.audit.byKind("DAEMON_BOOTSTRAP_ABANDONED")).toHaveLength(1);
+  });
+
+  it("serves the documented CLI command over a real socket while parked", async () => {
+    // Everything above calls handleOperatorRequest directly. The change exists so that
+    // `agentctl capacity observe` works on a host whose /usage cannot be read automatically,
+    // and that claim is about the CLI, the socket and the token — none of which those tests
+    // touch. Without this, the PR's entire justification has no test.
+    const { daemon, stateDir } = makeDaemon([
+      report("BLOCKED", [COVERAGE]),
+      report("BLOCKED", [COVERAGE]),
+      report("HEALTHY", []),
+    ]);
+    const starting = daemon.start({
+      bootstrapDoor: () =>
+        startBootstrapOperatorDoor(
+          daemon,
+          stateDir,
+          { token: TEST_OPERATOR_TOKEN, peerId: "cli:fixture-operator", actor: "fixture-operator" },
+          { mcpToken: TEST_MCP_TOKEN },
+        ),
+    });
+    const socketPath = join(stateDir, "agentcpd.operator.sock");
+    await vi.waitFor(() => expect(existsSync(socketPath)).toBe(true));
+
+    const client = createOperatorClient({ socketPath, token: TEST_OPERATOR_TOKEN });
+    const observation = (remainingPercent: number): string =>
+      JSON.stringify({
+        observedAt: "2026-08-12T00:00:00.000Z",
+        buckets: [
+          {
+            id: "fixture-window",
+            remainingPercent,
+            resetAt: null,
+            capabilities: ["ceo", "cto", "blind-review", "worker"],
+          },
+        ],
+      });
+
+    const printed: string[] = [];
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      printed.push(String(chunk));
+      return true;
+    });
+    let observeCode: number;
+    let statusCode: number;
+    try {
+      // The command an operator is told to run, with the payload capacity-source.md documents.
+      observeCode = await dispatch(client, "capacity", ["observe", "scripted", observation(90)], false);
+      // Still parked: this reading landed and left coverage unroutable, which is precisely the
+      // case the daemon says an operator must be able to tell apart from success.
+      // Through main(), not dispatch(): main() is where `daemon status` used to short-circuit
+      // to a lock-file read, which made dispatch's socket branch unreachable from the CLI.
+      process.env["ACP_OPERATOR_SOCKET"] = socketPath;
+      process.env["ACP_OPERATOR_TOKEN"] = TEST_OPERATOR_TOKEN;
+      statusCode = await cliMain(["daemon", "status"]);
+      await dispatch(client, "capacity", ["observe", "scripted", observation(91)], false);
+    } finally {
+      stdout.mockRestore();
+      delete process.env["ACP_OPERATOR_SOCKET"];
+      delete process.env["ACP_OPERATOR_TOKEN"];
+    }
+
+    expect(observeCode).toBe(0);
+    expect(statusCode).toBe(0);
+    // The designed tell has to be reachable from the same CLI, or the failure has moved rather
+    // than closed. `agentctl daemon status` read only the lock file before this change.
+    expect(printed.join("")).toContain("BOOTSTRAP");
+    expect((await starting).allowed).toBe(true);
+    await daemon.stop();
   });
 
   it("is decided by the finding codes, not by how many there are", () => {
