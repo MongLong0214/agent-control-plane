@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { chmodSync, writeFileSync } from "node:fs";
+import { chmodSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
@@ -19,6 +19,8 @@ import {
   type CodexRateLimitProbe,
   GrokUsageCollector,
   grokBearer,
+  parseCodexRateLimits,
+  parseGrokBilling,
   type GrokBillingProbe,
   parseUsageOutput,
   ExpectUsageTerminal,
@@ -582,6 +584,117 @@ describe("Grok subscription billing (#582)", () => {
     expect(reading.sensorHealth).toBe("ERROR");
     expect(reading.error).toContain("only the CLI can renew it");
   });
+});
+
+describe("capacity review findings (#582)", () => {
+  it("refuses an absent percentage instead of reading it as a full window", () => {
+    // `Number()` maps null, "", [] and false to 0, and a zero used-percentage is a *full*
+    // window. Every one of these reported complete headroom on an account that had stated
+    // nothing — and on Codex those buckets carry ceo and worker.
+    for (const absent of [null, "", [], false, {}, "n/a"]) {
+      expect(parseGrokBilling({ config: { creditUsagePercent: absent } }).ok, JSON.stringify(absent)).toBe(false);
+      expect(
+        parseCodexRateLimits("gpt", { primary: { usedPercent: absent, windowDurationMins: 10080, resetsAt: 1 } }).ok,
+        JSON.stringify(absent),
+      ).toBe(false);
+    }
+    // A real zero is a real statement and must still be read.
+    const zero = parseGrokBilling({ config: { creditUsagePercent: 0 } });
+    expect(zero.ok).toBe(true);
+    if (!zero.ok) return;
+    expect(zero.buckets[0]?.remainingPercent).toBe(100);
+  });
+
+  it("folds two windows of one duration to the lower reading", () => {
+    // Keeping the first discarded a spent secondary behind a healthy primary. Every Codex
+    // bucket carries every Codex capability, so the healthy one alone admitted work.
+    const parsed = parseCodexRateLimits("gpt", {
+      primary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: 1 },
+      secondary: { usedPercent: 95, windowDurationMins: 10080, resetsAt: 1 },
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 5]]);
+  });
+
+  it("folds product names that normalise together, keeping the tightest", () => {
+    // `Grok-Build`, `Grok Build` and `grok_build` are one id. The first won, so the 90% and
+    // 99% used rows vanished behind a 10% one.
+    const parsed = parseGrokBilling({
+      config: {
+        creditUsagePercent: 10,
+        productUsage: [
+          { product: "Grok-Build", usagePercent: 10 },
+          { product: "Grok Build", usagePercent: 90 },
+          { product: "grok_build", usagePercent: 99 },
+        ],
+      },
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["credits", 90],
+      ["grok-build", 1],
+    ]);
+  });
+
+  it("will not read a credential through a symlink, a non-file, or an ambiguous auth file", () => {
+    const root = tempDir("acp-grok-auth-guard-");
+    const write = (name: string, body: unknown): string => {
+      const at = join(root, name);
+      writeFileSync(at, JSON.stringify(body), { mode: 0o600 });
+      return at;
+    };
+
+    // A `~/.grok/auth.json` pointing at another JSON store had its first long `key` sent as
+    // the Authorization header to a third party.
+    const other = write("other-secrets.json", { key: "exfiltrated-other-secret-value-XXXXXXXX" });
+    const link = join(root, "auth-link.json");
+    symlinkSync(other, link);
+    expect(grokBearer(link)).toBeNull();
+
+    // Two credential-shaped values mean this is not the file this code was written for.
+    // Picking either sends a secret somewhere; the earlier one used to win on insertion order.
+    expect(
+      grokBearer(write("two.json", { signing: { key: "pk_test_yyyyyyyyyyyyyyyyyyyyyyyy" }, entry: { key: "xai-real-token-should-not-lose" } })),
+    ).toBeNull();
+
+    // A value carrying CR/LF is quoted back verbatim by fetch's error, which is then recorded
+    // in the reading, mirrored to disk, and served over the operator socket.
+    expect(grokBearer(write("crlf.json", { key: "xai-secret\r\nX-Inject: 1 aaaaaaaaaaaaaaaaaaaa" }))).toBeNull();
+
+    // The ordinary file still works.
+    const credential = "x".repeat(40);
+    expect(grokBearer(write("one.json", { entry: { key: credential } }))).toBe(credential);
+  });
+
+  it("answers a Codex stream whose ids are strings, and ignores an id it did not ask for", async () => {
+    // JSON-RPC ids may be strings. Comparing with === to a number meant a stack echoing "0"
+    // never received the read, and one echoing "1" was never answered — both spent the whole
+    // timeout looking like an unresponsive server.
+    const root = tempDir("acp-codex-strid-");
+    const binary = join(root, "codex-string-ids.mjs");
+    writeFileSync(
+      binary,
+      `#!${process.execPath}\n` +
+        `process.stdout.write(JSON.stringify({ id: 1, result: { primary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1 } } }) + "\\n");\n` +
+        `process.stdout.write(JSON.stringify({ id: "0", result: {} }) + "\\n");\n` +
+        `process.stdin.on("data", () => {\n` +
+        `  process.stdout.write(JSON.stringify({ id: "1", result: { primary: { usedPercent: 95, windowDurationMins: 10080, resetsAt: 1 } } }) + "\\n");\n` +
+        `});\n` +
+        `setInterval(() => {}, 1000);\n`,
+    );
+    chmodSync(binary, 0o700);
+
+    const started = Date.now();
+    const reading = await new CodexUsageCollector({ clock: clock(), binary, timeoutMs: 6_000 }).collect();
+
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    // The stray id:1 printed before the read was sent stated 99 remaining. The answer is the
+    // one that came back after asking.
+    expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 5]]);
+  }, 20_000);
 });
 
 describe("interactive provider usage collectors", () => {
