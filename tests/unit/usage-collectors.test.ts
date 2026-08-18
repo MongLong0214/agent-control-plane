@@ -12,6 +12,7 @@ import {
 import {
   CLAUDE_NON_INTERACTIVE_ARGS,
   ClaudeUsageCollector,
+  parseNonInteractiveUsage,
   parseResetWallClock,
   CodexUsageCollector,
   GrokUsageCollector,
@@ -78,20 +79,52 @@ describe("non-interactive account usage (#582)", () => {
     expect(reading.buckets.every((bucket) => bucket.measuredAs === "used")).toBe(true);
   });
 
-  it("refuses a reading in which a window it could not read has vanished", async () => {
-    // Skipping was worse than misreading: the window disappears and the ones that did parse
-    // route on their own — a spent week beside a fresh session turns SUSPENDED into OPEN.
-    // Widening the pattern to catch those lines then produced something worse still: a lazy
-    // label ate the first digit of its own percentage, so `99% used` became a window named "9"
-    // with 91 remaining. A stated quota that cannot be read now ends the reading.
-    for (const orphan of ["99% used", "· 99% used", "12% used and 30% remaining"]) {
-      const reading = await new ClaudeUsageCollector({
-        clock: clock(),
-        binary: "claude",
-        nonInteractive: probeReturning({ stdout: envelope(["Current session: 12% used", orphan].join("\n")) }),
-      }).collect();
-      expect(reading.sensorHealth, orphan).toBe("ERROR");
-      expect(reading.buckets, orphan).toEqual([]);
+  it("refuses a window-shaped line it cannot read, and steps over prose that merely quotes one", () => {
+    // Two opposite hazards, one boundary. Skipping an unreadable *window* loses a constraint and
+    // lets the survivors route alone. Refusing on any line that mentions a percentage makes a
+    // tip fatal — and a refused reading is no capacity, which is no dispatch, so a parser can
+    // shut the daemon down over a sentence. A window states its figure immediately after a
+    // label separator; prose does not.
+    const now = clock().nowIso();
+    const live = [
+      "Current session: 12% used · resets Aug 18 at 7:49pm (Asia/Seoul)",
+      "Current week (all models): 95% used",
+    ];
+
+    for (const prose of [
+      "You're at 12% used overall",
+      "Tip: stop at 20% remaining to leave headroom",
+      "Error: could not refresh (12% used cached)",
+      "You have 5% remaining before you hit the limit",
+    ]) {
+      const parsed = parseNonInteractiveUsage("claude", [...live, prose].join("\n"), now);
+      expect(parsed.ok, prose).toBe(true);
+      if (!parsed.ok) return;
+      expect(parsed.buckets.map((bucket) => bucket.remainingPercent), prose).toEqual([88, 5]);
+    }
+
+    // Window-shaped and unreadable. An unknown sense word is the case that matters: the line is
+    // unmistakably a window, and stepping over it drops the constraint while its siblings route.
+    for (const unreadable of ["Current month: 95% consumed", "Current month: 95% utilised", "Current month: 140% used"]) {
+      expect(parseNonInteractiveUsage("claude", [...live, unreadable].join("\n"), now).ok, unreadable).toBe(false);
+    }
+  });
+
+  it("takes the lowest figure when one line states more than one quota", () => {
+    // The label bound the first figure and the rest was discarded, so a line stating 99% used
+    // and 10% used reported 90 remaining — inventing headroom, the same direction as the lazy
+    // label that read `99% used` as a window named "9".
+    const now = clock().nowIso();
+    for (const [line, expected] of [
+      ["Current session: 99% used · Current week: 10% used", 1],
+      ["Current week: 12% used and 30% remaining", 30],
+      ["Current week: 70% used and 5% remaining", 5],
+      ["Current week: 5% remaining 99% used", 1],
+    ] as const) {
+      const parsed = parseNonInteractiveUsage("claude", line, now);
+      expect(parsed.ok, line).toBe(true);
+      if (!parsed.ok) return;
+      expect(parsed.buckets[0]?.remainingPercent, line).toBe(expected);
     }
   });
 
@@ -103,6 +136,7 @@ describe("non-interactive account usage (#582)", () => {
       ["em dash", "Current week (all models): 95% used — resets Aug 21 at 4:59am (Asia/Seoul)", 5],
       ["colon in label", "Current week (UTC+09:00): 99% used · resets Aug 21 at 4:59am (Asia/Seoul)", 1],
       ["capital USED", "Current week: 99% USED", 1],
+      ["em dash as the label separator", "Current week (all models) — 99% used", 1],
     ] as const) {
       const reading = await new ClaudeUsageCollector({
         clock: clock(),
