@@ -238,8 +238,14 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     const parsed = parseUsageOutput("claude", HOME + damaged + HOME + current, now);
     expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
     if (!parsed.ok) return;
-    // Both spellings of both windows, all stating the same quota. No reading is above 59.
-    expect(Math.max(...parsed.buckets.map((bucket) => bucket.remainingPercent ?? 0))).toBe(92);
+    // Both spellings of both windows survive, which is the union's accepted cost. Asserting a
+    // maximum alone does not lock that — the last paint on its own already satisfies it.
+    expect(parsed.buckets.map((bucket) => bucket.id).sort()).toEqual([
+      "current-session",
+      "current-week-ll-model",
+      "currentsession",
+      "currentweek-allmodels",
+    ]);
     expect(parsed.buckets.filter((bucket) => bucket.remainingPercent === 59)).toHaveLength(2);
 
     // The case a single-frame rule gets wrong in the dangerous direction: the earlier paint is
@@ -280,19 +286,55 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(parsed.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(5);
   });
 
-  it("stops carrying a window forward at the first line that states no figure", () => {
+  it("lets a window lend to the next line only, so a guess cannot chain", () => {
     // A figure with no label of its own is folded into the window above by minimum, which is
-    // how a redraw's stale bar and a nested child are kept. Unbounded, that reach crosses a
-    // promo line into an unrelated percentage and silently replaces a real window's number —
-    // withholding work for a window it never described.
-    const bridged = parseUsageOutput(
+    // how a redraw's stale bar and a nested child are kept. Ending that run at "a line stating
+    // no figure" was not enough: any run of sense-bearing lines walked a stale window across
+    // what is visually a new section, and because the fold takes the minimum, the window ended
+    // up with whatever number appeared last — withholding work for a window it never described.
+    const now = clock().nowIso();
+
+    // A promo carries no sense word, so it never lent in the first place.
+    const promo = parseUsageOutput(
       "claude",
       ["Currentweek(allmodels)", "41%used", "+5%weeklylimitspromothroughAug20", "3% remaining"].join("\n"),
-      clock().nowIso(),
+      now,
     );
-    expect(bridged.ok, bridged.ok ? "" : bridged.error).toBe(true);
-    if (!bridged.ok) return;
-    expect(bridged.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+    expect(promo.ok, promo.ok ? "" : promo.error).toBe(true);
+    if (!promo.ok) return;
+    expect(promo.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+
+    // A section heading that states its own percentage did lend, and the bare figure under it
+    // then lowered the week to 3.
+    const chained = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "Token activity last 12 months 40% used", "3% remaining"].join("\n"),
+      now,
+    );
+    expect(chained.ok, chained.ok ? "" : chained.error).toBe(true);
+    if (!chained.ok) return;
+    expect(chained.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+
+    // A run of bare percentages did the same, at any distance.
+    const walked = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "90% remaining", "80% remaining", "70% remaining", "3% remaining"].join("\n"),
+      now,
+    );
+    expect(walked.ok, walked.ok ? "" : walked.error).toBe(true);
+    if (!walked.ok) return;
+    expect(walked.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+
+    // A reset line is a horizon, not a quota statement, even when it carries a sense word.
+    const reset = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "Resets Aug18 at 9am 3% left", "Currentweek(Fable)", "12%used"].join("\n"),
+      now,
+    );
+    expect(reset.ok, reset.ok ? "" : reset.error).toBe(true);
+    if (!reset.ok) return;
+    expect(reset.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+    expect(reset.buckets.find((bucket) => bucket.id === "currentweek-fable")?.remainingPercent).toBe(88);
   });
 
   it("keeps the empty-stream cause distinct from a screen that stated no quota", () => {
@@ -359,14 +401,33 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(interleaved.buckets.map((bucket) => bucket.remainingPercent)).toEqual([59]);
   });
 
-  it("refuses a line that states both senses of one window rather than picking one", () => {
+  it("takes the lower figure when a line states both senses of one window", () => {
     // Squeezing removed the spaces, so `41% used 80% remaining` arrived as one token and the
-    // old word boundary skipped `used` — reporting 80 for a window with 59 left. The two
-    // figures contradict each other, so neither is evidence.
+    // old word boundary skipped `used` — reporting 80 for a window with 59 left.
+    //
+    // This refused, at first. Refusing was measured to be worse than folding: when the
+    // ambiguous paint is the one saying a window is spent, refusing it — or skipping only that
+    // paint — lets a stale high reading from another paint stand. `X% used` and
+    // `(100-X)% remaining` agree by construction, so a disagreeing pair is a screen
+    // contradicting itself, and the lower number is the one that cannot admit work the quota
+    // will not cover.
     const contradictory = parseUsageOutput("claude", "weekly: 41% used 80% remaining", clock().nowIso());
-    expect(contradictory.ok).toBe(false);
-    if (contradictory.ok) return;
-    expect(contradictory.error).toContain("duplicate quota-window labels");
+    expect(contradictory.ok, contradictory.ok ? "" : contradictory.error).toBe(true);
+    if (!contradictory.ok) return;
+    expect(contradictory.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["weekly", 59]]);
+
+    // The ambiguous paint is the only one that says the week is spent. Discarding it accepts
+    // the other paint's 92.
+    const ESC = String.fromCharCode(27);
+    const HOME = ESC + "[H";
+    const outvoted = parseUsageOutput(
+      "claude",
+      HOME + "Currentweek(allmodels)\n95%used 5%remaining" + HOME + "Currentweek(allmodels)\n8%used",
+      clock().nowIso(),
+    );
+    expect(outvoted.ok, outvoted.ok ? "" : outvoted.error).toBe(true);
+    if (!outvoted.ok) return;
+    expect(outvoted.buckets[0]?.remainingPercent).toBe(5);
   });
 
   it("still refuses a trust prompt raised in an earlier frame", () => {
@@ -393,15 +454,18 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(consumed.error).toContain("1 line(s)");
   });
 
-  it("mutation: malformed and duplicate windows refuse collection", () => {
+  it("mutation: an impossible percentage refuses; a repeated label takes its lowest figure", () => {
+    // An impossible percentage is still fatal: nothing about the screen is evidence.
     expect(parseUsageOutput("claude", "rolling: 101% remaining", clock().nowIso()).ok).toBe(false);
-    expect(parseUsageOutput("claude", `
-rolling: 40% remaining
-rolling: 30% remaining
-`, clock().nowIso())).toEqual({
-      ok: false,
-      error: "interactive /usage output contains duplicate quota-window labels",
-    });
+
+    // A label stated twice used to refuse the whole observation. That was fail-closed for a
+    // single screen but not for a stream: a paint is discarded together with the constraint it
+    // was the only one to state, and another paint's stale higher reading then stands. Folding
+    // to the lowest keeps the tighter figure, and no fold can raise a window.
+    const repeated = parseUsageOutput("claude", "\nrolling: 40% remaining\nrolling: 30% remaining\n", clock().nowIso());
+    expect(repeated.ok, repeated.ok ? "" : repeated.error).toBe(true);
+    if (!repeated.ok) return;
+    expect(repeated.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["rolling", 30]]);
   });
 
   it("waits for the CLI to be ready before typing, through a real pseudo-terminal", async () => {

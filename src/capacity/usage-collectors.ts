@@ -394,7 +394,6 @@ export const parseUsageOutput = (
   // the quota cannot pay for, so the reading is assembled from whichever frame stated the
   // least remaining for each window.
   let lines: string[] = [];
-  let refusal: { ok: false; error: string } | null = null;
   const lowest = new Map<string, CapacityBucket>();
   for (const frame of frames) {
     const frameLines = stripTerminal(frame)
@@ -408,17 +407,13 @@ export const parseUsageOutput = (
     // frames around it would turn a malformed screen into a partial success.
     if (!parsed.ok) return parsed;
 
-    // A window this paint labelled twice with two numbers is ambiguous in a way nothing here
-    // can resolve, so the paint is not used. It is not fatal on its own: another paint of the
-    // same screen may be unambiguous, and discarding the whole observation for one damaged
-    // repaint is how a readable screen became no reading at all.
-    const ids = new Set<string>();
-    const duplicated = parsed.buckets.some((bucket) => ids.has(bucket.id) || (ids.add(bucket.id), false));
-    if (duplicated) {
-      refusal = { ok: false, error: "interactive /usage output contains duplicate quota-window labels" };
-      continue;
-    }
-
+    // A window labelled twice folds to its lowest reading like any other repeated window.
+    // Refusing the whole observation was fail-closed but cost a readable screen; skipping only
+    // the ambiguous paint was worse than either, and measured to be so: when the ambiguous
+    // paint is the one saying the week is spent, dropping it accepts a stale high reading from
+    // another paint. `X% used` and `(100-X)% remaining` agree by construction, so a pair that
+    // disagrees is a screen contradicting itself, and the lower number is the reading that
+    // cannot admit work the quota will not cover.
     for (const bucket of parsed.buckets) {
       const seen = lowest.get(bucket.id);
       // A null remaining is "stated but unusable", which admission already treats as
@@ -428,7 +423,6 @@ export const parseUsageOutput = (
     }
   }
   const buckets: CapacityBucket[] = [...lowest.values()];
-  if (buckets.length === 0 && refusal) return refusal;
 
   if (buckets.length === 0) {
     // Three different failures used to arrive as this one sentence: a binary that never
@@ -533,11 +527,20 @@ const parseFrameBuckets = (
 
   const named: CapacityBucket[] = [];
   const carriedBuckets: CapacityBucket[] = [];
-  let carried: string | null = null;
+  // A figure with no label of its own may borrow the previous line's window, and only the
+  // previous line's — a line that borrowed cannot lend. Ending the run at "a line that stated
+  // no figure" was not enough: any run of sense-bearing lines kept a stale window alive across
+  // what is visually a new section, so a heading carrying its own percentage, or a row of bare
+  // percentages, walked the week window down to whatever appeared last. One hop keeps the two
+  // shapes this exists for — a redraw's stale bar and a child nested under its parent, both on
+  // the very next line — and reaches nothing further.
+  let lender: string | null = null;
   for (let index = 0; index < lines.length; index += 1) {
     const own = windowFor(index);
-    if (own) carried = own;
-    const window = own ?? carried;
+    // A reset is a horizon, not a quota statement. A leftover sense word on that line ("resets
+    // Aug 18 — 3% left") would otherwise be folded into the window above as a real constraint.
+    const isReset = /\breset(?:s|ting)?\b/i.test(lines[index] ?? "");
+    const window = own ?? (isReset ? null : lender);
 
     SENSE.lastIndex = 0;
     let stated = false;
@@ -569,12 +572,9 @@ const parseFrameBuckets = (
         measuredAs,
       });
     }
-    // The carry ends where the figures do. A window's stale bar and its nested child are the
-    // next line; anything after a line that states no figure at all — a promo, a reset, a row
-    // of bar glyphs — belongs to whatever comes next. Without this the carry reached the rest
-    // of the frame, and because the fold takes the minimum, one unrelated low percentage
-    // silently replaced a real window's figure.
-    if (!stated) carried = null;
+    // Only a line that resolved its own window lends to the next one. A carried figure is
+    // already a guess; letting it lend chains the guess.
+    lender = own && stated ? own : null;
   }
 
   // A figure with no label of its own is the same window measured again — a redraw that used
