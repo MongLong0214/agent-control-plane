@@ -899,6 +899,7 @@ const parseFrameBuckets = (
    * permissive reading is the safe one.
    */
   const SENSE = /(?<value>\d{1,3}(?:\.\d+)?)%(?<sense>used|remaining|left|available)/gi;
+  const SENSE_ANYWHERE = /\d{1,3}(?:\.\d+)?%(?:used|remaining|left|available)/i;
 
   /**
    * The window a percentage belongs to is not always on its line. Measured on claude 2.1.233,
@@ -977,6 +978,23 @@ const parseFrameBuckets = (
     // that named itself is unaffected: `5-hour limit: 62% remaining — resets in 1h 15m` is the
     // measured single-line shape and states both. This guard was removed once as unreachable,
     // which it was only because the borrow used to end before the figure was taken.
+    // A figure whose digits may be the tail of the line above is not a figure. A bar that wraps
+    // mid-number leaves `████4` above `1%used`, and reading the second line alone reports 99
+    // remaining for a window at 59 — inventing headroom, the direction that dispatches work the
+    // quota cannot cover. The tell is a preceding line that ends in a digit and states no quota
+    // of its own: a complete bar line does not end mid-number.
+    const previous = squeezed[index - 1] ?? "";
+    // No letters in the previous line: a wrapped bar is glyphs and digits. A promo or a heading
+    // that happens to end in a digit — `+5%weeklylimitspromothroughAug20` — carries words, and
+    // refusing on that would kill a whole reading over a line of marketing.
+    const continues =
+      /\d$/.test(previous) && !/[A-Za-z]/.test(previous) && !SENSE_ANYWHERE.test(previous) && /^\d/.test(squeezed[index]!);
+    if (continues) {
+      return {
+        ok: false,
+        error: "interactive /usage stated a percentage that may be the tail of a wrapped line",
+      };
+    }
     const window = own ?? (/reset/i.test(squeezed[index]!) ? null : carried);
 
     // Every stated figure on the line, not the first. One line can carry both senses of the

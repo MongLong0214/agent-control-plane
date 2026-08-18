@@ -913,6 +913,38 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(outvoted.buckets[0]?.remainingPercent).toBe(5);
   });
 
+  it("refuses a figure that may be the tail of a wrapped bar, without refusing a promo", () => {
+    // A bar that wraps mid-number leaves `████4` above `1%used`. Reading the second line alone
+    // reports 99 remaining for a window at 59 — inventing headroom, which is the direction that
+    // dispatches work the quota cannot cover. The pty is pinned to 200 columns, but the parser
+    // takes no width and accepts any capture handed to it.
+    const now = clock().nowIso();
+    for (const wrapped of [
+      ["Currentweek(allmodels)", "\u2588\u2588\u25884", "1%used"],
+      ["Currentweek(allmodels)", "\u2588\u2588\u258841", "0%used"],
+    ]) {
+      const parsed = parseUsageOutput("claude", wrapped.join("\n"), now);
+      expect(parsed.ok, wrapped.join(" / ")).toBe(false);
+    }
+
+    // The tell is a letterless line — a bar is glyphs and digits. A promo that happens to end
+    // in a digit carries words, and refusing on that would kill a whole reading over marketing.
+    const promo = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "+5%weeklylimitspromothroughAug20", "3% remaining"].join("\n"),
+      now,
+    );
+    expect(promo.ok, promo.ok ? "" : promo.error).toBe(true);
+    if (!promo.ok) return;
+    expect(promo.buckets.map((bucket) => bucket.remainingPercent)).toEqual([59]);
+
+    // An intact bar on one line is untouched.
+    const intact = parseUsageOutput("claude", ["Currentweek(allmodels)", "\u2588\u2588\u2588 41%used"].join("\n"), now);
+    expect(intact.ok, intact.ok ? "" : intact.error).toBe(true);
+    if (!intact.ok) return;
+    expect(intact.buckets[0]?.remainingPercent).toBe(59);
+  });
+
   it("still refuses a trust prompt raised in an earlier frame", () => {
     // The refusal has to see the whole stream. A prompt that appeared and was repainted over
     // is still a failed observation — narrowing the check to the current frame would trade a
