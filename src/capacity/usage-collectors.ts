@@ -53,7 +53,12 @@ export interface UsageCollectorOptions {
  * reviewer's credential tree stays inside the tool that owns it.
  */
 export interface NonInteractiveUsageProbe {
-  run(input: { binary: string; timeoutMs: number }): Promise<{ stdout: string; stderr: string; code: number | null }>;
+  run(input: { binary: string; timeoutMs: number }): Promise<{
+    stdout: string;
+    stderr: string;
+    code: number | null;
+    timedOut?: boolean;
+  }>;
 }
 
 const DEFAULT_TIMEOUT_MS = 45_000;
@@ -79,28 +84,59 @@ export const CLAUDE_NON_INTERACTIVE_ARGS = [
   "/usage",
 ] as const;
 
+/**
+ * What a quota read needs and nothing else. The daemon's environment is not a safe default for
+ * a spawned provider CLI: it carries the operator credential, and a provider-credential
+ * variable in it silently redirects which account is measured.
+ */
+const nonInteractiveEnvironment = (): NodeJS.ProcessEnv => ({
+  PATH: process.env["PATH"] ?? "",
+  HOME: process.env["HOME"] ?? "",
+  ...(process.env["SHELL"] ? { SHELL: process.env["SHELL"] } : {}),
+  // Pinned so a localised build cannot state its windows in a language this parser then
+  // silently drops — the drop is what makes a spent window disappear.
+  LANG: "C.UTF-8",
+  LC_ALL: "C",
+});
+
 export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
   constructor(private readonly args: readonly string[]) {}
 
-  async run(input: { binary: string; timeoutMs: number }): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  async run(input: { binary: string; timeoutMs: number }): Promise<{ stdout: string; stderr: string; code: number | null; timedOut: boolean }> {
     return new Promise((resolve) => {
+      // Detached, so the whole process group can be killed. A grandchild that inherits the pipe
+      // keeps `close` from ever firing, and resolving only on `close` means the capacity refresh
+      // — which `Daemon.start()` awaits — never returns. That is a hang, not a slow read.
       const child = spawn(input.binary, [...this.args], {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env },
+        detached: true,
+        // Not the daemon's environment. The pseudo-terminal path has always passed an allowlist
+        // (#564): the daemon's own environment carries ACP_OPERATOR_TOKEN and can carry
+        // CLAUDE_SECURESTORAGE_CONFIG_DIR, which is the exact variable that made a probe read
+        // the wrong credential store. A quota read needs none of it.
+        env: nonInteractiveEnvironment(),
       });
       let stdout = "";
       let stderr = "";
-      const timer = setTimeout(() => child.kill("SIGKILL"), input.timeoutMs);
+      let settled = false;
+      const finish = (outcome: { code: number | null; timedOut: boolean; error?: string }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          if (child.pid) process.kill(-child.pid, "SIGKILL");
+        } catch {
+          /* the group is already gone */
+        }
+        resolve({ stdout, stderr: stderr || outcome.error || "", code: outcome.code, timedOut: outcome.timedOut });
+      };
+      // Resolve on the timer itself rather than waiting for a close that may never come.
+      const timer = setTimeout(() => finish({ code: null, timedOut: true }), input.timeoutMs);
       child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
       child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-      child.once("error", (error) => {
-        clearTimeout(timer);
-        resolve({ stdout, stderr: stderr || error.message, code: null });
-      });
-      child.once("close", (code) => {
-        clearTimeout(timer);
-        resolve({ stdout, stderr, code });
-      });
+      child.once("error", (error) => finish({ code: null, timedOut: false, error: error.message }));
+      // `exit` fires when the process goes, whether or not a descendant still holds the pipe.
+      child.once("exit", (code) => finish({ code, timedOut: false }));
     });
   }
 }
@@ -395,7 +431,7 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
     if (this.claudeOptions.terminal) return super.collect();
 
     const observedAt = this.claudeOptions.clock.nowIso();
-    let outcome: { stdout: string; stderr: string; code: number | null };
+    let outcome: { stdout: string; stderr: string; code: number | null; timedOut?: boolean };
     try {
       outcome = await this.probe.run({ binary: this.claudeOptions.binary, timeoutMs: this.probeTimeoutMs });
     } catch (error) {
@@ -420,6 +456,22 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
     } catch {
       envelope = null;
     }
+    // A read that was killed or exited badly is not a reading, whatever landed in the buffer.
+    // A complete envelope can already be buffered when the timer fires, and filing that as
+    // healthy reports a quota from a process that did not finish saying it. The timer resolves
+    // with a null code, so this one check covers both — a separate `timedOut` gate passed every
+    // mutation, which is what an unreachable one does.
+    if (outcome.code !== 0) {
+      return failedReading(
+        this.provider,
+        observedAt,
+        source,
+        digest,
+        outcome.timedOut === true
+          ? "non-interactive /usage did not finish in time"
+          : `non-interactive /usage exited ${outcome.code ?? "on a signal"}`,
+      );
+    }
     if (!envelope || typeof envelope.result !== "string") {
       return failedReading(
         this.provider,
@@ -431,8 +483,16 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
           : `non-interactive /usage exited ${outcome.code ?? "on a signal"} without a JSON envelope`,
       );
     }
-    if (envelope.is_error === true) {
-      return failedReading(this.provider, observedAt, source, digest, "non-interactive /usage reported an error envelope");
+    // Anything but an explicit `false` is not a claim of success. Refusing only on boolean
+    // `true` accepted `"true"`, `1`, and an omitted field as if the run had gone well.
+    if (envelope.is_error !== false) {
+      return failedReading(
+        this.provider,
+        observedAt,
+        source,
+        digest,
+        "non-interactive /usage did not state a successful envelope",
+      );
     }
 
     const parsed = parseNonInteractiveUsage(this.provider, envelope.result, observedAt);
@@ -785,7 +845,10 @@ const parseFrameBuckets = (
 
 /**
  * The account windows as `claude -p "/usage"` prints them, which is a formatter's output rather
- * than a repainted frame:
+ * than a repainted frame. The label runs greedily to the LAST colon before the percentage, so a
+ * colon inside it — `Current week (UTC+09:00)` — does not cut the window in half, and it must
+ * contain a letter, because a lazy label was measured eating the first digit of its own
+ * percentage and reporting `99% used` as a window named "9" with 91 remaining.
  *
  *     Current session: 12% used · resets Aug 18 at 7:49pm (Asia/Seoul)
  *     Current week (all models): 64% used · resets Aug 21 at 4:59am (Asia/Seoul)
@@ -795,7 +858,16 @@ const parseFrameBuckets = (
  * that does not match this shape is a changed contract and must refuse rather than guess.
  */
 const NON_INTERACTIVE_WINDOW =
-  /^(?<window>[^:]{1,80}):\s*(?<value>\d{1,3}(?:\.\d+)?)%\s*used(?:\s*[\u00B7·|-]\s*resets\s+(?<reset>.+?))?\s*$/;
+  /^(?<window>.*[A-Za-z].*):\s*(?<value>\d{1,3}(?:\.\d+)?)\s*%\s*(?<sense>used|remaining|left)\b(?<rest>.*)$/iu;
+
+/**
+ * Any line that states a quota at all. A line matching this but not the pattern above is a
+ * window this parser failed to read, and the reading is refused rather than continued past.
+ */
+const STATES_A_QUOTA = /\d{1,3}(?:\.\d+)?\s*%\s*(?:used|remaining|left)\b/iu;
+
+/** The reset clause inside whatever trails the percentage. */
+const RESET_CLAUSE = /\bresets?\s+(?<reset>.+?)\s*$/iu;
 
 /** `Aug 21 at 4:59am (Asia/Seoul)` — a wall-clock time in a named zone, with the year implied. */
 const RESET_WALL_CLOCK =
@@ -843,12 +915,22 @@ export const parseResetWallClock = (text: string, observedAt: string): string | 
   if (month < 0 || !Number.isFinite(day) || !Number.isFinite(hour) || !Number.isFinite(minute) || !Number.isFinite(base)) {
     return null;
   }
+  if (minute > 59 || hour > 23) return null;
   if (meridiem === "pm" && hour < 12) hour += 12;
   if (meridiem === "am" && hour === 12) hour = 0;
 
-  for (const year of [new Date(base).getUTCFullYear(), new Date(base).getUTCFullYear() + 1]) {
+  // Three years, not two. Near midnight UTC the zone is in a different calendar year, and
+  // starting at UTC's meant a horizon two hours away resolved a year out — which drives the
+  // reserve to hold the entire window and withholds every worker while the percentages look
+  // fine. Widening the window covers that without a second source of truth for the year: a
+  // zone-derived year passed every mutation once this loop existed.
+  const utcYear = new Date(base).getUTCFullYear();
+  for (const year of [utcYear - 1, utcYear, utcYear + 1]) {
     const wall = Date.UTC(year, month, day, hour, minute);
-    if (!Number.isFinite(wall)) continue;
+    // `Date.UTC` rolls a day that does not exist — Feb 31 becomes March 3 — so a stated date
+    // that does not survive the round trip is not a date, and a guessed one is worse than none.
+    const rolled = new Date(wall);
+    if (rolled.getUTCMonth() !== month || rolled.getUTCDate() !== day) continue;
     let instant = wall;
     if (zone) {
       // Two passes: the offset is looked up at the guessed instant, then confirmed at the
@@ -878,7 +960,17 @@ export const parseNonInteractiveUsage = (
   const ids = new Set<string>();
   for (const line of text.split("\n").map((value) => value.trim()).filter(Boolean)) {
     const match = NON_INTERACTIVE_WINDOW.exec(line);
-    if (!match?.groups) continue;
+    if (!match?.groups) {
+      // Skipping was the whole defect. The comment above already said an unmatched shape must
+      // refuse, and the loop continued instead — so a window this pattern could not read simply
+      // vanished, and the windows it could read then routed on their own. A spent week dropped
+      // beside a fresh session turns SUSPENDED into OPEN. Anything that states a quota and does
+      // not parse ends the reading.
+      if (STATES_A_QUOTA.test(line)) {
+        return { ok: false, error: `non-interactive /usage stated a quota this parser could not read: ${line.slice(0, 80)}` };
+      }
+      continue;
+    }
     const stated = Number(match.groups["value"]);
     const window = match.groups["window"]!.trim();
     if (!Number.isFinite(stated) || stated < 0 || stated > 100) {
@@ -890,12 +982,15 @@ export const parseNonInteractiveUsage = (
     // ambiguity this source exists to remove.
     if (ids.has(id)) return { ok: false, error: "non-interactive /usage repeated a quota-window label" };
     ids.add(id);
+    const sense = (match.groups["sense"] ?? "used").toLowerCase();
+    const measuredAs = sense === "used" ? ("used" as const) : ("remaining" as const);
+    const reset = RESET_CLAUSE.exec(match.groups["rest"] ?? "")?.groups?.["reset"];
     buckets.push({
       id,
-      remainingPercent: 100 - stated,
-      resetAt: match.groups["reset"] ? parseResetWallClock(match.groups["reset"], observedAt) : null,
+      remainingPercent: measuredAs === "used" ? 100 - stated : stated,
+      resetAt: reset ? parseResetWallClock(reset, observedAt) : null,
       capabilities: [...CAPABILITIES[provider]],
-      measuredAs: "used",
+      measuredAs,
     });
   }
   if (buckets.length === 0) {

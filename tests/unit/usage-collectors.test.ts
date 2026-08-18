@@ -12,6 +12,7 @@ import {
 import {
   CLAUDE_NON_INTERACTIVE_ARGS,
   ClaudeUsageCollector,
+  parseResetWallClock,
   CodexUsageCollector,
   GrokUsageCollector,
   parseUsageOutput,
@@ -75,6 +76,92 @@ describe("non-interactive account usage (#582)", () => {
     // Stated as used, subtracted here. Without a resolved horizon every bucket would hold its
     // whole window in reserve and no worker would ever be admitted.
     expect(reading.buckets.every((bucket) => bucket.measuredAs === "used")).toBe(true);
+  });
+
+  it("refuses a reading in which a window it could not read has vanished", async () => {
+    // Skipping was worse than misreading: the window disappears and the ones that did parse
+    // route on their own — a spent week beside a fresh session turns SUSPENDED into OPEN.
+    // Widening the pattern to catch those lines then produced something worse still: a lazy
+    // label ate the first digit of its own percentage, so `99% used` became a window named "9"
+    // with 91 remaining. A stated quota that cannot be read now ends the reading.
+    for (const orphan of ["99% used", "· 99% used", "12% used and 30% remaining"]) {
+      const reading = await new ClaudeUsageCollector({
+        clock: clock(),
+        binary: "claude",
+        nonInteractive: probeReturning({ stdout: envelope(["Current session: 12% used", orphan].join("\n")) }),
+      }).collect();
+      expect(reading.sensorHealth, orphan).toBe("ERROR");
+      expect(reading.buckets, orphan).toEqual([]);
+    }
+  });
+
+  it("reads a window whose separator or label is not the shape first assumed", async () => {
+    // Every one of these was silently dropped, leaving the session to route alone. The em dash
+    // is the separator this file's own interactive fixtures use; the colon inside the label is
+    // a zone offset; the capital is the TUI's own spelling.
+    for (const [name, week, expected] of [
+      ["em dash", "Current week (all models): 95% used — resets Aug 21 at 4:59am (Asia/Seoul)", 5],
+      ["colon in label", "Current week (UTC+09:00): 99% used · resets Aug 21 at 4:59am (Asia/Seoul)", 1],
+      ["capital USED", "Current week: 99% USED", 1],
+    ] as const) {
+      const reading = await new ClaudeUsageCollector({
+        clock: clock(),
+        binary: "claude",
+        nonInteractive: probeReturning({ stdout: envelope(["Current session: 12% used", week].join("\n")) }),
+      }).collect();
+      expect(reading.sensorHealth, name).toBe("HEALTHY");
+      expect(Math.min(...reading.buckets.map((bucket) => bucket.remainingPercent ?? 100)), name).toBe(expected);
+    }
+  });
+
+  it("refuses an unfinished or badly exited run even when a whole envelope is buffered", async () => {
+    // A complete JSON object can already be in the buffer when the timer fires. Filing that as
+    // a reading reports a quota from a process that did not finish saying it — and the exit
+    // code was ignored entirely once `result` was a string.
+    const healthy = envelope("Current session: 1% used · resets Aug 18 at 7:49pm (Asia/Seoul)");
+    for (const [name, outcome] of [
+      ["killed on the timer", { stdout: healthy, code: null, timedOut: true }],
+      ["non-zero exit", { stdout: healthy, code: 1 }],
+      ["died on a signal", { stdout: healthy, code: null }],
+    ] as const) {
+      const reading = await new ClaudeUsageCollector({
+        clock: clock(),
+        binary: "claude",
+        nonInteractive: { run: async () => ({ stderr: "", ...outcome }) },
+      }).collect();
+      expect(reading.sensorHealth, name).toBe("ERROR");
+      expect(reading.buckets, name).toEqual([]);
+    }
+  });
+
+  it("treats anything but an explicit success flag as a failure", async () => {
+    const result = "Current session: 1% used";
+    for (const flag of ["true", 1, undefined, null, 0]) {
+      const stdout = JSON.stringify(flag === undefined ? { result } : { is_error: flag, result });
+      const reading = await new ClaudeUsageCollector({
+        clock: clock(),
+        binary: "claude",
+        nonInteractive: probeReturning({ stdout }),
+      }).collect();
+      expect(reading.sensorHealth, String(flag)).toBe("ERROR");
+    }
+  });
+
+  it("resolves a horizon in the zone's own year, and refuses a date that is not one", () => {
+    // The year was taken from UTC. Near midnight UTC the zone is in a different one, and a
+    // horizon two hours away resolved a year out — which holds the whole window in reserve and
+    // withholds every worker while the percentages look fine.
+    expect(parseResetWallClock("Dec 31 at 11:00pm (America/Los_Angeles)", "2026-01-01T05:00:00.000Z")).toBe(
+      "2026-01-01T07:00:00.000Z",
+    );
+    // `Date.UTC` rolls a day that does not exist rather than rejecting it, so Feb 31 became
+    // March 3 and was reported as a real horizon.
+    expect(parseResetWallClock("Feb 31 at 4:59am (Asia/Seoul)", "2026-08-13T00:00:00.000Z")).toBeNull();
+    expect(parseResetWallClock("Feb 29 at 4:59am (Asia/Seoul)", "2026-01-01T00:00:00.000Z")).toBeNull();
+    expect(parseResetWallClock("Aug 21 at 4:99am (Asia/Seoul)", "2026-08-13T00:00:00.000Z")).toBeNull();
+    expect(parseResetWallClock("Aug 21 at 4:59am (Asia/Seoul)", "2026-08-13T00:00:00.000Z")).toBe(
+      "2026-08-20T19:59:00.000Z",
+    );
   });
 
   it("refuses rather than guessing when the output contract changes", async () => {
