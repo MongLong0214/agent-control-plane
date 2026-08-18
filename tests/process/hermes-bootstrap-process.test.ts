@@ -285,6 +285,30 @@ describe("fresh-install Hermes bootstrap process acceptance", () => {
       writeFileSync(path, `#!/bin/sh\nprintf '%b' '${providerOutput[binary]}'\nexit 0\n`, { mode: 0o700 });
       chmodSync(path, 0o700);
     }
+    // Claude and Codex no longer read quota from a terminal, so a stub that only prints a line
+    // is not a stub of what they do. Claude is asked for a JSON envelope; Codex is asked over
+    // the app-server's JSON-RPC. A stub that cannot answer leaves coverage as the only blocking
+    // finding, which is precisely the state the bootstrap park exists for — so the daemon parks
+    // and waits for an operator, and the test reads that silence as a daemon that never started.
+    writeFileSync(
+      join(fakeBin, "claude"),
+      `#!/bin/sh\nprintf '%s' '{"is_error":false,"result":"Current session: 20% used"}'\nexit 0\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(join(fakeBin, "claude"), 0o700);
+    writeFileSync(
+      join(fakeBin, "codex"),
+      [
+        "#!/bin/sh",
+        `printf '%s\\n' '{"id":0,"result":{}}'`,
+        "while IFS= read -r _line; do",
+        `  printf '%s\\n' '{"id":1,"result":{"rateLimits":{"primary":{"usedPercent":20,"windowDurationMins":10080,"resetsAt":1787196559}}}}'`,
+        "done",
+        "",
+      ].join("\n"),
+      { mode: 0o700 },
+    );
+    chmodSync(join(fakeBin, "codex"), 0o700);
 
     const stateDir = join(home, ".agent-control-plane");
     // A real daemon preflight also requires the independently provisioned GitHub App

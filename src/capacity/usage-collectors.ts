@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import type { Clock } from "../core/clock.ts";
 import { sha256 } from "../core/digest.ts";
@@ -45,6 +47,10 @@ export interface UsageCollectorOptions {
   providerCredentialDir?: string;
   /** Injected in tests. Production runs the provider CLI's own non-interactive usage command. */
   nonInteractive?: NonInteractiveUsageProbe;
+  /** Injected in tests. Production asks the Codex app-server for the account's rate limits. */
+  codexRateLimits?: CodexRateLimitProbe;
+  /** Pinned, never inherited: a different CODEX_HOME is a different account's quota. */
+  codexHome?: string;
 }
 
 /**
@@ -400,6 +406,146 @@ abstract class BaseUsageCollector implements UsageCollector {
   }
 }
 
+/**
+ * One exchange with the Codex app-server, which states the account's rate limits as fields.
+ *
+ * The app-server is a *server*, and that is the whole hazard. Measured on 0.146.0: the correct
+ * handshake answers in 1.6–2.2s and the process then never exits, so awaiting `exit` or `close`
+ * is an unbounded wait on a startup path. Sending the read without `initialize` first is a
+ * 56ms `-32600`, not a hang — the handshake was never the problem. This resolves on the
+ * response and kills the group; it never waits for the process to end.
+ *
+ * `account/usage/read` is a different method: lifetime token activity, the chart the TUI draws.
+ * It cannot answer whether work may be dispatched and must not be mistaken for this one.
+ */
+export interface CodexRateLimitProbe {
+  read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown>;
+}
+
+export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
+  async read(input: { binary: string; timeoutMs: number; codexHome: string }): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(input.binary, ["app-server", "--stdio"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
+        // CODEX_HOME is pinned, never inherited. A daemon can be started under an environment
+        // naming a different Codex home — this machine has two — and reading the wrong one
+        // reports another account's quota while looking entirely healthy.
+        env: { ...nonInteractiveEnvironment(), CODEX_HOME: input.codexHome },
+      });
+      let buffer = "";
+      let settled = false;
+      const finish = (outcome: { value?: unknown; error?: string }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          if (child.pid) process.kill(-child.pid, "SIGKILL");
+        } catch {
+          /* the group is already gone */
+        }
+        if (outcome.error) reject(new Error(outcome.error));
+        else resolve(outcome.value);
+      };
+      const timer = setTimeout(() => finish({ error: "codex app-server did not answer in time" }), input.timeoutMs);
+      const send = (message: unknown): void => void child.stdin.write(`${JSON.stringify(message)}\n`);
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString();
+        let newline: number;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (!line.trim()) continue;
+          let message: { id?: unknown; result?: unknown; error?: unknown };
+          try {
+            message = JSON.parse(line) as { id?: unknown; result?: unknown; error?: unknown };
+          } catch {
+            continue;
+          }
+          if (message.id === 0) {
+            send({ method: "initialized" });
+            send({ method: "account/rateLimits/read", id: 1, params: {} });
+          }
+          if (message.id === 1) {
+            if (message.error) finish({ error: "account/rateLimits/read was refused" });
+            else finish({ value: message.result });
+          }
+        }
+      });
+      child.once("error", (error) => finish({ error: error.message }));
+      // Only to notice a process that died before answering. The answer never arrives this way.
+      child.once("exit", () => finish({ error: "codex app-server exited before answering" }));
+      send({ method: "initialize", id: 0, params: { clientInfo: { name: "agent-control-plane", version: "1.0.0" } } });
+    });
+  }
+}
+
+const codexWindowId = (windowDurationMins: number): string => {
+  if (windowDurationMins % 1440 === 0) return `${windowDurationMins / 1440}d`;
+  if (windowDurationMins % 60 === 0) return `${windowDurationMins / 60}h`;
+  return `${windowDurationMins}m`;
+};
+
+/**
+ * One stated window. `primary: null` is *unknown* — the app-server returns it when the last
+ * turn carried no limit information, and this machine's freshest session file has exactly that.
+ * Reading an absence as either extreme is the failure this whole change exists to end.
+ */
+const codexBucket = (window: unknown, provider: UsageProvider, fallbackId: string): CapacityBucket | null => {
+  if (!window || typeof window !== "object") return null;
+  const value = window as { usedPercent?: unknown; windowDurationMins?: unknown; resetsAt?: unknown };
+  const usedPercent = Number(value.usedPercent);
+  if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) return null;
+  const durationMins = Number(value.windowDurationMins);
+  const resetsAtSeconds = Number(value.resetsAt);
+  return {
+    id: Number.isFinite(durationMins) && durationMins > 0 ? codexWindowId(durationMins) : fallbackId,
+    remainingPercent: 100 - usedPercent,
+    resetAt: Number.isFinite(resetsAtSeconds) && resetsAtSeconds > 0 ? new Date(resetsAtSeconds * 1000).toISOString() : null,
+    capabilities: [...CAPABILITIES[provider]],
+    measuredAs: "used",
+  };
+};
+
+export const parseCodexRateLimits = (
+  provider: UsageProvider,
+  payload: unknown,
+): { ok: true; buckets: CapacityBucket[] } | { ok: false; error: string } => {
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, error: "account/rateLimits/read returned no object" };
+  }
+  // The response nests the snapshot under `rateLimits` on this build; older shapes state it at
+  // the top level. Accept either rather than depending on one nesting.
+  const outer = payload as Record<string, unknown>;
+  const inner = outer["rateLimits"];
+  const record = (inner && typeof inner === "object" ? inner : outer) as Record<string, unknown>;
+
+  const buckets: CapacityBucket[] = [];
+  const primary = codexBucket(record["primary"], provider, "primary");
+  const secondary = codexBucket(record["secondary"], provider, "secondary");
+  if (primary) buckets.push(primary);
+  if (secondary && !buckets.some((bucket) => bucket.id === secondary.id)) buckets.push(secondary);
+
+  // A stated block outranks any percentage beside it. The other values name different blocks —
+  // workspace credits, a member cap — and every one of them is equally disqualifying, so none
+  // of them is read as quota.
+  const reached = record["rateLimitReachedType"];
+  if (typeof reached === "string" && reached.length > 0) {
+    return {
+      ok: true,
+      buckets:
+        buckets.length > 0
+          ? buckets.map((bucket) => ({ ...bucket, remainingPercent: 0 }))
+          : [{ id: "account", remainingPercent: 0, resetAt: null, capabilities: [...CAPABILITIES[provider]], measuredAs: "used" }],
+    };
+  }
+  if (buckets.length === 0) {
+    return { ok: false, error: "account/rateLimits/read stated no usable window; an absent limit is unknown, not unlimited" };
+  }
+  return { ok: true, buckets };
+};
+
 export class ClaudeUsageCollector extends BaseUsageCollector {
   protected readonly provider = "claude" as const;
 
@@ -512,6 +658,58 @@ export class ClaudeUsageCollector extends BaseUsageCollector {
 
 export class CodexUsageCollector extends BaseUsageCollector {
   protected readonly provider = "gpt" as const;
+
+  private readonly rateLimits: CodexRateLimitProbe;
+  private readonly probeTimeoutMs: number;
+  private readonly codexHome: string;
+
+  constructor(private readonly codexOptions: UsageCollectorOptions) {
+    super(codexOptions);
+    this.rateLimits = codexOptions.codexRateLimits ?? new SpawnCodexRateLimitProbe();
+    this.probeTimeoutMs = codexOptions.timeoutMs ?? NON_INTERACTIVE_TIMEOUT_MS;
+    this.codexHome = codexOptions.codexHome ?? join(homedir(), ".codex");
+  }
+
+  /**
+   * Ask the account rather than reconstruct a screen. An explicitly configured terminal still
+   * selects the pseudo-terminal path, for a host whose CLI predates the method.
+   */
+  override async collect(): Promise<CapacityReading> {
+    if (this.codexOptions.terminal) return super.collect();
+
+    const observedAt = this.codexOptions.clock.nowIso();
+    let payload: unknown;
+    try {
+      payload = await this.rateLimits.read({
+        binary: this.codexOptions.binary,
+        timeoutMs: this.probeTimeoutMs,
+        codexHome: this.codexHome,
+      });
+    } catch (error) {
+      const digest = sha256("");
+      return failedReading(
+        this.provider,
+        observedAt,
+        `account-rate-limits:${this.provider};raw-output-digest:${digest}`,
+        digest,
+        error instanceof Error ? error.message : "account/rateLimits/read threw a non-error value",
+      );
+    }
+    const digest = sha256(JSON.stringify(payload ?? null));
+    const source = `account-rate-limits:${this.provider};raw-output-digest:${digest}`;
+    const parsed = parseCodexRateLimits(this.provider, payload);
+    return parsed.ok
+      ? {
+          provider: this.provider,
+          sensorHealth: "HEALTHY",
+          runtimeHealth: "UNKNOWN",
+          observedAt,
+          buckets: parsed.buckets,
+          source,
+          rawOutputDigest: digest,
+        }
+      : failedReading(this.provider, observedAt, source, digest, parsed.error);
+  }
 }
 
 export class GrokUsageCollector extends BaseUsageCollector {
@@ -880,9 +1078,17 @@ const WINDOW_SHAPED = /^.*[A-Za-z].*[:\u2014\u00B7-]\s*\d{1,4}(?:\.\d+)?\s*%/iu;
 /** The reset clause inside whatever trails the percentage. */
 const RESET_CLAUSE = /\bresets?\s+(?<reset>.+?)\s*$/iu;
 
-/** `Aug 21 at 4:59am (Asia/Seoul)` — a wall-clock time in a named zone, with the year implied. */
+/**
+ * `Aug 21 at 4:59am (Asia/Seoul)` — a wall-clock time in a named zone, with the year implied.
+ *
+ * The minutes are optional because the CLI prints both forms for the same instant: successive
+ * calls seconds apart gave `4:59am` and then `5am`. Requiring `:MM` made the horizon flicker
+ * between resolved and null on a window whose percentage never moved — and a bucket with no
+ * horizon holds its entire window in reserve, so worker admission failed and recovered every
+ * few minutes with nothing in the quota to explain it.
+ */
 const RESET_WALL_CLOCK =
-  /^(?<month>[A-Za-z]{3,9})\s+(?<day>\d{1,2})\s+at\s+(?<hour>\d{1,2}):(?<minute>\d{2})\s*(?<meridiem>am|pm)?\s*(?:\((?<zone>[A-Za-z_]+\/[A-Za-z_]+)\))?$/i;
+  /^(?<month>[A-Za-z]{3,9})\s+(?<day>\d{1,2})\s+at\s+(?<hour>\d{1,2})(?::(?<minute>\d{2}))?\s*(?<meridiem>am|pm)?\s*(?:\((?<zone>[A-Za-z_]+\/[A-Za-z_]+)\))?$/i;
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
@@ -919,7 +1125,7 @@ export const parseResetWallClock = (text: string, observedAt: string): string | 
   const month = MONTHS.indexOf(match.groups["month"]!.slice(0, 3).toLowerCase());
   const day = Number(match.groups["day"]);
   let hour = Number(match.groups["hour"]);
-  const minute = Number(match.groups["minute"]);
+  const minute = match.groups["minute"] === undefined ? 0 : Number(match.groups["minute"]);
   const meridiem = match.groups["meridiem"]?.toLowerCase();
   const zone = match.groups["zone"];
   const base = Date.parse(observedAt);
