@@ -1078,9 +1078,17 @@ const WINDOW_SHAPED = /^.*[A-Za-z].*[:\u2014\u00B7-]\s*\d{1,4}(?:\.\d+)?\s*%/iu;
 /** The reset clause inside whatever trails the percentage. */
 const RESET_CLAUSE = /\bresets?\s+(?<reset>.+?)\s*$/iu;
 
-/** `Aug 21 at 4:59am (Asia/Seoul)` — a wall-clock time in a named zone, with the year implied. */
+/**
+ * `Aug 21 at 4:59am (Asia/Seoul)` — a wall-clock time in a named zone, with the year implied.
+ *
+ * The minutes are optional because the CLI prints both forms for the same instant: successive
+ * calls seconds apart gave `4:59am` and then `5am`. Requiring `:MM` made the horizon flicker
+ * between resolved and null on a window whose percentage never moved — and a bucket with no
+ * horizon holds its entire window in reserve, so worker admission failed and recovered every
+ * few minutes with nothing in the quota to explain it.
+ */
 const RESET_WALL_CLOCK =
-  /^(?<month>[A-Za-z]{3,9})\s+(?<day>\d{1,2})\s+at\s+(?<hour>\d{1,2}):(?<minute>\d{2})\s*(?<meridiem>am|pm)?\s*(?:\((?<zone>[A-Za-z_]+\/[A-Za-z_]+)\))?$/i;
+  /^(?<month>[A-Za-z]{3,9})\s+(?<day>\d{1,2})\s+at\s+(?<hour>\d{1,2})(?::(?<minute>\d{2}))?\s*(?<meridiem>am|pm)?\s*(?:\((?<zone>[A-Za-z_]+\/[A-Za-z_]+)\))?$/i;
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
@@ -1117,7 +1125,7 @@ export const parseResetWallClock = (text: string, observedAt: string): string | 
   const month = MONTHS.indexOf(match.groups["month"]!.slice(0, 3).toLowerCase());
   const day = Number(match.groups["day"]);
   let hour = Number(match.groups["hour"]);
-  const minute = Number(match.groups["minute"]);
+  const minute = match.groups["minute"] === undefined ? 0 : Number(match.groups["minute"]);
   const meridiem = match.groups["meridiem"]?.toLowerCase();
   const zone = match.groups["zone"];
   const base = Date.parse(observedAt);

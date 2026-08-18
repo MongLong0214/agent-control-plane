@@ -198,6 +198,15 @@ describe("non-interactive account usage (#582)", () => {
     expect(parseResetWallClock("Aug 21 at 4:59am (Asia/Seoul)", "2026-08-13T00:00:00.000Z")).toBe(
       "2026-08-20T19:59:00.000Z",
     );
+    // The CLI prints both forms for the same reset. Successive calls seconds apart gave
+    // `4:59am` and then `5am`, and requiring `:MM` turned the second into no horizon at all —
+    // so a window whose percentage never moved lost and regained its reserve every few minutes.
+    expect(parseResetWallClock("Aug 21 at 5am (Asia/Seoul)", "2026-08-13T00:00:00.000Z")).toBe(
+      "2026-08-20T20:00:00.000Z",
+    );
+    expect(parseResetWallClock("Aug 19 at 12am (Asia/Seoul)", "2026-08-13T00:00:00.000Z")).toBe(
+      "2026-08-18T15:00:00.000Z",
+    );
   });
 
   it("refuses rather than guessing when the output contract changes", async () => {
