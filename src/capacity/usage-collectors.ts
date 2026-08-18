@@ -376,34 +376,59 @@ export const parseUsageOutput = (
    * and is read whole, unchanged.
    */
   const frames = raw.split(/\u001B\[H/);
-  // The most complete paint, and among equally complete ones the most recent.
+  // Every frame contributes, and the smallest reading of a window wins.
   //
   // Reading only the last frame assumed the final paint is a whole screen. It is not: the
-  // collector stops after two seconds of quiet, so a home followed by a partial repaint is a
-  // complete observation in which the tightest window is simply absent, and a trailing home
-  // leaves an empty frame that read as "the binary never launched". Reading *every* frame is
-  // the opposite error — a damaged repaint spells one window two ways, which is the duplicate
-  // refusal #573 was written for. Completeness picks the paint that lost the least, and the
-  // recency tie-break keeps a stale frame from beating an equally complete current one.
-  const readings = frames.map((frame) => {
+  // collector stops after two seconds of quiet, so a home plus a partial repaint is a complete
+  // observation whose tightest window is simply absent.
+  //
+  // Picking the frame with the most windows was the wrong repair and was measured to be wrong
+  // in the original direction: a complete earlier paint outvotes a shorter current one that
+  // just moved a shared window down, so a week bar repainted to 95% used still reported 95
+  // remaining. Bucket count is not completeness, and a split or damaged paint can hold more
+  // ids than the intact one.
+  //
+  // The union costs a damaged repaint's misspelled window appearing beside the real one. That
+  // cannot grant work: `isRoutableFor` requires *every* applicable bucket to clear the floor,
+  // so an extra bucket can only withhold. Over-reporting is the failure that dispatches work
+  // the quota cannot pay for, so the reading is assembled from whichever frame stated the
+  // least remaining for each window.
+  let lines: string[] = [];
+  let refusal: { ok: false; error: string } | null = null;
+  const lowest = new Map<string, CapacityBucket>();
+  for (const frame of frames) {
     const frameLines = stripTerminal(frame)
       .split("\n")
       .map((line) => line.replace(/\s+/g, " ").trim())
       .filter(Boolean);
-    return { lines: frameLines, parsed: parseFrameBuckets(frameLines, provider, observedAt) };
-  });
-  const invalid = readings.find((reading) => !reading.parsed.ok);
-  // An impossible percentage is a refusal about the reading, not about one frame: quietly
-  // using the frames around it would turn a malformed source into a partial success.
-  if (invalid && !invalid.parsed.ok) return invalid.parsed;
+    if (frameLines.length > lines.length) lines = frameLines;
 
-  let chosen = readings[readings.length - 1] ?? { lines: [] as string[], parsed: { ok: true as const, buckets: [] } };
-  for (const reading of readings) {
-    if (!reading.parsed.ok || !chosen.parsed.ok) continue;
-    if (reading.parsed.buckets.length > chosen.parsed.buckets.length) chosen = reading;
+    const parsed = parseFrameBuckets(frameLines, provider, observedAt);
+    // An impossible percentage is a statement about the source, not about one paint: using the
+    // frames around it would turn a malformed screen into a partial success.
+    if (!parsed.ok) return parsed;
+
+    // A window this paint labelled twice with two numbers is ambiguous in a way nothing here
+    // can resolve, so the paint is not used. It is not fatal on its own: another paint of the
+    // same screen may be unambiguous, and discarding the whole observation for one damaged
+    // repaint is how a readable screen became no reading at all.
+    const ids = new Set<string>();
+    const duplicated = parsed.buckets.some((bucket) => ids.has(bucket.id) || (ids.add(bucket.id), false));
+    if (duplicated) {
+      refusal = { ok: false, error: "interactive /usage output contains duplicate quota-window labels" };
+      continue;
+    }
+
+    for (const bucket of parsed.buckets) {
+      const seen = lowest.get(bucket.id);
+      // A null remaining is "stated but unusable", which admission already treats as
+      // unroutable. It must not be beaten by a number, so it sorts below every reading.
+      const rank = (candidate: CapacityBucket): number => candidate.remainingPercent ?? -1;
+      if (!seen || rank(bucket) < rank(seen)) lowest.set(bucket.id, bucket);
+    }
   }
-  const lines = chosen.lines;
-  const buckets = chosen.parsed.ok ? chosen.parsed.buckets : [];
+  const buckets: CapacityBucket[] = [...lowest.values()];
+  if (buckets.length === 0 && refusal) return refusal;
 
   if (buckets.length === 0) {
     // Three different failures used to arrive as this one sentence: a binary that never
@@ -431,10 +456,6 @@ export const parseUsageOutput = (
         `interactive /usage output contains no explicit remaining-quota percentage ` +
         `(${lines.length} line(s) read); it was neither a quota screen nor a recognised prompt`,
     };
-  }
-  const ids = new Set<string>();
-  if (buckets.some((bucket) => ids.has(bucket.id) || (ids.add(bucket.id), false))) {
-    return { ok: false, error: "interactive /usage output contains duplicate quota-window labels" };
   }
   return { ok: true, buckets };
 };
@@ -517,16 +538,18 @@ const parseFrameBuckets = (
     const own = windowFor(index);
     if (own) carried = own;
     const window = own ?? carried;
-    if (!window) continue;
 
     SENSE.lastIndex = 0;
+    let stated = false;
     let match: RegExpExecArray | null;
     // Every stated figure on the line, not the first. One line can carry both senses of the
     // same window, and taking whichever came first is a coin flip on which one is reported.
     while ((match = SENSE.exec(squeezed[index]!)) !== null) {
       if (!match.groups) continue;
-      const stated = Number(match.groups["value"]);
-      if (!Number.isFinite(stated) || stated < 0 || stated > 100) {
+      stated = true;
+      if (!window) continue;
+      const value = Number(match.groups["value"]);
+      if (!Number.isFinite(value) || value < 0 || value > 100) {
         return { ok: false, error: `usage window '${window}' has an invalid percentage` };
       }
       // #570 — `used` is accepted and subtracted. The invariant refuses a chart, a plan label
@@ -534,7 +557,7 @@ const parseFrameBuckets = (
       // in the reading, so `100 - used` is arithmetic on a stated quantity. Applying a stricter
       // rule to `used` than to `remaining` treats the same evidence differently over one word.
       const measuredAs = /^used$/i.test(match.groups["sense"] ?? "") ? "used" as const : "remaining" as const;
-      const remainingPercent = measuredAs === "used" ? 100 - stated : stated;
+      const remainingPercent = measuredAs === "used" ? 100 - value : value;
 
       const resetText = [lines[index] ?? "", lines[index + 1] ?? "", lines[index + 2] ?? ""]
         .find((value) => /\breset(?:s|ting)?\b/i.test(value) || /reset/i.test(value.replace(/\s+/g, ""))) ?? "";
@@ -546,6 +569,12 @@ const parseFrameBuckets = (
         measuredAs,
       });
     }
+    // The carry ends where the figures do. A window's stale bar and its nested child are the
+    // next line; anything after a line that states no figure at all — a promo, a reset, a row
+    // of bar glyphs — belongs to whatever comes next. Without this the carry reached the rest
+    // of the frame, and because the fold takes the minimum, one unrelated low percentage
+    // silently replaced a real window's figure.
+    if (!stated) carried = null;
   }
 
   // A figure with no label of its own is the same window measured again — a redraw that used

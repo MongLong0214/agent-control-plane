@@ -218,22 +218,94 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(parsed.ok).toBe(false);
   });
 
-  it("reads the current frame when the TUI has repainted", () => {
-    // A repaint is not a second screen. Measured on claude 2.1.233: the same three windows
-    // arrive three times, and not identically — one paint keeps its spaces, another loses
-    // characters, so `Current week (all models)` normalises two different ways and the
-    // duplicate-window refusal fires on one screen read twice (#564).
-    const ESC = "\u001B";
-    const damaged = ["Current session", "\u2588 8%used", "Current week (ll model)", "\u2588 41%used"].join("\n");
-    const current = ["Currentsession", "\u2588 8%used", "Currentweek(allmodels)", "\u2588 41%used"].join("\n");
-    const repainted = `${ESC}[H${damaged}${ESC}[H${current}`;
+  it("assembles a repaint from whichever paint stated the least, not from one chosen paint", () => {
+    // This replaces an assertion that the reported ids are exactly the last paint's. Choosing a
+    // single frame — the last, or the one with the most windows — was measured to over-report:
+    // a complete earlier paint outvotes a shorter current one that just moved a shared window
+    // down, and a damaged paint can hold more ids than the intact one. Over-reporting is the
+    // failure that dispatches work the quota cannot pay for.
+    //
+    // The union's cost is that a damaged repaint's misspelling appears beside the real window.
+    // That cannot grant work: `isRoutableFor` requires *every* applicable bucket to clear the
+    // floor, so an extra bucket can only withhold. The trade is a noisier reported set for a
+    // decision that cannot be too generous.
+    const ESC = String.fromCharCode(27);
+    const HOME = ESC + "[H";
+    const now = clock().nowIso();
 
-    // Without frame awareness this is four windows, two of them the same quota under
-    // different ids — which is what the deployment recorded as a duplicate refusal.
-    const parsed = parseUsageOutput("claude", repainted, clock().nowIso());
+    const damaged = ["Current session", "8%used", "Current week (ll model)", "41%used"].join("\n");
+    const current = ["Currentsession", "8%used", "Currentweek(allmodels)", "41%used"].join("\n");
+    const parsed = parseUsageOutput("claude", HOME + damaged + HOME + current, now);
     expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
     if (!parsed.ok) return;
-    expect(parsed.buckets.map((b) => b.id)).toEqual(["currentsession", "currentweek-allmodels"]);
+    // Both spellings of both windows, all stating the same quota. No reading is above 59.
+    expect(Math.max(...parsed.buckets.map((bucket) => bucket.remainingPercent ?? 0))).toBe(92);
+    expect(parsed.buckets.filter((bucket) => bucket.remainingPercent === 59)).toHaveLength(2);
+
+    // The case a single-frame rule gets wrong in the dangerous direction: the earlier paint is
+    // complete and the later one is partial, but the later one is what says the week is spent.
+    const moved =
+      HOME + ["Currentsession", "8%used", "Currentweek(allmodels)", "5%used", "Currentweek(Fable)", "12%used"].join("\n") +
+      HOME + ["Currentsession", "8%used", "Currentweek(allmodels)", "95%used"].join("\n");
+    const lowered = parseUsageOutput("claude", moved, now);
+    expect(lowered.ok, lowered.ok ? "" : lowered.error).toBe(true);
+    if (!lowered.ok) return;
+    expect(lowered.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(5);
+
+    // One damaged paint must not take the whole observation down with it. A window labelled
+    // twice in a single paint is ambiguous, so that paint is skipped — not the reading.
+    const ambiguous =
+      HOME + ["Currentsession", "8%used", "Currentweek(allmodels)", "41%used 59% remaining"].join("\n") +
+      HOME + ["Currentsession", "8%used", "Currentweek(allmodels)", "95%used"].join("\n");
+    const survived = parseUsageOutput("claude", ambiguous, now);
+    expect(survived.ok, survived.ok ? "" : survived.error).toBe(true);
+    if (!survived.ok) return;
+    expect(survived.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(5);
+  });
+
+  it("prefers the lowest reading of a window even when the later paint states more", () => {
+    // Minimum across paints, not the most recent one. A repaint caught mid-draw states a
+    // prefix of the real figure — `95%used` half-drawn is `9%used`, which reads as 91
+    // remaining instead of 5. Taking the later paint believes the half-drawn number; taking
+    // the lowest cannot, and the direction of that error is the one that dispatches work the
+    // quota cannot pay for.
+    const ESC = String.fromCharCode(27);
+    const HOME = ESC + "[H";
+    const midDraw =
+      HOME + ["Currentweek(allmodels)", "95%used"].join("\n") +
+      HOME + ["Currentweek(allmodels)", "9%used"].join("\n");
+    const parsed = parseUsageOutput("claude", midDraw, clock().nowIso());
+    expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(5);
+  });
+
+  it("stops carrying a window forward at the first line that states no figure", () => {
+    // A figure with no label of its own is folded into the window above by minimum, which is
+    // how a redraw's stale bar and a nested child are kept. Unbounded, that reach crosses a
+    // promo line into an unrelated percentage and silently replaces a real window's number —
+    // withholding work for a window it never described.
+    const bridged = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "+5%weeklylimitspromothroughAug20", "3% remaining"].join("\n"),
+      clock().nowIso(),
+    );
+    expect(bridged.ok, bridged.ok ? "" : bridged.error).toBe(true);
+    if (!bridged.ok) return;
+    expect(bridged.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(59);
+  });
+
+  it("keeps the empty-stream cause distinct from a screen that stated no quota", () => {
+    // #564: those two failures used to arrive as one sentence, and a whole causal chain was
+    // built on the wrong one. A trailing home leaves an empty final frame, so a rule that read
+    // only the last frame reported "the binary may not have launched" about a screen that had
+    // just printed two lines.
+    const ESC = String.fromCharCode(27);
+    const trailing = parseUsageOutput("claude", "Welcome back\nToken activity: 40%" + ESC + "[H", clock().nowIso());
+    expect(trailing.ok).toBe(false);
+    if (trailing.ok) return;
+    expect(trailing.error).toContain("no explicit remaining-quota percentage");
+    expect(trailing.error).not.toContain("may not have launched");
   });
 
   it("keeps a window the last paint dropped, and every reading that would lower it", () => {
