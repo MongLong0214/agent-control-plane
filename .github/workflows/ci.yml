@@ -1,9 +1,9 @@
 name: project-ci
 on:
   push:
-    branches: [main, dev, 'release/**', 'hotfix/**']
+    branches: [main, 'release/**', 'hotfix/**']
   pull_request:
-    branches: [main, dev, 'feature/**', 'release/**']
+    branches: [main, 'feature/**', 'release/**']
 jobs:
   verify:
     runs-on: macos-15
