@@ -1202,7 +1202,11 @@ export class Daemon {
     }
   }
 
-  /** §33.1 — health endpoint. A file the supervisor and `agentctl` can both read. */
+  /**
+   * §33.1 — health endpoint. A file the supervisor can read, and the one place a parked
+   * daemon's `mode` is legible without the operator token that the socket method requires.
+   * `agentctl daemon status` does not read it: it asks the socket and falls back to the lock.
+   */
   writeHealth(reconcile: ReconcileReport | null): void {
     const health = {
       pid: process.pid,

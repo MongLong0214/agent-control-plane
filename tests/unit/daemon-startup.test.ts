@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
@@ -154,4 +154,49 @@ describe("agentcpd main Telegram startup composition", () => {
     expect(result.stdout, diagnostics).toContain("startup test owner approval cleared gate");
     expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
   }, 40_000);
+});
+
+describe("#568: a parked daemon still answers a supervisor's stop", () => {
+  it("releases the single-instance lock on SIGTERM while parked", async () => {
+    // `install-launchd.sh upgrade` and `rollback` both wait for `agentcpd.lock` to disappear
+    // before they will touch the database, and only `Daemon.stop()` removes it. Before the
+    // signal handlers were installed ahead of `start()`, a parked daemon — which never returns
+    // from `start()` — met a default kill and left that file behind, failing every deploy on
+    // the host this park was written for.
+    const root = mkdtempSync(join("/tmp", "acp-park-sigterm-"));
+    const stateRoot = join(root, ".agent-control-plane");
+    const child = spawn(process.execPath, ["--import", "tsx", mainRunner], {
+      cwd: repositoryRoot,
+      env: {
+        ...process.env,
+        HOME: root,
+        USER: "park-owner",
+        ACP_MCP_TOKEN: "park-mcp-token",
+        ACP_OPERATOR_TOKEN: "park-operator-token",
+        ACP_OPERATOR_ACTOR: "park-owner",
+        ACP_STARTUP_TEST_ROOT: root,
+        ACP_STARTUP_TEST_SEED: "1",
+        ACP_STARTUP_TEST_PARK: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const exited = new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code)));
+
+    try {
+      // The door binding is the observable proof the daemon parked rather than exited.
+      const doorPath = join(stateRoot, "agentcpd.operator.sock");
+      const lockPath = join(stateRoot, "agentcpd.lock");
+      await vi.waitFor(() => expect(existsSync(doorPath)).toBe(true), { timeout: 60_000, interval: 100 });
+      expect(existsSync(lockPath)).toBe(true);
+
+      child.kill("SIGTERM");
+      await exited;
+
+      // What the deploy script actually waits for.
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
 });

@@ -113,6 +113,22 @@ if (process.env["ACP_STARTUP_TEST_SEED"] === "1") {
   chmodSync(envFile, 0o600);
 }
 
+if (process.env["ACP_STARTUP_TEST_PARK"] === "1") {
+  // No routable quota from any provider, which is the host this bootstrap park exists for:
+  // every required role is uncovered, so the startup doctor blocks on
+  // ROLE_COVERAGE_NO_VALID_COVERAGE alone and `start()` parks instead of returning.
+  for (const adapter of adapters) {
+    adapter.setCapacity({
+      provider: adapter.provider,
+      sensorHealth: "ERROR",
+      runtimeHealth: "UNAVAILABLE",
+      observedAt: systemClock.nowIso(),
+      source: "startup-test-no-usage-surface",
+      buckets: [],
+    });
+  }
+}
+
 const expectTelegram = process.env["ACP_STARTUP_TEST_EXPECT_TELEGRAM"] === "1";
 const expectPromptFlow = process.env["ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW"] === "1";
 const startupTransport = new StartupTelegramTransport(expectPromptFlow);

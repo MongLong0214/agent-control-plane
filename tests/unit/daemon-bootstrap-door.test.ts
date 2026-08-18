@@ -625,14 +625,74 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     // The offline inspection must survive: no token still answers, and answers zero.
     expect(code).toBe(0);
     const answer = JSON.parse(printed.join("")) as Record<string, unknown>;
-    // A missing token is the daemon refusing to be asked, not the daemon being unreachable,
-    // and a wrong token is the daemon answering with a denial. Naming either "unreachable"
-    // beside a lock file that says a process is live is three states under one label.
-    expect(answer["daemonStatus"]).toMatchObject({
-      answered: false,
-      reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED,
-    });
+    // Naming this "unreachable" beside a lock file that says a process is live puts three
+    // states under one label, and asserting the daemon did not answer is untrue when a wrong
+    // token means it answered with a denial. The reason code is the only honest discriminator.
+    expect(answer["daemonStatus"]).toMatchObject({ reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED });
     expect(Object.keys(answer)).not.toContain("daemonUnreachable");
+    expect(answer["daemonStatus"]).not.toHaveProperty("answered");
+  });
+
+  it("reports a live parked daemon's refusal as a refusal, not as an absent one", async () => {
+    // The case round 7 found untested, and the one most likely on the real host: the token is
+    // wrong rather than missing, so the daemon accepts the connection and answers with a
+    // denial. A fallback that called that "unreachable" — or asserted the daemon never
+    // answered — describes the opposite of what happened.
+    const { daemon, stateDir } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])]);
+    const starting = daemon.start({
+      bootstrapDoor: () =>
+        startBootstrapOperatorDoor(
+          daemon,
+          stateDir,
+          { token: TEST_OPERATOR_TOKEN, peerId: "cli:fixture-operator", actor: "fixture-operator" },
+          { mcpToken: TEST_MCP_TOKEN },
+        ),
+    });
+    const socketPath = join(stateDir, "agentcpd.operator.sock");
+    await vi.waitFor(() => expect(existsSync(socketPath)).toBe(true));
+
+    const printed: string[] = [];
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      printed.push(String(chunk));
+      return true;
+    });
+    const previousToken = process.env["ACP_OPERATOR_TOKEN"];
+    let code: number;
+    try {
+      process.env["ACP_OPERATOR_SOCKET"] = socketPath;
+      process.env["ACP_OPERATOR_TOKEN"] = "not-the-daemons-operator-token";
+      code = await cliMain(["daemon", "status"]);
+    } finally {
+      stdout.mockRestore();
+      delete process.env["ACP_OPERATOR_SOCKET"];
+      if (previousToken === undefined) delete process.env["ACP_OPERATOR_TOKEN"];
+      else process.env["ACP_OPERATOR_TOKEN"] = previousToken;
+    }
+
+    expect(code).toBe(0);
+    const answer = JSON.parse(printed.join("")) as Record<string, unknown>;
+    expect(answer["daemonStatus"]).toMatchObject({ reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED });
+    // The daemon was right there and said no. Nothing printed may claim it was not reached.
+    expect(printed.join("")).not.toContain("unavailable");
+    expect(printed.join("")).not.toContain(ReasonCode.DAEMON_LOCK_LOST);
+
+    await daemon.stop();
+    await starting;
+  });
+
+  it("does not increment the crash-loop record for the capacity block it parks on", async () => {
+    // capacity-source.md promises "no crash-loop increment for the capacity block itself".
+    // Nothing held that: every crash-loop test covers the old release-and-exit path.
+    const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    expect(daemon.crashLoopState().failures).toBe(0);
+    expect((await observe(daemon)).allowed).toBe(true);
+    expect((await starting).allowed).toBe(true);
+    expect(daemon.crashLoopState().failures).toBe(0);
+    await daemon.stop();
   });
 
   it("is decided by the finding codes, not by how many there are", () => {

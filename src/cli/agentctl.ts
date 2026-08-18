@@ -110,15 +110,18 @@ export const main = async (argv: string[]): Promise<number> => {
       print(live.value);
       return 0;
     }
-    // Not "unreachable": this branch covers a daemon that answered and refused (a wrong or
-    // absent operator token) as well as one that could not be reached at all, and the client
-    // reports both as DAEMON_LOCK_LOST. Say what happened instead of naming a cause. The lock
-    // is a file read that does not prove its pid is alive, so it can appear beside any of them.
+    // Three different situations reach here: no token, so the client never opened a socket;
+    // a wrong token, where the daemon accepted the connection and *answered* with a denial;
+    // and a socket that could not be reached at all. Only `reasonCode` separates them, so that
+    // is what this reports — an earlier version asserted `answered: false`, which is simply
+    // untrue of the middle case, and the one before that called all three "unreachable".
+    // `lock` is a file read that never checks whether its pid is alive, so it can appear
+    // beside any of them, including beside a process that is already gone.
     const lock = new SingleInstanceLock(join(config.databasePath, "..", "agentcpd.lock"));
     print({
       lock: lock.read(),
       databasePath: config.databasePath,
-      daemonStatus: { answered: false, reasonCode: live.reasonCode, message: live.message },
+      daemonStatus: { reasonCode: live.reasonCode, message: live.message },
     });
     return 0;
   }

@@ -161,10 +161,14 @@ While parked that reports `mode: "BOOTSTRAP"`, the admitted method list, and the
 findings that remain. When it reports `mode: "NORMAL"` the daemon is dispatching.
 
 Without the token the command still answers, but only from the local lock file, and it says
-so under `daemonStatus`. **That answer cannot tell you whether the daemon is parked**: a lock
-file records a process that is live, not one that is serving, and a parked daemon holds its
-lock exactly like a running one. The same fallback appears when the socket genuinely cannot
-be reached, so read the `reasonCode` beside it rather than the lock alone.
+why under `daemonStatus`. **That answer cannot tell you whether the daemon is parked**: a
+parked daemon holds its lock exactly like a running one, and the lock is read from a file
+whose pid is never checked, so it can also outlive the process it names. The same fallback
+appears for a wrong token — where the daemon did answer, with a refusal — and for a socket
+that genuinely cannot be reached. Read the `reasonCode` beside the lock rather than the lock.
+
+If you cannot get the token, `~/.agent-control-plane/health.json` carries the same `mode` and
+`blockingFindings` the socket reports, and the daemon rewrites it on every parked re-check.
 
 Two limits worth knowing before relying on this:
 
