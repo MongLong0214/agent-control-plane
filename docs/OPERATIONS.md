@@ -28,17 +28,31 @@ node dist/cli/agentctl.js help
 node dist/cli/agentctl.js daemon status
 ```
 
-The status command reports the local daemon lock and configured database path. It does not
-prove the daemon is healthy, the external integrations are connected, or that a deployment
-has satisfied acceptance.
+The status command asks the daemon for its mode and health over the operator socket, which
+needs `ACP_OPERATOR_TOKEN`, and falls back to the local lock file and configured database
+path when the daemon does not answer — including when no token was provided to ask with. The
+example above has no token, so it takes that fallback: it reports the lock and a `reasonCode`,
+never `mode`. The launcher provisions the operator token for `agentcpd`, not for an operator
+shell, so export it deliberately when you need to ask the daemon anything.
+
+A lock read is weaker evidence than a socket answer in two ways: it does not check that its
+pid is alive, and a parked daemon holds its lock exactly like a dispatching one. A daemon
+reporting `mode: "BOOTSTRAP"` is parked and serving only the capacity door; see
+[provider capacity source](capacity-source.md). `~/.agent-control-plane/health.json` carries
+the same `mode` without needing the token.
+
+None of these prove the external integrations are connected or that a deployment has
+satisfied acceptance.
 
 ## Foreground daemon experiment
 
-`agentcpd` needs an MCP token before it exposes its local authenticated sockets. For a
-disposable local experiment:
+`agentcpd` needs an MCP token and a distinct operator credential before it exposes its local
+authenticated sockets; it refuses to start without either, and refuses to start if they are
+the same value. For a disposable local experiment:
 
 ```bash
 export ACP_MCP_TOKEN="$(openssl rand -hex 32)"
+export ACP_OPERATOR_TOKEN="$(openssl rand -hex 32)"
 node dist/daemon/agentcpd.js
 ```
 

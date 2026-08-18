@@ -65,11 +65,12 @@ node dist/cli/agentctl.js project register my-project /abs/path/to/checkout
 node dist/cli/agentctl.js doctor
 ```
 
-For a disposable local experiment, set a fresh local MCP token and start the daemon in the
-foreground:
+For a disposable local experiment, set a fresh local MCP token and a distinct operator
+credential, then start the daemon in the foreground:
 
 ```bash
 export ACP_MCP_TOKEN="$(openssl rand -hex 32)"
+export ACP_OPERATOR_TOKEN="$(openssl rand -hex 32)"
 node dist/daemon/agentcpd.js
 ```
 

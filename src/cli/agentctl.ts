@@ -12,8 +12,9 @@ import type { RunState } from "../domain/types.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
 
 /**
- * PRD §28.4 — the operator CLI is a client, never a composition root. Every command other
- * than the lock-only status inspection crosses the authenticated daemon socket.
+ * PRD §28.4 — the operator CLI is a client, never a composition root. Every command crosses
+ * the authenticated daemon socket. `daemon status` additionally falls back to reading the
+ * local lock file, so that it still answers when no daemon does.
  */
 const USAGE = `agentctl — Agent Control Plane operator CLI
 
@@ -39,7 +40,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor list                     list registered conversational actors
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
   agentctl bootstrap hermes -- <command>  launch Hermes and establish CEO generation 1
-  agentctl daemon status                  daemon lock (read-only local inspection)
+  agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
 
 export interface OperatorClientOptions {
@@ -92,19 +93,39 @@ export const main = async (argv: string[]): Promise<number> => {
   const owner = rest.includes("--owner");
   const args = rest.filter((arg) => arg !== "--owner");
 
-  // This is deliberately the one offline inspection: it reads lock metadata only and never
-  // opens SQLite. All state and every mutation use the operator socket below.
-  if (command === "daemon" && args[0] === "status") {
-    const lock = new SingleInstanceLock(join(config.databasePath, "..", "agentcpd.lock"));
-    print({ lock: lock.read(), databasePath: config.databasePath });
-    return 0;
-  }
-
   const client = createOperatorClient({
     socketPath:
       process.env["ACP_OPERATOR_SOCKET"] ?? join(config.databasePath, "..", "agentcpd.operator.sock"),
     token: process.env["ACP_OPERATOR_TOKEN"],
   });
+
+  // `daemon status` keeps its offline reading — it must answer when no daemon is running — but
+  // it asks the daemon first. A parked daemon is the one state where the lock file is actively
+  // misleading: it says a process holds the lock, and nothing in it says that process is
+  // serving only the capacity door. `mode` and the remaining blocking findings live on the
+  // socket method, so an inspection that never sends it cannot report the state this exists for.
+  if (command === "daemon" && args[0] === "status") {
+    const live = await client.request("daemon.status", {});
+    if (live.allowed) {
+      print(live.value);
+      return 0;
+    }
+    // Three different situations reach here: no token, so the client never opened a socket;
+    // a wrong token, where the daemon accepted the connection and *answered* with a denial;
+    // and a socket that could not be reached at all. Only `reasonCode` separates them, so that
+    // is what this reports — an earlier version asserted `answered: false`, which is simply
+    // untrue of the middle case, and the one before that called all three "unreachable".
+    // `lock` is a file read that never checks whether its pid is alive, so it can appear
+    // beside any of them, including beside a process that is already gone.
+    const lock = new SingleInstanceLock(join(config.databasePath, "..", "agentcpd.lock"));
+    print({
+      lock: lock.read(),
+      databasePath: config.databasePath,
+      daemonStatus: { reasonCode: live.reasonCode, message: live.message },
+    });
+    return 0;
+  }
+
   return dispatch(client, command, args, owner);
 };
 

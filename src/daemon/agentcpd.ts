@@ -382,6 +382,20 @@ export const startOperatorSocket = async (
   };
 };
 
+/**
+ * The listener a parked daemon serves. It is the operator socket with the Hermes bootstrap
+ * extension withheld: `bootstrap.hermes` constitutes CEO (`hermes-bootstrap.ts`), which is not
+ * something a daemon that has not passed its startup doctor may hand out. Every other
+ * restriction is the daemon's — `BOOTSTRAP_OPERATOR_METHODS` decides what a parked daemon
+ * answers, so the transport never becomes a second, divergent opinion about what is admitted.
+ */
+export const startBootstrapOperatorDoor = (
+  daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
+  stateDir: string,
+  credential: LocalOperatorCredential,
+  options: Omit<LocalOperatorSocketOptions, "bootstrapHermes"> = {},
+): Promise<LocalOperatorListener> => startOperatorSocket(daemon, stateDir, credential, options);
+
 const startMcpSocket = async (
   path: string,
   token: string,
@@ -1213,7 +1227,56 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   const daemon = cp.createDaemon({ stateDir, buzz });
 
-  const started = await daemon.start();
+  let listeners: LocalMcpListeners | null = null;
+  let buzzActorIngress: LocalBuzzActorIngress | null = null;
+  let operator: LocalOperatorListener | null = null;
+  let hermesBootstrap: HermesBootstrapAuthority | null = null;
+  let telegram: TelegramLongPollListener | null = null;
+  let startCompleted = false;
+
+  let shuttingDown: Promise<void> | null = null;
+  const shutdown = async (signal: string): Promise<void> => {
+    // A supervisor that sends SIGTERM twice, or SIGTERM then SIGINT, must not run this twice:
+    // the listener handles have no closing guard, and Node rejects a second `server.close()`
+    // with ERR_SERVER_NOT_RUNNING — which, through `void shutdown(...)`, is an unhandled
+    // rejection during the one operation that most needs to finish.
+    if (shuttingDown) return shuttingDown;
+    shuttingDown = (async () => {
+    process.stdout.write(`\nshutting down on ${signal}\n`);
+    await telegram?.close();
+    await buzzActorIngress?.close();
+    await operator?.close();
+    await hermesBootstrap?.close();
+    await listeners?.close();
+    await sessionLaunch.close();
+    await daemon.stop();
+    // Before `start()` returns, the control plane is still unwinding it — `daemon.stop()` has
+    // released the lock, which is what a supervisor is waiting for, and closing the database
+    // out from under that unwind would only turn a clean stop into an error.
+    if (startCompleted) cp.close();
+    process.exit(0);
+    })();
+    return shuttingDown;
+  };
+
+  // Installed before `start()`, not after. A daemon that parks has not returned from `start()`,
+  // and only `daemon.stop()` releases the single-instance lock. Without a handler here a
+  // supervisor's SIGTERM is a default kill that leaves the lock file behind, and
+  // `install-launchd.sh upgrade` and `rollback` both wait for that file to disappear before
+  // they will touch the database — so a parked daemon would fail every deploy on the host this
+  // whole change exists for.
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+
+  const started = await daemon.start({
+    bootstrapDoor: () =>
+      startBootstrapOperatorDoor(
+        daemon,
+        stateDir,
+        { token: operatorToken, peerId: `cli:${operatorActor}`, actor: operatorActor },
+        { mcpToken },
+      ),
+  });
   if (!started.allowed) {
     process.stderr.write(`${JSON.stringify(started, null, 2)}\n`);
     process.stderr.write(
@@ -1226,11 +1289,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     process.exit(1);
   }
 
-  let listeners: LocalMcpListeners | null = null;
-  let buzzActorIngress: LocalBuzzActorIngress | null = null;
-  let operator: LocalOperatorListener | null = null;
-  let hermesBootstrap: HermesBootstrapAuthority | null = null;
-  let telegram: TelegramLongPollListener | null = null;
+  startCompleted = true;
   try {
     hermesBootstrap = createHermesBootstrapAuthority(cp, {
       stateDir,
@@ -1283,23 +1342,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   process.stdout.write(`${JSON.stringify({ started: started.value }, null, 2)}\n`);
 
-  const shutdown = async (signal: string): Promise<void> => {
-    process.stdout.write(`\nshutting down on ${signal}\n`);
-    await telegram?.close();
-    await buzzActorIngress?.close();
-    await operator?.close();
-    await hermesBootstrap?.close();
-    await listeners?.close();
-    await sessionLaunch.close();
-    await daemon.stop();
-    cp.close();
-    process.exit(0);
-  };
-
   const context: AgentcpdMainContext = { cp, daemon, telegram };
-
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
-  process.on("SIGINT", () => void shutdown("SIGINT"));
 
   // Keep the process alive; work arrives through authenticated local MCP sockets or timers.
   if (options.waitForShutdown) {
