@@ -35,6 +35,13 @@ import { SingleInstanceLock } from "./single-instance.ts";
  * `assertContinuityFreshnessOrdering` below fails at startup if the relationship is broken,
  * because a comment saying "keep these in step" is not a thing that keeps them in step.
  */
+/**
+ * Generous against the measured cost of one pass — Claude answers in ~2s and the Codex
+ * app-server in ~3s — and far short of the point where a supervisor concludes the daemon is
+ * dead. It bounds the sum, so one unresponsive provider cannot spend the others' time.
+ */
+const DEFAULT_CAPACITY_REFRESH_BUDGET_MS = 15_000;
+
 const DEFAULT_CAPACITY_REFRESH_MS = 4 * 60_000;
 
 /**
@@ -63,6 +70,8 @@ export interface DaemonOptions {
   buzz?: BuzzAdapter;
   /** Consecutive start failures before the supervisor should back off harder. */
   crashLoopThreshold?: number;
+  /** How long the whole capacity refresh may hold startup before it is abandoned. */
+  capacityRefreshBudgetMs?: number;
   /**
    * How often a parked daemon re-reads its own sensors without being asked. The operator door
    * must not be the only way out of a park: the block it exists for is the one an automatic
@@ -1185,7 +1194,42 @@ export class Daemon {
    * deployment artifact. Preserve the adapter's timestamp: manufacturing "now" here
    * would let an old quota reading remain fresh forever.
    */
+  /**
+   * The whole refresh is bounded, not just each probe inside it.
+   *
+   * `start()` awaits this, and the collectors spawn real provider CLIs — a `claude -p` that
+   * answers in two seconds here, an app-server handshake that answers in three. Multiply that
+   * by the providers and add a host where one of them is missing from PATH or is waiting on
+   * something, and the daemon produces no output at all while a supervisor decides it never
+   * started. That is a startup held hostage by a third-party binary.
+   *
+   * A budget makes the worst case a known one. Whatever did not answer is simply absent, and
+   * absent capacity is already handled: the doctor blocks on coverage, and the bootstrap park
+   * keeps the daemon alive and reachable while an operator or the periodic refresh supplies it.
+   * Failing to read a quota must never be the same event as failing to start.
+   */
   private async refreshCapacitySensors(): Promise<void> {
+    const budgetMs = this.options.capacityRefreshBudgetMs ?? DEFAULT_CAPACITY_REFRESH_BUDGET_MS;
+    let timer: NodeJS.Timeout | null = null;
+    const budget = new Promise<"BUDGET_SPENT">((resolve) => {
+      timer = setTimeout(() => resolve("BUDGET_SPENT"), budgetMs);
+      timer.unref();
+    });
+    try {
+      const outcome = await Promise.race([this.refreshCapacitySensorsUnbounded(), budget]);
+      if (outcome === "BUDGET_SPENT") {
+        this.cp.audit.record({
+          kind: "CAPACITY_REFRESH_ABANDONED",
+          reasonCode: ReasonCode.CAPACITY_SENSOR_FILE_STALE,
+          evidence: { budgetMs, pid: process.pid },
+        });
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async refreshCapacitySensorsUnbounded(): Promise<void> {
     const directory = this.cp.config.capacityDir;
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     chmodSync(directory, 0o700);
