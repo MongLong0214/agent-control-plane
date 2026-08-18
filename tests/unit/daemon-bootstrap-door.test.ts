@@ -151,6 +151,41 @@ const status = (daemon: Daemon) =>
     PEER,
   );
 
+describe("#582: reading a quota must not be able to stop the daemon starting", () => {
+  it("abandons a capacity refresh that outlives its budget and starts anyway", async () => {
+    // `start()` awaits the refresh, and the collectors spawn real provider CLIs — two seconds
+    // for one, three for another, and unbounded for a host where one is missing or waiting.
+    // The daemon writes nothing until start() returns, so a supervisor sees a process that
+    // never started rather than a quota that could not be read. Those must not be one event.
+    const harness = makeHarness();
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    vi.spyOn(harness.cp.doctor, "run").mockResolvedValue({
+      scope: "system",
+      target: null,
+      status: "HEALTHY",
+      findings: [],
+      ranAt: "2026-08-12T00:00:00.000Z",
+    });
+    const held: { release: (() => void) | null } = { release: null };
+    vi.spyOn(harness.cp.capacity, "refresh").mockImplementation(
+      () => new Promise((resolve) => {
+        held.release = () => resolve([]);
+      }),
+    );
+
+    const daemon = new Daemon(harness.cp, {
+      stateDir: tempDir("acp-capacity-budget-"),
+      capacityRefreshBudgetMs: 50,
+    });
+    const started = await daemon.start();
+
+    expect(started.allowed, started.allowed ? "" : started.message).toBe(true);
+    expect(harness.cp.audit.byKind("CAPACITY_REFRESH_ABANDONED")).toHaveLength(1);
+    await daemon.stop();
+    held.release?.();
+  });
+});
+
 describe("#568: the documented capacity remedy is reachable in the state that needs it", () => {
   it("parks with the lock still held instead of releasing it and exiting", async () => {
     const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])]);
