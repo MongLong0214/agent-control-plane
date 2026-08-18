@@ -18,6 +18,8 @@ import {
   SpawnCodexRateLimitProbe,
   type CodexRateLimitProbe,
   GrokUsageCollector,
+  grokBearer,
+  type GrokBillingProbe,
   parseUsageOutput,
   ExpectUsageTerminal,
   type UsageTerminal,
@@ -412,6 +414,174 @@ describe("Codex account rate limits (#582)", () => {
     expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
     expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 60]]);
   }, 20_000);
+});
+
+describe("Grok subscription billing (#582)", () => {
+  // Captured live from cli-chat-proxy.grok.com/v1/billing?format=credits on this host.
+  const LIVE = {
+    config: {
+      currentPeriod: {
+        type: "USAGE_PERIOD_TYPE_WEEKLY",
+        start: "2026-08-12T06:08:19.603673+00:00",
+        end: "2026-08-19T06:08:19.603673+00:00",
+      },
+      creditUsagePercent: 51.0,
+      productUsage: [
+        { product: "GrokBuild", usagePercent: 50.0 },
+        { product: "GrokChat", usagePercent: 1.0 },
+      ],
+    },
+  };
+
+  const probeReturning = (payload: unknown): GrokBillingProbe => ({ read: async () => payload });
+
+  it("reads the credit window and each product's share of it", async () => {
+    const reading = await new GrokUsageCollector({
+      clock: clock(),
+      binary: "grok",
+      grokBilling: probeReturning(LIVE),
+    }).collect();
+
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    expect(reading.source).toMatch(/^account-billing:grok;/u);
+    expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["credits", 49],
+      ["grokbuild", 50],
+      ["grokchat", 99],
+    ]);
+    // Grok's capability set is unchanged by the new source: optional diversity only, never a
+    // critical continuity role (ADR-0007).
+    expect(reading.buckets.every((bucket) => bucket.capabilities.join() === "adversarial-review")).toBe(true);
+    expect(reading.buckets[0]?.resetAt).toBe("2026-08-19T06:08:19.603Z");
+  });
+
+  it("refuses rather than guessing when the account states no usable percentage", async () => {
+    for (const payload of [null, {}, { config: {} }, { config: { creditUsagePercent: "n/a" } }, { config: { creditUsagePercent: 140 } }]) {
+      const reading = await new GrokUsageCollector({
+        clock: clock(),
+        binary: "grok",
+        grokBilling: probeReturning(payload),
+      }).collect();
+      expect(reading.sensorHealth, JSON.stringify(payload)).toBe("ERROR");
+      expect(reading.buckets).toEqual([]);
+    }
+  });
+
+  it("drops a product whose share is not a usable percentage", async () => {
+    // A malformed product must not become a bucket. Every applicable bucket has to clear the
+    // floor, so a nonsense one either withholds all Grok work or, read as zero used, quietly
+    // adds headroom that was never stated.
+    const reading = await new GrokUsageCollector({
+      clock: clock(),
+      binary: "grok",
+      grokBilling: probeReturning({
+        config: {
+          creditUsagePercent: 10,
+          currentPeriod: { end: "2026-08-19T06:08:19.603673+00:00" },
+          productUsage: [
+            { product: "GrokBuild", usagePercent: 20 },
+            { product: "Broken", usagePercent: "n/a" },
+            { product: "AlsoBroken", usagePercent: 140 },
+            { product: 42, usagePercent: 5 },
+          ],
+        },
+      }),
+    }).collect();
+
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    expect(reading.buckets.map((bucket) => bucket.id)).toEqual(["credits", "grokbuild"]);
+  });
+
+  it("keeps the borrowed credential out of everything it records", async () => {
+    // This is the one provider whose quota cannot be read through its own CLI, so ACP holds the
+    // subscription's bearer for the length of one request. Nothing about that may survive into
+    // a reading, a source string or a digest.
+    const secret = "xai-secret-token-value-that-must-not-appear-anywhere";
+    const reading = await new GrokUsageCollector({
+      clock: clock(),
+      binary: "grok",
+      grokBilling: {
+        read: async () => ({ config: { ...LIVE.config, echoedToken: secret } }),
+      },
+    }).collect();
+
+    const recorded = JSON.stringify(reading);
+    expect(recorded).not.toContain(secret);
+    expect(recorded).not.toContain("Bearer");
+  });
+
+  it("reports a missing credential through the real probe, not an injected one", async () => {
+    // Every other test here injects a probe, which means the shipped one — the part that reads
+    // the auth file and makes the request — is never entered. This drives it, stopping before
+    // the network: no credential, no call. The same tests that pass with a fake probe would
+    // pass if the real one threw on its first line.
+    const reading = await new GrokUsageCollector({
+      clock: clock(),
+      binary: "grok",
+      grokAuthPath: join(tempDir("acp-grok-noauth-"), "absent.json"),
+    }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.error).toContain("no usable credential");
+    expect(reading.buckets).toEqual([]);
+  });
+
+  it("picks the credential, not the first field that happens to be called key", () => {
+    // The file carries several. A short one earlier in the object is an identifier, not a
+    // bearer, and choosing it sends a request that fails for a reason nothing here explains.
+    const root = tempDir("acp-grok-keys-");
+    const authPath = join(root, "auth.json");
+    const credential = "x".repeat(48);
+    writeFileSync(
+      authPath,
+      JSON.stringify({ meta: { key: "abc" }, entry: { oidc_client_id: "cli", key: credential } }),
+      { mode: 0o600 },
+    );
+
+    expect(grokBearer(authPath)).toBe(credential);
+    expect(grokBearer(join(root, "absent.json"))).toBeNull();
+  });
+
+  it("finds the bearer wherever the CLI's auth file nests it", async () => {
+    const root = tempDir("acp-grok-auth-");
+    const authPath = join(root, "auth.json");
+    // Nested the way the CLI writes it, and deliberately beside a short value that must not be
+    // mistaken for a credential.
+    writeFileSync(
+      authPath,
+      JSON.stringify({ version: 2, entry: { oidc_client_id: "short", key: "x".repeat(40) } }),
+      { mode: 0o600 },
+    );
+
+    // Reaching the network is the proof it got a bearer: without one it refuses before calling.
+    const reading = await new GrokUsageCollector({
+      clock: clock(),
+      binary: "grok",
+      timeoutMs: 1,
+      grokAuthPath: authPath,
+    }).collect();
+
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.error, reading.error ?? "").not.toContain("no usable credential");
+  }, 20_000);
+
+  it("says plainly that an expired credential is the CLI's to renew", async () => {
+    const reading = await new GrokUsageCollector({
+      clock: clock(),
+      binary: "grok",
+      grokBilling: {
+        read: async () => {
+          throw new Error("grok billing refused the stored credential; it has expired and only the CLI can renew it");
+        },
+      },
+    }).collect();
+
+    // Measured at six hours, and it expired mid-session while this was being written. Nothing
+    // here writes a refreshed token back: that file belongs to the CLI, and racing it would be
+    // a second writer to a credential store.
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.error).toContain("only the CLI can renew it");
+  });
 });
 
 describe("interactive provider usage collectors", () => {

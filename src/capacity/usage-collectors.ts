@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -51,6 +51,10 @@ export interface UsageCollectorOptions {
   codexRateLimits?: CodexRateLimitProbe;
   /** Pinned, never inherited: a different CODEX_HOME is a different account's quota. */
   codexHome?: string;
+  /** Injected in tests. Production reads the subscription's own billing summary. */
+  grokBilling?: GrokBillingProbe;
+  /** Where the Grok CLI keeps the credential this probe borrows. */
+  grokAuthPath?: string;
 }
 
 /**
@@ -546,6 +550,125 @@ export const parseCodexRateLimits = (
   return { ok: true, buckets };
 };
 
+/**
+ * Grok states its subscription's credit usage over the same route its CLI uses. Verified on this
+ * host: `creditUsagePercent`, a weekly period with a start and an end, and a per-product split.
+ *
+ * This is the one provider whose quota cannot be read through its own CLI. `grok agent stdio`
+ * answers `-32601` for billing and there is no exiting subcommand, so the choice was this route
+ * or leaving Grok to operator observation. The owner chose this route.
+ *
+ * The cost is stated rather than hidden: reading it means holding the subscription's bearer,
+ * which every other provider here avoids by letting its CLI hold its own. The token is read at
+ * probe time and never stored, never logged, and never reaches the reading's digest.
+ */
+export interface GrokBillingProbe {
+  read(input: { timeoutMs: number; authPath: string }): Promise<unknown>;
+}
+
+const GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+
+/**
+ * The bearer, wherever the CLI's auth file currently keeps it. Exported so the choice it makes
+ * can be tested: a file can carry several `key` fields, and picking the wrong one sends a
+ * request that fails for a reason nothing here would explain.
+ */
+export const grokBearer = (authPath: string): string | null => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(authPath, "utf8"));
+  } catch {
+    return null;
+  }
+  const walk = (value: unknown): string | null => {
+    if (!value || typeof value !== "object") return null;
+    const record = value as Record<string, unknown>;
+    const key = record["key"];
+    if (typeof key === "string" && key.length > 20) return key;
+    for (const nested of Object.values(record)) {
+      const found = walk(nested);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(parsed);
+};
+
+export class FetchGrokBillingProbe implements GrokBillingProbe {
+  async read(input: { timeoutMs: number; authPath: string }): Promise<unknown> {
+    const bearer = grokBearer(input.authPath);
+    // No bearer is a state to report, not one to work around. The token expires — measured at
+    // six hours — and nothing here refreshes it: writing a new one back would race the CLI that
+    // owns the file.
+    if (!bearer) throw new Error("grok auth file states no usable credential");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), input.timeoutMs);
+    try {
+      const response = await fetch(GROK_BILLING_URL, {
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          "x-xai-token-auth": "xai-grok-cli",
+          Accept: "application/json",
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(
+          response.status === 401
+            ? "grok billing refused the stored credential; it has expired and only the CLI can renew it"
+            : `grok billing answered ${response.status}`,
+        );
+      }
+      return await response.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+const grokPeriodEnd = (period: unknown): string | null => {
+  if (!period || typeof period !== "object") return null;
+  const end = (period as { end?: unknown }).end;
+  if (typeof end !== "string") return null;
+  const parsed = Date.parse(end);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+};
+
+export const parseGrokBilling = (
+  payload: unknown,
+): { ok: true; buckets: CapacityBucket[] } | { ok: false; error: string } => {
+  const config = (payload as { config?: unknown } | null)?.config;
+  if (!config || typeof config !== "object") {
+    return { ok: false, error: "grok billing returned no config" };
+  }
+  const record = config as Record<string, unknown>;
+  const used = Number(record["creditUsagePercent"]);
+  if (!Number.isFinite(used) || used < 0 || used > 100) {
+    return { ok: false, error: "grok billing stated no usable credit percentage" };
+  }
+  const resetAt = grokPeriodEnd(record["currentPeriod"]);
+  const capabilities = [...CAPABILITIES.grok];
+  const buckets: CapacityBucket[] = [
+    { id: "credits", remainingPercent: 100 - used, resetAt, capabilities, measuredAs: "used" },
+  ];
+
+  // Each product's own share, when stated. Admission requires every applicable bucket to clear
+  // the floor, so naming them can only withhold work — and it says which one is spending.
+  const products = record["productUsage"];
+  if (Array.isArray(products)) {
+    for (const entry of products) {
+      if (!entry || typeof entry !== "object") continue;
+      const name = (entry as { product?: unknown }).product;
+      const percent = Number((entry as { usagePercent?: unknown }).usagePercent);
+      if (typeof name !== "string" || !Number.isFinite(percent) || percent < 0 || percent > 100) continue;
+      const id = normaliseBucketId(name);
+      if (buckets.some((bucket) => bucket.id === id)) continue;
+      buckets.push({ id, remainingPercent: 100 - percent, resetAt, capabilities, measuredAs: "used" });
+    }
+  }
+  return { ok: true, buckets };
+};
+
 export class ClaudeUsageCollector extends BaseUsageCollector {
   protected readonly provider = "claude" as const;
 
@@ -714,6 +837,58 @@ export class CodexUsageCollector extends BaseUsageCollector {
 
 export class GrokUsageCollector extends BaseUsageCollector {
   protected readonly provider = "grok" as const;
+
+  private readonly billing: GrokBillingProbe;
+  private readonly probeTimeoutMs: number;
+  private readonly authPath: string;
+
+  constructor(private readonly grokOptions: UsageCollectorOptions) {
+    super(grokOptions);
+    this.billing = grokOptions.grokBilling ?? new FetchGrokBillingProbe();
+    this.probeTimeoutMs = grokOptions.timeoutMs ?? NON_INTERACTIVE_TIMEOUT_MS;
+    this.authPath = grokOptions.grokAuthPath ?? join(homedir(), ".grok", "auth.json");
+  }
+
+  /**
+   * Ask the subscription for its own credit usage. An explicitly configured terminal still
+   * selects the pseudo-terminal path, which is what this replaces.
+   */
+  override async collect(): Promise<CapacityReading> {
+    if (this.grokOptions.terminal) return super.collect();
+
+    const observedAt = this.grokOptions.clock.nowIso();
+    let payload: unknown;
+    try {
+      payload = await this.billing.read({ timeoutMs: this.probeTimeoutMs, authPath: this.authPath });
+    } catch (error) {
+      const digest = sha256("");
+      return failedReading(
+        this.provider,
+        observedAt,
+        `account-billing:${this.provider};raw-output-digest:${digest}`,
+        digest,
+        error instanceof Error ? error.message : "grok billing threw a non-error value",
+      );
+    }
+    // The digest is over the payload, as `rawOutputDigest` says and as every other collector
+    // does. A hash does not disclose what it covers, so this is not where the borrowed
+    // credential is contained — that is done by never storing, printing or forwarding it, and
+    // by the bearer never appearing in the response body at all.
+    const parsed = parseGrokBilling(payload);
+    const digest = sha256(JSON.stringify(payload ?? null));
+    const source = `account-billing:${this.provider};raw-output-digest:${digest}`;
+    return parsed.ok
+      ? {
+          provider: this.provider,
+          sensorHealth: "HEALTHY",
+          runtimeHealth: "UNKNOWN",
+          observedAt,
+          buckets: parsed.buckets,
+          source,
+          rawOutputDigest: digest,
+        }
+      : failedReading(this.provider, observedAt, source, digest, parsed.error);
+  }
 }
 
 const failedReading = (
