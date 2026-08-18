@@ -50,13 +50,16 @@ const report = (status: DoctorReport["status"], findings: readonly Finding[]): D
  * The doctor is stubbed rather than driven into a real uncovered state: what is under test is
  * which branch `start()` takes for a given finding set, so the finding set has to be the input.
  */
-const makeDaemon = (statuses: readonly DoctorReport[]) => {
+const makeDaemon = (statuses: readonly DoctorReport[], delayMsByCall: readonly number[] = []) => {
   const harness = makeHarness();
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
   let call = 0;
-  const doctor = vi
-    .spyOn(harness.cp.doctor, "run")
-    .mockImplementation(async () => statuses[Math.min(call++, statuses.length - 1)]!);
+  const doctor = vi.spyOn(harness.cp.doctor, "run").mockImplementation(async () => {
+    const index = call++;
+    const delay = delayMsByCall[index] ?? 0;
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    return statuses[Math.min(index, statuses.length - 1)]!;
+  });
   const stateDir = tempDir("acp-bootstrap-door-");
   return { harness, daemon: new Daemon(harness.cp, { stateDir }), stateDir, doctor };
 };
@@ -75,10 +78,17 @@ const recordingDoor = () => {
   };
 };
 
-const observe = (daemon: Daemon) =>
+/**
+ * `agentctl` attaches `idempotencyKey: operator:<digest of method+params>` to every mutation
+ * (`cli/agentctl.ts:78-80`), so a request without one is a shape production never sends. The
+ * key is derived from the payload here for the same reason: re-running the same documented
+ * observation file is the same key.
+ */
+const observe = (daemon: Daemon, remainingPercent = 90) =>
   daemon.handleOperatorRequest(
     {
-      requestId: "req-observe",
+      requestId: `req-observe-${remainingPercent}`,
+      idempotencyKey: `operator:capacity:${remainingPercent}`,
       method: OPERATOR_METHOD.CAPACITY_OBSERVE,
       params: {
         provider: "scripted",
@@ -87,7 +97,7 @@ const observe = (daemon: Daemon) =>
           buckets: [
             {
               id: "fixture-window",
-              remainingPercent: 90,
+              remainingPercent,
               resetAt: null,
               capabilities: ["ceo", "cto", "blind-review", "worker"],
             },
@@ -318,6 +328,90 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     } finally {
       await listener.close();
     }
+  });
+
+  it("re-checks on a repeated observation instead of replaying a cached OK", async () => {
+    const { daemon, doctor } = makeDaemon([
+      report("BLOCKED", [COVERAGE]),
+      report("BLOCKED", [COVERAGE]),
+      report("HEALTHY", []),
+    ]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    // The same payload is the same idempotency key. Replaying the cached result would skip
+    // executeOperatorRequest entirely, and with it the re-check the park is waiting for —
+    // observeCapacity also re-probes runtime health, so the same payload is not the same answer.
+    expect((await observe(daemon)).allowed).toBe(true);
+    await vi.waitFor(() => expect(doctor).toHaveBeenCalledTimes(2));
+    expect((await observe(daemon)).allowed).toBe(true);
+
+    expect((await starting).allowed).toBe(true);
+    expect(doctor).toHaveBeenCalledTimes(3);
+    await daemon.stop();
+  });
+
+  it("does not lose an observation that lands while the re-check is still running", async () => {
+    const { daemon } = makeDaemon(
+      [report("BLOCKED", [COVERAGE]), report("BLOCKED", [COVERAGE]), report("HEALTHY", [])],
+      [0, 250],
+    );
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    expect((await observe(daemon, 90)).allowed).toBe(true);
+    // The second lands mid-re-check, when a one-shot waiter would be unarmed and the signal
+    // would be delivered to nobody. Nothing else will ever arrive to unstick it.
+    expect((await observe(daemon, 91)).allowed).toBe(true);
+
+    expect((await starting).allowed).toBe(true);
+    await daemon.stop();
+  });
+
+  it("settles instead of wedging when stop() lands during the re-check", async () => {
+    const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("BLOCKED", [COVERAGE])], [0, 250]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    expect((await observe(daemon)).allowed).toBe(true);
+    // stop() releases the lock. If the abandon is not latched, the loop sleeps again behind a
+    // released lock with the door still open — a live socket that no longer implies a held lock.
+    await daemon.stop();
+
+    const started = await starting;
+    expect(started.allowed).toBe(false);
+    expect(door.closed).toHaveLength(1);
+    expect(daemon.lock.held()).toBe(false);
+  });
+
+  it("does not pin a parked refusal to a key the operator retries after promotion", async () => {
+    const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    const approval = {
+      requestId: "req-approve",
+      idempotencyKey: "operator:approve-1",
+      method: OPERATOR_METHOD.OWNER_APPROVE,
+      params: {},
+    };
+    expect((await daemon.handleOperatorRequest(approval, PEER)).reasonCode).toBe(
+      ReasonCode.DAEMON_BOOTSTRAP_MODE,
+    );
+
+    expect((await observe(daemon)).allowed).toBe(true);
+    expect((await starting).allowed).toBe(true);
+
+    // A refusal that existed only because the daemon was parked must not outlive the park.
+    // Reaching INVALID_ARGUMENT means the request got past the cache and into the handler.
+    const retried = await daemon.handleOperatorRequest(approval, PEER);
+    expect(retried.reasonCode).not.toBe(ReasonCode.DAEMON_BOOTSTRAP_MODE);
+    expect(retried.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    await daemon.stop();
   });
 
   it("is decided by the finding codes, not by how many there are", () => {

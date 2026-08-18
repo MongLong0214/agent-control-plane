@@ -235,7 +235,12 @@ export class Daemon {
   #startedAt: string | null = null;
   #mode: DaemonMode = "NORMAL";
   #bootstrapBlocking: BlockingFinding[] = [];
-  #bootstrapWaiters: Array<(reason: "OBSERVED" | "ABANDONED") => void> = [];
+  // A counter, not a one-shot waiter: an observation can land while the park is inside its
+  // re-check, and a signal delivered to nobody must not be discarded. The park compares the
+  // counter against what it last consumed, so it only sleeps when nothing is outstanding.
+  #bootstrapSignal = 0;
+  #bootstrapAbandoned = false;
+  #bootstrapWaiter: (() => void) | null = null;
   #timerFailures = new Map<string, TimerFailure>();
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
@@ -276,7 +281,14 @@ export class Daemon {
       method: request.method,
       params: request.params,
     });
-    const key = OPERATOR_MUTATION_METHODS.has(request.method) && request.idempotencyKey
+    // A parked daemon never uses the idempotency cache. The cache exists to make a retry
+    // idempotent, and while parked that is the wrong property twice over: `capacity.observe`
+    // re-probes runtime health on every call, so the same payload can legitimately produce a
+    // different admission; and a replayed result never reaches `executeOperatorRequest`, so it
+    // would silently skip the re-check the whole park is waiting for. It also stops a
+    // DAEMON_BOOTSTRAP_MODE denial from being pinned to a key the operator retries after
+    // promotion.
+    const key = this.#mode !== "BOOTSTRAP" && OPERATOR_MUTATION_METHODS.has(request.method) && request.idempotencyKey
       ? `${peer.value.peerId}:${peer.value.incarnation}:${request.idempotencyKey}`
       : undefined;
 
@@ -1322,12 +1334,21 @@ export class Daemon {
 
     let door: BootstrapDoor | null = null;
     try {
+      // Arm before the door opens. A door that admits an observation the instant it binds must
+      // not be able to signal a park that has not started counting yet.
+      let consumed = this.#bootstrapSignal;
       door = await open();
       for (;;) {
-        const wake = await new Promise<"OBSERVED" | "ABANDONED">((resolve) => {
-          this.#bootstrapWaiters.push(resolve);
-        });
-        if (wake === "ABANDONED") return null;
+        if (this.#bootstrapAbandoned) return null;
+        if (this.#bootstrapSignal === consumed) {
+          await new Promise<void>((resolve) => {
+            this.#bootstrapWaiter = resolve;
+          });
+          continue;
+        }
+        // Consume every signal outstanding at this moment, not one: the re-check below reads
+        // current state, so two observations that arrived together are answered by one pass.
+        consumed = this.#bootstrapSignal;
 
         const rechecked = await this.reconcile();
         if (rechecked.doctorStatus !== "BLOCKED" && rechecked.doctorStatus !== "ERROR") {
@@ -1347,7 +1368,9 @@ export class Daemon {
     } finally {
       this.#mode = "NORMAL";
       this.#bootstrapBlocking = [];
-      this.#bootstrapWaiters = [];
+      this.#bootstrapWaiter = null;
+      this.#bootstrapAbandoned = false;
+      this.#bootstrapSignal = 0;
       // The door closes before this returns, on both exits. The promoting caller opens the
       // real operator socket on the same path, and an abandoned park must not leave a
       // restricted listener behind a released lock.
@@ -1355,10 +1378,17 @@ export class Daemon {
     }
   }
 
+  /**
+   * Record the signal first, deliver second. `stop()` can land while the park is inside its
+   * re-check with no waiter armed; latching the abandon means the loop still sees it on the
+   * next pass instead of sleeping again behind a released lock.
+   */
   private wakeBootstrap(reason: "OBSERVED" | "ABANDONED"): void {
-    const waiters = this.#bootstrapWaiters;
-    this.#bootstrapWaiters = [];
-    for (const waiter of waiters) waiter(reason);
+    if (reason === "ABANDONED") this.#bootstrapAbandoned = true;
+    this.#bootstrapSignal += 1;
+    const waiter = this.#bootstrapWaiter;
+    this.#bootstrapWaiter = null;
+    waiter?.();
   }
 
   async stop(): Promise<void> {
