@@ -643,6 +643,26 @@ describe("a gate is only an approval when GitHub says it passed (§24.5)", () =>
     return { fixture, pullNumber };
   };
 
+  it("binds the gate to a GitHub-queryable correlator and refuses one that was altered", async () => {
+    // `external_id` is the only part of the gate GitHub itself can be searched by — the payload
+    // digest travels in `output.summary`, which only ACP can look up. A correlator that is sent
+    // and never read back would be decoration, so publication verifies it on re-read like every
+    // other field, and this pins that.
+    const { fixture, pullNumber } = await publishedFixture();
+    const check = fixture.github.checkRuns.find((c) => c.name === GATE_CHECK_NAME)!;
+
+    expect(check.external_id).toMatch(/^acp:[^:]+:sha256:[0-9a-f]{64}:sha256:[0-9a-f]{64}$/);
+    expect(check.external_id).toContain(fixture.payload.runId);
+    expect(check.external_id).toContain(fixture.payload.candidateSnapshotDigest);
+
+    // Altered after publication, as a second integration or a hand edit would leave it.
+    check.external_id = `acp:${fixture.payload.runId}:sha256:${"0".repeat(64)}:sha256:${"0".repeat(64)}`;
+
+    const refused = await fixture.harness.cp.github.mergeEvaluate(mergeInput(fixture, pullNumber));
+    expect(refused.allowed, "a gate whose correlator no longer matches its payload was accepted").toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID);
+  });
+
   it("refuses a gate check that has not completed", async () => {
     const { fixture, pullNumber } = await publishedFixture();
     const check = fixture.github.checkRuns.find((c) => c.name === GATE_CHECK_NAME)!;

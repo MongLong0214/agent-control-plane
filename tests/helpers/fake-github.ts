@@ -16,6 +16,8 @@ export interface FakeCheckRun {
   id: number;
   name: string;
   head_sha: string;
+  /** GitHub echoes what the publisher sent; the gate re-read verifies it, so the double must too. */
+  external_id?: string | null;
   conclusion: string | null;
   status: string;
   app?: { slug?: string } | null;
@@ -118,11 +120,12 @@ export class FakeGitHub implements GitHubClient {
 
     // --- check runs --------------------------------------------------------
     if (method === "POST" && /\/check-runs$/.test(path)) {
-      const input = body as { name: string; head_sha: string; conclusion: string; output?: FakeCheckRun["output"] };
+      const input = body as { name: string; head_sha: string; conclusion: string; external_id?: string | null; output?: FakeCheckRun["output"] };
       const check: FakeCheckRun = {
         id: this.#nextId++,
         name: input.name,
         head_sha: input.head_sha,
+        external_id: input.external_id ?? null,
         conclusion: input.conclusion,
         status: "completed",
         app: { slug: "acp-trusted-app" },
