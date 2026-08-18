@@ -884,7 +884,9 @@ export class GitHubKernel {
       // Checked only when GitHub returned one. The correlator grants no authority — the digest
       // does — so making publication depend on a field GitHub may stop echoing would put an
       // availability risk on the merge path in exchange for nothing. If it comes back, it must
-      // be ours; if it does not, the digest comparison below is still what decides.
+      // be ours; if it does not, the digest comparison below is still what decides. Same limit as
+      // at the merge boundary: a deleted correlator passes, and one recomputed from the payload
+      // agrees by construction.
       (typeof reread.external_id === "string" &&
         reread.external_id !== gateExternalId(payload.runId, payload.candidateSnapshotDigest, payloadDigest)) ||
       reread.head_sha !== payload.exactHead ||
@@ -1342,8 +1344,16 @@ export class GitHubKernel {
       // `external_id`, and a check run edited after publication can have it rewritten while the
       // digest in `output.summary` still reads correctly. The digest is what grants authority, so
       // a correlator that no longer derives from the receipt's payload means the run's GitHub side
-      // was rewritten — and this is the only place that would notice, since publication verifies
-      // its own POST and nothing re-reads the field afterwards.
+      // was rewritten. Publication verifies its own POST and nothing re-reads the field afterwards,
+      // so this is where a *mismatched* one is seen.
+      //
+      // Limit, because the sentence above reads like coverage and is not: this catches an
+      // `external_id` that is still present and disagrees. It does not catch one that was deleted —
+      // both comparisons skip when the field is absent, so silence passes — and it does not catch
+      // one recomputed to agree, because the formula is deterministic from values inside the
+      // payload and anyone holding it can reproduce the string. It is a consistency label, not a
+      // MAC. Authority is the digest's, which is why the skip-when-absent behaviour is correct
+      // rather than a gap to close here.
       //
       // Derived from the stored receipt rather than from current state: recomputing from the live
       // candidate would fold in a freshness judgement that belongs to the checks above.
