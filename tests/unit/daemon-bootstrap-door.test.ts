@@ -506,6 +506,29 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     await daemon.stop();
   });
 
+  it("stops parking when the sweep itself creates the unparkable finding", async () => {
+    // The check exists for CTO_BINDING_POINTS_AT_DEAD_SESSION, which the doctor raises only
+    // after a session's lifecycle is ERROR — and the thing that flips READY to ERROR is the
+    // sweep. So the pass that can produce it is the promote attempt, not the doctor-only
+    // re-check. A scope check placed only where the finding cannot appear is not a check.
+    const { harness, daemon } = makeDaemon([
+      report("BLOCKED", [COVERAGE]),
+      report("HEALTHY", []),
+      report("ERROR", [finding("CTO_BINDING_POINTS_AT_DEAD_SESSION", "project:fixture")]),
+    ]);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    expect((await observe(daemon)).allowed).toBe(true);
+
+    const started = await starting;
+    expect(started.allowed).toBe(false);
+    expect(daemon.lock.held()).toBe(false);
+    expect(door.closed).toHaveLength(1);
+    expect(harness.cp.audit.byKind("DAEMON_BOOTSTRAP_ABANDONED")).toHaveLength(1);
+  });
+
   it("is decided by the finding codes, not by how many there are", () => {
     expect(canParkForBootstrap([COVERAGE])).toBe(true);
     expect(canParkForBootstrap([COVERAGE, finding("CAPACITY_SENSOR_FAILED", "capacity")])).toBe(true);

@@ -163,6 +163,19 @@ export const blockingFindingsOf = (report: { findings: readonly Finding[] }): Bl
     .filter((finding) => finding.blocking)
     .map((finding) => ({ code: finding.code, severity: finding.severity, scope: finding.scope }));
 
+/** Folds one reconcile pass into another so a multi-pass start reports all of its own work. */
+const mergeReconciled = (earlier: ReconcileReport, later: ReconcileReport): ReconcileReport => ({
+  ...later,
+  expiredClaims: earlier.expiredClaims + later.expiredClaims,
+  expiredMessages: earlier.expiredMessages + later.expiredMessages,
+  orphanedExecutions: [...earlier.orphanedExecutions, ...later.orphanedExecutions],
+  sessionsMarkedError: [...earlier.sessionsMarkedError, ...later.sessionsMarkedError],
+  reclaimedFinalizationAttempts: [
+    ...earlier.reclaimedFinalizationAttempts,
+    ...later.reclaimedFinalizationAttempts,
+  ],
+});
+
 export const canParkForBootstrap = (blockingFindings: readonly BlockingFinding[]): boolean =>
   blockingFindings.length > 0 &&
   blockingFindings.every(
@@ -1345,6 +1358,9 @@ export class Daemon {
     });
 
     let door: BootstrapDoor | null = null;
+    // Every pass that mutates contributes to what this start did. A report carrying only the
+    // last sweep says the start did less than it did.
+    let applied = blocked;
     try {
       // Arm before the door opens. A door that admits an observation the instant it binds must
       // not be able to signal a park that has not started counting yet.
@@ -1368,42 +1384,31 @@ export class Daemon {
         // those sweeps safe to act on.
         const doctorReport = await this.cp.doctor.run("system");
         if (this.#bootstrapAbandoned) return null;
-        const blockingFindings = blockingFindingsOf(doctorReport);
+        let blockingFindings = blockingFindingsOf(doctorReport);
 
         if (doctorReport.status !== "BLOCKED" && doctorReport.status !== "ERROR") {
           const swept = await this.reconcile();
           if (this.#bootstrapAbandoned) return null;
-          if (swept.doctorStatus === "BLOCKED" || swept.doctorStatus === "ERROR") {
-            this.#bootstrapBlocking = swept.blockingFindings;
-            this.writeHealth(swept);
-            continue;
+          if (swept.doctorStatus !== "BLOCKED" && swept.doctorStatus !== "ERROR") {
+            this.cp.audit.record({
+              kind: "DAEMON_BOOTSTRAP_PROMOTED",
+              evidence: { pid: process.pid, doctorStatus: swept.doctorStatus },
+            });
+            // Only here: an abandoned park is followed by stop(), which has already uninstalled.
+            this.installContinuityCoordinator();
+            return { ...mergeReconciled(applied, swept), bootstrapParked: true };
           }
-          this.cp.audit.record({
-            kind: "DAEMON_BOOTSTRAP_PROMOTED",
-            evidence: { pid: process.pid, doctorStatus: swept.doctorStatus },
-          });
-          // Only here: an abandoned park is followed by stop(), which has already uninstalled.
-          this.installContinuityCoordinator();
-          // The entry pass mutated state too, and its counts are absent from this one. A
-          // report that shows only the promoting sweep says the start did less than it did.
-          return {
-            ...swept,
-            bootstrapParked: true,
-            expiredClaims: swept.expiredClaims + blocked.expiredClaims,
-            expiredMessages: swept.expiredMessages + blocked.expiredMessages,
-            orphanedExecutions: [...blocked.orphanedExecutions, ...swept.orphanedExecutions],
-            sessionsMarkedError: [...blocked.sessionsMarkedError, ...swept.sessionsMarkedError],
-            reclaimedFinalizationAttempts: [
-              ...blocked.reclaimedFinalizationAttempts,
-              ...swept.reclaimedFinalizationAttempts,
-            ],
-          };
+          // The sweep ran and the doctor still blocks. Its mutations happened, so they belong
+          // to whatever report this start eventually produces.
+          applied = mergeReconciled(applied, swept);
+          blockingFindings = swept.blockingFindings;
         }
 
-        // Re-read the park's own precondition. A block can drift into one no observation can
-        // clear — a session dying while parked raises CTO_BINDING_POINTS_AT_DEAD_SESSION, which
-        // is CRITICAL and blocking — and without this the daemon waits forever on a door that
-        // cannot help, holding the lock, with the supervisor unable to restart it.
+        // One site, both branches. Re-read the park's own precondition: a block can drift into
+        // one no observation can clear, and the finding this exists for —
+        // CTO_BINDING_POINTS_AT_DEAD_SESSION — is raised only after a session's lifecycle is
+        // ERROR, which is something the sweep above does and the doctor-only pass never can.
+        // Checking only where the finding cannot appear is not checking.
         if (!canParkForBootstrap(blockingFindings)) {
           this.cp.audit.record({
             kind: "DAEMON_BOOTSTRAP_ABANDONED",
