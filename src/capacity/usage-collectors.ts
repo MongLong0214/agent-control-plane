@@ -43,9 +43,67 @@ export interface UsageCollectorOptions {
   terminal?: UsageTerminal;
   /** Provider-specific dedicated credential configuration, never a daemon env dump. */
   providerCredentialDir?: string;
+  /** Injected in tests. Production runs the provider CLI's own non-interactive usage command. */
+  nonInteractive?: NonInteractiveUsageProbe;
+}
+
+/**
+ * A provider CLI asked for its own account usage without a terminal. The CLI reads and refreshes
+ * the subscription credential itself, so nothing here handles a token — the same reason a
+ * reviewer's credential tree stays inside the tool that owns it.
+ */
+export interface NonInteractiveUsageProbe {
+  run(input: { binary: string; timeoutMs: number }): Promise<{ stdout: string; stderr: string; code: number | null }>;
 }
 
 const DEFAULT_TIMEOUT_MS = 45_000;
+/** The non-interactive read is a local command with no model turn; it answered in ~2s measured. */
+const NON_INTERACTIVE_TIMEOUT_MS = 20_000;
+
+/**
+ * `claude -p "/usage"` prints the account windows and spends nothing: measured `num_turns: 0`,
+ * `total_cost_usd: 0`, `output_tokens: 0`, two seconds. `/usage` is a local slash command the
+ * CLI marks non-interactive, so this is the tool's own contract rather than its rendering.
+ *
+ * `--safe-mode` keeps the credential path and skips hooks. `--bare` must never be used here: it
+ * refuses the keychain and returns a session-cost stub with no windows, which is a silent wrong
+ * answer rather than a failure.
+ */
+export const CLAUDE_NON_INTERACTIVE_ARGS = [
+  "-p",
+  "--output-format",
+  "json",
+  "--safe-mode",
+  "--max-turns",
+  "1",
+  "/usage",
+] as const;
+
+export class SpawnNonInteractiveUsageProbe implements NonInteractiveUsageProbe {
+  constructor(private readonly args: readonly string[]) {}
+
+  async run(input: { binary: string; timeoutMs: number }): Promise<{ stdout: string; stderr: string; code: number | null }> {
+    return new Promise((resolve) => {
+      const child = spawn(input.binary, [...this.args], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env },
+      });
+      let stdout = "";
+      let stderr = "";
+      const timer = setTimeout(() => child.kill("SIGKILL"), input.timeoutMs);
+      child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      child.once("error", (error) => {
+        clearTimeout(timer);
+        resolve({ stdout, stderr: stderr || error.message, code: null });
+      });
+      child.once("close", (code) => {
+        clearTimeout(timer);
+        resolve({ stdout, stderr, code });
+      });
+    });
+  }
+}
 
 /**
  * macOS ships `expect(1)`, which creates a real pseudo-terminal without introducing a
@@ -308,6 +366,88 @@ abstract class BaseUsageCollector implements UsageCollector {
 
 export class ClaudeUsageCollector extends BaseUsageCollector {
   protected readonly provider = "claude" as const;
+
+  private readonly probe: NonInteractiveUsageProbe;
+  private readonly probeTimeoutMs: number;
+
+  constructor(private readonly claudeOptions: UsageCollectorOptions) {
+    super(claudeOptions);
+    this.probe = claudeOptions.nonInteractive ?? new SpawnNonInteractiveUsageProbe(CLAUDE_NON_INTERACTIVE_ARGS);
+    this.probeTimeoutMs = claudeOptions.timeoutMs ?? NON_INTERACTIVE_TIMEOUT_MS;
+  }
+
+  /**
+   * Read the account windows from the CLI's own non-interactive command rather than from a
+   * repainted terminal. The pseudo-terminal path re-derived a rendered frame, and four
+   * adversarial rounds of that parser produced fifteen defects, most of them reporting more
+   * remaining quota than the screen stated — the direction that dispatches work the quota
+   * cannot pay for.
+   *
+   * There is no fallback to the terminal on failure. A fallback would mean the safer source
+   * silently handing back to the one it replaced, and an unreadable quota already has a correct
+   * answer: refuse, and let admission treat the provider as unroutable.
+   */
+  override async collect(): Promise<CapacityReading> {
+    // An explicitly configured terminal selects the pseudo-terminal path — for a host whose CLI
+    // predates the non-interactive command. Selected by configuration, never by failure: a
+    // fallback on error would hand a quota read back to the source this replaced, at exactly the
+    // moment the safer one could not answer.
+    if (this.claudeOptions.terminal) return super.collect();
+
+    const observedAt = this.claudeOptions.clock.nowIso();
+    let outcome: { stdout: string; stderr: string; code: number | null };
+    try {
+      outcome = await this.probe.run({ binary: this.claudeOptions.binary, timeoutMs: this.probeTimeoutMs });
+    } catch (error) {
+      const digest = sha256("");
+      return failedReading(
+        this.provider,
+        observedAt,
+        `non-interactive-/usage:${this.provider};raw-output-digest:${digest}`,
+        digest,
+        error instanceof Error ? error.message : "non-interactive /usage collector threw a non-error value",
+      );
+    }
+    const raw = `${outcome.stdout}${outcome.stderr ? `\n${outcome.stderr}` : ""}`;
+    const digest = sha256(raw);
+    const source = `non-interactive-/usage:${this.provider};raw-output-digest:${digest}`;
+
+    // The envelope, not the prose, says whether the command ran. `is_error` and a non-zero exit
+    // are different failures — a refused trust prompt exits zero with an error envelope.
+    let envelope: { is_error?: unknown; result?: unknown } | null = null;
+    try {
+      envelope = JSON.parse(outcome.stdout) as { is_error?: unknown; result?: unknown };
+    } catch {
+      envelope = null;
+    }
+    if (!envelope || typeof envelope.result !== "string") {
+      return failedReading(
+        this.provider,
+        observedAt,
+        source,
+        digest,
+        outcome.code === 0
+          ? "non-interactive /usage returned no JSON envelope; the CLI's output contract may have changed"
+          : `non-interactive /usage exited ${outcome.code ?? "on a signal"} without a JSON envelope`,
+      );
+    }
+    if (envelope.is_error === true) {
+      return failedReading(this.provider, observedAt, source, digest, "non-interactive /usage reported an error envelope");
+    }
+
+    const parsed = parseNonInteractiveUsage(this.provider, envelope.result, observedAt);
+    return parsed.ok
+      ? {
+          provider: this.provider,
+          sensorHealth: "HEALTHY",
+          runtimeHealth: "UNKNOWN",
+          observedAt,
+          buckets: parsed.buckets,
+          source,
+          rawOutputDigest: digest,
+        }
+      : failedReading(this.provider, observedAt, source, digest, parsed.error);
+  }
 }
 
 export class CodexUsageCollector extends BaseUsageCollector {
@@ -641,6 +781,132 @@ const parseFrameBuckets = (
     }
   }
   return { ok: true, buckets: named };
+};
+
+/**
+ * The account windows as `claude -p "/usage"` prints them, which is a formatter's output rather
+ * than a repainted frame:
+ *
+ *     Current session: 12% used · resets Aug 18 at 7:49pm (Asia/Seoul)
+ *     Current week (all models): 64% used · resets Aug 21 at 4:59am (Asia/Seoul)
+ *
+ * Matched strictly, one window per line. The interactive parser had to be permissive because it
+ * was re-deriving a screen; this input is one line per window with a stated label, so anything
+ * that does not match this shape is a changed contract and must refuse rather than guess.
+ */
+const NON_INTERACTIVE_WINDOW =
+  /^(?<window>[^:]{1,80}):\s*(?<value>\d{1,3}(?:\.\d+)?)%\s*used(?:\s*[\u00B7·|-]\s*resets\s+(?<reset>.+?))?\s*$/;
+
+/** `Aug 21 at 4:59am (Asia/Seoul)` — a wall-clock time in a named zone, with the year implied. */
+const RESET_WALL_CLOCK =
+  /^(?<month>[A-Za-z]{3,9})\s+(?<day>\d{1,2})\s+at\s+(?<hour>\d{1,2}):(?<minute>\d{2})\s*(?<meridiem>am|pm)?\s*(?:\((?<zone>[A-Za-z_]+\/[A-Za-z_]+)\))?$/i;
+
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+/** What a UTC instant is offset by in a named zone, so a wall-clock time there can be resolved. */
+const zoneOffsetMs = (zone: string, instantMs: number): number | null => {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: zone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(new Date(instantMs));
+    const field = (type: string): number => Number(parts.find((part) => part.type === type)?.value);
+    const asUtc = Date.UTC(field("year"), field("month") - 1, field("day"), field("hour"), field("minute"), field("second"));
+    return Number.isFinite(asUtc) ? asUtc - instantMs : null;
+  } catch {
+    // An unknown zone is not a reason to invent a horizon.
+    return null;
+  }
+};
+
+/**
+ * The year is not printed, so it is inferred as the next occurrence at or after the observation.
+ * Without a resolvable horizon every bucket holds its whole window in reserve, which withholds
+ * worker fan-out entirely — so this is worth resolving properly rather than returning null.
+ */
+export const parseResetWallClock = (text: string, observedAt: string): string | null => {
+  const match = RESET_WALL_CLOCK.exec(text.trim());
+  if (!match?.groups) return null;
+  const month = MONTHS.indexOf(match.groups["month"]!.slice(0, 3).toLowerCase());
+  const day = Number(match.groups["day"]);
+  let hour = Number(match.groups["hour"]);
+  const minute = Number(match.groups["minute"]);
+  const meridiem = match.groups["meridiem"]?.toLowerCase();
+  const zone = match.groups["zone"];
+  const base = Date.parse(observedAt);
+  if (month < 0 || !Number.isFinite(day) || !Number.isFinite(hour) || !Number.isFinite(minute) || !Number.isFinite(base)) {
+    return null;
+  }
+  if (meridiem === "pm" && hour < 12) hour += 12;
+  if (meridiem === "am" && hour === 12) hour = 0;
+
+  for (const year of [new Date(base).getUTCFullYear(), new Date(base).getUTCFullYear() + 1]) {
+    const wall = Date.UTC(year, month, day, hour, minute);
+    if (!Number.isFinite(wall)) continue;
+    let instant = wall;
+    if (zone) {
+      // Two passes: the offset is looked up at the guessed instant, then confirmed at the
+      // corrected one. A single pass is wrong across a DST boundary, which Asia/Seoul does not
+      // observe but other operators' zones do.
+      const first = zoneOffsetMs(zone, wall);
+      if (first === null) return null;
+      const second = zoneOffsetMs(zone, wall - first);
+      if (second === null) return null;
+      instant = wall - second;
+    }
+    if (instant >= base) return new Date(instant).toISOString();
+  }
+  return null;
+};
+
+/**
+ * The non-interactive reading. Refuses rather than guessing: this is a stated contract, so a
+ * shape it does not produce means the contract changed and the reading is not evidence.
+ */
+export const parseNonInteractiveUsage = (
+  provider: UsageProvider,
+  text: string,
+  observedAt: string,
+): { ok: true; buckets: CapacityBucket[] } | { ok: false; error: string } => {
+  const buckets: CapacityBucket[] = [];
+  const ids = new Set<string>();
+  for (const line of text.split("\n").map((value) => value.trim()).filter(Boolean)) {
+    const match = NON_INTERACTIVE_WINDOW.exec(line);
+    if (!match?.groups) continue;
+    const stated = Number(match.groups["value"]);
+    const window = match.groups["window"]!.trim();
+    if (!Number.isFinite(stated) || stated < 0 || stated > 100) {
+      return { ok: false, error: `usage window '${window}' has an invalid percentage` };
+    }
+    const id = normaliseBucketId(window);
+    // One line per window is the whole point of this surface. A repeated label means the shape
+    // is not what it is taken to be, and guessing which line is current would reintroduce the
+    // ambiguity this source exists to remove.
+    if (ids.has(id)) return { ok: false, error: "non-interactive /usage repeated a quota-window label" };
+    ids.add(id);
+    buckets.push({
+      id,
+      remainingPercent: 100 - stated,
+      resetAt: match.groups["reset"] ? parseResetWallClock(match.groups["reset"], observedAt) : null,
+      capabilities: [...CAPABILITIES[provider]],
+      measuredAs: "used",
+    });
+  }
+  if (buckets.length === 0) {
+    return {
+      ok: false,
+      error:
+        `non-interactive /usage stated no quota window (${text.split("\n").filter(Boolean).length} line(s) read); ` +
+        "it was neither a usage report nor a recognised refusal",
+    };
+  }
+  return { ok: true, buckets };
 };
 
 export const stripTerminal = (value: string): string =>
