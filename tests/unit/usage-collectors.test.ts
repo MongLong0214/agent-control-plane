@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { chmodSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, linkSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { ManualClock } from "../../src/core/clock.ts";
@@ -19,6 +20,8 @@ import {
   type CodexRateLimitProbe,
   GrokUsageCollector,
   grokBearer,
+  parseCodexRateLimits,
+  parseGrokBilling,
   type GrokBillingProbe,
   parseUsageOutput,
   ExpectUsageTerminal,
@@ -526,30 +529,18 @@ describe("Grok subscription billing (#582)", () => {
     expect(reading.buckets).toEqual([]);
   });
 
-  it("picks the credential, not the first field that happens to be called key", () => {
-    // The file carries several. A short one earlier in the object is an identifier, not a
-    // bearer, and choosing it sends a request that fails for a reason nothing here explains.
-    const root = tempDir("acp-grok-keys-");
-    const authPath = join(root, "auth.json");
-    const credential = "x".repeat(48);
-    writeFileSync(
-      authPath,
-      JSON.stringify({ meta: { key: "abc" }, entry: { oidc_client_id: "cli", key: credential } }),
-      { mode: 0o600 },
-    );
-
-    expect(grokBearer(authPath)).toBe(credential);
-    expect(grokBearer(join(root, "absent.json"))).toBeNull();
-  });
-
-  it("finds the bearer wherever the CLI's auth file nests it", async () => {
+  it("reaches the request once it has a credential, and refuses before it otherwise", async () => {
     const root = tempDir("acp-grok-auth-");
     const authPath = join(root, "auth.json");
-    // Nested the way the CLI writes it, and deliberately beside a short value that must not be
-    // mistaken for a credential.
     writeFileSync(
       authPath,
-      JSON.stringify({ version: 2, entry: { oidc_client_id: "short", key: "x".repeat(40) } }),
+      JSON.stringify({
+        "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+          key: "x".repeat(882),
+          create_time: "2026-08-01T00:00:00.000Z",
+          auth_mode: "oidc",
+        },
+      }),
       { mode: 0o600 },
     );
 
@@ -563,6 +554,8 @@ describe("Grok subscription billing (#582)", () => {
 
     expect(reading.sensorHealth).toBe("ERROR");
     expect(reading.error, reading.error ?? "").not.toContain("no usable credential");
+    // And whatever fetch said about it, the credential is not in what gets recorded.
+    expect(JSON.stringify(reading)).not.toContain("x".repeat(40));
   }, 20_000);
 
   it("says plainly that an expired credential is the CLI's to renew", async () => {
@@ -582,6 +575,148 @@ describe("Grok subscription billing (#582)", () => {
     expect(reading.sensorHealth).toBe("ERROR");
     expect(reading.error).toContain("only the CLI can renew it");
   });
+});
+
+describe("capacity review findings (#582)", () => {
+  it("refuses an absent percentage instead of reading it as a full window", () => {
+    // `Number()` maps null, "", [] and false to 0, and a zero used-percentage is a *full*
+    // window. Every one of these reported complete headroom on an account that had stated
+    // nothing — and on Codex those buckets carry ceo and worker.
+    for (const absent of [null, "", [], false, {}, "n/a"]) {
+      expect(parseGrokBilling({ config: { creditUsagePercent: absent } }).ok, JSON.stringify(absent)).toBe(false);
+      expect(
+        parseCodexRateLimits("gpt", { primary: { usedPercent: absent, windowDurationMins: 10080, resetsAt: 1 } }).ok,
+        JSON.stringify(absent),
+      ).toBe(false);
+    }
+    // A real zero is a real statement and must still be read.
+    const zero = parseGrokBilling({ config: { creditUsagePercent: 0 } });
+    expect(zero.ok).toBe(true);
+    if (!zero.ok) return;
+    expect(zero.buckets[0]?.remainingPercent).toBe(100);
+  });
+
+  it("folds two windows of one duration to the lower reading", () => {
+    // Keeping the first discarded a spent secondary behind a healthy primary. Every Codex
+    // bucket carries every Codex capability, so the healthy one alone admitted work.
+    const parsed = parseCodexRateLimits("gpt", {
+      primary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: 1 },
+      secondary: { usedPercent: 95, windowDurationMins: 10080, resetsAt: 1 },
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 5]]);
+  });
+
+  it("folds product names that normalise together, keeping the tightest", () => {
+    // `Grok-Build`, `Grok Build` and `grok_build` are one id. The first won, so the 90% and
+    // 99% used rows vanished behind a 10% one.
+    const parsed = parseGrokBilling({
+      config: {
+        creditUsagePercent: 10,
+        productUsage: [
+          { product: "Grok-Build", usagePercent: 10 },
+          { product: "Grok Build", usagePercent: 90 },
+          { product: "grok_build", usagePercent: 99 },
+        ],
+      },
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["credits", 90],
+      ["grok-build", 1],
+    ]);
+  });
+
+  it("reads the credential only from a file shaped like the CLI's own auth store", () => {
+    const root = tempDir("acp-grok-auth-guard-");
+    const write = (name: string, body: unknown): string => {
+      const at = join(root, name);
+      writeFileSync(at, JSON.stringify(body), { mode: 0o600 });
+      return at;
+    };
+    const scope = (id: string, key: string, createdAt: string): Record<string, unknown> => ({
+      [`https://auth.x.ai::${id}`]: { key, create_time: createdAt, auth_mode: "oidc" },
+    });
+
+    // The live shape: one scope entry keyed by the issuer.
+    const credential = "x".repeat(40);
+    expect(grokBearer(write("one.json", scope("a", credential, "2026-08-01T00:00:00.000Z")))).toBe(credential);
+
+    // Several scopes is normal — the CLI's own migration leaves a legacy entry behind — and
+    // refusing on that was a dead sensor for a file the CLI writes and calls healthy. The live
+    // credential is the most recently created.
+    const newest = "b".repeat(40);
+    expect(
+      grokBearer(
+        write("two.json", {
+          ...scope("a", "a".repeat(40), "2026-01-01T00:00:00.000Z"),
+          ...scope("b", newest, "2026-08-01T00:00:00.000Z"),
+        }),
+      ),
+    ).toBe(newest);
+
+    // Undated or tied entries leave no way to say which is current.
+    expect(grokBearer(write("undated.json", { ...scope("a", "a".repeat(40), "nonsense"), ...scope("b", "b".repeat(40), "2026-08-01T00:00:00.000Z") }))).toBeNull();
+
+    // A foreign secrets store, reached three ways. The first two are about the path; the third
+    // is not — a hard link *is* the file, so only what the file says can refuse it.
+    // Nested the way a real secrets store is, so what refuses it is the file's *shape* rather
+    // than a stricter check further down. A flat `{ key: … }` is rejected for the wrong reason.
+    const foreign = write("other-secrets.json", {
+      "signing-material": { key: "exfiltrated-other-secret-value-XXXXXXXX", create_time: "2026-08-01T00:00:00.000Z" },
+    });
+    const symlinked = join(root, "sym.json");
+    symlinkSync(foreign, symlinked);
+    expect(grokBearer(symlinked)).toBeNull();
+    const hardLinked = join(root, "hard.json");
+    linkSync(foreign, hardLinked);
+    expect(grokBearer(hardLinked)).toBeNull();
+    expect(grokBearer(foreign)).toBeNull();
+
+    // Non-files, including the one that used to block outside every timer this code has.
+    expect(grokBearer(root)).toBeNull();
+    expect(grokBearer("/dev/null")).toBeNull();
+    const fifo = join(root, "fifo.json");
+    execFileSync("mkfifo", [fifo]);
+    const started = Date.now();
+    expect(grokBearer(fifo)).toBeNull();
+    expect(Date.now() - started).toBeLessThan(1_000);
+
+    // A value carrying CR/LF is quoted back verbatim by fetch's error, which is recorded in the
+    // reading, mirrored to disk, and served over the operator socket.
+    expect(grokBearer(write("crlf.json", scope("a", "xai-secret\r\nX-Inject: 1 aaaaaaaaaaaaaaaaaaaa", "2026-08-01T00:00:00.000Z")))).toBeNull();
+  });
+
+  it("answers a Codex stream whose ids are strings, and ignores an id it did not ask for", async () => {
+    // JSON-RPC ids may be strings. Comparing with === to a number meant a stack echoing "0"
+    // never received the read, and one echoing "1" was never answered — both spent the whole
+    // timeout looking like an unresponsive server.
+    const root = tempDir("acp-codex-strid-");
+    const binary = join(root, "codex-string-ids.mjs");
+    writeFileSync(
+      binary,
+      `#!${process.execPath}\n` +
+        // The handshake and a generous window in one burst, before the read is sent. Those
+        // bytes cannot be the answer to a request that did not exist when they were written.
+        `process.stdout.write(JSON.stringify({ id: "0", result: {} }) + "\\n" + JSON.stringify({ id: 1, result: { primary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 1 } } }) + "\\n");\n` +
+        `process.stdin.on("data", () => {\n` +
+        `  process.stdout.write(JSON.stringify({ id: "1", result: { primary: { usedPercent: 95, windowDurationMins: 10080, resetsAt: 1 } } }) + "\\n");\n` +
+        `});\n` +
+        `setInterval(() => {}, 1000);\n`,
+    );
+    chmodSync(binary, 0o700);
+
+    const started = Date.now();
+    const reading = await new CodexUsageCollector({ clock: clock(), binary, timeoutMs: 6_000 }).collect();
+
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    // The stray id:1 arrived alongside the handshake and stated 99 remaining. The answer is
+    // the one that came back after asking.
+    expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["7d", 5]]);
+  }, 20_000);
 });
 
 describe("interactive provider usage collectors", () => {

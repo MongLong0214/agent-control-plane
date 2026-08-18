@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -439,6 +439,7 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
       });
       let buffer = "";
       let settled = false;
+      let asked = false;
       const finish = (outcome: { value?: unknown; error?: string }): void => {
         if (settled) return;
         settled = true;
@@ -463,15 +464,29 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
           if (!line.trim()) continue;
           let message: { id?: unknown; result?: unknown; error?: unknown };
           try {
-            message = JSON.parse(line) as { id?: unknown; result?: unknown; error?: unknown };
+            // A leading BOM makes the whole line unparseable, which reads as a server that
+            // never answered — a full timeout rather than a refusal.
+            message = JSON.parse(line.replace(/^\uFEFF/, "")) as { id?: unknown; result?: unknown; error?: unknown };
           } catch {
             continue;
           }
-          if (message.id === 0) {
+          // JSON-RPC ids may be strings. Comparing with === to a number meant a stack that
+          // echoed "0" never got the read sent, and one that echoed "1" was never answered:
+          // both spent the entire timeout looking like an unresponsive server.
+          const id = typeof message.id === "string" || typeof message.id === "number" ? Number(message.id) : null;
+          if (id === 0 && !asked) {
+            asked = true;
             send({ method: "initialized" });
             send({ method: "account/rateLimits/read", id: 1, params: {} });
+            // Anything already buffered was written before the request existed, so it cannot be
+            // the answer to it. Keeping it let a generous window that arrived alongside the
+            // handshake be taken as the reading, ahead of the real one.
+            buffer = "";
+            break;
           }
-          if (message.id === 1) {
+          // A response, not a request: a server-originated message carrying a method is not
+          // the answer to anything this sent.
+          if (id === 1 && asked && !("method" in message)) {
             if (message.error) finish({ error: "account/rateLimits/read was refused" });
             else finish({ value: message.result });
           }
@@ -484,6 +499,18 @@ export class SpawnCodexRateLimitProbe implements CodexRateLimitProbe {
     });
   }
 }
+
+/**
+ * A stated percentage, or nothing. `Number()` maps `null`, `""`, `[]` and `false` to **0**, and
+ * a zero used-percentage is a *full* window — so every one of those absences was reported as
+ * complete headroom. Only a real number, or a string that is entirely a number, is a statement.
+ */
+const statedPercent = (value: unknown): number | null => {
+  if (typeof value === "number") return Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 100 ? parsed : null;
+};
 
 const codexWindowId = (windowDurationMins: number): string => {
   if (windowDurationMins % 1440 === 0) return `${windowDurationMins / 1440}d`;
@@ -499,8 +526,8 @@ const codexWindowId = (windowDurationMins: number): string => {
 const codexBucket = (window: unknown, provider: UsageProvider, fallbackId: string): CapacityBucket | null => {
   if (!window || typeof window !== "object") return null;
   const value = window as { usedPercent?: unknown; windowDurationMins?: unknown; resetsAt?: unknown };
-  const usedPercent = Number(value.usedPercent);
-  if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) return null;
+  const usedPercent = statedPercent(value.usedPercent);
+  if (usedPercent === null) return null;
   const durationMins = Number(value.windowDurationMins);
   const resetsAtSeconds = Number(value.resetsAt);
   return {
@@ -528,8 +555,15 @@ export const parseCodexRateLimits = (
   const buckets: CapacityBucket[] = [];
   const primary = codexBucket(record["primary"], provider, "primary");
   const secondary = codexBucket(record["secondary"], provider, "secondary");
-  if (primary) buckets.push(primary);
-  if (secondary && !buckets.some((bucket) => bucket.id === secondary.id)) buckets.push(secondary);
+  for (const bucket of [primary, secondary]) {
+    if (!bucket) continue;
+    const existing = buckets.findIndex((seen) => seen.id === bucket.id);
+    // Two windows of the same duration are the same window stated twice. Keeping the first
+    // discarded a spent secondary behind a healthy primary; the lower reading is the one that
+    // cannot admit work the account will not cover.
+    if (existing < 0) buckets.push(bucket);
+    else if ((bucket.remainingPercent ?? -1) < (buckets[existing]!.remainingPercent ?? -1)) buckets[existing] = bucket;
+  }
 
   // A stated block outranks any percentage beside it. The other values name different blocks —
   // workspace credits, a member cap — and every one of them is equally disqualifying, so none
@@ -569,29 +603,79 @@ export interface GrokBillingProbe {
 const GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 
 /**
+ * What a bearer may contain. Length alone accepted a value carrying CR/LF, which `fetch` then
+ * quoted verbatim into its error — and that error is copied into the reading, the capacity
+ * mirror on disk, and the doctor evidence served over the operator socket.
+ */
+const GROK_BEARER = /^[A-Za-z0-9._~+/=-]{20,4096}$/;
+
+/** A top-level entry the Grok CLI writes: one authenticated scope. */
+const GROK_SCOPE = /^https:\/\/auth\.x\.ai::/;
+
+/**
  * The bearer, wherever the CLI's auth file currently keeps it. Exported so the choice it makes
  * can be tested: a file can carry several `key` fields, and picking the wrong one sends a
  * request that fails for a reason nothing here would explain.
  */
 export const grokBearer = (authPath: string): string | null => {
+  // Opened without following a link, and checked on the descriptor rather than the path. A
+  // symlinked `auth.json` sent another store's secret to a third party; `lstat` then
+  // `readFileSync(path)` is two lookups and the path can change between them.
+  let contents: string;
+  let handle: number | null = null;
+  try {
+    // O_NONBLOCK so a FIFO at this path cannot block the open — that read sat outside every
+    // timer this code has, and the doctor's capacity refresh is not inside the startup budget.
+    handle = openSync(authPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    if (!fstatSync(handle).isFile()) return null;
+    contents = readFileSync(handle, "utf8");
+  } catch {
+    return null;
+  } finally {
+    if (handle !== null) {
+      try {
+        closeSync(handle);
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(authPath, "utf8"));
+    parsed = JSON.parse(contents);
   } catch {
     return null;
   }
-  const walk = (value: unknown): string | null => {
-    if (!value || typeof value !== "object") return null;
-    const record = value as Record<string, unknown>;
-    const key = record["key"];
-    if (typeof key === "string" && key.length > 20) return key;
-    for (const nested of Object.values(record)) {
-      const found = walk(nested);
-      if (found) return found;
-    }
-    return null;
-  };
-  return walk(parsed);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  // The file must be the shape the Grok CLI writes: top-level scope keys, each holding its own
+  // credential. This is what actually stops another secrets store being read — a hard link
+  // passes every check about the *path*, because a hard link is the file. It does not pass a
+  // check about what the file says.
+  const scopes = Object.entries(parsed as Record<string, unknown>).filter(([name]) => GROK_SCOPE.test(name));
+  if (scopes.length === 0) return null;
+
+  // Several scopes is a normal state — the CLI's own migration leaves a legacy entry behind.
+  // Refusing on that was a dead sensor for a file the CLI writes and does not treat as corrupt.
+  // The live credential is the most recently created one.
+  const candidates = scopes
+    .map(([, entry]) => (entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null))
+    .filter((entry): entry is Record<string, unknown> => entry !== null)
+    .filter((entry) => typeof entry["key"] === "string" && GROK_BEARER.test(entry["key"]))
+    .map((entry) => ({
+      key: entry["key"] as string,
+      createdAt: typeof entry["create_time"] === "string" ? Date.parse(entry["create_time"]) : Number.NaN,
+    }));
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0]!.key;
+
+  const dated = candidates.filter((candidate) => Number.isFinite(candidate.createdAt));
+  // Undated or tied entries leave no way to say which is current, and sending the wrong one
+  // sends a secret to the wrong place.
+  if (dated.length !== candidates.length) return null;
+  const newest = dated.reduce((best, candidate) => (candidate.createdAt > best.createdAt ? candidate : best));
+  return dated.filter((candidate) => candidate.createdAt === newest.createdAt).length === 1 ? newest.key : null;
 };
 
 export class FetchGrokBillingProbe implements GrokBillingProbe {
@@ -620,6 +704,14 @@ export class FetchGrokBillingProbe implements GrokBillingProbe {
         );
       }
       return await response.json();
+    } catch (error) {
+      // Never the underlying message. `fetch` quotes an invalid header value back, so a
+      // malformed credential arrives inside the string this becomes — and that string is
+      // recorded in the reading, mirrored to disk, and served over the operator socket.
+      if (error instanceof Error && /^grok billing/.test(error.message)) throw error;
+      throw new Error(
+        controller.signal.aborted ? "grok billing did not answer in time" : "grok billing request failed",
+      );
     } finally {
       clearTimeout(timer);
     }
@@ -642,8 +734,8 @@ export const parseGrokBilling = (
     return { ok: false, error: "grok billing returned no config" };
   }
   const record = config as Record<string, unknown>;
-  const used = Number(record["creditUsagePercent"]);
-  if (!Number.isFinite(used) || used < 0 || used > 100) {
+  const used = statedPercent(record["creditUsagePercent"]);
+  if (used === null) {
     return { ok: false, error: "grok billing stated no usable credit percentage" };
   }
   const resetAt = grokPeriodEnd(record["currentPeriod"]);
@@ -659,11 +751,17 @@ export const parseGrokBilling = (
     for (const entry of products) {
       if (!entry || typeof entry !== "object") continue;
       const name = (entry as { product?: unknown }).product;
-      const percent = Number((entry as { usagePercent?: unknown }).usagePercent);
-      if (typeof name !== "string" || !Number.isFinite(percent) || percent < 0 || percent > 100) continue;
+      const percent = statedPercent((entry as { usagePercent?: unknown }).usagePercent);
+      if (typeof name !== "string" || percent === null) continue;
       const id = normaliseBucketId(name);
-      if (buckets.some((bucket) => bucket.id === id)) continue;
-      buckets.push({ id, remainingPercent: 100 - percent, resetAt, capabilities, measuredAs: "used" });
+      const existing = buckets.findIndex((bucket) => bucket.id === id);
+      // Names that normalise together — `Grok-Build`, `Grok Build`, `grok_build` — are one
+      // bucket. Keeping the first dropped the tighter rows behind a looser one, and a product
+      // named `Credits` could not constrain the aggregate at all.
+      if (existing < 0) buckets.push({ id, remainingPercent: 100 - percent, resetAt, capabilities, measuredAs: "used" });
+      else if (100 - percent < (buckets[existing]!.remainingPercent ?? -1)) {
+        buckets[existing] = { id, remainingPercent: 100 - percent, resetAt, capabilities, measuredAs: "used" };
+      }
     }
   }
   return { ok: true, buckets };
