@@ -535,8 +535,11 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
   it("serves the documented CLI command over a real socket while parked", async () => {
     // Everything above calls handleOperatorRequest directly. The change exists so that
     // `agentctl capacity observe` works on a host whose /usage cannot be read automatically,
-    // and that claim is about the CLI, the socket and the token — none of which those tests
-    // touch. Without this, the PR's entire justification has no test.
+    // and that claim is about the socket and the token — neither of which those tests touch.
+    // The observe here goes through the CLI's `dispatch`, which is what carries the payload
+    // and idempotency key; the status goes through `main`, which is where the lock-file
+    // short-circuit lived. Two entry points because the defect and the payload are in
+    // different places.
     const { daemon, stateDir } = makeDaemon([
       report("BLOCKED", [COVERAGE]),
       report("BLOCKED", [COVERAGE]),
@@ -599,6 +602,37 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     expect(printed.join("")).toContain("BOOTSTRAP");
     expect((await starting).allowed).toBe(true);
     await daemon.stop();
+  });
+
+  it("does not report a daemon that refused as a daemon that could not be reached", async () => {
+    const printed: string[] = [];
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      printed.push(String(chunk));
+      return true;
+    });
+    const previousToken = process.env["ACP_OPERATOR_TOKEN"];
+    let code: number;
+    try {
+      process.env["ACP_OPERATOR_SOCKET"] = join(tempDir("acp-bootstrap-nosock-"), "absent.sock");
+      delete process.env["ACP_OPERATOR_TOKEN"];
+      code = await cliMain(["daemon", "status"]);
+    } finally {
+      stdout.mockRestore();
+      delete process.env["ACP_OPERATOR_SOCKET"];
+      if (previousToken !== undefined) process.env["ACP_OPERATOR_TOKEN"] = previousToken;
+    }
+
+    // The offline inspection must survive: no token still answers, and answers zero.
+    expect(code).toBe(0);
+    const answer = JSON.parse(printed.join("")) as Record<string, unknown>;
+    // A missing token is the daemon refusing to be asked, not the daemon being unreachable,
+    // and a wrong token is the daemon answering with a denial. Naming either "unreachable"
+    // beside a lock file that says a process is live is three states under one label.
+    expect(answer["daemonStatus"]).toMatchObject({
+      answered: false,
+      reasonCode: ReasonCode.OPERATOR_UNAUTHENTICATED,
+    });
+    expect(Object.keys(answer)).not.toContain("daemonUnreachable");
   });
 
   it("is decided by the finding codes, not by how many there are", () => {

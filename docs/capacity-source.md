@@ -140,7 +140,8 @@ lock, leaves its timers and continuity coordinator off, and serves a restricted 
 
 ```text
 admitted while parked    capacity.observe   daemon.status
-refused while parked     everything else, with reasonCode DAEMON_BOOTSTRAP_MODE
+refused while parked     every other daemon method, with reasonCode DAEMON_BOOTSTRAP_MODE
+never served here        bootstrap.hermes, refused by the socket before the daemon sees it
 ```
 
 Each observation that lands re-runs the doctor. When it passes, the daemon promotes itself
@@ -149,16 +150,21 @@ capacity block itself.
 
 **A successful `capacity observe` is not evidence that dispatch resumed.** The daemon derives
 `runtimeHealth` from the adapter's liveness probe, so a reading can persist and still leave
-the role unroutable. Ask the daemon:
+the role unroutable. Ask the daemon — which, like `capacity observe`, needs the operator token:
 
 ```text
+export ACP_OPERATOR_TOKEN="<the daemon's operator credential>"
 agentctl daemon status
 ```
 
 While parked that reports `mode: "BOOTSTRAP"`, the admitted method list, and the blocking
-findings that remain. When it reports `mode: "NORMAL"` the daemon is dispatching. If the
-socket cannot be reached at all the command falls back to the lock file and says so, which
-is not the same answer — a lock file records a live process, not a serving one.
+findings that remain. When it reports `mode: "NORMAL"` the daemon is dispatching.
+
+Without the token the command still answers, but only from the local lock file, and it says
+so under `daemonStatus`. **That answer cannot tell you whether the daemon is parked**: a lock
+file records a process that is live, not one that is serving, and a parked daemon holds its
+lock exactly like a running one. The same fallback appears when the socket genuinely cannot
+be reached, so read the `reasonCode` beside it rather than the lock alone.
 
 Two limits worth knowing before relying on this:
 

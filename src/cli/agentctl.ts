@@ -12,8 +12,9 @@ import type { RunState } from "../domain/types.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
 
 /**
- * PRD §28.4 — the operator CLI is a client, never a composition root. Every command other
- * than the lock-only status inspection crosses the authenticated daemon socket.
+ * PRD §28.4 — the operator CLI is a client, never a composition root. Every command crosses
+ * the authenticated daemon socket. `daemon status` additionally falls back to reading the
+ * local lock file, so that it still answers when no daemon does.
  */
 const USAGE = `agentctl — Agent Control Plane operator CLI
 
@@ -109,8 +110,16 @@ export const main = async (argv: string[]): Promise<number> => {
       print(live.value);
       return 0;
     }
+    // Not "unreachable": this branch covers a daemon that answered and refused (a wrong or
+    // absent operator token) as well as one that could not be reached at all, and the client
+    // reports both as DAEMON_LOCK_LOST. Say what happened instead of naming a cause. The lock
+    // is a file read that does not prove its pid is alive, so it can appear beside any of them.
     const lock = new SingleInstanceLock(join(config.databasePath, "..", "agentcpd.lock"));
-    print({ lock: lock.read(), databasePath: config.databasePath, daemonUnreachable: live.reasonCode });
+    print({
+      lock: lock.read(),
+      databasePath: config.databasePath,
+      daemonStatus: { answered: false, reasonCode: live.reasonCode, message: live.message },
+    });
     return 0;
   }
 
