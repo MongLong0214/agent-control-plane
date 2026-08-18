@@ -10,6 +10,7 @@ import {
   GrokCliAdapter,
 } from "../../src/runtime/cli-adapters.ts";
 import {
+  CLAUDE_NON_INTERACTIVE_ARGS,
   ClaudeUsageCollector,
   CodexUsageCollector,
   GrokUsageCollector,
@@ -37,9 +38,103 @@ const terminal = (stdout: string, error: string | null = null): UsageTerminal =>
   },
 });
 
+describe("non-interactive account usage (#582)", () => {
+  const envelope = (result: string, extra: Record<string, unknown> = {}): string =>
+    JSON.stringify({ is_error: false, num_turns: 0, total_cost_usd: 0, result, ...extra });
+
+  const probeReturning = (outcome: { stdout: string; stderr?: string; code?: number | null }) => ({
+    run: async () => ({ stdout: outcome.stdout, stderr: outcome.stderr ?? "", code: outcome.code ?? 0 }),
+  });
+
+  // Captured from `claude -p --output-format json --safe-mode --max-turns 1 "/usage"` on the
+  // deployment host: num_turns 0, total_cost_usd 0, output_tokens 0, two seconds.
+  const LIVE_RESULT = [
+    "You are currently using your subscription to power your Claude Code usage",
+    "",
+    "Current session: 12% used · resets Aug 18 at 7:49pm (Asia/Seoul)",
+    "Current week (all models): 64% used · resets Aug 21 at 4:59am (Asia/Seoul)",
+    "Current week (Fable): 18% used · resets Aug 21 at 4:59am (Asia/Seoul)",
+    "",
+    "What's contributing to your limits usage?",
+  ].join("\n");
+
+  it("reads every account window, and the horizon each one states", async () => {
+    const reading = await new ClaudeUsageCollector({
+      clock: clock(),
+      binary: "claude",
+      nonInteractive: probeReturning({ stdout: envelope(LIVE_RESULT) }),
+    }).collect();
+
+    expect(reading.sensorHealth, reading.error ?? "").toBe("HEALTHY");
+    expect(reading.source).toMatch(/^non-interactive-\/usage:claude;/u);
+    expect(reading.buckets.map((bucket) => [bucket.id, bucket.remainingPercent, bucket.resetAt])).toEqual([
+      ["current-session", 88, "2026-08-18T10:49:00.000Z"],
+      ["current-week-all-models", 36, "2026-08-20T19:59:00.000Z"],
+      ["current-week-fable", 82, "2026-08-20T19:59:00.000Z"],
+    ]);
+    // Stated as used, subtracted here. Without a resolved horizon every bucket would hold its
+    // whole window in reserve and no worker would ever be admitted.
+    expect(reading.buckets.every((bucket) => bucket.measuredAs === "used")).toBe(true);
+  });
+
+  it("refuses rather than guessing when the output contract changes", async () => {
+    const clockAt = clock();
+    const cases: Array<[string, { stdout: string; code?: number | null }]> = [
+      ["not JSON at all", { stdout: "Current session: 12% used" }],
+      ["an envelope with no result", { stdout: JSON.stringify({ is_error: false }) }],
+      // Carrying text that WOULD parse: an errored invocation whose result still looks like a
+      // usage report is the dangerous shape, because ignoring the flag reads it as quota.
+      [
+        "an error envelope with parseable text",
+        { stdout: JSON.stringify({ is_error: true, result: "Current session: 12% used" }) },
+      ],
+      ["a result with no window", { stdout: envelope("You are logged in. Nothing else to report.") }],
+      ["a non-zero exit and no envelope", { stdout: "", code: 1 }],
+    ];
+    for (const [name, outcome] of cases) {
+      const reading = await new ClaudeUsageCollector({
+        clock: clockAt,
+        binary: "claude",
+        nonInteractive: probeReturning(outcome),
+      }).collect();
+      expect(reading.sensorHealth, name).toBe("ERROR");
+      expect(reading.buckets, name).toEqual([]);
+    }
+  });
+
+  it("refuses a repeated window label instead of choosing between two numbers", async () => {
+    const reading = await new ClaudeUsageCollector({
+      clock: clock(),
+      binary: "claude",
+      nonInteractive: probeReturning({
+        stdout: envelope(["Current session: 12% used", "Current session: 90% used"].join("\n")),
+      }),
+    }).collect();
+
+    // One line per window is what this surface is for. Two lines for one label means the shape
+    // is not what it is taken to be, and picking one would reintroduce exactly the ambiguity
+    // that made the terminal parser wrong fifteen times.
+    expect(reading.sensorHealth).toBe("ERROR");
+    expect(reading.error).toContain("repeated a quota-window label");
+  });
+
+  it("never reads a quota by handling the subscription credential itself", () => {
+    // The command carries no token and sets no credential path: the CLI reads and refreshes its
+    // own. `--bare` is the one flag that would break this — it refuses the keychain and returns
+    // a session-cost stub with no windows, which is a silent wrong answer rather than a failure.
+    const args = CLAUDE_NON_INTERACTIVE_ARGS as readonly string[];
+    expect(args).toContain("--safe-mode");
+    expect(args).toContain("/usage");
+    expect(args).not.toContain("--bare");
+    expect(args.join(" ")).not.toMatch(/token|key|credential/iu);
+  });
+});
+
 describe("interactive provider usage collectors", () => {
   it("normalises explicit quota windows, reset horizons, capabilities, and raw-output digest", async () => {
-    const collector = new ClaudeUsageCollector({
+    // Through Codex: Claude reads its account non-interactively now, and this pins the
+    // terminal parser that Codex and Grok still use.
+    const collector = new CodexUsageCollector({
       clock: clock(),
       binary: "unused-by-injected-terminal",
       terminal: terminal(`
@@ -51,11 +146,11 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     const reading = await collector.collect();
 
     expect(reading).toMatchObject({
-      provider: "claude",
+      provider: "gpt",
       sensorHealth: "HEALTHY",
       runtimeHealth: "UNKNOWN",
       observedAt: "2026-08-13T00:00:00.000Z",
-      source: expect.stringMatching(/^interactive-\/usage:claude;raw-output-digest:sha256:[a-f0-9]{64}$/),
+      source: expect.stringMatching(/^interactive-\/usage:gpt;raw-output-digest:sha256:[a-f0-9]{64}$/),
       rawOutputDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
     });
     expect(reading.buckets).toEqual([
@@ -63,7 +158,7 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
         id: "5-hour",
         remainingPercent: 62,
         resetAt: "2026-08-13T01:15:00.000Z",
-        capabilities: expect.arrayContaining(["cto", "blind-review"]),
+        capabilities: expect.arrayContaining(["ceo", "blind-review"]),
       }),
       expect.objectContaining({
         id: "weekly",
@@ -103,7 +198,7 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
   const CHA = (column: number) => `[${column}G`;
 
   it("refuses live trust prompts from Claude and Grok rather than approving them", async () => {
-    const claude = await new ClaudeUsageCollector({
+    const claude = await new CodexUsageCollector({
       clock: clock(),
       binary: "unused-by-injected-terminal",
       terminal: terminal(
@@ -128,7 +223,7 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     // a plain pipe rather than a TUI — would stop matching if the candidate were not
     // normalised too. Without this, fixing the terminal case would have broken the case the
     // original fixture was written for, and nothing would have said so.
-    const claude = await new ClaudeUsageCollector({
+    const claude = await new CodexUsageCollector({
       clock: clock(),
       binary: "unused-by-injected-terminal",
       terminal: terminal("Quick safety check: Is this a project you trust? 1. Yes, I trust this folder"),
@@ -593,6 +688,8 @@ setInterval(() => {}, 1_000);
 `);
     chmodSync(binary, 0o700);
 
+    // Explicitly through the terminal path, which Claude now takes only when one is configured
+    // — a host whose CLI predates the non-interactive command still needs the readiness wait.
     const reading = await new ClaudeUsageCollector({
       clock: clock(),
       binary,
