@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -165,35 +165,58 @@ describe("#568: a parked daemon still answers a supervisor's stop", () => {
     // the host this park was written for.
     const root = mkdtempSync(join("/tmp", "acp-park-sigterm-"));
     const stateRoot = join(root, ".agent-control-plane");
+    const environment: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: root,
+      USER: "park-owner",
+      ACP_MCP_TOKEN: "park-mcp-token",
+      ACP_OPERATOR_TOKEN: "park-operator-token",
+      ACP_OPERATOR_ACTOR: "park-owner",
+      ACP_STARTUP_TEST_ROOT: root,
+      ACP_STARTUP_TEST_SEED: "1",
+      ACP_STARTUP_TEST_PARK: "1",
+    };
+    // An inherited partial Telegram config takes the exit-1 path, and this test would then
+    // time out waiting for a door that is never bound — for a reason unrelated to what it asks.
+    for (const name of TELEGRAM_VARIABLES) delete environment[name];
+
     const child = spawn(process.execPath, ["--import", "tsx", mainRunner], {
       cwd: repositoryRoot,
-      env: {
-        ...process.env,
-        HOME: root,
-        USER: "park-owner",
-        ACP_MCP_TOKEN: "park-mcp-token",
-        ACP_OPERATOR_TOKEN: "park-operator-token",
-        ACP_OPERATOR_ACTOR: "park-owner",
-        ACP_STARTUP_TEST_ROOT: root,
-        ACP_STARTUP_TEST_SEED: "1",
-        ACP_STARTUP_TEST_PARK: "1",
-      },
+      env: environment,
       stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
     });
     const exited = new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code)));
 
     try {
-      // The door binding is the observable proof the daemon parked rather than exited.
       const doorPath = join(stateRoot, "agentcpd.operator.sock");
       const lockPath = join(stateRoot, "agentcpd.lock");
-      await vi.waitFor(() => expect(existsSync(doorPath)).toBe(true), { timeout: 60_000, interval: 100 });
+      const healthPath = join(stateRoot, "health.json");
+      // The socket alone does not prove a park: a started daemon binds the same path. The
+      // parked mode does, and it is the state the rest of this test is about.
+      await vi.waitFor(
+        () => {
+          expect(existsSync(doorPath)).toBe(true);
+          expect(JSON.parse(readFileSync(healthPath, "utf8")) as { mode?: string }).toMatchObject({
+            mode: "BOOTSTRAP",
+          });
+        },
+        { timeout: 60_000, interval: 100 },
+      );
       expect(existsSync(lockPath)).toBe(true);
 
       child.kill("SIGTERM");
-      await exited;
+      const code = await exited;
 
-      // What the deploy script actually waits for.
+      // What the deploy script waits for — and proof the handler is what released it, rather
+      // than a crash or an ordinary exit that would satisfy the file check by accident.
       expect(existsSync(lockPath)).toBe(false);
+      expect(stdout).toContain("shutting down on SIGTERM");
+      expect(code).toBe(0);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       rmSync(root, { recursive: true, force: true });

@@ -114,9 +114,13 @@ if (process.env["ACP_STARTUP_TEST_SEED"] === "1") {
 }
 
 if (process.env["ACP_STARTUP_TEST_PARK"] === "1") {
-  // No routable quota from any provider, which is the host this bootstrap park exists for:
-  // every required role is uncovered, so the startup doctor blocks on
-  // ROLE_COVERAGE_NO_VALID_COVERAGE alone and `start()` parks instead of returning.
+  // No routable quota from any provider, which is the host this bootstrap park exists for.
+  // `isRoutableFor` rejects on `runtimeHealth === "UNAVAILABLE"` before it reads buckets, so
+  // that field is what makes every required role uncovered here; the empty buckets would do it
+  // on their own too. The ERROR sensor raises CAPACITY_SENSOR_FAILED, which is deliberately
+  // non-blocking, so ROLE_COVERAGE_NO_VALID_COVERAGE is the only blocking finding and `start()`
+  // parks instead of returning. The GitHub credential seed is load-bearing: without it
+  // TRUSTED_GATE_CREDENTIAL_MISSING is also blocking and the daemon takes the exit path.
   for (const adapter of adapters) {
     adapter.setCapacity({
       provider: adapter.provider,

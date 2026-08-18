@@ -1234,7 +1234,14 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   let telegram: TelegramLongPollListener | null = null;
   let startCompleted = false;
 
+  let shuttingDown: Promise<void> | null = null;
   const shutdown = async (signal: string): Promise<void> => {
+    // A supervisor that sends SIGTERM twice, or SIGTERM then SIGINT, must not run this twice:
+    // the listener handles have no closing guard, and Node rejects a second `server.close()`
+    // with ERR_SERVER_NOT_RUNNING — which, through `void shutdown(...)`, is an unhandled
+    // rejection during the one operation that most needs to finish.
+    if (shuttingDown) return shuttingDown;
+    shuttingDown = (async () => {
     process.stdout.write(`\nshutting down on ${signal}\n`);
     await telegram?.close();
     await buzzActorIngress?.close();
@@ -1248,6 +1255,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     // out from under that unwind would only turn a clean stop into an error.
     if (startCompleted) cp.close();
     process.exit(0);
+    })();
+    return shuttingDown;
   };
 
   // Installed before `start()`, not after. A daemon that parks has not returned from `start()`,
