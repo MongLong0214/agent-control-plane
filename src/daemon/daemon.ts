@@ -1351,6 +1351,11 @@ export class Daemon {
         consumed = this.#bootstrapSignal;
 
         const rechecked = await this.reconcile();
+        // Re-read the latch on this side of the re-check too. `stop()` has already released the
+        // lock by the time it returns, so promoting on a report that arrived after it would
+        // start timers and resume runs with no lock held — the failure the park exists to
+        // prevent, reached through its success path instead of its sleep.
+        if (this.#bootstrapAbandoned) return null;
         if (rechecked.doctorStatus !== "BLOCKED" && rechecked.doctorStatus !== "ERROR") {
           this.cp.audit.record({
             kind: "DAEMON_BOOTSTRAP_PROMOTED",
@@ -1380,8 +1385,8 @@ export class Daemon {
 
   /**
    * Record the signal first, deliver second. `stop()` can land while the park is inside its
-   * re-check with no waiter armed; latching the abandon means the loop still sees it on the
-   * next pass instead of sleeping again behind a released lock.
+   * re-check with no waiter armed, so the abandon is latched rather than delivered — the loop
+   * reads it on both sides of the re-check, whether that re-check would have slept or promoted.
    */
   private wakeBootstrap(reason: "OBSERVED" | "ABANDONED"): void {
     if (reason === "ABANDONED") this.#bootstrapAbandoned = true;

@@ -387,6 +387,28 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     expect(daemon.lock.held()).toBe(false);
   });
 
+  it("does not promote on a re-check that finished after stop() released the lock", async () => {
+    const { harness, daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])], [0, 250]);
+    const attach = vi.spyOn(harness.cp.continuity, "attach");
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    expect((await observe(daemon)).allowed).toBe(true);
+    // stop() lands while the re-check that would promote is still running. Reading the latch
+    // only before the re-check lets this one through: start() would resume runs and start
+    // timers on a daemon whose lock stop() has already released.
+    await daemon.stop();
+
+    const started = await starting;
+    expect(started.allowed).toBe(false);
+    expect(daemon.lock.held()).toBe(false);
+    // Exactly the one install start() does before it reconciles — promotion would add a second,
+    // re-arming a coordinator that stop() has already taken down.
+    expect(attach).toHaveBeenCalledTimes(1);
+    expect(door.closed).toHaveLength(1);
+  });
+
   it("does not pin a parked refusal to a key the operator retries after promotion", async () => {
     const { daemon } = makeDaemon([report("BLOCKED", [COVERAGE]), report("HEALTHY", [])]);
     const door = recordingDoor();
