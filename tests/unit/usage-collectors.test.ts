@@ -218,22 +218,320 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(parsed.ok).toBe(false);
   });
 
-  it("reads the current frame when the TUI has repainted", () => {
-    // A repaint is not a second screen. Measured on claude 2.1.233: the same three windows
-    // arrive three times, and not identically — one paint keeps its spaces, another loses
-    // characters, so `Current week (all models)` normalises two different ways and the
-    // duplicate-window refusal fires on one screen read twice (#564).
-    const ESC = "\u001B";
-    const damaged = ["Current session", "\u2588 8%used", "Current week (ll model)", "\u2588 41%used"].join("\n");
-    const current = ["Currentsession", "\u2588 8%used", "Currentweek(allmodels)", "\u2588 41%used"].join("\n");
-    const repainted = `${ESC}[H${damaged}${ESC}[H${current}`;
+  it("assembles a repaint from whichever paint stated the least, not from one chosen paint", () => {
+    // This replaces an assertion that the reported ids are exactly the last paint's. Choosing a
+    // single frame — the last, or the one with the most windows — was measured to over-report:
+    // a complete earlier paint outvotes a shorter current one that just moved a shared window
+    // down, and a damaged paint can hold more ids than the intact one. Over-reporting is the
+    // failure that dispatches work the quota cannot pay for.
+    //
+    // The union's cost is that a damaged repaint's misspelling appears beside the real window.
+    // That cannot grant work: `isRoutableFor` requires *every* applicable bucket to clear the
+    // floor, so an extra bucket can only withhold. The trade is a noisier reported set for a
+    // decision that cannot be too generous.
+    const ESC = String.fromCharCode(27);
+    const HOME = ESC + "[H";
+    const now = clock().nowIso();
 
-    // Without frame awareness this is four windows, two of them the same quota under
-    // different ids — which is what the deployment recorded as a duplicate refusal.
-    const parsed = parseUsageOutput("claude", repainted, clock().nowIso());
+    const damaged = ["Current session", "8%used", "Current week (ll model)", "41%used"].join("\n");
+    const current = ["Currentsession", "8%used", "Currentweek(allmodels)", "41%used"].join("\n");
+    const parsed = parseUsageOutput("claude", HOME + damaged + HOME + current, now);
     expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
     if (!parsed.ok) return;
-    expect(parsed.buckets.map((b) => b.id)).toEqual(["currentsession", "currentweek-allmodels"]);
+    // Both spellings of both windows survive, which is the union's accepted cost. Asserting a
+    // maximum alone does not lock that — the last paint on its own already satisfies it.
+    expect(parsed.buckets.map((bucket) => bucket.id).sort()).toEqual([
+      "current-session",
+      "current-week-ll-model",
+      "currentsession",
+      "currentweek-allmodels",
+    ]);
+    expect(parsed.buckets.filter((bucket) => bucket.remainingPercent === 59)).toHaveLength(2);
+
+    // The case a single-frame rule gets wrong in the dangerous direction: the earlier paint is
+    // complete and the later one is partial, but the later one is what says the week is spent.
+    const moved =
+      HOME + ["Currentsession", "8%used", "Currentweek(allmodels)", "5%used", "Currentweek(Fable)", "12%used"].join("\n") +
+      HOME + ["Currentsession", "8%used", "Currentweek(allmodels)", "95%used"].join("\n");
+    const lowered = parseUsageOutput("claude", moved, now);
+    expect(lowered.ok, lowered.ok ? "" : lowered.error).toBe(true);
+    if (!lowered.ok) return;
+    expect(lowered.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(5);
+
+    // One damaged paint must not take the whole observation down with it. A window labelled
+    // twice in a single paint is ambiguous, so that paint is skipped — not the reading.
+    const ambiguous =
+      HOME + ["Currentsession", "8%used", "Currentweek(allmodels)", "41%used 59% remaining"].join("\n") +
+      HOME + ["Currentsession", "8%used", "Currentweek(allmodels)", "95%used"].join("\n");
+    const survived = parseUsageOutput("claude", ambiguous, now);
+    expect(survived.ok, survived.ok ? "" : survived.error).toBe(true);
+    if (!survived.ok) return;
+    expect(survived.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(5);
+  });
+
+  it("prefers the lowest reading of a window even when the later paint states more", () => {
+    // Minimum across paints, not the most recent one. A repaint caught mid-draw states a
+    // prefix of the real figure — `95%used` half-drawn is `9%used`, which reads as 91
+    // remaining instead of 5. Taking the later paint believes the half-drawn number; taking
+    // the lowest cannot, and the direction of that error is the one that dispatches work the
+    // quota cannot pay for.
+    const ESC = String.fromCharCode(27);
+    const HOME = ESC + "[H";
+    const midDraw =
+      HOME + ["Currentweek(allmodels)", "95%used"].join("\n") +
+      HOME + ["Currentweek(allmodels)", "9%used"].join("\n");
+    const parsed = parseUsageOutput("claude", midDraw, clock().nowIso());
+    expect(parsed.ok, parsed.ok ? "" : parsed.error).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.buckets.find((bucket) => bucket.id === "currentweek-allmodels")?.remainingPercent).toBe(5);
+  });
+
+  it("ends a borrow at a line with words of its own, and keeps it across a redrawn bar", () => {
+    // A figure with no words of its own borrows the window in force — that is a redraw's stale
+    // bar and its successors. Bounding that borrow by position was measured to report the
+    // *stalest* of a three-times-redrawn bar: 80 remaining for a window at 59, in the direction
+    // that dispatches work the quota cannot pay for. So the borrow is unbounded in length, and
+    // what ends it is content rather than distance.
+    const now = clock().nowIso();
+    const CR = String.fromCharCode(13);
+
+    // Three redraws of one bar. Every figure belongs to the window above it.
+    const redrawn = parseUsageOutput(
+      "claude",
+      "Currentweek(allmodels)\n0%used" + CR + "20%used" + CR + "41%used",
+      now,
+    );
+    expect(redrawn.ok, redrawn.ok ? "" : redrawn.error).toBe(true);
+    if (!redrawn.ok) return;
+    expect(redrawn.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+    ]);
+
+    // A promo has words of its own and cannot be named, so it ends the borrow and the figure
+    // below it belongs to nothing.
+    const promo = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "+5%weeklylimitspromothroughAug20", "3% remaining"].join("\n"),
+      now,
+    );
+    expect(promo.ok, promo.ok ? "" : promo.error).toBe(true);
+    if (!promo.ok) return;
+    expect(promo.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+    ]);
+
+    // A section heading that states its own percentage names itself, so the figure under it is
+    // that section's, not the week's.
+    const sectioned = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "Token activity last 12 months 40% used", "3% remaining"].join("\n"),
+      now,
+    );
+    expect(sectioned.ok, sectioned.ok ? "" : sectioned.error).toBe(true);
+    if (!sectioned.ok) return;
+    // Asserted in full rather than by lookup: naming the section makes it a window, and the
+    // figure under it becomes that window's. Stated so it is visible — it lands at 3, which is
+    // above the exhaustion floor of 2, so it moves the provider to CONSERVE and does not make
+    // any role unroutable.
+    expect(sectioned.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+      ["token-activity-last-12-months", 3],
+    ]);
+
+    // A reset is a horizon. It neither borrows nor names a window, even carrying a sense word.
+    const reset = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "Resets Aug18 at 9am 3% left", "Currentweek(Fable)", "12%used"].join("\n"),
+      now,
+    );
+    expect(reset.ok, reset.ok ? "" : reset.error).toBe(true);
+    if (!reset.ok) return;
+    expect(reset.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+      ["currentweek-fable", 88],
+    ]);
+
+    // Accepted, and stated rather than left to be discovered: an unbroken run of *unlabelled*
+    // figures under a real window walks that window down to the last of them. Nothing observed
+    // draws that shape, and it withholds work rather than granting it — the one direction this
+    // parser is allowed to be wrong in.
+    const walked = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "90% remaining", "3% remaining"].join("\n"),
+      now,
+    );
+    expect(walked.ok, walked.ok ? "" : walked.error).toBe(true);
+    if (!walked.ok) return;
+    expect(walked.buckets[0]?.remainingPercent).toBe(3);
+  });
+
+  it("takes the figure on the line that ends a borrow, and not the stale one before it", () => {
+    // Deciding whether a borrow survives BEFORE taking the line's own figures drops the figure
+    // on that very line — and that line is often the freshest. Every case here left the stale
+    // number standing, which is the over-reporting direction this whole change exists to close.
+    const now = clock().nowIso();
+    const CR = String.fromCharCode(13);
+
+    // A repaint whose bar and horizon share a row. `(Asia/Seoul)` is the live horizon spelling.
+    const withHorizon = parseUsageOutput(
+      "claude",
+      "Currentweek(allmodels)\n0%used" + CR + "41%used (Asia/Seoul)",
+      now,
+    );
+    expect(withHorizon.ok, withHorizon.ok ? "" : withHorizon.error).toBe(true);
+    if (!withHorizon.ok) return;
+    expect(withHorizon.buckets[0]?.remainingPercent).toBe(59);
+
+    // A unit after the figure. `min`, `hrs` and `UTC` are three letters; `am` and `pm` are two,
+    // which is why those never showed the fault.
+    for (const trailer of ["15min", "2hrs", "UTC"]) {
+      const united = parseUsageOutput(
+        "claude",
+        ["Currentweek(allmodels)", "80% remaining", `59% remaining ${trailer}`].join("\n"),
+        now,
+      );
+      expect(united.ok, united.ok ? "" : united.error).toBe(true);
+      if (!united.ok) return;
+      expect(united.buckets[0]?.remainingPercent, trailer).toBe(59);
+    }
+  });
+
+  it("does not turn a horizon into a quota window, in the spelling the CLI actually uses", () => {
+    // The exclusion was a word-boundary match, and the live reset has no boundary to find:
+    // `ResetsAug18at9am(Asia/Seoul)`. A horizon that trailed a percentage therefore became a
+    // window — every claude bucket advertises every capability, so that one lands on all four.
+    const now = clock().nowIso();
+    const glued = parseUsageOutput("claude", "ResetsAug18at9am 3% left", now);
+    expect(glued.ok).toBe(false);
+
+    const inSitu = parseUsageOutput(
+      "claude",
+      ["Currentweek(allmodels)", "41%used", "Resets Aug18 at 9am 3% left", "Currentweek(Fable)", "12%used"].join("\n"),
+      now,
+    );
+    expect(inSitu.ok, inSitu.ok ? "" : inSitu.error).toBe(true);
+    if (!inSitu.ok) return;
+    expect(inSitu.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentweek-allmodels", 59],
+      ["currentweek-fable", 88],
+    ]);
+  });
+
+  it("names a window whose figure is glued to it, because the spaces are what vanish", () => {
+    // The label form was added for `Fable 12% remaining` nested under its parent, and it
+    // required whitespace — so the one new same-line shape died exactly when the spaces did,
+    // and the child's constraint disappeared instead of being read.
+    const glued = parseUsageOutput(
+      "claude",
+      ["Current week", "all models 41% remaining", "Fable12%remaining"].join("\n"),
+      clock().nowIso(),
+    );
+    expect(glued.ok, glued.ok ? "" : glued.error).toBe(true);
+    if (!glued.ok) return;
+    // The name keeps its spaces where the paint had them, so one window is not two ids.
+    expect(glued.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["all-models", 41],
+      ["fable", 12],
+    ]);
+  });
+
+  it("keeps the empty-stream cause distinct from a screen that stated no quota", () => {
+    // #564: those two failures used to arrive as one sentence, and a whole causal chain was
+    // built on the wrong one. A trailing home leaves an empty final frame, so a rule that read
+    // only the last frame reported "the binary may not have launched" about a screen that had
+    // just printed two lines.
+    const ESC = String.fromCharCode(27);
+    const trailing = parseUsageOutput("claude", "Welcome back\nToken activity: 40%" + ESC + "[H", clock().nowIso());
+    expect(trailing.ok).toBe(false);
+    if (trailing.ok) return;
+    expect(trailing.error).toContain("no explicit remaining-quota percentage");
+    expect(trailing.error).not.toContain("may not have launched");
+  });
+
+  it("keeps a window the last paint dropped, and every reading that would lower it", () => {
+    // Every case below was measured against the merged parser and produced a remaining percent
+    // HIGHER than the screen stated. That is the only direction that matters: `isRoutableFor`
+    // admits a role when every applicable bucket clears the floor, so over-reporting dispatches
+    // work the quota cannot pay for, while under-reporting only withholds it.
+    const ESC = String.fromCharCode(27);
+    const HOME = ESC + "[H";
+    const CR = String.fromCharCode(13);
+    const now = clock().nowIso();
+
+    // The collector stops after two seconds of quiet, so a home plus a partial repaint is a
+    // complete observation. Reading only the last frame lost the week window entirely and left
+    // the session bucket at 92 to route on its own.
+    const partial = HOME + "Currentsession\n8%used\nCurrentweek(allmodels)\n95%used" + HOME + "Currentsession\n8%used";
+    const dropped = parseUsageOutput("claude", partial, now);
+    expect(dropped.ok, dropped.ok ? "" : dropped.error).toBe(true);
+    if (!dropped.ok) return;
+    expect(dropped.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["currentsession", 92],
+      ["currentweek-allmodels", 5],
+    ]);
+
+    // A trailing home leaves an empty final frame. That read as "the binary may not have
+    // launched", which is a false cause for a stream that had just stated a quota.
+    const trailing = parseUsageOutput("claude", "Currentweek(allmodels)\n41%used" + HOME, now);
+    expect(trailing.ok, trailing.ok ? "" : trailing.error).toBe(true);
+    if (!trailing.ok) return;
+    expect(trailing.buckets[0]?.remainingPercent).toBe(59);
+
+    // A TUI redrawing a bar in place emits the stale figure, CR, then the fresh one. Because
+    // `stripTerminal` turns CR into a newline, both survive as lines — and the first won.
+    const redrawn = parseUsageOutput("claude", "Currentweek(allmodels)\n0%used" + CR + "41%used", now);
+    expect(redrawn.ok, redrawn.ok ? "" : redrawn.error).toBe(true);
+    if (!redrawn.ok) return;
+    expect(redrawn.buckets[0]?.remainingPercent).toBe(59);
+
+    // A window nested under its parent was dropped, so routing saw the parent's 41 and never
+    // the child's 12 — the tighter constraint, and the one that should govern.
+    const nested = parseUsageOutput("claude", "Current week\nall models 41% remaining\nFable 12% remaining", now);
+    expect(nested.ok, nested.ok ? "" : nested.error).toBe(true);
+    if (!nested.ok) return;
+    // Both are real windows and both are kept, because a line with words of its own names
+    // itself. Admission needs every applicable bucket to clear the floor, so the child's 12
+    // governs — which is the constraint that used to be dropped entirely.
+    expect(nested.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([
+      ["all-models", 41],
+      ["fable", 12],
+    ]);
+
+    // Two labels then two figures: the nearer label took the other window's number and the
+    // second figure was discarded, reporting 88 for a bar that said 41% used.
+    const interleaved = parseUsageOutput("claude", "Currentweek(Fable)\nCurrentweek(allmodels)\n12%used\n41%used", now);
+    expect(interleaved.ok, interleaved.ok ? "" : interleaved.error).toBe(true);
+    if (!interleaved.ok) return;
+    expect(interleaved.buckets.map((bucket) => bucket.remainingPercent)).toEqual([59]);
+  });
+
+  it("takes the lower figure when a line states both senses of one window", () => {
+    // Squeezing removed the spaces, so `41% used 80% remaining` arrived as one token and the
+    // old word boundary skipped `used` — reporting 80 for a window with 59 left.
+    //
+    // This refused, at first. Refusing was measured to be worse than folding: when the
+    // ambiguous paint is the one saying a window is spent, refusing it — or skipping only that
+    // paint — lets a stale high reading from another paint stand. `X% used` and
+    // `(100-X)% remaining` agree by construction, so a disagreeing pair is a screen
+    // contradicting itself, and the lower number is the one that cannot admit work the quota
+    // will not cover.
+    const contradictory = parseUsageOutput("claude", "weekly: 41% used 80% remaining", clock().nowIso());
+    expect(contradictory.ok, contradictory.ok ? "" : contradictory.error).toBe(true);
+    if (!contradictory.ok) return;
+    expect(contradictory.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["weekly", 59]]);
+
+    // The ambiguous paint is the only one that says the week is spent. Discarding it accepts
+    // the other paint's 92.
+    const ESC = String.fromCharCode(27);
+    const HOME = ESC + "[H";
+    const outvoted = parseUsageOutput(
+      "claude",
+      HOME + "Currentweek(allmodels)\n95%used 5%remaining" + HOME + "Currentweek(allmodels)\n8%used",
+      clock().nowIso(),
+    );
+    expect(outvoted.ok, outvoted.ok ? "" : outvoted.error).toBe(true);
+    if (!outvoted.ok) return;
+    expect(outvoted.buckets[0]?.remainingPercent).toBe(5);
   });
 
   it("still refuses a trust prompt raised in an earlier frame", () => {
@@ -260,15 +558,18 @@ weekly quota: 41% left — resets at 2026-08-18T00:00:00Z
     expect(consumed.error).toContain("1 line(s)");
   });
 
-  it("mutation: malformed and duplicate windows refuse collection", () => {
+  it("mutation: an impossible percentage refuses; a repeated label takes its lowest figure", () => {
+    // An impossible percentage is still fatal: nothing about the screen is evidence.
     expect(parseUsageOutput("claude", "rolling: 101% remaining", clock().nowIso()).ok).toBe(false);
-    expect(parseUsageOutput("claude", `
-rolling: 40% remaining
-rolling: 30% remaining
-`, clock().nowIso())).toEqual({
-      ok: false,
-      error: "interactive /usage output contains duplicate quota-window labels",
-    });
+
+    // A label stated twice used to refuse the whole observation. That was fail-closed for a
+    // single screen but not for a stream: a paint is discarded together with the constraint it
+    // was the only one to state, and another paint's stale higher reading then stands. Folding
+    // to the lowest keeps the tighter figure, and no fold can raise a window.
+    const repeated = parseUsageOutput("claude", "\nrolling: 40% remaining\nrolling: 30% remaining\n", clock().nowIso());
+    expect(repeated.ok, repeated.ok ? "" : repeated.error).toBe(true);
+    if (!repeated.ok) return;
+    expect(repeated.buckets.map((bucket) => [bucket.id, bucket.remainingPercent])).toEqual([["rolling", 30]]);
   });
 
   it("waits for the CLI to be ready before typing, through a real pseudo-terminal", async () => {
