@@ -314,6 +314,18 @@ export interface CapacityBucket {
   remainingPercent: number | null;
   resetAt: string | null;
   capabilities: string[];
+  /**
+   * How the provider stated the number this bucket carries.
+   *
+   * `remaining` is the value as read. `used` means the CLI reported consumption and
+   * `remainingPercent` is `100 - used` — arithmetic on a stated quantity, not an inference
+   * about an unstated one (#570). Recorded as evidence rather than as a branch: nothing
+   * downstream decides differently on it, but when a derived figure later disagrees with a
+   * provider's own view, this says which side of the subtraction it came from.
+   *
+   * Optional so existing readings, including operator observations, stay valid unchanged.
+   */
+  measuredAs?: "remaining" | "used";
 }
 
 export interface CapacityReading {
