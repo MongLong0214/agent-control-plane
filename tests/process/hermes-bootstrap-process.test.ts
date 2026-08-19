@@ -130,6 +130,22 @@ const runAgentctl = async (
   }
 };
 
+describe("the reference CEO runtime", () => {
+  it("declares sampling in its initialize request, on the MCP connection itself", () => {
+    // A text check, and it says so. The behavioural path needs Telegram ingress configured, so
+    // nothing here can drive an owner message through `Server.createMessage` — but a client
+    // copied from a reference that omitted the capability looks correct while every ordinary
+    // owner message is refused with CEO_CONVERSATION_UNSUPPORTED. This is a guard against the
+    // declaration being dropped, not a proof that conversation works.
+    const reference = readFileSync(HERMES_RUNTIME, "utf8");
+
+    expect(reference).toContain("capabilities: { sampling: {} }");
+    // And it answers what it declared. Declaring without answering is worse than not
+    // declaring: the daemon holds the owner's turn until the budget expires.
+    expect(reference).toContain('method === "sampling/createMessage"');
+  });
+});
+
 describe("fresh-install Hermes bootstrap process acceptance", () => {
   it("bootstraps through agentctl, restarts agentcpd, and authenticates Hermes MCP tool calls", async () => {
     // Keep the Unix socket pathname below macOS's AF_UNIX limit. /tmp is an approved

@@ -92,6 +92,21 @@ const mcp = (sessionId, sessionSecret) => new Promise((resolve, reject) => {
       if (!line.trim()) continue;
       try {
         const value = JSON.parse(line);
+        // Declaring `sampling` and then not answering is worse than not declaring it: the
+        // daemon holds the owner's turn open until the conversation budget expires and the
+        // owner is told the CEO did not answer in time. A real Hermes puts its own reply here.
+        if (value && value.method === "sampling/createMessage") {
+          oneLine(socket, {
+            jsonrpc: "2.0",
+            id: value.id,
+            result: {
+              model: "hermes-ceo-reference",
+              role: "assistant",
+              content: { type: "text", text: "reference runtime acknowledges the owner's turn" },
+            },
+          });
+          continue;
+        }
         if (value && value.id !== undefined) responses.set(value.id, value);
       } catch {
         // The transport only emits JSON lines; incomplete chunks are handled below.
@@ -115,14 +130,18 @@ const mcp = (sessionId, sessionSecret) => new Promise((resolve, reject) => {
       sessionId,
       sessionSecret,
     });
+    // `sampling` is declared here, in the initialize request, on this same connection — it is
+    // not a later step and not a second socket. Without it the daemon answers every ordinary
+    // owner message with CEO_CONVERSATION_UNSUPPORTED, and a client copied from an example that
+    // omitted it would look correct while the owner's conversation went nowhere.
     oneLine(socket, {
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
       params: {
         protocolVersion: "2025-11-25",
-        capabilities: {},
-        clientInfo: { name: "hermes-bootstrap-process-test", version: "1" },
+        capabilities: { sampling: {} },
+        clientInfo: { name: "hermes-ceo-reference", version: "1" },
       },
     });
     oneLine(socket, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
