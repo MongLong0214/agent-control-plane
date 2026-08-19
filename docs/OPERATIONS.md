@@ -41,6 +41,26 @@ reporting `mode: "BOOTSTRAP"` is parked and serving only the capacity door; see
 [provider capacity source](capacity-source.md). `~/.agent-control-plane/health.json` carries
 the same `mode` without needing the token.
 
+### Reading the doctor's findings
+
+`agentctl doctor` asks the running daemon over the operator socket, and against a *live* daemon
+that request does not currently complete: the client gives it 5 s (`cli/agentctl.ts`) and a pass
+that runs the capacity sensors takes longer, so it comes back `OPERATOR_UNAUTHENTICATED` or
+`DAEMON_LOCK_LOST` (#609). Both name something real — a handshake, a lock — which is what makes
+the refusal misleading: a healthy `DEGRADED` daemon with no blocking findings reads as an unwell
+one.
+
+The daemon writes each pass to the audit log, so read it there instead:
+
+```bash
+sqlite3 ~/.agent-control-plane/state.sqlite \
+  "select at, evidence_json from audit_events where kind='DOCTOR_REPORT' order by at desc limit 1;"
+```
+
+That returns the same report the daemon just computed — `status`, and each finding with its
+`severity` and whether it is `blocking`. Copy `state.sqlite-wal` alongside the database if you
+move it anywhere, or the most recent writes are not in what you read.
+
 None of these prove the external integrations are connected or that a deployment has
 satisfied acceptance.
 
