@@ -922,10 +922,22 @@ export class Daemon {
         const assignment = plan.assignments.find((candidate) => candidate.roleKey === required.roleKey);
         const session = this.cp.sessions.get(current.sessionId);
         const currentCapacity = session ? this.cp.capacity.current(session.provider) : null;
+        // Capacity constrains the providers it manages. It has nothing to say about one it does
+        // not, and "nothing to say" is not "not covered" — reading it that way evicted the only
+        // authority the once-ever bootstrap can create. The generation-1 CEO runs as
+        // `provider: "hermes"`, no collector writes a snapshot for that name, so `current()`
+        // returned null on every pass and this predicate handed the role to continuity, which
+        // replaced it with gpt/claude or revoked the binding. The bootstrap door is closed by
+        // history, so there was no second one to make.
+        //
+        // Liveness still decides. A hermes CEO whose session is not READY falls through to
+        // failover exactly as before, which is the path §15 relies on once the door is shut.
+        const capacityManaged = session !== null && this.cp.capacity.manages(session.provider);
         const currentStillCovered =
           session?.lifecycle === SessionLifecycle.READY &&
-          currentCapacity !== null &&
-          this.cp.capacity.isRoutableFor(currentCapacity, required.capability);
+          (!capacityManaged ||
+            (currentCapacity !== null &&
+              this.cp.capacity.isRoutableFor(currentCapacity, required.capability)));
         // A new plan may prefer a recovered provider over an already healthy fallback.
         // That is restoration, not failure, and §15.8 keeps the acting owner in place
         // until the explicit non-preemptive restore path can safely move it.

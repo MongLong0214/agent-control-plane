@@ -333,13 +333,23 @@ const terminalEnvironment = (
   ...(provider === "gpt" && credentialDir ? { CODEX_HOME: credentialDir } : {}),
 });
 
-const CAPABILITIES: Readonly<Record<UsageProvider, readonly string[]>> = {
+export const CAPABILITIES: Readonly<Record<UsageProvider, readonly string[]>> = {
   gpt: ["ceo", "blind-review", "worker", "luna-worker"],
   claude: ["cto", "ceo", "blind-review", "worker"],
   // Grok's only production role is optional diversity. It must never advertise a
   // critical continuity capability merely because its usage command happened to work.
   grok: ["adversarial-review"],
 };
+
+/**
+ * The providers capacity has a vocabulary for, derived rather than maintained.
+ *
+ * `CAPABILITIES` is `Record<UsageProvider, …>`, so the compiler refuses an entry that is
+ * missing — adding a member to the union forces it to appear here too. A hand-kept second list
+ * would let a new provider drift onto the "capacity has nothing to say" side in silence, which
+ * is the shape of every defect this file's neighbours were written against.
+ */
+export const USAGE_PROVIDERS: readonly UsageProvider[] = Object.keys(CAPABILITIES) as UsageProvider[];
 
 const CLI: Readonly<Record<UsageProvider, { args: readonly string[]; steps: readonly UsageTerminalStep[] }>> = {
   claude: {

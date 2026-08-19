@@ -866,6 +866,71 @@ describe("round-2 capacity and runtime regressions", () => {
     }
   });
 
+  it("#596: a CEO on a provider capacity does not manage is not evicted by reconciliation", async () => {
+    // The once-ever bootstrap creates the generation-1 CEO as `provider: "hermes"`. No collector
+    // writes a capacity snapshot for that name, so `capacity.current()` returns null on every
+    // pass. Reading that as "not covered" handed the role to continuity, which replaced it with
+    // gpt/claude — and the bootstrap door is closed by history, so there was no second one to
+    // make. Pressing the button produced a CEO a periodic timer took away.
+    const plane = makePlane();
+    const bootstrapped = bindCeo(plane, "hermes");
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    attachRoutablePorts(plane.cp);
+
+    const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    try {
+      // Healthy gpt and claude are the dangerous case, not the safe one: the more coverage the
+      // plan can offer, the more certainly the incumbent is replaced.
+      const reconciled = await daemon.reconcileContinuity("periodic capacity sensor refresh");
+
+      expect(reconciled?.reassigned).toEqual([]);
+      const current = plane.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(current.sessionId).toBe(bootstrapped.sessionId);
+      expect(current.bindingGeneration).toBe(bootstrapped.bindingGeneration);
+      expect(plane.cp.sessions.require(current.sessionId).provider).toBe("hermes");
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it("#596: a CEO on an unmanaged provider still fails over once its session stops being ready", async () => {
+    // Liveness is what decides, not capacity. Exempting the unmanaged provider from capacity
+    // eviction must not make its binding permanent — §15 relies on failover being the only path
+    // to a CEO once the bootstrap door is shut, and a binding nothing can replace would close
+    // that path too.
+    const plane = makePlane();
+    const bootstrapped = bindCeo(plane, "hermes");
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    plane.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    attachRoutablePorts(plane.cp);
+    const stopped = plane.cp.sessions.transition(
+      bootstrapped.sessionId, SessionLifecycle.STOPPED, "the hermes runtime exited");
+    if (!stopped.allowed) throw new Error(stopped.message);
+
+    const daemon = new Daemon(plane.cp, { stateDir: join(plane.root, "daemon") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    if (!started.allowed) return;
+
+    try {
+      const reconciled = await daemon.reconcileContinuity("the bound CEO runtime is gone");
+
+      expect(reconciled?.reassigned.map((r) => r.roleKey)).toContain(roleKeyFor(Role.CEO));
+      const current = plane.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(current.sessionId).not.toBe(bootstrapped.sessionId);
+      expect(plane.cp.sessions.require(current.sessionId).provider).not.toBe("hermes");
+    } finally {
+      await daemon.stop();
+    }
+  });
+
   it("P0-06: daemon reconciliation restores an idle acting CTO to the recovered preferred provider", async () => {
     const plane = makePlane();
     plane.gpt.setCapacity(healthy("gpt", plane.clock));
