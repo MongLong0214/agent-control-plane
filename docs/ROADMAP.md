@@ -37,7 +37,12 @@ and only a session bound to the CEO role may call it. `~/.hermes` contains zero 
 on an active binding, so a rehearsal bind is permanent (#596).
 
 Together: **the thin Hermes-side MCP client is a prerequisite of phase 1, not a migration step**,
-and the first bootstrap must be the CEO the deployment intends to keep. Hermes's *rule and prompt*
+and the first bootstrap must be the CEO the deployment intends to keep.
+
+They also fix an ordering this document originally had backwards. Handing Telegram to the daemon
+before a CEO is bound would leave `ask` with nothing to ask: the owner's assistant channel would be
+taken away and a refusal handed back. The cutover is therefore phase 2b, after the binding, and it
+carries a rollback. Hermes's *rule and prompt*
 refactor correctly stays late — it touches the running system — but the client does not; it is
 pure addition and changes nothing about how Hermes behaves today.
 
@@ -53,34 +58,58 @@ pure addition and changes nothing about how Hermes behaves today.
   almost no control-plane work.
 - ADR-0009 decides the owner's Telegram channel enters through the control plane.
 
-## Phase 1 — make a CEO bindable
-
-Nothing here touches how the running system behaves.
+## Phase 1 — build the client, and prove it without touching the running system
 
 | | Work | Where |
 |---|---|---|
 | 1.1 | Hermes gains an ACP MCP client: bootstrap handshake, CEO authentication, `sampling` capability | Hermes |
-| 1.2 | `onDirect` delivers ordinary conversation to the CEO session over `createMessage` | #595 |
-| 1.3 | Resolve `provider: "hermes"` against `CAPABILITIES`, which has no such entry | #596 |
-| 1.4 | Hermes stops polling Telegram; the same bot token moves to the daemon's Keychain entries | owner + Hermes |
+| 1.2 | `onDirect` delivers ordinary conversation to the CEO session over `createMessage` | done — #595 |
+| 1.3 | A process test binds that client on a **disposable state directory** and exchanges one DIRECT turn | Hermes + ACP |
+| 1.4 | Resolve `provider: "hermes"` against `CAPABILITIES`, which has no such entry | #596 |
 
-1.4 is an exchange, not an addition — Telegram admits one `getUpdates` consumer per bot. Doing 1.4
-before Hermes stops polling splits the owner's messages between two processes.
+1.3 is where the client is proven. It cannot be proven on the production state directory, because
+the bootstrap that would prove it is the one bootstrap that deployment ever gets.
 
-**Exit:** a Telegram round trip passes through the daemon's long-poll listener. #510 closes here.
+**Exit:** the client binds, holds the CEO role and answers a DIRECT turn — on a throwaway state
+directory. Telegram is untouched; the owner still talks to the same Hermes they talk to today.
 
-## Phase 2 — bind the CEO
+## Phase 2 — bind the CEO on production state, once
 
-`agentctl bootstrap hermes -- <Hermes in ACP mode>`, once. Detached, long-lived, survives daemon
+`agentctl bootstrap hermes -- <Hermes in ACP mode>`. Detached, long-lived, survives daemon
 restarts. `CEO_ROLE_UNBOUND` clears.
 
-**This step is irreversible.** Do not run it to rehearse.
+**This step is irreversible** — the guard refuses on binding *history*, not only on an active
+binding (#596). It runs after 1.3 has shown the client works, and never as a rehearsal.
 
 What it establishes is the CEO **actor**, not merely a process. If that Hermes runtime later dies,
 continuity re-staffs the role from the coverage plan — `CAPABILITIES` advertises `ceo` on `claude`
 and `gpt` — so the owner keeps the counterpart and the transcript while the runtime behind it
 changes. Restarting Hermes specifically is a separate operational question that continuity does
 not answer.
+
+**Exit:** `doctor` no longer reports `CEO_ROLE_UNBOUND`, and a DIRECT turn over the MCP socket is
+answered by Hermes rather than refused.
+
+## Phase 2b — hand over Telegram, atomically, with a way back
+
+Only now. Before the CEO is bound, `ask` can only answer `CEO_CONVERSATION_UNAVAILABLE`, so a
+cutover at that point would take the owner's assistant away and give back a refusal.
+
+```
+1  Hermes stops polling Telegram
+2  the same bot token moves into the daemon's Keychain entries
+3  the daemon's listener starts
+4  one real round trip is observed and captured
+```
+
+Steps 1–3 are one operation. Telegram admits a single `getUpdates` consumer per bot, so a gap
+between them drops the owner's messages and an overlap splits them.
+
+**Rollback:** delete the four Keychain entries, restart the daemon — it logs `Telegram ingress not
+configured` and continues — then restart Hermes polling. The bot, the chat and the transcript are
+unchanged throughout, because only the consumer moved.
+
+**Exit:** #510 closes here, on a round trip through the daemon's listener that Hermes answered.
 
 ## Phase 3 — the three proofs
 
