@@ -248,9 +248,10 @@ export const startLocalMcpListeners = async (
     handshakeTimeoutMs,
     (auth) => {
       const server = createHermesServer(hermesPort, auth);
-      // The peer already proved it holds the active CEO binding to reach this line, so the
-      // conversation route never has to re-decide who the CEO is.
-      server.server.onclose = ceoConversation.attach(server);
+      // The authenticator travels with the connection, not just the server. Reaching this line
+      // proves the peer held the CEO binding at handshake; `ask` re-runs `auth` so a socket
+      // that outlives its binding cannot keep receiving the owner.
+      server.server.onclose = ceoConversation.attach(server, auth);
       return server;
     },
   );
