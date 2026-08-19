@@ -46,6 +46,30 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    what: "the tool bridge rewrites request ids so Hermes cannot collide with the runtime's own",
+    symbols: ["serve"],
+    file: "src/runtime/hermes-ceo.ts",
+    find: "      line(upstream, { ...value, id: ourId });",
+    replace: "      line(upstream, { ...value });",
+    killedBy: ["tests/unit/hermes-ceo-runtime.test.ts"],
+  },
+  {
+    what: "the tool bridge answers Hermes's initialize instead of sending a second one to ACP",
+    symbols: ["serve"],
+    file: "src/runtime/hermes-ceo.ts",
+    find: '      if (method === "initialize") {',
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/hermes-ceo-runtime.test.ts"],
+  },
+  {
+    what: "the tool bridge forwards only the methods ACP agreed to receive on the CEO's connection",
+    symbols: ["serve"],
+    file: "src/runtime/hermes-ceo.ts",
+    find: '      if (method !== "tools/list" && method !== "tools/call") {',
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/hermes-ceo-runtime.test.ts"],
+  },
+  {
     what: "the CEO runtime declares sampling, so ordinary owner conversation is not refused",
     symbols: ["serve"],
     file: "src/runtime/hermes-ceo.ts",

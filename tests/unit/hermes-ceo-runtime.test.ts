@@ -3,6 +3,8 @@ import { createHmac } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 
+import { createConnection } from "node:net";
+
 import { handshake, promptFrom, serve } from "../../src/runtime/hermes-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -185,5 +187,108 @@ describe("the owner's words reach the reply source", () => {
     expect(promptFrom({ messages: [{ content: "one" }, { content: "two" }] })).toBe("one\n\ntwo");
     // No messages is not an empty prompt to send onward — it is nothing to ask.
     expect(promptFrom({})).toBe("");
+  });
+});
+
+
+describe("the tool socket Hermes reaches ACP through", () => {
+  /** Drives the bridge's side: connect, speak MCP, collect the replies. */
+  const asHermes = async (
+    socketPath: string,
+    requests: readonly Record<string, unknown>[],
+    until: number,
+  ): Promise<Record<string, unknown>[]> => {
+    const seen: Record<string, unknown>[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const client = createConnection(socketPath);
+      client.once("error", reject);
+      client.on("connect", () => {
+        for (const request of requests) client.write(`${JSON.stringify(request)}\n`);
+      });
+      lines(client, (value) => {
+        seen.push(value);
+        if (seen.length >= until) {
+          client.end();
+          resolve();
+        }
+      });
+    });
+    return seen;
+  };
+
+  const attachedRuntime = async (
+    onUpstream: (socket: Socket, value: Record<string, unknown>) => void,
+  ): Promise<{ toolSocketPath: string; done: Promise<void>; stop: () => void }> => {
+    const toolSocketPath = join(tempDir("ceo-tools-"), "tools.sock");
+    let upstreamSocket: Socket | null = null;
+    const mcpPath = await listening((socket) => {
+      upstreamSocket = socket;
+      lines(socket, (value) => onUpstream(socket, value));
+    });
+    let ready: () => void = () => {};
+    const attached = new Promise<void>((resolve) => { ready = resolve; });
+    const done = serve(SESSION, {
+      mcpSocketPath: mcpPath, mcpToken: "t", replyCommand: echoCommand,
+      reattach: false, toolSocketPath, onToolSocketReady: () => ready(),
+    });
+    await attached;
+    return { toolSocketPath, done, stop: () => upstreamSocket?.end() };
+  };
+
+  it("answers Hermes's initialize itself instead of sending a second one upstream", async () => {
+    const upstream: Record<string, unknown>[] = [];
+    const runtime = await attachedRuntime((_socket, value) => { upstream.push(value); });
+
+    const replies = await asHermes(runtime.toolSocketPath, [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+    ], 1);
+    runtime.stop();
+    await runtime.done;
+
+    expect(replies[0]).toMatchObject({ id: 1, result: { capabilities: { tools: {} } } });
+    // ACP's connection was initialized once, by the runtime. Forwarding Hermes's initialize
+    // would put a second handshake on a connection already past it, and the two ends would
+    // disagree about which one they are in.
+    const upstreamInitializes = upstream.filter((v) => v["method"] === "initialize");
+    expect(upstreamInitializes).toHaveLength(1);
+  });
+
+  it("rewrites ids so Hermes cannot collide with the runtime's own request", async () => {
+    const forwarded: Record<string, unknown>[] = [];
+    const runtime = await attachedRuntime((socket, value) => {
+      if (value["method"] !== "tools/call") return;
+      forwarded.push(value);
+      socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: value["id"], result: { ok: true } })}\n`);
+    });
+
+    // Hermes numbers from 1 and so does the runtime — its initialize is id 1. Passing this
+    // through unchanged would make the reply to one readable as the reply to the other.
+    const replies = await asHermes(runtime.toolSocketPath, [
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "doctor_run" } },
+    ], 1);
+    runtime.stop();
+    await runtime.done;
+
+    expect(forwarded[0]?.["id"]).not.toBe(1);
+    // And it comes back wearing the id Hermes used, or Hermes cannot match it to its request.
+    expect(replies[0]).toMatchObject({ id: 1, result: { ok: true } });
+  });
+
+  it("refuses a method it does not forward rather than passing it to ACP", async () => {
+    const upstream: Record<string, unknown>[] = [];
+    const runtime = await attachedRuntime((_socket, value) => { upstream.push(value); });
+
+    const replies = await asHermes(runtime.toolSocketPath, [
+      { jsonrpc: "2.0", id: 5, method: "resources/read", params: {} },
+    ], 1);
+    runtime.stop();
+    await runtime.done;
+
+    expect(replies[0]).toMatchObject({ id: 5 });
+    expect(String((replies[0] as { error: { message: string } }).error.message))
+      .toContain("does not forward");
+    // A method this bridge does not understand is one ACP never agreed to receive on the CEO's
+    // authenticated connection.
+    expect(upstream.some((v) => v["method"] === "resources/read")).toBe(false);
   });
 });
