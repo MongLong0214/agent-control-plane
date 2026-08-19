@@ -407,7 +407,11 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
       expect(bind).toHaveBeenCalledTimes(1);
       expect(result.allowed).toBe(false);
       expect(result.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_ALREADY_INITIALIZED);
-      expect(revoke).toHaveBeenCalledWith(CEO_ROLE_KEY, "Hermes bootstrap did not mint generation 1");
+      // The fence used to read "must be generation 1", which refused every legitimate
+      // re-constitution while catching the same forced bind it catches now. It reads "must be
+      // the generation this call planned" — here 1, because the role had no history.
+      expect(revoke).toHaveBeenCalledWith(
+        CEO_ROLE_KEY, "Hermes bootstrap did not mint the generation it planned");
       expect(history.map((binding) => binding.bindingGeneration)).toEqual([1, 2]);
       expect(history.map((binding) => binding.status)).toEqual(["REVOKED", "REVOKED"]);
       expect(harness.cp.bindings.active(CEO_ROLE_KEY)).toBeNull();

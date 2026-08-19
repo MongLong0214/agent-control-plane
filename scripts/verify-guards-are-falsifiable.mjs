@@ -46,6 +46,18 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    what: "a CEO binding that appeared and was revoked mid-bootstrap is refused before anything is minted",
+    symbols: ["constituteHermesAuthority"],
+    file: "src/bootstrap/hermes-bootstrap.ts",
+    find:
+      "  const observed = cp.bindings.history(roleKey).length;\n" +
+      "  if (observed !== expectedGeneration - 1) {\n",
+    replace:
+      "  const observed = cp.bindings.history(roleKey).length;\n" +
+      "  if (false) {\n",
+    killedBy: ["tests/scenarios/hermes-bootstrap-mutation.test.ts"],
+  },
+  {
     what: "the pre-constitution fence refuses to constitute a CEO once the daemon lock is gone",
     symbols: ["constituteHermesAuthority"],
     file: "src/bootstrap/hermes-bootstrap.ts",
