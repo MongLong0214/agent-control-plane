@@ -99,9 +99,20 @@ export const CLAUDE_NON_INTERACTIVE_ARGS = [
  * a spawned provider CLI: it carries the operator credential, and a provider-credential
  * variable in it silently redirects which account is measured.
  */
-const nonInteractiveEnvironment = (): NodeJS.ProcessEnv => ({
+export const nonInteractiveEnvironment = (): NodeJS.ProcessEnv => ({
   PATH: process.env["PATH"] ?? "",
   HOME: process.env["HOME"] ?? "",
+  // Measured 2026-08-19, and the reason is not obvious enough to leave unwritten: without
+  // `USER` the CLI answers `/usage` with a cost-and-duration summary instead of the
+  // subscription windows. Five lines that parse as nothing, so the reading fails as
+  // "stated no quota window" and the provider goes ERROR while its quota is fine.
+  //
+  //   PATH HOME LANG LC_ALL              → cost summary
+  //   … + TMPDIR / LOGNAME / SHELL / TERM → cost summary
+  //   … + USER                            → the usage report
+  //
+  // launchd supplies USER to the daemon, so this passes through rather than inventing one.
+  ...(process.env["USER"] ? { USER: process.env["USER"] } : {}),
   ...(process.env["SHELL"] ? { SHELL: process.env["SHELL"] } : {}),
   // Pinned so a localised build cannot state its windows in a language this parser then
   // silently drops — the drop is what makes a spent window disappear.

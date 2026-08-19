@@ -26,6 +26,7 @@ import {
   parseUsageOutput,
   ExpectUsageTerminal,
   type UsageTerminal,
+  nonInteractiveEnvironment,
 } from "../../src/capacity/usage-collectors.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -1477,5 +1478,42 @@ setInterval(() => {}, 1_000);
     }
     // Deleting Grok from the composition root turns this into a two-provider registry;
     // merely defining a collector elsewhere is not enough to satisfy P0-11.
+  });
+});
+
+describe("the non-interactive usage probe's environment", () => {
+  it("passes USER through, because without it the CLI answers with a cost summary", () => {
+    // Measured 2026-08-19 against the real binary. With PATH, HOME, LANG and LC_ALL the answer
+    // is five lines of cost and duration — which parse as no quota window at all, so the
+    // provider reports ERROR while its quota is perfectly fine. Adding TMPDIR, LOGNAME, SHELL
+    // or TERM changes nothing; USER is the one that does.
+    const before = process.env["USER"];
+    process.env["USER"] = "isaac";
+    try {
+      expect(nonInteractiveEnvironment()["USER"]).toBe("isaac");
+    } finally {
+      if (before === undefined) delete process.env["USER"];
+      else process.env["USER"] = before;
+    }
+  });
+
+  it("carries nothing the daemon holds that a quota read has no use for", () => {
+    // #564 — the daemon's own environment carries ACP_OPERATOR_TOKEN, and
+    // CLAUDE_SECURESTORAGE_CONFIG_DIR is the variable that once made a probe read the wrong
+    // credential store. The allowlist is the point; widening it for USER must not widen it further.
+    const before = { ...process.env };
+    process.env["ACP_OPERATOR_TOKEN"] = "secret";
+    process.env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = "/elsewhere";
+    try {
+      const passed = Object.keys(nonInteractiveEnvironment());
+      expect(passed.sort()).toEqual(["HOME", "LANG", "LC_ALL", "PATH", "SHELL", "USER"].filter(
+        (name) => name === "HOME" || name === "LANG" || name === "LC_ALL" || name === "PATH" ||
+          process.env[name] !== undefined,
+      ).sort());
+      expect(passed).not.toContain("ACP_OPERATOR_TOKEN");
+      expect(passed).not.toContain("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+    } finally {
+      process.env = before;
+    }
   });
 });
