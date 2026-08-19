@@ -71,7 +71,14 @@ export interface NonInteractiveUsageProbe {
   }>;
 }
 
-const DEFAULT_TIMEOUT_MS = 45_000;
+/**
+ * The widest a single collector may hang. Exported because the operator socket derives its
+ * `doctor.run` budget from it: the doctor refreshes every provider sequentially, so a deadline
+ * chosen without reference to this number is a deadline that happens to be large enough on a
+ * healthy day. Measured 2026-08-19 with three healthy providers: 7.4s.
+ */
+export const COLLECTOR_TIMEOUT_MS = 45_000;
+const DEFAULT_TIMEOUT_MS = COLLECTOR_TIMEOUT_MS;
 /** The non-interactive read is a local command with no model turn; it answered in ~2s measured. */
 const NON_INTERACTIVE_TIMEOUT_MS = 20_000;
 

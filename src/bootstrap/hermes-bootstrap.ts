@@ -21,7 +21,7 @@ import {
 } from "../db/state-preflight.ts";
 
 const BOOTSTRAP_SOCKET_NAME = "hermes.bootstrap.sock";
-const DEFAULT_RUNTIME_TIMEOUT_MS = 30_000;
+export const DEFAULT_RUNTIME_TIMEOUT_MS = 30_000; // exported: agentcpd sizes its bootstrap budget against it
 const BOOTSTRAP_LINE_LIMIT = 64 * 1024;
 const PROOF_HEX_LENGTH = 64;
 const NONCE_MIN_LENGTH = 16;

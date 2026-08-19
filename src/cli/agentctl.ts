@@ -309,12 +309,15 @@ export const dispatch = async (
 };
 
 /**
- * Strictly greater than `DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS`, asserted by a test rather than
- * left to the two numbers happening to differ. Both were five seconds, so whichever timer fired
- * first decided whether the same healthy daemon read as unauthenticated or as having lost its
- * lock — neither of which was true (#609).
+ * Larger than the widest budget the daemon may take (`MAX_OPERATOR_METHOD_BUDGET_MS`), asserted
+ * by a test rather than imported: this CLI is a socket client, and pulling the daemon module in to
+ * read a number would hand it the runtime surface it is deliberately without. Both were five seconds once,
+ * so whichever timer fired first decided whether the same healthy daemon read as unauthenticated
+ * or as having lost its lock — neither of which was true (#609). Writing the client's number by
+ * hand puts that race one edit away from returning; a test asserts the inequality as well,
+ * because a derivation can still be edited into equality.
  */
-export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 45_000;
+export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 180_000;
 
 const exchangeOperatorRequest = (
   options: OperatorClientOptions,

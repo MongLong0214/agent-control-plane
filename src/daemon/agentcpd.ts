@@ -9,7 +9,9 @@ import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
 import { ControlPlane, defaultConfig, type ControlPlaneConfig } from "../app/control-plane.ts";
+import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import {
+  DEFAULT_RUNTIME_TIMEOUT_MS as HERMES_RUNTIME_TIMEOUT_MS,
   createHermesBootstrapAuthority,
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
@@ -48,6 +50,50 @@ const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
  * to an operator whose token was correct and whose peer had already been admitted (#609).
  */
 export const DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * How many collectors a doctor pass may wait on, one after another. `CapacityMonitor.refresh`
+ * loops the adapters sequentially, so the pass costs the sum and not the maximum.
+ */
+const PROVIDER_BUDGET_SLOTS = 3;
+
+/**
+ * Per-method budgets, because one number cannot be right for both `daemon.status` (2ms measured)
+ * and `doctor.run`.
+ *
+ * A flat 30s was chosen against a healthy day — measured 7.4s with three healthy providers — and
+ * would have refused the very method it was raised for as soon as two providers went slow, which
+ * is #609 again in a different dress. So the doctor's budget is derived from the collector budget
+ * rather than picked, and grows when that grows.
+ *
+ * `bootstrap.hermes` gets more than the runtime budget it waits on, for the same reason the
+ * client budget exceeds the server's: two equal deadlines racing is how one healthy daemon
+ * reported two different reason codes for one failure.
+ */
+export const OPERATOR_METHOD_BUDGET_MS: Readonly<Record<string, number>> = {
+  "doctor.run": PROVIDER_BUDGET_SLOTS * COLLECTOR_TIMEOUT_MS + DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,
+  "bootstrap.hermes": HERMES_RUNTIME_TIMEOUT_MS + DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,
+};
+
+/**
+ * `configured` scales the whole table rather than replacing one entry. A socket configured with a
+ * smaller budget shrinks every method in proportion, which keeps the ratios — the reason
+ * `doctor.run` is wider than `daemon.status` does not change because a test wants both faster —
+ * and keeps the table reachable from a test at all. An absolute table that ignored the option
+ * would have made these budgets unconfigurable and unmeasurable, which is the same thing.
+ */
+export const operatorMethodBudgetMs = (method: string, configured: number): number => {
+  const stated = OPERATOR_METHOD_BUDGET_MS[method];
+  if (stated === undefined) return configured;
+  const scale = configured / DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS;
+  return Math.max(1, Math.round(stated * scale));
+};
+
+/** The widest server-side budget any method may take; the client has to outlast it. */
+export const MAX_OPERATOR_METHOD_BUDGET_MS = Math.max(
+  DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,
+  ...Object.values(OPERATOR_METHOD_BUDGET_MS),
+);
 // A normal handoff package remains deliverable for thirty minutes. Do not make its recipient's
 // one-time bootstrap proof expire sooner than the package it must acknowledge.
 const SESSION_LAUNCH_TTL_MS = 30 * 60_000;
@@ -516,14 +562,19 @@ const serveOperatorRequest = (
   };
   const beginRequest = (method: string): void => {
     if (timeout) clearTimeout(timeout);
+    const budgetMs = operatorMethodBudgetMs(method, requestTimeoutMs);
     timeout = setTimeout(() => {
+      // "did not answer", not "did not happen". The socket closes; the dispatched method keeps
+      // running and its later `finish` is a no-op, so a mutation can still land after this
+      // refusal. Calling it a failure would be a claim about the write, which this does not know.
       finish(
-        deny(ReasonCode.OPERATOR_REQUEST_TIMEOUT, "operator method did not answer within its budget", {
-          method,
-          budgetMs: requestTimeoutMs,
-        }),
+        deny(
+          ReasonCode.OPERATOR_REQUEST_TIMEOUT,
+          "operator method did not answer within its budget; it was not cancelled and may still complete",
+          { method, budgetMs },
+        ),
       );
-    }, requestTimeoutMs);
+    }, budgetMs);
     timeout.unref();
   };
   const receive = (chunk: Buffer): void => {
