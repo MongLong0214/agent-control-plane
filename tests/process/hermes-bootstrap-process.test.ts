@@ -19,148 +19,12 @@ const TSX_ENTRY = join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
 const DAEMON_ENTRY = join(process.cwd(), "src", "daemon", "agentcpd.ts");
 const CLI_ENTRY = join(process.cwd(), "src", "cli", "agentctl.ts");
 
-const HERMES_RUNTIME = String.raw`
-const crypto = require("node:crypto");
-const fs = require("node:fs");
-const net = require("node:net");
-const pidPath = process.argv[1];
-const continuePath = process.argv[2];
-const secretPath = process.argv[3];
-const resultPath = process.argv[4];
-fs.writeFileSync(pidPath, String(process.pid));
-
-const waitForFile = (path) => new Promise((resolve) => {
-  const timer = setInterval(() => {
-    if (fs.existsSync(path)) {
-      clearInterval(timer);
-      resolve();
-    }
-  }, 25);
-});
-
-const oneLine = (socket, body) => socket.write(JSON.stringify(body) + "\n");
-const bootstrap = () => new Promise((resolve, reject) => {
-  const socketPath = process.env.ACP_HERMES_BOOTSTRAP_SOCKET;
-  const token = process.env.ACP_HERMES_BOOTSTRAP_TOKEN;
-  const nonce = "process-runtime-possession-nonce-123";
-  const proof = crypto.createHmac("sha256", token).update(nonce).digest("hex");
-  const socket = net.createConnection(socketPath, () => {
-    oneLine(socket, { runtimeNonce: nonce, runtimeProof: proof });
-  });
-  let received = "";
-  socket.setEncoding("utf8");
-  socket.on("data", (chunk) => {
-    received += chunk;
-    const boundary = received.indexOf("\n");
-    if (boundary === -1) return;
-    const response = JSON.parse(received.slice(0, boundary));
-    if (!response.ok) return reject(new Error("bootstrap denied: " + response.reasonCode));
-    resolve({ sessionId: response.sessionId, sessionSecret: response.sessionSecret });
-  });
-  socket.on("error", reject);
-});
-
-const mcp = (sessionId, sessionSecret) => new Promise((resolve, reject) => {
-  const socket = net.createConnection(process.env.ACP_HERMES_MCP_SOCKET);
-  const responses = new Map();
-  let received = "";
-  let finished = false;
-  const finish = (value, error) => {
-    if (finished) return;
-    finished = true;
-    if (error) reject(error);
-    else resolve(value);
-  };
-  const timer = setTimeout(() => finish(null, new Error("MCP response timed out")), 30_000);
-  const inspect = () => {
-    for (const line of received.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const value = JSON.parse(line);
-        if (value && value.id !== undefined) responses.set(value.id, value);
-      } catch {
-        // The transport only emits JSON lines; incomplete chunks are handled below.
-      }
-    }
-    if (responses.has(2) && responses.has(3)) {
-      clearTimeout(timer);
-      socket.end();
-      finish({ project: responses.get(2), doctor: responses.get(3) });
-    }
-    if (received.includes("MCP_PEER_UNAUTHENTICATED")) {
-      clearTimeout(timer);
-      socket.destroy();
-      finish(null, new Error("normal Hermes MCP authentication was refused"));
-    }
-  };
-  socket.setEncoding("utf8");
-  socket.on("connect", () => {
-    oneLine(socket, {
-      token: process.env.ACP_MCP_TOKEN,
-      sessionId,
-      sessionSecret,
-    });
-    oneLine(socket, {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-11-25",
-        capabilities: {},
-        clientInfo: { name: "hermes-bootstrap-process-test", version: "1" },
-      },
-    });
-    oneLine(socket, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
-    oneLine(socket, {
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name: "project_get", arguments: { projectId: "fresh-install-project" } },
-    });
-    oneLine(socket, {
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: { name: "doctor_run", arguments: { scope: "system" } },
-    });
-  });
-  socket.on("data", (chunk) => {
-    received += chunk;
-    inspect();
-  });
-  socket.on("error", (error) => {
-    clearTimeout(timer);
-    finish(null, error);
-  });
-  socket.on("close", () => {
-    if (!finished) {
-      clearTimeout(timer);
-      finish(null, new Error("MCP socket closed before authenticated tool responses"));
-    }
-  });
-});
-
-// The handshake returns the secret before the daemon restart. The runtime retains it only
-// in this process and never writes it to stdout, stderr, an audit record, or the result file.
-bootstrap().then(async ({ sessionId, sessionSecret }) => {
-  fs.writeFileSync(secretPath, sessionSecret, { mode: 0o600 });
-  await waitForFile(continuePath);
-  const result = await mcp(sessionId, sessionSecret);
-  const projectText = JSON.stringify(result.project);
-  const doctorText = JSON.stringify(result.doctor);
-  fs.writeFileSync(resultPath, JSON.stringify({
-    projectResponseId: result.project.id,
-    doctorResponseId: result.doctor.id,
-    projectAuthenticated: !projectText.includes("MCP_PEER_UNAUTHENTICATED"),
-    doctorAuthenticated: !doctorText.includes("MCP_PEER_UNAUTHENTICATED"),
-    projectNotFound: projectText.includes("NOT_FOUND"),
-  }));
-  process.exit(0);
-}).catch((error) => {
-  fs.writeFileSync(resultPath, JSON.stringify({ error: String(error).slice(0, 200) }));
-  process.exit(2);
-});
-`;
+/**
+ * The runtime this test spawns is a real file, not a literal here: whoever writes the Hermes
+ * client needs to read it, and nobody looks for a wire protocol inside a process test. Spawning
+ * the same file the reference documents is what stops the two from drifting.
+ */
+const HERMES_RUNTIME = join(process.cwd(), "docs", "reference", "hermes-ceo-runtime.cjs");
 
 interface ManagedDaemon {
   child: ChildProcess;
@@ -361,7 +225,6 @@ describe("fresh-install Hermes bootstrap process acceptance", () => {
         "hermes",
         "--",
         process.execPath,
-        "-e",
         HERMES_RUNTIME,
         pidPath,
         continuePath,
