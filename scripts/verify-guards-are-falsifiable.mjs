@@ -142,6 +142,20 @@ const GUARDS = [
     killedBy: ["tests/unit/grok-billing-probe.test.ts"],
   },
   {
+    what: "the handshake deadline stops governing once the peer has authenticated",
+    file: "src/daemon/agentcpd.ts",
+    find: "    beginRequest(method ?? \"<none>\");\n",
+    replace: "",
+    killedBy: ["tests/unit/operator-socket.test.ts"],
+  },
+  {
+    what: "the client budget is strictly larger than the daemon's, so the daemon's answer wins",
+    file: "src/cli/agentctl.ts",
+    find: "export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 45_000;",
+    replace: "export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 5_000;",
+    killedBy: ["tests/unit/operator-socket.test.ts"],
+  },
+  {
     what: "a verification executable is judged on the binary it resolves to, not the name it was called by",
     file: "src/contracts/verification-command.ts",
     find: "  const resolvedName = resolvedPath !== null ? executableName(resolvedPath) : null;",

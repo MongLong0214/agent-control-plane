@@ -308,6 +308,14 @@ export const dispatch = async (
   return fail(`unknown command: ${command}`);
 };
 
+/**
+ * Strictly greater than `DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS`, asserted by a test rather than
+ * left to the two numbers happening to differ. Both were five seconds, so whichever timer fired
+ * first decided whether the same healthy daemon read as unauthenticated or as having lost its
+ * lock — neither of which was true (#609).
+ */
+export const DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS = 45_000;
+
 const exchangeOperatorRequest = (
   options: OperatorClientOptions,
   request: { requestId: string; method: string; params: Record<string, unknown>; idempotencyKey?: string },
@@ -325,7 +333,11 @@ const exchangeOperatorRequest = (
 
   return new Promise<Decision<unknown>>((resolveExchange) => {
     const socket = createConnection(options.socketPath);
-    const timeoutMs = options.timeoutMs ?? 5_000;
+    // Strictly greater than the daemon's own execution budget, so its typed refusal wins the
+    // race and the operator reads why the method failed rather than that the client gave up.
+    // These were both five seconds, and which one fired decided whether the same healthy daemon
+    // was reported as unauthenticated or as having lost its lock (#609).
+    const timeoutMs = options.timeoutMs ?? DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS;
     let received = "";
     let settled = false;
     let timeout: NodeJS.Timeout | null = null;
@@ -347,7 +359,13 @@ const exchangeOperatorRequest = (
 
     timeout = setTimeout(() => {
       socket.destroy();
-      unavailable(new Error("operator request timed out"));
+      finish(
+        deny(
+          ReasonCode.OPERATOR_REQUEST_TIMEOUT,
+          "agentcpd accepted the request and did not answer within the client budget",
+          { socketPath: options.socketPath, budgetMs: timeoutMs },
+        ),
+      );
     }, timeoutMs);
     timeout.unref();
     socket.setEncoding("utf8");
