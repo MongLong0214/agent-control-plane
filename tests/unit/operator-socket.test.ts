@@ -7,7 +7,14 @@ import { promisify } from "node:util";
 
 import { DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS, createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { OPERATOR_METHOD } from "../../src/daemon/daemon.ts";
-import { DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS, startOperatorSocket } from "../../src/daemon/agentcpd.ts";
+import {
+  DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS,
+  MAX_OPERATOR_METHOD_BUDGET_MS,
+  OPERATOR_METHOD_BUDGET_MS,
+  startOperatorSocket,
+} from "../../src/daemon/agentcpd.ts";
+import { COLLECTOR_TIMEOUT_MS } from "../../src/capacity/usage-collectors.ts";
+import { DEFAULT_RUNTIME_TIMEOUT_MS } from "../../src/bootstrap/hermes-bootstrap.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import { allow } from "../../src/core/errors.ts";
@@ -177,10 +184,50 @@ describe("operator deadlines name the phase they govern (#609)", () => {
     }
   });
 
-  it("gives the client a strictly larger budget than the daemon, so the daemon's answer wins", () => {
+  it("gives the client a strictly larger budget than the widest one any method may take", () => {
     // Equal budgets are a coin flip, and the live daemon lost it both ways: three attempts
     // produced OPERATOR_UNAUTHENTICATED once and DAEMON_LOCK_LOST twice, from one healthy daemon.
-    expect(DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS).toBeGreaterThan(DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS);
+    //
+    // Against the *widest* budget, not the default. Comparing to the default passed while
+    // `doctor.run` — the method this whole seam exists for — could legitimately take five times
+    // it, so the client would have given up first and reported the daemon unreachable.
+    expect(DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS).toBeGreaterThan(MAX_OPERATOR_METHOD_BUDGET_MS);
+    expect(MAX_OPERATOR_METHOD_BUDGET_MS).toBeGreaterThanOrEqual(DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS);
+  });
+
+  it("sizes the doctor's budget against what a doctor pass actually waits on", () => {
+    // `CapacityMonitor.refresh` loops the adapters sequentially, so a pass costs the sum of the
+    // collector budgets and not the maximum. A flat 30s was measured against a healthy day —
+    // 7.4s with three healthy providers — and two slow providers put the pass over it. A number
+    // that only holds while nothing is wrong is not a budget for the case it exists to survive.
+    expect(OPERATOR_METHOD_BUDGET_MS["doctor.run"]).toBeGreaterThan(2 * COLLECTOR_TIMEOUT_MS);
+  });
+
+  it("gives the Hermes bootstrap more than the runtime budget it waits on", () => {
+    expect(OPERATOR_METHOD_BUDGET_MS["bootstrap.hermes"]).toBeGreaterThan(DEFAULT_RUNTIME_TIMEOUT_MS);
+  });
+
+  it("says a timed-out method may still complete rather than that it failed", async () => {
+    // The socket closes and the dispatched method keeps running: its later `finish` is a silent
+    // no-op because `settled` is already set. So a mutation can land after the operator was told
+    // the request timed out, and a refusal that reads as "it did not happen" would be a claim
+    // about the write that this code cannot make.
+    const listener = await startSleepingOperator({
+      answerAfterMs: 4_000,
+      handshakeTimeoutMs: 120,
+      requestTimeoutMs: 250,
+    });
+    try {
+      const response = await operatorRequest(listener.socketPath, OPERATOR_TOKEN, {
+        requestId: "req-uncancelled",
+        method: "run.cancel",
+        params: {},
+      });
+      expect(response["reasonCode"]).toBe(ReasonCode.OPERATOR_REQUEST_TIMEOUT);
+      expect(String(response["message"])).toContain("may still complete");
+    } finally {
+      await listener.close();
+    }
   });
 });
 
