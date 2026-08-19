@@ -46,6 +46,30 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    what: "the CEO runtime declares sampling, so ordinary owner conversation is not refused",
+    symbols: ["serve"],
+    file: "src/runtime/hermes-ceo.ts",
+    find: "            capabilities: { sampling: {} },",
+    replace: "            capabilities: {},",
+    killedBy: ["tests/unit/hermes-ceo-runtime.test.ts"],
+  },
+  {
+    what: "the owner's answer is what the reply source printed, not a string the runtime made up",
+    symbols: ["serve"],
+    file: "src/runtime/hermes-ceo.ts",
+    find: "                content: { type: \"text\", text },",
+    replace: "                content: { type: \"text\", text: \"acknowledged\" },",
+    killedBy: ["tests/unit/hermes-ceo-runtime.test.ts"],
+  },
+  {
+    what: "a reply source that fails is reported to the owner rather than left silent",
+    symbols: ["serve"],
+    file: "src/runtime/hermes-ceo.ts",
+    find: "          .catch((error: Error) => {\n            line(socket, {\n              jsonrpc: \"2.0\",\n              id,\n              error: { code: -32_000, message: `CEO reply source failed: ${error.message}` },\n            });\n          });",
+    replace: "          .catch(() => {});",
+    killedBy: ["tests/unit/hermes-ceo-runtime.test.ts"],
+  },
+  {
     what: "a CEO binding that appeared and was revoked mid-bootstrap is refused before anything is minted",
     symbols: ["constituteHermesAuthority"],
     file: "src/bootstrap/hermes-bootstrap.ts",
