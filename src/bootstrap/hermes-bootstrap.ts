@@ -128,18 +128,24 @@ export const createHermesBootstrapAuthority = (
         ),
       );
     }
-    const history = cp.bindings.history(roleKey);
-    if (history.length > 0) {
-      return Promise.resolve(
-        deny(
-          ReasonCode.HERMES_BOOTSTRAP_ALREADY_INITIALIZED,
-          "CEO authority has already been initialized; use continuity or handoff",
-          { roleKey, generations: history.map((binding) => binding.bindingGeneration) },
-        ),
-      );
-    }
+    // A CEO that was bound before and is not bound now is a role standing empty, and this is
+    // the path that fills it. It used to be refused on binding *history*, which made the
+    // bootstrap once-ever for the lifetime of a deployment: a runtime crash, an upgrade, or a
+    // reboot ended the Hermes CEO permanently, because the session secret is issued once and
+    // no process can reattach without it (#618).
+    //
+    // Nothing needed that. `bindings.history` was read in exactly two places, both of them
+    // this refusal, and no code anywhere treats generation 1 as special. The property existed
+    // only to enforce itself, while the refusal above — an *active* CEO may not be replaced —
+    // is the one that carries the safety. A caller that can reach this method can already
+    // constitute generation 1 and choose the runtime command; refusing generation 2 protected
+    // nothing it had not already handed over.
+    //
+    // What the clean-install proof actually needs is that the binding this call mints is the
+    // one it planned to mint. That is a generation comparison, not a constant.
+    const expectedGeneration = cp.bindings.history(roleKey).length + 1;
 
-    const operation = runBootstrap(parsed.value).finally(() => {
+    const operation = runBootstrap(parsed.value, expectedGeneration).finally(() => {
       inFlight = null;
       activeCancel = null;
     });
@@ -149,6 +155,7 @@ export const createHermesBootstrapAuthority = (
 
   const runBootstrap = async (
     request: HermesBootstrapRequest,
+    expectedGeneration: number,
   ): Promise<Decision<HermesBootstrapResult>> => {
     let door: BootstrapDoor | null = null;
     let child: ChildProcess | null = null;
@@ -165,7 +172,7 @@ export const createHermesBootstrapAuthority = (
             {},
           );
         }
-        return constituteHermesAuthority(cp, roleKey, request, child, proof, options.authorityHeld);
+        return constituteHermesAuthority(cp, roleKey, request, child, proof, expectedGeneration, options.authorityHeld);
       });
       activeCancel = door.close;
       if (options.authorityHeld && !options.authorityHeld()) {
@@ -261,18 +268,33 @@ const constituteHermesAuthority = async (
   request: HermesBootstrapRequest,
   child: ChildProcess,
   _proof: RuntimeProof,
+  expectedGeneration: number,
   authorityHeld?: () => boolean,
 ): Promise<Decision<HermesBootstrapCredential>> => {
   if (authorityHeld && !authorityHeld()) {
     return deny(ReasonCode.DAEMON_LOCK_LOST, "daemon lock was lost before CEO constitution", {});
   }
-  // Recheck immediately before the binding transaction. A different in-process authority
-  // must not turn a clean-install proof into a generation-2 or replacement CEO.
-  if (cp.bindings.active(roleKey) || cp.bindings.history(roleKey).length > 0) {
+  // Recheck immediately before the binding transaction. A different in-process authority must
+  // not have taken the role while this bootstrap was completing — which is what the message
+  // says, and what a race actually produces: an **active** binding. Reading history here made
+  // the same call refuse itself on every generation after the first.
+  if (cp.bindings.active(roleKey)) {
+    return deny(
+      ReasonCode.BINDING_ALREADY_ACTIVE,
+      "CEO authority became active while Hermes bootstrap was completing",
+      { roleKey },
+    );
+  }
+  // A binding that appeared and was revoked between the precheck and here leaves no active CEO
+  // and still moves the generation, so an activity check alone would mint on top of it and only
+  // notice afterwards — leaving a revoked binding in the history as the trace of a race that
+  // should have been refused before it wrote anything. Comparing the count catches it here.
+  const observed = cp.bindings.history(roleKey).length;
+  if (observed !== expectedGeneration - 1) {
     return deny(
       ReasonCode.HERMES_BOOTSTRAP_ALREADY_INITIALIZED,
-      "CEO authority was initialized while Hermes bootstrap was completing",
-      { roleKey },
+      "CEO authority changed while Hermes bootstrap was completing",
+      { roleKey, plannedGeneration: expectedGeneration, observedGenerations: observed },
     );
   }
 
@@ -320,15 +342,17 @@ const constituteHermesAuthority = async (
   if (!bound.allowed) {
     return failSession(cp, created.sessionId, bound.reasonCode, bound.message);
   }
-  if (bound.value.bindingGeneration !== 1) {
-    // This is a defense-in-depth refusal. The precheck and the database transaction should
-    // make it unreachable; retaining it makes a future generation mistake fail closed.
-    void cp.bindings.revoke(roleKey, "Hermes bootstrap did not mint generation 1");
+  if (bound.value.bindingGeneration !== expectedGeneration) {
+    // Defense in depth, and the reason the generation is carried rather than assumed: a binding
+    // that arrived between the precheck and this transaction moves the number, and that is
+    // exactly the race the precheck cannot see. Comparing against a constant made this check
+    // refuse every legitimate re-constitution while catching the same races it catches now.
+    void cp.bindings.revoke(roleKey, "Hermes bootstrap did not mint the generation it planned");
     return failSession(
       cp,
       created.sessionId,
       ReasonCode.HERMES_BOOTSTRAP_ALREADY_INITIALIZED,
-      "Hermes bootstrap refused a non-generation-1 CEO binding",
+      `Hermes bootstrap planned generation ${expectedGeneration} and minted ${bound.value.bindingGeneration}`,
     );
   }
 

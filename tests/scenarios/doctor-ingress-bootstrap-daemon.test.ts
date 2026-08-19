@@ -225,7 +225,7 @@ describe("Hermes CEO bootstrap authority", () => {
     }
   });
 
-  it("requires runtime possession, creates only generation 1, and does not publish the session secret", async () => {
+  it("requires runtime possession, refuses to replace a live CEO, and re-constitutes an empty one", async () => {
     const harness = makeHarness();
     const stateDir = tempDir("acp-hermes-bootstrap-");
     const modePath = join(stateDir, "runtime-mode");
@@ -292,13 +292,26 @@ describe("Hermes CEO bootstrap authority", () => {
 
       expect(harness.cp.bindings.revoke(roleKeyFor(Role.CEO), "bootstrap generation-1 test cleanup").allowed)
         .toBe(true);
+      // A revoked CEO leaves the role empty, and filling it again is what this path is for.
+      // This used to refuse on binding *history*, which made the bootstrap once-ever for the
+      // life of a deployment: the session secret is issued once and only hashed at rest, so a
+      // runtime that crashes, is upgraded, or loses its machine can never reattach — and the
+      // refusal meant no replacement could be constituted either (#618). Nothing depended on
+      // that. `bindings.history` was read only by the refusal itself, and no code treats
+      // generation 1 as special; the guard above — a *live* CEO may not be replaced — is the
+      // one carrying the safety.
       const afterRevoke = await authority.bootstrap({
-        command: [join(stateDir, "no-hermes-runtime-command")],
+        command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath],
       });
-      expect(afterRevoke.allowed).toBe(false);
-      expect(afterRevoke.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_ALREADY_INITIALIZED);
+      expect(afterRevoke).toMatchObject({ allowed: true, value: { bindingGeneration: 2 } });
       expect(harness.cp.bindings.history(roleKeyFor(Role.CEO)).map((binding) => binding.bindingGeneration))
-        .toEqual([1]);
+        .toEqual([1, 2]);
+      // The second constitution is a different session with its own secret. Reusing the first
+      // would make the re-constitution cosmetic — the same unreachable session under a new
+      // generation number.
+      if (afterRevoke.allowed) {
+        expect(afterRevoke.value.sessionId).not.toBe(result.value.sessionId);
+      }
     } finally {
       verifySecret.mockRestore();
       await authority.close();
