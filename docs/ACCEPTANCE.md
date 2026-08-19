@@ -28,6 +28,38 @@
 This is a status ledger, not a claim of completion. Items that require an observation
 period cannot be satisfied by a build, and are marked as such rather than glossed.
 
+## Current reading — `main` at `8f0aacf`, 2026-08-19
+
+The ledger below was written against `integration/r3` at `9bbbae6`. That branch no longer
+exists, and several of the conditions it records have since changed. It is kept as the reading
+it was rather than edited in place — a status ledger that is quietly rewritten stops being
+evidence of anything. What follows is the current measurement; where the two disagree, this
+section is the later one.
+
+```
+npx vitest run                    1009 passed | 2 skipped  (67 files, 0 failing)
+npx tsc --noEmit                  clean
+npx eslint .                      clean
+node scripts/ssot-report.mjs      reconciled — every tracked finding has one current issue
+capacity_snapshots                claude HEALTHY · gpt HEALTHY · grok HEALTHY
+```
+
+Three differences from the ledger below are worth naming, because each was a stated limit
+rather than a number:
+
+- **The 12 failures are gone.** They were being fixed as that section was written and it says so.
+- **Capacity is no longer read from an interactive `/usage`.** All three providers read their own
+  account surfaces — `non-interactive-/usage`, `account-rate-limits`, `account-billing` — and
+  that was observed on the running daemon rather than in a test (#567, #582).
+- **`dev` no longer exists.** This repository is trunk-only; the `main`/`dev` pair belongs to the
+  repositories it generates.
+
+Still true and not softened by any of the above: no full lifecycle has reached `CEO_APPROVED`,
+no CEO is bound, `runs` and `projects` are both zero, and the three-proof gate stands at
+`BLOCKED__0_OF_3`.
+
+---
+
 Every number below was observed on `integration/r3` at `9bbbae6`, against a pristine export
 of that commit (`git archive HEAD`), because the working tree is being edited concurrently:
 
