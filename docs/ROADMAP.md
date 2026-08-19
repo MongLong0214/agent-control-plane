@@ -105,18 +105,41 @@ RepoFactory registration node was retired by the 2026-08-16 owner decision, not 
 - **4.2 Hermes rules.** Reduce to assistant + CEO + specification authority. Everything about
   session identity, provider fallback, quota, retry counts, reviewer creation, merge
   admissibility, worker concurrency, routing tables and handoff state moves out.
-- **4.3 CTO rules.** Keep repo analysis, technical challenge, dynamic task graph, worker and model
-  selection, implementation, integration, the blind-review revision loop, escalation judgement.
-  Remove fixed pipelines, fixed concurrency, permanent-CTO identity, self-owned run lifecycle,
-  global doctor, global merge authority, self-approved blind review.
-- **4.4 Project rules.** `AGENTS.md` keeps project-local content only — structure, test commands,
-  coding rules, real prohibitions. The portable half already has a schema: `ProjectManifest` in
+- **4.3 CTO rules — the global half only.** Keep repo analysis, technical challenge, dynamic task
+  graph, worker and model selection, implementation, integration, the blind-review revision loop,
+  escalation judgement. Remove fixed pipelines, fixed concurrency, permanent-CTO identity,
+  self-owned run lifecycle, global doctor, global merge authority, self-approved blind review.
+- **4.4 Project rules travel with their project, not with this phase.** A CTO is
+  `PRIMARY_CTO:{projectId}`, so before a project is registered there is no CTO whose rules could be
+  verified. Per-project rule stripping belongs to that project's onboarding step in 5.3.
+  `AGENTS.md` keeps project-local content only — structure, test commands, coding rules, real
+  prohibitions — and the portable half already has a schema: `ProjectManifest` in
   `contracts/manifest.ts`.
 
 **Every `MOVE_TO_ACP` row must name the ACP symbol that will enforce it (#597).** Loci are named
 by symbol, never by line number. A row whose symbol does not resolve is not a move — it is a
 missing capability, and the rule stays where it is until a ticket closes it. The current list all
 resolves, so this is a check that already passes rather than a tax.
+
+## What runs in parallel, starting now
+
+The phases above are a dependency chain, not a schedule. Three tracks do not sit on it.
+
+**Repo Factory implementation is unblocked today.** The 2026-08-16 owner decision retired
+`T7B-RF-REGISTER` — Repo Factory is not going on Buzz as a conversational actor — which removed
+its only tie to the three-proof gate. Its integration point is producing a `RepoFactoryResult`,
+and the control plane's consuming side is finished (ADR-0008). The checkout is still the public
+skill repository at its initial commit with zero occurrences of `buzz`, so nothing there has to be
+undone first. It must land before phase 5.1; it can start before phase 1.
+
+**Rule classification can be done before it is applied.** Reading every Hermes rule, global and
+per-project `CLAUDE.md`, `AGENTS.md` and agent prompt, and sorting them into
+KEEP / MOVE_TO_ACP / SIMPLIFY / DELETE / PROJECT_LOCAL is analysis, not change. Doing it early
+surfaces the rows whose ACP enforcement symbol does not resolve (#597), and each of those is a
+control-plane ticket that wants to be found before phase 4 rather than during it.
+
+**Closing the open-issue backlog** is an owner criterion for transition and is independent of
+every phase here.
 
 ## Phase 5 — rollout
 
