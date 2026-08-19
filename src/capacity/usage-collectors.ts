@@ -601,6 +601,32 @@ export interface GrokBillingProbe {
 }
 
 const GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const GROK_BILLING_ORIGIN = "https://cli-chat-proxy.grok.com";
+
+/**
+ * A billing document is small. Bounding the read keeps a compromised or confused endpoint from
+ * spending the daemon's memory on a response nobody asked for; the largest real reading
+ * observed is under 3 KB.
+ */
+const GROK_BILLING_MAX_BYTES = 256 * 1024;
+
+/**
+ * Environment that would move or unwrap this request. The daemon inherits its environment from
+ * launchd, so any of these being set is a deployment fact — and sending a subscription bearer
+ * through a proxy, or over a connection whose certificate is not checked, is not a thing to do
+ * quietly. Refusing states the condition; unsetting them here would be a process-global write
+ * racing every other request in flight.
+ */
+const GROK_UNSAFE_TRANSPORT_ENV = [
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+  "NODE_USE_ENV_PROXY",
+] as const;
+
+const unsafeGrokTransport = (env: NodeJS.ProcessEnv): string | null => {
+  if (env["NODE_TLS_REJECT_UNAUTHORIZED"] === "0") return "NODE_TLS_REJECT_UNAUTHORIZED=0";
+  const proxied = GROK_UNSAFE_TRANSPORT_ENV.find((name) => (env[name] ?? "").trim() !== "");
+  return proxied ?? null;
+};
 
 /**
  * What a bearer may contain. Length alone accepted a value carrying CR/LF, which `fetch` then
@@ -685,6 +711,10 @@ export class FetchGrokBillingProbe implements GrokBillingProbe {
     // six hours — and nothing here refreshes it: writing a new one back would race the CLI that
     // owns the file.
     if (!bearer) throw new Error("grok auth file states no usable credential");
+    const unsafe = unsafeGrokTransport(process.env);
+    if (unsafe) {
+      throw new Error(`grok billing will not send a credential while ${unsafe} is set`);
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), input.timeoutMs);
     try {
@@ -694,6 +724,9 @@ export class FetchGrokBillingProbe implements GrokBillingProbe {
           "x-xai-token-auth": "xai-grok-cli",
           Accept: "application/json",
         },
+        // A redirect on a billing read is not something to follow carrying a bearer: the next
+        // hop chooses its own host, and the header travels with it.
+        redirect: "error",
         signal: controller.signal,
       });
       if (!response.ok) {
@@ -703,7 +736,18 @@ export class FetchGrokBillingProbe implements GrokBillingProbe {
             : `grok billing answered ${response.status}`,
         );
       }
-      return await response.json();
+      if (new URL(response.url || GROK_BILLING_URL).origin !== GROK_BILLING_ORIGIN) {
+        throw new Error("grok billing answered from an unexpected origin");
+      }
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!/^application\/json\b/i.test(contentType.trim())) {
+        throw new Error("grok billing answered with a content type this reader does not parse");
+      }
+      const body = await response.text();
+      if (body.length > GROK_BILLING_MAX_BYTES) {
+        throw new Error("grok billing answered with more than this reader will hold");
+      }
+      return JSON.parse(body);
     } catch (error) {
       // Never the underlying message. `fetch` quotes an invalid header value back, so a
       // malformed credential arrives inside the string this becomes — and that string is
