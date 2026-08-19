@@ -982,7 +982,12 @@ describe("round 2 daemon regressions", () => {
 
     const stateDir = tempDir("acp-daemon-r2-");
     const probe = vi.spyOn(harness.scripted, "probeCapacity");
-    const daemon = new Daemon(harness.cp, { stateDir, capacityRefreshIntervalMs: 1 });
+    // A sweep must fit inside the interval between sweeps, so a test that shrinks the interval
+    // to drive the timer has to shrink the budget with it. 1ms left no room for any budget at
+    // all; 20ms still fires well inside the 25ms this test waits.
+    const daemon = new Daemon(harness.cp, {
+      stateDir, capacityRefreshIntervalMs: 20, capacityRefreshBudgetMs: 10,
+    });
     const started = await daemon.start();
     expect(started.allowed).toBe(true);
 
