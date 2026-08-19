@@ -34,6 +34,9 @@ jobs:
       # sandboxed children. The JSON reporter is configured in vitest.config.ts under CI, so
       # this stays a plain `pnpm test`.
       - run: pnpm test
+      # Deletes each named guard on purpose and requires a named test to die. It edits the
+      # working tree in place and restores it, so it never runs alongside `pnpm test`.
+      - run: pnpm guards:falsifiable
       - run: pnpm trace
         env:
           ACP_VITEST_RESULTS: evidence/local/ci-vitest-results.json
