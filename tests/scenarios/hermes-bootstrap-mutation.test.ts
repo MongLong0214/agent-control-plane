@@ -265,6 +265,10 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
       const result = await resultPromise;
 
       expect(result.allowed).toBe(false);
+      // `Decision` is a discriminated union and `message` lives only on the refusal arm, so the
+      // narrowing is real rather than a cast. A cast here would let a future `allowed: true`
+      // reach the message assertion as `undefined` and read as a fence that said nothing.
+      if (result.allowed) throw new Error("expected a refusal at the fence under test");
       expect(result.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
       // The fence that answered is the fence this case is about. Without this the ordinal is an
       // unchecked guess and a shift would move the case onto a neighbour in silence.
