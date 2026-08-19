@@ -221,6 +221,14 @@ export const ReasonCode = {
   MCP_PEER_UNAUTHENTICATED: "MCP_PEER_UNAUTHENTICATED",
   OPERATOR_UNAUTHENTICATED: "OPERATOR_UNAUTHENTICATED",
   OPERATOR_METHOD_NOT_ALLOWED: "OPERATOR_METHOD_NOT_ALLOWED",
+  /** Ordinary conversation arrived while no CEO peer held an authenticated socket. */
+  CEO_CONVERSATION_UNAVAILABLE: "CEO_CONVERSATION_UNAVAILABLE",
+  /** The connected CEO peer did not declare the `sampling` capability at handshake. */
+  CEO_CONVERSATION_UNSUPPORTED: "CEO_CONVERSATION_UNSUPPORTED",
+  /** The CEO peer accepted the turn but did not answer within the conversation budget. */
+  CEO_CONVERSATION_TIMEOUT: "CEO_CONVERSATION_TIMEOUT",
+  /** The CEO peer answered with content this text-only seam cannot deliver. */
+  CEO_CONVERSATION_NOT_TEXT: "CEO_CONVERSATION_NOT_TEXT",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",

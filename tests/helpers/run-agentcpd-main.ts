@@ -22,6 +22,8 @@ class StartupTelegramTransport implements TelegramBotTransport {
   approvalSent = false;
   /** Replies the router produced for an inbound message, as opposed to prompts it initiated. */
   routedReplies = 0;
+  /** The text of the last reply the router produced for an inbound update. */
+  lastRoutedReply = "";
   private nextMessageId = 1;
   private updates: TelegramUpdate[] = [];
 
@@ -50,7 +52,10 @@ class StartupTelegramTransport implements TelegramBotTransport {
     // correlationIdFor() stamps a routed reply as telegram:<update_id>:<message_id>. Owner
     // prompts use telegram:owner-gate:/owner-prompt:, so the numeric shape is what marks a
     // reply the router produced for an inbound update rather than one it initiated.
-    if (/^telegram:\d+:/.test(input.correlationId)) this.routedReplies += 1;
+    if (/^telegram:\d+:/.test(input.correlationId)) {
+      this.routedReplies += 1;
+      this.lastRoutedReply = input.text;
+    }
     if (input.replyToMessageId !== undefined) {
       this.approvalSent = true;
     } else if (this.expectPromptFlow && input.text.startsWith("OWNER DECISION REQUIRED")) {
@@ -260,8 +265,18 @@ try {
         if (startupTransport.routedReplies === 0) {
           throw new Error("Telegram startup test polled but never routed an inbound message");
         }
+        // Routing alone does not show which handler answered. Production supplies `onDirect`
+        // from the CEO conversation port; no CEO peer is connected here, so that port is the
+        // only thing that can produce this reason code. Without the wiring the reply is the
+        // router's own formatted string and this fails.
+        if (!startupTransport.lastRoutedReply.includes("CEO_CONVERSATION_UNAVAILABLE")) {
+          throw new Error(
+            `Telegram startup test reply did not come from the CEO route: ${startupTransport.lastRoutedReply}`,
+          );
+        }
         process.stdout.write("startup test Telegram poll observed\n");
         process.stdout.write("startup test Telegram inbound routed\n");
+        process.stdout.write("startup test DIRECT answered by the CEO route\n");
       }
       await shutdown("STARTUP_TEST");
     },
