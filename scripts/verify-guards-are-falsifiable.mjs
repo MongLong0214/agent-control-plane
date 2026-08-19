@@ -46,6 +46,28 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    what: "the pre-constitution fence refuses to constitute a CEO once the daemon lock is gone",
+    symbols: ["constituteHermesAuthority"],
+    file: "src/bootstrap/hermes-bootstrap.ts",
+    find:
+      "  if (authorityHeld && !authorityHeld()) {\n" +
+      "    return deny(ReasonCode.DAEMON_LOCK_LOST, \"daemon lock was lost before CEO constitution\", {});\n" +
+      "  }\n",
+    replace: "",
+    killedBy: ["tests/scenarios/hermes-bootstrap-mutation.test.ts"],
+  },
+  {
+    what: "the pre-launch fence refuses to spawn a Hermes runtime once the daemon lock is gone",
+    symbols: ["createHermesBootstrapAuthority"],
+    file: "src/bootstrap/hermes-bootstrap.ts",
+    find:
+      "      if (options.authorityHeld && !options.authorityHeld()) {\n" +
+      "        return deny(ReasonCode.DAEMON_LOCK_LOST, \"daemon lock was lost before Hermes runtime launch\", {});\n" +
+      "      }\n",
+    replace: "",
+    killedBy: ["tests/scenarios/hermes-bootstrap-mutation.test.ts"],
+  },
+  {
     what: "capacity having nothing to say about a provider is not the same as the role being uncovered",
     symbols: ["manages"],
     file: "src/daemon/daemon.ts",
