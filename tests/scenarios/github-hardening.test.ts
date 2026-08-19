@@ -1165,6 +1165,41 @@ describe("merge order and dependents are enforced by the kernel (§24.7)", () =>
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.DEPENDENT_MERGE_BLOCKED);
   });
+
+  it("releases the dependent once the earlier repository has passed post-merge verification", async () => {
+    // Every other assertion about this guard is a refusal, and the one `allowed` case in the
+    // suite is "before any repository merged" — which a guard that denies whenever a merge
+    // receipt exists would also satisfy. Without this, a permanently-closed gate passes the
+    // whole suite, and the ordered two-repository run would deadlock at the first hand-off
+    // with nothing to point at.
+    const fixture = await setupTrustedPostMergeFixture({});
+    const mergeSha = await mergeForReal(fixture);
+
+    const whilePending = fixture.harness.cp.github.dependentMergeBlocked(
+      fixture.runId,
+      fixture.identity,
+    );
+    expect(whilePending.allowed, "the guard must hold while the answer is not in").toBe(false);
+    expect(whilePending.reasonCode).toBe(ReasonCode.DEPENDENT_MERGE_BLOCKED);
+
+    fixture.github.setTrustedPostMergeCheck(mergeSha, "project-ci", ".github/workflows/ci.yml");
+    const verified = await fixture.harness.cp.github.postMergeVerify(
+      fixture.runId,
+      fixture.identity,
+      mergeSha,
+    );
+    expect(verified.allowed, verified.allowed ? "" : verified.message).toBe(true);
+
+    const afterPass = fixture.harness.cp.github.dependentMergeBlocked(
+      fixture.runId,
+      fixture.identity,
+    );
+    expect(
+      afterPass.allowed,
+      "the earlier repository passed post-merge verification and the dependent is still held",
+    ).toBe(true);
+    expect(afterPass.reasonCode).toBe(ReasonCode.OK);
+  });
 });
 
 describe("round-2 review: post-merge coverage and receipts", () => {
