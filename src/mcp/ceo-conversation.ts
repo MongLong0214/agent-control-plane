@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import type { McpPeerAuthenticator } from "./shared.ts";
 
 /**
  * How long the daemon will hold a Telegram turn open waiting for the CEO to answer.
@@ -34,9 +35,21 @@ export interface CeoConversationOptions {
  * so no new transport, port or credential appears, and the only thing that can cross is a
  * completion. An owner decision cannot arrive this way: it is minted by the ingress that
  * authenticated the update (CP-HI-07), never asserted by the role holder that read it.
+ *
+ * **A connection is not standing authority.** An inbound tool call re-authenticates on every
+ * request — secret, incarnation, lifecycle, and the binding generation the socket was admitted
+ * under. Sampling travels the other way and would otherwise skip all of it, so a former CEO
+ * whose socket has not finished closing would keep receiving the owner's conversation after the
+ * role moved. `ask` therefore runs the same authenticator before it speaks, and drops a peer
+ * that no longer answers for it.
  */
+interface LivePeer {
+  server: McpServer;
+  authenticate: McpPeerAuthenticator;
+}
+
 export class CeoConversationPort {
-  #live: McpServer | null = null;
+  #live: LivePeer | null = null;
   readonly #budgetMs: number;
   readonly #maxTokens: number;
 
@@ -54,10 +67,11 @@ export class CeoConversationPort {
    * while the daemon has not yet observed the close. Detach is identity-checked so a late
    * close from the replaced connection cannot clear its successor.
    */
-  attach(server: McpServer): () => void {
-    this.#live = server;
+  attach(server: McpServer, authenticate: McpPeerAuthenticator): () => void {
+    const peer: LivePeer = { server, authenticate };
+    this.#live = peer;
     return () => {
-      if (this.#live === server) this.#live = null;
+      if (this.#live === peer) this.#live = null;
     };
   }
 
@@ -66,14 +80,29 @@ export class CeoConversationPort {
   }
 
   async ask(text: string): Promise<Decision<string>> {
-    const server = this.#live;
-    if (!server) {
+    const peer = this.#live;
+    if (!peer) {
       return deny(
         ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
         "no CEO peer is connected to answer ordinary conversation",
         {},
       );
     }
+
+    // The same check an inbound tool call makes, before anything is sent outbound. A socket
+    // admitted under a superseded binding generation is a former CEO, and the owner's
+    // conversation is not its to receive.
+    const current = peer.authenticate();
+    if (!current.allowed) {
+      if (this.#live === peer) this.#live = null;
+      return deny(
+        ReasonCode.CEO_CONVERSATION_STALE,
+        "the connected peer no longer holds the CEO role its socket was admitted under",
+        { authenticator: current.reasonCode },
+      );
+    }
+
+    const server = peer.server;
     if (!server.server.getClientCapabilities()?.sampling) {
       return deny(
         ReasonCode.CEO_CONVERSATION_UNSUPPORTED,

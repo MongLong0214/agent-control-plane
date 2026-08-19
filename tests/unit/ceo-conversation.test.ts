@@ -2,7 +2,16 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it } from "vitest";
 
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
+import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+
+/** Stands in for the per-request authenticator every inbound tool call already runs. */
+const stillCeo = (): McpPeerAuthenticator => () =>
+  allow(ReasonCode.OK, { sessionId: "s", sessionIncarnation: "i", sessionSecret: "x" } as never);
+
+const noLongerCeo = (): McpPeerAuthenticator => () =>
+  deny(ReasonCode.BINDING_GENERATION_STALE, "the binding moved on", {});
 
 interface FakePeer {
   capabilities: { sampling?: Record<string, unknown> } | undefined;
@@ -49,7 +58,7 @@ describe("CEO conversation port", () => {
   it("carries the owner's text to the peer and returns what it answered", async () => {
     const port = new CeoConversationPort();
     const { peer, server } = textPeer("돌고 있어");
-    port.attach(server);
+    port.attach(server, stillCeo());
 
     const answered = await port.ask("어떻게 돼가?");
 
@@ -62,7 +71,7 @@ describe("CEO conversation port", () => {
   it("refuses a peer that never declared sampling instead of hanging on a request it cannot serve", async () => {
     const port = new CeoConversationPort();
     const peer: FakePeer = { capabilities: {}, answer: null, calls: [] };
-    port.attach(fakePeer(peer));
+    port.attach(fakePeer(peer), stillCeo());
 
     const answered = await port.ask("어떻게 돼가?");
 
@@ -80,7 +89,7 @@ describe("CEO conversation port", () => {
       },
       calls: [],
     };
-    port.attach(fakePeer(peer));
+    port.attach(fakePeer(peer), stillCeo());
 
     const answered = await port.ask("어떻게 돼가?");
 
@@ -100,7 +109,7 @@ describe("CEO conversation port", () => {
       }),
       calls: [],
     };
-    port.attach(fakePeer(peer));
+    port.attach(fakePeer(peer), stillCeo());
 
     const answered = await port.ask("도표 그려줘");
 
@@ -114,8 +123,8 @@ describe("CEO conversation port", () => {
     const port = new CeoConversationPort();
     const first = textPeer("stale");
     const second = textPeer("current");
-    const detachFirst = port.attach(first.server);
-    port.attach(second.server);
+    const detachFirst = port.attach(first.server, stillCeo());
+    port.attach(second.server, stillCeo());
 
     detachFirst();
     const answered = await port.ask("누구야?");
@@ -127,12 +136,54 @@ describe("CEO conversation port", () => {
   it("stops answering once the live connection detaches", async () => {
     const port = new CeoConversationPort();
     const { server } = textPeer("here");
-    const detach = port.attach(server);
+    const detach = port.attach(server, stillCeo());
 
     detach();
     const answered = await port.ask("아직 있어?");
 
     expect(port.connected()).toBe(false);
     expect(answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_UNAVAILABLE);
+  });
+
+  it("refuses a socket that outlived the binding it was admitted under", async () => {
+    // An inbound tool call re-authenticates on every request. Sampling travels the other way,
+    // so without the same check a former CEO whose socket has not finished closing keeps
+    // receiving the owner's conversation after the role has moved.
+    const port = new CeoConversationPort();
+    const { peer, server } = textPeer("I am no longer the CEO");
+    port.attach(server, noLongerCeo());
+
+    const answered = await port.ask("어떻게 돼가?");
+
+    expect(answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_STALE);
+    expect(peer.calls, "a stale runtime must not be spoken to at all").toEqual([]);
+  });
+
+  it("drops the stale peer so the next turn does not re-ask it", async () => {
+    const port = new CeoConversationPort();
+    const { server } = textPeer("stale");
+    port.attach(server, noLongerCeo());
+
+    await port.ask("first");
+
+    expect(port.connected()).toBe(false);
+  });
+
+  it("lets the successor answer after the superseded socket has been refused", async () => {
+    // The full sequence §8.6 names: A is attached, the binding rotates, A stays open, B
+    // arrives, and only B is spoken to.
+    const port = new CeoConversationPort();
+    const stale = textPeer("A");
+    const current = textPeer("B");
+    const detachStale = port.attach(stale.server, noLongerCeo());
+    expect((await port.ask("while only A is here")).reasonCode).toBe(ReasonCode.CEO_CONVERSATION_STALE);
+
+    port.attach(current.server, stillCeo());
+    detachStale();
+    const answered = await port.ask("who answers now?");
+
+    expect(answered.allowed && answered.value).toBe("B");
+    expect(stale.peer.calls).toEqual([]);
+    expect(current.peer.calls).toEqual(["who answers now?"]);
   });
 });

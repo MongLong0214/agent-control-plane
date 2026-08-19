@@ -229,6 +229,8 @@ export const ReasonCode = {
   CEO_CONVERSATION_TIMEOUT: "CEO_CONVERSATION_TIMEOUT",
   /** The CEO peer answered with content this text-only seam cannot deliver. */
   CEO_CONVERSATION_NOT_TEXT: "CEO_CONVERSATION_NOT_TEXT",
+  /** The connected peer no longer holds the CEO role its socket was admitted under. */
+  CEO_CONVERSATION_STALE: "CEO_CONVERSATION_STALE",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",
