@@ -32,6 +32,7 @@ import { Role, SessionLifecycle, roleKeyFor, type RoleBinding } from "../domain/
 import type { SessionLaunchCredential } from "../cto/cto-lifecycle.ts";
 import { createCtoMcpPort, createCtoServer } from "../mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../mcp/hermes-server.ts";
+import { CeoConversationPort } from "../mcp/ceo-conversation.ts";
 import type { AuthenticatedMcpPeer, McpPeerAuthenticator } from "../mcp/shared.ts";
 import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 
@@ -43,6 +44,8 @@ const SESSION_LAUNCH_TTL_MS = 30 * 60_000;
 
 export interface LocalMcpListeners {
   socketPaths: readonly string[];
+  /** §6.1 DIRECT — the daemon's handle on whoever currently holds the CEO socket. */
+  ceoConversation: CeoConversationPort;
   close(): Promise<void>;
 }
 
@@ -62,6 +65,8 @@ export interface LocalMcpListenerOptions {
   handshakeTimeoutMs?: number;
   /** Internal daemon notification after a successful ordinary CEO confirmation. */
   onCeoApproved?: (runId: string) => void | Promise<unknown>;
+  /** Lets a test shorten the conversation budget without waiting out the production one. */
+  ceoConversation?: CeoConversationPort;
 }
 
 /** A one-time, owner-only credential handoff for a runtime that was just constituted. */
@@ -234,13 +239,20 @@ export const startLocalMcpListeners = async (
   // raw database access or evidence-write authority (#352).
   const hermesPort = createHermesMcpPort(cp, { onCeoApproved: options.onCeoApproved });
   const ctoPort = createCtoMcpPort(cp);
+  const ceoConversation = options.ceoConversation ?? new CeoConversationPort();
   const hermes = await startMcpSocket(
     hermesPath,
     token,
     cp,
     [Role.CEO],
     handshakeTimeoutMs,
-    (auth) => createHermesServer(hermesPort, auth),
+    (auth) => {
+      const server = createHermesServer(hermesPort, auth);
+      // The peer already proved it holds the active CEO binding to reach this line, so the
+      // conversation route never has to re-decide who the CEO is.
+      server.server.onclose = ceoConversation.attach(server);
+      return server;
+    },
   );
   let cto: Server;
   try {
@@ -266,6 +278,7 @@ export const startLocalMcpListeners = async (
 
   return {
     socketPaths: [hermesPath, ctoPath],
+    ceoConversation,
     close: async () => {
       await Promise.all(servers.map(closeSocketServer));
       for (const path of [hermesPath, ctoPath]) {
@@ -1146,6 +1159,31 @@ export const startDaemonTelegramListener = (
     onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
   });
 
+/**
+ * `directHandler` returns a string, so a refusal has to be readable rather than thrown: the
+ * owner is a person waiting in a chat, and an exception here would surface as a dropped
+ * message. The reason code travels with the sentence so a refusal in the transcript can still
+ * be traced to the branch that produced it.
+ */
+const answerAsCeo = async (port: CeoConversationPort, text: string): Promise<string> => {
+  const answered = await port.ask(text);
+  if (answered.allowed) return answered.value;
+  return `${ceoUnavailableSentence(answered.reasonCode)} (${answered.reasonCode})`;
+};
+
+const ceoUnavailableSentence = (reasonCode: string): string => {
+  if (reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE) {
+    return "No CEO session is connected right now, so there is nobody to answer this. Commands and owner decisions still work.";
+  }
+  if (reasonCode === ReasonCode.CEO_CONVERSATION_UNSUPPORTED) {
+    return "The connected CEO session cannot hold a conversation over this route — it did not offer sampling at handshake.";
+  }
+  if (reasonCode === ReasonCode.CEO_CONVERSATION_TIMEOUT) {
+    return "The CEO session did not answer in time. Nothing was lost; ask again.";
+  }
+  return "The CEO session answered with something this route cannot deliver as a message.";
+};
+
 export interface AgentcpdMainOptions {
   /** Test-only composition override; production calls `main()` without options. */
   config?: ControlPlaneConfig;
@@ -1318,7 +1356,11 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     }
     if (telegramConfig) {
       const telegramStartOptions = options.telegramStartOptions ?? {};
+      const ceoConversation = listeners.ceoConversation;
       telegram = await startDaemonTelegramListener(cp, telegramConfig, daemon, {
+        // §6.1 — ordinary conversation goes to the CEO. A test that supplies its own handler
+        // keeps it; production has none, which is how this route stayed unreachable.
+        onDirect: (input) => answerAsCeo(ceoConversation, input.text),
         ...telegramStartOptions,
         onError: (error) => {
           process.stderr.write(`telegram ingress error: ${error instanceof Error ? error.message : String(error)}\n`);

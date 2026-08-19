@@ -132,6 +132,8 @@ describe("agentcpd main Telegram startup composition", () => {
     // Polling alone shows the loop turning. This is what shows an inbound update reaches the
     // router: without it the test passed even when route() never ran.
     expect(result.stdout).toContain("startup test Telegram inbound routed");
+    // §6.1 DIRECT reaches the CEO conversation port rather than a formatted placeholder.
+    expect(result.stdout).toContain("startup test DIRECT answered by the CEO route");
   }, 40_000);
 
   it("emits and resolves an owner prompt through main without a test-side send", async () => {
