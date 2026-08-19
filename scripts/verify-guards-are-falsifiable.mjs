@@ -46,6 +46,14 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    what: "the periodic capacity sweep gets a budget sized against the sweep, not against startup",
+    symbols: ["sweepBudgetMs"],
+    file: "src/daemon/daemon.ts",
+    find: "  providerCount * COLLECTOR_TIMEOUT_MS + STARTUP_CAPACITY_REFRESH_BUDGET_MS;",
+    replace: "  STARTUP_CAPACITY_REFRESH_BUDGET_MS;",
+    killedBy: ["tests/unit/capacity-sweep-budget.test.ts"],
+  },
+  {
     what: "the tool bridge rewrites request ids so Hermes cannot collide with the runtime's own",
     symbols: ["serve"],
     file: "src/runtime/hermes-ceo.ts",

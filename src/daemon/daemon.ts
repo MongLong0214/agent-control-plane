@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import type { ControlPlane } from "../app/control-plane.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
+import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
 import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
@@ -36,11 +37,37 @@ import { SingleInstanceLock } from "./single-instance.ts";
  * because a comment saying "keep these in step" is not a thing that keeps them in step.
  */
 /**
- * Generous against the measured cost of one pass — Claude answers in ~2s and the Codex
- * app-server in ~3s — and far short of the point where a supervisor concludes the daemon is
- * dead. It bounds the sum, so one unresponsive provider cannot spend the others' time.
+ * What a capacity read may take **while the daemon is coming up, or parked**.
+ *
+ * Sized against the measured cost of one healthy pass — Claude answers in ~2s and the Codex
+ * app-server in ~3s — because failing to read a quota must never be the same event as failing
+ * to start. Here, abandoning is the right outcome: the daemon comes up and the periodic refresh
+ * supplies what the startup sweep did not.
+ *
+ * It is the wrong budget for that periodic refresh, and it was being used there too. See
+ * `sweepBudgetMs`.
  */
-const DEFAULT_CAPACITY_REFRESH_BUDGET_MS = 15_000;
+const STARTUP_CAPACITY_REFRESH_BUDGET_MS = 15_000;
+
+/**
+ * What a full sweep may take, derived from the work rather than from a healthy day.
+ *
+ * `CapacityMonitor.refresh` loops the registered providers **one at a time** and each collector
+ * may run to `COLLECTOR_TIMEOUT_MS`. A budget smaller than that product does not bound the
+ * sweep — it guarantees the sweep is cut short whenever a single provider is slow, and the
+ * providers that never got their turn are left with no fresh observation at all.
+ *
+ * Measured 2026-08-19 with the startup budget in both places: **24 of the ~30 periodic sweeps in
+ * two hours were abandoned**, and each abandonment was followed ~27 seconds later by the CEO
+ * role going uncovered for about three and a half minutes. The comment on the old constant said
+ * it "bounds the sum, so one unresponsive provider cannot spend the others' time" — with a
+ * sequential loop that is not what it did. It spent their time and then cut them off.
+ *
+ * This is #613 and #614 in a third place: a budget that was right for one phase, applied to
+ * another, and measured against the case where nothing is slow.
+ */
+export const sweepBudgetMs = (providerCount: number): number =>
+  providerCount * COLLECTOR_TIMEOUT_MS + STARTUP_CAPACITY_REFRESH_BUDGET_MS;
 
 const DEFAULT_CAPACITY_REFRESH_MS = 4 * 60_000;
 
@@ -57,6 +84,24 @@ const assertContinuityFreshnessOrdering = (refreshMs: number): void => {
       ReasonCode.INVALID_ARGUMENT,
       "capacity refresh interval must be shorter than the continuity freshness window",
       { refreshMs, continuityWindowMs: CONTINUITY_MODE_MAX_AGE_MS },
+    );
+  }
+};
+
+/**
+ * Refuses a configuration where a sweep cannot finish before the next one starts.
+ *
+ * `runPeriodic` has a failure backoff and no overlap guard, so a sweep that outlives its
+ * interval runs alongside its successor and both compete for the same sequential collectors.
+ * Checked at start for the same reason as the ordering above: the two values are derived in
+ * different places, and the failure is silent.
+ */
+const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, providerCount: number): void => {
+  if (budgetMs >= refreshMs) {
+    throw acpError(
+      ReasonCode.INVALID_ARGUMENT,
+      "a capacity sweep may take longer than the interval between sweeps",
+      { budgetMs, refreshMs, providerCount, collectorTimeoutMs: COLLECTOR_TIMEOUT_MS },
     );
   }
 };
@@ -1138,6 +1183,14 @@ export class Daemon {
     // boundary keeps the local sensor current without turning it into a per-minute dashboard.
     const capacityRefreshMs = this.options.capacityRefreshIntervalMs ?? DEFAULT_CAPACITY_REFRESH_MS;
     assertContinuityFreshnessOrdering(capacityRefreshMs);
+    // The effective budget, not "was an option set" — an explicit budget larger than the
+    // interval is the same broken configuration arrived at by a different route.
+    const providerCount = this.cp.providers.list().length;
+    assertSweepFitsItsInterval(
+      capacityRefreshMs,
+      this.options.capacityRefreshBudgetMs ?? sweepBudgetMs(providerCount),
+      providerCount,
+    );
 
     const watchdog = setInterval(() => {
       void this.runPeriodic("watchdog", async () => {
@@ -1154,7 +1207,11 @@ export class Daemon {
 
     const capacitySensor = setInterval(() => {
       void this.runPeriodic("capacity_sensor", async () => {
-        await this.refreshCapacitySensors();
+        // The sweep's own budget, not the startup one. This is the caller that must be allowed
+        // to finish: what it abandons is what goes stale, and stale capacity reads as uncovered.
+        await this.refreshCapacitySensors(
+          this.options.capacityRefreshBudgetMs ?? sweepBudgetMs(this.cp.providers.list().length),
+        );
         await this.reconcileContinuity("periodic capacity sensor refresh");
       });
     }, capacityRefreshMs);
@@ -1220,11 +1277,12 @@ export class Daemon {
    * keeps the daemon alive and reachable while an operator or the periodic refresh supplies it.
    * Failing to read a quota must never be the same event as failing to start.
    */
-  private async refreshCapacitySensors(): Promise<void> {
-    const budgetMs = this.options.capacityRefreshBudgetMs ?? DEFAULT_CAPACITY_REFRESH_BUDGET_MS;
+  private async refreshCapacitySensors(budgetMs?: number): Promise<void> {
+    const spendMs = budgetMs ?? this.options.capacityRefreshBudgetMs
+      ?? STARTUP_CAPACITY_REFRESH_BUDGET_MS;
     let timer: NodeJS.Timeout | null = null;
     const budget = new Promise<"BUDGET_SPENT">((resolve) => {
-      timer = setTimeout(() => resolve("BUDGET_SPENT"), budgetMs);
+      timer = setTimeout(() => resolve("BUDGET_SPENT"), spendMs);
       timer.unref();
     });
     try {
@@ -1233,7 +1291,7 @@ export class Daemon {
         this.cp.audit.record({
           kind: "CAPACITY_REFRESH_ABANDONED",
           reasonCode: ReasonCode.CAPACITY_SENSOR_FILE_STALE,
-          evidence: { budgetMs, pid: process.pid },
+          evidence: { budgetMs: spendMs, pid: process.pid },
         });
       }
     } finally {
