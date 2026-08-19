@@ -24,7 +24,7 @@ const CLI_ENTRY = join(process.cwd(), "src", "cli", "agentctl.ts");
  * client needs to read it, and nobody looks for a wire protocol inside a process test. Spawning
  * the same file the reference documents is what stops the two from drifting.
  */
-const HERMES_RUNTIME = join(process.cwd(), "docs", "reference", "hermes-ceo-runtime.cjs");
+const HERMES_RUNTIME = join(process.cwd(), "tests", "fixtures", "hermes-ceo-reference.cjs");
 
 interface ManagedDaemon {
   child: ChildProcess;
@@ -130,19 +130,41 @@ const runAgentctl = async (
   }
 };
 
-describe("the reference CEO runtime", () => {
-  it("declares sampling in its initialize request, on the MCP connection itself", () => {
-    // A text check, and it says so. The behavioural path needs Telegram ingress configured, so
-    // nothing here can drive an owner message through `Server.createMessage` — but a client
-    // copied from a reference that omitted the capability looks correct while every ordinary
-    // owner message is refused with CEO_CONVERSATION_UNSUPPORTED. This is a guard against the
-    // declaration being dropped, not a proof that conversation works.
+describe("the reference runtime and the product agree on the protocol", () => {
+  /**
+   * Two implementations of one wire protocol, and that is deliberate: the fixture is what a real
+   * `agentctl bootstrap hermes` spawns in this process test, and `src/runtime/hermes-ceo.ts` is
+   * what ships. A second implementation is how a protocol only one side understands gets caught.
+   *
+   * What they must not do is drift. This used to be a text grep with literals copied into the
+   * assertion — a check whose expected value is a copy of the thing it checks goes stale the
+   * moment the product moves, and reads as a pass. **The expectations are read out of the
+   * product**, so a rename there fails here instead of quietly agreeing with itself.
+   */
+  it("uses the same four environment variables the runtime reads", () => {
+    const product = readFileSync(join(process.cwd(), "src", "runtime", "hermes-ceo.ts"), "utf8");
     const reference = readFileSync(HERMES_RUNTIME, "utf8");
+    const named = [...product.matchAll(/"(ACP_[A-Z_]+)"/g)].map((match) => match[1]);
 
-    expect(reference).toContain("capabilities: { sampling: {} }");
-    // And it answers what it declared. Declaring without answering is worse than not
-    // declaring: the daemon holds the owner's turn until the budget expires.
-    expect(reference).toContain('method === "sampling/createMessage"');
+    expect(new Set(named)).toEqual(new Set([
+      "ACP_HERMES_BOOTSTRAP_SOCKET", "ACP_HERMES_BOOTSTRAP_TOKEN",
+      "ACP_HERMES_MCP_SOCKET", "ACP_MCP_TOKEN",
+    ]));
+    for (const variable of named) {
+      expect(reference, `the reference does not read ${variable}`).toContain(variable);
+    }
+  });
+
+  it("both declare sampling, and the product's declaration is proved on a live socket", () => {
+    // The fixture's declaration is still only readable as text — driving an owner message
+    // through `Server.createMessage` needs Telegram ingress, which this process test has no way
+    // to configure. The product's is not: `tests/unit/hermes-ceo-runtime.test.ts` asserts the
+    // capability on the wire and then answers a real sampling request over a real socket.
+    // A client copied from a reference that omitted it looks correct while every ordinary owner
+    // message is refused with CEO_CONVERSATION_UNSUPPORTED.
+    expect(readFileSync(HERMES_RUNTIME, "utf8")).toContain("capabilities: { sampling: {} }");
+    expect(readFileSync(join(process.cwd(), "src", "runtime", "hermes-ceo.ts"), "utf8"))
+      .toContain("capabilities: { sampling: {} }");
   });
 });
 

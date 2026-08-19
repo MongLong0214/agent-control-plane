@@ -3,7 +3,7 @@
  * The CEO runtime — the process `agentctl bootstrap hermes -- <command>` spawns, and the one
  * that stays.
  *
- * `docs/reference/hermes-ceo-runtime.cjs` proves the same handshake in executable form, but it
+ * `tests/fixtures/hermes-ceo-reference.cjs` proves the same handshake in executable form, but it
  * performs two tool calls and exits because a test needs a terminating process. A CEO that exits
  * is not a CEO: the daemon notices the dead pid, continuity staffs the role from gpt or claude,
  * and the owner's next message is answered by something that is not Hermes.
