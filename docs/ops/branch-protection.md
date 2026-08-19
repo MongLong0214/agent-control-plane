@@ -3,7 +3,7 @@
 Wave 0 of `docs/review/AGENT_CONTROL_PLANE_v1.0_FINAL_IMPLEMENTATION_CLOSEOUT_REVIEW.md` requires
 that the repository protect itself before any later wave's "green" means anything:
 
-- `main` and `dev` cannot take an unsafe direct push
+- `main` cannot take an unsafe direct push
 - a fresh pull request must have every required CI check green
 - force-push and branch deletion are refused
 - there are **no bypass actors** — the review is explicit that this count is zero
@@ -27,7 +27,7 @@ cat > /tmp/acp-ruleset.json <<'JSON'
   "enforcement": "active",
   "bypass_actors": [],
   "conditions": {
-    "ref_name": { "include": ["refs/heads/main", "refs/heads/dev"], "exclude": [] }
+    "ref_name": { "include": ["refs/heads/main"], "exclude": [] }
   },
   "rules": [
     { "type": "deletion" },
@@ -89,7 +89,7 @@ The last push is expected to fail. If it succeeds, the ruleset is not matching `
 
 ## Alternative (classic branch protection)
 
-Only if rulesets are unavailable. Repeat for `dev`.
+Only if rulesets are unavailable.
 
 `checks` with an `app_id`, not `contexts`. The two are not interchangeable: `contexts` names a
 check and accepts it from whatever reported it, which is the exact hole the section below
@@ -176,4 +176,8 @@ be changed with a user-to-server token:
 
 - `acp-production-gate` is installed on **one** repository (`repository_selection: selected`,
   `total_count: 1`). #240's ordered two-repository merge cannot run until a second is added.
-- `dev` is currently unprotected; the ruleset above covers both refs and applies to it too.
+- `dev` no longer exists. It was deleted on 2026-08-19 with zero commits unique to it, and the
+  CI triggers that named it were removed in #593, so this repository is trunk-only. Earlier
+  revisions of this page protected two refs; the ruleset above names `main` alone because that
+  is now the only long-lived branch here. Repositories this control plane *generates* keep the
+  `main`/`dev` pair — that contract is theirs, not this one's.
