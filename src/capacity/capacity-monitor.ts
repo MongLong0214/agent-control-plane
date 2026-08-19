@@ -5,6 +5,7 @@ import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import type { CapacityBucket, CapacityReading, ProviderRegistry } from "../runtime/provider.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
+import { USAGE_PROVIDERS } from "./usage-collectors.ts";
 
 export type AllocationAdmission = "OPEN" | "CONSERVE" | "SUSPENDED";
 
@@ -756,6 +757,22 @@ export class CapacityMonitor {
   }
 
   /** Exposed so the coverage planner applies the same routability rule. */
+  /**
+   * Whether capacity has anything to say about this provider at all.
+   *
+   * "no capacity reading" and "not covered" are different facts, and reading the first as the
+   * second evicts a session whose provider was never quota-managed. The generation-1 CEO is
+   * recorded as `provider: "hermes"`, no collector ever writes a snapshot for it, and the
+   * reconciliation predicate therefore judged a healthy bound CEO uncovered on every pass.
+   */
+  manages(provider: string): boolean {
+    // Registered adapters, plus every provider capacity has a vocabulary for. The second half
+    // matters: a provider named in `UsageProvider` but not yet registered would otherwise land
+    // on the "nothing to say" side and be exempted from the reading it genuinely needs. Only a
+    // provider capacity was never built to measure — the bootstrap CEO runtime — is exempt.
+    return this.providers.has(provider) || (USAGE_PROVIDERS as readonly string[]).includes(provider);
+  }
+
   isRoutableFor(capacity: ProviderCapacity, capability: string): boolean {
     if (capacity.allocationAdmission === "SUSPENDED") return false;
     if (capacity.runtimeHealth === "UNAVAILABLE" || capacity.runtimeHealth === "UNKNOWN") return false;

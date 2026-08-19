@@ -46,6 +46,27 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    what: "capacity having nothing to say about a provider is not the same as the role being uncovered",
+    symbols: ["manages"],
+    file: "src/daemon/daemon.ts",
+    find:
+      "          (!capacityManaged ||\n" +
+      "            (currentCapacity !== null &&\n" +
+      "              this.cp.capacity.isRoutableFor(currentCapacity, required.capability)));",
+    replace:
+      "          (currentCapacity !== null &&\n" +
+      "            this.cp.capacity.isRoutableFor(currentCapacity, required.capability));",
+    killedBy: ["tests/unit/continuity-r2.test.ts"],
+  },
+  {
+    what: "the exemption is for providers capacity never measured, not for a missing reading",
+    symbols: ["manages"],
+    file: "src/capacity/capacity-monitor.ts",
+    find: "    return this.providers.has(provider) || (USAGE_PROVIDERS as readonly string[]).includes(provider);",
+    replace: "    return this.providers.has(provider);",
+    killedBy: ["tests/unit/capacity-manages.test.ts"],
+  },
+  {
     what: "a run whose earlier repository failed post-merge verification still blocks the next merge",
     symbols: ["dependentMergeBlocked"],
     file: "src/github/github-kernel.ts",
