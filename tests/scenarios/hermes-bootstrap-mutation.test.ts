@@ -209,39 +209,71 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     }
   });
 
-  // These identify a specific `authorityHeld()` call site by its line number in
-// hermes-bootstrap.ts, so any edit above one silently retargets it. When that happens the
-// failure reads "expected true to be false" — indistinguishable from the fence itself
-// regressing — which is how a brittle mechanism turns a source edit into a false alarm about
-// the product. Recorded as a finding; updated here rather than redesigned.
-const runLockLossCase = async (sourceLine: 158 | 266, label: string): Promise<void> => {
+  // Each authority fence is named by **what it says**, not by where it sits.
+  //
+  // These cases used to select a fence by matching `hermes-bootstrap.ts:<line>:` in a stack
+  // frame. A four-line doc comment above an unrelated constant moved every fence and all three
+  // released at no fence at all. That failure was loud, which was luck: a shift that lands one
+  // fence's number on another leaves the test green while checking the wrong one.
+  //
+  // The trigger is the call ordinal, measured rather than assumed — in a run that completes the
+  // fences are reached 112, 171, 158, 266, in that order. `158` sits between the other two in
+  // the file and is reached third, because it is inside the bootstrap-door callback and that
+  // callback only runs once the runtime connects. An earlier attempt at this conversion read an
+  // instrumented run that aborted before the runtime connected, saw no 158 at all, and stopped.
+  //
+  // The ordinal is only the trigger. **The assertion is the message**, which is unique per fence
+  // and moves with it. If a fence is added the ordinals shift, and each case then fails naming
+  // the fence it actually reached instead of quietly checking a neighbour.
+  const FENCES = {
+    entry: { ordinal: 1, says: "daemon lock is not held for Hermes bootstrap" },
+    preLaunch: { ordinal: 2, says: "daemon lock was lost before Hermes runtime launch" },
+    duringDoor: { ordinal: 3, says: "daemon lock was lost during Hermes bootstrap" },
+    constitution: { ordinal: 4, says: "daemon lock was lost before CEO constitution" },
+  } as const;
+
+  const releasingAt = (ordinal: number, lock: SingleInstanceLock): (() => boolean) => {
+    let reached = 0;
+    return () => {
+      reached += 1;
+      if (reached === ordinal) lock.release();
+      return lock.held();
+    };
+  };
+
+  const runLockLossCase = async (
+    fence: { ordinal: number; says: string },
+    label: string,
+    expectLaunched: boolean,
+  ): Promise<void> => {
     const harness = makeHarness();
     const stateDir = tempDir(`hb-l-${label.slice(0, 2)}-`);
     const launchedPath = join(stateDir, "runtime-launched");
     const lock = new SingleInstanceLock(join(stateDir, "agentcpd.lock"));
     const acquired = lock.acquire(harness.clock.nowIso());
     expect(acquired.allowed).toBe(true);
-    const authorityHeld = (): boolean => {
-      const stack = new Error().stack ?? "";
-      if (stack.split("\n").some((frame) => frame.includes(`hermes-bootstrap.ts:${sourceLine}:`))) {
-        lock.release();
-      }
-      return lock.held();
-    };
     const authority = createHermesBootstrapAuthority(
       harness.cp,
-      bootstrapOptions(stateDir, authorityHeld),
+      bootstrapOptions(stateDir, releasingAt(fence.ordinal, lock)),
     );
 
     try {
       const resultPromise = authority.bootstrap({
         command: commandFor(MARKED_RUNTIME, launchedPath),
       });
-      await waitForPath(launchedPath, "Hermes runtime launch before lock loss");
+      if (expectLaunched) await waitForPath(launchedPath, "Hermes runtime launch before lock loss");
       const result = await resultPromise;
 
       expect(result.allowed).toBe(false);
+      // `Decision` is a discriminated union and `message` lives only on the refusal arm, so the
+      // narrowing is real rather than a cast. A cast here would let a future `allowed: true`
+      // reach the message assertion as `undefined` and read as a fence that said nothing.
+      if (result.allowed) throw new Error("expected a refusal at the fence under test");
       expect(result.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
+      // The fence that answered is the fence this case is about. Without this the ordinal is an
+      // unchecked guess and a shift would move the case onto a neighbour in silence.
+      expect(result.message).toBe(fence.says);
+      expect(existsSync(launchedPath)).toBe(expectLaunched);
       expect(harness.cp.bindings.history(CEO_ROLE_KEY)).toHaveLength(0);
     } finally {
       await authority.close();
@@ -250,47 +282,40 @@ const runLockLossCase = async (sourceLine: 158 | 266, label: string): Promise<vo
     }
   };
 
-  it("refuses when the daemon lock is lost at the first post-launch fence", async () => {
-    await runLockLossCase(158, "first-fence");
+  it("names every authority fence the source actually has", () => {
+    // The ordinals above are positions in a sequence, so a fence added anywhere renumbers the
+    // ones after it. This is what notices, and it fails at the table rather than inside a case.
+    const source = readFileSync(
+      new URL("../../src/bootstrap/hermes-bootstrap.ts", import.meta.url),
+      "utf8",
+    );
+    const said = [...source.matchAll(
+      /authorityHeld\(\)\)\s*\{[\s\S]{0,200}?ReasonCode\.DAEMON_LOCK_LOST,\s*"([^"]+)"/g,
+    )].map((m) => m[1]);
+
+    // Compared as a set. Source order is not call order — `duringDoor` sits second in the file
+    // and is reached third, because its callback waits for the runtime to connect. The ordinal
+    // mapping is proved by the four cases below, each asserting the message it reached; this
+    // one only checks that the table names every fence the source has, and no others.
+    expect([...said].sort()).toEqual(Object.values(FENCES).map((f) => f.says).sort());
   });
 
-  it("refuses when the daemon lock is lost at the pre-constitution fence", async () => {
-    await runLockLossCase(266, "constitution-fence");
+  it("refuses when the daemon lock is lost before the bootstrap even begins", async () => {
+    // The entry fence had no case at all while three line numbers were being maintained for the
+    // other three.
+    await runLockLossCase(FENCES.entry, "entry-fence", false);
   });
 
   it("does not launch Hermes after losing the lock when the bootstrap door opens", async () => {
-    const harness = makeHarness();
-    const stateDir = tempDir("hb-l-prelaunch-");
-    const launchedPath = join(stateDir, "runtime-launched");
-    const lock = new SingleInstanceLock(join(stateDir, "agentcpd.lock"));
-    const acquired = lock.acquire(harness.clock.nowIso());
-    expect(acquired.allowed).toBe(true);
-    const authorityHeld = (): boolean => {
-      const stack = new Error().stack ?? "";
-      if (stack.split("\n").some((frame) => frame.includes("hermes-bootstrap.ts:171:"))) {
-        lock.release();
-      }
-      return lock.held();
-    };
-    const authority = createHermesBootstrapAuthority(
-      harness.cp,
-      bootstrapOptions(stateDir, authorityHeld),
-    );
+    await runLockLossCase(FENCES.preLaunch, "prelaunch-fence", false);
+  });
 
-    try {
-      const result = await authority.bootstrap({
-        command: commandFor(MARKED_RUNTIME, launchedPath),
-      });
+  it("refuses when the daemon lock is lost at the first post-launch fence", async () => {
+    await runLockLossCase(FENCES.duringDoor, "during-fence", true);
+  });
 
-      expect(existsSync(launchedPath)).toBe(false);
-      expect(result.allowed).toBe(false);
-      expect(result.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
-      expect(harness.cp.bindings.history(CEO_ROLE_KEY)).toHaveLength(0);
-    } finally {
-      await authority.close();
-      lock.release();
-      harness.cp.close();
-    }
+  it("refuses when the daemon lock is lost at the pre-constitution fence", async () => {
+    await runLockLossCase(FENCES.constitution, "constitution-fence", true);
   });
 
   it("refuses a proof replay from a connection that was already preconnected", async () => {
