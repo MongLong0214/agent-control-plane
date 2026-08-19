@@ -221,6 +221,8 @@ export const ReasonCode = {
   MCP_PEER_UNAUTHENTICATED: "MCP_PEER_UNAUTHENTICATED",
   OPERATOR_UNAUTHENTICATED: "OPERATOR_UNAUTHENTICATED",
   OPERATOR_METHOD_NOT_ALLOWED: "OPERATOR_METHOD_NOT_ALLOWED",
+  /** An authenticated operator method outlived its execution budget. Not an authentication fact. */
+  OPERATOR_REQUEST_TIMEOUT: "OPERATOR_REQUEST_TIMEOUT",
   /** Ordinary conversation arrived while no CEO peer held an authenticated socket. */
   CEO_CONVERSATION_UNAVAILABLE: "CEO_CONVERSATION_UNAVAILABLE",
   /** The connected CEO peer did not declare the `sampling` capability at handshake. */

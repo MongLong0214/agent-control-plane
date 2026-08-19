@@ -38,6 +38,16 @@ import type { AuthenticatedOperatorPeer, Daemon } from "./daemon.ts";
 
 const MAX_MCP_LINE_BYTES = 1024 * 1024;
 const DEFAULT_MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
+/**
+ * The handshake budget covers reaching an authenticated request and nothing after it. Execution
+ * gets its own, larger one because the two answer different questions: a peer that has not
+ * identified itself in five seconds is not going to, while `doctor.run` probes every capacity
+ * sensor and measured about six seconds on the deployment host.
+ *
+ * Running one deadline over both is how a healthy daemon came to answer `OPERATOR_UNAUTHENTICATED`
+ * to an operator whose token was correct and whose peer had already been admitted (#609).
+ */
+export const DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS = 30_000;
 // A normal handoff package remains deliverable for thirty minutes. Do not make its recipient's
 // one-time bootstrap proof expire sooner than the package it must acknowledge.
 const SESSION_LAUNCH_TTL_MS = 30 * 60_000;
@@ -103,6 +113,8 @@ export interface LocalOperatorCredential {
 
 export interface LocalOperatorSocketOptions {
   handshakeTimeoutMs?: number;
+  /** Execution budget for an authenticated method, distinct from the handshake budget. */
+  requestTimeoutMs?: number;
   /** Used only to reject accidental reuse of the non-identifying MCP deployment token. */
   mcpToken?: string;
   /** The sole additional operator method: a fresh-install Hermes authority bootstrap. */
@@ -364,6 +376,10 @@ export const startOperatorSocket = async (
   if (!Number.isInteger(handshakeTimeoutMs) || handshakeTimeoutMs <= 0) {
     throw new Error("operator handshake timeout must be a positive integer");
   }
+  const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS;
+  if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs <= 0) {
+    throw new Error("operator request timeout must be a positive integer");
+  }
 
   const binding: LiveOperatorBinding = {
     token,
@@ -374,7 +390,9 @@ export const startOperatorSocket = async (
   };
   const socketPath = join(stateDir, "agentcpd.operator.sock");
   removeStaleSocket(socketPath);
-  const server = createServer((socket) => serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs, options));
+  const server = createServer((socket) =>
+    serveOperatorRequest(socket, daemon, binding, handshakeTimeoutMs, requestTimeoutMs, options),
+  );
   try {
     await listenSocket(server, socketPath);
   } catch (err) {
@@ -483,6 +501,7 @@ const serveOperatorRequest = (
   daemon: Pick<Daemon, "handleOperatorRequest" | "lock">,
   binding: LiveOperatorBinding,
   handshakeTimeoutMs: number,
+  requestTimeoutMs: number,
   options: LocalOperatorSocketOptions,
 ): void => {
   let buffer = Buffer.alloc(0);
@@ -494,6 +513,18 @@ const serveOperatorRequest = (
     if (timeout) clearTimeout(timeout);
     socket.removeListener("data", receive);
     if (!socket.destroyed) socket.end(`${JSON.stringify(decision)}\n`);
+  };
+  const beginRequest = (method: string): void => {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => {
+      finish(
+        deny(ReasonCode.OPERATOR_REQUEST_TIMEOUT, "operator method did not answer within its budget", {
+          method,
+          budgetMs: requestTimeoutMs,
+        }),
+      );
+    }, requestTimeoutMs);
+    timeout.unref();
   };
   const receive = (chunk: Buffer): void => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -515,6 +546,11 @@ const serveOperatorRequest = (
     const peer = authenticateOperatorPeer(value, binding);
     if (!peer.allowed) return finish(peer);
     const method = operatorRequestMethod(value);
+    // The handshake is over: this peer authenticated. Everything from here is a statement about
+    // the method, so the deadline governing it has to be a different one under a different name.
+    // Leaving the handshake timer armed made every method slower than five seconds report that
+    // the operator had not authenticated, which they had.
+    beginRequest(method ?? "<none>");
     if (method === "bootstrap.hermes") {
       if (!options.bootstrapHermes) {
         return finish(deny(ReasonCode.OPERATOR_METHOD_NOT_ALLOWED, "Hermes bootstrap is not enabled on this socket", {}));

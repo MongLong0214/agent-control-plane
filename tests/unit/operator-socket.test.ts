@@ -5,11 +5,12 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
+import { DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS, createOperatorClient, dispatch } from "../../src/cli/agentctl.ts";
 import { OPERATOR_METHOD } from "../../src/daemon/daemon.ts";
-import { startOperatorSocket } from "../../src/daemon/agentcpd.ts";
+import { DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS, startOperatorSocket } from "../../src/daemon/agentcpd.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
+import { allow } from "../../src/core/errors.ts";
 import { cleanupTempDirs, gitSync, tempDir } from "../helpers/fixtures.ts";
 import {
   makeStartedOperator,
@@ -76,6 +77,112 @@ const createQueuedRun = async (harness: Harness): Promise<string> => {
   if (!created.allowed) throw new Error(created.message);
   return created.value.runId;
 };
+
+/**
+ * A socket whose only method sleeps. The two budgets are passed explicitly and small so the test
+ * measures which deadline governs which phase, not how long a real doctor pass takes.
+ */
+const startSleepingOperator = async (budgets: {
+  answerAfterMs: number;
+  handshakeTimeoutMs: number;
+  requestTimeoutMs: number;
+}) => {
+  const stateDir = tempDir("acp-operator-deadlines-");
+  return startOperatorSocket(
+    {
+      lock: { held: () => true } as never,
+      handleOperatorRequest: async () => {
+        await new Promise((resolve) => setTimeout(resolve, budgets.answerAfterMs));
+        return allow(ReasonCode.OK, { answered: true });
+      },
+    } as never,
+    stateDir,
+    { token: OPERATOR_TOKEN, peerId: `cli:${TEST_OWNER.actor}`, actor: TEST_OWNER.actor },
+    {
+      mcpToken: MCP_TOKEN,
+      handshakeTimeoutMs: budgets.handshakeTimeoutMs,
+      requestTimeoutMs: budgets.requestTimeoutMs,
+    },
+  );
+};
+
+describe("operator deadlines name the phase they govern (#609)", () => {
+  it("answers a method that outlives the handshake budget instead of calling it unauthenticated", async () => {
+    // The defect this pins: the handshake timer stayed armed after the peer authenticated, so a
+    // method slower than five seconds answered OPERATOR_UNAUTHENTICATED to an operator whose
+    // token was correct. Measured against the live daemon, `doctor.run` came back at 5002ms with
+    // exactly that code while `daemon.status` answered in 2ms on the same socket and token.
+    const listener = await startSleepingOperator({
+      answerAfterMs: 400,
+      handshakeTimeoutMs: 120,
+      requestTimeoutMs: 4_000,
+    });
+    try {
+      const response = await operatorRequest(listener.socketPath, OPERATOR_TOKEN, {
+        requestId: "req-slow-but-fine",
+        method: "doctor.run",
+        params: { scope: "system", target: null },
+      });
+      expect(response["allowed"]).toBe(true);
+      expect(response["reasonCode"]).toBe(ReasonCode.OK);
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("refuses a method that outlives its own budget as a timeout, naming the method", async () => {
+    const listener = await startSleepingOperator({
+      answerAfterMs: 4_000,
+      handshakeTimeoutMs: 120,
+      requestTimeoutMs: 250,
+    });
+    try {
+      const response = await operatorRequest(listener.socketPath, OPERATOR_TOKEN, {
+        requestId: "req-too-slow",
+        method: "doctor.run",
+        params: {},
+      });
+      expect(response["allowed"]).toBe(false);
+      expect(response["reasonCode"]).toBe(ReasonCode.OPERATOR_REQUEST_TIMEOUT);
+      expect((response["evidence"] as { method?: string }).method).toBe("doctor.run");
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("still closes a connection that authenticates nothing, and still calls that unauthenticated", async () => {
+    const listener = await startSleepingOperator({
+      answerAfterMs: 0,
+      handshakeTimeoutMs: 120,
+      requestTimeoutMs: 4_000,
+    });
+    try {
+      const silent = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const socket = createConnection(listener.socketPath);
+        let received = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk: string) => {
+          received += chunk;
+          if (!received.includes("\n")) return;
+          socket.end();
+          resolve(JSON.parse(received.trim()) as Record<string, unknown>);
+        });
+        socket.once("error", reject);
+      });
+      expect(silent["allowed"]).toBe(false);
+      expect(silent["reasonCode"]).toBe(ReasonCode.OPERATOR_UNAUTHENTICATED);
+      expect(silent["message"]).toBe("operator handshake timed out");
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("gives the client a strictly larger budget than the daemon, so the daemon's answer wins", () => {
+    // Equal budgets are a coin flip, and the live daemon lost it both ways: three attempts
+    // produced OPERATOR_UNAUTHENTICATED once and DAEMON_LOCK_LOST twice, from one healthy daemon.
+    expect(DEFAULT_OPERATOR_CLIENT_TIMEOUT_MS).toBeGreaterThan(DEFAULT_OPERATOR_REQUEST_TIMEOUT_MS);
+  });
+});
 
 describe("authenticated operator socket (#393/#405)", () => {
   it("removes capacity set instead of retaining a command that only writes an ignored file", async () => {
