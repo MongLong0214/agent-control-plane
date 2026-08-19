@@ -29,7 +29,8 @@
  */
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { createConnection, type Socket } from "node:net";
+import { chmodSync, rmSync } from "node:fs";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 
 /** How long the reply source may take before the owner is told nobody answered. */
 const DEFAULT_REPLY_TIMEOUT_MS = 120_000;
@@ -158,12 +159,100 @@ export const promptFrom = (params: unknown): string => {
     .join("\n\n");
 };
 
+/**
+ * The tool socket: MCP served to Hermes, forwarded to ACP over the connection that is already
+ * authenticated.
+ *
+ * Hermes is a client here, so its `initialize` is answered by this runtime — forwarding it would
+ * put a second initialize on a connection ACP has already initialized, and the two sides would
+ * disagree about which handshake they are in. Only `tools/list` and `tools/call` travel.
+ *
+ * Ids are rewritten. Hermes numbers its requests from 1 and so does this runtime, so passing
+ * them through would let Hermes's `id: 1` collide with the initialize this runtime already sent
+ * — and the reply to one would be read as the reply to the other.
+ */
+const openToolSocket = (path: string, upstream: Socket, clientName: string): { close(): void } => {
+  // A stale socket from a previous run would make `listen` fail with EADDRINUSE and take the CEO
+  // down with it. Removing our own path is safe; the runtime is the only writer of it.
+  rmSync(path, { force: true });
+  const pending = new Map<number, { socket: Socket; theirId: unknown }>();
+  let nextId = 1_000;
+
+  const routeUpstream = (value: Record<string, unknown>): void => {
+    const id = value["id"];
+    if (typeof id !== "number") return;
+    const waiting = pending.get(id);
+    if (!waiting) return;
+    pending.delete(id);
+    if (!waiting.socket.destroyed) line(waiting.socket, { ...value, id: waiting.theirId });
+  };
+  readLines(upstream, routeUpstream);
+
+  const server: Server = createServer((client) => {
+    readLines(client, (value) => {
+      const method = String(value["method"] ?? "");
+      const theirId = value["id"];
+      if (method === "initialize") {
+        // Answered here. This runtime is the MCP server Hermes talks to; ACP is upstream of it.
+        line(client, {
+          jsonrpc: "2.0",
+          id: theirId,
+          result: {
+            protocolVersion: "2025-11-25",
+            capabilities: { tools: {} },
+            serverInfo: { name: `${clientName}-tools`, version: "1" },
+          },
+        });
+        return;
+      }
+      if (method === "notifications/initialized") return;
+      if (method !== "tools/list" && method !== "tools/call") {
+        if (theirId === undefined) return;
+        // Refused by name rather than forwarded. A method this bridge does not understand is one
+        // ACP did not agree to receive on the CEO's authenticated connection.
+        line(client, {
+          jsonrpc: "2.0",
+          id: theirId,
+          error: { code: -32_601, message: `the CEO tool bridge does not forward ${method}` },
+        });
+        return;
+      }
+      const ourId = nextId;
+      nextId += 1;
+      pending.set(ourId, { socket: client, theirId });
+      line(upstream, { ...value, id: ourId });
+    });
+    client.on("close", () => {
+      for (const [ourId, waiting] of pending) {
+        if (waiting.socket === client) pending.delete(ourId);
+      }
+    });
+  });
+  server.listen(path, () => {
+    // Whoever can reach this socket calls ACP tools as the CEO. Same trust boundary as the MCP
+    // socket itself, and it must not be widened by a permissive default.
+    chmodSync(path, 0o600);
+  });
+  return {
+    close: () => {
+      server.close();
+      rmSync(path, { force: true });
+    },
+  };
+};
+
 export interface ServeOptions {
   mcpSocketPath: string;
   mcpToken: string;
   replyCommand: readonly string[];
   replyTimeoutMs?: number;
   clientName?: string;
+  /**
+   * Where Hermes reaches ACP's tools. The runtime listens here and forwards; the bridge Hermes
+   * spawns holds no credential, because the session secret exists only in this process.
+   */
+  toolSocketPath?: string;
+  onToolSocketReady?: (path: string) => void;
   /** Reattach after the socket closes. False makes one attachment observable in a test. */
   reattach?: boolean;
   onAttached?: (attempt: number) => void;
@@ -176,6 +265,7 @@ export interface ServeOptions {
 export const serve = async (session: CeoSession, options: ServeOptions): Promise<void> => {
   const replyTimeoutMs = options.replyTimeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS;
   const clientName = options.clientName ?? "hermes-ceo";
+  let tools: { close(): void } | null = null;
   for (let attempt = 1; ; attempt += 1) {
     await new Promise<void>((resolve, reject) => {
       const socket = createConnection(options.mcpSocketPath);
@@ -230,7 +320,14 @@ export const serve = async (session: CeoSession, options: ServeOptions): Promise
             });
           });
       });
+      if (options.toolSocketPath) {
+        tools = openToolSocket(options.toolSocketPath, socket, clientName);
+        options.onToolSocketReady?.(options.toolSocketPath);
+      }
       socket.on("close", () => resolve());
+    }).finally(() => {
+      tools?.close();
+      tools = null;
     });
 
     if (options.reattach === false) return;
@@ -243,9 +340,18 @@ export const serve = async (session: CeoSession, options: ServeOptions): Promise
 
 export const main = async (argv: readonly string[]): Promise<number> => {
   const replyAt = argv.indexOf("--reply-command");
+  // `--reply-command` takes the rest of the line, so anything after it would be swallowed as
+  // arguments to the reply source. The other flags are read from the part before it.
   const replyCommand = replyAt === -1 ? ["hermes", "-z"] : argv.slice(replyAt + 1);
+  const flags = replyAt === -1 ? [...argv] : argv.slice(0, replyAt);
   if (replyCommand.length === 0) {
     process.stderr.write("--reply-command needs a command to run\n");
+    return 2;
+  }
+  const toolAt = flags.indexOf("--tool-socket");
+  const toolSocketPath = toolAt === -1 ? undefined : flags[toolAt + 1];
+  if (toolAt !== -1 && !toolSocketPath) {
+    process.stderr.write("--tool-socket needs a path\n");
     return 2;
   }
   const bootstrapSocket = process.env["ACP_HERMES_BOOTSTRAP_SOCKET"];
@@ -264,7 +370,7 @@ export const main = async (argv: readonly string[]): Promise<number> => {
     process.stdout.write(
       `${JSON.stringify({ ceo: "attached", bindingGeneration: session.bindingGeneration })}\n`,
     );
-    await serve(session, { mcpSocketPath, mcpToken, replyCommand });
+    await serve(session, { mcpSocketPath, mcpToken, replyCommand, toolSocketPath });
     return 0;
   } catch (error) {
     process.stderr.write(`${String(error instanceof Error ? error.message : error).slice(0, 300)}\n`);
