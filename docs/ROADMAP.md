@@ -6,13 +6,22 @@
 
 The end state the owner stated: **one Hermes that is both the personal assistant and the CEO,
 several CTOs — one per project, grok as adversarial reviewer, and the control plane as the belt
-they all run on.** Conversation reaches the same session whichever channel it arrives on, and the
-context is the control plane's.
+they all run on.** Whichever channel the owner arrives on, they reach the same counterpart and the
+same history, and that history is the control plane's.
 
-That is not a new architecture. `domain/types.ts` already scopes `CEO` globally,
+That counterpart is a **conversational actor**, not a session, and the distinction is load-bearing
+here. `docs/TERMINOLOGY.md` defines it as the thing that owns the transcript and is reached
+identically over Remote Control, Buzz or Telegram, whose replacement is a generation rotation
+requiring owner approval. The sessions underneath it are meant to be swapped by failover without
+asking anyone. Phrase the requirement at that layer and the control plane violates it by working
+correctly: a failover rotates the CTO mid-conversation and the owner loses context without being
+told.
+
+None of this is a new architecture. `domain/types.ts` already scopes `CEO` globally,
 `PRIMARY_CTO` per `projectId`, `OPTIONAL_ADVERSARIAL_REVIEWER` per `runId`, and `WORKER` per
-`taskId`; `assertCurrentCeo` already refuses any session but the bound one. What is missing is
-that nothing is connected to it.
+`taskId`; `assertCurrentCeo` refuses any session but the bound one; `assignments` carries
+`actor_id` and `registry/conversational-actor-registry.ts` holds the registered set. What is
+missing is that nothing is connected to it.
 
 ## The ordering constraint that shapes everything below
 
@@ -66,6 +75,12 @@ before Hermes stops polling splits the owner's messages between two processes.
 restarts. `CEO_ROLE_UNBOUND` clears.
 
 **This step is irreversible.** Do not run it to rehearse.
+
+What it establishes is the CEO **actor**, not merely a process. If that Hermes runtime later dies,
+continuity re-staffs the role from the coverage plan — `CAPABILITIES` advertises `ceo` on `claude`
+and `gpt` — so the owner keeps the counterpart and the transcript while the runtime behind it
+changes. Restarting Hermes specifically is a separate operational question that continuity does
+not answer.
 
 ## Phase 3 — the three proofs
 
