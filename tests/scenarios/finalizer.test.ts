@@ -490,6 +490,36 @@ describe("daemon-owned approved-run finalization", () => {
     await daemon.stop();
   });
 
+  it("refuses to finalize a run whose state carries no CEO approval at all", async () => {
+    // The neighbouring test hands the run a CEO_APPROVED state and proves a bare transition is
+    // not a durable decision. This one never reaches that state, so the question is whether
+    // finalization is reachable from outside the approved lifecycle at all.
+    //
+    // The refusal alone does not distinguish the entry check from the one inside
+    // `reconfirmAndPlan`: both apply the same predicate and both answer GATE_AUTHORITY_DENIED,
+    // so a test that reads only the decision passes with the entry check deleted — measured,
+    // 1009 tests green. What separates them is when they fire. Without the entry check the run
+    // acquires a finalization lease first and is refused holding it, leaving a recorded attempt
+    // against a run that was never approved. The absence of that row is the assertion.
+    const { github, harness, driven } = await approvedFixture({ confirm: false });
+    const before = harness.cp.runs.require(driven.runId).state;
+    expect(before).not.toBe(RunState.CEO_APPROVED);
+    const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-finalizer-unapproved-state-") });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    const finalized = await daemon.finalizeApprovedRun(driven.runId);
+    expect(finalized.allowed).toBe(false);
+    expect(finalized.reasonCode).toBe(ReasonCode.GATE_AUTHORITY_DENIED);
+    expect(harness.cp.runs.require(driven.runId).state).toBe(before);
+    const attempt = harness.cp.db.get<{ run_id: string }>(
+      "SELECT run_id FROM finalization_attempts WHERE run_id = ?",
+      [driven.runId],
+    );
+    expect(attempt).toBeUndefined();
+    expect(github.mergeCount).toBe(0);
+    await daemon.stop();
+  });
+
   it("finalizes one repository through the production daemon entry point and replays with zero external writes", async () => {
     const { github, harness, driven } = await approvedFixture();
     const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-finalizer-daemon-") });
