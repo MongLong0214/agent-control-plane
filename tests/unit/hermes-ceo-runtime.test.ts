@@ -13,7 +13,7 @@ afterAll(cleanupTempDirs);
 /**
  * The runtime is exercised against a socket that answers, not against itself.
  *
- * `docs/reference/hermes-ceo-runtime.cjs` already proves the handshake by being spawned in a
+ * `tests/fixtures/hermes-ceo-reference.cjs` already proves the handshake by being spawned in a
  * process test. What that cannot show is the part this runtime exists for: staying attached and
  * answering the owner's turn from a real source. A test that stubbed the socket and asserted the
  * runtime's own view would pass whether or not anything went over the wire.

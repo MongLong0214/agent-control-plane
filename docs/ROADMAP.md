@@ -62,7 +62,7 @@ pure addition and changes nothing about how Hermes behaves today.
 
 | | Work | Where |
 |---|---|---|
-| 1.1 | Hermes gains an ACP MCP client: bootstrap handshake, CEO authentication, `sampling` capability. `docs/reference/hermes-ceo-runtime.cjs` is a working one — the process test spawns that exact file, so it is the protocol rather than a description of it | Hermes |
+| 1.1 | Hermes gains an ACP MCP client: bootstrap handshake, CEO authentication, `sampling` capability. `src/runtime/hermes-ceo.ts` ships it; `tests/fixtures/hermes-ceo-reference.cjs` is a second implementation the process test spawns, so the protocol has two readers rather than one description | Hermes |
 | 1.2 | `onDirect` delivers ordinary conversation to the CEO session over `createMessage` | done — #595 |
 | 1.3 | A process test binds that client on a **disposable state directory** and exchanges one DIRECT turn | Hermes + ACP |
 | 1.4 | Resolve `provider: "hermes"` against `CAPABILITIES`, which has no such entry | #596 |
