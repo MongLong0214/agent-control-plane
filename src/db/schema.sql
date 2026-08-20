@@ -1269,5 +1269,40 @@ CREATE TABLE IF NOT EXISTS continuity_state (
   evaluated_at TEXT
 );
 
+
+-- canonical_turns  (one outstanding turn per conversation, separate from the message that
+-- started it)
+--
+-- A turn used to live in `inbound_messages.result_json`. That row is the *source* message's
+-- replay and reply-delivery record; a turn is a fact about the *target* conversation. Sharing a
+-- field made the second a casualty of the first — reserving the outbound reply replaces the
+-- whole document and erased the claim, so the protection covered a crash and not an ordinary
+-- timeout.
+--
+-- A row is created before the reply command runs and is never cleared by a timeout, a rejection
+-- or a restart. Only a positively observed terminal outcome settles it; anything else leaves it
+-- IN_DOUBT, which is a state a person or a reconciler resolves, not a timer.
+CREATE TABLE IF NOT EXISTS canonical_turns (
+  turn_request_id            TEXT PRIMARY KEY,
+  -- The serialisation key. Today the composition root has no resolved canonical id to give and
+  -- passes the source conversation's digest; the column is named for what it must become
+  -- because that is what the table is for.
+  target_conversation_digest TEXT NOT NULL,
+  source_channel             TEXT NOT NULL,
+  source_nonce               TEXT NOT NULL,
+  -- Not identity: the case it exists to refuse is the same id arriving with a different intent.
+  prompt_digest              TEXT NOT NULL,
+  -- Evidence for matching a receipt, never a partition key — two failover generations write the
+  -- same transcript, and splitting them reopens the overlap this table prevents.
+  binding_generation         INTEGER,
+  state                      TEXT NOT NULL CHECK (state IN ('IN_DOUBT', 'COMPLETED')),
+  claimed_at                 TEXT NOT NULL,
+  settled_at                 TEXT,
+  CHECK ((state = 'COMPLETED') = (settled_at IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS canonical_turns_target ON canonical_turns(target_conversation_digest, state);
+CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_source ON canonical_turns(source_channel, source_nonce);
+
 INSERT OR IGNORE INTO continuity_state (id, mode, changed_at)
 VALUES (1, 'NORMAL', '1970-01-01T00:00:00.000Z');
