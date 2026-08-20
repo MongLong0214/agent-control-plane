@@ -465,6 +465,9 @@ export class Doctor {
           recommendedAction: "restore a supported usage source; the operator observation expires and will not renew itself",
         });
       }
+      // UNKNOWN is deliberately not here. A provider whose quota could not be read is reported
+      // by CAPACITY_SENSOR_FAILED above, which says the true thing; adding CAPACITY_LOW beside it
+      // would state a second, false one — and with `confidence: "HIGH"`, on no observation.
       if (reading.advisoryState === "EXHAUSTED" || reading.advisoryState === "CRITICAL") {
         findings.push({
           code: "CAPACITY_LOW",
