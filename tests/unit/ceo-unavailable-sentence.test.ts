@@ -59,12 +59,17 @@ describe("what the owner is told when the CEO route refuses", () => {
     expect(sentence).toMatch(/second turn/i);
   });
 
-  it("tells a busy owner their message was not started, so resending is the right move", () => {
+  it("tells a busy owner their message was not started, and does not ask them to resend", () => {
     // The turn was refused before reaching the session (#630). If the sentence were vague the
     // owner would not know whether resending duplicates the message or is required.
     const sentence = ceoUnavailableSentence(ReasonCode.CEO_CONVERSATION_BUSY);
 
     expect(sentence).toMatch(/not started/i);
+    // Third correction to this shape. #633 removed a claim the seam could not observe, #643
+    // removed an invitation that was itself the duplicate path, and this removes the last copy.
+    // It is true today — the turn genuinely did not start — and becomes wrong the moment BUSY is
+    // reachable in production (#630), because a held message is waiting rather than discarded.
+    expect(sentence).not.toMatch(/send it again|ask again|try again/i);
   });
 
   it("gives every CEO conversation reason code its own sentence", () => {

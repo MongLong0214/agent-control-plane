@@ -1298,7 +1298,12 @@ export const ceoUnavailableSentence = (reasonCode: string): string => {
     return "The CEO session has not answered yet. Its turn is unresolved rather than abandoned — an answer may still be arriving in the conversation. Sending the same message again starts a second turn rather than retrying this one.";
   }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_BUSY) {
-    return "The CEO is still working on the previous message. This one was not started, so send it again once the answer arrives.";
+    // Not "send it again". This is the third copy of a sentence this repository has now
+    // corrected twice: #633 removed a claim the seam could not observe, #643 removed an
+    // invitation that was itself the duplicate path. The advice is true today — the turn
+    // genuinely did not start — and becomes wrong the moment BUSY is reachable in production
+    // (#630), because by then a held message is waiting rather than discarded.
+    return "The CEO is still working on the previous message. This one was not started; it will be taken once that turn finishes.";
   }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_STALE) {
     // This used to fall through to the sentence below, which says the CEO answered. It did not:
