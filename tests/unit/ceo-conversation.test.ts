@@ -1,7 +1,14 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
+import {
+  CEO_CONVERSATION_BUDGET_MS,
+  CEO_REPLY_TIMEOUT_MS,
+  assertOuterOutlastsInner,
+} from "../../src/contracts/ceo-turn-budget.ts";
 import type { McpPeerAuthenticator } from "../../src/mcp/shared.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -81,7 +88,10 @@ describe("CEO conversation port", () => {
   });
 
   it("treats a peer that never answers as a timeout without repeating its error text", async () => {
-    const port = new CeoConversationPort({ budgetMs: 5 });
+    // Both sides are stated, not just the budget. The port checks that its own deadline
+    // outlasts the peer's, and a test that shortened only one of them would be asking for the
+    // inverted arrangement the check exists to refuse.
+    const port = new CeoConversationPort({ budgetMs: 5, peerReplyTimeoutMs: 1 });
     const peer: FakePeer = {
       capabilities: { sampling: {} },
       answer: async () => {
@@ -185,5 +195,60 @@ describe("CEO conversation port", () => {
     expect(answered.allowed && answered.value).toBe("B");
     expect(stale.peer.calls).toEqual([]);
     expect(current.peer.calls).toEqual(["who answers now?"]);
+  });
+});
+
+describe("the deadlines on one owner turn", () => {
+  /**
+   * An owner turn crosses two process boundaries and had a deadline at each: the daemon waited
+   * 60s while the CEO runtime waited 120s for its spawned reply command. Ordered that way the
+   * inner deadline can never fire in the ordinary case — the daemon has already abandoned the
+   * turn — so a failure is always reported as "the CEO did not answer" and never as "the reply
+   * source did not answer", which is the one of the two that says where the fault is.
+   *
+   * They were two constants in two files with nothing relating them, which is how they came to
+   * be ordered backwards without anything failing.
+   */
+  it("gives the daemon longer than the runtime it is waiting on", () => {
+    // The real constants, not the relationship restated. Recomputing `inner + margin` here
+    // would agree with any pair of values at all, including an inverted one.
+    expect(CEO_CONVERSATION_BUDGET_MS).toBeGreaterThan(CEO_REPLY_TIMEOUT_MS);
+  });
+
+  it("requires the runtime to actually wait on the shared constant", () => {
+    // The assertion above is, by itself, `margin > 0`. Both values come from this contract, so
+    // comparing them says nothing about whether the process that waits on the child still reads
+    // it — and the original bug was exactly that the two sides had drifted apart. A blind review
+    // caught this: every test here stayed green while `hermes-ceo.ts` hardcoded a larger inner
+    // timeout, which is the bug shape returning.
+    //
+    // So the source is read. The daemon cannot observe the peer's timer at runtime, and the
+    // repository is the only place the two can be held together.
+    const runtime = readFileSync(join(process.cwd(), "src", "runtime", "hermes-ceo.ts"), "utf8");
+
+    expect(runtime).toContain("const DEFAULT_REPLY_TIMEOUT_MS = CEO_REPLY_TIMEOUT_MS;");
+    // And the runtime holds itself to the relationship for a caller-supplied override, which is
+    // the one path the daemon's constructor check cannot see at all.
+    expect(runtime).toContain("assertOuterOutlastsInner(CEO_CONVERSATION_BUDGET_MS, replyTimeoutMs)");
+  });
+
+  it("refuses a budget that does not outlast the peer's reply timeout", () => {
+    // The derived defaults are the case that cannot go wrong. An override is where the
+    // inversion comes back, and it would surface as an unexplained timeout on every turn.
+    expect(() => new CeoConversationPort({ budgetMs: 30_000, peerReplyTimeoutMs: 120_000 })).toThrow(
+      /must outlast the reply timeout/,
+    );
+  });
+
+  it("refuses a tie, because equal deadlines still let the outer one fire first", () => {
+    // `>=` would accept this. Two deadlines that expire together race, and the daemon losing
+    // that race produces exactly the unattributable timeout the ordering exists to prevent.
+    expect(() => assertOuterOutlastsInner(120_000, 120_000)).toThrow(/must outlast/);
+  });
+
+  it("names both numbers in the refusal, so the operator can see which way round they are", () => {
+    // "budget must outlast reply timeout" alone does not say which of the two the operator set
+    // wrongly — and the peer's value is in another process, where they cannot go and read it.
+    expect(() => assertOuterOutlastsInner(30_000, 120_000)).toThrow(/30000.*120000/s);
   });
 });
