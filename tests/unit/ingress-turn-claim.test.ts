@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { IngressGuard, TURN_CLAIMED } from "../../src/ingress/ingress-guard.ts";
+import { IngressGuard, TURN_CLAIMED, type TurnIdentity } from "../../src/ingress/ingress-guard.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -25,6 +25,14 @@ const guardFor = (harness: ReturnType<typeof makeHarness>) =>
     },
   });
 
+/** A fixed identity, so a test that cares about the claim is not also testing UUID generation. */
+const identity = (turnRequestId = "turn-1"): TurnIdentity => ({
+  turnRequestId,
+  sessionDigest: "session-digest",
+  promptDigest: "prompt-digest",
+  bindingDigest: "binding-digest",
+});
+
 const admitOne = (guard: IngressGuard, nonce: string) =>
   guard.admit({
     channel: "telegram",
@@ -40,8 +48,8 @@ describe("taking the right to run a message's handler", () => {
     const guard = guardFor(harness);
     expect(admitOne(guard, "n1").allowed).toBe(true);
 
-    const first = guard.claimTurn("telegram", "n1");
-    const second = guard.claimTurn("telegram", "n1");
+    const first = guard.claimTurn("telegram", "n1", identity());
+    const second = guard.claimTurn("telegram", "n1", identity());
 
     expect(first.allowed).toBe(true);
     expect(second.allowed).toBe(false);
@@ -53,7 +61,7 @@ describe("taking the right to run a message's handler", () => {
     // report success — a handler would then run for a message the guard never let in.
     const harness = makeHarness();
 
-    const claimed = guardFor(harness).claimTurn("telegram", "never-seen");
+    const claimed = guardFor(harness).claimTurn("telegram", "never-seen", identity());
 
     expect(claimed.allowed).toBe(false);
     expect(claimed.reasonCode).toBe(ReasonCode.NOT_FOUND);
@@ -65,7 +73,7 @@ describe("taking the right to run a message's handler", () => {
     const harness = makeHarness();
     const guard = guardFor(harness);
     admitOne(guard, "n2");
-    expect(guard.claimTurn("telegram", "n2").allowed).toBe(true);
+    expect(guard.claimTurn("telegram", "n2", identity()).allowed).toBe(true);
 
     const replayed = admitOne(guard, "n2");
 
@@ -81,7 +89,7 @@ describe("taking the right to run a message's handler", () => {
     const harness = makeHarness();
     const guard = guardFor(harness);
     admitOne(guard, "n3");
-    guard.claimTurn("telegram", "n3");
+    guard.claimTurn("telegram", "n3", identity());
 
     admitOne(guard, "n3");
 
@@ -92,5 +100,116 @@ describe("taking the right to run a message's handler", () => {
 
   it("names the claimed state so a reader can tell it from a delivery status", () => {
     expect(TURN_CLAIMED).toBe("TURN_CLAIMED");
+  });
+});
+
+describe("what the claim carries", () => {
+  /**
+   * The identity is written in the same statement as the claim. Nothing reads it yet — the reply
+   * command has no argument that would carry the id to Hermes, and no receipt comes back (#638).
+   *
+   * What can be established now is that it survives, which is the floor the later comparison
+   * stands on: a comparison against an id that drifts fails always, and its failure cannot be
+   * told apart from a missing receipt.
+   */
+  const storedClaim = (harness: ReturnType<typeof makeHarness>, nonce: string): Record<string, unknown> => {
+    const row = harness.cp.db.get<{ result_json: string | null }>(
+      "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
+      [nonce],
+    );
+    return JSON.parse(row?.result_json ?? "{}") as Record<string, unknown>;
+  };
+
+  it("stores the identity in the same row as the claim", () => {
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "n10");
+
+    const claimed = guard.claimTurn("telegram", "n10", identity("turn-abc"));
+
+    expect(claimed.allowed).toBe(true);
+    expect(storedClaim(harness, "n10")).toMatchObject({
+      deliveryStatus: TURN_CLAIMED,
+      turnRequestId: "turn-abc",
+      sessionDigest: "session-digest",
+      promptDigest: "prompt-digest",
+      bindingDigest: "binding-digest",
+    });
+  });
+
+  it("keeps it byte-identical when the row is read back by a new guard", () => {
+    // The reader after a crash is a different process against the same file. This is the
+    // property #639's later comparison depends on, and the only one observable before #638.
+    const harness = makeHarness();
+    admitOne(guardFor(harness), "n11");
+    guardFor(harness).claimTurn("telegram", "n11", identity("turn-xyz"));
+
+    const first = storedClaim(harness, "n11");
+    const second = storedClaim(harness, "n11");
+
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+    expect(second["turnRequestId"]).toBe("turn-xyz");
+  });
+
+  it("does not let a second claim overwrite the first one's identity", () => {
+    // The refusal already returns OUTCOME_UNKNOWN. What matters here is that the stored identity
+    // is still the one whose handler may have run — overwriting it would point a later receipt
+    // match at an attempt that never happened.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "n12");
+    guard.claimTurn("telegram", "n12", identity("first"));
+
+    guard.claimTurn("telegram", "n12", identity("second"));
+
+    expect(storedClaim(harness, "n12")["turnRequestId"]).toBe("first");
+  });
+});
+
+describe("expiry of the nonce window", () => {
+  /**
+   * The row is aged directly rather than by shortening the TTL. A TTL small enough to expire the
+   * row also expires it inside the same `admit` that inserted it — `prune` runs after the insert
+   * — so the claim under test never gets a row to claim, and the test would pass for the wrong
+   * reason. Ageing the row states what the test is about.
+   */
+  const age = (harness: ReturnType<typeof makeHarness>, nonce: string): void => {
+    harness.cp.db.run(
+      "UPDATE inbound_messages SET received_at = ? WHERE channel = 'telegram' AND nonce = ?",
+      ["2000-01-01T00:00:00.000Z", nonce],
+    );
+  };
+
+  it("does not delete a turn whose outcome is unknown", () => {
+    // The window exists so a replay of old traffic is refused cheaply. A claimed row is not old
+    // traffic: it is the only record that a handler may already have run, and deleting it frees
+    // the nonce — so the fail-closed state becomes fail-open after nonceTtlMs, and the replay
+    // executes the turn a second time. Found by a blind review of this design.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "n20");
+    expect(guard.claimTurn("telegram", "n20", identity()).allowed).toBe(true);
+    age(harness, "n20");
+
+    // Any later admission runs the prune.
+    admitOne(guard, "n21");
+
+    const replayed = admitOne(guard, "n20");
+    expect(replayed.allowed, "a pruned claim would be admitted and run again").toBe(false);
+    expect(replayed.reasonCode).toBe(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN);
+  });
+
+  it("still expires an ordinary row, so the window has not been disabled", () => {
+    // Without this, exempting claimed rows could be widened to exempt everything and nothing
+    // here would notice.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "n30");
+    age(harness, "n30");
+
+    admitOne(guard, "n31");
+
+    // Re-admitted rather than refused as a replay: the row aged out, which is the point of a TTL.
+    expect(admitOne(guard, "n30").allowed).toBe(true);
   });
 });

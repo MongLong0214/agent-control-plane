@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -8,6 +8,8 @@ import {
   ownerApprovalPayload,
   type IngressGuard,
   type IngressRequest,
+  type TurnClaim,
+  type TurnIdentity,
   type OwnerApprovalIngress,
 } from "./ingress-guard.ts";
 
@@ -254,8 +256,29 @@ export class TelegramIngress {
    * Named on this class rather than reached through `guard` by callers, so the channel string
    * is supplied here alongside `nonceFor` and cannot be passed inconsistently.
    */
-  claimTurn(nonce: string): Decision<void> {
-    return this.guard.claimTurn("telegram", nonce);
+  claimTurn(nonce: string, identity: TurnIdentity): Decision<TurnClaim> {
+    return this.guard.claimTurn("telegram", nonce, identity);
+  }
+
+  /**
+   * What this update's turn is, as ACP fixes it before the reply command runs.
+   *
+   * The id is a fresh UUID rather than anything derived from the update. Deriving it would make
+   * two claims of the same message share an id, and the question a receipt answers is *which
+   * attempt* reached the session — so a second attempt after an unknown outcome must not be able
+   * to match the first one's receipt.
+   *
+   * The digests are derived, because they answer the other half: not "which attempt" but "what
+   * was attempted". A receipt that matches the id but names a different session, prompt or
+   * binding generation is not this turn's.
+   */
+  turnIdentityFor(update: TelegramUpdate, text: string, bindingGeneration: number | null): TurnIdentity {
+    return {
+      turnRequestId: randomUUID(),
+      sessionDigest: digestOf({ channel: "telegram", conversation: String(update.message?.chat?.id ?? "") }),
+      promptDigest: digestOf(text),
+      bindingDigest: digestOf({ bindingGeneration }),
+    };
   }
 
   /** Conditional durable transition for Telegram's PENDING → APPLIED reply protocol. */
