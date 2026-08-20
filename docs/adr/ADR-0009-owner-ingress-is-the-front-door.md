@@ -67,7 +67,22 @@ pollers.
 
 **Hermes gains a dependency on the control plane being up** for its Telegram surface. This is
 accepted: the CEO role already requires the daemon, and a Hermes that can chat but cannot act
-is not a state worth preserving separately. Buzz remains a direct path to Hermes.
+is not a state worth preserving separately. ~~Buzz remains a direct path to Hermes.~~
+
+> **Amended 2026-08-20.** That last sentence is withdrawn. It contradicts the consequence two
+> paragraphs above — *"Both of the owner's channels now terminate in the control plane"* — and
+> the contradiction was not noticed because Buzz was out of scope on the day this was written.
+>
+> Read as licence, it kept `buzz-acp --agent-command hermes --agent-args=acp` in place. `hermes
+> acp` takes no session argument, so every Buzz exchange started its own conversation: eleven
+> days of them sit in the session store beside the one the owner actually uses. That is a
+> surface creating a conversational actor, which `SSOT.md:99` forbids by name, and it makes the
+> two surfaces impossible to order into one history.
+>
+> The decision this ADR records already covers Buzz. What was missing was the mechanism, not the
+> intent — see #627, where it is a façade behind `buzz-acp` delivering one DIRECT turn to the
+> bound CEO, the same seam Telegram uses. **A direct path to Hermes and one context across
+> channels are not both available, and this ADR chose the second.**
 
 **Rejected — leaving Hermes on the bot and approving over CLI.** It keeps one bot but pushes
 every approval to a terminal, and leaves the conversation outside the control plane, so
