@@ -66,6 +66,36 @@ interface LivePeer {
   authenticate: McpPeerAuthenticator;
 }
 
+
+/**
+ * Whether a turn reached the CEO, as a fact the boundary produces rather than one the caller
+ * names.
+ *
+ * A refusal that happened **before** `createMessage` is positive evidence that nothing ran: no
+ * process was spawned, no row was written, the CEO never heard the message. A refusal after it
+ * is not — a timeout, a socket close, a rejection and a kill attempt all leave a child that may
+ * still be appending, and the CEO's verdict on #651 names those explicitly as *not* evidence.
+ *
+ * The distinction is a type rather than a reason code because a reason code is a label the
+ * caller attaches. Adding a new refusal and reusing an existing code would silently move it to
+ * the wrong side; this way the person adding one has to choose, and the choice is what the
+ * settle path reads.
+ *
+ *     NEVER_REACHED   nothing was asked of the CEO. Safe to settle as never admitted.
+ *     REACHED         the request was sent. What happened after it is not observable here.
+ */
+export type CeoTurnContact = "NEVER_REACHED" | "REACHED";
+
+/**
+ * An answer, or a refusal that carries which side of the boundary it fell on.
+ *
+ * `contact` is deliberately not derivable from `reasonCode`: the point is that the executor
+ * boundary states it, so a later reader is not inferring non-execution from an error string.
+ */
+export type CeoTurnOutcome =
+  | { readonly contact: "REACHED"; readonly answered: Decision<string> }
+  | { readonly contact: "NEVER_REACHED"; readonly answered: Decision<string> };
+
 export class CeoConversationPort {
   #live: LivePeer | null = null;
   /**
@@ -81,6 +111,14 @@ export class CeoConversationPort {
    * explicit here first, while it is still true, rather than after it stops being true.
    */
   #inFlight = false;
+  /**
+   * Set at the one place the request crosses to the peer, and read by `attempt`.
+   *
+   * A flag rather than a return value because `ask`'s signature is used by callers that do not
+   * care; what matters is that it is set *at* `createMessage` and nowhere else, so no refusal
+   * can claim to have reached the CEO and no dispatch can claim not to have.
+   */
+  #reachedPeer = false;
   readonly #budgetMs: number;
   readonly #maxTokens: number;
 
@@ -113,6 +151,26 @@ export class CeoConversationPort {
 
   connected(): boolean {
     return this.#live !== null;
+  }
+
+  /**
+   * The turn, with the contact fact the settle path needs.
+   *
+   * `ask` stays as the narrow "give me an answer" call every existing caller uses; this is the
+   * one a coordinator uses, because settling a claim requires knowing which side of the peer
+   * call the outcome came from and `Decision` cannot carry that.
+   */
+  async attempt(text: string): Promise<CeoTurnOutcome> {
+    const before = this.#reachedPeer;
+    this.#reachedPeer = false;
+    try {
+      const answered = await this.ask(text);
+      return this.#reachedPeer
+        ? { contact: "REACHED", answered }
+        : { contact: "NEVER_REACHED", answered };
+    } finally {
+      this.#reachedPeer = before;
+    }
   }
 
   async ask(text: string): Promise<Decision<string>> {
@@ -160,6 +218,9 @@ export class CeoConversationPort {
     }
 
     let result: Awaited<ReturnType<McpServer["server"]["createMessage"]>>;
+    // The boundary. Everything above refused without asking the CEO anything; everything below
+    // has, whatever it returns.
+    this.#reachedPeer = true;
     // Set here rather than at the top: everything above refuses without reaching the session, so
     // marking those as a turn would lock the CEO out on a failure that never touched it.
     this.#inFlight = true;
