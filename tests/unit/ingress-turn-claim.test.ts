@@ -213,3 +213,69 @@ describe("expiry of the nonce window", () => {
     expect(admitOne(guard, "n30").allowed).toBe(true);
   });
 });
+
+describe("finding an unresolved turn without knowing its nonce", () => {
+  /**
+   * A claimed turn could only be found by nonce, and the person who needs to find one is the
+   * owner — who has an unanswered message, not a nonce. The single state that requires a human
+   * was reachable only by someone who already knew where to look.
+   *
+   * The lookup is by `sessionDigest` because it is already in the claim and is exactly
+   * `digestOf({ channel, conversation })`. A second column recording the conversation would be a
+   * second definition of "the same conversation", free to disagree with the first.
+   */
+  const claimOne = (guard: IngressGuard, nonce: string, session: string, id: string): void => {
+    admitOne(guard, nonce);
+    guard.claimTurn("telegram", nonce, { ...identity(id), sessionDigest: session });
+  };
+
+  it("returns the turns of that conversation and not another's", () => {
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    claimOne(guard, "a1", "chat-A", "turn-a1");
+    claimOne(guard, "b1", "chat-B", "turn-b1");
+
+    const outstanding = guard.unresolvedTurns("telegram", "chat-A");
+
+    expect(outstanding.map((turn) => turn.turnRequestId)).toEqual(["turn-a1"]);
+  });
+
+  it("carries the nonce and the prompt digest, so a reader can say which message it was", () => {
+    // A list of ids answers "how many" and nothing else. The owner's question is which of their
+    // messages is outstanding, and the digest is what a caller can compare their text against.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    claimOne(guard, "a2", "chat-A", "turn-a2");
+
+    const [turn] = guard.unresolvedTurns("telegram", "chat-A");
+
+    expect(turn?.nonce).toBe("a2");
+    expect(turn?.promptDigest).toBe("prompt-digest");
+    expect(turn?.claimedAt).toBeTruthy();
+  });
+
+  it("does not return a turn that was never claimed", () => {
+    // Admitted-and-running is not outstanding, and neither is admitted-and-answered. Returning
+    // them would make every message look unresolved and the list would stop meaning anything.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "a3");
+
+    expect(guard.unresolvedTurns("telegram", "chat-A")).toEqual([]);
+  });
+
+  it("returns the oldest first, because that is the one unanswered longest", () => {
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    claimOne(guard, "a4", "chat-A", "older");
+    harness.cp.db.run(
+      "UPDATE inbound_messages SET received_at = ? WHERE nonce = ?",
+      ["2000-01-01T00:00:00.000Z", "a4"],
+    );
+    claimOne(guard, "a5", "chat-A", "newer");
+
+    const outstanding = guard.unresolvedTurns("telegram", "chat-A");
+
+    expect(outstanding.map((turn) => turn.turnRequestId)).toEqual(["older", "newer"]);
+  });
+});
