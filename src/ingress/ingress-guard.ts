@@ -484,7 +484,12 @@ export class IngressGuard {
     );
     return rows.map((row) => ({
       nonce: row.nonce,
-      claimedAt: row.received_at,
+      // `received_at`, and named for it. It was called `claimedAt`, which is a different moment:
+      // a message admitted, lost to a crash, redelivered and only then claimed has a gap between
+      // the two. The surface this feeds is a person deciding what to do about an outstanding
+      // turn, and handing them the wrong timestamp under a confident name is worse than handing
+      // them the right one under a plain name.
+      receivedAt: row.received_at,
       ...(JSON.parse(row.result_json) as TurnClaim),
     }));
   }
@@ -570,7 +575,14 @@ export interface TurnClaim extends TurnIdentity {
 /** A claimed turn with the row context a reader needs to say which message it was. */
 export interface UnresolvedTurn extends TurnClaim {
   nonce: string;
-  claimedAt: string;
+  /**
+   * When the source message was admitted — not when its turn was claimed.
+   *
+   * The two differ whenever a message is admitted, lost, redelivered and claimed on the second
+   * pass. The claim moment is not recorded anywhere today; when `canonical_turns` gains a writer
+   * it will have `claimed_at`, and this field stays what it says it is.
+   */
+  receivedAt: string;
 }
 
 /**

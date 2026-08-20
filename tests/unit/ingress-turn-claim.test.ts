@@ -251,7 +251,7 @@ describe("finding an unresolved turn without knowing its nonce", () => {
 
     expect(turn?.nonce).toBe("a2");
     expect(turn?.promptDigest).toBe("prompt-digest");
-    expect(turn?.claimedAt).toBeTruthy();
+    expect(turn?.receivedAt).toBeTruthy();
   });
 
   it("does not return a turn that was never claimed", () => {
