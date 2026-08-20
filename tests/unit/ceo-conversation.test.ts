@@ -329,3 +329,109 @@ describe("one turn at a time on the CEO's canonical session", () => {
     expect(second.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_BUSY);
   });
 });
+
+describe("whether a refusal reached the CEO", () => {
+  /**
+   * A settle path needs to know which side of the peer call an outcome fell on, and the CEO's
+   * verdict on #651 is explicit that it must be a typed result at the executor boundary rather
+   * than an error string or an inference:
+   *
+   *   "dispatch 이후 timeout, socket close, rejection, kill attempt, child exit code 는
+   *    그 증거가 아니다. 이 구분을 error string 이나 추정으로 만들지 말고
+   *    executor boundary 의 typed result 로 강제한다."
+   *
+   * These tests pin each refusal to a side. They exist because a reason code is a label the
+   * caller attaches: adding a refusal and reusing a code would move it silently.
+   */
+  it("says NEVER_REACHED when no peer is connected", async () => {
+    const outcome = await new CeoConversationPort().attempt("어떻게 돼가?");
+
+    expect(outcome.contact).toBe("NEVER_REACHED");
+    expect(outcome.answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_UNAVAILABLE);
+  });
+
+  it("says NEVER_REACHED when the peer never declared sampling", async () => {
+    const port = new CeoConversationPort();
+    const peer: FakePeer = { capabilities: {}, answer: null, calls: [] };
+    port.attach(fakePeer(peer), stillCeo());
+
+    const outcome = await port.attempt("어떻게 돼가?");
+
+    expect(outcome.contact).toBe("NEVER_REACHED");
+    expect(peer.calls, "the claim of not reaching has to match the peer's own record").toEqual([]);
+  });
+
+  it("says NEVER_REACHED when the socket outlived its binding", async () => {
+    const port = new CeoConversationPort();
+    const { peer, server } = textPeer("stale");
+    port.attach(server, noLongerCeo());
+
+    const outcome = await port.attempt("어떻게 돼가?");
+
+    expect(outcome.contact).toBe("NEVER_REACHED");
+    expect(peer.calls).toEqual([]);
+  });
+
+  it("says REACHED for a timeout, because a timeout is not evidence of not running", async () => {
+    // The case the whole distinction exists for. The daemon stopped waiting; the reply command
+    // it spawned may still be writing the owner's conversation. Reporting this as never-reached
+    // would settle a turn that is still happening.
+    const port = new CeoConversationPort({ budgetMs: 5, peerReplyTimeoutMs: 1 });
+    const peer: FakePeer = {
+      capabilities: { sampling: {} },
+      answer: async () => {
+        throw new Error("budget expired");
+      },
+      calls: [],
+    };
+    port.attach(fakePeer(peer), stillCeo());
+
+    const outcome = await port.attempt("어떻게 돼가?");
+
+    expect(outcome.contact).toBe("REACHED");
+    expect(outcome.answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_TIMEOUT);
+  });
+
+  it("says REACHED for an answer this route cannot deliver", async () => {
+    // The peer answered; the transport cannot carry it. The turn happened either way.
+    const port = new CeoConversationPort();
+    const peer: FakePeer = {
+      capabilities: { sampling: {} },
+      answer: async () => ({
+        model: "fake",
+        role: "assistant",
+        content: { type: "image", data: "…", mimeType: "image/png" },
+      }),
+      calls: [],
+    };
+    port.attach(fakePeer(peer), stillCeo());
+
+    const outcome = await port.attempt("도표");
+
+    expect(outcome.contact).toBe("REACHED");
+  });
+
+  it("says REACHED on success", async () => {
+    const port = new CeoConversationPort();
+    const { server } = textPeer("돌고 있어");
+    port.attach(server, stillCeo());
+
+    const outcome = await port.attempt("어떻게 돼가?");
+
+    expect(outcome.contact).toBe("REACHED");
+    expect(outcome.answered.allowed && outcome.answered.value).toBe("돌고 있어");
+  });
+
+  it("never reports NEVER_REACHED for an outcome the peer recorded", async () => {
+    // The invariant behind all of the above, stated so a new refusal cannot break it quietly:
+    // the port's claim about contact must agree with the peer's own call log.
+    const port = new CeoConversationPort();
+    const { peer, server } = textPeer("답");
+    port.attach(server, stillCeo());
+
+    const outcome = await port.attempt("물음");
+
+    expect(outcome.contact === "NEVER_REACHED" ? peer.calls.length : 0).toBe(0);
+    expect(peer.calls.length > 0 ? outcome.contact : "REACHED").toBe("REACHED");
+  });
+});
