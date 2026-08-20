@@ -338,12 +338,26 @@ describe("the reply source the runtime is started with", () => {
 
   it("says how to pin the session, because 'required' alone is satisfied by the broken form", async () => {
     // An operator who reads only "--reply-command is required" supplies `hermes -z` — the exact
-    // command that was wrong — and the refusal has taught them nothing. The message has to carry
-    // the pinned shape, with `-z` last so the appended prompt lands on `-z` and not on
-    // `--resume`.
+    // command that was wrong — and the refusal has taught them nothing.
+    //
+    // The first draft of this message said `hermes --resume <id> -z`, which does not work:
+    // Hermes dispatches `-z` through a one-shot runner that takes no session argument and
+    // returns before `--resume` is applied, and its own source calls that path stateless. So the
+    // message has to name `chat`, and end in `-q` so the appended prompt lands on the query flag
+    // rather than on `--resume`.
     const { text } = await stderrOf([]);
 
+    expect(text).toContain("chat");
     expect(text).toContain("--resume");
-    expect(text.indexOf("-z")).toBeGreaterThan(text.indexOf("--resume"));
+    expect(text.lastIndexOf("-q")).toBeGreaterThan(text.indexOf("--resume"));
+  });
+
+  it("says why the one-shot cannot simply be pinned, so nobody re-derives the broken form", async () => {
+    // Without this, the natural repair for "`hermes -z` is unpinned" is "`hermes --resume <id>
+    // -z`" — which reads as fixed, runs, answers, and is still a fresh conversation every turn.
+    // That is the same failure the whole guard exists to stop, arrived at from the other side.
+    const { text } = await stderrOf([]);
+
+    expect(text).toContain("stateless");
   });
 });
