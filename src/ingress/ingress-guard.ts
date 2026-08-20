@@ -457,6 +457,38 @@ export class IngressGuard {
     return deny(reasonCode, message, { channel: request.channel, actor: request.actor });
   }
 
+  /**
+   * Every turn on this conversation whose outcome was never recorded.
+   *
+   * Until now a claimed turn could only be found by its nonce, and the person who needs to find
+   * it is the owner — who has an unanswered message, not a nonce. So the one state that requires
+   * a human was reachable only by someone who already knew where to look.
+   *
+   * The lookup is by `sessionDigest` rather than by a stored conversation id, because the digest
+   * is already written into the claim and is exactly `digestOf({ channel, conversation })`. That
+   * makes this a query over data that exists rather than a schema change, and it keeps one
+   * definition of what "the same conversation" means — a second column would be a second
+   * definition, free to disagree with the first.
+   *
+   * Ordered oldest first: the question this answers is "what is still outstanding", and the
+   * oldest outstanding turn is the one that has been unanswered longest.
+   */
+  unresolvedTurns(channel: string, sessionDigest: string): readonly UnresolvedTurn[] {
+    const rows = this.db.all<{ nonce: string; received_at: string; result_json: string }>(
+      `SELECT nonce, received_at, result_json FROM inbound_messages
+        WHERE channel = ?
+          AND json_extract(result_json, '$.deliveryStatus') IS ?
+          AND json_extract(result_json, '$.sessionDigest') IS ?
+        ORDER BY received_at ASC`,
+      [channel, TURN_CLAIMED, sessionDigest],
+    );
+    return rows.map((row) => ({
+      nonce: row.nonce,
+      claimedAt: row.received_at,
+      ...(JSON.parse(row.result_json) as TurnClaim),
+    }));
+  }
+
   private prune(channel: string, ttlMs: number): void {
     // A claimed turn whose outcome was never recorded is exempt.
     //
@@ -533,6 +565,12 @@ export interface TurnIdentity {
 
 export interface TurnClaim extends TurnIdentity {
   deliveryStatus: typeof TURN_CLAIMED;
+}
+
+/** A claimed turn with the row context a reader needs to say which message it was. */
+export interface UnresolvedTurn extends TurnClaim {
+  nonce: string;
+  claimedAt: string;
 }
 
 /**
