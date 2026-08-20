@@ -28,6 +28,17 @@ import type { SessionRegistry } from "../session/session-registry.ts";
 
 const exec = promisify(execFile);
 
+/**
+ * When an unresolved turn stops being an ordinary crash artefact and becomes something nobody
+ * looked at.
+ *
+ * Sized against the thing it is waiting for: a measured CEO turn is about three and a half
+ * minutes, so anything still outstanding after several times that is not slow, it is stuck.
+ * The threshold raises severity and never clears the finding — a turn does not become safe by
+ * getting old, which is why `IngressGuard.prune` exempts these rows too.
+ */
+const UNRESOLVED_TURN_ESCALATION_MINUTES = 15;
+
 export type Severity = "INFO" | "WARN" | "ERROR" | "CRITICAL";
 
 /** PRD §25.4 — the finding contract. */
@@ -126,6 +137,7 @@ export class Doctor {
       findings.push(...(await this.checkHostResources()));
       findings.push(...this.checkClaims());
       findings.push(...this.checkOutbox());
+      findings.push(...this.checkUnresolvedTurns());
       findings.push(...(await this.checkRepositories()));
       findings.push(...(await this.checkWorktrees()));
     }
@@ -631,6 +643,56 @@ export class Doctor {
       },
       recommendedAction: "expire the claim if the holder is gone",
     }));
+  }
+
+  /**
+   * Turns whose outcome nobody established.
+   *
+   * This is the one state in the whole conversation path that a timer must not resolve — the
+   * reply command may have written into the owner's transcript, and only a receipt or a person
+   * can say. The CEO's verdict on #632 made surfacing it a required condition:
+   *
+   *   `OUTCOME_UNKNOWN` 을 완료나 정상 replay-ignore 로 숨기지 말고 audit/doctor 에서
+   *   명시적으로 보여야 한다.
+   *
+   * #635 shipped the audit event and this half did not, so for a while the state that needs a
+   * person was visible only to someone tailing `audit_events` — while every runbook here starts
+   * with `agentctl doctor system`. That is the gap this closes.
+   *
+   * Not blocking, and not an ERROR on count alone. One unresolved turn is a normal outcome of a
+   * crash; what is not normal is one that nobody has looked at, so age carries the severity. The
+   * threshold escalates rather than clears — a turn does not become safe by getting old, which
+   * is the same reason `prune` exempts these rows.
+   */
+  private checkUnresolvedTurns(): Finding[] {
+    const rows = this.db.all<{ nonce: string; channel: string; received_at: string }>(
+      `SELECT channel, nonce, received_at FROM inbound_messages
+        WHERE json_extract(result_json, '$.deliveryStatus') IS 'TURN_CLAIMED'
+        ORDER BY received_at ASC`,
+    );
+    if (rows.length === 0) return [];
+
+    const oldest = rows[0]!;
+    const ageMs = Date.parse(this.clock.nowIso()) - Date.parse(oldest.received_at);
+    const ageMinutes = Math.max(0, Math.round(ageMs / 60_000));
+    return [
+      {
+        code: "TURN_OUTCOME_UNKNOWN",
+        // A conversation with an unresolved turn does not accept later turns, so this is not a
+        // note about the past — it is why the next message will not be answered.
+        severity: ageMinutes >= UNRESOLVED_TURN_ESCALATION_MINUTES ? "ERROR" : "WARN",
+        scope: "conversation",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          outstanding: rows.length,
+          oldestAgeMinutes: ageMinutes,
+          oldest: { channel: oldest.channel, nonce: oldest.nonce, claimedAt: oldest.received_at },
+        },
+        recommendedAction:
+          "establish what happened to the turn — it may have reached the conversation. Later turns on it are refused until it is settled",
+      },
+    ];
   }
 
   private checkOutbox(): Finding[] {
