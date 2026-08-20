@@ -644,6 +644,94 @@ describe("Telegram production ingress", () => {
     }
   });
 
+  it("does not run the CEO turn a second time when the daemon dies after it and before the reply", async () => {
+    // The recovery path re-admits an update whose workflow is still ADMITTED, which is right for
+    // a handler that only formats a reply. The DIRECT handler is not that any more: in production
+    // it reaches the CEO, whose reply command resumes the owner's own conversation. Running it
+    // twice appends the same exchange twice to a transcript carried forward as context, and
+    // neither the owner nor the CEO can tell it happened.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const turns: string[] = [];
+    const crashingTurn = async (input: { text: string }): Promise<string> => {
+      // Ordered so the turn is recorded before the failure: this stands for the CEO having
+      // already written to the canonical session when the process goes away.
+      turns.push(input.text);
+      throw new TelegramInterruption("after-dispatch");
+    };
+
+    const firstTransport = new FakeTelegramTransport();
+    const owed = update("어떻게 돼가?", {}, 700);
+    firstTransport.updates = [owed];
+    const first = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: firstTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      await expect(first.service.pollOnce()).rejects.toBeInstanceOf(TelegramInterruption);
+    } finally {
+      await first.close();
+    }
+    expect(turns).toEqual(["어떻게 돼가?"]);
+
+    const secondTransport = new FakeTelegramTransport();
+    secondTransport.updates = [owed];
+    const second = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: secondTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      const resumed = await second.service.pollOnce();
+
+      // The assertion that matters is the handler count, not the reason code. A test that only
+      // checked the code would pass against an implementation that refused *and* ran.
+      expect(turns).toEqual(["어떻게 돼가?"]);
+      expect(resumed.outcomes[0]?.reasonCode).toBe(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN);
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("tells an unknown outcome apart from an ordinary replay", async () => {
+    // Both are "this update came back". They need different responses: a replay means the work
+    // was done and this copy is redundant, an unknown outcome means nobody knows whether it was.
+    // One code for both would file every occurrence of the second inside the first.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const transport = new FakeTelegramTransport();
+    const answered = update("완료되는 메시지", {}, 701);
+    transport.updates = [answered];
+    const listener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport,
+      start: false,
+      onDirect: () => "답",
+    });
+    try {
+      const firstPass = await listener.service.pollOnce();
+      expect(firstPass.outcomes[0]?.reasonCode).toBe(ReasonCode.OK);
+
+      // A fresh listener, because the first one advanced its offset past this update and would
+      // skip it — the replay this is about is one Telegram hands back after a restart.
+      const replayTransport = new FakeTelegramTransport();
+      replayTransport.updates = [answered];
+      const replayListener = await startDaemonTelegramListener(
+        harness.cp, telegramConfig, daemonStub,
+        { transport: replayTransport, start: false, onDirect: () => "답" },
+      );
+      const replay = await replayListener.service.pollOnce();
+      await replayListener.close();
+
+      expect(replay.outcomes[0]?.reasonCode).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
+      expect(replay.outcomes[0]?.reasonCode).not.toBe(ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN);
+    } finally {
+      await listener.close();
+    }
+  });
+
   it("crashes after admission, Hermes create, dispatch, and before reply, then resumes exactly once", async () => {
     const interruptionPoints = ["after-admission", "after-hermes-create", "after-dispatch"] as const;
 

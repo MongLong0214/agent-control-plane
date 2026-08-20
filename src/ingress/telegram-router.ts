@@ -471,6 +471,27 @@ export class TelegramHermesRouter {
 
     try {
       if (classified.value.kind === "DIRECT") {
+        // Claimed before it runs, because this handler is no longer a formatter.
+        //
+        // In production it reaches the CEO, whose reply command resumes the owner's own
+        // conversation — so running it twice appends the same exchange twice to a transcript
+        // that is then carried forward as context. The ingress recovery path re-admits an
+        // update whose result was never recorded, which is correct for a handler that only
+        // produced a reply and wrong for one that writes somewhere durable.
+        //
+        // A failed claim means another poller holds it, or a previous attempt was cut off
+        // before recording an outcome. Neither is a case to run it again.
+        const claimed = this.ingress.claimTurn(this.ingress.nonceFor(update));
+        if (!claimed.allowed) {
+          return this.outcomeWithReply(
+            update,
+            true,
+            false,
+            null,
+            this.replyFor(update, this.failureText("Telegram request not run", claimed)),
+            claimed.reasonCode,
+          );
+        }
         const directText = await this.directHandler(classified.value);
         return this.outcomeWithReply(
           update,

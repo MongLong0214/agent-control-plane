@@ -248,6 +248,16 @@ export class TelegramIngress {
     this.guard.recordResult("telegram", nonce, result);
   }
 
+  /**
+   * Takes the right to run this update's handler, once. See `IngressGuard.claimTurn`.
+   *
+   * Named on this class rather than reached through `guard` by callers, so the channel string
+   * is supplied here alongside `nonceFor` and cannot be passed inconsistently.
+   */
+  claimTurn(nonce: string): Decision<void> {
+    return this.guard.claimTurn("telegram", nonce);
+  }
+
   /** Conditional durable transition for Telegram's PENDING → APPLIED reply protocol. */
   recordResultIf(
     nonce: string,
