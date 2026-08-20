@@ -213,6 +213,23 @@ export class IngressGuard {
           { recovered: true },
         );
       }
+      // A claimed turn whose outcome was never recorded is not an ordinary replay. Both are
+      // "this message came back", but a replay means the work was done and this copy is
+      // redundant, while this means nobody knows whether it was. Reporting them with one code
+      // files every occurrence of the second inside the first, where no one looks for it.
+      if (resultDeliveryStatus(seen.result_json) === TURN_CLAIMED) {
+        this.audit.record({
+          kind: "INGRESS_TURN_OUTCOME_UNKNOWN",
+          actor: request.actor,
+          reasonCode: ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+          evidence: { channel: request.channel, nonce: request.nonce, firstSeen: seen.received_at },
+        });
+        return deny(
+          ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+          "this message's turn was claimed and its outcome was never recorded",
+          { channel: request.channel, nonce: request.nonce, firstSeen: seen.received_at },
+        );
+      }
       // §27.1 / CP-S49 — a replay is idempotently ignored, not re-executed.
       this.audit.record({
         kind: "INGRESS_REPLAY",
@@ -314,6 +331,64 @@ export class IngressGuard {
   }
 
   /**
+   * Takes the right to run this message's handler, once.
+   *
+   * The recovery path above re-admits an update whose result was never recorded, on the
+   * assumption that nothing irreversible happened before the crash. That assumption held while
+   * a handler only produced a reply. It stopped holding when the Telegram DIRECT handler became
+   * a CEO turn: `hermes chat --resume <canonical session>` writes into the owner's own
+   * conversation, so a re-run appends the same exchange twice to a transcript the CEO then
+   * carries forward as context. It cannot be unwound, and the CEO cannot tell it happened.
+   *
+   * So the handler is claimed before it runs, and a claimed message is not recoverable. A crash
+   * after the claim leaves the outcome genuinely unknown — the turn may or may not have reached
+   * the session — and the honest response to that is to stop, not to guess. The owner can ask
+   * again; a duplicated turn cannot be taken back.
+   *
+   * The compare-and-set is the point. An unconditional write would let two pollers claim the
+   * same message and both proceed, which is the concurrency this exists to refuse — the same
+   * reason `recordResultIf` is a transaction rather than a read followed by a write.
+   */
+  claimTurn(channel: string, nonce: string): Decision<void> {
+    return this.db.tx(() => {
+      const current = this.db.get<{ result_json: string | null }>(
+        `SELECT result_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [channel, nonce],
+      );
+      if (current && isClaimable(current.result_json)) {
+        const updated = this.db.run(
+          `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND result_json IS ?`,
+          [JSON.stringify({ deliveryStatus: TURN_CLAIMED }), channel, nonce, current.result_json],
+        );
+        // What serialises two claimers is the transaction, not this WHERE clause. `db.tx` runs
+        // the read and the write as one unit and SQLite serialises write transactions, so a
+        // second claimer cannot observe the pre-claim value and act on it.
+        //
+        // The clause is kept because it makes the read the write depends on explicit rather than
+        // implied by the enclosing transaction — but it is honest to say it is unreachable
+        // today: replacing it with an unconditional update kills no test, and no test here can
+        // kill it, because the interleaving it would catch cannot be produced while `tx` holds.
+        // It is a second statement of the same fact, not a second guard.
+        if (updated.changes === 1) return allow(ReasonCode.OK, undefined);
+      }
+      if (!current) {
+        return deny(ReasonCode.NOT_FOUND, "cannot claim a turn for a message that was never admitted", {
+          channel,
+          nonce,
+        });
+      }
+      // Named apart from an ordinary replay. A message whose turn was claimed and never
+      // completed is not a duplicate the owner sent twice — it is one the daemon may already
+      // have acted on, and folding the two together hides the case that needs a person.
+      return deny(
+        ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
+        "this message's turn was already claimed and its outcome was never recorded",
+        { channel, nonce, deliveryStatus: resultDeliveryStatus(current.result_json) },
+      );
+    });
+  }
+
+  /**
    * Conditional result transition used by Telegram's durable reply protocol. The database
    * transaction makes two pollers race on the reservation rather than both calling Telegram;
    * completion is only allowed from PENDING, so APPLIED cannot be rewritten.
@@ -384,6 +459,47 @@ export class IngressGuard {
  * The marker is deliberately narrow: a malformed or already-sent result remains a replay and
  * cannot be promoted back into an executable request.
  */
+/**
+ * The delivery status written when a handler's right to run is taken.
+ *
+ * It is deliberately not called STARTED. The value is written *before* the handler is invoked,
+ * so it cannot testify that anything started — only that this daemon took the right to try. The
+ * distinction matters at exactly the moment it is read: after a crash, "claimed" says the
+ * outcome is unknown, whereas "started" would invite the reader to assume it did.
+ *
+ * First state of the sequence the eventual protocol needs:
+ *
+ *     AVAILABLE → TURN_CLAIMED → (turn outcome) → REPLY_PENDING → REPLY_APPLIED
+ *
+ * The middle transition does not exist yet — resolving a claim against a completion receipt is
+ * still to be built. Until it is, a claim that is never superseded stays unknown rather than
+ * being read as either outcome.
+ */
+export const TURN_CLAIMED = "TURN_CLAIMED";
+
+/**
+ * The states a turn may be claimed from: nothing recorded, or admitted and not yet run.
+ *
+ * `TelegramIngress.admit` writes `phase: "ADMITTED"` as soon as a message is let in, so the
+ * column is never actually null on that path — a first draft of `claimTurn` compared against
+ * null and refused every real message. The tests caught it, which is the reason to keep the
+ * condition named here rather than inline in the SQL where it cannot be read against the
+ * writers that produce these values.
+ *
+ * These are exactly the states `isRecoverableIngressResult` would re-admit. Claiming what
+ * recovery would otherwise re-run is the whole mechanism: after the claim the same reader sees
+ * a state it will not re-run, so the handler cannot execute twice.
+ */
+const isClaimable = (resultJson: string | null): boolean => {
+  if (!resultJson) return true;
+  try {
+    const value = JSON.parse(resultJson) as { kind?: unknown; phase?: unknown };
+    return value.kind === "TELEGRAM_WORKFLOW" && value.phase === "ADMITTED";
+  } catch {
+    return false;
+  }
+};
+
 const isRecoverableIngressResult = (resultJson: string | null): boolean => {
   if (!resultJson) return true;
   try {
@@ -391,7 +507,12 @@ const isRecoverableIngressResult = (resultJson: string | null): boolean => {
       kind?: unknown;
       phase?: unknown;
       sent?: unknown;
+      deliveryStatus?: unknown;
     };
+    // A claimed turn is not recoverable at any phase. It is checked before the workflow
+    // branch because a claim carries no `kind`, and falling through would reach the
+    // `value.sent === false` default and re-admit it.
+    if (value.deliveryStatus === TURN_CLAIMED) return false;
     if (value.kind === "TELEGRAM_WORKFLOW") {
       return value.phase === "ADMITTED" || value.phase === "CREATED" || value.phase === "DISPATCHED" || value.sent === false;
     }

@@ -216,6 +216,15 @@ export const ReasonCode = {
   INGRESS_CHAT_NOT_ALLOWLISTED: "INGRESS_CHAT_NOT_ALLOWLISTED",
   INGRESS_SIGNATURE_INVALID: "INGRESS_SIGNATURE_INVALID",
   INGRESS_REPLAY_IGNORED: "INGRESS_REPLAY_IGNORED",
+  /**
+   * A message whose handler was claimed and whose outcome was never recorded.
+   *
+   * Deliberately not folded into `INGRESS_REPLAY_IGNORED`. That code means the work was already
+   * done and this copy is redundant; this one means nobody knows whether it was done. The two
+   * need different responses — the second is a person's to resolve — and one code for both would
+   * hide every occurrence of the second inside the first.
+   */
+  INGRESS_TURN_OUTCOME_UNKNOWN: "INGRESS_TURN_OUTCOME_UNKNOWN",
   INGRESS_NONCE_EXPIRED: "INGRESS_NONCE_EXPIRED",
   UNTRUSTED_CONTENT_IS_DATA: "UNTRUSTED_CONTENT_IS_DATA",
   MCP_PEER_UNAUTHENTICATED: "MCP_PEER_UNAUTHENTICATED",
