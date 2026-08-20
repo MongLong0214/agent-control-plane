@@ -126,6 +126,36 @@ describe("CEO conversation port", () => {
     expect(answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_NOT_TEXT);
   });
 
+  it("takes the next turn after non-text content, because the peer did answer", async () => {
+    // A CEO review confirmed the judgement — production `hermes-ceo` always returns
+    // `{type:"text"}` on success, and a reply-source failure is a JSON-RPC error that arrives as
+    // a `createMessage` rejection — but noted the existing test only checks the reason code.
+    //
+    // The code alone does not say whether the turn was left open. NOT_TEXT is a fact about this
+    // transport, not about whether the conversation was written, so the next turn must be
+    // admitted; asserting only the code would pass just as well if it were not.
+    const port = new CeoConversationPort();
+    const peer: FakePeer = {
+      capabilities: { sampling: {} },
+      answer: async () => ({
+        model: "fake",
+        role: "assistant",
+        content: { type: "image", data: "…", mimeType: "image/png" },
+      }),
+      calls: [],
+    };
+    port.attach(fakePeer(peer), stillCeo());
+    expect((await port.ask("도표")).reasonCode).toBe(ReasonCode.CEO_CONVERSATION_NOT_TEXT);
+
+    const next = await port.ask("그러면 글로");
+
+    expect(next.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_OUTCOME_UNKNOWN);
+    expect(next.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_BUSY);
+    // Reached the peer, which is the observation. A reason code that merely differs would also
+    // be produced by a refusal for some third reason.
+    expect(peer.calls).toEqual(["도표", "그러면 글로"]);
+  });
+
   it("keeps the newer connection when the replaced one closes late", async () => {
     // A reconnecting CEO can leave its old socket closing after the new one is attached. An
     // unguarded detach would clear the live peer and answer the owner CEO_CONVERSATION_UNAVAILABLE
@@ -309,23 +339,70 @@ describe("one turn at a time on the CEO's canonical session", () => {
     expect(second.allowed).toBe(true);
   });
 
-  it("takes the next turn after one that timed out, rather than locking the owner out", async () => {
-    // A timed-out turn is over as far as this port is concerned — it has stopped waiting. The
-    // runtime may still have work behind it, which is #632's problem and is not solved by
-    // refusing every later turn.
-    const port = new CeoConversationPort({ budgetMs: 5, peerReplyTimeoutMs: 1 });
-    const failing: FakePeer = {
+  it("does not take a second turn after one whose outcome is unknown", async () => {
+    // The counterexample a CEO exact-head review returned against the first version of this
+    // guard, which cleared a boolean in a `finally` on every exit including the timeout:
+    //
+    //     ask #1 hits the daemon's budget → returns TIMEOUT → the flag is cleared
+    //     the reply command it spawned is still writing the canonical session
+    //     ask #2 is admitted → same peer, same session → the interleaving this prevents
+    //
+    // A measured turn is 3m15s against a 120s inner deadline, so this is not a rare race. The
+    // old test asserted the second turn *was* accepted, which codified the unsafe behaviour.
+    //
+    // The peer here is the shape that matters: the first call rejects while its downstream work
+    // is still outstanding, which is exactly what a timeout is.
+    let downstreamStillRunning!: (text: string) => void;
+    const outstanding = new Promise<unknown>((resolve) => {
+      downstreamStillRunning = (text: string) =>
+        resolve({ model: "fake", role: "assistant", content: { type: "text", text } });
+    });
+    let call = 0;
+    const peer: FakePeer = {
       capabilities: { sampling: {} },
-      answer: async () => {
-        throw new Error("no answer");
+      answer: () => {
+        call += 1;
+        // Call 1 rejects — the caller's deadline — while `outstanding` stays live, standing for
+        // the reply command that has not finished writing.
+        return call === 1 ? Promise.reject(new Error("budget expired")) : outstanding;
       },
       calls: [],
     };
-    port.attach(fakePeer(failing), stillCeo());
+    const port = new CeoConversationPort({ budgetMs: 5, peerReplyTimeoutMs: 1 });
+    port.attach(fakePeer(peer), stillCeo());
 
     expect((await port.ask("첫 번째")).reasonCode).toBe(ReasonCode.CEO_CONVERSATION_TIMEOUT);
-    const second = await port.ask("두 번째");
 
-    expect(second.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_BUSY);
+    // Started, not awaited. A guard that lets the second turn through reaches a peer whose
+    // answer never arrives, so awaiting it would hang until the runner's own timeout and the
+    // failure would take a minute to say something a single tick already knows.
+    //
+    // The peer contact is also the stronger assertion: it observes the thing that corrupts the
+    // transcript, rather than the return value of the call that would have caused it.
+    const second = port.ask("두 번째");
+    await Promise.resolve();
+
+    expect(peer.calls, "the refused turn must not have reached the session").toEqual(["첫 번째"]);
+    const answered = await second;
+    expect(answered.allowed).toBe(false);
+    expect(answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_OUTCOME_UNKNOWN);
+
+    downstreamStillRunning("late");
   });
-});
+
+  it("tells an unknown outcome apart from a turn that is merely in flight", async () => {
+    // A busy session stops being busy; this one does not, without someone establishing what
+    // happened. One code for both would put the second behind advice written for the first.
+    const port = new CeoConversationPort();
+    const { peer, server, release } = heldPeer();
+    port.attach(server, stillCeo());
+
+    const first = port.ask("첫 번째");
+    const busy = await port.ask("두 번째");
+
+    expect(busy.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_BUSY);
+    expect(peer.calls).toEqual(["첫 번째"]);
+
+    release("답");
+    await first;
+  });});

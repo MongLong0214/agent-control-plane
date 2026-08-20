@@ -1278,6 +1278,12 @@ export const ceoUnavailableSentence = (reasonCode: string): string => {
     // see which happened (#633), so it says what it knows and lets the owner look.
     return "The CEO session did not answer in time. It may have written part of an answer to the conversation already — check there before asking again.";
   }
+  if (reasonCode === ReasonCode.CEO_CONVERSATION_OUTCOME_UNKNOWN) {
+    // Apart from BUSY on purpose. A busy session stops being busy on its own; this one does not.
+    // Saying "try shortly" here would send the owner back every few minutes to a state that
+    // cannot change without someone establishing what happened to the earlier turn.
+    return "An earlier message on this chat is still unresolved — its turn may or may not have reached the conversation — so this one was not started. It needs to be settled before the next turn runs.";
+  }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_BUSY) {
     return "The CEO is still working on the previous message. This one was not started, so send it again once the answer arrives.";
   }

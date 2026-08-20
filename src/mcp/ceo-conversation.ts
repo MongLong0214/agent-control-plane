@@ -69,18 +69,38 @@ interface LivePeer {
 export class CeoConversationPort {
   #live: LivePeer | null = null;
   /**
-   * Whether a turn is already open on the CEO's canonical session.
+   * What is known about the last turn on the CEO's canonical conversation.
    *
-   * Nothing downstream enforces this. The runtime fires its reply command with `void` and keeps
-   * no queue, so two overlapping turns both reach `hermes chat --resume <same id>` and
-   * interleave in a transcript the CEO then carries forward as context. That cannot be unwound
+   * Nothing downstream enforces one-at-a-time. The runtime fires its reply command with `void`
+   * and keeps no queue, so two overlapping turns both reach `hermes chat --resume <same id>` and
+   * interleave in a transcript the CEO then carries forward as context. That cannot be unwound,
    * and the CEO cannot tell it happened.
    *
-   * Today the property holds anyway, because `TelegramLongPoller.pollOnce` awaits each update in
-   * turn — the stack frame is the mutex. #630 removes that await, so the invariant is made
-   * explicit here first, while it is still true, rather than after it stops being true.
+   * "Conversation" rather than "session" throughout, because the two systems spell it
+   * differently and the difference is load-bearing here: an ACP session is replaceable by
+   * failover, while the transcript being protected survives that replacement. A terminology
+   * check caught this on the version below and it is the right correction — what must not
+   * interleave is the conversation, whichever session is currently serving it.
+   *
+   * This was a boolean, cleared in a `finally` on every exit including the timeout. A CEO review
+   * of that version returned a blocking counterexample, and it is the whole reason this is three
+   * states rather than two:
+   *
+   *     ask #1 hits the daemon's budget → returns TIMEOUT → finally clears the flag
+   *     the reply command it spawned is still writing the canonical conversation
+   *     ask #2 is admitted → same peer, same canonical conversation → the interleaving
+   *
+   * A measured turn is 3m15s and the inner deadline is 120s, so that is not a rare race — it is
+   * what an ordinary long turn does. The flag was cleared on the caller giving up, which is a
+   * fact about the caller, not about the turn.
+   *
+   * So a turn is only closed by a positively observed terminal answer. An ambiguous end — a
+   * timeout, a transport rejection — leaves `OUTCOME_UNKNOWN`, and later turns are refused until
+   * something says what happened. Nothing can say that yet (#638), which is why the escape is an
+   * explicit one rather than a timer: the automatic path fails closed and the owner keeps a way
+   * through (#641).
    */
-  #inFlight = false;
+  #turn: "IDLE" | "IN_FLIGHT" | "OUTCOME_UNKNOWN" = "IDLE";
   readonly #budgetMs: number;
   readonly #maxTokens: number;
 
@@ -125,14 +145,22 @@ export class CeoConversationPort {
       );
     }
 
-    if (this.#inFlight) {
+    if (this.#turn !== "IDLE") {
       // Refused rather than queued. A queue here would hold the caller for the length of a turn,
       // which is the stall this port is being taken out of the poll loop to remove — and the
       // ordering a queue would impose is #631's to own, where the update is durable. Refusing
       // says the true thing now: this turn did not start.
+      //
+      // The two non-idle states are reported apart because the reader's next move differs. A
+      // turn in flight will end; a turn whose outcome is unknown will not, without someone
+      // looking. Folding them together would put the second behind advice written for the first.
       return deny(
-        ReasonCode.CEO_CONVERSATION_BUSY,
-        "a turn is already open on the CEO's canonical session",
+        this.#turn === "IN_FLIGHT"
+          ? ReasonCode.CEO_CONVERSATION_BUSY
+          : ReasonCode.CEO_CONVERSATION_OUTCOME_UNKNOWN,
+        this.#turn === "IN_FLIGHT"
+          ? "a turn is already open on the CEO's canonical conversation"
+          : "the previous turn on this session ended without a known outcome",
         {},
       );
     }
@@ -162,7 +190,7 @@ export class CeoConversationPort {
     let result: Awaited<ReturnType<McpServer["server"]["createMessage"]>>;
     // Set here rather than at the top: everything above refuses without reaching the session, so
     // marking those as a turn would lock the CEO out on a failure that never touched it.
-    this.#inFlight = true;
+    this.#turn = "IN_FLIGHT";
     try {
       result = await server.server.createMessage(
         {
@@ -174,23 +202,29 @@ export class CeoConversationPort {
     } catch (error) {
       // The peer's own message is not repeated into the chat: it is written by the CEO
       // runtime and may quote whatever it was handling when it failed.
+
+      // Not cleared to IDLE. The caller has stopped waiting, which says nothing about whether
+      // the reply command stopped writing — and the version this replaces cleared here, which
+      // is precisely how a second turn reached the same canonical conversation while the first
+      // was still writing to it.
+      this.#turn = "OUTCOME_UNKNOWN";
       return deny(
         ReasonCode.CEO_CONVERSATION_TIMEOUT,
         "the CEO peer did not answer within the conversation budget",
         { budgetMs: this.#budgetMs, error: error instanceof Error ? error.name : "unknown" },
       );
-    } finally {
-      // Cleared on every exit, including the timeout. A turn that timed out is over as far as
-      // this port is concerned — it has stopped waiting, and holding the flag would lock the
-      // owner out of their CEO permanently after one slow turn.
-      //
-      // The runtime may still have work running behind it; that is #632's problem, and it is
-      // not solved by refusing every later turn.
-      this.#inFlight = false;
     }
+
+    // The turn is closed here and nowhere else: `createMessage` resolved, which is the peer
+    // saying this turn produced an answer. Everything else — a timeout, a rejection, the caller
+    // walking away — is the absence of that statement, not a weaker version of it.
+    this.#turn = "IDLE";
 
     const content = result.content;
     if (!isTextContent(content)) {
+      // Still IDLE. The peer answered and the turn is over; this route cannot *deliver* what it
+      // answered, which is a fact about the transport, not about whether the conversation was
+      // written.
       return deny(
         ReasonCode.CEO_CONVERSATION_NOT_TEXT,
         "the CEO peer answered with content this text-only route cannot deliver",

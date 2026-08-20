@@ -249,6 +249,15 @@ export const ReasonCode = {
    * transcript that is then carried forward as context, and that cannot be unwound.
    */
   CEO_CONVERSATION_BUSY: "CEO_CONVERSATION_BUSY",
+  /**
+   * The previous turn on this session ended without a known outcome, so this one was not started.
+   *
+   * Deliberately not `CEO_CONVERSATION_BUSY`. A busy session will stop being busy; this one will
+   * not, without someone establishing what happened to the earlier turn. Reporting them with one
+   * code puts the second behind advice written for the first — "try shortly" is true of a turn
+   * in flight and false here.
+   */
+  CEO_CONVERSATION_OUTCOME_UNKNOWN: "CEO_CONVERSATION_OUTCOME_UNKNOWN",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",
