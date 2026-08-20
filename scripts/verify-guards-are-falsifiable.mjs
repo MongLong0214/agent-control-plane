@@ -336,8 +336,43 @@ if (dirty.length > 0) {
 }
 
 const originals = new Map(files.map((f) => [f, readFileSync(join(ROOT, f), "utf8")]));
+/**
+ * Refuses to write over a file that is not in the state this harness left it in.
+ *
+ * Every write here is "put back what I know is there". When that is false, the write is not a
+ * restore — it is an overwrite of whatever the other writer did, and it is invisible because
+ * the harness goes on to report success.
+ */
+const ours = (path, expected, file, when) => {
+  let actual;
+  try {
+    actual = readFileSync(path, "utf8");
+  } catch (error) {
+    fail(`${file} disappeared ${when}: ${error.message}`);
+  }
+  if (actual !== expected) {
+    fail(
+      `${file} changed underneath this run — refusing to overwrite it ${when}.\n` +
+        "  Something else edited it after the harness snapshotted it at startup. Writing the\n" +
+        "  snapshot back would destroy that edit. Nothing has been restored past this point;\n" +
+        "  check `git diff` before re-running.",
+    );
+  }
+};
+
+const fail = (message) => {
+  out(`verify-guards-are-falsifiable: ${message}\n`);
+  process.exit(1);
+};
+
 const restore = () => {
-  for (const [file, text] of originals) writeFileSync(join(ROOT, file), text);
+  for (const [file, text] of originals) {
+    // Not `ours`: at this point the file is legitimately either mutated or already restored,
+    // so there is no single expected value. Writing the snapshot is right unless the content is
+    // neither — but distinguishing that needs the per-row expectation, which the loop above has
+    // and this does not. The loop is where the check belongs; this is the crash path.
+    writeFileSync(join(ROOT, file), text);
+  }
 };
 let restored = false;
 const restoreOnce = () => {
@@ -396,13 +431,23 @@ try {
     if (failures.some((f) => f.guard === guard)) continue;
     const path = join(ROOT, guard.file);
     const original = originals.get(guard.file);
-    writeFileSync(path, original.replace(guard.find, guard.replace));
+    // The snapshot was taken at startup, and a write from here is a write of that startup
+    // content. If someone edited the file since — the run takes minutes, and the natural thing
+    // to do while waiting is keep working — restoring the snapshot silently destroys their
+    // edit. That happened on 2026-08-20, on a run that exited 0.
+    //
+    // So each write checks that the file is still where this harness left it. The startup guard
+    // cannot cover this: it looks once, and what it establishes is only true at that instant.
+    ours(path, original, guard.file, "before mutating");
+    const mutated = original.replace(guard.find, guard.replace);
+    writeFileSync(path, mutated);
     const done = spawnSync(VITEST, ["run", ...guard.killedBy, "--reporter=dot"], {
       cwd: ROOT,
       encoding: "utf8",
       env: { ...process.env, CI: "" },
       timeout: 600_000,
     });
+    ours(path, mutated, guard.file, "before restoring");
     writeFileSync(path, original);
     const killed = done.status !== 0;
     out(`${killed ? "  killed " : "  SURVIVED"}  ${guard.file}  ${guard.what}`);
