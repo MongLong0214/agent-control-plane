@@ -1,5 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
+import {
+  CEO_CONVERSATION_BUDGET_MS,
+  CEO_REPLY_TIMEOUT_MS,
+  assertOuterOutlastsInner,
+} from "../contracts/ceo-turn-budget.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { McpPeerAuthenticator } from "./shared.ts";
@@ -11,8 +16,13 @@ import type { McpPeerAuthenticator } from "./shared.ts";
  * ordinary message can stall the next one. A CEO that is genuinely thinking for longer than
  * this is not a state the chat should hide: the owner gets a timeout they can retry, rather
  * than silence.
+ *
+ * It is no longer written down here. This deadline contains the runtime's own reply timeout,
+ * and as two independent constants they were ordered backwards — 60s out, 120s in — so the
+ * daemon gave up while the runtime was still waiting. See `contracts/ceo-turn-budget.ts`, which
+ * also records why neither number is yet sized against a measured turn.
  */
-export const DEFAULT_CEO_CONVERSATION_BUDGET_MS = 60_000;
+export const DEFAULT_CEO_CONVERSATION_BUDGET_MS = CEO_CONVERSATION_BUDGET_MS;
 
 /**
  * A Telegram message is capped at 4096 characters, so a longer completion cannot be delivered
@@ -24,6 +34,14 @@ export const DEFAULT_CEO_CONVERSATION_MAX_TOKENS = 1024;
 export interface CeoConversationOptions {
   budgetMs?: number;
   maxTokens?: number;
+  /**
+   * The deadline the peer runtime applies to its own reply source, when it is not the default.
+   *
+   * The port cannot observe it — the runtime is a separate process — so a caller that shortens
+   * one side has to say so, or the check below is comparing against a number the peer stopped
+   * using.
+   */
+  peerReplyTimeoutMs?: number;
 }
 
 /**
@@ -56,6 +74,11 @@ export class CeoConversationPort {
   constructor(options: CeoConversationOptions = {}) {
     this.#budgetMs = options.budgetMs ?? DEFAULT_CEO_CONVERSATION_BUDGET_MS;
     this.#maxTokens = options.maxTokens ?? DEFAULT_CEO_CONVERSATION_MAX_TOKENS;
+    // Checked here rather than only at the constants, because the defaults are the one case
+    // that cannot go wrong — they are derived. An override is where the inversion comes back,
+    // and a deployment that shortens the budget would otherwise fail as an unexplained timeout
+    // on every turn.
+    assertOuterOutlastsInner(this.#budgetMs, options.peerReplyTimeoutMs ?? CEO_REPLY_TIMEOUT_MS);
   }
 
   /**

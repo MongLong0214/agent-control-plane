@@ -49,6 +49,12 @@ import { createHmac, randomBytes } from "node:crypto";
 import { chmodSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 
+import {
+  CEO_CONVERSATION_BUDGET_MS,
+  CEO_REPLY_TIMEOUT_MS,
+  assertOuterOutlastsInner,
+} from "../contracts/ceo-turn-budget.ts";
+
 /**
  * Named once so the two ways of omitting it — no flag, or the flag with nothing after it —
  * answer identically. They are the same operator mistake.
@@ -64,8 +70,14 @@ const REPLY_COMMAND_REQUIRED =
   "remember the owner's previous message. `-z` cannot be pinned: Hermes declares that path\n" +
   "stateless and it ignores --resume. `chat` is the entry point that resumes.\n";
 
-/** How long the reply source may take before the owner is told nobody answered. */
-const DEFAULT_REPLY_TIMEOUT_MS = 120_000;
+/**
+ * How long the reply source may take before the owner is told nobody answered.
+ *
+ * Shared with the daemon's side of the same turn, because the daemon's budget has to outlast
+ * this one — as two independent constants they were ordered backwards. See
+ * `contracts/ceo-turn-budget.ts`.
+ */
+const DEFAULT_REPLY_TIMEOUT_MS = CEO_REPLY_TIMEOUT_MS;
 /** A closed MCP socket is usually a daemon restart, so the runtime waits and reattaches. */
 const RECONNECT_DELAY_MS = 2_000;
 
@@ -296,6 +308,11 @@ export interface ServeOptions {
  */
 export const serve = async (session: CeoSession, options: ServeOptions): Promise<void> => {
   const replyTimeoutMs = options.replyTimeoutMs ?? DEFAULT_REPLY_TIMEOUT_MS;
+  // The daemon asserts the same relationship on its side, but from there it cannot see this
+  // number — it compares against the shared constant and trusts that this process still uses
+  // it. Raising the inner timeout here would invert the live pair while the daemon's check
+  // stayed green, which is the two-file divergence the contract was written to end.
+  assertOuterOutlastsInner(CEO_CONVERSATION_BUDGET_MS, replyTimeoutMs);
   const clientName = options.clientName ?? "hermes-ceo";
   let tools: { close(): void } | null = null;
   for (let attempt = 1; ; attempt += 1) {
