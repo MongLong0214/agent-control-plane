@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { createConnection } from "node:net";
 
-import { handshake, promptFrom, serve } from "../../src/runtime/hermes-ceo.ts";
+import { handshake, main, promptFrom, serve } from "../../src/runtime/hermes-ceo.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -290,5 +290,60 @@ describe("the tool socket Hermes reaches ACP through", () => {
     // A method this bridge does not understand is one ACP never agreed to receive on the CEO's
     // authenticated connection.
     expect(upstream.some((v) => v["method"] === "resources/read")).toBe(false);
+  });
+});
+
+describe("the reply source the runtime is started with", () => {
+  /**
+   * The runtime used to default to `hermes -z`, and that default is why this test exists.
+   *
+   * `-z` is a one-shot: every owner turn spawned a new Hermes with no history, so the CEO could
+   * not remember the previous message. It answered, so nothing looked broken — the session store
+   * is where it showed, as a row of abandoned conversations beside the one real one.
+   *
+   * Nothing downstream can catch this. A bound-but-amnesiac CEO reports as bound, and `doctor`
+   * has no finding for it. The only place it can be refused is before the runtime starts.
+   */
+  const stderrOf = async (argv: readonly string[]): Promise<{ code: number; text: string }> => {
+    let text = "";
+    const original = process.stderr.write.bind(process.stderr);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (process.stderr as any).write = (chunk: any): boolean => {
+      text += String(chunk);
+      return true;
+    };
+    try {
+      return { code: await main(argv), text };
+    } finally {
+      process.stderr.write = original;
+    }
+  };
+
+  it("refuses to start when no reply command is named", async () => {
+    // Not `toBeGreaterThan(0)`: the old default made this path return 0-and-run, so an
+    // assertion that merely wanted a nonzero code would have been satisfied by a crash later
+    // for an unrelated reason.
+    const { code, text } = await stderrOf(["--tool-socket", "/tmp/does-not-matter.sock"]);
+
+    expect(code).toBe(2);
+    expect(text).toContain("--reply-command is required");
+  });
+
+  it("refuses the flag with nothing after it, the same way", async () => {
+    const { code, text } = await stderrOf(["--reply-command"]);
+
+    expect(code).toBe(2);
+    expect(text).toContain("--reply-command is required");
+  });
+
+  it("says how to pin the session, because 'required' alone is satisfied by the broken form", async () => {
+    // An operator who reads only "--reply-command is required" supplies `hermes -z` — the exact
+    // command that was wrong — and the refusal has taught them nothing. The message has to carry
+    // the pinned shape, with `-z` last so the appended prompt lands on `-z` and not on
+    // `--resume`.
+    const { text } = await stderrOf([]);
+
+    expect(text).toContain("--resume");
+    expect(text.indexOf("-z")).toBeGreaterThan(text.indexOf("--resume"));
   });
 });

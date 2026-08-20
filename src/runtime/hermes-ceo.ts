@@ -21,8 +21,18 @@
  * **The owner's turn arrives as `sampling/createMessage`, and the answer has to come from
  * somewhere real.** Declaring the capability and then replying with a canned string is worse
  * than not declaring it — the owner gets an answer nobody wrote. So the reply source is a
- * command this runtime runs, and the deployment says what it is: `--reply-command hermes -z`
- * makes Hermes the CEO, which is the point of the whole path.
+ * command this runtime runs, and the deployment says what it is.
+ *
+ * **That command has to name a session.** `--reply-command hermes -z` was the documented
+ * deployment and it is wrong: `-z` starts a fresh Hermes per invocation, so turn two reaches a
+ * process that never saw turn one. It does make Hermes answer, which is why it read as correct;
+ * what it does not make is *the same* Hermes. The pinned form is
+ *
+ *     --reply-command hermes --resume <session-id> -z
+ *
+ * and the session id is the owner's existing conversation, not a new one. This is the same rule
+ * `SSOT.md:99` states for Buzz — a surface reaches the CEO by delivering a turn into the
+ * canonical session, never by starting a second one to answer for it.
  *
  * The session secret stays in memory for the life of this process. It is never written to a
  * file, an argument, an environment variable a child inherits, or a log line.
@@ -31,6 +41,20 @@ import { spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { chmodSync, rmSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+
+/**
+ * Named once so the two ways of omitting it — no flag, or the flag with nothing after it —
+ * answer identically. They are the same operator mistake.
+ *
+ * The example is spelled with `-z` last on purpose: `askReplySource` appends the prompt to the
+ * end of the line, so a command ending in `--resume` would receive the prompt as the session id
+ * and the real prompt would never be asked.
+ */
+const REPLY_COMMAND_REQUIRED =
+  "--reply-command is required, and it has to name a session-pinned reply source:\n" +
+  "  --reply-command hermes --resume <session-id> -z\n" +
+  "An unpinned command (`hermes -z`) starts a new conversation on every turn, so the CEO\n" +
+  "would not remember the owner's previous message.\n";
 
 /** How long the reply source may take before the owner is told nobody answered. */
 const DEFAULT_REPLY_TIMEOUT_MS = 120_000;
@@ -342,10 +366,23 @@ export const main = async (argv: readonly string[]): Promise<number> => {
   const replyAt = argv.indexOf("--reply-command");
   // `--reply-command` takes the rest of the line, so anything after it would be swallowed as
   // arguments to the reply source. The other flags are read from the part before it.
-  const replyCommand = replyAt === -1 ? ["hermes", "-z"] : argv.slice(replyAt + 1);
-  const flags = replyAt === -1 ? [...argv] : argv.slice(0, replyAt);
+  //
+  // There is deliberately no default. It used to be `hermes -z`, which starts a *fresh* Hermes
+  // for every turn: the owner's second message reaches something that never saw the first. The
+  // damage is visible in the session store — eleven days of one-shot spawns left a row of
+  // abandoned sessions beside the one real conversation.
+  //
+  // A CEO that answers from a new stranger each turn is worse than an unbound role, because
+  // `doctor` reports CEO_ROLE_UNBOUND for the unbound one and nothing at all for this one. So
+  // the operator has to name the session, and the runtime will not guess it.
+  if (replyAt === -1) {
+    process.stderr.write(REPLY_COMMAND_REQUIRED);
+    return 2;
+  }
+  const replyCommand = argv.slice(replyAt + 1);
+  const flags = argv.slice(0, replyAt);
   if (replyCommand.length === 0) {
-    process.stderr.write("--reply-command needs a command to run\n");
+    process.stderr.write(REPLY_COMMAND_REQUIRED);
     return 2;
   }
   const toolAt = flags.indexOf("--tool-socket");
