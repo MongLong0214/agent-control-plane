@@ -1259,7 +1259,12 @@ const answerAsCeo = async (port: CeoConversationPort, text: string): Promise<str
   return `${ceoUnavailableSentence(answered.reasonCode)} (${answered.reasonCode})`;
 };
 
-const ceoUnavailableSentence = (reasonCode: string): string => {
+/**
+ * Exported for test: these sentences are the only thing the owner sees when the CEO route
+ * refuses, and one of them used to assert something this seam cannot observe. A sentence with no
+ * test is a sentence that drifts back.
+ */
+export const ceoUnavailableSentence = (reasonCode: string): string => {
   if (reasonCode === ReasonCode.CEO_CONVERSATION_UNAVAILABLE) {
     return "No CEO session is connected right now, so there is nobody to answer this. Commands and owner decisions still work.";
   }
@@ -1267,7 +1272,21 @@ const ceoUnavailableSentence = (reasonCode: string): string => {
     return "The connected CEO session cannot hold a conversation over this route — it did not offer sampling at handshake.";
   }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_TIMEOUT) {
-    return "The CEO session did not answer in time. Nothing was lost; ask again.";
+    // Not "Nothing was lost". The reply command resumes the owner's own conversation, so by the
+    // time this deadline passes the CEO may already have written part of an answer into it —
+    // and "ask again" then continues on top of that rather than starting over. This seam cannot
+    // see which happened (#633), so it says what it knows and lets the owner look.
+    return "The CEO session did not answer in time. It may have written part of an answer to the conversation already — check there before asking again.";
+  }
+  if (reasonCode === ReasonCode.CEO_CONVERSATION_BUSY) {
+    return "The CEO is still working on the previous message. This one was not started, so send it again once the answer arrives.";
+  }
+  if (reasonCode === ReasonCode.CEO_CONVERSATION_STALE) {
+    // This used to fall through to the sentence below, which says the CEO answered. It did not:
+    // `ask` refuses a superseded socket before speaking to it at all, and the existing port test
+    // asserts the peer received nothing. The owner was being told about an answer that was never
+    // requested, on the one occasion when the identity of who answers had just changed.
+    return "The CEO role moved to a new session, and the one this route was holding is no longer it. Nothing was asked of either; send the message again.";
   }
   return "The CEO session answered with something this route cannot deliver as a message.";
 };

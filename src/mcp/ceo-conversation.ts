@@ -68,6 +68,19 @@ interface LivePeer {
 
 export class CeoConversationPort {
   #live: LivePeer | null = null;
+  /**
+   * Whether a turn is already open on the CEO's canonical session.
+   *
+   * Nothing downstream enforces this. The runtime fires its reply command with `void` and keeps
+   * no queue, so two overlapping turns both reach `hermes chat --resume <same id>` and
+   * interleave in a transcript the CEO then carries forward as context. That cannot be unwound
+   * and the CEO cannot tell it happened.
+   *
+   * Today the property holds anyway, because `TelegramLongPoller.pollOnce` awaits each update in
+   * turn — the stack frame is the mutex. #630 removes that await, so the invariant is made
+   * explicit here first, while it is still true, rather than after it stops being true.
+   */
+  #inFlight = false;
   readonly #budgetMs: number;
   readonly #maxTokens: number;
 
@@ -112,6 +125,18 @@ export class CeoConversationPort {
       );
     }
 
+    if (this.#inFlight) {
+      // Refused rather than queued. A queue here would hold the caller for the length of a turn,
+      // which is the stall this port is being taken out of the poll loop to remove — and the
+      // ordering a queue would impose is #631's to own, where the update is durable. Refusing
+      // says the true thing now: this turn did not start.
+      return deny(
+        ReasonCode.CEO_CONVERSATION_BUSY,
+        "a turn is already open on the CEO's canonical session",
+        {},
+      );
+    }
+
     // The same check an inbound tool call makes, before anything is sent outbound. A socket
     // admitted under a superseded binding generation is a former CEO, and the owner's
     // conversation is not its to receive.
@@ -135,6 +160,9 @@ export class CeoConversationPort {
     }
 
     let result: Awaited<ReturnType<McpServer["server"]["createMessage"]>>;
+    // Set here rather than at the top: everything above refuses without reaching the session, so
+    // marking those as a turn would lock the CEO out on a failure that never touched it.
+    this.#inFlight = true;
     try {
       result = await server.server.createMessage(
         {
@@ -151,6 +179,14 @@ export class CeoConversationPort {
         "the CEO peer did not answer within the conversation budget",
         { budgetMs: this.#budgetMs, error: error instanceof Error ? error.name : "unknown" },
       );
+    } finally {
+      // Cleared on every exit, including the timeout. A turn that timed out is over as far as
+      // this port is concerned — it has stopped waiting, and holding the flag would lock the
+      // owner out of their CEO permanently after one slow turn.
+      //
+      // The runtime may still have work running behind it; that is #632's problem, and it is
+      // not solved by refusing every later turn.
+      this.#inFlight = false;
     }
 
     const content = result.content;
