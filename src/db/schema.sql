@@ -1270,39 +1270,149 @@ CREATE TABLE IF NOT EXISTS continuity_state (
 );
 
 
--- canonical_turns  (one outstanding turn per conversation, separate from the message that
--- started it)
+-- The canonical-turn ledger
 --
--- A turn used to live in `inbound_messages.result_json`. That row is the *source* message's
--- replay and reply-delivery record; a turn is a fact about the *target* conversation. Sharing a
--- field made the second a casualty of the first — reserving the outbound reply replaces the
--- whole document and erased the claim, so the protection covered a crash and not an ordinary
--- timeout.
+-- Four tables, because four different facts were being asked of one:
 --
--- A row is created before the reply command runs and is never cleared by a timeout, a rejection
--- or a restart. Only a positively observed terminal outcome settles it; anything else leaves it
--- IN_DOUBT, which is a state a person or a reconciler resolves, not a timer.
-CREATE TABLE IF NOT EXISTS canonical_turns (
-  turn_request_id            TEXT PRIMARY KEY,
-  -- The serialisation key. Today the composition root has no resolved canonical id to give and
-  -- passes the source conversation's digest; the column is named for what it must become
-  -- because that is what the table is for.
-  target_conversation_digest TEXT NOT NULL,
-  source_channel             TEXT NOT NULL,
-  source_nonce               TEXT NOT NULL,
-  -- Not identity: the case it exists to refuse is the same id arriving with a different intent.
-  prompt_digest              TEXT NOT NULL,
-  -- Evidence for matching a receipt, never a partition key — two failover generations write the
-  -- same transcript, and splitting them reopens the overlap this table prevents.
-  binding_generation         INTEGER,
-  state                      TEXT NOT NULL CHECK (state IN ('IN_DOUBT', 'COMPLETED')),
-  claimed_at                 TEXT NOT NULL,
-  settled_at                 TEXT,
-  CHECK ((state = 'COMPLETED') = (settled_at IS NOT NULL))
+--   actor_target_bindings       which Hermes conversation an ACP actor owns. Lifetime bijection.
+--   actor_target_attestations   the authenticated proof of that binding, per runtime generation.
+--   canonical_turns             one outstanding turn per actor, and how it ended.
+--   canonical_turn_sources      which inbound messages a turn consumed, and the retry chain.
+--
+-- The shape this replaces put a digest of the *source* conversation in a column named for the
+-- target, kept turn state in the row that also tracks the source message's reply delivery, and
+-- permitted two outstanding turns on one conversation. Each was a different fact wearing another
+-- one's name.
+--
+-- Nothing writes any of this before the target protocol exists, and that is structural rather
+-- than a matter of discipline: a turn requires a binding and an attestation, and only an
+-- authenticated preflight bind can produce them. Admission fails closed at the schema.
+
+-- Seeded and immutable, so a new executor cannot be introduced by writing a string.
+CREATE TABLE IF NOT EXISTS executor_kinds (
+  executor_kind TEXT PRIMARY KEY
+);
+INSERT OR IGNORE INTO executor_kinds (executor_kind) VALUES ('hermes');
+
+CREATE TABLE IF NOT EXISTS actor_target_bindings (
+  target_binding_id     TEXT PRIMARY KEY,
+  target_actor_id       TEXT NOT NULL REFERENCES conversational_actors(actor_id),
+  executor_kind         TEXT NOT NULL REFERENCES executor_kinds(executor_kind),
+  -- What the target itself accepts as a lookup handle. Not parsed from a command line, not
+  -- echoed by the runtime, not typed twice by an operator — supplied by an authenticated
+  -- preflight bind, because every other route is a claim rather than a proof.
+  target_locator        TEXT NOT NULL,
+  -- For comparison, logging and uniqueness. A digest cannot serve as a lookup handle; keeping
+  -- both means neither has to do the other's job.
+  target_locator_digest TEXT NOT NULL,
+  bound_at              TEXT NOT NULL,
+  -- Lifetime, not active-only. An active-only constraint would let a retired actor's target be
+  -- rebound to a fresh actor, which is exactly the alias a re-bootstrap produces today.
+  UNIQUE (target_actor_id),
+  UNIQUE (executor_kind, target_locator_digest),
+  -- Referenced as a pair by canonical_turns, so a turn cannot cite a binding that belongs to a
+  -- different actor.
+  UNIQUE (target_binding_id, target_actor_id)
 );
 
-CREATE INDEX IF NOT EXISTS canonical_turns_target ON canonical_turns(target_conversation_digest, state);
-CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_source ON canonical_turns(source_channel, source_nonce);
+-- Append-only. A binding is the actor's lifetime target; an attestation is the evidence that a
+-- particular runtime, under a particular authority generation, verified it.
+CREATE TABLE IF NOT EXISTS actor_target_attestations (
+  target_attestation_id         TEXT PRIMARY KEY,
+  target_binding_id             TEXT NOT NULL REFERENCES actor_target_bindings(target_binding_id),
+  protocol_version              TEXT NOT NULL,
+  attestation_digest            TEXT NOT NULL,
+  executor_session_id           TEXT NOT NULL,
+  executor_session_incarnation  TEXT NOT NULL,
+  binding_generation            INTEGER NOT NULL,
+  attested_at                   TEXT NOT NULL,
+  UNIQUE (target_binding_id, attestation_digest),
+  UNIQUE (target_attestation_id, target_binding_id)
+);
+
+-- Seeded vocabularies. Adding an outcome later must not rebuild canonical_turns, which is the
+-- cost this schema is being written to pay exactly once.
+CREATE TABLE IF NOT EXISTS turn_outcome_kinds (
+  outcome_kind TEXT PRIMARY KEY
+);
+INSERT OR IGNORE INTO turn_outcome_kinds (outcome_kind) VALUES
+  -- A terminal commit the target proved. Not "the answer was good".
+  ('COMPLETED'),
+  -- Typed pre-dispatch evidence that execution never started.
+  ('NEVER_ADMITTED'),
+  -- The target proved a stale execution can no longer append, run a tool, or commit.
+  ('ABORTED');
+
+CREATE TABLE IF NOT EXISTS turn_resolution_authorities (
+  resolution_authority TEXT PRIMARY KEY
+);
+INSERT OR IGNORE INTO turn_resolution_authorities (resolution_authority) VALUES
+  ('ACP_PRE_DISPATCH'),
+  ('HERMES_TARGET'),
+  ('OWNER_AFTER_TARGET_FENCE');
+
+CREATE TABLE IF NOT EXISTS canonical_turns (
+  turn_request_id               TEXT PRIMARY KEY,
+  target_actor_id               TEXT NOT NULL,
+  target_binding_id             TEXT NOT NULL,
+  target_attestation_id         TEXT NOT NULL,
+  executor_session_id           TEXT NOT NULL,
+  executor_session_incarnation  TEXT NOT NULL,
+  binding_generation            INTEGER NOT NULL,
+  -- Not identity. The case it refuses is the same id arriving with a different intent.
+  prompt_digest                 TEXT NOT NULL,
+  lifecycle_state               TEXT NOT NULL CHECK (lifecycle_state IN ('IN_DOUBT', 'SETTLED')),
+  outcome_kind                  TEXT REFERENCES turn_outcome_kinds(outcome_kind),
+  settled_at                    TEXT,
+  resolution_authority          TEXT REFERENCES turn_resolution_authorities(resolution_authority),
+  reason_code                   TEXT,
+  evidence_digest               TEXT,
+  audit_event_id                TEXT,
+  -- A relation, not an outcome. A replacement says what was run instead; it does not say the old
+  -- turn ended safely, and an unfenced run-as-new leaves that one IN_DOUBT.
+  replacement_turn_request_id   TEXT REFERENCES canonical_turns(turn_request_id),
+  FOREIGN KEY (target_binding_id, target_actor_id)
+    REFERENCES actor_target_bindings(target_binding_id, target_actor_id),
+  FOREIGN KEY (target_attestation_id, target_binding_id)
+    REFERENCES actor_target_attestations(target_attestation_id, target_binding_id),
+  -- In doubt means nothing is known, so nothing is recorded.
+  CHECK (lifecycle_state <> 'IN_DOUBT' OR (
+    outcome_kind IS NULL AND settled_at IS NULL AND resolution_authority IS NULL
+    AND reason_code IS NULL AND evidence_digest IS NULL AND audit_event_id IS NULL)),
+  -- Settled means all of it is known. A settlement missing its authority or its evidence is a
+  -- verdict with nothing behind it.
+  CHECK (lifecycle_state <> 'SETTLED' OR (
+    outcome_kind IS NOT NULL AND settled_at IS NOT NULL AND resolution_authority IS NOT NULL
+    AND reason_code IS NOT NULL AND evidence_digest IS NOT NULL AND audit_event_id IS NOT NULL))
+);
+
+-- The property the table exists for, enforced by the database rather than by whoever remembers
+-- to check. The shape this replaces named it and did not hold it.
+CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved
+  ON canonical_turns(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT';
+
+-- Which inbound messages a turn consumed. N:1, because consecutive owner messages coalesce into
+-- one turn with their ids and boundaries preserved — three messages are not three turns.
+CREATE TABLE IF NOT EXISTS canonical_turn_sources (
+  turn_request_id              TEXT NOT NULL REFERENCES canonical_turns(turn_request_id),
+  source_channel               TEXT NOT NULL,
+  source_nonce                 TEXT NOT NULL,
+  -- Attempts are numbered and chained, because that is what makes a retry legal. A global unique
+  -- on (channel, nonce) would forbid the second attempt the design requires; "not in two
+  -- unresolved turns" alone would permit silently re-running a message that already completed.
+  source_attempt               INTEGER NOT NULL CHECK (source_attempt > 0),
+  batch_ordinal                INTEGER NOT NULL CHECK (batch_ordinal >= 0),
+  source_digest                TEXT NOT NULL,
+  predecessor_turn_request_id  TEXT REFERENCES canonical_turns(turn_request_id),
+  admission_audit_event_id     TEXT,
+  PRIMARY KEY (source_channel, source_nonce, source_attempt),
+  UNIQUE (turn_request_id, batch_ordinal),
+  UNIQUE (turn_request_id, source_channel, source_nonce),
+  -- The first attempt has no predecessor and every later one does. Which predecessor, and
+  -- whether its outcome permits a retry, is checked in the admission transaction — SQLite cannot
+  -- express "the previous attempt of this same source settled safely" as a constraint.
+  CHECK ((source_attempt = 1) = (predecessor_turn_request_id IS NULL))
+);
 
 INSERT OR IGNORE INTO continuity_state (id, mode, changed_at)
 VALUES (1, 'NORMAL', '1970-01-01T00:00:00.000Z');
