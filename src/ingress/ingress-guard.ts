@@ -342,23 +342,34 @@ export class IngressGuard {
    *
    * So the handler is claimed before it runs, and a claimed message is not recoverable. A crash
    * after the claim leaves the outcome genuinely unknown — the turn may or may not have reached
-   * the session — and the honest response to that is to stop, not to guess. The owner can ask
-   * again; a duplicated turn cannot be taken back.
+   * the session — and the honest response to that is to stop, not to guess.
+   *
+   * This comment used to end "the owner can ask again", offered as the reason stopping was
+   * cheap. It is not: a resend is a new update with a new nonce and a new turn id, so nothing
+   * here treats it as the same turn and the transcript gets the exchange twice — the case this
+   * whole mechanism exists to prevent. The escape from an unresolved turn has to be an explicit
+   * choice that is recorded as one (#641), not the owner repeating themselves into a second
+   * claim nobody marked as deliberate.
    *
    * The compare-and-set is the point. An unconditional write would let two pollers claim the
    * same message and both proceed, which is the concurrency this exists to refuse — the same
    * reason `recordResultIf` is a transaction rather than a read followed by a write.
    */
-  claimTurn(channel: string, nonce: string): Decision<void> {
+  claimTurn(channel: string, nonce: string, identity: TurnIdentity): Decision<TurnClaim> {
     return this.db.tx(() => {
       const current = this.db.get<{ result_json: string | null }>(
         `SELECT result_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
         [channel, nonce],
       );
       if (current && isClaimable(current.result_json)) {
+        // The identity is written in the same statement as the claim, inside the same
+        // transaction. Recording them separately leaves a window where a crash produces a row
+        // that is claimed but says nothing about what it claimed — a fourth state, and one
+        // nothing can resolve, added to the three this file already distinguishes.
+        const claim: TurnClaim = { deliveryStatus: TURN_CLAIMED, ...identity };
         const updated = this.db.run(
           `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND result_json IS ?`,
-          [JSON.stringify({ deliveryStatus: TURN_CLAIMED }), channel, nonce, current.result_json],
+          [JSON.stringify(claim), channel, nonce, current.result_json],
         );
         // What serialises two claimers is the transaction, not this WHERE clause. `db.tx` runs
         // the read and the write as one unit and SQLite serialises write transactions, so a
@@ -369,7 +380,7 @@ export class IngressGuard {
         // today: replacing it with an unconditional update kills no test, and no test here can
         // kill it, because the interleaving it would catch cannot be produced while `tx` holds.
         // It is a second statement of the same fact, not a second guard.
-        if (updated.changes === 1) return allow(ReasonCode.OK, undefined);
+        if (updated.changes === 1) return allow(ReasonCode.OK, claim);
       }
       if (!current) {
         return deny(ReasonCode.NOT_FOUND, "cannot claim a turn for a message that was never admitted", {
@@ -447,10 +458,29 @@ export class IngressGuard {
   }
 
   private prune(channel: string, ttlMs: number): void {
-    this.db.run(`DELETE FROM inbound_messages WHERE channel = ? AND received_at < ?`, [
-      channel,
-      new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString(),
-    ]);
+    // A claimed turn whose outcome was never recorded is exempt.
+    //
+    // The nonce window exists so a replay of old traffic is refused cheaply, and for an ordinary
+    // row expiry is right: after the TTL, the message is not coming back. A claimed row is not
+    // that. It is the only record that a handler may already have run, and deleting it frees the
+    // nonce — so the fail-closed state this guard establishes would quietly become fail-open
+    // after `nonceTtlMs`, and a replay would execute the turn a second time.
+    //
+    // It also carries the turn identity, which is what a receipt would have to be matched
+    // against. Pruning it leaves nothing to match even if the receipt exists.
+    //
+    // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` in the audit log is
+    // where they are visible.
+    this.db.run(
+      `DELETE FROM inbound_messages
+        WHERE channel = ? AND received_at < ?
+          AND (result_json IS NULL OR json_extract(result_json, '$.deliveryStatus') IS NOT ?)`,
+      [
+        channel,
+        new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString(),
+        TURN_CLAIMED,
+      ],
+    );
   }
 }
 
@@ -476,6 +506,34 @@ export class IngressGuard {
  * being read as either outcome.
  */
 export const TURN_CLAIMED = "TURN_CLAIMED";
+
+/**
+ * What the turn was, fixed at the moment the right to run it is taken.
+ *
+ * A receipt has to be matched against something, and an id alone is not enough. A turn claimed
+ * under one CEO generation and reconciled under the next is a different CEO's work, and
+ * `bindingGeneration` is the fence the rest of this repository already uses for exactly that.
+ *
+ * Nothing reads these yet — the reply command has no argument that would carry the id to Hermes,
+ * and no receipt comes back to compare them with (#638). What can be established now is that the
+ * values survive a restart unchanged, which is the floor the later comparison stands on: a
+ * comparison against an id that drifts fails always, and its failure cannot be told apart from
+ * a missing receipt.
+ */
+export interface TurnIdentity {
+  /** Opaque and stable. Its content carries no meaning; its persistence is the whole point. */
+  turnRequestId: string;
+  /** Which conversation the turn was aimed at. */
+  sessionDigest: string;
+  /** What was asked. */
+  promptDigest: string;
+  /** Which CEO generation asked it. */
+  bindingDigest: string;
+}
+
+export interface TurnClaim extends TurnIdentity {
+  deliveryStatus: typeof TURN_CLAIMED;
+}
 
 /**
  * The states a turn may be claimed from: nothing recorded, or admitted and not yet run.

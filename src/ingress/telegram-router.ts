@@ -164,6 +164,14 @@ export interface TelegramRouterOptions {
   getStoredResponse?: (nonce: string) => TelegramStoredResponse | null;
   /** Durable workflow state used to resume a Telegram update after a process crash. */
   getStoredState?: (nonce: string) => TelegramStoredState | null;
+  /**
+   * The CEO binding generation a turn is being run under, read at claim time.
+   *
+   * Optional, and its absence is recorded as absence rather than as a generation. A default of
+   * zero would put a number in the digest that no binding ever had, and a later receipt would
+   * be compared against it and disagree for a reason nobody could find.
+   */
+  bindingGeneration?: () => number | null;
   /** Fault-injection seam for proving each durable checkpoint is restartable. */
   onInterrupt?: (point: TelegramInterruptPoint, update: TelegramUpdate, runId?: string) => void | Promise<void>;
 }
@@ -294,6 +302,7 @@ export const correlationIdFor = (update: TelegramUpdate): string =>
  */
 export class TelegramHermesRouter {
   private readonly ingress: TelegramIngress;
+  private readonly bindingGeneration: () => number | null;
   private readonly hermes: HermesMcpPort;
   private readonly currentCandidateSnapshotDigest: TelegramRouterOptions["currentCandidateSnapshotDigest"];
   private readonly resolveOwnerPrompt: NonNullable<TelegramRouterOptions["resolveOwnerPrompt"]>;
@@ -317,6 +326,7 @@ export class TelegramHermesRouter {
     this.ownerDecision = options.ownerDecision;
     this.defaultProjectId = options.defaultProjectId ?? null;
     this.directHandler = options.directHandler ?? defaultDirectHandler;
+    this.bindingGeneration = options.bindingGeneration ?? (() => null);
     this.getStoredResponse = options.getStoredResponse ?? (() => null);
     this.getStoredState = options.getStoredState ?? ((nonce) => {
       const stored = this.getStoredResponse(nonce);
@@ -481,7 +491,13 @@ export class TelegramHermesRouter {
         //
         // A failed claim means another poller holds it, or a previous attempt was cut off
         // before recording an outcome. Neither is a case to run it again.
-        const claimed = this.ingress.claimTurn(this.ingress.nonceFor(update));
+        // Fixed here rather than inside the guard: the identity says what *this* turn is, and
+        // only the router knows the text and the binding it is running under. The guard's job is
+        // to store it atomically with the claim, not to invent it.
+        const claimed = this.ingress.claimTurn(
+          this.ingress.nonceFor(update),
+          this.ingress.turnIdentityFor(update, classified.value.text, this.bindingGeneration()),
+        );
         if (!claimed.allowed) {
           return this.outcomeWithReply(
             update,
