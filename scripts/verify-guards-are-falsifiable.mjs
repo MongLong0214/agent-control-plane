@@ -54,6 +54,17 @@ const GUARDS = [
     killedBy: ["tests/unit/capacity-sweep-budget.test.ts"],
   },
   {
+    // The default this replaces was `["hermes", "-z"]`, which spawns a fresh Hermes per turn.
+    // It answered, so every behavioural test passed; what it never did was answer *as the same
+    // CEO*. The mutation is the old default put back verbatim.
+    what: "the runtime refuses to start without a session-pinned reply source",
+    symbols: ["main"],
+    file: "src/runtime/hermes-ceo.ts",
+    find: "  if (replyAt === -1) {\n    process.stderr.write(REPLY_COMMAND_REQUIRED);\n    return 2;\n  }\n  const replyCommand = argv.slice(replyAt + 1);\n  const flags = argv.slice(0, replyAt);",
+    replace: '  const replyCommand = replyAt === -1 ? ["hermes", "-z"] : argv.slice(replyAt + 1);\n  const flags = replyAt === -1 ? [...argv] : argv.slice(0, replyAt);',
+    killedBy: ["tests/unit/hermes-ceo-runtime.test.ts"],
+  },
+  {
     what: "the tool bridge rewrites request ids so Hermes cannot collide with the runtime's own",
     symbols: ["serve"],
     file: "src/runtime/hermes-ceo.ts",
