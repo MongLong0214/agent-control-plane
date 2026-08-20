@@ -1272,11 +1272,30 @@ export const ceoUnavailableSentence = (reasonCode: string): string => {
     return "The connected CEO session cannot hold a conversation over this route — it did not offer sampling at handshake.";
   }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_TIMEOUT) {
-    // Not "Nothing was lost". The reply command resumes the owner's own conversation, so by the
-    // time this deadline passes the CEO may already have written part of an answer into it —
-    // and "ask again" then continues on top of that rather than starting over. This seam cannot
-    // see which happened (#633), so it says what it knows and lets the owner look.
-    return "The CEO session did not answer in time. It may have written part of an answer to the conversation already — check there before asking again.";
+    // Three corrections have landed on this one sentence, and each was the same mistake in a
+    // different place.
+    //
+    // It said "Nothing was lost; ask again". The first correction was that this seam cannot see
+    // whether anything was lost — the reply command resumes the owner's own conversation, so the
+    // CEO may already have written part of an answer into it (#633).
+    //
+    // The second is that "ask again" is not advice, it is a mechanism. A resent message is a new
+    // update with a new nonce and a new turn id, so nothing in the duplicate protection treats
+    // it as the same turn — and the transcript gets the exchange twice (#641). The sentence that
+    // was meant to help the owner recover was the path by which the thing being prevented
+    // happened.
+    //
+    // So it no longer invites it. What it must not do instead is promise the mechanism that
+    // replaces it: an earlier draft said a later message "is held rather than run", and the gate
+    // that would hold it does not exist yet (#641). That sentence would have been false in the
+    // other direction — the same defect, pointed the other way — and a blind review caught it
+    // before it shipped.
+    //
+    // So it says only what is true now and stays true after the gate lands: the turn is
+    // unresolved rather than failed, and a resend is a second turn rather than a retry. Asking
+    // again remains the owner's call; it is not something this sentence asks for on their
+    // behalf, before anyone knows whether the first turn landed.
+    return "The CEO session has not answered yet. Its turn is unresolved rather than abandoned — an answer may still be arriving in the conversation. Sending the same message again starts a second turn rather than retrying this one.";
   }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_BUSY) {
     return "The CEO is still working on the previous message. This one was not started, so send it again once the answer arrives.";
