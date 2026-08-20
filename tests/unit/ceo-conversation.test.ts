@@ -252,3 +252,80 @@ describe("the deadlines on one owner turn", () => {
     expect(() => assertOuterOutlastsInner(30_000, 120_000)).toThrow(/30000.*120000/s);
   });
 });
+
+describe("one turn at a time on the CEO's canonical session", () => {
+  /**
+   * The reply command resumes one conversation by id, and the runtime fires it with `void` and
+   * keeps no queue (`hermes-ceo.ts:341`). Two overlapping turns therefore both reach
+   * `hermes chat --resume <same id>` and interleave in a transcript the CEO carries forward as
+   * context — which cannot be unwound, and which the CEO cannot tell happened.
+   *
+   * The property holds today only because `TelegramLongPoller.pollOnce` awaits each update in
+   * turn. That await is what #630 removes, so this is written while the invariant is still true
+   * rather than after it stops being.
+   */
+  const heldPeer = (): { peer: FakePeer; server: McpServer; release: (text: string) => void } => {
+    let release!: (text: string) => void;
+    const held = new Promise<unknown>((resolve) => {
+      release = (text: string) =>
+        resolve({ model: "fake", role: "assistant", content: { type: "text", text } });
+    });
+    const peer: FakePeer = { capabilities: { sampling: {} }, answer: () => held, calls: [] };
+    return { peer, server: fakePeer(peer), release };
+  };
+
+  it("refuses a second turn while the first is still open", async () => {
+    const port = new CeoConversationPort();
+    const { peer, server, release } = heldPeer();
+    port.attach(server, stillCeo());
+
+    const first = port.ask("첫 번째");
+    const second = await port.ask("두 번째");
+
+    expect(second.allowed).toBe(false);
+    expect(second.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_BUSY);
+    // The assertion that matters: the second turn never reached the session. A refusal that
+    // still sent the message would satisfy the reason code and cause the exact interleaving
+    // this exists to prevent.
+    expect(peer.calls).toEqual(["첫 번째"]);
+
+    release("답");
+    const answered = await first;
+    expect(answered.allowed && answered.value).toBe("답");
+  });
+
+  it("takes the next turn once the first one finishes", async () => {
+    // Without this the guard would be indistinguishable from a port that refuses forever after
+    // one turn, and the owner would lose their CEO after a single message.
+    const port = new CeoConversationPort();
+    const { server, release } = heldPeer();
+    port.attach(server, stillCeo());
+
+    const first = port.ask("첫 번째");
+    release("답");
+    await first;
+    const second = await port.ask("두 번째");
+
+    expect(second.allowed).toBe(true);
+  });
+
+  it("takes the next turn after one that timed out, rather than locking the owner out", async () => {
+    // A timed-out turn is over as far as this port is concerned — it has stopped waiting. The
+    // runtime may still have work behind it, which is #632's problem and is not solved by
+    // refusing every later turn.
+    const port = new CeoConversationPort({ budgetMs: 5, peerReplyTimeoutMs: 1 });
+    const failing: FakePeer = {
+      capabilities: { sampling: {} },
+      answer: async () => {
+        throw new Error("no answer");
+      },
+      calls: [],
+    };
+    port.attach(fakePeer(failing), stillCeo());
+
+    expect((await port.ask("첫 번째")).reasonCode).toBe(ReasonCode.CEO_CONVERSATION_TIMEOUT);
+    const second = await port.ask("두 번째");
+
+    expect(second.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_BUSY);
+  });
+});

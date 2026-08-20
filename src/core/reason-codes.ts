@@ -233,6 +233,13 @@ export const ReasonCode = {
   CEO_CONVERSATION_NOT_TEXT: "CEO_CONVERSATION_NOT_TEXT",
   /** The connected peer no longer holds the CEO role its socket was admitted under. */
   CEO_CONVERSATION_STALE: "CEO_CONVERSATION_STALE",
+  /**
+   * A turn was already open on the CEO's canonical session, so this one was not started.
+   *
+   * The reply command resumes one conversation by id. Two turns against it interleave in a
+   * transcript that is then carried forward as context, and that cannot be unwound.
+   */
+  CEO_CONVERSATION_BUSY: "CEO_CONVERSATION_BUSY",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",
