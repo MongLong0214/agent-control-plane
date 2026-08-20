@@ -813,7 +813,10 @@ describe("baseline boundary contracts", () => {
     expect(parseRepoFactoryResult(result).allowed).toBe(true);
     expect(parseRepoFactoryResult({ ...result, unversionedExtra: true }).allowed).toBe(false);
     expect(parseRepoFactoryResult({ ...result, schema: "repo-factory.result.v3" }).allowed).toBe(false);
-    expect(SCHEMA_VERSION).toBe(20);
+    // Not `toBe(20)`. That restated the constant, so it failed on every correct migration and
+    // caught nothing a wrong one would do. The chain below is the real statement — it pins the
+    // order and the ids — and this pins that the declared version is where the chain ends.
+    expect(migrationChainFrom(12).at(-1)?.toVersion).toBe(SCHEMA_VERSION);
     expect(migrationChainFrom(12).map((migration) => migration.id)).toEqual([
       "v13-finalization-state-machine",
       "v14-baseline-evidence-ledger",
@@ -823,6 +826,7 @@ describe("baseline boundary contracts", () => {
       "v18-conversational-actor",
       "v19-session-process-identity",
       "v20-conversational-actor-registry",
+      "v21-canonical-turns",
     ]);
   });
 

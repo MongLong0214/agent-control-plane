@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, ControlPlane } from "../../src/app/control-plane.ts";
 import { defaultBackupDirectory, restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
-import { replayDdlWithoutPostV12Columns } from "../../src/db/migrations.ts";
+import { MIGRATIONS, replayDdlWithoutPostV12Columns } from "../../src/db/migrations.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -431,7 +431,13 @@ describe("versioned SQLite migration", () => {
       // The fixture must walk the whole ordered chain through v20, not stop at the version
       // the original workdir lane was written on.
       expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(SCHEMA_VERSION);
-      expect(SCHEMA_VERSION).toBe(20);
+      // The chain reaches the declared version and nothing is left beyond it. This used to be
+      // `toBe(20)`, which restated the constant and so failed on every correct addition while
+      // catching nothing a wrong one would do. What can actually go wrong is a migration added
+      // without bumping SCHEMA_VERSION, or a gap in `fromVersion`/`toVersion` — the line above
+      // passes in both cases, and these do not.
+      expect(SCHEMA_VERSION).toBe(Math.max(...MIGRATIONS.map((m) => m.toVersion)));
+      expect(MIGRATIONS.map((m) => m.fromVersion)).toEqual(MIGRATIONS.map((m) => m.toVersion - 1));
       assertEmptyActorRegistry(migrated);
       migrated.run(
         `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, workdir, created_at, updated_at)
@@ -489,63 +495,21 @@ describe("versioned SQLite migration", () => {
         [17, "v17-telegram-owner-prompts"],
         [18, "v18-conversational-actor"],
         [19, "v19-session-process-identity"],
-        [SCHEMA_VERSION, "v20-conversational-actor-registry"],
+        [20, "v20-conversational-actor-registry"],
+        [SCHEMA_VERSION, "v21-canonical-turns"],
       ]);
-      expect(receipts).toEqual([
-        expect.objectContaining({
-          version: 12,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-        }),
-        expect.objectContaining({
-          version: 13,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_file: null,
-          backup_checksum: null,
-        }),
-        expect.objectContaining({
-          version: 14,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_file: null,
-          backup_checksum: null,
-        }),
-        expect.objectContaining({
-          version: 15,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_file: null,
-          backup_checksum: null,
-        }),
-        expect.objectContaining({
-          version: 16,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_file: null,
-          backup_checksum: null,
-        }),
-        expect.objectContaining({
-          version: 17,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_file: null,
-          backup_checksum: null,
-        }),
-        expect.objectContaining({
-          version: 18,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_file: null,
-          backup_checksum: null,
-        }),
-        expect.objectContaining({
-          version: 19,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_file: null,
-          backup_checksum: null,
-        }),
-        expect.objectContaining({
-          version: SCHEMA_VERSION,
-          checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-          backup_file: null,
-          backup_checksum: null,
-        }),
-      ]);
+      // Stated as properties rather than one `objectContaining` per version. The list above
+      // already pins the exact order and ids; this block only ever said "every receipt carries a
+      // checksum, and only the first carries a backup" — and as an enumeration it needed a new
+      // entry for every migration, so it failed on correct additions while catching nothing a
+      // wrong one would do.
+      expect(receipts.every((entry) => /^sha256:[a-f0-9]{64}$/.test(entry.checksum))).toBe(true);
+      // The first migration in the chain takes the automatic backup; the rest run inside it.
+      expect(receipts[0]).toMatchObject({ version: 12 });
+      expect(receipts[0]?.backup_checksum).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(
+        receipts.slice(1).every((e) => e.backup_file === null && e.backup_checksum === null),
+      ).toBe(true);
       expect(receipts[0]?.backup_file).toBeTruthy();
       expect(existsSync(receipts[0]!.backup_file!)).toBe(true);
       expect(migrated.get<{

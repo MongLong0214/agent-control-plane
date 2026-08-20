@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -669,6 +669,64 @@ const v20: SchemaMigration = {
   checksum: () => sha256(`v20-conversational-actor-registry\n${V20_CONVERSATIONAL_ACTOR_REGISTRY_DDL}`),
 };
 
+
+const V21_CANONICAL_TURNS_DDL = `
+  CREATE TABLE canonical_turns (
+    turn_request_id            TEXT PRIMARY KEY,
+    -- Which conversation this turn serialises against. Today the composition root has no
+    -- resolved canonical id to give, so what arrives is the source conversation's digest; the
+    -- column is named for what it must become because the serialisation key is the whole point
+    -- of the table, and #639 step 2 replaces the value without moving the column.
+    target_conversation_digest TEXT NOT NULL,
+    -- Where the turn came from. Kept so a resend can be grouped with its predecessor without
+    -- reading the source channel's own tables, and so an operator can find the message.
+    source_channel             TEXT NOT NULL,
+    source_nonce               TEXT NOT NULL,
+    -- Not identity. Same-id-different-intent is the case it exists to refuse.
+    prompt_digest              TEXT NOT NULL,
+    -- Evidence for matching a receipt, never a partition key: two failover generations write
+    -- the same transcript, and splitting them reopens the overlap this table prevents.
+    binding_generation         INTEGER,
+    state                      TEXT NOT NULL CHECK (state IN ('IN_DOUBT', 'COMPLETED')),
+    claimed_at                 TEXT NOT NULL,
+    settled_at                 TEXT,
+    CHECK ((state = 'COMPLETED') = (settled_at IS NOT NULL))
+  );
+
+  CREATE INDEX canonical_turns_target ON canonical_turns(target_conversation_digest, state);
+  CREATE UNIQUE INDEX canonical_turns_source ON canonical_turns(source_channel, source_nonce);
+`;
+
+/**
+ * v21 gives a turn its own row.
+ *
+ * It lived in `inbound_messages.result_json`, which is the source message's replay and
+ * reply-delivery record. Those are different facts: one is "this Telegram update was seen and
+ * answered", the other is "this conversation has a turn outstanding". Sharing a field made the
+ * second a casualty of the first — `recordResultIf` replaces the whole document, so reserving
+ * the outbound reply erased the claim, and the protection existed for a crash and not for an
+ * ordinary timeout (#646).
+ *
+ * The table is created empty. Any claim currently sitting in `inbound_messages` belongs to a
+ * turn whose outcome nobody established, and inventing a row for it here would assert a state
+ * this migration cannot observe.
+ */
+const v21: SchemaMigration = {
+  id: "v21-canonical-turns",
+  fromVersion: 20,
+  toVersion: 21,
+  apply: (raw) => {
+    // The v12/v13 replay trap, which v19 hit before this. Those migrations replay the *live*
+    // `schema.sql`, so a database reconstructed part-way along the chain already has this table
+    // from the CREATE — and a bare `CREATE TABLE` then fails with "table already exists". A
+    // genuine v20 file gains the table; a replayed one already had it.
+    const present = (raw.prepare(`PRAGMA table_list`).all() as Array<{ name: string }>)
+      .some((table) => table.name === "canonical_turns");
+    if (!present) raw.exec(V21_CANONICAL_TURNS_DDL);
+  },
+  checksum: () => sha256(`v21-canonical-turns\n${V21_CANONICAL_TURNS_DDL}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -679,6 +737,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v18,
   v19,
   v20,
+  v21,
 ]);
 
 interface RequiredTrigger {
