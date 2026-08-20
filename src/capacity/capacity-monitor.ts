@@ -43,7 +43,17 @@ const isRoutableBucket = (
 /** The only lower-priority allocation capabilities defined by §14.5. */
 const isWorkerCapability = (capability: string): boolean =>
   capability === "worker" || capability === "luna-worker";
-export type AdvisoryCapacityState = "HEALTHY" | "CONSERVE" | "CRITICAL" | "EXHAUSTED";
+/**
+ * `UNKNOWN` is not a degree of low. It means no bucket was read at all, and it exists because
+ * the absence used to be reported as `EXHAUSTED` — the strongest possible claim about a number
+ * nobody had. A grok billing token that expires every six hours produced exactly that: the
+ * doctor said the quota was exhausted with `confidence: "HIGH"` and advised waiting for a reset,
+ * while the provider was in fact usable and the reset would never come.
+ *
+ * Routing was never wrong — `allocationAdmission` distinguishes the two and suspends either way.
+ * What was wrong is what a reader is told, and a reader acting on "exhausted" waits.
+ */
+export type AdvisoryCapacityState = "HEALTHY" | "CONSERVE" | "CRITICAL" | "EXHAUSTED" | "UNKNOWN";
 
 export interface ProviderCapacity extends CapacityReading {
   allocationAdmission: AllocationAdmission;
@@ -973,7 +983,11 @@ export class CapacityMonitor {
     })();
 
     const advisoryState = ((): AdvisoryCapacityState => {
-      if (lowest === null) return "EXHAUSTED";
+      // Said before the thresholds, because every one of them is a comparison against a number
+      // that does not exist here. `admission` above already treats this case separately; this is
+      // the same distinction, kept in the value the reader is shown.
+      if (lowest === null) return "UNKNOWN";
+      if (unknownBuckets.length === reading.buckets.length) return "UNKNOWN";
       if (lowest <= this.#options.exhaustedPercent) return "EXHAUSTED";
       if (lowest <= this.#options.criticalPercent) return "CRITICAL";
       if (lowest <= this.#options.conservePercent) return "CONSERVE";
