@@ -169,7 +169,7 @@ export class ArtifactStore {
    * database finds the capabilities already spent and cannot mint its own (#70, CP-HI-04).
    */
   issueEvidenceWriters(): EvidenceWriterSet {
-    if (ISSUED_WRITERS.has(this.db.file)) {
+    if (ISSUED_WRITERS.has(this.db.identity)) {
       fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         "evidence writer capabilities were already issued for this database",
@@ -177,7 +177,10 @@ export class ArtifactStore {
       );
     }
     const writePort = this.db.claimEvidenceWritePort();
-    ISSUED_WRITERS.add(this.db.file);
+    ISSUED_WRITERS.add(this.db.identity);
+    // Handed back when the connection closes. Keyed by identity for the same reason the
+    // database's own slots are: two names for one inode are one database.
+    this.db.releaseOnClose(() => ISSUED_WRITERS.delete(this.db.identity));
     const verification = new EvidenceWriterToken(WRITER_MINT, "VERIFICATION");
     const blindReview = new EvidenceWriterToken(WRITER_MINT, "BLIND_REVIEW");
     const productionReady = new EvidenceWriterToken(WRITER_MINT, "PRODUCTION_READY_PACKET");

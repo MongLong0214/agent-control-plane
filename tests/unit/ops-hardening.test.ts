@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { symlinkSync } from "node:fs";
+import { symlinkSync, linkSync} from "node:fs";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -106,6 +106,39 @@ describe("MCP evidence authority has no route through a tool handler (#352)", ()
 
     expect(createHermesServer(hermesPort, authenticate)).toBeDefined();
     expect(createCtoServer(ctoPort, authenticate)).toBeDefined();
+  });
+
+  it("treats two names for one inode as one database", () => {
+    // `realpath` collapses a symlink and leaves a hard link alone, so the issuance key — a
+    // resolved path string — was two different strings for one file. Measured before this test:
+    // an owner claimed through the real path and a second handle claimed through a hard link,
+    // both live, both materializers of the same ledger.
+    const root = tempDir("acp-hardlink-");
+    const databasePath = join(root, "state.sqlite");
+    const aliasPath = join(root, "alias.sqlite");
+    // Linked while nothing is connected: SQLite derives its `-wal` sidecar from the path it was
+    // opened by, so making the second name while the first connection is live gives the alias no
+    // journal to find. That is a property of SQLite, not of this guard, and it would make the
+    // test fail for a reason that has nothing to do with what it is named for.
+    new Db(databasePath).close();
+    linkSync(databasePath, aliasPath);
+
+    const owner = new Db(databasePath);
+    try {
+      owner.claimTurnMaterializationAuthority();
+      const throughTheLink = new Db(aliasPath);
+      try {
+        expect(throughTheLink.file).not.toBe(owner.file);
+        expect(throughTheLink.identity).toBe(owner.identity);
+        expect(denialCode(() => throughTheLink.claimTurnMaterializationAuthority())).toBe(
+          ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        );
+      } finally {
+        throughTheLink.close();
+      }
+    } finally {
+      owner.close();
+    }
   });
 
   it("frees a capability slot when its issuer closes, and only then", () => {

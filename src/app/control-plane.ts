@@ -358,264 +358,275 @@ export class ControlPlane {
     const runtimeRoot = config.runtimeRoot ?? join(dirname(config.databasePath), "runtime");
     ensurePrivateDirectory(runtimeRoot);
     this.db = new Db(config.databasePath);
-    this.audit = new AuditLog(this.db, this.clock);
-    this.conversation = new ConversationTurnCoordinator(this.db, this.clock, this.audit);
-    this.artifacts = new ArtifactStore(this.db, this.clock);
-    // Claimed immediately: issuance succeeds once per database, so claiming here is what
-    // makes every later claim — by any component that reaches this store — fail.
-    this.#evidenceWriters = this.artifacts.issueEvidenceWriters();
-    this.telemetry = new Telemetry(this.db, this.clock);
-    this.outbox = new Outbox(this.db, this.clock, this.audit);
+    // Everything after the database handle exists, wrapped because the coordinator below claims
+    // the materialization capability and this constructor can still throw afterwards — rejecting
+    // a non-production adapter, for one. A throw leaves no value for the caller to close, so the
+    // slot stayed held by a control plane that does not exist and an in-process retry with
+    // corrected configuration was refused for the life of the process. Closing the handle here
+    // hands back exactly what this attempt took.
+    try {
+      this.audit = new AuditLog(this.db, this.clock);
+      this.conversation = new ConversationTurnCoordinator(this.db, this.clock, this.audit);
+      this.artifacts = new ArtifactStore(this.db, this.clock);
+      // Claimed immediately: issuance succeeds once per database, so claiming here is what
+      // makes every later claim — by any component that reaches this store — fail.
+      this.#evidenceWriters = this.artifacts.issueEvidenceWriters();
+      this.telemetry = new Telemetry(this.db, this.clock);
+      this.outbox = new Outbox(this.db, this.clock, this.audit);
 
-    // Construct this before the default runtime adapters. A writable CLI process is never
-    // handed an unconstrained checkout: the adapters receive this exact guard-backed broker
-    // and invoke it immediately around process launch (CP-HI-01).
-    this.guard = new ManagedWriteGuard(
-      this.db,
-      config.workspaceProbe ?? realWorkspaceProbe,
-      this.audit,
-      this.clock,
-      { directWriteRoots: config.directWriteRoots },
-    );
-    // Claim before any request-facing service is assembled. A second component cannot mint
-    // itself a daemon identity after it has obtained the composition root.
-    this.#daemonFinalizerAuthority = this.guard.claimDaemonFinalizerAuthority();
-    this.#repairWorktreeAuthority = this.guard.claimRepairWorktreeAuthority();
-    this.#bootstrapManifestAuthority = this.guard.claimBootstrapManifestAuthority();
+      // Construct this before the default runtime adapters. A writable CLI process is never
+      // handed an unconstrained checkout: the adapters receive this exact guard-backed broker
+      // and invoke it immediately around process launch (CP-HI-01).
+      this.guard = new ManagedWriteGuard(
+        this.db,
+        config.workspaceProbe ?? realWorkspaceProbe,
+        this.audit,
+        this.clock,
+        { directWriteRoots: config.directWriteRoots },
+      );
+      // Claim before any request-facing service is assembled. A second component cannot mint
+      // itself a daemon identity after it has obtained the composition root.
+      this.#daemonFinalizerAuthority = this.guard.claimDaemonFinalizerAuthority();
+      this.#repairWorktreeAuthority = this.guard.claimRepairWorktreeAuthority();
+      this.#bootstrapManifestAuthority = this.guard.claimBootstrapManifestAuthority();
 
-    this.projects = new ProjectRegistry(this.db, this.clock, this.audit, this.guard);
-    this.repositories = new RepositoryRegistry(this.db, this.clock, this.audit);
-    this.sessions = new SessionRegistry(this.db, this.clock, this.audit);
-    this.bindings = new BindingRegistry(this.db, this.clock, this.audit, this.sessions, this.outbox);
-    this.actors = new ConversationalActorRegistry(this.db, this.clock);
-    this.claims = new ClaimRegistry(this.db, this.clock, this.audit, this.bindings);
+      this.projects = new ProjectRegistry(this.db, this.clock, this.audit, this.guard);
+      this.repositories = new RepositoryRegistry(this.db, this.clock, this.audit);
+      this.sessions = new SessionRegistry(this.db, this.clock, this.audit);
+      this.bindings = new BindingRegistry(this.db, this.clock, this.audit, this.sessions, this.outbox);
+      this.actors = new ConversationalActorRegistry(this.db, this.clock);
+      this.claims = new ClaimRegistry(this.db, this.clock, this.audit, this.bindings);
 
-    this.providers = new ProviderRegistry();
-    for (const adapter of config.adapters ?? this.defaultAdapters()) {
-      if (adapter.isProduction) this.providers.register(adapter);
-      else if (config.allowNonProductionAdapters) this.providers.registerTestAdapter(adapter);
-      else {
-        throw new Error(`adapter '${adapter.provider}' fabricates responses; it is test-only`);
+      this.providers = new ProviderRegistry();
+      for (const adapter of config.adapters ?? this.defaultAdapters()) {
+        if (adapter.isProduction) this.providers.register(adapter);
+        else if (config.allowNonProductionAdapters) this.providers.registerTestAdapter(adapter);
+        else {
+          throw new Error(`adapter '${adapter.provider}' fabricates responses; it is test-only`);
+        }
       }
+
+      this.worktrees = new WorktreeManager(config.worktreeRoot);
+      this.tasks = new TaskGraph(this.db, this.clock, this.audit, this.telemetry);
+      this.tasks.attach({
+        workerBindings: {
+          hasLiveWorkerBinding: (taskId, sessionId) => {
+            const binding = this.bindings.active(roleKeyFor(Role.WORKER, { taskId }));
+            const session = this.sessions.get(sessionId);
+            return Boolean(
+              binding &&
+                binding.role === Role.WORKER &&
+                binding.taskId === taskId &&
+                binding.sessionId === sessionId &&
+                session?.lifecycle === SessionLifecycle.READY,
+            );
+          },
+        },
+      });
+      this.bindings.attach({ tasks: this.tasks });
+      this.runs = new RunEngine(
+        this.db, this.clock, this.audit, this.artifacts, this.outbox,
+        this.projects, this.repositories, this.tasks, this.claims, this.telemetry,
+      );
+      this.#completionAuthorities = this.runs.issueCompletionAuthorities();
+      this.verification = new VerificationEngine(
+        this.db, this.clock, this.audit, this.artifacts, this.#evidenceWriters.VERIFICATION,
+        this.repositories, this.worktrees, this.claims, this.guard, this.telemetry,
+      );
+      this.review = new BlindReviewGate(
+        this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
+        this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
+        config.reviewer ?? {
+          preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
+          fallbacks: [{ provider: "claude", model: "opus", effort: null }],
+        },
+        config.reviewerEgress?.providerEndpoints ?? REVIEWER_PROVIDER_ENDPOINTS,
+      );
+      this.capacity = new CapacityMonitor(
+        this.db, this.clock, this.audit, this.providers, this.telemetry, config.capacity,
+      );
+      // Provider operations must observe capacity through the same monitor that dispatch
+      // uses; otherwise the runtime wrapper is present but no production adapter reaches it.
+      this.providers.attachCapacity(this.capacity);
+      this.tasks.attach({
+        capacity: {
+          refreshForWorkerFanout: (target) => this.capacity.refreshForWorkerFanout(target),
+          workerReserveDemand: (provider) => this.capacity.workerReserveDemand(provider),
+        },
+      });
+      this.review.attach({
+        capacity: { refreshForBlindReview: (target) => this.capacity.refreshForBlindReview(target) },
+      });
+      this.continuity = new ContinuityKernel(
+        this.db, this.clock, this.audit, this.capacity, this.providers,
+        this.projects, this.runs, this.sessions, this.bindings, this.telemetry, runtimeRoot,
+      );
+      this.capacity.attach({
+        providerFailureContinuity: {
+          evaluate: (reason) => this.continuity.evaluate(reason),
+        },
+      });
+      this.cto = new CtoLifecycle(
+        this.db, this.clock, this.audit, this.projects, this.sessions, this.bindings,
+        this.providers, this.outbox, this.runs,
+        config.ctoPreference ?? { provider: "claude", model: "opus", effort: null },
+        runtimeRoot,
+      );
+      this.ceo = new ProductionGate(
+        this.db, this.clock, this.audit, this.artifacts,
+        this.#evidenceWriters.PRODUCTION_READY_PACKET,
+        this.#completionAuthorities,
+        this.runs, this.tasks, this.bindings, this.outbox, this.telemetry,
+      );
+
+      this.pipeline = new CandidatePipeline(
+        this.db, this.clock, this.audit, this.artifacts, this.runs, this.tasks, this.projects,
+        this.repositories, this.verification, this.review, this.review.controlPlaneInvoker(), this.ceo, this.bindings, this.outbox,
+        this.telemetry, this.guard,
+      );
+
+      const githubKernelOptions = config.githubKernelOptions ?? (config.githubClient
+        ? {}
+        : {
+            // A successful merge starts GitHub Actions asynchronously. Fifteen minutes is
+            // enough for dispatch and a normal project-ci job, while remaining bounded.
+            postMergePollAttempts: 60,
+            postMergePollIntervalMs: 15_000,
+          });
+      this.github = new GitHubKernel(
+        this.db, this.clock, this.audit, this.artifacts, this.credentials,
+        this.repositories, this.runs, this.projects, this.guard,
+        config.githubClient,
+        githubKernelOptions,
+      );
+      this.verification.attachCi(this.github.ciEvidenceSource());
+      this.verification.attachManifests((digest) => this.projects.manifest(digest));
+      this.verification.attachRuns((runId) => this.runs.get(runId));
+      // Production lays the disposable worktrees below the state root. The sandbox denies
+      // that encompassing root and then explicitly re-allows only the current worktree, so
+      // the root's other children remain unreadable. The database family is derived from the
+      // same path for SQLite's WAL, shared-memory and rollback-journal siblings.
+      this.verification.setDenyReadPaths(controlPlaneStateDenyReadPaths(config.databasePath, [
+        // The production defaults are already below dirname(databasePath). Keep explicit
+        // non-default roots denied as well, so customizing a deployment cannot weaken the
+        // previous secret/capacity boundary or leave a sibling managed worktree readable.
+        config.worktreeRoot,
+        config.capacityDir,
+        config.secretsDir,
+        runtimeRoot,
+        // The App private key and its env file: added after this lane was branched.
+        ...this.credentials.sensitivePaths(),
+      ]));
+
+      this.repair = new RepairService(
+        this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees,
+        this.repositories, this.guard, this.#repairWorktreeAuthority,
+      );
+      this.doctor = new Doctor(
+        this.db, this.clock, this.audit, this.projects, this.repositories, this.sessions,
+        this.bindings, this.runs, this.tasks, this.claims, this.capacity, this.providers, this.continuity,
+        this.outbox, this.github, this.worktrees, {
+          directory: config.capacityDir,
+          freshnessMs: config.capacity?.freshnessMs ?? 5 * 60 * 1000,
+          maxClockSkewMs: config.capacity?.maxClockSkewMs ?? 60_000,
+        }, {
+          databasePath: config.databasePath,
+          worktreeRoot: config.worktreeRoot,
+          secretsDir: config.secretsDir,
+          capacityDir: config.capacityDir,
+        },
+      );
+      this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
+      this.bootstrap = new BootstrapActivation(
+        this.db, this.clock, this.audit, this.artifacts, this.projects, this.repositories,
+        this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox,
+      );
+
+      // Close the dependency cycles with narrow ports.
+      this.runs.attach({
+        cto: {
+          ensurePrimaryCto: (projectId, runId) => this.cto.ensurePrimaryCto(projectId, runId),
+          isDraining: (projectId) => this.cto.isDraining(projectId),
+          plannedProvider: (projectId) => this.cto.plannedProvider(projectId),
+        },
+        // The target has to survive the port: dropping it here is what made every dispatch
+        // ask "is any provider healthy?" instead of "is the one this run will use healthy?".
+        capacity: { refreshForDispatch: (target) => this.capacity.refreshForDispatch(target) },
+        continuity: {
+          mode: () => this.continuity.mode(),
+          // Dispatch needs the age too: §15.6's rule is that a verdict computed before the
+          // providers changed is not evidence, and `evaluate` is how it gets a current one.
+          modeAgeMs: () => this.continuity.modeAgeMs(),
+          evaluate: (reason) => this.continuity.evaluate(reason),
+        },
+      });
+      this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? [], this.clock);
+      // The GitHub kernel binds the production gate's single human-gate predicate to its
+      // payload. It never reinterprets APPROVAL artifacts or ingress receipts itself.
+      this.github.attach({
+        humanGateStatus: {
+          humanGateStatus: (runId) => {
+            const status = this.ceo.humanGateStatus(runId);
+            return { ...status, humanGateDigest: digestOf(status.items) };
+          },
+        },
+      });
+      this.cto.attach({
+        ownerAuthority: this.ownerAuthority,
+        // §10.1's recipient is intentionally unbound until this acknowledgement switches
+        // generations. The session secret is therefore the authentication proof here; the
+        // lifecycle validates the delivered envelope and incarnation before it switches.
+        handoffAuthentication: {
+          verifyHandoffAcknowledgement: (acknowledgement) => {
+            const session = this.sessions.verifySecret(
+              acknowledgement.sessionId,
+              acknowledgement.sessionSecret,
+            );
+            if (!session.allowed) {
+              return deny(
+                ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED,
+                "handoff acknowledgement session secret did not authenticate its recipient",
+                { sessionId: acknowledgement.sessionId, authenticationReason: session.reasonCode },
+              );
+            }
+            if (session.value.incarnation !== acknowledgement.sessionIncarnation) {
+              return deny(
+                ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED,
+                "handoff acknowledgement belongs to a stale session incarnation",
+                {
+                  sessionId: acknowledgement.sessionId,
+                  acknowledgementIncarnation: acknowledgement.sessionIncarnation,
+                  currentIncarnation: session.value.incarnation,
+                },
+              );
+            }
+            return allow(ReasonCode.OK, undefined);
+          },
+        },
+      });
+      this.repair.attach({ ownerAuthority: this.ownerAuthority });
+      this.ceo.attach({
+        ownerAuthority: this.ownerAuthority,
+        bootstrapActivation: {
+          finalizeBootstrapActivationConfirm: (input) => this.bootstrap.finalizeBootstrapActivationConfirm(input),
+        },
+        sourceReadLeases: this.guard,
+        continuity: {
+          mode: () => this.continuity.mode(),
+          modeAgeMs: () => this.continuity.modeAgeMs(),
+          assertCompletionAllowed: (runId) => this.continuity.assertCompletionAllowed(runId),
+          evaluate: (reason) => this.continuity.evaluate(reason),
+        },
+      });
+      this.pipeline.attach({
+        continuity: { evaluate: (reason) => this.continuity.evaluate(reason) },
+      });
+      this.cto.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
+      this.continuity.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
+    } catch (error) {
+      this.db.close();
+      throw error;
     }
-
-    this.worktrees = new WorktreeManager(config.worktreeRoot);
-    this.tasks = new TaskGraph(this.db, this.clock, this.audit, this.telemetry);
-    this.tasks.attach({
-      workerBindings: {
-        hasLiveWorkerBinding: (taskId, sessionId) => {
-          const binding = this.bindings.active(roleKeyFor(Role.WORKER, { taskId }));
-          const session = this.sessions.get(sessionId);
-          return Boolean(
-            binding &&
-              binding.role === Role.WORKER &&
-              binding.taskId === taskId &&
-              binding.sessionId === sessionId &&
-              session?.lifecycle === SessionLifecycle.READY,
-          );
-        },
-      },
-    });
-    this.bindings.attach({ tasks: this.tasks });
-    this.runs = new RunEngine(
-      this.db, this.clock, this.audit, this.artifacts, this.outbox,
-      this.projects, this.repositories, this.tasks, this.claims, this.telemetry,
-    );
-    this.#completionAuthorities = this.runs.issueCompletionAuthorities();
-    this.verification = new VerificationEngine(
-      this.db, this.clock, this.audit, this.artifacts, this.#evidenceWriters.VERIFICATION,
-      this.repositories, this.worktrees, this.claims, this.guard, this.telemetry,
-    );
-    this.review = new BlindReviewGate(
-      this.clock, this.db, this.audit, this.artifacts, this.#evidenceWriters.BLIND_REVIEW,
-      this.sessions, this.bindings, this.providers, this.repositories, this.telemetry,
-      config.reviewer ?? {
-        preferred: { provider: "gpt", model: "gpt-5.6-sol", effort: "xhigh" },
-        fallbacks: [{ provider: "claude", model: "opus", effort: null }],
-      },
-      config.reviewerEgress?.providerEndpoints ?? REVIEWER_PROVIDER_ENDPOINTS,
-    );
-    this.capacity = new CapacityMonitor(
-      this.db, this.clock, this.audit, this.providers, this.telemetry, config.capacity,
-    );
-    // Provider operations must observe capacity through the same monitor that dispatch
-    // uses; otherwise the runtime wrapper is present but no production adapter reaches it.
-    this.providers.attachCapacity(this.capacity);
-    this.tasks.attach({
-      capacity: {
-        refreshForWorkerFanout: (target) => this.capacity.refreshForWorkerFanout(target),
-        workerReserveDemand: (provider) => this.capacity.workerReserveDemand(provider),
-      },
-    });
-    this.review.attach({
-      capacity: { refreshForBlindReview: (target) => this.capacity.refreshForBlindReview(target) },
-    });
-    this.continuity = new ContinuityKernel(
-      this.db, this.clock, this.audit, this.capacity, this.providers,
-      this.projects, this.runs, this.sessions, this.bindings, this.telemetry, runtimeRoot,
-    );
-    this.capacity.attach({
-      providerFailureContinuity: {
-        evaluate: (reason) => this.continuity.evaluate(reason),
-      },
-    });
-    this.cto = new CtoLifecycle(
-      this.db, this.clock, this.audit, this.projects, this.sessions, this.bindings,
-      this.providers, this.outbox, this.runs,
-      config.ctoPreference ?? { provider: "claude", model: "opus", effort: null },
-      runtimeRoot,
-    );
-    this.ceo = new ProductionGate(
-      this.db, this.clock, this.audit, this.artifacts,
-      this.#evidenceWriters.PRODUCTION_READY_PACKET,
-      this.#completionAuthorities,
-      this.runs, this.tasks, this.bindings, this.outbox, this.telemetry,
-    );
-
-    this.pipeline = new CandidatePipeline(
-      this.db, this.clock, this.audit, this.artifacts, this.runs, this.tasks, this.projects,
-      this.repositories, this.verification, this.review, this.review.controlPlaneInvoker(), this.ceo, this.bindings, this.outbox,
-      this.telemetry, this.guard,
-    );
-
-    const githubKernelOptions = config.githubKernelOptions ?? (config.githubClient
-      ? {}
-      : {
-          // A successful merge starts GitHub Actions asynchronously. Fifteen minutes is
-          // enough for dispatch and a normal project-ci job, while remaining bounded.
-          postMergePollAttempts: 60,
-          postMergePollIntervalMs: 15_000,
-        });
-    this.github = new GitHubKernel(
-      this.db, this.clock, this.audit, this.artifacts, this.credentials,
-      this.repositories, this.runs, this.projects, this.guard,
-      config.githubClient,
-      githubKernelOptions,
-    );
-    this.verification.attachCi(this.github.ciEvidenceSource());
-    this.verification.attachManifests((digest) => this.projects.manifest(digest));
-    this.verification.attachRuns((runId) => this.runs.get(runId));
-    // Production lays the disposable worktrees below the state root. The sandbox denies
-    // that encompassing root and then explicitly re-allows only the current worktree, so
-    // the root's other children remain unreadable. The database family is derived from the
-    // same path for SQLite's WAL, shared-memory and rollback-journal siblings.
-    this.verification.setDenyReadPaths(controlPlaneStateDenyReadPaths(config.databasePath, [
-      // The production defaults are already below dirname(databasePath). Keep explicit
-      // non-default roots denied as well, so customizing a deployment cannot weaken the
-      // previous secret/capacity boundary or leave a sibling managed worktree readable.
-      config.worktreeRoot,
-      config.capacityDir,
-      config.secretsDir,
-      runtimeRoot,
-      // The App private key and its env file: added after this lane was branched.
-      ...this.credentials.sensitivePaths(),
-    ]));
-
-    this.repair = new RepairService(
-      this.db, this.clock, this.audit, this.artifacts, this.claims, this.worktrees,
-      this.repositories, this.guard, this.#repairWorktreeAuthority,
-    );
-    this.doctor = new Doctor(
-      this.db, this.clock, this.audit, this.projects, this.repositories, this.sessions,
-      this.bindings, this.runs, this.tasks, this.claims, this.capacity, this.providers, this.continuity,
-      this.outbox, this.github, this.worktrees, {
-        directory: config.capacityDir,
-        freshnessMs: config.capacity?.freshnessMs ?? 5 * 60 * 1000,
-        maxClockSkewMs: config.capacity?.maxClockSkewMs ?? 60_000,
-      }, {
-        databasePath: config.databasePath,
-        worktreeRoot: config.worktreeRoot,
-        secretsDir: config.secretsDir,
-        capacityDir: config.capacityDir,
-      },
-    );
-    this.watchdog = new Watchdog(this.db, this.clock, this.audit, this.doctor, this.claims, this.outbox);
-    this.bootstrap = new BootstrapActivation(
-      this.db, this.clock, this.audit, this.artifacts, this.projects, this.repositories,
-      this.runs, this.bindings, this.sessions, this.cto, this.doctor, this.ceo, this.outbox,
-    );
-
-    // Close the dependency cycles with narrow ports.
-    this.runs.attach({
-      cto: {
-        ensurePrimaryCto: (projectId, runId) => this.cto.ensurePrimaryCto(projectId, runId),
-        isDraining: (projectId) => this.cto.isDraining(projectId),
-        plannedProvider: (projectId) => this.cto.plannedProvider(projectId),
-      },
-      // The target has to survive the port: dropping it here is what made every dispatch
-      // ask "is any provider healthy?" instead of "is the one this run will use healthy?".
-      capacity: { refreshForDispatch: (target) => this.capacity.refreshForDispatch(target) },
-      continuity: {
-        mode: () => this.continuity.mode(),
-        // Dispatch needs the age too: §15.6's rule is that a verdict computed before the
-        // providers changed is not evidence, and `evaluate` is how it gets a current one.
-        modeAgeMs: () => this.continuity.modeAgeMs(),
-        evaluate: (reason) => this.continuity.evaluate(reason),
-      },
-    });
-    this.ownerAuthority = new OwnerAuthority(this.db, config.ownerIdentities ?? [], this.clock);
-    // The GitHub kernel binds the production gate's single human-gate predicate to its
-    // payload. It never reinterprets APPROVAL artifacts or ingress receipts itself.
-    this.github.attach({
-      humanGateStatus: {
-        humanGateStatus: (runId) => {
-          const status = this.ceo.humanGateStatus(runId);
-          return { ...status, humanGateDigest: digestOf(status.items) };
-        },
-      },
-    });
-    this.cto.attach({
-      ownerAuthority: this.ownerAuthority,
-      // §10.1's recipient is intentionally unbound until this acknowledgement switches
-      // generations. The session secret is therefore the authentication proof here; the
-      // lifecycle validates the delivered envelope and incarnation before it switches.
-      handoffAuthentication: {
-        verifyHandoffAcknowledgement: (acknowledgement) => {
-          const session = this.sessions.verifySecret(
-            acknowledgement.sessionId,
-            acknowledgement.sessionSecret,
-          );
-          if (!session.allowed) {
-            return deny(
-              ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED,
-              "handoff acknowledgement session secret did not authenticate its recipient",
-              { sessionId: acknowledgement.sessionId, authenticationReason: session.reasonCode },
-            );
-          }
-          if (session.value.incarnation !== acknowledgement.sessionIncarnation) {
-            return deny(
-              ReasonCode.HANDOFF_ACK_AUTHENTICATION_FAILED,
-              "handoff acknowledgement belongs to a stale session incarnation",
-              {
-                sessionId: acknowledgement.sessionId,
-                acknowledgementIncarnation: acknowledgement.sessionIncarnation,
-                currentIncarnation: session.value.incarnation,
-              },
-            );
-          }
-          return allow(ReasonCode.OK, undefined);
-        },
-      },
-    });
-    this.repair.attach({ ownerAuthority: this.ownerAuthority });
-    this.ceo.attach({
-      ownerAuthority: this.ownerAuthority,
-      bootstrapActivation: {
-        finalizeBootstrapActivationConfirm: (input) => this.bootstrap.finalizeBootstrapActivationConfirm(input),
-      },
-      sourceReadLeases: this.guard,
-      continuity: {
-        mode: () => this.continuity.mode(),
-        modeAgeMs: () => this.continuity.modeAgeMs(),
-        assertCompletionAllowed: (runId) => this.continuity.assertCompletionAllowed(runId),
-        evaluate: (reason) => this.continuity.evaluate(reason),
-      },
-    });
-    this.pipeline.attach({
-      continuity: { evaluate: (reason) => this.continuity.evaluate(reason) },
-    });
-    this.cto.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
-    this.continuity.attach({ readiness: { checkSession: (id) => this.doctor.sessionReadiness(id) } });
   }
 
   private defaultAdapters(): ProviderAdapter[] {

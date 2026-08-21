@@ -489,6 +489,30 @@ const GUARDS = [
     replace: "    if (false) {",
     killedBy: ["tests/unit/a-database-built-by-an-earlier-head.test.ts"],
   },
+  {
+    // Two names for one inode were two capability slots, so a hard-link alias got its own.
+    what: "the capability key names the file, not a path that reaches it",
+    file: "src/db/database.ts",
+    find: "            const stat = statSync(this.file);\n            return `${stat.dev}:${stat.ino}`;",
+    replace: "            void statSync(this.file);\n            return this.file;",
+    killedBy: ["tests/unit/ops-hardening.test.ts"],
+  },
+  {
+    // A control plane that threw mid-construction kept the slots; no value came back to close.
+    what: "a composition root that fails to build releases what it took",
+    file: "src/app/control-plane.ts",
+    find: "    } catch (error) {\n      this.db.close();\n      throw error;\n    }",
+    replace: "    } catch (error) {\n      throw error;\n    }",
+    killedBy: ["tests/unit/a-control-plane-that-failed-to-build.test.ts"],
+  },
+  {
+    // Issuers that keep their own registry outlived the handle without this.
+    what: "an issuer in another module hands its slot back when the connection closes",
+    file: "src/db/database.ts",
+    find: "    for (const release of this.#releases) release();",
+    replace: "    for (const release of this.#releases) void release;",
+    killedBy: ["tests/unit/a-control-plane-that-failed-to-build.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

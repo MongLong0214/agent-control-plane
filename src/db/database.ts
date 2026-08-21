@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
@@ -226,6 +226,8 @@ export class Db {
    * a fresh set of evidence writers for rows the composition root already owned (#352).
    */
   readonly file: string;
+  /** What the once-per-database capabilities are keyed by: the file itself, not a name for it. */
+  readonly identity: string;
 
   constructor(filename: string, private readonly options: DbOpenOptions = {}) {
     const persistent = filename !== ":memory:";
@@ -240,6 +242,18 @@ export class Db {
     // which would let two connections to one SQLite file receive separate capabilities.
     // Resolve after SQLite creates the file so the issuance key names the actual file.
     this.file = filename === ":memory:" ? `:memory:${Math.random()}` : realpathSync(filename);
+    // `realpath` collapses symlinks and leaves hard links alone: two names for one inode resolve
+    // to two different strings, and a capability keyed by the string then issues twice for one
+    // database. Measured — an owner claimed through the real path and a second handle claimed
+    // through a hard link, both live. The identity of a file is its (device, inode); the path is
+    // a way to reach it, and this comment used to say realpath was enough.
+    this.identity =
+      filename === ":memory:"
+        ? this.file
+        : ((): string => {
+            const stat = statSync(this.file);
+            return `${stat.dev}:${stat.ino}`;
+          })();
     this.#raw.pragma("foreign_keys = ON");
     this.#raw.pragma("busy_timeout = 10000");
     // SQLite performs REPLACE's implicit delete *without* firing DELETE triggers unless this is
@@ -522,15 +536,30 @@ export class Db {
   /** What *this* handle issued, so closing it releases its own slots and nobody else's. */
   readonly #issuedHere = new Set<"evidence" | "materialization" | "runState">();
 
+  /**
+   * Releases registered by capability issuers that live in other modules.
+   *
+   * `ArtifactStore` and `RunEngine` each keep their own once-per-database set, and this class
+   * cannot import them without a cycle. Without a hook their slots outlived the handle: a control
+   * plane that threw while constructing took the evidence-writer slot with it, and every corrected
+   * retry in that process was refused. Measured.
+   */
+  readonly #releases = new Set<() => void>();
+
+  /** Called by an issuer that keeps its own registry, so `close()` hands that slot back as well. */
+  releaseOnClose(release: () => void): void {
+    this.#releases.add(release);
+  }
+
   claimEvidenceWritePort(): EvidenceWritePort {
-    if (ISSUED_EVIDENCE_WRITE_PORTS.has(this.file)) {
+    if (ISSUED_EVIDENCE_WRITE_PORTS.has(this.identity)) {
       fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         "evidence-write authority was already issued for this database",
         {},
       );
     }
-    ISSUED_EVIDENCE_WRITE_PORTS.add(this.file);
+    ISSUED_EVIDENCE_WRITE_PORTS.add(this.identity);
     this.#issuedHere.add("evidence");
     return new EvidenceWritePortToken(EVIDENCE_WRITE_MINT, this);
   }
@@ -543,28 +572,28 @@ export class Db {
    * property of the ledger the moment two things can decide it.
    */
   claimTurnMaterializationAuthority(): TurnMaterializationAuthority {
-    if (ISSUED_TURN_MATERIALIZATION_AUTHORITIES.has(this.file)) {
+    if (ISSUED_TURN_MATERIALIZATION_AUTHORITIES.has(this.identity)) {
       fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         "turn-materialization authority was already issued for this database",
         {},
       );
     }
-    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.add(this.file);
+    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.add(this.identity);
     this.#issuedHere.add("materialization");
     return new TurnMaterializationAuthorityToken(TURN_MATERIALIZATION_MINT, this);
   }
 
   /** Claimed by RunEngine at construction; raw callers never receive this capability. */
   claimRunStateTransitionAuthority(): RunStateTransitionAuthority {
-    if (ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.has(this.file)) {
+    if (ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.has(this.identity)) {
       fail(
         ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
         "run-state transition authority was already issued for this database",
         {},
       );
     }
-    ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.add(this.file);
+    ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.add(this.identity);
     this.#issuedHere.add("runState");
     return new RunStateTransitionAuthorityToken(RUN_STATE_TRANSITION_MINT, this);
   }
@@ -738,12 +767,14 @@ export class Db {
    * bookkeeping was.
    */
   private releaseIssuedCapabilities(): void {
-    if (this.#issuedHere.has("evidence")) ISSUED_EVIDENCE_WRITE_PORTS.delete(this.file);
+    if (this.#issuedHere.has("evidence")) ISSUED_EVIDENCE_WRITE_PORTS.delete(this.identity);
     if (this.#issuedHere.has("materialization")) {
-      ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.file);
+      ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.identity);
     }
-    if (this.#issuedHere.has("runState")) ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.delete(this.file);
+    if (this.#issuedHere.has("runState")) ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.delete(this.identity);
     this.#issuedHere.clear();
+    for (const release of this.#releases) release();
+    this.#releases.clear();
   }
 
   private assertUsable(): void {
