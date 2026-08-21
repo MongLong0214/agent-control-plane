@@ -98,24 +98,40 @@ describe("a settlement cannot be rewritten", () => {
     ).toThrow(/CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED/);
   });
 
-  it("refuses to weaken an outcome even from inside the materializer", () => {
-    // The authority trigger stops an outsider. This one stops the materializer itself, and it is
-    // the only place the weakening rule is reachable — so it is tested with the marker held,
-    // which is where it actually stands.
+  it("refuses to weaken an outcome, even for the coordinator", () => {
+    // The authority trigger stops an outsider. This one stops the only insider there is: the
+    // conservative order is recomputed from the observations, and a weaker later record cannot
+    // pull a completed turn back into a state that permits a re-run.
     const h = makeHarness();
-    const turnRequestId = settledTurn(h);
+    const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+    const claimed = coordinator.claim({
+      targetActorId: target(h),
+      prompt: "q",
+      sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
+    });
+    if (!claimed.allowed) throw new Error("claim refused");
+    coordinator.observe(claimed.value, {
+      outcome: "COMPLETED",
+      authority: "HERMES_TARGET",
+      receiptId: "r1",
+      evidenceDigest: "sha256:a",
+      reasonCode: ReasonCode.OK,
+    });
 
-    expect(() =>
-      h.cp.db.materializeTurn(
-        { turnRequestId, outcome: "ABORTED", authority: "HERMES_TARGET", consistency: "CONSISTENT" },
-        () =>
-          h.cp.db.run(
-            `UPDATE canonical_turns SET outcome_kind='ABORTED', resolution_authority='HERMES_TARGET'
-              WHERE turn_request_id = ?`,
-            [turnRequestId],
-          ),
-      ),
-    ).toThrow(/CANONICAL_TURN_OUTCOME_WEAKENED/);
+    coordinator.observe(claimed.value, {
+      outcome: "ABORTED",
+      authority: "OWNER_AFTER_TARGET_FENCE",
+      receiptId: "r2",
+      evidenceDigest: "sha256:b",
+      reasonCode: ReasonCode.OK,
+    });
+
+    const row = h.cp.db.get<{ outcome_kind: string; observation_consistency: string }>(
+      `SELECT outcome_kind, observation_consistency FROM canonical_turns WHERE turn_request_id = ?`,
+      [claimed.value.turnRequestId],
+    );
+    expect(row?.outcome_kind).toBe("COMPLETED");
+    expect(row?.observation_consistency).toBe("CONTRADICTED");
   });
 
   it("refuses to repoint a turn at another actor", () => {
@@ -174,6 +190,72 @@ describe("a settlement cannot be rewritten", () => {
     expect(() =>
       h.cp.db.run(`DELETE FROM canonical_turns WHERE turn_request_id = ?`, [claimed.value.turnRequestId]),
     ).toThrow(/CANONICAL_TURN_NO_DELETE/);
+  });
+});
+
+describe("REPLACE is not a way around any of this", () => {
+  it("cannot replace a settled turn with a weaker one", () => {
+    // `Db.run` accepts REPLACE, and SQLite performs its implicit delete *without* firing DELETE
+    // triggers unless recursive triggers are on. Measured on a review head: a settled COMPLETED
+    // turn was replaced with an ABORTED one, its completed observation replaced, its source kept,
+    // and the retry then admitted. `INSERT OR REPLACE` passed the statement check too, because
+    // its first verb is INSERT.
+    const h = makeHarness();
+    const turnRequestId = settledTurn(h);
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT OR REPLACE INTO canonical_turns
+           (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
+            executor_session_id, executor_session_incarnation, binding_generation,
+            prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state, outcome_kind,
+            settled_at, resolution_authority, reason_code, evidence_digest)
+         SELECT turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
+                executor_session_id, executor_session_incarnation, binding_generation,
+                prompt_digest, claimed_at, claim_audit_event_id, 'SETTLED', 'ABORTED',
+                settled_at, 'HERMES_TARGET', 'OK', 'forged'
+           FROM canonical_turns WHERE turn_request_id = ?`,
+        [turnRequestId],
+      ),
+    ).toThrow();
+  });
+
+  it("cannot replace an observation", () => {
+    const h = makeHarness();
+    settledTurn(h);
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT OR REPLACE INTO canonical_turn_observations
+           (observation_id, turn_request_id, observed_outcome, observing_authority, receipt_id,
+            evidence_digest, reason_code, observed_at, audit_event_id)
+         SELECT observation_id, turn_request_id, 'ABORTED', 'HERMES_TARGET', receipt_id,
+                evidence_digest, reason_code, observed_at, audit_event_id
+           FROM canonical_turn_observations`,
+      ),
+    ).toThrow();
+  });
+});
+
+describe("an observation cannot appear without the outcome being recomputed", () => {
+  it("refuses a directly inserted observation", () => {
+    // Measured on a review head: settle NEVER_ADMITTED normally, then insert a valid
+    // HERMES_TARGET/COMPLETED observation directly. The records disagreed while the turn still
+    // read NEVER_ADMITTED / CONSISTENT — so the doctor stayed green, the quarantine never
+    // engaged, and a later legitimate redelivery took the receipt fast path without recomputing.
+    const h = makeHarness();
+    const turnRequestId = settledTurn(h);
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT INTO canonical_turn_observations
+           (turn_request_id, observed_outcome, observing_authority, receipt_id,
+            evidence_digest, reason_code, observed_at, audit_event_id)
+         VALUES (?, 'ABORTED', 'HERMES_TARGET', 'smuggled', 'sha256:x', 'OK', ?,
+                 (SELECT MIN(event_id) FROM audit_events))`,
+        [turnRequestId, NOW],
+      ),
+    ).toThrow(/CANONICAL_TURN_OBSERVATION_AUTHORITY_DENIED/);
   });
 });
 
@@ -388,23 +470,17 @@ describe("an outcome may only be recorded under an authority that could have obs
     }
   });
 
-  it("accepts each pairing an authority could actually testify to", () => {
+  it("refuses a turn that arrives already settled", () => {
+    // The pairing CHECK used to be exercised by inserting settled rows directly, which is the
+    // same statement that let a turn arrive settled with no observation behind it. A turn is born
+    // in doubt now, so the pairing is reachable only through the materializer — and the tests for
+    // it live where settlement happens.
     const h = makeHarness();
     target(h);
     h.cp.db.run(`INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, 'FIXTURE', '{}')`, [NOW]);
-    const accepted: readonly [string, string][] = [
-      ["NEVER_ADMITTED", "ACP_PRE_DISPATCH"],
-      ["COMPLETED", "HERMES_TARGET"],
-      ["ABORTED", "HERMES_TARGET"],
-      ["ABORTED", "OWNER_AFTER_TARGET_FENCE"],
-    ];
 
-    // Inserted directly rather than updated, because the authority trigger guards UPDATE — an
-    // INSERT of a settled row is a different hole and is named in its own issue. What this pins
-    // is only that the CHECK accepts these five pairings and refuses the others.
-    for (const [outcome, authority] of accepted) {
-      h.cp.db.run(settledRow(outcome, authority).replace("'x'", `'x_${outcome}_${authority}'`));
-    }
-    expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(accepted.length);
+    expect(() => h.cp.db.run(settledRow("COMPLETED", "HERMES_TARGET"))).toThrow(
+      /CANONICAL_TURN_NOT_BORN_IN_DOUBT/,
+    );
   });
 });

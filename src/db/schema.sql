@@ -1486,6 +1486,11 @@ WHEN OLD.target_actor_id IS NOT NEW.target_actor_id
   OR OLD.prompt_digest IS NOT NEW.prompt_digest
   OR OLD.claimed_at IS NOT NEW.claimed_at
   OR OLD.claim_audit_event_id IS NOT NEW.claim_audit_event_id
+  -- The retry lineage. Left out of every guard it belonged in, so a settled turn could be
+  -- pointed at an unrelated replacement, repointed, and cleared — editable history of what was
+  -- run instead of what.
+  OR (OLD.replacement_turn_request_id IS NOT NULL
+      AND OLD.replacement_turn_request_id IS NOT NEW.replacement_turn_request_id)
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_IDENTITY_IMMUTABLE');
 END;
@@ -1514,6 +1519,25 @@ BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_OUTCOME_WEAKENED');
 END;
 
+-- CP-HI-02 — a turn is born in doubt. Settlement is something an observation causes, never
+-- something a row arrives already carrying.
+--
+-- The authority trigger beside this one guards UPDATE, and an INSERT of a fully settled row with
+-- zero observations walked past it: the CHECKs accept any syntactically valid settled tuple, and
+-- the one-unresolved index only constrains IN_DOUBT rows. A review found it in a test comment of
+-- mine that called it "a different hole named in its own issue" — an issue that did not exist.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_born_in_doubt
+BEFORE INSERT ON canonical_turns
+WHEN NEW.lifecycle_state <> 'IN_DOUBT'
+  OR NEW.outcome_kind IS NOT NULL
+  OR NEW.settled_at IS NOT NULL
+  OR NEW.resolution_authority IS NOT NULL
+  OR NEW.evidence_digest IS NOT NULL
+  OR NEW.observation_consistency <> 'CONSISTENT'
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_NOT_BORN_IN_DOUBT');
+END;
+
 -- CP-HI-02 — only the materializer may move a turn's settlement columns or its consistency.
 --
 -- The version this replaces guarded the *weakening* of an outcome and nothing else, so an
@@ -1534,9 +1558,7 @@ WHEN (OLD.lifecycle_state IS NOT NEW.lifecycle_state
       OR OLD.reason_code IS NOT NEW.reason_code
       OR OLD.evidence_digest IS NOT NEW.evidence_digest
       OR OLD.observation_consistency IS NOT NEW.observation_consistency)
-  AND acp_turn_materialization_authorized(
-        NEW.turn_request_id, NEW.outcome_kind, NEW.resolution_authority,
-        NEW.observation_consistency) <> 1
+  AND acp_turn_materialization_authorized(NEW.turn_request_id) <> 1
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED');
 END;
@@ -1566,6 +1588,12 @@ WHEN NOT (
   OLD.observation_consistency = NEW.observation_consistency
   OR (OLD.observation_consistency = 'CONSISTENT' AND NEW.observation_consistency = 'CONTRADICTED')
   OR (OLD.observation_consistency = 'CONTRADICTED' AND NEW.observation_consistency = 'ADJUDICATED')
+  -- An adjudication closes the disagreement it read. A *new* disagreement is a different fact,
+  -- and it has to be able to re-open the turn — otherwise the first adjudication makes the ledger
+  -- deaf: every later observation recomputes a consistency the trigger refuses, and the whole
+  -- transaction rolls back, discarding evidence that arrived after someone said the matter was
+  -- settled. Monotone here means "never silently consistent", not "never re-opened".
+  OR (OLD.observation_consistency = 'ADJUDICATED' AND NEW.observation_consistency = 'CONTRADICTED')
 )
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_CONSISTENCY_NOT_MONOTONE');
@@ -1577,6 +1605,20 @@ CREATE TRIGGER IF NOT EXISTS canonical_turns_no_delete
 BEFORE DELETE ON canonical_turns
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_DELETE');
+END;
+
+-- CP-HI-02 — an observation is what the outcome is computed from, so a row that appears without
+-- the materializer having run leaves the computed columns describing a set that no longer exists.
+--
+-- Measured on a review head: settle NEVER_ADMITTED normally, then insert a valid
+-- HERMES_TARGET/COMPLETED observation directly. The records disagreed while the turn still read
+-- NEVER_ADMITTED / CONSISTENT, so the doctor stayed green, the quarantine did not engage, and a
+-- later legitimate redelivery took the receipt fast path and never recomputed.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_observations_write_authority
+BEFORE INSERT ON canonical_turn_observations
+WHEN acp_turn_materialization_authorized(NEW.turn_request_id) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_OBSERVATION_AUTHORITY_DENIED');
 END;
 
 -- CP-HI-06 — an observation is what an authority reported. Editing one rewrites the testimony
@@ -1641,13 +1683,6 @@ BEGIN
   SELECT RAISE(ABORT, 'ACTOR_TARGET_BINDING_IMMUTABLE');
 END;
 
--- CP-HI-04 — a deleted binding frees its target locator for a different actor, which is the same
--- alias arriving by removal rather than by edit.
-CREATE TRIGGER IF NOT EXISTS actor_target_bindings_no_delete
-BEFORE DELETE ON actor_target_bindings
-BEGIN
-  SELECT RAISE(ABORT, 'ACTOR_TARGET_BINDING_IMMUTABLE');
-END;
 
 INSERT OR IGNORE INTO continuity_state (id, mode, changed_at)
 VALUES (1, 'NORMAL', '1970-01-01T00:00:00.000Z');

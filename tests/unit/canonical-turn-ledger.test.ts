@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import type { TurnMaterializationAuthority } from "../../src/db/database.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -94,23 +95,38 @@ const inDoubtTurn = (
  * own constraints rather than about the coordinator, so they hold the marker directly instead of
  * going through it.
  */
+/**
+ * Settles a raw turn the way the schema now requires: under the materialization marker.
+ *
+ * A plain `UPDATE` no longer settles anything — that was the hole where an ordinary statement
+ * produced a settled row with zero observations behind it. Raising the marker needs a capability
+ * issued once per database; these tests hold no coordinator, so the fixture claims it directly.
+ * That is exactly the boundary being tested: the capability, not the method name, is what makes
+ * a writer the materializer.
+ */
+const authorities = new WeakMap<object, TurnMaterializationAuthority>();
+const materializationAuthorityFor = (h: Harness): TurnMaterializationAuthority => {
+  const held = authorities.get(h.cp.db as object);
+  if (held) return held;
+  const claimed = h.cp.db.claimTurnMaterializationAuthority();
+  authorities.set(h.cp.db as object, claimed);
+  return claimed;
+};
+
 const settleRaw = (
   h: Harness,
   turnId: string,
   outcome: string,
   authority: string,
-  extra = "",
 ): void => {
-  h.cp.db.materializeTurn(
-    { turnRequestId: turnId, outcome, authority, consistency: "CONSISTENT" },
-    () =>
-      h.cp.db.run(
-        `UPDATE canonical_turns
-            SET lifecycle_state='SETTLED', outcome_kind=?, settled_at=?, resolution_authority=?,
-                reason_code='OK', evidence_digest='sha256:e'${extra}
-          WHERE turn_request_id = ?`,
-        [outcome, NOW, authority, turnId],
-      ),
+  h.cp.db.materializeTurn(materializationAuthorityFor(h), { turnRequestId: turnId }, () =>
+    h.cp.db.run(
+      `UPDATE canonical_turns
+          SET lifecycle_state='SETTLED', outcome_kind=?, settled_at=?, resolution_authority=?,
+              reason_code='OK', evidence_digest='sha256:e'
+        WHERE turn_request_id = ?`,
+      [outcome, NOW, authority, turnId],
+    ),
   );
 };
 
@@ -244,12 +260,8 @@ describe("a settlement carries what settled it", () => {
     // pass without exercising the constraint it is named for.
     expect(() =>
       h.cp.db.materializeTurn(
-        {
-          turnRequestId: "turn:half",
-          outcome: "COMPLETED",
-          authority: "HERMES_TARGET",
-          consistency: "CONSISTENT",
-        },
+        materializationAuthorityFor(h),
+        { turnRequestId: "turn:half" },
         () =>
           h.cp.db.run(
             `UPDATE canonical_turns

@@ -303,6 +303,8 @@ export const ReasonCode = {
    * second, so a genuine observation could be discarded and reported as landed.
    */
   CONVERSATION_TURN_RECEIPT_REUSED: "CONVERSATION_TURN_RECEIPT_REUSED",
+  /** An adjudication cited only part of the disagreement, or something outside it. */
+  CONVERSATION_ADJUDICATION_INCOMPLETE: "CONVERSATION_ADJUDICATION_INCOMPLETE",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",

@@ -5,7 +5,7 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, acpError, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
-import type { Db } from "../db/database.ts";
+import type { Db, TurnMaterializationAuthority } from "../db/database.ts";
 
 /**
  * One inbound message a turn is being asked to answer.
@@ -167,11 +167,23 @@ export class ConversationTurnCoordinator {
   /** Never persisted, never exported. See `TurnPermit.issuance`. */
   readonly #issuanceKey = randomUUID();
 
+  /**
+   * The capability that lets this coordinator settle a turn.
+   *
+   * Claimed once per database. The trigger that guards the settlement columns asks the database
+   * for a connection-local marker, and only this method can raise it — so "the outcome is
+   * computed from the observations" is a property the database holds rather than a rule this
+   * class remembers.
+   */
+  readonly #materialization: TurnMaterializationAuthority;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
-  ) {}
+  ) {
+    this.#materialization = db.claimTurnMaterializationAuthority();
+  }
 
   #sign(fields: Omit<TurnPermit, "issuance">): string {
     return createHmac("sha256", this.#issuanceKey)
@@ -456,24 +468,138 @@ export class ConversationTurnCoordinator {
       });
       if (!audited.allowed) throw acpError(audited.reasonCode, audited.message, audited.evidence);
 
+      // Recording and recomputing under one marker. Split, an observation could land while the
+      // computed columns still described the set without it — measured on a review head, where a
+      // directly inserted completion left the turn reading NEVER_ADMITTED / CONSISTENT, so the
+      // doctor stayed green and the quarantine never engaged.
+      return this.db.materializeTurn(this.#materialization, { turnRequestId: permit.turnRequestId }, () => {
+        this.db.run(
+          `INSERT INTO canonical_turn_observations
+             (turn_request_id, observed_outcome, observing_authority, receipt_id,
+              evidence_digest, reason_code, observed_at, audit_event_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            permit.turnRequestId,
+            observation.outcome,
+            observation.authority,
+            observation.receiptId,
+            observation.evidenceDigest,
+            observation.reasonCode,
+            this.clock.nowIso(),
+            audited.value,
+          ],
+        );
+        return allow(ReasonCode.OK, this.materialize(permit.turnRequestId));
+      });
+    });
+  }
+
+  /**
+   * Closes a disagreement by citing the observations that made it, and nothing else.
+   *
+   * Until this existed a contradicted conversation had **no exit at all** — not through the API,
+   * which had no method; not through raw SQL, which the settlement-authority trigger refuses; not
+   * through the sqlite3 CLI, which cannot supply the connection-local marker the trigger calls;
+   * and not by dropping the trigger, because the load-bearing-invariant check rejects the
+   * database on the next open. The doctor told an operator to record an adjudication that
+   * nothing could record. A review traced all four doors.
+   *
+   * What it cannot do is decide the outcome. An adjudication moves consistency and only
+   * consistency: the conservative order already chose the outcome from the evidence, and letting
+   * a human step choose a more retry-safe one would make "an authenticated COMPLETED is never
+   * lowered" a preference rather than a rule.
+   */
+  adjudicate(input: {
+    targetActorId: string;
+    turnRequestId: string;
+    /** Every observation the adjudication answers. Citing them is what distinguishes this from
+     *  an assertion that the disagreement is over. */
+    citedObservationIds: readonly number[];
+    reasonCode: string;
+    evidenceDigest: string;
+  }): Decision<TurnMaterialization> {
+    return this.db.tx(() => {
+      const turn = this.db.get<{ target_actor_id: string; observation_consistency: string }>(
+        `SELECT target_actor_id, observation_consistency FROM canonical_turns
+          WHERE turn_request_id = ?`,
+        [input.turnRequestId],
+      );
+      if (!turn || turn.target_actor_id !== input.targetActorId) {
+        return deny(ReasonCode.NOT_FOUND, "no such turn on this conversation", {
+          turnRequestId: input.turnRequestId,
+        });
+      }
+      if (turn.observation_consistency !== "CONTRADICTED") {
+        // Adjudicating a turn nothing disagreed about would let the vocabulary be used to mark a
+        // conversation as reviewed when nothing was.
+        return deny(
+          ReasonCode.CONFLICT,
+          "this turn's observations do not disagree, so there is nothing to adjudicate",
+          { turnRequestId: input.turnRequestId, consistency: turn.observation_consistency },
+        );
+      }
+
+      const conflicting = this.db
+        .all<{ observation_id: number }>(
+          `SELECT observation_id FROM canonical_turn_observations WHERE turn_request_id = ?`,
+          [input.turnRequestId],
+        )
+        .map((row) => row.observation_id);
+      const cited = new Set(input.citedObservationIds);
+      const uncited = conflicting.filter((id) => !cited.has(id));
+      if (uncited.length > 0 || input.citedObservationIds.some((id) => !conflicting.includes(id))) {
+        // Every observation on the turn has to be answered, and nothing else may be cited. A
+        // partial citation closes a disagreement while leaving part of it unread, which is the
+        // same shape as a review that reports on what it happened to look at.
+        return deny(
+          ReasonCode.CONVERSATION_ADJUDICATION_INCOMPLETE,
+          "an adjudication has to cite every observation on the turn, and only those",
+          { turnRequestId: input.turnRequestId, uncited, cited: [...cited] },
+        );
+      }
+
+      const audited = this.audit.record({
+        kind: "CONVERSATION_TURN_ADJUDICATED",
+        actor: input.targetActorId,
+        evidence: {
+          turnRequestId: input.turnRequestId,
+          citedObservationIds: [...cited],
+          reasonCode: input.reasonCode,
+        },
+      });
+      if (!audited.allowed) throw acpError(audited.reasonCode, audited.message, audited.evidence);
+
+      const current = this.materialization(input.turnRequestId);
+      return this.db.materializeTurn(this.#materialization, { turnRequestId: input.turnRequestId }, () => {
       this.db.run(
         `INSERT INTO canonical_turn_observations
            (turn_request_id, observed_outcome, observing_authority, receipt_id,
-            evidence_digest, reason_code, observed_at, audit_event_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            evidence_digest, reason_code, observed_at, audit_event_id, adjudicates_observation_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          permit.turnRequestId,
-          observation.outcome,
-          observation.authority,
-          observation.receiptId,
-          observation.evidenceDigest,
-          observation.reasonCode,
+          input.turnRequestId,
+          current.outcome,
+          current.authority,
+          `adjudication:${audited.value}`,
+          input.evidenceDigest,
+          input.reasonCode,
           this.clock.nowIso(),
           audited.value,
+          Math.max(...conflicting),
         ],
       );
-
-      return allow(ReasonCode.OK, this.materialize(permit.turnRequestId));
+      this.db.materializeTurn(
+        this.#materialization,
+        { turnRequestId: input.turnRequestId },
+        () =>
+          this.db.run(
+            `UPDATE canonical_turns SET observation_consistency = 'ADJUDICATED'
+              WHERE turn_request_id = ?`,
+            [input.turnRequestId],
+          ),
+      );
+      return allow(ReasonCode.OK, this.materialization(input.turnRequestId));
+      });
     });
   }
 
@@ -528,12 +654,8 @@ export class ConversationTurnCoordinator {
       // makes the trigger's refusal something this code never has to hit.
       const settledAt = this.clock.nowIso();
       this.db.materializeTurn(
-        {
-          turnRequestId,
-          outcome: strongest.observed_outcome,
-          authority: strongest.observing_authority,
-          consistency,
-        },
+        this.#materialization,
+        { turnRequestId },
         () =>
           this.db.run(
             `UPDATE canonical_turns
@@ -555,7 +677,8 @@ export class ConversationTurnCoordinator {
       );
     } else if (consistency !== current.consistency) {
       this.db.materializeTurn(
-        { turnRequestId, outcome: current.outcome, authority: current.authority, consistency },
+        this.#materialization,
+        { turnRequestId },
         () =>
           this.db.run(`UPDATE canonical_turns SET observation_consistency = ? WHERE turn_request_id = ?`, [
             consistency,

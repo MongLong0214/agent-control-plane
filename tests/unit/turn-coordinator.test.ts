@@ -70,7 +70,14 @@ const coordinatorOf = (h: Harness): ConversationTurnCoordinator => {
   return made;
 };
 
-const anotherCoordinator = (h: Harness): ConversationTurnCoordinator =>
+/**
+ * Constructing a second coordinator on the same database — as a thunk, because it throws.
+ *
+ * The materialization authority is issued once per database file, for the same reason the
+ * evidence port is: two materializers make "the outcome is computed from the observations" a
+ * matter of which one ran.
+ */
+const anotherCoordinator = (h: Harness): (() => ConversationTurnCoordinator) => () =>
   new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
 
 /**
@@ -571,22 +578,15 @@ describe("only a permit this coordinator issued can settle a turn", () => {
     expect(coordinatorOf(h).unresolved(cto)).toHaveLength(1);
   });
 
-  it("refuses a permit issued by a different coordinator instance", () => {
-    // The key is per instance and never persisted, so a permit does not outlive the execution
-    // that took it. A process that died observed nothing, and settling from a resurrected
-    // permit would be recording an outcome nobody saw.
+  it("refuses to exist as a second coordinator on the same database", () => {
+    // The permit key is per instance and never persisted, so a permit was already unusable by a
+    // second coordinator. This is the stronger statement: there is no second coordinator, because
+    // the materialization authority is issued once per database file. Two materializers would
+    // make "the outcome is computed from the observations" a matter of which one ran.
     const h = makeHarness();
-    const actorId = target(h, "ceo");
-    const elsewhere = anotherCoordinator(h);
-    const permit = claimOf(h, actorId, [source("m1")]);
+    claimOf(h, target(h, "ceo"), [source("m1")]);
 
-    expect(
-      settle(elsewhere, permit, {
-        kind: "NEVER_ADMITTED",
-        authority: "ACP_PRE_DISPATCH",
-        reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
-      }).reasonCode,
-    ).toBe(ReasonCode.CONVERSATION_TURN_PERMIT_UNISSUED);
+    expect(anotherCoordinator(h)).toThrow();
   });
 
   it("records the audit against the turn's own actor", () => {
