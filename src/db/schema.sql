@@ -1554,8 +1554,16 @@ END;
 --
 -- `acp_turn_materialization_authorized` is a connection-local marker in the same shape as the
 -- run-state and evidence guards: a raw SQL caller can invoke it and cannot make it answer true
--- outside the owning operation. It is bound to the exact tuple being written, not merely to the
--- row, so the materializer's own transaction cannot be cover for a different write.
+-- outside the owning operation.
+--
+-- What it binds is the *turn*, not the tuple. The run-state marker carries (run, target state)
+-- and can therefore refuse a transition it did not authorise; this one carries only the turn id,
+-- because one materialization writes an observation, a turn row and sometimes an adjudication —
+-- three tables with no common tuple to name. So the property is narrower than that one and worth
+-- stating exactly: a materialization of turn X cannot be cover for a write to turn Y, and within
+-- turn X the seven columns below are open for the duration of the closure. What keeps them right
+-- is that the closure is the recompute itself, which reads the observations rather than a value
+-- a caller supplied.
 CREATE TRIGGER IF NOT EXISTS canonical_turns_settlement_authority
 BEFORE UPDATE ON canonical_turns
 WHEN (OLD.lifecycle_state IS NOT NEW.lifecycle_state

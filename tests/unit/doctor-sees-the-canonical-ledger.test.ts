@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { ConversationTurnCoordinator, type TurnPermit } from "../../src/conversation/turn-coordinator.ts";
+import type { ConversationTurnCoordinator} from "../../src/conversation/turn-coordinator.ts";
+import { type TurnPermit } from "../../src/conversation/turn-coordinator.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { DoctorReport } from "../../src/doctor/doctor.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -51,14 +52,7 @@ const target = (h: Harness, name: string): string => {
  * that issued it, so a second instance cannot settle what the first claimed — deliberate, and
  * the reason these helpers share one.
  */
-const coordinators = new WeakMap<object, ConversationTurnCoordinator>();
-const coordinatorOf = (h: Harness): ConversationTurnCoordinator => {
-  const existing = coordinators.get(h.cp.db as object);
-  if (existing) return existing;
-  const made = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
-  coordinators.set(h.cp.db as object, made);
-  return made;
-};
+const coordinatorOf = (h: Harness): ConversationTurnCoordinator => h.cp.conversation;
 
 const claim = (h: Harness, actorId: string, nonce: string): TurnPermit => {
   const coordinator = coordinatorOf(h);
@@ -112,9 +106,7 @@ describe("doctor reads the canonical ledger, not only the ingress claim", () => 
     const h = makeHarness();
     const coordinator = coordinatorOf(h);
     const permit = claim(h, target(h, "ceo"), "n1");
-    coordinator.observe(permit, {
-      outcome: "COMPLETED",
-      authority: "HERMES_TARGET",
+    coordinator.ports.target.completed(permit, {
       receiptId: "r1",
       evidenceDigest: "sha256:receipt",
       reasonCode: ReasonCode.OK,
@@ -145,16 +137,12 @@ describe("doctor surfaces a disagreement between authorities", () => {
   const contradict = (h: Harness, actorId: string): TurnPermit => {
     const coordinator = coordinatorOf(h);
     const permit = claim(h, actorId, "n1");
-    coordinator.observe(permit, {
-      outcome: "NEVER_ADMITTED",
-      authority: "ACP_PRE_DISPATCH",
+    coordinator.ports.preDispatch.neverAdmitted(permit, {
       receiptId: "pre-1",
       evidenceDigest: "sha256:pre",
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
     });
-    coordinator.observe(permit, {
-      outcome: "COMPLETED",
-      authority: "HERMES_TARGET",
+    coordinator.ports.target.completed(permit, {
       receiptId: "target-1",
       evidenceDigest: "sha256:target",
       reasonCode: ReasonCode.OK,
@@ -193,16 +181,12 @@ describe("doctor surfaces a disagreement between authorities", () => {
     const h = makeHarness();
     const coordinator = coordinatorOf(h);
     const permit = claim(h, target(h, "ceo"), "n1");
-    coordinator.observe(permit, {
-      outcome: "COMPLETED",
-      authority: "ACP_OBSERVED_HERMES_REPLY",
+    coordinator.ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-1",
       evidenceDigest: "sha256:acp",
       reasonCode: ReasonCode.OK,
     });
-    coordinator.observe(permit, {
-      outcome: "COMPLETED",
-      authority: "HERMES_TARGET",
+    coordinator.ports.target.completed(permit, {
       receiptId: "target-1",
       evidenceDigest: "sha256:target",
       reasonCode: ReasonCode.OK,

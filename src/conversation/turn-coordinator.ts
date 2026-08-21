@@ -55,6 +55,13 @@ export interface TurnPermit {
  * Reported, not decided. Several of these can exist for one turn and two of them may disagree;
  * the turn's outcome is computed from the set rather than written by whichever arrived first.
  */
+/** What an authority carries when it reports an outcome: which receipt, and on what evidence. */
+export interface TurnReceipt {
+  readonly receiptId: string;
+  readonly evidenceDigest: string;
+  readonly reasonCode: string;
+}
+
 export interface TurnObservation {
   readonly outcome: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
   readonly authority:
@@ -184,6 +191,40 @@ export class ConversationTurnCoordinator {
   ) {
     this.#materialization = db.claimTurnMaterializationAuthority();
   }
+
+  /**
+   * Settlement entry points, one per authority, to be handed out individually by the wiring.
+   *
+   * Each method fixes both halves of the pair the schema already constrains — an authority and
+   * the outcomes it is competent to report — so an unreachable combination cannot be expressed
+   * rather than being rejected after the fact. The one asymmetry is deliberate:
+   * `acpObservedReply` records a completion that will not materialize one, because ACP watching a
+   * reply return is evidence and is not the target proving a durable commit.
+   */
+  readonly ports = {
+    preDispatch: {
+      neverAdmitted: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
+        this.#observe(permit, { ...receipt, outcome: "NEVER_ADMITTED", authority: "ACP_PRE_DISPATCH" }),
+    },
+    target: {
+      completed: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
+        this.#observe(permit, { ...receipt, outcome: "COMPLETED", authority: "HERMES_TARGET" }),
+      aborted: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
+        this.#observe(permit, { ...receipt, outcome: "ABORTED", authority: "HERMES_TARGET" }),
+    },
+    ownerFence: {
+      aborted: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
+        this.#observe(permit, { ...receipt, outcome: "ABORTED", authority: "OWNER_AFTER_TARGET_FENCE" }),
+    },
+    acpObservedReply: {
+      sawCompletion: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
+        this.#observe(permit, {
+          ...receipt,
+          outcome: "COMPLETED",
+          authority: "ACP_OBSERVED_HERMES_REPLY",
+        }),
+    },
+  } as const;
 
   #sign(fields: Omit<TurnPermit, "issuance">): string {
     return createHmac("sha256", this.#issuanceKey)
@@ -394,7 +435,16 @@ export class ConversationTurnCoordinator {
    * conservative order, and a disagreement raises the turn's consistency rather than picking a
    * winner.
    */
-  observe(permit: TurnPermit, observation: TurnObservation): Decision<TurnMaterialization> {
+  /**
+   * The one settlement path, reached only through a port that names the authority for the caller.
+   *
+   * Private because the authority is the whole claim an observation makes. While a caller passed
+   * it as a field, "the target committed this turn" was a string anyone holding the coordinator
+   * could type, and the ledger recorded a provenance nobody had established. The ports below
+   * derive it from which object the caller was given, so a component wired with the pre-dispatch
+   * port cannot record a target receipt however it is called.
+   */
+  #observe(permit: TurnPermit, observation: TurnObservation): Decision<TurnMaterialization> {
     return this.db.tx(() => {
       const issued = this.assertIssuedHere(permit);
       if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);

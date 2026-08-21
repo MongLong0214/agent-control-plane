@@ -1,7 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import type { TurnMaterializationAuthority } from "../../src/db/database.ts";
+import { cleanupTempDirs, makeCore } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
@@ -88,46 +87,29 @@ const inDoubtTurn = (
 };
 
 /**
- * Settles a turn the way the schema now requires: under the materializer's authority marker.
- *
- * A raw `UPDATE` no longer settles anything — that was the hole where an ordinary statement
- * produced a settled row with zero observations behind it. These fixtures are about the table's
- * own constraints rather than about the coordinator, so they hold the marker directly instead of
- * going through it.
- */
-/**
- * Settles a raw turn the way the schema now requires: under the materialization marker.
+ * Settles a turn the way production does, through the coordinator the composition root owns.
  *
  * A plain `UPDATE` no longer settles anything — that was the hole where an ordinary statement
  * produced a settled row with zero observations behind it. Raising the marker needs a capability
- * issued once per database; these tests hold no coordinator, so the fixture claims it directly.
- * That is exactly the boundary being tested: the capability, not the method name, is what makes
- * a writer the materializer.
+ * that the composition root now claims while it is still constructing itself, so the fixture
+ * cannot claim it and does not try: it settles the way production does, through the coordinator
+ * the root owns. The turn it settles is a real one, which is the point — a hand-built settled row
+ * is exactly what the capability exists to refuse.
  */
-const authorities = new WeakMap<object, TurnMaterializationAuthority>();
-const materializationAuthorityFor = (h: Harness): TurnMaterializationAuthority => {
-  const held = authorities.get(h.cp.db as object);
-  if (held) return held;
-  const claimed = h.cp.db.claimTurnMaterializationAuthority();
-  authorities.set(h.cp.db as object, claimed);
-  return claimed;
-};
-
-const settleRaw = (
-  h: Harness,
-  turnId: string,
-  outcome: string,
-  authority: string,
-): void => {
-  h.cp.db.materializeTurn(materializationAuthorityFor(h), { turnRequestId: turnId }, () =>
-    h.cp.db.run(
-      `UPDATE canonical_turns
-          SET lifecycle_state='SETTLED', outcome_kind=?, settled_at=?, resolution_authority=?,
-              reason_code='OK', evidence_digest='sha256:e'
-        WHERE turn_request_id = ?`,
-      [outcome, NOW, authority, turnId],
-    ),
-  );
+const settleThroughCoordinator = (h: Harness, actorId: string, nonce: string, outcome: "COMPLETED" | "NEVER_ADMITTED"): string => {
+  const claimed = h.cp.conversation.claim({
+    targetActorId: actorId,
+    prompt: nonce,
+    sources: [{ channel: "telegram", nonce, attempt: 1, payload: {} }],
+  });
+  if (!claimed.allowed) throw new Error(`claim refused: ${claimed.reasonCode}`);
+  const receipt = { receiptId: `receipt:${nonce}`, evidenceDigest: "sha256:e", reasonCode: "OK" };
+  const observed =
+    outcome === "COMPLETED"
+      ? h.cp.conversation.ports.target.completed(claimed.value, receipt)
+      : h.cp.conversation.ports.preDispatch.neverAdmitted(claimed.value, receipt);
+  if (!observed.allowed) throw new Error(`observe refused: ${observed.reasonCode}`);
+  return claimed.value.turnRequestId;
 };
 
 /** A fully-populated target for an actor, which every turn needs before it can exist. */
@@ -231,8 +213,7 @@ describe("one unresolved turn per actor", () => {
     // conversation forever, which would be the lock-out this design rejects elsewhere.
     const h = makeHarness();
     const t = target(h, "freed");
-    inDoubtTurn(h, "turn:done", t.actorId, t.bindingId, t.attestationId);
-    settleRaw(h, "turn:done", "COMPLETED", "HERMES_TARGET");
+    settleThroughCoordinator(h, t.actorId, "done", "COMPLETED");
 
     expect(() => inDoubtTurn(h, "turn:next", t.actorId, t.bindingId, t.attestationId)).not.toThrow();
   });
@@ -251,7 +232,12 @@ describe("a settlement carries what settled it", () => {
   it("refuses an outcome with no authority, reason or evidence", () => {
     // A verdict with nothing behind it is the failure this whole design is about. The CHECK
     // makes "settled" and "we know why" the same statement.
-    const h = makeHarness();
+    // On a bare core rather than the harness, because the composition root claims the
+    // materialization authority as it constructs itself and a test cannot take it back. Here the
+    // test *is* the composition root, so it holds the capability the way production's owner does.
+    const core = makeCore();
+    const h = { cp: core } as unknown as Harness;
+    const authority = core.db.claimTurnMaterializationAuthority();
     const t = target(h, "halfsettled");
     inDoubtTurn(h, "turn:half", t.actorId, t.bindingId, t.attestationId);
 
@@ -260,7 +246,7 @@ describe("a settlement carries what settled it", () => {
     // pass without exercising the constraint it is named for.
     expect(() =>
       h.cp.db.materializeTurn(
-        materializationAuthorityFor(h),
+        authority,
         { turnRequestId: "turn:half" },
         () =>
           h.cp.db.run(
@@ -365,12 +351,10 @@ describe("which messages a turn consumed", () => {
     // numbered instead.
     const h = makeHarness();
     const t = target(h, "retry");
-    inDoubtTurn(h, "turn:try1", t.actorId, t.bindingId, t.attestationId);
-    source(h, "turn:try1", "update:9", 1, 0, null);
-    settleRaw(h, "turn:try1", "NEVER_ADMITTED", "ACP_PRE_DISPATCH");
+    const first = settleThroughCoordinator(h, t.actorId, "update:9", "NEVER_ADMITTED");
     inDoubtTurn(h, "turn:try2", t.actorId, t.bindingId, t.attestationId);
 
-    expect(() => source(h, "turn:try2", "update:9", 2, 0, "turn:try1")).not.toThrow();
+    expect(() => source(h, "turn:try2", "update:9", 2, 0, first)).not.toThrow();
   });
 
   it("refuses a first attempt that names a predecessor", () => {

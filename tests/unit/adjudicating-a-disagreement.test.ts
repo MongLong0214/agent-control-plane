@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { ConversationTurnCoordinator, type TurnPermit } from "../../src/conversation/turn-coordinator.ts";
+import type { ConversationTurnCoordinator} from "../../src/conversation/turn-coordinator.ts";
+import { type TurnPermit } from "../../src/conversation/turn-coordinator.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -45,14 +46,7 @@ const target = (h: Harness, name = "ceo"): string => {
   return actorId;
 };
 
-const coordinators = new WeakMap<object, ConversationTurnCoordinator>();
-const coordinatorOf = (h: Harness): ConversationTurnCoordinator => {
-  const held = coordinators.get(h.cp.db as object);
-  if (held) return held;
-  const made = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
-  coordinators.set(h.cp.db as object, made);
-  return made;
-};
+const coordinatorOf = (h: Harness): ConversationTurnCoordinator => h.cp.conversation;
 
 const claim = (h: Harness, actorId: string, nonce: string): TurnPermit => {
   const claimed = coordinatorOf(h).claim({
@@ -67,16 +61,12 @@ const claim = (h: Harness, actorId: string, nonce: string): TurnPermit => {
 /** A turn whose records disagree: the target says it committed, pre-dispatch says nothing ran. */
 const disputed = (h: Harness, actorId: string, nonce = "m1"): TurnPermit => {
   const permit = claim(h, actorId, nonce);
-  coordinatorOf(h).observe(permit, {
-    outcome: "COMPLETED",
-    authority: "HERMES_TARGET",
+  coordinatorOf(h).ports.target.completed(permit, {
     receiptId: `target:${nonce}`,
     evidenceDigest: "sha256:receipt",
     reasonCode: ReasonCode.OK,
   });
-  coordinatorOf(h).observe(permit, {
-    outcome: "NEVER_ADMITTED",
-    authority: "ACP_PRE_DISPATCH",
+  coordinatorOf(h).ports.preDispatch.neverAdmitted(permit, {
     receiptId: `pre:${nonce}`,
     evidenceDigest: "sha256:pre",
     reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
@@ -182,9 +172,7 @@ describe("an adjudication has to have read the whole disagreement", () => {
     const h = makeHarness();
     const actorId = target(h);
     const permit = claim(h, actorId, "m1");
-    coordinatorOf(h).observe(permit, {
-      outcome: "COMPLETED",
-      authority: "HERMES_TARGET",
+    coordinatorOf(h).ports.target.completed(permit, {
       receiptId: "r1",
       evidenceDigest: "sha256:receipt",
       reasonCode: ReasonCode.OK,
@@ -302,9 +290,7 @@ describe("what an adjudication survives, and what re-opens it", () => {
     const permit = disputed(h, actorId);
     adjudicate(h, actorId, permit);
 
-    coordinatorOf(h).observe(permit, {
-      outcome: "COMPLETED",
-      authority: "ACP_OBSERVED_HERMES_REPLY",
+    coordinatorOf(h).ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp:late",
       evidenceDigest: "sha256:watched",
       reasonCode: ReasonCode.OK,
@@ -321,9 +307,7 @@ describe("what an adjudication survives, and what re-opens it", () => {
     const permit = disputed(h, actorId);
     adjudicate(h, actorId, permit);
 
-    coordinatorOf(h).observe(permit, {
-      outcome: "ABORTED",
-      authority: "OWNER_AFTER_TARGET_FENCE",
+    coordinatorOf(h).ports.ownerFence.aborted(permit, {
       receiptId: "fence:late",
       evidenceDigest: "sha256:fence",
       reasonCode: ReasonCode.OK,
@@ -337,9 +321,7 @@ describe("what an adjudication survives, and what re-opens it", () => {
     const actorId = target(h);
     const permit = disputed(h, actorId);
     adjudicate(h, actorId, permit);
-    coordinatorOf(h).observe(permit, {
-      outcome: "ABORTED",
-      authority: "OWNER_AFTER_TARGET_FENCE",
+    coordinatorOf(h).ports.ownerFence.aborted(permit, {
       receiptId: "fence:late",
       evidenceDigest: "sha256:fence",
       reasonCode: ReasonCode.OK,

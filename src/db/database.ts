@@ -575,6 +575,12 @@ export class Db {
    * `acp_turn_materialization_authorized` and cannot make it answer true. That is the same shape
    * the run-state and evidence guards already use, and the reason the trigger is a property of
    * the database rather than a rule the coordinator remembers.
+   *
+   * It names the turn and not the columns. Unlike `applyRunStateTransition`, whose marker carries
+   * the target state and so can refuse a transition it did not authorise, one materialization
+   * spans three tables and has no tuple they share. The guarantee is therefore that a
+   * materialization of one turn cannot authorise a write to another — not that the values written
+   * to this one were the right ones.
    */
   materializeTurn<T>(
     authority: TurnMaterializationAuthority,
@@ -706,6 +712,26 @@ export class Db {
 
   close(): void {
     if (this.#raw.open) this.#raw.close();
+    this.releaseIssuedCapabilities();
+  }
+
+  /**
+   * Hands the once-per-file capability slots back when the connection they belong to is gone.
+   *
+   * Without this the issuance is a process-lifetime lockout rather than an exclusion: measured on
+   * 2026-08-22, opening a database, closing it and opening it again refused the second claim with
+   * COMPLETION_AUTHORITY_DENIED, so any path that reopens the same file in one process — a
+   * fail-closed rebuild, a doctor repair, a control plane restarted in place — could not construct
+   * its coordinator at all.
+   *
+   * Releasing is not a way to steal one. Every token is brand-checked against the exact `Db` that
+   * minted it, so the slot freed here belongs to a handle that can no longer answer, and the
+   * caller who could reach `close()` could already deny service by closing it.
+   */
+  private releaseIssuedCapabilities(): void {
+    ISSUED_EVIDENCE_WRITE_PORTS.delete(this.file);
+    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.file);
+    ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.delete(this.file);
   }
 
   private assertUsable(): void {
@@ -720,6 +746,7 @@ export class Db {
   private poison(): void {
     this.#poisoned = true;
     if (this.#raw.open) this.#raw.close();
+    this.releaseIssuedCapabilities();
   }
 }
 

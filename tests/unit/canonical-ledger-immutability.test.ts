@@ -1,6 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { ConversationTurnCoordinator } from "../../src/conversation/turn-coordinator.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -42,16 +41,14 @@ const target = (h: Harness): string => {
 };
 
 const settledTurn = (h: Harness): string => {
-  const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+  const coordinator = h.cp.conversation;
   const claimed = coordinator.claim({
     targetActorId: target(h),
     prompt: "question",
     sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
   });
   if (!claimed.allowed) throw new Error(`claim refused: ${claimed.reasonCode}`);
-  const settled = coordinator.observe(claimed.value, {
-    outcome: "COMPLETED",
-    authority: "HERMES_TARGET",
+  const settled = coordinator.ports.target.completed(claimed.value, {
     receiptId: "receipt-1",
     evidenceDigest: "sha256:reply",
     reasonCode: ReasonCode.OK,
@@ -103,24 +100,20 @@ describe("a settlement cannot be rewritten", () => {
     // conservative order is recomputed from the observations, and a weaker later record cannot
     // pull a completed turn back into a state that permits a re-run.
     const h = makeHarness();
-    const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+    const coordinator = h.cp.conversation;
     const claimed = coordinator.claim({
       targetActorId: target(h),
       prompt: "q",
       sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
     });
     if (!claimed.allowed) throw new Error("claim refused");
-    coordinator.observe(claimed.value, {
-      outcome: "COMPLETED",
-      authority: "HERMES_TARGET",
+    coordinator.ports.target.completed(claimed.value, {
       receiptId: "r1",
       evidenceDigest: "sha256:a",
       reasonCode: ReasonCode.OK,
     });
 
-    coordinator.observe(claimed.value, {
-      outcome: "ABORTED",
-      authority: "OWNER_AFTER_TARGET_FENCE",
+    coordinator.ports.ownerFence.aborted(claimed.value, {
       receiptId: "r2",
       evidenceDigest: "sha256:b",
       reasonCode: ReasonCode.OK,
@@ -179,7 +172,7 @@ describe("a settlement cannot be rewritten", () => {
     // The hold is releasable only by an observed outcome. Deleting the row releases it and
     // leaves nothing behind that says so.
     const h = makeHarness();
-    const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+    const coordinator = h.cp.conversation;
     const claimed = coordinator.claim({
       targetActorId: target(h),
       prompt: "q",
@@ -391,7 +384,7 @@ describe("an outcome may only be recorded under an authority that could have obs
     // forged outcome and admitted attempt 2. The outcome-weakening trigger did not fire because
     // it only guards a row that was already settled.
     const h = makeHarness();
-    const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+    const coordinator = h.cp.conversation;
     const claimed = coordinator.claim({
       targetActorId: target(h),
       prompt: "q",
@@ -421,23 +414,19 @@ describe("an outcome may only be recorded under an authority that could have obs
     // The only exit an operator had was a raw UPDATE that no trigger guarded, took no citation,
     // and left no audit row — so the sanctioned repair was an unaudited hand-edit.
     const h = makeHarness();
-    const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+    const coordinator = h.cp.conversation;
     const claimed = coordinator.claim({
       targetActorId: target(h),
       prompt: "q",
       sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
     });
     if (!claimed.allowed) throw new Error("claim refused");
-    coordinator.observe(claimed.value, {
-      outcome: "NEVER_ADMITTED",
-      authority: "ACP_PRE_DISPATCH",
+    coordinator.ports.preDispatch.neverAdmitted(claimed.value, {
       receiptId: "p1",
       evidenceDigest: "sha256:a",
       reasonCode: ReasonCode.OK,
     });
-    coordinator.observe(claimed.value, {
-      outcome: "COMPLETED",
-      authority: "HERMES_TARGET",
+    coordinator.ports.target.completed(claimed.value, {
       receiptId: "t1",
       evidenceDigest: "sha256:b",
       reasonCode: ReasonCode.OK,

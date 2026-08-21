@@ -2,9 +2,12 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import {
   ConversationTurnCoordinator,
+  type TurnMaterialization,
   type TurnPermit,
+  type TurnReceipt,
   type TurnSource,
 } from "../../src/conversation/turn-coordinator.ts";
+import { isAcpError, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -61,14 +64,7 @@ const target = (h: Harness, name: string): string => {
  * nothing to do with what the test is about. The composed daemon holds one, and these tests hold
  * one. Where a *second* instance is the subject, `anotherCoordinator` says so out loud.
  */
-const coordinators = new WeakMap<object, ConversationTurnCoordinator>();
-const coordinatorOf = (h: Harness): ConversationTurnCoordinator => {
-  const existing = coordinators.get(h.cp.db as object);
-  if (existing) return existing;
-  const made = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
-  coordinators.set(h.cp.db as object, made);
-  return made;
-};
+const coordinatorOf = (h: Harness): ConversationTurnCoordinator => h.cp.conversation;
 
 /**
  * Constructing a second coordinator on the same database — as a thunk, because it throws.
@@ -99,13 +95,31 @@ const settle = (
     evidenceDigest?: string;
   },
 ) =>
-  coordinator.observe(permit, {
-    outcome: outcome.kind,
-    authority: outcome.authority,
+  portFor(coordinator, outcome.kind, outcome.authority)(permit, {
     receiptId: `receipt-${(receiptCounter += 1)}`,
     evidenceDigest: outcome.evidenceDigest ?? "sha256:evidence",
     reasonCode: outcome.reasonCode,
   });
+
+/**
+ * The port an (outcome, authority) pair names, for tests written before the ports existed.
+ *
+ * Production never picks a port this way — a component is handed the one it is entitled to. Here
+ * the pair is the test's subject, so the lookup is explicit and an unreachable pair throws rather
+ * than silently settling under some other authority.
+ */
+const portFor = (
+  coordinator: ConversationTurnCoordinator,
+  kind: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED",
+  authority: "ACP_PRE_DISPATCH" | "HERMES_TARGET" | "OWNER_AFTER_TARGET_FENCE",
+): ((permit: TurnPermit, receipt: TurnReceipt) => Decision<TurnMaterialization>) => {
+  const { ports } = coordinator;
+  if (kind === "NEVER_ADMITTED" && authority === "ACP_PRE_DISPATCH") return ports.preDispatch.neverAdmitted;
+  if (kind === "COMPLETED" && authority === "HERMES_TARGET") return ports.target.completed;
+  if (kind === "ABORTED" && authority === "HERMES_TARGET") return ports.target.aborted;
+  if (kind === "ABORTED" && authority === "OWNER_AFTER_TARGET_FENCE") return ports.ownerFence.aborted;
+  throw new Error(`no port reports ${kind} under ${authority}`);
+};
 
 const claimOf = (h: Harness, actorId: string, sources: TurnSource[], prompt = "hello") => {
   const decision = coordinatorOf(h).claim({ targetActorId: actorId, prompt, sources });
@@ -504,9 +518,7 @@ describe("settlement needs an authority that observed something", () => {
     const actorId = target(h, "ceo");
     const permit = claimOf(h, actorId, [source("m1")]);
     const twice = () =>
-      coordinatorOf(h).observe(permit, {
-        outcome: "COMPLETED",
-        authority: "HERMES_TARGET",
+      coordinatorOf(h).ports.target.completed(permit, {
         receiptId: "the-same-receipt",
         evidenceDigest: "sha256:receipt",
         reasonCode: ReasonCode.OK,
@@ -637,9 +649,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     const h = makeHarness();
     const actorId = target(h, "ceo");
     const permit = claimOf(h, actorId, [source("m1")]);
-    coordinatorOf(h).observe(permit, {
-      outcome: "COMPLETED",
-      authority: "ACP_OBSERVED_HERMES_REPLY",
+    coordinatorOf(h).ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-1",
       evidenceDigest: "sha256:watched",
       reasonCode: ReasonCode.OK,
@@ -666,9 +676,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     const h = makeHarness();
     const actorId = target(h, "ceo");
     const permit = claimOf(h, actorId, [source("m1")]);
-    coordinatorOf(h).observe(permit, {
-      outcome: "COMPLETED",
-      authority: "ACP_OBSERVED_HERMES_REPLY",
+    coordinatorOf(h).ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-1",
       evidenceDigest: "sha256:watched",
       reasonCode: ReasonCode.OK,
@@ -722,16 +730,12 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     const h = makeHarness();
     const actorId = target(h, "ceo");
     const permit = claimOf(h, actorId, [source("m1")]);
-    coordinatorOf(h).observe(permit, {
-      outcome: "COMPLETED",
-      authority: "ACP_OBSERVED_HERMES_REPLY",
+    coordinatorOf(h).ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-1",
       evidenceDigest: "sha256:watched",
       reasonCode: ReasonCode.OK,
     });
-    coordinatorOf(h).observe(permit, {
-      outcome: "COMPLETED",
-      authority: "HERMES_TARGET",
+    coordinatorOf(h).ports.target.completed(permit, {
       receiptId: "target-1",
       evidenceDigest: "sha256:receipt",
       reasonCode: ReasonCode.OK,
@@ -763,9 +767,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     )?.settled_at;
 
     h.clock.advance(60_000);
-    coordinatorOf(h).observe(permit, {
-      outcome: "COMPLETED",
-      authority: "ACP_OBSERVED_HERMES_REPLY",
+    coordinatorOf(h).ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-late",
       evidenceDigest: "sha256:watched",
       reasonCode: ReasonCode.OK,
@@ -885,5 +887,115 @@ describe("nothing clears a hold on time", () => {
     claimOf(h, actorId, [source("m1")]);
 
     expect(coordinatorOf(h).unresolved(actorId).map((t) => t.claimedAt)).toEqual([h.clock.nowIso()]);
+  });
+});
+
+
+const denialCode = (action: () => unknown): string => {
+  try {
+    action();
+  } catch (error) {
+    return isAcpError(error) ? error.reasonCode : `unstructured:${String(error)}`;
+  }
+  return "not-denied";
+};
+
+/**
+ * What the composition root reserving the capability actually buys.
+ *
+ * The issuer is a public method on a `Db`, so nothing stops code that already holds the database
+ * from calling it — that is a property of the language, not of this design, and claiming
+ * otherwise would be the check that does not hold its own subject. What *is* enforceable is the
+ * order: the production root claims it while it is still constructing itself, so a later claimant
+ * loses loudly instead of quietly becoming a second materializer.
+ */
+describe("the composition root owns the materializer", () => {
+  it("has already claimed the authority by the time anything else can ask", () => {
+    const h = makeHarness();
+    expect(denialCode(() => h.cp.db.claimTurnMaterializationAuthority())).toBe(
+      ReasonCode.COMPLETION_AUTHORITY_DENIED,
+    );
+  });
+
+  it("hands the same coordinator to every caller rather than minting one per use", () => {
+    const h = makeHarness();
+    expect(h.cp.conversation).toBe(h.cp.conversation);
+  });
+});
+
+
+/**
+ * What the ports buy, stated as something that can fail.
+ *
+ * A caller used to pass `authority` as a field, so "the target committed this turn" was a string
+ * anyone holding the coordinator could type and the ledger recorded a provenance nobody had
+ * established. The ports derive it from which object the caller was handed. That is a wiring
+ * property and no runtime test can prove a component was handed the right one — what *is*
+ * checkable is that each port records only its own authority, and that the pairs the ports can
+ * express are exactly the pairs the schema is willing to store. If those two sets ever drift, one
+ * of them is enforcing something the other only names.
+ */
+describe("an authority is derived from the port, not supplied by the caller", () => {
+  const pairsThePortsCanExpress = (h: Harness): string[] => {
+    const { ports } = coordinatorOf(h);
+    const actorId = target(h, "ports");
+    const written: string[] = [];
+    const record = (
+      label: string,
+      call: (permit: TurnPermit, receipt: TurnReceipt) => Decision<TurnMaterialization>,
+    ): void => {
+      const permit = claimOf(h, actorId, [source(label)]);
+      const decision = call(permit, {
+        receiptId: `receipt:${label}`,
+        evidenceDigest: "sha256:e",
+        reasonCode: ReasonCode.OK,
+      });
+      expect(decision.allowed).toBe(true);
+      const row = h.cp.db.get<{ observed_outcome: string; observing_authority: string }>(
+        `SELECT observed_outcome, observing_authority FROM canonical_turn_observations
+          WHERE receipt_id = ?`,
+        [`receipt:${label}`],
+      )!;
+      written.push(`${row.observed_outcome}/${row.observing_authority}`);
+    };
+    record("a", ports.preDispatch.neverAdmitted);
+    record("b", ports.target.completed);
+    record("c", ports.target.aborted);
+    record("d", ports.ownerFence.aborted);
+    record("e", ports.acpObservedReply.sawCompletion);
+    return written.sort();
+  };
+
+  it("records exactly the pairs the schema permits, and no others", () => {
+    const h = makeHarness();
+
+    // The CHECK on canonical_turn_observations, written out. Kept here rather than read from the
+    // schema on purpose: a test that derives its expectation from the thing under test agrees
+    // with it by construction.
+    expect(pairsThePortsCanExpress(h)).toEqual(
+      [
+        "ABORTED/HERMES_TARGET",
+        "ABORTED/OWNER_AFTER_TARGET_FENCE",
+        "COMPLETED/ACP_OBSERVED_HERMES_REPLY",
+        "COMPLETED/HERMES_TARGET",
+        "NEVER_ADMITTED/ACP_PRE_DISPATCH",
+      ].sort(),
+    );
+  });
+
+  it("refuses a pair no port can express, so the two agree by enforcement rather than by habit", () => {
+    const h = makeHarness();
+    const actorId = target(h, "unreachable");
+    const permit = claimOf(h, actorId, [source("u")]);
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT INTO canonical_turn_observations
+           (turn_request_id, observed_outcome, observing_authority, receipt_id, evidence_digest,
+            reason_code, observed_at, audit_event_id)
+         VALUES (?, 'NEVER_ADMITTED', 'HERMES_TARGET', 'r', 'sha256:e', 'OK', ?, 1)`,
+        [permit.turnRequestId, "2026-08-22T00:00:00.000Z"],
+      ),
+    ).toThrow();
   });
 });

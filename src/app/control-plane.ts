@@ -10,6 +10,7 @@ import { ClaimRegistry } from "../claims/claim-registry.ts";
 import { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import { CtoLifecycle, type CtoPreference } from "../cto/cto-lifecycle.ts";
 import { ProductionGate } from "../ceo/production-gate.ts";
+import { ConversationTurnCoordinator } from "../conversation/turn-coordinator.ts";
 import { AuditLog } from "../db/audit.ts";
 import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -200,6 +201,16 @@ export class ControlPlane {
   readonly db: Db;
   readonly clock: Clock;
   readonly audit: AuditLog;
+  /**
+   * The single materializer of canonical turn outcomes.
+   *
+   * Held here rather than constructed where it is used, because the materialization
+   * capability is issued once per database file and whoever claims it first keeps it. With no
+   * owner in the composition root the winner of that race was whichever code happened to build
+   * a coordinator first, and the production one would then refuse to construct at all. Claiming
+   * it here is what makes every later claim fail.
+   */
+  readonly conversation: ConversationTurnCoordinator;
   readonly artifacts: ArtifactStore;
   readonly telemetry: Telemetry;
   readonly outbox: Outbox;
@@ -348,6 +359,7 @@ export class ControlPlane {
     ensurePrivateDirectory(runtimeRoot);
     this.db = new Db(config.databasePath);
     this.audit = new AuditLog(this.db, this.clock);
+    this.conversation = new ConversationTurnCoordinator(this.db, this.clock, this.audit);
     this.artifacts = new ArtifactStore(this.db, this.clock);
     // Claimed immediately: issuance succeeds once per database, so claiming here is what
     // makes every later claim — by any component that reaches this store — fail.
