@@ -455,6 +455,22 @@ const GUARDS = [
     replace: "    const unanswered = observations;",
     killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
   },
+  {
+    // The wide version: releasing by file let a bystander's close hand the owner's slot away.
+    what: "closing a handle frees only the capability slots that handle issued",
+    file: "src/db/database.ts",
+    find: '    if (this.#issuedHere.has("materialization")) {\n      ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.file);\n    }',
+    replace: "    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.file);",
+    killedBy: ["tests/unit/ops-hardening.test.ts"],
+  },
+  {
+    // The narrow version: never releasing made the issuance a process-lifetime lockout.
+    what: "a capability slot is released when the connection holding it closes",
+    file: "src/db/database.ts",
+    find: "  close(): void {\n    if (this.#raw.open) this.#raw.close();\n    this.releaseIssuedCapabilities();",
+    replace: "  close(): void {\n    if (this.#raw.open) this.#raw.close();",
+    killedBy: ["tests/unit/ops-hardening.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

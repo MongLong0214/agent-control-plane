@@ -108,6 +108,38 @@ describe("MCP evidence authority has no route through a tool handler (#352)", ()
     expect(createCtoServer(ctoPort, authenticate)).toBeDefined();
   });
 
+  it("frees a capability slot when its issuer closes, and only then", () => {
+    // Both halves were wrong once, in opposite directions. Holding the slot for the life of the
+    // process meant reopening a database in place — a fail-closed rebuild, a repair, a control
+    // plane restarted where it stands — could not construct its materializer at all. Releasing it
+    // by file meant any second connection freed the owner's slot merely by closing, and the next
+    // claimant became a second materializer while the owner's token went on working. Measured
+    // both ways before this test existed.
+    const root = tempDir("acp-capability-release-");
+    const databasePath = join(root, "state.sqlite");
+    const owner = new Db(databasePath);
+    owner.claimTurnMaterializationAuthority();
+
+    const bystander = new Db(databasePath);
+    bystander.close();
+    const whileOwnerLives = new Db(databasePath);
+    try {
+      expect(denialCode(() => whileOwnerLives.claimTurnMaterializationAuthority())).toBe(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+      );
+    } finally {
+      whileOwnerLives.close();
+    }
+
+    owner.close();
+    const afterOwnerClosed = new Db(databasePath);
+    try {
+      expect(() => afterOwnerClosed.claimTurnMaterializationAuthority()).not.toThrow();
+    } finally {
+      afterOwnerClosed.close();
+    }
+  });
+
   it("issues evidence writers once for the underlying database file and refuses a symlink alias", () => {
     const root = tempDir("acp-evidence-file-");
     const databasePath = join(root, "state.sqlite");

@@ -519,6 +519,9 @@ export class Db {
   }
 
   /** Claimed by ArtifactStore while the composition root is still being constructed. */
+  /** What *this* handle issued, so closing it releases its own slots and nobody else's. */
+  readonly #issuedHere = new Set<"evidence" | "materialization" | "runState">();
+
   claimEvidenceWritePort(): EvidenceWritePort {
     if (ISSUED_EVIDENCE_WRITE_PORTS.has(this.file)) {
       fail(
@@ -528,6 +531,7 @@ export class Db {
       );
     }
     ISSUED_EVIDENCE_WRITE_PORTS.add(this.file);
+    this.#issuedHere.add("evidence");
     return new EvidenceWritePortToken(EVIDENCE_WRITE_MINT, this);
   }
 
@@ -547,6 +551,7 @@ export class Db {
       );
     }
     ISSUED_TURN_MATERIALIZATION_AUTHORITIES.add(this.file);
+    this.#issuedHere.add("materialization");
     return new TurnMaterializationAuthorityToken(TURN_MATERIALIZATION_MINT, this);
   }
 
@@ -560,6 +565,7 @@ export class Db {
       );
     }
     ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.add(this.file);
+    this.#issuedHere.add("runState");
     return new RunStateTransitionAuthorityToken(RUN_STATE_TRANSITION_MINT, this);
   }
 
@@ -724,14 +730,20 @@ export class Db {
    * fail-closed rebuild, a doctor repair, a control plane restarted in place — could not construct
    * its coordinator at all.
    *
-   * Releasing is not a way to steal one. Every token is brand-checked against the exact `Db` that
-   * minted it, so the slot freed here belongs to a handle that can no longer answer, and the
-   * caller who could reach `close()` could already deny service by closing it.
+   * It releases only what *this* handle issued. The first version released by file, so any second
+   * connection on the same path — one that had claimed nothing — freed the owner's slot merely by
+   * closing, and the next claimant became a second materializer while the owner's brand-checked
+   * token went on working. Measured, on the head this paragraph was written for: a bystander's
+   * close handed the authority away. Brand-checking the token was never the part at risk; the
+   * bookkeeping was.
    */
   private releaseIssuedCapabilities(): void {
-    ISSUED_EVIDENCE_WRITE_PORTS.delete(this.file);
-    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.file);
-    ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.delete(this.file);
+    if (this.#issuedHere.has("evidence")) ISSUED_EVIDENCE_WRITE_PORTS.delete(this.file);
+    if (this.#issuedHere.has("materialization")) {
+      ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.file);
+    }
+    if (this.#issuedHere.has("runState")) ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.delete(this.file);
+    this.#issuedHere.clear();
   }
 
   private assertUsable(): void {
