@@ -616,13 +616,21 @@ export class Daemon {
           if (!evidenceDigest.allowed) return evidenceDigest;
           const cited = requiredOperatorIntegerList(request.params, "citedObservationIds");
           if (!cited.allowed) return cited;
-          return this.cp.conversation.adjudicate({
+          const adjudicated = this.cp.conversation.adjudicate({
             targetActorId: targetActorId.value,
             turnRequestId: turnRequestId.value,
             citedObservationIds: cited.value,
             reasonCode: reasonCode.value,
             evidenceDigest: evidenceDigest.value,
           });
+          // Symmetrical with the capacity door above, and for the same reason. Without it an
+          // operator follows the doctor's remedy exactly, both calls succeed, and `daemon.status`
+          // goes on reporting BOOTSTRAP with the stale finding for up to the recheck interval —
+          // four minutes by default, longer if configured. The remedy landed and the report said
+          // it had not, which is the shape this whole door was built to remove. A denied
+          // adjudication must not consume the wake-up: nothing changed for the doctor to see.
+          if (adjudicated.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");
+          return adjudicated;
         }
 
         case OPERATOR_METHOD.DAEMON_STATUS:

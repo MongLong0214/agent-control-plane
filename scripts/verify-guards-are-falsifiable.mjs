@@ -32,7 +32,7 @@
  * Dependency-free, in the shape of the other verify scripts (PRD §17.4).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -530,6 +530,24 @@ const GUARDS = [
     replace: "  blockingFindings.length > 0 &&\n  blockingFindings.some(",
     killedBy: ["tests/unit/the-quarantine-has-an-operator-door.test.ts"],
   },
+  {
+    // Without it the operator's remedy lands and `daemon.status` reports BOOTSTRAP for another
+    // four minutes, which is the report disagreeing with what just happened.
+    what: "a landed adjudication promotes the daemon rather than waiting out the recheck timer",
+    file: "src/daemon/daemon.ts",
+    find: '          if (adjudicated.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");',
+    replace: "          void adjudicated;",
+    killedBy: ["tests/unit/daemon-bootstrap-door.test.ts"],
+  },
+  {
+    // A refused adjudication changed nothing the doctor can see, so spending the wake-up on it
+    // promotes on the strength of a denial.
+    what: "a refused adjudication does not spend the park's wake-up",
+    file: "src/daemon/daemon.ts",
+    find: '          if (adjudicated.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");\n          return adjudicated;',
+    replace: '          if (this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");\n          return adjudicated;',
+    killedBy: ["tests/unit/daemon-bootstrap-door.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
@@ -560,6 +578,19 @@ const failures = [];
 if (anchorsOnly) {
   const dead = [];
   for (const guard of rows) {
+    // The other field that goes stale, and the one nothing was checking. `vitest run <path>` exits
+    // non-zero when the path matches no file — "No test files found" is a failure — and this
+    // harness reads a non-zero exit as "the guard was killed". So renaming or deleting a
+    // `killedBy` file makes its rows report a kill forever, having run no test at all. Found by a
+    // review, which is the same way the anchor half was found.
+    for (const test of guard.killedBy) {
+      if (!existsSync(join(ROOT, test))) {
+        dead.push({
+          guard,
+          why: `killedBy names ${test}, which does not exist — vitest exits non-zero for a missing path, so this row reports a kill it never ran`,
+        });
+      }
+    }
     const text = readFileSync(join(ROOT, guard.file), "utf8");
     const count = text.split(guard.find).length - 1;
     if (count !== 1) {

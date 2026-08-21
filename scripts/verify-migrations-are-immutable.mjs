@@ -23,7 +23,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const MANIFEST = join(ROOT, "evidence/migration-checksums.json");
+/**
+ * Beside the migrations rather than under evidence/. It is not a measurement of a tree — it is the
+ * contract those migrations are held to, and it changes only when one is added. Under evidence/ it
+ * failed the freshness gate for having no source digest, which was that gate correctly saying this
+ * file is not the kind of thing it checks.
+ */
+const MANIFEST = join(ROOT, "src/db/migration-checksums.json");
 
 const { MIGRATIONS, SCHEMA_VERSION } = await import(join(ROOT, "src/db/migrations.ts"));
 

@@ -40,6 +40,7 @@ const finding = (code: string, scope: string): Finding => ({
 
 const COVERAGE = finding("ROLE_COVERAGE_NO_VALID_COVERAGE", "continuity");
 const CREDENTIAL = finding("TRUSTED_GATE_CREDENTIAL_MISSING", "github");
+const CONTRADICTED = finding("CANONICAL_TURN_CONTRADICTED", "conversation");
 
 const report = (status: DoctorReport["status"], findings: readonly Finding[]): DoctorReport => ({
   scope: "system",
@@ -752,5 +753,139 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
     expect(canParkForBootstrap([COVERAGE, CREDENTIAL])).toBe(false);
     // A blocked doctor with no blocking finding is blocked for a reason this door cannot read.
     expect(canParkForBootstrap([])).toBe(false);
+  });
+});
+
+describe("the adjudication door promotes the daemon, not just the ledger", () => {
+  const NOW = "2026-08-22T00:00:00.000Z";
+
+  /** An actor with a verified target, and a turn whose two records disagree. */
+  const contradictedTurn = (harness: ReturnType<typeof makeHarness>) => {
+    const db = harness.cp.db;
+    db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES ('a','CEO',?)`, [NOW]);
+    db.run(
+      `INSERT INTO actor_target_bindings
+         (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
+       VALUES ('b','a','hermes','L','D',?)`,
+      [NOW],
+    );
+    db.run(
+      `INSERT INTO actor_target_attestations
+         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+          executor_session_id, executor_session_incarnation, binding_generation, attested_at)
+       VALUES ('t','b','v1','AD','s','i',1,?)`,
+      [NOW],
+    );
+    const claimed = harness.cp.conversation.claim({
+      targetActorId: "a",
+      prompt: "m1",
+      sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload: {} }],
+    });
+    if (!claimed.allowed) throw new Error(`claim refused: ${claimed.reasonCode}`);
+    harness.cp.conversation.ports.target.completed(claimed.value, {
+      receiptId: "target:m1",
+      evidenceDigest: "sha256:receipt",
+      reasonCode: "OK",
+    });
+    harness.cp.conversation.ports.preDispatch.neverAdmitted(claimed.value, {
+      receiptId: "pre:m1",
+      evidenceDigest: "sha256:pre",
+      reasonCode: "CEO_CONVERSATION_UNAVAILABLE",
+    });
+    return claimed.value.turnRequestId;
+  };
+
+  it("wakes the park when an adjudication lands, instead of leaving it on the recheck timer", async () => {
+    // Without the wake, an operator follows the doctor's remedy exactly, both calls succeed, and
+    // `daemon.status` goes on reporting BOOTSTRAP with the stale finding until the recheck
+    // interval elapses — four minutes by default. The remedy landed and the report said it had
+    // not, which is the shape this door was built to remove. The interval here is deliberately
+    // enormous: if the promotion happens, it happened because of the adjudication.
+    const { harness, daemon } = makeDaemon(
+      [report("BLOCKED", [CONTRADICTED]), report("HEALTHY", [])],
+      [],
+      { bootstrapRecheckIntervalMs: 600_000 },
+    );
+    const turnRequestId = contradictedTurn(harness);
+    const door = recordingDoor();
+
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+    expect(allowedValue(await status(daemon))).toMatchObject({
+      mode: "BOOTSTRAP",
+      blockingFindings: [{ code: "CANONICAL_TURN_CONTRADICTED" }],
+    });
+
+    // The read half, through the same parked door the operator has.
+    const seen = await daemon.handleOperatorRequest(
+      {
+        requestId: "req-contradictions",
+        method: OPERATOR_METHOD.CONVERSATION_CONTRADICTIONS,
+        params: {},
+      },
+      PEER,
+    );
+    expect(seen.allowed).toBe(true);
+    const citedObservationIds = (
+      allowedValue(seen) as Array<{ observations: Array<{ observationId: number }> }>
+    )[0]!.observations.map((o) => o.observationId);
+
+    const adjudicated = await daemon.handleOperatorRequest(
+      {
+        requestId: "req-adjudicate",
+        idempotencyKey: `operator:adjudicate:${turnRequestId}`,
+        method: OPERATOR_METHOD.CONVERSATION_ADJUDICATE,
+        params: {
+          targetActorId: "a",
+          turnRequestId,
+          citedObservationIds,
+          reasonCode: "OK",
+          evidenceDigest: "sha256:operator-read-both",
+        },
+      },
+      PEER,
+    );
+    expect(adjudicated.allowed, adjudicated.allowed ? "" : adjudicated.message).toBe(true);
+
+    const started = await starting;
+    expect(started.allowed).toBe(true);
+    expect(allowedValue(await status(daemon))).toMatchObject({ mode: "NORMAL", blockingFindings: [] });
+    await daemon.stop();
+  });
+
+  it("does not spend the wake-up on an adjudication that was refused", async () => {
+    // Symmetrical with the capacity door: nothing changed for the doctor to see, so consuming the
+    // signal would promote on the strength of a denial.
+    const { harness, daemon } = makeDaemon(
+      [report("BLOCKED", [CONTRADICTED]), report("HEALTHY", [])],
+      [],
+      { bootstrapRecheckIntervalMs: 600_000 },
+    );
+    const turnRequestId = contradictedTurn(harness);
+    const door = recordingDoor();
+    const starting = daemon.start({ bootstrapDoor: door.open });
+    await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    const refused = await daemon.handleOperatorRequest(
+      {
+        requestId: "req-adjudicate-partial",
+        idempotencyKey: "operator:adjudicate:partial",
+        method: OPERATOR_METHOD.CONVERSATION_ADJUDICATE,
+        params: {
+          targetActorId: "a",
+          turnRequestId,
+          // One id short of the set: the coordinator refuses a partial citation.
+          citedObservationIds: [1],
+          reasonCode: "OK",
+          evidenceDigest: "sha256:partial",
+        },
+      },
+      PEER,
+    );
+    expect(refused.allowed).toBe(false);
+    expect(allowedValue(await status(daemon))).toMatchObject({ mode: "BOOTSTRAP" });
+
+    daemon.stop();
+    await starting;
   });
 });

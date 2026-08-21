@@ -35,7 +35,8 @@
     "trailers": "node scripts/verify-trailers-are-parsable.mjs",
     "migrations:check": "node scripts/verify-migrations-are-immutable.mjs",
     "migrations:freeze": "node scripts/verify-migrations-are-immutable.mjs --update",
-    "schema:census": "node scripts/verify-append-only-tables-are-closed.mjs"
+    "schema:census": "node scripts/verify-append-only-tables-are-closed.mjs",
+    "schema:denials": "node scripts/verify-trigger-denials-are-typed.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
