@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 25;
+export const SCHEMA_VERSION = 26;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -111,8 +111,14 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
  * and drift is what put a database at version 24 with a different trigger set than version 24
  * defines. Pulling them from `schema.sql` means the migration owns the ordering and nothing else.
  */
-export const ledgerTriggerDdl = (): string => {
-  const names = [
+/**
+ * Every ledger trigger, in one place, because two lists of the same thing is how one goes stale.
+ *
+ * `ledgerTriggerDdl()` reads its bodies from schema.sql by these names; `ledgerTriggerDrops()`
+ * drops exactly these. A migration that recreates the set therefore cannot repair some of it and
+ * silently leave the rest — which is precisely what v25 did with a hand-picked list of eight.
+ */
+export const LEDGER_TRIGGER_NAMES: readonly string[] = [
     "canonical_turns_identity_immutable",
     "canonical_turns_born_in_doubt",
     "canonical_turns_settlement_authority",
@@ -138,10 +144,44 @@ export const ledgerTriggerDdl = (): string => {
     "canonical_turn_adjudications_write_authority",
     "canonical_turn_adjudications_append_only",
     "canonical_turn_adjudications_no_delete",
+    "canonical_turn_adjudication_citations_write_authority",
     "canonical_turn_adjudication_citations_append_only",
     "canonical_turn_adjudication_citations_no_delete",
     "canonical_turn_adjudication_citations_same_turn",
-  ];
+];
+
+/**
+ * `DROP TRIGGER IF EXISTS` for every ledger trigger, derived from the list above.
+ *
+ * Dropping before recreating is what makes a repair migration a repair. `CREATE TRIGGER IF NOT
+ * EXISTS` against a trigger that is already there is a no-op, so a body that drifted survives the
+ * migration built to replace it — measured on a database created at `132309a`, which migrated to
+ * v25, reported healthy, and then threw on every settlement because its settlement trigger still
+ * called the four-argument marker that no longer exists.
+ */
+export const ledgerTriggerDrops = (): string =>
+  `${dropsFor(LEDGER_TRIGGER_NAMES)}${dropsFor(PROVENANCE_NO_REPLACE_TRIGGERS)}`;
+
+/**
+ * Provenance tables that had UPDATE and DELETE guards and nothing on INSERT.
+ *
+ * Found by census after the same hole was closed on the ledger tables and missed here. Kept
+ * separate from the ledger set because they are not part of the canonical turn's own schema, and
+ * kept in this file because the repair migration has to install them for databases that already
+ * exist.
+ */
+export const PROVENANCE_NO_REPLACE_TRIGGERS: readonly string[] = [
+  "audit_events_no_replace",
+  "baseline_records_no_replace",
+  "telegram_owner_prompts_no_replace",
+];
+
+/** `DROP TRIGGER IF EXISTS` for a set of triggers, so a repair replaces rather than skips. */
+const dropsFor = (names: readonly string[]): string =>
+  `${names.map((name) => `DROP TRIGGER IF EXISTS ${name};`).join("\n")}\n`;
+
+/** The definitions of the named triggers, read out of the live schema so the two cannot drift. */
+const triggerDdlFor = (names: readonly string[]): string => {
   const ddl = schemaDdl();
   const found = names.map((name) => {
     const pattern = new RegExp(
@@ -162,6 +202,9 @@ export const ledgerTriggerDdl = (): string => {
   });
   return `${found.join("\n\n")}\n`;
 };
+
+export const ledgerTriggerDdl = (): string => triggerDdlFor(LEDGER_TRIGGER_NAMES);
+export const provenanceNoReplaceDdl = (): string => triggerDdlFor(PROVENANCE_NO_REPLACE_TRIGGERS);
 
 /** The adjudication tables and their index, taken from the live schema for the same reason. */
 export const adjudicationDdl = (): string => {
@@ -1527,6 +1570,152 @@ const v25: SchemaMigration = {
     sha256(`v25-ledger-guards\n${V25_LEDGER_GUARDS_DDL}\n${adjudicationDdl()}\n${ledgerTriggerDdl()}`),
 };
 
+/** One object out of the live schema, by pattern, so a rebuild cannot invent its own definition. */
+const schemaObject = (pattern: RegExp, what: string): string => {
+  const match = pattern.exec(schemaDdl());
+  if (!match) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, `${what} is missing from schema.sql`, {});
+  }
+  return match[0];
+};
+
+const observationsTableOnlyDdl = (): string =>
+  schemaObject(
+    /CREATE TABLE IF NOT EXISTS canonical_turn_observations \([\s\S]*?\n\);/,
+    "the observations table",
+  );
+
+const observationsIndexDdl = (): string =>
+  schemaObject(
+    /CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn[^;]*;/,
+    "the observations index",
+  );
+
+/**
+ * Rebuilds `canonical_turn_observations` when its stored definition is not the current one.
+ *
+ * v24 created it with `UNIQUE (turn_request_id, observing_authority, receipt_id)`. The live schema
+ * scopes receipt identity to the authority across all turns, because per-turn scoping let one
+ * authority's receipt id land on two turns — a wrong-turn completion laundering path. Nothing
+ * rebuilt the table, so *every* database upgrading from v23 or earlier through v24 gets the old
+ * constraint and keeps it: the code queries globally while the index only enforces per-turn.
+ *
+ * A duplicate that the new constraint forbids is refused rather than dropped. Losing an
+ * observation is losing the evidence a turn's outcome was computed from, and a migration that
+ * quietly discards one is worse than a migration that stops.
+ */
+const rebuildObservationsIfStale = (raw: Database.Database): void => {
+  const stored = (
+    raw
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turn_observations'")
+      .get() as { sql?: string } | undefined
+  )?.sql;
+  if (stored === undefined) return;
+  const wanted = /CREATE TABLE IF NOT EXISTS canonical_turn_observations \([\s\S]*?\n\);/.exec(schemaDdl());
+  // Quote-insensitive, because `ALTER TABLE … RENAME TO` writes the name back quoted. Comparing
+  // the raw text would report a table this migration had just rebuilt as still stale.
+  const normalise = (sql: string): string =>
+    sql
+      .replace(/CREATE TABLE IF NOT EXISTS /, "CREATE TABLE ")
+      .replace(/"/g, "")
+      .replace(/;\s*$/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  if (wanted && normalise(stored) === normalise(wanted[0])) return;
+
+  const clash = raw
+    .prepare(
+      `SELECT observing_authority AS a, receipt_id AS r, COUNT(*) AS n
+         FROM canonical_turn_observations
+        GROUP BY observing_authority, receipt_id HAVING n > 1`,
+    )
+    .all() as Array<{ a: string; r: string; n: number }>;
+  if (clash.length > 0) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "receipt ids are reused across turns, which the current identity forbids and this migration will not discard",
+      { duplicates: clash.length, first: clash[0] ?? null },
+    );
+  }
+
+  // SQLite's documented order, and the reason it is that order: renaming the *old* table makes
+  // SQLite rewrite every foreign key that names it, so the adjudication citations came out of the
+  // first attempt pointing at `canonical_turn_observations_stale` — a table this function then
+  // dropped. Building the replacement under a temporary name and renaming *it* leaves every
+  // existing reference textually correct, because nothing references the temporary name.
+  const columns = `observation_id, turn_request_id, observed_outcome, observing_authority, receipt_id,
+        evidence_digest, reason_code, observed_at, audit_event_id, adjudicates_observation_id`;
+  raw.exec(
+    observationsTableOnlyDdl().replace(
+      "CREATE TABLE IF NOT EXISTS canonical_turn_observations",
+      "CREATE TABLE canonical_turn_observations_rebuilt",
+    ),
+  );
+  raw.exec(
+    `INSERT INTO canonical_turn_observations_rebuilt (${columns})
+     SELECT ${columns} FROM canonical_turn_observations`,
+  );
+  raw.exec("DROP TABLE canonical_turn_observations");
+  raw.exec("ALTER TABLE canonical_turn_observations_rebuilt RENAME TO canonical_turn_observations");
+  raw.exec(observationsIndexDdl());
+
+  // The check that would have caught the first attempt. A dangling reference survives
+  // `foreign_key_check` when the table it names does not exist, so ask the schema directly.
+  const dangling = raw
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND sql LIKE '%canonical_turn_observations_rebuilt%'`,
+    )
+    .all() as Array<{ name: string }>;
+  if (dangling.length > 0) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "rebuilding the observations table left a reference to its temporary name",
+      { tables: dangling.map((row) => row.name) },
+    );
+  }
+};
+
+/**
+ * Replaces every ledger trigger body, for databases whose triggers drifted under an earlier head.
+ *
+ * v25 dropped eight triggers by name and then ran `CREATE TRIGGER IF NOT EXISTS` for all
+ * twenty-eight, so the other twenty kept whatever body they already had. Measured on a database
+ * built by `132309a` and opened by this head:
+ *
+ * ```
+ * opened; user_version now: 25
+ * canonical_turns_settlement_authority  { fourArgCall: true }
+ * SETTLEMENT THREW: wrong number of arguments to function acp_turn_materialization_authorized()
+ * ```
+ *
+ * The turn stays IN_DOUBT — nothing can settle it, `adjudicate()` refuses it because it is not
+ * contradicted, and the actor's next claim is refused because the first is unresolved. A
+ * conversation wedged with no exit, arriving through the migration written to prevent exactly
+ * that.
+ *
+ * This runs after v25 rather than editing it, because a database created at the head that shipped
+ * v25 has already taken it and would otherwise keep the same stale bodies one version later.
+ */
+const v26: SchemaMigration = {
+  id: "v26-ledger-trigger-bodies",
+  fromVersion: 25,
+  toVersion: 26,
+  foreignKeysOffDuringApply: true,
+  apply: (raw) => {
+    raw.exec(ledgerTriggerDrops());
+    rebuildObservationsIfStale(raw);
+    raw.exec(adjudicationDdl());
+    raw.exec(ledgerTriggerDdl());
+    raw.exec(provenanceNoReplaceDdl());
+  },
+  checksum: () =>
+    sha256(
+      `v26-ledger-trigger-bodies\n${ledgerTriggerDrops()}\n${adjudicationDdl()}\n` +
+        `${ledgerTriggerDdl()}\n${provenanceNoReplaceDdl()}`,
+    ),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -1542,6 +1731,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v23,
   v24,
   v25,
+  v26,
 ]);
 
 interface RequiredTrigger {
@@ -1597,6 +1787,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "outbox_request_fingerprint_immutable", sentinel: "OUTBOX_REQUEST_FINGERPRINT_IMMUTABLE" },
   { name: "github_receipts_applied_requires_reservation", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
   { name: "github_receipts_pending_completion", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
+  { name: "audit_events_no_replace", sentinel: "AUDIT_NO_REPLACE", introducedIn: 26 },
   { name: "audit_events_append_only", sentinel: "AUDIT_APPEND_ONLY" },
   { name: "audit_events_no_delete", sentinel: "AUDIT_APPEND_ONLY" },
   { name: "canonical_turns_identity_immutable", sentinel: "CANONICAL_TURN_IDENTITY_IMMUTABLE", introducedIn: 24 },
@@ -1607,6 +1798,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_turn_adjudications_write_authority", sentinel: "CANONICAL_TURN_ADJUDICATION_AUTHORITY_DENIED", introducedIn: 25 },
   { name: "canonical_turn_adjudications_append_only", sentinel: "CANONICAL_TURN_ADJUDICATION_APPEND_ONLY", introducedIn: 25 },
   { name: "canonical_turn_adjudications_no_delete", sentinel: "CANONICAL_TURN_ADJUDICATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudication_citations_write_authority", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_AUTHORITY_DENIED", introducedIn: 26 },
   { name: "canonical_turn_adjudication_citations_append_only", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY", introducedIn: 25 },
   { name: "canonical_turn_adjudication_citations_no_delete", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY", introducedIn: 25 },
   { name: "canonical_turn_adjudication_citations_same_turn", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_FOREIGN", introducedIn: 25 },
@@ -1636,22 +1828,50 @@ const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
 ];
 
 const REQUIRED_BASELINE_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  { name: "baseline_records_no_replace", sentinel: "BASELINE_RECORD_NO_REPLACE", introducedIn: 26 },
   { name: "baseline_records_immutable", sentinel: "BASELINE_RECORD_IMMUTABLE" },
   { name: "baseline_records_no_delete", sentinel: "BASELINE_RECORD_IMMUTABLE" },
 ];
 
 const REQUIRED_TELEGRAM_OWNER_PROMPT_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  { name: "telegram_owner_prompts_no_replace", sentinel: "TELEGRAM_PROMPT_NO_REPLACE", introducedIn: 26 },
   { name: "telegram_owner_prompts_immutable", sentinel: "TELEGRAM_PROMPT_IMMUTABLE" },
   { name: "telegram_owner_prompts_no_delete", sentinel: "TELEGRAM_PROMPT_IMMUTABLE" },
 ];
 
 /**
  * Names alone are not enough: a same-named no-op trigger would make a corrupt database look
- * healthy. The embedded denial marker proves that each load-bearing guard still has its
- * intended enforcement body. Historical backups are checked against the registry as it
- * existed at their recorded schema version, so a v11 image is not rejected merely because
- * a later migration added another load-bearing trigger.
+ * healthy. Historical backups are checked against the registry as it existed at their recorded
+ * schema version, so a v11 image is not rejected merely because a later migration added another
+ * load-bearing trigger.
+ *
+ * The denial marker is not enough either, and that is what this file learned the expensive way. A
+ * database created at `132309a` kept a settlement trigger calling a four-argument marker that no
+ * longer exists; the body was wrong in the one way that mattered and still contained
+ * `CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED`, so this check passed it as healthy and every
+ * settlement afterwards threw. A substring proves a name is present in a body. It does not prove
+ * the body is the one the guard was written as.
+ *
+ * So for the ledger triggers — the set whose bodies this module can produce — the whole body is
+ * compared against the live schema, normalised the way SQLite stores it. The rest still rest on
+ * their sentinel, which is a weaker check and is written down as one: there is no extractor for
+ * their definitions, and a check that quietly skipped what it could not verify would be the same
+ * defect wearing this function's name.
  */
+const normaliseTriggerSql = (sql: string): string =>
+  sql.replace(/CREATE TRIGGER IF NOT EXISTS /, "CREATE TRIGGER ").replace(/;\s*$/, "").trim();
+
+/** The body each ledger trigger is defined as, by name, taken from the live schema. */
+const ledgerTriggerBodies = (): ReadonlyMap<string, string> => {
+  const bodies = new Map<string, string>();
+  for (const match of ledgerTriggerDdl().matchAll(
+    /CREATE TRIGGER IF NOT EXISTS (\w+)\n[\s\S]*?\nEND;/g,
+  )) {
+    bodies.set(match[1]!, normaliseTriggerSql(match[0]));
+  }
+  return bodies;
+};
+
 export const assertLoadBearingInvariants = (
   raw: Database.Database,
   options: {
@@ -1662,6 +1882,10 @@ export const assertLoadBearingInvariants = (
   },
 ): void => {
   const schemaVersion = options.schemaVersion ?? SCHEMA_VERSION;
+  // Only for a database at the current version. An older image's ledger triggers are legitimately
+  // the older definitions, and rejecting a v11 backup for not carrying today's bodies would make
+  // this check refuse the archives it exists to validate.
+  const bodies = schemaVersion === SCHEMA_VERSION ? ledgerTriggerBodies() : new Map<string, string>();
   const expected = [
     ...REQUIRED_SCHEMA_TRIGGERS,
     ...(options.includeMigrationLedger
@@ -1675,6 +1899,14 @@ export const assertLoadBearingInvariants = (
     const row = raw
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
       .get(trigger.name) as { sql?: string | null } | undefined;
+    const expectedBody = bodies.get(trigger.name);
+    if (row?.sql && expectedBody !== undefined && normaliseTriggerSql(row.sql) !== expectedBody) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `load-bearing trigger ${trigger.name} does not have the body this schema defines`,
+        { trigger: trigger.name, schemaVersion },
+      );
+    }
     if (!row?.sql || !row.sql.includes(trigger.sentinel)) {
       throw acpError(
         ReasonCode.INTERNAL_ERROR,

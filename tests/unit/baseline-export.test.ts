@@ -831,6 +831,7 @@ describe("baseline boundary contracts", () => {
       "v23-turn-claimed-at",
       "v24-observation-ledger",
       "v25-ledger-guards",
+      "v26-ledger-trigger-bodies",
     ]);
   });
 
@@ -918,8 +919,13 @@ describe("baseline boundary contracts", () => {
       expect(triggers.map((trigger) => trigger.name)).toEqual([
         "baseline_records_immutable",
         "baseline_records_no_delete",
+        // v26. A census found three provenance tables with UPDATE and DELETE guards and nothing on
+        // INSERT, which left `INSERT OR REPLACE` free to rewrite a row by its key.
+        "baseline_records_no_replace",
       ]);
-      expect(triggers.every((trigger) => trigger.sql.includes("BASELINE_RECORD_IMMUTABLE"))).toBe(true);
+      expect(
+        triggers.every((trigger) => /BASELINE_RECORD_(IMMUTABLE|NO_REPLACE)/.test(trigger.sql)),
+      ).toBe(true);
     } finally {
       migrated.close();
     }

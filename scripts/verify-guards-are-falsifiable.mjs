@@ -472,6 +472,23 @@ const GUARDS = [
     replace: "  close(): void {\n    if (this.#raw.open) this.#raw.close();",
     killedBy: ["tests/unit/ops-hardening.test.ts"],
   },
+  {
+    // v25 dropped eight of twenty-eight and recreated with IF NOT EXISTS, so twenty kept whatever
+    // body they had. A database from 132309a then threw on every settlement and opened clean.
+    what: "a migration that recreates the ledger triggers drops all of them first",
+    file: "src/db/migrations.ts",
+    find: "    raw.exec(ledgerTriggerDrops());\n    raw.exec(adjudicationDdl());",
+    replace: "    raw.exec(adjudicationDdl());",
+    killedBy: ["tests/unit/a-database-built-by-an-earlier-head.test.ts"],
+  },
+  {
+    // A stale body always keeps its denial marker, so the substring check could never see one.
+    what: "a load-bearing trigger is checked by its body, not by its name and marker",
+    file: "src/db/migrations.ts",
+    find: "    if (row?.sql && expectedBody !== undefined && normaliseTriggerSql(row.sql) !== expectedBody) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/a-database-built-by-an-earlier-head.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

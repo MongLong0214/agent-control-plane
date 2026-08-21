@@ -1048,6 +1048,15 @@ BEGIN
   SELECT RAISE(ABORT, 'TELEGRAM_PROMPT_IMMUTABLE');
 END;
 
+-- CP-HI-06 — same census, same hole. These rows are the owner's own messages.
+CREATE TRIGGER IF NOT EXISTS telegram_owner_prompts_no_replace
+BEFORE INSERT ON telegram_owner_prompts
+WHEN EXISTS (SELECT 1 FROM telegram_owner_prompts
+              WHERE chat_id = NEW.chat_id AND message_id = NEW.message_id)
+BEGIN
+  SELECT RAISE(ABORT, 'TELEGRAM_PROMPT_NO_REPLACE');
+END;
+
 -- CP-HI-08 — a deleted prompt would make an unanswered gate indistinguishable from one never raised.
 CREATE TRIGGER IF NOT EXISTS telegram_owner_prompts_no_delete
 BEFORE DELETE ON telegram_owner_prompts
@@ -1191,6 +1200,25 @@ BEGIN
   SELECT RAISE(ABORT, 'AUDIT_APPEND_ONLY');
 END;
 
+-- CP-HI-06 — the provenance every canonical turn cites, rewritable by an ordinary statement.
+--
+-- `audit_events` had append-only on UPDATE and no-delete on DELETE and nothing on INSERT, so an
+-- external connection could `INSERT OR REPLACE` a row by its id: SQLite skips the implicit
+-- delete's triggers when `recursive_triggers` is off, and a connection ACP did not open has it
+-- off by default. Measured on this head — `ORIGINAL|{"v":1}` became `FORGED|{"v":2}` under the
+-- same `event_id`, the canonical turn went on citing that id, and `foreign_key_check` reported
+-- nothing, because every reference stayed valid while what it referenced changed underneath.
+--
+-- Found by a census after the same hole was closed on five ledger tables and missed here. The
+-- lesson is in the census, not the trigger: guarding a table means covering INSERT, UPDATE and
+-- DELETE, and REPLACE is an INSERT that deletes.
+CREATE TRIGGER IF NOT EXISTS audit_events_no_replace
+BEFORE INSERT ON audit_events
+WHEN EXISTS (SELECT 1 FROM audit_events WHERE event_id = NEW.event_id)
+BEGIN
+  SELECT RAISE(ABORT, 'AUDIT_NO_REPLACE');
+END;
+
 -- CP-HI-08 — erasing a denial or takeover destroys exactly what explainability needs.
 -- Append-only means no deletes either: erasing a denial or a takeover record would
 -- destroy exactly the evidence §40 requires for explainability.
@@ -1225,6 +1253,15 @@ CREATE TRIGGER IF NOT EXISTS baseline_records_immutable
 BEFORE UPDATE ON baseline_records
 BEGIN
   SELECT RAISE(ABORT, 'BASELINE_RECORD_IMMUTABLE');
+END;
+
+-- CP-HI-06 — a baseline is the comparison point; editing it silently redefines what counts as regression.
+-- CP-HI-06 — same census, same hole: a baseline is verification provenance and REPLACE rewrote it.
+CREATE TRIGGER IF NOT EXISTS baseline_records_no_replace
+BEFORE INSERT ON baseline_records
+WHEN EXISTS (SELECT 1 FROM baseline_records WHERE record_id = NEW.record_id)
+BEGIN
+  SELECT RAISE(ABORT, 'BASELINE_RECORD_NO_REPLACE');
 END;
 
 -- CP-HI-08 — a missing baseline must not read as a clean comparison.
@@ -1745,6 +1782,24 @@ CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudications_no_delete
 BEFORE DELETE ON canonical_turn_adjudications
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_APPEND_ONLY');
+END;
+
+-- CP-HI-06 — a citation appended later lets an adjudication claim evidence it never read.
+--
+-- The adjudication row itself required the marker; its citations did not, and append-only plus
+-- no-delete plus same-turn left INSERT wide open. Measured: after a genuine adjudication resolved
+-- two observations, a third disagreeing observation re-opened the turn, a raw INSERT attached that
+-- third observation to the *existing* adjudication, and the next agreeing observation restored
+-- ADJUDICATED — the quarantine cleared with nobody having read the thing that caused it. The
+-- citation is the whole difference between an adjudication and an assertion that the disagreement
+-- is over, so it is authenticated exactly as the adjudication is.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudication_citations_write_authority
+BEFORE INSERT ON canonical_turn_adjudication_citations
+WHEN acp_turn_materialization_authorized(
+       (SELECT turn_request_id FROM canonical_turn_adjudications
+         WHERE adjudication_id = NEW.adjudication_id)) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_CITATION_AUTHORITY_DENIED');
 END;
 
 -- CP-HI-06 — a citation set that can be edited afterwards does not record what was read.

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { Db } from "../../src/db/database.ts";
+import { LEDGER_TRIGGER_NAMES } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -36,6 +37,26 @@ const freshDatabasePath = (): string => join(tempDir("schema-triggers"), "acp.db
 describe("every schema trigger is load-bearing and checked", () => {
   it("declares at least the triggers this repository ships", () => {
     expect(triggersInSchema.length).toBeGreaterThanOrEqual(29);
+  });
+
+  it("names every ledger trigger in the list the repair migration is built from", () => {
+    // The list drifting the other way is silent. `ledgerTriggerDdl()` throws when it names a
+    // trigger schema.sql does not define, so that direction is loud; a trigger *added* to
+    // schema.sql and not added to the list is created on a fresh install and never dropped or
+    // recreated by the repair migration, which is how a body goes stale under a corrected head
+    // without anything noticing. Measured once already: v25 recreated twenty-eight triggers while
+    // dropping eight, and a database from an earlier head kept twenty stale bodies and opened
+    // clean.
+    const ledgerTriggers = triggersInSchema.filter(
+      (name) => name.startsWith("canonical_turn") || name.startsWith("actor_target"),
+    );
+    const listed = new Set(LEDGER_TRIGGER_NAMES);
+    const missing = ledgerTriggers.filter((name) => !listed.has(name));
+
+    expect(
+      missing,
+      `declared in schema.sql but absent from LEDGER_TRIGGER_NAMES: ${missing.join(", ")}`,
+    ).toEqual([]);
   });
 
   it("creates every trigger schema.sql declares", () => {
