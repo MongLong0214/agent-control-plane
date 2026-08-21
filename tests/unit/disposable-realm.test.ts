@@ -1,4 +1,4 @@
-import { chmodSync, linkSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -523,10 +523,19 @@ describe("the evidence claim is bounded in the code, not in the write-up", () =>
  * string equal: false           same inode: true
  * ```
  *
- * These run on any filesystem. On a case-sensitive one the two spellings really are two
- * directories and the refusals below come from the ordinary rules — the test still passes, and it
- * is measuring something weaker there. That is worth saying rather than pretending otherwise.
+ * The expectation depends on the volume, so it is measured rather than assumed. On a
+ * case-insensitive one the two spellings are one directory and the plan must refuse; on a
+ * case-sensitive one they are two directories and the plan must *allow*, because nothing is
+ * shared. The first version of this file asserted a refusal either way and claimed in a comment
+ * that it "still passes" on a case-sensitive host. A reviewer built a case-sensitive APFS volume
+ * and ran it: both tests failed. The claim was the untested half of the test.
  */
+/** Whether this volume distinguishes `A` from `a`, asked of the volume the tests run on. */
+const volumeIsCaseSensitive = (): boolean => {
+  const dir = tempDir("acp-case-probe-");
+  mkdirSync(join(dir, "Probe"));
+  return !existsSync(join(dir, "probe"));
+};
 describe("a different spelling of a path is the same path", () => {
   it("refuses a probe target spelled as a case variant of the canonical root", () => {
     const home = fakeHome();
@@ -541,6 +550,12 @@ describe("a different spelling of a path is the same path", () => {
       probeTargetRoot: join(scratch, "canonical-root"),
     });
 
+    if (volumeIsCaseSensitive()) {
+      // Two directories, nothing shared, and refusing would be this module refusing a legitimate
+      // realm — the failure in the other direction.
+      expect(decision.allowed).toBe(true);
+      return;
+    }
     expect(decision.allowed).toBe(false);
     if (decision.allowed) return;
     expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_PROBE_TARGET_IS_CANONICAL);
@@ -552,6 +567,7 @@ describe("a different spelling of a path is the same path", () => {
     // realm's database, sockets and lock would be created inside production.
     const variant = join(home, ".Agent-Control-Plane", "acceptance");
     mkdirSync(variant, { recursive: true });
+    const scratch = tempDir("acp-case-roots-");
 
     const decision = planDisposableRealm({
       home,
@@ -562,10 +578,17 @@ describe("a different spelling of a path is the same path", () => {
         socketDir: join(variant, "sockets"),
         lockPath: join(variant, "agentcpd.lock"),
       },
-      probeTargetRoot: join(variant, "probe"),
-      canonicalTargetRoot: join(variant, "canonical"),
+      // Outside the realm, because a canonical root *inside* the state directory is refused by a
+      // different rule — and on a case-sensitive volume that rule, not this one, would be what
+      // answered. A test whose subject is decided by a neighbouring check is not measuring itself.
+      probeTargetRoot: join(scratch, "probe"),
+      canonicalTargetRoot: join(scratch, "canonical"),
     });
 
+    if (volumeIsCaseSensitive()) {
+      expect(decision.allowed).toBe(true);
+      return;
+    }
     expect(decision.allowed).toBe(false);
     if (decision.allowed) return;
     expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
@@ -659,4 +682,141 @@ describe("residue is the entry on disk, not what it points at", () => {
     expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_RESIDUE);
     expect((decision.evidence as { remaining: string[] }).remaining).toContain(dangling);
   });
+});
+
+/**
+ * What a path that is not there yet can still be.
+ *
+ * `realpathSync` answers ENOENT for a symlink pointing at a file that does not exist, and the
+ * version this replaces read that as "nothing here yet" and judged where the link *sat*. Measured
+ * end to end before the fix: a realm database pre-created as a link to a not-yet-existing file
+ * inside production planned as ALLOWED, and writing the realm database created that file inside
+ * production with the realm's bytes in it — invisible afterwards, because a new file under
+ * production is not an id the census watches and not a path the residue check looks at.
+ */
+describe("a symlink to nothing is still a directory entry", () => {
+  it("refuses a realm path that is a link into production, target absent", () => {
+    const home = fakeHome();
+    const scratch = tempDir("acp-dangling-");
+    const paths = realmUnder(scratch);
+    symlinkSync(join(productionRoot(home), "not-there-yet.sqlite"), paths.databasePath);
+
+    const decision = planDisposableRealm({
+      home,
+      paths,
+      probeTargetRoot: join(scratch, "probe-root"),
+      canonicalTargetRoot: join(scratch, "canonical-root"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+
+  it("refuses a link that names itself rather than following it forever", () => {
+    const home = fakeHome();
+    const scratch = tempDir("acp-selflink-");
+    const paths = realmUnder(scratch);
+    symlinkSync(paths.databasePath, paths.databasePath);
+
+    const decision = planDisposableRealm({
+      home,
+      paths,
+      probeTargetRoot: join(scratch, "probe-root"),
+      canonicalTargetRoot: join(scratch, "canonical-root"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_UNRESOLVABLE);
+  });
+});
+
+describe("the probe target is refused for being inside, not only for being equal", () => {
+  it("refuses a probe target one directory under the canonical root", () => {
+    // The row for this guard survived the sweep and turned CI red: every probe test tripped the
+    // equality clause instead, so nothing was watching containment. The clause the tests were
+    // hitting is gone now — containment subsumed it — and this is the test that kills the mutation.
+    const home = fakeHome();
+    const scratch = tempDir("acp-probe-inside-");
+    const canonical = join(scratch, "canonical-root");
+    mkdirSync(canonical, { recursive: true });
+
+    const decision = planDisposableRealm({
+      home,
+      paths: realmUnder(scratch),
+      canonicalTargetRoot: canonical,
+      probeTargetRoot: join(canonical, "sub"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_PROBE_TARGET_IS_CANONICAL);
+  });
+});
+
+describe("the two roots are checked against the realm's geography too", () => {
+  it("refuses a probe target inside production, whose writes would land there", () => {
+    // A probe root under production means the probe's Hermes instance builds its root and its
+    // transcripts inside production state. Nothing downstream would report it: a new directory
+    // there is not an id the census watches, and residue only looks inside the realm.
+    const home = fakeHome();
+    const scratch = tempDir("acp-probe-in-prod-");
+
+    const decision = planDisposableRealm({
+      home,
+      paths: realmUnder(scratch),
+      probeTargetRoot: join(productionRoot(home), "hermes"),
+      canonicalTargetRoot: join(scratch, "canonical-root"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+
+  it("refuses a canonical root inside the directory cleanup may remove whole", () => {
+    // The same hazard this file states for production, applied to the other thing the realm
+    // exists to protect: the owner's conversation root inside a directory the run deletes.
+    const home = fakeHome();
+    const scratch = tempDir("acp-canonical-inside-");
+    const paths = realmUnder(scratch);
+
+    const decision = planDisposableRealm({
+      home,
+      paths,
+      probeTargetRoot: join(scratch, "probe-root"),
+      canonicalTargetRoot: join(paths.stateDir, "canonical"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+});
+
+describe("a database is its sidecars", () => {
+  it.each(["-wal", "-shm", "-journal"] as const)(
+    "refuses a %s sidecar that is a second name for a production file",
+    (suffix) => {
+      // Under WAL the sidecar is where the write goes — this module's own census says so. SQLite
+      // opens it by name the moment it opens the database beside it, so a pre-created link there
+      // reaches production before any after-census could refuse anything.
+      const home = fakeHome();
+      const scratch = tempDir(`acp-sidecar${suffix}-`);
+      const paths = realmUnder(scratch);
+      linkSync(join(productionRoot(home), "state.sqlite"), `${paths.databasePath}${suffix}`);
+
+      const decision = planDisposableRealm({
+        home,
+        paths,
+        probeTargetRoot: join(scratch, "probe-root"),
+        canonicalTargetRoot: join(scratch, "canonical-root"),
+      });
+
+      expect(decision.allowed).toBe(false);
+      if (decision.allowed) return;
+      expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+    },
+  );
 });

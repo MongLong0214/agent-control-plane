@@ -86,13 +86,6 @@ const GUARDS = [
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
   {
-    what: "a probe that would address the canonical conversation is refused",
-    file: "src/acceptance/disposable-realm.ts",
-    find: "    sameFile(settled(request.probeTargetRoot), settled(request.canonicalTargetRoot)) ||",
-    replace: "  if (false) {",
-    killedBy: ["tests/unit/disposable-realm.test.ts"],
-  },
-  {
     // The catch-all. Without it an unforeseen write that leaves the three lists identical passes.
     what: "a write that only the -wal sidecar records still fails the census",
     file: "src/acceptance/disposable-realm.ts",
@@ -502,11 +495,12 @@ const GUARDS = [
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
   {
-    // Every other check asks "is it inside"; this one asked "is it the same".
+    // It asked "is it the same" while every other check here asks "is it inside", so a probe one
+    // directory under the canonical root passed while still addressing the owner's conversation.
     what: "a probe target inside the canonical root is refused, not only one equal to it",
     file: "src/acceptance/disposable-realm.ts",
-    find: "    within(settled(request.canonicalTargetRoot), settled(request.probeTargetRoot))",
-    replace: "    false",
+    find: "  if (within(settled(request.canonicalTargetRoot), settled(request.probeTargetRoot))) {",
+    replace: "  if (false) {",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
   {
@@ -531,6 +525,38 @@ const GUARDS = [
     file: "src/acceptance/disposable-realm.ts",
     find: "      lstatSync(path);",
     replace: "      statSync(path);",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // ENOENT from a dangling symlink is a directory entry that redirects writes, not an absence.
+    what: "a symlink to a file that does not exist yet is resolved through, not walked past",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "      if (entry?.isSymbolicLink() === true) {",
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The probe's Hermes instance would build its transcripts inside production state.
+    what: "a probe target inside production is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (within(production, settled(request.probeTargetRoot))) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The owner's conversation root inside the directory this run is licensed to delete.
+    what: "the canonical root may not sit inside the directory cleanup removes whole",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (within(settled(request.paths.stateDir), settled(request.canonicalTargetRoot))) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Under WAL the sidecar is where the write lands, and it was outside every check.
+    what: "the database's sidecars are checked the same way the database is",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    ...family,",
+    replace: "",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
 ];

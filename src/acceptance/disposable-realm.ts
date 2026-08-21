@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -207,17 +207,6 @@ const within = (parent: string, child: string): boolean => {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 };
 
-/**
- * Whether two paths name the same place — by identity where they exist, lexically where they do not.
- *
- * Separate from `within` because the probe check used `===` on resolved strings while every other
- * check used containment, and that asymmetry was itself a finding: a probe target *inside* the
- * canonical root is still addressing the owner's conversation tree.
- */
-const sameFile = (a: string, b: string): boolean => {
-  const left = identityOf(a);
-  return left !== null ? left === identityOf(b) : resolve(a) === resolve(b);
-};
 
 /**
  * Resolves as much of a path as exists, and keeps the rest.
@@ -261,6 +250,27 @@ const settled = (path: string): string => {
       // be reported as a clean one. Measured on the version this replaces: a self-referential
       // symlink (ELOOP) was allowed as a realm path.
       if (code !== "ENOENT") throw new UnresolvablePath(probe, code);
+      // ENOENT does not mean "there is nothing here". A symlink pointing at a file that does not
+      // exist yet is a directory entry that exists and redirects every write through it, and
+      // `realpathSync` reports ENOENT for exactly that. The version this replaces walked past it
+      // and judged where the link *sits* rather than where it *points*.
+      //
+      // Measured: a realm database pre-created as a symlink to a not-yet-existing file inside
+      // production planned as ALLOWED, and writing to the realm database created that file inside
+      // production with the realm's bytes in it. Nothing afterwards saw it — a new file under
+      // production is not an id the census watches, and the residue check never looks there.
+      //
+      // So the entry is asked about directly. Where it is a link, its target is what this path
+      // resolves to, and the walk continues from there rather than around it.
+      const entry = lstatSync(probe, { throwIfNoEntry: false });
+      if (entry?.isSymbolicLink() === true) {
+        const target = resolve(dirname(probe), readlinkSync(probe));
+        // Guard against a link that names itself, directly or through a chain: `settled` of the
+        // target re-enters here, and a cycle would otherwise recurse until the stack gave out
+        // rather than arriving at this module's typed refusal.
+        if (target === probe) throw new UnresolvablePath(probe, "ELOOP");
+        return join(settled(target), ...missing);
+      }
       const parent = dirname(probe);
       // Reached the filesystem root without finding anything that exists. Nothing can be
       // resolved, so the lexical path is all there is.
@@ -295,12 +305,21 @@ export const planDisposableRealm = (request: RealmRequest): Decision<RealmPaths>
 
 const planResolvedRealm = (request: RealmRequest): Decision<RealmPaths> => {
   const production = settled(productionRoot(request.home));
+  // The sidecars are where a WAL database's writes land — this file says so itself, in the census
+  // that reads them. Checking `databasePath` alone left `state.sqlite-wal` free to be pre-created
+  // as a hard link or a symlink to production's, and SQLite opens it by name the moment it opens
+  // the database beside it. Measured: both spellings planned as ALLOWED.
+  const family = DATABASE_FAMILY_SUFFIXES.filter((suffix) => suffix !== "").map(
+    (suffix) => [`databasePath${suffix}`, `${request.paths.databasePath}${suffix}`] as const,
+  );
+
   const named: readonly (readonly [string, string])[] = [
     ["stateDir", request.paths.stateDir],
     ["databasePath", request.paths.databasePath],
     ["runtimeRoot", request.paths.runtimeRoot],
     ["socketDir", request.paths.socketDir],
     ["lockPath", request.paths.lockPath],
+    ...family,
   ];
 
   // The two roots whose comparison *is* the safety decision were the two the loop below never
@@ -377,10 +396,29 @@ const planResolvedRealm = (request: RealmRequest): Decision<RealmPaths> => {
     }
   }
 
-  if (
-    sameFile(settled(request.probeTargetRoot), settled(request.canonicalTargetRoot)) ||
-    within(settled(request.canonicalTargetRoot), settled(request.probeTargetRoot))
-  ) {
+  // The two roots are checked against the realm's own geography as well, which the loop above
+  // cannot see because they are not realm paths. A probe root under production means the probe's
+  // Hermes instance builds its root and its transcripts inside production state — a new directory
+  // there is not an id the census watches and not a path the residue check looks at, so it would
+  // be permanent and unreported. And a canonical root inside the state directory puts the owner's
+  // conversation inside the directory cleanup is licensed to remove whole, which is the exact
+  // hazard this file states for production and had not applied to the other thing it protects.
+  if (within(production, settled(request.probeTargetRoot))) {
+    return deny(
+      ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED,
+      "the probe target is inside the production root, so what it writes would land in production",
+      { probeTargetRoot: request.probeTargetRoot, production },
+    );
+  }
+  if (within(settled(request.paths.stateDir), settled(request.canonicalTargetRoot))) {
+    return deny(
+      ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED,
+      "the canonical root is inside this realm's state directory, which cleanup is allowed to remove whole",
+      { canonicalTargetRoot: request.canonicalTargetRoot, stateDir: request.paths.stateDir },
+    );
+  }
+
+  if (within(settled(request.canonicalTargetRoot), settled(request.probeTargetRoot))) {
     // The condition that separates this from the procedure that was refused. A probe against
     // the canonical root is a second writer to the owner's transcript no matter how isolated
     // the ACP side is.
