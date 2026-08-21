@@ -419,17 +419,24 @@ export class ConversationTurnCoordinator {
         );
       }
 
+      // Looked up across turns, because a receipt id names something the issuing authority
+      // produced — not something this turn owns. Searching only this turn let one authority's
+      // receipt land on two turns, which with a caller-supplied authority is a wrong-turn
+      // completion laundering path.
       const already = this.db.get<{
+        turn_request_id: string;
         observed_outcome: string;
         evidence_digest: string;
         reason_code: string;
       }>(
-        `SELECT observed_outcome, evidence_digest, reason_code FROM canonical_turn_observations
-          WHERE turn_request_id = ? AND observing_authority = ? AND receipt_id = ?`,
-        [permit.turnRequestId, observation.authority, observation.receiptId],
+        `SELECT turn_request_id, observed_outcome, evidence_digest, reason_code
+           FROM canonical_turn_observations
+          WHERE observing_authority = ? AND receipt_id = ?`,
+        [observation.authority, observation.receiptId],
       );
       if (already) {
         const identical =
+          already.turn_request_id === permit.turnRequestId &&
           already.observed_outcome === observation.outcome &&
           already.evidence_digest === observation.evidenceDigest &&
           already.reason_code === observation.reasonCode;
@@ -440,7 +447,9 @@ export class ConversationTurnCoordinator {
           // rather than believing evidence landed that did not.
           return deny(
             ReasonCode.CONVERSATION_TURN_RECEIPT_REUSED,
-            "this receipt id already carries different evidence on this turn",
+            already.turn_request_id === permit.turnRequestId
+              ? "this receipt id already carries different evidence on this turn"
+              : "this receipt id is already bound to a different turn",
             {
               turnRequestId: permit.turnRequestId,
               authority: observation.authority,
@@ -518,6 +527,13 @@ export class ConversationTurnCoordinator {
     reasonCode: string;
     evidenceDigest: string;
   }): Decision<TurnMaterialization> {
+    if (input.reasonCode.length === 0 || input.evidenceDigest.length === 0) {
+      // An adjudication with no reason and no evidence is a state change wearing the word. The
+      // schema refuses it too; refusing here means the caller learns which field was empty.
+      return deny(ReasonCode.INVALID_ARGUMENT, "an adjudication has to say why, and on what", {
+        turnRequestId: input.turnRequestId,
+      });
+    }
     return this.db.tx(() => {
       const turn = this.db.get<{ target_actor_id: string; observation_consistency: string }>(
         `SELECT target_actor_id, observation_consistency FROM canonical_turns
@@ -530,8 +546,6 @@ export class ConversationTurnCoordinator {
         });
       }
       if (turn.observation_consistency !== "CONTRADICTED") {
-        // Adjudicating a turn nothing disagreed about would let the vocabulary be used to mark a
-        // conversation as reviewed when nothing was.
         return deny(
           ReasonCode.CONFLICT,
           "this turn's observations do not disagree, so there is nothing to adjudicate",
@@ -571,34 +585,32 @@ export class ConversationTurnCoordinator {
 
       const current = this.materialization(input.turnRequestId);
       return this.db.materializeTurn(this.#materialization, { turnRequestId: input.turnRequestId }, () => {
-      this.db.run(
-        `INSERT INTO canonical_turn_observations
-           (turn_request_id, observed_outcome, observing_authority, receipt_id,
-            evidence_digest, reason_code, observed_at, audit_event_id, adjudicates_observation_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          input.turnRequestId,
-          current.outcome,
-          current.authority,
-          `adjudication:${audited.value}`,
-          input.evidenceDigest,
-          input.reasonCode,
-          this.clock.nowIso(),
-          audited.value,
-          Math.max(...conflicting),
-        ],
-      );
-      this.db.materializeTurn(
-        this.#materialization,
-        { turnRequestId: input.turnRequestId },
-        () =>
+        const written = this.db.run(
+          `INSERT INTO canonical_turn_adjudications
+             (turn_request_id, resolved_outcome, reason_code, evidence_digest, adjudicated_at,
+              audit_event_id)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            input.turnRequestId,
+            // Recorded, not chosen. The conservative order produced this from the evidence, and
+            // an adjudication that could pick a different one would make "an authenticated
+            // COMPLETED is never lowered" a preference rather than a rule.
+            current.outcome,
+            input.reasonCode,
+            input.evidenceDigest,
+            this.clock.nowIso(),
+            audited.value,
+          ],
+        );
+        const adjudicationId = Number(written.lastInsertRowid);
+        for (const observationId of conflicting) {
           this.db.run(
-            `UPDATE canonical_turns SET observation_consistency = 'ADJUDICATED'
-              WHERE turn_request_id = ?`,
-            [input.turnRequestId],
-          ),
-      );
-      return allow(ReasonCode.OK, this.materialization(input.turnRequestId));
+            `INSERT INTO canonical_turn_adjudication_citations (adjudication_id, observation_id)
+             VALUES (?, ?)`,
+            [adjudicationId, observationId],
+          );
+        }
+        return allow(ReasonCode.OK, this.materialize(input.turnRequestId));
       });
     });
   }
@@ -618,9 +630,9 @@ export class ConversationTurnCoordinator {
    * beside it as what ACP saw at the time.
    */
   private materialize(turnRequestId: string): TurnMaterialization {
-    const observations = this.db.all<{ observed_outcome: string; observing_authority: string;
-      evidence_digest: string; reason_code: string }>(
-      `SELECT observed_outcome, observing_authority, evidence_digest, reason_code
+    const observations = this.db.all<{ observation_id: number; observed_outcome: string;
+      observing_authority: string; evidence_digest: string; reason_code: string }>(
+      `SELECT observation_id, observed_outcome, observing_authority, evidence_digest, reason_code
          FROM canonical_turn_observations WHERE turn_request_id = ? ORDER BY observation_id ASC`,
       [turnRequestId],
     );
@@ -630,6 +642,30 @@ export class ConversationTurnCoordinator {
     const strongest = [...materializing].sort(
       (a, b) => strengthOf(b.observed_outcome) - strengthOf(a.observed_outcome),
     )[0];
+
+    // What an adjudication already answered, and what it resolved to.
+    //
+    // Without this the recompute counted every observation that ever existed, and the disagreeing
+    // ones are permanent — so an adjudication lasted exactly until the next observation of any
+    // kind, including one that *agreed* with the resolution. A late or redelivered receipt, which
+    // is precisely what this ledger is built to keep accepting, re-wedged the conversation with
+    // no new disagreement to answer. Measured end to end by two review lanes.
+    const resolved = this.db.get<{ adjudication_id: number; resolved_outcome: string }>(
+      `SELECT adjudication_id, resolved_outcome FROM canonical_turn_adjudications
+        WHERE turn_request_id = ? ORDER BY adjudication_id DESC LIMIT 1`,
+      [turnRequestId],
+    );
+    const answered = resolved
+      ? new Set(
+          this.db
+            .all<{ observation_id: number }>(
+              `SELECT observation_id FROM canonical_turn_adjudication_citations
+                WHERE adjudication_id = ?`,
+              [resolved.adjudication_id],
+            )
+            .map((row) => row.observation_id),
+        )
+      : new Set<number>();
 
     // A disagreement about whether the turn ran at all, or about how it ended — across **every**
     // observation, not only the ones that can materialize.
@@ -641,8 +677,17 @@ export class ConversationTurnCoordinator {
     // admitted attempt 2 — a re-run of an exchange ACP had watched reach the owner. Measured.
     //
     // Two observations of the same outcome are corroboration, not conflict, whoever made them.
-    const distinct = new Set(observations.map((o) => o.observed_outcome));
-    const consistency = distinct.size > 1 ? "CONTRADICTED" : "CONSISTENT";
+    // Observations the adjudication did not read. Anything it did read is answered, whatever it
+    // said; what re-opens a turn is a *new* record that disagrees with what was resolved.
+    const unanswered = observations.filter((o) => !answered.has(o.observation_id));
+    const distinct = new Set(unanswered.map((o) => o.observed_outcome));
+    const disagreesWithResolution =
+      resolved !== undefined && unanswered.some((o) => o.observed_outcome !== resolved.resolved_outcome);
+    const consistency = disagreesWithResolution || distinct.size > 1
+      ? "CONTRADICTED"
+      : resolved !== undefined
+        ? "ADJUDICATED"
+        : "CONSISTENT";
 
     const current = this.materialization(turnRequestId);
 
@@ -676,14 +721,11 @@ export class ConversationTurnCoordinator {
           ),
       );
     } else if (consistency !== current.consistency) {
-      this.db.materializeTurn(
-        this.#materialization,
-        { turnRequestId },
-        () =>
-          this.db.run(`UPDATE canonical_turns SET observation_consistency = ? WHERE turn_request_id = ?`, [
-            consistency,
-            turnRequestId,
-          ]),
+      this.db.materializeTurn(this.#materialization, { turnRequestId }, () =>
+        this.db.run(`UPDATE canonical_turns SET observation_consistency = ? WHERE turn_request_id = ?`, [
+          consistency,
+          turnRequestId,
+        ]),
       );
     }
 

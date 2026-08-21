@@ -423,6 +423,38 @@ const GUARDS = [
     replace: "                    settled_at = ?,",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
+  {
+    what: "an adjudication has to say why, and on what",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "    if (input.reasonCode.length === 0 || input.evidenceDigest.length === 0) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // Without it the word becomes a way to mark a conversation reviewed when nothing disagreed.
+    what: "only a turn whose records actually disagree can be adjudicated",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '      if (turn.observation_consistency !== "CONTRADICTED") {',
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // A partial citation closes a disagreement while leaving part of it unread.
+    what: "an adjudication has to cite every observation on the turn, and only those",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (uncited.length > 0 || input.citedObservationIds.some((id) => !conflicting.includes(id))) {",
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // The first version resolved to whatever the caller passed, which let an adjudication choose
+    // an outcome the evidence never produced.
+    what: "an adjudication records the outcome the evidence produced and does not choose one",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "    const unanswered = observations.filter((o) => !answered.has(o.observation_id));",
+    replace: "    const unanswered = observations;",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

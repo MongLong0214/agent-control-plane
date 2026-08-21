@@ -1461,7 +1461,12 @@ CREATE TABLE IF NOT EXISTS canonical_turn_observations (
   -- Scoped to the turn, not global. A global key made one turn's receipt id collide with
   -- another's: a genuine target receipt for turn B, numbered the same as one turn A had already
   -- consumed, was silently discarded and turn B kept its weaker outcome. Measured.
-  UNIQUE (turn_request_id, observing_authority, receipt_id),
+  -- Scoped to the issuing authority, across turns. Per-turn scoping let one authority's receipt
+  -- id land on two turns, which with a caller-supplied authority is a wrong-turn completion
+  -- laundering path; global scoping alone silently discarded a genuine receipt whose number
+  -- collided. Both are wrong in the same place: the identity has to name the issuer *and* bind
+  -- the turn, so exact redelivery is a no-op and anything else is a typed conflict.
+  UNIQUE (observing_authority, receipt_id),
   CHECK (
     (observed_outcome = 'NEVER_ADMITTED' AND observing_authority = 'ACP_PRE_DISPATCH')
     OR (observed_outcome = 'COMPLETED'
@@ -1489,8 +1494,10 @@ WHEN OLD.target_actor_id IS NOT NEW.target_actor_id
   -- The retry lineage. Left out of every guard it belonged in, so a settled turn could be
   -- pointed at an unrelated replacement, repointed, and cleared — editable history of what was
   -- run instead of what.
-  OR (OLD.replacement_turn_request_id IS NOT NULL
-      AND OLD.replacement_turn_request_id IS NOT NEW.replacement_turn_request_id)
+  -- Including the first write. The guard this replaces fired only when the column was already
+  -- non-null, so the one write that matters — setting it — went unguarded, and since nothing in
+  -- production writes this column at all, every non-null value would have arrived that way.
+  OR OLD.replacement_turn_request_id IS NOT NEW.replacement_turn_request_id
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_IDENTITY_IMMUTABLE');
 END;
@@ -1665,6 +1672,160 @@ CREATE TRIGGER IF NOT EXISTS actor_target_attestations_no_delete
 BEFORE DELETE ON actor_target_attestations
 BEGIN
   SELECT RAISE(ABORT, 'ACTOR_TARGET_ATTESTATION_APPEND_ONLY');
+END;
+
+-- CP-HI-06 — REPLACE is refused by the schema, not by a connection setting.
+--
+-- SQLite performs REPLACE's implicit delete without firing DELETE triggers unless
+-- `recursive_triggers` is on, and that pragma is **per connection** and defaults off. Setting it
+-- on the daemon's connection protected the daemon and left the database unprotected: a review
+-- opened a second default connection and replaced an immutable identity, a source digest, and an
+-- observation. The pragma stays on as defence in depth; these triggers are the invariant.
+--
+-- Written as "this key is taken" rather than as a delete guard, because REPLACE begins as an
+-- INSERT — refusing the insert is the one point both spellings pass through.
+
+-- An adjudication is its own fact, not an observation wearing an authority's name.
+--
+-- The shape this replaces inserted a row into `canonical_turn_observations` carrying the current
+-- outcome's authority and a receipt id of its own making — so resolving a dispute about what
+-- HERMES_TARGET said produced a second row claiming HERMES_TARGET had said it again. An
+-- adjudicator is not the target, and an audit id is not a receipt.
+CREATE TABLE IF NOT EXISTS canonical_turn_adjudications (
+  adjudication_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  turn_request_id   TEXT NOT NULL REFERENCES canonical_turns(turn_request_id),
+  -- What the conservative order had already produced. Recorded so a later reader can see what
+  -- was being agreed to; an adjudication cannot choose it.
+  resolved_outcome  TEXT NOT NULL REFERENCES turn_outcome_kinds(outcome_kind),
+  reason_code       TEXT NOT NULL CHECK (length(reason_code) > 0),
+  evidence_digest   TEXT NOT NULL CHECK (length(evidence_digest) > 0),
+  adjudicated_at    TEXT NOT NULL,
+  audit_event_id    INTEGER NOT NULL REFERENCES audit_events(event_id)
+);
+
+-- Which observations the adjudication read, as rows rather than as a number in a column.
+--
+-- The previous shape stored `max(observation_id)` and kept the real list in audit JSON, so the
+-- durable relational record did not support the claim that every observation was cited.
+CREATE TABLE IF NOT EXISTS canonical_turn_adjudication_citations (
+  adjudication_id  INTEGER NOT NULL REFERENCES canonical_turn_adjudications(adjudication_id),
+  observation_id   INTEGER NOT NULL REFERENCES canonical_turn_observations(observation_id),
+  PRIMARY KEY (adjudication_id, observation_id)
+);
+
+CREATE INDEX IF NOT EXISTS canonical_turn_adjudications_by_turn
+  ON canonical_turn_adjudications(turn_request_id, adjudication_id);
+
+-- CP-HI-02 — an adjudication moves a conversation out of quarantine, so it needs the same
+-- authority as the settlement it closes.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudications_write_authority
+BEFORE INSERT ON canonical_turn_adjudications
+WHEN acp_turn_materialization_authorized(NEW.turn_request_id) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — an adjudication is a record of a decision that was made. Editing one rewrites it.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudications_append_only
+BEFORE UPDATE ON canonical_turn_adjudications
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_APPEND_ONLY');
+END;
+
+-- CP-HI-06 — removing an adjudication removes the reason a conversation was let out of quarantine.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudications_no_delete
+BEFORE DELETE ON canonical_turn_adjudications
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_APPEND_ONLY');
+END;
+
+-- CP-HI-06 — a citation set that can be edited afterwards does not record what was read.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudication_citations_append_only
+BEFORE UPDATE ON canonical_turn_adjudication_citations
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY');
+END;
+
+-- CP-HI-06 — dropping a citation makes a partial reading look complete.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudication_citations_no_delete
+BEFORE DELETE ON canonical_turn_adjudication_citations
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY');
+END;
+
+-- CP-HI-08 — a citation must belong to the turn it is adjudicating. Without this an adjudication
+-- of turn B could cite observations from turn A and mark B resolved without reading it.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudication_citations_same_turn
+BEFORE INSERT ON canonical_turn_adjudication_citations
+WHEN (SELECT turn_request_id FROM canonical_turn_observations WHERE observation_id = NEW.observation_id)
+     IS NOT (SELECT turn_request_id FROM canonical_turn_adjudications
+              WHERE adjudication_id = NEW.adjudication_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_CITATION_FOREIGN');
+END;
+
+-- CP-HI-06 — a turn's identity is exact evidence, and REPLACE rewrites it without firing an
+-- update or delete guard on a connection that did not opt into recursive triggers.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_no_replace
+BEFORE INSERT ON canonical_turns
+WHEN EXISTS (SELECT 1 FROM canonical_turns WHERE turn_request_id = NEW.turn_request_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_REPLACE');
+END;
+
+-- CP-HI-06 — an observation is testimony. Replacing one rewrites what an authority reported.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_observations_no_replace
+BEFORE INSERT ON canonical_turn_observations
+WHEN EXISTS (
+  SELECT 1 FROM canonical_turn_observations
+   WHERE observation_id = NEW.observation_id
+      OR (observing_authority = NEW.observing_authority AND receipt_id = NEW.receipt_id)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_OBSERVATION_NO_REPLACE');
+END;
+
+-- CP-HI-08 — moving a source between turns by REPLACE makes a completed message look like it
+-- belongs to a retry-safe turn, and the retry rule then admits it. Measured.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_no_replace
+BEFORE INSERT ON canonical_turn_sources
+WHEN EXISTS (
+  SELECT 1 FROM canonical_turn_sources
+   WHERE (source_channel = NEW.source_channel AND source_nonce = NEW.source_nonce
+          AND source_attempt = NEW.source_attempt)
+      OR (turn_request_id = NEW.turn_request_id AND batch_ordinal = NEW.batch_ordinal)
+      OR (turn_request_id = NEW.turn_request_id AND source_channel = NEW.source_channel
+          AND source_nonce = NEW.source_nonce)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_SOURCE_NO_REPLACE');
+END;
+
+-- CP-HI-04 — replacing a binding is the alias arriving by a third spelling, after edit and
+-- delete were both refused.
+CREATE TRIGGER IF NOT EXISTS actor_target_bindings_no_replace
+BEFORE INSERT ON actor_target_bindings
+WHEN EXISTS (
+  SELECT 1 FROM actor_target_bindings
+   WHERE target_binding_id = NEW.target_binding_id
+      OR target_actor_id = NEW.target_actor_id
+      OR (executor_kind = NEW.executor_kind AND target_locator_digest = NEW.target_locator_digest)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_TARGET_BINDING_NO_REPLACE');
+END;
+
+-- CP-HI-04 — replacing an attestation presents a stale generation as current, which is what
+-- admission reads.
+CREATE TRIGGER IF NOT EXISTS actor_target_attestations_no_replace
+BEFORE INSERT ON actor_target_attestations
+WHEN EXISTS (
+  SELECT 1 FROM actor_target_attestations
+   WHERE target_attestation_id = NEW.target_attestation_id
+      OR (target_binding_id = NEW.target_binding_id AND attestation_digest = NEW.attestation_digest)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_TARGET_ATTESTATION_NO_REPLACE');
 END;
 
 -- CP-HI-04 — the binding is a lifetime bijection between an actor and one conversation. A

@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 24;
+export const SCHEMA_VERSION = 25;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -103,6 +103,82 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
   /-- ---------------------------------------------------------------------------\n-- conversational_actor_registrations[\s\S]*?(?=-- ---------------------------------------------------------------------------\n-- assignments)/,
 ];
+
+/**
+ * Every ledger trigger, taken from the live schema.
+ *
+ * A migration that carried its own copy would drift from the file it is supposed to reproduce,
+ * and drift is what put a database at version 24 with a different trigger set than version 24
+ * defines. Pulling them from `schema.sql` means the migration owns the ordering and nothing else.
+ */
+export const ledgerTriggerDdl = (): string => {
+  const names = [
+    "canonical_turns_identity_immutable",
+    "canonical_turns_born_in_doubt",
+    "canonical_turns_settlement_authority",
+    "canonical_turns_settlement_provenance_immutable",
+    "canonical_turns_consistency_monotone",
+    "canonical_turns_lifecycle_monotone",
+    "canonical_turns_outcome_never_weakens",
+    "canonical_turns_no_delete",
+    "canonical_turns_no_replace",
+    "canonical_turn_observations_write_authority",
+    "canonical_turn_observations_append_only",
+    "canonical_turn_observations_no_delete",
+    "canonical_turn_observations_no_replace",
+    "canonical_turn_sources_immutable",
+    "canonical_turn_sources_no_delete",
+    "canonical_turn_sources_no_replace",
+    "actor_target_attestations_append_only",
+    "actor_target_attestations_no_delete",
+    "actor_target_attestations_no_replace",
+    "actor_target_bindings_immutable",
+    "actor_target_bindings_no_delete",
+    "actor_target_bindings_no_replace",
+    "canonical_turn_adjudications_write_authority",
+    "canonical_turn_adjudications_append_only",
+    "canonical_turn_adjudications_no_delete",
+    "canonical_turn_adjudication_citations_append_only",
+    "canonical_turn_adjudication_citations_no_delete",
+    "canonical_turn_adjudication_citations_same_turn",
+  ];
+  const ddl = schemaDdl();
+  const found = names.map((name) => {
+    const pattern = new RegExp(
+      `CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`,
+      "m",
+    );
+    const match = pattern.exec(ddl);
+    if (!match) {
+      // A name here with no definition in schema.sql means the two have already drifted, which is
+      // the failure this function exists to make impossible. Loud rather than partial.
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `ledger trigger ${name} is named by the migration and absent from schema.sql`,
+        { trigger: name },
+      );
+    }
+    return match[0];
+  });
+  return `${found.join("\n\n")}\n`;
+};
+
+/** The adjudication tables and their index, taken from the live schema for the same reason. */
+export const adjudicationDdl = (): string => {
+  const ddl = schemaDdl();
+  const parts = [
+    /CREATE TABLE IF NOT EXISTS canonical_turn_adjudications \([\s\S]*?\n\);/,
+    /CREATE TABLE IF NOT EXISTS canonical_turn_adjudication_citations \([\s\S]*?\n\);/,
+    /CREATE INDEX IF NOT EXISTS canonical_turn_adjudications_by_turn[^;]*;/,
+  ].map((pattern) => {
+    const match = pattern.exec(ddl);
+    if (!match) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "an adjudication object is missing from schema.sql", {});
+    }
+    return match[0];
+  });
+  return `${parts.join("\n\n")}\n`;
+};
 
 export const replayDdlWithoutPostV12Columns = (): string =>
   REPLAY_EXCLUDES_INTRODUCED_AFTER_V12.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdl());
@@ -1406,6 +1482,51 @@ const v24: SchemaMigration = {
   checksum: () => sha256(`v24-observation-ledger\n${V24_OBSERVATION_LEDGER_DDL}`),
 };
 
+/**
+ * The guards v24 should have carried, for databases that already ran it.
+ *
+ * v24's DDL was edited in place across two correction rounds. That is the one thing this file's
+ * whole discipline exists to prevent: a database that ran the earlier v24 is at version 24, has
+ * none of the later triggers, and takes the same-version path at startup — where the required
+ * trigger registry now demands objects it does not have and refuses to open it. It never
+ * migrates, because as far as the ledger is concerned it is already current.
+ *
+ * A review found it by instantiating the previous v24 schema and starting against it. Neither a
+ * fresh install nor a v11-to-current replay can show it, because both build the current DDL.
+ */
+const V25_LEDGER_GUARDS_DDL = `
+INSERT OR IGNORE INTO turn_resolution_authorities (resolution_authority) VALUES
+  ('ACP_OBSERVED_HERMES_REPLY');
+
+DROP TRIGGER IF EXISTS canonical_turns_identity_immutable;
+DROP TRIGGER IF EXISTS canonical_turns_born_in_doubt;
+DROP TRIGGER IF EXISTS canonical_turn_observations_write_authority;
+DROP TRIGGER IF EXISTS canonical_turns_no_replace;
+DROP TRIGGER IF EXISTS canonical_turn_observations_no_replace;
+DROP TRIGGER IF EXISTS canonical_turn_sources_no_replace;
+DROP TRIGGER IF EXISTS actor_target_bindings_no_replace;
+DROP TRIGGER IF EXISTS actor_target_attestations_no_replace;
+`;
+
+/**
+ * Applies the current ledger trigger set to a database that ran an earlier v24.
+ *
+ * The triggers themselves come from the live schema so the two cannot drift; this migration owns
+ * only the ordering — drop what the earlier v24 left, then create what the current one defines.
+ */
+const v25: SchemaMigration = {
+  id: "v25-ledger-guards",
+  fromVersion: 24,
+  toVersion: 25,
+  apply: (raw) => {
+    raw.exec(V25_LEDGER_GUARDS_DDL);
+    raw.exec(adjudicationDdl());
+    raw.exec(ledgerTriggerDdl());
+  },
+  checksum: () =>
+    sha256(`v25-ledger-guards\n${V25_LEDGER_GUARDS_DDL}\n${adjudicationDdl()}\n${ledgerTriggerDdl()}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -1420,6 +1541,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v22,
   v23,
   v24,
+  v25,
 ]);
 
 interface RequiredTrigger {
@@ -1482,6 +1604,17 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_turns_outcome_never_weakens", sentinel: "CANONICAL_TURN_OUTCOME_WEAKENED", introducedIn: 24 },
   { name: "canonical_turns_born_in_doubt", sentinel: "CANONICAL_TURN_NOT_BORN_IN_DOUBT", introducedIn: 24 },
   { name: "canonical_turn_observations_write_authority", sentinel: "CANONICAL_TURN_OBSERVATION_AUTHORITY_DENIED", introducedIn: 24 },
+  { name: "canonical_turn_adjudications_write_authority", sentinel: "CANONICAL_TURN_ADJUDICATION_AUTHORITY_DENIED", introducedIn: 25 },
+  { name: "canonical_turn_adjudications_append_only", sentinel: "CANONICAL_TURN_ADJUDICATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudications_no_delete", sentinel: "CANONICAL_TURN_ADJUDICATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudication_citations_append_only", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudication_citations_no_delete", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudication_citations_same_turn", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_FOREIGN", introducedIn: 25 },
+  { name: "canonical_turns_no_replace", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 25 },
+  { name: "canonical_turn_observations_no_replace", sentinel: "CANONICAL_TURN_OBSERVATION_NO_REPLACE", introducedIn: 25 },
+  { name: "canonical_turn_sources_no_replace", sentinel: "CANONICAL_TURN_SOURCE_NO_REPLACE", introducedIn: 25 },
+  { name: "actor_target_bindings_no_replace", sentinel: "ACTOR_TARGET_BINDING_NO_REPLACE", introducedIn: 25 },
+  { name: "actor_target_attestations_no_replace", sentinel: "ACTOR_TARGET_ATTESTATION_NO_REPLACE", introducedIn: 25 },
   { name: "canonical_turns_settlement_authority", sentinel: "CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED", introducedIn: 24 },
   { name: "canonical_turns_settlement_provenance_immutable", sentinel: "CANONICAL_TURN_SETTLEMENT_PROVENANCE_IMMUTABLE", introducedIn: 24 },
   { name: "canonical_turns_consistency_monotone", sentinel: "CANONICAL_TURN_CONSISTENCY_NOT_MONOTONE", introducedIn: 24 },
