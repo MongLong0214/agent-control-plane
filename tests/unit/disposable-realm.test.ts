@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -508,5 +508,155 @@ describe("the evidence claim is bounded in the code, not in the write-up", () =>
   it("reports the realm's layout relative to its own root", () => {
     const paths = realmUnder(tempDir("acp-layout-"));
     expect(realmLayout(paths)).toEqual(["agentcpd.lock", "runtime", "sockets", "state.sqlite"]);
+  });
+});
+
+/**
+ * The gap a review reached production through, twice, on the host this module reasons about.
+ *
+ * `realpathSync` resolves symlinks and leaves case alone, while a default macOS volume does not
+ * distinguish it. So two spellings of one directory produce two different strings, and a decision
+ * made of strings calls them two places:
+ *
+ * ```
+ * realpath(FooBar) = FooBar     realpath(foobar) = foobar
+ * string equal: false           same inode: true
+ * ```
+ *
+ * These run on any filesystem. On a case-sensitive one the two spellings really are two
+ * directories and the refusals below come from the ordinary rules — the test still passes, and it
+ * is measuring something weaker there. That is worth saying rather than pretending otherwise.
+ */
+describe("a different spelling of a path is the same path", () => {
+  it("refuses a probe target spelled as a case variant of the canonical root", () => {
+    const home = fakeHome();
+    const scratch = tempDir("acp-case-probe-");
+    const canonical = join(scratch, "Canonical-Root");
+    mkdirSync(canonical, { recursive: true });
+
+    const decision = planDisposableRealm({
+      home,
+      paths: realmUnder(scratch),
+      canonicalTargetRoot: canonical,
+      probeTargetRoot: join(scratch, "canonical-root"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_PROBE_TARGET_IS_CANONICAL);
+  });
+
+  it("refuses a state directory spelled as a case variant of the production root", () => {
+    const home = fakeHome();
+    // `.Agent-Control-Plane` is `.agent-control-plane` on a case-insensitive volume, so this
+    // realm's database, sockets and lock would be created inside production.
+    const variant = join(home, ".Agent-Control-Plane", "acceptance");
+    mkdirSync(variant, { recursive: true });
+
+    const decision = planDisposableRealm({
+      home,
+      paths: {
+        stateDir: variant,
+        databasePath: join(variant, "state.sqlite"),
+        runtimeRoot: join(variant, "runtime"),
+        socketDir: join(variant, "sockets"),
+        lockPath: join(variant, "agentcpd.lock"),
+      },
+      probeTargetRoot: join(variant, "probe"),
+      canonicalTargetRoot: join(variant, "canonical"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+});
+
+describe("resolving a path does not reveal a second name for it", () => {
+  it("refuses a realm file that is a hard link to something else", () => {
+    // A hard link resolves to itself. The realm path looks clean and the bytes are production's:
+    // measured before this refusal existed, a write through the realm database changed production.
+    const home = fakeHome();
+    const scratch = tempDir("acp-hardlink-realm-");
+    const paths = realmUnder(scratch);
+    linkSync(join(productionRoot(home), "state.sqlite"), paths.databasePath);
+
+    const decision = planDisposableRealm({
+      home,
+      paths,
+      probeTargetRoot: join(scratch, "probe-root"),
+      canonicalTargetRoot: join(scratch, "canonical-root"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+
+  it("still allows an ordinary realm, whose directories all have several links of their own", () => {
+    // The first version of the link check asked `nlink > 1` on every path. A directory always has
+    // at least two — itself and its `.` — so it refused every realm there could be, and each
+    // scenario above "passed" for a reason that had nothing to do with what it was named for.
+    const home = fakeHome();
+    const scratch = tempDir("acp-ordinary-realm-");
+
+    expect(
+      planDisposableRealm({
+        home,
+        paths: realmUnder(scratch),
+        probeTargetRoot: join(scratch, "probe-root"),
+        canonicalTargetRoot: join(scratch, "canonical-root"),
+      }).allowed,
+    ).toBe(true);
+  });
+});
+
+describe("the two roots whose comparison is the safety decision", () => {
+  it.each(["probeTargetRoot", "canonicalTargetRoot"] as const)(
+    "refuses a relative %s, which would resolve against whatever cwd it ran in",
+    (field) => {
+      const home = fakeHome();
+      const scratch = tempDir("acp-relative-root-");
+
+      const decision = planDisposableRealm({
+        home,
+        paths: realmUnder(scratch),
+        probeTargetRoot: join(scratch, "probe-root"),
+        canonicalTargetRoot: join(scratch, "canonical-root"),
+        [field]: "relative-root",
+      });
+
+      expect(decision.allowed).toBe(false);
+      if (decision.allowed) return;
+      expect(decision.reasonCode).toBe(ReasonCode.INVALID_ARGUMENT);
+    },
+  );
+});
+
+describe("residue is the entry on disk, not what it points at", () => {
+  it("reports a leftover symlink whose target is gone", () => {
+    // `existsSync` follows the link and answers about the target, so a dangling one — a real
+    // directory entry, still there — reported clean. Reachable: a socket directory declared
+    // outside the state directory but resolving inside it passes planning, cleanup removes the
+    // state directory, and the entry outside is left behind and invisible.
+    const scratch = tempDir("acp-residue-symlink-");
+    const stateDir = join(scratch, "realm");
+    mkdirSync(stateDir, { recursive: true });
+    const dangling = join(scratch, "sockets");
+    symlinkSync(join(stateDir, "gone"), dangling);
+    rmSync(stateDir, { recursive: true, force: true });
+
+    const decision = verifyRealmResidue({
+      stateDir,
+      databasePath: join(stateDir, "state.sqlite"),
+      runtimeRoot: join(stateDir, "runtime"),
+      socketDir: dangling,
+      lockPath: join(stateDir, "agentcpd.lock"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_RESIDUE);
+    expect((decision.evidence as { remaining: string[] }).remaining).toContain(dangling);
   });
 });

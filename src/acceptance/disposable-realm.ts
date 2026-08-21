@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -155,16 +155,68 @@ export interface OwnedProcess {
   readonly startedAtMs: number;
 }
 
+/** A file's identity: what it *is*, rather than a string that reaches it. `null` if it is absent. */
+const identityOf = (path: string): string | null => {
+  try {
+    const stat = statSync(path);
+    return `${stat.dev}:${stat.ino}`;
+  } catch {
+    return null;
+  }
+};
+
 /**
  * Containment, on paths both sides of which have already been resolved.
  *
  * It does not resolve anything itself, on purpose: a caller that passes one resolved path and one
  * declared path gets a wrong answer on any host where a temporary directory is a symlink — which
  * is every macOS host, where `/var` links to `/private/var`.
+ *
+ * And on those same macOS hosts `realpathSync` preserves case rather than normalising it, while
+ * the volume does not distinguish it. So two spellings of one directory resolve to two different
+ * strings, and a comparison made of strings says they are different places. Measured:
+ *
+ * ```
+ * realpath(FooBar) = FooBar     realpath(foobar) = foobar
+ * string equal: false           same inode: true
+ * ```
+ *
+ * A review reached production twice through that gap — a probe target spelled in lower case, and
+ * a realm state directory spelled as a case variant of the production root. So the decision is
+ * made on `(device, inode)` wherever the path exists: that is the identity, and the string is a
+ * way to reach it. The lexical comparison remains for the part of a path that does not exist yet,
+ * where there is nothing to stat and nothing but the string to go on.
  */
 const within = (parent: string, child: string): boolean => {
+  const parentIdentity = identityOf(parent);
+  if (parentIdentity !== null) {
+    // Walk the child upward. An ancestor that *is* the parent settles it whatever either was
+    // spelled as; reaching the root without finding one settles the other way.
+    for (let cursor = resolve(child); ; ) {
+      const cursorIdentity = identityOf(cursor);
+      if (cursorIdentity !== null && cursorIdentity === parentIdentity) return true;
+      const up = dirname(cursor);
+      if (up === cursor) break;
+      cursor = up;
+    }
+    // The child may not exist yet, in which case the walk above compared nothing until it reached
+    // an existing ancestor. Fall through to the lexical answer, which is what a not-yet-created
+    // path has.
+  }
   const rel = relative(resolve(parent), resolve(child));
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+};
+
+/**
+ * Whether two paths name the same place — by identity where they exist, lexically where they do not.
+ *
+ * Separate from `within` because the probe check used `===` on resolved strings while every other
+ * check used containment, and that asymmetry was itself a finding: a probe target *inside* the
+ * canonical root is still addressing the owner's conversation tree.
+ */
+const sameFile = (a: string, b: string): boolean => {
+  const left = identityOf(a);
+  return left !== null ? left === identityOf(b) : resolve(a) === resolve(b);
 };
 
 /**
@@ -251,11 +303,45 @@ const planResolvedRealm = (request: RealmRequest): Decision<RealmPaths> => {
     ["lockPath", request.paths.lockPath],
   ];
 
+  // The two roots whose comparison *is* the safety decision were the two the loop below never
+  // checked, so a relative one was silently rebased on `process.cwd()` — the ambient working
+  // directory deciding whether a probe is the owner's conversation.
+  for (const [name, path] of [
+    ["probeTargetRoot", request.probeTargetRoot],
+    ["canonicalTargetRoot", request.canonicalTargetRoot],
+  ] as const) {
+    if (!isAbsolute(path)) {
+      return deny(ReasonCode.INVALID_ARGUMENT, `${name} has to be an absolute path`, { name, path });
+    }
+  }
+
   for (const [name, path] of named) {
     if (!isAbsolute(path)) {
       return deny(ReasonCode.INVALID_ARGUMENT, `${name} has to be an absolute path`, { name, path });
     }
-    if (within(production, settled(path))) {
+    // A hard link is a second name for one file, and no amount of resolving reveals it: the realm
+    // path resolves to itself while the bytes are production's. Measured — a realm database
+    // pre-created as a link to production's passed isolation, and writing through it changed
+    // production. `nlink > 1` is what a second name looks like from here.
+    //
+    // Regular files only. A directory always has at least two links — itself and its own `.` —
+    // and one more per child, so the same rule applied to `stateDir` refuses every realm there
+    // could ever be. The first version of this check did exactly that, and every scenario it was
+    // written for still "passed" because it refused them all for the wrong reason.
+    // `settled` first, and deliberately: it is what turns an unresolvable path — a symlink cycle,
+    // a directory that cannot be read — into this module's typed refusal. A bare `statSync` ahead
+    // of it throws ELOOP or EACCES straight out of the planner, which is the same "unknown
+    // identity reported as something else" the resolver exists to prevent. Two tests said so.
+    const resolved = settled(path);
+    const existing = statSync(resolved, { throwIfNoEntry: false });
+    if (existing?.isFile() === true && existing.nlink > 1) {
+      return deny(
+        ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED,
+        `${name} has more than one name on disk, so what it resolves to is not what it is`,
+        { name, path },
+      );
+    }
+    if (within(production, resolved)) {
       // The whole point of the realm. A path that resolves inside production is production,
       // whatever it is called.
       return deny(
@@ -291,10 +377,17 @@ const planResolvedRealm = (request: RealmRequest): Decision<RealmPaths> => {
     }
   }
 
-  if (settled(request.probeTargetRoot) === settled(request.canonicalTargetRoot)) {
+  if (
+    sameFile(settled(request.probeTargetRoot), settled(request.canonicalTargetRoot)) ||
+    within(settled(request.canonicalTargetRoot), settled(request.probeTargetRoot))
+  ) {
     // The condition that separates this from the procedure that was refused. A probe against
     // the canonical root is a second writer to the owner's transcript no matter how isolated
     // the ACP side is.
+    //
+    // Containment, not equality. Every other check here asks "is it inside", and this one asked
+    // "is it the same" — so a probe target one directory *under* the canonical root passed, while
+    // still addressing the owner's conversation tree. The asymmetry was the defect.
     return deny(
       ReasonCode.ACCEPTANCE_PROBE_TARGET_IS_CANONICAL,
       "the probe target is the canonical root, which is the thing this realm exists not to touch",
@@ -365,10 +458,24 @@ export const assertProductionUnchanged = (
  * looking; "these four files remain" tells them where.
  */
 export const verifyRealmResidue = (paths: RealmPaths): Decision<void> => {
+  // `lstat`, not `exists`. `existsSync` follows the link and answers about the target, so a
+  // leftover symlink whose target is gone — a real directory entry, still on disk — reported
+  // clean. That is reachable: a socket directory declared outside the state directory but
+  // resolving inside it passes planning, cleanup removes the state directory, and the entry
+  // outside is left dangling and invisible. The mirror image of the hazard this file was written
+  // around, from the other side.
+  const present = (path: string): boolean => {
+    try {
+      lstatSync(path);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const remaining = [paths.databasePath, paths.runtimeRoot, paths.socketDir, paths.lockPath].filter(
-    (path) => existsSync(path),
+    (path) => present(path),
   );
-  if (existsSync(paths.stateDir)) {
+  if (present(paths.stateDir)) {
     const entries = readdirSync(paths.stateDir).map((entry) => join(paths.stateDir, entry));
     remaining.push(paths.stateDir, ...entries);
   }

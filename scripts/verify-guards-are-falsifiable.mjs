@@ -48,7 +48,7 @@ const GUARDS = [
   {
     what: "an acceptance realm path that resolves inside production is refused",
     file: "src/acceptance/disposable-realm.ts",
-    find: "    if (within(production, settled(path))) {",
+    find: "    if (within(production, resolved)) {",
     replace: "    if (false) {",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
@@ -88,7 +88,7 @@ const GUARDS = [
   {
     what: "a probe that would address the canonical conversation is refused",
     file: "src/acceptance/disposable-realm.ts",
-    find: "  if (settled(request.probeTargetRoot) === settled(request.canonicalTargetRoot)) {",
+    find: "    sameFile(settled(request.probeTargetRoot), settled(request.canonicalTargetRoot)) ||",
     replace: "  if (false) {",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
@@ -119,7 +119,7 @@ const GUARDS = [
   {
     what: "a state directory left behind counts as residue even when it is empty",
     file: "src/acceptance/disposable-realm.ts",
-    find: "  if (existsSync(paths.stateDir)) {",
+    find: "  if (present(paths.stateDir)) {",
     replace: "  if (false) {",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
@@ -492,6 +492,46 @@ const GUARDS = [
     find: "            promptDigest,\n            this.clock.nowIso(),",
     replace: '            promptDigest,\n            "1970-01-01T00:00:00.000Z",',
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    // Two spellings of one directory resolved to two strings, and production was reachable twice.
+    what: "containment is judged on what a path is, not on how it was spelled",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  const parentIdentity = identityOf(parent);",
+    replace: "  const parentIdentity = null;",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Every other check asks "is it inside"; this one asked "is it the same".
+    what: "a probe target inside the canonical root is refused, not only one equal to it",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    within(settled(request.canonicalTargetRoot), settled(request.probeTargetRoot))",
+    replace: "    false",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A hard link resolves to itself while the bytes belong to production.
+    what: "a realm file with a second name on disk is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    if (existing?.isFile() === true && existing.nlink > 1) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The inputs whose comparison is the safety decision were the ones never required absolute.
+    what: "the probe and canonical roots have to be absolute, like every other path here",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '    ["probeTargetRoot", request.probeTargetRoot],\n    ["canonicalTargetRoot", request.canonicalTargetRoot],\n  ] as const) {',
+    replace: "  ] as const) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // existsSync follows the link, so a dangling leftover read as clean.
+    what: "residue is the directory entry, not what it points at",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "      lstatSync(path);",
+    replace: "      statSync(path);",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
 ];
 
