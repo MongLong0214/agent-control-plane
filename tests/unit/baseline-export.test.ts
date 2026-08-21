@@ -829,6 +829,7 @@ describe("baseline boundary contracts", () => {
       "v21-canonical-turns",
       "v22-canonical-turn-ledger",
       "v23-turn-claimed-at",
+      "v24-observation-ledger",
     ]);
   });
 

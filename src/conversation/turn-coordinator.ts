@@ -2,7 +2,7 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { type Decision, acpError, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -49,6 +49,69 @@ export interface TurnPermit {
   readonly issuance: string;
 }
 
+/**
+ * What an authority reported about a turn.
+ *
+ * Reported, not decided. Several of these can exist for one turn and two of them may disagree;
+ * the turn's outcome is computed from the set rather than written by whichever arrived first.
+ */
+export interface TurnObservation {
+  readonly outcome: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
+  readonly authority:
+    | "ACP_PRE_DISPATCH"
+    | "HERMES_TARGET"
+    | "OWNER_AFTER_TARGET_FENCE"
+    | "ACP_OBSERVED_HERMES_REPLY";
+  /**
+   * Identity of the receipt this observation carries, scoped to its authority.
+   *
+   * Makes redelivery a no-op. Without it a retrying transport reports the same receipt twice and
+   * manufactures a disagreement with itself, which quarantines a conversation for no reason.
+   */
+  readonly receiptId: string;
+  readonly evidenceDigest: string;
+  readonly reasonCode: string;
+}
+
+/** What the ledger now holds about a turn, after an observation was recorded. */
+export interface TurnMaterialization {
+  readonly lifecycleState: "IN_DOUBT" | "SETTLED";
+  readonly outcome: string | null;
+  readonly authority: string | null;
+  readonly consistency: "CONSISTENT" | "CONTRADICTED" | "ADJUDICATED";
+}
+
+/**
+ * How retry-blocking each outcome is. Higher wins, and the winner is never lowered.
+ *
+ * `COMPLETED` forbids a re-run; the other two permit one. So lowering an outcome is exactly how a
+ * completed exchange becomes runnable again — the measured defect this ordering exists to make
+ * unreachable. A fence is a stronger statement than an intention, so `ABORTED` outranks
+ * `NEVER_ADMITTED`.
+ */
+const OUTCOME_STRENGTH: Record<string, number> = {
+  NEVER_ADMITTED: 1,
+  ABORTED: 2,
+  COMPLETED: 3,
+};
+
+/**
+ * The authorities whose observations may set the turn's outcome.
+ *
+ * `ACP_OBSERVED_HERMES_REPLY` is deliberately absent. ACP watching a reply come back is real
+ * evidence and is recorded as such, but it is not the target proving a durable commit — and the
+ * cost of confusing them falls in the direction that loses the owner's message: a turn marked
+ * `COMPLETED` on an answer Hermes never committed is never re-run, and the question disappears.
+ *
+ * This is the one line the whole authority argument reduces to, so it is here rather than spread
+ * across the branches that consult it.
+ */
+const MATERIALIZING_AUTHORITIES = new Set([
+  "ACP_PRE_DISPATCH",
+  "HERMES_TARGET",
+  "OWNER_AFTER_TARGET_FENCE",
+]);
+
 /** How a turn ended, when something positively established it. */
 export type TurnOutcome =
   | {
@@ -58,9 +121,20 @@ export type TurnOutcome =
       readonly reasonCode: string;
     }
   | {
-      /** A terminal commit the target proved. Nothing here can mint this yet (#638). */
+      /**
+       * The turn ended and must never run again.
+       *
+       * Two authorities can say so, and they are not the same claim. `HERMES_TARGET` is the
+       * target's own durable receipt, which nothing can mint yet (#638). `ACP_OBSERVED_HERMES_REPLY`
+       * is what ACP can honestly say about a success it watched: the peer was re-authenticated
+       * before dispatch, `createMessage` returned a correlated reply, and the runtime resolved
+       * only after the reply child exited zero.
+       *
+       * The second is strong enough to forbid a re-run and not strong enough to be called the
+       * first. Stretching one name over both is the laundering this file keeps having to remove.
+       */
       readonly kind: "COMPLETED";
-      readonly authority: "HERMES_TARGET";
+      readonly authority: "HERMES_TARGET" | "ACP_OBSERVED_HERMES_REPLY";
       readonly reasonCode: string;
       readonly evidenceDigest: string;
     }
@@ -188,47 +262,95 @@ export class ConversationTurnCoordinator {
       const chained = this.assertAttemptsMayRun(input.sources);
       if (!chained.allowed) return deny(chained.reasonCode, chained.message, chained.evidence);
 
-      const turnRequestId = `tr_${randomUUID().replace(/-/g, "")}`;
-      const promptDigest = digestOf(input.prompt);
-      try {
-        this.db.run(
-          `INSERT INTO canonical_turns
-             (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
-              executor_session_id, executor_session_incarnation, binding_generation,
-              prompt_digest, claimed_at, lifecycle_state)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_DOUBT')`,
-          [
-            turnRequestId,
-            input.targetActorId,
-            target.target_binding_id,
-            attestation.target_attestation_id,
-            attestation.executor_session_id,
-            attestation.executor_session_incarnation,
-            attestation.binding_generation,
-            promptDigest,
-            this.clock.nowIso(),
-          ],
+      // A turn on this actor whose observations disagree. The disagreement is about whether a
+      // past turn ran, so nothing new may be admitted until someone adjudicates it — running a
+      // fresh turn against a conversation whose last outcome is disputed is how the dispute
+      // becomes two disputes.
+      //
+      // Checked per actor rather than per turn, and separately from the unresolved hold: a
+      // contradicted turn may already be settled, so the partial unique index does not see it.
+      const contradicted = this.db.get<{ turn_request_id: string }>(
+        `SELECT turn_request_id FROM canonical_turns
+          WHERE target_actor_id = ? AND observation_consistency = 'CONTRADICTED'
+          ORDER BY rowid ASC LIMIT 1`,
+        [input.targetActorId],
+      );
+      if (contradicted) {
+        return deny(
+          ReasonCode.CONVERSATION_ACTOR_QUARANTINED,
+          "an earlier turn on this conversation has observations that disagree, so no new turn may start",
+          { targetActorId: input.targetActorId, contradicted: contradicted.turn_request_id },
         );
-      } catch (error) {
-        // The partial unique index fired: this actor already has an unresolved turn. Reported by
-        // its own code rather than as a generic conflict, because the caller's next move differs
-        // — a busy conversation is not a malformed request.
+      }
+
+      // Read the incumbent before writing anything, so a busy conversation is an ordinary
+      // refusal rather than an exception. `db.tx` holds a write lock from BEGIN IMMEDIATE, so
+      // nothing can slip a turn in between this read and the insert below; the partial unique
+      // index stays as the backstop for a bug, and firing it is a fault rather than a state.
+      const incumbent = this.db.get<{ turn_request_id: string }>(
+        `SELECT turn_request_id FROM canonical_turns
+          WHERE target_actor_id = ? AND lifecycle_state = 'IN_DOUBT'`,
+        [input.targetActorId],
+      );
+      if (incumbent) {
         return deny(
           ReasonCode.CONVERSATION_TURN_IN_DOUBT,
           "this conversation already has a turn whose outcome is unknown",
-          {
-            targetActorId: input.targetActorId,
-            error: error instanceof Error ? error.message : String(error),
-          },
+          { targetActorId: input.targetActorId, incumbent: incumbent.turn_request_id },
         );
       }
+
+      // Everything above this line is a read. Everything below is a write, and none of it may
+      // report a refusal by returning — `Db.tx` commits a body that returns a denial, so a
+      // `return deny()` after a write leaves the write behind (#664). Below, failure throws and
+      // the transaction rolls back whole.
+      const turnRequestId = `tr_${randomUUID().replace(/-/g, "")}`;
+      const promptDigest = digestOf(input.prompt);
+
+      // The audit row first, so the turn can cite its real identity. The shape this replaces
+      // minted an `ev_<uuid>` string and stored that — a value satisfying a NOT NULL column while
+      // identifying no row an operator could find.
+      const audited = this.audit.record({
+        kind: "CONVERSATION_TURN_CLAIMED",
+        actor: input.targetActorId,
+        evidence: {
+          turnRequestId,
+          sources: input.sources.map(
+            (source) => `${source.channel}:${source.nonce}#${source.attempt}`,
+          ),
+        },
+      });
+      if (!audited.allowed) {
+        throw acpError(audited.reasonCode, audited.message, audited.evidence);
+      }
+      const claimAuditEventId = audited.value;
+
+      this.db.run(
+        `INSERT INTO canonical_turns
+           (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
+            executor_session_id, executor_session_incarnation, binding_generation,
+            prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'IN_DOUBT')`,
+        [
+          turnRequestId,
+          input.targetActorId,
+          target.target_binding_id,
+          attestation.target_attestation_id,
+          attestation.executor_session_id,
+          attestation.executor_session_incarnation,
+          attestation.binding_generation,
+          promptDigest,
+          this.clock.nowIso(),
+          claimAuditEventId,
+        ],
+      );
 
       input.sources.forEach((source, ordinal) => {
         this.db.run(
           `INSERT INTO canonical_turn_sources
              (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,
-              source_digest, predecessor_turn_request_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              source_digest, predecessor_turn_request_id, admission_audit_event_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             turnRequestId,
             source.channel,
@@ -237,17 +359,9 @@ export class ConversationTurnCoordinator {
             ordinal,
             digestOf(source.payload),
             source.attempt === 1 ? null : this.previousAttempt(source)?.turn_request_id ?? null,
+            claimAuditEventId,
           ],
         );
-      });
-
-      this.audit.record({
-        kind: "CONVERSATION_TURN_CLAIMED",
-        actor: input.targetActorId,
-        evidence: {
-          turnRequestId,
-          sources: input.sources.map((source) => `${source.channel}:${source.nonce}#${source.attempt}`),
-        },
       });
 
       const fields = { turnRequestId, targetActorId: input.targetActorId, promptDigest };
@@ -256,14 +370,19 @@ export class ConversationTurnCoordinator {
   }
 
   /**
-   * Records how a turn ended, from something that observed it.
+   * Records what an authority observed, and recomputes the turn's outcome from every such record.
    *
-   * There is no `settle` for "we stopped waiting". Every outcome this accepts names an authority
-   * that saw something: pre-dispatch evidence that nothing ran, or the target's own word that it
-   * committed or was fenced. A caller with none of those has nothing to record, which is the
-   * state the design calls in-doubt.
+   * Not an update of the turn. The shape this replaces settled with an `UPDATE … WHERE
+   * lifecycle_state = 'IN_DOUBT'`, which correctly refuses an overwrite and therefore **discards
+   * the later, more authoritative record**: a mistaken pre-dispatch refusal arriving first kept
+   * the false retry-safe answer and threw away the target's real receipt. That is worse than the
+   * overwrite it prevents — an overwrite loses the first record, this lost the true one.
+   *
+   * So both are kept. The outcome is materialized from the observation set under a fixed
+   * conservative order, and a disagreement raises the turn's consistency rather than picking a
+   * winner.
    */
-  settle(permit: TurnPermit, outcome: TurnOutcome): Decision<void> {
+  observe(permit: TurnPermit, observation: TurnObservation): Decision<TurnMaterialization> {
     return this.db.tx(() => {
       const issued = this.assertIssuedHere(permit);
       if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
@@ -273,15 +392,14 @@ export class ConversationTurnCoordinator {
         [permit.turnRequestId],
       );
       if (!row) {
+        // Unreachable since v24: a turn cannot be deleted, so a genuinely issued permit always
+        // names a row. Recorded as unreachable rather than claimed as a guard — no test can kill
+        // it, and a falsifiability row for it would report coverage that does not exist.
         return deny(ReasonCode.CONFLICT, "no turn was ever claimed under this id", {
           turnRequestId: permit.turnRequestId,
         });
       }
       if (row.target_actor_id !== permit.targetActorId || row.prompt_digest !== permit.promptDigest) {
-        // A permit whose signature is genuine but whose contents disagree with the row it names.
-        // Reachable if a caller keeps a permit and mutates it before settling; the signature
-        // covers the fields, so this is belt and braces, and it is the check that makes the
-        // settlement provably about the turn the permit was issued for.
         return deny(
           ReasonCode.CONVERSATION_TURN_PERMIT_MISMATCH,
           "this permit does not describe the turn it names",
@@ -289,61 +407,180 @@ export class ConversationTurnCoordinator {
         );
       }
 
-      const auditEventId = `ev_${randomUUID().replace(/-/g, "")}`;
-      const evidenceDigest =
-        outcome.kind === "NEVER_ADMITTED"
-          ? digestOf({ authority: outcome.authority, reasonCode: outcome.reasonCode })
-          : outcome.evidenceDigest;
-      const updated = this.db.run(
-        `UPDATE canonical_turns
-            SET lifecycle_state = 'SETTLED', outcome_kind = ?, settled_at = ?,
-                resolution_authority = ?, reason_code = ?, evidence_digest = ?, audit_event_id = ?
-          WHERE turn_request_id = ? AND lifecycle_state = 'IN_DOUBT'`,
-        [
-          outcome.kind,
-          this.clock.nowIso(),
-          outcome.authority,
-          outcome.reasonCode,
-          evidenceDigest,
-          auditEventId,
-          permit.turnRequestId,
-        ],
+      const already = this.db.get<{
+        observed_outcome: string;
+        evidence_digest: string;
+        reason_code: string;
+      }>(
+        `SELECT observed_outcome, evidence_digest, reason_code FROM canonical_turn_observations
+          WHERE turn_request_id = ? AND observing_authority = ? AND receipt_id = ?`,
+        [permit.turnRequestId, observation.authority, observation.receiptId],
       );
-      if (updated.changes !== 1) {
-        // Conditional on IN_DOUBT, so a second settlement cannot overwrite the first. Which
-        // authority settled a turn is the thing a later reader needs most, and a last-write-wins
-        // update would quietly replace it.
-        //
-        // Unlike the unreachable conditional this design once carried in its claim path, this one
-        // is reachable without any interleaving: two ordinary sequential calls on the same permit
-        // reach it, which is the case that actually happens — a pre-dispatch refusal recorded,
-        // and then a late receipt arriving for the same turn.
-        return deny(
-          ReasonCode.CONFLICT,
-          "this turn is not in doubt; it was settled already or never claimed",
-          { turnRequestId: permit.turnRequestId },
-        );
+      if (already) {
+        const identical =
+          already.observed_outcome === observation.outcome &&
+          already.evidence_digest === observation.evidenceDigest &&
+          already.reason_code === observation.reasonCode;
+        if (!identical) {
+          // A receipt id reused for different content is not a redelivery — it is two claims
+          // wearing one identity, and accepting the second silently reported the first back as a
+          // confirmation of it. Refused so the caller learns its receipt identity is wrong,
+          // rather than believing evidence landed that did not.
+          return deny(
+            ReasonCode.CONVERSATION_TURN_RECEIPT_REUSED,
+            "this receipt id already carries different evidence on this turn",
+            {
+              turnRequestId: permit.turnRequestId,
+              authority: observation.authority,
+              receiptId: observation.receiptId,
+            },
+          );
+        }
+        // The same receipt redelivered is a no-op, not a second opinion. Without this a retrying
+        // transport manufactures a disagreement with itself and quarantines the conversation.
+        return allow(ReasonCode.OK, this.materialization(permit.turnRequestId));
       }
-      this.audit.record({
-        kind: "CONVERSATION_TURN_SETTLED",
-        // The row's actor, not the permit's.
-        //
-        // Not independently falsifiable, and listed as such rather than as a guard: the issuance
-        // signature covers the actor, so anything reaching this line already agrees with the row,
-        // and swapping this expression for `permit.targetActorId` kills no test. It stays because
-        // the row is the authoritative source and reading it costs nothing — but a falsifiability
-        // row for it would report coverage that does not exist. The check that actually stops a
-        // re-pointed permit is the signature, and that one has a test which dies without it.
+
+      // Past this line every failure throws, because `Db.tx` commits a body that returns a
+      // denial (#664) and an observation written without its audit row is testimony with no
+      // provenance.
+      const audited = this.audit.record({
+        kind: "CONVERSATION_TURN_OBSERVED",
         actor: row.target_actor_id,
         evidence: {
           turnRequestId: permit.turnRequestId,
-          outcome: outcome.kind,
-          authority: outcome.authority,
-          auditEventId,
+          outcome: observation.outcome,
+          authority: observation.authority,
+          receiptId: observation.receiptId,
         },
       });
-      return allow(ReasonCode.OK, undefined);
+      if (!audited.allowed) throw acpError(audited.reasonCode, audited.message, audited.evidence);
+
+      this.db.run(
+        `INSERT INTO canonical_turn_observations
+           (turn_request_id, observed_outcome, observing_authority, receipt_id,
+            evidence_digest, reason_code, observed_at, audit_event_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          permit.turnRequestId,
+          observation.outcome,
+          observation.authority,
+          observation.receiptId,
+          observation.evidenceDigest,
+          observation.reasonCode,
+          this.clock.nowIso(),
+          audited.value,
+        ],
+      );
+
+      return allow(ReasonCode.OK, this.materialize(permit.turnRequestId));
     });
+  }
+
+  /**
+   * Recomputes a turn's outcome from every observation on it.
+   *
+   * The order is conservative and fixed: **an authenticated `COMPLETED` beats everything.** No
+   * later adjudication, fence or owner decision can lower it, because lowering it is precisely
+   * what re-opens a completed exchange for a second run. Below that, a fenced `ABORTED` beats a
+   * pre-dispatch `NEVER_ADMITTED`, since a fence is a stronger statement than an intention.
+   *
+   * Only authorities the turn table accepts can *materialize* an outcome. `ACP_OBSERVED_HERMES_REPLY`
+   * is recorded as an observation and does not raise the outcome — ACP watching a reply is not
+   * the target proving a commit, and the difference is the whole reason the authority column
+   * exists. When a target receipt arrives, it materializes and the earlier observation stands
+   * beside it as what ACP saw at the time.
+   */
+  private materialize(turnRequestId: string): TurnMaterialization {
+    const observations = this.db.all<{ observed_outcome: string; observing_authority: string;
+      evidence_digest: string; reason_code: string }>(
+      `SELECT observed_outcome, observing_authority, evidence_digest, reason_code
+         FROM canonical_turn_observations WHERE turn_request_id = ? ORDER BY observation_id ASC`,
+      [turnRequestId],
+    );
+
+    const materializing = observations.filter((o) => MATERIALIZING_AUTHORITIES.has(o.observing_authority));
+    const strengthOf = (outcome: string): number => OUTCOME_STRENGTH[outcome] ?? 0;
+    const strongest = [...materializing].sort(
+      (a, b) => strengthOf(b.observed_outcome) - strengthOf(a.observed_outcome),
+    )[0];
+
+    // A disagreement about whether the turn ran at all, or about how it ended — across **every**
+    // observation, not only the ones that can materialize.
+    //
+    // The version this replaces counted only materializing records, which made a
+    // non-materializing COMPLETED invisible twice over: it could not raise the outcome, and it
+    // could not dissent either. So an ACP-observed reply followed by a pre-dispatch
+    // NEVER_ADMITTED settled the turn retry-safe and reported CONSISTENT, and the retry rule
+    // admitted attempt 2 — a re-run of an exchange ACP had watched reach the owner. Measured.
+    //
+    // Two observations of the same outcome are corroboration, not conflict, whoever made them.
+    const distinct = new Set(observations.map((o) => o.observed_outcome));
+    const consistency = distinct.size > 1 ? "CONTRADICTED" : "CONSISTENT";
+
+    const current = this.materialization(turnRequestId);
+
+    if (strongest) {
+      // `settled_at` records when this turn *settled*, so it is written once and then left alone.
+      // The version this replaced rewrote it on every later observation, including ones that
+      // changed no outcome, so a late weak record moved the terminal time of a turn it did not
+      // decide. The provenance trigger now refuses that; keeping the first value here is what
+      // makes the trigger's refusal something this code never has to hit.
+      const settledAt = this.clock.nowIso();
+      this.db.materializeTurn(
+        {
+          turnRequestId,
+          outcome: strongest.observed_outcome,
+          authority: strongest.observing_authority,
+          consistency,
+        },
+        () =>
+          this.db.run(
+            `UPDATE canonical_turns
+                SET lifecycle_state = 'SETTLED', outcome_kind = ?,
+                    settled_at = COALESCE(settled_at, ?),
+                    resolution_authority = ?, reason_code = ?, evidence_digest = ?,
+                    observation_consistency = ?
+              WHERE turn_request_id = ?`,
+            [
+              strongest.observed_outcome,
+              settledAt,
+              strongest.observing_authority,
+              strongest.reason_code,
+              strongest.evidence_digest,
+              consistency,
+              turnRequestId,
+            ],
+          ),
+      );
+    } else if (consistency !== current.consistency) {
+      this.db.materializeTurn(
+        { turnRequestId, outcome: current.outcome, authority: current.authority, consistency },
+        () =>
+          this.db.run(`UPDATE canonical_turns SET observation_consistency = ? WHERE turn_request_id = ?`, [
+            consistency,
+            turnRequestId,
+          ]),
+      );
+    }
+
+    return this.materialization(turnRequestId);
+  }
+
+  /** The turn's current outcome and consistency, as the ledger now holds them. */
+  private materialization(turnRequestId: string): TurnMaterialization {
+    const row = this.db.get<{ lifecycle_state: string; outcome_kind: string | null;
+      resolution_authority: string | null; observation_consistency: string }>(
+      `SELECT lifecycle_state, outcome_kind, resolution_authority, observation_consistency
+         FROM canonical_turns WHERE turn_request_id = ?`,
+      [turnRequestId],
+    );
+    return {
+      lifecycleState: (row?.lifecycle_state ?? "IN_DOUBT") as TurnMaterialization["lifecycleState"],
+      outcome: row?.outcome_kind ?? null,
+      authority: row?.resolution_authority ?? null,
+      consistency: (row?.observation_consistency ?? "CONSISTENT") as TurnMaterialization["consistency"],
+    };
   }
 
   /**
@@ -415,14 +652,39 @@ export class ConversationTurnCoordinator {
       //
       // Note the shape it must *not* collapse to: `!== "COMPLETED"` reads as the same rule and
       // is not, because it admits the NULL of a turn still in doubt.
+      // The materialized outcome is not the whole record, and reading it alone is how a
+      // completed exchange became re-runnable: a COMPLETED observation from an authority that
+      // cannot materialize left the turn's outcome saying something weaker. So the retry rule
+      // asks the observation set directly — was this ever reported completed, by anyone, and is
+      // the disagreement still open.
+      // Three conditions guarding one property from three sides, which is deliberate and has a
+      // cost worth naming: a COMPLETED previous turn is refused by the outcome test *and* by this
+      // count, so neither of those two is killable by a test of that case alone. The count is
+      // what carries the falsifiability row, because it is the side that catches a completion the
+      // materialized outcome does not show — an observation from an authority that cannot set the
+      // outcome. The outcome test has no row of its own for the same reason the audit actor does
+      // not: a row for a check nothing can kill reports coverage that does not exist.
+      const anyCompletion = this.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM canonical_turn_observations
+          WHERE turn_request_id = ? AND observed_outcome = 'COMPLETED'`,
+        [previous.turn_request_id],
+      );
+      const unresolved = this.db.get<{ observation_consistency: string }>(
+        `SELECT observation_consistency FROM canonical_turns WHERE turn_request_id = ?`,
+        [previous.turn_request_id],
+      );
       const settledSafely =
-        previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED";
+        (previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED") &&
+        (anyCompletion?.n ?? 0) === 0 &&
+        unresolved?.observation_consistency !== "CONTRADICTED";
       if (!settledSafely) {
         return deny(
           ReasonCode.CONVERSATION_TURN_ATTEMPT_UNSAFE,
-          previous.outcome_kind === "COMPLETED"
-            ? "the previous attempt at this message completed; running it again would repeat it"
-            : "the previous attempt at this message has no known outcome, so it may still be running",
+          previous.outcome_kind === "COMPLETED" || (anyCompletion?.n ?? 0) > 0
+            ? "the previous attempt at this message was reported completed; running it again would repeat it"
+            : unresolved?.observation_consistency === "CONTRADICTED"
+              ? "the previous attempt's observations disagree, so whether it ran is still open"
+              : "the previous attempt at this message has no known outcome, so it may still be running",
           {
             channel: source.channel,
             nonce: source.nonce,

@@ -50,6 +50,25 @@ const attestation = (h: Harness, id: string, bindingId: string): string => {
   return id;
 };
 
+/**
+ * A real audit row, and its real id.
+ *
+ * `claim_audit_event_id` is a foreign key to `audit_events(event_id)` now, so a fixture cannot
+ * invent one. That is the point of the change it came from: the shape this replaces stored a
+ * minted `ev_<uuid>` string that identified no row, and a fixture could satisfy it with anything.
+ */
+const auditEvent = (h: Harness, kind = "FIXTURE"): number => {
+  h.cp.db.run(
+    `INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, ?, '{}')`,
+    [NOW, kind],
+  );
+  return Number(
+    (h.cp.db.get<{ event_id: number }>(`SELECT MAX(event_id) AS event_id FROM audit_events`) ?? {
+      event_id: 0,
+    }).event_id,
+  );
+};
+
 const inDoubtTurn = (
   h: Harness,
   turnId: string,
@@ -61,9 +80,37 @@ const inDoubtTurn = (
     `INSERT INTO canonical_turns
        (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
         executor_session_id, executor_session_incarnation, binding_generation,
-        prompt_digest, claimed_at, lifecycle_state)
-     VALUES (?, ?, ?, ?, 'ses-1', 'inc-1', 1, 'prompt', ?, 'IN_DOUBT')`,
-    [turnId, actorId, bindingId, attestationId, NOW],
+        prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state)
+     VALUES (?, ?, ?, ?, 'ses-1', 'inc-1', 1, 'prompt', ?, ?, 'IN_DOUBT')`,
+    [turnId, actorId, bindingId, attestationId, NOW, auditEvent(h)],
+  );
+};
+
+/**
+ * Settles a turn the way the schema now requires: under the materializer's authority marker.
+ *
+ * A raw `UPDATE` no longer settles anything — that was the hole where an ordinary statement
+ * produced a settled row with zero observations behind it. These fixtures are about the table's
+ * own constraints rather than about the coordinator, so they hold the marker directly instead of
+ * going through it.
+ */
+const settleRaw = (
+  h: Harness,
+  turnId: string,
+  outcome: string,
+  authority: string,
+  extra = "",
+): void => {
+  h.cp.db.materializeTurn(
+    { turnRequestId: turnId, outcome, authority, consistency: "CONSISTENT" },
+    () =>
+      h.cp.db.run(
+        `UPDATE canonical_turns
+            SET lifecycle_state='SETTLED', outcome_kind=?, settled_at=?, resolution_authority=?,
+                reason_code='OK', evidence_digest='sha256:e'${extra}
+          WHERE turn_request_id = ?`,
+        [outcome, NOW, authority, turnId],
+      ),
   );
 };
 
@@ -145,9 +192,9 @@ describe("a turn cannot cite a target it does not belong to", () => {
         `INSERT INTO canonical_turns
            (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
             executor_session_id, executor_session_incarnation, binding_generation,
-            prompt_digest, claimed_at, lifecycle_state)
-         VALUES ('turn:3', ?, ?, NULL, 'ses-1', 'inc-1', 1, 'prompt', ?, 'IN_DOUBT')`,
-        [t.actorId, t.bindingId, NOW],
+            prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state)
+         VALUES ('turn:3', ?, ?, NULL, 'ses-1', 'inc-1', 1, 'prompt', ?, ?, 'IN_DOUBT')`,
+        [t.actorId, t.bindingId, NOW, auditEvent(h)],
       ),
     ).toThrow();
   });
@@ -169,14 +216,7 @@ describe("one unresolved turn per actor", () => {
     const h = makeHarness();
     const t = target(h, "freed");
     inDoubtTurn(h, "turn:done", t.actorId, t.bindingId, t.attestationId);
-    h.cp.db.run(
-      `UPDATE canonical_turns
-          SET lifecycle_state='SETTLED', outcome_kind='COMPLETED', settled_at=?,
-              resolution_authority='HERMES_TARGET', reason_code='OK',
-              evidence_digest='sha256:x', audit_event_id='evt-1'
-        WHERE turn_request_id='turn:done'`,
-      [NOW],
-    );
+    settleRaw(h, "turn:done", "COMPLETED", "HERMES_TARGET");
 
     expect(() => inDoubtTurn(h, "turn:next", t.actorId, t.bindingId, t.attestationId)).not.toThrow();
   });
@@ -199,10 +239,24 @@ describe("a settlement carries what settled it", () => {
     const t = target(h, "halfsettled");
     inDoubtTurn(h, "turn:half", t.actorId, t.bindingId, t.attestationId);
 
+    // Held under the materializer's marker, because that is where the CHECK now stands: an
+    // unauthorised writer is stopped earlier and by a different rule, which would make this test
+    // pass without exercising the constraint it is named for.
     expect(() =>
-      h.cp.db.run(
-        `UPDATE canonical_turns SET lifecycle_state='SETTLED', outcome_kind='COMPLETED'
-          WHERE turn_request_id='turn:half'`,
+      h.cp.db.materializeTurn(
+        {
+          turnRequestId: "turn:half",
+          outcome: "COMPLETED",
+          authority: "HERMES_TARGET",
+          consistency: "CONSISTENT",
+        },
+        () =>
+          h.cp.db.run(
+            `UPDATE canonical_turns
+                SET lifecycle_state='SETTLED', outcome_kind='COMPLETED',
+                    resolution_authority='HERMES_TARGET'
+              WHERE turn_request_id='turn:half'`,
+          ),
       ),
     ).toThrow();
   });
@@ -218,9 +272,9 @@ describe("a settlement carries what settled it", () => {
         `INSERT INTO canonical_turns
            (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
             executor_session_id, executor_session_incarnation, binding_generation,
-            prompt_digest, claimed_at, lifecycle_state, outcome_kind)
-         VALUES ('turn:contradiction', ?, ?, ?, 'ses-1', 'inc-1', 1, 'p', ?, 'IN_DOUBT', 'COMPLETED')`,
-        [t.actorId, t.bindingId, t.attestationId, NOW],
+            prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state, outcome_kind)
+         VALUES ('turn:contradiction', ?, ?, ?, 'ses-1', 'inc-1', 1, 'p', ?, ?, 'IN_DOUBT', 'COMPLETED')`,
+        [t.actorId, t.bindingId, t.attestationId, NOW, auditEvent(h)],
       ),
     ).toThrow();
   });
@@ -251,9 +305,9 @@ describe("which messages a turn consumed", () => {
     h.cp.db.run(
       `INSERT INTO canonical_turn_sources
          (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,
-          source_digest, predecessor_turn_request_id)
-       VALUES (?, 'telegram', ?, ?, ?, ?, ?)`,
-      [turnId, nonce, attempt, ordinal, `d:${nonce}`, predecessor],
+          source_digest, predecessor_turn_request_id, admission_audit_event_id)
+       VALUES (?, 'telegram', ?, ?, ?, ?, ?, ?)`,
+      [turnId, nonce, attempt, ordinal, `d:${nonce}`, predecessor, auditEvent(h)],
     );
   };
 
@@ -301,14 +355,7 @@ describe("which messages a turn consumed", () => {
     const t = target(h, "retry");
     inDoubtTurn(h, "turn:try1", t.actorId, t.bindingId, t.attestationId);
     source(h, "turn:try1", "update:9", 1, 0, null);
-    h.cp.db.run(
-      `UPDATE canonical_turns
-          SET lifecycle_state='SETTLED', outcome_kind='NEVER_ADMITTED', settled_at=?,
-              resolution_authority='ACP_PRE_DISPATCH', reason_code='CEO_CONVERSATION_UNAVAILABLE',
-              evidence_digest='sha256:y', audit_event_id='evt-2'
-        WHERE turn_request_id='turn:try1'`,
-      [NOW],
-    );
+    settleRaw(h, "turn:try1", "NEVER_ADMITTED", "ACP_PRE_DISPATCH");
     inDoubtTurn(h, "turn:try2", t.actorId, t.bindingId, t.attestationId);
 
     expect(() => source(h, "turn:try2", "update:9", 2, 0, "turn:try1")).not.toThrow();

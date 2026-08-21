@@ -287,6 +287,22 @@ export const ReasonCode = {
   CONVERSATION_TURN_PERMIT_UNISSUED: "CONVERSATION_TURN_PERMIT_UNISSUED",
   /** A genuinely issued permit whose contents disagree with the turn row it names. */
   CONVERSATION_TURN_PERMIT_MISMATCH: "CONVERSATION_TURN_PERMIT_MISMATCH",
+  /**
+   * An earlier turn on this conversation has observations that disagree, so no new turn starts.
+   *
+   * The disagreement is about whether that turn ran. Admitting a fresh one against a conversation
+   * whose last outcome is disputed turns one dispute into two, and the second is harder to read
+   * because the transcript now has both.
+   */
+  CONVERSATION_ACTOR_QUARANTINED: "CONVERSATION_ACTOR_QUARANTINED",
+  /**
+   * A receipt id already carries different evidence on this turn.
+   *
+   * Redelivery of the same receipt is a no-op; the same identity over different content is two
+   * claims wearing one name. Accepting it silently returned the first as a confirmation of the
+   * second, so a genuine observation could be discarded and reported as landed.
+   */
+  CONVERSATION_TURN_RECEIPT_REUSED: "CONVERSATION_TURN_RECEIPT_REUSED",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",

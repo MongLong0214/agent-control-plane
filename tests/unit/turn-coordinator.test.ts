@@ -73,6 +73,33 @@ const coordinatorOf = (h: Harness): ConversationTurnCoordinator => {
 const anotherCoordinator = (h: Harness): ConversationTurnCoordinator =>
   new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
 
+/**
+ * The old `settle(permit, outcome)` shape, expressed against `observe`.
+ *
+ * Settlement is an observation now, and an observation carries a receipt identity so that the
+ * same receipt redelivered is a no-op rather than a second opinion. These tests predate that, so
+ * the adapter mints a unique receipt per call — which is what a caller with one genuine receipt
+ * would supply, and keeps the tests about the behaviour they were written for.
+ */
+let receiptCounter = 0;
+const settle = (
+  coordinator: ConversationTurnCoordinator,
+  permit: TurnPermit,
+  outcome: {
+    kind: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
+    authority: "ACP_PRE_DISPATCH" | "HERMES_TARGET" | "OWNER_AFTER_TARGET_FENCE";
+    reasonCode: string;
+    evidenceDigest?: string;
+  },
+) =>
+  coordinator.observe(permit, {
+    outcome: outcome.kind,
+    authority: outcome.authority,
+    receiptId: `receipt-${(receiptCounter += 1)}`,
+    evidenceDigest: outcome.evidenceDigest ?? "sha256:evidence",
+    reasonCode: outcome.reasonCode,
+  });
+
 const claimOf = (h: Harness, actorId: string, sources: TurnSource[], prompt = "hello") => {
   const decision = coordinatorOf(h).claim({ targetActorId: actorId, prompt, sources });
   if (!decision.allowed) throw new Error(`expected a permit, got ${decision.reasonCode}`);
@@ -246,7 +273,7 @@ describe("one unresolved turn per conversation", () => {
     const actorId = target(h, "ceo");
     const first = claimOf(h, actorId, [source("m1")]);
 
-    coordinatorOf(h).settle(first, {
+    settle(coordinatorOf(h), first, {
       kind: "NEVER_ADMITTED",
       authority: "ACP_PRE_DISPATCH",
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
@@ -281,7 +308,8 @@ describe("one unresolved turn per conversation", () => {
 describe("a retry is legal only when the previous attempt ended safely", () => {
   const settleFirst = (h: Harness, actorId: string, outcome: "NEVER_ADMITTED" | "ABORTED" | "COMPLETED") => {
     const first = claimOf(h, actorId, [source("m1")]);
-    coordinatorOf(h).settle(
+    settle(
+      coordinatorOf(h),
       first,
       outcome === "NEVER_ADMITTED"
         ? { kind: "NEVER_ADMITTED", authority: "ACP_PRE_DISPATCH", reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE }
@@ -358,7 +386,7 @@ describe("a retry is legal only when the previous attempt ended safely", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
     const first = claimOf(h, actorId, [source("m1")]);
-    coordinatorOf(h).settle(first, {
+    settle(coordinatorOf(h), first, {
       kind: "NEVER_ADMITTED",
       authority: "ACP_PRE_DISPATCH",
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
@@ -378,7 +406,7 @@ describe("settlement needs an authority that observed something", () => {
     const actorId = target(h, "ceo");
     const permit = claimOf(h, actorId, [source("m1")]);
 
-    coordinatorOf(h).settle(permit, {
+    settle(coordinatorOf(h), permit, {
       kind: "COMPLETED",
       authority: "HERMES_TARGET",
       reasonCode: ReasonCode.OK,
@@ -399,39 +427,100 @@ describe("settlement needs an authority that observed something", () => {
     expect(row?.settled_at).toBe(h.clock.nowIso());
   });
 
-  it("refuses to overwrite a settlement that already happened", () => {
-    // Two sequential calls, no interleaving required. A late receipt arriving after a
-    // pre-dispatch refusal is the case, and last-write-wins would replace the authority that
-    // actually decided — the single thing a later reader needs most.
+  it("lets a late target receipt beat an earlier mistaken refusal, and keeps both", () => {
+    // The behaviour that replaced first-settlement-wins. A pre-dispatch refusal arriving before
+    // the target's real receipt used to keep the false retry-safe answer and discard the true
+    // one — worse than the overwrite it prevented, because an overwrite loses the first record
+    // and this lost the correct one.
     const h = makeHarness();
     const actorId = target(h, "ceo");
     const permit = claimOf(h, actorId, [source("m1")]);
-    coordinatorOf(h).settle(permit, {
+    settle(coordinatorOf(h), permit, {
       kind: "NEVER_ADMITTED",
       authority: "ACP_PRE_DISPATCH",
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
     });
 
-    const second = coordinatorOf(h).settle(permit, {
+    const late = settle(coordinatorOf(h), permit, {
       kind: "COMPLETED",
       authority: "HERMES_TARGET",
       reasonCode: ReasonCode.OK,
       evidenceDigest: "sha256:late",
     });
 
-    expect(second.allowed).toBe(false);
-    const row = h.cp.db.get<{ outcome_kind: string; resolution_authority: string }>(
-      `SELECT outcome_kind, resolution_authority FROM canonical_turns WHERE turn_request_id = ?`,
+    expect(late.allowed).toBe(true);
+    const row = h.cp.db.get<{ outcome_kind: string; resolution_authority: string;
+      observation_consistency: string }>(
+      `SELECT outcome_kind, resolution_authority, observation_consistency
+         FROM canonical_turns WHERE turn_request_id = ?`,
       [permit.turnRequestId],
     );
-    expect(row?.outcome_kind).toBe("NEVER_ADMITTED");
-    expect(row?.resolution_authority).toBe("ACP_PRE_DISPATCH");
+    expect(row?.outcome_kind).toBe("COMPLETED");
+    expect(row?.resolution_authority).toBe("HERMES_TARGET");
+    // Both records survive, and the turn says the two authorities disagreed.
+    expect(row?.observation_consistency).toBe("CONTRADICTED");
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_observations`)).toHaveLength(2);
+  });
+
+  it("never lowers an outcome, whatever arrives afterwards", () => {
+    // The direction that matters. COMPLETED forbids a re-run; ABORTED and NEVER_ADMITTED permit
+    // one. So a later authority talking a completion down is exactly how a finished exchange
+    // becomes runnable again.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+    settle(coordinatorOf(h), permit, {
+      kind: "COMPLETED",
+      authority: "HERMES_TARGET",
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:receipt",
+    });
+
+    settle(coordinatorOf(h), permit, {
+      kind: "ABORTED",
+      authority: "OWNER_AFTER_TARGET_FENCE",
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:fence",
+    });
+
+    const row = h.cp.db.get<{ outcome_kind: string }>(
+      `SELECT outcome_kind FROM canonical_turns WHERE turn_request_id = ?`,
+      [permit.turnRequestId],
+    );
+    expect(row?.outcome_kind).toBe("COMPLETED");
+  });
+
+  it("treats the same receipt redelivered as a no-op, not a disagreement", () => {
+    // Without receipt identity a retrying transport reports itself twice and quarantines the
+    // conversation for no reason.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+    const twice = () =>
+      coordinatorOf(h).observe(permit, {
+        outcome: "COMPLETED",
+        authority: "HERMES_TARGET",
+        receiptId: "the-same-receipt",
+        evidenceDigest: "sha256:receipt",
+        reasonCode: ReasonCode.OK,
+      });
+
+    twice();
+    const again = twice();
+
+    expect(again.allowed).toBe(true);
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_observations`)).toHaveLength(1);
+    const row = h.cp.db.get<{ observation_consistency: string }>(
+      `SELECT observation_consistency FROM canonical_turns WHERE turn_request_id = ?`,
+      [permit.turnRequestId],
+    );
+    expect(row?.observation_consistency).toBe("CONSISTENT");
   });
 });
 
 describe("only a permit this coordinator issued can settle a turn", () => {
   const settleWith = (h: Harness, permit: TurnPermit) =>
-    coordinatorOf(h).settle(permit, {
+    settle(coordinatorOf(h), permit, {
       kind: "COMPLETED",
       authority: "HERMES_TARGET",
       reasonCode: ReasonCode.OK,
@@ -492,7 +581,7 @@ describe("only a permit this coordinator issued can settle a turn", () => {
     const permit = claimOf(h, actorId, [source("m1")]);
 
     expect(
-      elsewhere.settle(permit, {
+      settle(elsewhere, permit, {
         kind: "NEVER_ADMITTED",
         authority: "ACP_PRE_DISPATCH",
         reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
@@ -507,29 +596,248 @@ describe("only a permit this coordinator issued can settle a turn", () => {
     const actorId = target(h, "ceo");
     const permit = claimOf(h, actorId, [source("m1")]);
 
-    coordinatorOf(h).settle(permit, {
+    settle(coordinatorOf(h), permit, {
       kind: "NEVER_ADMITTED",
       authority: "ACP_PRE_DISPATCH",
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
     });
 
     const row = h.cp.db.get<{ actor: string }>(
-      `SELECT actor FROM audit_events WHERE kind = 'CONVERSATION_TURN_SETTLED'`,
+      `SELECT actor FROM audit_events WHERE kind = 'CONVERSATION_TURN_OBSERVED'`,
     );
     expect(row?.actor).toBe(actorId);
   });
 
-  it("refuses a genuine permit whose turn no longer exists", () => {
-    // Distinct from a forged permit, and reported as such: the permit is real, the turn is not.
-    // Collapsing the two would tell an operator to look for an attacker when the answer is that
-    // something removed the row.
+  it("cannot be given a permit whose turn vanished, because a turn cannot vanish", () => {
+    // This test used to delete the rows and assert that `settle()` reported CONFLICT rather than
+    // a forgery. The v24 triggers make that state unreachable, which is the better answer: the
+    // hold is releasable only by an observed outcome, and a deletion released it silently.
+    //
+    // `settle()` keeps the branch for a row it cannot find. Nothing can reach it now, and it is
+    // recorded as unreachable rather than claimed as a guard — the distinction this file has had
+    // to make twice already.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const real = claimOf(h, actorId, [source("m1")]);
-    h.cp.db.run(`DELETE FROM canonical_turn_sources`);
-    h.cp.db.run(`DELETE FROM canonical_turns`);
+    claimOf(h, actorId, [source("m1")]);
 
-    expect(settleWith(h, real).reasonCode).toBe(ReasonCode.CONFLICT);
+    expect(() => h.cp.db.run(`DELETE FROM canonical_turn_sources`)).toThrow(
+      /CANONICAL_TURN_SOURCE_IMMUTABLE/,
+    );
+    expect(() => h.cp.db.run(`DELETE FROM canonical_turns`)).toThrow(/CANONICAL_TURN_NO_DELETE/);
+  });
+});
+
+describe("evidence that cannot set the outcome still counts against a retry", () => {
+  it("refuses a retry after ACP watched the reply reach the owner", () => {
+    // The blocking counterexample from review, reproduced exactly. ACP_OBSERVED_HERMES_REPLY
+    // cannot raise the outcome — deliberate — but it was also not counted as dissent, so a later
+    // pre-dispatch NEVER_ADMITTED became the only materializing record, settled the turn
+    // retry-safe, reported CONSISTENT, and the retry rule admitted attempt 2. That is a re-run of
+    // an exchange ACP had watched Hermes deliver.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+    coordinatorOf(h).observe(permit, {
+      outcome: "COMPLETED",
+      authority: "ACP_OBSERVED_HERMES_REPLY",
+      receiptId: "acp-1",
+      evidenceDigest: "sha256:watched",
+      reasonCode: ReasonCode.OK,
+    });
+    settle(coordinatorOf(h), permit, {
+      kind: "NEVER_ADMITTED",
+      authority: "ACP_PRE_DISPATCH",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+
+    const retry = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source("m1", 2)],
+    });
+
+    expect(retry.allowed).toBe(false);
+    expect(retry.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_ATTEMPT_UNSAFE);
+  });
+
+  it("raises the disagreement rather than reporting it as consistent", () => {
+    // "ACP observed a reply" and "nothing was admitted" cannot both be true, so the honest
+    // record is a disagreement — not a settlement that looks decided.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+    coordinatorOf(h).observe(permit, {
+      outcome: "COMPLETED",
+      authority: "ACP_OBSERVED_HERMES_REPLY",
+      receiptId: "acp-1",
+      evidenceDigest: "sha256:watched",
+      reasonCode: ReasonCode.OK,
+    });
+    settle(coordinatorOf(h), permit, {
+      kind: "NEVER_ADMITTED",
+      authority: "ACP_PRE_DISPATCH",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+
+    const row = h.cp.db.get<{ observation_consistency: string }>(
+      `SELECT observation_consistency FROM canonical_turns WHERE turn_request_id = ?`,
+      [permit.turnRequestId],
+    );
+    expect(row?.observation_consistency).toBe("CONTRADICTED");
+  });
+
+  it("refuses a retry while the previous attempt's observations are still in dispute", () => {
+    // A disagreement with no completion in it: the target says it was fenced, pre-dispatch says
+    // nothing ran. Both permit a retry on their own, so nothing but the open dispute refuses
+    // this — which makes it the one case that tests the dispute check by itself.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+    settle(coordinatorOf(h), permit, {
+      kind: "ABORTED",
+      authority: "HERMES_TARGET",
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:fence",
+    });
+    settle(coordinatorOf(h), permit, {
+      kind: "NEVER_ADMITTED",
+      authority: "ACP_PRE_DISPATCH",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+
+    const retry = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source("m1", 2)],
+    });
+
+    expect(retry.allowed).toBe(false);
+    expect(retry.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_ATTEMPT_UNSAFE);
+  });
+
+  it("still treats two authorities reporting the same outcome as corroboration", () => {
+    // The over-correction to avoid. If any two observations counted as conflict, the ordinary
+    // case — a target receipt confirming what ACP already saw — would quarantine every
+    // conversation that worked.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+    coordinatorOf(h).observe(permit, {
+      outcome: "COMPLETED",
+      authority: "ACP_OBSERVED_HERMES_REPLY",
+      receiptId: "acp-1",
+      evidenceDigest: "sha256:watched",
+      reasonCode: ReasonCode.OK,
+    });
+    coordinatorOf(h).observe(permit, {
+      outcome: "COMPLETED",
+      authority: "HERMES_TARGET",
+      receiptId: "target-1",
+      evidenceDigest: "sha256:receipt",
+      reasonCode: ReasonCode.OK,
+    });
+
+    const row = h.cp.db.get<{ observation_consistency: string; outcome_kind: string }>(
+      `SELECT observation_consistency, outcome_kind FROM canonical_turns WHERE turn_request_id = ?`,
+      [permit.turnRequestId],
+    );
+    expect(row?.observation_consistency).toBe("CONSISTENT");
+    expect(row?.outcome_kind).toBe("COMPLETED");
+  });
+
+  it("records when the turn settled, and does not move it afterwards", () => {
+    // A late observation that decides nothing was rewriting the terminal time of a turn it did
+    // not settle.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+    settle(coordinatorOf(h), permit, {
+      kind: "COMPLETED",
+      authority: "HERMES_TARGET",
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:receipt",
+    });
+    const settledAt = h.cp.db.get<{ settled_at: string }>(
+      `SELECT settled_at FROM canonical_turns WHERE turn_request_id = ?`,
+      [permit.turnRequestId],
+    )?.settled_at;
+
+    h.clock.advance(60_000);
+    coordinatorOf(h).observe(permit, {
+      outcome: "COMPLETED",
+      authority: "ACP_OBSERVED_HERMES_REPLY",
+      receiptId: "acp-late",
+      evidenceDigest: "sha256:watched",
+      reasonCode: ReasonCode.OK,
+    });
+
+    expect(
+      h.cp.db.get<{ settled_at: string }>(
+        `SELECT settled_at FROM canonical_turns WHERE turn_request_id = ?`,
+        [permit.turnRequestId],
+      )?.settled_at,
+    ).toBe(settledAt);
+  });
+});
+
+describe("a conversation whose last outcome is disputed takes no new turns", () => {
+  const contradict = (h: Harness, actorId: string) => {
+    const permit = claimOf(h, actorId, [source("m1")]);
+    settle(coordinatorOf(h), permit, {
+      kind: "NEVER_ADMITTED",
+      authority: "ACP_PRE_DISPATCH",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+    settle(coordinatorOf(h), permit, {
+      kind: "COMPLETED",
+      authority: "HERMES_TARGET",
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:late",
+    });
+    return permit;
+  };
+
+  it("refuses a new claim while an earlier turn's observations disagree", () => {
+    // The contradicted turn is *settled*, so the one-unresolved index does not see it. Without a
+    // separate check the conversation would carry on as if the disagreement had been resolved.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    contradict(h, actorId);
+
+    const next = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "a new question",
+      sources: [source("m2")],
+    });
+
+    expect(next.allowed).toBe(false);
+    expect(next.reasonCode).toBe(ReasonCode.CONVERSATION_ACTOR_QUARANTINED);
+  });
+
+  it("names the disputed turn, so the refusal points somewhere", () => {
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const disputed = contradict(h, actorId);
+
+    const next = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "q",
+      sources: [source("m2")],
+    });
+
+    expect(next.evidence).toMatchObject({ contradicted: disputed.turnRequestId });
+  });
+
+  it("quarantines the disputed conversation and no other", () => {
+    // Per actor, not global. A disagreement on one conversation stopping every other would be a
+    // worse failure than the one it is protecting against.
+    const h = makeHarness();
+    contradict(h, target(h, "ceo"));
+    const cto = target(h, "cto");
+
+    expect(
+      coordinatorOf(h).claim({ targetActorId: cto, prompt: "q", sources: [source("m3")] }).allowed,
+    ).toBe(true);
   });
 });
 

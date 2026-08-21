@@ -138,6 +138,7 @@ export class Doctor {
       findings.push(...this.checkClaims());
       findings.push(...this.checkOutbox());
       findings.push(...this.checkUnresolvedTurns());
+      findings.push(...this.checkCanonicalTurns());
       findings.push(...(await this.checkRepositories()));
       findings.push(...(await this.checkWorktrees()));
     }
@@ -693,6 +694,85 @@ export class Doctor {
           "establish what happened to the turn — it may have reached the conversation. Later turns on it are refused until it is settled",
       },
     ];
+  }
+
+  /**
+   * The canonical ledger, read directly.
+   *
+   * Reported separately from `checkUnresolvedTurns` and never merged with it. They watch two
+   * different representations of a turn — the ingress claim in `inbound_messages`, and the
+   * canonical row — and the ingress one is erased by the reply reservation on an ordinary
+   * timeout. Summing them would let a healthy count in one hide a wedge in the other, which is
+   * exactly the state this exists to make visible: the ledger red and the doctor green.
+   */
+  private checkCanonicalTurns(): Finding[] {
+    const findings: Finding[] = [];
+
+    const inDoubt = this.db.all<{ turn_request_id: string; target_actor_id: string; claimed_at: string }>(
+      `SELECT turn_request_id, target_actor_id, claimed_at FROM canonical_turns
+        WHERE lifecycle_state = 'IN_DOUBT'
+        ORDER BY claimed_at ASC, rowid ASC`,
+    );
+    if (inDoubt.length > 0) {
+      const oldest = inDoubt[0]!;
+      const ageMinutes = Math.max(
+        0,
+        Math.round((Date.parse(this.clock.nowIso()) - Date.parse(oldest.claimed_at)) / 60_000),
+      );
+      findings.push({
+        code: "CANONICAL_TURN_IN_DOUBT",
+        // Age is the only thing separating a turn in flight from a wedged conversation, and
+        // nothing here clears the hold — so this escalates rather than resolves.
+        severity: ageMinutes >= UNRESOLVED_TURN_ESCALATION_MINUTES ? "ERROR" : "WARN",
+        scope: "conversation",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          outstanding: inDoubt.length,
+          oldestAgeMinutes: ageMinutes,
+          oldest: {
+            turnRequestId: oldest.turn_request_id,
+            actor: oldest.target_actor_id,
+            claimedAt: oldest.claimed_at,
+          },
+        },
+        recommendedAction:
+          "establish what happened to the turn and record it as an observation. The conversation refuses later turns until one arrives",
+      });
+    }
+
+    const contradicted = this.db.all<{ turn_request_id: string; target_actor_id: string }>(
+      `SELECT turn_request_id, target_actor_id FROM canonical_turns
+        WHERE observation_consistency = 'CONTRADICTED' ORDER BY rowid ASC`,
+    );
+    for (const turn of contradicted) {
+      const conflicting = this.db.all<{ observation_id: number; observed_outcome: string;
+        observing_authority: string }>(
+        `SELECT observation_id, observed_outcome, observing_authority
+           FROM canonical_turn_observations WHERE turn_request_id = ? ORDER BY observation_id ASC`,
+        [turn.turn_request_id],
+      );
+      findings.push({
+        code: "CANONICAL_TURN_CONTRADICTED",
+        // Two authorities disagreed about whether this turn ran or how it ended. Both records
+        // are kept; the actor takes no new turns until someone adjudicates, so this blocks.
+        severity: "ERROR",
+        scope: "conversation",
+        blocking: true,
+        confidence: "HIGH",
+        observedEvidence: {
+          turnRequestId: turn.turn_request_id,
+          actor: turn.target_actor_id,
+          conflicting: conflicting.map(
+            (o) => `${o.observation_id}:${o.observing_authority}:${o.observed_outcome}`,
+          ),
+        },
+        recommendedAction:
+          "read the conflicting observations and record an adjudication citing them. Adjudication closes the disagreement; it cannot choose an outcome that permits a re-run",
+      });
+    }
+
+    return findings;
   }
 
   private checkOutbox(): Finding[] {

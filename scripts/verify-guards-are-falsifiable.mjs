@@ -327,10 +327,15 @@ const GUARDS = [
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
-    what: "a message whose previous attempt completed is never run again",
+    // Three conditions guard the retry rule and they overlap: a completion is refused by the
+    // outcome test and by the observation count, and a completion beside a weaker record is also
+    // a dispute. The only case any one of them refuses alone is a dispute with no completion in
+    // it — a fenced ABORTED against a pre-dispatch NEVER_ADMITTED, where both records permit a
+    // retry individually. So this is the row, and the other two carry none.
+    what: "a retry is refused while the previous attempt's observations are still in dispute",
     file: "src/conversation/turn-coordinator.ts",
-    find: '        previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED";',
-    replace: "        previous.outcome_kind !== null;",
+    find: '        unresolved?.observation_consistency !== "CONTRADICTED";',
+    replace: "        true;",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
@@ -339,16 +344,27 @@ const GUARDS = [
     // where the previous execution may still be writing.
     what: "a message whose previous attempt is still in doubt is not raced",
     file: "src/conversation/turn-coordinator.ts",
-    find: '        previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED";',
-    replace: '        previous.outcome_kind !== "COMPLETED";',
+    find: '        (previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED") &&',
+    replace: '        previous.outcome_kind !== "COMPLETED" &&',
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
-    what: "a settlement cannot overwrite the authority that already decided the turn",
+    // The row this replaces guarded the old settle-by-UPDATE, which no longer exists. What
+    // stands in its place is that evidence unable to *set* the outcome still counts against a
+    // retry — the hole a review found, where an ACP-observed reply was invisible both as a
+    // winner and as dissent, so a later weaker record settled the turn retry-safe.
+    what: "evidence that cannot set the outcome still counts against a retry",
     file: "src/conversation/turn-coordinator.ts",
-    find: "          WHERE turn_request_id = ? AND lifecycle_state = 'IN_DOUBT'`,",
-    replace: "          WHERE turn_request_id = ?`,",
+    find: "    const distinct = new Set(observations.map((o) => o.observed_outcome));",
+    replace: "    const distinct = new Set(materializing.map((o) => o.observed_outcome));",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "only the materializer may settle a turn, so an ordinary UPDATE cannot forge one",
+    file: "src/db/schema.sql",
+    find: "  AND acp_turn_materialization_authorized(",
+    replace: "  AND 0 = 1 AND acp_turn_materialization_authorized(",
+    killedBy: ["tests/unit/canonical-ledger-immutability.test.ts"],
   },
   {
     // There is no code to delete here: the guard is the *absence* of an expiry path. So the
@@ -394,8 +410,17 @@ const GUARDS = [
   {
     what: "a claimed turn records when it was claimed, so its age is read rather than guessed",
     file: "src/conversation/turn-coordinator.ts",
-    find: "            promptDigest,\n            this.clock.nowIso(),",
-    replace: '            promptDigest,\n            "1970-01-01T00:00:00.000Z",',
+    find: "          promptDigest,\n          this.clock.nowIso(),",
+    replace: '          promptDigest,\n          "1970-01-01T00:00:00.000Z",',
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    // The enforcement is the COALESCE, not the TypeScript that feeds it: mutating the parameter
+    // changes nothing while the SQL still refuses to overwrite a value that is already there.
+    what: "a terminal time is written once and not moved by a later observation",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "                    settled_at = COALESCE(settled_at, ?),",
+    replace: "                    settled_at = ?,",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
 ];

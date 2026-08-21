@@ -146,7 +146,14 @@ export interface RunStateTransitionWork<T> {
   /** The only row and target state for which this operation may raise the marker. */
   runId: string;
   toState: string;
-  recordTransitionEvidence(): Decision<void>;
+  /**
+   * Records the evidence for this transition, and answers whether that worked.
+   *
+   * The value is `unknown` because this seam cares only about the decision. `AuditLog.record`
+   * answers with the row's real identity for callers that need to cite it; a caller that only
+   * needs "did it land" should not be forced to name a type it will discard.
+   */
+  recordTransitionEvidence(): Decision<unknown>;
   enqueueTransitionEnvelope(): Decision<unknown>;
   updateState(): T;
 }
@@ -168,6 +175,20 @@ export class Db {
   #evidenceWriteMarkerDepth = 0;
   #schemaMigrationMarkerDepth = 0;
   #runStateTransitionMarkers: Array<{ runId: string; toState: string }> = [];
+  /**
+   * The turn whose settlement columns may move, and the exact tuple they may move to.
+   *
+   * Bound to both, not just to the turn: a marker that authorised "any update to this row" would
+   * let the materializer's own transaction be the cover for a different write. What the ledger
+   * has to be able to say is that a settlement came from an observation, and the tuple is the
+   * part of that claim a trigger can check.
+   */
+  #turnMaterializationMarkers: Array<{
+    turnRequestId: string;
+    outcome: string | null;
+    authority: string | null;
+    consistency: string;
+  }> = [];
 
   /**
    * The file this connection opened. Capability issuance is keyed by it: two `Db` objects
@@ -205,6 +226,19 @@ export class Db {
       const marker = this.#runStateTransitionMarkers[this.#runStateTransitionMarkers.length - 1];
       return marker && marker.runId === runId && marker.toState === toState ? 1 : 0;
     });
+    this.#raw.function(
+      "acp_turn_materialization_authorized",
+      (turnRequestId: unknown, outcome: unknown, authority: unknown, consistency: unknown) => {
+        const marker = this.#turnMaterializationMarkers[this.#turnMaterializationMarkers.length - 1];
+        return marker &&
+          marker.turnRequestId === turnRequestId &&
+          (marker.outcome ?? null) === (outcome ?? null) &&
+          (marker.authority ?? null) === (authority ?? null) &&
+          marker.consistency === consistency
+          ? 1
+          : 0;
+      },
+    );
     this.#raw.function("acp_schema_migration_authorized", () =>
       this.#schemaMigrationMarkerDepth > 0 ? 1 : 0,
     );
@@ -487,6 +521,26 @@ export class Db {
    * are written before the marker permits `UPDATE runs SET state`, so any failure rolls all
    * three facts back together rather than leaving a naked state edge behind.
    */
+  /**
+   * Runs a turn materialization with the marker its trigger requires.
+   *
+   * The marker is connection-local and lives only for this call, so a raw SQL caller can invoke
+   * `acp_turn_materialization_authorized` and cannot make it answer true. That is the same shape
+   * the run-state and evidence guards already use, and the reason the trigger is a property of
+   * the database rather than a rule the coordinator remembers.
+   */
+  materializeTurn<T>(
+    into: { turnRequestId: string; outcome: string | null; authority: string | null; consistency: string },
+    write: () => T,
+  ): T {
+    this.#turnMaterializationMarkers.push(into);
+    try {
+      return write();
+    } finally {
+      this.#turnMaterializationMarkers.pop();
+    }
+  }
+
   applyRunStateTransition<T>(
     authority: RunStateTransitionAuthority,
     work: RunStateTransitionWork<T>,
