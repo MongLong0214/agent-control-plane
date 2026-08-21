@@ -46,6 +46,101 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    what: "an acceptance realm path that resolves inside production is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    if (within(production, settled(path))) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Comparing declared paths passes a scratch directory that is a symlink into production.
+    what: "isolation is judged on the resolved path, not the one that was typed",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "      return join(realpathSync(probe), ...missing);",
+    replace: "      return resolve(path);",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a realm path outside the realm's own state directory is refused, so cleanup can be complete",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    if (!within(settled(request.paths.stateDir), settled(path))) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Only "it does not exist yet" justifies the ancestor walk. Treating every resolution
+    // failure as a missing path let a symlink cycle through as a clean realm path.
+    what: "a path that cannot be resolved is refused rather than guessed at",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '      if (code !== "ENOENT") throw new UnresolvablePath(probe, code);',
+    replace: "",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A failure to look is not an observation that there is nothing there. Recording it as
+    // absence made two unreadable censuses compare equal.
+    what: "a census that could not be read is refused, not recorded as absence",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '      if (code === "ENOENT") {',
+    replace: "      if (true) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a probe that would address the canonical conversation is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (settled(request.probeTargetRoot) === settled(request.canonicalTargetRoot)) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The catch-all. Without it an unforeseen write that leaves the three lists identical passes.
+    what: "a write that only the -wal sidecar records still fails the census",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  if (!sameFamily(before.databaseFamily, after.databaseFamily)) differences.push("databaseFamily");',
+    replace: '  if (before.databaseFamily[0]?.mtimeMs !== after.databaseFamily[0]?.mtimeMs) differences.push("databaseFamily");',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a new production actor fails the census",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  if (!sameMultiset(before.actorIds, after.actorIds)) differences.push("actorIds");',
+    replace: "",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The comparison this replaces joined and compared strings, so an element containing the
+    // delimiter split across its neighbour and two different multisets read as equal.
+    what: "two multisets are compared element by element, not by a joined spelling",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    const left = [...a].sort();\n    const right = [...b].sort();\n    return left.every((value, index) => value === right[index]);",
+    replace: '    return [...a].sort().join("|") === [...b].sort().join("|");',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a state directory left behind counts as residue even when it is empty",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (existsSync(paths.stateDir)) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A retry disposition is what turns an unanswerable outcome into a duplicate.
+    what: "every signal but an observed reply is inconclusive, and inconclusive is terminal",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  signal === "REPLY_OBSERVED" ? "CONTINUE" : "INCONCLUSIVE";',
+    replace: '  signal === "SOCKET_CLOSED" ? "INCONCLUSIVE" : "CONTINUE";',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A pid alone is not an identity. Matching on it alone is how a cleanup kills whatever
+    // inherited the number — here, the shared Hermes instance that must survive.
+    what: "cleanup terminates a process only when the pid and its start time both match",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  owned.some((one) => one.pid === candidate.pid && one.startedAtMs === candidate.startedAtMs);",
+    replace: "  owned.some((one) => one.pid === candidate.pid);",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
     what: "the periodic capacity sweep gets a budget sized against the sweep, not against startup",
     symbols: ["sweepBudgetMs"],
     file: "src/daemon/daemon.ts",
@@ -656,6 +751,23 @@ try {
     });
     ours(path, mutated, guard.file, "before restoring");
     writeFileSync(path, original);
+
+    // A test run that never happened is not a test run that failed.
+    //
+    // `spawnSync` reports a child it could not start, or one it killed at the timeout, as
+    // `status: null` — and `done.error` carries the spawn failure. Reading only `status !== 0`
+    // counts both as a kill, so with `node_modules/.bin/vitest` missing every row prints
+    // "killed", the harness exits 0, and it prints its success banner. This file exists to
+    // catch exactly that class in other people's code; it committed it in its own verdict.
+    if (done.error || done.status === null) {
+      restoreOnce();
+      out("");
+      out(`verify-guards-are-falsifiable: could not run ${guard.killedBy.join(", ")} for this row`);
+      out(`  ${guard.file}  ${guard.what}`);
+      out(`  ${done.error ? `spawn failed: ${done.error.message}` : `killed by signal ${done.signal ?? "?"}`}`);
+      out("\nA run that did not happen cannot kill a guard. Refusing to report it as one.");
+      process.exit(1);
+    }
     const killed = done.status !== 0;
     out(`${killed ? "  killed " : "  SURVIVED"}  ${guard.file}  ${guard.what}`);
     if (!killed) {
