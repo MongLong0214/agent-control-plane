@@ -52,6 +52,10 @@ jobs:
       # more tables in that shape within a minute of first running.
       - run: pnpm migrations:check
       - run: pnpm schema:census
+      # A trigger sentinel with no entry in TRIGGER_CODES reaches its caller as a raw Error
+      # instead of a Decision, so a refusal is indistinguishable from a bug. The whole
+      # canonical-turn ledger was in that state, and a census found five more that predate it.
+      - run: pnpm schema:denials
       # A wrapped CommitLore trailer is not a trailer: git ends the block at the continuation
       # line and the record is stored by nobody. It happened six times on 2026-08-22, and
       # every one was *detected* — `commitlore validate` printed a warning and exited 0, after
