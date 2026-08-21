@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, rmSync} from "node:fs";
 import { join } from "node:path";
 
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
@@ -61,6 +61,11 @@ describe("the falsifiability harness, when a guarded file changes underneath it"
     } finally {
       child.kill("SIGKILL");
       writeFileSync(GUARDED, pristine);
+      // This test deliberately drives the harness onto the path that *keeps* its sentinel — the
+      // one that says "nothing has been restored past this point; reconcile by hand". Leaving it
+      // behind makes the next commit refuse, which is correct behaviour reacting to a state this
+      // test invented. The file above is already back, so there is nothing left to reconcile.
+      rmSync(join(ROOT, ".git/verify-guards-in-flight.json"), { force: true });
     }
   }, 120_000);
 });

@@ -28,6 +28,11 @@ jobs:
       - run: pnpm evidence:freshness
       - run: pnpm invariants
       - run: pnpm typecheck
+      # Seconds, and it answers the question that actually goes stale: does every mutation row
+      # still name a line that exists. Editing a guarded line renames its anchor and the row
+      # silently stops checking anything — three times on one branch, each found only when the
+      # full sweep reached it forty minutes in. This fails first instead.
+      - run: pnpm guards:anchors
       - run: pnpm build
       # One suite run, not two. `trace` needs a JSON reporter pass; it used to obtain that by
       # running the whole suite a second time, which doubled a suite that spawns real

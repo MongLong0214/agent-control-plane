@@ -460,8 +460,8 @@ const GUARDS = [
     // The wide version: releasing by file let a bystander's close hand the owner's slot away.
     what: "closing a handle frees only the capability slots that handle issued",
     file: "src/db/database.ts",
-    find: '    if (this.#issuedHere.has("materialization")) {\n      ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.file);\n    }',
-    replace: "    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.file);",
+    find: '    if (this.#issuedHere.has("materialization")) {\n      ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.identity);\n    }',
+    replace: "    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.identity);",
     killedBy: ["tests/unit/ops-hardening.test.ts"],
   },
   {
@@ -477,8 +477,8 @@ const GUARDS = [
     // body they had. A database from 132309a then threw on every settlement and opened clean.
     what: "a migration that recreates the ledger triggers drops all of them first",
     file: "src/db/migrations.ts",
-    find: "    raw.exec(ledgerTriggerDrops());\n    raw.exec(adjudicationDdl());",
-    replace: "    raw.exec(adjudicationDdl());",
+    find: "    raw.exec(ledgerTriggerDrops());\n    rebuildObservationsIfStale(raw);",
+    replace: "    rebuildObservationsIfStale(raw);",
     killedBy: ["tests/unit/a-database-built-by-an-earlier-head.test.ts"],
   },
   {
@@ -533,6 +533,17 @@ const GUARDS = [
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
+
+/**
+ * Check that every row still names a line that exists, and stop — no mutation, no tests.
+ *
+ * The full sweep takes over an hour, so it is something you run at the end and read in CI. That
+ * left a gap wide enough to walk through three times on one branch: editing a guarded line renames
+ * its anchor, the row silently stops checking anything, and nothing says so until the sweep gets
+ * there. This part of the sweep is a string search over files already in memory. It costs a second
+ * and answers the question that actually goes stale.
+ */
+const anchorsOnly = process.argv.includes("--anchors-only");
 
 const rows = GUARDS.filter((g) => !g.skip).filter(
   (g) => !only || g.what.includes(only) || g.file.includes(only),
@@ -761,6 +772,25 @@ if (!lociBlock) {
 const loci = [...lociBlock[1].matchAll(/^\s*(\w+):/gm)].map((m) => m[1]);
 const claimed = new Set(GUARDS.flatMap((g) => g.symbols ?? []));
 const unclaimed = loci.filter((s) => !claimed.has(s));
+
+// The cheap half is done. `--anchors-only` stops here, so this is runnable before every push
+// rather than read out of a CI log afterwards.
+if (anchorsOnly) {
+  for (const failure of failures) {
+    out(`  ${failure.guard.file}`);
+    out(`    ${failure.guard.what}`);
+    out(`    ${failure.why}`);
+  }
+  if (unclaimed.length > 0) {
+    out(`verify-guards-are-falsifiable: enforcement loci with no row: ${unclaimed.join(", ")}`);
+  }
+  if (failures.length === 0 && unclaimed.length === 0) {
+    out(`verify-guards-are-falsifiable: ${rows.length} anchor(s) still match, exactly once each.`);
+    out("An anchor that matches is not a guard that is tested — run the full sweep for that.");
+  }
+  restoreOnce();
+  process.exit(failures.length === 0 && unclaimed.length === 0 ? 0 : 1);
+}
 
 // ---------------------------------------------------------------------------
 // Behavioural: remove each guard, require a named test to die.

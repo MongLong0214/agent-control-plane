@@ -28,7 +28,8 @@
     "release:version": "node scripts/verify-release-version.mjs",
     "symbols": "node scripts/verify-enforcement-symbols.mjs",
     "adapter:source": "node scripts/verify-acceptance-adapter-source.mjs",
-    "guards:falsifiable": "node scripts/verify-guards-are-falsifiable.mjs"
+    "guards:falsifiable": "node scripts/verify-guards-are-falsifiable.mjs",
+    "guards:anchors": "node scripts/verify-guards-are-falsifiable.mjs --anchors-only"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
