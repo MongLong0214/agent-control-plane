@@ -1600,10 +1600,14 @@ export class Daemon {
 
   /**
    * Sleep until an observation arrives, or until the re-check interval expires — whichever is
-   * first. The timeout exists because the operator door must not be the only way out: the park
-   * only ever guards a capacity/coverage block, which is exactly what an automatic collector
-   * can also clear, and the release-and-exit path this replaces got that re-read for free from
-   * the supervisor restarting the process.
+   * first. The timeout exists because the operator door must not be the only way out: a
+   * capacity/coverage block is exactly what an automatic collector can also clear, and the
+   * release-and-exit path this replaces got that re-read for free from the supervisor restarting
+   * the process.
+   *
+   * A contradicted conversation parks here too now, and that one the timer cannot clear — only an
+   * adjudication can, which is why that door signals this waiter the way the capacity door does.
+   * The timer is then a re-read that finds the same finding, not a way out.
    */
   private async awaitBootstrapSignal(): Promise<void> {
     const intervalMs = this.options.bootstrapRecheckIntervalMs ?? DEFAULT_CAPACITY_REFRESH_MS;

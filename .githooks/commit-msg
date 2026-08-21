@@ -1,28 +1,29 @@
 #!/bin/sh
-# A CommitLore trailer that wraps is not a trailer.
+# A CommitLore trailer git will not parse is not a trailer.
 #
-# `git interpret-trailers` reads the last paragraph, one trailer per line. A `Limit:` or
-# `Ruled-out:` line wrapped across two lines makes the continuation an ordinary line, which ends
-# the trailer block — so the record is written, looks right in the editor, and is stored by
-# nobody. Six times on 2026-08-22 alone. CommitLore already prints a warning; a warning that
-# arrives after the commit succeeded is a note about a mistake that is now in the history.
+# Six times on 2026-08-22 a `Limit:` or `Ruled-out:` wrapped onto a second line, which ends the
+# trailer block — so the record was written, looked right in the editor, and was stored by nobody.
+# CommitLore prints a warning and exits 0, which is a note about a mistake that already exists.
 #
-# This refuses instead. The message is still on disk, so the fix is to unwrap the line and retry.
+# The first version of this hook approximated git's rule with awk and got it wrong: it caught a
+# wrapped line and missed a trailer block with no blank line before it, which git also refuses.
+# So it asks git. `git interpret-trailers --parse` is the code that decides, and comparing what
+# the message *says* against what that returns is the only phrasing of the question that cannot
+# drift from the answer.
 MSG_FILE="$1"
 [ -f "$MSG_FILE" ] || exit 0
 
-awk '
-  /^#/ { next }
-  /^(Limit|Ruled-out|Warn|Supersedes|Refs):/ { intrailer = 1; next }
-  intrailer && /^[[:space:]]*$/ { intrailer = 0; next }
-  intrailer && !/^[A-Za-z-]+:/ {
-    printf "commit-msg: this line continues a trailer instead of being one:\n  %s\n", $0 > "/dev/stderr"
-    bad = 1
-    intrailer = 0
-  }
-  END { exit bad ? 1 : 0 }
-' "$MSG_FILE" || {
+# Comments are stripped the way git strips them, so a commented-out example is not counted.
+body=$(grep -v '^#' "$MSG_FILE")
+
+written=$(printf '%s\n' "$body" | grep -cE '^(Limit|Ruled-out|Warn|Supersedes|Refs):' || true)
+parsed=$(printf '%s\n' "$body" | git interpret-trailers --parse \
+  | grep -cE '^(Limit|Ruled-out|Warn|Supersedes|Refs):' || true)
+
+if [ "$written" -gt "$parsed" ]; then
+  echo "commit-msg: the message writes $written trailer line(s); git parses $parsed." >&2
   echo "" >&2
-  echo "A trailer must be one line. Unwrap it — length is fine, a line break is not." >&2
+  echo "A trailer must be one line, and the block must be the last paragraph with a blank line" >&2
+  echo "before it. Length is fine; a line break inside a trailer is not." >&2
   exit 1
-}
+fi

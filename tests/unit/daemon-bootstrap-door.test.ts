@@ -856,8 +856,8 @@ describe("the adjudication door promotes the daemon, not just the ledger", () =>
   it("does not spend the wake-up on an adjudication that was refused", async () => {
     // Symmetrical with the capacity door: nothing changed for the doctor to see, so consuming the
     // signal would promote on the strength of a denial.
-    const { harness, daemon } = makeDaemon(
-      [report("BLOCKED", [CONTRADICTED]), report("HEALTHY", [])],
+    const { harness, daemon, doctor } = makeDaemon(
+      [report("BLOCKED", [CONTRADICTED])],
       [],
       { bootstrapRecheckIntervalMs: 600_000 },
     );
@@ -865,6 +865,13 @@ describe("the adjudication door promotes the daemon, not just the ledger", () =>
     const door = recordingDoor();
     const starting = daemon.start({ bootstrapDoor: door.open });
     await vi.waitFor(() => expect(door.opened).toHaveLength(1));
+
+    // Both reports block, so the daemon stays parked either way. What separates the two is
+    // whether the doctor was consulted a second time: waking re-runs it, and not waking does not.
+    // Asserting on the mode instead let the mutation through — the promotion is asynchronous and
+    // the status read raced it, so the test passed for a reason that had nothing to do with the
+    // guard. CI caught that; the local run did not.
+    expect(doctor).toHaveBeenCalledTimes(1);
 
     const refused = await daemon.handleOperatorRequest(
       {
@@ -883,7 +890,12 @@ describe("the adjudication door promotes the daemon, not just the ledger", () =>
       PEER,
     );
     expect(refused.allowed).toBe(false);
-    expect(allowedValue(await status(daemon))).toMatchObject({ mode: "BOOTSTRAP" });
+
+    // The wake resolves a promise rather than setting a timer, so the parked loop would reach the
+    // doctor within a couple of turns of the event loop. Giving it those turns is what makes the
+    // negative assertion below mean something.
+    for (let turn = 0; turn < 5; turn += 1) await new Promise((r) => setImmediate(r));
+    expect(doctor).toHaveBeenCalledTimes(1);
 
     daemon.stop();
     await starting;

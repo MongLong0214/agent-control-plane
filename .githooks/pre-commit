@@ -20,12 +20,12 @@ if [ -e "$SENTINEL" ]; then
   exit 1
 fi
 
-# Only when a file the rows anchor into is staged: the check is cheap, but a commit that touches
-# nothing it names does not need to pay for it, and a hook that always runs gets bypassed.
-if git diff --cached --name-only | grep -qE '^(src/|scripts/verify-guards-are-falsifiable\.mjs)'; then
-  if ! node scripts/verify-guards-are-falsifiable.mjs --anchors-only; then
-    echo "pre-commit: a falsifiability row no longer names a line that exists." >&2
-    echo "Fix the row, or say why the guard it named is gone." >&2
-    exit 1
-  fi
+# Unconditionally. The first version ran it only when `src/` or the harness itself was staged,
+# which excluded the one case the newest half of that check exists for: deleting or renaming a
+# test file a row names in `killedBy`. A filter written to save a second had a hole shaped exactly
+# like the defect, one hour after that pattern was catalogued.
+if ! node scripts/verify-guards-are-falsifiable.mjs --anchors-only; then
+  echo "pre-commit: a falsifiability row no longer names something that exists." >&2
+  echo "Fix the row, or say why the guard or test it named is gone." >&2
+  exit 1
 fi

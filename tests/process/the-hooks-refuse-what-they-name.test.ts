@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -78,14 +78,28 @@ describe("pre-commit refuses while the falsifiability harness holds a mutation",
     }
   });
 
-  it("says nothing when there is no sentinel and nothing staged that rows anchor into", () => {
-    const fake = join(tempDir("acp-hook-clean-"), "repo");
-    mkdirSync(fake, { recursive: true });
+  it("runs the anchors pass whatever is staged, because the filter had a hole shaped like the defect", () => {
+    // The first version ran it only when `src/` or the harness was staged. That excluded deleting
+    // a test file a row names in `killedBy` — the case the newest half of that check exists for.
+    // A filter written to save a second had a hole shaped exactly like the defect.
+    //
+    // Proven in a repository of its own, with a stub standing in for the harness: running against
+    // this one would answer differently depending on whether a real sweep happens to be in
+    // progress, and a test whose result depends on that is not measuring the hook.
+    const fake = join(tempDir("acp-hook-unfiltered-"), "repo");
+    mkdirSync(join(fake, "scripts"), { recursive: true });
     chmodSync(fake, 0o700);
     expect(spawnSync("git", ["init", "-q"], { cwd: fake }).status).toBe(0);
 
-    // No `src/` in the staged set, so the anchors pass is skipped: a commit that touches nothing
-    // the rows name should not pay for the check, and a hook that always runs gets bypassed.
-    expect(spawnSync(hook("pre-commit"), [], { cwd: fake, encoding: "utf8" }).status).toBe(0);
+    const marker = join(fake, "ran");
+    writeFileSync(
+      join(fake, "scripts", "verify-guards-are-falsifiable.mjs"),
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "yes");\n`,
+    );
+
+    // Nothing staged at all — the case the old filter skipped.
+    const done = spawnSync(hook("pre-commit"), [], { cwd: fake, encoding: "utf8" });
+    expect(done.status).toBe(0);
+    expect(existsSync(marker), "the hook did not run the anchors pass").toBe(true);
   });
 });
