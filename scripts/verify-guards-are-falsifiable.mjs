@@ -32,7 +32,7 @@
  * Dependency-free, in the shape of the other verify scripts (PRD §17.4).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -305,6 +305,90 @@ const GUARDS = [
     replace: "  const resolvedName = executableName(argv0);",
     killedBy: ["tests/unit/verify-r2.test.ts"],
   },
+  {
+    what: "a turn is refused for an actor whose target no runtime attested",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (!attestation) {",
+    replace: "      if (attestation === null) {",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "a turn is refused for an actor with no verified target at all — the embargo itself",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (!target) {",
+    replace: "      if (target === null) {",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "the retry chain is consulted before a claim is admitted",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (!chained.allowed) return deny(chained.reasonCode, chained.message, chained.evidence);",
+    replace: "      void chained;",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "a message whose previous attempt completed is never run again",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '        previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED";',
+    replace: "        previous.outcome_kind !== null;",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    // The retry rule collapsed to the shape it reads like. "Anything but completed" sounds
+    // equivalent and admits the NULL outcome of a turn still in doubt, which is the one case
+    // where the previous execution may still be writing.
+    what: "a message whose previous attempt is still in doubt is not raced",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '        previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED";',
+    replace: '        previous.outcome_kind !== "COMPLETED";',
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "a settlement cannot overwrite the authority that already decided the turn",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          WHERE turn_request_id = ? AND lifecycle_state = 'IN_DOUBT'`,",
+    replace: "          WHERE turn_request_id = ?`,",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    // There is no code to delete here: the guard is the *absence* of an expiry path. So the
+    // mutation adds the sweeper someone will eventually be tempted to add, and requires a test
+    // to notice. A hold that ages out is fail-open, which is the one direction this must not go.
+    //
+    // The first version of this row mutated `unresolved()`'s SELECT instead, which is a reader
+    // and releases nothing. A hand-written sweeper passed the suite untouched while this row
+    // reported the guard as covered — the row named the property and watched somewhere else.
+    // It is written against `claim()` now, and the test that kills it claims again rather than
+    // asking `unresolved()` what it thinks.
+    what: "no age releases a hold — an unresolved turn stays unresolved until an authority settles it",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      const turnRequestId = `tr_${randomUUID().replace(/-/g, \"\")}`;",
+    replace:
+      "      this.db.run(\n" +
+      "        `UPDATE canonical_turns SET lifecycle_state='SETTLED', outcome_kind='ABORTED',\n" +
+      "           settled_at=?, resolution_authority='OWNER_AFTER_TARGET_FENCE', reason_code='STALE',\n" +
+      "           evidence_digest='x', audit_event_id='x'\n" +
+      "         WHERE target_actor_id = ? AND lifecycle_state='IN_DOUBT' AND claimed_at < ?`,\n" +
+      "        [this.clock.nowIso(), input.targetActorId,\n" +
+      "         new Date(this.clock.now().getTime() - 1_800_000).toISOString()],\n" +
+      "      );\n" +
+      "      const turnRequestId = `tr_${randomUUID().replace(/-/g, \"\")}`;",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "an attempt numbered below one is a malformed request, not a retry-ordering problem",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (source.attempt < 1) {",
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "a claimed turn records when it was claimed, so its age is read rather than guessed",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            promptDigest,\n            this.clock.nowIso(),",
+    replace: '            promptDigest,\n            "1970-01-01T00:00:00.000Z",',
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
@@ -321,6 +405,50 @@ const failures = [];
 // mid-run would be indistinguishable from the author's own work in progress.
 // ---------------------------------------------------------------------------
 const files = [...new Set(rows.map((g) => g.file))];
+
+/**
+ * The crash path the signal handlers below cannot cover.
+ *
+ * Every row runs vitest through `spawnSync`, which blocks the event loop for its whole duration.
+ * A SIGTERM arriving in that window is queued and never delivered to JS, so the handler does not
+ * run and the mutation stays on disk. Observed: a run killed by an outer timeout left a mutated
+ * source file behind, and the next run reported it as *the author's* uncommitted work and advised
+ * committing it. Following that advice commits a deliberately broken guard.
+ *
+ * So the originals are also written outside the process, before anything is mutated. A later run
+ * reads them back, restores, and says so — which is the difference between a harness that can
+ * crash and one whose crash quietly poisons the tree.
+ *
+ * Kept in .git/ because it must survive the crash, must never be committed, and must not look
+ * like a source file to anything that scans the working tree.
+ */
+const INFLIGHT = join(ROOT, ".git", "verify-guards-in-flight.json");
+
+const repairAbandonedRun = () => {
+  let parked;
+  try {
+    parked = JSON.parse(readFileSync(INFLIGHT, "utf8"));
+  } catch {
+    return; // No file, or one this version cannot read. Either way there is nothing to put back.
+  }
+  const repaired = [];
+  for (const [file, text] of Object.entries(parked.originals ?? {})) {
+    if (readFileSync(join(ROOT, file), "utf8") === text) continue;
+    writeFileSync(join(ROOT, file), text);
+    repaired.push(file);
+  }
+  rmSync(INFLIGHT, { force: true });
+  if (repaired.length > 0) {
+    out(`verify-guards-are-falsifiable: a previous run died mid-mutation; restored ${repaired.length} file(s)`);
+    for (const file of repaired) out(`  ${file}`);
+    out("");
+  }
+};
+
+// Before the dirty check, because a leftover mutation *is* dirt, and reporting it as the author's
+// work in progress is what sends someone to commit a deliberately broken guard.
+repairAbandonedRun();
+
 const dirty = execFileSync("git", ["status", "--porcelain", "--", ...files], {
   cwd: ROOT,
   encoding: "utf8",
@@ -336,6 +464,7 @@ if (dirty.length > 0) {
 }
 
 const originals = new Map(files.map((f) => [f, readFileSync(join(ROOT, f), "utf8")]));
+writeFileSync(INFLIGHT, JSON.stringify({ originals: Object.fromEntries(originals) }));
 /**
  * Refuses to write over a file that is not in the state this harness left it in.
  *
@@ -366,6 +495,9 @@ const fail = (message) => {
 };
 
 const restore = () => {
+  // The sentinel is cleared last, and only after every write above has returned. Clearing it
+  // first would hand a crash mid-restore the same blind spot this whole mechanism exists to
+  // close.
   for (const [file, text] of originals) {
     // Not `ours`: at this point the file is legitimately either mutated or already restored,
     // so there is no single expected value. Writing the snapshot is right unless the content is
@@ -373,6 +505,7 @@ const restore = () => {
     // and this does not. The loop is where the check belongs; this is the crash path.
     writeFileSync(join(ROOT, file), text);
   }
+  rmSync(INFLIGHT, { force: true });
 };
 let restored = false;
 const restoreOnce = () => {
