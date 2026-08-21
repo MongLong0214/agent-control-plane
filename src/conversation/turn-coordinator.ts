@@ -554,6 +554,52 @@ export class ConversationTurnCoordinator {
   }
 
   /**
+   * Every contradicted turn, with the observations an adjudication would have to cite.
+   *
+   * The read half of the one operator action a quarantined conversation needs. Doctor named the
+   * action and nothing could perform it, so this is the surface that makes the instruction true:
+   * an operator sees which records disagree, and passes exactly those ids back to `adjudicate`.
+   *
+   * Returns the ids rather than a summary, because the adjudication has to name them and an
+   * operator retyping them from prose is a way to cite the wrong set.
+   */
+  contradictions(): Array<{
+    readonly turnRequestId: string;
+    readonly targetActorId: string;
+    readonly outcomeKind: string | null;
+    readonly observations: Array<{
+      readonly observationId: number;
+      readonly outcome: string;
+      readonly authority: string;
+      readonly reasonCode: string;
+    }>;
+  }> {
+    const turns = this.db.all<{ turn_request_id: string; target_actor_id: string; outcome_kind: string | null }>(
+      `SELECT turn_request_id, target_actor_id, outcome_kind FROM canonical_turns
+        WHERE observation_consistency = 'CONTRADICTED'
+        ORDER BY turn_request_id`,
+    );
+    return turns.map((turn) => ({
+      turnRequestId: turn.turn_request_id,
+      targetActorId: turn.target_actor_id,
+      outcomeKind: turn.outcome_kind,
+      observations: this.db
+        .all<{ observation_id: number; observed_outcome: string; observing_authority: string; reason_code: string }>(
+          `SELECT observation_id, observed_outcome, observing_authority, reason_code
+             FROM canonical_turn_observations WHERE turn_request_id = ?
+            ORDER BY observation_id`,
+          [turn.turn_request_id],
+        )
+        .map((row) => ({
+          observationId: row.observation_id,
+          outcome: row.observed_outcome,
+          authority: row.observing_authority,
+          reasonCode: row.reason_code,
+        })),
+    }));
+  }
+
+  /**
    * Closes a disagreement by citing the observations that made it, and nothing else.
    *
    * Until this existed a contradicted conversation had **no exit at all** — not through the API,

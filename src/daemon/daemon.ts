@@ -173,6 +173,8 @@ export const OPERATOR_METHOD = {
   ACTOR_LIST: "actor.list",
   ACTOR_REGISTER: "actor.register",
   ACTOR_UNREGISTER: "actor.unregister",
+  CONVERSATION_CONTRADICTIONS: "conversation.contradictions",
+  CONVERSATION_ADJUDICATE: "conversation.adjudicate",
   DAEMON_STATUS: "daemon.status",
 } as const;
 
@@ -189,6 +191,7 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.PROJECT_REGISTER,
   OPERATOR_METHOD.ACTOR_REGISTER,
   OPERATOR_METHOD.ACTOR_UNREGISTER,
+  OPERATOR_METHOD.CONVERSATION_ADJUDICATE,
 ]);
 
 /**
@@ -201,6 +204,11 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
  */
 export const BOOTSTRAP_OPERATOR_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.CAPACITY_OBSERVE,
+  // The two halves of the one operator action a contradicted conversation needs: see what
+  // disagreed, and answer it. Without them the doctor told an operator to record an
+  // adjudication and the daemon that would have accepted one refused to start.
+  OPERATOR_METHOD.CONVERSATION_CONTRADICTIONS,
+  OPERATOR_METHOD.CONVERSATION_ADJUDICATE,
   OPERATOR_METHOD.DAEMON_STATUS,
 ]);
 
@@ -233,7 +241,14 @@ const mergeReconciled = (earlier: ReconcileReport, later: ReconcileReport): Reco
 export const canParkForBootstrap = (blockingFindings: readonly BlockingFinding[]): boolean =>
   blockingFindings.length > 0 &&
   blockingFindings.every(
-    (finding) => finding.code.startsWith("ROLE_COVERAGE_") || finding.code.startsWith("CAPACITY_"),
+    (finding) =>
+      finding.code.startsWith("ROLE_COVERAGE_") ||
+      finding.code.startsWith("CAPACITY_") ||
+      // A contradicted conversation meets this rule the moment a door exists that clears it,
+      // and until one did, the rule read as "park for capacity" rather than as what it says.
+      // Parking does not weaken the quarantine: a claim is refused by the ledger, not by the
+      // daemon's mode, so a parked daemon admits no new turn for that actor either.
+      finding.code.startsWith("CANONICAL_TURN_"),
   );
 
 /**
@@ -584,6 +599,29 @@ export class Daemon {
             actorGeneration: actorGeneration.value,
             expectedRegistrySetGeneration: expected.value,
             reason: reason.value,
+          });
+        }
+
+        case OPERATOR_METHOD.CONVERSATION_CONTRADICTIONS:
+          return allow(ReasonCode.OK, this.cp.conversation.contradictions());
+
+        case OPERATOR_METHOD.CONVERSATION_ADJUDICATE: {
+          const targetActorId = requiredOperatorString(request.params, "targetActorId");
+          if (!targetActorId.allowed) return targetActorId;
+          const turnRequestId = requiredOperatorString(request.params, "turnRequestId");
+          if (!turnRequestId.allowed) return turnRequestId;
+          const reasonCode = requiredOperatorString(request.params, "reasonCode");
+          if (!reasonCode.allowed) return reasonCode;
+          const evidenceDigest = requiredOperatorString(request.params, "evidenceDigest");
+          if (!evidenceDigest.allowed) return evidenceDigest;
+          const cited = requiredOperatorIntegerList(request.params, "citedObservationIds");
+          if (!cited.allowed) return cited;
+          return this.cp.conversation.adjudicate({
+            targetActorId: targetActorId.value,
+            turnRequestId: turnRequestId.value,
+            citedObservationIds: cited.value,
+            reasonCode: reasonCode.value,
+            evidenceDigest: evidenceDigest.value,
           });
         }
 
@@ -1697,6 +1735,29 @@ const requiredOperatorInteger = (
   return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum
     ? allow(ReasonCode.OK, value)
     : invalidOperatorParam(name, value);
+};
+
+/**
+ * A non-empty list of observation ids, over the wire.
+ *
+ * Non-empty because an adjudication that cites nothing is the assertion this vocabulary exists to
+ * refuse; the coordinator rejects it too, and refusing here tells the operator which parameter was
+ * wrong rather than which invariant they tripped.
+ */
+const requiredOperatorIntegerList = (
+  params: Record<string, unknown>,
+  name: string,
+): Decision<number[]> => {
+  const value = params[name];
+  if (!Array.isArray(value) || value.length === 0) return invalidOperatorParam(name, value);
+  const out: number[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 1) {
+      return invalidOperatorParam(name, entry);
+    }
+    out.push(entry);
+  }
+  return allow(ReasonCode.OK, out);
 };
 
 const operatorStringRecord = (value: unknown): Decision<Record<string, string>> => {

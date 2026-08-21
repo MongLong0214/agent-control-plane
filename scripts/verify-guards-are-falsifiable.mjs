@@ -513,6 +513,23 @@ const GUARDS = [
     replace: "    for (const release of this.#releases) void release;",
     killedBy: ["tests/unit/a-control-plane-that-failed-to-build.test.ts"],
   },
+  {
+    // Before the door existed the daemon refused to start on a contradiction, so the action the
+    // doctor named had no socket to reach.
+    what: "a contradicted conversation parks the daemon instead of stopping it",
+    file: "src/daemon/daemon.ts",
+    find: '      finding.code.startsWith("CANONICAL_TURN_"),',
+    replace: "      false,",
+    killedBy: ["tests/unit/the-quarantine-has-an-operator-door.test.ts"],
+  },
+  {
+    // Parking is weaker than stopping, so it must stay unreachable for a finding no door clears.
+    what: "parking stays unreachable for a finding an operator cannot answer",
+    file: "src/daemon/daemon.ts",
+    find: "  blockingFindings.length > 0 &&\n  blockingFindings.every(",
+    replace: "  blockingFindings.length > 0 &&\n  blockingFindings.some(",
+    killedBy: ["tests/unit/the-quarantine-has-an-operator-door.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

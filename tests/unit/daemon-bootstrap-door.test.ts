@@ -151,6 +151,21 @@ const status = (daemon: Daemon) =>
     PEER,
   );
 
+/**
+ * Everything the parked door admits, written out so widening it is a deliberate edit.
+ *
+ * It grew once: a contradicted conversation is a blocking finding an operator *can* clear, and
+ * the doctor said so while the daemon refused to start and left them no socket to say it to. The
+ * rule was always "park for what an operator can actually clear"; the set is what makes that
+ * sentence true rather than aspirational.
+ */
+const PARKED_DOOR = [
+  "capacity.observe",
+  "conversation.adjudicate",
+  "conversation.contradictions",
+  "daemon.status",
+];
+
 describe("#582: reading a quota must not be able to stop the daemon starting", () => {
   it("abandons a capacity refresh that outlives its budget and starts anyway", async () => {
     // `start()` awaits the refresh, and the collectors spawn real provider CLIs — two seconds
@@ -234,10 +249,10 @@ describe("#568: the documented capacity remedy is reachable in the state that ne
       expect(refused.reasonCode).toBe(ReasonCode.DAEMON_BOOTSTRAP_MODE);
       expect(refused.evidence).toMatchObject({
         mode: "BOOTSTRAP",
-        admittedMethods: ["capacity.observe", "daemon.status"],
+        admittedMethods: PARKED_DOOR,
       });
     }
-    expect([...BOOTSTRAP_OPERATOR_METHODS].sort()).toEqual(["capacity.observe", "daemon.status"]);
+    expect([...BOOTSTRAP_OPERATOR_METHODS].sort()).toEqual(PARKED_DOOR);
 
     await daemon.stop();
     await starting;

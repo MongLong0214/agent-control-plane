@@ -768,7 +768,7 @@ export class Doctor {
           ),
         },
         recommendedAction:
-          "read the conflicting observations and record an adjudication citing them. Adjudication closes the disagreement; it cannot choose an outcome that permits a re-run",
+          "run `agentctl conversation contradictions` to read the conflicting observations, then `agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...` citing every one of them. Adjudication closes the disagreement; it cannot choose an outcome that permits a re-run",
       });
     }
 

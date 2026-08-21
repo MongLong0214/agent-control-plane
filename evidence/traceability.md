@@ -6,11 +6,11 @@ the JSON-reporter result set named below. Behavioural coverage and production-en
 coverage are not measured, so this report is not proof that a requirement is met in the
 running system.
 
-Measured at `00d0a03bfe2041daa03aa27e9f7c4fa0c2a4e8b8 (working tree modified)`. The copy committed to the repository is only as current
+Measured at `b8bb6b8feb08767b44071e6b7f062513467e8269 (working tree modified)`. The copy committed to the repository is only as current
 as its last regeneration — `pnpm trace` recomputes it, and CI recomputes it on every run, so
 a reader comparing this file against a later tree should re-run rather than trust the counts.
 
-- Vitest result set: 1234/1236 passed; 0 failed; 2 pending
+- Vitest result set: 1238/1240 passed; 0 failed; 2 pending
 - Requirements: 22 (declaration coverage 22, gaps 0)
 - Scenarios: 59 (passed declarations 59)
 - Missing scenarios: none
