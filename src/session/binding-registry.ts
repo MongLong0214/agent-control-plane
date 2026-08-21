@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Clock } from "../core/clock.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { newAssignmentId } from "../core/ids.ts";
@@ -17,6 +18,26 @@ import type { Outbox } from "../outbox/outbox.ts";
 import type { TaskGraph } from "../run/task-graph.ts";
 import type { SessionRegistry } from "./session-registry.ts";
 
+/**
+ * Proof, supplied by the caller, that a target belongs to an actor.
+ *
+ * Only an authenticated preflight bind against the executor can produce one (#638). It is a
+ * parameter rather than something this registry derives, because every route it could derive it
+ * from is a claim: a command line is execution configuration, a runtime echoing its own argv is
+ * the same string travelling through a handshake, and an operator typing the id twice drifts.
+ *
+ * Its absence is not an error and not a default — it means the actor's target is unestablished,
+ * and a role bound without one is deliberately not routable.
+ */
+export interface VerifiedTargetBinding {
+  /** Which executor family the locator belongs to. */
+  executorKind: string;
+  /** What the executor itself accepts as a lookup handle. Never derived, never parsed. */
+  targetLocator: string;
+  /** For comparison and uniqueness; a digest cannot serve as a lookup handle. */
+  targetLocatorDigest: string;
+}
+
 export interface BindInput {
   /**
    * Optional. The key is *derived* from the role and its scope; supplying one that does
@@ -30,6 +51,15 @@ export interface BindInput {
   runId?: string | null;
   taskId?: string | null;
   mode?: "PREFERRED" | "FALLBACK";
+  /**
+   * The target this binding's actor owns, if it has been established.
+   *
+   * Supplied, an actor that already owns this target is reused rather than replaced — which is
+   * what makes reconstitution a recovery instead of a second owner for one transcript. Omitted,
+   * a fresh actor is minted and the binding is not routable to a conversation, because nothing
+   * has said which conversation it is.
+   */
+  verifiedTarget?: VerifiedTargetBinding;
 }
 
 const LIVE_RUN_STATES = [
@@ -160,7 +190,36 @@ export class BindingRegistry {
 
       const generation = this.nextGeneration(roleKey);
       const assignmentId = newAssignmentId();
-      const actorId = this.mintActor(input.role, input.sessionId, session.incarnation);
+      const reused = this.actorOwning(input.verifiedTarget);
+      if (!reused.allowed) return reused as Decision<RoleBinding>;
+      // Reuse when the target says which actor owns it; mint otherwise.
+      //
+      // Minting unconditionally is how re-bootstrapping against the same conversation produced a
+      // second owner for one transcript (#649). Two actors do not collide on anything — not the
+      // turn partition, not receipt harvest, not reconstitution — so the alias is silent, and
+      // `canonical_turns` records a lifetime bijection that would then be unsatisfiable.
+      //
+      // Without a verified target the mint still happens, because a role has to bind for the
+      // deployment to come up at all. What does not happen is any claim about which conversation
+      // it answers: that is established by an authenticated preflight bind (#638), and until one
+      // exists this binding is not routable to a transcript.
+      const actorId = reused.value ?? this.mintActor(input.role, input.sessionId, session.incarnation);
+      if (reused.value === null && input.verifiedTarget) {
+        const recorded = this.recordTargetBinding(actorId, input.verifiedTarget);
+        if (!recorded.allowed) return recorded as Decision<RoleBinding>;
+      }
+      if (reused.value !== null) {
+        // The actor survives and the runtime does not, which is the whole content of a reuse.
+        // `mintActor` sets this pointer for a new actor; without the same move here the recovered
+        // actor would still name the process that died, and every reader of the live pointer —
+        // routing, doctor, the conversation port — would be sent to it.
+        this.db.run(
+          `UPDATE conversational_actors
+              SET current_session_id = ?, current_session_incarnation = ?
+            WHERE actor_id = ?`,
+          [input.sessionId, session.incarnation, actorId],
+        );
+      }
       this.db.run(
         `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id,
                                   actor_id, session_id, session_incarnation, binding_generation,
@@ -792,6 +851,61 @@ export class BindingRegistry {
    * touching the binding. `assignments.session_id` keeps recording the runtime at binding time,
    * which is why the composite owner tuple — and the FK from `runs` onto it — still resolves.
    */
+
+  /**
+   * The actor that already owns this target, or null when the target is new or unestablished.
+   *
+   * Refuses rather than guesses in the one case that would corrupt the bijection: a locator whose
+   * binding names an actor that is no longer usable. A retired actor still owns its transcript —
+   * `actor_target_bindings` is a lifetime relation, not an active-only one — so this returns it
+   * and lets the caller's own lifecycle rules decide, instead of quietly minting a second owner.
+   */
+  private actorOwning(target: VerifiedTargetBinding | undefined): Decision<string | null> {
+    if (!target) return allow(ReasonCode.OK, null);
+    const row = this.db.get<{ target_actor_id: string }>(
+      `SELECT target_actor_id FROM actor_target_bindings
+        WHERE executor_kind = ? AND target_locator_digest = ?`,
+      [target.executorKind, target.targetLocatorDigest],
+    );
+    return allow(ReasonCode.OK, row?.target_actor_id ?? null);
+  }
+
+  /**
+   * Records that this actor owns this target, once.
+   *
+   * The uniqueness is the database's, not this method's: an actor with a second target and a
+   * target with a second actor are both refused by constraints, so a race that got past the read
+   * above fails here rather than producing the alias. That is why the insert is not conditional
+   * on the read.
+   */
+  private recordTargetBinding(actorId: string, target: VerifiedTargetBinding): Decision<void> {
+    try {
+      this.db.run(
+        `INSERT INTO actor_target_bindings
+           (target_binding_id, target_actor_id, executor_kind, target_locator,
+            target_locator_digest, bound_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          `tb_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+          actorId,
+          target.executorKind,
+          target.targetLocator,
+          target.targetLocatorDigest,
+          this.clock.nowIso(),
+        ],
+      );
+      return allow(ReasonCode.OK, undefined);
+    } catch (error) {
+      // The constraint fired. Which one it was matters to the reader: an actor cannot take a
+      // second transcript, and a transcript cannot take a second actor.
+      return deny(
+        ReasonCode.CONFLICT,
+        "this actor or this target is already bound to another; the relation is one-to-one for their lifetimes",
+        { actorId, executorKind: target.executorKind, error: error instanceof Error ? error.message : String(error) },
+      );
+    }
+  }
+
   private mintActor(role: string, sessionId: string, incarnation: string): string {
     const actorId = `actor:${newAssignmentId()}`;
     this.db.run(
