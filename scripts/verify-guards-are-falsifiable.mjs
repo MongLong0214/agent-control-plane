@@ -33,7 +33,7 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -437,7 +437,7 @@ const files = [...new Set(rows.map((g) => g.file))];
  * `git worktree add --detach` is how a review copy of a branch gets made, and this harness ran
  * inside one. Reproduced, then fixed.
  */
-const INFLIGHT = join(
+const INFLIGHT = resolve(
   ROOT,
   execFileSync("git", ["rev-parse", "--git-path", "verify-guards-in-flight.json"], {
     cwd: ROOT,
