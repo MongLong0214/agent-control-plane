@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -911,6 +911,114 @@ const v22: SchemaMigration = {
   checksum: () => sha256(`v22-canonical-turn-ledger\n${V22_CANONICAL_TURN_LEDGER_DDL}`),
 };
 
+/**
+ * The two turn tables again, with the one column v22 left out.
+ *
+ * A turn in doubt is only actionable if someone can say *how long* it has been in doubt — that is
+ * the whole of the doctor's escalation rule and the operator's first question. v22 recorded when a
+ * turn settled and not when it was claimed, so an unresolved row had no age at all, and the only
+ * ordering available was rowid. Reporting a rowid as a time would have been the same defect the
+ * ledger was built to remove: a value standing in for a fact it is not.
+ */
+const V23_TURN_CLAIMED_AT_DDL = `
+CREATE TABLE IF NOT EXISTS canonical_turns (
+  turn_request_id               TEXT PRIMARY KEY,
+  target_actor_id               TEXT NOT NULL,
+  target_binding_id             TEXT NOT NULL,
+  target_attestation_id         TEXT NOT NULL,
+  executor_session_id           TEXT NOT NULL,
+  executor_session_incarnation  TEXT NOT NULL,
+  binding_generation            INTEGER NOT NULL,
+  -- Not identity. The case it refuses is the same id arriving with a different intent.
+  prompt_digest                 TEXT NOT NULL,
+  -- When the right to run this turn was taken. NOT NULL because the age of an unresolved turn is
+  -- the only thing that distinguishes a turn in flight from a wedged conversation.
+  claimed_at                    TEXT NOT NULL,
+  lifecycle_state               TEXT NOT NULL CHECK (lifecycle_state IN ('IN_DOUBT', 'SETTLED')),
+  outcome_kind                  TEXT REFERENCES turn_outcome_kinds(outcome_kind),
+  settled_at                    TEXT,
+  resolution_authority          TEXT REFERENCES turn_resolution_authorities(resolution_authority),
+  reason_code                   TEXT,
+  evidence_digest               TEXT,
+  audit_event_id                TEXT,
+  -- A relation, not an outcome. A replacement says what was run instead; it does not say the old
+  -- turn ended safely, and an unfenced run-as-new leaves that one IN_DOUBT.
+  replacement_turn_request_id   TEXT REFERENCES canonical_turns(turn_request_id),
+  FOREIGN KEY (target_binding_id, target_actor_id)
+    REFERENCES actor_target_bindings(target_binding_id, target_actor_id),
+  FOREIGN KEY (target_attestation_id, target_binding_id)
+    REFERENCES actor_target_attestations(target_attestation_id, target_binding_id),
+  -- In doubt means nothing is known, so nothing is recorded.
+  CHECK (lifecycle_state <> 'IN_DOUBT' OR (
+    outcome_kind IS NULL AND settled_at IS NULL AND resolution_authority IS NULL
+    AND reason_code IS NULL AND evidence_digest IS NULL AND audit_event_id IS NULL)),
+  -- Settled means all of it is known. A settlement missing its authority or its evidence is a
+  -- verdict with nothing behind it.
+  CHECK (lifecycle_state <> 'SETTLED' OR (
+    outcome_kind IS NOT NULL AND settled_at IS NOT NULL AND resolution_authority IS NOT NULL
+    AND reason_code IS NOT NULL AND evidence_digest IS NOT NULL AND audit_event_id IS NOT NULL))
+);
+
+-- The property the table exists for, enforced by the database rather than by whoever remembers
+-- to check.
+CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved
+  ON canonical_turns(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT';
+
+-- Which inbound messages a turn consumed. N:1, because consecutive owner messages coalesce into
+-- one turn with their ids and boundaries preserved — three messages are not three turns.
+CREATE TABLE IF NOT EXISTS canonical_turn_sources (
+  turn_request_id              TEXT NOT NULL REFERENCES canonical_turns(turn_request_id),
+  source_channel               TEXT NOT NULL,
+  source_nonce                 TEXT NOT NULL,
+  -- Attempts are numbered and chained, because that is what makes a retry legal. A global unique
+  -- on (channel, nonce) would forbid the second attempt the design requires; "not in two
+  -- unresolved turns" alone would permit silently re-running a message that already completed.
+  source_attempt               INTEGER NOT NULL CHECK (source_attempt > 0),
+  batch_ordinal                INTEGER NOT NULL CHECK (batch_ordinal >= 0),
+  source_digest                TEXT NOT NULL,
+  predecessor_turn_request_id  TEXT REFERENCES canonical_turns(turn_request_id),
+  admission_audit_event_id     TEXT,
+  PRIMARY KEY (source_channel, source_nonce, source_attempt),
+  UNIQUE (turn_request_id, batch_ordinal),
+  UNIQUE (turn_request_id, source_channel, source_nonce),
+  -- The first attempt has no predecessor and every later one does. Which predecessor, and
+  -- whether its outcome permits a retry, is checked in the admission transaction — SQLite cannot
+  -- express "the previous attempt of this same source settled safely" as a constraint.
+  CHECK ((source_attempt = 1) = (predecessor_turn_request_id IS NULL))
+);
+`;
+
+/**
+ * Recreated rather than altered, for the same reason v22 was.
+ *
+ * `ALTER TABLE ADD COLUMN` cannot add a NOT NULL column without a default, and a default here
+ * would be a fabricated claim time on any row that had one. Dropping is safe because it is not a
+ * judgement call: the tables are structurally unwritable until an authenticated preflight bind
+ * exists, and the emptiness is verified rather than assumed.
+ */
+const v23: SchemaMigration = {
+  id: "v23-turn-claimed-at",
+  fromVersion: 22,
+  toVersion: 23,
+  apply: (raw) => {
+    for (const table of ["canonical_turn_sources", "canonical_turns"]) {
+      const rows = raw.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number };
+      if (rows.n > 0) {
+        throw acpError(
+          ReasonCode.INTERNAL_ERROR,
+          `v23 will not invent a claim time for turns it did not observe; ${table} is not empty`,
+          { table, rows: rows.n },
+        );
+      }
+    }
+    raw.exec(`DROP INDEX IF EXISTS canonical_turns_one_unresolved`);
+    raw.exec(`DROP TABLE IF EXISTS canonical_turn_sources`);
+    raw.exec(`DROP TABLE IF EXISTS canonical_turns`);
+    raw.exec(V23_TURN_CLAIMED_AT_DDL);
+  },
+  checksum: () => sha256(`v23-turn-claimed-at\n${V23_TURN_CLAIMED_AT_DDL}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -923,6 +1031,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v20,
   v21,
   v22,
+  v23,
 ]);
 
 interface RequiredTrigger {

@@ -1361,6 +1361,9 @@ CREATE TABLE IF NOT EXISTS canonical_turns (
   binding_generation            INTEGER NOT NULL,
   -- Not identity. The case it refuses is the same id arriving with a different intent.
   prompt_digest                 TEXT NOT NULL,
+  -- When the right to run this turn was taken. NOT NULL because the age of an unresolved turn is
+  -- the only thing that distinguishes a turn in flight from a wedged conversation.
+  claimed_at                    TEXT NOT NULL,
   lifecycle_state               TEXT NOT NULL CHECK (lifecycle_state IN ('IN_DOUBT', 'SETTLED')),
   outcome_kind                  TEXT REFERENCES turn_outcome_kinds(outcome_kind),
   settled_at                    TEXT,

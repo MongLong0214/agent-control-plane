@@ -250,6 +250,44 @@ export const ReasonCode = {
    */
   CEO_CONVERSATION_BUSY: "CEO_CONVERSATION_BUSY",
 
+  // --- canonical turns -----------------------------------------------------
+  /**
+   * No verified target binding exists for this actor, so no turn can be claimed for it.
+   *
+   * This is the activation embargo arriving as an ordinary refusal rather than as a rule someone
+   * follows: until an authenticated preflight bind records which conversation an actor owns,
+   * there is nothing to serialise against and no honest way to say where an answer would land.
+   */
+  CONVERSATION_TARGET_UNVERIFIED: "CONVERSATION_TARGET_UNVERIFIED",
+  /**
+   * The actor's target has a binding but no runtime ever attested it.
+   *
+   * A binding says which conversation; an attestation says a named runtime generation verified
+   * that claim. Admitting on the binding alone trusts an assertion nothing has rechecked since.
+   */
+  CONVERSATION_TARGET_UNATTESTED: "CONVERSATION_TARGET_UNATTESTED",
+  /** This conversation already holds a turn whose outcome nobody established. */
+  CONVERSATION_TURN_IN_DOUBT: "CONVERSATION_TURN_IN_DOUBT",
+  /** A retry numbered past its predecessor, which does not exist — nothing says the earlier
+   *  attempt ended. */
+  CONVERSATION_TURN_ATTEMPT_UNCHAINED: "CONVERSATION_TURN_ATTEMPT_UNCHAINED",
+  /**
+   * The previous attempt at this message did not end in a way that makes a retry safe.
+   *
+   * Only two outcomes qualify: nothing ran, or the target proved the old execution can no longer
+   * write. A completed one must never run again; one still in doubt must not be raced.
+   */
+  CONVERSATION_TURN_ATTEMPT_UNSAFE: "CONVERSATION_TURN_ATTEMPT_UNSAFE",
+  /**
+   * A permit offered to settle a turn was not issued by the coordinator being asked.
+   *
+   * `TurnPermit` is a structural type, so the shape alone proves nothing; the signature is what
+   * separates a permit from an object that looks like one.
+   */
+  CONVERSATION_TURN_PERMIT_UNISSUED: "CONVERSATION_TURN_PERMIT_UNISSUED",
+  /** A genuinely issued permit whose contents disagree with the turn row it names. */
+  CONVERSATION_TURN_PERMIT_MISMATCH: "CONVERSATION_TURN_PERMIT_MISMATCH",
+
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",
   OUTBOX_RETARGETED: "OUTBOX_RETARGETED",

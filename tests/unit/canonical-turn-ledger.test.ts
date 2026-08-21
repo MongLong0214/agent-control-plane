@@ -61,9 +61,9 @@ const inDoubtTurn = (
     `INSERT INTO canonical_turns
        (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
         executor_session_id, executor_session_incarnation, binding_generation,
-        prompt_digest, lifecycle_state)
-     VALUES (?, ?, ?, ?, 'ses-1', 'inc-1', 1, 'prompt', 'IN_DOUBT')`,
-    [turnId, actorId, bindingId, attestationId],
+        prompt_digest, claimed_at, lifecycle_state)
+     VALUES (?, ?, ?, ?, 'ses-1', 'inc-1', 1, 'prompt', ?, 'IN_DOUBT')`,
+    [turnId, actorId, bindingId, attestationId, NOW],
   );
 };
 
@@ -145,9 +145,9 @@ describe("a turn cannot cite a target it does not belong to", () => {
         `INSERT INTO canonical_turns
            (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
             executor_session_id, executor_session_incarnation, binding_generation,
-            prompt_digest, lifecycle_state)
-         VALUES ('turn:3', ?, ?, NULL, 'ses-1', 'inc-1', 1, 'prompt', 'IN_DOUBT')`,
-        [t.actorId, t.bindingId],
+            prompt_digest, claimed_at, lifecycle_state)
+         VALUES ('turn:3', ?, ?, NULL, 'ses-1', 'inc-1', 1, 'prompt', ?, 'IN_DOUBT')`,
+        [t.actorId, t.bindingId, NOW],
       ),
     ).toThrow();
   });
@@ -218,9 +218,9 @@ describe("a settlement carries what settled it", () => {
         `INSERT INTO canonical_turns
            (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
             executor_session_id, executor_session_incarnation, binding_generation,
-            prompt_digest, lifecycle_state, outcome_kind)
-         VALUES ('turn:contradiction', ?, ?, ?, 'ses-1', 'inc-1', 1, 'p', 'IN_DOUBT', 'COMPLETED')`,
-        [t.actorId, t.bindingId, t.attestationId],
+            prompt_digest, claimed_at, lifecycle_state, outcome_kind)
+         VALUES ('turn:contradiction', ?, ?, ?, 'ses-1', 'inc-1', 1, 'p', ?, 'IN_DOUBT', 'COMPLETED')`,
+        [t.actorId, t.bindingId, t.attestationId, NOW],
       ),
     ).toThrow();
   });
