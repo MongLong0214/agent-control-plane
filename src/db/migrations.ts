@@ -174,6 +174,8 @@ export const PROVENANCE_NO_REPLACE_TRIGGERS: readonly string[] = [
   "audit_events_no_replace",
   "baseline_records_no_replace",
   "telegram_owner_prompts_no_replace",
+  "conversational_actors_no_replace",
+  "manifests_no_replace",
 ];
 
 /** `DROP TRIGGER IF EXISTS` for a set of triggers, so a repair replaces rather than skips. */
@@ -1787,6 +1789,8 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "outbox_request_fingerprint_immutable", sentinel: "OUTBOX_REQUEST_FINGERPRINT_IMMUTABLE" },
   { name: "github_receipts_applied_requires_reservation", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
   { name: "github_receipts_pending_completion", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
+  { name: "conversational_actors_no_replace", sentinel: "CONVERSATIONAL_ACTOR_NO_REPLACE", introducedIn: 26 },
+  { name: "manifests_no_replace", sentinel: "MANIFEST_NO_REPLACE", introducedIn: 26 },
   { name: "audit_events_no_replace", sentinel: "AUDIT_NO_REPLACE", introducedIn: 26 },
   { name: "audit_events_append_only", sentinel: "AUDIT_APPEND_ONLY" },
   { name: "audit_events_no_delete", sentinel: "AUDIT_APPEND_ONLY" },

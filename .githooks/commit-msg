@@ -1,0 +1,28 @@
+#!/bin/sh
+# A CommitLore trailer that wraps is not a trailer.
+#
+# `git interpret-trailers` reads the last paragraph, one trailer per line. A `Limit:` or
+# `Ruled-out:` line wrapped across two lines makes the continuation an ordinary line, which ends
+# the trailer block — so the record is written, looks right in the editor, and is stored by
+# nobody. Six times on 2026-08-22 alone. CommitLore already prints a warning; a warning that
+# arrives after the commit succeeded is a note about a mistake that is now in the history.
+#
+# This refuses instead. The message is still on disk, so the fix is to unwrap the line and retry.
+MSG_FILE="$1"
+[ -f "$MSG_FILE" ] || exit 0
+
+awk '
+  /^#/ { next }
+  /^(Limit|Ruled-out|Warn|Supersedes|Refs):/ { intrailer = 1; next }
+  intrailer && /^[[:space:]]*$/ { intrailer = 0; next }
+  intrailer && !/^[A-Za-z-]+:/ {
+    printf "commit-msg: this line continues a trailer instead of being one:\n  %s\n", $0 > "/dev/stderr"
+    bad = 1
+    intrailer = 0
+  }
+  END { exit bad ? 1 : 0 }
+' "$MSG_FILE" || {
+  echo "" >&2
+  echo "A trailer must be one line. Unwrap it — length is fine, a line break is not." >&2
+  exit 1
+}

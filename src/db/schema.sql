@@ -32,6 +32,14 @@ BEGIN
   SELECT RAISE(ABORT, 'MANIFEST_IMMUTABLE');
 END;
 
+-- CP-HI-06 — same census, same hole: a manifest is immutable and REPLACE rewrote it by digest.
+CREATE TRIGGER IF NOT EXISTS manifests_no_replace
+BEFORE INSERT ON manifests
+WHEN EXISTS (SELECT 1 FROM manifests WHERE digest = NEW.digest)
+BEGIN
+  SELECT RAISE(ABORT, 'MANIFEST_NO_REPLACE');
+END;
+
 -- ---------------------------------------------------------------------------
 -- projects  (PRD §9.1)
 --   Holds identity + activation reference only. NOT a copy of the manifest.
@@ -220,6 +228,23 @@ BEFORE UPDATE ON conversational_actors
 WHEN OLD.retired_at IS NOT NULL AND NEW.retired_at IS NULL
 BEGIN
   SELECT RAISE(ABORT, 'ACTOR_RETIREMENT_TERMINAL');
+END;
+
+-- CP-HI-06 — retirement is terminal, and REPLACE undid it.
+--
+-- `conversational_actors_retirement_terminal` guards UPDATE, so it never saw an
+-- `INSERT OR REPLACE` on an existing actor_id: SQLite skips the implicit delete's triggers when
+-- `recursive_triggers` is off, which it is on any connection ACP did not open. Measured — a
+-- retired actor's `retired_at` went from a timestamp to NULL under the same id, and retirement is
+-- what stops an actor taking turns.
+--
+-- Found by the census in scripts/verify-append-only-tables-are-closed.mjs rather than by anyone
+-- looking, which is the point of having it.
+CREATE TRIGGER IF NOT EXISTS conversational_actors_no_replace
+BEFORE INSERT ON conversational_actors
+WHEN EXISTS (SELECT 1 FROM conversational_actors WHERE actor_id = NEW.actor_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CONVERSATIONAL_ACTOR_NO_REPLACE');
 END;
 
 -- ---------------------------------------------------------------------------

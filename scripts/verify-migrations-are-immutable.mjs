@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+/**
+ * Fails when a migration that already exists changes what it does.
+ *
+ * The whole discipline of `migrations.ts` is that a step, once written, is what every database
+ * that ran it actually ran. It was broken twice: v24's DDL was edited in place across two
+ * correction rounds, and a database created at the earlier v24 then sat at version 24 with bodies
+ * nobody's code expected, took the same-version path at startup, and could not settle a turn. The
+ * repair for that — v25 — repaired eight objects of twenty-eight, so a third migration was needed
+ * to repair the repair.
+ *
+ * Both times the rule was known and written down in that file's own comments. Naming it did not
+ * catch the next instance, which is the pattern this repository keeps finding.
+ *
+ * So the ids and their checksums are committed, and changing one is a diff someone has to explain
+ * rather than an edit that looks like any other. Adding a migration is an ordinary append; the
+ * manifest grows and nothing here objects.
+ *
+ * Usage: verify-migrations-are-immutable.mjs [--update]
+ */
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const MANIFEST = join(ROOT, "evidence/migration-checksums.json");
+
+const { MIGRATIONS, SCHEMA_VERSION } = await import(join(ROOT, "src/db/migrations.ts"));
+
+/**
+ * Runs `work` with one harmless comment appended to schema.sql, then puts the file back.
+ *
+ * Classifying by observation rather than by a list: a migration that reads the schema at run time
+ * produces a different checksum when the schema differs, and one holding its own DDL does not. A
+ * list would have to be maintained by whoever adds the next schema-reading migration, and this
+ * file exists because a rule that depends on someone remembering it was already broken twice.
+ *
+ * The write is restored in `finally`, and the appended line is a SQL comment, so a crash between
+ * the two leaves a schema that still parses and differs from git by one line.
+ */
+const SCHEMA = join(ROOT, "src/db/schema.sql");
+const withPerturbedSchema = (work) => {
+  const original = readFileSync(SCHEMA, "utf8");
+  writeFileSync(SCHEMA, `${original}\n-- checksum classification probe\n`);
+  try {
+    return work();
+  } finally {
+    writeFileSync(SCHEMA, original);
+  }
+};
+
+/**
+ * Migrations whose DDL is read from `schema.sql` when they run, rather than held as a constant.
+ *
+ * Their checksum hashes the live schema, so it moves every time any table or trigger anywhere is
+ * edited — by design: v12 exists to replay the idempotent schema objects onto a v11 database that
+ * is missing one, and v26 to replace ledger trigger bodies that drifted. Freezing them would mean
+ * re-freezing on every schema change, and a check that has to be re-blessed constantly is a check
+ * that gets re-blessed without being read.
+ *
+ * The case that actually failed twice is the other kind: v24 held its DDL in a constant and that
+ * constant was edited across two correction rounds. Those are the ones frozen here.
+ *
+ * Derived rather than listed, so a new schema-reading migration is classified by what it does.
+ */
+const derivesFromSchema = (migration) => {
+  const before = migration.checksum();
+  const after = withPerturbedSchema(() => migration.checksum());
+  return before !== after;
+};
+
+/** id → checksum, in chain order, for the migrations that hold their own DDL. */
+const live = {};
+for (const migration of MIGRATIONS) {
+  if (derivesFromSchema(migration)) continue;
+  live[migration.id] = migration.checksum();
+}
+
+if (process.argv.includes("--update")) {
+  writeFileSync(MANIFEST, `${JSON.stringify({ schemaVersion: SCHEMA_VERSION, live }, null, 2)}\n`);
+  process.stdout.write(`RESULT: PASS — wrote ${Object.keys(live).length} checksum(s) to the manifest.\n`);
+  process.exit(0);
+}
+
+let recorded;
+try {
+  recorded = JSON.parse(readFileSync(MANIFEST, "utf8")).live ?? {};
+} catch {
+  process.stdout.write(
+    `  ${MANIFEST} is missing or unreadable.\n  Create it once with \`pnpm migrations:freeze\`.\n` +
+      "\nRESULT: FAIL — nothing was compared.\n",
+  );
+  process.exit(2);
+}
+
+const changed = [];
+const removed = [];
+for (const [id, checksum] of Object.entries(recorded)) {
+  if (!(id in live)) removed.push(id);
+  else if (live[id] !== checksum) changed.push(id);
+}
+const added = Object.keys(live).filter((id) => !(id in recorded));
+
+if (changed.length > 0 || removed.length > 0) {
+  for (const id of changed) {
+    process.stdout.write(
+      `  ${id} changed what it does.\n` +
+        "    A database that already ran it did not run this. If the step was wrong, the fix is a\n" +
+        "    new migration that repairs it — v25 and v26 both exist because that was skipped once.\n",
+    );
+  }
+  for (const id of removed) {
+    process.stdout.write(`  ${id} is gone from the chain, and some database has run it.\n`);
+  }
+  process.stdout.write(
+    "\nIf this change is deliberate — the migration has never been in a commit anyone ran —\n" +
+      "re-freeze with `pnpm migrations:freeze` and say so in the commit message.\n" +
+      `RESULT: FAIL — ${changed.length + removed.length} migration(s) are not what they were.\n`,
+  );
+  process.exit(1);
+}
+
+const note = added.length > 0 ? `, ${added.length} new (${added.join(", ")})` : "";
+process.stdout.write(
+  `RESULT: PASS — ${Object.keys(recorded).length} frozen migration(s) unchanged${note}.\n`,
+);

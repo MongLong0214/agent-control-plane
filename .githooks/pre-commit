@@ -1,0 +1,31 @@
+#!/bin/sh
+# Two things that went wrong repeatedly on 2026-08-19..22, made impossible rather than remembered.
+#
+# 1. The falsifiability harness edits guarded sources in place and restores them at the end. Its
+#    own start-up check asks "is the tree dirty?", which a *concurrent* commit passes trivially:
+#    the harness is alive, its mutation is on disk, and `git add -A` takes it. A guard removal
+#    reached a commit that way, twice. The sentinel file exists for exactly the window where
+#    committing is unsafe — during a live run and after a killed one — so that is the thing to ask.
+#
+# 2. Editing a line a mutation row anchors to leaves the row matching nothing, which means it
+#    checks nothing while still reporting the guard as covered. Three times on one branch, each
+#    found forty minutes into CI. The anchors pass is a string search and costs about a second.
+set -e
+
+SENTINEL="$(git rev-parse --git-dir)/verify-guards-in-flight.json"
+if [ -e "$SENTINEL" ]; then
+  echo "pre-commit: the falsifiability harness has a mutation applied." >&2
+  echo "  $SENTINEL" >&2
+  echo "Wait for it to finish, or reconcile that file by hand, before committing." >&2
+  exit 1
+fi
+
+# Only when a file the rows anchor into is staged: the check is cheap, but a commit that touches
+# nothing it names does not need to pay for it, and a hook that always runs gets bypassed.
+if git diff --cached --name-only | grep -qE '^(src/|scripts/verify-guards-are-falsifiable\.mjs)'; then
+  if ! node scripts/verify-guards-are-falsifiable.mjs --anchors-only; then
+    echo "pre-commit: a falsifiability row no longer names a line that exists." >&2
+    echo "Fix the row, or say why the guard it named is gone." >&2
+    exit 1
+  fi
+fi

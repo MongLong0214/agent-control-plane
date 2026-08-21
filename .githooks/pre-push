@@ -1,0 +1,16 @@
+#!/bin/sh
+# Refuse a push whose falsifiability rows no longer name lines that exist.
+#
+# Twice on 2026-08-22 a push went out while the full sweep was still running locally, and CI came
+# back red for a row that matched nothing — the same class both times, and both times the answer
+# was already on this machine a minute after the edit that broke it.
+#
+# The full sweep is over an hour and is not a pre-push check; the anchors pass is a string search
+# and is. It cannot tell you a guard is tested. It can tell you a row stopped checking anything,
+# which is what CI failed on.
+set -e
+if ! node scripts/verify-guards-are-falsifiable.mjs --anchors-only; then
+  echo "pre-push: a falsifiability row no longer names a line that exists." >&2
+  echo "CI runs this before the build; it will fail there in seconds. Fix the row first." >&2
+  exit 1
+fi

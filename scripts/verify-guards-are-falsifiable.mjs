@@ -540,8 +540,13 @@ const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".
  * The full sweep takes over an hour, so it is something you run at the end and read in CI. That
  * left a gap wide enough to walk through three times on one branch: editing a guarded line renames
  * its anchor, the row silently stops checking anything, and nothing says so until the sweep gets
- * there. This part of the sweep is a string search over files already in memory. It costs a second
- * and answers the question that actually goes stale.
+ * there. This pass is a string search and costs a second.
+ *
+ * It runs **before** the snapshot, the sentinel and the dirty check, and takes none of them. The
+ * first version sat after all three and called the restore on its way out — so a hook that ran it
+ * while a full sweep was mid-mutation wrote its own snapshot over the sweep's work, and the sweep
+ * stopped with "changed underneath this run". A read-only check that has side effects is not a
+ * read-only check, and this one is meant to be safe to run at any moment.
  */
 const anchorsOnly = process.argv.includes("--anchors-only");
 
@@ -551,6 +556,36 @@ const rows = GUARDS.filter((g) => !g.skip).filter(
 
 const out = (line) => process.stdout.write(line + "\n");
 const failures = [];
+
+if (anchorsOnly) {
+  const dead = [];
+  for (const guard of rows) {
+    const text = readFileSync(join(ROOT, guard.file), "utf8");
+    const count = text.split(guard.find).length - 1;
+    if (count !== 1) {
+      dead.push({
+        guard,
+        why:
+          count === 0
+            ? "the mutation no longer matches this file — the guard moved, and this row stopped checking anything"
+            : `the mutation matches ${count} places — a row that is not about one specific guard`,
+      });
+    }
+  }
+  for (const failure of dead) {
+    out(`  ${failure.guard.file}`);
+    out(`    ${failure.guard.what}`);
+    out(`    ${failure.why}`);
+  }
+  if (dead.length > 0) {
+    out(`\nRESULT: FAIL — ${dead.length} row(s) name a line that is not there.`);
+    process.exit(1);
+  }
+  out(`verify-guards-are-falsifiable: ${rows.length} anchor(s) still match, exactly once each.`);
+  out("An anchor that matches is not a guard that is tested — run the full sweep for that.");
+  out("RESULT: PASS");
+  process.exit(0);
+}
 
 // ---------------------------------------------------------------------------
 // Safety. This edits tracked files in place. A dirty guarded file means a crash
@@ -773,25 +808,6 @@ const loci = [...lociBlock[1].matchAll(/^\s*(\w+):/gm)].map((m) => m[1]);
 const claimed = new Set(GUARDS.flatMap((g) => g.symbols ?? []));
 const unclaimed = loci.filter((s) => !claimed.has(s));
 
-// The cheap half is done. `--anchors-only` stops here, so this is runnable before every push
-// rather than read out of a CI log afterwards.
-if (anchorsOnly) {
-  for (const failure of failures) {
-    out(`  ${failure.guard.file}`);
-    out(`    ${failure.guard.what}`);
-    out(`    ${failure.why}`);
-  }
-  if (unclaimed.length > 0) {
-    out(`verify-guards-are-falsifiable: enforcement loci with no row: ${unclaimed.join(", ")}`);
-  }
-  if (failures.length === 0 && unclaimed.length === 0) {
-    out(`verify-guards-are-falsifiable: ${rows.length} anchor(s) still match, exactly once each.`);
-    out("An anchor that matches is not a guard that is tested — run the full sweep for that.");
-  }
-  restoreOnce();
-  process.exit(failures.length === 0 && unclaimed.length === 0 ? 0 : 1);
-}
-
 // ---------------------------------------------------------------------------
 // Behavioural: remove each guard, require a named test to die.
 // ---------------------------------------------------------------------------
@@ -858,6 +874,10 @@ if (failures.length > 0 || unclaimed.length > 0) {
     "\nA guard no test can kill is worse than no guard: it answers 'is this checked?' with a yes.\n" +
       "Either write a test that fails when the guard is removed, or remove the guard.\n",
   );
+  // Last line, always, and one of two words. The failure text above once read as a footer to
+  // someone checking `tail -6`, and a red gate got reported as green — a pipeline's status is its
+  // last command's, so `| tail` had already thrown the exit code away.
+  out(`RESULT: FAIL — ${failures.length} row(s) and ${unclaimed.length} unclaimed locus/loci.`);
   process.exit(1);
 }
 
@@ -865,3 +885,4 @@ out("");
 out(`verify-guards-are-falsifiable: ${rows.length} guard(s) removed on purpose, each killed a named test`);
 out(`${loci.length} enforcement locus/loci from verify-enforcement-symbols.mjs are all claimed.`);
 out("A mutation proves the test is coupled to the guard, not that it asserts the right thing.");
+out("RESULT: PASS");
