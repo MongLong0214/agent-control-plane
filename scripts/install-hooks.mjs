@@ -32,7 +32,13 @@ const shim = (name) =>
   `#!/bin/sh\n${MARK}\n` +
   `# Written by scripts/install-hooks.mjs. The logic lives in .githooks/${name}, versioned so it\n` +
   `# can be reviewed; this file only points at it.\n` +
-  `exec "$(git rev-parse --show-toplevel)/.githooks/${name}" "$@"\n`;
+  `#\n` +
+  `# Absent is not a failure. A worktree or branch that predates the versioned hooks has nothing\n` +
+  `# here to run, and the first version treated that as an error — which blocked every commit on\n` +
+  `# those branches. Measured, on a worktree one branch back, while fixing something else.\n` +
+  `HOOK="$(git rev-parse --show-toplevel)/.githooks/${name}"\n` +
+  `[ -x "$HOOK" ] || exit 0\n` +
+  `exec "$HOOK" "$@"\n`;
 
 /**
  * Where each versioned hook has to land.
