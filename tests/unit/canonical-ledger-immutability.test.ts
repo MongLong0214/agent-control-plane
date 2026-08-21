@@ -41,12 +41,22 @@ const target = (h: Harness): string => {
   return "a";
 };
 
+/** An admitted inbound message, which a turn's source now has to name. */
+const admit = (h: Harness, nonce: string, channel = "telegram"): void => {
+  h.cp.db.run(
+    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at, payload_digest)
+     VALUES (?, ?, 'owner', ?, ?)`,
+    [channel, nonce, NOW, `sha256:${channel}:${nonce}`],
+  );
+};
+
 const settledTurn = (h: Harness): string => {
   const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+  admit(h, "n1");
   const claimed = coordinator.claim({
     targetActorId: target(h),
     prompt: "question",
-    sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
+    sources: [{ channel: "telegram", nonce: "n1", attempt: 1 }],
   });
   if (!claimed.allowed) throw new Error(`claim refused: ${claimed.reasonCode}`);
   const settled = coordinator.observe(claimed.value, {
@@ -104,10 +114,11 @@ describe("a settlement cannot be rewritten", () => {
     // pull a completed turn back into a state that permits a re-run.
     const h = makeHarness();
     const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+    admit(h, "n1");
     const claimed = coordinator.claim({
       targetActorId: target(h),
       prompt: "q",
-      sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
+      sources: [{ channel: "telegram", nonce: "n1", attempt: 1 }],
     });
     if (!claimed.allowed) throw new Error("claim refused");
     coordinator.observe(claimed.value, {
@@ -180,10 +191,11 @@ describe("a settlement cannot be rewritten", () => {
     // leaves nothing behind that says so.
     const h = makeHarness();
     const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
-    const claimed = coordinator.claim({
+    admit(h, "n1");
+  const claimed = coordinator.claim({
       targetActorId: target(h),
       prompt: "q",
-      sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
+      sources: [{ channel: "telegram", nonce: "n1", attempt: 1 }],
     });
     if (!claimed.allowed) throw new Error("claim refused");
 
@@ -392,10 +404,11 @@ describe("an outcome may only be recorded under an authority that could have obs
     // it only guards a row that was already settled.
     const h = makeHarness();
     const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
-    const claimed = coordinator.claim({
+    admit(h, "n1");
+  const claimed = coordinator.claim({
       targetActorId: target(h),
       prompt: "q",
-      sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
+      sources: [{ channel: "telegram", nonce: "n1", attempt: 1 }],
     });
     if (!claimed.allowed) throw new Error("claim refused");
 
@@ -422,10 +435,11 @@ describe("an outcome may only be recorded under an authority that could have obs
     // and left no audit row — so the sanctioned repair was an unaudited hand-edit.
     const h = makeHarness();
     const coordinator = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
-    const claimed = coordinator.claim({
+    admit(h, "n1");
+  const claimed = coordinator.claim({
       targetActorId: target(h),
       prompt: "q",
-      sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
+      sources: [{ channel: "telegram", nonce: "n1", attempt: 1 }],
     });
     if (!claimed.allowed) throw new Error("claim refused");
     coordinator.observe(claimed.value, {

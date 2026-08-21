@@ -23,11 +23,25 @@ type Harness = ReturnType<typeof makeHarness>;
 
 const NOW = "2026-08-21T00:00:00.000Z";
 
+/**
+ * An admitted inbound message, which a turn's source now has to name.
+ *
+ * A source used to carry a digest of a payload its caller supplied, so the ledger's record of
+ * what a turn consumed was the caller's word about a message the caller also named. It reads the
+ * digest from this row instead.
+ */
+const admit = (h: Harness, nonce: string, channel = "telegram"): void => {
+  h.cp.db.run(
+    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at, payload_digest)
+     VALUES (?, ?, 'owner', ?, ?)`,
+    [channel, nonce, NOW, `sha256:${channel}:${nonce}`],
+  );
+};
+
 const source = (nonce: string, attempt = 1): TurnSource => ({
   channel: "telegram",
   nonce,
-  attempt,
-  payload: { text: `message ${nonce}` },
+  attempt
 });
 
 /** An actor with a verified, attested target — everything a turn needs before it can exist. */
@@ -108,6 +122,7 @@ const settle = (
   });
 
 const claimOf = (h: Harness, actorId: string, sources: TurnSource[], prompt = "hello") => {
+  for (const one of sources) admit(h, one.nonce, one.channel);
   const decision = coordinatorOf(h).claim({ targetActorId: actorId, prompt, sources });
   if (!decision.allowed) throw new Error(`expected a permit, got ${decision.reasonCode}`);
   return decision.value;
@@ -174,6 +189,98 @@ describe("a turn cannot be claimed without a verified target", () => {
   });
 });
 
+describe("a turn's sources name messages someone admitted", () => {
+  it("refuses a source with no admission record", () => {
+    // The ledger used to record that a turn consumed a message that did not exist, because the
+    // source was whatever the caller handed over. The retry chain then reasoned about attempts
+    // of a message nobody had let in.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source("never-admitted")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_SOURCE_NOT_ADMITTED);
+  });
+
+  it("refuses a message admitted before its payload was recorded", () => {
+    // A digest that was never written cannot be checked. Treating its absence as satisfaction
+    // would restore the gap the column closed, under the column's own name.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    h.cp.db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram','legacy','owner',?)`,
+      [NOW],
+    );
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source("legacy")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_SOURCE_NOT_DIGESTED);
+  });
+
+  it("takes the digest from the admitted row, not from the caller", () => {
+    // Two halves of one claim — what the message was, and that it was admitted — used to come
+    // from the same untrusted place.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+
+    const stored = h.cp.db.get<{ source_digest: string }>(
+      `SELECT source_digest FROM canonical_turn_sources WHERE turn_request_id = ?`,
+      [permit.turnRequestId],
+    );
+    const admittedRow = h.cp.db.get<{ payload_digest: string }>(
+      `SELECT payload_digest FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'm1'`,
+    );
+    expect(stored?.source_digest).toBe(admittedRow?.payload_digest);
+  });
+
+  it("refuses to delete an admitted row a turn's source points at", () => {
+    // The reference is evidence that the message was let in. Deleting the row leaves the source
+    // naming nothing — and a cascade would erase the source instead of protecting it, which is
+    // the opposite of what the reference is for.
+    const h = makeHarness();
+    claimOf(h, target(h, "ceo"), [source("m1")]);
+
+    expect(() =>
+      h.cp.db.run(`DELETE FROM inbound_messages WHERE channel='telegram' AND nonce='m1'`),
+    ).toThrow(/INBOUND_MESSAGE_REFERENCED_BY_TURN/);
+  });
+
+  it("refuses to rewrite an admitted payload digest", () => {
+    const h = makeHarness();
+    claimOf(h, target(h, "ceo"), [source("m1")]);
+
+    expect(() =>
+      h.cp.db.run(`UPDATE inbound_messages SET payload_digest='sha256:other' WHERE nonce='m1'`),
+    ).toThrow(/INBOUND_PAYLOAD_DIGEST_IMMUTABLE/);
+  });
+
+  it("writes nothing when a source is refused", () => {
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    admit(h, "m1");
+
+    coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source("m1"), source("never-admitted")],
+    });
+
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(0);
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_sources`)).toHaveLength(0);
+  });
+});
+
 describe("a claim takes the hold in the same transaction", () => {
   it("records the turn already in doubt, before anything has run", () => {
     // The ordering the design turns on. The hold exists before the peer is called, so a crash
@@ -216,6 +323,10 @@ describe("a claim takes the hold in the same transaction", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
 
+    admit(h, "m1");
+
+    admit(h, "m1");
+
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "x",
@@ -244,6 +355,10 @@ describe("one unresolved turn per conversation", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
     claimOf(h, actorId, [source("m1")]);
+
+    admit(h, "m2");
+
+    admit(h, "m2");
 
     const second = coordinatorOf(h).claim({
       targetActorId: actorId,
@@ -285,6 +400,8 @@ describe("one unresolved turn per conversation", () => {
       authority: "ACP_PRE_DISPATCH",
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
     });
+    admit(h, "m2");
+    admit(h, "m2");
     const second = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "another",
@@ -301,6 +418,10 @@ describe("one unresolved turn per conversation", () => {
     const ceo = target(h, "ceo");
     const cto = target(h, "cto");
     claimOf(h, ceo, [source("m1")]);
+
+    admit(h, "m2");
+
+    admit(h, "m2");
 
     const other = coordinatorOf(h).claim({
       targetActorId: cto,
@@ -363,6 +484,10 @@ describe("a retry is legal only when the previous attempt ended safely", () => {
     const second = target(h, "second");
     claimOf(h, first, [source("m1")]);
 
+    admit(h, "m1");
+
+    admit(h, "m1");
+
     const decision = coordinatorOf(h).claim({
       targetActorId: second,
       prompt: "hello",
@@ -378,6 +503,10 @@ describe("a retry is legal only when the previous attempt ended safely", () => {
     // earlier attempts ended safely.
     const h = makeHarness();
     const actorId = target(h, "ceo");
+
+    admit(h, "m1");
+
+    admit(h, "m1");
 
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,
@@ -650,6 +779,10 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
     });
 
+    admit(h, "m1");
+
+    admit(h, "m1");
+
     const retry = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "hello",
@@ -704,6 +837,10 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
       authority: "ACP_PRE_DISPATCH",
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
     });
+
+    admit(h, "m1");
+
+    admit(h, "m1");
 
     const retry = coordinatorOf(h).claim({
       targetActorId: actorId,
@@ -804,6 +941,10 @@ describe("a conversation whose last outcome is disputed takes no new turns", () 
     const actorId = target(h, "ceo");
     contradict(h, actorId);
 
+    admit(h, "m2");
+
+    admit(h, "m2");
+
     const next = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "a new question",
@@ -818,6 +959,10 @@ describe("a conversation whose last outcome is disputed takes no new turns", () 
     const h = makeHarness();
     const actorId = target(h, "ceo");
     const disputed = contradict(h, actorId);
+
+    admit(h, "m2");
+
+    admit(h, "m2");
 
     const next = coordinatorOf(h).claim({
       targetActorId: actorId,
@@ -835,6 +980,7 @@ describe("a conversation whose last outcome is disputed takes no new turns", () 
     contradict(h, target(h, "ceo"));
     const cto = target(h, "cto");
 
+    admit(h, "m3");
     expect(
       coordinatorOf(h).claim({ targetActorId: cto, prompt: "q", sources: [source("m3")] }).allowed,
     ).toBe(true);
@@ -852,6 +998,8 @@ describe("nothing clears a hold on time", () => {
     claimOf(h, actorId, [source("m1")]);
 
     h.clock.advance(60 * 60 * 1000);
+    admit(h, "m2");
+    admit(h, "m2");
     const next = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "later",

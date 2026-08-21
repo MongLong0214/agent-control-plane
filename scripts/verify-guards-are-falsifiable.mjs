@@ -306,6 +306,29 @@ const GUARDS = [
     killedBy: ["tests/unit/verify-r2.test.ts"],
   },
   {
+    what: "a turn's source has to name a message someone admitted",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (!row) {\n        return deny(\n          ReasonCode.CONVERSATION_SOURCE_NOT_ADMITTED,",
+    replace: "      if (false) {\n        return deny(\n          ReasonCode.CONVERSATION_SOURCE_NOT_ADMITTED,",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    // A digest that was never written cannot be checked; treating its absence as satisfaction
+    // restores the gap the column closed, under the column's own name.
+    what: "a message admitted before its payload was recorded is not consumable",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (row.payload_digest === null) {",
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "an admitted row a source points at cannot be deleted out from under it",
+    file: "src/db/schema.sql",
+    find: "CREATE TRIGGER IF NOT EXISTS inbound_messages_referenced_by_turn\nBEFORE DELETE ON inbound_messages\nWHEN EXISTS (",
+    replace: "CREATE TRIGGER IF NOT EXISTS inbound_messages_referenced_by_turn\nBEFORE DELETE ON inbound_messages\nWHEN 0 = 1 AND EXISTS (",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
     what: "a turn is refused for an actor whose target no runtime attested",
     file: "src/conversation/turn-coordinator.ts",
     find: "      if (!attestation) {",

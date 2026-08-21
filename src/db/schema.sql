@@ -1016,8 +1016,27 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
   actor       TEXT NOT NULL,
   received_at TEXT NOT NULL,
   result_json TEXT,
+  -- What was admitted, recorded by the writer that admitted it.
+  --
+  -- A canonical turn's sources used to carry a digest the *caller* computed from a payload it
+  -- supplied, so the ledger's record of what a turn consumed rested on a value nobody had
+  -- checked. A source points at this row now and reads the digest from it.
+  --
+  -- Nullable because rows admitted before this column existed have no digest and none can be
+  -- invented for them. A NULL digest is not consumable by a claim: a digest that was never
+  -- recorded cannot be checked, and admitting on one would restore the gap under a column name.
+  payload_digest TEXT,
   PRIMARY KEY (channel, nonce)
 );
+
+-- CP-HI-06 — the admitted payload is exact evidence of what was let in. Filled once by the admit
+-- writer; a later rewrite would change what a settled turn is recorded as having consumed.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_digest_immutable
+BEFORE UPDATE OF payload_digest ON inbound_messages
+WHEN OLD.payload_digest IS NOT NULL AND OLD.payload_digest IS NOT NEW.payload_digest
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_DIGEST_IMMUTABLE');
+END;
 
 CREATE INDEX IF NOT EXISTS inbound_received ON inbound_messages(received_at);
 
@@ -1435,8 +1454,24 @@ CREATE TABLE IF NOT EXISTS canonical_turn_sources (
   PRIMARY KEY (source_channel, source_nonce, source_attempt),
   UNIQUE (turn_request_id, batch_ordinal),
   UNIQUE (turn_request_id, source_channel, source_nonce),
-  CHECK ((source_attempt = 1) = (predecessor_turn_request_id IS NULL))
+  CHECK ((source_attempt = 1) = (predecessor_turn_request_id IS NULL)),
+  -- The row this source is about. Without it a source could name a channel and nonce nobody
+  -- admitted, and the ledger would record a turn as having consumed a message that does not exist.
+  FOREIGN KEY (source_channel, source_nonce) REFERENCES inbound_messages(channel, nonce)
 );
+
+-- CP-HI-08 — an inbound row a source points at is the evidence that message was admitted.
+-- Deleting it leaves the source naming nothing. Not ON DELETE CASCADE: that erases the source
+-- identity instead of protecting it, which is the opposite of what the reference is for.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_referenced_by_turn
+BEFORE DELETE ON inbound_messages
+WHEN EXISTS (
+  SELECT 1 FROM canonical_turn_sources
+   WHERE source_channel = OLD.channel AND source_nonce = OLD.nonce
+)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_MESSAGE_REFERENCED_BY_TURN');
+END;
 
 -- What an authority reported about a turn. Append-only, and the only way an outcome is ever set.
 --

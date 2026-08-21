@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 24;
+export const SCHEMA_VERSION = 25;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -100,6 +100,11 @@ export const installMigrationLedger = (raw: Database.Database): void => {
  */
 const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /CREATE INDEX IF NOT EXISTS assignments_actor[^;]*;/,
+  // v25 adds `inbound_messages.payload_digest`, so a trigger naming it cannot be created against
+  // the v11 table that has no such column. The general rule this file already states: an object
+  // introduced after v12 is excluded here and created by the migration that owns it.
+  /-- CP-HI-06 — the admitted payload is exact evidence[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_digest_immutable[\s\S]*?\nEND;/,
+  /-- CP-HI-08 — an inbound row a source points at[\s\S]*?CREATE TRIGGER IF NOT EXISTS inbound_messages_referenced_by_turn[\s\S]*?\nEND;/,
   /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
   /-- ---------------------------------------------------------------------------\n-- conversational_actor_registrations[\s\S]*?(?=-- ---------------------------------------------------------------------------\n-- assignments)/,
 ];
@@ -1406,6 +1411,109 @@ const v24: SchemaMigration = {
   checksum: () => sha256(`v24-observation-ledger\n${V24_OBSERVATION_LEDGER_DDL}`),
 };
 
+/**
+ * A source names a message someone admitted, and the digest is the admitter's, not the caller's.
+ *
+ * `claim()` took `TurnSource` objects from its caller and wrote them straight into
+ * `canonical_turn_sources` — no foreign key to `inbound_messages`, and a `source_digest` computed
+ * from a payload the caller supplied. So the ledger could record that a turn consumed a message
+ * that was never admitted, and the retry chain then reasoned about attempts of a message with no
+ * admission record. The whole "this must not run again" argument rested on identifiers nobody
+ * had checked.
+ *
+ * The digest column is nullable because rows admitted before it existed have none, and none can
+ * be invented for them. A NULL digest is not consumable by a claim — a digest that was never
+ * recorded cannot be checked, and admitting on one would restore the gap under a column name.
+ */
+const V25_SOURCES_NAME_ADMITTED_MESSAGES_DDL = `
+CREATE TRIGGER IF NOT EXISTS inbound_messages_payload_digest_immutable
+BEFORE UPDATE OF payload_digest ON inbound_messages
+WHEN OLD.payload_digest IS NOT NULL AND OLD.payload_digest IS NOT NEW.payload_digest
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_PAYLOAD_DIGEST_IMMUTABLE');
+END;
+
+CREATE TABLE IF NOT EXISTS canonical_turn_sources (
+  turn_request_id              TEXT NOT NULL REFERENCES canonical_turns(turn_request_id),
+  source_channel               TEXT NOT NULL,
+  source_nonce                 TEXT NOT NULL,
+  source_attempt               INTEGER NOT NULL CHECK (source_attempt > 0),
+  batch_ordinal                INTEGER NOT NULL CHECK (batch_ordinal >= 0),
+  source_digest                TEXT NOT NULL,
+  predecessor_turn_request_id  TEXT REFERENCES canonical_turns(turn_request_id),
+  admission_audit_event_id     INTEGER NOT NULL REFERENCES audit_events(event_id),
+  PRIMARY KEY (source_channel, source_nonce, source_attempt),
+  UNIQUE (turn_request_id, batch_ordinal),
+  UNIQUE (turn_request_id, source_channel, source_nonce),
+  CHECK ((source_attempt = 1) = (predecessor_turn_request_id IS NULL)),
+  -- The row this source is about. Without it a source could name a channel and nonce nobody
+  -- admitted, and the ledger would record a turn as having consumed a message that does not
+  -- exist.
+  FOREIGN KEY (source_channel, source_nonce) REFERENCES inbound_messages(channel, nonce)
+);
+
+-- CP-HI-06 — which messages a turn consumed is the other half of "this must not run again".
+CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_immutable
+BEFORE UPDATE ON canonical_turn_sources
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_SOURCE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — a source removed from under a turn makes the retry rule read a turn that consumed
+-- nothing, and nothing reports the loss.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_no_delete
+BEFORE DELETE ON canonical_turn_sources
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_SOURCE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — an inbound row a source points at is the evidence that message was admitted.
+-- Deleting it leaves the source naming nothing. Not ON DELETE CASCADE: that erases the source
+-- identity instead of protecting it, which is the opposite of what the reference is for.
+CREATE TRIGGER IF NOT EXISTS inbound_messages_referenced_by_turn
+BEFORE DELETE ON inbound_messages
+WHEN EXISTS (
+  SELECT 1 FROM canonical_turn_sources
+   WHERE source_channel = OLD.channel AND source_nonce = OLD.nonce
+)
+BEGIN
+  SELECT RAISE(ABORT, 'INBOUND_MESSAGE_REFERENCED_BY_TURN');
+END;
+`;
+
+/**
+ * Rebuilt rather than altered, because SQLite cannot add a foreign key to an existing table.
+ * Refuses to run against rows it cannot re-derive, the same as v22 through v24.
+ */
+const v25: SchemaMigration = {
+  id: "v25-sources-name-admitted-messages",
+  fromVersion: 24,
+  toVersion: 25,
+  apply: (raw) => {
+    const rows = raw.prepare(`SELECT COUNT(*) AS n FROM canonical_turn_sources`).get() as { n: number };
+    if (rows.n > 0) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        "v25 cannot attach sources to admitted rows it did not see; canonical_turn_sources is not empty",
+        { rows: rows.n },
+      );
+    }
+    // Added separately from the DDL because `ADD COLUMN` has no `IF NOT EXISTS`, and the column
+    // is already present on any database built from the current schema.sql — a fresh install
+    // rewound to an earlier version for a migration test is exactly that shape. Checking is not
+    // defensive here: the migration's job is to end with the column present, not to be the only
+    // thing that ever creates it.
+    const columns = raw.prepare(`PRAGMA table_info(inbound_messages)`).all() as { name: string }[];
+    if (!columns.some((column) => column.name === "payload_digest")) {
+      raw.exec(`ALTER TABLE inbound_messages ADD COLUMN payload_digest TEXT`);
+    }
+    raw.exec(`DROP TABLE IF EXISTS canonical_turn_sources`);
+    raw.exec(V25_SOURCES_NAME_ADMITTED_MESSAGES_DDL);
+  },
+  checksum: () =>
+    sha256(`v25-sources-name-admitted-messages\n${V25_SOURCES_NAME_ADMITTED_MESSAGES_DDL}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -1420,6 +1528,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v22,
   v23,
   v24,
+  v25,
 ]);
 
 interface RequiredTrigger {
@@ -1489,6 +1598,8 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_turn_observations_append_only", sentinel: "CANONICAL_TURN_OBSERVATION_APPEND_ONLY", introducedIn: 24 },
   { name: "canonical_turn_observations_no_delete", sentinel: "CANONICAL_TURN_OBSERVATION_APPEND_ONLY", introducedIn: 24 },
   { name: "canonical_turn_sources_immutable", sentinel: "CANONICAL_TURN_SOURCE_IMMUTABLE", introducedIn: 24 },
+  { name: "inbound_messages_payload_digest_immutable", sentinel: "INBOUND_PAYLOAD_DIGEST_IMMUTABLE", introducedIn: 25 },
+  { name: "inbound_messages_referenced_by_turn", sentinel: "INBOUND_MESSAGE_REFERENCED_BY_TURN", introducedIn: 25 },
   { name: "canonical_turn_sources_no_delete", sentinel: "CANONICAL_TURN_SOURCE_IMMUTABLE", introducedIn: 24 },
   { name: "actor_target_attestations_append_only", sentinel: "ACTOR_TARGET_ATTESTATION_APPEND_ONLY", introducedIn: 24 },
   { name: "actor_target_attestations_no_delete", sentinel: "ACTOR_TARGET_ATTESTATION_APPEND_ONLY", introducedIn: 24 },

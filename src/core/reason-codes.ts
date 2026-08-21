@@ -305,6 +305,15 @@ export const ReasonCode = {
   CONVERSATION_TURN_RECEIPT_REUSED: "CONVERSATION_TURN_RECEIPT_REUSED",
   /** An adjudication cited only part of the disagreement, or something outside it. */
   CONVERSATION_ADJUDICATION_INCOMPLETE: "CONVERSATION_ADJUDICATION_INCOMPLETE",
+  /** A turn named a message with no admission record, so nothing says it was ever let in. */
+  CONVERSATION_SOURCE_NOT_ADMITTED: "CONVERSATION_SOURCE_NOT_ADMITTED",
+  /**
+   * The message was admitted before its payload digest was recorded.
+   *
+   * Refused rather than admitted on an absent value: a digest that was never written cannot be
+   * checked, and treating its absence as satisfaction restores the gap the column closed.
+   */
+  CONVERSATION_SOURCE_NOT_DIGESTED: "CONVERSATION_SOURCE_NOT_DIGESTED",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",

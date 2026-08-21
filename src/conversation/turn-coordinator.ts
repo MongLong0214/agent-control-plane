@@ -19,7 +19,6 @@ export interface TurnSource {
   /** Which attempt at *this* message. The first is 1; a later one needs its predecessor to have
    *  settled safely, which is checked here rather than in a constraint SQLite cannot express. */
   attempt: number;
-  payload: unknown;
 }
 
 /**
@@ -274,6 +273,9 @@ export class ConversationTurnCoordinator {
       const chained = this.assertAttemptsMayRun(input.sources);
       if (!chained.allowed) return deny(chained.reasonCode, chained.message, chained.evidence);
 
+      const admitted = this.assertSourcesWereAdmitted(input.sources);
+      if (!admitted.allowed) return deny(admitted.reasonCode, admitted.message, admitted.evidence);
+
       // A turn on this actor whose observations disagree. The disagreement is about whether a
       // past turn ran, so nothing new may be admitted until someone adjudicates it — running a
       // fresh turn against a conversation whose last outcome is disputed is how the dispute
@@ -369,7 +371,7 @@ export class ConversationTurnCoordinator {
             source.nonce,
             source.attempt,
             ordinal,
-            digestOf(source.payload),
+            admitted.value[ordinal]!,
             source.attempt === 1 ? null : this.previousAttempt(source)?.turn_request_id ?? null,
             claimAuditEventId,
           ],
@@ -723,6 +725,44 @@ export class ConversationTurnCoordinator {
         [targetActorId],
       )
       .map((row) => ({ turnRequestId: row.turn_request_id, claimedAt: row.claimed_at }));
+  }
+
+  /**
+   * Whether every source names a message that was actually admitted, and returns their digests.
+   *
+   * The digest comes from the admitted row, not from the caller. The shape this replaces took a
+   * payload from its caller and hashed that, so the ledger's record of what a turn consumed was
+   * the caller's word about a message the caller also named — two halves of one claim, neither
+   * checked. A source could name a channel and nonce nobody admitted.
+   *
+   * A row admitted before the digest column existed carries NULL, and is refused rather than
+   * admitted on an absent value. A digest that was never recorded cannot be checked, and treating
+   * its absence as satisfaction restores the gap under a column name.
+   */
+  private assertSourcesWereAdmitted(sources: readonly TurnSource[]): Decision<readonly string[]> {
+    const digests: string[] = [];
+    for (const source of sources) {
+      const row = this.db.get<{ payload_digest: string | null }>(
+        `SELECT payload_digest FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [source.channel, source.nonce],
+      );
+      if (!row) {
+        return deny(
+          ReasonCode.CONVERSATION_SOURCE_NOT_ADMITTED,
+          "this turn names a message that was never admitted",
+          { channel: source.channel, nonce: source.nonce },
+        );
+      }
+      if (row.payload_digest === null) {
+        return deny(
+          ReasonCode.CONVERSATION_SOURCE_NOT_DIGESTED,
+          "this message was admitted before its payload was recorded, so what it contains cannot be checked",
+          { channel: source.channel, nonce: source.nonce },
+        );
+      }
+      digests.push(row.payload_digest);
+    }
+    return allow(ReasonCode.OK, digests);
   }
 
   private previousAttempt(source: TurnSource) {

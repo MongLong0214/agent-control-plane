@@ -314,6 +314,14 @@ describe("which messages a turn consumed", () => {
     ordinal: number,
     predecessor: string | null,
   ): void => {
+    // The source has to name a row that was admitted, so the fixture admits one. That reference
+    // is the point of the change it came from: a source used to be able to name a channel and
+    // nonce nobody had let in.
+    h.cp.db.run(
+      `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at, payload_digest)
+       VALUES ('telegram', ?, 'owner', ?, ?)`,
+      [nonce, NOW, `sha256:${nonce}`],
+    );
     h.cp.db.run(
       `INSERT INTO canonical_turn_sources
          (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,

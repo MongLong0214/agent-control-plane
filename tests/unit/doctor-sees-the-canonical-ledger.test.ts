@@ -60,12 +60,22 @@ const coordinatorOf = (h: Harness): ConversationTurnCoordinator => {
   return made;
 };
 
+/** An admitted inbound message, which a turn's source now has to name. */
+const admit = (h: Harness, nonce: string, channel = "telegram"): void => {
+  h.cp.db.run(
+    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at, payload_digest)
+     VALUES (?, ?, 'owner', ?, ?)`,
+    [channel, nonce, NOW, `sha256:${channel}:${nonce}`],
+  );
+};
+
 const claim = (h: Harness, actorId: string, nonce: string): TurnPermit => {
   const coordinator = coordinatorOf(h);
+  admit(h, nonce);
   const claimed = coordinator.claim({
     targetActorId: actorId,
     prompt: "question",
-    sources: [{ channel: "telegram", nonce, attempt: 1, payload: {} }],
+    sources: [{ channel: "telegram", nonce, attempt: 1 }],
   });
   if (!claimed.allowed) throw new Error(`claim refused: ${claimed.reasonCode}`);
   return claimed.value;
