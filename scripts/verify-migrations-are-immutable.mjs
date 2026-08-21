@@ -18,7 +18,8 @@
  *
  * Usage: verify-migrations-are-immutable.mjs [--update]
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -45,13 +46,80 @@ const { MIGRATIONS, SCHEMA_VERSION } = await import(join(ROOT, "src/db/migration
  * the two leaves a schema that still parses and differs from git by one line.
  */
 const SCHEMA = join(ROOT, "src/db/schema.sql");
+
+/**
+ * Where the original is parked while the probe is applied, so a death mid-probe is repairable.
+ *
+ * The same discipline `verify-guards-are-falsifiable.mjs` uses, for the same reason: this writes
+ * to a tracked source file, and a process that dies between the write and the restore leaves that
+ * file altered with nothing saying so. A `finally` covers a thrown error and covers neither a
+ * SIGKILL nor a machine losing power.
+ */
+const PARKED = join(ROOT, execFileSync("git", ["rev-parse", "--git-path", "schema-probe-in-flight"], {
+  cwd: ROOT,
+  encoding: "utf8",
+}).trim());
+
+/** Puts back whatever a previous run was holding, before this one reads anything. */
+const repairAbandonedProbe = () => {
+  if (!existsSync(PARKED)) return;
+  const parked = readFileSync(PARKED, "utf8");
+  if (readFileSync(SCHEMA, "utf8") !== parked) {
+    writeFileSync(SCHEMA, parked);
+    process.stdout.write("  a previous run died mid-probe; src/db/schema.sql restored\n");
+  }
+  rmSync(PARKED, { force: true });
+};
+
+let holding = null;
+const putBack = () => {
+  if (holding === null) return;
+  writeFileSync(SCHEMA, holding);
+  rmSync(PARKED, { force: true });
+  holding = null;
+};
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => {
+    putBack();
+    process.exit(130);
+  });
+}
+process.on("uncaughtException", (error) => {
+  putBack();
+  throw error;
+});
+
+// Before anything reads the schema, including the import above having read it: a run that died
+// mid-probe left the file altered, and every check after that would be measuring the probe.
+repairAbandonedProbe();
+
+/**
+ * Runs `work` with one SQL comment appended to schema.sql, then puts the file back.
+ *
+ * Classifying by observation rather than by a list: a migration that reads the schema at run time
+ * produces a different checksum when the schema differs, and one holding its own DDL does not. A
+ * list would have to be maintained by whoever adds the next schema-reading migration, and this
+ * file exists because a rule that depends on someone remembering it was already broken twice.
+ *
+ * The window is one synchronous call wide and the original is on disk throughout it, so a reader
+ * that lands inside it sees a schema that still parses and differs by a comment — and the next run
+ * of this script puts it back regardless of how the last one ended.
+ */
 const withPerturbedSchema = (work) => {
   const original = readFileSync(SCHEMA, "utf8");
+  writeFileSync(PARKED, original);
+  holding = original;
   writeFileSync(SCHEMA, `${original}\n-- checksum classification probe\n`);
   try {
     return work();
   } finally {
-    writeFileSync(SCHEMA, original);
+    putBack();
+    // The check the harness learned to make: a restore that did not restore is the failure this
+    // whole mechanism exists to prevent, and it is one comparison away from being observable.
+    if (readFileSync(SCHEMA, "utf8") !== original) {
+      process.stdout.write("  src/db/schema.sql was not restored\n\nRESULT: FAIL\n");
+      process.exit(1);
+    }
   }
 };
 
