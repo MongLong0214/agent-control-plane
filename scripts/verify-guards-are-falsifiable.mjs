@@ -355,8 +355,9 @@ const GUARDS = [
     // winner and as dissent, so a later weaker record settled the turn retry-safe.
     what: "evidence that cannot set the outcome still counts against a retry",
     file: "src/conversation/turn-coordinator.ts",
-    find: "    const distinct = new Set(observations.map((o) => o.observed_outcome));",
-    replace: "    const distinct = new Set(materializing.map((o) => o.observed_outcome));",
+    find: "    const distinct = new Set(unanswered.map((o) => o.observed_outcome));",
+    replace:
+      "    const distinct = new Set(unanswered.filter((o) => MATERIALIZING_AUTHORITIES.has(o.observing_authority)).map((o) => o.observed_outcome));",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
