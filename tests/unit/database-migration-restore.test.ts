@@ -497,7 +497,8 @@ describe("versioned SQLite migration", () => {
         [19, "v19-session-process-identity"],
         [20, "v20-conversational-actor-registry"],
         [21, "v21-canonical-turns"],
-        [SCHEMA_VERSION, "v22-canonical-turn-ledger"],
+        [22, "v22-canonical-turn-ledger"],
+        [SCHEMA_VERSION, "v23-turn-claimed-at"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

@@ -1,6 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { ConversationTurnCoordinator, type TurnSource } from "../../src/conversation/turn-coordinator.ts";
+import {
+  ConversationTurnCoordinator,
+  type TurnPermit,
+  type TurnSource,
+} from "../../src/conversation/turn-coordinator.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -49,7 +53,24 @@ const target = (h: Harness, name: string): string => {
   return actorId;
 };
 
-const coordinatorOf = (h: Harness): ConversationTurnCoordinator =>
+/**
+ * One coordinator per harness.
+ *
+ * Deliberate: a permit is signed with a key that lives only in the instance that issued it, so
+ * handing every call its own coordinator would make every settlement fail for a reason that has
+ * nothing to do with what the test is about. The composed daemon holds one, and these tests hold
+ * one. Where a *second* instance is the subject, `anotherCoordinator` says so out loud.
+ */
+const coordinators = new WeakMap<object, ConversationTurnCoordinator>();
+const coordinatorOf = (h: Harness): ConversationTurnCoordinator => {
+  const existing = coordinators.get(h.cp.db as object);
+  if (existing) return existing;
+  const made = new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
+  coordinators.set(h.cp.db as object, made);
+  return made;
+};
+
+const anotherCoordinator = (h: Harness): ConversationTurnCoordinator =>
   new ConversationTurnCoordinator(h.cp.db, h.cp.clock, h.cp.audit);
 
 const claimOf = (h: Harness, actorId: string, sources: TurnSource[], prompt = "hello") => {
@@ -405,6 +426,110 @@ describe("settlement needs an authority that observed something", () => {
     );
     expect(row?.outcome_kind).toBe("NEVER_ADMITTED");
     expect(row?.resolution_authority).toBe("ACP_PRE_DISPATCH");
+  });
+});
+
+describe("only a permit this coordinator issued can settle a turn", () => {
+  const settleWith = (h: Harness, permit: TurnPermit) =>
+    coordinatorOf(h).settle(permit, {
+      kind: "COMPLETED",
+      authority: "HERMES_TARGET",
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:forged",
+    });
+
+  it("refuses a hand-built permit naming a real turn", () => {
+    // `TurnPermit` is a structural type, so this object satisfies it without a cast. That is
+    // exactly why the shape cannot be the check: what separates a permit from something that
+    // looks like one is the signature, and only the coordinator can produce that.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const real = claimOf(h, actorId, [source("m1")]);
+
+    const decision = settleWith(h, { ...real, issuance: "00".repeat(32) });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_PERMIT_UNISSUED);
+    expect(coordinatorOf(h).unresolved(actorId)).toHaveLength(1);
+  });
+
+  it("refuses a permit whose signature is absent entirely", () => {
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const real = claimOf(h, actorId, [source("m1")]);
+
+    const decision = settleWith(h, { ...real, issuance: "" });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_PERMIT_UNISSUED);
+  });
+
+  it("refuses a genuine permit re-pointed at another actor's turn", () => {
+    // The signature covers the actor, so editing it invalidates the permit. Without that
+    // coverage a caller could settle any turn it knew the id of and have the audit blame
+    // whichever actor it named.
+    const h = makeHarness();
+    const ceo = target(h, "ceo");
+    const cto = target(h, "cto");
+    const real = claimOf(h, ceo, [source("m1")]);
+    claimOf(h, cto, [source("m2")]);
+
+    const decision = settleWith(h, { ...real, targetActorId: cto });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_PERMIT_UNISSUED);
+    expect(coordinatorOf(h).unresolved(ceo)).toHaveLength(1);
+    expect(coordinatorOf(h).unresolved(cto)).toHaveLength(1);
+  });
+
+  it("refuses a permit issued by a different coordinator instance", () => {
+    // The key is per instance and never persisted, so a permit does not outlive the execution
+    // that took it. A process that died observed nothing, and settling from a resurrected
+    // permit would be recording an outcome nobody saw.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const elsewhere = anotherCoordinator(h);
+    const permit = claimOf(h, actorId, [source("m1")]);
+
+    expect(
+      elsewhere.settle(permit, {
+        kind: "NEVER_ADMITTED",
+        authority: "ACP_PRE_DISPATCH",
+        reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+      }).reasonCode,
+    ).toBe(ReasonCode.CONVERSATION_TURN_PERMIT_UNISSUED);
+  });
+
+  it("records the audit against the turn's own actor", () => {
+    // Taken from the row rather than from the permit, so no future bug in permit handling can
+    // steer who the audit says a settlement was about.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+
+    coordinatorOf(h).settle(permit, {
+      kind: "NEVER_ADMITTED",
+      authority: "ACP_PRE_DISPATCH",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+
+    const row = h.cp.db.get<{ actor: string }>(
+      `SELECT actor FROM audit_events WHERE kind = 'CONVERSATION_TURN_SETTLED'`,
+    );
+    expect(row?.actor).toBe(actorId);
+  });
+
+  it("refuses a genuine permit whose turn no longer exists", () => {
+    // Distinct from a forged permit, and reported as such: the permit is real, the turn is not.
+    // Collapsing the two would tell an operator to look for an attacker when the answer is that
+    // something removed the row.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const real = claimOf(h, actorId, [source("m1")]);
+    h.cp.db.run(`DELETE FROM canonical_turn_sources`);
+    h.cp.db.run(`DELETE FROM canonical_turns`);
+
+    expect(settleWith(h, real).reasonCode).toBe(ReasonCode.CONFLICT);
   });
 });
 

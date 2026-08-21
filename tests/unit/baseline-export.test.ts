@@ -828,6 +828,7 @@ describe("baseline boundary contracts", () => {
       "v20-conversational-actor-registry",
       "v21-canonical-turns",
       "v22-canonical-turn-ledger",
+      "v23-turn-claimed-at",
     ]);
   });
 

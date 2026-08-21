@@ -376,6 +376,15 @@ const GUARDS = [
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
+    // `TurnPermit` is a structural type, so the shape alone proves nothing. Without the signature
+    // check any caller can write an object of that shape and settle a turn it never ran.
+    what: "only a permit this coordinator issued can settle a turn",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      const issued = this.assertIssuedHere(permit);\n      if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);",
+    replace: "      void this.assertIssuedHere(permit);",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
     what: "an attempt numbered below one is a malformed request, not a retry-ordering problem",
     file: "src/conversation/turn-coordinator.ts",
     find: "      if (source.attempt < 1) {",
@@ -419,11 +428,42 @@ const files = [...new Set(rows.map((g) => g.file))];
  * reads them back, restores, and says so — which is the difference between a harness that can
  * crash and one whose crash quietly poisons the tree.
  *
- * Kept in .git/ because it must survive the crash, must never be committed, and must not look
- * like a source file to anything that scans the working tree.
+ * Kept in the git directory because it must survive the crash, must never be committed, and must
+ * not look like a source file to anything that scans the working tree.
+ *
+ * Resolved through `git rev-parse --git-path` rather than by joining `.git` onto the root. In a
+ * linked worktree `.git` is a *file* pointing at the real git directory, so the join produces a
+ * path under a regular file and every write dies with ENOTDIR. That is not a corner case here:
+ * `git worktree add --detach` is how a review copy of a branch gets made, and this harness ran
+ * inside one. Reproduced, then fixed.
  */
-const INFLIGHT = join(ROOT, ".git", "verify-guards-in-flight.json");
+const INFLIGHT = join(
+  ROOT,
+  execFileSync("git", ["rev-parse", "--git-path", "verify-guards-in-flight.json"], {
+    cwd: ROOT,
+    encoding: "utf8",
+  }).trim(),
+);
 
+/**
+ * Puts back what this harness is *known* to have written, and refuses to touch anything else.
+ *
+ * The distinction matters because a crash is not the only thing that happens to a file. Between
+ * the death and the next run, someone may legitimately have edited it — and the previous version
+ * of this function wrote the snapshot back whenever the bytes differed from the original, which
+ * silently destroys that edit. A repair that can eat an unrelated change is a worse failure than
+ * the leftover mutation it exists to clean up, because nothing reports it.
+ *
+ * So three states, and only the middle one is written:
+ *
+ *   bytes === the original                  already clean; nothing to do
+ *   bytes === one of this run's mutations    ours, and provably so; restore it
+ *   anything else                            not ours; leave it alone and say so
+ *
+ * The candidate mutations are recomputed from the rows parked *at the time of the crash*, not
+ * from the current table — a row edited since then would otherwise make this run's own leftovers
+ * unrecognisable, which is the same blind spot in a slower form.
+ */
 const repairAbandonedRun = () => {
   let parked;
   try {
@@ -432,10 +472,30 @@ const repairAbandonedRun = () => {
     return; // No file, or one this version cannot read. Either way there is nothing to put back.
   }
   const repaired = [];
+  const unknown = [];
   for (const [file, text] of Object.entries(parked.originals ?? {})) {
-    if (readFileSync(join(ROOT, file), "utf8") === text) continue;
+    const current = readFileSync(join(ROOT, file), "utf8");
+    if (current === text) continue;
+    // Mirrors how a mutation is applied: `String.replace` with a string pattern, first match
+    // only. The anchor was proven unique before any of them ran.
+    const ours = (parked.mutations?.[file] ?? []).some(
+      (m) => text.replace(m.find, m.replace) === current,
+    );
+    if (!ours) {
+      unknown.push(file);
+      continue;
+    }
     writeFileSync(join(ROOT, file), text);
     repaired.push(file);
+  }
+  if (unknown.length > 0) {
+    // Fail closed, and keep the sentinel: whoever resolves this by hand still needs it, and
+    // deleting it here would throw away the only record of what the dead run was holding.
+    out("verify-guards-are-falsifiable: a previous run died mid-mutation, and these files have");
+    out("changed since in a way this harness did not write. Refusing to overwrite them.\n");
+    for (const file of unknown) out("  " + file);
+    out(`\nThe originals it was holding are in ${INFLIGHT}. Reconcile by hand, then delete it.`);
+    process.exit(1);
   }
   rmSync(INFLIGHT, { force: true });
   if (repaired.length > 0) {
@@ -464,7 +524,21 @@ if (dirty.length > 0) {
 }
 
 const originals = new Map(files.map((f) => [f, readFileSync(join(ROOT, f), "utf8")]));
-writeFileSync(INFLIGHT, JSON.stringify({ originals: Object.fromEntries(originals) }));
+// The rows go in alongside the originals so a later run can tell this run's leftovers from an
+// unrelated edit. Recomputing from the live table instead would stop recognising them the moment
+// a row is edited — the same blind spot, arriving later.
+writeFileSync(
+  INFLIGHT,
+  JSON.stringify({
+    originals: Object.fromEntries(originals),
+    mutations: Object.fromEntries(
+      files.map((file) => [
+        file,
+        rows.filter((g) => g.file === file).map((g) => ({ find: g.find, replace: g.replace })),
+      ]),
+    ),
+  }),
+);
 /**
  * Refuses to write over a file that is not in the state this harness left it in.
  *

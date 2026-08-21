@@ -278,6 +278,15 @@ export const ReasonCode = {
    * write. A completed one must never run again; one still in doubt must not be raced.
    */
   CONVERSATION_TURN_ATTEMPT_UNSAFE: "CONVERSATION_TURN_ATTEMPT_UNSAFE",
+  /**
+   * A permit offered to settle a turn was not issued by the coordinator being asked.
+   *
+   * `TurnPermit` is a structural type, so the shape alone proves nothing; the signature is what
+   * separates a permit from an object that looks like one.
+   */
+  CONVERSATION_TURN_PERMIT_UNISSUED: "CONVERSATION_TURN_PERMIT_UNISSUED",
+  /** A genuinely issued permit whose contents disagree with the turn row it names. */
+  CONVERSATION_TURN_PERMIT_MISMATCH: "CONVERSATION_TURN_PERMIT_MISMATCH",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",

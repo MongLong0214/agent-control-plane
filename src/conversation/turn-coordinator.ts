@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
@@ -33,6 +33,20 @@ export interface TurnPermit {
   readonly turnRequestId: string;
   readonly targetActorId: string;
   readonly promptDigest: string;
+  /**
+   * Proof that this coordinator issued the permit, over the three fields above.
+   *
+   * A TypeScript interface is structural: any caller can write an object of this shape, and
+   * `settle()` used to trust whatever `turnRequestId` it found there. So the opacity is enforced
+   * at runtime instead of by the type — the key never leaves the coordinator, and a hand-built
+   * permit cannot carry a signature that verifies.
+   *
+   * The key is per instance and not persisted, so a permit does not survive the process that
+   * issued it. That is the right lifetime rather than a limitation: a permit is the right to
+   * report what *this* execution observed, and a process that died observed nothing. Settling a
+   * turn after a restart is the reconciler's job, from a receipt, not a resurrected permit.
+   */
+  readonly issuance: string;
 }
 
 /** How a turn ended, when something positively established it. */
@@ -76,11 +90,41 @@ export type TurnOutcome =
  * somebody follows.
  */
 export class ConversationTurnCoordinator {
+  /** Never persisted, never exported. See `TurnPermit.issuance`. */
+  readonly #issuanceKey = randomUUID();
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
   ) {}
+
+  #sign(fields: Omit<TurnPermit, "issuance">): string {
+    return createHmac("sha256", this.#issuanceKey)
+      .update(digestOf([fields.turnRequestId, fields.targetActorId, fields.promptDigest]))
+      .digest("hex");
+  }
+
+  /**
+   * Whether this coordinator issued this permit.
+   *
+   * Compared in constant time. The comparison is not a secret-recovery target in any realistic
+   * sense here, but a plain `!==` on a MAC is the kind of detail that gets copied into somewhere
+   * it does matter.
+   */
+  private assertIssuedHere(permit: TurnPermit): Decision<void> {
+    const expected = Buffer.from(this.#sign(permit), "hex");
+    const offered = Buffer.from(String(permit.issuance ?? ""), "hex");
+    const genuine = expected.length === offered.length && timingSafeEqual(expected, offered);
+    if (!genuine) {
+      return deny(
+        ReasonCode.CONVERSATION_TURN_PERMIT_UNISSUED,
+        "this permit was not issued by this coordinator",
+        { turnRequestId: permit.turnRequestId },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
 
   /**
    * Claims the right to run one turn for an actor, consuming one or more inbound messages.
@@ -206,7 +250,8 @@ export class ConversationTurnCoordinator {
         },
       });
 
-      return allow(ReasonCode.OK, { turnRequestId, targetActorId: input.targetActorId, promptDigest });
+      const fields = { turnRequestId, targetActorId: input.targetActorId, promptDigest };
+      return allow(ReasonCode.OK, { ...fields, issuance: this.#sign(fields) });
     });
   }
 
@@ -220,6 +265,30 @@ export class ConversationTurnCoordinator {
    */
   settle(permit: TurnPermit, outcome: TurnOutcome): Decision<void> {
     return this.db.tx(() => {
+      const issued = this.assertIssuedHere(permit);
+      if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
+
+      const row = this.db.get<{ target_actor_id: string; prompt_digest: string }>(
+        `SELECT target_actor_id, prompt_digest FROM canonical_turns WHERE turn_request_id = ?`,
+        [permit.turnRequestId],
+      );
+      if (!row) {
+        return deny(ReasonCode.CONFLICT, "no turn was ever claimed under this id", {
+          turnRequestId: permit.turnRequestId,
+        });
+      }
+      if (row.target_actor_id !== permit.targetActorId || row.prompt_digest !== permit.promptDigest) {
+        // A permit whose signature is genuine but whose contents disagree with the row it names.
+        // Reachable if a caller keeps a permit and mutates it before settling; the signature
+        // covers the fields, so this is belt and braces, and it is the check that makes the
+        // settlement provably about the turn the permit was issued for.
+        return deny(
+          ReasonCode.CONVERSATION_TURN_PERMIT_MISMATCH,
+          "this permit does not describe the turn it names",
+          { turnRequestId: permit.turnRequestId },
+        );
+      }
+
       const auditEventId = `ev_${randomUUID().replace(/-/g, "")}`;
       const evidenceDigest =
         outcome.kind === "NEVER_ADMITTED"
@@ -257,7 +326,15 @@ export class ConversationTurnCoordinator {
       }
       this.audit.record({
         kind: "CONVERSATION_TURN_SETTLED",
-        actor: permit.targetActorId,
+        // The row's actor, not the permit's.
+        //
+        // Not independently falsifiable, and listed as such rather than as a guard: the issuance
+        // signature covers the actor, so anything reaching this line already agrees with the row,
+        // and swapping this expression for `permit.targetActorId` kills no test. It stays because
+        // the row is the authoritative source and reading it costs nothing — but a falsifiability
+        // row for it would report coverage that does not exist. The check that actually stops a
+        // re-pointed permit is the signature, and that one has a test which dies without it.
+        actor: row.target_actor_id,
         evidence: {
           turnRequestId: permit.turnRequestId,
           outcome: outcome.kind,
