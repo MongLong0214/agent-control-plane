@@ -95,3 +95,62 @@ END;
     expect(done.status).toBe(0);
   });
 });
+
+describe("a no_replace trigger has to name what a REPLACE would collide on", () => {
+  it("fails on a guard that names none of its table's keys", () => {
+    // The guard exists, is named correctly, and refuses nothing. Its presence used to be all the
+    // census asked for — a check satisfied by a name.
+    const injected = `${CURRENT()}
+CREATE TABLE IF NOT EXISTS census_probe_table (
+  probe_id TEXT PRIMARY KEY
+);
+
+CREATE TRIGGER IF NOT EXISTS census_probe_immutable
+BEFORE UPDATE OF probe_id ON census_probe_table
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS census_probe_table_no_replace
+BEFORE INSERT ON census_probe_table
+WHEN 1 = 2
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_NO_REPLACE');
+END;
+`;
+    const done = censusOn(injected);
+
+    expect(done.stdout).toContain("census_probe_table");
+    expect(done.status).toBe(1);
+  });
+
+  it("fails on a guard that names only part of a composite key", () => {
+    // Naming less than the key refuses legitimate inserts — measured once, on a registry whose
+    // rotation this shape blocked — and naming a key that is not the whole one lets the collision
+    // it was written for through.
+    const injected = `${CURRENT()}
+CREATE TABLE IF NOT EXISTS census_probe_table (
+  left_id  TEXT NOT NULL,
+  right_id TEXT NOT NULL,
+  PRIMARY KEY (left_id, right_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS census_probe_immutable
+BEFORE UPDATE OF left_id ON census_probe_table
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS census_probe_table_no_replace
+BEFORE INSERT ON census_probe_table
+WHEN EXISTS (SELECT 1 FROM census_probe_table WHERE left_id = NEW.left_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_NO_REPLACE');
+END;
+`;
+    const done = censusOn(injected);
+
+    expect(done.stdout).toContain("census_probe_table");
+    expect(done.status).toBe(1);
+  });
+});

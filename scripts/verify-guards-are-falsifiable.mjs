@@ -573,6 +573,15 @@ const GUARDS = [
     replace: "   WHERE (actor_id = NEW.actor_id)",
     killedBy: ["tests/unit/replace-cannot-rewrite-a-guarded-row.test.ts"],
   },
+  {
+    // Its first version required the WHEN clause on one line and silently checked sixteen of
+    // twenty triggers, in the check written to close the census's blind spot.
+    what: "the key check reads every no_replace trigger, whatever its line breaks",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "  const uncovered = keys.filter(",
+    replace: "  const uncovered = [].filter(",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
