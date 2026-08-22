@@ -1645,6 +1645,13 @@ CREATE TABLE IF NOT EXISTS canonical_turn_observations (
   -- collided. Both are wrong in the same place: the identity has to name the issuer *and* bind
   -- the turn, so exact redelivery is a no-op and anything else is a typed conflict.
   UNIQUE (observing_authority, receipt_id),
+  -- The three fields are what make the row a record of something observed rather than a caller's
+  -- assertion, and NOT NULL does not say that: all three were accepted empty and stored empty on
+  -- the head that merged this table, so a settlement could say COMPLETED and cite nothing.
+  -- `receipt_id` is the sharpest of the three because it is half of the identity above — the first
+  -- blank settlement an authority makes takes that slot, and every later blank one is read as a
+  -- redelivery of it or refused as a reuse conflict against evidence that never existed.
+  CHECK (receipt_id <> '' AND evidence_digest <> '' AND reason_code <> ''),
   CHECK (
     (observed_outcome = 'NEVER_ADMITTED' AND observing_authority = 'ACP_PRE_DISPATCH')
     OR (observed_outcome = 'COMPLETED'

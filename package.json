@@ -33,6 +33,7 @@
     "hooks:check": "node scripts/verify-hooks-are-installed.mjs",
     "hooks:install": "node scripts/install-hooks.mjs",
     "trailers": "node scripts/verify-trailers-are-parsable.mjs",
+    "merge": "node scripts/merge-pr.mjs",
     "migrations:check": "node scripts/verify-migrations-are-immutable.mjs",
     "migrations:freeze": "node scripts/verify-migrations-are-immutable.mjs --update",
     "schema:census": "node scripts/verify-append-only-tables-are-closed.mjs",

@@ -34,3 +34,15 @@ hook that a clone silently starts running is a code-execution path, and git clos
 
 Both hooks refuse rather than warn, for the same reason: every one of these was already *detected*
 by something that let the commit through.
+
+**What a hook cannot reach.** A squash-merge commit is composed by GitHub from the arguments given
+to `gh pr merge`, so no hook on this machine sees it. On 2026-08-22 a wrapped `Limit:` landed on
+`main` that way, with this hook installed and working. Measuring it found the larger loss: a squash
+concatenates every branch commit message and git reads only the *last* paragraph, so a merge drops
+all but the final commit's records — 41 of 44 across the three merges then on `main`.
+
+`scripts/merge-pr.mjs` (`pnpm merge`) is the path that can reach it: it hands the draft body to
+`commitlore squash-preserve`, which carries the branch's records onto the merge message, then runs
+the same check this hook runs before anything is merged. Nothing *forces* a merge through it —
+`gh pr merge` still works — so the post-merge `pnpm trailers HEAD~1..HEAD` step in CI stays as the
+loud failure on any other path.

@@ -449,6 +449,23 @@ export class ConversationTurnCoordinator {
       const issued = this.assertIssuedHere(permit);
       if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
 
+      // The three fields are what make the row a record of something observed. Measured on the
+      // merged head, all three were accepted empty and stored empty, so a settlement could say
+      // COMPLETED and cite nothing. The receipt id is the sharpest: it is half of
+      // `(observing_authority, receipt_id)`, so the first blank settlement an authority makes takes
+      // that slot and every later blank one is either a redelivery of it or a reuse conflict
+      // against evidence that never existed.
+      const blank = (["receiptId", "evidenceDigest", "reasonCode"] as const).filter(
+        (field) => String(observation[field] ?? "").trim() === "",
+      );
+      if (blank.length > 0) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_OBSERVATION_UNEVIDENCED,
+          `an observation must carry a ${blank.join(", a ")}`,
+          { turnRequestId: permit.turnRequestId, authority: observation.authority, blank },
+        );
+      }
+
       const row = this.db.get<{ target_actor_id: string; prompt_digest: string }>(
         `SELECT target_actor_id, prompt_digest FROM canonical_turns WHERE turn_request_id = ?`,
         [permit.turnRequestId],
@@ -952,6 +969,20 @@ export class ConversationTurnCoordinator {
       //
       // The lesson is not about this condition. I reasoned from two mechanisms to "no state can
       // reach here" and did not try to build one; the state took three calls.
+      //
+      // And the guarantee these three make is conditional, which is worth stating where the rule
+      // is rather than in a design note. A retry is admitted after `NEVER_ADMITTED`, so:
+      //
+      //   preDispatch.neverAdmitted(P1)  -> a turn that in fact ran is recorded as never started
+      //   claim(attempt 2)               -> admitted; the owner's message is dispatched again
+      //   target.completed(P1) arrives   -> CONTRADICTED, correctly, and one turn too late
+      //
+      // Nothing here can refuse that, because the rule's whole input is what the authorities
+      // reported. **Exactly-once holds exactly as far as `ACP_PRE_DISPATCH` is truthful**, and
+      // what makes it truthful is that the port is only reachable before dispatch — a discipline
+      // in the caller, not a property the coordinator checks. #662 is that gap; this is what it
+      // costs. Refusing the retry instead would turn every transient refusal into a permanent
+      // hold, which is the failure #651 is about, so the trade is deliberate and one-directional.
       const settledSafely =
         (previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED") &&
         (anyCompletion?.n ?? 0) === 0 &&

@@ -5,25 +5,25 @@
 # trailer block — so the record was written, looked right in the editor, and was stored by nobody.
 # CommitLore prints a warning and exits 0, which is a note about a mistake that already exists.
 #
-# The first version of this hook approximated git's rule with awk and got it wrong: it caught a
-# wrapped line and missed a trailer block with no blank line before it, which git also refuses.
-# So it asks git. `git interpret-trailers --parse` is the code that decides, and comparing what
-# the message *says* against what that returns is the only phrasing of the question that cannot
-# drift from the answer.
+# This hook used to hold its own copy of the rule, in shell. That copy and the range check in
+# `scripts/verify-trailers-are-parsable.mjs` were two implementations of one rule, and they did not
+# agree: the range check could not see a trailer stranded in a paragraph that was not the last one,
+# which is what a squash merge produces, and it reported three such merges on `main` as clean while
+# 41 records were dropped. One rule has one implementation now, and this hook is one of its callers.
+#
+# The script asks `git interpret-trailers --parse` rather than restating its rule, because every
+# phrasing of the question that is not "run the code that decides" can drift from the answer — and
+# the first version of this hook drifted exactly that way.
 MSG_FILE="$1"
 [ -f "$MSG_FILE" ] || exit 0
 
-# Comments are stripped the way git strips them, so a commented-out example is not counted.
-body=$(grep -v '^#' "$MSG_FILE")
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+CHECK="$ROOT/scripts/verify-trailers-are-parsable.mjs"
+[ -f "$CHECK" ] || exit 0
 
-written=$(printf '%s\n' "$body" | grep -cE '^(Limit|Ruled-out|Warn|Supersedes|Refs):' || true)
-parsed=$(printf '%s\n' "$body" | git interpret-trailers --parse \
-  | grep -cE '^(Limit|Ruled-out|Warn|Supersedes|Refs):' || true)
-
-if [ "$written" -gt "$parsed" ]; then
-  echo "commit-msg: the message writes $written trailer line(s); git parses $parsed." >&2
+if ! node "$CHECK" --message-file "$MSG_FILE" >/dev/null 2>&1; then
+  node "$CHECK" --message-file "$MSG_FILE" >&2
   echo "" >&2
-  echo "A trailer must be one line, and the block must be the last paragraph with a blank line" >&2
-  echo "before it. Length is fine; a line break inside a trailer is not." >&2
+  echo "commit-msg: this message writes a record git will not store." >&2
   exit 1
 fi
