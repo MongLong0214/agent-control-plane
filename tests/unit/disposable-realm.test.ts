@@ -13,6 +13,7 @@ import {
   REALM_EVIDENCE_CLAIM,
   assertProductionUnchanged,
   censusDatabaseFamily,
+  censusProductionEntries,
   classifyProbeSignal,
   mayTerminate,
   planDisposableRealm,
@@ -286,6 +287,7 @@ describe("production has to be the same set of facts afterwards", () => {
     bindingGenerations: ["CEO:1"],
     assignmentIds: ["assign:1"],
     databaseFamily: family(),
+    productionEntries: ["state.sqlite", "state.sqlite-wal"],
     ...overrides,
   });
 
@@ -353,6 +355,36 @@ describe("production has to be the same set of facts afterwards", () => {
     const before = census({ actorIds: ["a", `b${delimiter}c`] });
     const after = census({ actorIds: [`a${delimiter}b`, "c"] });
     expect(assertProductionUnchanged(before, after).allowed).toBe(false);
+  });
+
+  it("reports a new entry under the production root", () => {
+    // The id lists answer "did production's records change" and the database family answers "did
+    // its bytes move". Neither answers "did something appear" — and twice on this branch a probe
+    // reached production by creating a file there, which this census called unchanged and the
+    // residue check never looks at.
+    const before = census();
+    const after = census({ productionEntries: ["state.sqlite", "state.sqlite-wal", "escape"] });
+
+    const decision = assertProductionUnchanged(before, after);
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect((decision.evidence as { differences: string[] }).differences).toContain("productionEntries");
+  });
+
+  it("reports one disappearing as well", () => {
+    const decision = assertProductionUnchanged(census(), census({ productionEntries: ["state.sqlite"] }));
+
+    expect(decision.allowed).toBe(false);
+  });
+
+  it("says nothing when the entries are the same set in a different order", () => {
+    const decision = assertProductionUnchanged(
+      census(),
+      census({ productionEntries: ["state.sqlite-wal", "state.sqlite"] }),
+    );
+
+    expect(decision.allowed).toBe(true);
   });
 });
 
@@ -895,5 +927,32 @@ describe("every path the realm declares is checked, by existing rather than by b
       if (decision.allowed) continue;
       expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
     }
+  });
+});
+
+describe("listing production is a read that can fail", () => {
+  it("refuses rather than reporting an empty production it could not read", () => {
+    // Fails closed like the family read does. An unreadable root is an unobserved production, and
+    // reporting it as empty would make "nothing is there" and "I could not look" the same census.
+    const root = join(tempDir("acp-census-unreadable-"), "production");
+    mkdirSync(root, { recursive: true });
+    chmodSync(root, 0o000);
+    try {
+      const decision = censusProductionEntries(root);
+
+      expect(decision.allowed).toBe(false);
+      if (decision.allowed) return;
+      expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_CENSUS_UNOBSERVABLE);
+    } finally {
+      chmodSync(root, 0o700);
+    }
+  });
+
+  it("reports an absent production root as an empty list, because absence is a fact", () => {
+    const decision = censusProductionEntries(join(tempDir("acp-census-absent-"), "nowhere"));
+
+    expect(decision.allowed).toBe(true);
+    if (!decision.allowed) return;
+    expect(decision.value).toEqual([]);
   });
 });

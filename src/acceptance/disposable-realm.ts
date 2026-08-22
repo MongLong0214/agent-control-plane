@@ -85,7 +85,41 @@ export interface ProductionCensus {
    * checkpoint ran, which is a write to the main file by another name.
    */
   readonly databaseFamily: readonly DatabaseFile[];
+  /**
+   * Every entry directly under the production root, by name.
+   *
+   * The three id lists and the database family answer "did production's records change". They do
+   * not answer "did something appear in production", and twice on this branch a probe reached
+   * production by creating a *file* there — a path this census would have called unchanged and the
+   * residue check never looks at, because it only looks inside the realm.
+   *
+   * Names rather than contents: this is the catch-all for something arriving, and reading every
+   * file to hash it would make the census a load on the deployment it is supposed to observe
+   * without touching. What a file's *contents* changing looks like is the database family's job.
+   */
+  readonly productionEntries: readonly string[];
 }
+
+/**
+ * The names directly under the production root, for a census.
+ *
+ * Fails closed like the family read does: a root that cannot be listed is an unobserved production,
+ * not an empty one.
+ */
+export const censusProductionEntries = (productionRoot: string): Decision<readonly string[]> => {
+  try {
+    return allow(ReasonCode.OK, readdirSync(productionRoot).sort());
+  } catch (error) {
+    const code = errorCodeOf(error);
+    // Absent is a value: production not existing is a fact two censuses can agree on.
+    if (code === "ENOENT") return allow(ReasonCode.OK, []);
+    return deny(
+      ReasonCode.ACCEPTANCE_CENSUS_UNOBSERVABLE,
+      "the production root could not be listed, so what is in it is unknown",
+      { productionRoot, code },
+    );
+  }
+};
 
 /** The suffixes SQLite may create beside a database file. */
 export const DATABASE_FAMILY_SUFFIXES = ["", "-wal", "-shm", "-journal"] as const;
@@ -493,6 +527,9 @@ export const assertProductionUnchanged = (
   }
   if (!sameMultiset(before.assignmentIds, after.assignmentIds)) differences.push("assignmentIds");
   if (!sameFamily(before.databaseFamily, after.databaseFamily)) differences.push("databaseFamily");
+  if (!sameMultiset(before.productionEntries, after.productionEntries)) {
+    differences.push("productionEntries");
+  }
 
   if (differences.length > 0) {
     return deny(

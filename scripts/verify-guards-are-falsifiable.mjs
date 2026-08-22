@@ -584,6 +584,24 @@ const GUARDS = [
     replace: "  for (const [name, path] of named.slice(1)) {",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
+  {
+    // Twice on this branch a probe reached production by creating a file there, and the census
+    // called production unchanged.
+    what: "something appearing under production is a census difference",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!sameMultiset(before.productionEntries, after.productionEntries)) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // An unreadable production root reported as empty makes "nothing is there" and "I could not
+    // look" the same census.
+    what: "a production root that cannot be listed is refused, not reported empty",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '    if (code === "ENOENT") return allow(ReasonCode.OK, []);',
+    replace: '    return allow(ReasonCode.OK, []);',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
