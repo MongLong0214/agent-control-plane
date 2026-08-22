@@ -129,6 +129,57 @@ describe("a reply moving through its lifecycle does not take the turn's with it"
     ).toBe("turn-1");
   });
 
+  it("resolves the turn in the same transaction that records the reply", () => {
+    // A review found the window: the process commits APPLIED, crashes, and on restart
+    // `completeResponse` sees APPLIED and returns before it ever resolves the turn. The claim is
+    // then outstanding forever — re-admission is refused as an unknown outcome and pruning
+    // preserves the row, so a finished turn holds the nonce.
+    //
+    // Any ordering of two commits has that window, so they are one commit.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "n1");
+    guard.claimTurn("telegram", "n1", identity());
+    reserve(guard, "n1");
+
+    const done = guard.completeReplyAndResolveTurn("telegram", "n1", {
+      kind: "TELEGRAM_WORKFLOW",
+      phase: "REPLIED",
+      reply: "답",
+      sent: true,
+      deliveryStatus: "APPLIED",
+    });
+
+    expect(done.allowed).toBe(true);
+    expect(
+      (JSON.parse(storedClaim(harness, "n1") ?? "{}") as { repliedAt?: string }).repliedAt,
+    ).toBe(harness.clock.nowIso());
+    expect(guard.unresolvedTurns("telegram", "session-digest")).toEqual([]);
+  });
+
+  it("leaves the claim outstanding when the reply transition is refused", () => {
+    // The other half of one transaction: a completion that cannot happen must not resolve the turn
+    // either. Without a reservation the APPLIED transition is refused, and the claim has to stay.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "n1");
+    guard.claimTurn("telegram", "n1", identity());
+
+    const refused = guard.completeReplyAndResolveTurn("telegram", "n1", {
+      kind: "TELEGRAM_WORKFLOW",
+      phase: "REPLIED",
+      reply: "답",
+      sent: true,
+      deliveryStatus: "APPLIED",
+    });
+
+    expect(refused.allowed).toBe(false);
+    expect(
+      (JSON.parse(storedClaim(harness, "n1") ?? "{}") as { repliedAt?: string }).repliedAt,
+    ).toBeUndefined();
+    expect(guard.unresolvedTurns("telegram", "session-digest").map((t) => t.nonce)).toEqual(["n1"]);
+  });
+
   it("is a no-op for a message that never claimed a turn", () => {
     // The ordinary non-CEO path: a handler that only formats a reply. Nothing to resolve, and a
     // refusal here would make every such message fail.

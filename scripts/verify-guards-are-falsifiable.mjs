@@ -99,10 +99,12 @@ const GUARDS = [
     // Without it a finished turn's claim is never cleared, and every replay of a completed
     // exchange reports an unknown outcome — a hold created by the fix above.
     what: "a turn whose reply the transport accepted stops being outstanding",
-    file: "src/ingress/telegram-router.ts",
-    find: "    const resolved = this.ingress.resolveTurn(outcome.nonce);",
-    replace: "    const resolved = { allowed: true } as const;",
-    killedBy: ["tests/unit/telegram-ingress.test.ts"],
+    file: "src/ingress/ingress-guard.ts",
+    find: "      return this.#resolveTurnHere(channel, nonce);",
+    replace: "      return completed;",
+    killedBy: [
+      "tests/unit/a-turn-and-a-reply-are-two-lifecycles.test.ts::resolves the turn in the same transaction that records the reply",
+    ],
   },
   {
     // The #662 hole: a caller that dispatched, reported that nothing ran, and got attempt 2

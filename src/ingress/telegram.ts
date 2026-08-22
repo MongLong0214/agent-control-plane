@@ -299,4 +299,9 @@ export class TelegramIngress {
   resolveTurn(nonce: string): Decision<void> {
     return this.guard.resolveTurn("telegram", nonce);
   }
+
+  /** The reply's terminal transition and the turn's resolution, in one transaction. */
+  completeReplyAndResolveTurn(nonce: string, result: unknown): Decision<void> {
+    return this.guard.completeReplyAndResolveTurn("telegram", nonce, result);
+  }
 }

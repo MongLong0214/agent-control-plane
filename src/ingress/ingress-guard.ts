@@ -431,7 +431,17 @@ export class IngressGuard {
     result: unknown,
     expected: "AVAILABLE" | "PENDING",
   ): Decision<void> {
-    return this.db.tx(() => {
+    return this.db.tx(() => this.#recordResultHere(channel, nonce, result, expected));
+  }
+
+  /** `recordResultIf` without its transaction, so it can share one with the turn's resolution. */
+  #recordResultHere(
+    channel: string,
+    nonce: string,
+    result: unknown,
+    expected: "AVAILABLE" | "PENDING",
+  ): Decision<void> {
+    {
       const current = this.db.get<{ result_json: string | null }>(
         `SELECT result_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
         [channel, nonce],
@@ -457,7 +467,7 @@ export class IngressGuard {
       return updated.changes === 1
         ? allow(ReasonCode.OK, undefined)
         : deny(ReasonCode.RESOURCE_COLLISION, "ingress result transition raced another writer", { channel, nonce });
-    });
+    }
   }
 
   private refuse(
@@ -533,7 +543,30 @@ export class IngressGuard {
    * against when one exists (#638).
    */
   resolveTurn(channel: string, nonce: string): Decision<void> {
+    return this.db.tx(() => this.#resolveTurnHere(channel, nonce));
+  }
+
+  /**
+   * The reply's terminal transition and the turn's resolution, in one transaction.
+   *
+   * They were two calls, and a review found the window between them: the process commits
+   * `APPLIED`, crashes, and on restart `completeResponse` sees `APPLIED` and returns before it
+   * reaches the resolution. The claim is then outstanding forever — re-admission is refused as an
+   * unknown outcome and pruning preserves the row, so the nonce is held by a turn that finished.
+   *
+   * One transaction is the fix, not a second call placed more carefully: any ordering of two
+   * commits has a window, and this is the commit that says the owner has the reply.
+   */
+  completeReplyAndResolveTurn(channel: string, nonce: string, result: unknown): Decision<void> {
     return this.db.tx(() => {
+      const completed = this.#recordResultHere(channel, nonce, result, "PENDING");
+      if (!completed.allowed) return completed;
+      return this.#resolveTurnHere(channel, nonce);
+    });
+  }
+
+  #resolveTurnHere(channel: string, nonce: string): Decision<void> {
+    {
       const current = this.db.get<{ turn_claim_json: string | null }>(
         `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
         [channel, nonce],
@@ -550,7 +583,7 @@ export class IngressGuard {
         [this.clock.nowIso(), channel, nonce],
       );
       return allow(ReasonCode.OK, undefined);
-    });
+    }
   }
 
   private prune(channel: string, ttlMs: number): void {

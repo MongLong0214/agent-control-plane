@@ -2008,10 +2008,16 @@ const v30: SchemaMigration = {
     }
     // A claim that is still in the reply's field. `result_json` is cleared for those rows because a
     // claimed turn has no reply yet — that is what made the overwrite possible in the first place.
+    // `json_valid` first. `json_extract` on a malformed value is an error, not NULL, so one
+    // unparseable row aborted the UPDATE and with it the migration — and it would abort every
+    // retry, because the row that caused it is still there. A row nobody can parse holds no claim
+    // anyone can act on, so it is left where it is rather than made fatal.
     raw.exec(
       `UPDATE inbound_messages
           SET turn_claim_json = result_json, result_json = NULL
         WHERE turn_claim_json IS NULL
+          AND result_json IS NOT NULL
+          AND json_valid(result_json)
           AND json_extract(result_json, '$.deliveryStatus') = 'TURN_CLAIMED'`,
     );
   },
