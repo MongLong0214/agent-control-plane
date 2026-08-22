@@ -1,0 +1,142 @@
+Limit: adjudication still has no writer. The vocabulary and the citation column exist and nothing produces one, so a contradicted conversation stays quarantined until someone acts through the database. Doctor names the conflicting observation ids so that action has something to cite. Raw SQL can no longer clear it silently, which makes the wedge honest rather than hidden — but it is still a wedge.
+Limit: a settlement is authenticated as coming from the coordinator, not as coming from the authority it names. `observe()` verifies the permit; nothing verifies a receipt signature or binds evidence to the attested session. That is the open caller-assertion problem and this PR does not close it.
+Limit: recovery after a restart cannot use this API. The permit key dies with the process, so a recovered target receipt has no way in. Authority-scoped entry points that do not require the dead permit are the next piece.
+Limit: the retry rule's three conditions overlap, and only the dispute check is independently falsifiable — a dispute with no completion in it. The other two carry no mutation row, because a row for a check nothing can kill reports coverage that does not exist.
+Ruled-out: settling by UPDATE conditional on IN_DOUBT | it makes the first record win, discarding the later authority — usually the one that knows.
+Ruled-out: a CONTRADICTED lifecycle state | a past turn can be contradicted while the actor already holds a new one, and one partial-unique slot cannot hold both.
+Ruled-out: letting ACP's own observation of a reply materialize COMPLETED | COMPLETED forbids a re-run, so a wrong one loses the owner's question rather than duplicating it.
+Ruled-out: counting only materializing observations when deciding contradiction | that is what made an observed reply invisible as dissent, and the measured result was a duplicate.
+Ruled-out: guarding only the weakening of an outcome | the first settlement was then unguarded, and a forged one legalised a retry.
+Ruled-out: a global receipt id namespace | one turn's receipt id collided with another's and silently discarded genuine evidence.
+Ruled-out: minting an `ev_<uuid>` for the audit link | it satisfies a NOT NULL column and identifies no row.
+Ruled-out: reporting every failed turn insert as a busy conversation | a foreign-key or IO fault wore a conversational name.
+Provenance: inherited 132309ae8db3b2022e5c57e1f851871717188e23
+
+Limit: a retry admitted before a late completion arrives is still outstanding when it arrives. Nothing here can un-authorise a dispatch that already happened; the quarantine stops the *next* claim, and a turn already dispatched waits for its own receipt or fence. Making the not-yet-dispatched case refuse is a property the wiring has to hold, and the wiring does not exist.
+Limit: `adjudicates_observation_id` is a plain foreign key with no same-turn constraint, so the citation is checked in the coordinator and not by the schema. A raw writer cannot insert an observation at all now, which is what makes that acceptable rather than merely tolerable.
+Limit: a settlement is still authenticated as coming from the coordinator rather than from the authority it names. That is the open caller-assertion problem.
+Ruled-out: leaving `materializeTurn` public because only the coordinator calls it | the whole premise of the marker, the capability tokens and the file-keyed issuance is that a `Db` holder is untrusted. Against that premise, "only the coordinator calls it" is a convention.
+Ruled-out: refusing REPLACE in the statement check instead of enabling recursive triggers | the check reads the first verb, and `INSERT OR REPLACE` passes it. The guards have to hold against the statement, not against its spelling.
+Ruled-out: keeping the marker's four-field tuple | it authenticated less than the trigger guarded, so the parts it did not name were free. A tuple that covers some of a write is a check that does not hold its own subject.
+Ruled-out: an adjudication that can choose the outcome | the conservative order chose it from the evidence, and letting a human step pick a more retry-safe one makes "an authenticated COMPLETED is never lowered" a preference.
+Ruled-out: ADJUDICATED as terminal | later evidence would then be discarded by a rollback, which is the ledger refusing to hear the thing it exists to record.
+Provenance: inherited c2b188910d88c5def30b3368f2b051d73ad58271
+
+Limit: the citation trigger proves an observation belongs to the turn; it does not prove the set is complete. Completeness is checked in the coordinator, and a raw writer cannot insert an adjudication at all, which is what makes that acceptable rather than merely tolerable.
+Limit: observe() still authenticates a settlement as coming from the coordinator rather than from the authority it names. Authority-specific ports are the next piece and this does not close the caller-assertion problem.
+Ruled-out: an adjudication that picks its own outcome | the evidence already chose it under the conservative order, and a step that could pick differently makes the order advisory.
+Ruled-out: ADJUDICATED as terminal | later evidence would be discarded by a rollback, which is the ledger refusing to hear the thing it exists to record.
+Ruled-out: rewriting v24's DDL a third time | a database created at the previous head would refuse to open, and the reviewer had to find that rather than the migration tests.
+Provenance: inherited 95cf91c8e7299ce38c00a06e196a762888b2b423
+
+Limit: which port a component holds is a property of the wiring, and no runtime test can prove a component was handed the right one. What is checkable is that each port records only its own authority and that the ports and the schema permit the same set.
+Limit: the root reserving the capability closes an ordering race, not an in-process adversary. A public issuer on an object anyone can hold cannot be made unreachable in this language, and saying otherwise would be the same overclaim the trigger comment just lost.
+Ruled-out: keeping observe() public with the authority as a field | the authority is the whole claim an observation makes, and a claim the caller types is not evidence.
+Ruled-out: binding the marker to the full tuple to make the old comment true | the recompute produces the values inside the closure and the three tables share no tuple, so the honest fix was the sentence.
+Ruled-out: an optional pre-issued token on each consumer's constructor | a parameter callers may omit is a check with a documented way past it; the once-per-file issuance already makes a late claimant fail loudly.
+Provenance: inherited fbf17b8c01cf34f4416cdadc3121070f45d630b4
+
+Ruled-out: reverting to never releasing | that was the defect this replaced — a reopen in place could not construct its coordinator, which is a startup failure rather than a theoretical one.
+Ruled-out: refusing to open a second handle on a file whose capabilities are issued | ordinary readers open one, and the export path opens a source database deliberately.
+Provenance: inherited bd1f6fa7cb9de173e42977beefce72685276abca
+
+Ruled-out: deleting the row because the guard moved | the guard did not move, only its variable did, and the property it names is still the one that keeps a wrongly-observed reply from silently permitting a retry.
+Provenance: inherited 2a79f3aac8feefb9cecab7ff116c2fd92e3b04b9
+
+Limit: the body comparison covers the ledger triggers, because those are the ones this module can produce from the live schema. A required trigger defined only by a migration is still checked by name and sentinel, and a stale body there would still read as healthy.
+Limit: the observations rebuild refuses a database whose receipt ids are reused across turns. That is deliberate — the alternative is discarding an observation — but it means such a database cannot be upgraded without an operator deciding which row to keep, and no tool offers that decision yet.
+Ruled-out: editing v25 in place | a database created at the head that shipped v25 would keep the same stale bodies one version later, which is the mistake v25 itself exists to answer.
+Ruled-out: dropping only the triggers whose bodies changed | that is the hand-maintained list again, and the next in-place edit repeats the defect.
+Ruled-out: scoping the REPLACE census to audit_events alone | the census found three, the trigger is four lines each, and a known-open path on the owner's own prompts is not a thing to defer to another PR.
+Provenance: inherited 00d0a03bfe2041daa03aa27e9f7c4fa0c2a4e8b8
+
+Limit: identity is read once, at open. A file replaced underneath a live handle keeps the identity it had, which is the same assumption the integrity check already makes and is not made worse here.
+Ruled-out: refusing to open a file with more than one link | ordinary backup schemes make hard links, and the key naming the inode is the fix for the actual confusion rather than a ban on the situation that exposed it.
+Ruled-out: leaving the two external registries keyed by path | they would then disagree with the database's own key about what one database is, which is the drift this commit exists to remove.
+Provenance: inherited b8bb6b8feb08767b44071e6b7f062513467e8269
+
+Limit: the adjudication is authenticated as coming from the operator socket, not as coming from a person who read the observations. Citing every id is checkable; having understood them is not, and this does not pretend otherwise.
+Ruled-out: an offline tool that opens the database directly | it would need the materialization capability, which is issued once per file and held by the running control plane — an offline writer either fights the daemon for it or is a second materializer.
+Ruled-out: parking for every blocking finding | parking is a weaker state than stopping, and reaching it for something no operator action can clear trades a refusal for a daemon that stays up and can do nothing.
+Provenance: inherited 4384d2744a5cf09af3903b2aa08003f15caa62cb
+
+Limit: this catches a row that names nothing and a row that names two places. A row whose anchor still matches but now sits above a different guard is exactly as wrong and looks exactly as healthy, and only reading the row against the code finds that.
+Ruled-out: deriving anchors from symbol names instead of source text | the rows deliberately name lines rather than symbols, because several guards are a condition inside a function and there is no symbol for the part that matters.
+Provenance: inherited 589caf4622fbee2c5298d34311306fbdef36f9a8
+
+Limit: the hooks are a local install and CI is a clone that never ran it. The properties CI can check itself — anchors, trailers, migration checksums, the census — are steps there; the sentinel one has no CI meaning and is local only.
+Limit: the census classifies by which verbs a table's triggers cover. A table with no triggers at all is not in scope and is not reported, so this finds a table guarded halfway rather than a table nobody guarded.
+Ruled-out: setting core.hooksPath | it retires CommitLore's four hooks in silence, and two guards where there were five is the kind of loss that reads as a gain.
+Ruled-out: listing the schema-derived migrations by hand | that list is maintained by whoever adds the next one, and this file exists because a rule depending on someone remembering it broke twice.
+Ruled-out: making commitlore validate fail instead of warn | it is another repository's tool, and the enforcement belongs where this repository can hold it.
+Provenance: inherited 68a35f5aa05a5cd9f6bccedef8c94244e9589935
+
+Limit: the killedBy check proves the path exists, not that the file contains a test that can fail. A file present but emptied still exits zero and still reads as a kill.
+Limit: three of the four findings this closes came from a review of the previous round's fixes, not from the suite. The pattern holds and the rounds should keep going while it does.
+Ruled-out: setting passWithNoTests | it would make a missing file report a *pass* instead of a kill, which is the same wrong answer with the opposite sign.
+Ruled-out: waking the park on every adjudication attempt | a denial changed nothing the doctor can see, so promoting on one promotes on the strength of a refusal.
+Provenance: inherited 38bceb3cbcbf483ceac86da4f9e8353e1de210f6
+
+Limit: the refusal test gives the wake five turns of the event loop and then asserts it did not happen. That is enough because the wake resolves a promise rather than setting a timer, and it would stop being enough if the wake ever became asynchronous in a different way.
+Ruled-out: asserting the doctor was called twice under the mutation | that is the assertion passing on the broken code and timing out on the correct one, which is the test inverted rather than fixed.
+Provenance: inherited 70712588532e84eda1f26246eb277c98772ecbcc
+
+Limit: this is a real hole in one direction — a branch that deletes .githooks/ silently stops being checked. The alternative refuses work on every branch that predates the hooks, and CI holds the same properties for any clone regardless.
+Provenance: inherited a4a2022602fe3a35a639425f1eb6e2751bd89a8d
+
+Limit: the window is one synchronous call and the file is on disk throughout it, so a concurrent reader can still see a schema with one comment appended. Nothing here can close that; what it can do is guarantee the next run puts the file back however this one ended.
+Ruled-out: an env var pointing the schema path elsewhere for the probe | it would let anything redirect which schema production reads, which is a worse hole than the one being closed.
+Provenance: inherited e9d12f15335857b928da3371bb8b350d65bd3b0a
+
+Limit: `DATABASE_FAMILY_SUFFIXES` and this census both enumerate; a table added with a guard form neither anticipates is still invisible. What changed is that the two forms this schema actually uses are both covered, and the correspondence between a guard and its key is checked rather than assumed.
+Ruled-out: keeping the exemption list with corrected entries | neither table was genuinely exempt — a receipt is the proof an operation happened and a run holds a pinned manifest, and neither should be rewritable by a second insert.
+Ruled-out: a skipped falsifiability row for the census pattern | a skipped row claims coverage and provides none, which is the failure this whole file exists to name.
+Provenance: inherited 50aba36447ad2a53a1ed14053f1054dceb1c5e40
+
+Limit: the probe is a comment inside every trigger body, so it moves any migration that reads any trigger. A future migration reading only a table declaration would still be classified as constant, and would need the probe widened to notice it.
+Ruled-out: re-freezing v25 and v26 and moving on | the gate would then fail on every legitimate ledger-body edit with an instruction that is wrong for those two migrations, and a gate that has to be re-blessed constantly is one that gets re-blessed without being read.
+Provenance: inherited c1d95c3c752d784fbbc10e6765415f0af9985eb0
+
+Limit: partial unique indexes are outside these guards. Covering one means replicating its predicate in the trigger, and getting that wrong refuses legitimate inserts — which it did, fifty-seven times, before this was scoped back.
+Limit: the census reads schema.sql as text. A uniqueness constraint expressed some way this parser does not model is invisible to it, and the only defence is that a guard it cannot parse is now reported rather than skipped.
+Ruled-out: keeping the guards at the primary key | measured, a REPLACE on a non-primary unique conflict deletes the colliding row and says nothing, which is the whole class this set exists to refuse.
+Provenance: inherited c76de84a2383142317df2c308b37ff8b1c4b7478
+
+Limit: these exercise the census against a synthetic table appended to a copy of the schema. They prove the rule fires on the shape; they do not prove the rule is the right rule, which only reading the guards against their tables does.
+Provenance: inherited 058cd41c4100fd2fbbef2189dc6e4b557e533449
+
+Limit: this makes a partial pass visible; it does not make the check complete. A shape neither the pattern nor the count anticipates is still absent from both numbers.
+Provenance: inherited 68b026c44ef17e42f5266231dd80d31f2b7165d7
+
+Limit: the predicate is carried as text and the census compares it as text. It proves the predicate reached the trigger, not that it means the same thing there — a predicate referring to a column the trigger spells differently would satisfy this check and refuse the wrong rows.
+Ruled-out: leaving partial indexes as a stated limit | the limit was reachable in the schema as it stood, and a registration disappearing silently is the class this whole set exists to refuse.
+Provenance: inherited c3044244dd393907d67c94f0b69aa29e287177ce
+
+Limit: it checks that a trigger is named somewhere, not that it is named in the right registry — a canonical-turn trigger listed among the baseline ones would satisfy this and be checked at the wrong schema version.
+Provenance: inherited de690040da9919519958817a8eb42029981f732e
+
+Limit: it checks the entries claiming 26 against what v26 installs, because 26 is the version this branch adds. An entry claiming an earlier version is still taken on trust.
+Provenance: inherited faefb16894bf0ece4547984cfd11d9f1dbefb950
+
+Limit: a comment naming a trap in one file is not a guard against it in the next. What would be is a check that no script builds a git path by hand, which is a lint rule this repository does not have.
+Provenance: inherited 23646042503f13deb3ba4d2416595cb0059083ca
+
+Limit: it counts. A trigger that arrives with the wrong body arrives, and the body check at open is what refuses that — a different guard, and one that only covers the ledger set.
+Provenance: inherited 8b78b6eb3ff57cfbb95721ae033b9c2f98786311
+
+Limit: "a different outcome" is exercised through the other port under the same authority, because the outcome is fixed by which port is called. That is how one receipt would carry two claims in production; it is not every way the field could differ.
+Provenance: inherited 3e2033107026216a18bc8cc24b61bf660ccfe1dd
+
+Limit: "cannot be killed" is a statement about the states this coordinator can reach today. A raw writer that produced a completion observation without disturbing consistency would be caught by this condition alone — and the schema refuses that writer, which is why the case cannot be written.
+Provenance: inherited ee287911852ab60e8a2ce53499ec6bd8d928d9d8
+
+Limit: `IF NOT EXISTS` was the variation this schema could plausibly grow. A trigger written across different line breaks than these patterns expect is still uncounted, and the count-what-you-inspected line added earlier is what would make that visible rather than silent.
+Provenance: inherited dc5e2b18b23cc70e1bfa59fbac7014ae48ef7c3c
+
+Limit: three of these four were found by asking one question — replace each operand of a refusal with `true` and see what dies — and I had asked it of the coordinator two commits ago and stopped at the sites I had just written. The question needs a place to be asked from, and this repository does not have one.
+Ruled-out: leaving the count documented as unkillable with the refutation noted | the comment would then describe a property the code does not have, which is the shape the whole branch is about.
+Provenance: inherited 728fcfeb32c38ecd863f51be13375c3668d540ef
+
+Limit: it does not run anything. An operand named by a row can still be unwatched if that row's test passes for another reason — three tests on this branch did exactly that — and only the full sweep can say. This narrows where to look; it does not certify.
+Ruled-out: discovering the deciding files by pattern instead of listing them | a heuristic that quietly skips a file is the failure this set exists to name, and a wrong list is at least visible.
+Provenance: inherited 0167992c3bbcd3f5bc8abeaad0154403e2523494
