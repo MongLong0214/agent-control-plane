@@ -1622,7 +1622,7 @@ const observationsTableOnlyDdl = (): string =>
  * Read from `pragma_table_info` on both sides, so the list cannot disagree with either table and a
  * column added later is carried without anyone remembering to add it here.
  */
-const sharedColumns = (raw: Database.Database, from: string, to: string): string[] => {
+export const sharedColumns = (raw: Database.Database, from: string, to: string): string[] => {
   // `table_xinfo` rather than `table_info`, because the latter omits generated and hidden columns —
   // so a source column of either kind would be invisible to the check below and the rebuild would
   // report a lossless copy it had not made.
@@ -1646,7 +1646,18 @@ const sharedColumns = (raw: Database.Database, from: string, to: string): string
   }
   // Generated columns are computed by SQLite and cannot be inserted into, so they are excluded from
   // the copy on purpose — present in both tables, and not carried.
-  return source.filter((row) => row.hidden !== 2 && row.hidden !== 3).map((row) => row.name);
+  //
+  // Judged on the **destination**, which is where the INSERT happens. The first version read the
+  // source's `hidden` and a review built the case it gets wrong: an ordinary column that becomes
+  // generated in the new table passes the missing-column check, reads `hidden = 0` on the source,
+  // and lands in the INSERT — which SQLite refuses with "cannot INSERT into generated column". The
+  // property is not "was this computed before" but "can this be written now".
+  return source
+    .filter((row) => {
+      const kind = destination.get(row.name);
+      return kind !== 2 && kind !== 3;
+    })
+    .map((row) => row.name);
 };
 
 const canonicalTurnsTableOnlyDdl = (): string =>

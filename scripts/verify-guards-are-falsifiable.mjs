@@ -85,6 +85,17 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // Insertability is a property of the destination. Read from the source, an ordinary column that
+    // becomes generated lands in the INSERT and SQLite refuses it.
+    what: "a rebuild judges what it can write from the table it writes into",
+    file: "src/db/migrations.ts",
+    find: "      const kind = destination.get(row.name);",
+    replace: "      const kind = row.hidden;",
+    killedBy: [
+      "tests/unit/a-rebuild-carries-the-rows-it-finds.test.ts::carries an ordinary column that the new table computes, without trying to write it",
+    ],
+  },
+  {
     // ABORTED means the execution can no longer write. Recording one for a turn whose incarnation
     // is still current admits attempt 2 while attempt 1 may still deliver.
     what: "a resolution needs a fence — verified, or the operator's explicit word",

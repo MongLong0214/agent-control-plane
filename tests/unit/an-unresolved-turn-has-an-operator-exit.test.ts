@@ -296,6 +296,39 @@ describe("a turn nothing observed can be settled by a person", () => {
     if (!refused.allowed) expect(refused.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_UNATTESTED);
   });
 
+  it("counts a different executor session as a fence, not only a different incarnation", () => {
+    // A review found the session-id half of the comparison unenforced: `superseded()` changes only
+    // the incarnation, so deleting the session-id check left every test green. Two runtimes number
+    // their incarnations independently, so a turn whose session was replaced while the incarnation
+    // string happens to repeat is exactly the case the number alone cannot see.
+    const h = makeHarness();
+    const actorId = target(h, "newsession");
+    const permit = claim(h, actorId, "m1");
+    h.cp.db.run(
+      `INSERT INTO actor_target_attestations
+         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+          executor_session_id, executor_session_incarnation, binding_generation, attested_at)
+       VALUES ('att3:newsession', 'bind:newsession', 'v1', 'attd3:newsession', 'ses-other', 'inc', 1, ?)`,
+      ["2026-08-22T01:00:00.000Z"],
+    );
+
+    // Same incarnation string, different session: the execution that held the turn is gone.
+    expect(
+      h.cp.conversation.resolveInDoubt({
+        targetActorId: actorId,
+        turnRequestId: permit.turnRequestId,
+        reasonCode: ReasonCode.OK,
+        evidenceDigest: "sha256:operator",
+      }).allowed,
+    ).toBe(true);
+
+    const audited = h.cp.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = 'CONVERSATION_TURN_OBSERVED'
+        ORDER BY event_id DESC LIMIT 1`,
+    );
+    expect(JSON.parse(audited?.evidence_json ?? "{}")).toMatchObject({ fence: "VERIFIED" });
+  });
+
   it("refuses a turn that is already settled", () => {
     const h = makeHarness();
     const actorId = target(h, "settled");

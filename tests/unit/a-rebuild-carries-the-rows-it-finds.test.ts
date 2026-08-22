@@ -6,6 +6,7 @@ import {
   rebuildCanonicalTurnsIfStale,
   rebuildObservationsIfStale,
   schemaDdl,
+  sharedColumns,
 } from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
@@ -193,6 +194,47 @@ describe("a rebuild carries the rows it finds", () => {
         (raw.prepare(`SELECT operator_note FROM canonical_turns`).get() as { operator_note: string })
           .operator_note,
       ).toBe("do not lose me");
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("carries an ordinary column that the new table computes, without trying to write it", () => {
+    // A review's counterexample against reading `hidden` from the source. An ordinary column that
+    // becomes generated in the new table passes the missing-column check, reads `hidden = 0` on the
+    // source, and lands in the INSERT — which SQLite refuses. The property is not "was this
+    // computed before" but "can this be written now", and only the destination can answer it.
+    //
+    // It also pins `pragma_table_xinfo`: `table_info` omits generated columns entirely, so the
+    // destination lookup would find nothing and the column would be copied anyway.
+    const raw = new Database(join(tempDir("acp-rebuild-generated-"), "state.sqlite"));
+    try {
+      raw.pragma("foreign_keys = OFF");
+      raw.exec(`CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT)`);
+      raw.prepare(`INSERT INTO t (a, b) VALUES ('one', 'ordinary')`).run();
+      raw.exec(`CREATE TABLE t_rebuilt (a TEXT PRIMARY KEY, b TEXT GENERATED ALWAYS AS (a || '!') VIRTUAL)`);
+
+      const columns = sharedColumns(raw, "t", "t_rebuilt");
+
+      expect(columns).toEqual(["a"]);
+      // And the copy it produces actually runs, which is the assertion the list alone does not make.
+      raw.exec(`INSERT INTO t_rebuilt (${columns.join(", ")}) SELECT ${columns.join(", ")} FROM t`);
+      expect(raw.prepare(`SELECT b FROM t_rebuilt`).get()).toEqual({ b: "one!" });
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("refuses when the new table lacks a column, including one the old table computed", () => {
+    // The missing-column check has to see generated and hidden source columns too, or a rebuild
+    // drops one while reporting a lossless copy.
+    const raw = new Database(join(tempDir("acp-rebuild-hidden-"), "state.sqlite"));
+    try {
+      raw.pragma("foreign_keys = OFF");
+      raw.exec(`CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT GENERATED ALWAYS AS (a || '!') VIRTUAL)`);
+      raw.exec(`CREATE TABLE t_rebuilt (a TEXT PRIMARY KEY)`);
+
+      expect(() => sharedColumns(raw, "t", "t_rebuilt")).toThrow(/drop column/);
     } finally {
       raw.close();
     }
