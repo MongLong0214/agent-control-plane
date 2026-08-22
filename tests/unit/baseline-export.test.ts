@@ -833,6 +833,7 @@ describe("baseline boundary contracts", () => {
       "v25-ledger-guards",
       "v26-ledger-trigger-bodies",
       "v27-an-observation-carries-its-evidence",
+      "v28-an-operator-can-settle-a-turn-nobody-observed",
     ]);
   });
 

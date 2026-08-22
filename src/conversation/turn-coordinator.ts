@@ -117,6 +117,13 @@ const MATERIALIZING_AUTHORITIES = new Set([
   "ACP_PRE_DISPATCH",
   "HERMES_TARGET",
   "OWNER_AFTER_TARGET_FENCE",
+  // A person deciding a turn nobody observed. It belongs here for the same reason
+  // `ACP_OBSERVED_HERMES_REPLY` does not: what matters is which direction an authority can move
+  // the outcome, not how strong its evidence is. This one is restricted to `ABORTED` by the
+  // schema, so the only thing it can do is release a hold in the retry-safe direction — and a
+  // resolution that could not set the outcome would leave the turn exactly as wedged as before,
+  // which is the state it exists to end.
+  "OPERATOR_AFTER_REVIEW",
 ]);
 
 /** How a turn ended, when something positively established it. */
@@ -568,6 +575,138 @@ export class ConversationTurnCoordinator {
         return allow(ReasonCode.OK, this.materialize(permit.turnRequestId));
       });
     });
+  }
+
+  /**
+   * Settles a turn nothing else can, under an authority that says a person decided it.
+   *
+   * The permit is signed with a key that dies with the coordinator instance, so a turn held across
+   * a restart has no settler: `contradictions()` does not list it because its records do not
+   * disagree, `adjudicate()` refuses it for the same reason, and the actor's next message is
+   * refused because the first is unresolved. Doctor reports `CANONICAL_TURN_IN_DOUBT` and names no
+   * command, which is the shape the operator door was built to remove and then did not cover — an
+   * exit that is named and unreachable is worse than one that is absent, because the report reads
+   * as actionable.
+   *
+   * Restricted to `ABORTED`, in the schema and not only here. An operator did not watch the target
+   * commit, so a completion under this authority would be a person asserting something nobody
+   * observed — and `COMPLETED` is the direction that loses the owner's question forever. `ABORTED`
+   * is retry-safe: it says the outcome is unknown and re-running is permitted, which is what a
+   * person choosing on incomplete information should be able to choose.
+   *
+   * It does not make the turn safe to retry on its own. If ACP watched a reply for this turn, that
+   * completion observation still stands, the retry rule still refuses, and the turn goes
+   * `CONTRADICTED` — which `adjudicate()` can now take, because the records genuinely disagree.
+   * Two steps, both reachable, and neither of them a timer.
+   */
+  resolveInDoubt(input: {
+    targetActorId: string;
+    turnRequestId: string;
+    reasonCode: string;
+    evidenceDigest: string;
+  }): Decision<TurnMaterialization> {
+    if (input.reasonCode.trim() === "" || input.evidenceDigest.trim() === "") {
+      // Same rule as an adjudication and as every other observation: a record with no reason and
+      // no evidence is a state change wearing the word. Trimmed, matching `#observe` — whitespace
+      // is not a reason, and the two checks disagreeing would be a difference nobody chose. Refused here so the caller learns which
+      // field was empty; the table refuses it too.
+      return deny(ReasonCode.CONVERSATION_TURN_OBSERVATION_UNEVIDENCED, "a resolution has to say why, and on what", {
+        turnRequestId: input.turnRequestId,
+      });
+    }
+    return this.db.tx(() => {
+      const held = this.db.get<{ target_actor_id: string; lifecycle_state: string }>(
+        `SELECT target_actor_id, lifecycle_state FROM canonical_turns WHERE turn_request_id = ?`,
+        [input.turnRequestId],
+      );
+      if (held?.target_actor_id !== input.targetActorId) {
+        // The actor is part of the identity, not a convenience. An operator holding one
+        // conversation's turn id must not be able to settle another's.
+        return deny(ReasonCode.NOT_FOUND, "no such turn on this conversation", {
+          turnRequestId: input.turnRequestId,
+        });
+      }
+      if (held.lifecycle_state !== "IN_DOUBT") {
+        return deny(ReasonCode.CONFLICT, "this turn is already settled, so there is nothing to resolve", {
+          turnRequestId: input.turnRequestId,
+          lifecycleState: held.lifecycle_state,
+        });
+      }
+
+      // Past this line every failure throws, for the reason `#observe` states: `Db.tx` commits a
+      // body that returns a denial (#664), and an observation written without its audit row is
+      // testimony with no provenance.
+      const audited = this.audit.record({
+        kind: "CONVERSATION_TURN_OBSERVED",
+        actor: held.target_actor_id,
+        evidence: {
+          turnRequestId: input.turnRequestId,
+          outcome: "ABORTED",
+          authority: "OPERATOR_AFTER_REVIEW",
+          reasonCode: input.reasonCode,
+        },
+      });
+      if (!audited.allowed) throw acpError(audited.reasonCode, audited.message, audited.evidence);
+
+      return this.db.materializeTurn(this.#materialization, { turnRequestId: input.turnRequestId }, () => {
+        this.db.run(
+          `INSERT INTO canonical_turn_observations
+             (turn_request_id, observed_outcome, observing_authority, receipt_id,
+              evidence_digest, reason_code, observed_at, audit_event_id)
+           VALUES (?, 'ABORTED', 'OPERATOR_AFTER_REVIEW', ?, ?, ?, ?, ?)`,
+          [
+            input.turnRequestId,
+            // Derived rather than supplied. The receipt identity is `(authority, receipt_id)`, so
+            // one resolution per turn is what this expresses; a second attempt is refused by the
+            // IN_DOUBT check above before it can reach the constraint.
+            `operator:${input.turnRequestId}`,
+            input.evidenceDigest,
+            input.reasonCode,
+            this.clock.nowIso(),
+            audited.value,
+          ],
+        );
+        return allow(ReasonCode.OK, this.materialize(input.turnRequestId));
+      });
+    });
+  }
+
+  /**
+   * Every turn waiting on a person, with what an operator needs to decide it.
+   *
+   * The read half of `resolveInDoubt`, and the same argument as `contradictions()`: doctor reports
+   * the count, and an operator acting on it needs the ids and the ages rather than a number.
+   */
+  unresolvedAcrossActors(): ReadonlyArray<{
+    turnRequestId: string;
+    targetActorId: string;
+    claimedAt: string;
+    observations: ReadonlyArray<{ observationId: number; authority: string; outcome: string }>;
+  }> {
+    return this.db
+      .all<{ turn_request_id: string; target_actor_id: string; claimed_at: string }>(
+        `SELECT turn_request_id, target_actor_id, claimed_at FROM canonical_turns
+          WHERE lifecycle_state = 'IN_DOUBT' ORDER BY claimed_at ASC`,
+      )
+      .map((row) => ({
+        turnRequestId: row.turn_request_id,
+        targetActorId: row.target_actor_id,
+        claimedAt: row.claimed_at,
+        // What is already on the turn, because it changes the decision: a turn carrying a
+        // completion ACP watched is not the same case as one carrying nothing, and an operator
+        // resolving the first will land on a contradiction that needs a second step.
+        observations: this.db
+          .all<{ observation_id: number; observing_authority: string; observed_outcome: string }>(
+            `SELECT observation_id, observing_authority, observed_outcome
+               FROM canonical_turn_observations WHERE turn_request_id = ? ORDER BY observation_id ASC`,
+            [row.turn_request_id],
+          )
+          .map((o) => ({
+            observationId: o.observation_id,
+            authority: o.observing_authority,
+            outcome: o.observed_outcome,
+          })),
+      }));
   }
 
   /**

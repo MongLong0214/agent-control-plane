@@ -164,6 +164,11 @@ const PARKED_DOOR = [
   "capacity.observe",
   "conversation.adjudicate",
   "conversation.contradictions",
+  // The unresolved pair, added with #668. A turn whose permit died with the process that issued
+  // it is not contradicted — its records agree, there is nothing to agree with — so the two above
+  // cannot reach it, and a parked daemon is exactly when an operator is looking at one.
+  "conversation.resolve",
+  "conversation.unresolved",
   "daemon.status",
 ];
 

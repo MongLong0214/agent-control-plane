@@ -85,6 +85,28 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // The operator authority exists to release a hold in the retry-safe direction. Allowed to
+    // record a completion, it would let a person assert something nobody observed — and a turn
+    // marked COMPLETED is never re-run, so the owner's question disappears.
+    what: "the operator authority can only record ABORTED, in the table",
+    file: "src/db/schema.sql",
+    find: "        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE',\n                                    'OPERATOR_AFTER_REVIEW')))",
+    replace: "        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE',\n                                    'OPERATOR_AFTER_REVIEW'))\n    OR observing_authority = 'OPERATOR_AFTER_REVIEW')",
+    killedBy: [
+      "tests/unit/an-unresolved-turn-has-an-operator-exit.test.ts::cannot record a completion, in the table and not only in the method",
+    ],
+  },
+  {
+    // Without the actor comparison an operator holding one conversation's turn id settles another's.
+    what: "a resolution names the conversation it settles, not just the turn",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (held?.target_actor_id !== input.targetActorId) {",
+    replace: "      if (held === undefined) {",
+    killedBy: [
+      "tests/unit/an-unresolved-turn-has-an-operator-exit.test.ts::refuses a turn on another conversation, so one turn id cannot settle another's",
+    ],
+  },
+  {
     // The tool that inherits the records writes one paragraph per source commit, and git stores
     // only the last. Without the collapse the merge path preserves nothing it claims to.
     what: "the inherited records are collapsed into one block git will keep",

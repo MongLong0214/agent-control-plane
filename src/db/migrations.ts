@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 27;
+export const SCHEMA_VERSION = 28;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -1601,6 +1601,67 @@ const observationsTableOnlyDdl = (): string =>
     "the observations table",
   );
 
+/**
+ * The `canonical_turns` table on its own, for a rebuild that changes one of its CHECKs.
+ *
+ * It is the parent of three tables, so the rebuild follows the order the observations rebuild
+ * documents: build under a temporary name, copy, drop the old, rename the new. Renaming the *old*
+ * table first would make SQLite rewrite every foreign key that names it, leaving the children
+ * pointing at a table this function then drops.
+ */
+const canonicalTurnsTableOnlyDdl = (): string =>
+  schemaObject(
+    /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/,
+    "the canonical turns table",
+  );
+
+const canonicalTurnsIndexDdl = (): string =>
+  schemaObject(
+    /CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved[\s\S]*?;/,
+    "the one-unresolved index",
+  );
+
+/**
+ * Rebuilds `canonical_turns` when its stored definition is not the current one.
+ *
+ * v28 widens the outcome/authority pairing CHECK to admit `OPERATOR_AFTER_REVIEW` for `ABORTED`.
+ * A CHECK cannot be altered in place, and the table carries the pairing on both sides — the
+ * observation row and the materialized tuple — so widening one without the other produces a
+ * settlement the observations accept and the turn refuses, which is a resolution that reports
+ * success and leaves the conversation exactly as wedged.
+ */
+const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
+  const stored = (
+    raw
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turns'")
+      .get() as { sql?: string } | undefined
+  )?.sql;
+  if (stored === undefined) return;
+  const wanted = /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/.exec(schemaDdl());
+  const normalise = (sql: string): string =>
+    sql
+      .replace(/CREATE TABLE IF NOT EXISTS /, "CREATE TABLE ")
+      .replace(/"/g, "")
+      .replace(/;\s*$/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  if (wanted && normalise(stored) === normalise(wanted[0])) return;
+
+  const columns = `turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
+        prompt_digest, lifecycle_state, outcome_kind, settled_at, resolution_authority, reason_code,
+        evidence_digest, observation_consistency, replacement_turn_request_id, claimed_at`;
+  raw.exec(
+    canonicalTurnsTableOnlyDdl().replace(
+      "CREATE TABLE IF NOT EXISTS canonical_turns",
+      "CREATE TABLE canonical_turns_rebuilt",
+    ),
+  );
+  raw.exec(`INSERT INTO canonical_turns_rebuilt (${columns}) SELECT ${columns} FROM canonical_turns`);
+  raw.exec("DROP TABLE canonical_turns");
+  raw.exec("ALTER TABLE canonical_turns_rebuilt RENAME TO canonical_turns");
+  raw.exec(canonicalTurnsIndexDdl());
+};
+
 const observationsIndexDdl = (): string =>
   schemaObject(
     /CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn[^;]*;/,
@@ -1779,6 +1840,44 @@ const v27: SchemaMigration = {
   checksum: () => sha256(`v27-an-observation-carries-its-evidence\n${observationsTableOnlyDdl()}\n${ledgerTriggerDdl()}`),
 };
 
+/**
+ * Adds the authority a person settles under, and lets an observation carry it.
+ *
+ * The permit that settles a turn is signed with a key that dies with the coordinator instance, so
+ * a turn held across a restart had no settler at all: `contradictions()` does not list it because
+ * its records do not disagree, `adjudicate()` refuses it for the same reason, and the actor's next
+ * message is refused because the first is unresolved. Doctor reported the state and named no
+ * command. #668, found by an independent review of the merged head.
+ *
+ * `OPERATOR_AFTER_REVIEW` is restricted to `ABORTED` by the outcome-pairing CHECK, which is why
+ * this migration rebuilds the observation table rather than only seeding a vocabulary row. An
+ * operator did not watch the target commit, so a completion under this authority would be a person
+ * asserting something nobody observed — and `COMPLETED` is the direction that loses the owner's
+ * question for good.
+ */
+const v28: SchemaMigration = {
+  id: "v28-an-operator-can-settle-a-turn-nobody-observed",
+  fromVersion: 27,
+  toVersion: 28,
+  foreignKeysOffDuringApply: true,
+  apply: (raw) => {
+    // Before the rebuild: the table's CHECK names the authority, so the row it references has to
+    // exist first or every insert into the rebuilt table fails its foreign key.
+    raw.exec(
+      `INSERT OR IGNORE INTO turn_resolution_authorities (resolution_authority) VALUES ('OPERATOR_AFTER_REVIEW');`,
+    );
+    rebuildCanonicalTurnsIfStale(raw);
+    rebuildObservationsIfStale(raw);
+    // Each rebuild drops its table and a table's triggers go with it, as v26 and v27 both note.
+    raw.exec(ledgerTriggerDdl());
+  },
+  checksum: () =>
+    sha256(
+      `v28-an-operator-can-settle-a-turn-nobody-observed\n${canonicalTurnsTableOnlyDdl()}\n` +
+        `${observationsTableOnlyDdl()}\n${ledgerTriggerDdl()}`,
+    ),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -1796,6 +1895,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v25,
   v26,
   v27,
+  v28,
 ]);
 
 interface RequiredTrigger {
