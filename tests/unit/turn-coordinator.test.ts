@@ -87,6 +87,21 @@ const anotherCoordinator = (h: Harness): (() => ConversationTurnCoordinator) => 
  * would supply, and keeps the tests about the behaviour they were written for.
  */
 let receiptCounter = 0;
+/**
+ * Marks the turn dispatched, which every authority except `ACP_PRE_DISPATCH` now needs.
+ *
+ * A settlement says something about a phase, and #662 made the phase a row rather than the caller's
+ * word: the target and owner-fence authorities report what happened to an execution, and a turn
+ * that was never dispatched has none. The adapter below does this for the tests that predate the
+ * rule, and the tests *about* the rule call it themselves.
+ */
+const dispatch = (coordinator: ConversationTurnCoordinator, permit: TurnPermit): void => {
+  // Refusals are ignored on purpose. These tests are about what a settlement does, and a permit
+  // that was never issued or a turn that is already settled has to reach the *settlement* to be
+  // refused there — a throw here would move the assertion into the fixture.
+  coordinator.markDispatching(permit);
+};
+
 const settle = (
   coordinator: ConversationTurnCoordinator,
   permit: TurnPermit,
@@ -96,12 +111,14 @@ const settle = (
     reasonCode: string;
     evidenceDigest?: string;
   },
-) =>
-  portFor(coordinator, outcome.kind, outcome.authority)(permit, {
+) => {
+  if (outcome.authority !== "ACP_PRE_DISPATCH") dispatch(coordinator, permit);
+  return portFor(coordinator, outcome.kind, outcome.authority)(permit, {
     receiptId: `receipt-${(receiptCounter += 1)}`,
     evidenceDigest: outcome.evidenceDigest ?? "sha256:evidence",
     reasonCode: outcome.reasonCode,
   });
+};
 
 /**
  * The port an (outcome, authority) pair names, for tests written before the ports existed.
@@ -766,14 +783,18 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     // A disagreement with no completion in it: the target says it was fenced, pre-dispatch says
     // nothing ran. Both permit a retry on their own, so nothing but the open dispute refuses
     // this — which makes it the one case that tests the dispute check by itself.
+    //
+    // The target receipt is recorded without marking the turn dispatched, which is what a caller
+    // that reached the target without telling the ledger looks like. With a dispatch row the
+    // pre-dispatch claim below is refused outright (#662) and this disagreement cannot form —
+    // correctly, and it would leave the dispute check with no case of its own.
     const h = makeHarness();
     const actorId = target(h, "ceo");
     const permit = claimOf(h, actorId, [source("m1")]);
-    settle(coordinatorOf(h), permit, {
-      kind: "ABORTED",
-      authority: "HERMES_TARGET",
-      reasonCode: ReasonCode.OK,
+    coordinatorOf(h).ports.target.aborted(permit, {
+      receiptId: `receipt-${(receiptCounter += 1)}`,
       evidenceDigest: "sha256:fence",
+      reasonCode: ReasonCode.OK,
     });
     settle(coordinatorOf(h), permit, {
       kind: "NEVER_ADMITTED",

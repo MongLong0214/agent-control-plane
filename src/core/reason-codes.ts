@@ -323,6 +323,17 @@ export const ReasonCode = {
    * rather than `VERIFIED`.
    */
   CONVERSATION_TURN_FENCE_UNPROVEN: "CONVERSATION_TURN_FENCE_UNPROVEN",
+  /**
+   * A settlement claims a phase the ledger's dispatch record contradicts.
+   *
+   * `ACP_PRE_DISPATCH` says nothing ran, and a turn with a dispatch row did. The target and
+   * owner-fence authorities are the other direction: they report what happened to an execution, and
+   * a turn that was never dispatched has none. What makes an authority truthful is when it can be
+   * reached, and this is that made checkable — the phase is a row, the outcome is a caller's word.
+   */
+  CONVERSATION_TURN_PHASE_MISMATCH: "CONVERSATION_TURN_PHASE_MISMATCH",
+  /** A turn was dispatched twice, which is the owner's message delivered twice. */
+  CONVERSATION_TURN_ALREADY_DISPATCHED: "CONVERSATION_TURN_ALREADY_DISPATCHED",
   /** An adjudication cited only part of the disagreement, or something outside it. */
   CONVERSATION_ADJUDICATION_INCOMPLETE: "CONVERSATION_ADJUDICATION_INCOMPLETE",
   // --- disposable acceptance realm ------------------------------------------

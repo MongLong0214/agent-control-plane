@@ -211,27 +211,102 @@ export class ConversationTurnCoordinator {
   readonly ports = {
     preDispatch: {
       neverAdmitted: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
-        this.#observe(permit, { ...receipt, outcome: "NEVER_ADMITTED", authority: "ACP_PRE_DISPATCH" }),
+        this.#observe(permit, { ...receipt, outcome: "NEVER_ADMITTED", authority: "ACP_PRE_DISPATCH" }, "BEFORE"),
     },
     target: {
       completed: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
-        this.#observe(permit, { ...receipt, outcome: "COMPLETED", authority: "HERMES_TARGET" }),
+        this.#observe(permit, { ...receipt, outcome: "COMPLETED", authority: "HERMES_TARGET" }, "AFTER"),
       aborted: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
-        this.#observe(permit, { ...receipt, outcome: "ABORTED", authority: "HERMES_TARGET" }),
+        this.#observe(permit, { ...receipt, outcome: "ABORTED", authority: "HERMES_TARGET" }, "AFTER"),
     },
     ownerFence: {
       aborted: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
-        this.#observe(permit, { ...receipt, outcome: "ABORTED", authority: "OWNER_AFTER_TARGET_FENCE" }),
+        this.#observe(permit, { ...receipt, outcome: "ABORTED", authority: "OWNER_AFTER_TARGET_FENCE" }, "AFTER"),
     },
     acpObservedReply: {
       sawCompletion: (permit: TurnPermit, receipt: TurnReceipt): Decision<TurnMaterialization> =>
-        this.#observe(permit, {
-          ...receipt,
-          outcome: "COMPLETED",
-          authority: "ACP_OBSERVED_HERMES_REPLY",
-        }),
+        this.#observe(
+          permit,
+          { ...receipt, outcome: "COMPLETED", authority: "ACP_OBSERVED_HERMES_REPLY" },
+          "AFTER",
+        ),
     },
   } as const;
+
+  /**
+   * Records that this turn was dispatched, which is what makes an authority's claim checkable.
+   *
+   * Every port above says something about a phase — `ACP_PRE_DISPATCH` that nothing ran, the target
+   * and owner-fence authorities that something did. Until this row existed both were reachable in
+   * either phase, so "only a positively observed outcome moves a turn" was a statement about the
+   * caller's discipline. It is a refusal with a row behind it now.
+   *
+   * Called by whatever reaches the target, in the same transaction as the attempt where possible.
+   * A crash between this row and the attempt leaves a dispatched turn with no outcome, which is
+   * `IN_DOUBT` and is the correct reading: something may have run.
+   *
+   * One per turn. A second dispatch is the owner's message delivered twice, which is refused here
+   * rather than counted — the primary key says so as well, for a caller that goes around this.
+   */
+  markDispatching(permit: TurnPermit): Decision<void> {
+    return this.db.tx(() => {
+      const permitted = this.assertIssuedHere(permit);
+      if (!permitted.allowed) {
+        return deny(permitted.reasonCode, permitted.message, permitted.evidence);
+      }
+
+      const turn = this.db.get<{ target_actor_id: string; lifecycle_state: string }>(
+        `SELECT target_actor_id, lifecycle_state FROM canonical_turns WHERE turn_request_id = ?`,
+        [permit.turnRequestId],
+      );
+      if (turn?.target_actor_id !== permit.targetActorId) {
+        return deny(ReasonCode.NOT_FOUND, "no such turn on this conversation", {
+          turnRequestId: permit.turnRequestId,
+        });
+      }
+      if (turn.lifecycle_state !== "IN_DOUBT") {
+        return deny(ReasonCode.CONFLICT, "this turn is settled, so nothing is left to dispatch", {
+          turnRequestId: permit.turnRequestId,
+        });
+      }
+      if (this.dispatched(permit.turnRequestId)) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_ALREADY_DISPATCHED,
+          "this turn was already dispatched; a second dispatch is the owner's message sent twice",
+          { turnRequestId: permit.turnRequestId },
+        );
+      }
+
+      // Past this line every failure throws, for the reason `#observe` states: `Db.tx` commits a
+      // body that returns a denial (#664), and a dispatch row without its audit row is a phase
+      // change with no provenance.
+      const audited = this.audit.record({
+        kind: "CONVERSATION_TURN_DISPATCHED",
+        actor: turn.target_actor_id,
+        evidence: { turnRequestId: permit.turnRequestId },
+      });
+      if (!audited.allowed) throw acpError(audited.reasonCode, audited.message, audited.evidence);
+
+      return this.db.materializeTurn(this.#materialization, { turnRequestId: permit.turnRequestId }, () => {
+        this.db.run(
+          `INSERT INTO canonical_turn_dispatches (turn_request_id, dispatched_at, audit_event_id)
+           VALUES (?, ?, ?)`,
+          [permit.turnRequestId, this.clock.nowIso(), audited.value],
+        );
+        return allow(ReasonCode.OK, undefined);
+      });
+    });
+  }
+
+  /** Whether the ledger holds a dispatch for this turn. */
+  private dispatched(turnRequestId: string): boolean {
+    return (
+      this.db.get<{ turn_request_id: string }>(
+        `SELECT turn_request_id FROM canonical_turn_dispatches WHERE turn_request_id = ?`,
+        [turnRequestId],
+      ) !== undefined
+    );
+  }
 
   #sign(fields: Omit<TurnPermit, "issuance">): string {
     return createHmac("sha256", this.#issuanceKey)
@@ -451,10 +526,46 @@ export class ConversationTurnCoordinator {
    * derive it from which object the caller was given, so a component wired with the pre-dispatch
    * port cannot record a target receipt however it is called.
    */
-  #observe(permit: TurnPermit, observation: TurnObservation): Decision<TurnMaterialization> {
+  #observe(
+    permit: TurnPermit,
+    observation: TurnObservation,
+    /**
+     * Which side of the dispatch this authority speaks from.
+     *
+     * `BEFORE` is the one authority that can say nothing ran; every other reports what happened to
+     * an execution. Checked against the ledger's dispatch row rather than trusted, because that is
+     * the whole of #662: the outcome is a caller's word and the phase is a fact.
+     */
+    phase: "BEFORE" | "AFTER",
+  ): Decision<TurnMaterialization> {
     return this.db.tx(() => {
       const issued = this.assertIssuedHere(permit);
       if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
+
+      // Asymmetric, and the asymmetry is the whole design.
+      //
+      // A turn with a dispatch row cannot be reported as never started: that claim contradicts a
+      // fact the ledger holds, and admitting it is #662 — the caller that dispatched, said nothing
+      // ran, and got attempt 2 admitted while attempt 1 was still in flight.
+      //
+      // The other direction is *not* symmetric. A target receipt for a turn with no dispatch row
+      // is either a caller that skipped `markDispatching`, or a genuine late receipt after a
+      // mistaken pre-dispatch refusal — and refusing it discards a true record to punish a
+      // bookkeeping mistake, which is precisely the failure this issue named when it said the
+      // first-settlement-wins rule "loses the *true* one". It is admitted, and if it disagrees with
+      // what is already there the consistency axis says so.
+      //
+      // What that leaves open is stated rather than implied: a caller that never dispatched can
+      // still fabricate a completion. Nothing here can tell that from a late receipt, because both
+      // are a caller supplying an evidence digest. Closing it needs a receipt the target signed,
+      // which is #638's to produce.
+      if (phase === "BEFORE" && this.dispatched(permit.turnRequestId)) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_PHASE_MISMATCH,
+          "this turn was dispatched, so nothing can report that it never started",
+          { turnRequestId: permit.turnRequestId, authority: observation.authority },
+        );
+      }
 
       // The three fields are what make the row a record of something observed. Measured on the
       // merged head, all three were accepted empty and stored empty, so a settlement could say

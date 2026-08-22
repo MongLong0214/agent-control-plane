@@ -85,6 +85,26 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // The #662 hole: a caller that dispatched, reported that nothing ran, and got attempt 2
+    // admitted while attempt 1 was still in flight.
+    what: "a dispatched turn cannot be reported as never started",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '      if (phase === "BEFORE" && this.dispatched(permit.turnRequestId)) {',
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/a-dispatch-is-a-fact.test.ts::refuses the claim that contradicts the ledger's own record",
+    ],
+  },
+  {
+    what: "a turn is dispatched once, because a second dispatch is the owner's message sent twice",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (this.dispatched(permit.turnRequestId)) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/a-dispatch-is-a-fact.test.ts::refuses a second dispatch of the same turn",
+    ],
+  },
+  {
     // Insertability is a property of the destination. Read from the source, an ordinary column that
     // becomes generated lands in the INSERT and SQLite refuses it.
     what: "a rebuild judges what it can write from the table it writes into",
