@@ -102,7 +102,11 @@ const dispatch = (coordinator: ConversationTurnCoordinator, permit: TurnPermit):
   //
   // Not awaited: the row is written and committed synchronously before `dispatch` returns its
   // promise, and these tests only need it to exist. A test *about* the send holds the promise.
-  void coordinator.dispatch(permit, () => undefined);
+  //
+  // The rejection is swallowed rather than left floating. `dispatch` is async, so a throw from the
+  // marking half arrives as a rejected promise; unhandled, it surfaces later as an unattributed
+  // failure in whichever test happens to be running — a review pointed that out.
+  void coordinator.dispatch(permit, () => undefined).catch(() => undefined);
 };
 
 const settle = (

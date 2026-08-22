@@ -148,6 +148,48 @@ describe("a dispatch is recorded once, by the coordinator, and cannot be taken b
     }
   });
 
+  it("holds the turn when the send fails, whichever side of the target it failed on", async () => {
+    // The cost of writing the row first, pinned so it is not rediscovered as a bug. A send that
+    // failed *before* the target was reached leaves the same durable state as one that failed
+    // after, because a thrown error does not say whether the peer received anything. The choice is
+    // which way to be wrong, and a duplicate is unrecoverable where a held turn is not.
+    const h = makeHarness();
+    const actorId = target(h, "failed");
+    const permit = claim(h, actorId, "m1");
+
+    await expect(
+      h.cp.conversation.dispatch(permit, () => {
+        throw new Error("connection refused before the request left");
+      }),
+    ).rejects.toThrow(/connection refused/);
+
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_dispatches`)).toHaveLength(1);
+    const refused = h.cp.conversation.ports.preDispatch.neverAdmitted(permit, {
+      receiptId: "pre-1",
+      evidenceDigest: "sha256:pre",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+    expect(refused.allowed).toBe(false);
+
+    // And the exit, which is why the cost is acceptable: the operator door settles it ABORTED, and
+    // asks for a fence precisely because the process that failed to send may still be alive.
+    const resolved = h.cp.conversation.resolveInDoubt({
+      targetActorId: actorId,
+      turnRequestId: permit.turnRequestId,
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:operator-checked-the-transcript",
+      fenceAsserted: true,
+    });
+    expect(resolved.allowed).toBe(true);
+    expect(
+      h.cp.conversation.claim({
+        targetActorId: actorId,
+        prompt: "hello",
+        sources: [{ channel: "telegram", nonce: "m1", attempt: 2, payload: {} }],
+      }).allowed,
+    ).toBe(true);
+  });
+
   it("refuses a permit this coordinator did not issue", async () => {
     const h = makeHarness();
     const actorId = target(h, "forged");

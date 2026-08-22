@@ -250,6 +250,20 @@ export class ConversationTurnCoordinator {
    * the correct reading: something may have run. The reverse crash cannot happen through this
    * method, which is the point of it holding the send.
    *
+   * **The cost, named because it is a real one.** A send that fails *before* the target is reached
+   * leaves the same state as one that fails after: the row is committed, so `NEVER_ADMITTED` is
+   * refused and the turn stays held. Before this method existed such a failure could release the
+   * conversation. Nothing here can tell a definite pre-send failure from an ambiguous one — the
+   * send either completed or it did not, and "did the peer receive it" is not something a thrown
+   * error answers — so the choice is which way to be wrong. A duplicate is unrecoverable and a
+   * held turn is not: `agentctl conversation resolve` is the exit (#669), and it asks for a fence
+   * exactly because the process making the pre-send failure may still be alive.
+   *
+   * Ruled out: letting `send` signal "not reached" so the row could be withheld. It puts the
+   * ordering back in the caller's hands under a different name — a send that forgets to signal is
+   * the send-before-mark bug again, and the signal is unverifiable in the one direction that
+   * matters.
+   *
    * One per turn. A second dispatch is the owner's message delivered twice, which is refused here
    * rather than counted — the primary key says so as well, for a caller that goes around this.
    *
