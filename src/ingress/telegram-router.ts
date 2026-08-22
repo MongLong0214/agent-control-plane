@@ -576,6 +576,11 @@ export class TelegramHermesRouter {
       deliveryStatus: "APPLIED",
     } satisfies TelegramStoredState, "PENDING");
     if (!completed.allowed) throw new Error(`${completed.reasonCode}: ${completed.message}`);
+    // The turn's own lifecycle, which is not this one. Telegram accepting the reply is what ACP can
+    // honestly observe about the turn ending, and until the two lifecycles were separated (#646)
+    // this line could not exist: the write above had already erased the claim.
+    const resolved = this.ingress.resolveTurn(outcome.nonce);
+    if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
   }
 
   /** Release only a reservation whose transport proved that no message was accepted. */

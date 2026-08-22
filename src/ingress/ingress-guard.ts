@@ -195,12 +195,21 @@ export class IngressGuard {
       }
     }
 
-    const seen = this.db.get<{ received_at: string; result_json: string | null }>(
-      `SELECT received_at, result_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    const seen = this.db.get<{
+      received_at: string;
+      result_json: string | null;
+      turn_claim_json: string | null;
+    }>(
+      `SELECT received_at, result_json, turn_claim_json FROM inbound_messages
+        WHERE channel = ? AND nonce = ?`,
       [request.channel, request.nonce],
     );
     if (seen) {
-      if (policy.recoverInFlight && isRecoverableIngressResult(seen.result_json)) {
+      // The claim is read first, and from its own column. Re-admitting a message whose turn was
+      // claimed would re-run a handler that may already have spoken to the CEO, and the claim used
+      // to live in `result_json` — where an ordinary timeout's reply reservation erased it, so
+      // this branch was reached only after a crash (#646).
+      if (!unresolvedClaim(seen.turn_claim_json) && policy.recoverInFlight && isRecoverableIngressResult(seen.result_json)) {
         this.audit.record({
           kind: "INGRESS_RECOVERY",
           actor: request.actor,
@@ -217,7 +226,7 @@ export class IngressGuard {
       // "this message came back", but a replay means the work was done and this copy is
       // redundant, while this means nobody knows whether it was. Reporting them with one code
       // files every occurrence of the second inside the first, where no one looks for it.
-      if (resultDeliveryStatus(seen.result_json) === TURN_CLAIMED) {
+      if (seen.turn_claim_json !== null && unresolvedClaim(seen.turn_claim_json)) {
         this.audit.record({
           kind: "INGRESS_TURN_OUTCOME_UNKNOWN",
           actor: request.actor,
@@ -357,19 +366,24 @@ export class IngressGuard {
    */
   claimTurn(channel: string, nonce: string, identity: TurnIdentity): Decision<TurnClaim> {
     return this.db.tx(() => {
-      const current = this.db.get<{ result_json: string | null }>(
-        `SELECT result_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      const current = this.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
         [channel, nonce],
       );
-      if (current && isClaimable(current.result_json)) {
+      if (current && current.turn_claim_json === null) {
         // The identity is written in the same statement as the claim, inside the same
         // transaction. Recording them separately leaves a window where a crash produces a row
         // that is claimed but says nothing about what it claimed — a fourth state, and one
         // nothing can resolve, added to the three this file already distinguishes.
+        //
+        // Into its own column, not into `result_json`. That field is this Telegram message's
+        // reply-delivery lifecycle, and the reservation writes it whole — so a claim stored there
+        // was erased by the first reply produced, which is every ordinary timeout (#646).
         const claim: TurnClaim = { deliveryStatus: TURN_CLAIMED, ...identity };
         const updated = this.db.run(
-          `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND result_json IS ?`,
-          [JSON.stringify(claim), channel, nonce, current.result_json],
+          `UPDATE inbound_messages SET turn_claim_json = ?
+            WHERE channel = ? AND nonce = ? AND turn_claim_json IS NULL`,
+          [JSON.stringify(claim), channel, nonce],
         );
         // What serialises two claimers is the transaction, not this WHERE clause. `db.tx` runs
         // the read and the write as one unit and SQLite serialises write transactions, so a
@@ -394,7 +408,7 @@ export class IngressGuard {
       return deny(
         ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN,
         "this message's turn was already claimed and its outcome was never recorded",
-        { channel, nonce, deliveryStatus: resultDeliveryStatus(current.result_json) },
+        { channel, nonce, deliveryStatus: TURN_CLAIMED },
       );
     });
   }
@@ -474,13 +488,14 @@ export class IngressGuard {
    * oldest outstanding turn is the one that has been unanswered longest.
    */
   unresolvedTurns(channel: string, sessionDigest: string): readonly UnresolvedTurn[] {
-    const rows = this.db.all<{ nonce: string; received_at: string; result_json: string }>(
-      `SELECT nonce, received_at, result_json FROM inbound_messages
+    const rows = this.db.all<{ nonce: string; received_at: string; turn_claim_json: string }>(
+      `SELECT nonce, received_at, turn_claim_json FROM inbound_messages
         WHERE channel = ?
-          AND json_extract(result_json, '$.deliveryStatus') IS ?
-          AND json_extract(result_json, '$.sessionDigest') IS ?
+          AND turn_claim_json IS NOT NULL
+          AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
+          AND json_extract(turn_claim_json, '$.sessionDigest') IS ?
         ORDER BY received_at ASC`,
-      [channel, TURN_CLAIMED, sessionDigest],
+      [channel, sessionDigest],
     );
     return rows.map((row) => ({
       nonce: row.nonce,
@@ -490,8 +505,45 @@ export class IngressGuard {
       // turn, and handing them the wrong timestamp under a confident name is worse than handing
       // them the right one under a plain name.
       receivedAt: row.received_at,
-      ...(JSON.parse(row.result_json) as TurnClaim),
+      ...(JSON.parse(row.turn_claim_json) as TurnClaim),
     }));
+  }
+
+  /**
+   * Records that this message's turn produced a reply the transport accepted.
+   *
+   * The middle transition of `AVAILABLE → TURN_CLAIMED → (turn outcome) → REPLY_PENDING →
+   * REPLY_APPLIED`, which the claim's own docstring said did not exist. It could not, while the
+   * claim shared a field with the reply lifecycle: the reservation overwrote it, and a completed
+   * turn looked like a message nobody had claimed. Separating them (#646) made the claim survive —
+   * and then nothing cleared it, so an ordinary replay of a *finished* turn started reporting an
+   * unknown outcome, which is #651's warning arriving on schedule.
+   *
+   * What it records is what ACP observed: the transport accepted the reply. That is not the CEO
+   * proving a durable commit, and it does not pretend to be — the canonical ledger draws exactly
+   * this distinction between `HERMES_TARGET` and `ACP_OBSERVED_HERMES_REPLY`, and this is the
+   * ingress side of the same fact. The identity stays in the row for a receipt to be matched
+   * against when one exists (#638).
+   */
+  resolveTurn(channel: string, nonce: string): Decision<void> {
+    return this.db.tx(() => {
+      const current = this.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [channel, nonce],
+      );
+      if (!current?.turn_claim_json) {
+        // Not an error. A message whose handler produced a reply without ever claiming a turn is
+        // the ordinary non-CEO path, and there is nothing to resolve.
+        return allow(ReasonCode.OK, undefined);
+      }
+      this.db.run(
+        `UPDATE inbound_messages
+            SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)
+          WHERE channel = ? AND nonce = ? AND json_extract(turn_claim_json, '$.repliedAt') IS NULL`,
+        [this.clock.nowIso(), channel, nonce],
+      );
+      return allow(ReasonCode.OK, undefined);
+    });
   }
 
   private prune(channel: string, ttlMs: number): void {
@@ -506,17 +558,17 @@ export class IngressGuard {
     // It also carries the turn identity, which is what a receipt would have to be matched
     // against. Pruning it leaves nothing to match even if the receipt exists.
     //
+    // Read from `turn_claim_json`. While the claim lived in `result_json` this exemption was lost
+    // the moment a reply was reserved — so the row a timeout produced was pruned like any other,
+    // and the nonce it held was freed (#646).
+    //
     // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` in the audit log is
     // where they are visible.
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
-          AND (result_json IS NULL OR json_extract(result_json, '$.deliveryStatus') IS NOT ?)`,
-      [
-        channel,
-        new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString(),
-        TURN_CLAIMED,
-      ],
+          AND (turn_claim_json IS NULL OR json_extract(turn_claim_json, '$.repliedAt') IS NOT NULL)`,
+      [channel, new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString()],
     );
   }
 }
@@ -627,6 +679,24 @@ const isRecoverableIngressResult = (resultJson: string | null): boolean => {
     return value.sent === false;
   } catch {
     return false;
+  }
+};
+
+/**
+ * Whether a stored claim is still waiting on an outcome.
+ *
+ * A claim with `repliedAt` produced a reply the transport accepted, which is the closest thing to
+ * an outcome this layer can observe. Without the distinction the claim would survive forever and
+ * every replay of a finished turn would report an unknown outcome — the hold #651 warned that
+ * fixing #646 would create.
+ */
+const unresolvedClaim = (turnClaimJson: string | null): boolean => {
+  if (!turnClaimJson) return false;
+  try {
+    return (JSON.parse(turnClaimJson) as { repliedAt?: unknown }).repliedAt === undefined;
+  } catch {
+    // Unparseable is treated as outstanding. A claim nobody can read is not a claim that resolved.
+    return true;
   }
 };
 

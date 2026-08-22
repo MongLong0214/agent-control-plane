@@ -289,4 +289,14 @@ export class TelegramIngress {
   ): Decision<void> {
     return this.guard.recordResultIf("telegram", nonce, result, expected);
   }
+
+  /**
+   * Records that this message's turn produced a reply the transport accepted.
+   *
+   * Separate from `recordResultIf` because they are separate lifecycles — that is the whole of
+   * #646. This one touches the turn and nothing else.
+   */
+  resolveTurn(nonce: string): Decision<void> {
+    return this.guard.resolveTurn("telegram", nonce);
+  }
 }

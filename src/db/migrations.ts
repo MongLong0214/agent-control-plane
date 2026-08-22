@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 29;
+export const SCHEMA_VERSION = 30;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -1981,6 +1981,43 @@ const v29: SchemaMigration = {
   checksum: () => sha256(`v29-a-dispatch-is-a-fact\n${dispatchesDdl()}\n${ledgerTriggerDdl()}`),
 };
 
+/**
+ * Gives the turn claim its own column, and moves the claims that are in the reply's.
+ *
+ * `result_json` is this Telegram message's reply-delivery lifecycle. The turn claim lived there
+ * too, and the reply reservation writes that field whole under a precondition — "not PENDING and
+ * not APPLIED" — that a claimed turn satisfies. So an ordinary timeout, which at a measured 3m15s
+ * turn against a 120s deadline is the common case rather than the rare one, produced a reply, the
+ * reservation overwrote the claim, and the turn identity went with it (#646).
+ *
+ * Rows already holding a claim are moved rather than dropped: the identity is what a receipt would
+ * be matched against, and the row is the only record that a handler may already have run.
+ */
+const v30: SchemaMigration = {
+  id: "v30-a-turn-and-a-reply-are-two-lifecycles",
+  fromVersion: 29,
+  toVersion: 30,
+  apply: (raw) => {
+    const columns = (
+      raw.prepare(`SELECT name FROM pragma_table_info('inbound_messages')`).all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+    if (!columns.includes("turn_claim_json")) {
+      raw.exec(`ALTER TABLE inbound_messages ADD COLUMN turn_claim_json TEXT`);
+    }
+    // A claim that is still in the reply's field. `result_json` is cleared for those rows because a
+    // claimed turn has no reply yet — that is what made the overwrite possible in the first place.
+    raw.exec(
+      `UPDATE inbound_messages
+          SET turn_claim_json = result_json, result_json = NULL
+        WHERE turn_claim_json IS NULL
+          AND json_extract(result_json, '$.deliveryStatus') = 'TURN_CLAIMED'`,
+    );
+  },
+  checksum: () => migrationChecksum("v30-a-turn-and-a-reply-are-two-lifecycles"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2000,6 +2037,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v27,
   v28,
   v29,
+  v30,
 ]);
 
 interface RequiredTrigger {
