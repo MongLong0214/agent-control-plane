@@ -157,6 +157,41 @@ describe("a reply moving through its lifecycle does not take the turn's with it"
     expect(guard.unresolvedTurns("telegram", "session-digest")).toEqual([]);
   });
 
+  it("rolls the reply back when the resolution cannot happen", () => {
+    // The assertion the previous test cannot make, and a review said so: it proves both state
+    // changes happen and would pass just as well against two transactions that each succeeded.
+    // What one transaction buys is the *failure* case — the reply must not stand alone.
+    //
+    // A claim nobody can parse is how the second half is made to fail: `json_set` on malformed JSON
+    // is an error, not a no-op.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "n1");
+    guard.claimTurn("telegram", "n1", identity());
+    reserve(guard, "n1");
+    harness.cp.db.run(
+      "UPDATE inbound_messages SET turn_claim_json = 'not json' WHERE channel = 'telegram' AND nonce = 'n1'",
+    );
+
+    expect(() =>
+      guard.completeReplyAndResolveTurn("telegram", "n1", {
+        kind: "TELEGRAM_WORKFLOW",
+        phase: "REPLIED",
+        reply: "답",
+        sent: true,
+        deliveryStatus: "APPLIED",
+      }),
+    ).toThrow();
+
+    // The reply is still reserved, not applied: the whole transaction went back.
+    const stored = harness.cp.db.get<{ result_json: string }>(
+      "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = 'n1'",
+    );
+    expect((JSON.parse(stored?.result_json ?? "{}") as { deliveryStatus?: string }).deliveryStatus).toBe(
+      "PENDING",
+    );
+  });
+
   it("leaves the claim outstanding when the reply transition is refused", () => {
     // The other half of one transaction: a completion that cannot happen must not resolve the turn
     // either. Without a reservation the APPLIED transition is refused, and the claim has to stay.
