@@ -445,14 +445,17 @@ export class RunEngine {
    * gets hold of this engine finds them spent.
    */
   issueCompletionAuthorities(): CompletionAuthoritySet {
-    if (ISSUED_COMPLETION_AUTHORITIES.has(this.db.file)) {
+    if (ISSUED_COMPLETION_AUTHORITIES.has(this.db.identity)) {
       fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         "completion authorities were already issued for this database",
         {},
       );
     }
-    ISSUED_COMPLETION_AUTHORITIES.add(this.db.file);
+    ISSUED_COMPLETION_AUTHORITIES.add(this.db.identity);
+    // Handed back when the connection closes. Keyed by identity for the same reason the
+    // database's own slots are: two names for one inode are one database.
+    this.db.releaseOnClose(() => ISSUED_COMPLETION_AUTHORITIES.delete(this.db.identity));
     const daemonFinalizer = new CompletionAuthorityToken(COMPLETION_MINT, "daemon-finalizer");
     return {
       daemonFinalizer,

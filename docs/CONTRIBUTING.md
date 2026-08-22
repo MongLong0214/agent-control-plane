@@ -224,3 +224,43 @@ The same rule explains a disagreement worth recording: a test named as the top p
 from the issue by one reviewer and from `main` by another, and only the second saw that it had
 been fixed. When an issue and the code disagree, the code is the fact.
 
+
+## Install the hooks, first thing
+
+```sh
+pnpm hooks:install   # writes shims into .git/hooks pointing at .githooks/
+pnpm hooks:check     # proves each one refuses the case it names
+```
+
+Git will not let a repository install its own hooks — a clone that silently starts executing them
+is a code-execution path, and git closes that deliberately. So this is a local step, and
+`hooks:check` is the thing that notices it was skipped.
+
+`core.hooksPath` would have been one line and is the wrong answer here: it replaces the hook
+directory wholesale, so CommitLore's four hooks would stop running the moment it was set. The
+installer writes into CommitLore's published `*.commitlore-chained` slots instead, which is why
+`commit-msg` is not at the path you would look for it.
+
+## What the hooks refuse, and what each one cost
+
+Every item here was made more than once inside 48 hours, and every one was already *detected* by
+something at the time. Detection was never the missing part.
+
+| Mistake | Times | What noticed, and why that was not enough | What refuses it now |
+|---|---|---|---|
+| Committing while the falsifiability sweep holds a mutation | 2 | The sweep's own start-up check asks "is the tree dirty" — false after a killed run, irrelevant during a live one | `pre-commit`, on the sentinel file, which exists in exactly both cases |
+| Editing a line a mutation row anchors to | 3 | The full sweep, forty minutes into CI | `pre-commit` and `pre-push` run the one-second anchors pass; CI runs it before the build |
+| Wrapping a `Limit:` or `Ruled-out:` trailer onto a second line | 6 | `commitlore validate` printed a warning **and exited 0**, after the commit existed | `commit-msg`, and `pnpm trailers` over the range in CI |
+| Pushing before the local gate CI runs had finished | 2 | CI, twice, in about eight minutes each | `pre-push` runs the cheap half of that gate |
+
+## Never pipe a gate
+
+```sh
+pnpm guards:falsifiable | tail -20     # WRONG — the status is tail's, which is 0
+pnpm guards:falsifiable > out.txt; echo $?   # right
+```
+
+A pipeline exits with its *last* command's status. A failing sweep piped into `tail` reports
+success, and on 2026-08-22 that is exactly how a red gate was read as green — the failure text was
+on screen and looked like a footer. Gates in this repository end with a single `RESULT: PASS` or
+`RESULT: FAIL` line so a truncated read still says which one it was.

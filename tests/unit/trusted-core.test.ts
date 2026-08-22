@@ -97,7 +97,11 @@ describe("database hard constraints (PRD §30.2)", () => {
          VALUES (?, ?, 'PRIMARY_CTO', ?, ?, 'ses_second', 'inc-2', 2, 'PREFERRED', 'ACTIVE', ?)`,
         [newAssignmentId(), `PRIMARY_CTO:other-key`, seeded.projectId, seedActor(db, "PRIMARY_CTO"), clock.nowIso()],
       ),
-    ).toThrowError(/active primary CTO/);
+    // The partial unique index and `assignments_no_replace` both refuse this row — the guard
+    // carries that index's predicate, because a REPLACE colliding inside it deletes the existing
+    // row silently. SQLite does not define which BEFORE INSERT trigger speaks first, so naming one
+    // asserts on firing order rather than on the property.
+    ).toThrowError(/active primary CTO|ASSIGNMENT_NO_REPLACE/);
   });
 
   it("enforces monotonic binding generation per role key", () => {
@@ -113,7 +117,12 @@ describe("database hard constraints (PRD §30.2)", () => {
          VALUES (?, ?, 'PRIMARY_CTO', ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
         [newAssignmentId(), seeded.roleKey, seeded.projectId, seedActor(db, "PRIMARY_CTO"), seeded.sessionId, clock.nowIso()],
       ),
-    ).toThrowError(/BINDING_GENERATION_NOT_MONOTONIC/);
+    // Either guard refusing this row is correct, and SQLite does not define which BEFORE INSERT
+    // trigger speaks first. The row reuses the owner tuple as well as the generation, so
+    // `assignments_no_replace` — added when a REPLACE was found to delete a colliding row
+    // silently — refuses it too. Naming one message made this assert on firing order rather than
+    // on the property.
+    ).toThrowError(/BINDING_GENERATION_NOT_MONOTONIC|ASSIGNMENT_NO_REPLACE/);
   });
 
   it("keeps session incarnation immutable", () => {

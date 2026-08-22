@@ -25,7 +25,16 @@ export class AuditLog {
     private readonly clock: Clock,
   ) {}
 
-  record(entry: AuditRecord): Decision<void> {
+  /**
+   * Records an event, and answers with the row's own identity.
+   *
+   * The identity is returned because a caller that wants to *cite* this record needs the real
+   * primary key. The alternative already tried and rejected: minting a `ev_<uuid>` string
+   * alongside the insert and storing that. It satisfies a NOT NULL column and identifies
+   * nothing — an operator following it finds no audit row, because the row's identity is this
+   * autoincrement integer and always was.
+   */
+  record(entry: AuditRecord): Decision<number> {
     if (!isAllowlistedAuditEvidence(entry.evidence ?? {})) {
       // Keep the decision itself visible without retaining the rejected payload. An audit
       // record that might contain a private payload is less useful than a privacy breach.
@@ -36,12 +45,12 @@ export class AuditLog {
         { kind: entry.kind },
       );
     }
-    this.insert(entry, entry.reasonCode ?? null, redact(entry.evidence ?? {}) as Evidence);
-    return allow(ReasonCode.OK, undefined);
+    const eventId = this.insert(entry, entry.reasonCode ?? null, redact(entry.evidence ?? {}) as Evidence);
+    return allow(ReasonCode.OK, eventId);
   }
 
-  private insert(entry: AuditRecord, reasonCode: ReasonCodeValue | null, evidence: Evidence): void {
-    this.db.run(
+  private insert(entry: AuditRecord, reasonCode: ReasonCodeValue | null, evidence: Evidence): number {
+    const written = this.db.run(
       `INSERT INTO audit_events (at, kind, reason_code, run_id, project_id, session_id, role_key, actor, evidence_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -56,6 +65,7 @@ export class AuditLog {
         JSON.stringify(evidence),
       ],
     );
+    return Number(written.lastInsertRowid);
   }
 
   forRun(runId: string): AuditRow[] {

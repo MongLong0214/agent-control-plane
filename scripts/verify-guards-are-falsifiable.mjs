@@ -32,7 +32,7 @@
  * Dependency-free, in the shape of the other verify scripts (PRD §17.4).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -415,10 +415,15 @@ const GUARDS = [
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
-    what: "a message whose previous attempt completed is never run again",
+    // Three conditions guard the retry rule and they overlap: a completion is refused by the
+    // outcome test and by the observation count, and a completion beside a weaker record is also
+    // a dispute. The only case any one of them refuses alone is a dispute with no completion in
+    // it — a fenced ABORTED against a pre-dispatch NEVER_ADMITTED, where both records permit a
+    // retry individually. So this is the row, and the other two carry none.
+    what: "a retry is refused while the previous attempt's observations are still in dispute",
     file: "src/conversation/turn-coordinator.ts",
-    find: '        previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED";',
-    replace: "        previous.outcome_kind !== null;",
+    find: '        unresolved?.observation_consistency !== "CONTRADICTED";',
+    replace: "        true;",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
@@ -427,16 +432,28 @@ const GUARDS = [
     // where the previous execution may still be writing.
     what: "a message whose previous attempt is still in doubt is not raced",
     file: "src/conversation/turn-coordinator.ts",
-    find: '        previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED";',
-    replace: '        previous.outcome_kind !== "COMPLETED";',
+    find: '        (previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED") &&',
+    replace: '        previous.outcome_kind !== "COMPLETED" &&',
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
-    what: "a settlement cannot overwrite the authority that already decided the turn",
+    // The row this replaces guarded the old settle-by-UPDATE, which no longer exists. What
+    // stands in its place is that evidence unable to *set* the outcome still counts against a
+    // retry — the hole a review found, where an ACP-observed reply was invisible both as a
+    // winner and as dissent, so a later weaker record settled the turn retry-safe.
+    what: "evidence that cannot set the outcome still counts against a retry",
     file: "src/conversation/turn-coordinator.ts",
-    find: "          WHERE turn_request_id = ? AND lifecycle_state = 'IN_DOUBT'`,",
-    replace: "          WHERE turn_request_id = ?`,",
+    find: "    const distinct = new Set(unanswered.map((o) => o.observed_outcome));",
+    replace:
+      "    const distinct = new Set(unanswered.filter((o) => MATERIALIZING_AUTHORITIES.has(o.observing_authority)).map((o) => o.observed_outcome));",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "only the materializer may settle a turn, so an ordinary UPDATE cannot forge one",
+    file: "src/db/schema.sql",
+    find: "  AND acp_turn_materialization_authorized(",
+    replace: "  AND 0 = 1 AND acp_turn_materialization_authorized(",
+    killedBy: ["tests/unit/canonical-ledger-immutability.test.ts"],
   },
   {
     // There is no code to delete here: the guard is the *absence* of an expiry path. So the
@@ -482,9 +499,216 @@ const GUARDS = [
   {
     what: "a claimed turn records when it was claimed, so its age is read rather than guessed",
     file: "src/conversation/turn-coordinator.ts",
-    find: "            promptDigest,\n            this.clock.nowIso(),",
-    replace: '            promptDigest,\n            "1970-01-01T00:00:00.000Z",',
+    find: "          promptDigest,\n          this.clock.nowIso(),",
+    replace: '          promptDigest,\n          "1970-01-01T00:00:00.000Z",',
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    // The enforcement is the COALESCE, not the TypeScript that feeds it: mutating the parameter
+    // changes nothing while the SQL still refuses to overwrite a value that is already there.
+    what: "a terminal time is written once and not moved by a later observation",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "                    settled_at = COALESCE(settled_at, ?),",
+    replace: "                    settled_at = ?,",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "an adjudication has to say why, and on what",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "    if (input.reasonCode.length === 0 || input.evidenceDigest.length === 0) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // Without it the word becomes a way to mark a conversation reviewed when nothing disagreed.
+    what: "only a turn whose records actually disagree can be adjudicated",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '      if (turn.observation_consistency !== "CONTRADICTED") {',
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // A partial citation closes a disagreement while leaving part of it unread.
+    what: "an adjudication has to cite every observation on the turn, and only those",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (uncited.length > 0 || input.citedObservationIds.some((id) => !conflicting.includes(id))) {",
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // The first version resolved to whatever the caller passed, which let an adjudication choose
+    // an outcome the evidence never produced.
+    what: "an adjudication records the outcome the evidence produced and does not choose one",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "    const unanswered = observations.filter((o) => !answered.has(o.observation_id));",
+    replace: "    const unanswered = observations;",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // The wide version: releasing by file let a bystander's close hand the owner's slot away.
+    what: "closing a handle frees only the capability slots that handle issued",
+    file: "src/db/database.ts",
+    find: '    if (this.#issuedHere.has("materialization")) {\n      ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.identity);\n    }',
+    replace: "    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.identity);",
+    killedBy: ["tests/unit/ops-hardening.test.ts"],
+  },
+  {
+    // The narrow version: never releasing made the issuance a process-lifetime lockout.
+    what: "a capability slot is released when the connection holding it closes",
+    file: "src/db/database.ts",
+    find: "  close(): void {\n    if (this.#raw.open) this.#raw.close();\n    this.releaseIssuedCapabilities();",
+    replace: "  close(): void {\n    if (this.#raw.open) this.#raw.close();",
+    killedBy: ["tests/unit/ops-hardening.test.ts"],
+  },
+  {
+    // v25 dropped eight of twenty-eight and recreated with IF NOT EXISTS, so twenty kept whatever
+    // body they had. A database from 132309a then threw on every settlement and opened clean.
+    what: "a migration that recreates the ledger triggers drops all of them first",
+    file: "src/db/migrations.ts",
+    find: "    raw.exec(ledgerTriggerDrops());\n    rebuildObservationsIfStale(raw);",
+    replace: "    rebuildObservationsIfStale(raw);",
+    killedBy: ["tests/unit/a-database-built-by-an-earlier-head.test.ts"],
+  },
+  {
+    // A stale body always keeps its denial marker, so the substring check could never see one.
+    what: "a load-bearing trigger is checked by its body, not by its name and marker",
+    file: "src/db/migrations.ts",
+    find: "    if (row?.sql && expectedBody !== undefined && normaliseTriggerSql(row.sql) !== expectedBody) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/a-database-built-by-an-earlier-head.test.ts"],
+  },
+  {
+    // Two names for one inode were two capability slots, so a hard-link alias got its own.
+    what: "the capability key names the file, not a path that reaches it",
+    file: "src/db/database.ts",
+    find: "            const stat = statSync(this.file);\n            return `${stat.dev}:${stat.ino}`;",
+    replace: "            void statSync(this.file);\n            return this.file;",
+    killedBy: ["tests/unit/ops-hardening.test.ts"],
+  },
+  {
+    // A control plane that threw mid-construction kept the slots; no value came back to close.
+    what: "a composition root that fails to build releases what it took",
+    file: "src/app/control-plane.ts",
+    find: "    } catch (error) {\n      this.db.close();\n      throw error;\n    }",
+    replace: "    } catch (error) {\n      throw error;\n    }",
+    killedBy: ["tests/unit/a-control-plane-that-failed-to-build.test.ts"],
+  },
+  {
+    // Issuers that keep their own registry outlived the handle without this.
+    what: "an issuer in another module hands its slot back when the connection closes",
+    file: "src/db/database.ts",
+    find: "    for (const release of this.#releases) release();",
+    replace: "    for (const release of this.#releases) void release;",
+    killedBy: ["tests/unit/a-control-plane-that-failed-to-build.test.ts"],
+  },
+  {
+    // Before the door existed the daemon refused to start on a contradiction, so the action the
+    // doctor named had no socket to reach.
+    what: "a contradicted conversation parks the daemon instead of stopping it",
+    file: "src/daemon/daemon.ts",
+    find: '      finding.code.startsWith("CANONICAL_TURN_"),',
+    replace: "      false,",
+    killedBy: ["tests/unit/the-quarantine-has-an-operator-door.test.ts"],
+  },
+  {
+    // Parking is weaker than stopping, so it must stay unreachable for a finding no door clears.
+    what: "parking stays unreachable for a finding an operator cannot answer",
+    file: "src/daemon/daemon.ts",
+    find: "  blockingFindings.length > 0 &&\n  blockingFindings.every(",
+    replace: "  blockingFindings.length > 0 &&\n  blockingFindings.some(",
+    killedBy: ["tests/unit/the-quarantine-has-an-operator-door.test.ts"],
+  },
+  {
+    // Without it the operator's remedy lands and `daemon.status` reports BOOTSTRAP for another
+    // four minutes, which is the report disagreeing with what just happened.
+    what: "a landed adjudication promotes the daemon rather than waiting out the recheck timer",
+    file: "src/daemon/daemon.ts",
+    find: '          if (adjudicated.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");',
+    replace: "          void adjudicated;",
+    killedBy: ["tests/unit/daemon-bootstrap-door.test.ts"],
+  },
+  {
+    // A refused adjudication changed nothing the doctor can see, so spending the wake-up on it
+    // promotes on the strength of a denial.
+    what: "a refused adjudication does not spend the park's wake-up",
+    file: "src/daemon/daemon.ts",
+    find: '          if (adjudicated.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");\n          return adjudicated;',
+    replace: '          if (this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");\n          return adjudicated;',
+    killedBy: ["tests/unit/daemon-bootstrap-door.test.ts"],
+  },
+  {
+    // The census could not see `BEFORE UPDATE OF`, so sixteen triggers were invisible to it —
+    // `sessions` among them, whose secret hash a REPLACE rewrote on ACP's own connection.
+    what: "the REPLACE census sees a guard written as BEFORE UPDATE OF a column",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "  /CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\\n]*?)?\\s+ON (\\w+)/g,",
+    replace: "  /CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE) ON (\\w+)/g,",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // A credential the schema calls immutable, rewritten by a statement its guard never sees.
+    what: "a session row cannot be rewritten by replacing it",
+    file: "src/db/schema.sql",
+    find: "  SELECT RAISE(ABORT, 'SESSION_NO_REPLACE');",
+    replace: "  SELECT 1;",
+    killedBy: ["tests/unit/replace-cannot-rewrite-a-guarded-row.test.ts"],
+  },
+  {
+    // Naming less than the key refuses legitimate inserts; this one refused a rotation.
+    what: "a REPLACE guard names its table's whole key",
+    file: "src/db/schema.sql",
+    find: "   WHERE (actor_id = NEW.actor_id AND actor_generation = NEW.actor_generation)",
+    replace: "   WHERE (actor_id = NEW.actor_id)",
+    killedBy: ["tests/unit/replace-cannot-rewrite-a-guarded-row.test.ts"],
+  },
+  {
+    // Its first version required the WHEN clause on one line and silently checked sixteen of
+    // twenty triggers, in the check written to close the census's blind spot.
+    what: "the key check reads every no_replace trigger, whatever its line breaks",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "  const uncovered = keys.filter(",
+    replace: "  const uncovered = [].filter(",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // Dropping the predicate refuses legitimate inserts; dropping the index refuses nothing —
+    // measured both ways, fifty-seven broken tests one way and a silent deletion the other.
+    what: "a partial unique index contributes a key carrying its own predicate",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "    keys.push(where === null ? columns : { columns, predicate: where[1].trim() });",
+    replace: "    if (where === null) keys.push(columns);",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // Four conditions decide whether a repeated receipt is a redelivery or a second claim, and
+    // replacing any one with `true` broke no test — `CONVERSATION_TURN_RECEIPT_REUSED` appeared
+    // in none.
+    what: "a receipt redelivered onto a different turn is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          already.turn_request_id === permit.turnRequestId &&",
+    replace: "          true &&",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
+    what: "a receipt redelivered with a different outcome is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          already.observed_outcome === observation.outcome &&",
+    replace: "          true &&",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
+    what: "a receipt redelivered with different evidence is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          already.evidence_digest === observation.evidenceDigest &&",
+    replace: "          true &&",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
+    what: "a receipt redelivered with a different reason code is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          already.reason_code === observation.reasonCode;",
+    replace: "          true;",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
   },
   {
     // Two spellings of one directory resolved to two strings, and production was reachable twice.
@@ -635,9 +859,76 @@ const GUARDS = [
     replace: "  if (false) {",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
+  {
+    // Every trigger here is written with `IF NOT EXISTS`, so a pattern requiring it counts only
+    // the ones written the way its author pictured — and a trigger added without it was invisible
+    // to two gates at once while both printed PASS.
+    what: "the REPLACE census sees a trigger written without IF NOT EXISTS",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "  /CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\\n]*?)?\\s+ON (\\w+)/g,",
+    replace: "  /CREATE TRIGGER IF NOT EXISTS (\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\\n]*?)?\\s+ON (\\w+)/g,",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    what: "the required-registry check sees a trigger written without IF NOT EXISTS",
+    file: "scripts/verify-every-trigger-is-required.mjs",
+    find: "const declared = [...schema.matchAll(/CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)/g)].map(",
+    replace: "const declared = [...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\\w+)/g)].map(",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // Requiring one line made a re-formatted entry read as "named by no registry" — a true failure
+    // with a false reason, and the reason is what whoever reads it acts on.
+    what: "the registry check recognises an entry however it is wrapped",
+    file: "scripts/verify-every-trigger-is-required.mjs",
+    find: "  [...migrations.matchAll(/\\{\\s*name:\\s*\"(\\w+)\"\\s*,\\s*sentinel:/g)].map((m) => m[1]),",
+    replace: "  [...migrations.matchAll(/\\{ name: \"(\\w+)\", sentinel:/g)].map((m) => m[1]),",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // I documented this as unkillable and was refuted: an adjudication moves the turn off
+    // CONTRADICTED while the completion observation stays on it.
+    what: "a completion observation still blocks a retry after an adjudication",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        (anyCompletion?.n ?? 0) === 0 &&",
+    replace: "        true &&",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
+    // The quarantine is per actor, and this is the line that makes it so.
+    what: "an adjudication may only be recorded by the actor whose turn it is",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (!turn || turn.target_actor_id !== input.targetActorId) {",
+    replace: "      if (!turn) {",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // A column written `<name> TYPE ... UNIQUE` is a key, and only the parenthesised form was read.
+    what: "the REPLACE census sees a UNIQUE declared on the column",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "  for (const inline of body.matchAll(/^\\s*(\\w+)\\s+[A-Z][^\\n]*?\\bUNIQUE\\b[^\\n]*$/gm)) {",
+    replace: "  for (const inline of []) {",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
+
+/**
+ * Check that every row still names a line that exists, and stop — no mutation, no tests.
+ *
+ * The full sweep takes over an hour, so it is something you run at the end and read in CI. That
+ * left a gap wide enough to walk through three times on one branch: editing a guarded line renames
+ * its anchor, the row silently stops checking anything, and nothing says so until the sweep gets
+ * there. This pass is a string search and costs a second.
+ *
+ * It runs **before** the snapshot, the sentinel and the dirty check, and takes none of them. The
+ * first version sat after all three and called the restore on its way out — so a hook that ran it
+ * while a full sweep was mid-mutation wrote its own snapshot over the sweep's work, and the sweep
+ * stopped with "changed underneath this run". A read-only check that has side effects is not a
+ * read-only check, and this one is meant to be safe to run at any moment.
+ */
+const anchorsOnly = process.argv.includes("--anchors-only");
 
 const rows = GUARDS.filter((g) => !g.skip).filter(
   (g) => !only || g.what.includes(only) || g.file.includes(only),
@@ -645,6 +936,81 @@ const rows = GUARDS.filter((g) => !g.skip).filter(
 
 const out = (line) => process.stdout.write(line + "\n");
 const failures = [];
+
+/**
+ * The table has as many entries as it has `what:` lines.
+ *
+ * A missing `},{` merges two rows into one object literal. JavaScript keeps the last value for a
+ * duplicate key, so the earlier row is discarded — silently, and by every gate: the sweep reports
+ * one fewer row while still saying each killed a named test, `--anchors-only` counts the survivors
+ * and calls them all matched, and eslint has nothing to say about a duplicate key in an object
+ * literal here. Measured on this file: 99 `what:` lines, 98 objects, and the row for
+ * "a receipt redelivered with a different reason code" was gone — one of four conditions this
+ * branch had just finished writing tests for.
+ *
+ * Counting the two is the whole check, and it is the "print what you inspected" rule turned on
+ * this file's own table.
+ */
+const tableSource = readFileSync(fileURLToPath(import.meta.url), "utf8").match(
+  /const GUARDS = \[([\s\S]*?)\n\];/,
+);
+if (tableSource === null) {
+  out("verify-guards-are-falsifiable: could not read its own GUARDS table");
+  process.exit(2);
+}
+const declaredWhats = [...tableSource[1].matchAll(/^\s*what: "/gm)].length;
+if (declaredWhats !== GUARDS.length) {
+  out(
+    `verify-guards-are-falsifiable: the table has ${declaredWhats} \`what:\` line(s) and ` +
+      `${GUARDS.length} row(s).`,
+  );
+  out("  A missing `},{` merges two rows into one object; the earlier one is discarded in silence.");
+  out(`\nRESULT: FAIL — ${declaredWhats - GUARDS.length} row(s) were lost to a merged literal.`);
+  process.exit(1);
+}
+
+if (anchorsOnly) {
+  const dead = [];
+  for (const guard of rows) {
+    // The other field that goes stale, and the one nothing was checking. `vitest run <path>` exits
+    // non-zero when the path matches no file — "No test files found" is a failure — and this
+    // harness reads a non-zero exit as "the guard was killed". So renaming or deleting a
+    // `killedBy` file makes its rows report a kill forever, having run no test at all. Found by a
+    // review, which is the same way the anchor half was found.
+    for (const test of guard.killedBy) {
+      if (!existsSync(join(ROOT, test))) {
+        dead.push({
+          guard,
+          why: `killedBy names ${test}, which does not exist — vitest exits non-zero for a missing path, so this row reports a kill it never ran`,
+        });
+      }
+    }
+    const text = readFileSync(join(ROOT, guard.file), "utf8");
+    const count = text.split(guard.find).length - 1;
+    if (count !== 1) {
+      dead.push({
+        guard,
+        why:
+          count === 0
+            ? "the mutation no longer matches this file — the guard moved, and this row stopped checking anything"
+            : `the mutation matches ${count} places — a row that is not about one specific guard`,
+      });
+    }
+  }
+  for (const failure of dead) {
+    out(`  ${failure.guard.file}`);
+    out(`    ${failure.guard.what}`);
+    out(`    ${failure.why}`);
+  }
+  if (dead.length > 0) {
+    out(`\nRESULT: FAIL — ${dead.length} row(s) name a line that is not there.`);
+    process.exit(1);
+  }
+  out(`verify-guards-are-falsifiable: ${rows.length} anchor(s) still match, exactly once each.`);
+  out("An anchor that matches is not a guard that is tested — run the full sweep for that.");
+  out("RESULT: PASS");
+  process.exit(0);
+}
 
 // ---------------------------------------------------------------------------
 // Safety. This edits tracked files in place. A dirty guarded file means a crash
@@ -950,6 +1316,10 @@ if (failures.length > 0 || unclaimed.length > 0) {
     "\nA guard no test can kill is worse than no guard: it answers 'is this checked?' with a yes.\n" +
       "Either write a test that fails when the guard is removed, or remove the guard.\n",
   );
+  // Last line, always, and one of two words. The failure text above once read as a footer to
+  // someone checking `tail -6`, and a red gate got reported as green — a pipeline's status is its
+  // last command's, so `| tail` had already thrown the exit code away.
+  out(`RESULT: FAIL — ${failures.length} row(s) and ${unclaimed.length} unclaimed locus/loci.`);
   process.exit(1);
 }
 
@@ -957,3 +1327,4 @@ out("");
 out(`verify-guards-are-falsifiable: ${rows.length} guard(s) removed on purpose, each killed a named test`);
 out(`${loci.length} enforcement locus/loci from verify-enforcement-symbols.mjs are all claimed.`);
 out("A mutation proves the test is coupled to the guard, not that it asserts the right thing.");
+out("RESULT: PASS");

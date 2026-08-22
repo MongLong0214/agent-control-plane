@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 23;
+export const SCHEMA_VERSION = 26;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -103,6 +103,141 @@ const REPLAY_EXCLUDES_INTRODUCED_AFTER_V12 = [
   /-- CP-HI-04 — the identity columns of a binding are fixed once written\.[\s\S]*?CREATE TRIGGER IF NOT EXISTS assignments_generation_immutable[\s\S]*?\nEND;/,
   /-- ---------------------------------------------------------------------------\n-- conversational_actor_registrations[\s\S]*?(?=-- ---------------------------------------------------------------------------\n-- assignments)/,
 ];
+
+/**
+ * Every ledger trigger, taken from the live schema.
+ *
+ * A migration that carried its own copy would drift from the file it is supposed to reproduce,
+ * and drift is what put a database at version 24 with a different trigger set than version 24
+ * defines. Pulling them from `schema.sql` means the migration owns the ordering and nothing else.
+ */
+/**
+ * Every ledger trigger, in one place, because two lists of the same thing is how one goes stale.
+ *
+ * `ledgerTriggerDdl()` reads its bodies from schema.sql by these names; `ledgerTriggerDrops()`
+ * drops exactly these. A migration that recreates the set therefore cannot repair some of it and
+ * silently leave the rest — which is precisely what v25 did with a hand-picked list of eight.
+ */
+export const LEDGER_TRIGGER_NAMES: readonly string[] = [
+    "canonical_turns_identity_immutable",
+    "canonical_turns_born_in_doubt",
+    "canonical_turns_settlement_authority",
+    "canonical_turns_settlement_provenance_immutable",
+    "canonical_turns_consistency_monotone",
+    "canonical_turns_lifecycle_monotone",
+    "canonical_turns_outcome_never_weakens",
+    "canonical_turns_no_delete",
+    "canonical_turns_no_replace",
+    "canonical_turn_observations_write_authority",
+    "canonical_turn_observations_append_only",
+    "canonical_turn_observations_no_delete",
+    "canonical_turn_observations_no_replace",
+    "canonical_turn_sources_immutable",
+    "canonical_turn_sources_no_delete",
+    "canonical_turn_sources_no_replace",
+    "actor_target_attestations_append_only",
+    "actor_target_attestations_no_delete",
+    "actor_target_attestations_no_replace",
+    "actor_target_bindings_immutable",
+    "actor_target_bindings_no_delete",
+    "actor_target_bindings_no_replace",
+    "canonical_turn_adjudications_write_authority",
+    "canonical_turn_adjudications_append_only",
+    "canonical_turn_adjudications_no_delete",
+    "canonical_turn_adjudication_citations_write_authority",
+    "canonical_turn_adjudication_citations_append_only",
+    "canonical_turn_adjudication_citations_no_delete",
+    "canonical_turn_adjudication_citations_same_turn",
+    "canonical_turn_adjudications_no_replace",
+    "canonical_turn_adjudication_citations_no_replace",
+];
+
+/**
+ * `DROP TRIGGER IF EXISTS` for every ledger trigger, derived from the list above.
+ *
+ * Dropping before recreating is what makes a repair migration a repair. `CREATE TRIGGER IF NOT
+ * EXISTS` against a trigger that is already there is a no-op, so a body that drifted survives the
+ * migration built to replace it — measured on a database created at `132309a`, which migrated to
+ * v25, reported healthy, and then threw on every settlement because its settlement trigger still
+ * called the four-argument marker that no longer exists.
+ */
+export const ledgerTriggerDrops = (): string =>
+  `${dropsFor(LEDGER_TRIGGER_NAMES)}${dropsFor(PROVENANCE_NO_REPLACE_TRIGGERS)}`;
+
+/**
+ * Provenance tables that had UPDATE and DELETE guards and nothing on INSERT.
+ *
+ * Found by census after the same hole was closed on the ledger tables and missed here. Kept
+ * separate from the ledger set because they are not part of the canonical turn's own schema, and
+ * kept in this file because the repair migration has to install them for databases that already
+ * exist.
+ */
+export const PROVENANCE_NO_REPLACE_TRIGGERS: readonly string[] = [
+  "audit_events_no_replace",
+  "baseline_records_no_replace",
+  "telegram_owner_prompts_no_replace",
+  "conversational_actors_no_replace",
+  "manifests_no_replace",
+  // Found when the census learned to see `BEFORE UPDATE OF <column>`, which four of this schema's
+  // most load-bearing guards use and its first pattern did not match. `sessions` was among the
+  // sixteen triggers it could not see, and a REPLACE rewrote a session's secret hash on ACP's own
+  // connection while the census printed PASS.
+  "sessions_no_replace",
+  "runs_no_replace",
+  "assignments_no_replace",
+  "task_executions_no_replace",
+  "conversational_actor_registrations_no_replace",
+  "outbox_no_replace",
+  "run_artifacts_no_replace",
+  "github_receipts_no_replace",
+];
+
+/** `DROP TRIGGER IF EXISTS` for a set of triggers, so a repair replaces rather than skips. */
+const dropsFor = (names: readonly string[]): string =>
+  `${names.map((name) => `DROP TRIGGER IF EXISTS ${name};`).join("\n")}\n`;
+
+/** The definitions of the named triggers, read out of the live schema so the two cannot drift. */
+const triggerDdlFor = (names: readonly string[]): string => {
+  const ddl = schemaDdl();
+  const found = names.map((name) => {
+    const pattern = new RegExp(
+      `CREATE TRIGGER IF NOT EXISTS ${name}\\n[\\s\\S]*?\\nEND;`,
+      "m",
+    );
+    const match = pattern.exec(ddl);
+    if (!match) {
+      // A name here with no definition in schema.sql means the two have already drifted, which is
+      // the failure this function exists to make impossible. Loud rather than partial.
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `ledger trigger ${name} is named by the migration and absent from schema.sql`,
+        { trigger: name },
+      );
+    }
+    return match[0];
+  });
+  return `${found.join("\n\n")}\n`;
+};
+
+export const ledgerTriggerDdl = (): string => triggerDdlFor(LEDGER_TRIGGER_NAMES);
+export const provenanceNoReplaceDdl = (): string => triggerDdlFor(PROVENANCE_NO_REPLACE_TRIGGERS);
+
+/** The adjudication tables and their index, taken from the live schema for the same reason. */
+export const adjudicationDdl = (): string => {
+  const ddl = schemaDdl();
+  const parts = [
+    /CREATE TABLE IF NOT EXISTS canonical_turn_adjudications \([\s\S]*?\n\);/,
+    /CREATE TABLE IF NOT EXISTS canonical_turn_adjudication_citations \([\s\S]*?\n\);/,
+    /CREATE INDEX IF NOT EXISTS canonical_turn_adjudications_by_turn[^;]*;/,
+  ].map((pattern) => {
+    const match = pattern.exec(ddl);
+    if (!match) {
+      throw acpError(ReasonCode.INTERNAL_ERROR, "an adjudication object is missing from schema.sql", {});
+    }
+    return match[0];
+  });
+  return `${parts.join("\n\n")}\n`;
+};
 
 export const replayDdlWithoutPostV12Columns = (): string =>
   REPLAY_EXCLUDES_INTRODUCED_AFTER_V12.reduce((ddl, pattern) => ddl.replace(pattern, ""), schemaDdl());
@@ -1019,6 +1154,584 @@ const v23: SchemaMigration = {
   checksum: () => sha256(`v23-turn-claimed-at\n${V23_TURN_CLAIMED_AT_DDL}`),
 };
 
+
+/**
+ * The ledger records what authorities observed, and computes the outcome from that.
+ *
+ * Three defects, all reproduced before this was written.
+ *
+ * **Nothing paired an outcome with an authority that could have observed it.** The pairing lived
+ * only in a TypeScript union, erased at runtime, so `COMPLETED` under `ACP_PRE_DISPATCH` — an
+ * authority that by definition saw nothing run — was accepted by the database.
+ *
+ * **Nothing made the ledger append-only.** A plain `UPDATE canonical_turns SET
+ * outcome_kind='ABORTED'` on a settled `COMPLETED` row makes the retry rule admit attempt 2, so
+ * a completed exchange can be run again. Deleting the sources and then the turn clears the
+ * "permanent" hold just as easily.
+ *
+ * **First settlement won.** A settlement was an UPDATE conditional on `IN_DOUBT`, which correctly
+ * refuses an overwrite and therefore *discards the later, more authoritative* record. A mistaken
+ * pre-dispatch refusal beating a real target receipt kept the false retry-safe answer and threw
+ * away the true one. That is worse than the overwrite it prevents.
+ *
+ * So a settlement is no longer an UPDATE. Authorities append observations; the turn's outcome is
+ * materialized from the set of them under a fixed conservative order, and the two records that
+ * disagree are both kept. Consistency is a separate axis from lifecycle because they are separate
+ * facts: a turn can be settled and later contradicted, and the actor may by then be holding a
+ * different turn — one partial-unique slot cannot express both.
+ */
+const V24_OBSERVATION_LEDGER_DDL = `
+-- Seeded here as well as in schema.sql, because a database that upgrades from v23 never runs the
+-- fresh bootstrap. Without this the vocabulary row exists only on new installs, and an ordinary
+-- ACP-observed reply on an upgraded deployment fails its foreign key and leaves the turn in
+-- doubt — a defect no fresh-database test can see.
+INSERT OR IGNORE INTO turn_resolution_authorities (resolution_authority) VALUES
+  ('ACP_OBSERVED_HERMES_REPLY');
+
+CREATE TABLE IF NOT EXISTS turn_observation_consistency (
+  observation_consistency TEXT PRIMARY KEY
+);
+INSERT OR IGNORE INTO turn_observation_consistency (observation_consistency) VALUES
+  -- Every observation on this turn agrees about whether it ran and how it ended.
+  ('CONSISTENT'),
+  -- Two authorities reported outcomes that cannot both be true. Both are kept; the actor is
+  -- quarantined until someone adjudicates.
+  ('CONTRADICTED'),
+  -- An adjudication citing the conflicting observations has closed the disagreement. It closes
+  -- consistency only; it can never choose an outcome more retry-safe than the conservative order
+  -- already produced.
+  ('ADJUDICATED');
+
+CREATE TABLE IF NOT EXISTS canonical_turns (
+  turn_request_id               TEXT PRIMARY KEY,
+  target_actor_id               TEXT NOT NULL,
+  target_binding_id             TEXT NOT NULL,
+  target_attestation_id         TEXT NOT NULL,
+  executor_session_id           TEXT NOT NULL,
+  executor_session_incarnation  TEXT NOT NULL,
+  binding_generation            INTEGER NOT NULL,
+  prompt_digest                 TEXT NOT NULL,
+  claimed_at                    TEXT NOT NULL,
+  -- The audit row this claim is explained by. A real foreign key to a real primary key: the
+  -- shape this replaces minted an \`ev_<uuid>\` string that identified no row at all.
+  claim_audit_event_id          INTEGER NOT NULL REFERENCES audit_events(event_id),
+  lifecycle_state               TEXT NOT NULL CHECK (lifecycle_state IN ('IN_DOUBT', 'SETTLED')),
+  -- Materialized from the observations, never written directly by a settling caller.
+  outcome_kind                  TEXT REFERENCES turn_outcome_kinds(outcome_kind),
+  settled_at                    TEXT,
+  resolution_authority          TEXT REFERENCES turn_resolution_authorities(resolution_authority),
+  reason_code                   TEXT,
+  evidence_digest               TEXT,
+  observation_consistency       TEXT NOT NULL DEFAULT 'CONSISTENT'
+                                REFERENCES turn_observation_consistency(observation_consistency),
+  replacement_turn_request_id   TEXT REFERENCES canonical_turns(turn_request_id),
+  FOREIGN KEY (target_binding_id, target_actor_id)
+    REFERENCES actor_target_bindings(target_binding_id, target_actor_id),
+  FOREIGN KEY (target_attestation_id, target_binding_id)
+    REFERENCES actor_target_attestations(target_attestation_id, target_binding_id),
+  CHECK (lifecycle_state <> 'IN_DOUBT' OR (
+    outcome_kind IS NULL AND settled_at IS NULL AND resolution_authority IS NULL
+    AND reason_code IS NULL AND evidence_digest IS NULL)),
+  CHECK (lifecycle_state <> 'SETTLED' OR (
+    outcome_kind IS NOT NULL AND settled_at IS NOT NULL AND resolution_authority IS NOT NULL
+    AND reason_code IS NOT NULL AND evidence_digest IS NOT NULL)),
+  -- An outcome may only stand under an authority that could have observed it.
+  --
+  --   NEVER_ADMITTED  only pre-dispatch evidence can say nothing ran
+  --   COMPLETED       only the target's own receipt
+  --   ABORTED         requires a fence, which only the target or the owner-after-fence can give
+  CHECK (outcome_kind IS NULL OR (
+    (outcome_kind = 'NEVER_ADMITTED' AND resolution_authority = 'ACP_PRE_DISPATCH')
+    OR (outcome_kind = 'COMPLETED' AND resolution_authority = 'HERMES_TARGET')
+    OR (outcome_kind = 'ABORTED'
+        AND resolution_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE'))))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved
+  ON canonical_turns(target_actor_id) WHERE lifecycle_state = 'IN_DOUBT';
+
+CREATE TABLE IF NOT EXISTS canonical_turn_sources (
+  turn_request_id              TEXT NOT NULL REFERENCES canonical_turns(turn_request_id),
+  source_channel               TEXT NOT NULL,
+  source_nonce                 TEXT NOT NULL,
+  source_attempt               INTEGER NOT NULL CHECK (source_attempt > 0),
+  batch_ordinal                INTEGER NOT NULL CHECK (batch_ordinal >= 0),
+  source_digest                TEXT NOT NULL,
+  predecessor_turn_request_id  TEXT REFERENCES canonical_turns(turn_request_id),
+  -- Filled at INSERT, from the same transaction's audit row. Nothing patches it later, because
+  -- an append-only table that has to be updated to become complete is not append-only.
+  admission_audit_event_id     INTEGER NOT NULL REFERENCES audit_events(event_id),
+  PRIMARY KEY (source_channel, source_nonce, source_attempt),
+  UNIQUE (turn_request_id, batch_ordinal),
+  UNIQUE (turn_request_id, source_channel, source_nonce),
+  CHECK ((source_attempt = 1) = (predecessor_turn_request_id IS NULL))
+);
+
+-- What an authority reported about a turn. Append-only, and the only way an outcome is ever set.
+--
+-- A settling caller inserts here; nothing writes canonical_turns' outcome columns directly. Two
+-- authorities that disagree both leave a row, which is the whole point: the record that arrives
+-- second is often the one that knows.
+CREATE TABLE IF NOT EXISTS canonical_turn_observations (
+  observation_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  turn_request_id           TEXT NOT NULL REFERENCES canonical_turns(turn_request_id),
+  observed_outcome          TEXT NOT NULL REFERENCES turn_outcome_kinds(outcome_kind),
+  observing_authority       TEXT NOT NULL REFERENCES turn_resolution_authorities(resolution_authority),
+  -- Authority-scoped receipt identity. The same receipt redelivered is a no-op rather than a
+  -- second opinion, so a retrying transport cannot manufacture a contradiction.
+  receipt_id                TEXT NOT NULL,
+  evidence_digest           TEXT NOT NULL,
+  reason_code               TEXT NOT NULL,
+  observed_at               TEXT NOT NULL,
+  audit_event_id            INTEGER NOT NULL REFERENCES audit_events(event_id),
+  -- An adjudication cites the observation it resolves. It closes consistency; it cannot choose a
+  -- more retry-safe outcome than the conservative order already produced.
+  adjudicates_observation_id INTEGER REFERENCES canonical_turn_observations(observation_id),
+  -- Scoped to the turn, not global. A global key made one turn's receipt id collide with
+  -- another's: a genuine target receipt for turn B, numbered the same as one turn A had already
+  -- consumed, was silently discarded and turn B kept its weaker outcome. Measured.
+  UNIQUE (turn_request_id, observing_authority, receipt_id),
+  CHECK (
+    (observed_outcome = 'NEVER_ADMITTED' AND observing_authority = 'ACP_PRE_DISPATCH')
+    OR (observed_outcome = 'COMPLETED'
+        AND observing_authority IN ('HERMES_TARGET', 'ACP_OBSERVED_HERMES_REPLY'))
+    OR (observed_outcome = 'ABORTED'
+        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE')))
+);
+
+CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn
+  ON canonical_turn_observations(turn_request_id, observation_id);
+
+-- CP-HI-06 — a turn's identity and the claim it was admitted under are exact evidence. Only the
+-- materialized outcome columns and the consistency axis may move, and only upward.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_identity_immutable
+BEFORE UPDATE ON canonical_turns
+WHEN OLD.target_actor_id IS NOT NEW.target_actor_id
+  OR OLD.target_binding_id IS NOT NEW.target_binding_id
+  OR OLD.target_attestation_id IS NOT NEW.target_attestation_id
+  OR OLD.executor_session_id IS NOT NEW.executor_session_id
+  OR OLD.executor_session_incarnation IS NOT NEW.executor_session_incarnation
+  OR OLD.binding_generation IS NOT NEW.binding_generation
+  OR OLD.prompt_digest IS NOT NEW.prompt_digest
+  OR OLD.claimed_at IS NOT NEW.claimed_at
+  OR OLD.claim_audit_event_id IS NOT NEW.claim_audit_event_id
+  -- The retry lineage. Left out of every guard it belonged in, so a settled turn could be
+  -- pointed at an unrelated replacement, repointed, and cleared — editable history of what was
+  -- run instead of what.
+  OR (OLD.replacement_turn_request_id IS NOT NULL
+      AND OLD.replacement_turn_request_id IS NOT NEW.replacement_turn_request_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_IDENTITY_IMMUTABLE');
+END;
+
+-- CP-HI-06 — the lifecycle is monotone. A settled turn never returns to doubt, which would put
+-- the hold back on a conversation whose outcome is known.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_lifecycle_monotone
+BEFORE UPDATE ON canonical_turns
+WHEN OLD.lifecycle_state = 'SETTLED' AND NEW.lifecycle_state = 'IN_DOUBT'
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_LIFECYCLE_NOT_MONOTONE');
+END;
+
+-- CP-HI-06 — an outcome may only become *more* retry-blocking, never less.
+--
+-- COMPLETED forbids a re-run, ABORTED and NEVER_ADMITTED permit one. Lowering an outcome is
+-- therefore how a completed exchange becomes runnable again, and it is exactly the measured
+-- defect: a plain UPDATE from COMPLETED to ABORTED made the retry rule admit attempt 2.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_outcome_never_weakens
+BEFORE UPDATE OF outcome_kind ON canonical_turns
+WHEN OLD.outcome_kind IS NOT NULL
+  AND (NEW.outcome_kind IS NULL
+       OR (OLD.outcome_kind = 'COMPLETED' AND NEW.outcome_kind <> 'COMPLETED')
+       OR (OLD.outcome_kind = 'ABORTED' AND NEW.outcome_kind = 'NEVER_ADMITTED'))
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_OUTCOME_WEAKENED');
+END;
+
+-- CP-HI-02 — a turn is born in doubt. Settlement is something an observation causes, never
+-- something a row arrives already carrying.
+--
+-- The authority trigger beside this one guards UPDATE, and an INSERT of a fully settled row with
+-- zero observations walked past it: the CHECKs accept any syntactically valid settled tuple, and
+-- the one-unresolved index only constrains IN_DOUBT rows. A review found it in a test comment of
+-- mine that called it "a different hole named in its own issue" — an issue that did not exist.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_born_in_doubt
+BEFORE INSERT ON canonical_turns
+WHEN NEW.lifecycle_state <> 'IN_DOUBT'
+  OR NEW.outcome_kind IS NOT NULL
+  OR NEW.settled_at IS NOT NULL
+  OR NEW.resolution_authority IS NOT NULL
+  OR NEW.evidence_digest IS NOT NULL
+  OR NEW.observation_consistency <> 'CONSISTENT'
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_NOT_BORN_IN_DOUBT');
+END;
+
+-- CP-HI-02 — only the materializer may move a turn's settlement columns or its consistency.
+--
+-- The version this replaces guarded the *weakening* of an outcome and nothing else, so an
+-- ordinary UPDATE setting lifecycle_state='SETTLED' and outcome_kind='ABORTED' on a
+-- turn that had never been settled succeeded with **zero observations**, and the retry rule then
+-- read that forged outcome and admitted attempt 2. Reproduced on the previous head.
+--
+-- acp_turn_materialization_authorized is a connection-local marker in the same shape as the
+-- run-state and evidence guards: a raw SQL caller can invoke it and cannot make it answer true
+-- outside the owning operation. It is bound to the exact tuple being written, not merely to the
+-- row, so the materializer's own transaction cannot be cover for a different write.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_settlement_authority
+BEFORE UPDATE ON canonical_turns
+WHEN (OLD.lifecycle_state IS NOT NEW.lifecycle_state
+      OR OLD.outcome_kind IS NOT NEW.outcome_kind
+      OR OLD.settled_at IS NOT NEW.settled_at
+      OR OLD.resolution_authority IS NOT NEW.resolution_authority
+      OR OLD.reason_code IS NOT NEW.reason_code
+      OR OLD.evidence_digest IS NOT NEW.evidence_digest
+      OR OLD.observation_consistency IS NOT NEW.observation_consistency)
+  AND acp_turn_materialization_authorized(NEW.turn_request_id) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — a settled turn's provenance is the evidence, and evidence that can be rewritten is
+-- not evidence. The authority trigger above stops an unauthorised writer; this stops the
+-- materializer itself from moving a terminal time or a digest it already recorded.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_settlement_provenance_immutable
+BEFORE UPDATE ON canonical_turns
+WHEN OLD.lifecycle_state = 'SETTLED'
+  AND (OLD.settled_at IS NOT NEW.settled_at
+       OR (OLD.outcome_kind IS NEW.outcome_kind
+           AND (OLD.evidence_digest IS NOT NEW.evidence_digest
+                OR OLD.reason_code IS NOT NEW.reason_code
+                OR OLD.resolution_authority IS NOT NEW.resolution_authority)))
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_SETTLEMENT_PROVENANCE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — a quarantine that ordinary SQL can lift silently is not a quarantine. Consistency
+-- moves only under the materializer, and only forward: CONSISTENT may become CONTRADICTED, and
+-- CONTRADICTED may become ADJUDICATED. Nothing returns to CONSISTENT, because the disagreement
+-- happened and erasing it is how the record stops being one.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_consistency_monotone
+BEFORE UPDATE OF observation_consistency ON canonical_turns
+WHEN NOT (
+  OLD.observation_consistency = NEW.observation_consistency
+  OR (OLD.observation_consistency = 'CONSISTENT' AND NEW.observation_consistency = 'CONTRADICTED')
+  OR (OLD.observation_consistency = 'CONTRADICTED' AND NEW.observation_consistency = 'ADJUDICATED')
+  -- An adjudication closes the disagreement it read. A *new* disagreement is a different fact,
+  -- and it has to be able to re-open the turn — otherwise the first adjudication makes the ledger
+  -- deaf: every later observation recomputes a consistency the trigger refuses, and the whole
+  -- transaction rolls back, discarding evidence that arrived after someone said the matter was
+  -- settled. Monotone here means "never silently consistent", not "never re-opened".
+  OR (OLD.observation_consistency = 'ADJUDICATED' AND NEW.observation_consistency = 'CONTRADICTED')
+)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_CONSISTENCY_NOT_MONOTONE');
+END;
+
+-- CP-HI-08 — deleting a turn clears a hold that is releasable only by an observed outcome, and
+-- leaves nothing that says it happened.
+CREATE TRIGGER IF NOT EXISTS canonical_turns_no_delete
+BEFORE DELETE ON canonical_turns
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_DELETE');
+END;
+
+-- CP-HI-02 — an observation is what the outcome is computed from, so a row that appears without
+-- the materializer having run leaves the computed columns describing a set that no longer exists.
+--
+-- Measured on a review head: settle NEVER_ADMITTED normally, then insert a valid
+-- HERMES_TARGET/COMPLETED observation directly. The records disagreed while the turn still read
+-- NEVER_ADMITTED / CONSISTENT, so the doctor stayed green, the quarantine did not engage, and a
+-- later legitimate redelivery took the receipt fast path and never recomputed.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_observations_write_authority
+BEFORE INSERT ON canonical_turn_observations
+WHEN acp_turn_materialization_authorized(NEW.turn_request_id) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_OBSERVATION_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — an observation is what an authority reported. Editing one rewrites the testimony
+-- the outcome was computed from.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_observations_append_only
+BEFORE UPDATE ON canonical_turn_observations
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_OBSERVATION_APPEND_ONLY');
+END;
+
+-- CP-HI-06 — removing an observation removes the testimony the outcome was computed from.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_observations_no_delete
+BEFORE DELETE ON canonical_turn_observations
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_OBSERVATION_APPEND_ONLY');
+END;
+
+-- CP-HI-06 — which messages a turn consumed is the other half of "this must not run again".
+CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_immutable
+BEFORE UPDATE ON canonical_turn_sources
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_SOURCE_IMMUTABLE');
+END;
+
+-- CP-HI-08 — a source removed from under a turn makes the retry rule read a turn that
+-- consumed nothing, and nothing reports the loss.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_no_delete
+BEFORE DELETE ON canonical_turn_sources
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_SOURCE_IMMUTABLE');
+END;
+
+-- CP-HI-04 — an attestation is a named runtime generation's proof about a binding. v22 called
+-- this table append-only and nothing enforced it; an editable one lets a stale generation be
+-- presented as current, which is exactly what admission reads.
+CREATE TRIGGER IF NOT EXISTS actor_target_attestations_append_only
+BEFORE UPDATE ON actor_target_attestations
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_TARGET_ATTESTATION_APPEND_ONLY');
+END;
+
+-- CP-HI-06 — removing an attestation removes the evidence a settled turn cites.
+CREATE TRIGGER IF NOT EXISTS actor_target_attestations_no_delete
+BEFORE DELETE ON actor_target_attestations
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_TARGET_ATTESTATION_APPEND_ONLY');
+END;
+
+-- CP-HI-04 — the binding is a lifetime bijection between an actor and one conversation. A
+-- rewritable one is how a retired actor's target gets re-pointed at a fresh actor.
+CREATE TRIGGER IF NOT EXISTS actor_target_bindings_immutable
+BEFORE UPDATE ON actor_target_bindings
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_TARGET_BINDING_IMMUTABLE');
+END;
+
+-- CP-HI-04 — a deleted binding frees its target locator for a different actor, which is the
+-- same alias arriving by removal rather than by edit.
+CREATE TRIGGER IF NOT EXISTS actor_target_bindings_no_delete
+BEFORE DELETE ON actor_target_bindings
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_TARGET_BINDING_IMMUTABLE');
+END;
+`;
+
+/**
+ * Recreated rather than altered, for the third time and the same reason: SQLite cannot add a
+ * CHECK to an existing table. Safe for the same reason as before, and verified rather than
+ * assumed — the migration refuses to run against rows it cannot attribute.
+ */
+const v24: SchemaMigration = {
+  id: "v24-observation-ledger",
+  fromVersion: 23,
+  toVersion: 24,
+  apply: (raw) => {
+    for (const table of ["canonical_turn_sources", "canonical_turns"]) {
+      const rows = raw.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number };
+      if (rows.n > 0) {
+        throw acpError(
+          ReasonCode.INTERNAL_ERROR,
+          `v24 cannot reconstruct observations for turns it did not see; ${table} is not empty`,
+          { table, rows: rows.n },
+        );
+      }
+    }
+    raw.exec(`DROP INDEX IF EXISTS canonical_turns_one_unresolved`);
+    raw.exec(`DROP TABLE IF EXISTS canonical_turn_sources`);
+    raw.exec(`DROP TABLE IF EXISTS canonical_turns`);
+    raw.exec(V24_OBSERVATION_LEDGER_DDL);
+  },
+  checksum: () => sha256(`v24-observation-ledger\n${V24_OBSERVATION_LEDGER_DDL}`),
+};
+
+/**
+ * The guards v24 should have carried, for databases that already ran it.
+ *
+ * v24's DDL was edited in place across two correction rounds. That is the one thing this file's
+ * whole discipline exists to prevent: a database that ran the earlier v24 is at version 24, has
+ * none of the later triggers, and takes the same-version path at startup — where the required
+ * trigger registry now demands objects it does not have and refuses to open it. It never
+ * migrates, because as far as the ledger is concerned it is already current.
+ *
+ * A review found it by instantiating the previous v24 schema and starting against it. Neither a
+ * fresh install nor a v11-to-current replay can show it, because both build the current DDL.
+ */
+const V25_LEDGER_GUARDS_DDL = `
+INSERT OR IGNORE INTO turn_resolution_authorities (resolution_authority) VALUES
+  ('ACP_OBSERVED_HERMES_REPLY');
+
+DROP TRIGGER IF EXISTS canonical_turns_identity_immutable;
+DROP TRIGGER IF EXISTS canonical_turns_born_in_doubt;
+DROP TRIGGER IF EXISTS canonical_turn_observations_write_authority;
+DROP TRIGGER IF EXISTS canonical_turns_no_replace;
+DROP TRIGGER IF EXISTS canonical_turn_observations_no_replace;
+DROP TRIGGER IF EXISTS canonical_turn_sources_no_replace;
+DROP TRIGGER IF EXISTS actor_target_bindings_no_replace;
+DROP TRIGGER IF EXISTS actor_target_attestations_no_replace;
+`;
+
+/**
+ * Applies the current ledger trigger set to a database that ran an earlier v24.
+ *
+ * The triggers themselves come from the live schema so the two cannot drift; this migration owns
+ * only the ordering — drop what the earlier v24 left, then create what the current one defines.
+ */
+const v25: SchemaMigration = {
+  id: "v25-ledger-guards",
+  fromVersion: 24,
+  toVersion: 25,
+  apply: (raw) => {
+    raw.exec(V25_LEDGER_GUARDS_DDL);
+    raw.exec(adjudicationDdl());
+    raw.exec(ledgerTriggerDdl());
+  },
+  checksum: () =>
+    sha256(`v25-ledger-guards\n${V25_LEDGER_GUARDS_DDL}\n${adjudicationDdl()}\n${ledgerTriggerDdl()}`),
+};
+
+/** One object out of the live schema, by pattern, so a rebuild cannot invent its own definition. */
+const schemaObject = (pattern: RegExp, what: string): string => {
+  const match = pattern.exec(schemaDdl());
+  if (!match) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, `${what} is missing from schema.sql`, {});
+  }
+  return match[0];
+};
+
+const observationsTableOnlyDdl = (): string =>
+  schemaObject(
+    /CREATE TABLE IF NOT EXISTS canonical_turn_observations \([\s\S]*?\n\);/,
+    "the observations table",
+  );
+
+const observationsIndexDdl = (): string =>
+  schemaObject(
+    /CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn[^;]*;/,
+    "the observations index",
+  );
+
+/**
+ * Rebuilds `canonical_turn_observations` when its stored definition is not the current one.
+ *
+ * v24 created it with `UNIQUE (turn_request_id, observing_authority, receipt_id)`. The live schema
+ * scopes receipt identity to the authority across all turns, because per-turn scoping let one
+ * authority's receipt id land on two turns — a wrong-turn completion laundering path. Nothing
+ * rebuilt the table, so *every* database upgrading from v23 or earlier through v24 gets the old
+ * constraint and keeps it: the code queries globally while the index only enforces per-turn.
+ *
+ * A duplicate that the new constraint forbids is refused rather than dropped. Losing an
+ * observation is losing the evidence a turn's outcome was computed from, and a migration that
+ * quietly discards one is worse than a migration that stops.
+ */
+const rebuildObservationsIfStale = (raw: Database.Database): void => {
+  const stored = (
+    raw
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turn_observations'")
+      .get() as { sql?: string } | undefined
+  )?.sql;
+  if (stored === undefined) return;
+  const wanted = /CREATE TABLE IF NOT EXISTS canonical_turn_observations \([\s\S]*?\n\);/.exec(schemaDdl());
+  // Quote-insensitive, because `ALTER TABLE … RENAME TO` writes the name back quoted. Comparing
+  // the raw text would report a table this migration had just rebuilt as still stale.
+  const normalise = (sql: string): string =>
+    sql
+      .replace(/CREATE TABLE IF NOT EXISTS /, "CREATE TABLE ")
+      .replace(/"/g, "")
+      .replace(/;\s*$/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  if (wanted && normalise(stored) === normalise(wanted[0])) return;
+
+  const clash = raw
+    .prepare(
+      `SELECT observing_authority AS a, receipt_id AS r, COUNT(*) AS n
+         FROM canonical_turn_observations
+        GROUP BY observing_authority, receipt_id HAVING n > 1`,
+    )
+    .all() as Array<{ a: string; r: string; n: number }>;
+  if (clash.length > 0) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "receipt ids are reused across turns, which the current identity forbids and this migration will not discard",
+      { duplicates: clash.length, first: clash[0] ?? null },
+    );
+  }
+
+  // SQLite's documented order, and the reason it is that order: renaming the *old* table makes
+  // SQLite rewrite every foreign key that names it, so the adjudication citations came out of the
+  // first attempt pointing at `canonical_turn_observations_stale` — a table this function then
+  // dropped. Building the replacement under a temporary name and renaming *it* leaves every
+  // existing reference textually correct, because nothing references the temporary name.
+  const columns = `observation_id, turn_request_id, observed_outcome, observing_authority, receipt_id,
+        evidence_digest, reason_code, observed_at, audit_event_id, adjudicates_observation_id`;
+  raw.exec(
+    observationsTableOnlyDdl().replace(
+      "CREATE TABLE IF NOT EXISTS canonical_turn_observations",
+      "CREATE TABLE canonical_turn_observations_rebuilt",
+    ),
+  );
+  raw.exec(
+    `INSERT INTO canonical_turn_observations_rebuilt (${columns})
+     SELECT ${columns} FROM canonical_turn_observations`,
+  );
+  raw.exec("DROP TABLE canonical_turn_observations");
+  raw.exec("ALTER TABLE canonical_turn_observations_rebuilt RENAME TO canonical_turn_observations");
+  raw.exec(observationsIndexDdl());
+
+  // The check that would have caught the first attempt. A dangling reference survives
+  // `foreign_key_check` when the table it names does not exist, so ask the schema directly.
+  const dangling = raw
+    .prepare(
+      `SELECT name FROM sqlite_master
+        WHERE type = 'table' AND sql LIKE '%canonical_turn_observations_rebuilt%'`,
+    )
+    .all() as Array<{ name: string }>;
+  if (dangling.length > 0) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      "rebuilding the observations table left a reference to its temporary name",
+      { tables: dangling.map((row) => row.name) },
+    );
+  }
+};
+
+/**
+ * Replaces every ledger trigger body, for databases whose triggers drifted under an earlier head.
+ *
+ * v25 dropped eight triggers by name and then ran `CREATE TRIGGER IF NOT EXISTS` for all
+ * twenty-eight, so the other twenty kept whatever body they already had. Measured on a database
+ * built by `132309a` and opened by this head:
+ *
+ * ```
+ * opened; user_version now: 25
+ * canonical_turns_settlement_authority  { fourArgCall: true }
+ * SETTLEMENT THREW: wrong number of arguments to function acp_turn_materialization_authorized()
+ * ```
+ *
+ * The turn stays IN_DOUBT — nothing can settle it, `adjudicate()` refuses it because it is not
+ * contradicted, and the actor's next claim is refused because the first is unresolved. A
+ * conversation wedged with no exit, arriving through the migration written to prevent exactly
+ * that.
+ *
+ * This runs after v25 rather than editing it, because a database created at the head that shipped
+ * v25 has already taken it and would otherwise keep the same stale bodies one version later.
+ */
+const v26: SchemaMigration = {
+  id: "v26-ledger-trigger-bodies",
+  fromVersion: 25,
+  toVersion: 26,
+  foreignKeysOffDuringApply: true,
+  apply: (raw) => {
+    raw.exec(ledgerTriggerDrops());
+    rebuildObservationsIfStale(raw);
+    raw.exec(adjudicationDdl());
+    raw.exec(ledgerTriggerDdl());
+    raw.exec(provenanceNoReplaceDdl());
+  },
+  checksum: () =>
+    sha256(
+      `v26-ledger-trigger-bodies\n${ledgerTriggerDrops()}\n${adjudicationDdl()}\n` +
+        `${ledgerTriggerDdl()}\n${provenanceNoReplaceDdl()}`,
+    ),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -1032,6 +1745,9 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v21,
   v22,
   v23,
+  v24,
+  v25,
+  v26,
 ]);
 
 interface RequiredTrigger {
@@ -1087,8 +1803,50 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "outbox_request_fingerprint_immutable", sentinel: "OUTBOX_REQUEST_FINGERPRINT_IMMUTABLE" },
   { name: "github_receipts_applied_requires_reservation", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
   { name: "github_receipts_pending_completion", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
+  { name: "conversational_actors_no_replace", sentinel: "CONVERSATIONAL_ACTOR_NO_REPLACE", introducedIn: 26 },
+  { name: "manifests_no_replace", sentinel: "MANIFEST_NO_REPLACE", introducedIn: 26 },
+  { name: "sessions_no_replace", sentinel: "SESSION_NO_REPLACE", introducedIn: 26 },
+  { name: "runs_no_replace", sentinel: "RUN_NO_REPLACE", introducedIn: 26 },
+  { name: "assignments_no_replace", sentinel: "ASSIGNMENT_NO_REPLACE", introducedIn: 26 },
+  { name: "task_executions_no_replace", sentinel: "TASK_EXECUTION_NO_REPLACE", introducedIn: 26 },
+  { name: "conversational_actor_registrations_no_replace", sentinel: "CONVERSATIONAL_ACTOR_REGISTRATION_NO_REPLACE", introducedIn: 26 },
+  { name: "outbox_no_replace", sentinel: "OUTBOX_NO_REPLACE", introducedIn: 26 },
+  { name: "run_artifacts_no_replace", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 26 },
+  { name: "github_receipts_no_replace", sentinel: "GITHUB_RECEIPT_NO_REPLACE", introducedIn: 26 },
+  { name: "canonical_turn_adjudications_no_replace", sentinel: "CANONICAL_TURN_ADJUDICATION_NO_REPLACE", introducedIn: 26 },
+  { name: "canonical_turn_adjudication_citations_no_replace", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_NO_REPLACE", introducedIn: 26 },
+  { name: "audit_events_no_replace", sentinel: "AUDIT_NO_REPLACE", introducedIn: 26 },
   { name: "audit_events_append_only", sentinel: "AUDIT_APPEND_ONLY" },
   { name: "audit_events_no_delete", sentinel: "AUDIT_APPEND_ONLY" },
+  { name: "canonical_turns_identity_immutable", sentinel: "CANONICAL_TURN_IDENTITY_IMMUTABLE", introducedIn: 24 },
+  { name: "canonical_turns_lifecycle_monotone", sentinel: "CANONICAL_TURN_LIFECYCLE_NOT_MONOTONE", introducedIn: 24 },
+  { name: "canonical_turns_outcome_never_weakens", sentinel: "CANONICAL_TURN_OUTCOME_WEAKENED", introducedIn: 24 },
+  { name: "canonical_turns_born_in_doubt", sentinel: "CANONICAL_TURN_NOT_BORN_IN_DOUBT", introducedIn: 24 },
+  { name: "canonical_turn_observations_write_authority", sentinel: "CANONICAL_TURN_OBSERVATION_AUTHORITY_DENIED", introducedIn: 24 },
+  { name: "canonical_turn_adjudications_write_authority", sentinel: "CANONICAL_TURN_ADJUDICATION_AUTHORITY_DENIED", introducedIn: 25 },
+  { name: "canonical_turn_adjudications_append_only", sentinel: "CANONICAL_TURN_ADJUDICATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudications_no_delete", sentinel: "CANONICAL_TURN_ADJUDICATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudication_citations_write_authority", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_AUTHORITY_DENIED", introducedIn: 26 },
+  { name: "canonical_turn_adjudication_citations_append_only", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudication_citations_no_delete", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY", introducedIn: 25 },
+  { name: "canonical_turn_adjudication_citations_same_turn", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_FOREIGN", introducedIn: 25 },
+  { name: "canonical_turns_no_replace", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 25 },
+  { name: "canonical_turn_observations_no_replace", sentinel: "CANONICAL_TURN_OBSERVATION_NO_REPLACE", introducedIn: 25 },
+  { name: "canonical_turn_sources_no_replace", sentinel: "CANONICAL_TURN_SOURCE_NO_REPLACE", introducedIn: 25 },
+  { name: "actor_target_bindings_no_replace", sentinel: "ACTOR_TARGET_BINDING_NO_REPLACE", introducedIn: 25 },
+  { name: "actor_target_attestations_no_replace", sentinel: "ACTOR_TARGET_ATTESTATION_NO_REPLACE", introducedIn: 25 },
+  { name: "canonical_turns_settlement_authority", sentinel: "CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED", introducedIn: 24 },
+  { name: "canonical_turns_settlement_provenance_immutable", sentinel: "CANONICAL_TURN_SETTLEMENT_PROVENANCE_IMMUTABLE", introducedIn: 24 },
+  { name: "canonical_turns_consistency_monotone", sentinel: "CANONICAL_TURN_CONSISTENCY_NOT_MONOTONE", introducedIn: 24 },
+  { name: "canonical_turns_no_delete", sentinel: "CANONICAL_TURN_NO_DELETE", introducedIn: 24 },
+  { name: "canonical_turn_observations_append_only", sentinel: "CANONICAL_TURN_OBSERVATION_APPEND_ONLY", introducedIn: 24 },
+  { name: "canonical_turn_observations_no_delete", sentinel: "CANONICAL_TURN_OBSERVATION_APPEND_ONLY", introducedIn: 24 },
+  { name: "canonical_turn_sources_immutable", sentinel: "CANONICAL_TURN_SOURCE_IMMUTABLE", introducedIn: 24 },
+  { name: "canonical_turn_sources_no_delete", sentinel: "CANONICAL_TURN_SOURCE_IMMUTABLE", introducedIn: 24 },
+  { name: "actor_target_attestations_append_only", sentinel: "ACTOR_TARGET_ATTESTATION_APPEND_ONLY", introducedIn: 24 },
+  { name: "actor_target_attestations_no_delete", sentinel: "ACTOR_TARGET_ATTESTATION_APPEND_ONLY", introducedIn: 24 },
+  { name: "actor_target_bindings_immutable", sentinel: "ACTOR_TARGET_BINDING_IMMUTABLE", introducedIn: 24 },
+  { name: "actor_target_bindings_no_delete", sentinel: "ACTOR_TARGET_BINDING_IMMUTABLE", introducedIn: 24 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
@@ -1098,22 +1856,50 @@ const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
 ];
 
 const REQUIRED_BASELINE_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  { name: "baseline_records_no_replace", sentinel: "BASELINE_RECORD_NO_REPLACE", introducedIn: 26 },
   { name: "baseline_records_immutable", sentinel: "BASELINE_RECORD_IMMUTABLE" },
   { name: "baseline_records_no_delete", sentinel: "BASELINE_RECORD_IMMUTABLE" },
 ];
 
 const REQUIRED_TELEGRAM_OWNER_PROMPT_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
+  { name: "telegram_owner_prompts_no_replace", sentinel: "TELEGRAM_PROMPT_NO_REPLACE", introducedIn: 26 },
   { name: "telegram_owner_prompts_immutable", sentinel: "TELEGRAM_PROMPT_IMMUTABLE" },
   { name: "telegram_owner_prompts_no_delete", sentinel: "TELEGRAM_PROMPT_IMMUTABLE" },
 ];
 
 /**
  * Names alone are not enough: a same-named no-op trigger would make a corrupt database look
- * healthy. The embedded denial marker proves that each load-bearing guard still has its
- * intended enforcement body. Historical backups are checked against the registry as it
- * existed at their recorded schema version, so a v11 image is not rejected merely because
- * a later migration added another load-bearing trigger.
+ * healthy. Historical backups are checked against the registry as it existed at their recorded
+ * schema version, so a v11 image is not rejected merely because a later migration added another
+ * load-bearing trigger.
+ *
+ * The denial marker is not enough either, and that is what this file learned the expensive way. A
+ * database created at `132309a` kept a settlement trigger calling a four-argument marker that no
+ * longer exists; the body was wrong in the one way that mattered and still contained
+ * `CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED`, so this check passed it as healthy and every
+ * settlement afterwards threw. A substring proves a name is present in a body. It does not prove
+ * the body is the one the guard was written as.
+ *
+ * So for the ledger triggers — the set whose bodies this module can produce — the whole body is
+ * compared against the live schema, normalised the way SQLite stores it. The rest still rest on
+ * their sentinel, which is a weaker check and is written down as one: there is no extractor for
+ * their definitions, and a check that quietly skipped what it could not verify would be the same
+ * defect wearing this function's name.
  */
+const normaliseTriggerSql = (sql: string): string =>
+  sql.replace(/CREATE TRIGGER IF NOT EXISTS /, "CREATE TRIGGER ").replace(/;\s*$/, "").trim();
+
+/** The body each ledger trigger is defined as, by name, taken from the live schema. */
+const ledgerTriggerBodies = (): ReadonlyMap<string, string> => {
+  const bodies = new Map<string, string>();
+  for (const match of ledgerTriggerDdl().matchAll(
+    /CREATE TRIGGER IF NOT EXISTS (\w+)\n[\s\S]*?\nEND;/g,
+  )) {
+    bodies.set(match[1]!, normaliseTriggerSql(match[0]));
+  }
+  return bodies;
+};
+
 export const assertLoadBearingInvariants = (
   raw: Database.Database,
   options: {
@@ -1124,6 +1910,10 @@ export const assertLoadBearingInvariants = (
   },
 ): void => {
   const schemaVersion = options.schemaVersion ?? SCHEMA_VERSION;
+  // Only for a database at the current version. An older image's ledger triggers are legitimately
+  // the older definitions, and rejecting a v11 backup for not carrying today's bodies would make
+  // this check refuse the archives it exists to validate.
+  const bodies = schemaVersion === SCHEMA_VERSION ? ledgerTriggerBodies() : new Map<string, string>();
   const expected = [
     ...REQUIRED_SCHEMA_TRIGGERS,
     ...(options.includeMigrationLedger
@@ -1137,6 +1927,14 @@ export const assertLoadBearingInvariants = (
     const row = raw
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
       .get(trigger.name) as { sql?: string | null } | undefined;
+    const expectedBody = bodies.get(trigger.name);
+    if (row?.sql && expectedBody !== undefined && normaliseTriggerSql(row.sql) !== expectedBody) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        `load-bearing trigger ${trigger.name} does not have the body this schema defines`,
+        { trigger: trigger.name, schemaVersion },
+      );
+    }
     if (!row?.sql || !row.sql.includes(trigger.sentinel)) {
       throw acpError(
         ReasonCode.INTERNAL_ERROR,

@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { readFileSync, writeFileSync, rmSync} from "node:fs";
+import { join, resolve } from "node:path";
 
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
@@ -61,6 +61,24 @@ describe("the falsifiability harness, when a guarded file changes underneath it"
     } finally {
       child.kill("SIGKILL");
       writeFileSync(GUARDED, pristine);
+      // This test deliberately drives the harness onto the path that *keeps* its sentinel — the
+      // one that says "nothing has been restored past this point; reconcile by hand". Leaving it
+      // behind makes the next commit refuse, which is correct behaviour reacting to a state this
+      // test invented. The file above is already back, so there is nothing left to reconcile.
+      // Asked of git rather than assembled from `.git`. In a linked worktree — which is how a
+      // review copy of a branch is made here, and where a merge dry run happens — `.git` is a
+      // *file*, so joining a name onto it produces a path under a regular file and lstat says
+      // ENOTDIR. The harness itself learned this; this cleanup had not.
+      rmSync(
+        resolve(
+          ROOT,
+          execFileSync("git", ["rev-parse", "--git-path", "verify-guards-in-flight.json"], {
+            cwd: ROOT,
+            encoding: "utf8",
+          }).trim(),
+        ),
+        { force: true },
+      );
     }
   }, 120_000);
 });

@@ -12,6 +12,12 @@ jobs:
       issues: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The trailer check reads every commit message in the range, and the default
+          # shallow clone has one. A range that cannot be resolved makes that check exit 2
+          # rather than report a clean result, so this is what keeps it from being a step
+          # that always fails and gets deleted.
+          fetch-depth: 0
       - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:
           version: 10
@@ -28,6 +34,43 @@ jobs:
       - run: pnpm evidence:freshness
       - run: pnpm invariants
       - run: pnpm typecheck
+      # Seconds, and it answers the question that actually goes stale: does every mutation row
+      # still name a line that exists. Editing a guarded line renames its anchor and the row
+      # silently stops checking anything — three times on one branch, each found only when the
+      # full sweep reached it forty minutes in. This fails first instead.
+      - run: pnpm guards:anchors
+      # The question that found three of the four findings in this branch's final review: which
+      # operand of a refusal does no falsifiability row name. The harness answers "is this guard
+      # tested" for the lines someone wrote a row for; it cannot answer which lines nobody did.
+      - run: pnpm guards:operands
+      # Two defect classes this branch hit twice each, turned into checks so the third time
+      # is a failing step rather than a review finding.
+      #
+      # `migrations:check` freezes what each migration does. v24's DDL was edited in place
+      # across two correction rounds; a database created at the earlier one then sat at that
+      # version with bodies nobody's code expected and could not settle a turn.
+      #
+      # `schema:census` refuses a table guarded on UPDATE or DELETE and open on INSERT.
+      # `INSERT OR REPLACE` skips the implicit delete's triggers on a connection with
+      # recursive_triggers off, which is any connection ACP did not open. Adding it found two
+      # more tables in that shape within a minute of first running.
+      - run: pnpm migrations:check
+      - run: pnpm schema:census
+      # A trigger sentinel with no entry in TRIGGER_CODES reaches its caller as a raw Error
+      # instead of a Decision, so a refusal is indistinguishable from a bug. The whole
+      # canonical-turn ledger was in that state, and a census found five more that predate it.
+      - run: pnpm schema:denials
+      # A trigger declared and named by no required registry is created on a fresh install and
+      # never checked again — drop it from a live database and nothing notices. The registries are
+      # hand-written lists, and four defects on this branch were a hand-written list that stopped
+      # matching what it enumerates.
+      - run: pnpm schema:registry
+      # A wrapped CommitLore trailer is not a trailer: git ends the block at the continuation
+      # line and the record is stored by nobody. It happened six times on 2026-08-22, and
+      # every one was *detected* — `commitlore validate` printed a warning and exited 0, after
+      # the commit it described already existed. The local commit-msg hook refuses it up
+      # front; this is the half that holds for a clone that never installed the hooks.
+      - run: pnpm trailers ${{ github.event.pull_request.base.sha && format('{0}..HEAD', github.event.pull_request.base.sha) || 'HEAD~1..HEAD' }}
       - run: pnpm build
       # One suite run, not two. `trace` needs a JSON reporter pass; it used to obtain that by
       # running the whole suite a second time, which doubled a suite that spawns real

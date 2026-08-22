@@ -39,6 +39,8 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor register <id> <generation> <expected-set-generation>
   agentctl actor list                     list registered conversational actors
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
+  agentctl conversation contradictions     turns whose records disagree, with the ids to cite
+  agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl bootstrap hermes -- <command>  launch Hermes and establish CEO generation 1
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
@@ -67,6 +69,7 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "project.register",
   "actor.register",
   "actor.unregister",
+  "conversation.adjudicate",
 ]);
 
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
@@ -304,6 +307,27 @@ export const dispatch = async (
     return fail(`unknown actor subcommand: ${sub ?? ""}`);
   }
 
+  if (command === "conversation") {
+    const [sub, targetActorId, turnRequestId, reasonCode, evidenceDigest, ...observationIds] = args;
+    if (sub === "contradictions") return call("conversation.contradictions");
+    if (sub === "adjudicate") {
+      // The ids come from `conversation contradictions`, which is why they are positional rather
+      // than a flag: an adjudication cites the set that turn actually holds, and retyping a
+      // summary is how a partial citation gets made.
+      const cited = observationIds.map((raw) => Number(raw));
+      if (cited.length === 0 || cited.some((id) => !Number.isSafeInteger(id) || id < 1)) {
+        return fail("adjudicate needs at least one observation id, and each must be a positive integer");
+      }
+      return call("conversation.adjudicate", {
+        targetActorId: required(targetActorId, "targetActorId"),
+        turnRequestId: required(turnRequestId, "turnRequestId"),
+        reasonCode: required(reasonCode, "reasonCode"),
+        evidenceDigest: required(evidenceDigest, "evidenceDigest"),
+        citedObservationIds: cited,
+      });
+    }
+    return fail(`unknown conversation subcommand: ${sub ?? ""}`);
+  }
   if (command === "daemon" && args[0] === "status") return call("daemon.status");
   return fail(`unknown command: ${command}`);
 };

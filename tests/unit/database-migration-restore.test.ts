@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, ControlPlane } from "../../src/app/control-plane.ts";
 import { defaultBackupDirectory, restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
-import { MIGRATIONS, replayDdlWithoutPostV12Columns } from "../../src/db/migrations.ts";
+import { MIGRATIONS, replayDdlWithoutPostV12Columns, schemaSql } from "../../src/db/migrations.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -498,7 +498,10 @@ describe("versioned SQLite migration", () => {
         [20, "v20-conversational-actor-registry"],
         [21, "v21-canonical-turns"],
         [22, "v22-canonical-turn-ledger"],
-        [SCHEMA_VERSION, "v23-turn-claimed-at"],
+        [23, "v23-turn-claimed-at"],
+        [24, "v24-observation-ledger"],
+        [25, "v25-ledger-guards"],
+        [SCHEMA_VERSION, "v26-ledger-trigger-bodies"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a
@@ -575,6 +578,40 @@ describe("versioned SQLite migration", () => {
     } finally {
       if (daemonRunning) await daemon.stop();
       controlPlane.close();
+    }
+  });
+
+  it("gives a v11 database every REPLACE guard the current schema declares", () => {
+    // The oldest supported database has to arrive at the current schema with every guard the
+    // current schema declares. Twenty `no_replace` triggers were added at v26, and v12 replays the
+    // *live* schema.sql minus an exclusion list — so a v11 database meets them twice, from two
+    // migrations written apart, and the only way to know what it ends up with is to run the chain
+    // and count.
+    //
+    // What it catches, established by trying each way of breaking it rather than by argument:
+    //
+    //   excluded from v12's replay        -> still passes, v26 creates it
+    //   added to schema.sql and nothing else -> still passes, v12's replay creates it
+    //   excluded from replay AND named by no migration -> FAILS
+    //
+    // So the property is "a guard reaches the oldest supported database by *some* route", and the
+    // shape it refuses is one that fell out of both. Two overlapping mechanisms mean neither is
+    // load-bearing alone, which is worth knowing: a reader could delete either and this stays
+    // green.
+    const path = join(tempDir("acp-v11-no-replace-"), "state.sqlite");
+    asV11Fixture(path);
+    const db = new Db(path);
+    try {
+      const declared = schemaSql().match(/CREATE TRIGGER IF NOT EXISTS \w+_no_replace/g) ?? [];
+      const present = db
+        .all<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%\\_no\\_replace' ESCAPE '\\'",
+        )
+        .map((row) => row.name);
+
+      expect(present).toHaveLength(declared.length);
+    } finally {
+      db.close();
     }
   });
 

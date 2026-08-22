@@ -28,7 +28,17 @@
     "release:version": "node scripts/verify-release-version.mjs",
     "symbols": "node scripts/verify-enforcement-symbols.mjs",
     "adapter:source": "node scripts/verify-acceptance-adapter-source.mjs",
-    "guards:falsifiable": "node scripts/verify-guards-are-falsifiable.mjs"
+    "guards:falsifiable": "node scripts/verify-guards-are-falsifiable.mjs",
+    "guards:anchors": "node scripts/verify-guards-are-falsifiable.mjs --anchors-only",
+    "hooks:check": "node scripts/verify-hooks-are-installed.mjs",
+    "hooks:install": "node scripts/install-hooks.mjs",
+    "trailers": "node scripts/verify-trailers-are-parsable.mjs",
+    "migrations:check": "node scripts/verify-migrations-are-immutable.mjs",
+    "migrations:freeze": "node scripts/verify-migrations-are-immutable.mjs --update",
+    "schema:census": "node scripts/verify-append-only-tables-are-closed.mjs",
+    "schema:denials": "node scripts/verify-trigger-denials-are-typed.mjs",
+    "schema:registry": "node scripts/verify-every-trigger-is-required.mjs",
+    "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

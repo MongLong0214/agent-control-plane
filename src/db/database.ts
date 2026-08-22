@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
@@ -70,10 +70,12 @@ export interface DbOpenOptions {
   afterMigration?: (migration: SchemaMigration) => void;
 }
 const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
+const TURN_MATERIALIZATION_MINT: unique symbol = Symbol("turn-materialization-mint");
 const RUN_STATE_TRANSITION_MINT: unique symbol = Symbol("run-state-transition-mint");
 
 /** Issuance follows the file rather than a connection, so a second Db cannot remint authority. */
 const ISSUED_EVIDENCE_WRITE_PORTS = new Set<string>();
+const ISSUED_TURN_MATERIALIZATION_AUTHORITIES = new Set<string>();
 const ISSUED_RUN_STATE_TRANSITION_AUTHORITIES = new Set<string>();
 
 /**
@@ -102,6 +104,39 @@ class EvidenceWritePortToken {
 }
 
 export type EvidenceWritePort = EvidenceWritePortToken;
+
+/**
+ * Opaque authority held by the turn coordinator, and issued once per database.
+ *
+ * Without it `materializeTurn` was a public method taking an arbitrary closure and an arbitrary
+ * tuple, so anything holding a `Db` could raise the marker for whatever it wanted to write. The
+ * trigger then stopped only a caller who wrote settlement columns *without* wrapping the write —
+ * which is to say it stopped a mistake and not an untrusted writer. The schema comment claiming
+ * it was "in the same shape as the run-state and evidence guards" was describing this class
+ * before it existed.
+ */
+class TurnMaterializationAuthorityToken {
+  readonly #minted = true;
+  readonly #db: Db;
+
+  constructor(mint: symbol, db: Db) {
+    this.#db = db;
+    if (mint !== TURN_MATERIALIZATION_MINT) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "a turn-materialization authority cannot be constructed outside its issuer",
+        {},
+      );
+    }
+  }
+
+  static belongsTo(value: unknown, db: Db): value is TurnMaterializationAuthority {
+    if (typeof value !== "object" || value === null || !(#minted in value)) return false;
+    return value.#db === db;
+  }
+}
+
+export type TurnMaterializationAuthority = TurnMaterializationAuthorityToken;
 
 /**
  * Opaque authority held by the run engine. It turns on the connection-local marker only
@@ -146,7 +181,14 @@ export interface RunStateTransitionWork<T> {
   /** The only row and target state for which this operation may raise the marker. */
   runId: string;
   toState: string;
-  recordTransitionEvidence(): Decision<void>;
+  /**
+   * Records the evidence for this transition, and answers whether that worked.
+   *
+   * The value is `unknown` because this seam cares only about the decision. `AuditLog.record`
+   * answers with the row's real identity for callers that need to cite it; a caller that only
+   * needs "did it land" should not be forced to name a type it will discard.
+   */
+  recordTransitionEvidence(): Decision<unknown>;
   enqueueTransitionEnvelope(): Decision<unknown>;
   updateState(): T;
 }
@@ -168,6 +210,15 @@ export class Db {
   #evidenceWriteMarkerDepth = 0;
   #schemaMigrationMarkerDepth = 0;
   #runStateTransitionMarkers: Array<{ runId: string; toState: string }> = [];
+  /**
+   * The turn whose settlement columns may move, and the exact tuple they may move to.
+   *
+   * Bound to both, not just to the turn: a marker that authorised "any update to this row" would
+   * let the materializer's own transaction be the cover for a different write. What the ledger
+   * has to be able to say is that a settlement came from an observation, and the tuple is the
+   * part of that claim a trigger can check.
+   */
+  #turnMaterializationMarkers: Array<{ turnRequestId: string }> = [];
 
   /**
    * The file this connection opened. Capability issuance is keyed by it: two `Db` objects
@@ -175,6 +226,8 @@ export class Db {
    * a fresh set of evidence writers for rows the composition root already owned (#352).
    */
   readonly file: string;
+  /** What the once-per-database capabilities are keyed by: the file itself, not a name for it. */
+  readonly identity: string;
 
   constructor(filename: string, private readonly options: DbOpenOptions = {}) {
     const persistent = filename !== ":memory:";
@@ -189,8 +242,27 @@ export class Db {
     // which would let two connections to one SQLite file receive separate capabilities.
     // Resolve after SQLite creates the file so the issuance key names the actual file.
     this.file = filename === ":memory:" ? `:memory:${Math.random()}` : realpathSync(filename);
+    // `realpath` collapses symlinks and leaves hard links alone: two names for one inode resolve
+    // to two different strings, and a capability keyed by the string then issues twice for one
+    // database. Measured — an owner claimed through the real path and a second handle claimed
+    // through a hard link, both live. The identity of a file is its (device, inode); the path is
+    // a way to reach it, and this comment used to say realpath was enough.
+    this.identity =
+      filename === ":memory:"
+        ? this.file
+        : ((): string => {
+            const stat = statSync(this.file);
+            return `${stat.dev}:${stat.ino}`;
+          })();
     this.#raw.pragma("foreign_keys = ON");
     this.#raw.pragma("busy_timeout = 10000");
+    // SQLite performs REPLACE's implicit delete *without* firing DELETE triggers unless this is
+    // on. Every no-delete guard in this schema — the audit trail, the artifacts, the receipts,
+    // the canonical turn ledger — was therefore bypassable by writing REPLACE instead of UPDATE,
+    // and `INSERT OR REPLACE` passed the statement check because its first verb is INSERT.
+    // Measured on a review head: a settled COMPLETED turn was replaced with an ABORTED one, its
+    // completed observation replaced, its source kept, and the retry then admitted.
+    this.#raw.pragma("recursive_triggers = ON");
     if (filename !== ":memory:") {
       this.#raw.pragma("journal_mode = WAL");
       this.#raw.pragma("synchronous = FULL");
@@ -204,6 +276,10 @@ export class Db {
     this.#raw.function("acp_run_state_transition_authorized", (runId: unknown, toState: unknown) => {
       const marker = this.#runStateTransitionMarkers[this.#runStateTransitionMarkers.length - 1];
       return marker && marker.runId === runId && marker.toState === toState ? 1 : 0;
+    });
+    this.#raw.function("acp_turn_materialization_authorized", (turnRequestId: unknown) => {
+      const marker = this.#turnMaterializationMarkers[this.#turnMaterializationMarkers.length - 1];
+      return marker && marker.turnRequestId === turnRequestId ? 1 : 0;
     });
     this.#raw.function("acp_schema_migration_authorized", () =>
       this.#schemaMigrationMarkerDepth > 0 ? 1 : 0,
@@ -457,28 +533,68 @@ export class Db {
   }
 
   /** Claimed by ArtifactStore while the composition root is still being constructed. */
+  /** What *this* handle issued, so closing it releases its own slots and nobody else's. */
+  readonly #issuedHere = new Set<"evidence" | "materialization" | "runState">();
+
+  /**
+   * Releases registered by capability issuers that live in other modules.
+   *
+   * `ArtifactStore` and `RunEngine` each keep their own once-per-database set, and this class
+   * cannot import them without a cycle. Without a hook their slots outlived the handle: a control
+   * plane that threw while constructing took the evidence-writer slot with it, and every corrected
+   * retry in that process was refused. Measured.
+   */
+  readonly #releases = new Set<() => void>();
+
+  /** Called by an issuer that keeps its own registry, so `close()` hands that slot back as well. */
+  releaseOnClose(release: () => void): void {
+    this.#releases.add(release);
+  }
+
   claimEvidenceWritePort(): EvidenceWritePort {
-    if (ISSUED_EVIDENCE_WRITE_PORTS.has(this.file)) {
+    if (ISSUED_EVIDENCE_WRITE_PORTS.has(this.identity)) {
       fail(
         ReasonCode.COMPLETION_AUTHORITY_DENIED,
         "evidence-write authority was already issued for this database",
         {},
       );
     }
-    ISSUED_EVIDENCE_WRITE_PORTS.add(this.file);
+    ISSUED_EVIDENCE_WRITE_PORTS.add(this.identity);
+    this.#issuedHere.add("evidence");
     return new EvidenceWritePortToken(EVIDENCE_WRITE_MINT, this);
+  }
+
+  /**
+   * Claimed by the turn coordinator at construction; raw callers never receive this capability.
+   *
+   * Issued once per database file, for the same reason the evidence port is: a second holder is a
+   * second materializer, and "the outcome is computed from the observations" stops being a
+   * property of the ledger the moment two things can decide it.
+   */
+  claimTurnMaterializationAuthority(): TurnMaterializationAuthority {
+    if (ISSUED_TURN_MATERIALIZATION_AUTHORITIES.has(this.identity)) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "turn-materialization authority was already issued for this database",
+        {},
+      );
+    }
+    ISSUED_TURN_MATERIALIZATION_AUTHORITIES.add(this.identity);
+    this.#issuedHere.add("materialization");
+    return new TurnMaterializationAuthorityToken(TURN_MATERIALIZATION_MINT, this);
   }
 
   /** Claimed by RunEngine at construction; raw callers never receive this capability. */
   claimRunStateTransitionAuthority(): RunStateTransitionAuthority {
-    if (ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.has(this.file)) {
+    if (ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.has(this.identity)) {
       fail(
         ReasonCode.RUN_STATE_TRANSITION_AUTHORITY_DENIED,
         "run-state transition authority was already issued for this database",
         {},
       );
     }
-    ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.add(this.file);
+    ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.add(this.identity);
+    this.#issuedHere.add("runState");
     return new RunStateTransitionAuthorityToken(RUN_STATE_TRANSITION_MINT, this);
   }
 
@@ -487,6 +603,40 @@ export class Db {
    * are written before the marker permits `UPDATE runs SET state`, so any failure rolls all
    * three facts back together rather than leaving a naked state edge behind.
    */
+  /**
+   * Runs a turn materialization with the marker its trigger requires.
+   *
+   * The marker is connection-local and lives only for this call, so a raw SQL caller can invoke
+   * `acp_turn_materialization_authorized` and cannot make it answer true. That is the same shape
+   * the run-state and evidence guards already use, and the reason the trigger is a property of
+   * the database rather than a rule the coordinator remembers.
+   *
+   * It names the turn and not the columns. Unlike `applyRunStateTransition`, whose marker carries
+   * the target state and so can refuse a transition it did not authorise, one materialization
+   * spans three tables and has no tuple they share. The guarantee is therefore that a
+   * materialization of one turn cannot authorise a write to another — not that the values written
+   * to this one were the right ones.
+   */
+  materializeTurn<T>(
+    authority: TurnMaterializationAuthority,
+    into: { turnRequestId: string },
+    write: () => T,
+  ): T {
+    if (!TurnMaterializationAuthorityToken.belongsTo(authority, this)) {
+      fail(
+        ReasonCode.COMPLETION_AUTHORITY_DENIED,
+        "settling a turn requires the authority held by the turn coordinator",
+        {},
+      );
+    }
+    this.#turnMaterializationMarkers.push(into);
+    try {
+      return write();
+    } finally {
+      this.#turnMaterializationMarkers.pop();
+    }
+  }
+
   applyRunStateTransition<T>(
     authority: RunStateTransitionAuthority,
     work: RunStateTransitionWork<T>,
@@ -597,6 +747,34 @@ export class Db {
 
   close(): void {
     if (this.#raw.open) this.#raw.close();
+    this.releaseIssuedCapabilities();
+  }
+
+  /**
+   * Hands the once-per-file capability slots back when the connection they belong to is gone.
+   *
+   * Without this the issuance is a process-lifetime lockout rather than an exclusion: measured on
+   * 2026-08-22, opening a database, closing it and opening it again refused the second claim with
+   * COMPLETION_AUTHORITY_DENIED, so any path that reopens the same file in one process — a
+   * fail-closed rebuild, a doctor repair, a control plane restarted in place — could not construct
+   * its coordinator at all.
+   *
+   * It releases only what *this* handle issued. The first version released by file, so any second
+   * connection on the same path — one that had claimed nothing — freed the owner's slot merely by
+   * closing, and the next claimant became a second materializer while the owner's brand-checked
+   * token went on working. Measured, on the head this paragraph was written for: a bystander's
+   * close handed the authority away. Brand-checking the token was never the part at risk; the
+   * bookkeeping was.
+   */
+  private releaseIssuedCapabilities(): void {
+    if (this.#issuedHere.has("evidence")) ISSUED_EVIDENCE_WRITE_PORTS.delete(this.identity);
+    if (this.#issuedHere.has("materialization")) {
+      ISSUED_TURN_MATERIALIZATION_AUTHORITIES.delete(this.identity);
+    }
+    if (this.#issuedHere.has("runState")) ISSUED_RUN_STATE_TRANSITION_AUTHORITIES.delete(this.identity);
+    this.#issuedHere.clear();
+    for (const release of this.#releases) release();
+    this.#releases.clear();
   }
 
   private assertUsable(): void {
@@ -611,6 +789,7 @@ export class Db {
   private poison(): void {
     this.#poisoned = true;
     if (this.#raw.open) this.#raw.close();
+    this.releaseIssuedCapabilities();
   }
 }
 
@@ -666,6 +845,58 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   SCHEMA_MIGRATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   SCHEMA_MIGRATION_RECEIPT_IMMUTABLE: ReasonCode.CONFLICT,
   BASELINE_RECORD_IMMUTABLE: ReasonCode.CONFLICT,
+  // The canonical-turn ledger, which had no entries here at all: every one of its denials came
+  // out of `db.tx` as a raw Error rather than as a typed refusal, so a claim whose source insert
+  // tripped a guard threw instead of denying. The guards are what this ledger is *for*, and the
+  // callers were the one part not told which one spoke.
+  CANONICAL_TURN_IDENTITY_IMMUTABLE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_NOT_BORN_IN_DOUBT: ReasonCode.CONFLICT,
+  CANONICAL_TURN_LIFECYCLE_NOT_MONOTONE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_OUTCOME_WEAKENED: ReasonCode.CONFLICT,
+  CANONICAL_TURN_CONSISTENCY_NOT_MONOTONE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_SETTLEMENT_PROVENANCE_IMMUTABLE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_NO_DELETE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_MATERIALIZATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  CANONICAL_TURN_OBSERVATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  CANONICAL_TURN_OBSERVATION_APPEND_ONLY: ReasonCode.CONFLICT,
+  CANONICAL_TURN_OBSERVATION_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_SOURCE_IMMUTABLE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_SOURCE_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_ADJUDICATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  CANONICAL_TURN_ADJUDICATION_APPEND_ONLY: ReasonCode.CONFLICT,
+  CANONICAL_TURN_ADJUDICATION_CITATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
+  CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY: ReasonCode.CONFLICT,
+  CANONICAL_TURN_ADJUDICATION_CITATION_FOREIGN: ReasonCode.CONFLICT,
+  ACTOR_TARGET_BINDING_IMMUTABLE: ReasonCode.CONFLICT,
+  ACTOR_TARGET_BINDING_NO_REPLACE: ReasonCode.CONFLICT,
+  ACTOR_TARGET_ATTESTATION_APPEND_ONLY: ReasonCode.CONFLICT,
+  ACTOR_TARGET_ATTESTATION_NO_REPLACE: ReasonCode.CONFLICT,
+  CONVERSATIONAL_ACTOR_NO_REPLACE: ReasonCode.CONFLICT,
+  MANIFEST_NO_REPLACE: ReasonCode.CONFLICT,
+  AUDIT_NO_REPLACE: ReasonCode.CONFLICT,
+  BASELINE_RECORD_NO_REPLACE: ReasonCode.CONFLICT,
+  TELEGRAM_PROMPT_NO_REPLACE: ReasonCode.CONFLICT,
+  // Found by the same census, and older than this branch: five sentinels the schema raises that
+  // nothing here translated. A guard whose denial arrives untyped is a guard whose caller cannot
+  // tell it apart from a bug.
+  // The ten a corrected census found. Its first pattern could not see `BEFORE UPDATE OF`,
+  // which is the form four of this schema's most load-bearing guards take.
+  SESSION_NO_REPLACE: ReasonCode.CONFLICT,
+  RUN_NO_REPLACE: ReasonCode.CONFLICT,
+  ASSIGNMENT_NO_REPLACE: ReasonCode.CONFLICT,
+  TASK_EXECUTION_NO_REPLACE: ReasonCode.CONFLICT,
+  CONVERSATIONAL_ACTOR_REGISTRATION_NO_REPLACE: ReasonCode.CONFLICT,
+  OUTBOX_NO_REPLACE: ReasonCode.CONFLICT,
+  RUN_ARTIFACT_NO_REPLACE: ReasonCode.CONFLICT,
+  GITHUB_RECEIPT_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_ADJUDICATION_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_ADJUDICATION_CITATION_NO_REPLACE: ReasonCode.CONFLICT,
+  TELEGRAM_PROMPT_IMMUTABLE: ReasonCode.CONFLICT,
+  ACTOR_RETIREMENT_TERMINAL: ReasonCode.CONFLICT,
+  ACTOR_RUNTIME_NOT_READY: ReasonCode.CONFLICT,
+  SESSION_WORKDIR_IMMUTABLE: ReasonCode.CONFLICT,
+  SESSION_SECRET_HASH_IMMUTABLE: ReasonCode.CONFLICT,
 };
 
 /**
