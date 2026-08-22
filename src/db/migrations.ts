@@ -1623,12 +1623,30 @@ const observationsTableOnlyDdl = (): string =>
  * column added later is carried without anyone remembering to add it here.
  */
 const sharedColumns = (raw: Database.Database, from: string, to: string): string[] => {
-  const names = (table: string): string[] =>
-    (raw.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as Array<{ name: string }>).map(
-      (row) => row.name,
+  // `table_xinfo` rather than `table_info`, because the latter omits generated and hidden columns —
+  // so a source column of either kind would be invisible to the check below and the rebuild would
+  // report a lossless copy it had not made.
+  const names = (table: string): Array<{ name: string; hidden: number }> =>
+    raw.prepare(`SELECT name, hidden FROM pragma_table_xinfo(?)`).all(table) as Array<{
+      name: string;
+      hidden: number;
+    }>;
+  const destination = new Map(names(to).map((row) => [row.name, row.hidden]));
+  const source = names(from);
+  // A column the destination does not have would be dropped when the old table goes, silently and
+  // permanently. Narrowing a table may be a deliberate migration one day; it is never something a
+  // rebuild helper should do because nobody listed the column.
+  const lost = source.filter((row) => !destination.has(row.name)).map((row) => row.name);
+  if (lost.length > 0) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `rebuilding ${from} would drop column(s) the new table does not have; a narrowing rebuild has to say so`,
+      { table: from, dropped: lost },
     );
-  const destination = new Set(names(to));
-  return names(from).filter((name) => destination.has(name));
+  }
+  // Generated columns are computed by SQLite and cannot be inserted into, so they are excluded from
+  // the copy on purpose — present in both tables, and not carried.
+  return source.filter((row) => row.hidden !== 2 && row.hidden !== 3).map((row) => row.name);
 };
 
 const canonicalTurnsTableOnlyDdl = (): string =>
@@ -1701,7 +1719,7 @@ const observationsIndexDdl = (): string =>
  * observation is losing the evidence a turn's outcome was computed from, and a migration that
  * quietly discards one is worse than a migration that stops.
  */
-const rebuildObservationsIfStale = (raw: Database.Database): void => {
+export const rebuildObservationsIfStale = (raw: Database.Database): void => {
   const stored = (
     raw
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turn_observations'")

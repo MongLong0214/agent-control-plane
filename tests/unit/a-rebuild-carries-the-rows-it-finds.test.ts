@@ -2,7 +2,11 @@ import { afterAll, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import { join } from "node:path";
 
-import { rebuildCanonicalTurnsIfStale, schemaDdl } from "../../src/db/migrations.ts";
+import {
+  rebuildCanonicalTurnsIfStale,
+  rebuildObservationsIfStale,
+  schemaDdl,
+} from "../../src/db/migrations.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -50,7 +54,18 @@ const TURN = {
   prompt_digest: "sha256:prompt",
   claimed_at: "2026-08-22T00:00:00.000Z",
   claim_audit_event_id: 7,
-  lifecycle_state: "IN_DOUBT",
+  // Settled, with every settlement column populated. A review pointed out that an IN_DOUBT
+  // fixture leaves `outcome_kind`, `settled_at`, `resolution_authority`, `reason_code` and
+  // `evidence_digest` NULL, so a hand-written copy list omitting all five would still pass — the
+  // fixture has to carry the columns the check is about.
+  lifecycle_state: "SETTLED",
+  outcome_kind: "ABORTED",
+  settled_at: "2026-08-22T00:05:00.000Z",
+  // An authority v27 already admitted: the row has to be one the *old* table would accept, since
+  // it is a row that existed before the migration ran.
+  resolution_authority: "OWNER_AFTER_TARGET_FENCE",
+  reason_code: "OK",
+  evidence_digest: "sha256:evidence",
   observation_consistency: "CONSISTENT",
 };
 
@@ -86,6 +101,98 @@ describe("a rebuild carries the rows it finds", () => {
           .get() as { sql: string }
       ).sql;
       expect(stored).toContain("OPERATOR_AFTER_REVIEW");
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("carries an observation too, which nothing was asking", () => {
+    // The other rebuild, and the same question. A review pointed out that
+    // `rebuildObservationsIfStale` was never exercised with a row either, so reverting *its* copy
+    // to a hand-written list left every test passing.
+    const raw = new Database(join(tempDir("acp-rebuild-obs-"), "state.sqlite"));
+    try {
+      raw.pragma("foreign_keys = OFF");
+      const current = /CREATE TABLE IF NOT EXISTS canonical_turn_observations \([\s\S]*?\n\);/.exec(
+        schemaDdl(),
+      );
+      if (current === null) throw new Error("canonical_turn_observations is not in schema.sql");
+      // The v27 shape: the same table without the CHECK that admits the operator authority.
+      raw.exec(
+        current[0].replace(
+          "        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE',\n" +
+            "                                    'OPERATOR_AFTER_REVIEW')))",
+          "        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE')))",
+        ),
+      );
+      const OBSERVATION = {
+        observation_id: 1,
+        turn_request_id: "turn-1",
+        observed_outcome: "ABORTED",
+        observing_authority: "OWNER_AFTER_TARGET_FENCE",
+        receipt_id: "fence-1",
+        evidence_digest: "sha256:fence",
+        reason_code: "OK",
+        observed_at: "2026-08-22T00:05:00.000Z",
+        audit_event_id: 7,
+        adjudicates_observation_id: null,
+      };
+      const names = Object.keys(OBSERVATION);
+      raw
+        .prepare(
+          `INSERT INTO canonical_turn_observations (${names.join(", ")}) ` +
+            `VALUES (${names.map(() => "?").join(", ")})`,
+        )
+        .run(...Object.values(OBSERVATION));
+
+      rebuildObservationsIfStale(raw);
+
+      const carried = raw.prepare(`SELECT * FROM canonical_turn_observations`).all() as Array<
+        Record<string, unknown>
+      >;
+      expect(carried).toHaveLength(1);
+      for (const [column, value] of Object.entries(OBSERVATION)) {
+        expect(carried[0]?.[column], `column ${column}`).toBe(value);
+      }
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("refuses to rebuild a table into one that would drop a column", () => {
+    // The intersection is not, on its own, a lossless copy: a column the new table does not have
+    // goes when the old table does, silently and permanently. Narrowing a table may be a
+    // deliberate migration one day; it is never something a rebuild helper should do because
+    // nobody listed the column.
+    const raw = new Database(join(tempDir("acp-rebuild-narrow-"), "state.sqlite"));
+    try {
+      raw.pragma("foreign_keys = OFF");
+      // Inserted among the column definitions, not after the CHECKs: SQLite wants every column
+      // before the first table constraint, and appending one at the end is a syntax error rather
+      // than the wider table this test needs.
+      raw.exec(
+        previousShape().replace(
+          "  prompt_digest                 TEXT NOT NULL,",
+          "  prompt_digest                 TEXT NOT NULL,\n  operator_note                 TEXT,",
+        ),
+      );
+      raw
+        .prepare(
+          `INSERT INTO canonical_turns (turn_request_id, target_actor_id, target_binding_id,
+             target_attestation_id, executor_session_id, executor_session_incarnation,
+             binding_generation, prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state,
+             operator_note)
+           VALUES ('turn-1', 'actor:ceo', 'bind-1', 'att-1', 'ses-1', 'inc-1', 3, 'sha256:p',
+                   '2026-08-22T00:00:00.000Z', 7, 'IN_DOUBT', 'do not lose me')`,
+        )
+        .run();
+
+      expect(() => rebuildCanonicalTurnsIfStale(raw)).toThrow(/drop column/);
+      // And the row is still there, because the refusal happens before anything is dropped.
+      expect(
+        (raw.prepare(`SELECT operator_note FROM canonical_turns`).get() as { operator_note: string })
+          .operator_note,
+      ).toBe("do not lose me");
     } finally {
       raw.close();
     }

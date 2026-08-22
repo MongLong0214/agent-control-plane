@@ -252,6 +252,50 @@ describe("a turn nothing observed can be settled by a person", () => {
     expect(JSON.parse(audited?.evidence_json ?? "{}")).toMatchObject({ fence: "ASSERTED" });
   });
 
+  it("rests on one binding per actor, which is a constraint rather than an assumption", () => {
+    // A review built a counterexample against the earlier, actor-wide lookup: a second binding
+    // attested later under a different incarnation would report VERIFIED while the first binding's
+    // execution was untouched. Measured, that state cannot exist — `UNIQUE (target_actor_id)`
+    // refuses the second binding — so the actor-wide query was equivalent to the binding-scoped
+    // one. The lookup is scoped anyway, because it should not depend on a constraint two tables
+    // away to be about the right subject; this test is what keeps that dependence visible if the
+    // constraint is ever widened.
+    const h = makeHarness();
+    const actorId = target(h, "onebind");
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT INTO actor_target_bindings
+           (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
+         VALUES ('bind:second', ?, 'hermes', 'locator:second', 'digest:second', ?)`,
+        [actorId, NOW],
+      ),
+    ).toThrow(/ACTOR_TARGET_BINDING_NO_REPLACE|UNIQUE/);
+  });
+
+  it("treats an unattested binding as unproven, which is also why a turn cannot be claimed on one", () => {
+    // The other reversion the review named as untested — reading "no attestation found" as
+    // VERIFIED. A turn cannot reach that state either: `claim()` refuses an actor whose binding
+    // nothing attested, so every turn's binding has at least one. The refusal is asserted at the
+    // claim, which is where the state is actually decided.
+    const h = makeHarness();
+    h.cp.db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES ('actor:bare', 'CEO', ?)`, [NOW]);
+    h.cp.db.run(
+      `INSERT INTO actor_target_bindings
+         (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
+       VALUES ('bind:bare', 'actor:bare', 'hermes', 'locator:bare', 'digest:bare', ?)`,
+      [NOW],
+    );
+
+    const refused = h.cp.conversation.claim({
+      targetActorId: "actor:bare",
+      prompt: "hello",
+      sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload: {} }],
+    });
+    expect(refused.allowed).toBe(false);
+    if (!refused.allowed) expect(refused.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_UNATTESTED);
+  });
+
   it("refuses a turn that is already settled", () => {
     const h = makeHarness();
     const actorId = target(h, "settled");

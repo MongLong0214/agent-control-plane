@@ -634,9 +634,12 @@ export class ConversationTurnCoordinator {
       const held = this.db.get<{
         target_actor_id: string;
         lifecycle_state: string;
+        target_binding_id: string;
+        executor_session_id: string;
         executor_session_incarnation: string;
       }>(
-        `SELECT target_actor_id, lifecycle_state, executor_session_incarnation
+        `SELECT target_actor_id, lifecycle_state, target_binding_id,
+                executor_session_id, executor_session_incarnation
            FROM canonical_turns WHERE turn_request_id = ?`,
         [input.turnRequestId],
       );
@@ -658,17 +661,32 @@ export class ConversationTurnCoordinator {
       // claimed under; if the actor's current attestation names a different one, the execution
       // that held this turn belongs to a superseded incarnation and cannot still write. That is
       // the restart case this whole method exists for, and it is a fact rather than a promise.
-      const current = this.db.get<{ executor_session_incarnation: string }>(
-        `SELECT a.executor_session_incarnation AS executor_session_incarnation
-           FROM actor_target_attestations a
-           JOIN actor_target_bindings b ON b.target_binding_id = a.target_binding_id
-          WHERE b.target_actor_id = ?
-          ORDER BY a.attested_at DESC, a.rowid DESC
+      //
+      // Scoped to the binding the turn was claimed under, not to the actor.
+      //
+      // A review built the actor-wide version's counterexample — a second binding for the same
+      // actor, attested later under a different incarnation, reporting VERIFIED while the first
+      // binding's execution is untouched. Measured, that state cannot exist: `UNIQUE
+      // (target_actor_id)` on `actor_target_bindings` refuses the second binding, so the two
+      // queries return the same row today. Scoped anyway, because a check should not depend on a
+      // constraint two tables away to be about the right subject, and the test that pins that
+      // constraint says so out loud.
+      //
+      // The session id is compared as well as the incarnation, because two runtimes can number
+      // their incarnations independently and a match on the number alone is not a match on the
+      // execution.
+      const current = this.db.get<{ executor_session_id: string; executor_session_incarnation: string }>(
+        `SELECT executor_session_id, executor_session_incarnation
+           FROM actor_target_attestations
+          WHERE target_binding_id = ?
+          ORDER BY attested_at DESC, rowid DESC
           LIMIT 1`,
-        [input.targetActorId],
+        [held.target_binding_id],
       );
       const fence =
-        current !== undefined && current.executor_session_incarnation !== held.executor_session_incarnation
+        current !== undefined &&
+        (current.executor_session_id !== held.executor_session_id ||
+          current.executor_session_incarnation !== held.executor_session_incarnation)
           ? "VERIFIED"
           : "ASSERTED";
       if (fence === "ASSERTED" && input.fenceAsserted !== true) {
