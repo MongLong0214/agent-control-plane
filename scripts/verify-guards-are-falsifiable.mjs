@@ -548,6 +548,31 @@ const GUARDS = [
     replace: '          if (this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");\n          return adjudicated;',
     killedBy: ["tests/unit/daemon-bootstrap-door.test.ts"],
   },
+  {
+    // The census could not see `BEFORE UPDATE OF`, so sixteen triggers were invisible to it —
+    // `sessions` among them, whose secret hash a REPLACE rewrote on ACP's own connection.
+    what: "the REPLACE census sees a guard written as BEFORE UPDATE OF a column",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "  /CREATE TRIGGER IF NOT EXISTS (\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\\n]*?)?\\s+ON (\\w+)/g,",
+    replace: "  /CREATE TRIGGER IF NOT EXISTS (\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE) ON (\\w+)/g,",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // A credential the schema calls immutable, rewritten by a statement its guard never sees.
+    what: "a session row cannot be rewritten by replacing it",
+    file: "src/db/schema.sql",
+    find: "  SELECT RAISE(ABORT, 'SESSION_NO_REPLACE');",
+    replace: "  SELECT 1;",
+    killedBy: ["tests/unit/replace-cannot-rewrite-a-guarded-row.test.ts"],
+  },
+  {
+    // Naming less than the key refuses legitimate inserts; this one refused a rotation.
+    what: "a REPLACE guard names its table's whole key",
+    file: "src/db/schema.sql",
+    find: "              WHERE actor_id = NEW.actor_id AND actor_generation = NEW.actor_generation)",
+    replace: "              WHERE actor_id = NEW.actor_id)",
+    killedBy: ["tests/unit/replace-cannot-rewrite-a-guarded-row.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

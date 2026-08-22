@@ -148,6 +148,8 @@ export const LEDGER_TRIGGER_NAMES: readonly string[] = [
     "canonical_turn_adjudication_citations_append_only",
     "canonical_turn_adjudication_citations_no_delete",
     "canonical_turn_adjudication_citations_same_turn",
+    "canonical_turn_adjudications_no_replace",
+    "canonical_turn_adjudication_citations_no_replace",
 ];
 
 /**
@@ -176,6 +178,18 @@ export const PROVENANCE_NO_REPLACE_TRIGGERS: readonly string[] = [
   "telegram_owner_prompts_no_replace",
   "conversational_actors_no_replace",
   "manifests_no_replace",
+  // Found when the census learned to see `BEFORE UPDATE OF <column>`, which four of this schema's
+  // most load-bearing guards use and its first pattern did not match. `sessions` was among the
+  // sixteen triggers it could not see, and a REPLACE rewrote a session's secret hash on ACP's own
+  // connection while the census printed PASS.
+  "sessions_no_replace",
+  "runs_no_replace",
+  "assignments_no_replace",
+  "task_executions_no_replace",
+  "conversational_actor_registrations_no_replace",
+  "outbox_no_replace",
+  "run_artifacts_no_replace",
+  "github_receipts_no_replace",
 ];
 
 /** `DROP TRIGGER IF EXISTS` for a set of triggers, so a repair replaces rather than skips. */
@@ -1791,6 +1805,16 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "github_receipts_pending_completion", sentinel: "GITHUB_RECEIPT_PROTOCOL_VIOLATION" },
   { name: "conversational_actors_no_replace", sentinel: "CONVERSATIONAL_ACTOR_NO_REPLACE", introducedIn: 26 },
   { name: "manifests_no_replace", sentinel: "MANIFEST_NO_REPLACE", introducedIn: 26 },
+  { name: "sessions_no_replace", sentinel: "SESSION_NO_REPLACE", introducedIn: 26 },
+  { name: "runs_no_replace", sentinel: "RUN_NO_REPLACE", introducedIn: 26 },
+  { name: "assignments_no_replace", sentinel: "ASSIGNMENT_NO_REPLACE", introducedIn: 26 },
+  { name: "task_executions_no_replace", sentinel: "TASK_EXECUTION_NO_REPLACE", introducedIn: 26 },
+  { name: "conversational_actor_registrations_no_replace", sentinel: "CONVERSATIONAL_ACTOR_REGISTRATION_NO_REPLACE", introducedIn: 26 },
+  { name: "outbox_no_replace", sentinel: "OUTBOX_NO_REPLACE", introducedIn: 26 },
+  { name: "run_artifacts_no_replace", sentinel: "RUN_ARTIFACT_NO_REPLACE", introducedIn: 26 },
+  { name: "github_receipts_no_replace", sentinel: "GITHUB_RECEIPT_NO_REPLACE", introducedIn: 26 },
+  { name: "canonical_turn_adjudications_no_replace", sentinel: "CANONICAL_TURN_ADJUDICATION_NO_REPLACE", introducedIn: 26 },
+  { name: "canonical_turn_adjudication_citations_no_replace", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_NO_REPLACE", introducedIn: 26 },
   { name: "audit_events_no_replace", sentinel: "AUDIT_NO_REPLACE", introducedIn: 26 },
   { name: "audit_events_append_only", sentinel: "AUDIT_APPEND_ONLY" },
   { name: "audit_events_no_delete", sentinel: "AUDIT_APPEND_ONLY" },

@@ -880,6 +880,18 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   // Found by the same census, and older than this branch: five sentinels the schema raises that
   // nothing here translated. A guard whose denial arrives untyped is a guard whose caller cannot
   // tell it apart from a bug.
+  // The ten a corrected census found. Its first pattern could not see `BEFORE UPDATE OF`,
+  // which is the form four of this schema's most load-bearing guards take.
+  SESSION_NO_REPLACE: ReasonCode.CONFLICT,
+  RUN_NO_REPLACE: ReasonCode.CONFLICT,
+  ASSIGNMENT_NO_REPLACE: ReasonCode.CONFLICT,
+  TASK_EXECUTION_NO_REPLACE: ReasonCode.CONFLICT,
+  CONVERSATIONAL_ACTOR_REGISTRATION_NO_REPLACE: ReasonCode.CONFLICT,
+  OUTBOX_NO_REPLACE: ReasonCode.CONFLICT,
+  RUN_ARTIFACT_NO_REPLACE: ReasonCode.CONFLICT,
+  GITHUB_RECEIPT_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_ADJUDICATION_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_ADJUDICATION_CITATION_NO_REPLACE: ReasonCode.CONFLICT,
   TELEGRAM_PROMPT_IMMUTABLE: ReasonCode.CONFLICT,
   ACTOR_RETIREMENT_TERMINAL: ReasonCode.CONFLICT,
   ACTOR_RUNTIME_NOT_READY: ReasonCode.CONFLICT,

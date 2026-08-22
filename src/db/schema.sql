@@ -132,6 +132,26 @@ BEGIN
   SELECT RAISE(ABORT, 'SESSION_INCARNATION_IMMUTABLE');
 END;
 
+-- CP-HI-06 — the session credential, rewritable by an ordinary statement.
+--
+-- Every guard on this table is `BEFORE UPDATE OF <column>`, and `INSERT OR REPLACE` is a delete
+-- and an insert: no UPDATE fires, so none of them sees it. `recursive_triggers` does not help
+-- either — it makes the implicit delete fire DELETE triggers, and this table has none. Measured
+-- on ACP's own connection, which sets that pragma ON:
+--
+--   UPDATE session_secret_hash  -> refused
+--   INSERT OR REPLACE           -> hash, incarnation, buzz actor and workdir all rewritten
+--
+-- The comment above `sessions_secret_hash_immutable` says a rewritable hash lets a local caller
+-- mint itself a new credential. That was true and the guard did not cover the statement that
+-- does it.
+CREATE TRIGGER IF NOT EXISTS sessions_no_replace
+BEFORE INSERT ON sessions
+WHEN EXISTS (SELECT 1 FROM sessions WHERE session_id = NEW.session_id)
+BEGIN
+  SELECT RAISE(ABORT, 'SESSION_NO_REPLACE');
+END;
+
 -- CP-HI-02 — a rotated secret would let a second peer inherit an established session's authority.
 -- An issued session secret cannot be rotated in place or cleared: the peer that holds
 -- the plaintext is the only thing that proves an MCP caller is this session, so a
@@ -287,6 +307,21 @@ BEGIN
   SELECT RAISE(ABORT, 'ACTOR_REGISTRATION_GENERATION_NOT_MONOTONIC');
 END;
 
+-- CP-HI-06 — registration state is monotone under UPDATE only.
+--
+-- The whole key, not its first column. This table's key is (actor_id, actor_generation),
+-- and a version of this trigger that named only the actor refused a *rotation* — a new row
+-- at a higher generation, which is the operation the registry exists to perform. A REPLACE
+-- guard that names less than the key refuses legitimate inserts; one that names more lets
+-- the collision through.
+CREATE TRIGGER IF NOT EXISTS conversational_actor_registrations_no_replace
+BEFORE INSERT ON conversational_actor_registrations
+WHEN EXISTS (SELECT 1 FROM conversational_actor_registrations
+              WHERE actor_id = NEW.actor_id AND actor_generation = NEW.actor_generation)
+BEGIN
+  SELECT RAISE(ABORT, 'CONVERSATIONAL_ACTOR_REGISTRATION_NO_REPLACE');
+END;
+
 -- CP-HI-04 — registration retirement is terminal; reactivation would bypass the fencing
 -- generation required for a new membership decision.
 CREATE TRIGGER IF NOT EXISTS conversational_actor_registration_retirement_terminal
@@ -341,6 +376,14 @@ WHEN NEW.binding_generation <= COALESCE(
   (SELECT MAX(binding_generation) FROM assignments WHERE role_key = NEW.role_key), 0)
 BEGIN
   SELECT RAISE(ABORT, 'BINDING_GENERATION_NOT_MONOTONIC');
+END;
+
+-- CP-HI-06 — revocation is terminal, and REPLACE un-revokes.
+CREATE TRIGGER IF NOT EXISTS assignments_no_replace
+BEFORE INSERT ON assignments
+WHEN EXISTS (SELECT 1 FROM assignments WHERE assignment_id = NEW.assignment_id)
+BEGIN
+  SELECT RAISE(ABORT, 'ASSIGNMENT_NO_REPLACE');
 END;
 
 -- CP-HI-04 — the identity columns of a binding are fixed once written.
@@ -532,6 +575,14 @@ BEGIN
   SELECT RAISE(ABORT, 'RUN_STATE_TRANSITION_ILLEGAL');
 END;
 
+-- CP-HI-06 — same shape: the pinned manifest and the state guards are all BEFORE UPDATE OF.
+CREATE TRIGGER IF NOT EXISTS runs_no_replace
+BEFORE INSERT ON runs
+WHEN EXISTS (SELECT 1 FROM runs WHERE run_id = NEW.run_id)
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_NO_REPLACE');
+END;
+
 -- CP-HI-02 — a legal edge still requires daemon authority; the connection marker proves it.
 -- A legal edge is not, by itself, authority to take it. The marker is connection-local and
 -- scoped to one run and target state while Db.applyRunStateTransition writes the audit proof
@@ -711,6 +762,14 @@ BEGIN
   SELECT RAISE(ABORT, 'TASK_EXECUTION_WORKER_BINDING_REQUIRED');
 END;
 
+-- CP-HI-06 — the worker identity is immutable under UPDATE and was rewritable by REPLACE.
+CREATE TRIGGER IF NOT EXISTS task_executions_no_replace
+BEFORE INSERT ON task_executions
+WHEN EXISTS (SELECT 1 FROM task_executions WHERE execution_id = NEW.execution_id)
+BEGIN
+  SELECT RAISE(ABORT, 'TASK_EXECUTION_NO_REPLACE');
+END;
+
 -- CP-HI-04 — recorded producer identity is historical provenance and cannot be rewritten.
 -- The identity recorded at admission is historical provenance. Rewriting its task, run,
 -- or worker afterwards would turn a valid receipt into a claim for someone else's work.
@@ -772,6 +831,14 @@ WHEN NEW.kind IN ('VERIFICATION','BLIND_REVIEW','PRODUCTION_READY_PACKET')
  )
 BEGIN
   SELECT RAISE(ABORT, 'EVIDENCE_CANDIDATE_MISMATCH');
+END;
+
+-- CP-HI-06 — evidence content is immutable under UPDATE and was rewritable by REPLACE.
+CREATE TRIGGER IF NOT EXISTS run_artifacts_no_replace
+BEFORE INSERT ON run_artifacts
+WHEN EXISTS (SELECT 1 FROM run_artifacts WHERE artifact_id = NEW.artifact_id)
+BEGIN
+  SELECT RAISE(ABORT, 'RUN_ARTIFACT_NO_REPLACE');
 END;
 
 -- CP-HI-06 — evidence requires the producer label *and* the authority marker, so raw SQL cannot forge it.
@@ -1023,6 +1090,14 @@ BEGIN
   SELECT RAISE(ABORT, 'OUTBOX_REQUEST_FINGERPRINT_IMMUTABLE');
 END;
 
+-- CP-HI-06 — the request fingerprint is what makes a send idempotent.
+CREATE TRIGGER IF NOT EXISTS outbox_no_replace
+BEFORE INSERT ON outbox
+WHEN EXISTS (SELECT 1 FROM outbox WHERE message_id = NEW.message_id)
+BEGIN
+  SELECT RAISE(ABORT, 'OUTBOX_NO_REPLACE');
+END;
+
 -- §30.2 #5
 CREATE UNIQUE INDEX IF NOT EXISTS outbox_idempotency ON outbox(idempotency_key);
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(status, created_at);
@@ -1153,6 +1228,14 @@ WHEN NOT (
 )
 BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_IMMUTABLE');
+END;
+
+-- CP-HI-06 — a receipt is the proof an operation already happened.
+CREATE TRIGGER IF NOT EXISTS github_receipts_no_replace
+BEFORE INSERT ON github_receipts
+WHEN EXISTS (SELECT 1 FROM github_receipts WHERE receipt_id = NEW.receipt_id)
+BEGIN
+  SELECT RAISE(ABORT, 'GITHUB_RECEIPT_NO_REPLACE');
 END;
 
 -- CP-HI-05 — an APPLIED row must descend from a reservation, so a write cannot mint its own proof.
@@ -1795,6 +1878,14 @@ BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_AUTHORITY_DENIED');
 END;
 
+-- CP-HI-06 — an adjudication is the reason a conversation left quarantine.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudications_no_replace
+BEFORE INSERT ON canonical_turn_adjudications
+WHEN EXISTS (SELECT 1 FROM canonical_turn_adjudications WHERE adjudication_id = NEW.adjudication_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_NO_REPLACE');
+END;
+
 -- CP-HI-06 — an adjudication is a record of a decision that was made. Editing one rewrites it.
 CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudications_append_only
 BEFORE UPDATE ON canonical_turn_adjudications
@@ -1825,6 +1916,15 @@ WHEN acp_turn_materialization_authorized(
          WHERE adjudication_id = NEW.adjudication_id)) <> 1
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_CITATION_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — the citation set is what makes an adjudication a reading rather than an assertion.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_adjudication_citations_no_replace
+BEFORE INSERT ON canonical_turn_adjudication_citations
+WHEN EXISTS (SELECT 1 FROM canonical_turn_adjudication_citations
+              WHERE adjudication_id = NEW.adjudication_id AND observation_id = NEW.observation_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_ADJUDICATION_CITATION_NO_REPLACE');
 END;
 
 -- CP-HI-06 — a citation set that can be edited afterwards does not record what was read.
