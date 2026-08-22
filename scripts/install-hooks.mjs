@@ -16,11 +16,13 @@
  */
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const HOOK_DIR = join(
+// `resolve`, not `join`: in a linked worktree that command answers with an absolute path, and
+// joining it onto the worktree root points at nothing.
+const HOOK_DIR = resolve(
   ROOT,
   execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd: ROOT, encoding: "utf8" }).trim(),
 );

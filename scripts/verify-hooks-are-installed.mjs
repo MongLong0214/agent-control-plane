@@ -15,13 +15,15 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const failures = [];
 
-const HOOK_DIR = join(
+// `resolve`, not `join` — see install-hooks.mjs. This crashed uncaught in a linked worktree,
+// which is a check reporting nothing rather than reporting a failure.
+const HOOK_DIR = resolve(
   ROOT,
   execFileSync("git", ["rev-parse", "--git-path", "hooks"], { cwd: ROOT, encoding: "utf8" }).trim(),
 );
@@ -91,7 +93,7 @@ if (runCommitMsg(INTACT_TRAILER).status !== 0) {
 // The pre-commit hook's sentinel branch, exercised where it can be observed: create the file the
 // harness writes, and require a refusal. Removed afterwards whatever happens, because leaving it
 // behind would refuse every later commit for a run that never existed.
-const sentinel = join(
+const sentinel = resolve(
   ROOT,
   execFileSync("git", ["rev-parse", "--git-path", "verify-guards-in-flight.json"], {
     cwd: ROOT,

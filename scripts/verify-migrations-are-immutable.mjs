@@ -20,7 +20,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -55,10 +55,18 @@ const SCHEMA = join(ROOT, "src/db/schema.sql");
  * file altered with nothing saying so. A `finally` covers a thrown error and covers neither a
  * SIGKILL nor a machine losing power.
  */
-const PARKED = join(ROOT, execFileSync("git", ["rev-parse", "--git-path", "schema-probe-in-flight"], {
-  cwd: ROOT,
-  encoding: "utf8",
-}).trim());
+// `resolve`, not `join`. In a linked worktree `git rev-parse --git-path` answers with an
+// absolute path into the shared git directory, and joining that onto the worktree root produces a
+// path under it that does not exist — every write dies with ENOENT. The sibling harness documents
+// this exact trap and uses `resolve`; these three scripts were written afterwards and did not.
+// Reproduced while dry-running a merge in a worktree, which is how review copies are made here.
+const PARKED = resolve(
+  ROOT,
+  execFileSync("git", ["rev-parse", "--git-path", "schema-probe-in-flight"], {
+    cwd: ROOT,
+    encoding: "utf8",
+  }).trim(),
+);
 
 /** Puts back whatever a previous run was holding, before this one reads anything. */
 const repairAbandonedProbe = () => {
