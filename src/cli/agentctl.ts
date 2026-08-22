@@ -41,6 +41,11 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
   agentctl conversation contradictions     turns whose records disagree, with the ids to cite
   agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
+  agentctl conversation unresolved         turns waiting on a person, with what each already holds
+  agentctl conversation resolve <actor> <turn> <reason-code> <evidence-digest> [--fenced]
+                                           settle an unobserved turn ABORTED, which permits a retry.
+                                           --fenced only when its executor incarnation is still
+                                           current: you are stating the execution cannot still write
   agentctl bootstrap hermes -- <command>  launch Hermes and establish CEO generation 1
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
@@ -70,6 +75,7 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "actor.register",
   "actor.unregister",
   "conversation.adjudicate",
+  "conversation.resolve",
 ]);
 
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
@@ -310,6 +316,21 @@ export const dispatch = async (
   if (command === "conversation") {
     const [sub, targetActorId, turnRequestId, reasonCode, evidenceDigest, ...observationIds] = args;
     if (sub === "contradictions") return call("conversation.contradictions");
+    if (sub === "unresolved") return call("conversation.unresolved");
+    if (sub === "resolve") {
+      // No observation ids: an unresolved turn has nothing to cite, which is exactly why
+      // `adjudicate` cannot take it. What the operator supplies instead is what they looked at.
+      return call("conversation.resolve", {
+        targetActorId: required(targetActorId, "targetActorId"),
+        turnRequestId: required(turnRequestId, "turnRequestId"),
+        reasonCode: required(reasonCode, "reasonCode"),
+        evidenceDigest: required(evidenceDigest, "evidenceDigest"),
+        // Needed only when ACP cannot see the fence for itself. If the turn's executor incarnation
+        // is still the current one, the execution may still be running, and settling ABORTED
+        // without this flag would admit a retry while the first attempt is in flight.
+        fenceAsserted: observationIds.includes("--fenced"),
+      });
+    }
     if (sub === "adjudicate") {
       // The ids come from `conversation contradictions`, which is why they are positional rather
       // than a flag: an adjudication cites the set that turn actually holds, and retyping a

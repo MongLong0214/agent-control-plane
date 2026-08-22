@@ -85,6 +85,72 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // Insertability is a property of the destination. Read from the source, an ordinary column that
+    // becomes generated lands in the INSERT and SQLite refuses it.
+    what: "a rebuild judges what it can write from the table it writes into",
+    file: "src/db/migrations.ts",
+    find: "      const kind = destination.get(row.name);",
+    replace: "      const kind = row.hidden;",
+    killedBy: [
+      "tests/unit/a-rebuild-carries-the-rows-it-finds.test.ts::carries a computed column into a table that stores it",
+    ],
+  },
+  {
+    // ABORTED means the execution can no longer write. Recording one for a turn whose incarnation
+    // is still current admits attempt 2 while attempt 1 may still deliver.
+    what: "a resolution needs a fence — verified, or the operator's explicit word",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '      if (fence === "ASSERTED" && input.fenceAsserted !== true) {',
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/an-unresolved-turn-has-an-operator-exit.test.ts::refuses while the execution that holds the turn may still be running",
+    ],
+  },
+  {
+    // The copy list was written by hand and omitted four NOT NULL columns; every test database is
+    // empty when a migration runs, so nothing noticed.
+    what: "a table rebuild carries every column both tables share",
+    file: "src/db/migrations.ts",
+    find: '  const columns = sharedColumns(raw, "canonical_turns", "canonical_turns_rebuilt").join(", ");',
+    replace: '  const columns = "turn_request_id, target_actor_id, prompt_digest, lifecycle_state, claimed_at";',
+    killedBy: [
+      "tests/unit/a-rebuild-carries-the-rows-it-finds.test.ts::copies every column of an existing turn, including the four a hand-written list forgot",
+    ],
+  },
+  {
+    // The operands check cannot see this one — it is a chain written on one line — so the row is
+    // what watches it.
+    what: "a resolution with no reason and no evidence is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '    if (input.reasonCode.trim() === "" || input.evidenceDigest.trim() === "") {',
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/an-unresolved-turn-has-an-operator-exit.test.ts::refuses a resolution that says nothing",
+    ],
+  },
+  {
+    // The operator authority exists to release a hold in the retry-safe direction. Allowed to
+    // record a completion, it would let a person assert something nobody observed — and a turn
+    // marked COMPLETED is never re-run, so the owner's question disappears.
+    what: "the operator authority can only record ABORTED, in the table",
+    file: "src/db/schema.sql",
+    find: "        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE',\n                                    'OPERATOR_AFTER_REVIEW')))",
+    replace: "        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE',\n                                    'OPERATOR_AFTER_REVIEW'))\n    OR observing_authority = 'OPERATOR_AFTER_REVIEW')",
+    killedBy: [
+      "tests/unit/an-unresolved-turn-has-an-operator-exit.test.ts::cannot record a completion, in the table and not only in the method",
+    ],
+  },
+  {
+    // Without the actor comparison an operator holding one conversation's turn id settles another's.
+    what: "a resolution names the conversation it settles, not just the turn",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (held?.target_actor_id !== input.targetActorId) {",
+    replace: "      if (held === undefined) {",
+    killedBy: [
+      "tests/unit/an-unresolved-turn-has-an-operator-exit.test.ts::refuses a turn on another conversation, so one turn id cannot settle another's",
+    ],
+  },
+  {
     // The tool that inherits the records writes one paragraph per source commit, and git stores
     // only the last. Without the collapse the merge path preserves nothing it claims to.
     what: "the inherited records are collapsed into one block git will keep",

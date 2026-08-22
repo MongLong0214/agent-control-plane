@@ -175,6 +175,8 @@ export const OPERATOR_METHOD = {
   ACTOR_UNREGISTER: "actor.unregister",
   CONVERSATION_CONTRADICTIONS: "conversation.contradictions",
   CONVERSATION_ADJUDICATE: "conversation.adjudicate",
+  CONVERSATION_UNRESOLVED: "conversation.unresolved",
+  CONVERSATION_RESOLVE: "conversation.resolve",
   DAEMON_STATUS: "daemon.status",
 } as const;
 
@@ -192,6 +194,7 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.ACTOR_REGISTER,
   OPERATOR_METHOD.ACTOR_UNREGISTER,
   OPERATOR_METHOD.CONVERSATION_ADJUDICATE,
+  OPERATOR_METHOD.CONVERSATION_RESOLVE,
 ]);
 
 /**
@@ -209,6 +212,12 @@ export const BOOTSTRAP_OPERATOR_METHODS: ReadonlySet<OperatorMethod> = new Set([
   // adjudication and the daemon that would have accepted one refused to start.
   OPERATOR_METHOD.CONVERSATION_CONTRADICTIONS,
   OPERATOR_METHOD.CONVERSATION_ADJUDICATE,
+  // And the two halves of the action an *unresolved* conversation needs. A turn whose permit died
+  // with the process that issued it is not contradicted — its records agree, there is just nothing
+  // to agree with — so the pair above cannot reach it and the doctor named a state no command
+  // could clear. #668.
+  OPERATOR_METHOD.CONVERSATION_UNRESOLVED,
+  OPERATOR_METHOD.CONVERSATION_RESOLVE,
   OPERATOR_METHOD.DAEMON_STATUS,
 ]);
 
@@ -604,6 +613,34 @@ export class Daemon {
 
         case OPERATOR_METHOD.CONVERSATION_CONTRADICTIONS:
           return allow(ReasonCode.OK, this.cp.conversation.contradictions());
+
+        case OPERATOR_METHOD.CONVERSATION_UNRESOLVED:
+          return allow(ReasonCode.OK, this.cp.conversation.unresolvedAcrossActors());
+
+        case OPERATOR_METHOD.CONVERSATION_RESOLVE: {
+          const targetActorId = requiredOperatorString(request.params, "targetActorId");
+          if (!targetActorId.allowed) return targetActorId;
+          const turnRequestId = requiredOperatorString(request.params, "turnRequestId");
+          if (!turnRequestId.allowed) return turnRequestId;
+          const reasonCode = requiredOperatorString(request.params, "reasonCode");
+          if (!reasonCode.allowed) return reasonCode;
+          const evidenceDigest = requiredOperatorString(request.params, "evidenceDigest");
+          if (!evidenceDigest.allowed) return evidenceDigest;
+          const resolved = this.cp.conversation.resolveInDoubt({
+            targetActorId: targetActorId.value,
+            turnRequestId: turnRequestId.value,
+            reasonCode: reasonCode.value,
+            evidenceDigest: evidenceDigest.value,
+            // Only `true` counts. Anything else — absent, "yes", 1 — is not an operator saying they
+            // established the fence, and the refusal it produces is the safe direction.
+            fenceAsserted: request.params?.fenceAsserted === true,
+          });
+          // Same reason as the adjudication below: an operator who follows the doctor's remedy
+          // exactly should not then watch `daemon.status` report the stale finding for a recheck
+          // interval. A denied resolution must not consume the wake-up — nothing changed to see.
+          if (resolved.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");
+          return resolved;
+        }
 
         case OPERATOR_METHOD.CONVERSATION_ADJUDICATE: {
           const targetActorId = requiredOperatorString(request.params, "targetActorId");

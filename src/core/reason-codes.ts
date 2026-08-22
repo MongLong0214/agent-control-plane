@@ -313,6 +313,16 @@ export const ReasonCode = {
    * a redelivery of it, or into a reuse conflict against evidence that was never produced.
    */
   CONVERSATION_TURN_OBSERVATION_UNEVIDENCED: "CONVERSATION_TURN_OBSERVATION_UNEVIDENCED",
+  /**
+   * A resolution would record a fence that nothing established.
+   *
+   * `ABORTED` means the execution can no longer write. An operator resolving a turn whose executor
+   * incarnation is still the current one is asserting that without evidence, and the cost lands as
+   * a duplicate: attempt 2 is admitted while attempt 1 may still deliver. Refused unless the
+   * operator says explicitly that they established it, which the ledger then records as `ASSERTED`
+   * rather than `VERIFIED`.
+   */
+  CONVERSATION_TURN_FENCE_UNPROVEN: "CONVERSATION_TURN_FENCE_UNPROVEN",
   /** An adjudication cited only part of the disagreement, or something outside it. */
   CONVERSATION_ADJUDICATION_INCOMPLETE: "CONVERSATION_ADJUDICATION_INCOMPLETE",
   // --- disposable acceptance realm ------------------------------------------

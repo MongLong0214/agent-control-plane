@@ -1532,7 +1532,14 @@ INSERT OR IGNORE INTO turn_resolution_authorities (resolution_authority) VALUES
   -- re-authenticated before dispatch, `createMessage` returned a correlated answer, and the
   -- runtime resolved only after the reply child exited zero. Strong enough to forbid a re-run,
   -- not strong enough to be called the target's own receipt — so it does not borrow that name.
-  ('ACP_OBSERVED_HERMES_REPLY');
+  ('ACP_OBSERVED_HERMES_REPLY'),
+  -- A person looked at a turn nothing could settle and chose the retry-safe direction. Not
+  -- evidence about what the target did — the operator did not watch it — so this authority is
+  -- restricted to ABORTED below and can never record a completion. It exists because the permit
+  -- dies with the coordinator instance that issued it, so a turn held across a restart had no
+  -- settler at all and no operator command could reach it: a wedge whose only exit was named in
+  -- the doctor's output and implemented nowhere.
+  ('OPERATOR_AFTER_REVIEW');
 
 -- How the observations on a turn relate to each other. A separate axis from the lifecycle,
 -- because they are separate facts: a turn can be settled and later contradicted, and by then the
@@ -1593,7 +1600,8 @@ CREATE TABLE IF NOT EXISTS canonical_turns (
     (outcome_kind = 'NEVER_ADMITTED' AND resolution_authority = 'ACP_PRE_DISPATCH')
     OR (outcome_kind = 'COMPLETED' AND resolution_authority = 'HERMES_TARGET')
     OR (outcome_kind = 'ABORTED'
-        AND resolution_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE'))))
+        AND resolution_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE',
+                                     'OPERATOR_AFTER_REVIEW'))))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS canonical_turns_one_unresolved
@@ -1657,7 +1665,8 @@ CREATE TABLE IF NOT EXISTS canonical_turn_observations (
     OR (observed_outcome = 'COMPLETED'
         AND observing_authority IN ('HERMES_TARGET', 'ACP_OBSERVED_HERMES_REPLY'))
     OR (observed_outcome = 'ABORTED'
-        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE')))
+        AND observing_authority IN ('HERMES_TARGET', 'OWNER_AFTER_TARGET_FENCE',
+                                    'OPERATOR_AFTER_REVIEW')))
 );
 
 CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn

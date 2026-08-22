@@ -736,8 +736,11 @@ export class Doctor {
             claimedAt: oldest.claimed_at,
           },
         },
+        // Names the command, because for a while it did not and there was none to name. A turn
+        // held across a restart has no permit and no disagreement, so neither settlement port nor
+        // `conversation adjudicate` can take it — the remedy read as actionable and was not (#668).
         recommendedAction:
-          "establish what happened to the turn and record it as an observation. The conversation refuses later turns until one arrives",
+          "establish what happened to the turn and record it as an observation. If nothing can — the permit died with the process that issued it — `agentctl conversation resolve <actor> <turn> <reason-code> <evidence-digest>` settles it ABORTED, which permits a retry. The conversation refuses later turns until one arrives",
       });
     }
 
