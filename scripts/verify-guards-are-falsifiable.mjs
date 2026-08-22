@@ -610,6 +610,15 @@ const GUARDS = [
     replace: "  if (false) return entries;",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
+  {
+    // The other read. Both had to be separated to be killable: every input where the two fail
+    // together leaves either check removable without a test noticing.
+    what: "a census whose database family could not be read is refused too",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!family.allowed) return family;",
+    replace: "  if (false) return family;",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

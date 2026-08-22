@@ -1015,11 +1015,36 @@ describe("a census is taken whole or not at all", () => {
     expect(taken.value.productionEntries).toContain("state.sqlite");
   });
 
-  it("refuses the whole census when either read fails", () => {
-    // Half a census is worse than none: it compares equal on the half it has.
-    const root = join(tempDir("acp-census-unreadable-whole-"), "production");
+  it("refuses when the listing fails, even though the database read would have succeeded", () => {
+    // The two reads have to be checked separately, and each needs an input where only it fails.
+    // A directory that cannot be opened at all fails both, so a test using one cannot tell whether
+    // either check is present — two mutations survived that test. `--x` is the arrangement that
+    // separates them: the directory can be traversed, so `stat` on a child answers ENOENT and the
+    // family read succeeds by recording absence, while `readdir` is refused.
+    const root = join(tempDir("acp-census-nolist-"), "production");
     mkdirSync(root, { recursive: true });
-    chmodSync(root, 0o000);
+    chmodSync(root, 0o111);
+
+    try {
+      const taken = censusProduction(root, records);
+
+      expect(taken.allowed).toBe(false);
+      if (taken.allowed) return;
+      expect(taken.reasonCode).toBe(ReasonCode.ACCEPTANCE_CENSUS_UNOBSERVABLE);
+    } finally {
+      chmodSync(root, 0o700);
+    }
+  });
+
+  it("refuses when the database family cannot be read, with the listing intact", () => {
+    // The mirror of the case above, and the reason both are needed: `r--` lists but cannot be
+    // traversed, so `readdir` succeeds and `stat` on a child is refused. Every arrangement where
+    // both reads fail together leaves either check removable without a test noticing — two
+    // mutations survived exactly that way before these two cases existed.
+    const root = join(tempDir("acp-census-nostat-"), "production");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, "state.sqlite"), "db");
+    chmodSync(root, 0o444);
     try {
       const taken = censusProduction(root, records);
 
