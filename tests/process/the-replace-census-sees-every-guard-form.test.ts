@@ -244,3 +244,38 @@ describe("a registry entry names a version that installs it", () => {
     expect(done.status).toBe(1);
   });
 });
+
+describe("a trigger written without IF NOT EXISTS is still a trigger", () => {
+  const withoutIfNotExists = () => `${CURRENT()}
+CREATE TABLE IF NOT EXISTS census_probe_table (
+  probe_id TEXT PRIMARY KEY
+);
+
+CREATE TRIGGER census_probe_immutable
+BEFORE UPDATE OF probe_id ON census_probe_table
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_IMMUTABLE');
+END;
+`;
+
+  it("is seen by the REPLACE census", () => {
+    // Every trigger in this schema is written with `IF NOT EXISTS` today, and both patterns
+    // required it — so a trigger added without it was invisible to two gates at once while both
+    // printed PASS. Third time on this branch a pattern has been narrower than what it enumerates.
+    const done = censusOn(withoutIfNotExists());
+
+    expect(done.stdout).toContain("census_probe_table");
+    expect(done.status).toBe(1);
+  });
+
+  it("is seen by the required-registry check", () => {
+    const repo = scratchRepo();
+    copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
+    writeFileSync(join(repo, "src/db/schema.sql"), withoutIfNotExists());
+
+    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+
+    expect(done.stdout).toContain("census_probe_immutable");
+    expect(done.status).toBe(1);
+  });
+});

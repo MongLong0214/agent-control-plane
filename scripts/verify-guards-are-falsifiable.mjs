@@ -641,8 +641,8 @@ const GUARDS = [
     // `sessions` among them, whose secret hash a REPLACE rewrote on ACP's own connection.
     what: "the REPLACE census sees a guard written as BEFORE UPDATE OF a column",
     file: "scripts/verify-append-only-tables-are-closed.mjs",
-    find: "  /CREATE TRIGGER IF NOT EXISTS (\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\\n]*?)?\\s+ON (\\w+)/g,",
-    replace: "  /CREATE TRIGGER IF NOT EXISTS (\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE) ON (\\w+)/g,",
+    find: "  /CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\\n]*?)?\\s+ON (\\w+)/g,",
+    replace: "  /CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE) ON (\\w+)/g,",
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
   {
@@ -856,6 +856,23 @@ const GUARDS = [
     find: "  if (!sameMultiset(before.bindingGenerations, after.bindingGenerations)) {",
     replace: "  if (false) {",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Every trigger here is written with `IF NOT EXISTS`, so a pattern requiring it counts only
+    // the ones written the way its author pictured — and a trigger added without it was invisible
+    // to two gates at once while both printed PASS.
+    what: "the REPLACE census sees a trigger written without IF NOT EXISTS",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "  /CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\\n]*?)?\\s+ON (\\w+)/g,",
+    replace: "  /CREATE TRIGGER IF NOT EXISTS (\\w+)\\s*\\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\\n]*?)?\\s+ON (\\w+)/g,",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    what: "the required-registry check sees a trigger written without IF NOT EXISTS",
+    file: "scripts/verify-every-trigger-is-required.mjs",
+    find: "const declared = [...schema.matchAll(/CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)/g)].map(",
+    replace: "const declared = [...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\\w+)/g)].map(",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
 ];
 

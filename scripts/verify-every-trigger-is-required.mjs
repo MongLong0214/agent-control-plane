@@ -22,7 +22,13 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const schema = readFileSync(join(ROOT, "src/db/schema.sql"), "utf8");
 const migrations = readFileSync(join(ROOT, "src/db/migrations.ts"), "utf8");
 
-const declared = [...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
+// `IF NOT EXISTS` optional. Every trigger in this schema is written with it today, and a check
+// that requires it counts only the ones written the way its author pictured — measured: a trigger
+// added without it was invisible to this gate and to the REPLACE census, while both printed PASS.
+// That is the third time on this branch a pattern has been narrower than the thing it enumerates.
+const declared = [...schema.matchAll(/CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/g)].map(
+  (m) => m[1],
+);
 const required = new Set([...migrations.matchAll(/\{ name: "(\w+)", sentinel:/g)].map((m) => m[1]));
 
 const unwatched = declared.filter((name) => !required.has(name));

@@ -46,7 +46,7 @@ const schema = readFileSync(join(ROOT, "src/db/schema.sql"), "utf8");
 // and the shape it could not see was the one that mattered most.
 const guards = new Map();
 for (const match of schema.matchAll(
-  /CREATE TRIGGER IF NOT EXISTS (\w+)\s*\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\n]*?)?\s+ON (\w+)/g,
+  /CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\nBEFORE (INSERT|UPDATE|DELETE)(?: OF [^\n]*?)?\s+ON (\w+)/g,
 )) {
   const [, name, verb, table] = match;
   if (!guards.has(table)) guards.set(table, { verbs: new Set(), names: [] });
@@ -126,7 +126,7 @@ const mismatched = [];
  * than skipped: silence is not a pass.
  */
 const bodies = [
-  ...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)_no_replace\n([\s\S]*?)\nEND;/g),
+  ...schema.matchAll(/CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)_no_replace\n([\s\S]*?)\nEND;/g),
 ];
 for (const guard of bodies) {
   const [, table, body] = guard;
@@ -201,7 +201,7 @@ if (open.length > 0) {
 
 // What it inspected, beside what exists. A PASS over a subset reads exactly like a PASS over the
 // set, and twice in one day a check here passed on sixteen of twenty without saying so.
-const declared = [...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)_no_replace/g)].length;
+const declared = [...schema.matchAll(/CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)_no_replace/g)].length;
 if (bodies.length !== declared) {
   process.stdout.write(
     `  ${declared} no_replace trigger(s) are declared and this check could read ${bodies.length}.\n` +
