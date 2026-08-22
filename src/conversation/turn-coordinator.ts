@@ -969,6 +969,20 @@ export class ConversationTurnCoordinator {
       //
       // The lesson is not about this condition. I reasoned from two mechanisms to "no state can
       // reach here" and did not try to build one; the state took three calls.
+      //
+      // And the guarantee these three make is conditional, which is worth stating where the rule
+      // is rather than in a design note. A retry is admitted after `NEVER_ADMITTED`, so:
+      //
+      //   preDispatch.neverAdmitted(P1)  -> a turn that in fact ran is recorded as never started
+      //   claim(attempt 2)               -> admitted; the owner's message is dispatched again
+      //   target.completed(P1) arrives   -> CONTRADICTED, correctly, and one turn too late
+      //
+      // Nothing here can refuse that, because the rule's whole input is what the authorities
+      // reported. **Exactly-once holds exactly as far as `ACP_PRE_DISPATCH` is truthful**, and
+      // what makes it truthful is that the port is only reachable before dispatch — a discipline
+      // in the caller, not a property the coordinator checks. #662 is that gap; this is what it
+      // costs. Refusing the retry instead would turn every transient refusal into a permanent
+      // hold, which is the failure #651 is about, so the trade is deliberate and one-directional.
       const settledSafely =
         (previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED") &&
         (anyCompletion?.n ?? 0) === 0 &&
