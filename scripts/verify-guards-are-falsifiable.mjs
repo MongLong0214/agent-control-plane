@@ -568,6 +568,22 @@ const GUARDS = [
     replace: "        const target = resolve(dirname(probe), readlinkSync(probe));",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
+  {
+    // A hand-written list here says "every path" and means "the ones someone remembered".
+    what: "the checked path set is derived from RealmPaths rather than listed",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    ...Object.entries(request.paths).map(([name, path]) => [name, path] as const),",
+    replace: '    ["stateDir", request.paths.stateDir] as const,',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // `slice(1)` meant "all but the state directory" only while it happened to be written first.
+    what: "the state directory is excluded from the containment loop by name, not by position",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  for (const [name, path] of named.filter(([field]) => field !== "stateDir")) {',
+    replace: "  for (const [name, path] of named.slice(1)) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

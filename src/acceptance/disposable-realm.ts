@@ -324,12 +324,12 @@ const planResolvedRealm = (request: RealmRequest): Decision<RealmPaths> => {
     (suffix) => [`databasePath${suffix}`, `${request.paths.databasePath}${suffix}`] as const,
   );
 
+  // Derived from the object rather than listed, so a path added to `RealmPaths` is checked by
+  // existing. A hand-written list here would be one more place that says "every path" and means
+  // "the five someone remembered" — the shape this module has already been corrected for twice,
+  // in the census that could not see a trigger form and in the guard that named part of a key.
   const named: readonly (readonly [string, string])[] = [
-    ["stateDir", request.paths.stateDir],
-    ["databasePath", request.paths.databasePath],
-    ["runtimeRoot", request.paths.runtimeRoot],
-    ["socketDir", request.paths.socketDir],
-    ["lockPath", request.paths.lockPath],
+    ...Object.entries(request.paths).map(([name, path]) => [name, path] as const),
     ...family,
   ];
 
@@ -395,7 +395,11 @@ const planResolvedRealm = (request: RealmRequest): Decision<RealmPaths> => {
     );
   }
 
-  for (const [name, path] of named.slice(1)) {
+  // By name, not by position. `slice(1)` meant "everything except the state directory" only while
+  // the state directory happened to be written first, and the list it indexes into is derived from
+  // an object now — where key order is a property of how the interface was typed rather than of
+  // anything this function controls.
+  for (const [name, path] of named.filter(([field]) => field !== "stateDir")) {
     if (!within(settled(request.paths.stateDir), settled(path))) {
       // Otherwise cleanup cannot be complete by construction: removing the state directory
       // would leave whatever was placed outside it, and nothing would say so.

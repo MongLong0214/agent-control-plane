@@ -851,3 +851,49 @@ describe("a database is its sidecars", () => {
     },
   );
 });
+
+describe("every path the realm declares is checked, by existing rather than by being listed", () => {
+  it("refuses each declared path in turn when it resolves inside production", () => {
+    // The checked set is derived from `RealmPaths`, so a field added there is covered by being
+    // there. A hand-written list would be one more place that says "every path" and means "the
+    // ones someone remembered" — the shape this module has been corrected for twice already.
+    const home = fakeHome();
+    for (const field of ["stateDir", "databasePath", "runtimeRoot", "socketDir", "lockPath"] as const) {
+      const scratch = tempDir(`acp-each-${field}-`);
+      const paths = { ...realmUnder(scratch), [field]: join(productionRoot(home), "inside") };
+
+      const decision = planDisposableRealm({
+        home,
+        paths,
+        probeTargetRoot: join(scratch, "probe-root"),
+        canonicalTargetRoot: join(scratch, "canonical-root"),
+      });
+
+      expect(decision.allowed, `${field} inside production was allowed`).toBe(false);
+      if (decision.allowed) continue;
+      expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+    }
+  });
+
+  it("requires every path but the state directory to be inside it, chosen by name", () => {
+    // `slice(1)` meant "all but the state directory" only while the state directory was written
+    // first. The list is derived from an object now, where key order is a property of the type
+    // rather than of this function.
+    const home = fakeHome();
+    for (const field of ["databasePath", "runtimeRoot", "socketDir", "lockPath"] as const) {
+      const scratch = tempDir(`acp-outside-${field}-`);
+      const paths = { ...realmUnder(scratch), [field]: join(scratch, "beside-the-realm") };
+
+      const decision = planDisposableRealm({
+        home,
+        paths,
+        probeTargetRoot: join(scratch, "probe-root"),
+        canonicalTargetRoot: join(scratch, "canonical-root"),
+      });
+
+      expect(decision.allowed, `${field} outside the state directory was allowed`).toBe(false);
+      if (decision.allowed) continue;
+      expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+    }
+  });
+});
