@@ -154,3 +154,40 @@ END;
     expect(done.status).toBe(1);
   });
 });
+
+describe("a partial unique index is a key the census demands too", () => {
+  it("fails on a guard that ignores a partial index's predicate", () => {
+    // Dropping partial indexes from the rule leaves a real hole: measured, a REPLACE colliding
+    // inside `WHERE state = 'ACTIVE'` deleted the existing row and said nothing. Keeping the
+    // columns without the predicate refuses legitimate inserts instead — fifty-seven of them.
+    // The rule takes both, so the census has to demand both.
+    const injected = `${CURRENT()}
+CREATE TABLE IF NOT EXISTS census_probe_table (
+  probe_id TEXT PRIMARY KEY,
+  owner    TEXT NOT NULL,
+  state    TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS census_probe_active_owner
+  ON census_probe_table(owner) WHERE state = 'ACTIVE';
+
+CREATE TRIGGER IF NOT EXISTS census_probe_immutable
+BEFORE UPDATE OF owner ON census_probe_table
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS census_probe_table_no_replace
+BEFORE INSERT ON census_probe_table
+WHEN EXISTS (SELECT 1 FROM census_probe_table WHERE probe_id = NEW.probe_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_NO_REPLACE');
+END;
+`;
+    const done = censusOn(injected);
+
+    expect(done.stdout).toContain("census_probe_table");
+    expect(done.stdout).toContain("where state = 'ACTIVE'");
+    expect(done.status).toBe(1);
+  });
+});

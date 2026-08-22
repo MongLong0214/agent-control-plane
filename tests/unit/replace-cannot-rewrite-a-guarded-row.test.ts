@@ -152,3 +152,78 @@ describe("a REPLACE cannot rewrite a row whose columns are guarded", () => {
     }
   });
 });
+
+describe("a partial unique index is a key too, inside its own predicate", () => {
+  it("refuses a REPLACE that collides inside the predicate", () => {
+    // Measured before the guards carried predicates: a second REGISTERED registration at a higher
+    // generation deleted the first silently. The primary key did not collide — the partial index
+    // on (actor_id) WHERE registration_state = 'REGISTERED' did, and REPLACE deletes on any
+    // uniqueness conflict.
+    const path = freshDatabase();
+    const db = openDb(path);
+    try {
+      db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES ('a','CEO',?)`, [
+        NOW,
+      ]);
+      db.run(
+        `INSERT INTO conversational_actor_registrations
+           (actor_id, actor_generation, registration_state, registered_at)
+         VALUES ('a', 1, 'REGISTERED', ?)`,
+        [NOW],
+      );
+
+      expect(() =>
+        db.run(
+          `INSERT OR REPLACE INTO conversational_actor_registrations
+             (actor_id, actor_generation, registration_state, registered_at)
+           VALUES ('a', 2, 'REGISTERED', ?)`,
+          [NOW],
+        ),
+      ).toThrow();
+
+      expect(
+        db.all<{ actor_generation: number }>(
+          `SELECT actor_generation FROM conversational_actor_registrations`,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("leaves an insert that does not match the predicate alone", () => {
+    // The other direction, which is what broke fifty-seven tests when the predicate was dropped
+    // and only the columns kept: a rotation retires the old row first, so the new one does not
+    // collide inside the predicate and is legitimate.
+    const path = freshDatabase();
+    const db = openDb(path);
+    try {
+      db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES ('a','CEO',?)`, [
+        NOW,
+      ]);
+      db.run(
+        `INSERT INTO conversational_actor_registrations
+           (actor_id, actor_generation, registration_state, registered_at)
+         VALUES ('a', 1, 'REGISTERED', ?)`,
+        [NOW],
+      );
+      db.run(
+        `UPDATE conversational_actor_registrations
+            SET registration_state = 'RETIRED', retired_at = ?, retired_reason = 'rotated'
+          WHERE actor_id = 'a' AND actor_generation = 1`,
+        [NOW],
+      );
+
+      expect(() =>
+        db.run(
+          `INSERT INTO conversational_actor_registrations
+             (actor_id, actor_generation, registration_state, registered_at)
+           VALUES ('a', 2, 'REGISTERED', ?)`,
+          [NOW],
+        ),
+      ).not.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+});

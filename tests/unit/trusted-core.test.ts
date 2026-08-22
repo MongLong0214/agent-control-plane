@@ -97,7 +97,11 @@ describe("database hard constraints (PRD §30.2)", () => {
          VALUES (?, ?, 'PRIMARY_CTO', ?, ?, 'ses_second', 'inc-2', 2, 'PREFERRED', 'ACTIVE', ?)`,
         [newAssignmentId(), `PRIMARY_CTO:other-key`, seeded.projectId, seedActor(db, "PRIMARY_CTO"), clock.nowIso()],
       ),
-    ).toThrowError(/active primary CTO/);
+    // The partial unique index and `assignments_no_replace` both refuse this row — the guard
+    // carries that index's predicate, because a REPLACE colliding inside it deletes the existing
+    // row silently. SQLite does not define which BEFORE INSERT trigger speaks first, so naming one
+    // asserts on firing order rather than on the property.
+    ).toThrowError(/active primary CTO|ASSIGNMENT_NO_REPLACE/);
   });
 
   it("enforces monotonic binding generation per role key", () => {

@@ -150,6 +150,7 @@ BEFORE INSERT ON sessions
 WHEN EXISTS (
   SELECT 1 FROM sessions
    WHERE (session_id = NEW.session_id)
+           OR (buzz_actor_id = NEW.buzz_actor_id AND (buzz_actor_id IS NOT NULL AND lifecycle IN ('STARTING','READY','DRAINING')) AND (NEW.buzz_actor_id IS NOT NULL AND NEW.lifecycle IN ('STARTING','READY','DRAINING')))
 )
 BEGIN
   SELECT RAISE(ABORT, 'SESSION_NO_REPLACE');
@@ -322,6 +323,7 @@ BEFORE INSERT ON conversational_actor_registrations
 WHEN EXISTS (
   SELECT 1 FROM conversational_actor_registrations
    WHERE (actor_id = NEW.actor_id AND actor_generation = NEW.actor_generation)
+           OR (actor_id = NEW.actor_id AND (registration_state = 'REGISTERED') AND (NEW.registration_state = 'REGISTERED'))
 )
 BEGIN
   SELECT RAISE(ABORT, 'CONVERSATIONAL_ACTOR_REGISTRATION_NO_REPLACE');
@@ -389,6 +391,8 @@ BEFORE INSERT ON assignments
 WHEN EXISTS (
   SELECT 1 FROM assignments
    WHERE (assignment_id = NEW.assignment_id)
+           OR (role_key = NEW.role_key AND (status = 'ACTIVE') AND (NEW.status = 'ACTIVE'))
+           OR (project_id = NEW.project_id AND (role = 'PRIMARY_CTO' AND status = 'ACTIVE') AND (NEW.role = 'PRIMARY_CTO' AND NEW.status = 'ACTIVE'))
            OR (role_key = NEW.role_key AND binding_generation = NEW.binding_generation AND session_id = NEW.session_id AND session_incarnation = NEW.session_incarnation)
 )
 BEGIN
@@ -1984,6 +1988,7 @@ BEFORE INSERT ON canonical_turns
 WHEN EXISTS (
   SELECT 1 FROM canonical_turns
    WHERE (turn_request_id = NEW.turn_request_id)
+           OR (target_actor_id = NEW.target_actor_id AND (lifecycle_state = 'IN_DOUBT') AND (NEW.lifecycle_state = 'IN_DOUBT'))
 )
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_REPLACE');

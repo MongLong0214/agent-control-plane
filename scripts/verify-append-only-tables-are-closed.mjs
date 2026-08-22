@@ -94,16 +94,20 @@ const uniqueKeysOf = (table) => {
   for (const unique of body.matchAll(/\bUNIQUE \(([^)]*)\)/g)) {
     keys.push(unique[1].split(",").map((column) => column.trim()));
   }
-  // Full unique indexes only. A *partial* one (`... WHERE status = 'ACTIVE'`) constrains a subset
-  // of rows, so a second insert that does not match the predicate is legitimate — and a guard
-  // written from the columns alone refuses it. Measured: widening the assignments guard to the
-  // partial `assignments_active_role_key` broke fifty-seven tests, all of them ordinary
-  // re-assignments after a revocation.
+  // A *partial* unique index constrains a subset of rows, so its columns alone are not the key —
+  // a second insert that does not match the predicate is legitimate. Widening a guard to the
+  // columns without the predicate broke fifty-seven tests, all ordinary re-assignments after a
+  // revocation. But dropping partial indexes entirely leaves a real hole: measured, a second
+  // REGISTERED registration at a higher generation deleted the first one silently.
+  //
+  // So a partial index contributes a key *with* its predicate, applied to both the existing row
+  // and the new one — which is exactly when SQLite's REPLACE would delete.
   for (const index of schema.matchAll(
     new RegExp(`CREATE UNIQUE INDEX IF NOT EXISTS \\w+\\s*\\n?\\s*ON ${table}\\(([^)]*)\\)([^;]*);`, "g"),
   )) {
-    if (/\bWHERE\b/.test(index[2])) continue;
-    keys.push(index[1].split(",").map((column) => column.trim()));
+    const columns = index[1].split(",").map((column) => column.trim());
+    const where = /\bWHERE\b([\s\S]*)/.exec(index[2]);
+    keys.push(where === null ? columns : { columns, predicate: where[1].trim() });
   }
   return keys.length > 0 ? keys : null;
 };
@@ -144,14 +148,26 @@ for (const guard of bodies) {
     .split(/\bOR\b/)
     .map((part) => new Set([...part.matchAll(/(\w+) = NEW\./g)].map((m) => m[1])))
     .filter((group) => group.size > 0);
-  const uncovered = keys.filter(
-    (key) => !groups.some((group) => key.every((column) => group.has(column)) && group.size === key.length),
-  );
+  const uncovered = keys.filter((key) => {
+    const columns = Array.isArray(key) ? key : key.columns;
+    const covered = groups.some(
+      (group) => columns.every((column) => group.has(column)) && group.size === columns.length,
+    );
+    if (Array.isArray(key)) return !covered;
+    // A partial key's group carries the predicate's own column too, so "group.size === columns"
+    // will not hold. It is covered when its columns appear together and the predicate's text is
+    // somewhere in the condition — a text check, and said to be one: it proves the predicate was
+    // carried across, not that it was carried across correctly.
+    const named = groups.some((group) => columns.every((column) => group.has(column)));
+    return !(named && condition.includes(key.predicate.replace(/\s+/g, " ")));
+  });
   if (uncovered.length > 0) {
     mismatched.push({
       table,
       why:
-        `nothing in the guard refuses a collision on (${uncovered.map((k) => k.join(", ")).join(") or (")})` +
+        `nothing in the guard refuses a collision on (${uncovered
+          .map((k) => (Array.isArray(k) ? k.join(", ") : `${k.columns.join(", ")} where ${k.predicate}`))
+          .join(") or (")})` +
         ` — it compares ${groups.map((g) => `(${[...g].sort().join(", ")})`).join(" or ")}`,
     });
   }

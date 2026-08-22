@@ -582,6 +582,15 @@ const GUARDS = [
     replace: "  const uncovered = [].filter(",
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
+  {
+    // Dropping the predicate refuses legitimate inserts; dropping the index refuses nothing —
+    // measured both ways, fifty-seven broken tests one way and a silent deletion the other.
+    what: "a partial unique index contributes a key carrying its own predicate",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "    keys.push(where === null ? columns : { columns, predicate: where[1].trim() });",
+    replace: "    if (where === null) keys.push(columns);",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
