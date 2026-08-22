@@ -199,14 +199,12 @@ describe("a rebuild carries the rows it finds", () => {
     }
   });
 
-  it("carries an ordinary column that the new table computes, without trying to write it", () => {
-    // A review's counterexample against reading `hidden` from the source. An ordinary column that
-    // becomes generated in the new table passes the missing-column check, reads `hidden = 0` on the
-    // source, and lands in the INSERT — which SQLite refuses. The property is not "was this
-    // computed before" but "can this be written now", and only the destination can answer it.
-    //
-    // It also pins `pragma_table_xinfo`: `table_info` omits generated columns entirely, so the
-    // destination lookup would find nothing and the column would be copied anyway.
+  it("refuses to replace a stored column with one the new table computes", () => {
+    // A review's counterexample against the first version of this test, which asserted the copy
+    // succeeded and so codified the loss: the source stored "ordinary", the destination computes
+    // `a || '!'`, the name exists on both sides so the missing-column check stays quiet, and the
+    // stored value is gone. That is a transformation, not a rebuild, and it has to be declared
+    // somewhere other than in a helper's filter.
     const raw = new Database(join(tempDir("acp-rebuild-generated-"), "state.sqlite"));
     try {
       raw.pragma("foreign_keys = OFF");
@@ -214,10 +212,49 @@ describe("a rebuild carries the rows it finds", () => {
       raw.prepare(`INSERT INTO t (a, b) VALUES ('one', 'ordinary')`).run();
       raw.exec(`CREATE TABLE t_rebuilt (a TEXT PRIMARY KEY, b TEXT GENERATED ALWAYS AS (a || '!') VIRTUAL)`);
 
+      expect(() => sharedColumns(raw, "t", "t_rebuilt")).toThrow(/replace stored column/);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("carries a computed column into a table that stores it", () => {
+    // The direction where the two judgements disagree, and so the only one that can kill the
+    // mutation. The source computes `b`; the destination stores it. Judged on the destination, `b`
+    // is ordinary and is copied, so the computed value becomes stored data. Judged on the source,
+    // `b` reads as generated, is dropped from the copy, and the new column silently arrives NULL.
+    const raw = new Database(join(tempDir("acp-rebuild-materialise-"), "state.sqlite"));
+    try {
+      raw.pragma("foreign_keys = OFF");
+      raw.exec(`CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT GENERATED ALWAYS AS (a || '?') VIRTUAL)`);
+      raw.prepare(`INSERT INTO t (a) VALUES ('one')`).run();
+      raw.exec(`CREATE TABLE t_rebuilt (a TEXT PRIMARY KEY, b TEXT)`);
+
+      const columns = sharedColumns(raw, "t", "t_rebuilt");
+
+      expect(columns).toEqual(["a", "b"]);
+      raw.exec(`INSERT INTO t_rebuilt (${columns.join(", ")}) SELECT ${columns.join(", ")} FROM t`);
+      expect(raw.prepare(`SELECT b FROM t_rebuilt`).get()).toEqual({ b: "one?" });
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("excludes a column both tables compute, because SQLite writes it either way", () => {
+    // The case the exclusion exists for, and the one the destination-side judgement has to keep
+    // working: generated on both sides, so nothing is stored and nothing is lost. It also pins
+    // `pragma_table_xinfo` — `table_info` omits generated columns entirely, so the destination
+    // lookup would find nothing and the column would land in the INSERT.
+    const raw = new Database(join(tempDir("acp-rebuild-both-generated-"), "state.sqlite"));
+    try {
+      raw.pragma("foreign_keys = OFF");
+      raw.exec(`CREATE TABLE t (a TEXT PRIMARY KEY, b TEXT GENERATED ALWAYS AS (a || '?') VIRTUAL)`);
+      raw.prepare(`INSERT INTO t (a) VALUES ('one')`).run();
+      raw.exec(`CREATE TABLE t_rebuilt (a TEXT PRIMARY KEY, b TEXT GENERATED ALWAYS AS (a || '!') VIRTUAL)`);
+
       const columns = sharedColumns(raw, "t", "t_rebuilt");
 
       expect(columns).toEqual(["a"]);
-      // And the copy it produces actually runs, which is the assertion the list alone does not make.
       raw.exec(`INSERT INTO t_rebuilt (${columns.join(", ")}) SELECT ${columns.join(", ")} FROM t`);
       expect(raw.prepare(`SELECT b FROM t_rebuilt`).get()).toEqual({ b: "one!" });
     } finally {

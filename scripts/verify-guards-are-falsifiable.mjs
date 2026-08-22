@@ -92,7 +92,7 @@ const GUARDS = [
     find: "      const kind = destination.get(row.name);",
     replace: "      const kind = row.hidden;",
     killedBy: [
-      "tests/unit/a-rebuild-carries-the-rows-it-finds.test.ts::carries an ordinary column that the new table computes, without trying to write it",
+      "tests/unit/a-rebuild-carries-the-rows-it-finds.test.ts::carries a computed column into a table that stores it",
     ],
   },
   {

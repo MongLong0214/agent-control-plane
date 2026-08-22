@@ -1652,6 +1652,25 @@ export const sharedColumns = (raw: Database.Database, from: string, to: string):
   // generated in the new table passes the missing-column check, reads `hidden = 0` on the source,
   // and lands in the INSERT — which SQLite refuses with "cannot INSERT into generated column". The
   // property is not "was this computed before" but "can this be written now".
+  //
+  // A column the destination computes and the source stored is a third kind of loss, and the
+  // missing-column check above cannot see it: the name exists on both sides, the filter drops it
+  // from the copy, and the stored values are replaced by whatever the expression yields. A review
+  // built it and pointed out that the first test for this codified the replacement as correct.
+  const overwritten = source.filter((row) => {
+    const kind = destination.get(row.name);
+    return (kind === 2 || kind === 3) && row.hidden !== 2 && row.hidden !== 3;
+  });
+  if (overwritten.length > 0) {
+    throw acpError(
+      ReasonCode.INTERNAL_ERROR,
+      `rebuilding ${from} would replace stored column(s) with a computed value; that is a transformation, not a rebuild`,
+      { table: from, overwritten: overwritten.map((row) => row.name) },
+    );
+  }
+  // Generated on both sides: SQLite computes them and refuses an INSERT, so they are excluded from
+  // the copy and nothing is lost. Judged on the destination, which is where the INSERT happens —
+  // `hidden === 1` is a virtual-table hidden column, which can accept values and stays in.
   return source
     .filter((row) => {
       const kind = destination.get(row.name);
