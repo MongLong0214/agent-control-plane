@@ -25,6 +25,7 @@ afterAll(cleanupTempDirs);
  */
 const ROOT = process.cwd();
 const SCRIPT = "scripts/verify-migrations-are-immutable.mjs";
+const MANIFEST = "src/db/migration-checksums.json";
 
 /** A throwaway clone, with the working tree and node_modules the script needs. */
 const scratchRepo = (): string => {
@@ -35,6 +36,10 @@ const scratchRepo = (): string => {
   // first version measured the old script and passed on the wrong evidence — the repair it was
   // asserting on had not been written into what it ran.
   copyFileSync(join(ROOT, SCRIPT), join(dir, SCRIPT));
+  // And the manifest it is checked against. The clone carries the committed pair; changing how the
+  // script classifies a migration changes which ids belong in the manifest, so copying one without
+  // the other measures a script against an answer key written for a different script.
+  copyFileSync(join(ROOT, MANIFEST), join(dir, MANIFEST));
   return dir;
 };
 

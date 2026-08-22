@@ -11,8 +11,6 @@
     "v21-canonical-turns": "sha256:474d28d76a85e62e1df1697f2bcf96a168061d799ee2b8a5d52c8d927158feb7",
     "v22-canonical-turn-ledger": "sha256:0431ddace84b2c2785fa2eca5107a4e9bd6a2a7d87e6070d6550c00dc0d6b5e7",
     "v23-turn-claimed-at": "sha256:a066442ba8603e17c6b2c969884edc99b6f2e5ca9fb219ea6d663b6da085ab27",
-    "v24-observation-ledger": "sha256:09b7d8c4f027fc3293832ff7266f4a50836c7998473e0dc2d61eb4802296d1d6",
-    "v25-ledger-guards": "sha256:34415df82f47a269a1092234dbd32fc9b1a822ec634c7be4beadd78a82eb4d25",
-    "v26-ledger-trigger-bodies": "sha256:4f1fc071a0263eb367f8309a4a274b0ecc4b222690baf5040135bdd78708d35b"
+    "v24-observation-ledger": "sha256:09b7d8c4f027fc3293832ff7266f4a50836c7998473e0dc2d61eb4802296d1d6"
   }
 }

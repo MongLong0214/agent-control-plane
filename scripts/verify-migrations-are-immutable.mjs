@@ -109,7 +109,23 @@ const withPerturbedSchema = (work) => {
   const original = readFileSync(SCHEMA, "utf8");
   writeFileSync(PARKED, original);
   holding = original;
-  writeFileSync(SCHEMA, `${original}\n-- checksum classification probe\n`);
+  // Inside a trigger body, not appended at the end. A migration that reads the schema through a
+  // narrow extraction — `ledgerTriggerDdl` takes exactly the text between a trigger's name and its
+  // `END;` — does not see a trailing comment at all, so the first version of this probe classified
+  // v25 and v26 as holding their own DDL and froze them. Its own docstring names v26 as the kind
+  // that must be excluded. A review found the contradiction; the consequence was latent, and would
+  // have arrived as "v26 changed what it does" the next time a ledger trigger body was legitimately
+  // edited, which is the one thing v26 exists to do.
+  // Every trigger body, so that any extraction sees it however narrow. Probing one place is not
+  // enough: the first attempt appended to the end of the file and a second put a comment in the
+  // first trigger, and both left v25 and v26 classified as holding their own DDL — they read the
+  // schema through regexes that take exactly the text between a named trigger and its `END;`.
+  const probed = original.replaceAll("\nEND;", "\n  -- checksum classification probe\nEND;");
+  if (probed === original) {
+    process.stdout.write("  schema.sql has no trigger body to probe\n\nRESULT: FAIL\n");
+    process.exit(2);
+  }
+  writeFileSync(SCHEMA, probed);
   try {
     return work();
   } finally {

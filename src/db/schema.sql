@@ -140,7 +140,7 @@ END;
 -- on ACP's own connection, which sets that pragma ON:
 --
 --   UPDATE session_secret_hash  -> refused
---   INSERT OR REPLACE           -> hash, incarnation, buzz actor and workdir all rewritten
+--   INSERT OR REPLACE           -> hash, incarnation, Buzz channel identity and workdir rewritten
 --
 -- The comment above `sessions_secret_hash_immutable` says a rewritable hash lets a local caller
 -- mint itself a new credential. That was true and the guard did not cover the statement that
