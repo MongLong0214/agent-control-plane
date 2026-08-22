@@ -1,0 +1,51 @@
+Limit: this closes the spawn-failure and signal-kill cases. It still cannot tell a test that died on the intended assertion from one that died for an unrelated reason — the file says so in its own header, and that remains the reviewer's job.
+Ruled-out: treating `status === null` as a kill because a timeout usually means the mutation hung the suite | a hang is also a run whose outcome is unknown, and this whole file is written against reporting unknown outcomes as answers.
+Provenance: inherited 4c0229de0f19cde51dce9a28ea0fc051d5a2e1c2
+
+Limit: this is the safety half only. Nothing here starts a realm, sends a message, or reads a real production database.
+Limit: the census is not bit-for-bit and the header used to say it was. It compares ids plus each database file's presence, size and mtime; a writer that rewrote bytes in place at equal length and restored timestamps would pass. A read-only SQLite generation counter would close it and needs an open connection this half does not have.
+Limit: planning is a time-of-check observation. It resolves paths and returns the strings it was given, so a component replaced by a symlink between planning and the first write is not caught here. The driver must re-verify identity immediately before its first mutation; that is the driver's obligation and the driver does not exist.
+Limit: `productionIsReadable` checks that the database is a regular file and nothing more. Whether a later read is read-only is a property of how the driver opens it.
+Ruled-out: treating every resolution failure as "the path does not exist yet" | measured: a self-referential symlink (ELOOP) was allowed as a realm path, because the failure took the missing-leaf branch and the lexical result looked clean.
+Ruled-out: recording every stat failure as absence | measured: an unreadable parent turned a populated family into four absent rows, and two such censuses compared equal.
+Ruled-out: checking only that realm paths sit outside production | the reverse containment is the dangerous one, because it is the direction that licenses deletion.
+Ruled-out: resolving only the whole path and falling back to the lexical one | a `stateDir/escape` link to production with `escape/new.sqlite` as the database was allowed.
+Ruled-out: a single mtime on state.sqlite as the census catch-all | under WAL a committed write leaves the main file byte-identical and grows the sidecar. Measured: two hundred inserts, main file unchanged, -wal past 800KB.
+Ruled-out: comparing two multisets by joining and comparing strings | any element containing the delimiter splits across its neighbour. No delimiter choice fixes it, and the one first used here was a literal NUL.
+Ruled-out: a RETRY disposition beside INCONCLUSIVE | every signal producing INCONCLUSIVE is a state where "did the side effect happen" is unanswerable, and the one thing that must not follow an unanswerable question is another message.
+Ruled-out: matching a process by pid, or by name | pids are reused, and a name matches the peer Hermes instance that has to survive.
+Provenance: inherited 4eb17ed8648666159c7dfc01f81eb9576e99f87d
+
+Limit: on a case-sensitive filesystem the two spellings really are two directories, so the case tests there pass through the ordinary rules and measure something weaker. Stated rather than hidden.
+Limit: the link refusal sees a second name that exists at plan time. A link created between the plan and the run is not covered, and nothing here can cover it — that is what the production census afterwards is for.
+Ruled-out: case-folding the resolved strings | it answers only the case question, and the same comparison is wrong for hard links and bind mounts, which identity gets for free.
+Ruled-out: refusing every path with nlink > 1 | directories always have more, so it refuses every realm — measured, and it hid all five scenarios behind one wrong refusal.
+Provenance: inherited 49816015231eedfa6128089f89ed9f1f057a9cc3
+
+Limit: the link resolution follows one entry at a time and re-enters through `settled`, so a chain of links is resolved by recursion. A self-naming link is refused; a long chain is bounded only by the filesystem's own limit, which surfaces as ELOOP and is already a typed refusal.
+Limit: this checks what exists at plan time. A link created between the plan and the run is not covered and cannot be from here — that is what the production census afterwards is for.
+Ruled-out: keeping sameFile beside the containment check | it is subsumed in every case, and a clause no input can reach is a second place for a future reader to believe the check happens.
+Provenance: inherited 9d08720bceb2e7a087bc6f2b5b1f5496d2b38666
+
+Limit: this resolves one link at a time and re-enters through `settled`, so a chain is followed by recursion and bounded by the filesystem's own ELOOP, which is already a typed refusal.
+Ruled-out: calling realpathSync on the link itself | it reports ENOENT for a dangling one, which is the case this whole branch exists to handle.
+Provenance: inherited 16684f6792d4a1f979f296b8ca3f85798efbce9c
+
+Limit: the derived set covers what RealmPaths declares. A path the realm creates without declaring is outside it, and outside every check in this file.
+Provenance: inherited 29790e182a85d7c043e80022bdb409fe3a1d10d7
+
+Limit: entries directly under the root, not a recursive walk. A file created inside an existing subdirectory of production is still invisible to this, and closing that means reading the tree on every census.
+Ruled-out: hashing the entries | the census runs against a live deployment and is supposed to cost nothing; what a file's contents changing looks like is already the database family's job.
+Provenance: inherited c549cb6f401451a9ff105a23496973c747f832cb
+
+Limit: this is one arrangement out of the orderings an object can have. It is the one where the two rules differ, which is what the row needed; it is not a proof that every ordering behaves.
+Provenance: inherited e1cddaca2c8392e7a4371daacd5dd0d0d1b442e8
+
+Limit: it takes the three id lists from the caller, because reading them means opening the production database and this module deliberately does not. Those three can still be assembled wrongly; what cannot be forgotten is the two it reads.
+Provenance: inherited a8cf6d5cf338be496ed95533e157c3ab15683589
+
+Limit: these depend on the filesystem honouring `--x` and `r--` distinctly, which is true on the hosts this runs on and is not a property of the code under test.
+Provenance: inherited 84bdc5c919f6e629a3323818060eeca8d43b5bd8
+
+Limit: each case moves one field and requires that field to be named in the differences. It does not check that a field which did *not* move stays absent from them, which a comparison reading the wrong pair of fields would satisfy.
+Provenance: inherited 20b09102bf9da0d624c0f248688d2c913b315ad6
