@@ -907,6 +907,38 @@ describe("every path the realm declares is checked, by existing rather than by b
     }
   });
 
+  it("still refuses an outside path when the state directory is not the first key", () => {
+    // The mutation this kills is `slice(1)` — "everything except the first entry", which is the
+    // state directory only while it happens to be written first. The list is derived from an
+    // object now, where key order is a property of how the caller built it. Every other test here
+    // builds `paths` with `stateDir` first, so `slice(1)` and "exclude by name" are
+    // indistinguishable in all of them; this one puts it last.
+    const home = fakeHome();
+    const scratch = tempDir("acp-key-order-");
+    const base = realmUnder(scratch);
+    // The offending path is the *first* key, so `slice(1)` drops exactly the one that has to be
+    // caught while `stateDir` — the one that must be skipped — is still checked and is trivially
+    // inside itself. That is the only arrangement where the two rules disagree.
+    const paths = {
+      lockPath: join(scratch, "beside-the-realm"),
+      stateDir: base.stateDir,
+      databasePath: base.databasePath,
+      runtimeRoot: base.runtimeRoot,
+      socketDir: base.socketDir,
+    };
+
+    const decision = planDisposableRealm({
+      home,
+      paths,
+      probeTargetRoot: join(scratch, "probe-root"),
+      canonicalTargetRoot: join(scratch, "canonical-root"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+
   it("requires every path but the state directory to be inside it, chosen by name", () => {
     // `slice(1)` meant "all but the state directory" only while the state directory was written
     // first. The list is derived from an object now, where key order is a property of the type
