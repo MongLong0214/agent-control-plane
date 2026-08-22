@@ -46,6 +46,94 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    what: "an acceptance realm path that resolves inside production is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    if (within(production, resolved)) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Comparing declared paths passes a scratch directory that is a symlink into production.
+    what: "isolation is judged on the resolved path, not the one that was typed",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "      return join(realpathSync(probe), ...missing);",
+    replace: "      return resolve(path);",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a realm path outside the realm's own state directory is refused, so cleanup can be complete",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    if (!within(settled(request.paths.stateDir), settled(path))) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Only "it does not exist yet" justifies the ancestor walk. Treating every resolution
+    // failure as a missing path let a symlink cycle through as a clean realm path.
+    what: "a path that cannot be resolved is refused rather than guessed at",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '      if (code !== "ENOENT") throw new UnresolvablePath(probe, code);',
+    replace: "",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A failure to look is not an observation that there is nothing there. Recording it as
+    // absence made two unreadable censuses compare equal.
+    what: "a census that could not be read is refused, not recorded as absence",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '      if (code === "ENOENT") {',
+    replace: "      if (true) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The catch-all. Without it an unforeseen write that leaves the three lists identical passes.
+    what: "a write that only the -wal sidecar records still fails the census",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  if (!sameFamily(before.databaseFamily, after.databaseFamily)) differences.push("databaseFamily");',
+    replace: '  if (before.databaseFamily[0]?.mtimeMs !== after.databaseFamily[0]?.mtimeMs) differences.push("databaseFamily");',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a new production actor fails the census",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  if (!sameMultiset(before.actorIds, after.actorIds)) differences.push("actorIds");',
+    replace: "",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The comparison this replaces joined and compared strings, so an element containing the
+    // delimiter split across its neighbour and two different multisets read as equal.
+    what: "two multisets are compared element by element, not by a joined spelling",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    const left = [...a].sort();\n    const right = [...b].sort();\n    return left.every((value, index) => value === right[index]);",
+    replace: '    return [...a].sort().join("|") === [...b].sort().join("|");',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a state directory left behind counts as residue even when it is empty",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (present(paths.stateDir)) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A retry disposition is what turns an unanswerable outcome into a duplicate.
+    what: "every signal but an observed reply is inconclusive, and inconclusive is terminal",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  signal === "REPLY_OBSERVED" ? "CONTINUE" : "INCONCLUSIVE";',
+    replace: '  signal === "SOCKET_CLOSED" ? "INCONCLUSIVE" : "CONTINUE";',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A pid alone is not an identity. Matching on it alone is how a cleanup kills whatever
+    // inherited the number — here, the shared Hermes instance that must survive.
+    what: "cleanup terminates a process only when the pid and its start time both match",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  owned.some((one) => one.pid === candidate.pid && one.startedAtMs === candidate.startedAtMs);",
+    replace: "  owned.some((one) => one.pid === candidate.pid);",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
     what: "the periodic capacity sweep gets a budget sized against the sweep, not against startup",
     symbols: ["sweepBudgetMs"],
     file: "src/daemon/daemon.ts",
@@ -398,6 +486,155 @@ const GUARDS = [
     replace: '            promptDigest,\n            "1970-01-01T00:00:00.000Z",',
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
+  {
+    // Two spellings of one directory resolved to two strings, and production was reachable twice.
+    what: "containment is judged on what a path is, not on how it was spelled",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  const parentIdentity = identityOf(parent);",
+    replace: "  const parentIdentity = null;",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // It asked "is it the same" while every other check here asks "is it inside", so a probe one
+    // directory under the canonical root passed while still addressing the owner's conversation.
+    what: "a probe target inside the canonical root is refused, not only one equal to it",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (within(settled(request.canonicalTargetRoot), settled(request.probeTargetRoot))) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A hard link resolves to itself while the bytes belong to production.
+    what: "a realm file with a second name on disk is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    if (existing?.isFile() === true && existing.nlink > 1) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The inputs whose comparison is the safety decision were the ones never required absolute.
+    what: "the probe and canonical roots have to be absolute, like every other path here",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '    ["probeTargetRoot", request.probeTargetRoot],\n    ["canonicalTargetRoot", request.canonicalTargetRoot],\n  ] as const) {',
+    replace: "  ] as const) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // existsSync follows the link, so a dangling leftover read as clean.
+    what: "residue is the directory entry, not what it points at",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "      lstatSync(path);",
+    replace: "      statSync(path);",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // ENOENT from a dangling symlink is a directory entry that redirects writes, not an absence.
+    what: "a symlink to a file that does not exist yet is resolved through, not walked past",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "      if (entry?.isSymbolicLink() === true) {",
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The probe's Hermes instance would build its transcripts inside production state.
+    what: "a probe target inside production is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (within(production, settled(request.probeTargetRoot))) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The owner's conversation root inside the directory this run is licensed to delete.
+    what: "the canonical root may not sit inside the directory cleanup removes whole",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (within(settled(request.paths.stateDir), settled(request.canonicalTargetRoot))) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Under WAL the sidecar is where the write lands, and it was outside every check.
+    what: "the database's sidecars are checked the same way the database is",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    ...family,",
+    replace: "",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The path used to reach a link and the directory it lives in are different places once an
+    // ancestor is itself a link, and a relative target follows the second.
+    what: "a relative symlink target is resolved against the directory the link is in",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "        const target = resolve(realpathSync(dirname(probe)), readlinkSync(probe));",
+    replace: "        const target = resolve(dirname(probe), readlinkSync(probe));",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // A hand-written list here says "every path" and means "the ones someone remembered".
+    what: "the checked path set is derived from RealmPaths rather than listed",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    ...Object.entries(request.paths).map(([name, path]) => [name, path] as const),",
+    replace: '    ["stateDir", request.paths.stateDir] as const,',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // `slice(1)` meant "all but the state directory" only while it happened to be written first.
+    what: "the state directory is excluded from the containment loop by name, not by position",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '  for (const [name, path] of named.filter(([field]) => field !== "stateDir")) {',
+    replace: "  for (const [name, path] of named.slice(1)) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Twice on this branch a probe reached production by creating a file there, and the census
+    // called production unchanged.
+    what: "something appearing under production is a census difference",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!sameMultiset(before.productionEntries, after.productionEntries)) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // An unreadable production root reported as empty makes "nothing is there" and "I could not
+    // look" the same census.
+    what: "a production root that cannot be listed is refused, not reported empty",
+    file: "src/acceptance/disposable-realm.ts",
+    find: '    if (code === "ENOENT") return allow(ReasonCode.OK, []);',
+    replace: '    return allow(ReasonCode.OK, []);',
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Half a census compares equal on the half it has.
+    what: "a census that could not read production is refused rather than returned partial",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!entries.allowed) return entries;",
+    replace: "  if (false) return entries;",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // The other read. Both had to be separated to be killable: every input where the two fail
+    // together leaves either check removable without a test noticing.
+    what: "a census whose database family could not be read is refused too",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!family.allowed) return family;",
+    replace: "  if (false) return family;",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    // Three of the five census comparisons had no test that failed when they were removed, in the
+    // branch whose subject is exactly that. These two were the ones with no row either.
+    what: "a changed assignment id is a census difference",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!sameMultiset(before.assignmentIds, after.assignmentIds)) differences.push(\"assignmentIds\");",
+    replace: "",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a changed binding generation is a census difference",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!sameMultiset(before.bindingGenerations, after.bindingGenerations)) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
@@ -656,6 +893,23 @@ try {
     });
     ours(path, mutated, guard.file, "before restoring");
     writeFileSync(path, original);
+
+    // A test run that never happened is not a test run that failed.
+    //
+    // `spawnSync` reports a child it could not start, or one it killed at the timeout, as
+    // `status: null` — and `done.error` carries the spawn failure. Reading only `status !== 0`
+    // counts both as a kill, so with `node_modules/.bin/vitest` missing every row prints
+    // "killed", the harness exits 0, and it prints its success banner. This file exists to
+    // catch exactly that class in other people's code; it committed it in its own verdict.
+    if (done.error || done.status === null) {
+      restoreOnce();
+      out("");
+      out(`verify-guards-are-falsifiable: could not run ${guard.killedBy.join(", ")} for this row`);
+      out(`  ${guard.file}  ${guard.what}`);
+      out(`  ${done.error ? `spawn failed: ${done.error.message}` : `killed by signal ${done.signal ?? "?"}`}`);
+      out("\nA run that did not happen cannot kill a guard. Refusing to report it as one.");
+      process.exit(1);
+    }
     const killed = done.status !== 0;
     out(`${killed ? "  killed " : "  SURVIVED"}  ${guard.file}  ${guard.what}`);
     if (!killed) {
