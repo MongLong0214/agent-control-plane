@@ -305,6 +305,37 @@ export const ReasonCode = {
   CONVERSATION_TURN_RECEIPT_REUSED: "CONVERSATION_TURN_RECEIPT_REUSED",
   /** An adjudication cited only part of the disagreement, or something outside it. */
   CONVERSATION_ADJUDICATION_INCOMPLETE: "CONVERSATION_ADJUDICATION_INCOMPLETE",
+  // --- disposable acceptance realm ------------------------------------------
+  /**
+   * A path the acceptance realm would use resolves inside production, or outside its own state
+   * directory.
+   *
+   * Both are the same failure seen from two sides: the first means the realm is production, the
+   * second means cleanup could not account for what the realm created.
+   */
+  ACCEPTANCE_REALM_NOT_ISOLATED: "ACCEPTANCE_REALM_NOT_ISOLATED",
+  /** The probe would address the canonical root, which is the one thing the realm exists to avoid. */
+  ACCEPTANCE_PROBE_TARGET_IS_CANONICAL: "ACCEPTANCE_PROBE_TARGET_IS_CANONICAL",
+  /** Production is not the set of facts it was before the run. */
+  ACCEPTANCE_PRODUCTION_CHANGED: "ACCEPTANCE_PRODUCTION_CHANGED",
+  /** The realm left files behind, so "disposable" was not observed. */
+  ACCEPTANCE_REALM_RESIDUE: "ACCEPTANCE_REALM_RESIDUE",
+  /**
+   * A realm path could not be resolved for a reason other than not existing yet.
+   *
+   * A symlink cycle, an unreadable directory, a component that is not a directory. Distinct from
+   * `ACCEPTANCE_REALM_NOT_ISOLATED` on purpose: that one says where the path goes, this one says
+   * nobody can tell. Both refuse, and an operator's next move differs.
+   */
+  ACCEPTANCE_REALM_UNRESOLVABLE: "ACCEPTANCE_REALM_UNRESOLVABLE",
+  /**
+   * The production census could not be taken.
+   *
+   * A failure to look is not an observation that there is nothing there — and recording it as
+   * absence makes two unreadable censuses compare equal, which reports an unchanged production
+   * database that was never read.
+   */
+  ACCEPTANCE_CENSUS_UNOBSERVABLE: "ACCEPTANCE_CENSUS_UNOBSERVABLE",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",

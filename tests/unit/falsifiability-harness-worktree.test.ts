@@ -67,4 +67,41 @@ describe("the falsifiability harness runs from a linked worktree", () => {
       rmSync(parent, { recursive: true, force: true });
     }
   });
+
+  it("refuses to call a row killed when the test run never happened", () => {
+    // A linked worktree has no `node_modules`, so the vitest spawn fails with ENOENT. `spawnSync`
+    // reports that as `status: null` with the failure in `error` — and reading only
+    // `status !== 0` counted it as a kill. Measured on the commit before the fix: with vitest
+    // unable to start, the harness printed `killed`, printed its success banner, and exited 0.
+    //
+    // This file's whole subject is that a run which did not happen cannot kill a guard, which is
+    // the same rule the acceptance realm states about `stat` and `realpath`. The harness was
+    // breaking it in its own verdict.
+    const parent = tempDir("acp-wt-nokill-");
+    const worktree = join(parent, "checkout");
+    const head = git(["rev-parse", "HEAD"], REPO_ROOT);
+    git(["worktree", "add", "--detach", "--quiet", worktree, head], REPO_ROOT);
+
+    try {
+      expect(existsSync(join(worktree, "node_modules"))).toBe(false);
+
+      const run = spawnSync(
+        process.execPath,
+        [
+          join(worktree, "scripts", "verify-guards-are-falsifiable.mjs"),
+          "--only=an attempt numbered below one",
+        ],
+        { cwd: worktree, encoding: "utf8" },
+      );
+
+      const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+      expect(run.status).toBe(1);
+      expect(output).toContain("could not run");
+      expect(output).not.toContain("killed");
+      expect(output).not.toContain("guard(s) removed on purpose");
+    } finally {
+      git(["worktree", "remove", "--force", worktree], REPO_ROOT);
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
 });
