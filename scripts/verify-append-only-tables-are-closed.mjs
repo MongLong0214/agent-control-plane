@@ -183,7 +183,18 @@ if (open.length > 0) {
   process.exit(1);
 }
 
+// What it inspected, beside what exists. A PASS over a subset reads exactly like a PASS over the
+// set, and twice in one day a check here passed on sixteen of twenty without saying so.
+const declared = [...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)_no_replace/g)].length;
+if (bodies.length !== declared) {
+  process.stdout.write(
+    `  ${declared} no_replace trigger(s) are declared and this check could read ${bodies.length}.\n` +
+      "\nRESULT: FAIL — a guard it cannot read is a guard it did not check.\n",
+  );
+  process.exit(1);
+}
+
 process.stdout.write(
-  `RESULT: PASS — all ${guards.size} guarded table(s) checked; ` +
-    `every one guarded on UPDATE or DELETE refuses a REPLACE of a key it already holds.\n`,
+  `RESULT: PASS — ${guards.size} guarded table(s), ${bodies.length} of ${declared} no_replace ` +
+    `trigger(s) read; every table guarded on UPDATE or DELETE refuses a REPLACE of a key it holds.\n`,
 );

@@ -161,8 +161,12 @@ const derivesFromSchema = (migration) => {
 
 /** id → checksum, in chain order, for the migrations that hold their own DDL. */
 const live = {};
+const schemaReading = [];
 for (const migration of MIGRATIONS) {
-  if (derivesFromSchema(migration)) continue;
+  if (derivesFromSchema(migration)) {
+    schemaReading.push(migration.id);
+    continue;
+  }
   live[migration.id] = migration.checksum();
 }
 
@@ -211,6 +215,11 @@ if (changed.length > 0 || removed.length > 0) {
 }
 
 const note = added.length > 0 ? `, ${added.length} new (${added.join(", ")})` : "";
+// What it did not check, named. The classification is the load-bearing half of this gate — it
+// decides which migrations are exempt — and it was wrong about two of them for a day while the
+// PASS line said only how many were frozen. A PASS that does not name its exclusions is a PASS
+// over a subset that reads like a PASS over the set.
 process.stdout.write(
-  `RESULT: PASS — ${Object.keys(recorded).length} frozen migration(s) unchanged${note}.\n`,
+  `RESULT: PASS — ${Object.keys(recorded).length} frozen migration(s) unchanged${note}; ` +
+    `${schemaReading.length} read the live schema and are exempt (${schemaReading.join(", ")}).\n`,
 );
