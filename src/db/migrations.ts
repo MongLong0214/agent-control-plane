@@ -1609,6 +1609,28 @@ const observationsTableOnlyDdl = (): string =>
  * table first would make SQLite rewrite every foreign key that names it, leaving the children
  * pointing at a table this function then drops.
  */
+/**
+ * The columns two tables share, read from the database rather than typed out.
+ *
+ * A rebuild copies rows from the old table into the new one, and the copy list was written by hand.
+ * `rebuildCanonicalTurnsIfStale` omitted four NOT NULL columns — `executor_session_id`,
+ * `executor_session_incarnation`, `binding_generation`, `claim_audit_event_id` — so the INSERT
+ * would have failed on any database holding a single turn. Nothing caught it because every test
+ * database is empty when a migration runs: a fresh install applies schema.sql whole and never
+ * copies anything.
+ *
+ * Read from `pragma_table_info` on both sides, so the list cannot disagree with either table and a
+ * column added later is carried without anyone remembering to add it here.
+ */
+const sharedColumns = (raw: Database.Database, from: string, to: string): string[] => {
+  const names = (table: string): string[] =>
+    (raw.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as Array<{ name: string }>).map(
+      (row) => row.name,
+    );
+  const destination = new Set(names(to));
+  return names(from).filter((name) => destination.has(name));
+};
+
 const canonicalTurnsTableOnlyDdl = (): string =>
   schemaObject(
     /CREATE TABLE IF NOT EXISTS canonical_turns \([\s\S]*?\n\);/,
@@ -1630,7 +1652,7 @@ const canonicalTurnsIndexDdl = (): string =>
  * settlement the observations accept and the turn refuses, which is a resolution that reports
  * success and leaves the conversation exactly as wedged.
  */
-const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
+export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
   const stored = (
     raw
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turns'")
@@ -1647,15 +1669,13 @@ const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
       .trim();
   if (wanted && normalise(stored) === normalise(wanted[0])) return;
 
-  const columns = `turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
-        prompt_digest, lifecycle_state, outcome_kind, settled_at, resolution_authority, reason_code,
-        evidence_digest, observation_consistency, replacement_turn_request_id, claimed_at`;
   raw.exec(
     canonicalTurnsTableOnlyDdl().replace(
       "CREATE TABLE IF NOT EXISTS canonical_turns",
       "CREATE TABLE canonical_turns_rebuilt",
     ),
   );
+  const columns = sharedColumns(raw, "canonical_turns", "canonical_turns_rebuilt").join(", ");
   raw.exec(`INSERT INTO canonical_turns_rebuilt (${columns}) SELECT ${columns} FROM canonical_turns`);
   raw.exec("DROP TABLE canonical_turns");
   raw.exec("ALTER TABLE canonical_turns_rebuilt RENAME TO canonical_turns");
@@ -1720,14 +1740,19 @@ const rebuildObservationsIfStale = (raw: Database.Database): void => {
   // first attempt pointing at `canonical_turn_observations_stale` — a table this function then
   // dropped. Building the replacement under a temporary name and renaming *it* leaves every
   // existing reference textually correct, because nothing references the temporary name.
-  const columns = `observation_id, turn_request_id, observed_outcome, observing_authority, receipt_id,
-        evidence_digest, reason_code, observed_at, audit_event_id, adjudicates_observation_id`;
   raw.exec(
     observationsTableOnlyDdl().replace(
       "CREATE TABLE IF NOT EXISTS canonical_turn_observations",
       "CREATE TABLE canonical_turn_observations_rebuilt",
     ),
   );
+  // Derived for the same reason as the turns rebuild: this list happened to be complete, and a
+  // column added to the table later would have made it silently lossy.
+  const columns = sharedColumns(
+    raw,
+    "canonical_turn_observations",
+    "canonical_turn_observations_rebuilt",
+  ).join(", ");
   raw.exec(
     `INSERT INTO canonical_turn_observations_rebuilt (${columns})
      SELECT ${columns} FROM canonical_turn_observations`,

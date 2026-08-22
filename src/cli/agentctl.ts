@@ -42,8 +42,10 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl conversation contradictions     turns whose records disagree, with the ids to cite
   agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl conversation unresolved         turns waiting on a person, with what each already holds
-  agentctl conversation resolve <actor> <turn> <reason-code> <evidence-digest>
-                                           settle an unobserved turn ABORTED, which permits a retry
+  agentctl conversation resolve <actor> <turn> <reason-code> <evidence-digest> [--fenced]
+                                           settle an unobserved turn ABORTED, which permits a retry.
+                                           --fenced only when its executor incarnation is still
+                                           current: you are stating the execution cannot still write
   agentctl bootstrap hermes -- <command>  launch Hermes and establish CEO generation 1
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
@@ -323,6 +325,10 @@ export const dispatch = async (
         turnRequestId: required(turnRequestId, "turnRequestId"),
         reasonCode: required(reasonCode, "reasonCode"),
         evidenceDigest: required(evidenceDigest, "evidenceDigest"),
+        // Needed only when ACP cannot see the fence for itself. If the turn's executor incarnation
+        // is still the current one, the execution may still be running, and settling ABORTED
+        // without this flag would admit a retry while the first attempt is in flight.
+        fenceAsserted: observationIds.includes("--fenced"),
       });
     }
     if (sub === "adjudicate") {

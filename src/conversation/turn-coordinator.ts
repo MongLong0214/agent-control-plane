@@ -604,6 +604,22 @@ export class ConversationTurnCoordinator {
     turnRequestId: string;
     reasonCode: string;
     evidenceDigest: string;
+    /**
+     * The operator's word that the execution holding this turn can no longer write.
+     *
+     * Needed only when ACP cannot see that for itself. `ABORTED` means a fence happened, and a
+     * review pointed out that this authority was recording one without any: resolve a turn whose
+     * execution is still live and attempt 2 is admitted while attempt 1 may still deliver, which is
+     * the duplicate the whole ledger exists to prevent.
+     *
+     * So the fence is *checked* where it can be. A turn records the executor incarnation it was
+     * claimed under; if the actor's current attestation names a different one, the execution that
+     * held this turn belongs to a superseded incarnation and provably cannot commit — which is
+     * exactly the restart case #668 is about. When the incarnation is still current, the execution
+     * may still be running and this flag is the only thing that admits the resolution, recorded as
+     * `ASSERTED` rather than `VERIFIED` so the ledger says which one it got.
+     */
+    fenceAsserted?: boolean;
   }): Decision<TurnMaterialization> {
     if (input.reasonCode.trim() === "" || input.evidenceDigest.trim() === "") {
       // Same rule as an adjudication and as every other observation: a record with no reason and
@@ -615,8 +631,13 @@ export class ConversationTurnCoordinator {
       });
     }
     return this.db.tx(() => {
-      const held = this.db.get<{ target_actor_id: string; lifecycle_state: string }>(
-        `SELECT target_actor_id, lifecycle_state FROM canonical_turns WHERE turn_request_id = ?`,
+      const held = this.db.get<{
+        target_actor_id: string;
+        lifecycle_state: string;
+        executor_session_incarnation: string;
+      }>(
+        `SELECT target_actor_id, lifecycle_state, executor_session_incarnation
+           FROM canonical_turns WHERE turn_request_id = ?`,
         [input.turnRequestId],
       );
       if (held?.target_actor_id !== input.targetActorId) {
@@ -633,6 +654,37 @@ export class ConversationTurnCoordinator {
         });
       }
 
+      // The fence, checked where it can be checked. A turn records the executor incarnation it was
+      // claimed under; if the actor's current attestation names a different one, the execution
+      // that held this turn belongs to a superseded incarnation and cannot still write. That is
+      // the restart case this whole method exists for, and it is a fact rather than a promise.
+      const current = this.db.get<{ executor_session_incarnation: string }>(
+        `SELECT a.executor_session_incarnation AS executor_session_incarnation
+           FROM actor_target_attestations a
+           JOIN actor_target_bindings b ON b.target_binding_id = a.target_binding_id
+          WHERE b.target_actor_id = ?
+          ORDER BY a.attested_at DESC, a.rowid DESC
+          LIMIT 1`,
+        [input.targetActorId],
+      );
+      const fence =
+        current !== undefined && current.executor_session_incarnation !== held.executor_session_incarnation
+          ? "VERIFIED"
+          : "ASSERTED";
+      if (fence === "ASSERTED" && input.fenceAsserted !== true) {
+        // The execution may still be able to write, and `ABORTED` means it cannot. Recording one
+        // here without the operator saying they established it is how a resolution admits attempt
+        // 2 while attempt 1 is still in flight — the duplicate this ledger exists to prevent.
+        return deny(
+          ReasonCode.CONVERSATION_TURN_FENCE_UNPROVEN,
+          "this turn's executor incarnation is still the current one, so its execution may still commit",
+          {
+            turnRequestId: input.turnRequestId,
+            incarnation: held.executor_session_incarnation,
+          },
+        );
+      }
+
       // Past this line every failure throws, for the reason `#observe` states: `Db.tx` commits a
       // body that returns a denial (#664), and an observation written without its audit row is
       // testimony with no provenance.
@@ -644,6 +696,9 @@ export class ConversationTurnCoordinator {
           outcome: "ABORTED",
           authority: "OPERATOR_AFTER_REVIEW",
           reasonCode: input.reasonCode,
+          // Which one the ledger got. A verified fence and a person's word are both admissible and
+          // they are not the same claim, so the record says which rather than flattening them.
+          fence,
         },
       });
       if (!audited.allowed) throw acpError(audited.reasonCode, audited.message, audited.evidence);

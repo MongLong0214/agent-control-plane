@@ -48,6 +48,24 @@ const target = (h: Harness, name: string): string => {
   return actorId;
 };
 
+/**
+ * A later attestation under a new incarnation — what a restart leaves behind.
+ *
+ * This is the fence ACP can check rather than take on trust: the turn recorded the incarnation it
+ * was claimed under, and an actor whose current attestation names a different one had its execution
+ * replaced. Without it the resolution is a person asserting a fence nobody established, and the
+ * coordinator refuses.
+ */
+const superseded = (h: Harness, name: string): void => {
+  h.cp.db.run(
+    `INSERT INTO actor_target_attestations
+       (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+        executor_session_id, executor_session_incarnation, binding_generation, attested_at)
+     VALUES (?, ?, 'v1', ?, 'ses', 'inc-2', 1, ?)`,
+    [`att2:${name}`, `bind:${name}`, `attd2:${name}`, "2026-08-22T01:00:00.000Z"],
+  );
+};
+
 const claim = (h: Harness, actorId: string, nonce: string, attempt = 1) => {
   const decision = h.cp.conversation.claim({
     targetActorId: actorId,
@@ -117,6 +135,7 @@ describe("a turn nothing observed can be settled by a person", () => {
     const h = makeHarness();
     const actorId = target(h, "resolved");
     const permit = claim(h, actorId, "m1");
+    superseded(h, "resolved");
 
     const resolved = h.cp.conversation.resolveInDoubt({
       targetActorId: actorId,
@@ -150,6 +169,7 @@ describe("a turn nothing observed can be settled by a person", () => {
     const h = makeHarness();
     const actorId = target(h, "watched");
     const permit = claim(h, actorId, "m1");
+    superseded(h, "watched");
     h.cp.conversation.ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-1",
       evidenceDigest: "sha256:watched",
@@ -185,6 +205,51 @@ describe("a turn nothing observed can be settled by a person", () => {
         evidenceDigest: "sha256:operator-read-both",
       }).allowed,
     ).toBe(true);
+  });
+
+  it("refuses while the execution that holds the turn may still be running", () => {
+    // `ABORTED` means the execution can no longer write, and this authority was recording one with
+    // nothing behind it. Resolve a turn whose executor incarnation is still current and attempt 2
+    // is admitted while attempt 1 may still deliver — the duplicate the whole ledger exists to
+    // prevent, arriving through the door built to end a wedge. Found by an independent review.
+    const h = makeHarness();
+    const actorId = target(h, "live");
+    const permit = claim(h, actorId, "m1");
+
+    const refused = h.cp.conversation.resolveInDoubt({
+      targetActorId: actorId,
+      turnRequestId: permit.turnRequestId,
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:operator",
+    });
+    expect(refused.allowed).toBe(false);
+    if (!refused.allowed) expect(refused.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_FENCE_UNPROVEN);
+    expect(stateOf(h, permit.turnRequestId)?.lifecycle_state).toBe("IN_DOUBT");
+  });
+
+  it("takes the operator's word when ACP cannot see the fence, and records which it got", () => {
+    // The case ACP cannot decide: the incarnation is unchanged, and the person says they
+    // established the execution is gone. Admissible — a wedge with no exit is worse — but it is a
+    // different claim from a verified fence, so the audit record says which one this was.
+    const h = makeHarness();
+    const actorId = target(h, "asserted");
+    const permit = claim(h, actorId, "m1");
+
+    expect(
+      h.cp.conversation.resolveInDoubt({
+        targetActorId: actorId,
+        turnRequestId: permit.turnRequestId,
+        reasonCode: ReasonCode.OK,
+        evidenceDigest: "sha256:operator-killed-the-child",
+        fenceAsserted: true,
+      }).allowed,
+    ).toBe(true);
+
+    const audited = h.cp.db.get<{ evidence_json: string }>(
+      `SELECT evidence_json FROM audit_events WHERE kind = 'CONVERSATION_TURN_OBSERVED'
+        ORDER BY event_id DESC LIMIT 1`,
+    );
+    expect(JSON.parse(audited?.evidence_json ?? "{}")).toMatchObject({ fence: "ASSERTED" });
   });
 
   it("refuses a turn that is already settled", () => {

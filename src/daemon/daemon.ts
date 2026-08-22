@@ -631,6 +631,9 @@ export class Daemon {
             turnRequestId: turnRequestId.value,
             reasonCode: reasonCode.value,
             evidenceDigest: evidenceDigest.value,
+            // Only `true` counts. Anything else — absent, "yes", 1 — is not an operator saying they
+            // established the fence, and the refusal it produces is the safe direction.
+            fenceAsserted: request.params?.fenceAsserted === true,
           });
           // Same reason as the adjudication below: an operator who follows the doctor's remedy
           // exactly should not then watch `daemon.status` report the stale finding for a recheck

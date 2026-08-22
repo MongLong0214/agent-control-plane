@@ -85,6 +85,28 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // ABORTED means the execution can no longer write. Recording one for a turn whose incarnation
+    // is still current admits attempt 2 while attempt 1 may still deliver.
+    what: "a resolution needs a fence — verified, or the operator's explicit word",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '      if (fence === "ASSERTED" && input.fenceAsserted !== true) {',
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/an-unresolved-turn-has-an-operator-exit.test.ts::refuses while the execution that holds the turn may still be running",
+    ],
+  },
+  {
+    // The copy list was written by hand and omitted four NOT NULL columns; every test database is
+    // empty when a migration runs, so nothing noticed.
+    what: "a table rebuild carries every column both tables share",
+    file: "src/db/migrations.ts",
+    find: '  const columns = sharedColumns(raw, "canonical_turns", "canonical_turns_rebuilt").join(", ");',
+    replace: '  const columns = "turn_request_id, target_actor_id, prompt_digest, lifecycle_state, claimed_at";',
+    killedBy: [
+      "tests/unit/a-rebuild-carries-the-rows-it-finds.test.ts::copies every column of an existing turn, including the four a hand-written list forgot",
+    ],
+  },
+  {
     // The operands check cannot see this one — it is a chain written on one line — so the row is
     // what watches it.
     what: "a resolution with no reason and no evidence is refused",
