@@ -934,22 +934,24 @@ export class ConversationTurnCoordinator {
         `SELECT observation_consistency FROM canonical_turns WHERE turn_request_id = ?`,
         [previous.turn_request_id],
       );
-      // Three conditions, and only two of them can be the sole reason a retry is refused.
+      // Three conditions, and each is the sole reason a retry is refused in some state.
       //
-      // Measured, by replacing each with `true` and running the suite: the outcome check and the
-      // contradiction check each have a case that dies without them; the completion count has
-      // none, and cannot have one. A completion observation under an authority that *can*
-      // materialize raises `outcome_kind` to COMPLETED, so the first condition already refuses;
-      // one under `ACP_OBSERVED_HERMES_REPLY` cannot raise it, but it disagrees with whatever
-      // settled the turn, so the consistency axis becomes CONTRADICTED and the third refuses.
-      // Every state the count would catch alone is caught by a neighbour first.
+      // I wrote here that the completion count could not be killed — that a materializing
+      // completion raises `outcome_kind` so the first condition refuses, and a non-materializing
+      // one makes the turn CONTRADICTED so the third does. Both are true and the conclusion was
+      // wrong: an adjudication moves the turn off CONTRADICTED while the completion observation
+      // stays on it. A review built that state through these ports and refuted the claim.
       //
-      // It stays because it is the condition that states the property — "no completion was ever
-      // observed, by anyone" — while the other two state consequences of it, and because the two
-      // that cover it today do so through the materialization order and the contradiction rule,
-      // either of which could be narrowed by a later change without anyone noticing this was
-      // load-bearing. It carries no falsifiability row, deliberately: a row for a condition
-      // nothing can kill reports coverage that does not exist.
+      //   ownerFence.aborted             -> ABORTED, which the first condition calls safe
+      //   acpObservedReply.sawCompletion -> a completion that cannot materialize; CONTRADICTED
+      //   adjudicate citing both         -> ADJUDICATED, so the third no longer refuses
+      //
+      // Only the count refuses the retry there, and with it removed the retry is admitted — a
+      // re-run of an exchange ACP watched Hermes deliver to the owner. It has a test and a
+      // falsifiability row now.
+      //
+      // The lesson is not about this condition. I reasoned from two mechanisms to "no state can
+      // reach here" and did not try to build one; the state took three calls.
       const settledSafely =
         (previous.outcome_kind === "NEVER_ADMITTED" || previous.outcome_kind === "ABORTED") &&
         (anyCompletion?.n ?? 0) === 0 &&

@@ -279,3 +279,58 @@ END;
     expect(done.status).toBe(1);
   });
 });
+
+describe("a registry entry wrapped across lines is the same entry", () => {
+  it("is recognised, rather than reported as a trigger no registry names", () => {
+    // The pattern required one line. Re-formatting an entry made the gate say the trigger was
+    // "named by no required registry" — a true failure with a false reason, and the reason is what
+    // whoever reads it acts on: they would add a duplicate entry for something already there.
+    const repo = scratchRepo();
+    copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
+    const migrations = join(repo, "src/db/migrations.ts");
+    writeFileSync(
+      migrations,
+      readFileSync(join(ROOT, "src/db/migrations.ts"), "utf8").replace(
+        '  { name: "sessions_no_replace", sentinel: "SESSION_NO_REPLACE", introducedIn: 26 },',
+        '  {\n    name: "sessions_no_replace",\n    sentinel: "SESSION_NO_REPLACE",\n    introducedIn: 26,\n  },',
+      ),
+    );
+
+    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+
+    expect(done.stdout).toContain("RESULT: PASS");
+    expect(done.status).toBe(0);
+  });
+});
+
+describe("a UNIQUE declared on the column is a key too", () => {
+  it("fails on a guard that ignores an inline UNIQUE", () => {
+    // Only the parenthesised `UNIQUE (...)` form was read. `github_receipts.idempotency_key` is
+    // written `idempotency_key TEXT NOT NULL UNIQUE`, and its guard checked `receipt_id` alone —
+    // so a REPLACE on a different receipt id carrying the same idempotency key deleted the row
+    // proving a merge had already happened, while this census reported every table closed.
+    const injected = `${CURRENT()}
+CREATE TABLE IF NOT EXISTS census_probe_table (
+  probe_id TEXT PRIMARY KEY,
+  ticket   TEXT NOT NULL UNIQUE
+);
+
+CREATE TRIGGER IF NOT EXISTS census_probe_immutable
+BEFORE UPDATE OF ticket ON census_probe_table
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_IMMUTABLE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS census_probe_table_no_replace
+BEFORE INSERT ON census_probe_table
+WHEN EXISTS (SELECT 1 FROM census_probe_table WHERE probe_id = NEW.probe_id)
+BEGIN
+  SELECT RAISE(ABORT, 'CENSUS_PROBE_NO_REPLACE');
+END;
+`;
+    const done = censusOn(injected);
+
+    expect(done.stdout).toContain("ticket");
+    expect(done.status).toBe(1);
+  });
+});

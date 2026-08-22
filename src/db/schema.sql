@@ -1258,7 +1258,11 @@ END;
 -- CP-HI-06 — a receipt is the proof an operation already happened.
 CREATE TRIGGER IF NOT EXISTS github_receipts_no_replace
 BEFORE INSERT ON github_receipts
-WHEN EXISTS (SELECT 1 FROM github_receipts WHERE receipt_id = NEW.receipt_id)
+WHEN EXISTS (
+  SELECT 1 FROM github_receipts
+   WHERE (receipt_id = NEW.receipt_id)
+           OR (idempotency_key = NEW.idempotency_key)
+)
 BEGIN
   SELECT RAISE(ABORT, 'GITHUB_RECEIPT_NO_REPLACE');
 END;

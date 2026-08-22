@@ -709,6 +709,8 @@ const GUARDS = [
     find: "          already.reason_code === observation.reasonCode;",
     replace: "          true;",
     killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
     // Two spellings of one directory resolved to two strings, and production was reachable twice.
     what: "containment is judged on what a path is, not on how it was spelled",
     file: "src/acceptance/disposable-realm.ts",
@@ -874,6 +876,40 @@ const GUARDS = [
     replace: "const declared = [...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\\w+)/g)].map(",
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
+  {
+    // Requiring one line made a re-formatted entry read as "named by no registry" — a true failure
+    // with a false reason, and the reason is what whoever reads it acts on.
+    what: "the registry check recognises an entry however it is wrapped",
+    file: "scripts/verify-every-trigger-is-required.mjs",
+    find: "  [...migrations.matchAll(/\\{\\s*name:\\s*\"(\\w+)\"\\s*,\\s*sentinel:/g)].map((m) => m[1]),",
+    replace: "  [...migrations.matchAll(/\\{ name: \"(\\w+)\", sentinel:/g)].map((m) => m[1]),",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // I documented this as unkillable and was refuted: an adjudication moves the turn off
+    // CONTRADICTED while the completion observation stays on it.
+    what: "a completion observation still blocks a retry after an adjudication",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        (anyCompletion?.n ?? 0) === 0 &&",
+    replace: "        true &&",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
+    // The quarantine is per actor, and this is the line that makes it so.
+    what: "an adjudication may only be recorded by the actor whose turn it is",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (!turn || turn.target_actor_id !== input.targetActorId) {",
+    replace: "      if (!turn) {",
+    killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
+  },
+  {
+    // A column written `<name> TYPE ... UNIQUE` is a key, and only the parenthesised form was read.
+    what: "the REPLACE census sees a UNIQUE declared on the column",
+    file: "scripts/verify-append-only-tables-are-closed.mjs",
+    find: "  for (const inline of body.matchAll(/^\\s*(\\w+)\\s+[A-Z][^\\n]*?\\bUNIQUE\\b[^\\n]*$/gm)) {",
+    replace: "  for (const inline of []) {",
+    killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
@@ -900,6 +936,38 @@ const rows = GUARDS.filter((g) => !g.skip).filter(
 
 const out = (line) => process.stdout.write(line + "\n");
 const failures = [];
+
+/**
+ * The table has as many entries as it has `what:` lines.
+ *
+ * A missing `},{` merges two rows into one object literal. JavaScript keeps the last value for a
+ * duplicate key, so the earlier row is discarded — silently, and by every gate: the sweep reports
+ * one fewer row while still saying each killed a named test, `--anchors-only` counts the survivors
+ * and calls them all matched, and eslint has nothing to say about a duplicate key in an object
+ * literal here. Measured on this file: 99 `what:` lines, 98 objects, and the row for
+ * "a receipt redelivered with a different reason code" was gone — one of four conditions this
+ * branch had just finished writing tests for.
+ *
+ * Counting the two is the whole check, and it is the "print what you inspected" rule turned on
+ * this file's own table.
+ */
+const tableSource = readFileSync(fileURLToPath(import.meta.url), "utf8").match(
+  /const GUARDS = \[([\s\S]*?)\n\];/,
+);
+if (tableSource === null) {
+  out("verify-guards-are-falsifiable: could not read its own GUARDS table");
+  process.exit(2);
+}
+const declaredWhats = [...tableSource[1].matchAll(/^\s*what: "/gm)].length;
+if (declaredWhats !== GUARDS.length) {
+  out(
+    `verify-guards-are-falsifiable: the table has ${declaredWhats} \`what:\` line(s) and ` +
+      `${GUARDS.length} row(s).`,
+  );
+  out("  A missing `},{` merges two rows into one object; the earlier one is discarded in silence.");
+  out(`\nRESULT: FAIL — ${declaredWhats - GUARDS.length} row(s) were lost to a merged literal.`);
+  process.exit(1);
+}
 
 if (anchorsOnly) {
   const dead = [];

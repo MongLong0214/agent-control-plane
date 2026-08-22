@@ -94,6 +94,14 @@ const uniqueKeysOf = (table) => {
   for (const unique of body.matchAll(/\bUNIQUE \(([^)]*)\)/g)) {
     keys.push(unique[1].split(",").map((column) => column.trim()));
   }
+  // A column declared `<name> TYPE ... UNIQUE` is a key too, and the parenthesised form was the
+  // only one this read. `github_receipts.idempotency_key` is written that way, and its guard
+  // checks `receipt_id` alone — so a REPLACE on a different receipt id carrying the same
+  // idempotency key deleted the row proving a merge had already happened, while this census
+  // reported every guarded table closed. Demonstrated on the real schema.
+  for (const inline of body.matchAll(/^\s*(\w+)\s+[A-Z][^\n]*?\bUNIQUE\b[^\n]*$/gm)) {
+    keys.push([inline[1]]);
+  }
   // A *partial* unique index constrains a subset of rows, so its columns alone are not the key —
   // a second insert that does not match the predicate is legitimate. Widening a guard to the
   // columns without the predicate broke fifty-seven tests, all ordinary re-assignments after a

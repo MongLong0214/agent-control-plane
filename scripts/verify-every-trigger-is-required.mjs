@@ -29,7 +29,13 @@ const migrations = readFileSync(join(ROOT, "src/db/migrations.ts"), "utf8");
 const declared = [...schema.matchAll(/CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/g)].map(
   (m) => m[1],
 );
-const required = new Set([...migrations.matchAll(/\{ name: "(\w+)", sentinel:/g)].map((m) => m[1]));
+// Whitespace-tolerant, because a registry entry wrapped across lines is the same entry. The
+// pattern this replaces required one line, so re-formatting an entry made this gate say the
+// trigger was "named by no registry" — a true failure with a false reason, which sends whoever
+// reads it to add a duplicate.
+const required = new Set(
+  [...migrations.matchAll(/\{\s*name:\s*"(\w+)"\s*,\s*sentinel:/g)].map((m) => m[1]),
+);
 
 const unwatched = declared.filter((name) => !required.has(name));
 
@@ -48,9 +54,9 @@ const installedByV26 = new Set(
     return body === null ? [] : [...body[1].matchAll(/"(\w+)"/g)].map((m) => m[1]);
   }),
 );
-const claimedAt26 = [...migrations.matchAll(/\{ name: "(\w+)", sentinel: "[^"]*", introducedIn: 26 \}/g)].map(
-  (m) => m[1],
-);
+const claimedAt26 = [
+  ...migrations.matchAll(/\{\s*name:\s*"(\w+)"\s*,\s*sentinel:\s*"[^"]*"\s*,\s*introducedIn:\s*26\s*,?\s*\}/g),
+].map((m) => m[1]);
 const unclaimed = claimedAt26.filter((name) => !installedByV26.has(name));
 
 if (unclaimed.length > 0) {

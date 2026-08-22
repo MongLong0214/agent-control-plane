@@ -126,6 +126,33 @@ describe("an adjudication has to have read the whole disagreement", () => {
     expect(consistencyOf(h, permit.turnRequestId)).toBe("CONTRADICTED");
   });
 
+  it("refuses an adjudication naming a different actor than the turn belongs to", () => {
+    // The quarantine is per actor, and this is the line that makes it so. Without it a caller
+    // holding actor B's identity clears actor A's quarantine, and the audit row attributes A's
+    // adjudication to B — the record of who decided is the point of recording it at all.
+    //
+    // Measured before this test: replacing the actor comparison with `false` broke nothing in the
+    // whole suite. An authorization boundary with no test.
+    const h = makeHarness();
+    const owner = target(h, "owner");
+    const other = target(h, "other");
+    const permit = disputed(h, owner);
+
+    const decision = coordinatorOf(h).adjudicate({
+      targetActorId: other,
+      turnRequestId: permit.turnRequestId,
+      citedObservationIds: observationsOn(h, permit.turnRequestId),
+      reasonCode: ReasonCode.OK,
+      evidenceDigest: "sha256:wrong-actor",
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.NOT_FOUND);
+    // And the quarantine is still on, which is what the refusal is for.
+    expect(consistencyOf(h, permit.turnRequestId)).toBe("CONTRADICTED");
+  });
+
   it("refuses a citation from another turn", () => {
     const h = makeHarness();
     const actorId = target(h);
