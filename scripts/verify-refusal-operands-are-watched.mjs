@@ -45,7 +45,11 @@ const DECIDING_FILES = [
  */
 const UNANSWERED = new Map([
   [
-    "src/daemon/daemon.ts:1028",
+    // Keyed by the operand's text, not its line. The first version keyed on `file:line` and this
+    // very entry went stale the first time something above it in daemon.ts grew — the check then
+    // reported a known-and-printed operand as a new failure, which is a reference that drifts
+    // away from what it names while still looking precise.
+    "src/daemon/daemon.ts::session?.lifecycle === SessionLifecycle.READY &&",
     "capacity failover, outside the ledger work this table was built for. Reported rather than " +
       "silenced: it is one operand of whether a session still covers its role.",
   ],
@@ -64,6 +68,19 @@ const anchors = [...table[1].matchAll(/find:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\
 
 const unnamed = [];
 let operands = 0;
+/**
+ * Chains written entirely on one line, which this check does not examine.
+ *
+ * It looks for a line that *ends* in `&&`/`||` and the line that closes such a run, so
+ * `if (a === "" || b === "") {` is invisible to it — including the one added with #668's resolution
+ * guard. Widening the detector to take them would pull in every argument-validation chain in
+ * `daemon.ts` and demand a falsifiability row for each `typeof x !== "string"`, which buries the
+ * operands this exists to surface.
+ *
+ * So they are counted and reported rather than silently dropped. A check that narrows its own
+ * subject and does not say so is the shape this file was written against.
+ */
+let singleLine = 0;
 
 for (const file of DECIDING_FILES) {
   const source = readFileSync(join(ROOT, file), "utf8");
@@ -78,7 +95,10 @@ for (const file of DECIDING_FILES) {
       /(&&|\|\|)\s*$/.test(trimmed) ||
       (/^[^/]*\b(?:===|!==|<|>|<=|>=|\?\?)\b/.test(trimmed) && /(;|\)\s*\{)\s*$/.test(trimmed) &&
         /(&&|\|\|)\s*$/.test((lines[index - 1] ?? "").trim()));
-    if (!isOperand) return;
+    if (!isOperand) {
+      if (/(&&|\|\|)/.test(trimmed) && /(;|\)\s*\{)\s*$/.test(trimmed)) singleLine += 1;
+      return;
+    }
     operands += 1;
     // A row's anchor is often several lines, and an operand belongs to it when the anchor contains
     // that line *or* an adjacent one — a mutation replacing a whole `every(...)` covers each
@@ -95,11 +115,11 @@ for (const file of DECIDING_FILES) {
   });
 }
 
-const answered = unnamed.filter(({ file, line }) => !UNANSWERED.has(`${file}:${line}`));
+const answered = unnamed.filter(({ file, text }) => !UNANSWERED.has(`${file}::${text}`));
 
 if (unnamed.length > 0) {
   for (const { file, line, text } of unnamed) {
-    const known = UNANSWERED.get(`${file}:${line}`);
+    const known = UNANSWERED.get(`${file}::${text}`);
     process.stdout.write(`  ${file}:${line}${known ? "  (known)" : ""}\n    ${text}\n`);
     if (known) process.stdout.write(`    ${known}\n`);
   }
@@ -118,5 +138,6 @@ if (answered.length > 0) {
 process.stdout.write(
   `RESULT: PASS — ${operands - UNANSWERED.size} of ${operands} refusal operand(s) in ` +
     `${DECIDING_FILES.length} file(s) are named by a falsifiability row, ` +
-    `${UNANSWERED.size} known and unanswered. Named is not tested; only the full sweep says that.\n`,
+    `${UNANSWERED.size} known and unanswered. ${singleLine} chain(s) written on one line were not ` +
+    `examined. Named is not tested; only the full sweep says that.\n`,
 );

@@ -85,6 +85,17 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // The operands check cannot see this one — it is a chain written on one line — so the row is
+    // what watches it.
+    what: "a resolution with no reason and no evidence is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '    if (input.reasonCode.trim() === "" || input.evidenceDigest.trim() === "") {',
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/an-unresolved-turn-has-an-operator-exit.test.ts::refuses a resolution that says nothing",
+    ],
+  },
+  {
     // The operator authority exists to release a hold in the retry-safe direction. Allowed to
     // record a completion, it would let a person assert something nobody observed — and a turn
     // marked COMPLETED is never re-run, so the owner's question disappears.
