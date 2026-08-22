@@ -358,6 +358,37 @@ describe("production has to be the same set of facts afterwards", () => {
     expect(assertProductionUnchanged(before, after).allowed).toBe(false);
   });
 
+  it.each([
+    ["actorIds", { actorIds: ["actor:ceo", "actor:new"] }],
+    ["bindingGenerations", { bindingGenerations: ["CEO:2"] }],
+    ["assignmentIds", { assignmentIds: ["assign:1", "assign:2"] }],
+    ["productionEntries", { productionEntries: ["state.sqlite"] }],
+  ] as const)("reports %s when it alone differs", (field, after) => {
+    // One case per field, because the comparison is one line per field and a test that moves two
+    // of them at once passes while either line is missing. Measured on the head this was written
+    // for: deleting the `actorIds`, `bindingGenerations` or `assignmentIds` comparison broke
+    // nothing in this file — three safety comparisons with nothing watching them, in the branch
+    // whose subject is exactly that.
+    const decision = assertProductionUnchanged(census(), census(after));
+
+    expect(decision.allowed, `${field} moved and the census called it unchanged`).toBe(false);
+    if (decision.allowed) return;
+    expect((decision.evidence as { differences: string[] }).differences).toContain(field);
+  });
+
+  it("reports the database family when it alone differs", () => {
+    // Separate because the family is compared by a different function — element-wise on records
+    // rather than as a multiset of strings.
+    const decision = assertProductionUnchanged(
+      census(),
+      census({ databaseFamily: family({ size: 9_999 }) }),
+    );
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect((decision.evidence as { differences: string[] }).differences).toContain("databaseFamily");
+  });
+
   it("reports a new entry under the production root", () => {
     // The id lists answer "did production's records change" and the database family answers "did
     // its bytes move". Neither answers "did something appear" — and twice on this branch a probe

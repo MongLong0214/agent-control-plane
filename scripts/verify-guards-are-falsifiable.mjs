@@ -619,6 +619,22 @@ const GUARDS = [
     replace: "  if (false) return family;",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
+  {
+    // Three of the five census comparisons had no test that failed when they were removed, in the
+    // branch whose subject is exactly that. These two were the ones with no row either.
+    what: "a changed assignment id is a census difference",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!sameMultiset(before.assignmentIds, after.assignmentIds)) differences.push(\"assignmentIds\");",
+    replace: "",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "a changed binding generation is a census difference",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!sameMultiset(before.bindingGenerations, after.bindingGenerations)) {",
+    replace: "  if (false) {",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
