@@ -835,6 +835,7 @@ describe("baseline boundary contracts", () => {
       "v27-an-observation-carries-its-evidence",
       "v28-an-operator-can-settle-a-turn-nobody-observed",
       "v29-a-dispatch-is-a-fact",
+      "v30-a-turn-and-a-reply-are-two-lifecycles",
     ]);
   });
 

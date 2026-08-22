@@ -1140,7 +1140,21 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
   nonce       TEXT NOT NULL,
   actor       TEXT NOT NULL,
   received_at TEXT NOT NULL,
+  -- This Telegram message's *reply delivery*: reserved, sent, applied. One lifecycle.
   result_json TEXT,
+  -- The turn this message's handler took the right to run. A different lifecycle, and it used to
+  -- live in `result_json` beside the one above.
+  --
+  -- Measured (#646): the reply reservation writes `result_json` whole, and its precondition —
+  -- "not PENDING and not APPLIED" — treats a claimed turn as a free slot. So an ordinary timeout,
+  -- which is the common case at a measured 3m15s turn against a 120s deadline, produces a reply,
+  -- the reservation overwrites the claim, and the turn identity goes with it. `unresolvedTurns`
+  -- then returns nothing and no one knows a turn was in flight. The crash path kept the claim,
+  -- which is exactly the path the tests covered.
+  --
+  -- Two lifecycles in one field is the whole defect: the reply's advanced and took the turn's with
+  -- it. They reference each other by id now and share no storage.
+  turn_claim_json TEXT,
   PRIMARY KEY (channel, nonce)
 );
 

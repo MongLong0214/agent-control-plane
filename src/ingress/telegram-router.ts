@@ -567,14 +567,19 @@ export class TelegramHermesRouter {
     if (this.deliveryStatus(prior) !== "PENDING") {
       throw new Error(`Telegram response completion requires a PENDING reservation (${outcome.nonce})`);
     }
-    const completed = this.ingress.recordResultIf(outcome.nonce, {
+    // Two lifecycles, one transaction. The turn's is not this message's reply — and until they were
+    // separated (#646) the write below erased the claim — but they end on the same fact, so they
+    // have to commit on the same fact: a review found the window where the process commits APPLIED,
+    // crashes, and on restart returns early without ever resolving the turn, holding the nonce with
+    // a turn that finished.
+    const completed = this.ingress.completeReplyAndResolveTurn(outcome.nonce, {
       kind: "TELEGRAM_WORKFLOW",
       phase: "REPLIED",
       ...(outcome.runId ?? prior?.runId ? { runId: outcome.runId ?? prior?.runId } : {}),
       reply: outcome.reply,
       sent: true,
       deliveryStatus: "APPLIED",
-    } satisfies TelegramStoredState, "PENDING");
+    } satisfies TelegramStoredState);
     if (!completed.allowed) throw new Error(`${completed.reasonCode}: ${completed.message}`);
   }
 

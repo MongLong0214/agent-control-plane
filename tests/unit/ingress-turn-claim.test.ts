@@ -113,11 +113,13 @@ describe("what the claim carries", () => {
    * told apart from a missing receipt.
    */
   const storedClaim = (harness: ReturnType<typeof makeHarness>, nonce: string): Record<string, unknown> => {
-    const row = harness.cp.db.get<{ result_json: string | null }>(
-      "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
+    // `turn_claim_json`, not `result_json`. The claim used to share a field with this message's
+    // reply-delivery lifecycle, and the reply's advanced and took the turn's with it (#646).
+    const row = harness.cp.db.get<{ turn_claim_json: string | null }>(
+      "SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
       [nonce],
     );
-    return JSON.parse(row?.result_json ?? "{}") as Record<string, unknown>;
+    return JSON.parse(row?.turn_claim_json ?? "{}") as Record<string, unknown>;
   };
 
   it("stores the identity in the same row as the claim", () => {

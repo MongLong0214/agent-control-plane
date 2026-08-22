@@ -85,6 +85,28 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // Two lifecycles in one field: the reply reservation writes `result_json` whole, and an
+    // ordinary timeout produces a reply, so the claim and the turn identity went with it.
+    what: "the turn claim is stored apart from the reply it will produce",
+    file: "src/ingress/ingress-guard.ts",
+    find: "          `UPDATE inbound_messages SET turn_claim_json = ?",
+    replace: "          `UPDATE inbound_messages SET result_json = ?",
+    killedBy: [
+      "tests/unit/a-turn-and-a-reply-are-two-lifecycles.test.ts::keeps the claim and its identity when a reply is reserved",
+    ],
+  },
+  {
+    // Without it a finished turn's claim is never cleared, and every replay of a completed
+    // exchange reports an unknown outcome — a hold created by the fix above.
+    what: "a turn whose reply the transport accepted stops being outstanding",
+    file: "src/ingress/ingress-guard.ts",
+    find: "      return this.#resolveTurnHere(channel, nonce);",
+    replace: "      return completed;",
+    killedBy: [
+      "tests/unit/a-turn-and-a-reply-are-two-lifecycles.test.ts::resolves the turn in the same transaction that records the reply",
+    ],
+  },
+  {
     // The #662 hole: a caller that dispatched, reported that nothing ran, and got attempt 2
     // admitted while attempt 1 was still in flight.
     what: "a dispatched turn cannot be reported as never started",
