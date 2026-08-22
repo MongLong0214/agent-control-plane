@@ -99,7 +99,10 @@ const dispatch = (coordinator: ConversationTurnCoordinator, permit: TurnPermit):
   // Refusals are ignored on purpose. These tests are about what a settlement does, and a permit
   // that was never issued or a turn that is already settled has to reach the *settlement* to be
   // refused there — a throw here would move the assertion into the fixture.
-  coordinator.markDispatching(permit);
+  //
+  // Not awaited: the row is written and committed synchronously before `dispatch` returns its
+  // promise, and these tests only need it to exist. A test *about* the send holds the promise.
+  void coordinator.dispatch(permit, () => undefined);
 };
 
 const settle = (

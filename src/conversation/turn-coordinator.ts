@@ -241,14 +241,33 @@ export class ConversationTurnCoordinator {
    * either phase, so "only a positively observed outcome moves a turn" was a statement about the
    * caller's discipline. It is a refusal with a row behind it now.
    *
-   * Called by whatever reaches the target, in the same transaction as the attempt where possible.
-   * A crash between this row and the attempt leaves a dispatched turn with no outcome, which is
-   * `IN_DOUBT` and is the correct reading: something may have run.
+   * The caller does not choose the order, because a review showed that choosing it wrongly is the
+   * whole defect back again: send first, then mark, and an error path reports `NEVER_ADMITTED` on a
+   * turn the target already has. So the send is passed *in* — the row is written and committed, and
+   * only then does the message go out.
+   *
+   * A crash between the two leaves a dispatched turn with no outcome, which is `IN_DOUBT` and is
+   * the correct reading: something may have run. The reverse crash cannot happen through this
+   * method, which is the point of it holding the send.
    *
    * One per turn. A second dispatch is the owner's message delivered twice, which is refused here
    * rather than counted — the primary key says so as well, for a caller that goes around this.
+   *
+   * Limit: a caller that never calls this and speaks to the target anyway is not stopped by
+   * anything here. What that produces is a turn with no dispatch row, where a `NEVER_ADMITTED`
+   * claim is admitted — the original defect, reachable only by declining the one API that reaches
+   * the target. Nothing in this process can close that; a receipt the target signed (#638) can.
    */
-  markDispatching(permit: TurnPermit): Decision<void> {
+  async dispatch<T>(permit: TurnPermit, send: () => Promise<T> | T): Promise<Decision<T>> {
+    const marked = this.#markDispatching(permit);
+    if (!marked.allowed) return deny(marked.reasonCode, marked.message, marked.evidence);
+    // Outside the transaction on purpose. `db.tx` bodies must be synchronous, and more importantly
+    // the row has to be *committed* before the message goes out: a transaction still open when the
+    // target receives it is a dispatch that happened and a record that can still roll back.
+    return allow(ReasonCode.OK, await send());
+  }
+
+  #markDispatching(permit: TurnPermit): Decision<void> {
     return this.db.tx(() => {
       const permitted = this.assertIssuedHere(permit);
       if (!permitted.allowed) {

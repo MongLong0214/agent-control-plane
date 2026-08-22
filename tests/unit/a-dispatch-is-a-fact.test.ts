@@ -61,14 +61,14 @@ const claim = (h: Harness, actorId: string, nonce: string, attempt = 1) => {
 };
 
 describe("a turn that was dispatched cannot be reported as never started", () => {
-  it("refuses the claim that contradicts the ledger's own record", () => {
+  it("refuses the claim that contradicts the ledger's own record", async () => {
     // The defect, stated as a sequence: dispatch, then say nothing ran, then retry. Before the
     // dispatch row existed every step was permitted and the owner's message went out twice.
     const h = makeHarness();
     const actorId = target(h, "dispatched");
     const permit = claim(h, actorId, "m1");
 
-    expect(h.cp.conversation.markDispatching(permit).allowed).toBe(true);
+    expect((await h.cp.conversation.dispatch(permit, () => undefined)).allowed).toBe(true);
 
     const refused = h.cp.conversation.ports.preDispatch.neverAdmitted(permit, {
       receiptId: "pre-1",
@@ -88,7 +88,7 @@ describe("a turn that was dispatched cannot be reported as never started", () =>
     expect(retry.allowed).toBe(false);
   });
 
-  it("still admits a pre-dispatch refusal when nothing was dispatched", () => {
+  it("still admits a pre-dispatch refusal when nothing was dispatched", async () => {
     // The case the port exists for, and the one that must keep working: a refusal that happened
     // before the peer was ever spoken to. It is the difference between a transient outage
     // releasing the conversation and wedging it (#651).
@@ -112,7 +112,7 @@ describe("a turn that was dispatched cannot be reported as never started", () =>
     ).toBe(true);
   });
 
-  it("admits a target receipt for a turn it has no dispatch row for", () => {
+  it("admits a target receipt for a turn it has no dispatch row for", async () => {
     // The asymmetry, and the reason for it. A completion arriving with no dispatch row is either a
     // caller that skipped `markDispatching` or a genuine late receipt after a mistaken refusal.
     // Refusing it discards a true record to punish a bookkeeping mistake — which is exactly what
@@ -134,32 +134,32 @@ describe("a turn that was dispatched cannot be reported as never started", () =>
 });
 
 describe("a dispatch is recorded once, by the coordinator, and cannot be taken back", () => {
-  it("refuses a second dispatch of the same turn", () => {
+  it("refuses a second dispatch of the same turn", async () => {
     // A second dispatch is the owner's message delivered twice — the thing counted, not the row.
     const h = makeHarness();
     const actorId = target(h, "twice");
     const permit = claim(h, actorId, "m1");
 
-    expect(h.cp.conversation.markDispatching(permit).allowed).toBe(true);
-    const second = h.cp.conversation.markDispatching(permit);
+    expect((await h.cp.conversation.dispatch(permit, () => undefined)).allowed).toBe(true);
+    const second = await h.cp.conversation.dispatch(permit, () => undefined);
     expect(second.allowed).toBe(false);
     if (!second.allowed) {
       expect(second.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_ALREADY_DISPATCHED);
     }
   });
 
-  it("refuses a permit this coordinator did not issue", () => {
+  it("refuses a permit this coordinator did not issue", async () => {
     const h = makeHarness();
     const actorId = target(h, "forged");
     const permit = claim(h, actorId, "m1");
 
-    const refused = h.cp.conversation.markDispatching({ ...permit, issuance: "00".repeat(32) });
+    const refused = await h.cp.conversation.dispatch({ ...permit, issuance: "00".repeat(32) }, () => undefined);
     expect(refused.allowed).toBe(false);
     if (!refused.allowed) expect(refused.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_PERMIT_UNISSUED);
     expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_dispatches`)).toEqual([]);
   });
 
-  it("refuses a turn that is already settled", () => {
+  it("refuses a turn that is already settled", async () => {
     const h = makeHarness();
     const actorId = target(h, "settled");
     const permit = claim(h, actorId, "m1");
@@ -169,18 +169,25 @@ describe("a dispatch is recorded once, by the coordinator, and cannot be taken b
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
     });
 
-    const refused = h.cp.conversation.markDispatching(permit);
+    const refused = await h.cp.conversation.dispatch(permit, () => undefined);
     expect(refused.allowed).toBe(false);
     if (!refused.allowed) expect(refused.reasonCode).toBe(ReasonCode.CONFLICT);
   });
 
-  it("cannot be written or removed by anything but the materializer", () => {
+  it("refuses an ordinary handle, and cannot refuse a handle that registers the scalar", async () => {
     // The row decides which claims are admissible, so a caller that can write it directly can
     // decide that for itself — which is the self-certification this table exists to stop.
+    //
+    // The name of this test used to be "cannot be written or removed by anything but the
+    // materializer", which is wider than the schema enforces, and a review said so. The authority
+    // guard is a connection-local SQL function: a separate process with its own SQLite handle can
+    // register a scalar of the same name returning 1 and forge a *first* dispatch row. What it
+    // still cannot do is update, delete or replace one, because those three guards are
+    // unconditional. That is the ceiling, and it is asserted here rather than described.
     const h = makeHarness();
     const actorId = target(h, "guarded");
     const permit = claim(h, actorId, "m1");
-    expect(h.cp.conversation.markDispatching(permit).allowed).toBe(true);
+    expect((await h.cp.conversation.dispatch(permit, () => undefined)).allowed).toBe(true);
 
     expect(() =>
       h.cp.db.run(
@@ -196,10 +203,12 @@ describe("a dispatch is recorded once, by the coordinator, and cannot be taken b
       /CANONICAL_TURN_DISPATCH_IMMUTABLE/,
     );
 
-    // And `INSERT OR REPLACE`, which deletes the conflicting row first and so walks past both.
     const foreign = new Database(join(h.root, "state.sqlite"));
     try {
       foreign.function("acp_turn_materialization_authorized", (_turnRequestId: unknown) => 1);
+
+      // `INSERT OR REPLACE` deletes the conflicting row first and so walks past the update and
+      // delete guards. Refused, even for this handle.
       expect(() =>
         foreign
           .prepare(
@@ -209,6 +218,20 @@ describe("a dispatch is recorded once, by the coordinator, and cannot be taken b
           )
           .run(permit.turnRequestId, NOW),
       ).toThrow(/CANONICAL_TURN_DISPATCH_NO_REPLACE/);
+
+      // And the ceiling, asserted so it is a measured boundary rather than a claim: a first row for
+      // an *undispatched* turn goes in. The authority trigger authenticates a function name on the
+      // caller's own connection, and that handle can also DROP TRIGGER — so what these guards bind
+      // is in-process writers and DML-only callers. #638's signed receipt is what closes it.
+      const undispatched = claim(h, target(h, "second"), "m2");
+      expect(() =>
+        foreign
+          .prepare(
+            `INSERT INTO canonical_turn_dispatches (turn_request_id, dispatched_at, audit_event_id)
+             VALUES (?, ?, (SELECT MIN(event_id) FROM audit_events))`,
+          )
+          .run(undispatched.turnRequestId, NOW),
+      ).not.toThrow();
     } finally {
       foreign.close();
     }
