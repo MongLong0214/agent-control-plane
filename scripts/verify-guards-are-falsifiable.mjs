@@ -559,6 +559,15 @@ const GUARDS = [
     replace: "",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
+  {
+    // The path used to reach a link and the directory it lives in are different places once an
+    // ancestor is itself a link, and a relative target follows the second.
+    what: "a relative symlink target is resolved against the directory the link is in",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "        const target = resolve(realpathSync(dirname(probe)), readlinkSync(probe));",
+    replace: "        const target = resolve(dirname(probe), readlinkSync(probe));",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

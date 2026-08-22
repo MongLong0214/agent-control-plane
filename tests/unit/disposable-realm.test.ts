@@ -713,10 +713,41 @@ describe("a symlink to nothing is still a directory entry", () => {
     expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
   });
 
+  it("refuses a relative link reached through a symlinked ancestor, judged where the link sits", () => {
+    // The kernel resolves a relative target against the directory the link is *in*. Reach that
+    // link through another symlink and the path used to get there names a different directory, so
+    // resolving against it lands somewhere the link never points. Measured before this fix: the
+    // plan answered ALLOWED and the realm's bytes were written into production.
+    const home = fakeHome();
+    const scratch = tempDir("acp-relative-through-link-");
+    const paths = realmUnder(scratch);
+    const inProduction = join(productionRoot(home), "sub");
+    mkdirSync(inProduction, { recursive: true });
+    symlinkSync(inProduction, join(paths.stateDir, "a"));
+    symlinkSync("../escape", join(inProduction, "b"));
+
+    const decision = planDisposableRealm({
+      home,
+      // `runtimeRoot` rather than `databasePath`: the sidecar checks would catch the database by
+      // way of a sibling that resolves correctly, which is a refusal for the wrong reason.
+      paths: { ...paths, runtimeRoot: join(paths.stateDir, "a", "b") },
+      probeTargetRoot: join(scratch, "probe-root"),
+      canonicalTargetRoot: join(scratch, "canonical-root"),
+    });
+
+    expect(decision.allowed).toBe(false);
+    if (decision.allowed) return;
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+
   it("refuses a link that names itself rather than following it forever", () => {
     const home = fakeHome();
     const scratch = tempDir("acp-selflink-");
     const paths = realmUnder(scratch);
+    // `realpathSync` reports ELOOP for a self-naming link before the symlink branch is reached,
+    // so this arrives through the "any error but ENOENT is an unknown identity" path. An explicit
+    // `target === probe` guard was written for it and was unreachable — the same dead clause this
+    // commit's predecessor deleted elsewhere and condemned in its own message.
     symlinkSync(paths.databasePath, paths.databasePath);
 
     const decision = planDisposableRealm({

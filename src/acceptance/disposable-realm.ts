@@ -264,11 +264,22 @@ const settled = (path: string): string => {
       // resolves to, and the walk continues from there rather than around it.
       const entry = lstatSync(probe, { throwIfNoEntry: false });
       if (entry?.isSymbolicLink() === true) {
-        const target = resolve(dirname(probe), readlinkSync(probe));
-        // Guard against a link that names itself, directly or through a chain: `settled` of the
-        // target re-enters here, and a cycle would otherwise recurse until the stack gave out
-        // rather than arriving at this module's typed refusal.
-        if (target === probe) throw new UnresolvablePath(probe, "ELOOP");
+        // Against where the link *physically sits*, not against the path used to reach it.
+        //
+        // A relative target is resolved by the kernel against the link's own directory. When the
+        // link is reached *through* another symlink, the path used to get there and the directory
+        // it lives in are different places — so `dirname(probe)` names a directory the link is not
+        // in, and a relative target lands somewhere it never points.
+        //
+        // Measured on the version this replaces: `realm/state/a` linked to `production/sub`, and
+        // `production/sub/b` a relative link to `../escape`. `settled(realm/state/a/b)` answered
+        // `realm/state/escape`; the write went to `production/escape`. The plan said ALLOWED and
+        // the realm's bytes landed in production — the same end-to-end escape the previous round
+        // found, reintroduced by the fix for it.
+        //
+        // `dirname(probe)` exists here, because `probe` is an entry inside it, so resolving it
+        // cannot fail with ENOENT.
+        const target = resolve(realpathSync(dirname(probe)), readlinkSync(probe));
         return join(settled(target), ...missing);
       }
       const parent = dirname(probe);
