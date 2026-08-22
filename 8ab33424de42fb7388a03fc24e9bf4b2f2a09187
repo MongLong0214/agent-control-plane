@@ -1,0 +1,24 @@
+Limit: an earlier version of this change claimed the falsifiability table caught an age-based hold sweeper. It did not. The row mutated `unresolved()`, which is a reader that releases nothing, and the test only read it back — a hand-written sweeper inside `claim()` passed the suite untouched while the row reported the guard as covered. Found by adversarial review, confirmed by writing the sweeper. The row is against `claim()` now and the test claims again rather than asking `unresolved()` what it thinks.
+Limit: the same review found the `attempt < 1` guard had no test at all; removing it left 20 of 20 green, because attempt 0 then looks up attempt -1 and is refused as unchained — a plausible denial with the wrong reason.
+Limit: nothing calls the coordinator yet. A turn needs a binding and an attestation, and only an authenticated preflight bind produces those (#638), so `claim` refuses every actor that exists today. That is the activation embargo as a constraint rather than a rule someone follows.
+Limit: the sentinel is only as good as the next run. A tree left mutated stays mutated until someone runs the harness again — the repair is automatic, noticing it is needed is not.
+Limit: the two counterexample inserts in the ledger test asserted only `toThrow`, so the new NOT NULL column would have satisfied them for the wrong reason; both now supply it.
+Ruled-out: keeping the `lifecycle_state === "SETTLED"` conjunct in the retry rule | the schema pairs state with outcome, so it refused nothing the outcome check did not, and the mutation harness proved no test could kill it. A redundant restatement answers "is this checked?" with a yes it has not earned.
+Ruled-out: ALTER TABLE ADD COLUMN for claimed_at | it cannot add NOT NULL without a default, and a default here is a fabricated claim time on any row that had one.
+Ruled-out: amending v22's DDL in place | its checksum derives from that string, so a database that already applied v22 would keep the old shape while schema.sql described the new one — silent divergence, which is worse than a second migration.
+Ruled-out: queueing a second claim instead of refusing it | it holds the caller for the length of a turn, which is the stall this design exists to remove; ordering belongs where the message is durable, not in a caller's stack frame.
+Ruled-out: "not currently in another unresolved turn" as the retry rule | it permits silently re-running a message that already completed. What makes a retry legal is the previous attempt's outcome, not its liveness.
+Ruled-out: making the vitest child asynchronous so the signal handlers can fire | it changes how every row executes to fix the crash path, and the parked copy covers SIGKILL too, which no handler can.
+Provenance: inherited 2fe9502fe8fa31fccb685a1b8ac6665e83a52379
+
+Limit: the permit key is per instance, so a coordinator restart invalidates every outstanding permit. Settling after a restart is the reconciler's job, from a receipt — that path does not exist yet, so today a turn held across a restart stays in doubt, which is the correct direction.
+Limit: the row cross-check in `settle()` is belt and braces. The signature already covers the actor and the prompt digest, so a forged field is refused before the row is read; the check earns its place by making the settlement provably about the turn the permit was issued for rather than about an id.
+Ruled-out: a private class or brand symbol for the permit | it stops a structural literal at compile time and stops nothing at runtime, and the boundary that matters here is a caller that already has an object.
+Ruled-out: persisting the issuance key so permits survive a restart | it converts "this execution observed the outcome" into "some execution once held this permit", which is the claim the whole in-doubt design refuses to let anything make.
+Ruled-out: repairing unknown bytes by preferring the parked original | that is the behaviour being fixed. A repair that can eat an unrelated change is worse than the leftover it cleans up, because nothing reports it.
+Provenance: inherited 1af1788f696c429ed8eb391b439534855b92f681
+
+Limit: the regression checks out `HEAD`, so it exercises the committed script rather than the working copy. That matches the harness's own rule — it refuses to run at all against uncommitted guarded files — but an in-progress edit to the script shows up here as a failure until it is committed.
+Ruled-out: asserting on the output of `git rev-parse` | that is the check which already passed while the code was broken.
+Ruled-out: computing the expected sentinel path in the test and comparing | it tests a second copy of the arithmetic, which is free to be wrong in the same way.
+Provenance: inherited 6586eeb065ea9eca1ce50f6592a8f66c342b8def
