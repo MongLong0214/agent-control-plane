@@ -449,6 +449,23 @@ export class ConversationTurnCoordinator {
       const issued = this.assertIssuedHere(permit);
       if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
 
+      // The three fields are what make the row a record of something observed. Measured on the
+      // merged head, all three were accepted empty and stored empty, so a settlement could say
+      // COMPLETED and cite nothing. The receipt id is the sharpest: it is half of
+      // `(observing_authority, receipt_id)`, so the first blank settlement an authority makes takes
+      // that slot and every later blank one is either a redelivery of it or a reuse conflict
+      // against evidence that never existed.
+      const blank = (["receiptId", "evidenceDigest", "reasonCode"] as const).filter(
+        (field) => String(observation[field] ?? "").trim() === "",
+      );
+      if (blank.length > 0) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_OBSERVATION_UNEVIDENCED,
+          `an observation must carry a ${blank.join(", a ")}`,
+          { turnRequestId: permit.turnRequestId, authority: observation.authority, blank },
+        );
+      }
+
       const row = this.db.get<{ target_actor_id: string; prompt_digest: string }>(
         `SELECT target_actor_id, prompt_digest FROM canonical_turns WHERE turn_request_id = ?`,
         [permit.turnRequestId],

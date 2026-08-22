@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 26;
+export const SCHEMA_VERSION = 27;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -1732,6 +1732,53 @@ const v26: SchemaMigration = {
     ),
 };
 
+/**
+ * Requires an observation to carry the three fields that make it evidence.
+ *
+ * `receipt_id`, `evidence_digest` and `reason_code` were NOT NULL and nothing said they could not
+ * be empty, so `ports.target.completed(permit, { receiptId: "", evidenceDigest: "", reasonCode: ""
+ * })` was accepted and stored blank — measured on 74c37fa, the head that merged the ledger. A
+ * settlement could say COMPLETED and cite nothing, and the retry rule would then refuse to re-run
+ * the owner's message on the strength of it.
+ *
+ * The coordinator refuses this now too. Both, because the whole table is written on the premise
+ * that a property stated in a caller is a property nothing enforces — and `receipt_id` in
+ * particular is half of `(observing_authority, receipt_id)`, so a blank one is not merely thin
+ * evidence, it is an identity collision waiting for the second blank settlement.
+ *
+ * A row that already violates it stops the migration rather than being discarded. Rows here are
+ * the testimony an outcome was computed from; dropping one to make a constraint pass is the
+ * failure the constraint exists to prevent.
+ */
+const v27: SchemaMigration = {
+  id: "v27-an-observation-carries-its-evidence",
+  fromVersion: 26,
+  toVersion: 27,
+  foreignKeysOffDuringApply: true,
+  apply: (raw) => {
+    const blank = raw
+      .prepare(
+        `SELECT observation_id AS id, observing_authority AS authority
+           FROM canonical_turn_observations
+          WHERE receipt_id = '' OR evidence_digest = '' OR reason_code = ''`,
+      )
+      .all() as Array<{ id: number; authority: string }>;
+    if (blank.length > 0) {
+      throw acpError(
+        ReasonCode.INTERNAL_ERROR,
+        "observations exist with no receipt id, evidence digest or reason code; they are testimony and this migration will not discard them",
+        { unevidenced: blank.length, first: blank[0] ?? null },
+      );
+    }
+    rebuildObservationsIfStale(raw);
+    // The rebuild drops the table, and a table's triggers go with it. v26 restores them by running
+    // the whole ledger DDL after its rebuild for the same reason; leaving it out would carry the
+    // CHECK in and take the authority, append-only and no-delete guards out.
+    raw.exec(ledgerTriggerDdl());
+  },
+  checksum: () => sha256(`v27-an-observation-carries-its-evidence\n${observationsTableOnlyDdl()}\n${ledgerTriggerDdl()}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -1748,6 +1795,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v24,
   v25,
   v26,
+  v27,
 ]);
 
 interface RequiredTrigger {

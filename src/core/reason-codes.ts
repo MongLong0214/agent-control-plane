@@ -303,6 +303,16 @@ export const ReasonCode = {
    * second, so a genuine observation could be discarded and reported as landed.
    */
   CONVERSATION_TURN_RECEIPT_REUSED: "CONVERSATION_TURN_RECEIPT_REUSED",
+  /**
+   * An observation arrived with no receipt id, no evidence digest, or no reason code.
+   *
+   * The three fields are what make the row a record of something observed rather than a caller's
+   * assertion, and an empty one was accepted and stored empty — measured on the merged head. The
+   * receipt id is worse than cosmetic: it is half of `(observing_authority, receipt_id)`, so the
+   * first blank settlement an authority makes takes that slot and turns every later blank one into
+   * a redelivery of it, or into a reuse conflict against evidence that was never produced.
+   */
+  CONVERSATION_TURN_OBSERVATION_UNEVIDENCED: "CONVERSATION_TURN_OBSERVATION_UNEVIDENCED",
   /** An adjudication cited only part of the disagreement, or something outside it. */
   CONVERSATION_ADJUDICATION_INCOMPLETE: "CONVERSATION_ADJUDICATION_INCOMPLETE",
   // --- disposable acceptance realm ------------------------------------------

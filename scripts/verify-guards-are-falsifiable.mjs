@@ -46,6 +46,22 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  */
 const GUARDS = [
   {
+    // Measured on the head that merged the ledger: all three fields were NOT NULL and empty was
+    // allowed, so a settlement could say COMPLETED and cite nothing.
+    what: "a settlement that carries no receipt, evidence or reason is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (blank.length > 0) {",
+    replace: "      if (false) {",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
+    what: "the observation table refuses an unevidenced row, not only the coordinator",
+    file: "src/db/schema.sql",
+    find: "  CHECK (receipt_id <> '' AND evidence_digest <> '' AND reason_code <> ''),",
+    replace: "",
+    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+  },
+  {
     what: "an acceptance realm path that resolves inside production is refused",
     file: "src/acceptance/disposable-realm.ts",
     find: "    if (within(production, resolved)) {",

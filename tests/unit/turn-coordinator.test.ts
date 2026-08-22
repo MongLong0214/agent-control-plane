@@ -1,4 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
+import { join } from "node:path";
 
 import {
   ConversationTurnCoordinator,
@@ -446,6 +448,72 @@ describe("settlement needs an authority that observed something", () => {
     expect(row?.resolution_authority).toBe("HERMES_TARGET");
     expect(row?.evidence_digest).toBe("sha256:receipt");
     expect(row?.settled_at).toBe(h.clock.nowIso());
+  });
+
+  it("refuses a settlement that cites nothing, in the coordinator and in the table", () => {
+    // Measured on 74c37fa, the head that merged this ledger: all three fields were NOT NULL and
+    // nothing said they could not be empty, so this exact call was accepted and stored blank. A
+    // turn then read COMPLETED / HERMES_TARGET while citing no receipt, no evidence and no reason,
+    // and the retry rule refuses to re-run the owner's message on the strength of it.
+    //
+    // `receipt_id` is the sharpest of the three: it is half of `(observing_authority, receipt_id)`,
+    // so the first blank settlement an authority makes takes that slot and the next one is read as
+    // a redelivery of it.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const permit = claimOf(h, actorId, [source("m1")]);
+
+    for (const receipt of [
+      { receiptId: "", evidenceDigest: "sha256:x", reasonCode: ReasonCode.OK },
+      { receiptId: "r", evidenceDigest: "", reasonCode: ReasonCode.OK },
+      { receiptId: "r", evidenceDigest: "sha256:x", reasonCode: "" as ReasonCode },
+      { receiptId: "  ", evidenceDigest: "sha256:x", reasonCode: ReasonCode.OK },
+    ]) {
+      const refused = h.cp.conversation.ports.target.completed(permit, receipt as TurnReceipt);
+      expect(refused.allowed).toBe(false);
+      if (!refused.allowed) {
+        expect(refused.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_OBSERVATION_UNEVIDENCED);
+      }
+    }
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_observations`)).toEqual([]);
+
+    // And in the table, because the coordinator refusing is a rule a caller can be written around
+    // — which is the premise the whole ledger is built on.
+    //
+    // Entered through the one path that actually reaches the CHECK. An ordinary `db.run` is
+    // refused by the authority trigger first, so asserting on it passes with the CHECK deleted:
+    // the falsifiability sweep reported this row SURVIVED until the insert came from a connection
+    // that had already defeated that trigger.
+    //
+    // Which is also a finding worth keeping as a test. A foreign process that opens its own SQLite
+    // API handle and registers a scalar named `acp_turn_materialization_authorized` returning 1
+    // gets past the authority trigger, because SQLite resolves the function on the connection
+    // executing the statement. That handle can also DROP TRIGGER, so this is the ceiling of what
+    // the DB guards promise — they bind in-process writers and DML-only callers, not a process
+    // holding an API handle. What must still hold at that ceiling is that the row it writes is at
+    // least a row that carries evidence.
+    const foreign = new Database(join(h.root, "state.sqlite"));
+    try {
+      foreign.function("acp_turn_materialization_authorized", (_turnRequestId: unknown) => 1);
+      const insert = foreign.prepare(
+        `INSERT INTO canonical_turn_observations
+           (turn_request_id, observed_outcome, observing_authority, receipt_id, evidence_digest,
+            reason_code, observed_at, audit_event_id)
+         VALUES (?, 'COMPLETED', 'HERMES_TARGET', ?, ?, ?, ?, (SELECT MIN(event_id) FROM audit_events))`,
+      );
+      expect(() => insert.run(permit.turnRequestId, "", "", "", NOW)).toThrow(/CHECK constraint/);
+      expect(() => insert.run(permit.turnRequestId, "r", "", "OK", NOW)).toThrow(/CHECK constraint/);
+      expect(() => insert.run(permit.turnRequestId, "r", "sha256:x", "", NOW)).toThrow(/CHECK constraint/);
+    } finally {
+      foreign.close();
+    }
+
+    // The turn is untouched: a refused settlement must not be a partial one.
+    const row = h.cp.db.get<{ lifecycle_state: string }>(
+      `SELECT lifecycle_state FROM canonical_turns WHERE turn_request_id = ?`,
+      [permit.turnRequestId],
+    );
+    expect(row?.lifecycle_state).toBe("IN_DOUBT");
   });
 
   it("lets a late target receipt beat an earlier mistaken refusal, and keeps both", () => {
