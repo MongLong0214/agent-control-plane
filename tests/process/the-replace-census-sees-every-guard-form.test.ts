@@ -21,6 +21,7 @@ afterAll(cleanupTempDirs);
  */
 const ROOT = process.cwd();
 const SCRIPT = "scripts/verify-append-only-tables-are-closed.mjs";
+const REGISTRY = "scripts/verify-every-trigger-is-required.mjs";
 
 /** A throwaway clone carrying the working-tree census, so this measures the script being edited. */
 const scratchRepo = (): string => {
@@ -189,5 +190,36 @@ END;
     expect(done.stdout).toContain("census_probe_table");
     expect(done.stdout).toContain("where state = 'ACTIVE'");
     expect(done.status).toBe(1);
+  });
+});
+
+describe("a trigger the schema declares is watched by a required registry", () => {
+  it("fails on a trigger no registry names", () => {
+    // `assertLoadBearingInvariants` refuses to open a database missing any trigger in those
+    // registries. One that is declared and named by none is created on a fresh install and never
+    // checked again: drop it from a live database and nothing notices.
+    const injected = `${CURRENT()}
+CREATE TRIGGER IF NOT EXISTS probe_unwatched
+BEFORE DELETE ON audit_events
+BEGIN
+  SELECT RAISE(ABORT, 'PROBE_UNWATCHED');
+END;
+`;
+    const repo = scratchRepo();
+    writeFileSync(join(repo, "src/db/schema.sql"), injected);
+    copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
+    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+
+    expect(done.stdout).toContain("probe_unwatched");
+    expect(done.status).toBe(1);
+  });
+
+  it("passes on the schema as it stands", () => {
+    const repo = scratchRepo();
+    copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
+    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+
+    expect(done.stdout).toContain("RESULT: PASS");
+    expect(done.status).toBe(0);
   });
 });

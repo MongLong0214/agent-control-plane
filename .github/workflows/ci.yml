@@ -56,6 +56,11 @@ jobs:
       # instead of a Decision, so a refusal is indistinguishable from a bug. The whole
       # canonical-turn ledger was in that state, and a census found five more that predate it.
       - run: pnpm schema:denials
+      # A trigger declared and named by no required registry is created on a fresh install and
+      # never checked again — drop it from a live database and nothing notices. The registries are
+      # hand-written lists, and four defects on this branch were a hand-written list that stopped
+      # matching what it enumerates.
+      - run: pnpm schema:registry
       # A wrapped CommitLore trailer is not a trailer: git ends the block at the continuation
       # line and the record is stored by nobody. It happened six times on 2026-08-22, and
       # every one was *detected* — `commitlore validate` printed a warning and exited 0, after
