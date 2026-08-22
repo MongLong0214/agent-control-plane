@@ -37,7 +37,8 @@
     "migrations:freeze": "node scripts/verify-migrations-are-immutable.mjs --update",
     "schema:census": "node scripts/verify-append-only-tables-are-closed.mjs",
     "schema:denials": "node scripts/verify-trigger-denials-are-typed.mjs",
-    "schema:registry": "node scripts/verify-every-trigger-is-required.mjs"
+    "schema:registry": "node scripts/verify-every-trigger-is-required.mjs",
+    "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

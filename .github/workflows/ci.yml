@@ -39,6 +39,10 @@ jobs:
       # silently stops checking anything — three times on one branch, each found only when the
       # full sweep reached it forty minutes in. This fails first instead.
       - run: pnpm guards:anchors
+      # The question that found three of the four findings in this branch's final review: which
+      # operand of a refusal does no falsifiability row name. The harness answers "is this guard
+      # tested" for the lines someone wrote a row for; it cannot answer which lines nobody did.
+      - run: pnpm guards:operands
       # Two defect classes this branch hit twice each, turned into checks so the third time
       # is a failing step rather than a review finding.
       #
