@@ -6,7 +6,7 @@ the JSON-reporter result set named below. Behavioural coverage and production-en
 coverage are not measured, so this report is not proof that a requirement is met in the
 running system.
 
-Measured at `50aba36447ad2a53a1ed14053f1054dceb1c5e40 (working tree modified)`. The copy committed to the repository is only as current
+Measured at `c1d95c3c752d784fbbc10e6765415f0af9985eb0 (working tree modified)`. The copy committed to the repository is only as current
 as its last regeneration — `pnpm trace` recomputes it, and CI recomputes it on every run, so
 a reader comparing this file against a later tree should re-run rather than trust the counts.
 

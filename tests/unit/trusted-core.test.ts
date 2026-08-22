@@ -113,7 +113,12 @@ describe("database hard constraints (PRD §30.2)", () => {
          VALUES (?, ?, 'PRIMARY_CTO', ?, ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
         [newAssignmentId(), seeded.roleKey, seeded.projectId, seedActor(db, "PRIMARY_CTO"), seeded.sessionId, clock.nowIso()],
       ),
-    ).toThrowError(/BINDING_GENERATION_NOT_MONOTONIC/);
+    // Either guard refusing this row is correct, and SQLite does not define which BEFORE INSERT
+    // trigger speaks first. The row reuses the owner tuple as well as the generation, so
+    // `assignments_no_replace` — added when a REPLACE was found to delete a colliding row
+    // silently — refuses it too. Naming one message made this assert on firing order rather than
+    // on the property.
+    ).toThrowError(/BINDING_GENERATION_NOT_MONOTONIC|ASSIGNMENT_NO_REPLACE/);
   });
 
   it("keeps session incarnation immutable", () => {

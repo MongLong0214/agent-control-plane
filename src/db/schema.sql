@@ -147,7 +147,10 @@ END;
 -- does it.
 CREATE TRIGGER IF NOT EXISTS sessions_no_replace
 BEFORE INSERT ON sessions
-WHEN EXISTS (SELECT 1 FROM sessions WHERE session_id = NEW.session_id)
+WHEN EXISTS (
+  SELECT 1 FROM sessions
+   WHERE (session_id = NEW.session_id)
+)
 BEGIN
   SELECT RAISE(ABORT, 'SESSION_NO_REPLACE');
 END;
@@ -316,8 +319,10 @@ END;
 -- the collision through.
 CREATE TRIGGER IF NOT EXISTS conversational_actor_registrations_no_replace
 BEFORE INSERT ON conversational_actor_registrations
-WHEN EXISTS (SELECT 1 FROM conversational_actor_registrations
-              WHERE actor_id = NEW.actor_id AND actor_generation = NEW.actor_generation)
+WHEN EXISTS (
+  SELECT 1 FROM conversational_actor_registrations
+   WHERE (actor_id = NEW.actor_id AND actor_generation = NEW.actor_generation)
+)
 BEGIN
   SELECT RAISE(ABORT, 'CONVERSATIONAL_ACTOR_REGISTRATION_NO_REPLACE');
 END;
@@ -381,7 +386,11 @@ END;
 -- CP-HI-06 — revocation is terminal, and REPLACE un-revokes.
 CREATE TRIGGER IF NOT EXISTS assignments_no_replace
 BEFORE INSERT ON assignments
-WHEN EXISTS (SELECT 1 FROM assignments WHERE assignment_id = NEW.assignment_id)
+WHEN EXISTS (
+  SELECT 1 FROM assignments
+   WHERE (assignment_id = NEW.assignment_id)
+           OR (role_key = NEW.role_key AND binding_generation = NEW.binding_generation AND session_id = NEW.session_id AND session_incarnation = NEW.session_incarnation)
+)
 BEGIN
   SELECT RAISE(ABORT, 'ASSIGNMENT_NO_REPLACE');
 END;
@@ -765,7 +774,11 @@ END;
 -- CP-HI-06 — the worker identity is immutable under UPDATE and was rewritable by REPLACE.
 CREATE TRIGGER IF NOT EXISTS task_executions_no_replace
 BEFORE INSERT ON task_executions
-WHEN EXISTS (SELECT 1 FROM task_executions WHERE execution_id = NEW.execution_id)
+WHEN EXISTS (
+  SELECT 1 FROM task_executions
+   WHERE (execution_id = NEW.execution_id)
+           OR (task_id = NEW.task_id AND attempt = NEW.attempt)
+)
 BEGIN
   SELECT RAISE(ABORT, 'TASK_EXECUTION_NO_REPLACE');
 END;
@@ -836,7 +849,11 @@ END;
 -- CP-HI-06 — evidence content is immutable under UPDATE and was rewritable by REPLACE.
 CREATE TRIGGER IF NOT EXISTS run_artifacts_no_replace
 BEFORE INSERT ON run_artifacts
-WHEN EXISTS (SELECT 1 FROM run_artifacts WHERE artifact_id = NEW.artifact_id)
+WHEN EXISTS (
+  SELECT 1 FROM run_artifacts
+   WHERE (artifact_id = NEW.artifact_id)
+           OR (run_id = NEW.run_id AND kind = NEW.kind AND digest = NEW.digest AND candidate_snapshot_digest = NEW.candidate_snapshot_digest)
+)
 BEGIN
   SELECT RAISE(ABORT, 'RUN_ARTIFACT_NO_REPLACE');
 END;
@@ -1093,7 +1110,11 @@ END;
 -- CP-HI-06 — the request fingerprint is what makes a send idempotent.
 CREATE TRIGGER IF NOT EXISTS outbox_no_replace
 BEFORE INSERT ON outbox
-WHEN EXISTS (SELECT 1 FROM outbox WHERE message_id = NEW.message_id)
+WHEN EXISTS (
+  SELECT 1 FROM outbox
+   WHERE (message_id = NEW.message_id)
+           OR (idempotency_key = NEW.idempotency_key)
+)
 BEGIN
   SELECT RAISE(ABORT, 'OUTBOX_NO_REPLACE');
 END;
@@ -1367,7 +1388,11 @@ END;
 -- CP-HI-06 — same census, same hole: a baseline is verification provenance and REPLACE rewrote it.
 CREATE TRIGGER IF NOT EXISTS baseline_records_no_replace
 BEFORE INSERT ON baseline_records
-WHEN EXISTS (SELECT 1 FROM baseline_records WHERE record_id = NEW.record_id)
+WHEN EXISTS (
+  SELECT 1 FROM baseline_records
+   WHERE (record_id = NEW.record_id)
+           OR (run_id = NEW.run_id AND record_kind = NEW.record_kind AND payload_digest = NEW.payload_digest)
+)
 BEGIN
   SELECT RAISE(ABORT, 'BASELINE_RECORD_NO_REPLACE');
 END;
@@ -1956,7 +1981,10 @@ END;
 -- update or delete guard on a connection that did not opt into recursive triggers.
 CREATE TRIGGER IF NOT EXISTS canonical_turns_no_replace
 BEFORE INSERT ON canonical_turns
-WHEN EXISTS (SELECT 1 FROM canonical_turns WHERE turn_request_id = NEW.turn_request_id)
+WHEN EXISTS (
+  SELECT 1 FROM canonical_turns
+   WHERE (turn_request_id = NEW.turn_request_id)
+)
 BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_NO_REPLACE');
 END;
@@ -1995,9 +2023,10 @@ CREATE TRIGGER IF NOT EXISTS actor_target_bindings_no_replace
 BEFORE INSERT ON actor_target_bindings
 WHEN EXISTS (
   SELECT 1 FROM actor_target_bindings
-   WHERE target_binding_id = NEW.target_binding_id
-      OR target_actor_id = NEW.target_actor_id
-      OR (executor_kind = NEW.executor_kind AND target_locator_digest = NEW.target_locator_digest)
+   WHERE (target_binding_id = NEW.target_binding_id)
+           OR (target_actor_id = NEW.target_actor_id)
+           OR (executor_kind = NEW.executor_kind AND target_locator_digest = NEW.target_locator_digest)
+           OR (target_binding_id = NEW.target_binding_id AND target_actor_id = NEW.target_actor_id)
 )
 BEGIN
   SELECT RAISE(ABORT, 'ACTOR_TARGET_BINDING_NO_REPLACE');
@@ -2009,8 +2038,9 @@ CREATE TRIGGER IF NOT EXISTS actor_target_attestations_no_replace
 BEFORE INSERT ON actor_target_attestations
 WHEN EXISTS (
   SELECT 1 FROM actor_target_attestations
-   WHERE target_attestation_id = NEW.target_attestation_id
-      OR (target_binding_id = NEW.target_binding_id AND attestation_digest = NEW.attestation_digest)
+   WHERE (target_attestation_id = NEW.target_attestation_id)
+           OR (target_binding_id = NEW.target_binding_id AND attestation_digest = NEW.attestation_digest)
+           OR (target_attestation_id = NEW.target_attestation_id AND target_binding_id = NEW.target_binding_id)
 )
 BEGIN
   SELECT RAISE(ABORT, 'ACTOR_TARGET_ATTESTATION_NO_REPLACE');

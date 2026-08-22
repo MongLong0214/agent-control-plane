@@ -569,8 +569,8 @@ const GUARDS = [
     // Naming less than the key refuses legitimate inserts; this one refused a rotation.
     what: "a REPLACE guard names its table's whole key",
     file: "src/db/schema.sql",
-    find: "              WHERE actor_id = NEW.actor_id AND actor_generation = NEW.actor_generation)",
-    replace: "              WHERE actor_id = NEW.actor_id)",
+    find: "   WHERE (actor_id = NEW.actor_id AND actor_generation = NEW.actor_generation)",
+    replace: "   WHERE (actor_id = NEW.actor_id)",
     killedBy: ["tests/unit/replace-cannot-rewrite-a-guarded-row.test.ts"],
   },
 ];

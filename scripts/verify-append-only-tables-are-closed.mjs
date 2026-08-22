@@ -74,36 +74,85 @@ for (const [table, { verbs, names }] of [...guards].sort()) {
  * collision it is supposed to catch walks through. Neither shows up as a missing trigger, which is
  * all the census above can see.
  */
-const keyOf = (table) => {
+/**
+ * Every set of columns a second insert could collide on: the primary key and each UNIQUE.
+ *
+ * The first version compared against the primary key alone and reported four correct guards as
+ * wrong — they also cover a UNIQUE, which is exactly what a REPLACE collides on when the primary
+ * key is a surrogate. A rule that calls a broader guard a defect teaches whoever reads it to
+ * narrow the guard.
+ */
+const uniqueKeysOf = (table) => {
   const declaration = new RegExp(`CREATE TABLE IF NOT EXISTS ${table} \\(([\\s\\S]*?)\\n\\);`).exec(schema);
   if (declaration === null) return null;
   const body = declaration[1];
+  const keys = [];
   const inline = [...body.matchAll(/^\s*(\w+)[^\n]*?\bPRIMARY KEY/gm)].map((m) => m[1]);
-  if (inline.length > 0) return inline;
+  if (inline.length > 0) keys.push(inline);
   const composite = /PRIMARY KEY \(([^)]*)\)/.exec(body);
-  return composite === null ? null : composite[1].split(",").map((column) => column.trim());
+  if (composite !== null) keys.push(composite[1].split(",").map((column) => column.trim()));
+  for (const unique of body.matchAll(/\bUNIQUE \(([^)]*)\)/g)) {
+    keys.push(unique[1].split(",").map((column) => column.trim()));
+  }
+  // Full unique indexes only. A *partial* one (`... WHERE status = 'ACTIVE'`) constrains a subset
+  // of rows, so a second insert that does not match the predicate is legitimate — and a guard
+  // written from the columns alone refuses it. Measured: widening the assignments guard to the
+  // partial `assignments_active_role_key` broke fifty-seven tests, all of them ordinary
+  // re-assignments after a revocation.
+  for (const index of schema.matchAll(
+    new RegExp(`CREATE UNIQUE INDEX IF NOT EXISTS \\w+\\s*\\n?\\s*ON ${table}\\(([^)]*)\\)([^;]*);`, "g"),
+  )) {
+    if (/\bWHERE\b/.test(index[2])) continue;
+    keys.push(index[1].split(",").map((column) => column.trim()));
+  }
+  return keys.length > 0 ? keys : null;
 };
 
 const mismatched = [];
-for (const guard of schema.matchAll(
-  /CREATE TRIGGER IF NOT EXISTS (\w+)_no_replace\nBEFORE INSERT ON \1\nWHEN EXISTS \(SELECT 1 FROM \1\s*([\s\S]*?)\)\nBEGIN/g,
-)) {
-  const [, table, condition] = guard;
-  const key = keyOf(table);
-  if (key === null) {
+/**
+ * Every `_no_replace` trigger, whatever its line breaks.
+ *
+ * The first version of this required `WHEN EXISTS (SELECT 1 FROM <table>` on one line, and four of
+ * the twenty triggers wrap it differently — so it silently checked sixteen and reported PASS. That
+ * is the same failure as the census above it, in the check written to close the census's blind
+ * spot, one hour later. A pattern that cannot match a formatting choice is a check with a hole
+ * whose shape is "however someone typed it".
+ *
+ * So the body is taken from the whole trigger, and a trigger this cannot read is *reported* rather
+ * than skipped: silence is not a pass.
+ */
+const bodies = [
+  ...schema.matchAll(/CREATE TRIGGER IF NOT EXISTS (\w+)_no_replace\n([\s\S]*?)\nEND;/g),
+];
+for (const guard of bodies) {
+  const [, table, body] = guard;
+  const when = /WHEN EXISTS \(([\s\S]*?)\)\s*\nBEGIN/.exec(`${body}\nBEGIN`) ?? /WHEN([\s\S]*)/.exec(body);
+  if (when === null) {
+    mismatched.push({ table, why: "has a no_replace trigger this check cannot read" });
+    continue;
+  }
+  const condition = when[1] ?? "";
+  const keys = uniqueKeysOf(table);
+  if (keys === null) {
     mismatched.push({ table, why: "has a no_replace trigger and no table declaration in this schema" });
     continue;
   }
-  const checked = new Set([...condition.matchAll(/(\w+) = NEW\./g)].map((m) => m[1]));
-  const missing = key.filter((column) => !checked.has(column));
-  const extra = [...checked].filter((column) => !key.includes(column));
-  if (missing.length > 0 || extra.length > 0) {
+  // The condition is an OR of column groups, one per uniqueness constraint it refuses a collision
+  // on. Every constraint has to have a group; a group naming something else is a broader guard,
+  // which is not a defect.
+  const groups = condition
+    .split(/\bOR\b/)
+    .map((part) => new Set([...part.matchAll(/(\w+) = NEW\./g)].map((m) => m[1])))
+    .filter((group) => group.size > 0);
+  const uncovered = keys.filter(
+    (key) => !groups.some((group) => key.every((column) => group.has(column)) && group.size === key.length),
+  );
+  if (uncovered.length > 0) {
     mismatched.push({
       table,
       why:
-        `its key is (${key.join(", ")}) and the guard compares (${[...checked].sort().join(", ")})` +
-        `${missing.length > 0 ? ` — missing ${missing.join(", ")}` : ""}` +
-        `${extra.length > 0 ? ` — extra ${extra.join(", ")}` : ""}`,
+        `nothing in the guard refuses a collision on (${uncovered.map((k) => k.join(", ")).join(") or (")})` +
+        ` — it compares ${groups.map((g) => `(${[...g].sort().join(", ")})`).join(" or ")}`,
     });
   }
 }
