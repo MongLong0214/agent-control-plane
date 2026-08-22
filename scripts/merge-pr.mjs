@@ -74,9 +74,15 @@ const fail = (why) => {
 
 // 1. The head this merge would take, and whether that exact commit is green. Read before the
 //    message is composed, because the records to inherit come from the range this head closes.
-const pr = JSON.parse(
-  run("gh", ["pr", "view", number, "--json", "mergeable,mergeStateStatus,headRefOid,baseRefOid,state,title"]),
-);
+let pr;
+try {
+  pr = JSON.parse(
+    run("gh", ["pr", "view", number, "--json", "mergeable,mergeStateStatus,headRefOid,baseRefOid,state,title,statusCheckRollup"]),
+  );
+} catch (error) {
+  process.stdout.write(String(error.stdout ?? error.stderr ?? error.message ?? ""));
+  fail(`could not read #${number} from GitHub. A check that cannot look reports that, not a verdict.`);
+}
 if (pr.state !== "OPEN") fail(`#${number} is ${pr.state}.`);
 
 const head = pr.headRefOid;
@@ -118,19 +124,28 @@ writeFileSync(bodyOut, composed.split("\n").slice(2).join("\n"));
 //    pending PR reports the merge state and never looks at the message at all.
 if (pr.mergeable !== "MERGEABLE") fail(`#${number} is ${pr.mergeable}.`);
 if (pr.mergeStateStatus !== "CLEAN") fail(`#${number} merge state is ${pr.mergeStateStatus}, not CLEAN.`);
-const runs = JSON.parse(
-  run("gh", ["run", "list", "--commit", head, "--limit", "20", "--json", "conclusion,status,databaseId,workflowName"]),
-);
-const finished = runs.filter((r) => r.status === "completed");
-if (finished.length === 0) fail(`no completed CI run for ${head.slice(0, 7)}. A green claim needs a run.`);
-const red = finished.filter((r) => r.conclusion !== "success" && r.conclusion !== "skipped");
+// The rollup comes from the same `gh pr view` above, which is one GraphQL call. The first version
+// asked `gh run list` instead — a second call, against the REST actions endpoint, which returned
+// HTTP 403 rate-limited mid-session and took the script down with an unhandled exception. A check
+// that cannot look must say it could not look; a stack trace says neither that nor "green".
+const checks = pr.statusCheckRollup ?? [];
+if (checks.length === 0) fail(`no check reported on ${head.slice(0, 7)}. A green claim needs a run.`);
+const unfinished = checks.filter((c) => c.status !== undefined && c.status !== "COMPLETED");
+if (unfinished.length > 0) {
+  for (const c of unfinished) process.stdout.write(`  ${c.name ?? c.context}: ${c.status}\n`);
+  fail(`${unfinished.length} check(s) on ${head.slice(0, 7)} have not finished.`);
+}
+const red = checks.filter((c) => {
+  const verdict = c.conclusion ?? c.state;
+  return verdict !== "SUCCESS" && verdict !== "SKIPPED" && verdict !== "NEUTRAL";
+});
 if (red.length > 0) {
-  for (const r of red) process.stdout.write(`  ${r.databaseId} ${r.workflowName}: ${r.conclusion}\n`);
-  fail(`${red.length} non-green run(s) on ${head.slice(0, 7)}.`);
+  for (const c of red) process.stdout.write(`  ${c.name ?? c.context}: ${c.conclusion ?? c.state}\n`);
+  fail(`${red.length} non-green check(s) on ${head.slice(0, 7)}.`);
 }
 
 process.stdout.write(
-  `\n  #${number} ${pr.title}\n  head ${head.slice(0, 7)} — ${finished.length} completed run(s), all green\n`,
+  `\n  #${number} ${pr.title}\n  head ${head.slice(0, 7)} — ${checks.length} check(s), all green\n`,
 );
 
 if (dryRun) {
