@@ -591,6 +591,37 @@ const GUARDS = [
     replace: "    if (where === null) keys.push(columns);",
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
+  {
+    // Four conditions decide whether a repeated receipt is a redelivery or a second claim, and
+    // replacing any one with `true` broke no test — `CONVERSATION_TURN_RECEIPT_REUSED` appeared
+    // in none.
+    what: "a receipt redelivered onto a different turn is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          already.turn_request_id === permit.turnRequestId &&",
+    replace: "          true &&",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
+    what: "a receipt redelivered with a different outcome is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          already.observed_outcome === observation.outcome &&",
+    replace: "          true &&",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
+    what: "a receipt redelivered with different evidence is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          already.evidence_digest === observation.evidenceDigest &&",
+    replace: "          true &&",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
+  {
+    what: "a receipt redelivered with a different reason code is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          already.reason_code === observation.reasonCode;",
+    replace: "          true;",
+    killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
