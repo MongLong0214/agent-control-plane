@@ -366,11 +366,18 @@ export class IngressGuard {
    */
   claimTurn(channel: string, nonce: string, identity: TurnIdentity): Decision<TurnClaim> {
     return this.db.tx(() => {
-      const current = this.db.get<{ turn_claim_json: string | null }>(
-        `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+        `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
         [channel, nonce],
       );
-      if (current && current.turn_claim_json === null) {
+      // Both conditions, and they say different things. `turn_claim_json IS NULL` is "nobody has
+      // taken this turn"; `isClaimable` is "this message is in a state recovery would re-run", and
+      // claiming exactly what recovery would otherwise re-run is the mechanism that stops a handler
+      // executing twice. Dropping the second when the claim moved to its own column would have
+      // permitted a claim on a message whose reply was already applied — unreachable today because
+      // `admit` refuses that replay first, which is precisely the kind of reachability argument
+      // this file has had to withdraw twice.
+      if (current && current.turn_claim_json === null && isClaimable(current.result_json)) {
         // The identity is written in the same statement as the claim, inside the same
         // transaction. Recording them separately leaves a window where a crash produces a row
         // that is claimed but says nothing about what it claimed — a fourth state, and one
