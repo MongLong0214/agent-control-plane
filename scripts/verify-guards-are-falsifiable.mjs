@@ -44,6 +44,45 @@ const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
  * that list must be claimed by some row. `find` must match its file exactly once — a mutation
  * with two homes is a mutation that is not about a specific guard.
  */
+/**
+ * A `killedBy` entry, which may name a file or one test inside it (`path::test name`).
+ *
+ * File granularity was the default and it credits a row with a kill it did not earn. Found by an
+ * independent review on 2026-08-22 and reproduced: the row "evidence that cannot set the outcome
+ * still counts against a retry" mutates the *consistency* computation, and the retry test it is
+ * named for kept passing — an independent completion count refuses that retry. What died was a
+ * different test in the same file, and because the harness reads any failure in the named file as
+ * a kill, the row reported retry coverage it never had.
+ *
+ * That is the defect this whole harness exists to find, in the harness's own attribution.
+ */
+const splitKilledBy = (entry) => {
+  const at = entry.indexOf("::");
+  return at === -1 ? { path: entry, name: null } : { path: entry.slice(0, at), name: entry.slice(at + 2) };
+};
+
+/**
+ * `vitest run` arguments for a row's `killedBy`.
+ *
+ * `-t` filters by test name across every file in the run, so a row naming one test in one file is
+ * run as that pair. Mixing a named test with a bare file in one row would apply the filter to both
+ * and silently narrow the bare one, so that combination is refused rather than run.
+ */
+const vitestArgsFor = (killedBy) => {
+  const parts = killedBy.map(splitKilledBy);
+  const named = parts.filter((p) => p.name !== null);
+  if (named.length === 0) return parts.map((p) => p.path);
+  if (named.length !== parts.length) {
+    throw new Error(
+      `killedBy mixes a named test with a bare file (${killedBy.join(", ")}); -t would narrow both`,
+    );
+  }
+  if (new Set(named.map((p) => p.name)).size > 1) {
+    throw new Error(`killedBy names more than one test (${killedBy.join(", ")}); -t takes one pattern`);
+  }
+  return [...parts.map((p) => p.path), "-t", named[0].name];
+};
+
 const GUARDS = [
   {
     // Measured on the head that merged the ledger: all three fields were NOT NULL and empty was
@@ -52,14 +91,18 @@ const GUARDS = [
     file: "src/conversation/turn-coordinator.ts",
     find: "      if (blank.length > 0) {",
     replace: "      if (false) {",
-    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses a settlement that cites nothing, in the coordinator and in the table",
+    ],
   },
   {
     what: "the observation table refuses an unevidenced row, not only the coordinator",
     file: "src/db/schema.sql",
     find: "  CHECK (receipt_id <> '' AND evidence_digest <> '' AND reason_code <> ''),",
     replace: "",
-    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses a settlement that cites nothing, in the coordinator and in the table",
+    ],
   },
   {
     what: "an acceptance realm path that resolves inside production is refused",
@@ -457,12 +500,18 @@ const GUARDS = [
     // stands in its place is that evidence unable to *set* the outcome still counts against a
     // retry — the hole a review found, where an ACP-observed reply was invisible both as a
     // winner and as dissent, so a later weaker record settled the turn retry-safe.
-    what: "evidence that cannot set the outcome still counts against a retry",
+    // Renamed after an independent review showed the old name was wider than the mutation. It
+    // said "still counts against a retry" and the retry test kept passing — the completion count
+    // below refuses that retry on its own. What the mutation actually kills is the consistency
+    // computation, so that is what the row now claims, and it names the test rather than the file.
+    what: "an observation that cannot set the outcome still counts as dissent",
     file: "src/conversation/turn-coordinator.ts",
     find: "    const distinct = new Set(unanswered.map((o) => o.observed_outcome));",
     replace:
       "    const distinct = new Set(unanswered.filter((o) => MATERIALIZING_AUTHORITIES.has(o.observing_authority)).map((o) => o.observed_outcome));",
-    killedBy: ["tests/unit/turn-coordinator.test.ts"],
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::raises the disagreement rather than reporting it as consistent",
+    ],
   },
   {
     what: "only the materializer may settle a turn, so an ordinary UPDATE cannot forge one",
@@ -994,10 +1043,11 @@ if (anchorsOnly) {
     // `killedBy` file makes its rows report a kill forever, having run no test at all. Found by a
     // review, which is the same way the anchor half was found.
     for (const test of guard.killedBy) {
-      if (!existsSync(join(ROOT, test))) {
+      const { path: testPath } = splitKilledBy(test);
+      if (!existsSync(join(ROOT, testPath))) {
         dead.push({
           guard,
-          why: `killedBy names ${test}, which does not exist — vitest exits non-zero for a missing path, so this row reports a kill it never ran`,
+          why: `killedBy names ${testPath}, which does not exist — vitest exits non-zero for a missing path, so this row reports a kill it never ran`,
         });
       }
     }
@@ -1267,7 +1317,7 @@ try {
     ours(path, original, guard.file, "before mutating");
     const mutated = original.replace(guard.find, guard.replace);
     writeFileSync(path, mutated);
-    const done = spawnSync(VITEST, ["run", ...guard.killedBy, "--reporter=dot"], {
+    const done = spawnSync(VITEST, ["run", ...vitestArgsFor(guard.killedBy), "--reporter=dot"], {
       cwd: ROOT,
       encoding: "utf8",
       env: { ...process.env, CI: "" },
