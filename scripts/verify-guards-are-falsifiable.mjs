@@ -85,6 +85,17 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // The tool that inherits the records writes one paragraph per source commit, and git stores
+    // only the last. Without the collapse the merge path preserves nothing it claims to.
+    what: "the inherited records are collapsed into one block git will keep",
+    file: "scripts/lib/collapse-trailer-paragraphs.mjs",
+    find: "  const paragraphs = message.split(/\\n{2,}/);",
+    replace: "  return message;",
+    killedBy: [
+      "tests/process/the-merge-path-carries-the-record.test.ts::joins the per-commit paragraphs squash-preserve writes",
+    ],
+  },
+  {
     // Measured on the head that merged the ledger: all three fields were NOT NULL and empty was
     // allowed, so a settlement could say COMPLETED and cite nothing.
     what: "a settlement that carries no receipt, evidence or reason is refused",

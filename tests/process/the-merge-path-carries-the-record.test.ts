@@ -4,6 +4,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { collapseTrailerParagraphs } from "../../scripts/lib/collapse-trailer-paragraphs.mjs";
 
 afterAll(cleanupTempDirs);
 
@@ -18,9 +19,9 @@ afterAll(cleanupTempDirs);
  * reads only the **last paragraph** as trailers, so all but the final commit's records are dropped
  * by the merge itself:
  *
- *     8ab3342   3 branch records   3 survived
- *     108ab1a  11 branch records   0 survived
- *     74c37fa  30 branch records   0 survived   (32 commits)
+ *     8ab3342   19 record lines on the branch    3 stored by the merge
+ *     108ab1a   30                                0
+ *     74c37fa   83                                0        (32 commits)
  *
  * The range check reported all three clean. It looked for a continuation line directly after a
  * trailer, which cannot see a trailer sitting in a paragraph that is not the last one — a check
@@ -112,6 +113,51 @@ describe("the trailer check sees what git stores, not what the message looks lik
     );
     expect(out.status).toBe(2);
     expect(out.stdout).toContain("nothing was examined");
+  });
+});
+
+describe("the inherited records are collapsed into one block git will keep", () => {
+  it("joins the per-commit paragraphs squash-preserve writes", () => {
+    // What `commitlore squash-preserve --message-file` actually produces: one paragraph per source
+    // commit, each closed by its own `Provenance:` line. Measured on #667 — the tool whose job is
+    // to preserve the records emitted a message that loses all but the last commit's.
+    const preserved = [
+      "merge subject",
+      "",
+      "what the branch did.",
+      "",
+      "Limit: the first commit's record.",
+      "Provenance: inherited aaaaaaa",
+      "",
+      "Limit: the second commit's record.",
+      "Ruled-out: an alternative | why not",
+      "Provenance: inherited bbbbbbb",
+      "",
+    ].join("\n");
+
+    const collapsed = collapseTrailerParagraphs(preserved);
+
+    expect(collapsed).toContain("the first commit's record.\nProvenance: inherited aaaaaaa\nLimit:");
+    // The property, stated where it can fail: git keeps every line, and each record still precedes
+    // the provenance it belongs to.
+    const parsed = spawnSync("git", ["interpret-trailers", "--parse"], {
+      cwd: ROOT,
+      encoding: "utf8",
+      input: collapsed,
+    }).stdout;
+    expect(parsed.split("\n").filter((l) => /^(Limit|Ruled-out|Provenance):/.test(l))).toHaveLength(5);
+  });
+
+  it("leaves a message whose records are already one block alone", () => {
+    const one = "subject\n\nbody\n\nLimit: one\nRuled-out: two | three\n";
+    expect(collapseTrailerParagraphs(one)).toBe(one);
+  });
+
+  it("does not join paragraphs that are not all trailers", () => {
+    // A prose paragraph between two trailer blocks means the earlier block is already lost, and
+    // joining across it would move prose into the trailer block rather than report the loss.
+    const mixed = "subject\n\nLimit: stranded\n\nprose that ends the block\n\nLimit: kept\n";
+    expect(collapseTrailerParagraphs(mixed)).toBe(mixed);
   });
 });
 

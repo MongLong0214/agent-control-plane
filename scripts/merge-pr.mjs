@@ -11,9 +11,9 @@
  * commit message, and git reads only the **last paragraph** as the trailer block, so all but the
  * final commit's records are dropped by the merge itself. Across the three merges on `main`:
  *
- *     8ab3342   3 branch records   3 survived
- *     108ab1a  11 branch records   0 survived
- *     74c37fa  30 branch records   0 survived   (32 commits)
+ *     8ab3342   19 record lines on the branch    3 stored by the merge
+ *     108ab1a   30                                0
+ *     74c37fa   83                                0        (32 commits)
  *
  * Nothing reported it. The previous range check looked for a continuation line directly after a
  * trailer and could not see a trailer sitting in a paragraph that was not the last one.
@@ -46,6 +46,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { collapseTrailerParagraphs } from "./lib/collapse-trailer-paragraphs.mjs";
+
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const run = (file, args, input) =>
   execFileSync(file, args, { cwd: ROOT, encoding: "utf8", ...(input === undefined ? {} : { input }) });
@@ -76,8 +78,6 @@ const pr = JSON.parse(
   run("gh", ["pr", "view", number, "--json", "mergeable,mergeStateStatus,headRefOid,baseRefOid,state,title"]),
 );
 if (pr.state !== "OPEN") fail(`#${number} is ${pr.state}.`);
-if (pr.mergeable !== "MERGEABLE") fail(`#${number} is ${pr.mergeable}.`);
-if (pr.mergeStateStatus !== "CLEAN") fail(`#${number} merge state is ${pr.mergeStateStatus}, not CLEAN.`);
 
 const head = pr.headRefOid;
 
@@ -93,6 +93,11 @@ try {
   fail("could not inherit the branch's records onto the merge message.");
 }
 
+// The tool that inherits the records writes them as one paragraph per source commit, which git
+// stores only the last of. Collapsed here, before the check below is asked whether git will keep
+// what results.
+writeFileSync(draft, collapseTrailerParagraphs(readFileSync(draft, "utf8")));
+
 // 3. What results, against git's own parser, before it becomes a commit nobody may rewrite.
 try {
   process.stdout.write(run("node", ["scripts/verify-trailers-are-parsable.mjs", "--message-file", draft]));
@@ -106,6 +111,13 @@ const inherited = composed.split("\n").filter((l) => /^(Limit|Ruled-out|Warn|Sup
 process.stdout.write(`  ${inherited.length} record line(s) will be stored on the merge commit\n`);
 const bodyOut = `${draft}.body`;
 writeFileSync(bodyOut, composed.split("\n").slice(2).join("\n"));
+
+// 4. Only now the mergeability gates. They come after the message on purpose: the message is the
+//    part that becomes history nobody may rewrite, and a PR sitting at BLOCKED while CI runs is
+//    exactly when you want to know the body is wrong — checking it last means a dry run against a
+//    pending PR reports the merge state and never looks at the message at all.
+if (pr.mergeable !== "MERGEABLE") fail(`#${number} is ${pr.mergeable}.`);
+if (pr.mergeStateStatus !== "CLEAN") fail(`#${number} merge state is ${pr.mergeStateStatus}, not CLEAN.`);
 const runs = JSON.parse(
   run("gh", ["run", "list", "--commit", head, "--limit", "20", "--json", "conclusion,status,databaseId,workflowName"]),
 );
