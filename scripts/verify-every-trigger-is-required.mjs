@@ -27,6 +27,37 @@ const required = new Set([...migrations.matchAll(/\{ name: "(\w+)", sentinel:/g)
 
 const unwatched = declared.filter((name) => !required.has(name));
 
+/**
+ * A registry entry claiming a schema version has to be installed by that version's migration.
+ *
+ * `assertLoadBearingInvariants` skips an entry whose `introducedIn` exceeds the database's
+ * version. Claim a version too high and the trigger is never required on the databases that do
+ * have it; claim one too low and a legitimately older database is refused for missing something
+ * its version never installed. Neither shows up as an absent trigger, which is all the check above
+ * can see — and two hand-written lists disagreeing is this branch's most repeated defect.
+ */
+const installedByV26 = new Set(
+  ["PROVENANCE_NO_REPLACE_TRIGGERS", "LEDGER_TRIGGER_NAMES"].flatMap((constant) => {
+    const body = new RegExp(`${constant}[^=]*= \\[([\\s\\S]*?)\\n\\];`).exec(migrations);
+    return body === null ? [] : [...body[1].matchAll(/"(\w+)"/g)].map((m) => m[1]);
+  }),
+);
+const claimedAt26 = [...migrations.matchAll(/\{ name: "(\w+)", sentinel: "[^"]*", introducedIn: 26 \}/g)].map(
+  (m) => m[1],
+);
+const unclaimed = claimedAt26.filter((name) => !installedByV26.has(name));
+
+if (unclaimed.length > 0) {
+  for (const name of unclaimed) {
+    process.stdout.write(
+      `  ${name} is required from schema version 26 and v26 does not install it.\n` +
+        "    Databases at 26 would be refused for missing a trigger nothing gave them.\n",
+    );
+  }
+  process.stdout.write(`\nRESULT: FAIL — ${unclaimed.length} entr(y/ies) claim a version that does not install them.\n`);
+  process.exit(1);
+}
+
 if (unwatched.length > 0) {
   for (const name of unwatched) {
     process.stdout.write(

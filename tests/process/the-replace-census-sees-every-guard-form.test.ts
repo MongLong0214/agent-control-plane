@@ -223,3 +223,24 @@ END;
     expect(done.status).toBe(0);
   });
 });
+
+describe("a registry entry names a version that installs it", () => {
+  it("fails when an entry is required from a version whose migration does not install it", () => {
+    // `assertLoadBearingInvariants` skips an entry whose `introducedIn` exceeds the database's
+    // version. Claim too high and the trigger is never required where it exists; claim too low and
+    // an older database is refused for missing something its version never installed. Neither is
+    // an absent trigger, which is all the other check can see.
+    const repo = scratchRepo();
+    copyFileSync(join(ROOT, REGISTRY), join(repo, REGISTRY));
+    const migrations = join(repo, "src/db/migrations.ts");
+    writeFileSync(
+      migrations,
+      readFileSync(join(ROOT, "src/db/migrations.ts"), "utf8").replace('  "sessions_no_replace",\n', ""),
+    );
+
+    const done = spawnSync("node", [REGISTRY], { cwd: repo, encoding: "utf8" });
+
+    expect(done.stdout).toContain("sessions_no_replace");
+    expect(done.status).toBe(1);
+  });
+});
