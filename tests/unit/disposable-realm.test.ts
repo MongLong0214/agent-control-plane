@@ -13,6 +13,7 @@ import {
   REALM_EVIDENCE_CLAIM,
   assertProductionUnchanged,
   censusDatabaseFamily,
+  censusProduction,
   censusProductionEntries,
   classifyProbeSignal,
   mayTerminate,
@@ -986,5 +987,47 @@ describe("listing production is a read that can fail", () => {
     expect(decision.allowed).toBe(true);
     if (!decision.allowed) return;
     expect(decision.value).toEqual([]);
+  });
+});
+
+describe("a census is taken whole or not at all", () => {
+  const records = { actorIds: ["a"], bindingGenerations: ["CEO:1"], assignmentIds: ["x"] };
+
+  it("fills every field the comparison reads", () => {
+    // Four fields, four ways production can change. A caller assembling the object literal is how
+    // the next one gets left out — and a census missing a field is not a smaller census, it is a
+    // comparison reporting "unchanged" about something it never looked at.
+    const root = join(tempDir("acp-census-whole-"), "production");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, "state.sqlite"), "x");
+
+    const taken = censusProduction(root, records);
+
+    expect(taken.allowed).toBe(true);
+    if (!taken.allowed) return;
+    expect(Object.keys(taken.value).sort()).toEqual([
+      "actorIds",
+      "assignmentIds",
+      "bindingGenerations",
+      "databaseFamily",
+      "productionEntries",
+    ]);
+    expect(taken.value.productionEntries).toContain("state.sqlite");
+  });
+
+  it("refuses the whole census when either read fails", () => {
+    // Half a census is worse than none: it compares equal on the half it has.
+    const root = join(tempDir("acp-census-unreadable-whole-"), "production");
+    mkdirSync(root, { recursive: true });
+    chmodSync(root, 0o000);
+    try {
+      const taken = censusProduction(root, records);
+
+      expect(taken.allowed).toBe(false);
+      if (taken.allowed) return;
+      expect(taken.reasonCode).toBe(ReasonCode.ACCEPTANCE_CENSUS_UNOBSERVABLE);
+    } finally {
+      chmodSync(root, 0o700);
+    }
   });
 });

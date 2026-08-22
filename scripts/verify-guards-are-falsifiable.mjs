@@ -602,6 +602,14 @@ const GUARDS = [
     replace: '    return allow(ReasonCode.OK, []);',
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
+  {
+    // Half a census compares equal on the half it has.
+    what: "a census that could not read production is refused rather than returned partial",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "  if (!entries.allowed) return entries;",
+    replace: "  if (false) return entries;",
+    killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

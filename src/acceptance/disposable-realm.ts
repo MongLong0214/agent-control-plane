@@ -327,6 +327,34 @@ const settled = (path: string): string => {
 };
 
 /**
+ * Takes the whole census, so a caller cannot take part of one.
+ *
+ * `ProductionCensus` has four fields and every one of them is a different way production can
+ * change. Assembling it by hand is four opportunities to leave one out — and a census missing a
+ * field is not a smaller census, it is a comparison that reports "unchanged" about something it
+ * never looked at. The field added most recently exists precisely because two escapes were
+ * invisible to the three that came before it.
+ *
+ * Nothing in this repository builds one yet: this is the safety half, and the driver that will use
+ * it is a later change. That is exactly why the constructor is here now rather than left for that
+ * change to write — a caller assembling the object literal is how the next field gets forgotten.
+ */
+export const censusProduction = (
+  productionRoot: string,
+  records: Pick<ProductionCensus, "actorIds" | "bindingGenerations" | "assignmentIds">,
+): Decision<ProductionCensus> => {
+  const entries = censusProductionEntries(productionRoot);
+  if (!entries.allowed) return entries;
+  const family = censusDatabaseFamily(join(productionRoot, "state.sqlite"));
+  if (!family.allowed) return family;
+  return allow(ReasonCode.OK, {
+    ...records,
+    productionEntries: entries.value,
+    databaseFamily: family.value,
+  });
+};
+
+/**
  * Whether this realm is separate from production in every way that matters.
  *
  * Checked by resolved path rather than by declared path, because a symlink into production is
