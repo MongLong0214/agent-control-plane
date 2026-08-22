@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 28;
+export const SCHEMA_VERSION = 29;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -132,6 +132,10 @@ export const LEDGER_TRIGGER_NAMES: readonly string[] = [
     "canonical_turn_observations_append_only",
     "canonical_turn_observations_no_delete",
     "canonical_turn_observations_no_replace",
+    "canonical_turn_dispatches_write_authority",
+    "canonical_turn_dispatches_append_only",
+    "canonical_turn_dispatches_no_delete",
+    "canonical_turn_dispatches_no_replace",
     "canonical_turn_sources_immutable",
     "canonical_turn_sources_no_delete",
     "canonical_turn_sources_no_replace",
@@ -1730,6 +1734,12 @@ export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
   raw.exec(canonicalTurnsIndexDdl());
 };
 
+const dispatchesDdl = (): string =>
+  schemaObject(
+    /CREATE TABLE IF NOT EXISTS canonical_turn_dispatches \([\s\S]*?\n\);/,
+    "the dispatches table",
+  );
+
 const observationsIndexDdl = (): string =>
   schemaObject(
     /CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn[^;]*;/,
@@ -1951,6 +1961,26 @@ const v28: SchemaMigration = {
     ),
 };
 
+/**
+ * Records which turns were dispatched, so an authority's claim can be checked rather than believed.
+ *
+ * `ports.preDispatch.neverAdmitted` says nothing ran, and it was reachable after a dispatch exactly
+ * as easily as before one — the retry rule then admits attempt 2 while attempt 1 may still commit.
+ * Signing the outcome into the permit does not close that: a caller would hold a signature for
+ * every outcome it might report and choose one. The phase is checkable and the outcome is not,
+ * because the ledger can watch the phase happen. #662.
+ */
+const v29: SchemaMigration = {
+  id: "v29-a-dispatch-is-a-fact",
+  fromVersion: 28,
+  toVersion: 29,
+  apply: (raw) => {
+    raw.exec(dispatchesDdl());
+    raw.exec(ledgerTriggerDdl());
+  },
+  checksum: () => sha256(`v29-a-dispatch-is-a-fact\n${dispatchesDdl()}\n${ledgerTriggerDdl()}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -1969,6 +1999,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v26,
   v27,
   v28,
+  v29,
 ]);
 
 interface RequiredTrigger {
@@ -2051,6 +2082,10 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "canonical_turn_adjudication_citations_append_only", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY", introducedIn: 25 },
   { name: "canonical_turn_adjudication_citations_no_delete", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_APPEND_ONLY", introducedIn: 25 },
   { name: "canonical_turn_adjudication_citations_same_turn", sentinel: "CANONICAL_TURN_ADJUDICATION_CITATION_FOREIGN", introducedIn: 25 },
+  { name: "canonical_turn_dispatches_write_authority", sentinel: "CANONICAL_TURN_DISPATCH_AUTHORITY_DENIED", introducedIn: 29 },
+  { name: "canonical_turn_dispatches_append_only", sentinel: "CANONICAL_TURN_DISPATCH_IMMUTABLE", introducedIn: 29 },
+  { name: "canonical_turn_dispatches_no_delete", sentinel: "CANONICAL_TURN_DISPATCH_IMMUTABLE", introducedIn: 29 },
+  { name: "canonical_turn_dispatches_no_replace", sentinel: "CANONICAL_TURN_DISPATCH_NO_REPLACE", introducedIn: 29 },
   { name: "canonical_turns_no_replace", sentinel: "CANONICAL_TURN_NO_REPLACE", introducedIn: 25 },
   { name: "canonical_turn_observations_no_replace", sentinel: "CANONICAL_TURN_OBSERVATION_NO_REPLACE", introducedIn: 25 },
   { name: "canonical_turn_sources_no_replace", sentinel: "CANONICAL_TURN_SOURCE_NO_REPLACE", introducedIn: 25 },

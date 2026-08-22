@@ -1669,6 +1669,63 @@ CREATE TABLE IF NOT EXISTS canonical_turn_observations (
                                     'OPERATOR_AFTER_REVIEW')))
 );
 
+-- ---------------------------------------------------------------------------
+-- canonical_turn_dispatches
+--
+-- Which turns were dispatched, so an authority's claim can be checked against a fact instead of
+-- taken as its word.
+--
+-- `ports.preDispatch.neverAdmitted` says nothing ran, and until this table existed it was reachable
+-- after a dispatch exactly as easily as before one — the retry rule then admits attempt 2 while
+-- attempt 1 may still commit, which is the duplicate the ledger exists to prevent (#662). Signing
+-- the outcome into the permit does not close it: the caller would hold a signature for every
+-- outcome it might report and pick one. **The phase is checkable and the outcome is not**, because
+-- the ledger can watch the phase happen.
+--
+-- One row per turn, so the primary key is the turn. A second dispatch of the same turn is a second
+-- delivery of the owner's message, and it is refused here rather than counted.
+CREATE TABLE IF NOT EXISTS canonical_turn_dispatches (
+  turn_request_id  TEXT PRIMARY KEY REFERENCES canonical_turns(turn_request_id),
+  dispatched_at    TEXT NOT NULL,
+  audit_event_id   INTEGER NOT NULL REFERENCES audit_events(event_id)
+);
+
+-- CP-HI-06 — only the materializer writes the ledger, here for the same reason as the observations:
+-- a row a caller can insert is a claim, and this table exists to stop claims being self-certifying.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_dispatches_write_authority
+BEFORE INSERT ON canonical_turn_dispatches
+WHEN acp_turn_materialization_authorized(NEW.turn_request_id) <> 1
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_DISPATCH_AUTHORITY_DENIED');
+END;
+
+-- CP-HI-06 — a dispatch happened or it did not. Editing the row rewrites which phase the turn was
+-- in, which is the whole thing the ports read it for.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_dispatches_append_only
+BEFORE UPDATE ON canonical_turn_dispatches
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_DISPATCH_IMMUTABLE');
+END;
+
+-- CP-HI-06 — deleting it turns a dispatched turn back into one that never started, which is exactly
+-- the false `NEVER_ADMITTED` this table was added to refuse.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_dispatches_no_delete
+BEFORE DELETE ON canonical_turn_dispatches
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_DISPATCH_IMMUTABLE');
+END;
+
+-- CP-HI-06 — `INSERT OR REPLACE` deletes the conflicting row before inserting, so it walks past
+-- both guards above. The predicate names this table's only uniqueness constraint.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_dispatches_no_replace
+BEFORE INSERT ON canonical_turn_dispatches
+WHEN EXISTS (
+  SELECT 1 FROM canonical_turn_dispatches WHERE turn_request_id = NEW.turn_request_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_DISPATCH_NO_REPLACE');
+END;
+
 CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn
   ON canonical_turn_observations(turn_request_id, observation_id);
 
