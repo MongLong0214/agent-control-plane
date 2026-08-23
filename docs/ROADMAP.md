@@ -60,6 +60,25 @@ These are timestamped evidence, not counters to maintain by hand.
   upstream #91434).
 - The current evidence manifests are stale, so none authorizes a live cutover.
 
+### Exact-source implementation baseline
+
+Current-source reconnaissance found usable primitives but no end-to-end canonical ingress:
+
+- the Gateway has read-only session lookup, a routing-key agent cache, a session-ID turn lease, and an
+  authenticated/body-limited API listener;
+- it has no canonical-surface binding registry, existing-only bound-turn endpoint, request-local reply
+  sink, or durable `(binding,event_id)` ledger;
+- the native Buzz adapter derives a Buzz routing key and therefore creates a different session on a
+  cache/store miss;
+- the current ACP CEO runtime spawns an external child command per turn and accepts a configured
+  session identifier, so it does not reuse the running Gateway's cached agent and is not targetless;
+- the implementation base is pinned to upstream Hermes commit
+  `4621a2d699daeaa92efb93dae9db076308cbe823`; a divergent working checkout and historical live binding
+  seals are not implementation authority.
+
+The first implementation slice therefore starts in disposable state and proves one event against a
+seeded existing session/cache/lease. It must not hard-code or rediscover a live owner binding.
+
 ### Explicit decoupling of #638
 
 A durable Hermes terminal receipt is required before production-ready closeout, but it is **not an
@@ -72,70 +91,86 @@ never auto-retried. This preserves at-most-once safety while canonical identity 
 No later lane may be pulled ahead merely because its implementation is easier. Read-only preparation
 may run in parallel; no second writer may alter the canonical CEO substrate.
 
-### C0 — freeze the fork and authority
+### C0 — freeze the fork and disposable authority
 
 1. Keep the legacy Buzz bridge quarantined as a known fork; do not relabel it canonical.
-2. Freeze the current canonical CEO actor key, transcript root, binding generation, and legacy Buzz
-   child identity from exact source/artifacts.
+2. Pin the current-source implementation base and the exact legacy child-creation chain.
 3. Reconcile #596's still-open bootstrap lifecycle with #627's recorded CEO binding before any live
    bootstrap action. Do not repeat bootstrap to repair documentation drift.
-4. Seal one migration rule for forked history and pending work: detect conflict, preserve both inputs,
-   and refuse silent merge or overwrite.
+4. In disposable state, seed an existing Telegram routing entry, session row, cached agent, and lease
+   target. Do not copy a historical live binding into configuration.
+5. Seal one later migration rule for forked history and pending work: detect conflict, preserve both
+   inputs, and refuse silent merge or overwrite.
 
-**Exit:** one signed authority packet names the existing canonical CEO target and the prohibited
-legacy child-creation path.
+**Exit:** one authority packet names the pinned implementation base, the disposable existing target,
+and the prohibited legacy child-creation path.
 
-### C1 — stable admission and fencing
+### C1 — VS1 targetless existing-only bound-turn kernel
 
-Close the smallest contract shared by both transports:
+Build the narrow server-side execution seam before transport migration:
 
-1. stable external event ID, canonical actor key, channel/thread origin, and request digest;
-2. binding generation plus actor fence on every create/renew/finish transition (#639, #664);
-3. one canonical top-level turn per admitted event;
+1. authenticated request schema accepts only a binding name, stable event ID, author/channel origin,
+   and text;
+2. caller-supplied session ID/key, route, platform, chat target, or user target is rejected before any
+   agent/session contact;
+3. server-side binding resolves one existing routing entry and session row without create, reset,
+   switch, fork, resume-child, or recovery fallback;
+4. the exact session-ID lease is acquired before history load;
+5. the exact routing-key cached agent is reused; cache miss fails closed instead of constructing one;
+6. one request appends one user row and one terminal assistant chain and returns the same event ID;
+7. pre/post session-ID set and existing row identity remain unchanged.
+
+The behavioral RED must use disposable state, raising spies on every constructor/create/reset/switch/
+fork path, and object-identity assertions on the cached agent.
+
+**Exit:** one synthetic Buzz-shaped event executes one turn on the seeded existing CEO target while all
+new-session and new-agent counters remain zero. This is isolated evidence only.
+
+### C2 — request-local reply sink
+
+Separate conversational execution from transport delivery:
+
+1. add a turn-local terminal reply capability that is bound to the admitted event;
+2. keep Telegram transport references out of Buzz-originated execution and Buzz transport references
+   out of the canonical transcript-root/conversational-actor identity;
+3. stream/progress/clarification paths without a safe sink fail closed in this slice;
+4. wrong event, channel, thread, or reused sink cannot receive the terminal response;
+5. sink failure records a durable reply obligation without replaying the model turn.
+
+**Exit:** the same canonical turn can return to its originating event without changing the actor's
+routing identity or invoking a second platform adapter.
+
+### C3 — durable admission, reconciliation, and delivery
+
+Close the shared durability contract before replacing the wrapper:
+
+1. stable external event ID, binding, origin route, request digest, and binding generation/fence
+   (#639, #664);
+2. single-flight ingress guard (#630);
+3. durable inbox before cursor advance (#631);
 4. duplicate ID with identical digest returns prior state; digest conflict fails closed;
-5. final delivery route is bound to the originating event and cannot be caller-retargeted;
-6. ambiguous downstream completion is `UNKNOWN/BLOCKED`, not an automatic replay.
+5. restart reconciliation plus durable reply outbox (#632, #641);
+6. owner-visible blocked/resend semantics (#650);
+7. settlement truth remains distinct from transport success (#660, #662, #666);
+8. ambiguous downstream completion remains `UNKNOWN/BLOCKED` with no automatic replay;
+9. restart/duplicate/process-crash acceptance matrix (#672, #673).
 
-**Exit:** a fresh process cannot admit the same event twice or route its result to a different target.
+**Exit:** the event and its delivery obligation survive restart without a second conversational turn or
+a retargeted reply.
 
-### C2 — durable ingress before cursor
+### C4 — model-free Buzz façade and offline wrapper migration
 
-Implement in dependency order:
+1. consume addressed events through an agent-independent durable relay subscription (#674);
+2. call C1–C3 with preserved event identity and origin route;
+3. remove `hermes acp` child/session ownership from the bridge path (#627);
+4. remove command/config session targeting and any child-model lifecycle from the façade;
+5. write owner-visible correlation/ACK/verdict/reply journal entries;
+6. deliver through the outbox to the originating Buzz channel/thread;
+7. on dependency loss, persist `BLOCKED` and stop—never spawn a fallback CEO;
+8. prove the legacy wrapper is absent or disabled before live activation.
 
-1. single-flight ingress guard (#630);
-2. durable inbox admission before cursor advance (#631);
-3. restart reconciliation plus durable reply outbox (#632, #641);
-4. owner-visible blocked/resend semantics (#650);
-5. restart/duplicate/process-crash acceptance matrix (#672, #673);
-6. settlement truth remains distinct from transport success (#660, #662, #666).
-
-**Exit:** the event and its reply obligation survive restart without a second conversational turn.
-
-### C3 — targetless ingress into the existing CEO
-
-Replace client-owned session construction with authenticated targetless ingress:
-
-1. the client submits signed event identity and origin metadata, not a caller-selected CEO/session;
-2. server-side canonical binding resolves the sole CEO actor and current runtime generation;
-3. actor creation, bootstrap, session cloning, and arbitrary session resume are impossible on this
-   endpoint;
-4. admission uses the C1/C2 durable ID and fence;
-5. the turn appends to the existing transcript root and returns a terminal correlation handle;
-6. wrong generation, wrong actor, old binary, nonparticipant, or stale binding fails closed.
-
-**Exit:** one synthetic Buzz event appends one top-level turn to the pre-existing canonical CEO while
-actor/session creation count remains zero.
-
-### C4 — convert Buzz to a transport adapter
-
-1. remove `hermes acp` child/session ownership from the bridge path (#627);
-2. consume addressed events through an agent-independent durable relay subscription (#674);
-3. call C3 with the preserved event ID and origin route;
-4. write owner-visible correlation/ACK/verdict/reply journal entries;
-5. deliver through the outbox to the originating Buzz channel/thread;
-6. on dependency loss, persist `BLOCKED` and stop—never spawn a fallback CEO.
-
-**Exit:** the adapter owns transport and delivery metadata only.
+**Exit:** the adapter owns transport and delivery metadata only; model/session/process ownership stays
+inside the existing Gateway.
 
 ### C5 — isolated zero-new-session gate
 
