@@ -296,7 +296,8 @@ CommitLore are outside this program. Its Task 7 lane is coordination continuity 
 The transition gate is exactly the conjunction of:
 
 1. installed Buzz adapter/CLI purpose contract and live capture PASS;
-2. #512 full lifecycle across two repositories through `CEO_APPROVED` and daemon finalization;
+2. #512 full-lifecycle bring-up through `CEO_APPROVED` and daemon finalization; it does not claim
+   #240 ordered two-repository acceptance or #241 observation;
 3. #245's declared owner identities plus one durable owner-decision receipt through that declaration.
 
 Distinct CEO/CTO conversational Buzz-key binding is a separate Task 7 identity proof and must be tied to
@@ -309,9 +310,10 @@ current binding artifacts; #245 does not prove it by itself.
 1. declared owner identities plus one durable owner-decision receipt (#245);
 2. Repo Factory producer contract (#246);
 3. generated-repository migrations and service-owned integration;
-4. two-repository ordered merge acceptance (#240/#512);
-5. observation window across at least three real projects and thirty lifecycles (#241);
-6. final open-issue disposition and fresh independent closeout review.
+4. #512 full-lifecycle bring-up through daemon finalization;
+5. ordered two-repository merge acceptance (#240);
+6. observation window across at least three real projects and thirty lifecycles (#241);
+7. final open-issue disposition and fresh independent closeout review.
 
 Owner/API/interactive boundaries remain explicit. A closed prerequisite or successful command is not a
 live acceptance proof.
