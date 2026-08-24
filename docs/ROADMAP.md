@@ -3,6 +3,7 @@
 - **Reconciled:** 2026-08-24
 - **Document base:** `686281a897c44937bd40e1759decd95b76d63f49`
 - **Purpose:** dependency order and terminal acceptance only; live status remains in the issue tracker.
+- **Owner terminal deadline:** `2026-08-27 09:12 KST` (72-hour program war room; acceptance unchanged).
 
 ## 1. Authority and state model
 
@@ -33,7 +34,8 @@ program phases are:
 4. factory acceptance and observation;
 5. final closeout.
 
-Only the first outcome is WIP 1.
+The complete terminal outcome remains one program WIP. Independent responsibility units may execute in
+parallel only when their writable files, symbols, and transaction ownership are disjoint and explicit.
 
 ## 3. Reconciliation snapshot
 
@@ -91,8 +93,9 @@ bounded rollback path all pass on one integrated candidate.
 
 ## 4. WIP 1 — canonical CEO critical path
 
-No later lane may be pulled ahead merely because its implementation is easier. Read-only preparation
-may run in parallel; no second writer may alter the canonical CEO substrate.
+No later acceptance may be declared early merely because its implementation is easier. C1/C2, C3/C4,
+C5, and C6 may use separate writers on explicitly disjoint responsibility units; shared transaction or
+schema files have one integration owner. C7 and C8 remain ordered terminal gates.
 
 ### C0 — freeze the fork and disposable authority
 
@@ -230,7 +233,9 @@ Run the full gate from disposable state with a known canonical transcript and no
 
 ### C8 — owner-authorized live cutover and zero-new-session proof (#510)
 
-This gate requires a fresh owner authorization after C3–C7 pass on the same integrated candidate.
+The 2026-08-24 09:12 KST owner direction is conditional activation authority: execute this gate only
+after C3–C7 pass on the same integrated candidate, without another stepwise confirmation. It does not
+authorize a direct or force push, destructive deletion, or activation with a failed prerequisite.
 
 1. verify the #638/#639 receipt contract, writer denominator, recovery rehearsal, and legacy-wrapper
    removal are exact-head current;
@@ -255,6 +260,22 @@ This gate requires a fresh owner authorization after C3–C7 pass on the same in
 - restart → zero unexpected conversational actors, runtime generations, processes, or transcript rows;
 - forked pending work → zero silent merges or overwrites;
 - transport failure → zero fallback actor creation.
+
+### 72-hour execution checkpoints
+
+The owner replaced every September checkpoint with this bounded schedule:
+
+1. exact writer map and candidate selection — `2026-08-24 13:12 KST`;
+2. C1–C4 implementation candidates — `2026-08-24 23:12 KST`;
+3. C5 rollback/recovery and C6 façade candidate — `2026-08-25 21:12 KST`;
+4. integrated exact-head gate — `2026-08-26 09:12 KST`;
+5. C7 isolated canonical/four-actor rehearsal — `2026-08-26 21:12 KST`;
+6. C8 live cutover and three canonical-CTO canaries — `2026-08-27 05:12 KST`;
+7. factory acceptance, thirty lifecycle observations, issue disposition, and closeout receipt —
+   `2026-08-27 09:12 KST`.
+
+This compression removes duplicate gates and parallelizes non-overlapping writers. It does not waive
+receipt, crash, rollback, wrong-target, zero-shadow, independent-review, or exact-head evidence.
 
 ## 5. WIP 2 — Task 7 full four-actor cardinality
 
