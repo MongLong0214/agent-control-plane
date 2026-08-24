@@ -27,12 +27,11 @@ independent CEO, or accumulate a separate conversation history.
 This is narrower than the complete four-actor Task 7 outcome and takes priority over it. The next
 program phases are:
 
-1. canonical CEO;
-2. Hermes rollback/turn-receipt completion;
-3. remaining three canonical actors;
-4. Buzz transition proofs;
-5. factory acceptance and observation;
-6. final closeout.
+1. canonical CEO safe terminalization, including durable turn truth and activation rollback;
+2. remaining three canonical actors;
+3. Buzz transition proofs;
+4. factory acceptance and observation;
+5. final closeout.
 
 Only the first outcome is WIP 1.
 
@@ -57,7 +56,9 @@ These are timestamped evidence, not counters to maintain by hand.
 - Stable identity, fencing, ingress, reconciliation, outbox, settlement, and crash behavior remain
   open in #639, #664, #630, #631, #632, #641, #650, #660, #662, #666, and #672–#673.
 - ACP cannot yet prove a disconnected Hermes turn's terminal commit from a durable receipt (#638;
-  upstream #91434).
+  upstream #91434), and broad writer closure plus its executable guard remain open in #675–#676.
+- Canonical live cutover remains owner-gated in #510 and may not run before the receipt, crash, recovery,
+  wrapper-removal, and rollback prerequisites below pass on one integrated candidate.
 - The current evidence manifests are stale, so none authorizes a live cutover.
 
 ### Exact-source implementation baseline
@@ -79,12 +80,14 @@ Current-source reconnaissance found usable primitives but no end-to-end canonica
 The first implementation slice therefore starts in disposable state and proves one event against a
 seeded existing session/cache/lease. It must not hard-code or rediscover a live owner binding.
 
-### Explicit decoupling of #638
+### Safety interlock with #638 and #510
 
-A durable Hermes terminal receipt is required before production-ready closeout, but it is **not an
-identity prerequisite** for replacing the Buzz fork with the already-existing canonical CEO. Until
-#638 closes, any lost-connection ambiguity remains `UNKNOWN/BLOCKED`, is visible to the owner, and is
-never auto-retried. This preserves at-most-once safety while canonical identity is closed first.
+A targetless existing-only ingress can be built and proven in disposable state before receipt support,
+but canonical activation cannot. Hermes must first commit the #638 receipt atomically with the final
+assistant row and provide idempotent re-invocation; ACP must then match that receipt through #639 and
+preserve `OUTCOME_UNKNOWN` with `NO_AUTO_RETRY` whenever identity or outcome is unproved. The live
+cutover in #510 remains blocked until that contract, its writer/crash matrix, wrapper removal, and the
+bounded rollback path all pass on one integrated candidate.
 
 ## 4. WIP 1 — canonical CEO critical path
 
@@ -140,28 +143,61 @@ Separate conversational execution from transport delivery:
 **Exit:** the same canonical turn can return to its originating event without changing the actor's
 routing identity or invoking a second platform adapter.
 
-### C3 — durable admission, reconciliation, and delivery
+### C3 — durable Hermes receipt and ACP receipt authority
 
-Close the shared durability contract before replacing the wrapper:
+Close terminal-turn truth before any canonical activation:
 
-1. stable external event ID, binding, origin route, request digest, and binding generation/fence
-   (#639, #664);
-2. single-flight ingress guard (#630);
-3. durable inbox before cursor advance (#631);
-4. duplicate ID with identical digest returns prior state; digest conflict fails closed;
-5. restart reconciliation plus durable reply outbox (#632, #641);
-6. owner-visible blocked/resend semantics (#650);
-7. settlement truth remains distinct from transport success (#660, #662, #666);
-8. ambiguous downstream completion remains `UNKNOWN/BLOCKED` with no automatic replay;
-9. restart/duplicate/process-crash acceptance matrix (#672, #673).
+1. Hermes commits the final assistant row, `COMPLETED`, stable turn request ID, terminal message ID,
+   response digest, and binding/session identity in one transaction (#638; upstream #91434);
+2. re-invoking the same turn request ID returns that completion receipt only, with zero model, tool, or
+   duplicate assistant execution;
+3. ACP fixes the stable turn ID, prompt/session/binding digests, and binding generation before dispatch,
+   and never transitions to completed without a matching receipt (#639);
+4. absent, stale-generation, contradictory, or identity-mismatched evidence remains
+   `OUTCOME_UNKNOWN`; queue state is separately `BLOCKED`, and retry policy is `NO_AUTO_RETRY`;
+5. admission-correctness writes roll back on deny (#664);
+6. broad writer closure and its executable future-writer guard pass before the denominator is frozen
+   (#675–#676);
+7. crash-before/after-row/receipt, duplicate-ID, wrong-target, and stale-generation matrices prove the
+   row and receipt are visible together or not visible together.
 
-**Exit:** the event and its delivery obligation survive restart without a second conversational turn or
-a retargeted reply.
+**Exit:** a matched atomic receipt—not process exit, stdout, or transport success—is the only terminal
+completion authority.
 
-### C4 — model-free Buzz façade and offline wrapper migration
+### C4 — durable admission, reconciliation, settlement, and delivery
+
+1. single-flight execution leaves the poll loop without losing serialization (#630);
+2. durable inbox precedes cursor advance (#631), and completed-turn reconciliation closes #632;
+3. duplicate ID with identical digest returns prior state; digest conflict fails closed;
+4. a durable reply outbox preserves the exact origin route without replaying the model turn;
+5. owner resend is a deliberate decision path, not a text-equality shortcut (#641);
+6. `OUTCOME_UNKNOWN` is visible in doctor and metrics (#650);
+7. the S2–S7/direct-wiring state census is represented in the acceptance matrix (#660);
+8. settlement authority, contradiction escalation, and source/attestation truth close #662 and #666;
+9. unresolved-turn operator recovery and durable duplicate retention close #672–#673.
+
+**Exit:** event admission, conversational execution, terminal truth, and delivery obligation survive
+restart without a second turn, hidden settlement, or retargeted reply.
+
+### C5 — bounded rollback and recovery prerequisite
+
+Before live transport ownership changes:
+
+1. correct the seven blocking manifest-v2 producer/restore/public-log classes and obtain a fresh
+   independent exact-head PASS;
+2. seal and read back the corrected topic head;
+3. implement detached-artifact rollback output;
+4. implement the store-wide maintenance epoch and one-connection in-place rollback;
+5. prove wrong-target, unsafe-path, tamper, publication-failure, crash, and recovery matrices;
+6. rehearse restoration without touching unowned or live state.
+
+**Exit:** activation has one operator-usable, evidence-bound recovery path; a blocked candidate or green
+focused test is not a seal.
+
+### C6 — model-free Buzz façade and offline wrapper migration
 
 1. consume addressed events through an agent-independent durable relay subscription (#674);
-2. call C1–C3 with preserved event identity and origin route;
+2. call C1–C5 with preserved event identity and origin route;
 3. remove `hermes acp` child/session ownership from the bridge path (#627);
 4. remove command/config session targeting and any child-model lifecycle from the façade;
 5. write owner-visible correlation/ACK/verdict/reply journal entries;
@@ -172,9 +208,12 @@ a retargeted reply.
 **Exit:** the adapter owns transport and delivery metadata only; model/session/process ownership stays
 inside the existing Gateway.
 
-### C5 — isolated zero-new-session gate
+### C7 — isolated zero-new-session gate
 
-Run from disposable state with a known canonical transcript and no live owner traffic:
+Issue #655 may supply a disposable two-message transport observation, but it proves only that bounded
+noncanonical realm. It is not a receipt, duplicate, canonical-safety, or full C7 proof.
+
+Run the full gate from disposable state with a known canonical transcript and no live owner traffic:
 
 1. Telegram event → canonical CEO turn → Telegram reply;
 2. Buzz event → same CEO continuation → originating Buzz reply;
@@ -189,16 +228,20 @@ Run from disposable state with a known canonical transcript and no live owner tr
 
 **Exit:** `ISOLATED_CANONICAL_CEO_PASS`; live traffic remains disabled.
 
-### C6 — live cutover and zero-new-session proof
+### C8 — owner-authorized live cutover and zero-new-session proof (#510)
 
-1. backup current bridge/binding/correlation state;
-2. drain ingress and prove one consumer;
-3. atomically switch the Buzz adapter;
-4. send a fresh Telegram nonce followed by a Buzz continuation, then reverse direction;
-5. compare exact pre/post identity and transcript-root census;
-6. restart the bridge/relay and replay duplicate delivery;
-7. prove the legacy fork path cannot become fallback;
-8. retain a bounded rollback to the **blocked legacy transport**, never to an independent CEO.
+This gate requires a fresh owner authorization after C3–C7 pass on the same integrated candidate.
+
+1. verify the #638/#639 receipt contract, writer denominator, recovery rehearsal, and legacy-wrapper
+   removal are exact-head current;
+2. backup current bridge/binding/correlation state;
+3. drain ingress and prove one consumer;
+4. atomically switch the Buzz adapter;
+5. send a fresh Telegram nonce followed by a Buzz continuation, then reverse direction;
+6. compare exact pre/post identity and transcript-root census;
+7. restart the bridge/relay and replay duplicate delivery;
+8. prove the legacy fork path cannot become fallback;
+9. retain a bounded rollback to the **blocked legacy transport**, never to an independent CEO.
 
 **Terminal acceptance:**
 
@@ -213,24 +256,9 @@ Run from disposable state with a known canonical transcript and no live owner tr
 - forked pending work → zero silent merges or overwrites;
 - transport failure → zero fallback actor creation.
 
-## 5. WIP 2 — Hermes #638 rollback and terminal receipt
+## 5. WIP 2 — Task 7 full four-actor cardinality
 
-This lane starts after C6. A blocked candidate is not a seal.
-
-1. correct and independently re-review manifest-v2 producer/restore authority;
-2. seal the corrected exact head and verify fork topic-branch readback;
-3. implement detached-artifact rollback output;
-4. implement the store-wide maintenance epoch and one-connection in-place rollback;
-5. complete Hermes terminal turn receipt (#91434);
-6. complete ACP receipt consumption and fail-closed contradictions (#638);
-7. run exact-head rollback, disconnect, duplicate, crash, wrong-target, and public-safety gates.
-
-**Exit:** rollback is operator-usable, terminal commit truth is durable, and a matched receipt—not a
-transport outcome—authorizes completion.
-
-## 6. WIP 3 — Task 7 full four-actor cardinality
-
-After WIP 2:
+After C8:
 
 1. lock the four canonical actor identities: CEO, AOS CTO, coordination-only CommitLore CTO, and Logic
    CTO;
@@ -242,19 +270,22 @@ After WIP 2:
 Product installation, configuration, diagnostics, auditing, repair, and feature/useability testing for
 CommitLore are outside this program. Its Task 7 lane is coordination continuity only.
 
-## 7. Buzz transition gate — three proofs, not issue count
+## 6. Buzz transition gate — three proofs, not issue count
 
 The transition gate is exactly the conjunction of:
 
 1. installed Buzz adapter/CLI purpose contract and live capture PASS;
 2. #512 full lifecycle across two repositories through `CEO_APPROVED` and daemon finalization;
-3. #245 owner identity declarations plus Telegram and distinct CEO/CTO Buzz-key allowlist grounding.
+3. #245's declared owner identities plus one durable owner-decision receipt through that declaration.
+
+Distinct CEO/CTO conversational Buzz-key binding is a separate Task 7 identity proof and must be tied to
+current binding artifacts; #245 does not prove it by itself.
 
 #306, #416, #418, #448, and #461—or any historical report—do not substitute for these proofs.
 
-## 8. Factory completion after transport/identity
+## 7. Factory completion after transport/identity
 
-1. owner identity declarations and allowlists (#245);
+1. declared owner identities plus one durable owner-decision receipt (#245);
 2. Repo Factory producer contract (#246);
 3. generated-repository migrations and service-owned integration;
 4. two-repository ordered merge acceptance (#240/#512);
@@ -264,13 +295,13 @@ The transition gate is exactly the conjunction of:
 Owner/API/interactive boundaries remain explicit. A closed prerequisite or successful command is not a
 live acceptance proof.
 
-## 9. Parallel, non-preempting work
+## 8. Parallel, non-preempting work
 
 Read-only analysis, issue normalization, rule classification, and Repo Factory implementation may
 continue when they do not mutate the canonical CEO substrate or consume its sole writer. Their
-completion cannot advance C0–C6.
+completion cannot advance C0–C8.
 
-## 10. Evidence invalidation
+## 9. Evidence invalidation
 
 Invalidate affected evidence when any of these changes:
 
@@ -284,16 +315,15 @@ Invalidate affected evidence when any of these changes:
 Role names, prompt similarity, process liveness, CLI exit 0, reply text, and transport ACK are not actor
 identity or terminal-commit evidence.
 
-## 11. Final program gate
+## 10. Final program gate
 
 The repository may claim production readiness only after all of the following are current:
 
-1. canonical CEO live gate C6;
-2. Hermes rollback and terminal-receipt gate;
-3. Task 7 four-actor continuity and zero-shadow gate;
-4. Buzz three-proof transition gate;
-5. full factory acceptance and observation window;
-6. every open issue has an evidence-backed terminal disposition;
-7. a fresh independent closeout review passes.
+1. canonical CEO live gate C8, including current receipt, writer-closure, recovery, and rollback evidence;
+2. Task 7 four-actor continuity and zero-shadow gate;
+3. Buzz three-proof transition gate;
+4. full factory acceptance and observation window;
+5. every open issue has an evidence-backed terminal disposition;
+6. a fresh independent closeout review passes.
 
 Until then the repository remains **not production-ready**.
