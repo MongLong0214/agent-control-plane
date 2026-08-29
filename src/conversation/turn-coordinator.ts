@@ -91,7 +91,20 @@ export type ReceiptLookupResult =
       readonly receiptId: string;
       readonly evidenceDigest: string;
       readonly reasonCode: string;
-      /** The generation the target says minted this receipt, compared against the query's. */
+      /**
+       * The identity the receipt itself attests to — which actor, which prompt, which CEO
+       * generation. Not an echo of the query.
+       *
+       * This is the untrusted half of contract 6. The query a reconciler sends is built from its
+       * own row and proves nothing; the receipt is the external evidence, and these three fields
+       * are what a caller must compare against the stored turn rather than assume, because they
+       * already knew the answer, matched. A port that confuses turns, actors or generations has
+       * to be caught here — `reconcileWithReceipt` checks exactly these three against the row it
+       * settles, so a caller that rebuilds them from its own query instead of from this answer
+       * makes that check compare the database against itself.
+       */
+      readonly targetActorId: string;
+      readonly promptDigest: string;
       readonly bindingGeneration: number;
     };
 

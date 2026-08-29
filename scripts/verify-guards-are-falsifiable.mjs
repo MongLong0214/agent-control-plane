@@ -1120,6 +1120,30 @@ const GUARDS = [
       "tests/unit/a-reconciler-settles-without-a-permit.test.ts::refuses to complete a turn when the receipt names a different CEO generation than the one that claimed it",
     ],
   },
+  {
+    // Sol's review of #691: the query the reconciler sends is built from the row it is about to
+    // check, so an identity check built from that query instead of the port's answer compares the
+    // database against itself and cannot fail. Reverting `result.targetActorId` to
+    // `query.targetActorId` here reintroduces exactly that — a receipt attesting to the wrong
+    // actor settles the turn anyway, because nothing but the query (self-sourced) was checked.
+    what: "the reconciler checks the actor the receipt attests to, not the actor it already knew",
+    file: "src/conversation/turn-reconciler.ts",
+    find: "          targetActorId: result.targetActorId,",
+    replace: "          targetActorId: query.targetActorId,",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong actor, even though the query it was asked under was correct",
+    ],
+  },
+  {
+    // Same defect, the other content field the tautology swallowed.
+    what: "the reconciler checks the prompt digest the receipt attests to, not the one it already knew",
+    file: "src/conversation/turn-reconciler.ts",
+    find: "          promptDigest: result.promptDigest,",
+    replace: "          promptDigest: query.promptDigest,",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong prompt",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

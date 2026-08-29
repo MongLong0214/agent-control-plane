@@ -56,14 +56,25 @@ export class TurnReconciler {
       }
       if (!result.found) continue;
 
-      // `query.bindingGeneration` is what was *asked*: the generation this turn was claimed
-      // under, per `unresolvedIdentities()`. `result.bindingGeneration` is what came *back*: the
-      // generation the port says actually minted the receipt, which need not be the one asked
-      // about — a target answering by `turnRequestId` alone could return a receipt from a later
-      // generation without knowing the two disagree. `reconcileWithReceipt` is what has to catch
-      // that, so it is given the answer's generation to check, not an echo of its own question.
+      // Every identity field passed to `reconcileWithReceipt` below comes from `result`, not from
+      // `query` or `candidate` — only `turnRequestId` is carried over, because that names which
+      // row to check and is not itself something the receipt attests to.
+      //
+      // `query` was built from this process's own database a few lines up; comparing it back
+      // against that same database proves nothing about the receipt at all. `result` is the one
+      // value here that came from outside — from the port, standing in for whatever #638 signs —
+      // and `targetActorId`/`promptDigest`/`bindingGeneration` are exactly the three fields
+      // contract 1 says a receipt has to be matched against. A caller that rebuilt them from its
+      // own query instead of reading this answer would make `reconcileWithReceipt`'s check compare
+      // the database against itself, which cannot fail and would settle a turn on any receipt
+      // shaped correctly, whatever it actually attested.
       const decision = this.coordinator.reconcileWithReceipt(
-        { ...query, bindingGeneration: result.bindingGeneration },
+        {
+          turnRequestId: query.turnRequestId,
+          targetActorId: result.targetActorId,
+          promptDigest: result.promptDigest,
+          bindingGeneration: result.bindingGeneration,
+        },
         {
           outcome: result.outcome,
           receiptId: result.receiptId,
