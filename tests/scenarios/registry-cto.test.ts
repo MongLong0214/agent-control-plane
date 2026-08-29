@@ -239,6 +239,60 @@ describe("CTO lifecycle (CP-S07 – CP-S11)", () => {
     expect(harness.cp.audit.byKind("HANDOFF_ACK")).toHaveLength(1);
   });
 
+  it("#664 — acknowledgeHandoff's own ACKED write rolls back when switchTo denies underneath it", async () => {
+    // This drives the real production path, not a substitute: prepareSwitchover and
+    // acknowledgeHandoff run exactly as the daemon calls them. The only thing arranged by
+    // the test is the precondition that makes the *real* `bindings.switchTo` deny after
+    // `acknowledgeHandoff` has already written 'ACKED' — the incoming session going
+    // not-READY is not something acknowledgeHandoff itself checks (only switchTo does),
+    // so this is a genuine instance of the #664 shape, not a manufactured one.
+    const harness = makeHarness();
+    harness.cp.cto.attach({
+      handoffAuthentication: { verifyHandoffAcknowledgement: () => allow(ReasonCode.OK, undefined) },
+    });
+    const { projectId } = await registerFixtureProject(harness);
+    const provisioned = await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
+    if (!provisioned.allowed) throw new Error(provisioned.message);
+    harness.cp.cto.requestReplacement(projectId, "operator request");
+    const prepared = await harness.cp.cto.prepareSwitchover(projectId, HANDOFF);
+    if (!prepared.allowed) throw new Error(prepared.message);
+
+    const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+    const beforeAck = harness.cp.bindings.require(roleKey);
+
+    // The incoming replacement session dies (provider crash, host reboot, whatever)
+    // after the handoff was prepared but before it was acknowledged. acknowledgeHandoff
+    // itself never checks the incoming session's lifecycle — only the nested
+    // `bindings.switchTo` call does, and only after acknowledgeHandoff's own ACKED write.
+    harness.cp.sessions.transition(
+      prepared.value.incomingSessionId,
+      SessionLifecycle.ERROR,
+      "incoming CTO runtime died before it could acknowledge",
+    );
+
+    const ack = deliveredHandoffAck(harness, prepared.value.handoffId, prepared.value.incomingSessionId);
+    const acked = harness.cp.cto.acknowledgeHandoff(prepared.value.handoffId, ack);
+
+    expect(acked.allowed).toBe(false);
+    expect(acked.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
+
+    // The whole point of #664: the handoffs row's ACKED write happened inside the same
+    // body that then called switchTo and got denied. Read it back directly from the
+    // database — not from a returned Decision — to prove the write did not survive.
+    const row = harness.cp.db.get<{ status: string; acked_at: string | null }>(
+      `SELECT status, acked_at FROM handoffs WHERE handoff_id = ?`,
+      [prepared.value.handoffId],
+    );
+    expect(row?.status).toBe("PENDING");
+    expect(row?.acked_at).toBeNull();
+
+    // The binding must also be unchanged: still the outgoing generation, still bound to
+    // the outgoing session, not switched to the now-dead incoming one.
+    const stillBound = harness.cp.bindings.require(roleKey);
+    expect(stillBound.sessionId).toBe(beforeAck.sessionId);
+    expect(stillBound.bindingGeneration).toBe(beforeAck.bindingGeneration);
+  });
+
   it("CP-S10: an ack from the wrong session cannot switch the binding", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
