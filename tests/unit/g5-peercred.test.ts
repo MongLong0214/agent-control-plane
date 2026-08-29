@@ -9,6 +9,18 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 afterAll(cleanupTempDirs);
 
 /**
+ * Scope, stated rather than left for a reader to infer: this drives `getPeerCredentials`
+ * directly against a real socket pair this test itself opens. It does not go through
+ * `agentcpd`, the real daemon assembly point where a connection is actually accepted in
+ * production — that is correct and deliberate here, not an oversight. #539's acceptance makes a
+ * live call site (in `agentcpd` or anywhere else) a RED mutant: `scripts/verify-peercred-is-
+ * unreachable.mjs` fails the build if one exists. So there is, on purpose, no integration test
+ * exercising this through the daemon; what this file proves is narrower — that the primitive
+ * itself is correct against a real kernel socket — and that narrower claim is what these tests
+ * are limited to.
+ */
+
+/**
  * Node exposes no public API for a socket's raw fd. `_handle.fd` is the same field Node's own
  * core test suite reads for exactly this reason — there is no other way to hand a real kernel fd
  * to `getsockopt`. A synthesized fd or a mocked syscall would not exercise the addon's actual

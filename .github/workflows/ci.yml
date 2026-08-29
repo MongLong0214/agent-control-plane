@@ -7,6 +7,18 @@ on:
 jobs:
   verify:
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        # `package.json` declares `"node": ">=22"`. `22` (bare) is a moving alias that resolves
+        # to whatever the newest 22.x is on the day the job runs — it can never fail at the
+        # declared range's actual edge, only at whatever is currently newest. `22.0.0` is that
+        # edge, pinned exactly rather than aliased: the version this repository promises to
+        # support and the one most likely to fall outside a build tool's own narrower engine
+        # range (ADR-0010 — `node-gyp` majors after 11.x each narrowed their own `engines.node`
+        # as a named breaking change, and `postinstall` now makes that toolchain's range
+        # everyone's `pnpm install` runs, not just CI's).
+        node-version: ["22.0.0", "22"]
     permissions:
       contents: read
       issues: read
@@ -23,7 +35,7 @@ jobs:
           version: 10
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
