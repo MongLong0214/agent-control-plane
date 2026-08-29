@@ -72,6 +72,33 @@ describe("what the owner is told when the CEO route refuses", () => {
     expect(sentence).not.toMatch(/send it again|ask again|try again/i);
   });
 
+  it("attributes a dropped connection to the transport, not to the CEO not answering in time", () => {
+    // #633: a transport failure used to fall into the same sentence as a timeout. It is a
+    // different repair (reconnect) from a different owner (whoever runs the peer process), so
+    // the sentence must not read like the timeout one.
+    const sentence = ceoUnavailableSentence(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED);
+
+    expect(sentence).toMatch(/connection/i);
+    expect(sentence).not.toMatch(/unresolved/i);
+  });
+
+  it("attributes a peer-side error to the CEO session having received and failed the turn", () => {
+    // #633: this is the one outcome of the three where the seam can say the turn reached the
+    // CEO — distinct from both the timeout (never known whether it landed) and the transport
+    // failure (never known whether it landed) sentences.
+    const sentence = ceoUnavailableSentence(ReasonCode.CEO_CONVERSATION_PEER_FAILED);
+
+    expect(sentence).toMatch(/received/i);
+  });
+
+  it("does not tell the owner the CEO answered when the failure was never classified", () => {
+    // Falling through to the not-text default would say "the CEO session answered with
+    // something" for a rejection that was never an answer at all.
+    const sentence = ceoUnavailableSentence(ReasonCode.INTERNAL_ERROR);
+
+    expect(sentence).not.toMatch(/answered/i);
+  });
+
   it("gives every CEO conversation reason code its own sentence", () => {
     // A new code added without a sentence falls through to the not-text default, which would tell
     // the owner the CEO answered with something undeliverable when in fact it never answered.

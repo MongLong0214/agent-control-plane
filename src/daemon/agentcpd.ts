@@ -1297,6 +1297,20 @@ export const ceoUnavailableSentence = (reasonCode: string): string => {
     // behalf, before anyone knows whether the first turn landed.
     return "The CEO session has not answered yet. Its turn is unresolved rather than abandoned — an answer may still be arriving in the conversation. Sending the same message again starts a second turn rather than retrying this one.";
   }
+  if (reasonCode === ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED) {
+    // Not a timeout: the connection itself closed, or was already gone, rather than this
+    // daemon's own clock running out. Same lesson as the sentence above — this seam cannot see
+    // whether the turn reached the CEO before the connection dropped, so it does not claim
+    // either way, and "ask again" is a new turn rather than advice to retry the old one.
+    return "The connection to the CEO session dropped before it answered. Whether this message reached it is not known from here. Sending the same message again starts a new turn rather than retrying this one.";
+  }
+  if (reasonCode === ReasonCode.CEO_CONVERSATION_PEER_FAILED) {
+    // This one the seam can say more about than the two above: the turn did reach the CEO
+    // session, and it answered with an error instead of a reply. The peer's own error text is
+    // not repeated here — it is written by the CEO runtime and may quote whatever it was
+    // handling when it failed (see the port's catch block).
+    return "The CEO session received this message and its reply failed. Sending the same message again starts a new turn rather than retrying this one.";
+  }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_BUSY) {
     // Not "send it again". This is the third copy of a sentence this repository has now
     // corrected twice: #633 removed a claim the seam could not observe, #643 removed an
@@ -1311,6 +1325,13 @@ export const ceoUnavailableSentence = (reasonCode: string): string => {
     // asserts the peer received nothing. The owner was being told about an answer that was never
     // requested, on the one occasion when the identity of who answers had just changed.
     return "The CEO role moved to a new session, and the one this route was holding is no longer it. Nothing was asked of either; send the message again.";
+  }
+  if (reasonCode === ReasonCode.INTERNAL_ERROR) {
+    // The port's catch block reaches this only when a rejection is none of the three it
+    // classifies (timeout, transport failure, peer error). Falling through to the sentence below
+    // would tell the owner the CEO answered, which is exactly the unearned claim this issue
+    // exists to remove — an unclassified failure is not an answer.
+    return "This message to the CEO session failed in a way that was not recognized. Sending the same message again starts a new turn rather than retrying this one.";
   }
   return "The CEO session answered with something this route cannot deliver as a message.";
 };
