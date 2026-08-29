@@ -326,6 +326,25 @@ interface TimerFailure {
 }
 
 /**
+ * Whether an optional ingress channel is actually running, for `health.json` — the surface
+ * `OPERATOR_METHOD.DAEMON_STATUS` (`agentctl daemon status`) reads verbatim.
+ *
+ * Found missing by review (#682, round 8's second follow-up): a daemon that comes up healthy
+ * while Telegram silently never started (an unmeasured transport's redelivery retention refused
+ * `IngressGuard`'s construction) had no health surface saying so — `mode: "NORMAL"` and a
+ * healthy `lockHeld` look identical whether Telegram is running or was refused. `configured`
+ * is false for a deployment that never set any `ACP_TELEGRAM_*` variable; `running` is the
+ * outcome; `disabledReason` names *why* when `configured && !running`, distinct from "never
+ * configured" for the same reason the stderr line at startup does not say "not configured" for
+ * this case (the operator set this up on purpose).
+ */
+export interface IngressChannelStatus {
+  configured: boolean;
+  running: boolean;
+  disabledReason: string | null;
+}
+
+/**
  * PRD §33.1 and §34.5.
  *
  * The single-instance lock is taken before any state is touched, and restart
@@ -347,6 +366,9 @@ export class Daemon {
   #bootstrapAbandoned = false;
   #bootstrapWaiter: (() => void) | null = null;
   #timerFailures = new Map<string, TimerFailure>();
+  // Unset until `main`'s composition root reports Telegram's outcome — `null` renders in
+  // `health.json` as "this daemon has no opinion yet", distinct from `configured: false`.
+  #telegramIngress: IngressChannelStatus | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
@@ -1400,6 +1422,17 @@ export class Daemon {
   }
 
   /**
+   * Recorded once, right after `main`'s composition root decides Telegram's outcome (started,
+   * refused, or never configured), and written into `health.json` immediately rather than
+   * waiting for the next periodic `writeHealth` — a daemon that comes up and sits idle for a
+   * while must not report a stale "no opinion yet" the whole time.
+   */
+  setTelegramIngressStatus(status: IngressChannelStatus): void {
+    this.#telegramIngress = status;
+    this.writeHealth(null);
+  }
+
+  /**
    * §33.1 — health endpoint. A file the supervisor can read, and the one place a parked
    * daemon's `mode` is legible without the operator token that the socket method requires.
    * `agentctl daemon status` does not read it: it asks the socket and falls back to the lock.
@@ -1428,6 +1461,9 @@ export class Daemon {
         status: this.#timerFailures.size === 0 ? "HEALTHY" : "DEGRADED",
         failures: Object.fromEntries(this.#timerFailures),
       },
+      // `null` until `main` reports an outcome — a daemon whose composition root has not
+      // gotten there yet, as opposed to one that checked and found nothing configured.
+      telegram: this.#telegramIngress,
     };
     writeFileSync(join(this.options.stateDir, "health.json"), JSON.stringify(health, null, 2), {
       mode: 0o600,

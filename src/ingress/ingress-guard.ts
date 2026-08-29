@@ -243,7 +243,6 @@ export class IngressGuard {
       if (channel === "telegram" && (!policy.allowedConversations || policy.allowedConversations.length === 0)) {
         throw new Error("Telegram ingress requires a non-empty conversation allowlist");
       }
-      const ttl = policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS;
       // The transport's own declared fact overrides the channel-keyed default (#682, round 8):
       // a policy that threads through a real transport instance's `redeliveryRetentionMs` gets
       // a floor derived from what that transport actually does, not from what channel it is
@@ -268,16 +267,34 @@ export class IngressGuard {
           { code: TRANSPORT_RETENTION_UNKNOWN, channel },
         );
       }
-      if (retention !== undefined && ttl < retention) {
-        // The relationship, not the number, is the property (#673): a nonce pruned before the
-        // transport itself stops redelivering reopens the exact duplicate-turn window the
-        // claim mechanism exists to close. Refusing construction makes that relationship hold
-        // by construction instead of by two constants that happen to agree today.
-        throw new Error(
-          `ingress policy for '${channel}' sets nonceTtlMs (${ttl}ms) shorter than the transport's own ` +
-            `redelivery retention (${retention}ms); a nonce could be pruned before a late redelivery stops ` +
-            `arriving, which would let its turn be claimed and run a second time (#673)`,
-        );
+      let ttl: number;
+      if (policy.nonceTtlMs !== undefined) {
+        // An explicit choice, kept literal rather than silently raised. Refusing a too-short
+        // explicit value (#673) still matters here — Sol's review (#682, round 8's third pass):
+        // an operator who explicitly configured a short `nonceTtlMs` alongside a transport (or an
+        // operator-asserted `transportRetentionMs`) that turns out to need a longer one must be
+        // told, not have their choice silently overridden into a floor they never asked for.
+        ttl = policy.nonceTtlMs;
+        if (retention !== undefined && ttl < retention) {
+          // The relationship, not the number, is the property (#673): a nonce pruned before the
+          // transport itself stops redelivering reopens the exact duplicate-turn window the
+          // claim mechanism exists to close. Refusing construction makes that relationship hold
+          // by construction instead of by two constants that happen to agree today.
+          throw new Error(
+            `ingress policy for '${channel}' sets nonceTtlMs (${ttl}ms) shorter than the transport's own ` +
+              `redelivery retention (${retention}ms); a nonce could be pruned before a late redelivery stops ` +
+              `arriving, which would let its turn be claimed and run a second time (#673)`,
+          );
+        }
+      } else {
+        // No explicit choice — the effective floor tracks whichever is larger: the system
+        // default, or the transport's own (possibly longer) retention. Found by review (#682,
+        // round 8's second follow-up): refusing construction outright for a transport that
+        // genuinely retains *longer* than the default, exactly as it does for one whose retention
+        // is *unknown*, conflated two different situations under one refusal — a known, longer
+        // window is a fact this guard can act on by raising the floor to match, not a reason to
+        // make the feature unreachable for anyone who did not also hand-tune `nonceTtlMs`.
+        ttl = retention !== undefined ? Math.max(DEFAULT_NONCE_TTL_MS, retention) : DEFAULT_NONCE_TTL_MS;
       }
       nonceTtlMsByChannel[channel] = ttl;
     }

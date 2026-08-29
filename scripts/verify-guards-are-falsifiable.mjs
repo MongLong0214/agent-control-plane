@@ -377,7 +377,7 @@ const GUARDS = [
     // has never measured.
     what: "production wiring threads the chosen transport's own declared retention into the guard",
     file: "src/ingress/telegram-polling.ts",
-    find: "      transportRetentionMs: transport.redeliveryRetentionMs,\n",
+    find: "      transportRetentionMs: transport.redeliveryRetentionMs ?? config.transportRetentionMs ?? null,\n",
     replace: "",
     killedBy: [
       "tests/unit/ingress-retention-derives-from-transport.test.ts::production wiring refuses to start against a transport whose retention is unknown, chosen before this fix constructed the guard",
@@ -397,6 +397,52 @@ const GUARDS = [
     replace: "    throw error;",
     killedBy: [
       "tests/unit/daemon-startup.test.ts::#682 round 8 follow-up: starts the daemon but refuses Telegram ingress when the transport's retention is unknown",
+    ],
+  },
+  {
+    // Found by Sol's second review (#682, round 8's second follow-up): a transport whose
+    // retention is genuinely *longer* than the default was refused exactly like one whose
+    // retention is unknown, conflating "different" with "unknown". Mutating the auto-derived
+    // floor back to the bare default removes exactly the raise: a known 48h retention with no
+    // explicit `nonceTtlMs` would then get a silent, unsafe 24h floor instead of 48h.
+    what: "the effective floor is raised to a known, longer transport retention rather than left at the bare default",
+    file: "src/ingress/ingress-guard.ts",
+    find: "        ttl = retention !== undefined ? Math.max(DEFAULT_NONCE_TTL_MS, retention) : DEFAULT_NONCE_TTL_MS;",
+    replace: "        ttl = DEFAULT_NONCE_TTL_MS;",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::raises the effective floor to a longer-than-24h transportRetentionMs rather than refusing, when nonceTtlMs is not explicit",
+    ],
+  },
+  {
+    // Found by Sol's third review (#682, round 8's third pass): refusing an unmeasured
+    // transport left an operator who knows their self-hosted server's real redelivery window
+    // with no production way to say so. Mutating away just the `config.transportRetentionMs`
+    // fallback (leaving the transport's own report and the outright refusal intact) removes
+    // exactly the escape hatch, without also disabling the surrounding refusal-when-unknown
+    // guard a coarser mutation on this line would.
+    what: "ACP_TELEGRAM_TRANSPORT_RETENTION_MS fills the gap when the transport itself reports unknown",
+    file: "src/ingress/telegram-polling.ts",
+    find: "transport.redeliveryRetentionMs ?? config.transportRetentionMs ?? null",
+    replace: "transport.redeliveryRetentionMs ?? null",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::fills the gap for a transport that reports its own retention as unknown",
+    ],
+  },
+  {
+    // Without reading the environment variable at all, the escape hatch above has nothing to
+    // fill the gap with — `config.transportRetentionMs` would always be `undefined`, and an
+    // operator who set `ACP_TELEGRAM_TRANSPORT_RETENTION_MS` would see it silently ignored.
+    what: "ACP_TELEGRAM_TRANSPORT_RETENTION_MS is read and validated into the configured Telegram config",
+    file: "src/ingress/telegram-polling.ts",
+    find:
+      "  const transportRetentionMs = parseOptionalBoundedInteger(\n" +
+      "    environment[\"ACP_TELEGRAM_TRANSPORT_RETENTION_MS\"],\n" +
+      "    60_000,\n" +
+      "    30 * 24 * 60 * 60 * 1000,\n" +
+      "  );",
+    replace: "  const transportRetentionMs = undefined;",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::is read into the configured config, validated the same way as the other Telegram integer settings",
     ],
   },
   {

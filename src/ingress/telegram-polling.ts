@@ -31,6 +31,23 @@ export interface TelegramLongPollConfig {
   retryDelayMs?: number;
   defaultProjectId?: string | null;
   apiBaseUrl?: string;
+  /**
+   * Operator-asserted redelivery retention (ms) for a transport this repository cannot measure
+   * on its own — the escape hatch for `apiBaseUrl` pointed anywhere but the official endpoint.
+   *
+   * Found missing by review (#682, round 8's third pass): refusing to construct `IngressGuard`
+   * for an unmeasured transport (the round-8 fix, kept — see `TelegramBotApi.redeliveryRetentionMs`)
+   * is the right default, but it leaves an operator who *does* know their self-hosted server's
+   * actual redelivery window with no production way to say so — the safety property was enforced
+   * by making the feature permanently unreachable for a deployment this repository supports,
+   * which is a much bigger operational change than "the floor tracks the transport". This is read
+   * and validated the same way every other `ACP_TELEGRAM_*` setting is (see
+   * `configuredTelegramLongPollConfig`), and it is still subject to the same #673 check as a
+   * transport-derived retention: an explicit `nonceTtlMs` shorter than this must still be refused
+   * — an operator can assert what their transport does, not that a too-short nonce window is
+   * safe anyway.
+   */
+  transportRetentionMs?: number;
 }
 
 export interface TelegramGetUpdatesOptions {
@@ -198,6 +215,15 @@ export const configuredTelegramLongPollConfig = (
   );
   const defaultProjectId = environment["ACP_TELEGRAM_DEFAULT_PROJECT_ID"]?.trim() || null;
   const apiBaseUrl = environment["ACP_TELEGRAM_API_BASE_URL"]?.trim() || undefined;
+  // 1 minute to 30 days: below the floor a "retention" is not what that word means for a
+  // redelivery queue, and above it is far past anything #673's own measurement considered —
+  // both ends exist to catch a typo (seconds where milliseconds were meant, or the reverse)
+  // rather than to second-guess an operator's real number.
+  const transportRetentionMs = parseOptionalBoundedInteger(
+    environment["ACP_TELEGRAM_TRANSPORT_RETENTION_MS"],
+    60_000,
+    30 * 24 * 60 * 60 * 1000,
+  );
 
   return {
     botToken,
@@ -208,6 +234,7 @@ export const configuredTelegramLongPollConfig = (
     retryDelayMs,
     defaultProjectId,
     ...(apiBaseUrl ? { apiBaseUrl } : {}),
+    ...(transportRetentionMs !== undefined ? { transportRetentionMs } : {}),
   };
 };
 
@@ -605,7 +632,11 @@ export const startTelegramLongPollListener = async (
       allowedActors: config.allowedOwnerIds,
       allowedConversations: config.allowedChatIds,
       recoverInFlight: true,
-      transportRetentionMs: transport.redeliveryRetentionMs,
+      // The transport's own report wins when it has one (the official endpoint, or a fake that
+      // declares its own value); `config.transportRetentionMs` — `ACP_TELEGRAM_TRANSPORT_RETENTION_MS`
+      // — fills the gap only when the transport itself reports unknown (#682, round 8's third
+      // pass: the escape hatch for an operator who knows their self-hosted server's real window).
+      transportRetentionMs: transport.redeliveryRetentionMs ?? config.transportRetentionMs ?? null,
     },
   });
   const ingress = new TelegramIngress(guard, { webhookSecret: config.webhookSecret });
@@ -1092,6 +1123,7 @@ const TELEGRAM_ENVIRONMENT_VARIABLES = [
   "ACP_TELEGRAM_RETRY_DELAY_MS",
   "ACP_TELEGRAM_DEFAULT_PROJECT_ID",
   "ACP_TELEGRAM_API_BASE_URL",
+  "ACP_TELEGRAM_TRANSPORT_RETENTION_MS",
 ] as const;
 
 const configuredValue = (
@@ -1124,6 +1156,24 @@ const parseBoundedInteger = (
   fallback: number,
 ): number => {
   if (!value?.trim()) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`Telegram configuration integer must be between ${minimum} and ${maximum}`);
+  }
+  return parsed;
+};
+
+/**
+ * `parseBoundedInteger`, but absence means "not asserted" rather than a numeric default —
+ * `ACP_TELEGRAM_TRANSPORT_RETENTION_MS` has no safe fallback to assume for an operator who has
+ * not said anything, unlike the timeouts above.
+ */
+const parseOptionalBoundedInteger = (
+  value: string | undefined,
+  minimum: number,
+  maximum: number,
+): number | undefined => {
+  if (!value?.trim()) return undefined;
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
     throw new Error(`Telegram configuration integer must be between ${minimum} and ${maximum}`);
