@@ -343,14 +343,23 @@ it shows the citation was stale on arrival, not merely stale by 2026-08-29:
   Sending the same message again starts a second turn rather than retrying this one."* That does
   not invite a resend; it warns against treating one as a retry — the opposite framing from what
   C2 quoted.
-- `CEO_CONVERSATION_STALE` itself is a distinct reason code (session rotated under failover, added
-  by #654/`f2497ec`, 2026-08-21) with its own sentence: *"The CEO role moved to a new session...
-  Nothing was asked of either; send the message again."* That one *does* invite a resend,
-  correctly — nothing was asked the first time, so there is no duplicate to create. #654's own
-  message is explicit that this and the #643 fix are two of the same shape found the same day:
-  *"#633 removed a claim the seam could not observe, #643 removed an invitation that was itself
-  the duplicate path, and this is the last one"* (the third being `CEO_CONVERSATION_BUSY`'s
-  sentence).
+- `CEO_CONVERSATION_STALE` itself is a distinct reason code (session rotated under failover) with
+  its own sentence: *"The CEO role moved to a new session... Nothing was asked of either; send the
+  message again."* That one *does* invite a resend, correctly — nothing was asked the first time,
+  so there is no duplicate to create. **This document's previous round attributed STALE's
+  addition to #654/`f2497ec` and that is wrong** — checked by reading each commit's diff rather
+  than trusting its file list, the actual sequence is three separate commits: `7b5490f` (#601,
+  2026-08-19) adds the bare reason-code constant `CEO_CONVERSATION_STALE` to `reason-codes.ts`
+  with no sentence yet; `1285e81` (#634, 2026-08-20 18:17) adds the dedicated sentence quoted
+  above, with its own commit message naming the defect it fixed — *"A stale binding was reported
+  as an undeliverable answer. `STALE` had no sentence and fell through to 'answered with something
+  this route cannot deliver'... Found by the third test here, which requires every
+  `CEO_CONVERSATION_*` code to have its own sentence."* `f2497ec` (#654, 2026-08-21 07:23, *after*
+  `1285e81`) does not touch `STALE` at all — its own message is about a different code
+  entirely: *"The BUSY sentence still told the owner to resend. This is the third copy of that
+  shape: #633 removed a claim the seam could not observe, #643 removed an invitation that was
+  itself the duplicate path, and this is the last one"* — "this" is `CEO_CONVERSATION_BUSY`'s
+  sentence, not `STALE`'s, and the quote was misapplied in the previous round.
 - `CEO_CONVERSATION_TRANSPORT_FAILED` and `CEO_CONVERSATION_PEER_FAILED` did not exist as reason
   codes at all when C2 was written; #681 (`3136292`, "a CEO conversation failure says which side
   failed," merged 2026-08-29 closing issue #633 — which had stayed open since 2026-08-20 for
@@ -479,7 +488,8 @@ Every code citation in this document was located by symbol name or by a quoted c
 re-`grep`ed against `157aeed` while writing this file — not carried forward from the original
 issue's line numbers.
 
-**Corrected after independent review, twice.** An xhigh read-only review of this document (21
+**Corrected after independent review, five times so far — the count below is itself append-only,
+not a final tally.** An xhigh read-only review of this document (21
 files) returned two findings, both accepted: S2's "closed" claim originally implied more than any
 test in this repository exercises — no test constructs two genuinely concurrent, non-crash
 claims on one session, only the crash/restart reconstruction #680's own tests use — and that
@@ -548,19 +558,40 @@ stay open on `main` regardless, and `1bd1b81`'s unmerged status (`git merge-base
 the commit *contains* was invented rather than read, corrected above in round two's own paragraph
 rather than left standing next to a retraction.
 
-Applying "was this inferred from a file-touched signal or read from the diff" to every other
-commit citation in this document: `f1cdde9` (#657, cited in C3) was spot-checked against its
-actual diff for this round and confirms the claim already made — it introduces
-`VerifiedTargetBinding` itself and its own commit message states *"Limit: nothing produces a
-VerifiedTargetBinding... until #638 exists every real reconstitution takes the mint path"*,
-matching C3 exactly. `0d12bf2` (#635, S3) was likewise spot-checked against its diff and confirms
-`claimTurn` was added before the handler dispatch exactly where S3 says. `97f5d0a` (#643, C2) was
-spot-checked and its diff's removed line is character-for-character the sentence C2 quotes as
-stale. `73328c0` (#669, S4) matches the `resolveInDoubt` behavior already read directly from the
-current source. None of the other citations rested on an inferred description; `1bd1b81` was the
-one case where a citation was written from a file list instead of a diff, and it is fixed above.
+**A fifth review found the previous round's own completeness claim was the same shape again**:
+"none of the other citations rested on an inferred description; `1bd1b81` was the one case" was
+itself a sweep result asserted as fact without the sweep having covered everything the word "the
+only one" claims. It also missed a real second case: C2's attribution of `CEO_CONVERSATION_STALE`
+to `#654`/`f2497ec` was wrong (see C2 above, corrected) — the sentence was invented by
+misapplying a quote from `f2497ec`'s message about a different reason code (`BUSY`), a citation
+error of the same kind as `1bd1b81`'s.
 
-Re-ran `pnpm typecheck`, `pnpm lint` and `pnpm guards:anchors` after every edit across all four
+So rather than assert a count again, here is the complete, checkable list: every commit hash this
+document cites, and whether the claim attached to it was confirmed by reading that commit's own
+diff (`git show <sha>`) as opposed to a commit message, a current-source read, or an inference
+from which files it touches.
+
+| Commit | Cited for | Diff read? |
+|---|---|---|
+| `686281a` (#671) | S1 — `turn_claim_json` split, `completeReplyAndResolveTurn` | yes — confirms the column and the split |
+| `157aeed` (#680, this branch's base) | S2/S6 — `unresolvedTurns` read only at `unresolved[0]`, park/override, `overridesUnresolved` | yes — confirms the exact `unresolved[0]` line S2 turns on |
+| `0d12bf2` (#635) | S3 — `claimTurn` added before handler dispatch | yes |
+| `73328c0` (#669) | S4 — `resolveInDoubt`, `MATERIALIZING_AUTHORITIES`, `OPERATOR_METHOD.CONVERSATION_RESOLVE` | yes |
+| `97f5d0a` (#643) | C2 — `CEO_CONVERSATION_TIMEOUT`'s sentence rewritten, removed line matches C2's quote verbatim | yes |
+| `7b5490f` (#601) | C2 — bare `CEO_CONVERSATION_STALE` constant added, no sentence yet | yes |
+| `1285e81` (#634) | C2 — `CEO_CONVERSATION_STALE`'s dedicated sentence added | yes |
+| `f2497ec` (#654) | C2 — fixes `CEO_CONVERSATION_BUSY`'s sentence; does **not** touch `STALE` (this document's previous round said it did — corrected above) | yes, on this round |
+| `3136292` (#681) | C2 — adds `CEO_CONVERSATION_TRANSPORT_FAILED` and `CEO_CONVERSATION_PEER_FAILED` | yes, on this round (previously read via the PR body only) |
+| `f1cdde9` (#657) | C3 — introduces `VerifiedTargetBinding`; its own message states nothing produces one yet | yes |
+| `1bd1b81` (unmerged `#666` branch) | S5/S7 — confirmed to add validation checks inside `claim()`, not a new writer (this document's earlier round said it added one — corrected above) | yes, on this round |
+
+Eleven commit citations, all now read by diff rather than by title, message, or file list alone.
+That is a complete list for this document as it stands today, not a claim that no future edit can
+introduce another inferred one — the next person adding a citation owes it the same check, and
+"was this diff actually opened" is now the standing question for any commit hash this document
+names.
+
+Re-ran `pnpm typecheck`, `pnpm lint` and `pnpm guards:anchors` after every edit across all five
 rounds — all still pass. Did not re-run `pnpm test` after any round, since no edit touched
 anything but prose and Markdown; the `1404 passed | 9 failed | 2 skipped` baseline above is from
 the unmodified checkout and stands unchanged.
