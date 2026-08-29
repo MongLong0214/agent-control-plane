@@ -253,8 +253,8 @@ END;
 -- trusting the copy would admit through it. `sessions.incarnation` is immutable for a session's
 -- lifetime (`sessions_incarnation_immutable`), so this is the one value the copy could ever
 -- honestly be; refused at both the insert that first sets the pointer and any later update of
--- either column together, since only comparing both against the same session catches a caller
--- that moves one without the other.
+-- either column, since watching only one would let a caller move it alone and leave the other
+-- disagreeing with the row `current_session_id` names.
 CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert
 BEFORE INSERT ON conversational_actors
 WHEN NEW.current_session_id IS NOT NULL

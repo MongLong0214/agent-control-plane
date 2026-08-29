@@ -190,6 +190,13 @@ export type TurnOutcome =
  * above is true of the code and false of the running system until something calls `claim()`.
  * Wiring a production entry point is a separate, larger change (tracked alongside #639's turn
  * reconciliation work) and is deliberately not attempted here.
+ *
+ * The currency check this file leans on hardest — the exact `assignments` row an attestation was
+ * made under, that row's own generation, its own actor, and a live `READY` session whose own
+ * `incarnation` column agrees with the actor's copy of it — answers the same way. Every layer of
+ * it, including the two write-time triggers added alongside it, exists for an attestation nothing
+ * writes yet (`#638`). Tested and correct is not the same claim as reachable, and this file does
+ * not get to keep the first word only by going quiet about the second.
  */
 export class ConversationTurnCoordinator {
   /** Never persisted, never exported. See `TurnPermit.issuance`. */

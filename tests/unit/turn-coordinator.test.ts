@@ -488,8 +488,9 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     expect(second.value.sessionId).toBe("sess-fixed");
     expect(second.value.bindingGeneration).toBe(first.value.bindingGeneration + 1);
 
-    // The stale attestation names the exact same session and incarnation the role is *still* at —
-    // only the generation it names is the one the role has moved past.
+    // The stale attestation names "sess-fixed"/"inc-fixed" — the session id and incarnation the
+    // role is *still* at, unchanged by the revoke and rebind — and only the generation it names
+    // is the one the role has moved past.
     attest(h, {
       id: "att:isolated",
       targetBindingId,
@@ -581,7 +582,7 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     // generation from 1 — so a fix that stopped at `role` cannot tell them apart. `bind()` reuses
     // the actor for the same verified target (#657); this shows a stale generation-1 attestation
     // for task-A's retired identity revived by task-B's own, unrelated, generation-1 counter,
-    // through the same session task-A originally used.
+    // through the session id "sess-shared" task-A originally bound.
     const h = makeHarness();
     readySession(h, "sess-shared", "inc-shared");
     const taskABound = h.cp.bindings.bind({
@@ -614,10 +615,10 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     });
     expect(replaced.allowed).toBe(true);
 
-    // The same physical actor is reused for a *different* WORKER role_key, task-B — bound to the
-    // same session task-A originally used, so the live pointer returns to exactly where the stale
-    // attestation says it is. Only the role_key is different; the role, and now the session, are
-    // identical to what the stale attestation names.
+    // The same physical actor is reused for a *different* WORKER role_key, task-B — bound to
+    // "sess-shared", the session id task-A originally used, so the live pointer returns to
+    // exactly where the stale attestation says it is. Only the role_key is different; the role,
+    // and now the session id, are identical to what the stale attestation names.
     const taskBBound = h.cp.bindings.bind({
       role: Role.WORKER,
       sessionId: "sess-shared",
