@@ -26,15 +26,21 @@
  *     text search, not declaration verification; see rounds 3 and 4 below for why)
  *   - a cited code line — quoted with an explicit delimiter right after an inline citation, or
  *     the rest of a fenced citation's line (the fence itself is the delimiter there; see round 5
- *     below for why an inline citation needs its own) — no longer appears anywhere in that file
+ *     below for why an inline citation needs its own) — no longer appears within
+ *     `CONTENT_SEARCH_WINDOW` (±60) lines of the cited line, not the whole file (see round 8 for
+ *     why the window is bounded rather than unbounded, and why an earlier version of this
+ *     paragraph said "anywhere in the file" when the code never searched further than that)
  *     (elision-tolerant: `...`/`()` stand for "and more")                   → STALE
  *
  * The last one is the one that actually catches #649's real citation. `binding-registry.ts:163`
  * is still in range — that file is 973 lines long — so the length check alone passes it. What
  * changed is the *content*: `const actorId = this.mintActor(...)` (unconditional mint) is not
- * what line 163 says any more, and it does not appear anywhere else in the file either, because
- * #657 rewrote the mechanism to reuse an actor first. A check that only asked "is the line
- * number still in range" would have missed the one case this script exists to catch.
+ * what line 163 says any more, and it does not appear within 60 lines of it either — checked, not
+ * assumed: `binding-registry.ts` does have a second, unrelated `this.mintActor(...)` call 225
+ * lines away (see `CONTENT_SEARCH_WINDOW`'s own comment), and the window is exactly what keeps
+ * that coincidence from counting as the cited line surviving. #657 rewrote the mechanism to reuse
+ * an actor first. A check that only asked "is the line number still in range" would have missed
+ * the one case this script exists to catch.
  *
  * ## Any `file:line` citation is ADVISORY, whether or not it is stale
  *
@@ -311,6 +317,59 @@
  *   or path citation in the corpus at the time of this snapshot, so they change nothing there; they
  *   are proven by the constructed counterexamples and tests instead.
  *
+ * ## Round 8: three more counterexamples run against the shipped script, one of them already
+ * published as a real finding elsewhere — again
+ *
+ *   GitHub permalinks got a second look, and the same class of bug both times: the path capture
+ *   excluded whitespace, `#`, and `)` but not a backtick, so `` `https://github.com/…/blob/main/
+ *   README.md` `` — a backtick-wrapped link with no `#L` anchor to stop the match early — captured
+ *   the closing backtick as part of the path and reported `README.md\`` missing. And `/blob/<ref>/
+ *   <path>` assumed `<ref>` is exactly one segment, which is false for this repository's own
+ *   branches — including the one this fix was written on,
+ *   `feat/597-tracker-loci-resolve-or-the-check-says-so` — so a URL built from that branch name
+ *   read `597-tracker-loci-resolve-…/README.md` as the file and reported it gone. Fixed by
+ *   excluding backtick from every capture group, and by having `resolveBlobRefAndPath` split the
+ *   ref-and-path span against two authorities in order: `knownRefs` (real branch and tag names,
+ *   from `git for-each-ref`), longest match first, since a real ref can itself be a prefix of
+ *   another one; then, if nothing there matches, the shortest split whose tail is an *exactly*
+ *   tracked file. Only if both fail does it fall back to the plain one-segment guess — and a first
+ *   version of this fix skipped that fallback entirely, returning `null` (silence) whenever no
+ *   split resolved, on the theory that a wrong guess is worse than staying quiet. Run against its
+ *   own test suite before trusting that: it cost the exact case this check exists for — a
+ *   multi-segment ref to a *deleted* file can never resolve against tracked files at any split, by
+ *   definition, so "resolves nowhere" and "the file is gone" became the same observation, and the
+ *   fix made every such permalink go silent instead of STALE. `knownRefs` is what makes the
+ *   fallback safe again: a real branch name verified independently of whether its file still
+ *   exists is the thing the first version was missing, not the fallback itself.
+ *
+ *   Third: `looksLikeCode` was asked, a fourth time, to widen for a form it did not recognise —
+ *   `` `README.md:1` — `return null;` `` is unmistakably code and unmistakably quoted, and came
+ *   back ADVISORY because nothing about it trips the camelCase, call, dot, assignment, or brace
+ *   checks. Rather than add a fifth check to the same heuristic, the question changed: an inline
+ *   citation's content only exists because an *explicit* delimiter followed it — the author's own
+ *   deliberate act of quoting, not a guess this script made — and asking "does it look like code"
+ *   on top of that is a second guess layered on a signal already stronger than the guess. Dropped
+ *   entirely for that branch. A fenced line's content has no delimiter of its own — the fence
+ *   marks the block, not each row in it, as code — and `looksLikeCode` stays there: #649's own
+ *   body mixes a literal quote with plain descriptions in the *same* fence, and checked directly
+ *   against that fixture, dropping the heuristic for fenced content reintroduces the false STALE
+ *   this whole check exists to avoid. Two branches, two different answers, because the strength of
+ *   the "this is quoted" signal is not the same in both.
+ *
+ *   Separately, disclosed rather than left standing: this docstring's own "What counts as stale"
+ *   section said a vanished quote "no longer appears anywhere in the file", and the search has
+ *   always been `CONTENT_SEARCH_WINDOW` (±60) lines, not the whole file — a stated contract the
+ *   code did not keep, which is the exact defect this whole PR exists to catch, found in its own
+ *   header. Corrected above.
+ *
+ *   Corpus diff (same snapshot, before/after, every changed line checked against the real issue
+ *   text): none. The one real permalink in the corpus (#597's own link to `docs/adr`) resolves
+ *   `main` via `knownRefs` exactly as before and still reports `docs/adr does not exist` — true
+ *   for a file-existence check even though `docs/adr` is a directory, not a file, and this script
+ *   has no separate category for that distinction. Every other change this round addresses is
+ *   proven by the constructed counterexamples and tests rather than a corpus shift, because none
+ *   of these three bugs happened to match anything in the corpus at the time of this snapshot.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -534,6 +593,38 @@ const trackedFiles = execFileSync("git", ["ls-files"], { cwd: repoRoot, encoding
   .filter(Boolean);
 
 /**
+ * Every local branch, remote-tracking branch, and tag this repository knows about — the authority
+ * for where a GitHub blob permalink's `<ref>` ends, independent of whether the file it cites still
+ * exists. That independence is the reason this exists rather than reusing `trackedFiles` for the
+ * ref/path split too: a permalink citing a *genuinely deleted* file can never resolve against
+ * tracked files at any split point, by definition, so a design that only trusts a split when the
+ * resulting path exists cannot ever report that file gone — the one case this whole check is for.
+ *
+ * A remote-tracking branch's short name (`origin/main`) is indexed with the leading remote segment
+ * stripped too (`main`), because a GitHub URL never spells the remote out.
+ */
+const knownRefs = (() => {
+  try {
+    const raw = execFileSync(
+      "git",
+      ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes", "refs/tags"],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    const refs = new Set();
+    for (const line of raw.split("\n")) {
+      const ref = line.trim();
+      if (!ref) continue;
+      refs.add(ref);
+      const slash = ref.indexOf("/");
+      if (slash !== -1) refs.add(ref.slice(slash + 1));
+    }
+    return refs;
+  } catch {
+    return new Set();
+  }
+})();
+
+/**
  * `owner/repo`, lowercased, derived from `origin` so a GitHub blob permalink can be told apart
  * from a link to someone else's repository (of which #597's own body has one, to `docs/adr`
  * elsewhere entirely). `null` if there is no such remote — a permalink is then treated as an
@@ -649,7 +740,59 @@ const URL_RE = /https?:\/\/\S+/g;
 // its raw text. Letting the generic regex loose inside a URL was the earlier bug: it greedily
 // matched a fragment of the URL itself (`com/<owner>/<repo>/blob/main/README.md`), not the path
 // the link actually names, and reported that fragment ambiguous against every tracked README.
-const GITHUB_BLOB_RE = /https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/blob\/[^/\s]+\/([^\s#)]+)(?:#L(\d+)(?:-L?(\d+))?)?/g;
+//
+// Round 8: two more bugs in this same structural parse, both fixed here.
+//
+// The path group excluded whitespace, `#`, and `)` but not a backtick — the ordinary way people
+// actually write a link in an issue body. `` `https://github.com/…/blob/main/README.md` `` (no
+// `#L` anchor to stop the match early at `#`) captured the closing backtick as part of the path,
+// and `README.md\`` does not exist. Fixed by excluding backtick from every capture group here.
+//
+// `/blob/<ref>/<path>` was parsed on the assumption `<ref>` is exactly one segment — true for
+// `main`, false for this repository's own branches, which are the whole reason it matters:
+// `feat/597-tracker-loci-resolve-or-the-check-says-so` has a slash in it. A URL built from that
+// branch name read as `<ref>` = `feat` and `<path>` = `597-tracker-loci-resolve-…/README.md`, a
+// file that has never existed. There is no purely syntactic way to know where a multi-segment ref
+// ends and the path begins — GitHub itself only knows because it holds the branch list — so this
+// group now captures the *whole* ref-and-path span, and `resolveBlobRefAndPath` (below) tries
+// splits against `knownRefs` and `trackedFiles`, the same two authorities this script already
+// defers to elsewhere.
+const GITHUB_BLOB_RE = /https:\/\/github\.com\/([^/\s`]+)\/([^/\s`]+)\/blob\/([^\s#`)]+)(?:#L(\d+)(?:-L?(\d+))?)?/g;
+
+/**
+ * Splits a permalink's `<ref>/<path>` span into the branch/tag it names and the file within it,
+ * three ways, most authoritative first:
+ *
+ *   1. The longest known ref (`knownRefs`) that is a prefix of the span, ending on a `/`. Longest
+ *      first because a real ref can itself be a segment-prefix of another — this repository has
+ *      `origin/feat/597-tracker-loci-resolve` alongside the longer local branch this fix was
+ *      written on, and matching short-to-long would stop at the wrong one.
+ *   2. Failing that (a fork's branch, a deleted branch, or a checkout where `git for-each-ref`
+ *      does not show it), the shortest split whose tail is an *exactly* tracked file — `main`,
+ *      the common case, needs nothing more than this.
+ *   3. Failing that too, the plain one-segment assumption (`main`-shaped), because a permalink to
+ *      a genuinely deleted file can never satisfy step 2 by definition — that file will not
+ *      exactly-match anything at any split — and refusing to guess at all here would make this
+ *      script unable to ever report the one thing it exists to report: a citation of something
+ *      that is gone. An earlier version of this function returned `null` when nothing resolved
+ *      exactly, on the theory that a wrong guess is worse than silence; measured against its own
+ *      test suite, that theory cost exactly the case it was trying to protect — a multi-segment
+ *      ref to a deleted file went silent instead of STALE, because "deleted" and "unresolvable
+ *      split" are the same observation from `trackedFiles` alone. Step 1 is what makes step 3 safe
+ *      to fall back to: a real branch name, verified independently of whether its file still
+ *      exists, is what step 3 lacked, and it did not need it if it never had to run.
+ */
+const resolveBlobRefAndPath = (refAndPath) => {
+  const segments = refAndPath.replace(/[.,;:)]+$/, "").split("/");
+  for (let i = segments.length - 1; i >= 1; i--) {
+    if (knownRefs.has(segments.slice(0, i).join("/"))) return segments.slice(i).join("/");
+  }
+  for (let i = 1; i < segments.length; i++) {
+    const candidate = segments.slice(i).join("/");
+    if (trackedFiles.includes(candidate)) return candidate;
+  }
+  return segments.length > 1 ? segments.slice(1).join("/") : null;
+};
 // A symbol may be cited as `name` or `name()` — the parens are the citer marking it a function or
 // method, not literal text to search for (a call site rarely has empty arguments); the extraction
 // below captures the identifier alone and drops them, the same way `snippetPattern`'s elision
@@ -857,11 +1000,36 @@ const extractFromBody = (body) => {
     // to the exact same vanished line #649's plain-path form catches passed in silence. The parse
     // differs by form (a URL's match end sits after the whole link, a bare citation's after just
     // the path:line); what happens with the text following it does not.
+    // Round 8, on `looksLikeCode`: asked here whether the heuristic is even needed once the text
+    // is already known to be quoted, rather than tuned a fourth time. The answer differs by which
+    // "quoted" this is:
+    //
+    //   - An inline citation's content only exists at all because `readDelimitedSpan` found an
+    //     *explicit* backtick or quote mark right after the citation. That delimiter is the
+    //     author's own deliberate act of quoting — choosing to wrap this specific span and not the
+    //     rest of the sentence — and second-guessing it with "but does it look like code" is a
+    //     check on a signal already stronger than the guess. `README.md:1` — `return null;` is
+    //     exactly this: unmistakably quoted, unmistakably code, and `looksLikeCode` rejected it
+    //     anyway (no mixed-case identifier, no call/dot/assignment/brace in its first three words)
+    //     — a real false ADVISORY this check's own header calls STALE. Fixed by trusting the
+    //     delimiter and skipping the heuristic entirely for this branch.
+    //   - A fenced line's content has no delimiter of its own; the fence marks the *block* as
+    //     code-like, not each row within it as a literal quote of the file it names. #649's own
+    //     body is the proof this distinction is real, not theoretical: its fence mixes a literal
+    //     quote (`const actorId = this.mintActor(...)`) with plain descriptions of what a range of
+    //     lines does (`reconstitution is allowed when no active CEO exists (#619)`), and the
+    //     second kind fails a literal match not because the fact is wrong but because a
+    //     description was never going to appear verbatim. `looksLikeCode` stays on this branch
+    //     because dropping it here reintroduces exactly that false STALE — checked directly against
+    //     this fixture before deciding, not assumed.
     const contentAfter = (matchEnd, startLine) => {
       if (startLine === null) return null;
       const afterCitation = stripCitationSeparator(rawLine.slice(matchEnd));
-      const candidate = inFence ? afterCitation : readDelimitedSpan(afterCitation);
-      return candidate && candidate.length > 0 && looksLikeCode(candidate) ? candidate : null;
+      if (inFence) {
+        return afterCitation.length > 0 && looksLikeCode(afterCitation) ? afterCitation : null;
+      }
+      const delimited = readDelimitedSpan(afterCitation);
+      return delimited && delimited.length > 0 ? delimited : null;
     };
 
     // A GitHub blob permalink to *this* repository is a precise, structured citation and is
@@ -872,7 +1040,8 @@ const extractFromBody = (body) => {
       for (const m of rawLine.matchAll(GITHUB_BLOB_RE)) {
         const slug = `${m[1]}/${m[2]}`.toLowerCase();
         if (slug !== repoSlug) continue;
-        const path = m[3].replace(/[.,;:)]+$/, "");
+        const path = resolveBlobRefAndPath(m[3]);
+        if (path === null) continue; // ref/path boundary not verifiable against a real branch
         const startLine = m[4] ? Number(m[4]) : null;
         const endLine = m[5] ? Number(m[5]) : null;
         const content = contentAfter(m.index + m[0].length, startLine);

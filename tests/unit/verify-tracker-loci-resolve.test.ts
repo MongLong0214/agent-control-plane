@@ -586,7 +586,7 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("[round 4] an inline citation whose quoted content still holds is ADVISORY, not STALE", () => {
-    const body = "The banner text is set in `README.md:1` — `# agent-control-plane` — right at the top.";
+    const body = "The banner text is set in `README.md:1` — `# Agent Control Plane` — right at the top.";
     const { path, cleanup } = withIssues([{ number: 8808, title: "inline current citation control", body }]);
     try {
       const result = run(path);
@@ -742,7 +742,7 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("[round 6] a permalink whose quoted content still holds remains ADVISORY", () => {
-    const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#L1 — `# agent-control-plane`.";
+    const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#L1 — `# Agent Control Plane`.";
     const { path, cleanup } = withIssues([{ number: 9402, title: "permalink current content control", body }]);
     try {
       const result = run(path);
@@ -908,6 +908,141 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.stdout).toContain("STALE");
       expect(result.stdout).toContain("#definitelyMissing");
       expect(result.stdout).toContain("does not appear");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // --- Round 8: an eighth independent review, run against the shipped script. Two parsing
+  // fixes and a decision on the heuristic question this PR has answered twice before.
+
+  it("[round 8] a backtick-wrapped permalink with no #L anchor does not capture the closing backtick", () => {
+    // With no `#L…` to stop the path capture at `#`, nothing stopped it at the closing backtick
+    // either — `README.md\`` does not exist, and a real link to a real file exited 1.
+    const body = "See `https://github.com/MongLong0214/agent-control-plane/blob/main/README.md` for details.";
+    const { path, cleanup } = withIssues([{ number: 9801, title: "backtick permalink counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 8] a backtick-wrapped permalink to a genuinely missing file is still STALE", () => {
+    const body = "See `https://github.com/MongLong0214/agent-control-plane/blob/main/scripts/does-not-exist.mjs` for details.";
+    const { path, cleanup } = withIssues([{ number: 9802, title: "backtick permalink missing file counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("scripts/does-not-exist.mjs");
+      expect(result.stdout).not.toContain("`");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 8] a permalink built from this repo's own multi-segment branch name resolves correctly", () => {
+    // The exact branch this fix was written on. `/blob/<ref>/<path>` assumed `<ref>` is one
+    // segment, so this read as file `597-tracker-loci-resolve-or-the-check-says-so/README.md` —
+    // never existed, reported STALE — instead of the real file, `README.md`, on the real branch.
+    const body =
+      "See https://github.com/MongLong0214/agent-control-plane/blob/" +
+      "feat/597-tracker-loci-resolve-or-the-check-says-so/README.md for the change.";
+    const { path, cleanup } = withIssues([{ number: 9803, title: "multi-segment branch ref counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 8] a multi-segment-ref permalink to a genuinely missing file is still STALE, not silently skipped", () => {
+    const body =
+      "See https://github.com/MongLong0214/agent-control-plane/blob/" +
+      "feat/597-tracker-loci-resolve-or-the-check-says-so/scripts/does-not-exist.mjs for the change.";
+    const { path, cleanup } = withIssues([{ number: 9804, title: "multi-segment branch ref missing file counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("scripts/does-not-exist.mjs");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 8] a permalink to a directory (not a file) is still checked against tracked files", () => {
+    // `main` is a known ref (`knownRefs` resolves it directly, independent of whether anything
+    // past it exists), so the split is never in question here — `docs/adr` is what remains, a
+    // real directory but not a tracked file, and reporting "does not exist" is accurate for a
+    // file-existence check even though it does not have a distinct category for "this is a
+    // directory". An earlier version of this fix tried resolving the split only against tracked
+    // files with no independent ref authority, under which this citation went silent instead —
+    // which looked like an improvement until the same change made a *deleted file* behind a
+    // multi-segment ref go silent too, the one case this check exists to catch. Restoring
+    // `knownRefs` fixed both at once, and returned this one to reporting what it always reported.
+    const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/docs/adr for the rule.";
+    const { path, cleanup } = withIssues([{ number: 9805, title: "directory permalink control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("docs/adr does not exist");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 8] explicitly quoted code that has vanished is STALE even when it trips no code heuristic", () => {
+    // `return null;` is unmistakably code and unmistakably quoted (an explicit backtick span
+    // right after the citation) — and it trips none of `looksLikeCode`'s checks (no mixed-case
+    // identifier, no call/dot/assignment/brace in its first words). The fix is not a fifth check
+    // added to that heuristic: an inline citation's content only exists because of an explicit
+    // delimiter, which is the author's own act of quoting, and the heuristic is dropped entirely
+    // for that branch rather than asked to recognise one more shape.
+    const body = "The banner check at `README.md:1` — `return null;` no longer holds.";
+    const { path, cleanup } = withIssues([{ number: 9806, title: "return null heuristic gap counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("return null;");
+      expect(result.stdout).toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 8] explicitly quoted prose that is still current is ADVISORY, not asserted stale on a technicality", () => {
+    const body = "The banner text is set in `README.md:1` — `# Agent Control Plane` — right at the top.";
+    const { path, cleanup } = withIssues([{ number: 9807, title: "explicit quote positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 8] fenced content still needs to read as code — the heuristic stays on that branch", () => {
+    // The other half of the round 8 decision: a fenced line has no delimiter of its own, and
+    // #649's real body proves the fence alone is not a reliable "this row is a literal quote"
+    // signal — it mixes exactly this kind of plain description with a literal quote in one fence.
+    // Dropping the heuristic here would reintroduce a false STALE for this real citation.
+    const body = ["```", "hermes-bootstrap.ts:121-146   reconstitution is allowed when no active CEO exists (#619)", "```"].join("\n");
+    const { path, cleanup } = withIssues([{ number: 9808, title: "fenced description positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
     } finally {
       cleanup();
     }
