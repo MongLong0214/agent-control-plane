@@ -476,7 +476,8 @@ export class ConversationTurnCoordinator {
    * this build will ever see comes from a test calling `claim()` directly. A review (#691) named
    * this precisely, and it is a correct description of the current system rather than a defect in
    * this one — wiring a production caller here is #683/#639's other half, deliberately not done in
-   * this change (see `reconcileUnresolved`'s docstring for what that means for the sweep).
+   * this change. See `reconcileUnresolved`'s docstring, fact 1 of 2, for what that means for the
+   * sweep — and fact 2, which is independent of this one and does not resolve when this does.
    */
   claim(input: {
     targetActorId: string;
@@ -910,26 +911,33 @@ export class ConversationTurnCoordinator {
    * where it was, `IN_DOUBT` and visible as `OUTCOME_UNKNOWN`, and contract 6 forbids treating
    * either as evidence for re-execution.
    *
-   * **What this does and does not do in the deployed system, stated exactly rather than deferred
-   * as "wiring is follow-up" (#691).** This sweep observes `canonical_turns`, which nothing in
-   * production currently populates, so it is a no-op in the deployed system until `claim()` has a
-   * caller — see that method's docstring. The design is kept rather than pointed at the ledger
-   * production does write (`inbound_messages.turn_claim_json`, via `IngressGuard`) because that is
-   * a different table with a different shape and its own review, and silently retargeting this
-   * sweep at it would change what this change *is* without saying so. Wiring a production writer
-   * for `canonical_turns` is #683/#639's other half.
+   * **What this does and does not do in the deployed system, stated as two separate facts rather
+   * than one, because a third review (#691) found the first draft's disclosure let the second one
+   * read as a footnote of the first. They are independent, and resolving #1 does not resolve #2:**
    *
-   * **What this does and does not do about contract 6's atomicity, also stated exactly (#691).**
-   * The contract requires a matched receipt to move `TURN_COMPLETED` and insert one reply-outbox
-   * item atomically — not as two facts that could disagree. This method only ever performs the
-   * first half: nothing here inserts anywhere a reply could be delivered from, because no such
-   * mechanism is wired to this ledger (`src/outbox/outbox.ts` exists, but its message kinds are
-   * role-to-role task dispatch, not a reply to the owner who asked). Building that mechanism now
-   * would be exactly the "much larger change" the previous paragraph declines for the same reason.
-   * So `#settleFromReceipt` refuses `COMPLETED` outright, for every receipt, until that mechanism
-   * exists — a refusal is recoverable; a `COMPLETED` recorded with no way to prove the reply went
-   * anywhere is not, since `canonical_turns`' settlement is one-way through the ordinary API.
-   * `ABORTED` carries no reply obligation and is unaffected.
+   * 1. **Nothing to sweep.** This method observes `canonical_turns`, which nothing in production
+   *    currently populates — `ConversationTurnCoordinator.claim()` has no caller in `src/` today;
+   *    the live Telegram path claims through `IngressGuard` into a different table,
+   *    `inbound_messages.turn_claim_json` (see `claim()`'s docstring). So today this sweep runs, and
+   *    asks, over an empty set. The design is kept rather than pointed at the ledger production
+   *    does write, because that is a different table with a different shape and its own review;
+   *    silently retargeting this sweep at it would change what this change *is* without saying so.
+   *    Wiring a production writer for `canonical_turns` is #683/#639's other half.
+   * 2. **Even with something to sweep, `COMPLETED` cannot be acted on — unconditionally, not only
+   *    while #1 holds.** Contract 6 requires a matched receipt to move `TURN_COMPLETED` and insert
+   *    one reply-outbox item atomically, in the same transaction. Nothing wired to `canonical_turns`
+   *    can perform the second half (`src/outbox/outbox.ts` exists, but its message kinds are
+   *    role-to-role task dispatch, not a reply to the owner who asked), so `#settleFromReceipt`
+   *    refuses every `COMPLETED` receipt outright, unconditionally — not "when the reply obligation
+   *    happens to be undischargeable", because there is no path today on which it is dischargeable.
+   *    This was a deliberate choice over a conditional refusal: a conditional check would need a
+   *    reply-outbox interface to test against, and no consumer of one exists yet — inventing that
+   *    seam now is how an API nobody can use gets built. What has to exist first is a reply-outbox
+   *    mechanism actually wired to this ledger; until it does, resolving #1 makes `ABORTED`
+   *    settlements real and leaves `COMPLETED` exactly as inert as it is today. `ABORTED` carries no
+   *    reply obligation and is unaffected by this refusal. A refusal here is recoverable; a
+   *    `COMPLETED` recorded with no way to prove the reply went anywhere is not, since
+   *    `canonical_turns`' settlement is one-way through the ordinary API.
    */
   async reconcileUnresolved(): Promise<{
     readonly swept: number;

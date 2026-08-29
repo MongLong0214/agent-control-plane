@@ -43,13 +43,18 @@ afterAll(cleanupTempDirs);
  *    as a public argument, `ReceiptPort` is bound once at construction (a true `#`-private field,
  *    since `private readonly` erases at compile time), and the exported default port is frozen so
  *    its `lookup` cannot be overwritten in place either.
- * 3. Round 2's fixes made the sweep sound but exposed two things it was never asked to be: it
- *    sweeps `canonical_turns`, which nothing in production writes to (`claim()` has no caller in
- *    `src/`; the live Telegram path claims through `IngressGuard` into a different table) — so
- *    this sweep runs, and asks, over an empty set, until #683/#639's other half wires a production
- *    writer. And every settlement below only ever moves `canonical_turns` — contract 6 also
- *    requires a reply-outbox insert in the same transaction, which nothing wired to this ledger can
- *    perform, so `#settleFromReceipt` now refuses `COMPLETED` outright and unconditionally.
+ * Round 2's fixes made the sweep sound but exposed two things it was never asked to be — two
+ * independent facts, stated adjacently and numbered because a fourth review found the first draft
+ * let the second read as a footnote of the first:
+ *
+ * 3. Nothing to sweep: it sweeps `canonical_turns`, which nothing in production writes to
+ *    (`claim()` has no caller in `src/`; the live Telegram path claims through `IngressGuard` into
+ *    a different table) — so this sweep runs, and asks, over an empty set, until #683/#639's other
+ *    half wires a production writer.
+ * 4. Even with something to sweep, `COMPLETED` cannot be acted on: every settlement below only
+ *    ever moves `canonical_turns`, and contract 6 also requires a reply-outbox insert in the same
+ *    transaction, which nothing wired to this ledger can perform. So `#settleFromReceipt` refuses
+ *    `COMPLETED` outright and unconditionally — not only while 3 holds, but independently of it.
  *    `ABORTED` carries no reply obligation and is what most tests below use to exercise the
  *    identity checks without that refusal masking them; the one test about `COMPLETED` itself says
  *    so explicitly.
