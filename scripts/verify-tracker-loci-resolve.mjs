@@ -24,9 +24,10 @@
  *     per extension, and an extension with no supported comment syntax is disclosed as a plain
  *     text search rather than silently inheriting another language's rules → STALE (this is a
  *     text search, not declaration verification; see rounds 3 and 4 below for why)
- *   - a cited code line, quoted alongside its file:line — inline in a sentence or inside a fenced
- *     block, both are read the same way — no longer appears anywhere in that file (elision-
- *     tolerant: `...`/`()` stand for "and more")                            → STALE
+ *   - a cited code line — quoted with an explicit delimiter right after an inline citation, or
+ *     the rest of a fenced citation's line (the fence itself is the delimiter there; see round 5
+ *     below for why an inline citation needs its own) — no longer appears anywhere in that file
+ *     (elision-tolerant: `...`/`()` stand for "and more")                   → STALE
  *
  * The last one is the one that actually catches #649's real citation. `binding-registry.ts:163`
  * is still in range — that file is 973 lines long — so the length check alone passes it. What
@@ -182,6 +183,50 @@
  *   followed the first word, and an ordinary sentence ending "...SSOT.md:99 structurally.**" (a
  *   markdown bold-close right after the period) matched it. Fixed by requiring a real identifier
  *   character after the dot, not just the dot itself.
+ *
+ * ## Round 5: three counterexamples, one underlying shape — a hand-maintained list deciding what
+ * counts, whichever direction it was enumerating
+ *
+ *   `` `session-registry.ts` — `definitelyMissing()` `` matched nothing: `SYMBOL_ROW_RE` did not
+ *   allow parentheses on a symbol at all, so a citation written the way people actually write a
+ *   function reference — with `()` — was invisible to the regex, not merely unresolved. Fixed:
+ *   the row pattern accepts an optional `()`, dropped before the identifier is searched for (the
+ *   parens mark "this is callable", they are not literal text a call site necessarily repeats,
+ *   the same reasoning `snippetPattern`'s elision already uses for an empty `()`).
+ *
+ *   The other two were the same defect in opposite directions. `looksLikeCode`'s keyword list
+ *   (round 4) recognised `const`/`let`/`return`/… and nothing else, so a genuinely vanished
+ *   `` `interface DefinitelyGone {` `` read as ADVISORY — this check's own header claims a
+ *   vanished quoted line is STALE, and it was not. Meanwhile `cleanInlineTail` + that same list
+ *   let ordinary sentences ("this describes the banner text... its return value...") be read as
+ *   quoted code, because `this` and `return` are common English words that also happen to be JS
+ *   keywords. Widening the list fixes the first and worsens the second; narrowing does the
+ *   reverse — the list itself was the problem, not its contents.
+ *
+ *   Two changes, addressing the two different halves of that one shape:
+ *
+ *   1. **The quoted/unquoted distinction now does the work.** An inline citation's content is
+ *      read only from an *explicit* delimiter — backticks or quotes right after the citation
+ *      (`readDelimitedSpan`) — never from unquoted trailing prose. There is no guess left to make
+ *      about whether "this describes..." was meant as a quote: without a delimiter, it never was
+ *      one, and `content` stays `null` unconditionally. A fenced line still needs no additional
+ *      delimiter — the fence itself is the quotation mark, as it always has been.
+ *   2. **`looksLikeCode` no longer enumerates keywords at all**, for text that is already known to
+ *      be quoted (by either of the above). It asks two questions that do not name a single word:
+ *      does a mixed-case identifier (`actorId`, `DefinitelyGone`, `ALLOWLIST_DIGEST`) appear —
+ *      English does not capitalize mid-word, every language this check reads does, for exactly
+ *      the names it declares; and, immediately after the first word only, does a call/member/
+ *      assignment boundary follow (widened just for `{`, since a sentence essentially never ends
+ *      in one regardless of what precedes it — see the comment beside it for why `(`/`.`/`=` stay
+ *      narrow: a first attempt at widening all four caught "calls bindings.bind()", an English
+ *      sentence about a call, as if it were the call itself, and lost the actual `bindings.bind(`
+ *      to the paraphrase word in front of it).
+ *
+ *   What this still cannot do — stated rather than hidden: a declaration with no distinguishing
+ *   capitalization and no boundary in its first word (`interface gone {`, all lowercase) is not
+ *   recognised. That is a fact about how little three words of context can prove without a list,
+ *   not a list this check forgot to extend — and the alternative, tuning the list a fourth time,
+ *   is the failure mode this round exists to stop.
  *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
@@ -487,7 +532,11 @@ const URL_RE = /https?:\/\/\S+/g;
 // matched a fragment of the URL itself (`com/<owner>/<repo>/blob/main/README.md`), not the path
 // the link actually names, and reported that fragment ambiguous against every tracked README.
 const GITHUB_BLOB_RE = /https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/blob\/[^/\s]+\/([^\s#)]+)(?:#L(\d+)(?:-L?(\d+))?)?/g;
-const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`[\w.$]+`,?\s*)+)/g;
+// A symbol may be cited as `name` or `name()` — the parens are the citer marking it a function or
+// method, not literal text to search for (a call site rarely has empty arguments); the extraction
+// below captures the identifier alone and drops them, the same way `snippetPattern`'s elision
+// treats an empty `()` as "a call, arguments omitted" rather than a literal empty parameter list.
+const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`[\w.$]+(?:\(\))?`,?\s*)+)/g;
 const NON_DURABLE_RE = /(\/private\/tmp\/[^\s`)]+|(?<![\w/])\/tmp\/[^\s`)]+)/g;
 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -518,73 +567,110 @@ const snippetPattern = (snippet) => {
   return source.length > 0 ? new RegExp(source, "s") : null;
 };
 
-const CODE_KEYWORDS = new Set([
-  "const", "let", "var", "return", "if", "else", "function", "class", "export", "import",
-  "await", "async", "new", "throw", "switch", "case", "for", "while", "try", "catch",
-  "this", "super", "private", "public", "static",
-]);
-
 /**
- * Extracts an inline citation's quoted content from the rest of its line — not just trims it. An
- * inline citation is written mid-sentence, with its own code span closing right where the match
- * ends: "`binding-registry.ts:163` — `const actorId = this.mintActor(...)` no longer holds." The
- * text after the match is `` ` — `const actorId = this.mintActor(...)` no longer holds. ``, and a
- * plain trim would keep the trailing sentence as if it were quoted code, checking a citation
- * against a string that was never a line in any file.
- *
- * So: drop the citation's own closing delimiter, drop the markdown separator (whitespace, a dash,
- * a colon) between citation and quote, then — if what is left opens with a backtick or quote —
- * read only up to its matching close and discard everything after. A citation with no wrapping
- * quote around its content (the fenced convention: `path:line   bare code`, nothing else on the
- * line) falls through unchanged, which is the behaviour this replaces and must not disturb.
+ * Strips the citation's own closing delimiter and the markdown separator between a citation and
+ * whatever follows it — whitespace, a dash, a colon. Shared by both the fenced and inline paths:
+ * a fenced line still has the citation's own trailing backtick to remove if it was written
+ * `` `path:line` `` inside the fence, and both need the separator dropped before looking at what
+ * comes next.
  */
-const cleanInlineTail = (text) => {
+const stripCitationSeparator = (text) => {
   let t = text.replace(/←.*$/, "").trimEnd();
   t = t.replace(/^\s*[`'"]/, ""); // the citation's own closing delimiter, if it had one
   t = t.replace(/^[\s:—–-]+/, ""); // the separator between a citation and what follows
-  for (const quote of ["`", '"', "'"]) {
-    if (t.startsWith(quote)) {
-      const closing = t.indexOf(quote, 1);
-      return (closing === -1 ? t.slice(1) : t.slice(1, closing)).trim();
-    }
-  }
-  return t.replace(/[`'"]\s*$/, "").trim();
+  return t;
 };
 
 /**
- * A trailing description is only checkable as literal content if the citation itself opens with
- * code, not with a description that merely mentions some. Requiring only *some* code-shaped
- * fragment anywhere in the text is not enough — "calls bindings.bind()" contains a real call, but
- * "calls" is the citer's paraphrase and does not appear next to it in the source, so a substring
- * match on the whole trailing text would call a perfectly current citation stale for a reason
- * that is about the paraphrase, not the tree. Requiring code at the very start is what a quoted
- * line looks like (`const actorId = this.mintActor(...)`, `sameProviderReplacement = outgoing…`);
- * a citation that instead reads as prose about a locus (`reconstitution is allowed when…`, a
- * state-machine row written `state → guard(...)`) is real information but not a literal quote,
- * and is left to the weaker line-in-bounds check rather than asserted stale on a technicality of
- * how it was phrased.
+ * Reads an *explicitly* quoted span from the start of already-separator-stripped text — a
+ * backtick or quote mark, up to its matching close — or returns `null` if there is none. Used
+ * only for an inline citation's trailing text, which is otherwise an ordinary sentence: without
+ * an explicit delimiter there is no fact to check here, only a guess about whether the citer
+ * meant to quote something, and guessing is exactly what let ordinary prose ("This describes the
+ * banner text and its return value has changed") be read as a stale quote of code that was never
+ * there. A citation with no such delimiter gets `null`, unconditionally — not "probably not code",
+ * not checked at all.
+ */
+const readDelimitedSpan = (text) => {
+  for (const quote of ["`", '"', "'"]) {
+    if (text.startsWith(quote)) {
+      const closing = text.indexOf(quote, 1);
+      return (closing === -1 ? text.slice(1) : text.slice(1, closing)).trim();
+    }
+  }
+  return null;
+};
+
+/**
+ * Whether text that is *already known to be quoted* — an explicit inline span, or the rest of a
+ * fenced citation's line, where the fence itself is the quotation mark — reads as code rather than
+ * as a description of code. This is never asked about unquoted prose; see `readDelimitedSpan` and
+ * the fenced branch below for where that line is drawn.
+ *
+ * Not a keyword list. Three rounds of tuning one (`const`/`let`/… added, then `interface`/`type`/
+ * `enum`/`def`/`CREATE` found still missing, while `this`/`return` — ordinary English words that
+ * are also JS keywords — separately let ordinary sentences through) proved the shape of the
+ * problem: any finite enumeration of "words that mean code" is both too narrow for a form nobody
+ * added yet and too wide for the same words used as English. So this asks two questions that do
+ * not name a single keyword:
+ *
+ *   1. Does a mixed-case identifier appear in the first few words — `actorId`, `mintActor`,
+ *      `DefinitelyGone`, `ALLOWLIST_DIGEST`? English does not capitalize mid-word or write
+ *      multi-word names with no spaces; every language this check reads does, for exactly the
+ *      names it declares or references. This alone recognises `interface DefinitelyGone {`
+ *      without a list ever having heard of `interface`.
+ *   2. Within up to three leading words (enough for `CREATE TABLE Name`, `const actorId =`,
+ *      `interface DefinitelyGone {`), does the text right after them open with a call, a member
+ *      access, an assignment, or a block? Each is a structural boundary, not a vocabulary word —
+ *      `(` immediately after a name; `.` immediately followed by another name (not `.` followed by
+ *      nothing or punctuation, which is just a sentence's period — the exact bug a prior round hit
+ *      live, on "...violates SSOT.md:99 structurally.**"); `=` not `==`; or `{`.
+ *
+ * What this still cannot do: recognise a declaration with no distinguishing capitalization and no
+ * nearby structural boundary within three words (rare — most real code fails that only when the
+ * words this check would see are themselves generic English, which is also when a human reading
+ * the same citation would be unsure). That gap is a fact about what three words of context can
+ * prove, not a list this check forgot to extend.
  */
 const looksLikeCode = (text) => {
   const stripped = text.replace(/\(#\d+\)/g, "").trim();
-  const firstToken = stripped.match(/^[A-Za-z_$][\w$]*/);
-  if (!firstToken) return false;
-  const word = firstToken[0];
-  const rest = stripped.slice(word.length);
-  if (CODE_KEYWORDS.has(word)) return true;
-  if (/^\s*\(/.test(rest)) return true; // identifier( — a call, first thing cited
-  // identifier.member — dotted access, first thing cited. The character right after the dot has
-  // to start a real member name: a dot followed by anything else (end of string, whitespace,
-  // punctuation) is an ordinary sentence-ending period, not code. Found live, once inline citations
-  // started being read the same way fenced ones are: "...violates SSOT.md:99 structurally.**" —
-  // a real citation, real prose — matched `/^\./` on "structurally.**" and was almost read as
-  // quoted code because a markdown bold-close sat right after the period.
-  if (/^\.[A-Za-z_$]/.test(rest)) return true;
-  if (/^\s*=[^=]/.test(rest)) return true; // identifier = value — assignment, first thing cited
+  if (stripped.length === 0) return false;
+
+  const leadingWords = stripped.match(/^(?:[A-Za-z_$][\w$]*\s+){0,4}[A-Za-z_$][\w$]*/);
+  const scope = leadingWords ? leadingWords[0] : stripped.slice(0, 40);
+  // camelCase / PascalCase (a lowercase letter directly followed by an uppercase one) or a
+  // SCREAMING_SNAKE_CASE run (two-or-more-capitals, an underscore, another capital) — neither is
+  // a shape English prose produces, and both are the ordinary naming convention in every language
+  // this check reads.
+  if (/[a-z][A-Z]/.test(scope) || /[A-Z]{2,}_[A-Z]/.test(scope)) return true;
+
+  const firstWord = stripped.match(/^[A-Za-z_$][\w$]*/);
+  if (!firstWord) return false;
+  const afterFirst = stripped.slice(firstWord[0].length);
+  // A call, a member access, or an assignment has to sit right after the *first* word, not
+  // merely somewhere within the first few — "calls bindings.bind()" is an English sentence about
+  // a call, and only widening this to "any of the first two or three words" (tried, and reverted)
+  // reads it as code because "bindings" happens to be followed by ".bind(". Requiring the boundary
+  // immediately after word one is what a real quoted line looks like; a describing sentence has a
+  // verb there instead.
+  if (/^\s*\(/.test(afterFirst)) return true; // name( — a call
+  if (/^\.[A-Za-z_$]/.test(afterFirst)) return true; // name.member — a real member name after the dot
+  if (/^\s*=[^=]/.test(afterFirst)) return true; // name = value — an assignment
+
+  // `{` is the one boundary safe to look for further out: unlike `(`, `.`, or `=`, an English
+  // sentence essentially never ends in an opening brace regardless of what comes before it, so a
+  // wider "a name, maybe a second name, then `{`" window catches `interface DefinitelyGone {`
+  // and similar declaration headers without also catching a sentence that happens to reach a
+  // dotted call two words in.
+  const braceScope = stripped.match(/^(?:[A-Za-z_$][\w$]*\s+){0,2}[A-Za-z_$][\w$]*/);
+  if (braceScope && /^\s*\{/.test(stripped.slice(braceScope[0].length))) return true;
+
   return false;
 };
 
 const extractFromBody = (body) => {
   const lines = body.split("\n");
+  let inFence = false;
   const seenPath = new Set();
   const seenSymbolRow = new Set();
   const seenNonDurable = new Set();
@@ -593,10 +679,10 @@ const extractFromBody = (body) => {
   const nonDurable = [];
 
   for (const rawLine of lines) {
-    // A fence delimiter line never itself matches a citation; skipped so nothing downstream has
-    // to know whether it is inside or outside a fence — quoted content is read the same way
-    // either side (see the `looksLikeCode` call below and round 4's note on inline citations).
-    if (/^\s*```/.test(rawLine)) continue;
+    if (/^\s*```/.test(rawLine)) {
+      inFence = !inFence;
+      continue;
+    }
 
     const nonDurableSpans = [];
     for (const m of rawLine.matchAll(NON_DURABLE_RE)) {
@@ -647,18 +733,21 @@ const extractFromBody = (body) => {
       const groups = m.groups ?? {};
       const startLine = groups.cs ? Number(groups.cs) : groups.as ? Number(groups.as) : null;
       const endLine = groups.ce ? Number(groups.ce) : groups.ae ? Number(groups.ae) : null;
-      // Round 4: this only ran inside a fenced block, so a citation written the ordinary way
-      // people actually write them — inline, in a sentence, no ``` around it — was never
-      // content-checked at all. That is the #649 shape itself: the real citation this check was
-      // built against, `` `binding-registry.ts:163` ... `const actorId = this.mintActor(...)` ``,
-      // could just as easily have been written as one inline sentence, and would have gone
-      // unchecked. `looksLikeCode` is what already keeps this from reading ordinary prose
-      // ("still resolves at line 121, reconstitution is allowed when...") as quoted code; the
-      // fence was never doing separate work once that guard exists.
+      // Round 4 opened content-checking to inline citations (not just fenced ones) — the #649
+      // shape itself, written the ordinary way people actually write one, was never checked at
+      // all before that. Round 5 narrows *how* an inline citation's content is found: only an
+      // *explicit* delimiter (backticks or quotes right after the citation) counts as quoted at
+      // all — a fenced line's content needs no such delimiter, because the fence itself is the
+      // quotation mark. Guessing at unquoted prose is what let "This describes the banner text
+      // and its return value has changed" read as a quote of code that was never there; requiring
+      // an explicit delimiter removes that guess rather than refining it. `looksLikeCode` runs
+      // only after a span is already known to be quoted, deciding whether *that* text reads as
+      // code or as a description — never whether unquoted prose should be treated as a quote.
       let content = null;
       if (startLine !== null) {
-        const rest = cleanInlineTail(rawLine.slice(m.index + m[0].length));
-        if (rest.length > 0 && looksLikeCode(rest)) content = rest;
+        const afterCitation = stripCitationSeparator(rawLine.slice(m.index + m[0].length));
+        const candidate = inFence ? afterCitation : readDelimitedSpan(afterCitation);
+        if (candidate && candidate.length > 0 && looksLikeCode(candidate)) content = candidate;
       }
       // The quoted content is part of the identity, not decoration on top of it. Two citations of
       // the same `path:line` are two different claims when one of them also quotes code — a bare
@@ -674,7 +763,7 @@ const extractFromBody = (body) => {
 
   for (const m of body.matchAll(SYMBOL_ROW_RE)) {
     const path = m[1];
-    const symbols = [...m[2].matchAll(/`([\w.$]+)`/g)].map((s) => s[1]);
+    const symbols = [...m[2].matchAll(/`([\w.$]+)(?:\(\))?`/g)].map((s) => s[1]);
     const key = `${path}:${symbols.join(",")}`;
     if (seenSymbolRow.has(key)) continue;
     seenSymbolRow.add(key);

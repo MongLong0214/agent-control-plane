@@ -622,6 +622,101 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
+  // --- Round 5: a fifth independent review, run against the shipped script through
+  // --issues-file. Three counterexamples, one underlying shape (a hand-maintained list deciding
+  // what counts — a symbol-form regex, a code-vs-prose keyword list), addressed by deleting the
+  // guessing rather than tuning the list a fourth time. See the round 5 docstring for the full
+  // argument on why.
+
+  it("[round 5] a symbol cited with parentheses is not invisible to the row regex", () => {
+    // `SYMBOL_ROW_RE` did not allow `()` on a symbol at all — a citation written the way people
+    // actually write a function reference, `definitelyMissing()`, matched nothing and produced an
+    // empty result, not merely an unresolved one.
+    const body = "`src/session/session-registry.ts` — `definitelyMissing()`";
+    const { path, cleanup } = withIssues([{ number: 9201, title: "symbol paren counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("definitelyMissing");
+      expect(result.stdout).toContain("src/session/session-registry.ts");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 5] a genuinely vanished quoted declaration is STALE, not silently ADVISORY", () => {
+    // `interface DefinitelyGone {` is a real declaration header the old keyword list did not
+    // recognise (it knew `const`/`let`/`return`/…, not `interface`), so this fenced, genuinely
+    // quoted, genuinely gone line read as merely "still resolves at line 1" — contradicting this
+    // script's own header, which claims a vanished quoted line is STALE.
+    const body = ["See below:", "", "```", "session-registry.ts:1  interface DefinitelyGone {", "```", ""].join("\n");
+    const { path, cleanup } = withIssues([{ number: 9202, title: "interface keyword counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("interface DefinitelyGone");
+      expect(result.stdout).toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 5] unquoted prose is never read as a citation's content, even using words that are also code keywords", () => {
+    // `this` and `return` are ordinary English words that also happen to be JS keywords; the old
+    // list treated the mere presence of either as proof of quoted code, so a plain sentence
+    // describing a citation — no delimiter anywhere — was checked as if it were a literal quote
+    // and reported as a stale citation of a string no file ever contained.
+    const body =
+      "The rule at `README.md:1` this describes the banner text and its return value has changed since.";
+    const { path, cleanup } = withIssues([{ number: 9203, title: "unquoted prose keyword counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+      expect(result.stdout).not.toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 5] an English sentence describing a call is not mistaken for the call itself", () => {
+    // Found while verifying the fix above, against the real #649 fixture: widening the
+    // call/member/assignment boundary to "within the first few words" (rather than immediately
+    // after the first word) made "calls bindings.bind()" — a real line in #649's own body,
+    // correctly ADVISORY since #619 — match as code, because "bindings" is followed by
+    // ".bind(". The whole phrase, paraphrase word included, then became the literal content to
+    // check, and "calls" is not in the source — a false STALE manufactured by the fix meant to
+    // remove false ADVISORYs. Reverted to requiring the boundary right after word one; `{` stays
+    // the one exception (see the docstring beside `looksLikeCode`).
+    const body = ["```", "hermes-bootstrap.ts:341       calls bindings.bind()", "```"].join("\n");
+    const { path, cleanup } = withIssues([{ number: 9204, title: "paraphrase call counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+      expect(result.stdout).not.toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 5] a fenced literal call is still checked and found current", () => {
+    const body = ["```", "src/bootstrap/hermes-bootstrap.ts:341   cp.bindings.bind({...})", "```"].join("\n");
+    const { path, cleanup } = withIssues([{ number: 9205, title: "fenced literal call positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);
