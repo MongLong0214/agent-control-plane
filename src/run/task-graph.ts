@@ -458,7 +458,7 @@ export class TaskGraph {
     /** When given, the execution must belong to this run (§25.2). */
     expectedRunId?: string,
   ): Decision<ExecutionRecord> {
-    return this.db.tx(() => {
+    const preflight = this.db.tx(() => {
       const execution = this.execution(executionId);
       if (!execution) return deny(ReasonCode.NOT_FOUND, "unknown execution", { executionId });
       if (expectedRunId !== undefined && execution.runId !== expectedRunId) {
@@ -476,6 +476,11 @@ export class TaskGraph {
         // A takeover invalidates an in-flight execution, even if the old process gets to
         // report after the replacement has started. Preserve the receipt attempt for
         // forensic audit but never let it advance the task state (§10.3, §15.7).
+        //
+        // #664 — this audit write is the only forensic record of a late/superseded result
+        // and must survive the denial right below it (the same shape as github-kernel.ts's
+        // claim-expiry sweep), which is why this preflight stays on plain `tx()` instead of
+        // being folded into the `txDecision()` below.
         this.audit.record({
           kind: "TASK_EXECUTION_LATE_RESULT_IGNORED",
           runId: execution.runId,
@@ -499,6 +504,19 @@ export class TaskGraph {
           },
         );
       }
+      return allow(ReasonCode.OK, undefined);
+    });
+    if (!preflight.allowed) return preflight as Decision<ExecutionRecord>;
+
+    // #664 — recordInvocationFinished below writes and commits, and recordTaskClassification
+    // right after it is an independent call that can still deny; a denial there must not
+    // leave the invocation-finished baseline record behind, so this body's own decision has
+    // to roll both back. `finishExecution` is fully synchronous — there is no `await`
+    // between the preflight above and this transaction — so nothing else in this process can
+    // run in the gap, and the ownership the preflight just confirmed cannot have changed
+    // underneath this second transaction.
+    return this.db.txDecision(() => {
+      const execution = this.execution(executionId)!;
       if (execution.status !== "RUNNING") {
         return deny(ReasonCode.CONFLICT, `execution is already ${execution.status}`, {
           executionId,

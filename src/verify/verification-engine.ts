@@ -406,7 +406,10 @@ export class VerificationEngine {
     const proposed = parsed.data;
     const proposedDigest = digestOf(proposed);
 
-    return this.db.tx(() => {
+    // #664 — every denial below this line is a decision about the pin this body just
+    // wrote (or found already written); none of it is housekeeping a caller relies on
+    // regardless of the outcome, so a denial must roll the pin attempt back.
+    return this.db.txDecision(() => {
       const current = this.db.get<{
         pinned_run_scoped_commands_digest: string | null;
         pinned_run_scoped_commands_json: string | null;
