@@ -7,6 +7,7 @@ import {
   ConversationTurnCoordinator,
   NEVER_FOUND_RECEIPT_PORT,
   RECEIPT_LOOKUP_TIMEOUT_MS,
+  RECONCILE_SWEEP_BUDGET_MS,
   type ReceiptLookupQuery,
   type ReceiptLookupResult,
   type ReceiptPort,
@@ -292,7 +293,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const result = await c.coordinator.reconcileUnresolved();
 
-    expect(result).toEqual({ swept: 2, settled: 1, unresolved: 1 });
+    expect(result).toEqual({ swept: 2, settled: 1, unresolved: 1, failed: 0 });
     expect(stateOf(c, receipted.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "ABORTED" });
     expect(stateOf(c, silent.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
     // Every unresolved turn was asked about, not just the one that happened to settle — the whole
@@ -310,7 +311,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 
@@ -338,7 +339,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 
@@ -366,7 +367,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 2, settled: 1, unresolved: 1 });
+    expect(summary).toEqual({ swept: 2, settled: 1, unresolved: 1, failed: 0 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
     expect(stateOf(c, alsoHeld.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "ABORTED" });
   });
@@ -387,7 +388,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 
@@ -408,7 +409,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 
@@ -433,7 +434,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 2, settled: 1, unresolved: 1 });
+    expect(summary).toEqual({ swept: 2, settled: 1, unresolved: 1, failed: 1 });
     expect(stateOf(c, broken.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
     expect(stateOf(c, fine.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "ABORTED" });
   });
@@ -508,7 +509,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
       targetAttestationId: "att:x",
       executorSessionId: "runtime:x",
       executorSessionIncarnation: "inc-1",
-    })).toEqual({ found: false });
+    }, new AbortController().signal)).toEqual({ found: false });
 
     const c = withCoordinator(NEVER_FOUND_RECEIPT_PORT);
     const actorId = target(c, "singleton-tamper-attempt", 1);
@@ -553,7 +554,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
     expect(stateOf(c, second.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 
@@ -607,7 +608,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 
@@ -628,7 +629,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 
@@ -650,7 +651,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     const summary = await c.coordinator.reconcileUnresolved();
 
-    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1, failed: 0 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 
@@ -693,9 +694,94 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
       const summary = await summaryPromise;
 
       expect(calls).toBe(2);
-      expect(summary).toEqual({ swept: 2, settled: 0, unresolved: 2 });
+      expect(summary).toEqual({ swept: 2, settled: 0, unresolved: 2, failed: 2 });
       expect(stateOf(c, hung.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
       expect(stateOf(c, fine.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * A seventh review: the first version of the timeout above only abandoned a slow lookup — the
+   * underlying promise kept running, so a genuinely slow port left duplicate, uncancelled network
+   * work behind on every timeout, and that work compounded across the overlapping sweeps a slow
+   * port also causes. `signal.aborted` is what a real implementation (a `fetch` call, an RPC
+   * client) would check to actually stop; this asserts the coordinator holds up its end by
+   * flipping it, which is as far as a test *can* verify without a real network client to cancel.
+   */
+  it("aborts the signal it gave a lookup once that lookup's own timeout fires", async () => {
+    vi.useFakeTimers();
+    try {
+      let seenSignal: AbortSignal | undefined;
+      const port: ReceiptPort = {
+        lookup: (_query, signal) => {
+          seenSignal = signal;
+          return new Promise<ReceiptLookupResult>(() => {});
+        },
+      };
+      const c = withCoordinator(port);
+      const actorId = target(c, "abort-on-timeout", 1);
+      claim(c, actorId, "m1");
+
+      const summaryPromise = c.coordinator.reconcileUnresolved();
+      expect(seenSignal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(RECEIPT_LOOKUP_TIMEOUT_MS);
+      await summaryPromise;
+
+      expect(seenSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * An eighth review: a per-lookup timeout bounds one turn, not the sweep. Seven honestly slow
+   * (not hung) lookups in one pass, each answering just under `RECEIPT_LOOKUP_TIMEOUT_MS`, add up
+   * past the periodic interval — and `runPeriodic` has no in-flight guard (see
+   * `capacity-sweep-budget.test.ts`), so the next sweep would start before this one returned.
+   * `RECONCILE_SWEEP_BUDGET_MS` is the bound on the whole pass, mirroring how the capacity sweep
+   * bounds itself (`Daemon.refreshCapacitySensors`'s own `Promise.race`): once it is spent, the
+   * loop stops issuing new lookups and returns with whatever it has, leaving the rest for the
+   * sweep after. This uses a port answering *immediately* but slowly enough, one candidate at a
+   * time, to exceed the budget partway through — proving the bound is on elapsed wall-clock time
+   * across the pass, not on any single lookup.
+   */
+  it("stops issuing new lookups once the whole pass exceeds its own budget, leaving the rest for the next sweep", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      // Each call must finish well *inside* `RECEIPT_LOOKUP_TIMEOUT_MS` (10s), or the per-lookup
+      // timeout — not the sweep budget — is what ends up bounding it; five of these, each
+      // answering honestly at 9s, still add up past `RECONCILE_SWEEP_BUDGET_MS` (45s) without any
+      // single one ever being slow enough to time out on its own.
+      const perCallDelayMs = 9_000;
+      expect(perCallDelayMs).toBeLessThan(RECEIPT_LOOKUP_TIMEOUT_MS);
+      const port: ReceiptPort = {
+        lookup: async () => {
+          calls += 1;
+          await new Promise<void>((resolve) => setTimeout(resolve, perCallDelayMs));
+          return { found: false };
+        },
+      };
+      const c = withCoordinator(port);
+      const actorIds = ["one", "two", "three", "four", "five", "six"].map((name) =>
+        target(c, `budget-${name}`, 1),
+      );
+      const held = actorIds.map((actorId, i) => claim(c, actorId, `m${i}`));
+
+      const summaryPromise = c.coordinator.reconcileUnresolved();
+      await vi.advanceTimersByTimeAsync(RECONCILE_SWEEP_BUDGET_MS * 2);
+      const summary = await summaryPromise;
+
+      // Five calls at 9s each land exactly on the 45s budget (5 * 9000 = 45000); the sixth is
+      // checked against a budget already spent and is never started.
+      expect(calls).toBe(5);
+      expect(summary.swept).toBe(6);
+      expect(summary.failed).toBe(0);
+      for (const permit of held) {
+        expect(stateOf(c, permit.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+      }
     } finally {
       vi.useRealTimers();
     }

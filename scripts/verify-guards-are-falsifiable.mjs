@@ -1284,8 +1284,8 @@ const GUARDS = [
     // forgery test proves no such method exists to call.
     what: "no public method accepts a receipt from a caller — only this coordinator's own port can produce one",
     file: "src/conversation/turn-coordinator.ts",
-    find: "  async reconcileUnresolved(): Promise<{",
-    replace: "  reconcileWithReceipt(query, receipt) { return this.#settleFromReceipt(query.turnRequestId, query, receipt); }\n\n  async reconcileUnresolved(): Promise<{",
+    find: "  async reconcileUnresolved(",
+    replace: "  reconcileWithReceipt(query, receipt) { return this.#settleFromReceipt(query.turnRequestId, query, receipt); }\n\n  async reconcileUnresolved(",
     killedBy: [
       "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::attack 1 — reassigning the coordinator's bound receipt port has no effect: the real field is not reachable by that name",
     ],
@@ -1420,6 +1420,55 @@ const GUARDS = [
     replace: "        result = await this.#receiptPort.lookup({",
     killedBy: [
       "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::treats a lookup that never settles as no evidence after its timeout, and keeps sweeping the rest",
+    ],
+  },
+  {
+    // Sol's seventh review: a per-lookup timeout only abandoned a slow call, leaving its promise
+    // — and any network work behind it — running. Removing the abort here reopens exactly that:
+    // a real implementation with something to cancel is never told to.
+    what: "a timed-out lookup's signal is aborted, not merely abandoned",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        controller.abort(new Error(`receipt lookup for ${query.turnRequestId} timed out`));",
+    replace: "        void 0;",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::aborts the signal it gave a lookup once that lookup's own timeout fires",
+    ],
+  },
+  {
+    // Sol's eighth review: a per-lookup timeout bounds one turn, not the whole pass. Seven
+    // honestly slow lookups in one sweep add up past the periodic interval, and `runPeriodic` has
+    // no in-flight guard — removing this check reopens the overlap the budget exists to prevent.
+    what: "the sweep stops issuing new lookups once the whole pass exceeds its own budget",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (Date.now() - startedAt >= budgetMs) break;",
+    replace: "      if (false) break;",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::stops issuing new lookups once the whole pass exceeds its own budget, leaving the rest for the next sweep",
+    ],
+  },
+  {
+    // Sol's second (of this round) finding: a sweep that silently swallows every lookup failure
+    // and still reports success is indistinguishable, to the daemon, from a port with nothing to
+    // find. Removing the increment here reopens that — `failed` stays 0 no matter how many
+    // lookups actually failed.
+    what: "the sweep counts lookups it could not get an honest answer from",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        failed += 1;",
+    replace: "        void 0;",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not stop the sweep when one lookup throws",
+    ],
+  },
+  {
+    // The daemon-side half of the same finding: `runPeriodic` only backs off and audits on a
+    // thrown `action()`. Without this throw, a sweep reporting `failed > 0` still reads to
+    // `runPeriodic` — and to the health file — as an ordinary success.
+    what: "the daemon throws when a turn-reconciliation sweep reports any failed lookups, so runPeriodic can see it",
+    file: "src/daemon/daemon.ts",
+    find: "    if (result.failed > 0) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/doctor-daemon-r2.test.ts::#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger",
     ],
   },
 ];

@@ -134,9 +134,20 @@ export type ReceiptLookupResult =
  * The seam #638 implements. Until it exists every real deployment wires a port that always
  * reports `found: false` — the unmatched-receipt state this whole design has run in since #635,
  * and the state contract 6 requires it keep running in rather than guess.
+ *
+ * `signal` is part of this seam on purpose, not added once a real implementation needed it. A
+ * review found the sweep's own per-lookup timeout only abandoned a slow call — the promise kept
+ * running, so a genuinely slow network request left duplicate, uncancelled work behind on every
+ * timeout, compounding across overlapping sweeps. `#lookupWithTimeout` aborts this signal exactly
+ * when it gives up waiting, so a real implementation backed by `fetch` or an RPC client with its
+ * own abort support can actually stop the call rather than merely being ignored by the caller.
+ * `NEVER_FOUND_RECEIPT_PORT` never needs to look at it, and that is fine — the contract is "you
+ * may honor this," not "you must," because nothing here can force a network client to cooperate.
+ * Adding the parameter after #638 already implemented this interface would have been the more
+ * expensive version of this same change.
  */
 export interface ReceiptPort {
-  lookup(query: ReceiptLookupQuery): Promise<ReceiptLookupResult> | ReceiptLookupResult;
+  lookup(query: ReceiptLookupQuery, signal: AbortSignal): Promise<ReceiptLookupResult> | ReceiptLookupResult;
 }
 
 /**
@@ -154,7 +165,7 @@ export interface ReceiptPort {
  * strict mode) instead of silently taking effect.
  */
 export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = Object.freeze({
-  lookup: (): ReceiptLookupResult => ({ found: false }),
+  lookup: (_query: ReceiptLookupQuery, _signal: AbortSignal): ReceiptLookupResult => ({ found: false }),
 });
 
 /**
@@ -172,6 +183,25 @@ export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = Object.freeze({
  * surfaces through its backoff and audit trail, not something a longer timeout should paper over.
  */
 export const RECEIPT_LOOKUP_TIMEOUT_MS = 10_000;
+
+/**
+ * How long one whole `reconcileUnresolved()` pass may run before it stops issuing new lookups and
+ * returns with whatever it swept.
+ *
+ * A per-lookup timeout bounds one turn; it does not bound the sweep. A review found seven slow
+ * (not hung) turns in one pass — each honestly answering just under `RECEIPT_LOOKUP_TIMEOUT_MS` —
+ * add up past the periodic interval, so the next sweep starts before the first returns. Nothing
+ * in `runPeriodic` guards against that overlap (see `capacity-sweep-budget.test.ts`'s own
+ * docstring: "`runPeriodic` has a failure backoff and no overlap guard"), and this codebase's
+ * answer to that for the capacity sensor sweep is not an in-flight lock — it is a budget the
+ * caller races the work against (`Daemon.refreshCapacitySensors`), sized to fit inside the
+ * interval and asserted so at startup rather than invented per call site. This constant and the
+ * assertion in `daemon.ts`'s `startTimers()` are the same shape applied here: a candidate not
+ * reached before the budget runs out is left exactly where it was, `IN_DOUBT`, for the next sweep
+ * to try — the same "absent is handled, not a special case" argument the capacity sweep already
+ * makes for its own abandoned collectors.
+ */
+export const RECONCILE_SWEEP_BUDGET_MS = 45_000;
 
 export interface TurnObservation {
   readonly outcome: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
@@ -1140,10 +1170,13 @@ export class ConversationTurnCoordinator {
    * settles — a legitimate implementation of the interface, not a misbehaving one — used to hang
    * this whole method on that single turn, forever, with every candidate after it never asked.
    * Every lookup now races against `RECEIPT_LOOKUP_TIMEOUT_MS` and a timeout is treated exactly
-   * like a thrown lookup: never evidence, never stopping the rest of the sweep. A lookup failure,
-   * a timeout and a `found: false` answer are not distinguished in the counts below — all three
-   * leave the turn exactly where it was, `IN_DOUBT` and visible as `OUTCOME_UNKNOWN`, and contract
-   * 6 forbids treating any of them as evidence for re-execution.
+   * like a thrown lookup: never evidence, never stopping the rest of the sweep, and both are
+   * counted in `failed`. A lookup failure or timeout and a `found: false` answer both leave the
+   * turn exactly where it was, `IN_DOUBT` and visible as `OUTCOME_UNKNOWN`, and contract 6 forbids
+   * treating either as evidence for re-execution — but they are no longer the same event to the
+   * caller: `found: false` is a real answer, `failed` is the sweep not getting one at all, and a
+   * second review found that difference used to be invisible, which made a port that fails on
+   * every call indistinguishable from one with nothing to report.
    *
    * **What this does and does not do in the deployed system, stated as two separate facts rather
    * than one, because a third review (#691) found the first draft's disclosure let the second one
@@ -1173,14 +1206,43 @@ export class ConversationTurnCoordinator {
    *    `COMPLETED` recorded with no way to prove the reply went anywhere is not, since
    *    `canonical_turns`' settlement is one-way through the ordinary API.
    */
-  async reconcileUnresolved(): Promise<{
+  async reconcileUnresolved(
+    /**
+     * How long this whole pass may run before it stops issuing new lookups. Defaults to
+     * `RECONCILE_SWEEP_BUDGET_MS`; overridable for the same reason `Daemon.refreshCapacitySensors`
+     * takes one — a caller sizing it against a deliberately short interval (tests, a tighter
+     * deployment) needs the two to agree, and a hardcoded budget could not.
+     */
+    budgetMs: number = RECONCILE_SWEEP_BUDGET_MS,
+  ): Promise<{
     readonly swept: number;
     readonly settled: number;
     readonly unresolved: number;
+    /**
+     * How many lookups this pass could not get an honest answer from — threw, or timed out.
+     *
+     * A review found the sweep swallowed these silently: `reconcileUnresolved()` always returned
+     * as if it had succeeded, so a port that fails on *every* call looked identical to one with
+     * nothing to find, which is the exact ambiguity contract 6 exists to remove. The daemon's
+     * caller throws when this is nonzero, so `runPeriodic`'s existing backoff and audit trail —
+     * built for the watchdog and capacity timers — sees a struggling receipt port the same way it
+     * already sees any other failing periodic job, with no new mechanism needed for it.
+     */
+    readonly failed: number;
   }> {
     const candidates = this.unresolvedIdentities();
+    const startedAt = Date.now();
     let settled = 0;
+    let failed = 0;
     for (const candidate of candidates) {
+      // The overall bound a per-lookup timeout does not provide. A review measured seven honestly
+      // slow (not hung) lookups in one pass adding up past the periodic interval, so the next
+      // sweep started before this one returned — `runPeriodic` has no in-flight guard, and this
+      // codebase's answer to that for the analogous capacity sweep is a budget the pass is raced
+      // against, not a lock (see `RECONCILE_SWEEP_BUDGET_MS`). A candidate not reached before the
+      // budget runs out is left exactly where it was, `IN_DOUBT`, for the next sweep to try.
+      if (Date.now() - startedAt >= budgetMs) break;
+
       let result: ReceiptLookupResult;
       try {
         result = await this.#lookupWithTimeout({
@@ -1194,6 +1256,7 @@ export class ConversationTurnCoordinator {
           executorSessionIncarnation: candidate.executorSessionIncarnation,
         });
       } catch {
+        failed += 1;
         continue;
       }
       if (!result.found) continue;
@@ -1219,7 +1282,7 @@ export class ConversationTurnCoordinator {
       // concurrent settlement reached first — leaves the turn exactly as it was. It is not
       // re-thrown: one candidate's refusal must not stop the sweep from asking about the rest.
     }
-    return { swept: candidates.length, settled, unresolved: candidates.length - settled };
+    return { swept: candidates.length, settled, unresolved: candidates.length - settled, failed };
   }
 
   /**
@@ -1229,17 +1292,25 @@ export class ConversationTurnCoordinator {
    * would make a timeout indistinguishable from the port's own answer in a stack trace or a log,
    * and the caller above already treats a thrown lookup as `found: false`'s equivalent, so
    * rejecting reuses that path instead of adding a second one. The timer is `unref()`d so a lookup
-   * that outlives this call cannot itself keep the process alive; a straggling `lookup()` promise
-   * is a leaked handle either way; `#638`'s real implementation is what actually stops it.
+   * that outlives this call cannot itself keep the process alive.
+   *
+   * A review found the first version of this method only abandoned a timed-out lookup — the
+   * underlying promise kept running, so a genuinely slow port left duplicate, uncancelled work
+   * behind on every timeout, and that work compounded across the overlapping sweeps a slow port
+   * also causes. `signal.abort()` on timeout is what tells a real implementation to actually stop:
+   * whether it does is that implementation's choice, not something this method can force on a
+   * network client, but the seam exists now rather than after #638 already built against a
+   * `lookup` with nothing to abort.
    */
   #lookupWithTimeout(query: ReceiptLookupQuery): Promise<ReceiptLookupResult> {
+    const controller = new AbortController();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`receipt lookup for ${query.turnRequestId} timed out`)),
-        RECEIPT_LOOKUP_TIMEOUT_MS,
-      );
+      const timer = setTimeout(() => {
+        controller.abort(new Error(`receipt lookup for ${query.turnRequestId} timed out`));
+        reject(new Error(`receipt lookup for ${query.turnRequestId} timed out`));
+      }, RECEIPT_LOOKUP_TIMEOUT_MS);
       timer.unref();
-      Promise.resolve(this.#receiptPort.lookup(query)).then(
+      Promise.resolve(this.#receiptPort.lookup(query, controller.signal)).then(
         (result) => {
           clearTimeout(timer);
           resolve(result);
