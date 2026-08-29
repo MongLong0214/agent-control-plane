@@ -92,17 +92,21 @@ export type ReceiptLookupResult =
       readonly evidenceDigest: string;
       readonly reasonCode: string;
       /**
-       * The identity the receipt itself attests to — which actor, which prompt, which CEO
-       * generation. Not an echo of the query.
+       * The identity the receipt itself attests to — which turn, which actor, which prompt, which
+       * CEO generation. Not an echo of the query.
        *
-       * This is the untrusted half of contract 6. The query a reconciler sends is built from its
-       * own row and proves nothing; the receipt is the external evidence, and these three fields
-       * are what a caller must compare against the stored turn rather than assume, because they
-       * already knew the answer, matched. A port that confuses turns, actors or generations has
-       * to be caught here — `reconcileWithReceipt` checks exactly these three against the row it
-       * settles, so a caller that rebuilds them from its own query instead of from this answer
-       * makes that check compare the database against itself.
+       * This is the untrusted half of contract 6: all four of `ReceiptLookupQuery`'s fields, and
+       * a caller must compare every one of them against the stored turn rather than assume they
+       * matched because they were asked about. `turnRequestId` is here for the same reason the
+       * other three are — a review found it was the one field still taken from the query that sent
+       * the lookup rather than from this answer, so a port that confused two turns sharing the
+       * same actor, prompt and generation (an earlier completed turn and a later one, say) could
+       * have its receipt settle the wrong one and nothing would notice. `reconcileUnresolved`
+       * checks all four against the row it settles, so a caller that rebuilds any of them from its
+       * own query instead of from this answer makes that check compare the database against
+       * itself for that field.
        */
+      readonly turnRequestId: string;
       readonly targetActorId: string;
       readonly promptDigest: string;
       readonly bindingGeneration: number;
@@ -122,8 +126,18 @@ export interface ReceiptPort {
  *
  * The coordinator's default, so composing it without a real port yet is the same visible,
  * intentional choice everywhere — not an omission a reader has to notice by its absence.
+ *
+ * `Object.freeze`d because it is exported, shared, and stateless. A review found that an
+ * un-frozen shared default is itself a forgery path one indirection removed from a swappable
+ * field: even with `#receiptPort` made truly private, code importing this singleton could still
+ * overwrite its `lookup` method in place, and every coordinator that was ever handed this exact
+ * object — which is every one of them, since it is the default — would answer differently from
+ * that point on. Freezing makes that assignment throw (this file, like every ES module, runs in
+ * strict mode) instead of silently taking effect.
  */
-export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = { lookup: () => ({ found: false }) };
+export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = Object.freeze({
+  lookup: (): ReceiptLookupResult => ({ found: false }),
+});
 
 export interface TurnObservation {
   readonly outcome: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
@@ -254,17 +268,29 @@ export class ConversationTurnCoordinator {
    */
   readonly #materialization: TurnMaterializationAuthority;
 
+  /**
+   * Where `reconcileUnresolved()` asks about a receipt. Bound once, in the constructor, and never
+   * exposed again — a review of the first version of this field found that `private readonly`
+   * is compile-time only: TypeScript erases it, and the ES2023 output was an ordinary writable,
+   * enumerable own property. Anything holding this coordinator could overwrite it with a fake port
+   * and call `reconcileUnresolved()` to forge a completion, the same attack the previous round's
+   * fix closed one door earlier for.
+   *
+   * A `#`-private field is a different part of the language, not a stricter annotation of the same
+   * one: there is no string or symbol key for it, so no assignment, `Object.defineProperty`,
+   * `Reflect.set` or enumeration from outside this class body can reach it. `#materialization`
+   * above already uses this for the same reason; this field failed to match it.
+   */
+  readonly #receiptPort: ReceiptPort;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
-    /**
-     * Where `reconcileUnresolved()` asks about a receipt. Bound once, here, rather than accepted
-     * as an argument anywhere a receipt is settled — see that method's docstring for why.
-     */
-    private readonly receiptPort: ReceiptPort = NEVER_FOUND_RECEIPT_PORT,
+    receiptPort: ReceiptPort = NEVER_FOUND_RECEIPT_PORT,
   ) {
     this.#materialization = db.claimTurnMaterializationAuthority();
+    this.#receiptPort = receiptPort;
   }
 
   /**
@@ -841,7 +867,7 @@ export class ConversationTurnCoordinator {
   }
 
   /**
-   * Sweeps every `IN_DOUBT` turn once, asking `this.receiptPort` about each — the write half of
+   * Sweeps every `IN_DOUBT` turn once, asking `this.#receiptPort` about each — the write half of
    * contract 6, and the one settlement path that does not take a `TurnPermit`.
    *
    * A permit proves the transaction that claimed the turn also issued this call, a discipline
@@ -861,7 +887,7 @@ export class ConversationTurnCoordinator {
    * close to irreversible: `COMPLETED` cannot be walked back through the ordinary API, so a forged
    * one permanently blocks a retry of a turn that may never have run.
    *
-   * What closes it is that the receipt never arrives as an argument at all. `this.receiptPort` is
+   * What closes it is that the receipt never arrives as an argument at all. `this.#receiptPort` is
    * bound once, at construction — by the composition root, the one place `claimTurnMaterializationAuthority`
    * already makes singular, since a second coordinator on the same database throws before it
    * could bind a different port. A caller can still read `unresolvedIdentities()`, but the only
@@ -885,7 +911,7 @@ export class ConversationTurnCoordinator {
     for (const candidate of candidates) {
       let result: ReceiptLookupResult;
       try {
-        result = await this.receiptPort.lookup({
+        result = await this.#receiptPort.lookup({
           turnRequestId: candidate.turnRequestId,
           targetActorId: candidate.targetActorId,
           promptDigest: candidate.promptDigest,
@@ -897,14 +923,17 @@ export class ConversationTurnCoordinator {
       if (!result.found) continue;
 
       // Every identity field checked below comes from `result` — the port's answer — not from
-      // `candidate`. `candidate` is this process's own row; comparing it back against that same
-      // row proves nothing about the receipt. Only `turnRequestId` is carried over, because that
-      // names which row to check and is not itself something the receipt attests to.
-      const decision = this.#settleFromReceipt(
-        candidate.turnRequestId,
-        { targetActorId: result.targetActorId, promptDigest: result.promptDigest, bindingGeneration: result.bindingGeneration },
-        { outcome: result.outcome, receiptId: result.receiptId, evidenceDigest: result.evidenceDigest, reasonCode: result.reasonCode },
-      );
+      // `candidate`. `candidate.turnRequestId` is passed too, but only as *which row this sweep
+      // asked about*; it is `result.turnRequestId` — what the receipt itself attests to — that
+      // `#settleFromReceipt` compares against it. A port that confused this turn with another
+      // sharing the same actor, prompt and generation used to be indistinguishable from a genuine
+      // match, because nothing compared the one field that would have caught it.
+      const decision = this.#settleFromReceipt(candidate.turnRequestId, {
+        turnRequestId: result.turnRequestId,
+        targetActorId: result.targetActorId,
+        promptDigest: result.promptDigest,
+        bindingGeneration: result.bindingGeneration,
+      }, { outcome: result.outcome, receiptId: result.receiptId, evidenceDigest: result.evidenceDigest, reasonCode: result.reasonCode });
       if (decision.allowed) settled += 1;
       // A denial here — wrong generation, mismatched identity, or an already-settled turn a
       // concurrent settlement reached first — leaves the turn exactly as it was. It is not
@@ -915,14 +944,26 @@ export class ConversationTurnCoordinator {
 
   /**
    * `reconcileUnresolved`'s settlement half, kept private so a receipt can only ever reach it from
-   * this coordinator's own `this.receiptPort.lookup()` call — never from a caller-supplied
+   * this coordinator's own `this.#receiptPort.lookup()` call — never from a caller-supplied
    * argument. See that method's docstring for why a public version of this was #691's finding.
    */
   #settleFromReceipt(
     turnRequestId: string,
-    attested: { targetActorId: string; promptDigest: string; bindingGeneration: number },
+    attested: { turnRequestId: string; targetActorId: string; promptDigest: string; bindingGeneration: number },
     receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
   ): Decision<TurnMaterialization> {
+    // Checked first, and against no table: a receipt attesting to a different turn than the one
+    // this sweep asked about is not evidence about this row at all, whatever else it says. A port
+    // that confused two turns sharing the same actor, prompt and generation — an earlier completed
+    // one and a later one, say — is exactly what this catches; every other field here could agree
+    // by coincidence, and this is the one contract 1 fixes so that coincidence is not enough.
+    if (attested.turnRequestId !== turnRequestId) {
+      return deny(
+        ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_TURN,
+        "this receipt attests to a different turn than the one this sweep asked about",
+        { turnRequestId, receiptTurnRequestId: attested.turnRequestId },
+      );
+    }
     return this.db.tx(() => {
       const row = this.db.get<{ binding_generation: number }>(
         `SELECT binding_generation FROM canonical_turns WHERE turn_request_id = ?`,

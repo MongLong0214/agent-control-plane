@@ -376,6 +376,16 @@ export const ReasonCode = {
    * observations say disagrees with anything; the receipt is simply not about this claim.
    */
   CONVERSATION_TURN_RECEIPT_WRONG_GENERATION: "CONVERSATION_TURN_RECEIPT_WRONG_GENERATION",
+  /**
+   * A reconciler's receipt attests to a different turn than the one the sweep asked about.
+   *
+   * `turnRequestId` is the fourth of contract 1's four fields, and a review found it was the one
+   * still taken from the sweep's own query rather than from the receipt's answer: a port that
+   * confused two turns sharing the same actor, prompt and generation could otherwise settle the
+   * wrong one on a receipt that was never about it. Left `IN_DOUBT`, for the same reason a wrong
+   * generation is: the receipt is simply not evidence about this claim, not a contradiction of it.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_TURN: "CONVERSATION_TURN_RECEIPT_WRONG_TURN",
   // --- disposable acceptance realm ------------------------------------------
   /**
    * A path the acceptance realm would use resolves inside production, or outside its own state

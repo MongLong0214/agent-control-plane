@@ -1143,7 +1143,47 @@ const GUARDS = [
     find: "  async reconcileUnresolved(): Promise<{",
     replace: "  reconcileWithReceipt(query, receipt) { return this.#settleFromReceipt(query.turnRequestId, query, receipt); }\n\n  async reconcileUnresolved(): Promise<{",
     killedBy: [
-      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::cannot be forged: reading unresolvedIdentities and re-running the sweep never settles a turn the production port never receipted",
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::attack 1 — reassigning the coordinator's bound receipt port has no effect: the real field is not reachable by that name",
+    ],
+  },
+  {
+    // Sol's review of #691's own fix: `private readonly receiptPort` is TypeScript-only and
+    // erases to a plain writable property, so anything holding the coordinator could reassign it
+    // to a forged port. Reverting `#receiptPort` to a non-private field here reopens exactly that
+    // — the attack test reassigns `receiptPort` from outside the class and expects it to do
+    // nothing; with the field public, the reassignment reaches the real slot and the forged port
+    // settles the turn.
+    what: "the receipt port is a true private field, not merely a TypeScript-private one",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "  readonly #receiptPort: ReceiptPort;",
+    replace: "  receiptPort: ReceiptPort;",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::attack 1 — reassigning the coordinator's bound receipt port has no effect: the real field is not reachable by that name",
+    ],
+  },
+  {
+    // The other half of the same review: even a private field does not help if the *object* it
+    // defaults to is exported, shared and mutable. Un-freezing here reopens overwriting
+    // `NEVER_FOUND_RECEIPT_PORT.lookup` in place — no coordinator field ever touched, every
+    // coordinator using the default affected.
+    what: "the exported default receipt port is frozen, so its lookup method cannot be reassigned in place",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = Object.freeze({",
+    replace: "export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = ({",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::attack 2 — tampering with the exported NEVER_FOUND_RECEIPT_PORT singleton throws, and its answer is unchanged",
+    ],
+  },
+  {
+    // Contract 1's fourth field. Without this, a receipt for one turn can settle a different one
+    // that happens to share the same actor, prompt and generation — precisely the case #691's round
+    // 1 fix left unchecked, because `turnRequestId` was still taken from the query, not the answer.
+    what: "a receipt attesting to a different turn than the one asked about cannot settle it",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "    if (attested.turnRequestId !== turnRequestId) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to a different turn id than the one asked about, even though actor, prompt and generation all agree",
     ],
   },
 ];

@@ -133,6 +133,7 @@ const matchingReceipt = (
   receiptId: `hermes:${permit.turnRequestId}`,
   evidenceDigest: `sha256:${permit.turnRequestId}`,
   reasonCode: ReasonCode.OK,
+  turnRequestId: permit.turnRequestId,
   targetActorId: permit.targetActorId,
   promptDigest: permit.promptDigest,
   bindingGeneration: 1,
@@ -286,43 +287,105 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
   });
 
   /**
-   * #691's P1: reading a turn's identity from a public method and handing it back with a
-   * fabricated receipt used to record a `HERMES_TARGET` completion with no target ever consulted.
-   * That call no longer type-checks — there is no public method left that takes a receipt — so
-   * this is the closest a test can come to reproducing the old attack: read everything the public
-   * surface still exposes, then run the one production entry point as many times as the caller
-   * likes, on the coordinator wired exactly as the daemon wires it today (`NEVER_FOUND_RECEIPT_PORT`).
-   * Nothing the caller read can turn into a completion, because nothing the caller supplies ever
-   * reaches the settlement logic — only what `this.receiptPort.lookup()` itself returns does.
+   * A second review (Sol, on #691's own fix) found that removing the public
+   * `reconcileWithReceipt` method proved the method was gone, not that the property it guards
+   * held. `private readonly receiptPort` erases to a plain, writable, enumerable own property in
+   * the compiled JS — TypeScript's `private` and `readonly` are both compile-time only — so
+   * anything holding this coordinator could reassign it to a fake port and call
+   * `reconcileUnresolved()` to forge a completion, one indirection past the door #691 closed.
+   *
+   * `#receiptPort` (a true private class field, matching `#materialization` above) closes it: the
+   * assignment below still "succeeds" as an ordinary JS statement — there is nothing to make it
+   * throw, since `receiptPort` is a different, unrelated string key from the actual `#receiptPort`
+   * slot — but it creates an inert property the class never reads. The proof is behavioral, not
+   * that the assignment failed: the forged port is never consulted, so nothing settles.
    */
-  it("cannot be forged: reading unresolvedIdentities and re-running the sweep never settles a turn the production port never receipted", async () => {
+  it("attack 1 — reassigning the coordinator's bound receipt port has no effect: the real field is not reachable by that name", async () => {
     const c = withCoordinator(NEVER_FOUND_RECEIPT_PORT);
-    const actorId = target(c, "unforgeable", 1);
+    const actorId = target(c, "port-swap-attempt", 1);
     const held = claim(c, actorId, "m1");
 
-    // Everything a would-be forger could read.
-    const exposed = c.coordinator.unresolvedIdentities();
-    expect(exposed).toEqual([
-      {
-        turnRequestId: held.turnRequestId,
-        targetActorId: actorId,
-        promptDigest: held.promptDigest,
-        bindingGeneration: 1,
-        claimedAt: expect.any(String),
-      },
-    ]);
+    const forgedPort: ReceiptPort = {
+      lookup: (query) => matchingReceipt({ ...query }),
+    };
+    // The attack: reassign what looks like the port field from outside the class.
+    (c.coordinator as unknown as { receiptPort: ReceiptPort }).receiptPort = forgedPort;
 
-    // The method #691 found forgeable no longer exists to call.
+    // #691's original finding: there is also no public method left that would take a receipt
+    // directly, so this is not merely inert — there is nothing else to call it through either.
     expect(typeof (c.coordinator as unknown as { reconcileWithReceipt?: unknown }).reconcileWithReceipt).toBe(
       "undefined",
     );
 
-    // Running the one production entry point, repeatedly, settles nothing — the port bound at
-    // construction is the only source of a receipt, and it was never asked to say anything but no.
-    await c.coordinator.reconcileUnresolved();
-    await c.coordinator.reconcileUnresolved();
     await c.coordinator.reconcileUnresolved();
 
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+  });
+
+  /**
+   * The second half of the same finding: even with the field itself unreachable, the *object* it
+   * was bound to is exported and shared. Every coordinator built with the default — which is every
+   * one built today, since no real port exists until #638 — holds the exact same
+   * `NEVER_FOUND_RECEIPT_PORT` reference. Overwriting its `lookup` method in place would change
+   * what all of them answer, with no need to touch any coordinator at all. `Object.freeze` is what
+   * makes that assignment throw instead of silently taking effect (this module runs in strict
+   * mode, like every ES module).
+   */
+  it("attack 2 — tampering with the exported NEVER_FOUND_RECEIPT_PORT singleton throws, and its answer is unchanged", async () => {
+    const attempt = () => {
+      (NEVER_FOUND_RECEIPT_PORT as unknown as { lookup: ReceiptPort["lookup"] }).lookup = () =>
+        matchingReceipt({ turnRequestId: "tr_anything", targetActorId: "actor:anything", promptDigest: "sha256:anything" });
+    };
+    expect(attempt).toThrow(TypeError);
+
+    // Unchanged, and a coordinator relying on the default default still settles nothing.
+    expect(await NEVER_FOUND_RECEIPT_PORT.lookup({
+      turnRequestId: "x",
+      targetActorId: "y",
+      promptDigest: "z",
+      bindingGeneration: 1,
+    })).toEqual({ found: false });
+
+    const c = withCoordinator(NEVER_FOUND_RECEIPT_PORT);
+    const actorId = target(c, "singleton-tamper-attempt", 1);
+    const held = claim(c, actorId, "m1");
+    await c.coordinator.reconcileUnresolved();
+
+    expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+  });
+
+  /**
+   * Contract 1's fourth field, closing the gap a second review found in round 1's identity fix:
+   * `targetActorId` and `promptDigest` were sourced from the receipt's own answer, but
+   * `turnRequestId` was still taken from the query that sent the lookup. Two turns on the same
+   * actor, claimed with the same prompt and generation (as both are here — nothing distinguishes
+   * them but their id), made that invisible: a receipt attesting to the *first* turn would still
+   * settle the *second*, because every field the sweep compared happened to agree anyway.
+   */
+  it("does not complete a turn when the receipt attests to a different turn id than the one asked about, even though actor, prompt and generation all agree", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c, "same-actor-twice", 1);
+
+    const first = claim(c, actorId, "m1");
+    port.answer(first.turnRequestId, matchingReceipt({ ...first, targetActorId: actorId }));
+    await c.coordinator.reconcileUnresolved();
+    expect(stateOf(c, first.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+
+    // A second turn on the same actor is claimable now that the first is settled — same prompt
+    // text ("hello"), same generation (1), so only the turn id differs from the first.
+    const second = claim(c, actorId, "m2");
+    port.answer(
+      second.turnRequestId,
+      matchingReceipt({ ...second, targetActorId: actorId }, {
+        turnRequestId: first.turnRequestId,
+        receiptId: "hermes:mixed-up",
+      }),
+    );
+
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(stateOf(c, second.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
   });
 });
