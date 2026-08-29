@@ -52,19 +52,37 @@ any actor binding exists (see C1, C3).
 
 - **State:** two or more rows claimed on the same channel and `sessionDigest`, with nothing naming
   which one is "the" outstanding turn.
-- **Produced by two paths, of different strength.** (1) A process crash before
-  `completeResponse`/`reserveResponse` ever run — what every existing test
-  (`TelegramInterruption`) simulates. (2) A Telegram delivery failure:
+- **Every DIRECT turn is unresolved for the duration of its own handler call, ordinary or not —
+  this is an interval claim, not a terminal one, and this row previously conflated the two.**
+  `claimTurn` (`telegram-router.ts` ~550) runs and sets `turn_claim_json` with no `repliedAt`
+  *before* `const directText = await this.directHandler(...)` (~564) — the external call to the
+  CEO. For the entire duration of that `await`, the row is exactly what `unresolvedTurns`
+  (`ingress-guard.ts` ~507, `turn_claim_json IS NOT NULL AND repliedAt IS NULL`) selects,
+  whether the CEO answers in a second or hits its own timeout. What is true only *after* the
+  handler returns: `CEO_CONVERSATION_TIMEOUT` is a deny (`src/mcp/ceo-conversation.ts`, on
+  `McpError`'s `RequestTimeout` — "a refusal, not a hang; the peer may still be running
+  server-side"), and `agentcpd.ts`'s `answerAsCeo` turns either an allow or that deny into the
+  same `Promise<string>` shape; `telegram-router.ts` reports `ReasonCode.OK` regardless, and once
+  the reply is sent, `completeResponse` resolves the row (`completeReplyAndResolveTurn`, setting
+  `repliedAt`). So a slow-but-answered turn *does* sit unresolved while its handler runs, and
+  *becomes* resolved only once that handler returns and the reply is accepted — both are true, at
+  different times.
+- **Why an ordinary slow turn does not by itself produce a second unresolved row: the poll loop's
+  seriality, not the first row never existing.** `telegram-polling.ts`'s `pollOnce` routes each
+  update in a batch with `for (const update of updates) { await this.router.route(update, ...);
+  ... }` — sequential, one `await` at a time. A second update in the same batch cannot begin
+  routing (and so cannot reach `claimTurn`) until the first's entire `route()` call, including its
+  `directHandler` await, has returned. This is a claim about this one loop processing one batch
+  at a time; it says nothing about whether two listener processes could run concurrently, which
+  this row does not check. **Produced by two paths that do reach a second, genuinely simultaneous
+  unresolved row:** (1) a process crash before `completeResponse`/`reserveResponse` ever run —
+  what every existing test (`TelegramInterruption`) simulates, ending the process (and the loop's
+  serialization with it) mid-await; (2) a Telegram delivery failure:
   `telegram-polling.ts`'s `pollOnce` calls `reserveResponse` before every send and
   `completeResponse` — the only call that sets `repliedAt` — only after `sendMessage` succeeds; if
   it throws, the claim stays unresolved and the exception is caught by `loop()`, which logs it via
-  `onError` and keeps polling — the daemon process survives. Neither is a slow CEO turn: a
-  `CEO_CONVERSATION_TIMEOUT` deny (`src/mcp/ceo-conversation.ts`, on `McpError`'s `RequestTimeout`
-  — "a refusal, not a hang; the peer may still be running server-side") becomes, via
-  `agentcpd.ts`'s `answerAsCeo`, an apology string with the same `Promise<string>` shape as a real
-  answer; `telegram-router.ts` reports `ReasonCode.OK` for it, and the reply resolves the instant
-  Telegram accepts it. A slow-but-answered turn never reaches `unresolvedTurns` at all — it does
-  not sit unresolved for the duration of the external call.
+  `onError` and keeps polling — the process survives, but the row stays unresolved past the
+  handler's own return, no longer bounded by the serialization argument above.
 - **Terminal or gap:** the single-unresolved-turn case is closed —
   `TelegramHermesRouter`'s DIRECT branch calls `unresolvedTurns(identity.sessionDigest)` before
   `claimTurn` for every DIRECT message (not only a suspected resend), parks with an explicit reply,
@@ -154,8 +172,12 @@ any actor binding exists (see C1, C3).
   text says. The question the router asks is "is this conversation's prior turn resolved," not
   "is this the same words" — the owner, not a text comparison, decides whether to proceed. Closed
   by #680. This row assumes an unresolved turn already exists and is only about what happens to
-  the *next* message given that precondition — it does not depend on S2's producing mechanism
-  (crash or delivery failure, not a slow turn).
+  the *next*, separately-routed message given that precondition. It does not depend on *how* the
+  earlier turn became unresolved: an ordinary in-flight turn is technically unresolved too (S2),
+  but the poll loop's seriality means no second message is routed while the first's handler is
+  still awaited, so in practice this row is reached via S2's crash or delivery-failure paths,
+  which are what let an unresolved row persist long enough for a genuinely separate message to
+  arrive and be routed against it.
 - **Disposition:** off the critical path.
 
 ### S7 — a later message against a coalesced batch
