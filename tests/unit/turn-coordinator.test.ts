@@ -11,8 +11,9 @@ import {
 } from "../../src/conversation/turn-coordinator.ts";
 import { isAcpError, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -28,32 +29,59 @@ type Harness = ReturnType<typeof makeHarness>;
 
 const NOW = "2026-08-21T00:00:00.000Z";
 
-const source = (nonce: string, attempt = 1): TurnSource => ({
-  channel: "telegram",
-  nonce,
-  attempt,
-  payload: { text: `message ${nonce}` },
-});
+/**
+ * Admits the message this source names through the real ingress path, then builds the source
+ * that refers to it.
+ *
+ * `claim()` now requires ingress to have admitted the (channel, nonce) a source names, *with the
+ * same payload* (#666) — so a fixture that only built the `TurnSource` object, or that admitted
+ * one payload and named another, would be building exactly the substitution the fix refuses.
+ * `admitInbound` is idempotent because a retry (`attempt > 1`) reuses the same nonce, and
+ * re-admitting it is a no-op.
+ */
+const source = (h: Harness, nonce: string, attempt = 1): TurnSource => {
+  const payload = { text: `message ${nonce}` };
+  admitInbound(h, { nonce, payload });
+  return { channel: "telegram", nonce, attempt, payload };
+};
 
 /** An actor with a verified, attested target — everything a turn needs before it can exist. */
 const target = (h: Harness, name: string): string => {
   const actorId = `actor:${name}`;
-  h.cp.db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'CEO', ?)`, [
-    actorId,
-    NOW,
-  ]);
+  const sessionId = `runtime:${name}`;
+  h.cp.db.run(
+    `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+     VALUES (?, 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
+    [sessionId, NOW, NOW],
+  );
+  h.cp.db.run(
+    `INSERT INTO conversational_actors
+       (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+     VALUES (?, 'CEO', ?, 'inc-1', ?)`,
+    [actorId, sessionId, NOW],
+  );
   h.cp.db.run(
     `INSERT INTO actor_target_bindings
        (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
      VALUES (?, ?, 'hermes', ?, ?, ?)`,
     [`bind:${name}`, actorId, `sess-${name}`, `digest:${name}`, NOW],
   );
+  // The active role binding the attestation's generation names, so `claim()`'s currency check
+  // (#666) has a current generation to find rather than reading an attestation nothing backs.
+  h.cp.db.run(
+    `INSERT INTO assignments
+       (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+        binding_generation, mode, status, created_at)
+     VALUES (?, ?, 'CEO', ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
+    [`asg:${name}`, `CEO:${name}`, actorId, sessionId, NOW],
+  );
   h.cp.db.run(
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-        executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-     VALUES (?, ?, 'v1', ?, 'ses-1', 'inc-1', 1, ?)`,
-    [`att:${name}`, `bind:${name}`, `attd:${name}`, NOW],
+        executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+        attested_at)
+     VALUES (?, ?, 'v1', ?, ?, 'inc-1', 1, ?, ?)`,
+    [`att:${name}`, `bind:${name}`, `attd:${name}`, sessionId, `asg:${name}`, NOW],
   );
   return actorId;
 };
@@ -166,7 +194,7 @@ describe("a turn cannot be claimed without a verified target", () => {
     const decision = coordinatorOf(h).claim({
       targetActorId: "actor:unbound",
       prompt: "hello",
-      sources: [source("m1")],
+      sources: [source(h, "m1")],
     });
 
     expect(decision.allowed).toBe(false);
@@ -191,7 +219,7 @@ describe("a turn cannot be claimed without a verified target", () => {
     const decision = coordinatorOf(h).claim({
       targetActorId: "actor:claimed",
       prompt: "hello",
-      sources: [source("m1")],
+      sources: [source(h, "m1")],
     });
 
     expect(decision.allowed).toBe(false);
@@ -207,10 +235,806 @@ describe("a turn cannot be claimed without a verified target", () => {
       NOW,
     ]);
 
-    coordinatorOf(h).claim({ targetActorId: "actor:unbound", prompt: "x", sources: [source("m1")] });
+    coordinatorOf(h).claim({ targetActorId: "actor:unbound", prompt: "x", sources: [source(h, "m1")] });
 
     expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(0);
     expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_sources`)).toHaveLength(0);
+  });
+});
+
+describe("a source must name a message ingress actually admitted (#666)", () => {
+  it("refuses a source naming a channel and nonce nothing ever admitted", () => {
+    // `claim()` used to write whatever channel/nonce a caller supplied straight into
+    // `canonical_turn_sources`, with nothing checking it against `inbound_messages`. A source
+    // could then name a message nobody admitted, and the retry chain would reason about attempts
+    // of a message with no admission record.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      // Built by hand rather than through the `source` fixture, which is exactly the point:
+      // the fixture always admits the message it names, and a caller is not a fixture.
+      sources: [{ channel: "telegram", nonce: "ghost", attempt: 1, payload: { text: "ghost" } }],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_SOURCE_UNADMITTED);
+  });
+
+  it("writes nothing when it refuses an unadmitted source", () => {
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+
+    coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [{ channel: "telegram", nonce: "ghost", attempt: 1, payload: { text: "ghost" } }],
+    });
+
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(0);
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_sources`)).toHaveLength(0);
+  });
+
+  it("admits a claim whose every source names a message ingress actually admitted", () => {
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(true);
+  });
+
+  it("refuses a source whose payload is not the one ingress admitted for that nonce", () => {
+    // The counterexample the existence-only check let through: ingress admits `{text:"A"}` for a
+    // nonce, and a caller then claims with `{text:"B"}` for that same nonce. The `(channel,
+    // nonce)` row exists either way, so a check that stops at existence cannot tell them apart —
+    // and `canonical_turn_sources.source_digest` would then record B's digest as what that nonce
+    // carried, permanently, in an append-only table. `claim()` has to read the digest
+    // `INGRESS_ADMITTED` itself recorded, not trust the caller's payload for both "did this
+    // happen" and "what happened".
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    admitInbound(h, { nonce: "m1", payload: { text: "A" } });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload: { text: "B" } }],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH);
+  });
+
+  it("writes nothing when it refuses a substituted payload", () => {
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    admitInbound(h, { nonce: "m1", payload: { text: "A" } });
+
+    coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload: { text: "B" } }],
+    });
+
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(0);
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_sources`)).toHaveLength(0);
+  });
+});
+
+describe("an attestation must name the actor's current generation (#666)", () => {
+  /**
+   * Brings a session to `READY` through `SessionRegistry.transition`, not a raw `UPDATE` of the
+   * column — a review's fourth finding was that these fixtures built states production could not,
+   * and the lifecycle column is exactly such a state (#666 round 3).
+   */
+  const readySession = (h: Harness, sessionId: string, incarnation: string): void => {
+    h.cp.sessions.create({ provider: "claude", model: "opus", sessionId, incarnation });
+    const ready = h.cp.sessions.transition(sessionId, SessionLifecycle.READY, "test");
+    if (!ready.allowed) throw new Error(`session ${sessionId} did not reach READY: ${ready.reasonCode}`);
+  };
+
+  /** The actor id `BindingRegistry` gave a role_key, read rather than fabricated. */
+  const actorOf = (h: Harness, roleKey: string): string => {
+    const row = h.cp.db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+      [roleKey],
+    );
+    if (!row) throw new Error(`no active assignment for role key ${roleKey}`);
+    return row.actor_id;
+  };
+
+  /** This actor's one lifetime target binding, read rather than fabricated. */
+  const bindingOf = (h: Harness, actorId: string): string =>
+    h.cp.db.get<{ target_binding_id: string }>(
+      `SELECT target_binding_id FROM actor_target_bindings WHERE target_actor_id = ?`,
+      [actorId],
+    )!.target_binding_id;
+
+  /**
+   * The one thing nothing in production writes yet (the activation embargo's writer is a
+   * separate gap, not this one) — so this stays a direct insert while everything around it now
+   * goes through `BindingRegistry`/`SessionRegistry`.
+   */
+  const attest = (
+    h: Harness,
+    input: {
+      id: string;
+      targetBindingId: string;
+      sessionId: string;
+      incarnation: string;
+      generation: number;
+      assignmentId: string;
+    },
+  ): void => {
+    h.cp.db.run(
+      `INSERT INTO actor_target_attestations
+         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+          executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+          attested_at)
+       VALUES (?, ?, 'v1', ?, ?, ?, ?, ?, ?)`,
+      [
+        input.id,
+        input.targetBindingId,
+        `digest:${input.id}`,
+        input.sessionId,
+        input.incarnation,
+        input.generation,
+        input.assignmentId,
+        NOW,
+      ],
+    );
+  };
+
+  /**
+   * An actor whose attestation is real but stale: a runtime once verified the target under
+   * generation 1, the role then failed over to a new runtime under generation 2, and nothing
+   * ever told `actor_target_attestations` — because nothing writes it in production yet either
+   * (the activation embargo's writer is a separate gap, not this one). `claim()` used to pick
+   * the most recent attestation by timestamp alone, which is this one: there is only one.
+   *
+   * Built through `revoke()` then `bind()` again — the actual sequence a real failover takes
+   * (`BindingRegistry` has no method that rewrites a live assignment's generation in place), and
+   * `bind()` reuses this actor because the verified target is the one it already owns.
+   */
+  const staleGenerationActor = (h: Harness): { actorId: string; targetBindingId: string } => {
+    readySession(h, "sess-old", "inc-old");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-old",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-stale-gen", targetLocatorDigest: "digest:stale-gen" },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+    attest(h, {
+      id: "att:stale-gen",
+      targetBindingId,
+      sessionId: "sess-old",
+      incarnation: "inc-old",
+      generation: 1,
+      assignmentId: bound.value.assignmentId,
+    });
+
+    // The role failed over: revoked, then bound again under a new runtime. The old attestation is
+    // left exactly where it was, naming a generation the role has moved past.
+    const revoked = h.cp.bindings.revoke(bound.value.roleKey, "test failover");
+    if (!revoked.allowed) throw new Error(`revoke refused: ${revoked.reasonCode}`);
+    readySession(h, "sess-new", "inc-new");
+    const rebound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-new",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-stale-gen", targetLocatorDigest: "digest:stale-gen" },
+    });
+    if (!rebound.allowed) throw new Error(`rebind refused: ${rebound.reasonCode}`);
+    return { actorId, targetBindingId };
+  };
+
+  it("refuses a claim whose only attestation names a generation the role has moved past", () => {
+    const h = makeHarness();
+    const { actorId } = staleGenerationActor(h);
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("writes nothing when it refuses a stale-generation attestation", () => {
+    const h = makeHarness();
+    const { actorId } = staleGenerationActor(h);
+
+    coordinatorOf(h).claim({ targetActorId: actorId, prompt: "hello", sources: [source(h, "m1")] });
+
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(0);
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_sources`)).toHaveLength(0);
+  });
+
+  it("refuses on generation alone, with the session and incarnation identical throughout", () => {
+    // A review's second finding: the test above changes generation *and* session/incarnation
+    // together, so deleting the generation condition alone left that case still refused by the
+    // session mismatch — the mutation row for it could not have killed anything. This isolates
+    // the one thing under test: revoked and bound again under the *same* session, so nothing
+    // about the runtime changes and only the generation the role is at moves.
+    const h = makeHarness();
+    readySession(h, "sess-fixed", "inc-fixed");
+    const first = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-fixed",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-isolated", targetLocatorDigest: "digest:isolated" },
+    });
+    if (!first.allowed) throw new Error(`bind refused: ${first.reasonCode}`);
+    const actorId = actorOf(h, first.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    const revoked = h.cp.bindings.revoke(first.value.roleKey, "test regeneration");
+    if (!revoked.allowed) throw new Error(`revoke refused: ${revoked.reasonCode}`);
+    const second = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-fixed",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-isolated", targetLocatorDigest: "digest:isolated" },
+    });
+    if (!second.allowed) throw new Error(`rebind refused: ${second.reasonCode}`);
+    expect(second.value.sessionId).toBe("sess-fixed");
+    expect(second.value.bindingGeneration).toBe(first.value.bindingGeneration + 1);
+
+    // The stale attestation names "sess-fixed"/"inc-fixed" — the session id and incarnation the
+    // role is *still* at, unchanged by the revoke and rebind — and only the generation it names
+    // is the one the role has moved past.
+    attest(h, {
+      id: "att:isolated",
+      targetBindingId,
+      sessionId: "sess-fixed",
+      incarnation: "inc-fixed",
+      generation: first.value.bindingGeneration,
+      assignmentId: first.value.assignmentId,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses a stale attestation matched through a different role's generation, not its own", () => {
+    // A review's first finding: the join found *any* ACTIVE assignment on the actor whose
+    // generation matched, and generation is minted per role_key — so a generation number means
+    // nothing without the role_key it belongs to. `bind()` can reuse one physical actor across
+    // different roles for the same verified target (#657); this builds exactly that reuse and
+    // shows a stale attestation for the actor's own (CEO) identity matched through an unrelated
+    // WORKER assignment whose own generation counter happened to coincide.
+    const h = makeHarness();
+    readySession(h, "sess-ceo-1", "inc-1");
+    const ceoBound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-ceo-1",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-reuse", targetLocatorDigest: "digest:reuse" },
+    });
+    if (!ceoBound.allowed) throw new Error(`ceo bind refused: ${ceoBound.reasonCode}`);
+    const actorId = actorOf(h, ceoBound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    // The CEO role replaces its runtime: `switchTo(REPLACED)` mints a fresh actor at generation 2
+    // and revokes this actor's own CEO assignment — but never touches `actor_target_bindings`, so
+    // this actor keeps the lifetime target it always owned.
+    readySession(h, "sess-ceo-2", "inc-2");
+    const replaced = h.cp.bindings.switchTo({
+      role: Role.CEO,
+      sessionId: "sess-ceo-2",
+      reason: "test replace",
+      conversation: "REPLACED",
+    });
+    expect(replaced.allowed).toBe(true);
+
+    // The same physical actor is reused for an unrelated WORKER binding, for the same verified
+    // target — the reuse this counterexample turns on.
+    readySession(h, "sess-worker", "inc-w");
+    const workerBound = h.cp.bindings.bind({
+      role: Role.WORKER,
+      sessionId: "sess-worker",
+      taskId: "t1",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-reuse", targetLocatorDigest: "digest:reuse" },
+    });
+    if (!workerBound.allowed) throw new Error(`worker bind refused: ${workerBound.reasonCode}`);
+    expect(actorOf(h, workerBound.value.roleKey)).toBe(actorId);
+
+    // A stale attestation for this actor's original CEO identity, at generation 1 — the CEO role
+    // has moved to generation 2, under a different actor entirely. It happens to equal the
+    // WORKER binding's own, unrelated, generation 1, and it names the session this actor's live
+    // pointer actually holds now (updated by the WORKER reuse) — so only the role scoping stands
+    // between this and admission.
+    attest(h, {
+      id: "att:reuse",
+      targetBindingId,
+      sessionId: "sess-worker",
+      incarnation: "inc-w",
+      generation: workerBound.value.bindingGeneration,
+      assignmentId: ceoBound.value.assignmentId,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses an unrelated role_key's generation reviving a retired one under the same role", () => {
+    // A follow-up review's counterexample: `role = kind` is not `role_key`. `WORKER:task-A` and
+    // `WORKER:task-B` are two different role_keys that share one `role`, and each counts its own
+    // generation from 1 — so a fix that stopped at `role` cannot tell them apart. `bind()` reuses
+    // the actor for the same verified target (#657); this shows a stale generation-1 attestation
+    // for task-A's retired identity revived by task-B's own, unrelated, generation-1 counter,
+    // through the session id "sess-shared" task-A originally bound.
+    const h = makeHarness();
+    readySession(h, "sess-shared", "inc-shared");
+    const taskABound = h.cp.bindings.bind({
+      role: Role.WORKER,
+      sessionId: "sess-shared",
+      taskId: "task-A",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-samerole", targetLocatorDigest: "digest:samerole" },
+    });
+    if (!taskABound.allowed) throw new Error(`task-A bind refused: ${taskABound.reasonCode}`);
+    const actorId = actorOf(h, taskABound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+    attest(h, {
+      id: "att:same-role",
+      targetBindingId,
+      sessionId: "sess-shared",
+      incarnation: "inc-shared",
+      generation: taskABound.value.bindingGeneration,
+      assignmentId: taskABound.value.assignmentId,
+    });
+
+    // task-A replaces its runtime: a fresh actor takes generation 2 under that role_key, and this
+    // actor's task-A assignment is revoked.
+    readySession(h, "sess-task-a-2", "inc-a2");
+    const replaced = h.cp.bindings.switchTo({
+      role: Role.WORKER,
+      taskId: "task-A",
+      sessionId: "sess-task-a-2",
+      reason: "test replace",
+      conversation: "REPLACED",
+    });
+    expect(replaced.allowed).toBe(true);
+
+    // The same physical actor is reused for a *different* WORKER role_key, task-B — bound to
+    // "sess-shared", the session id task-A originally used, so the live pointer returns to
+    // exactly where the stale attestation says it is. Only the role_key is different; the role,
+    // and now the session id, are identical to what the stale attestation names.
+    const taskBBound = h.cp.bindings.bind({
+      role: Role.WORKER,
+      sessionId: "sess-shared",
+      taskId: "task-B",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-samerole", targetLocatorDigest: "digest:samerole" },
+    });
+    if (!taskBBound.allowed) throw new Error(`task-B bind refused: ${taskBBound.reasonCode}`);
+    expect(actorOf(h, taskBBound.value.roleKey)).toBe(actorId);
+    expect(taskBBound.value.bindingGeneration).toBe(1);
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses an attestation whose claimed generation disagrees with the assignment it names", () => {
+    // A third review's counterexample: `assignment_id` pins *which* assignment an attestation
+    // speaks for; on its own it does not check what the attestation *says* about that
+    // assignment. An attestation could cite a real, currently ACTIVE assignment_id while
+    // claiming generation 1, when that very assignment's own row already reads 2 — the join
+    // matched on identity alone, admitted the claim, and `canonical_turns` recorded generation 2
+    // for a turn no attestation ever attested. `attestation_generation_matches_assignment`
+    // refuses this shape at the source (write time); this test drops that trigger first, so it
+    // proves the read-time join is independently sufficient for a row that reached the table by
+    // any other path — not merely that the trigger caught it before the query had to.
+    const h = makeHarness();
+    readySession(h, "sess-mismatch-1", "inc-1");
+    const first = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-mismatch-1",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-mismatch", targetLocatorDigest: "digest:mismatch" },
+    });
+    if (!first.allowed) throw new Error(`bind refused: ${first.reasonCode}`);
+    const actorId = actorOf(h, first.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    const revoked = h.cp.bindings.revoke(first.value.roleKey, "test regeneration");
+    if (!revoked.allowed) throw new Error(`revoke refused: ${revoked.reasonCode}`);
+    readySession(h, "sess-mismatch-2", "inc-2");
+    const second = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-mismatch-2",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-mismatch", targetLocatorDigest: "digest:mismatch" },
+    });
+    if (!second.allowed) throw new Error(`rebind refused: ${second.reasonCode}`);
+    expect(second.value.bindingGeneration).toBe(2);
+
+    // The one row a trigger would refuse: a real, ACTIVE assignment_id, claiming a generation
+    // that is not the one on that row. `Db.run` is DML-only by design (it cannot drop a
+    // trigger), so this uses a second, unrestricted connection to the same file — the same
+    // escape hatch `a-dispatch-is-a-fact.test.ts` names: "that handle can also DROP TRIGGER".
+    const foreign = new Database(join(h.root, "state.sqlite"));
+    try {
+      foreign.exec(`DROP TRIGGER attestation_generation_matches_assignment`);
+    } finally {
+      foreign.close();
+    }
+    attest(h, {
+      id: "att:mismatch",
+      targetBindingId,
+      sessionId: "sess-mismatch-2",
+      incarnation: "inc-2",
+      generation: 1,
+      assignmentId: second.value.assignmentId,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses to record an attestation whose generation disagrees with the assignment it names", () => {
+    // The write-time half: the trigger itself, reached the ordinary way rather than by dropping
+    // it first.
+    const h = makeHarness();
+    readySession(h, "sess-write-1", "inc-1");
+    const first = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-write-1",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-write", targetLocatorDigest: "digest:write" },
+    });
+    if (!first.allowed) throw new Error(`bind refused: ${first.reasonCode}`);
+    const actorId = actorOf(h, first.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    const revoked = h.cp.bindings.revoke(first.value.roleKey, "test regeneration");
+    if (!revoked.allowed) throw new Error(`revoke refused: ${revoked.reasonCode}`);
+    readySession(h, "sess-write-2", "inc-2");
+    const second = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-write-2",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-write", targetLocatorDigest: "digest:write" },
+    });
+    if (!second.allowed) throw new Error(`rebind refused: ${second.reasonCode}`);
+    expect(second.value.bindingGeneration).toBe(2);
+
+    // A string match on the message is what let the omission through in the first place: the
+    // trigger raised the sentinel, but with no `TRIGGER_CODES` entry the denial reached this
+    // test as a raw SQLite error, and a substring match on that raw message would have passed
+    // just as happily as it would on a typed one. Asserting `isAcpError` and the reason code is
+    // what actually distinguishes a Decision-shaped refusal from a database exception no caller
+    // asked for.
+    let thrown: unknown;
+    try {
+      attest(h, {
+        id: "att:write-mismatch",
+        targetBindingId,
+        sessionId: "sess-write-2",
+        incarnation: "inc-2",
+        generation: 1,
+        assignmentId: second.value.assignmentId,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isAcpError(thrown)).toBe(true);
+    if (isAcpError(thrown)) {
+      expect(thrown.reasonCode).toBe(ReasonCode.ATTESTATION_GENERATION_MISMATCH);
+    }
+  });
+
+  it("refuses an attestation whose assignment_id names a different actor's assignment entirely", () => {
+    // The audit this round asked for: what else on the row is a copy of something authoritative
+    // elsewhere, unchecked? `target_binding_id` implies an actor (via `actor_target_bindings`);
+    // `assignment_id` implies one too (via `assignments.actor_id`), and nothing before this
+    // asked whether they agree. The generation trigger above does not catch this shape — the
+    // cited assignment's generation is exactly right, for its *own* actor — only
+    // `asg.actor_id = ca.actor_id` in the query does. This constructs a real, ACTIVE, correctly
+    // generationed assignment that simply belongs to someone else, and asks `claim()` to admit
+    // through it anyway.
+    const h = makeHarness();
+    readySession(h, "sess-owner", "inc-owner");
+    const owner = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-owner",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-owner", targetLocatorDigest: "digest:owner" },
+    });
+    if (!owner.allowed) throw new Error(`owner bind refused: ${owner.reasonCode}`);
+    const ownerActorId = actorOf(h, owner.value.roleKey);
+    const targetBindingId = bindingOf(h, ownerActorId);
+
+    // A second, unrelated actor — a different verified target, so no reuse — with its own
+    // real, ACTIVE assignment at its own real generation.
+    readySession(h, "sess-stranger", "inc-stranger");
+    const stranger = h.cp.bindings.bind({
+      role: Role.WORKER,
+      sessionId: "sess-stranger",
+      taskId: "task-stranger",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-stranger", targetLocatorDigest: "digest:stranger" },
+    });
+    if (!stranger.allowed) throw new Error(`stranger bind refused: ${stranger.reasonCode}`);
+    expect(actorOf(h, stranger.value.roleKey)).not.toBe(ownerActorId);
+
+    // An attestation for the owner's binding, naming the owner's own live session (so every
+    // other condition reads as current) but citing the stranger's assignment_id — generation
+    // matches that assignment exactly, so only the actor identity is wrong.
+    attest(h, {
+      id: "att:stranger",
+      targetBindingId,
+      sessionId: "sess-owner",
+      incarnation: "inc-owner",
+      generation: stranger.value.bindingGeneration,
+      assignmentId: stranger.value.assignmentId,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: ownerActorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses an attestation whose incarnation was never the session's own, though the actor's copy agrees", () => {
+    // A sixth review's counterexample, one table further out than the last two rounds looked:
+    // `conversational_actors.current_session_incarnation` is itself a copy of
+    // `sessions.incarnation`, and nothing compared it to that authority — only to another copy
+    // on the attestation. `conversational_actors_incarnation_matches_session_on_update` now
+    // refuses the corrupting write at its source (see the write-time test below); this test
+    // drops that trigger first, through the same second-connection escape hatch used for the
+    // generation counterexample two rounds ago, so it proves the read-time join is independently
+    // sufficient for a row that reached the table by any other path.
+    const h = makeHarness();
+    readySession(h, "sess-copy", "inc-real");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-copy",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-copy", targetLocatorDigest: "digest:copy" },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    // The corrupting write: only the actor's copy moves, not the session it names.
+    const foreign = new Database(join(h.root, "state.sqlite"));
+    try {
+      foreign.exec(`DROP TRIGGER conversational_actors_incarnation_matches_session_on_update`);
+      foreign
+        .prepare(`UPDATE conversational_actors SET current_session_incarnation = ? WHERE actor_id = ?`)
+        .run("inc-fake", actorId);
+    } finally {
+      foreign.close();
+    }
+
+    attest(h, {
+      id: "att:copy-drift",
+      targetBindingId,
+      sessionId: "sess-copy",
+      incarnation: "inc-fake",
+      generation: bound.value.bindingGeneration,
+      assignmentId: bound.value.assignmentId,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses to move the actor's incarnation copy away from the session it names", () => {
+    // The write-time half: the trigger itself, reached the ordinary way rather than by dropping
+    // it first.
+    const h = makeHarness();
+    readySession(h, "sess-write-copy", "inc-real");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-write-copy",
+      verifiedTarget: {
+        executorKind: "hermes",
+        targetLocator: "loc-write-copy",
+        targetLocatorDigest: "digest:write-copy",
+      },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+
+    let thrown: unknown;
+    try {
+      h.cp.db.run(`UPDATE conversational_actors SET current_session_incarnation = ? WHERE actor_id = ?`, [
+        "inc-fake",
+        actorId,
+      ]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isAcpError(thrown)).toBe(true);
+    if (isAcpError(thrown)) {
+      expect(thrown.reasonCode).toBe(ReasonCode.ACTOR_SESSION_INCARNATION_MISMATCH);
+    }
+  });
+
+  it("refuses to insert an actor whose incarnation was never the session's own", () => {
+    // The insert half of the same rule — `mintActor` goes through this path too.
+    const h = makeHarness();
+    readySession(h, "sess-insert-copy", "inc-real");
+
+    let thrown: unknown;
+    try {
+      h.cp.db.run(
+        `INSERT INTO conversational_actors
+           (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+         VALUES ('actor:insert-copy', 'CEO', 'sess-insert-copy', 'inc-fake', ?)`,
+        [NOW],
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isAcpError(thrown)).toBe(true);
+    if (isAcpError(thrown)) {
+      expect(thrown.reasonCode).toBe(ReasonCode.ACTOR_SESSION_INCARNATION_MISMATCH);
+    }
+  });
+
+  it("refuses a retired actor's attestation even under its recorded generation", () => {
+    // Retirement is terminal (`conversational_actors_retirement_terminal`); admitting a turn for
+    // a retired actor would make superseded authority current again.
+    const h = makeHarness();
+    const actorId = target(h, "retiree");
+    h.cp.db.run(
+      `UPDATE conversational_actors SET retired_at = ?, retired_reason = 'test' WHERE actor_id = ?`,
+      [NOW, actorId],
+    );
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("admits a claim under an attestation that still names the actor's current generation", () => {
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(true);
+  });
+
+  /**
+   * A role whose counterpart *survived* a failover (#493): only the runtime moved, so
+   * `BindingRegistry.switchTo({ conversation: "SURVIVED" })` never rewrites `assignments` — the
+   * same generation, the same binding row, the same `assignments.session_id` it was created with
+   * (schema's own words: "The runtime at binding time, not the live one"). The live pointer moves
+   * only on `conversational_actors.current_session_id`.
+   *
+   * A fresh attestation naming the new live session is exactly the current, honest state of this
+   * actor — and `claim()` must admit it.
+   */
+  const survivedFailoverActor = (h: Harness): { actorId: string; targetBindingId: string } => {
+    readySession(h, "sess-original", "inc-1");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-original",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-survived", targetLocatorDigest: "digest:survived" },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    // The failover: only the live pointer moves, to a new session and incarnation. `assignments`
+    // is untouched by `switchTo(SURVIVED)` — same generation, same `session_id`.
+    readySession(h, "sess-failover", "inc-2");
+    const survived = h.cp.bindings.switchTo({
+      role: Role.CEO,
+      sessionId: "sess-failover",
+      reason: "test survived failover",
+      conversation: "SURVIVED",
+    });
+    if (!survived.allowed) throw new Error(`switchTo refused: ${survived.reasonCode}`);
+
+    // A fresh attestation from the surviving runtime, naming its own live session and the
+    // generation that never changed.
+    attest(h, {
+      id: "att:survived",
+      targetBindingId,
+      sessionId: "sess-failover",
+      incarnation: "inc-2",
+      generation: survived.value.bindingGeneration,
+      assignmentId: survived.value.assignmentId,
+    });
+    return { actorId, targetBindingId };
+  };
+
+  it("admits a claim after a SURVIVED failover, under the live session and the generation that never changed", () => {
+    const h = makeHarness();
+    const { actorId } = survivedFailoverActor(h);
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(true);
+  });
+
+  it("refuses an attestation whose named session is no longer usable, though still the live pointer", () => {
+    // A review's third finding: "live" was checked as "still pointed at", not "still usable".
+    // `SessionRegistry.transition` moves `sessions.lifecycle` to `ERROR` or `STOPPED` without ever
+    // touching `conversational_actors.current_session_id` — #493 moved the live pointer off
+    // `assignments` for exactly the SURVIVED case above, and nothing sweeps it when the session it
+    // names stops being usable for a different reason.
+    const h = makeHarness();
+    readySession(h, "sess-errored", "inc-1");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-errored",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-error", targetLocatorDigest: "digest:error" },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+    attest(h, {
+      id: "att:error",
+      targetBindingId,
+      sessionId: "sess-errored",
+      incarnation: "inc-1",
+      generation: bound.value.bindingGeneration,
+      assignmentId: bound.value.assignmentId,
+    });
+
+    const errored = h.cp.sessions.transition("sess-errored", SessionLifecycle.ERROR, "test");
+    expect(errored.allowed).toBe(true);
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
   });
 });
 
@@ -221,7 +1045,7 @@ describe("a claim takes the hold in the same transaction", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
 
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
 
     const row = h.cp.db.get<{ lifecycle_state: string; claimed_at: string }>(
       `SELECT lifecycle_state, claimed_at FROM canonical_turns WHERE turn_request_id = ?`,
@@ -237,7 +1061,7 @@ describe("a claim takes the hold in the same transaction", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
 
-    const permit = claimOf(h, actorId, [source("m1"), source("m2"), source("m3")]);
+    const permit = claimOf(h, actorId, [source(h, "m1"), source(h, "m2"), source(h, "m3")]);
 
     const rows = h.cp.db.all<{ source_nonce: string; batch_ordinal: number }>(
       `SELECT source_nonce, batch_ordinal FROM canonical_turn_sources
@@ -259,7 +1083,7 @@ describe("a claim takes the hold in the same transaction", () => {
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "x",
-      sources: [source("m1", 0)],
+      sources: [source(h, "m1", 0)],
     });
 
     expect(decision.allowed).toBe(false);
@@ -283,12 +1107,12 @@ describe("one unresolved turn per conversation", () => {
     // which is the stall this design exists to remove.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    claimOf(h, actorId, [source("m1")]);
+    claimOf(h, actorId, [source(h, "m1")]);
 
     const second = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "another",
-      sources: [source("m2")],
+      sources: [source(h, "m2")],
     });
 
     expect(second.allowed).toBe(false);
@@ -300,9 +1124,9 @@ describe("one unresolved turn per conversation", () => {
     // is the half a bare "it throws" assertion would not notice.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const first = claimOf(h, actorId, [source("m1")]);
+    const first = claimOf(h, actorId, [source(h, "m1")]);
 
-    coordinatorOf(h).claim({ targetActorId: actorId, prompt: "another", sources: [source("m2")] });
+    coordinatorOf(h).claim({ targetActorId: actorId, prompt: "another", sources: [source(h, "m2")] });
 
     expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(1);
     expect(
@@ -318,7 +1142,7 @@ describe("one unresolved turn per conversation", () => {
     // refusal would be permanent.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const first = claimOf(h, actorId, [source("m1")]);
+    const first = claimOf(h, actorId, [source(h, "m1")]);
 
     settle(coordinatorOf(h), first, {
       kind: "NEVER_ADMITTED",
@@ -328,7 +1152,7 @@ describe("one unresolved turn per conversation", () => {
     const second = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "another",
-      sources: [source("m2")],
+      sources: [source(h, "m2")],
     });
 
     expect(second.allowed).toBe(true);
@@ -340,12 +1164,12 @@ describe("one unresolved turn per conversation", () => {
     const h = makeHarness();
     const ceo = target(h, "ceo");
     const cto = target(h, "cto");
-    claimOf(h, ceo, [source("m1")]);
+    claimOf(h, ceo, [source(h, "m1")]);
 
     const other = coordinatorOf(h).claim({
       targetActorId: cto,
       prompt: "unrelated",
-      sources: [source("m2")],
+      sources: [source(h, "m2")],
     });
 
     expect(other.allowed).toBe(true);
@@ -354,7 +1178,7 @@ describe("one unresolved turn per conversation", () => {
 
 describe("a retry is legal only when the previous attempt ended safely", () => {
   const settleFirst = (h: Harness, actorId: string, outcome: "NEVER_ADMITTED" | "ABORTED" | "COMPLETED") => {
-    const first = claimOf(h, actorId, [source("m1")]);
+    const first = claimOf(h, actorId, [source(h, "m1")]);
     settle(
       coordinatorOf(h),
       first,
@@ -370,7 +1194,7 @@ describe("a retry is legal only when the previous attempt ended safely", () => {
     return coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "hello",
-      sources: [source("m1", 2)],
+      sources: [source(h, "m1", 2)],
     });
   };
 
@@ -401,12 +1225,12 @@ describe("a retry is legal only when the previous attempt ended safely", () => {
     const h = makeHarness();
     const first = target(h, "first");
     const second = target(h, "second");
-    claimOf(h, first, [source("m1")]);
+    claimOf(h, first, [source(h, "m1")]);
 
     const decision = coordinatorOf(h).claim({
       targetActorId: second,
       prompt: "hello",
-      sources: [source("m1", 2)],
+      sources: [source(h, "m1", 2)],
     });
 
     expect(decision.allowed).toBe(false);
@@ -422,7 +1246,7 @@ describe("a retry is legal only when the previous attempt ended safely", () => {
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "hello",
-      sources: [source("m1", 3)],
+      sources: [source(h, "m1", 3)],
     });
 
     expect(decision.allowed).toBe(false);
@@ -432,13 +1256,13 @@ describe("a retry is legal only when the previous attempt ended safely", () => {
   it("records which turn a retry followed", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const first = claimOf(h, actorId, [source("m1")]);
+    const first = claimOf(h, actorId, [source(h, "m1")]);
     settle(coordinatorOf(h), first, {
       kind: "NEVER_ADMITTED",
       authority: "ACP_PRE_DISPATCH",
       reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
     });
-    claimOf(h, actorId, [source("m1", 2)]);
+    claimOf(h, actorId, [source(h, "m1", 2)]);
 
     const row = h.cp.db.get<{ predecessor_turn_request_id: string }>(
       `SELECT predecessor_turn_request_id FROM canonical_turn_sources WHERE source_attempt = 2`,
@@ -451,7 +1275,7 @@ describe("settlement needs an authority that observed something", () => {
   it("records the authority and its evidence", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
 
     settle(coordinatorOf(h), permit, {
       kind: "COMPLETED",
@@ -485,7 +1309,7 @@ describe("settlement needs an authority that observed something", () => {
     // a redelivery of it.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
 
     for (const receipt of [
       { receiptId: "", evidenceDigest: "sha256:x", reasonCode: ReasonCode.OK },
@@ -547,7 +1371,7 @@ describe("settlement needs an authority that observed something", () => {
     // and this lost the correct one.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     settle(coordinatorOf(h), permit, {
       kind: "NEVER_ADMITTED",
       authority: "ACP_PRE_DISPATCH",
@@ -581,7 +1405,7 @@ describe("settlement needs an authority that observed something", () => {
     // becomes runnable again.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     settle(coordinatorOf(h), permit, {
       kind: "COMPLETED",
       authority: "HERMES_TARGET",
@@ -608,7 +1432,7 @@ describe("settlement needs an authority that observed something", () => {
     // conversation for no reason.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     const twice = () =>
       coordinatorOf(h).ports.target.completed(permit, {
         receiptId: "the-same-receipt",
@@ -644,7 +1468,7 @@ describe("only a permit this coordinator issued can settle a turn", () => {
     // looks like one is the signature, and only the coordinator can produce that.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const real = claimOf(h, actorId, [source("m1")]);
+    const real = claimOf(h, actorId, [source(h, "m1")]);
 
     const decision = settleWith(h, { ...real, issuance: "00".repeat(32) });
 
@@ -656,7 +1480,7 @@ describe("only a permit this coordinator issued can settle a turn", () => {
   it("refuses a permit whose signature is absent entirely", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const real = claimOf(h, actorId, [source("m1")]);
+    const real = claimOf(h, actorId, [source(h, "m1")]);
 
     const decision = settleWith(h, { ...real, issuance: "" });
 
@@ -671,8 +1495,8 @@ describe("only a permit this coordinator issued can settle a turn", () => {
     const h = makeHarness();
     const ceo = target(h, "ceo");
     const cto = target(h, "cto");
-    const real = claimOf(h, ceo, [source("m1")]);
-    claimOf(h, cto, [source("m2")]);
+    const real = claimOf(h, ceo, [source(h, "m1")]);
+    claimOf(h, cto, [source(h, "m2")]);
 
     const decision = settleWith(h, { ...real, targetActorId: cto });
 
@@ -688,7 +1512,7 @@ describe("only a permit this coordinator issued can settle a turn", () => {
     // the materialization authority is issued once per database file. Two materializers would
     // make "the outcome is computed from the observations" a matter of which one ran.
     const h = makeHarness();
-    claimOf(h, target(h, "ceo"), [source("m1")]);
+    claimOf(h, target(h, "ceo"), [source(h, "m1")]);
 
     expect(anotherCoordinator(h)).toThrow();
   });
@@ -698,7 +1522,7 @@ describe("only a permit this coordinator issued can settle a turn", () => {
     // steer who the audit says a settlement was about.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
 
     settle(coordinatorOf(h), permit, {
       kind: "NEVER_ADMITTED",
@@ -722,7 +1546,7 @@ describe("only a permit this coordinator issued can settle a turn", () => {
     // to make twice already.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    claimOf(h, actorId, [source("m1")]);
+    claimOf(h, actorId, [source(h, "m1")]);
 
     expect(() => h.cp.db.run(`DELETE FROM canonical_turn_sources`)).toThrow(
       /CANONICAL_TURN_SOURCE_IMMUTABLE/,
@@ -740,7 +1564,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     // an exchange ACP had watched Hermes deliver.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     coordinatorOf(h).ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-1",
       evidenceDigest: "sha256:watched",
@@ -755,7 +1579,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     const retry = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "hello",
-      sources: [source("m1", 2)],
+      sources: [source(h, "m1", 2)],
     });
 
     expect(retry.allowed).toBe(false);
@@ -767,7 +1591,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     // record is a disagreement — not a settlement that looks decided.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     coordinatorOf(h).ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-1",
       evidenceDigest: "sha256:watched",
@@ -797,7 +1621,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     // correctly, and it would leave the dispute check with no case of its own.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     coordinatorOf(h).ports.target.aborted(permit, {
       receiptId: `receipt-${(receiptCounter += 1)}`,
       evidenceDigest: "sha256:fence",
@@ -812,7 +1636,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     const retry = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "hello",
-      sources: [source("m1", 2)],
+      sources: [source(h, "m1", 2)],
     });
 
     expect(retry.allowed).toBe(false);
@@ -825,7 +1649,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     // conversation that worked.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     coordinatorOf(h).ports.acpObservedReply.sawCompletion(permit, {
       receiptId: "acp-1",
       evidenceDigest: "sha256:watched",
@@ -850,7 +1674,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
     // not settle.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     settle(coordinatorOf(h), permit, {
       kind: "COMPLETED",
       authority: "HERMES_TARGET",
@@ -880,7 +1704,7 @@ describe("evidence that cannot set the outcome still counts against a retry", ()
 
 describe("a conversation whose last outcome is disputed takes no new turns", () => {
   const contradict = (h: Harness, actorId: string) => {
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     settle(coordinatorOf(h), permit, {
       kind: "NEVER_ADMITTED",
       authority: "ACP_PRE_DISPATCH",
@@ -905,7 +1729,7 @@ describe("a conversation whose last outcome is disputed takes no new turns", () 
     const next = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "a new question",
-      sources: [source("m2")],
+      sources: [source(h, "m2")],
     });
 
     expect(next.allowed).toBe(false);
@@ -920,7 +1744,7 @@ describe("a conversation whose last outcome is disputed takes no new turns", () 
     const next = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "q",
-      sources: [source("m2")],
+      sources: [source(h, "m2")],
     });
 
     expect(next.evidence).toMatchObject({ contradicted: disputed.turnRequestId });
@@ -934,7 +1758,7 @@ describe("a conversation whose last outcome is disputed takes no new turns", () 
     const cto = target(h, "cto");
 
     expect(
-      coordinatorOf(h).claim({ targetActorId: cto, prompt: "q", sources: [source("m3")] }).allowed,
+      coordinatorOf(h).claim({ targetActorId: cto, prompt: "q", sources: [source(h, "m3")] }).allowed,
     ).toBe(true);
   });
 });
@@ -947,13 +1771,13 @@ describe("nothing clears a hold on time", () => {
     // until this test existed.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    claimOf(h, actorId, [source("m1")]);
+    claimOf(h, actorId, [source(h, "m1")]);
 
     h.clock.advance(60 * 60 * 1000);
     const next = coordinatorOf(h).claim({
       targetActorId: actorId,
       prompt: "later",
-      sources: [source("m2")],
+      sources: [source(h, "m2")],
     });
 
     expect(next.allowed).toBe(false);
@@ -966,7 +1790,7 @@ describe("nothing clears a hold on time", () => {
     // adds an age-based cleanup, this is what fails.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    const permit = claimOf(h, actorId, [source("m1")]);
+    const permit = claimOf(h, actorId, [source(h, "m1")]);
     const claimedAt = h.clock.nowIso();
 
     h.clock.advance(60 * 60 * 1000);
@@ -980,7 +1804,7 @@ describe("nothing clears a hold on time", () => {
     // caller actually sees comes from it, rather than from something reconstructed at read time.
     const h = makeHarness();
     const actorId = target(h, "ceo");
-    claimOf(h, actorId, [source("m1")]);
+    claimOf(h, actorId, [source(h, "m1")]);
 
     expect(coordinatorOf(h).unresolved(actorId).map((t) => t.claimedAt)).toEqual([h.clock.nowIso()]);
   });
@@ -1040,7 +1864,7 @@ describe("an authority is derived from the port, not supplied by the caller", ()
       label: string,
       call: (permit: TurnPermit, receipt: TurnReceipt) => Decision<TurnMaterialization>,
     ): void => {
-      const permit = claimOf(h, actorId, [source(label)]);
+      const permit = claimOf(h, actorId, [source(h, label)]);
       const decision = call(permit, {
         receiptId: `receipt:${label}`,
         evidenceDigest: "sha256:e",
@@ -1082,7 +1906,7 @@ describe("an authority is derived from the port, not supplied by the caller", ()
   it("refuses a pair no port can express, so the two agree by enforcement rather than by habit", () => {
     const h = makeHarness();
     const actorId = target(h, "unreachable");
-    const permit = claimOf(h, actorId, [source("u")]);
+    const permit = claimOf(h, actorId, [source(h, "u")]);
 
     expect(() =>
       h.cp.db.run(
