@@ -39,13 +39,40 @@ const binding = (h: Harness, id: string, actorId: string, locator: string): stri
   return id;
 };
 
+/**
+ * An attestation, plus the runtime session and active role assignment `claim()`'s currency check
+ * (#666) reads to decide the attestation still names the actor's current generation.
+ */
 const attestation = (h: Harness, id: string, bindingId: string): string => {
+  const owner = h.cp.db.get<{ target_actor_id: string }>(
+    `SELECT target_actor_id FROM actor_target_bindings WHERE target_binding_id = ?`,
+    [bindingId],
+  );
+  const actorId = owner!.target_actor_id;
+  const sessionId = `ses:${id}`;
+  h.cp.db.run(
+    `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+     VALUES (?, 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
+    [sessionId, NOW, NOW],
+  );
+  h.cp.db.run(
+    `UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = 'inc-1'
+      WHERE actor_id = ?`,
+    [sessionId, actorId],
+  );
+  h.cp.db.run(
+    `INSERT INTO assignments
+       (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+        binding_generation, mode, status, created_at)
+     VALUES (?, ?, 'CEO', ?, ?, 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
+    [`asg:${id}`, `CEO:${id}`, actorId, sessionId, NOW],
+  );
   h.cp.db.run(
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
         executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-     VALUES (?, ?, 'v1', ?, 'ses-1', 'inc-1', 1, ?)`,
-    [id, bindingId, `att:${id}`, NOW],
+     VALUES (?, ?, 'v1', ?, ?, 'inc-1', 1, ?)`,
+    [id, bindingId, `att:${id}`, sessionId, NOW],
   );
   return id;
 };
@@ -97,6 +124,12 @@ const inDoubtTurn = (
  * is exactly what the capability exists to refuse.
  */
 const settleThroughCoordinator = (h: Harness, actorId: string, nonce: string, outcome: "COMPLETED" | "NEVER_ADMITTED"): string => {
+  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
+  h.cp.db.run(
+    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at)
+     VALUES ('telegram', ?, 'owner', ?)`,
+    [nonce, NOW],
+  );
   const claimed = h.cp.conversation.claim({
     targetActorId: actorId,
     prompt: nonce,

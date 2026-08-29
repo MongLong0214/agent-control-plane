@@ -28,22 +28,39 @@ const NOW = "2026-08-22T00:00:00.000Z";
 
 const target = (h: Harness, name: string): string => {
   const actorId = `actor:${name}`;
-  h.cp.db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'CEO', ?)`, [
-    actorId,
-    NOW,
-  ]);
+  const sessionId = `runtime:${name}`;
+  h.cp.db.run(
+    `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+     VALUES (?, 'inc', 'claude', 'opus', 'READY', ?, ?)`,
+    [sessionId, NOW, NOW],
+  );
+  h.cp.db.run(
+    `INSERT INTO conversational_actors
+       (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+     VALUES (?, 'CEO', ?, 'inc', ?)`,
+    [actorId, sessionId, NOW],
+  );
   h.cp.db.run(
     `INSERT INTO actor_target_bindings
        (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
      VALUES (?, ?, 'hermes', ?, ?, ?)`,
     [`bind:${name}`, actorId, `locator:${name}`, `digest:${name}`, NOW],
   );
+  // The active role binding the attestation's generation names, so `claim()`'s currency check
+  // (#666) has a current generation to find.
+  h.cp.db.run(
+    `INSERT INTO assignments
+       (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+        binding_generation, mode, status, created_at)
+     VALUES (?, ?, 'CEO', ?, ?, 'inc', 1, 'PREFERRED', 'ACTIVE', ?)`,
+    [`asg:${name}`, `CEO:${name}`, actorId, sessionId, NOW],
+  );
   h.cp.db.run(
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
         executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-     VALUES (?, ?, 'v1', ?, 'ses', 'inc', 1, ?)`,
-    [`att:${name}`, `bind:${name}`, `attd:${name}`, NOW],
+     VALUES (?, ?, 'v1', ?, ?, 'inc', 1, ?)`,
+    [`att:${name}`, `bind:${name}`, `attd:${name}`, sessionId, NOW],
   );
   return actorId;
 };
@@ -61,12 +78,18 @@ const superseded = (h: Harness, name: string): void => {
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
         executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-     VALUES (?, ?, 'v1', ?, 'ses', 'inc-2', 1, ?)`,
-    [`att2:${name}`, `bind:${name}`, `attd2:${name}`, "2026-08-22T01:00:00.000Z"],
+     VALUES (?, ?, 'v1', ?, ?, 'inc-2', 1, ?)`,
+    [`att2:${name}`, `bind:${name}`, `attd2:${name}`, `runtime:${name}`, "2026-08-22T01:00:00.000Z"],
   );
 };
 
 const claim = (h: Harness, actorId: string, nonce: string, attempt = 1) => {
+  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
+  h.cp.db.run(
+    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at)
+     VALUES ('telegram', ?, 'owner', ?)`,
+    [nonce, NOW],
+  );
   const decision = h.cp.conversation.claim({
     targetActorId: actorId,
     prompt: "hello",

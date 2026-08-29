@@ -266,6 +266,25 @@ export const ReasonCode = {
    * that claim. Admitting on the binding alone trusts an assertion nothing has rechecked since.
    */
   CONVERSATION_TARGET_UNATTESTED: "CONVERSATION_TARGET_UNATTESTED",
+  /**
+   * An attestation exists for this binding, but none names the actor's current generation.
+   *
+   * A binding is a lifetime relation; an attestation is scoped to a runtime generation. The most
+   * recent attestation by time is not necessarily the current one: the actor may have retired, its
+   * runtime session and incarnation may have moved, or the role's active binding generation may
+   * have advanced past the one this attestation named. Admitting on the latest timestamp alone
+   * trusts a generation nothing has confirmed is still in force.
+   */
+  CONVERSATION_TARGET_ATTESTATION_STALE: "CONVERSATION_TARGET_ATTESTATION_STALE",
+  /**
+   * A source names a channel and nonce that ingress never admitted.
+   *
+   * `claim()` used to write whatever channel/nonce a caller supplied straight into
+   * `canonical_turn_sources`, with nothing checking it against `inbound_messages`. So a source
+   * could name a message nobody admitted, and the retry chain would then reason about attempts of
+   * a message with no admission record.
+   */
+  CONVERSATION_TURN_SOURCE_UNADMITTED: "CONVERSATION_TURN_SOURCE_UNADMITTED",
   /** This conversation already holds a turn whose outcome nobody established. */
   CONVERSATION_TURN_IN_DOUBT: "CONVERSATION_TURN_IN_DOUBT",
   /** A retry numbered past its predecessor, which does not exist — nothing says the earlier
@@ -445,6 +464,7 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
   ReasonCode.CAPACITY_PROBE_STALE,
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,
+  ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,
   ReasonCode.EVIDENCE_STALE,
   ReasonCode.FINALIZATION_ATTEMPT_STALE,
   ReasonCode.MERGE_BASE_STALE,

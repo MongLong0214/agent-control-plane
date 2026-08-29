@@ -767,11 +767,30 @@ describe("the adjudication door promotes the daemon, not just the ledger", () =>
   /** An actor with a verified target, and a turn whose two records disagree. */
   const contradictedTurn = (harness: ReturnType<typeof makeHarness>) => {
     const db = harness.cp.db;
-    db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES ('a','CEO',?)`, [NOW]);
+    db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES ('s','i','claude','opus','READY',?,?)`,
+      [NOW, NOW],
+    );
+    db.run(
+      `INSERT INTO conversational_actors
+         (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+       VALUES ('a','CEO','s','i',?)`,
+      [NOW],
+    );
     db.run(
       `INSERT INTO actor_target_bindings
          (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
        VALUES ('b','a','hermes','L','D',?)`,
+      [NOW],
+    );
+    // The active role binding the attestation's generation names, so `claim()`'s currency check
+    // (#666) has a current generation to find.
+    db.run(
+      `INSERT INTO assignments
+         (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+          binding_generation, mode, status, created_at)
+       VALUES ('asg:a','CEO:a','CEO','a','s','i',1,'PREFERRED','ACTIVE',?)`,
       [NOW],
     );
     db.run(
@@ -779,6 +798,11 @@ describe("the adjudication door promotes the daemon, not just the ledger", () =>
          (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
           executor_session_id, executor_session_incarnation, binding_generation, attested_at)
        VALUES ('t','b','v1','AD','s','i',1,?)`,
+      [NOW],
+    );
+    // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
+    db.run(
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'm1', 'owner', ?)`,
       [NOW],
     );
     const claimed = harness.cp.conversation.claim({

@@ -402,28 +402,92 @@ export class ConversationTurnCoordinator {
         );
       }
 
+      // The most recent attestation *that is still current*, checked from the same admission
+      // snapshot rather than trusted on its timestamp alone (#666): the actor must not have
+      // retired, its live runtime pointer must still be the one this attestation named, and the
+      // role's active assignment must still be at the generation this attestation attested —
+      // reusing `assignments.binding_generation`, the fencing token every other authority
+      // decision in the system already reads (`BindingRegistry`), rather than inventing a
+      // parallel one scoped to this table alone.
       const attestation = this.db.get<{
         target_attestation_id: string;
         executor_session_id: string;
         executor_session_incarnation: string;
         binding_generation: number;
       }>(
-        `SELECT target_attestation_id, executor_session_id, executor_session_incarnation,
-                binding_generation
-           FROM actor_target_attestations
-          WHERE target_binding_id = ?
-          ORDER BY attested_at DESC, rowid DESC
+        `SELECT att.target_attestation_id AS target_attestation_id,
+                att.executor_session_id AS executor_session_id,
+                att.executor_session_incarnation AS executor_session_incarnation,
+                att.binding_generation AS binding_generation
+           FROM actor_target_attestations att
+           JOIN actor_target_bindings tb
+             ON tb.target_binding_id = att.target_binding_id
+           JOIN conversational_actors ca
+             ON ca.actor_id = tb.target_actor_id
+           JOIN assignments asg
+             ON asg.actor_id = ca.actor_id
+            AND asg.status = 'ACTIVE'
+          WHERE att.target_binding_id = ?
+            AND tb.target_actor_id = ?
+            AND ca.retired_at IS NULL
+            AND ca.current_session_id = att.executor_session_id
+            AND ca.current_session_incarnation = att.executor_session_incarnation
+            AND asg.binding_generation = att.binding_generation
+            AND asg.session_id = att.executor_session_id
+            AND asg.session_incarnation = att.executor_session_incarnation
+          ORDER BY att.attested_at DESC, att.rowid DESC
           LIMIT 1`,
-        [target.target_binding_id],
+        [target.target_binding_id, input.targetActorId],
       );
       if (!attestation) {
-        // A binding says which conversation; an attestation says a runtime verified it under a
-        // named authority generation. Admitting on the first alone would trust a claim that has
-        // not been checked since it was made.
+        // Which refusal to report depends on whether an attestation exists at all: one that
+        // never happened is a different fact from one that happened and has since gone stale,
+        // and the two point an operator somewhere different.
+        const everAttested = this.db.get<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM actor_target_attestations WHERE target_binding_id = ?`,
+          [target.target_binding_id],
+        );
+        if (!everAttested || everAttested.n === 0) {
+          // A binding says which conversation; an attestation says a runtime verified it under a
+          // named authority generation. Admitting on the first alone would trust a claim that has
+          // not been checked since it was made.
+          return deny(
+            ReasonCode.CONVERSATION_TARGET_UNATTESTED,
+            "this actor's target has never been attested by a runtime, so a turn cannot be claimed",
+            { targetActorId: input.targetActorId, targetBindingId: target.target_binding_id },
+          );
+        }
+        // An attestation exists, but nothing ties it to the actor's current generation: the
+        // actor may have retired, its runtime may have moved, or the role's active assignment may
+        // have advanced past the generation this attestation named. The value stored as proof
+        // that a named generation verified the target may be from a generation that is gone.
         return deny(
-          ReasonCode.CONVERSATION_TARGET_UNATTESTED,
-          "this actor's target has never been attested by a runtime, so a turn cannot be claimed",
+          ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,
+          "this actor's target was attested, but not by anything the current generation can verify",
           { targetActorId: input.targetActorId, targetBindingId: target.target_binding_id },
+        );
+      }
+
+      const unadmitted = input.sources.find(
+        (candidate) =>
+          !this.db.get<{ 1: number }>(
+            `SELECT 1 FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+            [candidate.channel, candidate.nonce],
+          ),
+      );
+      if (unadmitted) {
+        // A source names which inbound message a turn consumed. Without this, a caller's word
+        // that a channel and nonce exist would be written straight into `canonical_turn_sources`
+        // — the ledger would record that a turn consumed a message that was never admitted, and
+        // the retry chain would reason about attempts of a message with no admission record.
+        return deny(
+          ReasonCode.CONVERSATION_TURN_SOURCE_UNADMITTED,
+          "a source names a channel and nonce that ingress never admitted",
+          {
+            targetActorId: input.targetActorId,
+            channel: unadmitted.channel,
+            nonce: unadmitted.nonce,
+          },
         );
       }
 
