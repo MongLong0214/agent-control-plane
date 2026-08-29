@@ -309,7 +309,10 @@ export class CtoLifecycle {
     if (!incoming.allowed) return incoming as Decision<{ handoffId: string; incomingSessionId: string }>;
 
     const handoffId = `hof_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
-    const prepared = this.db.tx(() => {
+    // #664 — the DRAINING transition and the handoffs INSERT below must not survive a
+    // later denial in this body (the outbox enqueue can deny after both have written),
+    // so this body's own decision has to roll them back the same way a throw would.
+    const prepared = this.db.txDecision(() => {
       // Spawn is asynchronous, so repeat the authority and active-run checks at the
       // moment the drain barrier is persisted. A replacement can never revoke a run that
       // appeared while its incoming session was being readied.
@@ -648,7 +651,13 @@ export class CtoLifecycle {
     const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
     const current = this.bindings.active(roleKey);
     const session = current ? this.sessions.require(current.sessionId) : null;
-    const prepared = this.db.tx(() => {
+    // #664 — a denial from a later run's BLOCKED checkpoint, or from the DRAINING
+    // transition, must not leave an earlier iteration's write (or the recovery INSERT)
+    // committed. This is independent of the durability note below: that note is about
+    // this transaction committing as a whole and the *external* provider stop failing
+    // afterward, which txDecision does not change — it only closes the gap where a
+    // denial *inside* this body left partial writes behind it.
+    const prepared = this.db.txDecision(() => {
       const suspended = this.projects.setSuspended(projectId, true, ownerApproved);
       if (!suspended.allowed) return suspended;
       if (!current || !session) return allow(ReasonCode.OK, undefined);
@@ -711,6 +720,15 @@ export class CtoLifecycle {
         });
       }
 
+      // #692 (deferred out of #664/#679) — `stopped` below writes and commits, and
+      // `bindings.revoke()` can then deny (e.g. a concurrent `resolveEscalation` flips a
+      // BLOCKED run back to ACTIVE between the two calls). This is deliberately left as
+      // plain `tx()`, not converted to `txDecision()`: by this point the external
+      // provider has already been told to stop and that is not reversible, so rolling
+      // the STOPPED write back would leave the session record disagreeing with reality.
+      // The real fix needs an explicit compensation policy and an interleaving test; see
+      // #692. `scripts/verify-tx-denial-sites.mjs` records this as a deferred, not an
+      // exempt, site — it is a known open defect, not a decision that the write is safe.
       const completed = this.db.tx(() => {
         const fresh = this.bindings.active(roleKey);
         if (

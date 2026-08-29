@@ -21,6 +21,25 @@
  * found in the body rather than a file:line, because a line number goes stale the moment
  * something above it grows (measured elsewhere in this repo) — see
  * scripts/verify-append-only-tables-are-closed.mjs for the same lesson learned once already.
+ *
+ * An adversarial review of #679 (the PR converting the first six sites) found that this
+ * census did not cover what it claimed: reverting a converted site back to plain `tx()`
+ * still passed, because two of the six real `txDecision()` bodies never registered as
+ * "writes, then can deny" in the first place —
+ *
+ *   - `WRITE_PATTERN` only matched literal `.run(`/`.exec(`. `SessionRegistry.transition`
+ *     and `RunEngine.transition` each wrap their own `db.run(...)` and are called by name,
+ *     not inlined, so a body that writes only by calling one of them looked write-free.
+ *   - `DENY_PATTERN` only matched a literal `return deny(...)`. A denial that is instead
+ *     *propagated* — `const x = someCall(...); if (!x.allowed) return x;`, or a generic
+ *     `return deny<T>(...)` — did not match the pattern at all.
+ *
+ * Both are fixed below by broadening the two patterns rather than special-casing the two
+ * sites that exposed the gap, so the same shape is caught wherever else it appears (it
+ * turned out to appear in three more places — see EXEMPT and DEFERRED for how each was
+ * resolved). `tests/process/the-tx-denial-census-sees-a-write-then-deny.test.ts` now
+ * reverts *every* converted site in turn, not just one, so this class of gap fails loudly
+ * instead of silently the next time a site's exact wording changes.
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -29,8 +48,18 @@ import { fileURLToPath } from "node:url";
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SRC = join(ROOT, "src");
 
-const WRITE_PATTERN = /\.run\(|\.exec\(/;
-const DENY_PATTERN = /return deny\(/;
+// `.transition(` is `SessionRegistry.transition` / `RunEngine.transition` — both wrap
+// their own `db.run(...)` and are called by name from every tx body that uses them, so a
+// literal `.run(`/`.exec(` search alone is blind to a write performed this way.
+const WRITE_PATTERN = /\.run\(|\.exec\(|\.transition\(/;
+// A denial-shaped return is either a literal `deny(...)` call (optionally generic, as in
+// `deny<RoleBinding>(...)`), or the `if (!x.allowed) return x;` idiom this codebase uses
+// everywhere to propagate a Decision produced by an earlier call without re-wrapping it in
+// a literal `deny(...)`. The second alternative is deliberately loose (a bounded lazy scan
+// for `return <same identifier>` after the guard, not a full parse) — over-matching here
+// only means a site gets reviewed and resolved below, where under-matching is the #679 gap.
+const DENY_PATTERN =
+  /return\s+deny(?:<[^>]*>)?\(|if\s*\(\s*!\s*(\w+)\.allowed\s*\)[\s\S]{0,300}?return\s+\1\b/;
 
 /**
  * Every plain `tx()` body this census has confirmed writes unconditional housekeeping
@@ -58,6 +87,38 @@ const EXEMPT = [
     reason:
       "claimTurn's only write is inside the branch that returns allow; every deny in this " +
       "body is reached only when nothing was written, so there is nothing to roll back.",
+  },
+  {
+    file: "ceo/production-gate.ts",
+    marker: "CEO ${input.decision}",
+    reason:
+      "the only `.transition(` in this body is `runs.transition(...)` itself, guarded " +
+      "immediately by `if (!transition.allowed) return transition`; RunEngine.transition " +
+      "denies only in its own pre-write guards (illegal edge, missing completion " +
+      "authority), so this specific deny is reached with nothing yet written. Nothing " +
+      "after that guard can deny.",
+  },
+];
+
+/**
+ * A site the census finds and a human has confirmed is a *real*, currently-unfixed
+ * instance of the #664 shape — as opposed to EXEMPT, where the write is intentionally
+ * meant to survive a denial. A DEFERRED entry is a known open defect with a tracking
+ * issue, not a claim of safety, and is reported as such rather than folded into
+ * "documented exemption(s)" where a reader could mistake it for one.
+ */
+const DEFERRED = [
+  {
+    file: "cto/cto-lifecycle.ts",
+    marker: "the CTO binding changed while runtime shutdown was in progress",
+    reason:
+      "suspendProject's STOPPED transition commits, then bindings.revoke() can deny " +
+      "(e.g. a concurrent resolveEscalation flips a BLOCKED run back to ACTIVE between " +
+      "the two calls) — and by then the external provider has already been told to " +
+      "stop, which is not reversible, so this is not a mechanical tx()->txDecision() " +
+      "substitution. Needs an explicit compensation policy and an interleaving test. " +
+      "Tracked in #692; see the comment at the call site.",
+    issue: "#692",
   },
 ];
 
@@ -108,8 +169,10 @@ const findTxSites = (text) => {
 const files = listTsFiles(SRC);
 const trapped = [];
 const exempted = [];
+const deferred = [];
 const converted = [];
 const matchedExemptMarkers = new Set();
+const matchedDeferredMarkers = new Set();
 
 for (const path of files) {
   const rel = relative(SRC, path);
@@ -136,22 +199,32 @@ for (const path of files) {
     if (exemption) {
       matchedExemptMarkers.add(exemption.marker);
       exempted.push({ file: rel, line: site.startLine, reason: exemption.reason });
-    } else {
-      trapped.push({ file: rel, line: site.startLine });
+      continue;
     }
+
+    const deferral = DEFERRED.find((d) => d.file === rel && site.body.includes(d.marker));
+    if (deferral) {
+      matchedDeferredMarkers.add(deferral.marker);
+      deferred.push({ file: rel, line: site.startLine, reason: deferral.reason, issue: deferral.issue });
+      continue;
+    }
+
+    trapped.push({ file: rel, line: site.startLine });
   }
 }
 
 const unmatchedExemptions = EXEMPT.filter((e) => !matchedExemptMarkers.has(e.marker));
+const unmatchedDeferrals = DEFERRED.filter((d) => !matchedDeferredMarkers.has(d.marker));
 
 process.stdout.write(
   `#664 tx-denial census: ${converted.length} using txDecision, ${exempted.length} documented ` +
-    `exemption(s), ${trapped.length} undocumented trap(s).\n`,
+    `exemption(s), ${deferred.length} deferred known defect(s), ${trapped.length} undocumented ` +
+    `trap(s).\n`,
 );
 
-// Both are reported, rather than exiting on the first: a marker drifting out of the
+// All four are reported, rather than exiting on the first: a marker drifting out of the
 // body it named and a genuinely new trap can happen in the same change, and stopping
-// at whichever this script checks first would hide the other one from the reader.
+// at whichever this script checks first would hide the others from the reader.
 if (trapped.length > 0) {
   process.stdout.write("\nUndocumented: a plain tx() body writes, then can return a denial.\n");
   for (const t of trapped) process.stdout.write(`  ${t.file}:${t.line}\n`);
@@ -159,6 +232,16 @@ if (trapped.length > 0) {
     "\nEither convert the call to txDecision(), or add it to EXEMPT in this script with the " +
       "reason the write must survive a denial.\n",
   );
+}
+
+if (deferred.length > 0) {
+  process.stdout.write(
+    "\nDeferred: a real, currently-unfixed tx-denial trap with a tracking issue (not a claim " +
+      "the write is safe):\n",
+  );
+  for (const d of deferred) {
+    process.stdout.write(`  ${d.file}:${d.line} (${d.issue})\n`);
+  }
 }
 
 if (unmatchedExemptions.length > 0) {
@@ -170,15 +253,25 @@ if (unmatchedExemptions.length > 0) {
   );
 }
 
-if (trapped.length > 0 || unmatchedExemptions.length > 0) {
+if (unmatchedDeferrals.length > 0) {
+  process.stdout.write("\nA DEFERRED entry named a body this census could not find (a stale deferral):\n");
+  for (const d of unmatchedDeferrals) process.stdout.write(`  ${d.file}: "${d.marker}" (${d.issue})\n`);
+  process.stdout.write(
+    "\nEither the defect was fixed (move this to EXEMPT or remove it) or the site's wording " +
+      "moved (fix the marker) — a deferral nothing consults hides an open defect entirely.\n",
+  );
+}
+
+if (trapped.length > 0 || unmatchedExemptions.length > 0 || unmatchedDeferrals.length > 0) {
   process.stdout.write(
     `\nRESULT: FAIL — ${trapped.length} undocumented tx-denial trap(s), ` +
-      `${unmatchedExemptions.length} stale exemption(s).\n`,
+      `${unmatchedExemptions.length} stale exemption(s), ${unmatchedDeferrals.length} stale ` +
+      `deferral(s).\n`,
   );
   process.exit(1);
 }
 
 process.stdout.write(
-  `RESULT: PASS — every tx() body that writes and can deny is either txDecision or a named, ` +
-    `matched exemption.\n`,
+  `RESULT: PASS — every tx() body that writes and can deny is either txDecision, a named, ` +
+    `matched exemption, or a named, matched, tracked deferral.\n`,
 );
