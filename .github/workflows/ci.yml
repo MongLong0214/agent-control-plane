@@ -86,11 +86,12 @@ jobs:
       - run: node scripts/ssot-report.mjs
         env:
           GH_TOKEN: ${{ github.token }}
-      # #597's rule, checked against every open issue's own citations rather than one migration
-      # table: a cited file/line/symbol that no longer resolves is stale, and a citation of
-      # /private/tmp or a scratchpad is a custody claim the filesystem will not honor (#603,
-      # #676). Silent on a clean subset; a PR can go red here without changing a line, the same
-      # way ssot-report.mjs can — someone edited an issue, or unrelated code moved a cited symbol.
-      - run: node scripts/verify-tracker-loci-resolve.mjs
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # `verify-tracker-loci-resolve.mjs` (#597's citation-staleness check) does NOT run here.
+      # It was here once and was wrong to be: it is a fact about the *tracker*, not about this
+      # PR's diff, and — unlike `ssot-report.mjs` above, whose reconciliation only turns red when
+      # someone actively mis-records a marker — it is red *today*, on an unedited `main`, because
+      # an open issue (#649) already cites a moved line. Requiring it here would block every PR's
+      # merge on an issue-thread fact nothing in the diff touched, for however long that issue
+      # stays open — which is the coupling that gets a check silenced rather than fixed. It runs
+      # instead in `.github/workflows/tracker-loci.yml` on a schedule, where it can fail loudly
+      # without failing anyone's merge.

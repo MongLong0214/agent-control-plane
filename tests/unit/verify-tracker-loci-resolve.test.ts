@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -249,6 +249,106 @@ describe("verify-tracker-loci-resolve", () => {
       // Diagnostic aside: it says where the symbol actually lives, which is what made the
       // original defeat possible in the first place.
       expect(result.stdout).toContain("continuity-kernel.ts");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // --- Round 2: an independent review of the fixed commit (xhigh, read-only, BLOCK) ----------
+  // One P0 (this check's own required CI step reddens `main` on an unedited tree, because #649
+  // is open and already stale) and three P1 counterexamples reproduced by running the production
+  // script, never a model of it.
+
+  it("[P0] verify-tracker-loci-resolve.mjs runs only in the scheduled workflow, never a required PR step", () => {
+    // The design fix, not a script fix: this check is a fact about the open issue tracker, not
+    // about any one PR's diff, and it is *already* red on an unedited `main` — #649 cites a line
+    // #657 moved, with no code change required to close that. A required `project-ci` step would
+    // block every PR's merge on that fact for as long as the issue stays open. Pinned here as a
+    // fact about the two workflow files so it cannot silently come back as a "just add the step"
+    // PR: `project-ci` must never invoke this script, and the scheduled workflow must.
+    const ciYaml = readFileSync(join(repoRoot, ".github", "workflows", "ci.yml"), "utf8");
+    const trackerYaml = readFileSync(join(repoRoot, ".github", "workflows", "tracker-loci.yml"), "utf8");
+    // Not a bare substring check: `ci.yml` is allowed (and expected) to *document* why the step
+    // is not here, which mentions the script by name in a comment. What must be absent is an
+    // actual invocation of it as a step.
+    expect(ciYaml).not.toContain("run: node scripts/verify-tracker-loci-resolve.mjs");
+    expect(trackerYaml).toContain("run: node scripts/verify-tracker-loci-resolve.mjs");
+    expect(trackerYaml).toContain("schedule:");
+    expect(trackerYaml).not.toMatch(/^\s*pull_request:/m);
+    expect(trackerYaml).not.toMatch(/^\s*push:/m);
+  });
+
+  it("[P1] a real GitHub blob permalink to this repo resolves by its actual path, not a URL fragment", () => {
+    // The exact shape that broke: a whole, well-formed permalink. The earlier fix (generic
+    // `#L`-anchor support) let the generic path regex loose on the URL's own text whenever a line
+    // number was present, and it matched `com/<owner>/<repo>/blob/main/README.md` — a fragment of
+    // the URL, not the path the link names — then reported that fragment ambiguous against every
+    // tracked README. Fixed by parsing a GitHub blob URL to this repo structurally instead.
+    const body =
+      "See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#L1 for the status banner.";
+    const { path, cleanup } = withIssues([{ number: 8301, title: "real permalink counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).toContain("README.md");
+      expect(result.stdout).not.toContain("ambiguous");
+      expect(result.stdout).not.toContain("STALE");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[P1] a permalink to a different repository is not read as a citation of this one", () => {
+    const body = "Compare https://github.com/some-other-org/some-other-repo/blob/main/README.md#L1 for contrast.";
+    const { path, cleanup } = withIssues([{ number: 8302, title: "foreign permalink", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[P1] a symbol mentioned only in a comment does not count as the cited file holding it", () => {
+    // `reconstitution` is real prose in `binding-registry.ts` — it appears twice, both times in a
+    // comment discussing the concept — but the file does not hold a symbol by that name. The
+    // narrowed-to-one-file search from counterexample 4 still passed this pairing in silence
+    // because it was still a plain text search, comments included.
+    const body = "`src/session/binding-registry.ts` — `reconstitution`";
+    const { path, cleanup } = withIssues([{ number: 8303, title: "comment-only symbol counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("reconstitution");
+      expect(result.stdout).toContain("does not resolve in src/session/binding-registry.ts");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[P1] a .mts citation is extracted — a real tracked extension, not a guess", () => {
+    const body = "The type declarations used to live in `scripts/definitely-missing.mts`, which was deleted.";
+    const { path, cleanup } = withIssues([{ number: 8304, title: "mts extension counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("scripts/definitely-missing.mts does not exist");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[P1] the real tracked .mts file resolves cleanly", () => {
+    const body = "Types live in `scripts/lib/collapse-trailer-paragraphs.d.mts`.";
+    const { path, cleanup } = withIssues([{ number: 8305, title: "mts positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
     } finally {
       cleanup();
     }

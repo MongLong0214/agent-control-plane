@@ -93,6 +93,33 @@
  * STALE ("does not exist", true but redundant and pointing at the wrong fix). Fixed by excluding
  * path-citation extraction inside a NON_DURABLE span.
  *
+ * ## Round 2: a second independent review found this script had NOT moved to CI correctly, plus
+ * three more counterexamples the first fix round did not cover
+ *
+ *   [P0, design, not a script bug] This script had also become a required `project-ci` step. That
+ *   was wrong: this is a fact about the open issue tracker, not about any one PR's diff, and it is
+ *   *already* red on an unedited `main` — #649 cites a line #657 moved, and closing that needs no
+ *   change to this repository's code. A required step in that state blocks every PR's merge on an
+ *   issue-thread fact the diff never touched, for as long as the issue stays open — the coupling
+ *   that gets a check disabled rather than fixed. Fixed by removing this script from `project-ci`
+ *   entirely; it now runs *only* in `.github/workflows/tracker-loci.yml`'s daily schedule, which
+ *   can fail loudly without failing anyone's merge. See that file's header for the full argument.
+ *   [P1] A real GitHub blob permalink (`https://github.com/<owner>/<repo>/blob/<ref>/<path>#L…`)
+ *   was rejected: the generic path regex, let loose on the URL's own text because a `#L` anchor
+ *   was present, matched a fragment of the URL (`com/<owner>/<repo>/blob/main/README.md`) rather
+ *   than the path the link names, and reported that fragment ambiguous against every tracked
+ *   README. Fixed: a blob permalink to *this* repository (`repoSlug`, derived from `origin`) is
+ *   now parsed structurally by `GITHUB_BLOB_RE` before the generic regex ever sees the line; the
+ *   generic regex now excludes anything inside any URL, unconditionally.
+ *   [P1] Symbol resolution was narrowed to the cited file in round 1, but stayed a plain text
+ *   search — `` `binding-registry.ts` — `reconstitution` `` passed because the file's own comments
+ *   discuss reconstitution in prose. Fixed: `readCode` strips `//` and `/* *\/` comments before a
+ *   symbol search runs (documented limitation: it does not know about string literals, so a
+ *   symbol name inside a quoted string still counts — narrower than the comment gap being closed).
+ *   [P1] `.mts` — a real extension this repository tracks (`scripts/lib/collapse-trailer-paragraphs.d.mts`)
+ *   — was missing from `FILE_EXT`, so a `.mts` citation was silently never checked. Added on the
+ *   same evidence-first basis as `py`/`plist`; `.cts` stays out because nothing here is tracked.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -142,6 +169,35 @@ const readText = (relPath) => {
 };
 
 /**
+ * Removes `//` line comments and `/* ... *\/` block comments before a symbol search, so a symbol
+ * mentioned only in prose about the code — a comment explaining what a mechanism used to do, or
+ * warning about a related concept — does not count as the file *holding* it. #597's rule is that
+ * the named enforcement site holds the symbol; a comment mentioning a word is not that site, it
+ * is a sentence about it.
+ *
+ * This is a text pass, not a parser: it does not know about string or template literals, so a
+ * symbol that appears only inside a quoted string still counts as present. That gap is narrower
+ * than the one being closed here — a string literal is a value the file deliberately wrote, where
+ * a comment is prose describing the file, and treating the two the same is exactly what let a
+ * comment stand in for an enforcement site. `://` is protected explicitly so a URL inside a
+ * comment or string (`https://…`) is not itself misread as the start of a line comment.
+ */
+const stripComments = (text) =>
+  text
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n")
+    .map((line) => line.replace(/(?<!:)\/\/.*$/, ""))
+    .join("\n");
+
+const codeTextCache = new Map();
+const readCode = (relPath) => {
+  if (!codeTextCache.has(relPath)) {
+    codeTextCache.set(relPath, stripComments(readText(relPath)));
+  }
+  return codeTextCache.get(relPath);
+};
+
+/**
  * Every tracked file, repo-root-relative with forward slashes. Used to resolve a citation that
  * names a file by less than its full path from the repo root — which is most of them: an issue
  * discussing `binding-registry.ts` inside a paragraph about the binding registry does not repeat
@@ -152,6 +208,25 @@ const readText = (relPath) => {
 const trackedFiles = execFileSync("git", ["ls-files"], { cwd: repoRoot, encoding: "utf8" })
   .split("\n")
   .filter(Boolean);
+
+/**
+ * `owner/repo`, lowercased, derived from `origin` so a GitHub blob permalink can be told apart
+ * from a link to someone else's repository (of which #597's own body has one, to `docs/adr`
+ * elsewhere entirely). `null` if there is no such remote — a permalink is then treated as an
+ * ordinary URL and skipped, never as a crash.
+ */
+const repoSlug = (() => {
+  try {
+    const originUrl = execFileSync("git", ["remote", "get-url", "origin"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }).trim();
+    const m = originUrl.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
+    return m ? `${m[1]}/${m[2]}`.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+})();
 
 /**
  * Resolves a cited path against the tracked tree, tolerating a citation that names less than the
@@ -197,7 +272,10 @@ const resolvePath = (cited) => {
 // guess at what else might show up. Extensions that looked plausible but turned out to collide
 // with ordinary property access (`process.env`, `console.log`, `cp.db`) were deliberately left
 // out after checking: adding them would misread prose as a citation of a file that was never cited.
-const FILE_EXT = "tsx|ts|mjs|cjs|json|js|plist|py|sh|sql|md|yaml|yml";
+// `mts` is here because this repository tracks one (`scripts/lib/collapse-trailer-paragraphs.d.mts`)
+// — a real extension in this tree, not a guess; `cts` is not tracked anywhere and stays out on the
+// same evidence-first basis.
+const FILE_EXT = "tsx|ts|mts|mjs|cjs|json|js|plist|py|sh|sql|md|yaml|yml";
 // The line-number suffix comes in the two forms this tracker's issues actually use: `:123` /
 // `:123-456` (the convention #649 and #597's own table use), and a GitHub-style `path#L123` /
 // `path#L123-L456` anchor. Both land in the same two named groups so extraction does not care
@@ -208,6 +286,11 @@ const PATH_RE = new RegExp(
   "g",
 );
 const URL_RE = /https?:\/\/\S+/g;
+// A GitHub blob permalink, parsed structurally rather than through the generic PATH_RE run over
+// its raw text. Letting the generic regex loose inside a URL was the earlier bug: it greedily
+// matched a fragment of the URL itself (`com/<owner>/<repo>/blob/main/README.md`), not the path
+// the link actually names, and reported that fragment ambiguous against every tracked README.
+const GITHUB_BLOB_RE = /https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/blob\/[^/\s]+\/([^\s#)]+)(?:#L(\d+)(?:-L?(\d+))?)?/g;
 const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`[\w.$]+`,?\s*)+)/g;
 const NON_DURABLE_RE = /(\/private\/tmp\/[^\s`)]+|(?<![\w/])\/tmp\/[^\s`)]+)/g;
 
@@ -306,17 +389,35 @@ const extractFromBody = (body) => {
     // something re-deriving cannot fix.
     const insideNonDurable = (idx) => nonDurableSpans.some(([s, e]) => idx >= s && idx < e);
 
+    // A GitHub blob permalink to *this* repository is a precise, structured citation and is
+    // parsed as one directly — see `GITHUB_BLOB_RE`'s comment for why the generic path regex
+    // must not also be let loose on this text. A permalink to a different repository names
+    // nothing in this tree and is dropped rather than misread as one of this repo's paths.
+    if (repoSlug) {
+      for (const m of rawLine.matchAll(GITHUB_BLOB_RE)) {
+        const slug = `${m[1]}/${m[2]}`.toLowerCase();
+        if (slug !== repoSlug) continue;
+        const path = m[3].replace(/[.,;:)]+$/, "");
+        const startLine = m[4] ? Number(m[4]) : null;
+        const endLine = m[5] ? Number(m[5]) : null;
+        const key = `${path}:${startLine ?? ""}:${endLine ?? ""}`;
+        if (seenPath.has(key)) continue;
+        seenPath.add(key);
+        pathCitations.push({ raw: m[0], path, startLine, endLine, content: null });
+      }
+    }
+
     for (const m of rawLine.matchAll(PATH_RE)) {
       if (insideNonDurable(m.index)) continue;
+      // Any URL, not only a GitHub blob link: a fragment of a hyperlink's text is not a citation
+      // in its own right, whether or not it superficially carries a line-number-shaped suffix —
+      // that leniency is exactly what let a URL fragment through as a fabricated path before. A
+      // link that does name a real locus in this repo is handled above, structurally.
+      if (insideUrl(m.index)) continue;
       const path = m[1];
       const groups = m.groups ?? {};
       const startLine = groups.cs ? Number(groups.cs) : groups.as ? Number(groups.as) : null;
       const endLine = groups.ce ? Number(groups.ce) : groups.ae ? Number(groups.ae) : null;
-      // A bare path mention inside an unrelated hyperlink is noise (a link to some other repo's
-      // README, say) and is skipped. A citation that also carries a specific line — `:123` or a
-      // GitHub `#L123` anchor — is a deliberate, precise pointer even when it rides inside a URL,
-      // and is kept rather than thrown away with the noise.
-      if (insideUrl(m.index) && startLine === null) continue;
       let content = null;
       if (inFence && startLine !== null) {
         const rest = rawLine.slice(m.index + m[0].length).replace(/←.*$/, "").trim();
@@ -462,13 +563,18 @@ for (const issue of issues) {
     // every file under `src/` was satisfied by the symbol existing anywhere, which is exactly the
     // defeat: it credited a row for a symbol that lives in a completely different enforcement
     // site than the one the row names.
-    const targetText = readText(resolved.path);
+    //
+    // Fixed further (independent review, round 2): the narrowed search still read comments as
+    // code. `` `binding-registry.ts` — `reconstitution` `` passed because the file's own comments
+    // discuss reconstitution in prose — the word is not a symbol the file holds, it is a sentence
+    // about a related concept. `readCode` strips comments before the search runs.
+    const targetCode = readCode(resolved.path);
     for (const symbol of symbolCitation.symbols) {
       const pattern = new RegExp(`\\b${escapeRegex(symbol)}\\b`);
-      if (pattern.test(targetText)) continue;
+      if (pattern.test(targetCode)) continue;
       const elsewhere = trackedFiles
         .filter((f) => f.startsWith("src/") && f.endsWith(".ts") && f !== resolved.path)
-        .find((f) => pattern.test(readText(f)));
+        .find((f) => pattern.test(readCode(f)));
       stale.push({
         issue,
         citation: symbolCitation.raw,
