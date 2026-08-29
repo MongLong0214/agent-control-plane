@@ -38,6 +38,10 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
+// The same path `vitest.config.ts` maps its `json` reporter to. Read after every per-row run so
+// a `killedBy` selector's *actual* match count can be checked rather than assumed from its exit
+// code — see the dead-selector check below.
+const VITEST_JSON_REPORT = join(ROOT, "evidence/local/ci-vitest-results.json");
 
 /**
  * `symbols` ties a row to the enforcement loci named by the Buzz-transition gate; every symbol in
@@ -1466,12 +1470,20 @@ try {
     ours(path, original, guard.file, "before mutating");
     const mutated = original.replace(guard.find, guard.replace);
     writeFileSync(path, mutated);
-    const done = spawnSync(VITEST, ["run", ...vitestArgsFor(guard.killedBy), "--reporter=dot"], {
-      cwd: ROOT,
-      encoding: "utf8",
-      env: { ...process.env, CI: "" },
-      timeout: 600_000,
-    });
+    // Removed, not overwritten-on-read: a crash that exits with a status but never reaches the
+    // JSON reporter would otherwise leave the *previous* row's report on disk, and the dead-
+    // selector check below would silently score this row against a different guard's numbers.
+    rmSync(VITEST_JSON_REPORT, { force: true });
+    const done = spawnSync(
+      VITEST,
+      ["run", ...vitestArgsFor(guard.killedBy), "--reporter=dot", "--reporter=json"],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: { ...process.env, CI: "" },
+        timeout: 600_000,
+      },
+    );
     ours(path, mutated, guard.file, "before restoring");
     writeFileSync(path, original);
 
@@ -1491,6 +1503,49 @@ try {
       out("\nA run that did not happen cannot kill a guard. Refusing to report it as one.");
       process.exit(1);
     }
+
+    /**
+     * A named `killedBy` entry (`path::test name`) runs as `-t "test name"` — a regex, not a
+     * literal string. A name that happens to contain a regex metacharacter (`()[]{}.*+?^$|\`)
+     * is parsed as one: an empty `()` group matches zero characters rather than the two literal
+     * parens, so the pattern silently selects nothing. Vitest still exits 0 for that — "0 tests
+     * ran" is not a failure to vitest — so `killed` above reads a `-t` that matched nothing the
+     * same as one that matched and passed: `SURVIVED`, which is at least loud. The dangerous
+     * direction is the other one: if some *other* test in the same file happens to fail (for any
+     * reason, related or not), the file's exit is non-zero, this row prints `killed`, and the
+     * test actually named by `killedBy` never ran at all. That row then claims coverage a
+     * completely different test produced.
+     *
+     * So the match count is checked directly from what vitest itself observed, not inferred from
+     * the exit code. `numPassedTests + numFailedTests` is how many tests the run actually
+     * executed under the `-t` filter; a filtered-out test is neither, so a selector matching zero
+     * tests is provable without guessing at what the name "should" match.
+     */
+    const namedSelectors = guard.killedBy.map(splitKilledBy).filter((p) => p.name !== null);
+    let deadSelector = null;
+    if (namedSelectors.length > 0) {
+      let report = null;
+      try {
+        report = JSON.parse(readFileSync(VITEST_JSON_REPORT, "utf8"));
+      } catch {
+        report = null;
+      }
+      const selected = report ? report.numPassedTests + report.numFailedTests : 0;
+      if (selected === 0) {
+        deadSelector = report
+          ? `killedBy names "${namedSelectors[0].name}" as a -t pattern, and vitest ran 0 tests under it ` +
+            `(${report.numTotalTests} in the file, all skipped) — the selector matches nothing, so this ` +
+            "row's exit code is not evidence about the guard either way"
+          : `killedBy names "${namedSelectors[0].name}", but no JSON test report was produced to confirm ` +
+            "it selected anything";
+      }
+    }
+    if (deadSelector) {
+      out(`  DEAD SELECTOR  ${guard.file}  ${guard.what}`);
+      failures.push({ guard, why: deadSelector });
+      continue;
+    }
+
     const killed = done.status !== 0;
     out(`${killed ? "  killed " : "  SURVIVED"}  ${guard.file}  ${guard.what}`);
     if (!killed) {
