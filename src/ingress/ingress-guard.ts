@@ -513,7 +513,28 @@ export class IngressGuard {
     return this.db.tx(() => this.#recordResultHere(channel, nonce, result, expected));
   }
 
-  /** `recordResultIf` without its transaction, so it can share one with the turn's resolution. */
+  /**
+   * `recordResultIf` without its transaction, so it can share one with the turn's resolution.
+   *
+   * Refuses outright when the claim already carries `noReplyAt` (#682, third review). Found by a
+   * counterexample that reserved a reply (`expected: "AVAILABLE"`) against a turn
+   * `completeNoReplyAndResolveTurn` had already closed: the reservation's own precondition reads
+   * only `result_json`'s delivery status, and the `TELEGRAM_NO_REPLY` marker has none, so it read
+   * as available. The reservation lands, `completeReplyAndResolveTurn` later moves it to
+   * `APPLIED`, and one row now asserts both "no reply was produced" (`noReplyAt`) and "the
+   * transport accepted a reply" (`result_json.sent: true`) — the same collapse #682's other
+   * guards exist to refuse, arriving through a field (`result_json`) neither of them reads.
+   *
+   * Refused here rather than left to roll back later: even the reservation alone, on its own,
+   * reopens the vulnerability #672 exists to close — it overwrites the non-recoverable
+   * `TELEGRAM_NO_REPLY` marker with a `sent: false` reservation, and `isRecoverableIngressResult`
+   * reads `sent: false` as recoverable, so a redelivery would re-run a turn that already finished
+   * before `completeReplyAndResolveTurn` is ever reached. There is no legitimate reason to
+   * reserve or complete a reply for a turn already resolved as no-reply, so refusing the
+   * transition outright — rather than letting it proceed and rolling the whole completion back
+   * later — is not just simpler, it is the only place that also protects the reservation taken on
+   * its own.
+   */
   #recordResultHere(
     channel: string,
     nonce: string,
@@ -521,12 +542,22 @@ export class IngressGuard {
     expected: "AVAILABLE" | "PENDING",
   ): Decision<void> {
     {
-      const current = this.db.get<{ result_json: string | null }>(
-        `SELECT result_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+        `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
         [channel, nonce],
       );
       if (!current) {
         return deny(ReasonCode.NOT_FOUND, "cannot transition a missing ingress result", { channel, nonce });
+      }
+      if (current.turn_claim_json) {
+        const claim = JSON.parse(current.turn_claim_json) as { noReplyAt?: unknown };
+        if (claim.noReplyAt !== undefined) {
+          return deny(
+            ReasonCode.RESOURCE_COLLISION,
+            "cannot transition an ingress result for a turn already resolved as no-reply",
+            { channel, nonce },
+          );
+        }
       }
       const deliveryStatus = resultDeliveryStatus(current.result_json);
       const allowed = expected === "PENDING"
@@ -723,23 +754,49 @@ export class IngressGuard {
         // the ordinary non-CEO path, and there is nothing to resolve.
         return allow(ReasonCode.OK, undefined);
       }
-      // `noReplyAt IS NULL`, not only `repliedAt IS NULL` (#682, second review): the two terminal
-      // facts have two writers now, and a guard on only one of them is not a guard on the field.
-      // Without this half, a turn `completeNoReplyAndResolveTurn` already closed with `noReplyAt`
-      // could still take `repliedAt` here — through the ordinary public API, no malformed state
-      // required — leaving one row asserting both "no reply was produced" and "the transport
-      // accepted a reply". The second is the one #638's later receipt match is meant to trust;
-      // a false version of it, permanently recorded, is worse than the unresolved state #672
-      // started from.
-      this.db.run(
+      // `noReplyAt`, not only `repliedAt` (#682, second review): the two terminal facts have two
+      // writers now, and a guard on only one of them is not a guard on the field. Checked here,
+      // explicitly, rather than left to the UPDATE's WHERE clause alone (third review) — a WHERE
+      // clause that matches nothing is silent, and the write below used to be followed by an
+      // unconditional `allow(OK)` regardless of whether it changed a row. `#recordResultHere`
+      // now refuses the reservation that would let a caller reach this state through the reply
+      // lifecycle, but `resolveTurn` is also called directly, bypassing that gate entirely — so
+      // this function has to refuse the conflict on its own rather than rely on an earlier guard.
+      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };
+      if (claim.repliedAt !== undefined) {
+        // Already resolved by an earlier reply. Idempotent, not a conflict: an ordinary redelivery
+        // of a completed turn reaches this on the reply path, and refusing it here would make
+        // every replay of a finished turn fail where it used to quietly do nothing.
+        return allow(ReasonCode.OK, undefined);
+      }
+      if (claim.noReplyAt !== undefined) {
+        // A *different* terminal fact already closed this claim. Writing `repliedAt` now would
+        // assert both "no reply was produced" and "the transport accepted a reply" on one row —
+        // refuse rather than silently do nothing and report success.
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "cannot record a reply for a turn already resolved as no-reply",
+          { channel, nonce },
+        );
+      }
+      const updated = this.db.run(
         `UPDATE inbound_messages
             SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)
-          WHERE channel = ? AND nonce = ?
-            AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
-            AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL`,
+          WHERE channel = ? AND nonce = ? AND json_extract(turn_claim_json, '$.repliedAt') IS NULL`,
         [this.clock.nowIso(), channel, nonce],
       );
-      return allow(ReasonCode.OK, undefined);
+      // The row count is checked (#682, third review) rather than returning `allow(OK)`
+      // unconditionally: an UPDATE that changes nothing is not evidence the write happened, and
+      // this function used to return success regardless — exactly the counterexample that found
+      // the `noReplyAt` branch above missing. The two checks above should make this WHERE clause
+      // unreachable in a false state now, the same claim `claimTurn`'s own WHERE-clause comment
+      // makes about itself: `tx` serialises the read this depends on, so no test here can produce
+      // the interleaving this would catch. It is a second statement of the same fact, kept as a
+      // last line rather than trusted to be one, not a second guard with its own falsifiability
+      // row — there is nothing left for a test to construct that reaches it in a false state.
+      return updated.changes === 1
+        ? allow(ReasonCode.OK, undefined)
+        : deny(ReasonCode.RESOURCE_COLLISION, "turn resolution raced another writer", { channel, nonce });
     }
   }
 

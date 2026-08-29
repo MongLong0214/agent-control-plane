@@ -266,14 +266,26 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
     expect(afterNoReplyCall["noReplyAt"]).toBeUndefined();
   });
 
-  it("#682: never writes repliedAt over a turn a no-reply resolution already closed", async () => {
+  it("#682: resolveTurn refuses rather than silently no-ops over a turn a no-reply resolution already closed", async () => {
     // The other order, found by a second review of the guard above: it covers reply-then-
-    // no-reply, but `resolveTurn` — reachable directly through the public API, not only through
-    // `completeReplyAndResolveTurn` — had no matching refusal for no-reply-then-reply. Without it,
-    // a turn `completeNoReplyAndResolveTurn` already closed with `noReplyAt` could still take
-    // `repliedAt` here, leaving one row asserting both "no reply was produced" and "the transport
-    // accepted a reply" — the second being exactly what #638's later receipt match is meant to
-    // trust. A guard on only one of the two writers is not a guard on the field.
+    // no-reply, but `#resolveTurnHere` had no matching refusal for no-reply-then-reply — its
+    // WHERE clause simply matched zero rows and the function still returned `allow(OK)`
+    // regardless (found by a *third* review). A no-op reported as success is how a guard becomes
+    // invisible: any caller trusting that return value would believe a reply was recorded when
+    // nothing moved.
+    //
+    // `resolveTurn` directly, not through `completeReplyAndResolveTurn`: there is no production
+    // caller of standalone `resolveTurn` today (confirmed by grep — only this test and
+    // `TelegramIngress.resolveTurn`'s own wrapper reach it, and nothing calls that wrapper
+    // either), so this is a disclosed unit-level check of `#resolveTurnHere`'s own defense, not a
+    // production reproduction. The production path this same collision reaches —
+    // `reserveResponse` → `recordResultIf` → `completeResponse` → `completeReplyAndResolveTurn`
+    // — is covered below, driven from `reserveResponse`, the real first call `pollOnce` makes,
+    // and is refused one step earlier by `#recordResultHere` before it would ever reach here.
+    // `#resolveTurnHere`'s own check stays in place as the second, independent guard on the same
+    // field — the one Sol's review said to fix regardless of whether the first reproduced — for
+    // whichever future caller reaches it directly (`resolveTurn` is public, and #638's later
+    // receipt-match reconciliation is a plausible one).
     const harness = makeHarness();
     const { guard } = buildRouter(harness);
     const nonce = "update:4";
@@ -288,13 +300,76 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
     expect(resolved["noReplyAt"]).toBeTruthy();
     expect(resolved["repliedAt"]).toBeUndefined();
 
-    // `resolveTurn` directly — the path `completeReplyAndResolveTurn` wraps, and the one this
-    // guard has to hold on its own since a caller can reach it without going through the reply
-    // lifecycle's own PENDING precondition at all.
-    expect(guard.resolveTurn("telegram", nonce).allowed).toBe(true);
+    const refused = guard.resolveTurn("telegram", nonce);
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
 
     const afterResolveTurnCall = storedClaim(harness, nonce);
     expect(afterResolveTurnCall["noReplyAt"]).toBe(resolved["noReplyAt"]);
     expect(afterResolveTurnCall["repliedAt"]).toBeUndefined();
+  });
+
+  it("#682: reserveResponse refuses a reply for a turn already resolved as no-reply", async () => {
+    // Sol's counterexample, driven from the real production entry point: `pollOnce` calls
+    // `reserveResponse` first, before ever sending to Telegram, and `reserveResponse`'s own
+    // precondition (`recordResultIf`, expecting "AVAILABLE") reads only `result_json`'s delivery
+    // status — the `TELEGRAM_NO_REPLY` marker has none, so it read as available. The reservation
+    // landed, and a later `completeResponse` could move it all the way to `sent: true,
+    // deliveryStatus: "APPLIED"` — one row then asserting both "no reply was produced"
+    // (`noReplyAt`) and "the transport accepted a reply" (`result_json`), without ever going
+    // through the `turn_claim_json` guards this file already had.
+    //
+    // Worse than the completion case alone: the reservation *by itself*, before any completion,
+    // already reopens #672 — it overwrites the non-recoverable `TELEGRAM_NO_REPLY` marker with a
+    // `sent: false` reservation, which `isRecoverableIngressResult` reads as recoverable. Refusing
+    // the reservation outright — rather than allowing it and rolling the whole completion back
+    // later — is the fix, and it is the only one of the two options that also protects this half.
+    const harness = makeHarness();
+    const { guard, router } = buildRouter(harness);
+    const nonce = "update:5";
+
+    expect(
+      guard.admit({ channel: "telegram", actor: "owner", conversation: "chat", nonce, payload: { text: "hi" } })
+        .allowed,
+    ).toBe(true);
+    expect(guard.claimTurn("telegram", nonce, identity()).allowed).toBe(true);
+    expect(guard.completeNoReplyAndResolveTurn("telegram", nonce).allowed).toBe(true);
+    const beforeResultJson = harness.cp.db.get<{ result_json: string | null }>(
+      "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
+      [nonce],
+    )?.result_json;
+    expect(beforeResultJson).toBe('{"kind":"TELEGRAM_NO_REPLY"}');
+
+    const lateReplyOutcome: TelegramRouteOutcome = {
+      updateId: 5,
+      nonce,
+      correlationId: "late-reply-correlation",
+      admitted: true,
+      replayed: false,
+      classification: "DIRECT",
+      input: null,
+      reply: {
+        chatId: "chat",
+        text: "a reply attempted after the turn was already resolved as no-reply",
+        replyToMessageId: 1,
+        correlationId: "late-reply-correlation",
+      },
+      reasonCode: ReasonCode.OK,
+    };
+
+    // The real first call: `pollOnce` invokes `reserveResponse` before ever calling
+    // `transport.sendMessage`. If this throws, no Telegram send is attempted at all.
+    expect(() => router.reserveResponse(lateReplyOutcome)).toThrow(/no-reply/i);
+
+    // Refused before any write: the durable non-recoverable marker is exactly what it was, and
+    // the claim still carries only `noReplyAt`.
+    const afterResultJson = harness.cp.db.get<{ result_json: string | null }>(
+      "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
+      [nonce],
+    )?.result_json;
+    expect(afterResultJson).toBe(beforeResultJson);
+    const claim = storedClaim(harness, nonce);
+    expect(claim["noReplyAt"]).toBeTruthy();
+    expect(claim["repliedAt"]).toBeUndefined();
   });
 });

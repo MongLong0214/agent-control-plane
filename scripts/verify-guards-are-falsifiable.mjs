@@ -215,24 +215,56 @@ const GUARDS = [
     // The other order of the same guard (#682, second review): the row above covers
     // reply-then-no-reply, but `#resolveTurnHere` — reachable directly through `resolveTurn`,
     // not only through `completeReplyAndResolveTurn`'s own PENDING precondition — had no
-    // matching refusal for no-reply-then-reply. Without the `noReplyAt IS NULL` clause, a claim
-    // `completeNoReplyAndResolveTurn` already closed could still take `repliedAt` here, leaving
-    // one row asserting both "no reply was produced" and "the transport accepted a reply". A
-    // guard on only one of a field's two writers is not a guard on the field.
-    what: "resolveTurn never moves a claim that already has a terminal fact",
+    // matching refusal for no-reply-then-reply. A *third* review found the first fix for this
+    // was itself a no-op: the WHERE clause silently matched zero rows and the function still
+    // returned `allow(OK)` regardless. This mutation removes the explicit, checked refusal that
+    // replaced it — writing `repliedAt` over a claim `completeNoReplyAndResolveTurn` already
+    // closed with `noReplyAt` would again leave one row asserting both "no reply was produced"
+    // and "the transport accepted a reply", and this time reporting success while doing it.
+    what: "resolveTurn refuses, rather than silently no-ops, over a claim a no-reply resolution already closed",
     file: "src/ingress/ingress-guard.ts",
     find:
-      "        `UPDATE inbound_messages\n" +
-      "            SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)\n" +
-      "          WHERE channel = ? AND nonce = ?\n" +
-      "            AND json_extract(turn_claim_json, '$.repliedAt') IS NULL\n" +
-      "            AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL`,",
-    replace:
-      "        `UPDATE inbound_messages\n" +
-      "            SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)\n" +
-      "          WHERE channel = ? AND nonce = ? AND json_extract(turn_claim_json, '$.repliedAt') IS NULL`,",
+      "      if (claim.noReplyAt !== undefined) {\n" +
+      "        // A *different* terminal fact already closed this claim. Writing `repliedAt` now would\n" +
+      "        // assert both \"no reply was produced\" and \"the transport accepted a reply\" on one row —\n" +
+      "        // refuse rather than silently do nothing and report success.\n" +
+      "        return deny(\n" +
+      "          ReasonCode.RESOURCE_COLLISION,\n" +
+      "          \"cannot record a reply for a turn already resolved as no-reply\",\n" +
+      "          { channel, nonce },\n" +
+      "        );\n" +
+      "      }\n",
+    replace: "",
     killedBy: [
-      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: never writes repliedAt over a turn a no-reply resolution already closed",
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: resolveTurn refuses rather than silently no-ops over a turn a no-reply resolution already closed",
+    ],
+  },
+  {
+    // Found by Sol's counterexample (#682, third review): `reserveResponse` calls
+    // `recordResultIf(…, "AVAILABLE")` before the two rows above ever run, and that check reads
+    // only `result_json`'s own delivery status — the `TELEGRAM_NO_REPLY` marker has none, so a
+    // reservation against an already-no-reply-resolved turn read as available. Worse than the two
+    // rows above on its own: the reservation alone overwrites the non-recoverable marker with a
+    // `sent: false` reply reservation, which `isRecoverableIngressResult` reads as recoverable —
+    // reopening #672's exact vulnerability before `completeReplyAndResolveTurn` is ever reached.
+    // Refused here outright, rather than left to a later rollback, because this is the only place
+    // that also protects the reservation taken on its own.
+    what: "a reply reservation is refused for a turn already resolved as no-reply",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      if (current.turn_claim_json) {\n" +
+      "        const claim = JSON.parse(current.turn_claim_json) as { noReplyAt?: unknown };\n" +
+      "        if (claim.noReplyAt !== undefined) {\n" +
+      "          return deny(\n" +
+      "            ReasonCode.RESOURCE_COLLISION,\n" +
+      "            \"cannot transition an ingress result for a turn already resolved as no-reply\",\n" +
+      "            { channel, nonce },\n" +
+      "          );\n" +
+      "        }\n" +
+      "      }\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: reserveResponse refuses a reply for a turn already resolved as no-reply",
     ],
   },
   {
