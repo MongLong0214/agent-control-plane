@@ -144,13 +144,18 @@ if (process.env["ACP_STARTUP_TEST_PARK"] === "1") {
 
 const expectTelegram = process.env["ACP_STARTUP_TEST_EXPECT_TELEGRAM"] === "1";
 const expectPromptFlow = process.env["ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW"] === "1";
+// Off by default so this fake stands in for the transport, the same as every other startup
+// scenario. Set to exercise the *real* `TelegramBotApi` composition — no fake transport at all —
+// so `ACP_TELEGRAM_API_BASE_URL` actually reaches it and its `redeliveryRetentionMs` is computed
+// from the real class rather than this fixture's own declared value.
+const useRealTelegramTransport = process.env["ACP_STARTUP_TEST_REAL_TELEGRAM_TRANSPORT"] === "1";
 const startupTransport = new StartupTelegramTransport(expectPromptFlow);
 
 try {
   await main({
     config,
     telegramStartOptions: {
-      transport: startupTransport,
+      ...(useRealTelegramTransport ? {} : { transport: startupTransport }),
       ...(expectPromptFlow ? { start: false } : {}),
     },
     waitForShutdown: async (shutdown, context) => {

@@ -154,7 +154,13 @@ describe("Telegram production ingress", () => {
       "utf8",
     );
     // This is a composition-root assertion only; the behavior below still runs the factory.
-    expect(agentcpdSource).toContain("telegram = await startDaemonTelegramListener(cp, telegramConfig, daemon");
+    // `main()` calls `startDaemonTelegramListenerOrRefuse` now, not `startDaemonTelegramListener`
+    // directly — the wrapper that catches only an unmeasured-transport-retention refusal so it
+    // does not take the rest of the daemon down (#682, round 8 follow-up). Both assertions matter:
+    // the first proves the composition root did not drift onto some other path, the second proves
+    // the wrapper itself still runs the real daemon-owned factory rather than a substitute.
+    expect(agentcpdSource).toContain("telegram = await startDaemonTelegramListenerOrRefuse(cp, telegramConfig, daemon");
+    expect(agentcpdSource).toContain("const listener = await startDaemonTelegramListener(cp, config, daemon, options);");
 
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],

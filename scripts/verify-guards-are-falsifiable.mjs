@@ -350,11 +350,16 @@ const GUARDS = [
       "        // The caller stated explicitly that this channel's transport retention is not known —\n" +
       "        // a self-hosted endpoint nobody has measured, or a stand-in for one. Assuming the\n" +
       "        // measured `api.telegram.org` figure applies anyway would be this issue's original\n" +
-      "        // mistake in a new place, so this refuses rather than guesses.\n" +
-      "        throw new Error(\n" +
-      "          `ingress policy for '${channel}' does not know its transport's redelivery retention ` +\n" +
-      "            `(transportRetentionMs is null); refusing to assume a measured default applies to a ` +\n" +
-      "            `transport that has not stated its own (#682)`,\n" +
+      "        // mistake in a new place, so this refuses rather than guesses. Marked with `code` and\n" +
+      "        // `channel` (see `isTransportRetentionUnknown` above) so a caller can tell this refusal\n" +
+      "        // apart from every other reason this constructor throws.\n" +
+      "        throw Object.assign(\n" +
+      "          new Error(\n" +
+      "            `ingress policy for '${channel}' does not know its transport's redelivery retention ` +\n" +
+      "              `(transportRetentionMs is null); refusing to assume a measured default applies to a ` +\n" +
+      "              `transport that has not stated its own (#682)`,\n" +
+      "          ),\n" +
+      "          { code: TRANSPORT_RETENTION_UNKNOWN, channel },\n" +
       "        );\n" +
       "      }\n",
     replace: "",
@@ -376,6 +381,22 @@ const GUARDS = [
     replace: "",
     killedBy: [
       "tests/unit/ingress-retention-derives-from-transport.test.ts::production wiring refuses to start against a transport whose retention is unknown, chosen before this fix constructed the guard",
+    ],
+  },
+  {
+    // Found by Sol's second review (#682, round 8 follow-up): the derivation above is right, but
+    // `agentcpd.ts`'s `main()` wraps every listener it starts in one `try`/`catch` that tears all
+    // of them down on any failure — so `IngressGuard`'s refusal for an unmeasured transport used
+    // to take the *whole daemon* down, not just Telegram, for a deployment that configured a
+    // supported self-hosted Bot API server on purpose. Mutating the guard back to an
+    // unconditional rethrow removes exactly the narrow catch that keeps MCP, Buzz and the
+    // operator door running when only Telegram's transport retention is unknown.
+    what: "an unmeasured transport's retention refuses only Telegram ingress, not the whole daemon",
+    file: "src/daemon/agentcpd.ts",
+    find: "    if (!isTransportRetentionUnknown(error)) throw error;",
+    replace: "    throw error;",
+    killedBy: [
+      "tests/unit/daemon-startup.test.ts::#682 round 8 follow-up: starts the daemon but refuses Telegram ingress when the transport's retention is unknown",
     ],
   },
   {

@@ -191,6 +191,27 @@ export const ingressSignature = (
   request: Parameters<typeof ingressSigningInput>[0],
 ): string => createHmac("sha256", secret).update(ingressSigningInput(request)).digest("hex");
 
+/**
+ * Marker on the `Error` `IngressGuard`'s constructor throws when a channel's
+ * `transportRetentionMs` is explicitly `null` — a caller stating its transport's redelivery
+ * retention is not known.
+ *
+ * A property, not a subclass: this constructor throws several plain `Error`s already (an
+ * empty allowlist, a missing conversation list), and this reason needs to be told apart from
+ * those by whoever catches it, not renamed into its own hierarchy. `isTransportRetentionUnknown`
+ * below is the narrow, structural way to ask "is this that reason" — `startDaemonTelegramListener`'s
+ * caller (`agentcpd.ts`) checks it specifically so an operator running a *supported*,
+ * deliberately-configured self-hosted transport gets "Telegram ingress refused, here is why,
+ * everything else is running" rather than the whole daemon going down (#682, round 8's follow-up).
+ */
+const TRANSPORT_RETENTION_UNKNOWN = "TRANSPORT_RETENTION_UNKNOWN";
+
+/** Structural check for the marker above — the one place that knows its shape. */
+export const isTransportRetentionUnknown = (error: unknown): error is Error & { channel: string } =>
+  error instanceof Error &&
+  (error as { code?: unknown }).code === TRANSPORT_RETENTION_UNKNOWN &&
+  typeof (error as { channel?: unknown }).channel === "string";
+
 export class IngressGuard {
   /**
    * The nonce TTL this guard actually uses, per channel — copied out of the caller's
@@ -235,11 +256,16 @@ export class IngressGuard {
         // The caller stated explicitly that this channel's transport retention is not known —
         // a self-hosted endpoint nobody has measured, or a stand-in for one. Assuming the
         // measured `api.telegram.org` figure applies anyway would be this issue's original
-        // mistake in a new place, so this refuses rather than guesses.
-        throw new Error(
-          `ingress policy for '${channel}' does not know its transport's redelivery retention ` +
-            `(transportRetentionMs is null); refusing to assume a measured default applies to a ` +
-            `transport that has not stated its own (#682)`,
+        // mistake in a new place, so this refuses rather than guesses. Marked with `code` and
+        // `channel` (see `isTransportRetentionUnknown` above) so a caller can tell this refusal
+        // apart from every other reason this constructor throws.
+        throw Object.assign(
+          new Error(
+            `ingress policy for '${channel}' does not know its transport's redelivery retention ` +
+              `(transportRetentionMs is null); refusing to assume a measured default applies to a ` +
+              `transport that has not stated its own (#682)`,
+          ),
+          { code: TRANSPORT_RETENTION_UNKNOWN, channel },
         );
       }
       if (retention !== undefined && ttl < retention) {
