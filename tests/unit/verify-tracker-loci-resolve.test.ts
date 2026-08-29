@@ -143,7 +143,7 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
-  it("a symbol citation that does not resolve anywhere under src/ is STALE", () => {
+  it("a symbol citation absent from src/ is STALE, worded as text-occurrence, not resolution", () => {
     const body = "`src/continuity/continuity-kernel.ts` — `definitelyNotARealSymbolXYZ`";
     const { path, cleanup } = withIssues([{ number: 9006, title: "symbol missing", body }]);
     try {
@@ -151,7 +151,8 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("STALE");
       expect(result.stdout).toContain("definitelyNotARealSymbolXYZ");
-      expect(result.stdout).toContain("does not resolve in src/continuity/continuity-kernel.ts");
+      expect(result.stdout).toContain("does not appear as code");
+      expect(result.stdout).toContain("src/continuity/continuity-kernel.ts");
     } finally {
       cleanup();
     }
@@ -245,7 +246,7 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("STALE");
       expect(result.stdout).toContain("failover");
-      expect(result.stdout).toContain("does not resolve in src/core/reason-codes.ts");
+      expect(result.stdout).toContain("does not appear as code in src/core/reason-codes.ts");
       // Diagnostic aside: it says where the symbol actually lives, which is what made the
       // original defeat possible in the first place.
       expect(result.stdout).toContain("continuity-kernel.ts");
@@ -323,7 +324,8 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("STALE");
       expect(result.stdout).toContain("reconstitution");
-      expect(result.stdout).toContain("does not resolve in src/session/binding-registry.ts");
+      expect(result.stdout).toContain("does not appear as code");
+      expect(result.stdout).toContain("src/session/binding-registry.ts");
     } finally {
       cleanup();
     }
@@ -349,6 +351,117 @@ describe("verify-tracker-loci-resolve", () => {
       const result = run(path);
       expect(result.status).toBe(0);
       expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // --- Round 3: a third independent review, run against the shipped script through
+  // --issues-file, same as the prior two rounds. One case per finding, not combined, per the
+  // explicit request — a combined `1-999999` case had hidden the fact that the boundary was
+  // untested on both sides.
+
+  it("[round 3] a citation of line 0 is STALE — a citation's first line is 1", () => {
+    const body = "See `README.md:0`.";
+    const { path, cleanup } = withIssues([{ number: 8501, title: "zero-line counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("README.md:0");
+      expect(result.stdout).toContain("does not exist");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 3] a citation one line past the true end is STALE — the trailing newline is not a line", () => {
+    // README.md has 196 lines. `text.split("\n").length` reads that as 197 (one trailing empty
+    // element from the final newline), so `:197` — genuinely one past the end — passed as
+    // "still resolves" until `countLines` stopped counting that element.
+    const realLineCount = readFileSync(join(repoRoot, "README.md"), "utf8")
+      .split("\n")
+      .filter((_, i, arr) => !(i === arr.length - 1 && arr[i] === "")).length;
+    const body = `See \`README.md:${realLineCount + 1}\`.`;
+    const { path, cleanup } = withIssues([{ number: 8502, title: "one-past-the-end counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain(`README.md has ${realLineCount} line(s)`);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 3] the true last line of a file is still ADVISORY, not STALE (the corrected boundary's other side)", () => {
+    const realLineCount = readFileSync(join(repoRoot, "README.md"), "utf8")
+      .split("\n")
+      .filter((_, i, arr) => !(i === arr.length - 1 && arr[i] === "")).length;
+    const body = `See \`README.md:${realLineCount}\`.`;
+    const { path, cleanup } = withIssues([{ number: 8503, title: "exact-last-line counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 3] an inverted range (end before start) is STALE", () => {
+    const body = "See `README.md:20-10`.";
+    const { path, cleanup } = withIssues([{ number: 8504, title: "inverted-range counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("inverted");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 3] a repeated locus with different quoted content is not collapsed by dedup", () => {
+    // A bare `README.md:1` and a later fenced, stale `README.md:1  const definitelyGone = true`
+    // cite the same path and line. The dedup key omitted the quoted content, so whichever the
+    // extractor saw first (the bare, unfalsifiable one) silently absorbed the second — the one
+    // citation that actually goes stale.
+    const body = [
+      "The banner is at `README.md:1`.",
+      "",
+      "```",
+      "README.md:1  const definitelyGone = true",
+      "```",
+    ].join("\n");
+    const { path, cleanup } = withIssues([{ number: 8505, title: "repeated-locus dedup counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("definitelyGone");
+      expect(result.stdout).toContain("ADVISORY");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 3] a symbol appearing only as a quoted string literal does not count as code", () => {
+    // `"utf8"` is a real, common string argument in `buzz-adapter.ts` — an encoding literal, not
+    // a declared symbol. Comment-stripping (round 2) does not touch string content, so this
+    // passed silently until `stripStrings` closed it too.
+    const body = "`src/buzz/buzz-adapter.ts` — `utf8`";
+    const { path, cleanup } = withIssues([{ number: 8506, title: "string-literal symbol counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("utf8");
+      // Renamed per the round-3 decision: this is a text-occurrence check, not declaration
+      // verification, and the report says so rather than claiming "resolve".
+      expect(result.stdout).toContain("does not appear as code");
+      expect(result.stdout).not.toContain("does not resolve");
     } finally {
       cleanup();
     }

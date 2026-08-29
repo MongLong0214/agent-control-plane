@@ -14,10 +14,14 @@
  * ## What counts as stale
  *
  *   - a cited file does not exist at all                                    → STALE
+ *   - a cited line is <= 0, or an end line before its start                 → STALE (impossible
+ *     regardless of the file's length; see round 3 below)
  *   - a cited line is beyond the file's current length                      → STALE (weak signal:
  *     a file can stay long after the cited region is rewritten, see below)
- *   - a cited symbol (the repo's own `` `path` — `symbol` `` table
- *     convention, e.g. #597's own migration table) does not resolve under `src/`  → STALE
+ *   - a cited symbol (the repo's own `` `path` — `symbol` `` table convention, e.g. #597's own
+ *     migration table) does not appear as code — outside a comment or quoted string — in the
+ *     named file                                                            → STALE (this is a
+ *     text search, not declaration verification; see round 3 below for why)
  *   - a cited code line, quoted alongside its file:line, no longer appears
  *     anywhere in that file (elision-tolerant: `...`/`()` stand for "and more") → STALE
  *
@@ -120,6 +124,29 @@
  *   — was missing from `FILE_EXT`, so a `.mts` citation was silently never checked. Added on the
  *   same evidence-first basis as `py`/`plist`; `.cts` stays out because nothing here is tracked.
  *
+ * ## Round 3: a third independent review, also run against the shipped script through
+ * `--issues-file` rather than a model of it
+ *
+ *   `README.md:0` (a line nothing is numbered), `README.md:197` on a file `text.split("\n")`
+ *   over-counted as 197 lines when it has 196 (a trailing newline produces one extra empty
+ *   split element that is not a line), and `README.md:20-10` (an inverted range) all read as
+ *   "still resolves", ADVISORY, exit 0. Fixed: `countLines` drops the trailing empty split
+ *   element, and `startLine < 1` / `endLine < startLine` are rejected as STALE before the file's
+ *   length is even asked, because neither needs an answer to that question.
+ *
+ *   The dedup key for a path citation (`seenPath`) did not include the quoted content, so a bare
+ *   `README.md:1` and a later fenced `README.md:1  const definitelyGone = true` collapsed to
+ *   whichever the loop saw first — silently dropping the one that actually goes stale, since a
+ *   citation with no quoted content has nothing to fail. Fixed: the content is part of the key.
+ *
+ *   Symbol resolution: see the comment beside `readCode`'s callers, below, for the full argument.
+ *   In short — `` `buzz-adapter.ts` — `utf8` `` passed because `"utf8"` is a string-literal
+ *   argument there, not a declared symbol, and this was the third round narrowing *where* a plain
+ *   text search looks. The decision made here is to stop narrowing and instead say plainly what
+ *   the check does: a text-occurrence search outside comments and quoted strings, not declaration
+ *   verification. `stripStrings` closes the concrete counterexample; the wording of what STALE
+ *   means for a symbol row changed from "does not resolve" to "does not appear as code" to match.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -169,18 +196,26 @@ const readText = (relPath) => {
 };
 
 /**
+ * How many lines a file has, for comparing against a cited line number. `text.split("\n").length`
+ * over-counts by one whenever the file ends with a newline — which is every POSIX text file this
+ * repository writes — because the split produces one trailing empty string after the final `\n`
+ * that is not a line at all. A 196-line `README.md` read that way is 197 lines, and a citation of
+ * line 197 ("one past the true end") passed as "still resolves" until this was fixed.
+ */
+const countLines = (text) => {
+  const lines = text.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines.length;
+};
+
+/**
  * Removes `//` line comments and `/* ... *\/` block comments before a symbol search, so a symbol
  * mentioned only in prose about the code — a comment explaining what a mechanism used to do, or
- * warning about a related concept — does not count as the file *holding* it. #597's rule is that
- * the named enforcement site holds the symbol; a comment mentioning a word is not that site, it
- * is a sentence about it.
+ * warning about a related concept — does not count toward it. A comment mentioning a word is a
+ * sentence about it, not code that holds it.
  *
- * This is a text pass, not a parser: it does not know about string or template literals, so a
- * symbol that appears only inside a quoted string still counts as present. That gap is narrower
- * than the one being closed here — a string literal is a value the file deliberately wrote, where
- * a comment is prose describing the file, and treating the two the same is exactly what let a
- * comment stand in for an enforcement site. `://` is protected explicitly so a URL inside a
- * comment or string (`https://…`) is not itself misread as the start of a line comment.
+ * `://` is protected explicitly so a URL inside a comment or string (`https://…`) is not itself
+ * misread as the start of a line comment.
  */
 const stripComments = (text) =>
   text
@@ -189,10 +224,34 @@ const stripComments = (text) =>
     .map((line) => line.replace(/(?<!:)\/\/.*$/, ""))
     .join("\n");
 
+/**
+ * Removes the contents of single- and double-quoted string literals (kept as empty pairs, so
+ * this does not fuse the tokens on either side together). `"utf8"` as an encoding argument is not
+ * a citation's enforcing symbol resolving — it is a string that happens to spell the same word,
+ * and without this a row pairing any file with any common string constant used in it would pass.
+ *
+ * Template literals (`` `...` ``) are deliberately left alone: a `${…}` interpolation inside one
+ * is real code, and stripping the whole literal would throw that away along with its string parts.
+ * The narrower gap that leaves — a symbol appearing only in a backtick string's non-interpolated
+ * text — is not the shape this was built to catch and is left for the same reason declaration
+ * detection was: a heuristic here risks becoming exactly the kind of narrow, incomplete rule this
+ * whole check exists to name.
+ *
+ * A second, measured gap: a regex literal with a quote inside a character class
+ * (`` /(["\\])/g `` — this repository has one, in `cli-adapters.ts`) is not told apart from a real
+ * string boundary, because this is a text pass and does not know a regex literal from division.
+ * Found while verifying this fix: it did not change the primary verdict for any cited file, only
+ * widened the "it also appears in" diagnostic aside on an unrelated file to include a false hit.
+ * That aside is disclosed as a heuristic below for exactly this reason — it is a pointer to go
+ * look, not a second verified fact.
+ */
+const stripStrings = (text) =>
+  text.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/'(?:[^'\\]|\\.)*'/g, "''");
+
 const codeTextCache = new Map();
 const readCode = (relPath) => {
   if (!codeTextCache.has(relPath)) {
-    codeTextCache.set(relPath, stripComments(readText(relPath)));
+    codeTextCache.set(relPath, stripStrings(stripComments(readText(relPath))));
   }
   return codeTextCache.get(relPath);
 };
@@ -400,7 +459,8 @@ const extractFromBody = (body) => {
         const path = m[3].replace(/[.,;:)]+$/, "");
         const startLine = m[4] ? Number(m[4]) : null;
         const endLine = m[5] ? Number(m[5]) : null;
-        const key = `${path}:${startLine ?? ""}:${endLine ?? ""}`;
+        // Content is always null for a URL citation (see below for why this field matters).
+        const key = `${path}:${startLine ?? ""}:${endLine ?? ""}:`;
         if (seenPath.has(key)) continue;
         seenPath.add(key);
         pathCitations.push({ raw: m[0], path, startLine, endLine, content: null });
@@ -423,7 +483,12 @@ const extractFromBody = (body) => {
         const rest = rawLine.slice(m.index + m[0].length).replace(/←.*$/, "").trim();
         if (rest.length > 0 && looksLikeCode(rest)) content = rest;
       }
-      const key = `${path}:${startLine ?? ""}:${endLine ?? ""}`;
+      // The quoted content is part of the identity, not decoration on top of it. Two citations of
+      // the same `path:line` are two different claims when one of them also quotes code — a bare
+      // `README.md:1` and a fenced `README.md:1  const definitelyGone = true` are not the same
+      // citation, and the second is precisely the one likely to be stale. Keying on path/line
+      // alone let the first (weaker, unquoted) citation's dedup entry silently absorb the second.
+      const key = `${path}:${startLine ?? ""}:${endLine ?? ""}:${content ?? ""}`;
       if (seenPath.has(key)) continue;
       seenPath.add(key);
       pathCitations.push({ raw: m[0], path, startLine, endLine, content });
@@ -493,11 +558,35 @@ for (const issue of issues) {
     }
 
     const text = readText(resolved.path);
-    const fileLines = text.split("\n").length;
-    // Fix (Sol counterexample 2): the end of a cited range has to resolve too. `README.md:1-999999`
-    // has a perfectly valid start line and an end line the file could never have; checking only
-    // `startLine` let the whole range through on the strength of its first number.
+    const fileLines = countLines(text);
     const citedEnd = citation.endLine ?? citation.startLine;
+
+    // Fix (independent review, round 3): a coordinate does not have to be beyond the file to be
+    // impossible. `README.md:0` names a line nothing is numbered, and no upper-bound check ever
+    // sees it because 0 is never past the end of anything. `README.md:20-10` is not out of range
+    // either — it is backwards, and "beyond the file" is not what is wrong with it. Both are
+    // checked before the file is even asked how long it is, because neither needs an answer.
+    if (citation.startLine < 1) {
+      stale.push({
+        issue,
+        citation: citation.raw,
+        reason: `line ${citation.startLine} does not exist — a citation's first line is 1, not ${citation.startLine}`,
+      });
+      continue;
+    }
+    if (citation.endLine !== null && citation.endLine < citation.startLine) {
+      stale.push({
+        issue,
+        citation: citation.raw,
+        reason: `cites lines ${citation.startLine}-${citation.endLine}, an inverted range — the end is before the start`,
+      });
+      continue;
+    }
+
+    // Fix (independent review, round 3): `text.split("\n")` counts a trailing newline as one more
+    // (empty) line, so a 196-line file ending the way POSIX text files do reads as 197 lines —
+    // exactly one past the true end, and exactly where `README.md:197` was let through as
+    // "still resolves". `countLines` drops that trailing empty element before counting.
     if (citation.startLine > fileLines || citedEnd > fileLines) {
       stale.push({
         issue,
@@ -557,17 +646,42 @@ for (const issue of issues) {
       continue;
     }
 
-    // Fix (Sol counterexample 4): #597's rule is that the *named enforcement site* holds the
-    // symbol — pairing `src/core/reason-codes.ts` with `failover` claims that file contains
-    // `failover`, not that `failover` is spelled correctly somewhere in the codebase. Searching
-    // every file under `src/` was satisfied by the symbol existing anywhere, which is exactly the
-    // defeat: it credited a row for a symbol that lives in a completely different enforcement
-    // site than the one the row names.
+    // Fix (round 1): #597's rule is that the *named enforcement site* holds the symbol — pairing
+    // `src/core/reason-codes.ts` with `failover` claims that file contains `failover`, not that
+    // `failover` is spelled correctly somewhere in the codebase. Searching every file under
+    // `src/` was satisfied by the symbol existing anywhere, crediting a row for a symbol that
+    // lives in a completely different file than the one the row names.
     //
-    // Fixed further (independent review, round 2): the narrowed search still read comments as
-    // code. `` `binding-registry.ts` — `reconstitution` `` passed because the file's own comments
-    // discuss reconstitution in prose — the word is not a symbol the file holds, it is a sentence
-    // about a related concept. `readCode` strips comments before the search runs.
+    // Fixed further (round 2): the narrowed search still read comments as code. `` `binding-
+    // registry.ts` — `reconstitution` `` passed because the file's own comments discuss
+    // reconstitution in prose. `stripComments` removes that before the search runs.
+    //
+    // Round 3, and a decision rather than a fourth narrowing: `stripStrings` (below) closes the
+    // next hole the same shape found — `` `buzz-adapter.ts` — `utf8` `` passed because `"utf8"`
+    // is a string literal argument in that file, not a symbol it declares. Stripping strings closes
+    // *this* case, but the pattern underneath all three rounds is that each fix narrowed *where*
+    // the search looks while it stayed a plain text search — never verification that the named
+    // file *declares* the symbol, which is what #597 actually asked for.
+    //
+    // A real declaration check was considered and rejected for this codebase, on evidence rather
+    // than a guess: spot-checking the symbols in `verify-enforcement-symbols.mjs`'s own LOCI table
+    // turned up five different declaration shapes in ten symbols — a class method
+    // (`isRoutableFor(...): boolean {`), an interface method signature with no body
+    // (`ensurePrimaryCto(...): Promise<...>;`), a multi-line method signature whose `{` is several
+    // lines below its name (`bindBuzzActor(\n  …\n): … {`), an object property holding an arrow
+    // (`channelsGet: (channelId) => […]`), and a plain object property value (`BLIND_REVIEWER:
+    // "BLIND_REVIEWER",`). A regex built to recognize all of these is exactly the "allow-list of
+    // syntactic forms" that misses the next one silently — and a missed form here is a *false*
+    // STALE against a symbol that is genuinely declared, which is worse than this check's current
+    // honest limit: it erodes trust in the same way a check that is always noisy does, except by
+    // being wrong instead of loud.
+    //
+    // So: this remains a text search, and says so. What it reports is renamed to describe that —
+    // "does not appear" rather than "does not resolve" — rather than continuing to claim a
+    // precision the search does not have. It still catches what matters most for #597's actual
+    // failure mode: a symbol renamed away or deleted outright, which is what #649 and #657 were.
+    // What it cannot catch: a symbol referenced but not declared in the cited file (an import, a
+    // parameter of the same name) reading as present. That gap is disclosed, not hidden.
     const targetCode = readCode(resolved.path);
     for (const symbol of symbolCitation.symbols) {
       const pattern = new RegExp(`\\b${escapeRegex(symbol)}\\b`);
@@ -579,8 +693,13 @@ for (const issue of issues) {
         issue,
         citation: symbolCitation.raw,
         reason: elsewhere
-          ? `symbol \`${symbol}\` does not resolve in ${resolved.path} — it is defined in ${elsewhere} instead, a different file than cited`
-          : `symbol \`${symbol}\` does not resolve in ${resolved.path}, or anywhere else under src/`,
+          ? `\`${symbol}\` does not appear as code in ${resolved.path} (outside a comment or quoted string) — ` +
+            // A pointer to go look, not a second verified fact: the same heuristic that catches
+            // most strings and comments does not tell a regex literal's quote from a real one
+            // (see `stripStrings`), so this hit is worth checking rather than trusting outright.
+            `the same search also matches in ${elsewhere}, a different file than cited`
+          : `\`${symbol}\` does not appear as code anywhere under src/ (outside a comment or quoted string), ` +
+            `including in ${resolved.path}`,
       });
     }
   }
