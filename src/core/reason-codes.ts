@@ -367,6 +367,15 @@ export const ReasonCode = {
   CONVERSATION_TURN_ALREADY_DISPATCHED: "CONVERSATION_TURN_ALREADY_DISPATCHED",
   /** An adjudication cited only part of the disagreement, or something outside it. */
   CONVERSATION_ADJUDICATION_INCOMPLETE: "CONVERSATION_ADJUDICATION_INCOMPLETE",
+  /**
+   * A reconciler's receipt names the right turn under the wrong CEO generation.
+   *
+   * `bindingGeneration` is why a receipt cannot be matched by id alone (#639): a turn claimed
+   * under generation N and a receipt minted under N+1 describe two different CEOs' work, even
+   * when every other field agrees. Left `IN_DOUBT`, not `CONTRADICTED` — nothing this turn's own
+   * observations say disagrees with anything; the receipt is simply not about this claim.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_GENERATION: "CONVERSATION_TURN_RECEIPT_WRONG_GENERATION",
   // --- disposable acceptance realm ------------------------------------------
   /**
    * A path the acceptance realm would use resolves inside production, or outside its own state

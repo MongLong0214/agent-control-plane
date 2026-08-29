@@ -111,7 +111,7 @@ const GUARDS = [
     // admitted while attempt 1 was still in flight.
     what: "a dispatched turn cannot be reported as never started",
     file: "src/conversation/turn-coordinator.ts",
-    find: '      if (phase === "BEFORE" && this.dispatched(permit.turnRequestId)) {',
+    find: '      if (phase === "BEFORE" && this.dispatched(identity.turnRequestId)) {',
     replace: "      if (false) {",
     killedBy: [
       "tests/unit/a-dispatch-is-a-fact.test.ts::refuses the claim that contradicts the ledger's own record",
@@ -669,8 +669,8 @@ const GUARDS = [
     // check any caller can write an object of that shape and settle a turn it never ran.
     what: "only a permit this coordinator issued can settle a turn",
     file: "src/conversation/turn-coordinator.ts",
-    find: "      const issued = this.assertIssuedHere(permit);\n      if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);",
-    replace: "      void this.assertIssuedHere(permit);",
+    find: "    const issued = this.assertIssuedHere(permit);\n    if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);",
+    replace: "    void this.assertIssuedHere(permit);",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
@@ -869,7 +869,7 @@ const GUARDS = [
     // in none.
     what: "a receipt redelivered onto a different turn is refused",
     file: "src/conversation/turn-coordinator.ts",
-    find: "          already.turn_request_id === permit.turnRequestId &&",
+    find: "          already.turn_request_id === identity.turnRequestId &&",
     replace: "          true &&",
     killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
   },
@@ -1093,6 +1093,32 @@ const GUARDS = [
     find: "  for (const inline of body.matchAll(/^\\s*(\\w+)\\s+[A-Z][^\\n]*?\\bUNIQUE\\b[^\\n]*$/gm)) {",
     replace: "  for (const inline of []) {",
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // #639 contract 6's reconciler entry point has no permit to check, unlike every other
+    // settlement port — it settles turns whose claiming process may be gone. Without this, a
+    // reconciled turnRequestId that names no row throws a raw TypeError reading `undefined
+    // .binding_generation` instead of returning a Decision, and the caller sees an unhandled
+    // exception rather than an ordinary refusal.
+    what: "a reconciler cannot settle a turn that was never claimed",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (!row) {\n        return deny(ReasonCode.NOT_FOUND, \"no turn was ever claimed under this id\", {\n          turnRequestId: query.turnRequestId,\n        });\n      }",
+    replace: "      if (false) {\n        return deny(ReasonCode.NOT_FOUND, \"no turn was ever claimed under this id\", {\n          turnRequestId: query.turnRequestId,\n        });\n      }",
+    killedBy: [
+      "tests/unit/a-reconciler-settles-without-a-permit.test.ts::refuses when no turn was ever claimed under this id",
+    ],
+  },
+  {
+    // Contract 1's whole point, landing here: a turn claimed under one CEO generation is a
+    // different CEO's work from a receipt minted under the next. Without this a reconciler
+    // completes a turn on a receipt that was never about this claim.
+    what: "a receipt naming a different CEO generation cannot complete the turn it names",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (row.binding_generation !== query.bindingGeneration) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/a-reconciler-settles-without-a-permit.test.ts::refuses to complete a turn when the receipt names a different CEO generation than the one that claimed it",
+    ],
   },
 ];
 

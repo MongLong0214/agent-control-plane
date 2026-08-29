@@ -62,6 +62,48 @@ export interface TurnReceipt {
   readonly reasonCode: string;
 }
 
+/**
+ * What a reconciler asks a target about one turn it is still holding.
+ *
+ * The four fields a receipt has to be matched against (#639 contract 1). `bindingGeneration`
+ * is carried apart from `TurnPermit` on purpose: a permit proves "the same process that claimed
+ * this also speaks for it", which says nothing about which CEO generation asked, because inside
+ * one process that never changes. A reconciler runs after the claiming process may be gone, and
+ * a receipt minted under a later generation has to be told apart from evidence about this one.
+ */
+export interface ReceiptLookupQuery {
+  readonly turnRequestId: string;
+  readonly targetActorId: string;
+  readonly promptDigest: string;
+  readonly bindingGeneration: number;
+}
+
+/**
+ * What a target answers a reconciler. Absence and ambiguity are both "no receipt", never
+ * evidence that one exists — the distinction contract 6 draws between a lookup that failed and
+ * one that found nothing to say.
+ */
+export type ReceiptLookupResult =
+  | { readonly found: false }
+  | {
+      readonly found: true;
+      readonly outcome: "COMPLETED" | "ABORTED";
+      readonly receiptId: string;
+      readonly evidenceDigest: string;
+      readonly reasonCode: string;
+      /** The generation the target says minted this receipt, compared against the query's. */
+      readonly bindingGeneration: number;
+    };
+
+/**
+ * The seam #638 implements. Until it exists every real deployment wires a port that always
+ * reports `found: false` — the unmatched-receipt state this whole design has run in since #635,
+ * and the state contract 6 requires it keep running in rather than guess.
+ */
+export interface ReceiptPort {
+  lookup(query: ReceiptLookupQuery): Promise<ReceiptLookupResult> | ReceiptLookupResult;
+}
+
 export interface TurnObservation {
   readonly outcome: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
   readonly authority:
@@ -571,10 +613,30 @@ export class ConversationTurnCoordinator {
      */
     phase: "BEFORE" | "AFTER",
   ): Decision<TurnMaterialization> {
-    return this.db.tx(() => {
-      const issued = this.assertIssuedHere(permit);
-      if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
+    const issued = this.assertIssuedHere(permit);
+    if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
+    return this.#observeVerified(
+      { turnRequestId: permit.turnRequestId, targetActorId: permit.targetActorId, promptDigest: permit.promptDigest },
+      observation,
+      phase,
+    );
+  }
 
+  /**
+   * `#observe`'s body, reached two ways that establish the same three facts by different means.
+   *
+   * A live caller's permit proves "the process that claimed this turn issued this call", checked
+   * by `assertIssuedHere` before this is reached. `reconcileWithReceipt` instead reads the row
+   * directly and compares every field a reconciler's identity carries — it has no permit to check,
+   * by design (see that method's docstring). Once either has established `identity`, the recording
+   * and materialization logic below does not need to know which path it came from.
+   */
+  #observeVerified(
+    identity: { turnRequestId: string; targetActorId: string; promptDigest: string },
+    observation: TurnObservation,
+    phase: "BEFORE" | "AFTER",
+  ): Decision<TurnMaterialization> {
+    return this.db.tx(() => {
       // Asymmetric, and the asymmetry is the whole design.
       //
       // A turn with a dispatch row cannot be reported as never started: that claim contradicts a
@@ -592,11 +654,11 @@ export class ConversationTurnCoordinator {
       // still fabricate a completion. Nothing here can tell that from a late receipt, because both
       // are a caller supplying an evidence digest. Closing it needs a receipt the target signed,
       // which is #638's to produce.
-      if (phase === "BEFORE" && this.dispatched(permit.turnRequestId)) {
+      if (phase === "BEFORE" && this.dispatched(identity.turnRequestId)) {
         return deny(
           ReasonCode.CONVERSATION_TURN_PHASE_MISMATCH,
           "this turn was dispatched, so nothing can report that it never started",
-          { turnRequestId: permit.turnRequestId, authority: observation.authority },
+          { turnRequestId: identity.turnRequestId, authority: observation.authority },
         );
       }
 
@@ -613,27 +675,27 @@ export class ConversationTurnCoordinator {
         return deny(
           ReasonCode.CONVERSATION_TURN_OBSERVATION_UNEVIDENCED,
           `an observation must carry a ${blank.join(", a ")}`,
-          { turnRequestId: permit.turnRequestId, authority: observation.authority, blank },
+          { turnRequestId: identity.turnRequestId, authority: observation.authority, blank },
         );
       }
 
       const row = this.db.get<{ target_actor_id: string; prompt_digest: string }>(
         `SELECT target_actor_id, prompt_digest FROM canonical_turns WHERE turn_request_id = ?`,
-        [permit.turnRequestId],
+        [identity.turnRequestId],
       );
       if (!row) {
         // Unreachable since v24: a turn cannot be deleted, so a genuinely issued permit always
         // names a row. Recorded as unreachable rather than claimed as a guard — no test can kill
         // it, and a falsifiability row for it would report coverage that does not exist.
         return deny(ReasonCode.CONFLICT, "no turn was ever claimed under this id", {
-          turnRequestId: permit.turnRequestId,
+          turnRequestId: identity.turnRequestId,
         });
       }
-      if (row.target_actor_id !== permit.targetActorId || row.prompt_digest !== permit.promptDigest) {
+      if (row.target_actor_id !== identity.targetActorId || row.prompt_digest !== identity.promptDigest) {
         return deny(
           ReasonCode.CONVERSATION_TURN_PERMIT_MISMATCH,
           "this permit does not describe the turn it names",
-          { turnRequestId: permit.turnRequestId },
+          { turnRequestId: identity.turnRequestId },
         );
       }
 
@@ -654,7 +716,7 @@ export class ConversationTurnCoordinator {
       );
       if (already) {
         const identical =
-          already.turn_request_id === permit.turnRequestId &&
+          already.turn_request_id === identity.turnRequestId &&
           already.observed_outcome === observation.outcome &&
           already.evidence_digest === observation.evidenceDigest &&
           already.reason_code === observation.reasonCode;
@@ -665,11 +727,11 @@ export class ConversationTurnCoordinator {
           // rather than believing evidence landed that did not.
           return deny(
             ReasonCode.CONVERSATION_TURN_RECEIPT_REUSED,
-            already.turn_request_id === permit.turnRequestId
+            already.turn_request_id === identity.turnRequestId
               ? "this receipt id already carries different evidence on this turn"
               : "this receipt id is already bound to a different turn",
             {
-              turnRequestId: permit.turnRequestId,
+              turnRequestId: identity.turnRequestId,
               authority: observation.authority,
               receiptId: observation.receiptId,
             },
@@ -677,7 +739,7 @@ export class ConversationTurnCoordinator {
         }
         // The same receipt redelivered is a no-op, not a second opinion. Without this a retrying
         // transport manufactures a disagreement with itself and quarantines the conversation.
-        return allow(ReasonCode.OK, this.materialization(permit.turnRequestId));
+        return allow(ReasonCode.OK, this.materialization(identity.turnRequestId));
       }
 
       // Past this line every failure throws, because `Db.tx` commits a body that returns a
@@ -687,7 +749,7 @@ export class ConversationTurnCoordinator {
         kind: "CONVERSATION_TURN_OBSERVED",
         actor: row.target_actor_id,
         evidence: {
-          turnRequestId: permit.turnRequestId,
+          turnRequestId: identity.turnRequestId,
           outcome: observation.outcome,
           authority: observation.authority,
           receiptId: observation.receiptId,
@@ -699,14 +761,14 @@ export class ConversationTurnCoordinator {
       // computed columns still described the set without it — measured on a review head, where a
       // directly inserted completion left the turn reading NEVER_ADMITTED / CONSISTENT, so the
       // doctor stayed green and the quarantine never engaged.
-      return this.db.materializeTurn(this.#materialization, { turnRequestId: permit.turnRequestId }, () => {
+      return this.db.materializeTurn(this.#materialization, { turnRequestId: identity.turnRequestId }, () => {
         this.db.run(
           `INSERT INTO canonical_turn_observations
              (turn_request_id, observed_outcome, observing_authority, receipt_id,
               evidence_digest, reason_code, observed_at, audit_event_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            permit.turnRequestId,
+            identity.turnRequestId,
             observation.outcome,
             observation.authority,
             observation.receiptId,
@@ -716,8 +778,97 @@ export class ConversationTurnCoordinator {
             audited.value,
           ],
         );
-        return allow(ReasonCode.OK, this.materialize(permit.turnRequestId));
+        return allow(ReasonCode.OK, this.materialize(identity.turnRequestId));
       });
+    });
+  }
+
+  /**
+   * Every turn a reconciler still needs to ask a target about, with the identity a lookup needs.
+   *
+   * The read half of contract 6. `unresolvedAcrossActors` answers a person and omits
+   * `promptDigest`/`bindingGeneration` because a person does not need them to decide; a
+   * reconciler's whole job is comparing them, so this exposes what that one omits.
+   */
+  unresolvedIdentities(): ReadonlyArray<ReceiptLookupQuery & { claimedAt: string }> {
+    return this.db
+      .all<{
+        turn_request_id: string;
+        target_actor_id: string;
+        prompt_digest: string;
+        binding_generation: number;
+        claimed_at: string;
+      }>(
+        `SELECT turn_request_id, target_actor_id, prompt_digest, binding_generation, claimed_at
+           FROM canonical_turns WHERE lifecycle_state = 'IN_DOUBT' ORDER BY claimed_at ASC`,
+      )
+      .map((row) => ({
+        turnRequestId: row.turn_request_id,
+        targetActorId: row.target_actor_id,
+        promptDigest: row.prompt_digest,
+        bindingGeneration: row.binding_generation,
+        claimedAt: row.claimed_at,
+      }));
+  }
+
+  /**
+   * Settles a turn from a receipt a reconciler harvested — the write half of contract 6, and the
+   * one entry point that does not take a `TurnPermit`.
+   *
+   * Every port above requires one because a permit is proof that the transaction which claimed the
+   * turn also issued this call — a discipline that only holds inside the process that ran
+   * `claim()`. A reconciler exists precisely because that process may be gone: `TurnPermit`'s own
+   * docstring says settling a turn after a restart is the reconciler's job, "not a resurrected
+   * permit", and `issuance` is signed with a key that dies with its coordinator instance. Nothing
+   * here can produce or check one; building a workaround would only be a second, weaker permit
+   * under a different name.
+   *
+   * What replaces it is reading `canonical_turns` directly and comparing every field the identity
+   * carries — including `bindingGeneration`, which `TurnPermit` does not sign because inside one
+   * process it never changes. Across a restart it can, and contract 1 exists exactly so a receipt
+   * minted under generation N+1 is told apart from a claim made under generation N: matching on
+   * `turnRequestId` alone would let that receipt materialize a turn it was never asked about.
+   */
+  reconcileWithReceipt(
+    query: ReceiptLookupQuery,
+    receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
+  ): Decision<TurnMaterialization> {
+    return this.db.tx(() => {
+      const row = this.db.get<{
+        target_actor_id: string;
+        prompt_digest: string;
+        binding_generation: number;
+      }>(
+        `SELECT target_actor_id, prompt_digest, binding_generation FROM canonical_turns
+          WHERE turn_request_id = ?`,
+        [query.turnRequestId],
+      );
+      if (!row) {
+        return deny(ReasonCode.NOT_FOUND, "no turn was ever claimed under this id", {
+          turnRequestId: query.turnRequestId,
+        });
+      }
+      // Deliberately not also checking `target_actor_id` / `prompt_digest` here: `#observeVerified`
+      // re-reads this same row and checks exactly those two fields against the identity it is
+      // given, below. A second copy of that comparison would be untested by construction — it
+      // could never fail a test on its own, because the downstream check would catch whatever it
+      // missed — and a check nothing can kill reports coverage it does not have.
+      if (row.binding_generation !== query.bindingGeneration) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_GENERATION,
+          "this receipt names a different CEO generation than the one that claimed this turn",
+          {
+            turnRequestId: query.turnRequestId,
+            claimedGeneration: row.binding_generation,
+            receiptGeneration: query.bindingGeneration,
+          },
+        );
+      }
+      return this.#observeVerified(
+        { turnRequestId: query.turnRequestId, targetActorId: query.targetActorId, promptDigest: query.promptDigest },
+        { ...receipt, authority: "HERMES_TARGET" },
+        "AFTER",
+      );
     });
   }
 
