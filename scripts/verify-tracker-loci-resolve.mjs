@@ -532,12 +532,54 @@
  *   punctuation" turned out to be a substitute for a real signal.
  *
  *   Corpus diff (fresh snapshot, before/after, every changed line checked against the real issue
- *   text): none. Each of the three fixes above was proven by a constructed counterexample against
- *   real tracked files (`.gitignore`, `src/daemon/agentcpd.ts`, `src/bootstrap/hermes-bootstrap.ts`)
- *   rather than a corpus shift, because none of these three defects happened to match anything in
- *   the corpus at the time of this snapshot — which is itself the lesson of finding one and three
- *   this round: a clean corpus diff proves the corpus does not currently contain the shape, not
- *   that the shape is handled.
+ *   text): one removed (`README:89`, #510 — no dot, no slash, the same shape as `localhost`/`HTTP`,
+ *   correctly no longer extracted), zero added. Each of the three fixes above was *also* proven by
+ *   a constructed counterexample against real tracked files (`.gitignore`, `src/daemon/agentcpd.ts`,
+ *   `src/bootstrap/hermes-bootstrap.ts`) rather than relying on the corpus shift alone — necessary,
+ *   because the corpus is silent on two of the three findings (nothing open right now pairs a bare
+ *   word with a line number the way `localhost:3000` does, and no open fenced citation happens to
+ *   quote a bare statement the way `return null;` does), which is itself the lesson of findings one
+ *   and three this round: a clean corpus diff proves the corpus does not currently contain the
+ *   shape, not that the shape is handled. The second fix's own corpus diff briefly showed a
+ *   different citation (#630, `src/runtime/hermes-ceo.ts:341`) flip ADVISORY→STALE before this
+ *   paragraph was written — investigating *why*, rather than trusting the flip, is what found round
+ *   12's desync bug below; see that section for the corrected, final diff for this fix.
+ *
+ * ## Round 12: the property the round 11 fix actually needed, not just the one instance a corpus
+ * citation happened to expose
+ *
+ *   Round 11's own closing judgment named the honest limit: the newline-preserving fix to
+ *   `stripSlashComments`/`stripSqlComments`/`stripStrings` was verified against the one real corpus
+ *   citation that exposed it (#630), not against the *general* claim that every stripper preserves
+ *   `text.split("\n").length` for any input — and a corpus diff cannot speak to shapes the corpus
+ *   does not currently contain, the same lesson round 11 itself had just learned the hard way.
+ *
+ *   `blankKeepingNewlines`, `stripSlashComments`, `stripHashComments`, `stripSqlComments`,
+ *   `stripStrings`, and `stripTemplateLiteralProse` moved to `./lib/tracker-loci-strip.mjs` — the
+ *   same move `collapse-trailer-paragraphs.mjs` made for the same reason — so a test could import
+ *   and drive them directly instead of only ever seeing them through whatever one issue's citation
+ *   happened to reach. `tests/unit/tracker-loci-strip-invariants.test.ts` asserts the property
+ *   itself, every stripper against every adversarial input, not just the pairing each input was
+ *   built for: nested template literals, an odd (unbalanced) quote count, an escaped multi-line
+ *   string, a `/* ... *\/` spanning many lines, and a `//`/`--`/`#` comment at end of file with no
+ *   trailing newline.
+ *
+ *   Building it found a second, real desync — not the one it was written to confirm.
+ *   `stripTemplateLiteralProse`'s escape-sequence branch blanked *every* `\X` pair to two spaces
+ *   unconditionally, on the theory that neither character is a symbol reference. True for an
+ *   ordinary escape (`\"`, `\\`); false for a template literal's own line-continuation (a backslash
+ *   followed by a literal newline, valid JS, the same escape an ordinary string uses) — blanking
+ *   that pair to `"  "` ate the newline along with the backslash, shifting every line after it out
+ *   of sync with the real file, exactly the class of bug round 11 fixed for the other three
+ *   strippers and missed here because nothing in the real corpus at the time happened to cite a
+ *   file with this shape in it. Fixed by checking which character was actually escaped: a newline
+ *   is re-emitted as a newline; anything else still becomes two blank spaces, unchanged.
+ *
+ *   Verified both directions on the same fresh corpus snapshot used for round 11's own diff: zero
+ *   change. No open issue currently quotes content from a file whose citation window crosses a
+ *   template literal with a line-continuation escape in its prose text — the property test, not
+ *   the corpus, is what proves this fix and the one before it, the same distinction this round
+ *   exists to make concrete rather than merely assert.
  *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
@@ -545,6 +587,13 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  stripHashComments,
+  stripSlashComments,
+  stripSqlComments,
+  stripStrings,
+  stripTemplateLiteralProse,
+} from "./lib/tracker-loci-strip.mjs";
 
 const defaultRepoRoot = fileURLToPath(new URL("..", import.meta.url));
 const repoRoot = resolve(
@@ -601,129 +650,13 @@ const countLines = (text) => {
 };
 
 /**
- * Blanks every non-newline character in a matched span, for use as a `String.replace` callback.
- * Round 11: `stripSlashComments`/`stripSqlComments`/`stripStrings` used to replace a whole matched
- * span — a block comment or a quoted string, either of which can legitimately span several lines
- * — with one fixed short string (`" "`, `'""'`, `"''"`). That collapses every internal newline the
- * match contained, shifting every line *after* the match one-for-one out of sync with the real
- * file — invisible for as long as `readCode`'s only consumer (`symbolPattern.test`) never asked
- * "which line", only "does this appear anywhere". It stopped being invisible the moment a second
- * consumer *did* ask which line: the content-search window (below) slices `readCode`'s output by
- * the cited line number, and a multi-line `/** ... *\/` docstring ahead of the cited line silently
- * moved every line after it, making the window look at the wrong span of the file entirely. Found
- * against the real corpus, not a constructed case — see the round 11 commit. Preserving every
- * newline (blanking everything else) keeps both properties at once: the match still cannot fuse
- * the tokens on either side of it (there is exactly as much blank space as there was match), and
- * every line number downstream of it still means the same real line it always did.
+ * `blankKeepingNewlines`, `stripSlashComments`, `stripHashComments`, `stripSqlComments`,
+ * `stripStrings`, and `stripTemplateLiteralProse` live in `./lib/tracker-loci-strip.mjs` now,
+ * not here — round 12 moved them so a property test could import them directly (see that
+ * file's own docstring for why, and `tests/unit/tracker-loci-strip-invariants.test.ts` for the
+ * property itself: every one of them has to preserve `text.split("\n").length`, because their
+ * output is sliced by line number downstream, not only searched as a whole).
  */
-const blankKeepingNewlines = (match) => match.replace(/[^\n]/g, " ");
-
-/**
- * Removes `//` line comments and `/* ... *\/` block comments before a symbol search, so a symbol
- * mentioned only in prose about the code — a comment explaining what a mechanism used to do, or
- * warning about a related concept — does not count toward it. A comment mentioning a word is a
- * sentence about it, not code that holds it.
- *
- * `://` is protected explicitly so a URL inside a comment or string (`https://…`) is not itself
- * misread as the start of a line comment.
- */
-const stripSlashComments = (text) =>
-  text
-    .replace(/\/\*[\s\S]*?\*\//g, blankKeepingNewlines)
-    .split("\n")
-    .map((line) => line.replace(/(?<!:)\/\/.*$/, ""))
-    .join("\n");
-
-/** `#` line comments — Python, shell, and YAML, the three `#`-comment extensions this checks. */
-const stripHashComments = (text) =>
-  text
-    .split("\n")
-    .map((line) => line.replace(/(?<!:)#.*$/, ""))
-    .join("\n");
-
-/** SQL's own comment forms: `--` to end of line, and the same `/* ... *\/` block form as JS. */
-const stripSqlComments = (text) =>
-  text
-    .replace(/\/\*[\s\S]*?\*\//g, blankKeepingNewlines)
-    .split("\n")
-    .map((line) => line.replace(/--.*$/, ""))
-    .join("\n");
-
-/**
- * Removes the contents of single- and double-quoted string literals (the opening and closing
- * quote characters are kept, so this does not fuse the tokens on either side together). `"utf8"`
- * as an encoding argument is not a citation's enforcing symbol resolving — it is a string that
- * happens to spell the same word, and without this a row pairing any file with any common string
- * constant used in it would pass. Applies across every language this check handles: Python, shell,
- * YAML, and SQL all use the same two quote characters for a string, and JS/TS's own `"`/`'`
- * strings are the same shape.
- *
- * A measured gap, not a guessed one: a regex literal with a quote inside a character class
- * (`` /(["\\])/g `` — this repository has one, in `cli-adapters.ts`) is not told apart from a real
- * string boundary, because this is a text pass and does not know a regex literal from division.
- * Found while verifying an earlier fix: it did not change the primary verdict for any cited file,
- * only widened the "it also appears in" diagnostic aside on an unrelated file to include a false
- * hit. That aside is disclosed as a heuristic for exactly this reason — a pointer to go look, not
- * a second verified fact.
- */
-const stripStrings = (text) =>
-  text
-    .replace(/"(?:[^"\\]|\\.)*"/g, (m) => `"${blankKeepingNewlines(m.slice(1, -1))}"`)
-    .replace(/'(?:[^'\\]|\\.)*'/g, (m) => `'${blankKeepingNewlines(m.slice(1, -1))}'`);
-
-/**
- * Template literals (`` `...` ``) hold two different things at once: literal text the author
- * wrote, and `${…}` expressions that are ordinary code. Stripping the whole literal (the earlier
- * approach) throws the code away with the prose; leaving it alone (the approach before that) reads
- * `` `session lifecycle ${a} -> ${b} is not legal` `` as *containing* the symbol `legal`, when
- * `legal` is prose the author wrote, not a reference to anything.
- *
- * So a template literal is walked, not stripped: everything between backticks that is *not*
- * inside a `${…}` becomes blank space, and a `${…}` span — brace-balanced, so a nested object
- * literal inside the expression does not end it early — passes through untouched, to be searched
- * as the real code it is. A stray, unterminated backtick (this is a text pass, not a lexer, so one
- * can appear from a markdown code span or a mismatched edit elsewhere) stops the walk at end of
- * string rather than consuming the rest of the file as one giant "literal".
- */
-const stripTemplateLiteralProse = (text) => {
-  let out = "";
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] !== "`") {
-      out += text[i];
-      i++;
-      continue;
-    }
-    out += "`";
-    i++;
-    while (i < text.length && text[i] !== "`") {
-      if (text[i] === "\\" && i + 1 < text.length) {
-        out += "  "; // an escape sequence in literal text; neither char is a symbol reference
-        i += 2;
-        continue;
-      }
-      if (text[i] === "$" && text[i + 1] === "{") {
-        let depth = 1;
-        const start = i;
-        i += 2;
-        while (i < text.length && depth > 0) {
-          if (text[i] === "{") depth++;
-          else if (text[i] === "}") depth--;
-          i++;
-        }
-        out += text.slice(start, i); // the ${...} expression, verbatim: this is real code
-        continue;
-      }
-      out += text[i] === "\n" ? "\n" : " ";
-      i++;
-    }
-    if (i < text.length) {
-      out += "`";
-      i++;
-    }
-  }
-  return out;
-};
 
 /**
  * What "does not appear as code" means, per language — see the round-4 note beside this
