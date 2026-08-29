@@ -1097,39 +1097,27 @@ const GUARDS = [
   {
     // #639 contract 6's reconciler entry point has no permit to check, unlike every other
     // settlement port — it settles turns whose claiming process may be gone. Without this, a
-    // reconciled turnRequestId that names no row throws a raw TypeError reading `undefined
-    // .binding_generation` instead of returning a Decision, and the caller sees an unhandled
-    // exception rather than an ordinary refusal.
-    what: "a reconciler cannot settle a turn that was never claimed",
-    file: "src/conversation/turn-coordinator.ts",
-    find: "      if (!row) {\n        return deny(ReasonCode.NOT_FOUND, \"no turn was ever claimed under this id\", {\n          turnRequestId: query.turnRequestId,\n        });\n      }",
-    replace: "      if (false) {\n        return deny(ReasonCode.NOT_FOUND, \"no turn was ever claimed under this id\", {\n          turnRequestId: query.turnRequestId,\n        });\n      }",
-    killedBy: [
-      "tests/unit/a-reconciler-settles-without-a-permit.test.ts::refuses when no turn was ever claimed under this id",
-    ],
-  },
-  {
     // Contract 1's whole point, landing here: a turn claimed under one CEO generation is a
     // different CEO's work from a receipt minted under the next. Without this a reconciler
     // completes a turn on a receipt that was never about this claim.
     what: "a receipt naming a different CEO generation cannot complete the turn it names",
     file: "src/conversation/turn-coordinator.ts",
-    find: "      if (row.binding_generation !== query.bindingGeneration) {",
+    find: "      if (row.binding_generation !== attested.bindingGeneration) {",
     replace: "      if (false) {",
     killedBy: [
-      "tests/unit/a-reconciler-settles-without-a-permit.test.ts::refuses to complete a turn when the receipt names a different CEO generation than the one that claimed it",
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn on a receipt naming a different CEO generation, and keeps sweeping the rest",
     ],
   },
   {
-    // Sol's review of #691: the query the reconciler sends is built from the row it is about to
-    // check, so an identity check built from that query instead of the port's answer compares the
-    // database against itself and cannot fail. Reverting `result.targetActorId` to
-    // `query.targetActorId` here reintroduces exactly that — a receipt attesting to the wrong
-    // actor settles the turn anyway, because nothing but the query (self-sourced) was checked.
+    // Sol's review of #691, round 1: the query the reconciler sends is built from the row it is
+    // about to check, so an identity check built from that query instead of the port's answer
+    // compares the database against itself and cannot fail. Reverting `result.targetActorId` to
+    // `candidate.targetActorId` here reintroduces exactly that — a receipt attesting to the wrong
+    // actor settles the turn anyway, because nothing but the candidate (self-sourced) was checked.
     what: "the reconciler checks the actor the receipt attests to, not the actor it already knew",
-    file: "src/conversation/turn-reconciler.ts",
-    find: "          targetActorId: result.targetActorId,",
-    replace: "          targetActorId: query.targetActorId,",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "targetActorId: result.targetActorId,",
+    replace: "targetActorId: candidate.targetActorId,",
     killedBy: [
       "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong actor, even though the query it was asked under was correct",
     ],
@@ -1137,11 +1125,25 @@ const GUARDS = [
   {
     // Same defect, the other content field the tautology swallowed.
     what: "the reconciler checks the prompt digest the receipt attests to, not the one it already knew",
-    file: "src/conversation/turn-reconciler.ts",
-    find: "          promptDigest: result.promptDigest,",
-    replace: "          promptDigest: query.promptDigest,",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "promptDigest: result.promptDigest,",
+    replace: "promptDigest: candidate.promptDigest,",
     killedBy: [
       "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong prompt",
+    ],
+  },
+  {
+    // Sol's review of #691, round 2: `reconcileWithReceipt` used to be public and receipt-shaped,
+    // so anyone holding the coordinator could read a turn's identity from `unresolvedIdentities()`
+    // and hand it back with a fabricated receipt — no `ReceiptPort` ever consulted. Restoring a
+    // public method of that shape (taking a receipt as a plain argument) reopens exactly that; the
+    // forgery test proves no such method exists to call.
+    what: "no public method accepts a receipt from a caller — only this coordinator's own port can produce one",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "  async reconcileUnresolved(): Promise<{",
+    replace: "  reconcileWithReceipt(query, receipt) { return this.#settleFromReceipt(query.turnRequestId, query, receipt); }\n\n  async reconcileUnresolved(): Promise<{",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::cannot be forged: reading unresolvedIdentities() and re-running the sweep never settles a turn the production port never receipted",
     ],
   },
 ];

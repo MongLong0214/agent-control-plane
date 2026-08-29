@@ -124,6 +124,8 @@ export interface DaemonOptions {
    * supervisor's restart.
    */
   bootstrapRecheckIntervalMs?: number;
+  /** How often the daemon asks its receipt port about every unresolved turn (#639 contract 6). */
+  turnReconcileIntervalMs?: number;
 }
 
 /**
@@ -951,6 +953,9 @@ export class Daemon {
 
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
+      // #639 contract 6, at the moment it matters most: right after a restart, before the first
+      // periodic sweep would otherwise get to it.
+      await this.cp.conversation.reconcileUnresolved();
       this.writeHealth(report);
       this.startTimers();
       this.clearCrashLoop();
@@ -1300,6 +1305,18 @@ export class Daemon {
     }, capacityRefreshMs);
     capacitySensor.unref();
     this.#timers.push(capacitySensor);
+
+    // #639 contract 6's active half: ask, on a schedule, rather than wait to be told. Before
+    // #638 this always asks a port that answers `found: false` — a real sweep that genuinely
+    // runs and finds nothing, not the absence of one.
+    const turnReconcileMs = this.options.turnReconcileIntervalMs ?? 60_000;
+    const turnReconcile = setInterval(() => {
+      void this.runPeriodic("turn_reconcile", async () => {
+        await this.cp.conversation.reconcileUnresolved();
+      });
+    }, turnReconcileMs);
+    turnReconcile.unref();
+    this.#timers.push(turnReconcile);
 
     if (this.options.buzz) {
       const delivery = setInterval(() => {

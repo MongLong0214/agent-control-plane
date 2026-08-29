@@ -117,6 +117,14 @@ export interface ReceiptPort {
   lookup(query: ReceiptLookupQuery): Promise<ReceiptLookupResult> | ReceiptLookupResult;
 }
 
+/**
+ * The only real deployment shape before #638: every lookup answers `found: false`.
+ *
+ * The coordinator's default, so composing it without a real port yet is the same visible,
+ * intentional choice everywhere — not an omission a reader has to notice by its absence.
+ */
+export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = { lookup: () => ({ found: false }) };
+
 export interface TurnObservation {
   readonly outcome: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
   readonly authority:
@@ -250,6 +258,11 @@ export class ConversationTurnCoordinator {
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
+    /**
+     * Where `reconcileUnresolved()` asks about a receipt. Bound once, here, rather than accepted
+     * as an argument anywhere a receipt is settled — see that method's docstring for why.
+     */
+    private readonly receiptPort: ReceiptPort = NEVER_FOUND_RECEIPT_PORT,
   ) {
     this.#materialization = db.claimTurnMaterializationAuthority();
   }
@@ -800,8 +813,11 @@ export class ConversationTurnCoordinator {
    * Every turn a reconciler still needs to ask a target about, with the identity a lookup needs.
    *
    * The read half of contract 6. `unresolvedAcrossActors` answers a person and omits
-   * `promptDigest`/`bindingGeneration` because a person does not need them to decide; a
-   * reconciler's whole job is comparing them, so this exposes what that one omits.
+   * `promptDigest`/`bindingGeneration` because a person does not need them to decide;
+   * `reconcileUnresolved`'s whole job is comparing them, so this exposes what that one omits.
+   * Read-only, and harmless on its own: naming which turns are open is not the write half of
+   * contract 6, and nothing here accepts an externally supplied receipt for one of them — see
+   * `reconcileUnresolved`.
    */
   unresolvedIdentities(): ReadonlyArray<ReceiptLookupQuery & { claimedAt: string }> {
     return this.db
@@ -825,60 +841,117 @@ export class ConversationTurnCoordinator {
   }
 
   /**
-   * Settles a turn from a receipt a reconciler harvested — the write half of contract 6, and the
-   * one entry point that does not take a `TurnPermit`.
+   * Sweeps every `IN_DOUBT` turn once, asking `this.receiptPort` about each — the write half of
+   * contract 6, and the one settlement path that does not take a `TurnPermit`.
    *
-   * Every port above requires one because a permit is proof that the transaction which claimed the
-   * turn also issued this call — a discipline that only holds inside the process that ran
-   * `claim()`. A reconciler exists precisely because that process may be gone: `TurnPermit`'s own
-   * docstring says settling a turn after a restart is the reconciler's job, "not a resurrected
-   * permit", and `issuance` is signed with a key that dies with its coordinator instance. Nothing
-   * here can produce or check one; building a workaround would only be a second, weaker permit
-   * under a different name.
+   * A permit proves the transaction that claimed the turn also issued this call, a discipline
+   * that only holds inside the process that ran `claim()`. Reconciliation exists precisely
+   * because that process may be gone: `TurnPermit`'s own docstring says settling a turn after a
+   * restart is the reconciler's job, "not a resurrected permit", and `issuance` is signed with a
+   * key that dies with its coordinator instance.
    *
-   * What replaces it is reading `canonical_turns` directly and comparing every field the identity
-   * carries — including `bindingGeneration`, which `TurnPermit` does not sign because inside one
-   * process it never changes. Across a restart it can, and contract 1 exists exactly so a receipt
-   * minted under generation N+1 is told apart from a claim made under generation N: matching on
-   * `turnRequestId` alone would let that receipt materialize a turn it was never asked about.
+   * A review of the first version of this method (#691) found what that gap actually costs: it
+   * took a receipt as a plain argument, `{turnRequestId, targetActorId, promptDigest,
+   * bindingGeneration}` and `{outcome, receiptId, evidenceDigest, reasonCode}`, both ordinary
+   * data. Anyone holding this coordinator could read a turn's identity from
+   * `unresolvedIdentities()`, hand it straight back with a fabricated receipt, and record a
+   * `HERMES_TARGET` completion that no target ever attested — the identity fix from the same
+   * review closed a tautology in *which* fields were compared, but a caller supplying both the
+   * query and the receipt satisfies any comparison between them. And the settlement it forges is
+   * close to irreversible: `COMPLETED` cannot be walked back through the ordinary API, so a forged
+   * one permanently blocks a retry of a turn that may never have run.
+   *
+   * What closes it is that the receipt never arrives as an argument at all. `this.receiptPort` is
+   * bound once, at construction — by the composition root, the one place `claimTurnMaterializationAuthority`
+   * already makes singular, since a second coordinator on the same database throws before it
+   * could bind a different port. A caller can still read `unresolvedIdentities()`, but the only
+   * receipt this method will ever act on is one *this instance's own port* returned to *this
+   * instance's own lookup call* — there is no public entry point left that accepts one from
+   * outside.
+   *
+   * One call per turn, not one `Promise.all`: a lookup that throws must not stop the sweep from
+   * asking about the rest, so each is awaited and caught independently. A lookup failure and a
+   * `found: false` answer are not distinguished in the counts below — both leave the turn exactly
+   * where it was, `IN_DOUBT` and visible as `OUTCOME_UNKNOWN`, and contract 6 forbids treating
+   * either as evidence for re-execution.
    */
-  reconcileWithReceipt(
-    query: ReceiptLookupQuery,
+  async reconcileUnresolved(): Promise<{
+    readonly swept: number;
+    readonly settled: number;
+    readonly unresolved: number;
+  }> {
+    const candidates = this.unresolvedIdentities();
+    let settled = 0;
+    for (const candidate of candidates) {
+      let result: ReceiptLookupResult;
+      try {
+        result = await this.receiptPort.lookup({
+          turnRequestId: candidate.turnRequestId,
+          targetActorId: candidate.targetActorId,
+          promptDigest: candidate.promptDigest,
+          bindingGeneration: candidate.bindingGeneration,
+        });
+      } catch {
+        continue;
+      }
+      if (!result.found) continue;
+
+      // Every identity field checked below comes from `result` — the port's answer — not from
+      // `candidate`. `candidate` is this process's own row; comparing it back against that same
+      // row proves nothing about the receipt. Only `turnRequestId` is carried over, because that
+      // names which row to check and is not itself something the receipt attests to.
+      const decision = this.#settleFromReceipt(
+        candidate.turnRequestId,
+        { targetActorId: result.targetActorId, promptDigest: result.promptDigest, bindingGeneration: result.bindingGeneration },
+        { outcome: result.outcome, receiptId: result.receiptId, evidenceDigest: result.evidenceDigest, reasonCode: result.reasonCode },
+      );
+      if (decision.allowed) settled += 1;
+      // A denial here — wrong generation, mismatched identity, or an already-settled turn a
+      // concurrent settlement reached first — leaves the turn exactly as it was. It is not
+      // re-thrown: one candidate's refusal must not stop the sweep from asking about the rest.
+    }
+    return { swept: candidates.length, settled, unresolved: candidates.length - settled };
+  }
+
+  /**
+   * `reconcileUnresolved`'s settlement half, kept private so a receipt can only ever reach it from
+   * this coordinator's own `this.receiptPort.lookup()` call — never from a caller-supplied
+   * argument. See that method's docstring for why a public version of this was #691's finding.
+   */
+  #settleFromReceipt(
+    turnRequestId: string,
+    attested: { targetActorId: string; promptDigest: string; bindingGeneration: number },
     receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
   ): Decision<TurnMaterialization> {
     return this.db.tx(() => {
-      const row = this.db.get<{
-        target_actor_id: string;
-        prompt_digest: string;
-        binding_generation: number;
-      }>(
-        `SELECT target_actor_id, prompt_digest, binding_generation FROM canonical_turns
-          WHERE turn_request_id = ?`,
-        [query.turnRequestId],
+      const row = this.db.get<{ binding_generation: number }>(
+        `SELECT binding_generation FROM canonical_turns WHERE turn_request_id = ?`,
+        [turnRequestId],
       );
       if (!row) {
-        return deny(ReasonCode.NOT_FOUND, "no turn was ever claimed under this id", {
-          turnRequestId: query.turnRequestId,
-        });
+        // Unreachable through this method's one caller: `reconcileUnresolved` sources
+        // `turnRequestId` from `unresolvedIdentities()`, which reads this same table, and turns
+        // are never deleted (canonical_turns_identity_immutable). Kept as a refusal rather than an
+        // assumption — a private method with one caller today is still a method a later caller
+        // could reach differently — and recorded as unreachable rather than claimed as a guard: no
+        // test can kill it, and a falsifiability row for it would report coverage that does not
+        // exist.
+        return deny(ReasonCode.NOT_FOUND, "no turn was ever claimed under this id", { turnRequestId });
       }
       // Deliberately not also checking `target_actor_id` / `prompt_digest` here: `#observeVerified`
       // re-reads this same row and checks exactly those two fields against the identity it is
       // given, below. A second copy of that comparison would be untested by construction — it
       // could never fail a test on its own, because the downstream check would catch whatever it
       // missed — and a check nothing can kill reports coverage it does not have.
-      if (row.binding_generation !== query.bindingGeneration) {
+      if (row.binding_generation !== attested.bindingGeneration) {
         return deny(
           ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_GENERATION,
           "this receipt names a different CEO generation than the one that claimed this turn",
-          {
-            turnRequestId: query.turnRequestId,
-            claimedGeneration: row.binding_generation,
-            receiptGeneration: query.bindingGeneration,
-          },
+          { turnRequestId, claimedGeneration: row.binding_generation, receiptGeneration: attested.bindingGeneration },
         );
       }
       return this.#observeVerified(
-        { turnRequestId: query.turnRequestId, targetActorId: query.targetActorId, promptDigest: query.promptDigest },
+        { turnRequestId, targetActorId: attested.targetActorId, promptDigest: attested.promptDigest },
         { ...receipt, authority: "HERMES_TARGET" },
         "AFTER",
       );

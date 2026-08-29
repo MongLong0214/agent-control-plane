@@ -10,7 +10,7 @@ import { ClaimRegistry } from "../claims/claim-registry.ts";
 import { ContinuityKernel } from "../continuity/continuity-kernel.ts";
 import { CtoLifecycle, type CtoPreference } from "../cto/cto-lifecycle.ts";
 import { ProductionGate } from "../ceo/production-gate.ts";
-import { ConversationTurnCoordinator } from "../conversation/turn-coordinator.ts";
+import { ConversationTurnCoordinator, NEVER_FOUND_RECEIPT_PORT } from "../conversation/turn-coordinator.ts";
 import { AuditLog } from "../db/audit.ts";
 import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
@@ -366,7 +366,15 @@ export class ControlPlane {
     // hands back exactly what this attempt took.
     try {
       this.audit = new AuditLog(this.db, this.clock);
-      this.conversation = new ConversationTurnCoordinator(this.db, this.clock, this.audit);
+      // The always-empty port, named explicitly rather than left to the default: this is the
+      // real, running state before #638 supplies a port that can answer `found: true` — a sweep
+      // that runs and asks, and today always hears nothing back.
+      this.conversation = new ConversationTurnCoordinator(
+        this.db,
+        this.clock,
+        this.audit,
+        NEVER_FOUND_RECEIPT_PORT,
+      );
       this.artifacts = new ArtifactStore(this.db, this.clock);
       // Claimed immediately: issuance succeeds once per database, so claiming here is what
       // makes every later claim — by any component that reaches this store — fail.
