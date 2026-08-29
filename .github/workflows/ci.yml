@@ -1,3 +1,12 @@
+# `project-ci` here is this workflow's own display name (the Actions-tab label) — it has never
+# been a job id or a check-run name in this file, so it is not at risk from the defect below by
+# itself. The defect is generic, though: GitHub always names a check run after the *job* (or a
+# job's explicit `name:`), never the workflow, and always appends matrix values to whichever name
+# that job has. `verify-matrix` hit this because branch protection, `docs/ops/branch-protection.md`,
+# and `tests/e2e/real-component-integration.test.ts` all pin the literal string `verify` — the full
+# audit of what depends on that string is in PR #694's body. If any *other* job here (or
+# `verify-gate` itself) is ever given a matrix while something still depends on its bare name, it
+# breaks the identical way: the name that dependants expect stops being producible, silently.
 name: project-ci
 on:
   push:
