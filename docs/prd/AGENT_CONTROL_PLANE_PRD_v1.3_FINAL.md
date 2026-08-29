@@ -913,7 +913,7 @@ Managed Work는 DB/Git Evidence로 강하게 복구한다. DIRECT 개인비서 �
     {
       "identity": "github:owner/repo",
       "repositoryRole": "primary",
-      "baseBranch": "dev",
+      "baseBranch": "main",
       "baseHead": "...",
       "candidateHead": "...",
       "treeDigest": "sha256:...",
