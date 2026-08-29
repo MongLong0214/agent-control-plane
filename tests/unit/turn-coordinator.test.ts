@@ -724,7 +724,14 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     if (!second.allowed) throw new Error(`rebind refused: ${second.reasonCode}`);
     expect(second.value.bindingGeneration).toBe(2);
 
-    expect(() =>
+    // A string match on the message is what let the omission through in the first place: the
+    // trigger raised the sentinel, but with no `TRIGGER_CODES` entry the denial reached this
+    // test as a raw SQLite error, and a substring match on that raw message would have passed
+    // just as happily as it would on a typed one. Asserting `isAcpError` and the reason code is
+    // what actually distinguishes a Decision-shaped refusal from a database exception no caller
+    // asked for.
+    let thrown: unknown;
+    try {
       attest(h, {
         id: "att:write-mismatch",
         targetBindingId,
@@ -732,8 +739,14 @@ describe("an attestation must name the actor's current generation (#666)", () =>
         incarnation: "inc-2",
         generation: 1,
         assignmentId: second.value.assignmentId,
-      }),
-    ).toThrow(/ATTESTATION_GENERATION_MISMATCH/);
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isAcpError(thrown)).toBe(true);
+    if (isAcpError(thrown)) {
+      expect(thrown.reasonCode).toBe(ReasonCode.ATTESTATION_GENERATION_MISMATCH);
+    }
   });
 
   it("refuses an attestation whose assignment_id names a different actor's assignment entirely", () => {

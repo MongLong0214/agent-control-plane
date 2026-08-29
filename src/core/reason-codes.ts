@@ -308,6 +308,14 @@ export const ReasonCode = {
    */
   CONVERSATION_TARGET_ATTESTATION_STALE: "CONVERSATION_TARGET_ATTESTATION_STALE",
   /**
+   * An attestation's own `binding_generation` disagrees with the assignment it names (#666
+   * round 5). The two are supposed to always agree — an honest writer reads both off the same
+   * `assignments` row — so this is `attestation_generation_matches_assignment` refusing the
+   * write, not `claim()` refusing a read: a database-level contradiction caught before it
+   * becomes a durable, self-inconsistent record.
+   */
+  ATTESTATION_GENERATION_MISMATCH: "ATTESTATION_GENERATION_MISMATCH",
+  /**
    * A source names a channel and nonce that ingress never admitted.
    *
    * `claim()` used to write whatever channel/nonce a caller supplied straight into
