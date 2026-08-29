@@ -760,25 +760,29 @@ const GUARDS = [
     // comparison back.
     what: "attestation currency is judged against the live session, not the one at binding time",
     file: "src/conversation/turn-coordinator.ts",
-    find: "            AND asg.binding_generation = att.binding_generation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
+    find: "            AND ca.current_session_incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
     replace:
-      "            AND asg.binding_generation = att.binding_generation\n            AND asg.session_id = att.executor_session_id\n            AND asg.session_incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
+      "            AND ca.current_session_incarnation = att.executor_session_incarnation\n            AND asg.session_id = att.executor_session_id\n            AND asg.session_incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
     killedBy: [
       "tests/unit/turn-coordinator.test.ts::admits a claim after a SURVIVED failover, under the live session and the generation that never changed",
     ],
   },
   {
-    // Generation is minted per role_key (`nextGeneration(roleKey)`), so a bare number is only
-    // meaningful paired with the role_key it belongs to. `bind()` can reuse one physical actor
-    // across different roles for the same verified target (#657); without this, a stale
-    // attestation for the actor's own role can be matched through an unrelated role's active
-    // assignment whose own generation counter happens to coincide.
-    what: "the active assignment consulted for currency is this actor's own role, not any active one",
+    // Two reviews found this at finer and finer grain. `role = kind` (an intermediate version of
+    // this join) scoped to the actor's own role and was still not enough: generation is minted
+    // per role_key, and `bind()` can reuse one physical actor across *different* role_keys that
+    // share one role (#657) — `WORKER:task-A` and `WORKER:task-B` both have `role = 'WORKER'` and
+    // each counts its own generation from 1. A `role`-only fix cannot tell them apart, so a stale
+    // attestation for task-A's retired generation 1 is revived by task-B's own, unrelated,
+    // generation 1. `assignment_id` has no such ambiguity — it names the exact role_key and
+    // generation together, which a bare role name (or a bare generation number) cannot.
+    what: "currency is judged on the exact assignment this attestation was made under, not on role alone",
     file: "src/conversation/turn-coordinator.ts",
-    find: "            AND asg.role = ca.kind\n",
-    replace: "",
+    find: "           JOIN assignments asg\n             ON asg.assignment_id = att.assignment_id\n            AND asg.actor_id = ca.actor_id\n            AND asg.status = 'ACTIVE'",
+    replace:
+      "           JOIN assignments asg\n             ON asg.actor_id = ca.actor_id\n            AND asg.status = 'ACTIVE'\n            AND asg.role = ca.kind",
     killedBy: [
-      "tests/unit/turn-coordinator.test.ts::refuses a stale attestation matched through a different role's generation, not its own",
+      "tests/unit/turn-coordinator.test.ts::refuses an unrelated role_key's generation reviving a retired one under the same role",
     ],
   },
   {
@@ -793,19 +797,6 @@ const GUARDS = [
     replace: "",
     killedBy: [
       "tests/unit/turn-coordinator.test.ts::refuses an attestation whose named session is no longer usable, though still the live pointer",
-    ],
-  },
-  {
-    // The non-isolated stale-generation test above changes generation *and* session/incarnation
-    // together, so this exact condition can be deleted and that test still passes — refused by
-    // the session mismatch instead. Only the isolated test, which holds session and incarnation
-    // fixed and moves generation alone, can kill this row.
-    what: "attestation currency is judged on generation specifically, not only on session identity",
-    file: "src/conversation/turn-coordinator.ts",
-    find: "            AND asg.binding_generation = att.binding_generation\n",
-    replace: "",
-    killedBy: [
-      "tests/unit/turn-coordinator.test.ts::refuses on generation alone, with the session and incarnation identical throughout",
     ],
   },
   {

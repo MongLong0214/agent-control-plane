@@ -796,8 +796,9 @@ describe("the adjudication door promotes the daemon, not just the ledger", () =>
     db.run(
       `INSERT INTO actor_target_attestations
          (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-          executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-       VALUES ('t','b','v1','AD','s','i',1,?)`,
+          executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+          attested_at)
+       VALUES ('t','b','v1','AD','s','i',1,'asg:a',?)`,
       [NOW],
     );
     // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with

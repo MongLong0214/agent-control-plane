@@ -57,9 +57,10 @@ const target = (h: Harness, name: string): string => {
   h.cp.db.run(
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-        executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-     VALUES (?, ?, 'v1', ?, ?, 'inc', 1, ?)`,
-    [`att:${name}`, `bind:${name}`, `attd:${name}`, sessionId, NOW],
+        executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+        attested_at)
+     VALUES (?, ?, 'v1', ?, ?, 'inc', 1, ?, ?)`,
+    [`att:${name}`, `bind:${name}`, `attd:${name}`, sessionId, `asg:${name}`, NOW],
   );
   return actorId;
 };

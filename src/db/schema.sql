@@ -1517,6 +1517,18 @@ CREATE TABLE IF NOT EXISTS actor_target_attestations (
   executor_session_id           TEXT NOT NULL,
   executor_session_incarnation  TEXT NOT NULL,
   binding_generation            INTEGER NOT NULL,
+  -- The specific `assignments` row this attestation was made under (#666 round 4). Neither
+  -- `role` nor `role_key` said enough on their own: generation is minted per role_key
+  -- (`BindingRegistry.nextGeneration`), and one physical actor can hold, in sequence or at once,
+  -- assignments under *different* role_keys that share one `role` (#657's reuse), each counting
+  -- its own generation from 1. A bare `role = kind` match let a stale attestation for one
+  -- role_key be revived by an unrelated role_key's identical, unrelated generation number. The
+  -- assignment id has no such ambiguity: it is minted once per bind/rebind and never reused, so
+  -- naming it *is* naming the exact role_key and generation this attestation speaks about.
+  -- Nullable for a legacy row this migration cannot back-fill (nothing writes an attestation in
+  -- production yet, so none exists to lose) — `claim()` cannot match a NULL to any assignment,
+  -- so an unfilled row is correctly read as unverifiable rather than current.
+  assignment_id                 TEXT REFERENCES assignments(assignment_id),
   attested_at                   TEXT NOT NULL,
   UNIQUE (target_binding_id, attestation_digest),
   UNIQUE (target_attestation_id, target_binding_id)

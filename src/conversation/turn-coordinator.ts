@@ -419,10 +419,8 @@ export class ConversationTurnCoordinator {
       // The most recent attestation *that is still current*, checked from the same admission
       // snapshot rather than trusted on its timestamp alone (#666): the actor must not have
       // retired, its live runtime pointer must still be the one this attestation named and that
-      // runtime must still be usable, and the *actor's own* active assignment must still be at
-      // the generation this attestation attested — reusing `assignments.binding_generation`, the
-      // fencing token every other authority decision in the system already reads
-      // (`BindingRegistry`), rather than inventing a parallel one scoped to this table alone.
+      // runtime must still be usable, and the *exact assignment* this attestation was made under
+      // must still be active.
       //
       // The session/incarnation currency is checked against `conversational_actors.current_*`
       // only, never against `assignments.session_id`/`session_incarnation`. Those columns are
@@ -433,23 +431,24 @@ export class ConversationTurnCoordinator {
       // leaves `assignments` untouched, so comparing the attestation against the binding-time
       // session made every fresh, honest attestation from a survived counterpart unmatchable —
       // the live pointer says one session, the frozen binding-time column says another, and no
-      // attestation can equal both at once. The live pointer is what "current" means here; the
-      // assignment contributes only its generation, which is the one field `switchTo` leaves
-      // unchanged on that path.
+      // attestation can equal both at once. The live pointer is what "current" means here.
       //
-      // `asg.role = ca.kind` is load-bearing, not decorative. Generation is minted per
-      // `role_key` (`nextGeneration(roleKey)`), so a bare number is only meaningful paired with
-      // the role_key it belongs to — and `bind()` can reuse one physical actor across *different*
-      // roles for the same verified target (#657). Without this, an actor whose real role
-      // (`ca.kind`, fixed at mint and never rewritten) has moved on can still be matched through
-      // some *other* active role it was later reused for, if that other role's own generation
-      // counter happens to equal the stale attestation's number — a review built exactly that:
-      // an actor's CEO assignment replaced at generation 2, the same actor then reused for a
-      // fresh `WORKER` binding at that role's own generation 1, and a generation-1 attestation
-      // for the actor's original (now-superseded) CEO identity matched through the unrelated
-      // WORKER row. `asg.role = ca.kind` restricts the join to the one active assignment that is
-      // actually this actor's own identity, so a coincidence in an unrelated role's counter
-      // cannot stand in for currency.
+      // Currency is judged on `asg.assignment_id = att.assignment_id`, not on role or generation
+      // read separately. Two reviews found the same shape twice over, at finer and finer grain:
+      // `asg.role = ca.kind` (an earlier version of this check) scoped to the actor's own role,
+      // and that still was not enough, because generation is minted per `role_key`
+      // (`nextGeneration(roleKey)`) and `bind()` can reuse one physical actor across *different*
+      // role_keys that share one `role` (#657) — `WORKER:task-A` and `WORKER:task-B` are both
+      // `role = 'WORKER'` and each counts its own generation from 1. A stale attestation for
+      // task-A's retired generation 1 was revived by task-B's own, unrelated, generation 1, and a
+      // `role`-only check cannot tell the two role_keys apart because nothing about `role` names
+      // which role_key a generation belongs to. `assignment_id` has no such ambiguity: it is
+      // minted once per bind or rebind and never reused, so naming it *is* naming the exact
+      // role_key and generation together — there is no bare number or bare role left to read
+      // separately, and so nothing left to match by coincidence. `asg.binding_generation` is read
+      // from the matched assignment itself (not compared against a copy on the attestation) for
+      // the same reason: once the assignment is pinned by id, its own generation is the only
+      // honest source for what generation this turn is claimed under.
       //
       // `sess.lifecycle = 'READY'` closes the other half of "current": the runtime-ready trigger
       // (`conversational_actors_runtime_ready`) only checks READY at the moment the pointer is
@@ -466,7 +465,7 @@ export class ConversationTurnCoordinator {
         `SELECT att.target_attestation_id AS target_attestation_id,
                 att.executor_session_id AS executor_session_id,
                 att.executor_session_incarnation AS executor_session_incarnation,
-                att.binding_generation AS binding_generation
+                asg.binding_generation AS binding_generation
            FROM actor_target_attestations att
            JOIN actor_target_bindings tb
              ON tb.target_binding_id = att.target_binding_id
@@ -475,16 +474,15 @@ export class ConversationTurnCoordinator {
            JOIN sessions sess
              ON sess.session_id = ca.current_session_id
            JOIN assignments asg
-             ON asg.actor_id = ca.actor_id
+             ON asg.assignment_id = att.assignment_id
+            AND asg.actor_id = ca.actor_id
             AND asg.status = 'ACTIVE'
-            AND asg.role = ca.kind
           WHERE att.target_binding_id = ?
             AND tb.target_actor_id = ?
             AND ca.retired_at IS NULL
             AND sess.lifecycle = 'READY'
             AND ca.current_session_id = att.executor_session_id
             AND ca.current_session_incarnation = att.executor_session_incarnation
-            AND asg.binding_generation = att.binding_generation
           ORDER BY att.attested_at DESC, att.rowid DESC
           LIMIT 1`,
         [target.target_binding_id, input.targetActorId],

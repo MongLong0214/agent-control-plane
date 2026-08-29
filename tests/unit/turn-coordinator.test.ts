@@ -78,9 +78,10 @@ const target = (h: Harness, name: string): string => {
   h.cp.db.run(
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-        executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-     VALUES (?, ?, 'v1', ?, ?, 'inc-1', 1, ?)`,
-    [`att:${name}`, `bind:${name}`, `attd:${name}`, sessionId, NOW],
+        executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+        attested_at)
+     VALUES (?, ?, 'v1', ?, ?, 'inc-1', 1, ?, ?)`,
+    [`att:${name}`, `bind:${name}`, `attd:${name}`, sessionId, `asg:${name}`, NOW],
   );
   return actorId;
 };
@@ -363,14 +364,31 @@ describe("an attestation must name the actor's current generation (#666)", () =>
    */
   const attest = (
     h: Harness,
-    input: { id: string; targetBindingId: string; sessionId: string; incarnation: string; generation: number },
+    input: {
+      id: string;
+      targetBindingId: string;
+      sessionId: string;
+      incarnation: string;
+      generation: number;
+      assignmentId: string;
+    },
   ): void => {
     h.cp.db.run(
       `INSERT INTO actor_target_attestations
          (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-          executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-       VALUES (?, ?, 'v1', ?, ?, ?, ?, ?)`,
-      [input.id, input.targetBindingId, `digest:${input.id}`, input.sessionId, input.incarnation, input.generation, NOW],
+          executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+          attested_at)
+       VALUES (?, ?, 'v1', ?, ?, ?, ?, ?, ?)`,
+      [
+        input.id,
+        input.targetBindingId,
+        `digest:${input.id}`,
+        input.sessionId,
+        input.incarnation,
+        input.generation,
+        input.assignmentId,
+        NOW,
+      ],
     );
   };
 
@@ -395,7 +413,14 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
     const actorId = actorOf(h, bound.value.roleKey);
     const targetBindingId = bindingOf(h, actorId);
-    attest(h, { id: "att:stale-gen", targetBindingId, sessionId: "sess-old", incarnation: "inc-old", generation: 1 });
+    attest(h, {
+      id: "att:stale-gen",
+      targetBindingId,
+      sessionId: "sess-old",
+      incarnation: "inc-old",
+      generation: 1,
+      assignmentId: bound.value.assignmentId,
+    });
 
     // The role failed over: revoked, then bound again under a new runtime. The old attestation is
     // left exactly where it was, naming a generation the role has moved past.
@@ -471,6 +496,7 @@ describe("an attestation must name the actor's current generation (#666)", () =>
       sessionId: "sess-fixed",
       incarnation: "inc-fixed",
       generation: first.value.bindingGeneration,
+      assignmentId: first.value.assignmentId,
     });
 
     const decision = coordinatorOf(h).claim({
@@ -536,7 +562,71 @@ describe("an attestation must name the actor's current generation (#666)", () =>
       sessionId: "sess-worker",
       incarnation: "inc-w",
       generation: workerBound.value.bindingGeneration,
+      assignmentId: ceoBound.value.assignmentId,
     });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses an unrelated role_key's generation reviving a retired one under the same role", () => {
+    // A follow-up review's counterexample: `role = kind` is not `role_key`. `WORKER:task-A` and
+    // `WORKER:task-B` are two different role_keys that share one `role`, and each counts its own
+    // generation from 1 — so a fix that stopped at `role` cannot tell them apart. `bind()` reuses
+    // the actor for the same verified target (#657); this shows a stale generation-1 attestation
+    // for task-A's retired identity revived by task-B's own, unrelated, generation-1 counter,
+    // through the same session task-A originally used.
+    const h = makeHarness();
+    readySession(h, "sess-shared", "inc-shared");
+    const taskABound = h.cp.bindings.bind({
+      role: Role.WORKER,
+      sessionId: "sess-shared",
+      taskId: "task-A",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-samerole", targetLocatorDigest: "digest:samerole" },
+    });
+    if (!taskABound.allowed) throw new Error(`task-A bind refused: ${taskABound.reasonCode}`);
+    const actorId = actorOf(h, taskABound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+    attest(h, {
+      id: "att:same-role",
+      targetBindingId,
+      sessionId: "sess-shared",
+      incarnation: "inc-shared",
+      generation: taskABound.value.bindingGeneration,
+      assignmentId: taskABound.value.assignmentId,
+    });
+
+    // task-A replaces its runtime: a fresh actor takes generation 2 under that role_key, and this
+    // actor's task-A assignment is revoked.
+    readySession(h, "sess-task-a-2", "inc-a2");
+    const replaced = h.cp.bindings.switchTo({
+      role: Role.WORKER,
+      taskId: "task-A",
+      sessionId: "sess-task-a-2",
+      reason: "test replace",
+      conversation: "REPLACED",
+    });
+    expect(replaced.allowed).toBe(true);
+
+    // The same physical actor is reused for a *different* WORKER role_key, task-B — bound to the
+    // same session task-A originally used, so the live pointer returns to exactly where the stale
+    // attestation says it is. Only the role_key is different; the role, and now the session, are
+    // identical to what the stale attestation names.
+    const taskBBound = h.cp.bindings.bind({
+      role: Role.WORKER,
+      sessionId: "sess-shared",
+      taskId: "task-B",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-samerole", targetLocatorDigest: "digest:samerole" },
+    });
+    if (!taskBBound.allowed) throw new Error(`task-B bind refused: ${taskBBound.reasonCode}`);
+    expect(actorOf(h, taskBBound.value.roleKey)).toBe(actorId);
+    expect(taskBBound.value.bindingGeneration).toBe(1);
 
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,
@@ -621,6 +711,7 @@ describe("an attestation must name the actor's current generation (#666)", () =>
       sessionId: "sess-failover",
       incarnation: "inc-2",
       generation: survived.value.bindingGeneration,
+      assignmentId: survived.value.assignmentId,
     });
     return { actorId, targetBindingId };
   };
@@ -660,6 +751,7 @@ describe("an attestation must name the actor's current generation (#666)", () =>
       sessionId: "sess-errored",
       incarnation: "inc-1",
       generation: bound.value.bindingGeneration,
+      assignmentId: bound.value.assignmentId,
     });
 
     const errored = h.cp.sessions.transition("sess-errored", SessionLifecycle.ERROR, "test");

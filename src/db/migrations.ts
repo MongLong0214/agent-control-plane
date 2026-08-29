@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 30;
+export const SCHEMA_VERSION = 31;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2024,6 +2024,40 @@ const v30: SchemaMigration = {
   checksum: () => migrationChecksum("v30-a-turn-and-a-reply-are-two-lifecycles"),
 };
 
+/**
+ * Gives an attestation the one identity that has no ambiguity: the specific `assignments` row it
+ * was made under.
+ *
+ * Neither `role` nor a bare generation number said enough on their own (#666 round 4). Generation
+ * is minted per `role_key`, and `bind()` can reuse one physical actor across *different*
+ * role_keys that share one `role` (#657) — each counting its own generation from 1. A stale
+ * attestation for one role_key's now-superseded generation could be revived by an unrelated
+ * role_key's identical, unrelated generation number, because nothing named which role_key a
+ * generation belonged to. The assignment id has no such ambiguity: minted once per bind or
+ * rebind and never reused, naming it names the exact role_key and generation together.
+ *
+ * Nullable, and left that way rather than backfilled: nothing in production writes an attestation
+ * yet (the activation embargo's writer is a separate gap, #638), so there is no existing row to
+ * lose. `claim()` cannot match a NULL to any assignment, so an unfilled row reads as unverifiable
+ * rather than as current — the fail-closed direction.
+ */
+const v31: SchemaMigration = {
+  id: "v31-a-generation-means-nothing-without-its-role-key",
+  fromVersion: 30,
+  toVersion: 31,
+  apply: (raw) => {
+    const columns = (
+      raw.prepare(`SELECT name FROM pragma_table_info('actor_target_attestations')`).all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+    if (!columns.includes("assignment_id")) {
+      raw.exec(`ALTER TABLE actor_target_attestations ADD COLUMN assignment_id TEXT REFERENCES assignments(assignment_id)`);
+    }
+  },
+  checksum: () => migrationChecksum("v31-a-generation-means-nothing-without-its-role-key"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2044,6 +2078,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v28,
   v29,
   v30,
+  v31,
 ]);
 
 interface RequiredTrigger {
