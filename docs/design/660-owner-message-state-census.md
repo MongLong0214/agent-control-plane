@@ -319,18 +319,64 @@ it shows the citation was stale on arrival, not merely stale by 2026-08-29:
   producing a state, not a state itself — holds regardless of which reason code says it, or how
   many now exist. It is just not the reason code, nor the wording, the original row named.
 
-### C3 — the embargo still makes S4, S5 and S7 unreachable, and "no occurrences observed" is still not evidence about them
+### C3 — the embargo still makes S4, S5 and S7 unreachable, but not for the reason this document first gave
 
 `ConversationTurnCoordinator.claim` refuses with `ReasonCode.CONVERSATION_TARGET_UNVERIFIED` until
 `actor_target_bindings` names which conversation an actor owns, and with
-`ReasonCode.CONVERSATION_TARGET_UNATTESTED` until a runtime has attested that binding — both gated
-behind the #638 authenticated preflight bind, which is still open (`state: OPEN`, measured
-2026-08-29). `src/db/schema.sql` and `src/db/migrations.ts` state the embargo is structural, not
-only behavioral: *"authenticated preflight bind can produce them. Admission fails closed at the
-schema."* #657 (merged — reconstitution reuses the actor a verified target names) closed Part A of
-#649 since the census opened, chipping at the machinery around the embargo — but #638 itself
-remains open, so `claim()` still cannot mint the incumbent that S4, S5 and S7 are all states *of*.
-The reasoning still holds: their absence from any log is silence, not confirmation.
+`ReasonCode.CONVERSATION_TARGET_UNATTESTED` until a runtime has attested that binding. Both
+refusals are real and directly verified by reading `claim()`. **The conclusion this document drew
+from them — a canonical turn is currently impossible in production — is correct. The reason this
+document first gave for it was wrong, and wrong in the dangerous direction: it said the schema
+enforces the embargo, and it does not.**
+
+The first pass here quoted `src/db/schema.sql`'s own comment — *"authenticated preflight bind can
+produce them. Admission fails closed at the schema"* — as if that were a verified mechanism. It is
+the schema's claim about itself, not a checked fact, and reading the code that actually produces
+these rows contradicts it:
+
+- `VerifiedTargetBinding` (`src/session/binding-registry.ts`) is an ordinary TypeScript interface
+  — `{ executorKind, targetLocator, targetLocatorDigest }` — with no signature, token, or any
+  other field a schema constraint could check for authenticity. `BindingRegistry.bind` takes one
+  as a plain, optional constructor argument (`BindInput.verifiedTarget`) and, when supplied,
+  `recordTargetBinding` inserts it into `actor_target_bindings` **as the caller handed it**: no
+  verification step sits between the argument and the `INSERT`.
+  `src/db/schema.sql`'s `actor_target_bindings` table constraints are `UNIQUE (target_actor_id)`,
+  `UNIQUE (executor_kind, target_locator_digest)`, and a foreign key to
+  `conversational_actors` — shape and uniqueness, not provenance. Nothing in the schema can tell
+  an authenticated preflight bind's object apart from one a caller constructed by hand.
+- `actor_target_attestations` has **no writer anywhere in `src/`** — confirmed by search; every
+  `INSERT INTO actor_target_attestations` in the repository is inside a test fixture
+  (`tests/unit/adjudicating-a-disagreement.test.ts`, `doctor-sees-the-canonical-ledger.test.ts`,
+  `an-unresolved-turn-has-an-operator-exit.test.ts`, and others), each writing the row directly by
+  raw SQL to construct a fixture, not through any production code path. There is no "authority
+  trigger" refusing an unauthorized write, because there is no writer, authorized or not, to
+  refuse.
+- **#666 (open) already says this in as many words**, in a section titled "Related, and not fixed
+  by either": *"The activation embargo is not a schema constraint. `bind()` accepts an
+  unauthenticated verified-target object, and the attestation table has no authority trigger and
+  no production writer. The honest statement is that the schema constrains shape, not provenance —
+  the embargo is the absence of a writer. Anything claiming otherwise in a comment or a commit
+  message is wrong and should be corrected where it appears."* This document's first pass was
+  exactly the kind of artifact that sentence warns about — it quoted the wrong comment as though
+  quoting it made it checked.
+
+**What actually holds the embargo today:** no production code path calls `bind()` with a
+populated `verifiedTarget`, and no production code path writes `actor_target_attestations` at
+all. `claim()`'s refusals are real and will keep firing as long as that remains true — but that is
+a fact about what nothing currently does, not a fact about what the schema would stop someone from
+doing. A caller wiring up a `VerifiedTargetBinding` from an unauthenticated source — a config
+value, an argv echo, an operator-typed string, exactly the routes `VerifiedTargetBinding`'s own
+doc comment lists as the wrong ones to derive it from — would pass every check `bind()` and the
+schema run today. The #638 authenticated preflight bind is what would make the object honestly
+mean what its name claims; until it exists, the embargo is enforced by nobody having written the
+caller, not by anything refusing to accept one that lies.
+
+#657 (merged — reconstitution reuses the actor a verified target names) closed Part A of #649
+since the census opened, touching how an existing binding is reused, not how one is authenticated
+or produced — it does not change any of the above. #638 remains open, so the state persists: no
+production writer exists for either table, `claim()` therefore still cannot mint the incumbent
+that S4, S5 and S7 are all states *of*, and their absence from any log is silence, not
+confirmation of anything the schema enforces.
 
 ## Disposition summary
 
@@ -402,7 +448,24 @@ branch, confirmed by `git merge-base --is-ancestor 1bd1b81 157aeed` returning fa
 also located the real re-execution risk S3's wording had been gesturing at: it is #673's
 prune-then-late-redelivery path, not S3's state, and the disposition summary above now says so.
 
-Re-ran `pnpm typecheck`, `pnpm lint` and `pnpm guards:anchors` after every edit in both rounds —
-all still pass. Did not re-run `pnpm test` after either round, since no edit touched anything but
-prose and Markdown; the `1404 passed | 9 failed | 2 skipped` baseline above is from the
-unmodified checkout and stands unchanged.
+A third review found C3 got its conclusion right (a canonical turn is currently impossible in
+production) from the wrong mechanism: this document had quoted `schema.sql`'s own comment —
+*"Admission fails closed at the schema"* — as though the schema enforced the embargo, when
+`VerifiedTargetBinding` (`src/session/binding-registry.ts`) is an ordinary caller-supplied object
+`bind()` writes into `actor_target_bindings` with no authenticity check, and
+`actor_target_attestations` has no production writer at all — every insert into it in the
+repository is a test fixture writing raw SQL directly. #666 (open) already states this outcome in
+its own words: *"the schema constrains shape, not provenance — the embargo is the absence of a
+writer."* C3 now says that, with the two code reads behind it, rather than quoting the schema's
+claim about itself. This is the same failure shape as S3, one level more subtle: S3 stated a false
+conclusion, C3 stated a true conclusion resting on a mechanism that does not produce it. The same
+"name the mechanism, confirm it does the work" check was then re-applied to every remaining claim
+in the document (S1's atomic transaction, S2's early-return ordering, S4's
+`MATERIALIZING_AUTHORITIES`/`materialize()` path that actually clears `IN_DOUBT`, S5/S7's writer
+absence, C1's caller absence) — each was already backed by a direct code read rather than a quoted
+comment, and none needed a further correction.
+
+Re-ran `pnpm typecheck`, `pnpm lint` and `pnpm guards:anchors` after every edit across all three
+rounds — all still pass. Did not re-run `pnpm test` after any round, since no edit touched
+anything but prose and Markdown; the `1404 passed | 9 failed | 2 skipped` baseline above is from
+the unmodified checkout and stands unchanged.
