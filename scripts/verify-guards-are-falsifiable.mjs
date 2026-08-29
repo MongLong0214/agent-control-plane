@@ -32,16 +32,39 @@
  * Dependency-free, in the shape of the other verify scripts (PRD §17.4).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
-// The same path `vitest.config.ts` maps its `json` reporter to. Read after every per-row run so
-// a `killedBy` selector's *actual* match count can be checked rather than assumed from its exit
-// code — see the dead-selector check below.
-const VITEST_JSON_REPORT = join(ROOT, "evidence/local/ci-vitest-results.json");
+/**
+ * Where each per-mutation run's JSON reporter writes, read back so a `killedBy` selector's
+ * *actual* match count can be checked rather than assumed from the exit code — see the
+ * dead-selector check below.
+ *
+ * Deliberately not `evidence/local/ci-vitest-results.json`, and not merely "not that path by
+ * default" — `--outputFile.json=` below pins it, so `vitest.config.ts`'s mapping of the `json`
+ * reporter to that path is never consulted for these runs. That path is where `pnpm test` writes
+ * the *full* suite's result for `pnpm trace` to read (CI runs the suite once, not twice, for
+ * exactly this reason). A mutation run only exercises `killedBy`'s one file or test, so had this
+ * shared the path, the last row processed would leave that shared file holding a partial result —
+ * `success: false`, a handful of tests, nothing else — and `pnpm trace` would read a `killed`
+ * mutation (the harness working correctly) as the whole suite having failed. Reproduced end to
+ * end in CI on this branch's own PR before this comment was written: `pnpm test` and
+ * `pnpm guards:falsifiable` both green, `pnpm trace` red, reporting all 59 scenarios missing.
+ *
+ * A fresh temp directory rather than a fixed name beside it: two sweeps must never share a file,
+ * the same reason `INFLIGHT`'s sentinel is per-repository rather than per-row.
+ */
+const MUTATION_REPORT_DIR = mkdtempSync(join(tmpdir(), "acp-guards-falsifiable-"));
+const MUTATION_JSON_REPORT = join(MUTATION_REPORT_DIR, "vitest-results.json");
+// `process.on("exit", ...)` rather than a call at each exit point: this file has several
+// (`process.exit(0)` for `--anchors-only`, several `process.exit(1)`s, and the normal fall-
+// through), and a temp directory outside the repo is cheap enough to leave for the OS to reclaim
+// on a crash — this is tidiness, not a correctness requirement the way `restoreOnce()` is.
+process.on("exit", () => rmSync(MUTATION_REPORT_DIR, { recursive: true, force: true }));
 
 /**
  * `symbols` ties a row to the enforcement loci named by the Buzz-transition gate; every symbol in
@@ -1491,10 +1514,19 @@ try {
     // Removed, not overwritten-on-read: a crash that exits with a status but never reaches the
     // JSON reporter would otherwise leave the *previous* row's report on disk, and the dead-
     // selector check below would silently score this row against a different guard's numbers.
-    rmSync(VITEST_JSON_REPORT, { force: true });
+    rmSync(MUTATION_JSON_REPORT, { force: true });
     const done = spawnSync(
       VITEST,
-      ["run", ...vitestArgsFor(guard.killedBy), "--reporter=dot", "--reporter=json"],
+      [
+        "run",
+        ...vitestArgsFor(guard.killedBy),
+        "--reporter=dot",
+        "--reporter=json",
+        // Pinned explicitly rather than left to vitest.config.ts's `outputFile.json` mapping —
+        // that mapping points at the full-suite artifact `pnpm trace` reads, and a mutation run
+        // only ever exercises one row's `killedBy`. See MUTATION_JSON_REPORT's comment.
+        `--outputFile.json=${MUTATION_JSON_REPORT}`,
+      ],
       {
         cwd: ROOT,
         encoding: "utf8",
@@ -1544,7 +1576,7 @@ try {
     if (namedSelectors.length > 0) {
       let report = null;
       try {
-        report = JSON.parse(readFileSync(VITEST_JSON_REPORT, "utf8"));
+        report = JSON.parse(readFileSync(MUTATION_JSON_REPORT, "utf8"));
       } catch {
         report = null;
       }
