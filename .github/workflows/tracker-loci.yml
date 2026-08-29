@@ -1,0 +1,26 @@
+name: tracker-loci
+on:
+  # #597's rule: a `MOVE_TO_ACP`-style citation is a claim about the tree, and the tree can move
+  # under it with no commit to *this* file at all — an unrelated PR edits the cited source, or
+  # someone edits an issue body. `project-ci` already runs this check on every push and PR (see
+  # `verify-tracker-loci-resolve.mjs`'s step there), which catches drift introduced *by* a commit,
+  # but does nothing between commits. This is the between-commits half, on its own schedule rather
+  # than folded into `project-ci`'s `verify` job: that job runs the full lint/typecheck/test suite
+  # plus `guards:falsifiable`, which is a deliberate hour-plus mutation sweep — tripling that cost
+  # once a day for a check that needs neither the build nor the test runner is not a reasonable
+  # trade. This script has no dependency beyond Node's own `fs`/`child_process` and the `gh` CLI
+  # already on the runner, so the job below skips `pnpm install` entirely.
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch: {}
+jobs:
+  loci:
+    runs-on: macos-15
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: node scripts/verify-tracker-loci-resolve.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}

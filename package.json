@@ -27,6 +27,7 @@
     "buzz:contract": "tsx scripts/verify-buzz-cli-contract.ts",
     "release:version": "node scripts/verify-release-version.mjs",
     "symbols": "node scripts/verify-enforcement-symbols.mjs",
+    "tracker:loci": "node scripts/verify-tracker-loci-resolve.mjs",
     "adapter:source": "node scripts/verify-acceptance-adapter-source.mjs",
     "guards:falsifiable": "node scripts/verify-guards-are-falsifiable.mjs",
     "guards:anchors": "node scripts/verify-guards-are-falsifiable.mjs --anchors-only",

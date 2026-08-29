@@ -86,3 +86,11 @@ jobs:
       - run: node scripts/ssot-report.mjs
         env:
           GH_TOKEN: ${{ github.token }}
+      # #597's rule, checked against every open issue's own citations rather than one migration
+      # table: a cited file/line/symbol that no longer resolves is stale, and a citation of
+      # /private/tmp or a scratchpad is a custody claim the filesystem will not honor (#603,
+      # #676). Silent on a clean subset; a PR can go red here without changing a line, the same
+      # way ssot-report.mjs can — someone edited an issue, or unrelated code moved a cited symbol.
+      - run: node scripts/verify-tracker-loci-resolve.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
