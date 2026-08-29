@@ -755,6 +755,47 @@ const GUARDS = [
     ],
   },
   {
+    // Generation is minted per role_key (`nextGeneration(roleKey)`), so a bare number is only
+    // meaningful paired with the role_key it belongs to. `bind()` can reuse one physical actor
+    // across different roles for the same verified target (#657); without this, a stale
+    // attestation for the actor's own role can be matched through an unrelated role's active
+    // assignment whose own generation counter happens to coincide.
+    what: "the active assignment consulted for currency is this actor's own role, not any active one",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND asg.role = ca.kind\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses a stale attestation matched through a different role's generation, not its own",
+    ],
+  },
+  {
+    // The runtime-ready trigger only checks READY at the moment the pointer is written
+    // (`conversational_actors_runtime_ready`); nothing re-checks it afterwards.
+    // `SessionRegistry.transition` can move a session to ERROR or STOPPED without ever touching
+    // the actor's live pointer, so pointing at *a* session is not the same fact as pointing at one
+    // still usable.
+    what: "the live pointer's session must still be usable, not merely still pointed at",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND sess.lifecycle = 'READY'\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an attestation whose named session is no longer usable, though still the live pointer",
+    ],
+  },
+  {
+    // The non-isolated stale-generation test above changes generation *and* session/incarnation
+    // together, so this exact condition can be deleted and that test still passes — refused by
+    // the session mismatch instead. Only the isolated test, which holds session and incarnation
+    // fixed and moves generation alone, can kill this row.
+    what: "attestation currency is judged on generation specifically, not only on session identity",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND asg.binding_generation = att.binding_generation\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses on generation alone, with the session and incarnation identical throughout",
+    ],
+  },
+  {
     // The wide version: releasing by file let a bystander's close hand the owner's slot away.
     what: "closing a handle frees only the capability slots that handle issued",
     file: "src/db/database.ts",

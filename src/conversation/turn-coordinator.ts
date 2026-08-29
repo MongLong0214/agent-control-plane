@@ -418,11 +418,11 @@ export class ConversationTurnCoordinator {
 
       // The most recent attestation *that is still current*, checked from the same admission
       // snapshot rather than trusted on its timestamp alone (#666): the actor must not have
-      // retired, its live runtime pointer must still be the one this attestation named, and the
-      // role's active assignment must still be at the generation this attestation attested —
-      // reusing `assignments.binding_generation`, the fencing token every other authority
-      // decision in the system already reads (`BindingRegistry`), rather than inventing a
-      // parallel one scoped to this table alone.
+      // retired, its live runtime pointer must still be the one this attestation named and that
+      // runtime must still be usable, and the *actor's own* active assignment must still be at
+      // the generation this attestation attested — reusing `assignments.binding_generation`, the
+      // fencing token every other authority decision in the system already reads
+      // (`BindingRegistry`), rather than inventing a parallel one scoped to this table alone.
       //
       // The session/incarnation currency is checked against `conversational_actors.current_*`
       // only, never against `assignments.session_id`/`session_incarnation`. Those columns are
@@ -436,6 +436,27 @@ export class ConversationTurnCoordinator {
       // attestation can equal both at once. The live pointer is what "current" means here; the
       // assignment contributes only its generation, which is the one field `switchTo` leaves
       // unchanged on that path.
+      //
+      // `asg.role = ca.kind` is load-bearing, not decorative. Generation is minted per
+      // `role_key` (`nextGeneration(roleKey)`), so a bare number is only meaningful paired with
+      // the role_key it belongs to — and `bind()` can reuse one physical actor across *different*
+      // roles for the same verified target (#657). Without this, an actor whose real role
+      // (`ca.kind`, fixed at mint and never rewritten) has moved on can still be matched through
+      // some *other* active role it was later reused for, if that other role's own generation
+      // counter happens to equal the stale attestation's number — a review built exactly that:
+      // an actor's CEO assignment replaced at generation 2, the same actor then reused for a
+      // fresh `WORKER` binding at that role's own generation 1, and a generation-1 attestation
+      // for the actor's original (now-superseded) CEO identity matched through the unrelated
+      // WORKER row. `asg.role = ca.kind` restricts the join to the one active assignment that is
+      // actually this actor's own identity, so a coincidence in an unrelated role's counter
+      // cannot stand in for currency.
+      //
+      // `sess.lifecycle = 'READY'` closes the other half of "current": the runtime-ready trigger
+      // (`conversational_actors_runtime_ready`) only checks READY at the moment the pointer is
+      // *written*. Nothing re-checks it afterwards, so a session that later transitions to
+      // `ERROR` or `STOPPED` (`SessionRegistry.transition`) leaves the pointer exactly where it
+      // was — a review matched an attestation through a session already in `ERROR`. Pointing at
+      // *a* session is not the same fact as pointing at one still capable of running anything.
       const attestation = this.db.get<{
         target_attestation_id: string;
         executor_session_id: string;
@@ -451,12 +472,16 @@ export class ConversationTurnCoordinator {
              ON tb.target_binding_id = att.target_binding_id
            JOIN conversational_actors ca
              ON ca.actor_id = tb.target_actor_id
+           JOIN sessions sess
+             ON sess.session_id = ca.current_session_id
            JOIN assignments asg
              ON asg.actor_id = ca.actor_id
             AND asg.status = 'ACTIVE'
+            AND asg.role = ca.kind
           WHERE att.target_binding_id = ?
             AND tb.target_actor_id = ?
             AND ca.retired_at IS NULL
+            AND sess.lifecycle = 'READY'
             AND ca.current_session_id = att.executor_session_id
             AND ca.current_session_incarnation = att.executor_session_incarnation
             AND asg.binding_generation = att.binding_generation

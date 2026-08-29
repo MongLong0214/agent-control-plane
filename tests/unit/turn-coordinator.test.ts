@@ -11,6 +11,7 @@ import {
 } from "../../src/conversation/turn-coordinator.ts";
 import { isAcpError, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { Role, SessionLifecycle } from "../../src/domain/types.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
@@ -328,64 +329,91 @@ describe("a source must name a message ingress actually admitted (#666)", () => 
 
 describe("an attestation must name the actor's current generation (#666)", () => {
   /**
+   * Brings a session to `READY` through `SessionRegistry.transition`, not a raw `UPDATE` of the
+   * column — a review's fourth finding was that these fixtures built states production could not,
+   * and the lifecycle column is exactly such a state (#666 round 3).
+   */
+  const readySession = (h: Harness, sessionId: string, incarnation: string): void => {
+    h.cp.sessions.create({ provider: "claude", model: "opus", sessionId, incarnation });
+    const ready = h.cp.sessions.transition(sessionId, SessionLifecycle.READY, "test");
+    if (!ready.allowed) throw new Error(`session ${sessionId} did not reach READY: ${ready.reasonCode}`);
+  };
+
+  /** The actor id `BindingRegistry` gave a role_key, read rather than fabricated. */
+  const actorOf = (h: Harness, roleKey: string): string => {
+    const row = h.cp.db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE role_key = ? AND status = 'ACTIVE'`,
+      [roleKey],
+    );
+    if (!row) throw new Error(`no active assignment for role key ${roleKey}`);
+    return row.actor_id;
+  };
+
+  /** This actor's one lifetime target binding, read rather than fabricated. */
+  const bindingOf = (h: Harness, actorId: string): string =>
+    h.cp.db.get<{ target_binding_id: string }>(
+      `SELECT target_binding_id FROM actor_target_bindings WHERE target_actor_id = ?`,
+      [actorId],
+    )!.target_binding_id;
+
+  /**
+   * The one thing nothing in production writes yet (the activation embargo's writer is a
+   * separate gap, not this one) — so this stays a direct insert while everything around it now
+   * goes through `BindingRegistry`/`SessionRegistry`.
+   */
+  const attest = (
+    h: Harness,
+    input: { id: string; targetBindingId: string; sessionId: string; incarnation: string; generation: number },
+  ): void => {
+    h.cp.db.run(
+      `INSERT INTO actor_target_attestations
+         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+          executor_session_id, executor_session_incarnation, binding_generation, attested_at)
+       VALUES (?, ?, 'v1', ?, ?, ?, ?, ?)`,
+      [input.id, input.targetBindingId, `digest:${input.id}`, input.sessionId, input.incarnation, input.generation, NOW],
+    );
+  };
+
+  /**
    * An actor whose attestation is real but stale: a runtime once verified the target under
    * generation 1, the role then failed over to a new runtime under generation 2, and nothing
    * ever told `actor_target_attestations` — because nothing writes it in production yet either
    * (the activation embargo's writer is a separate gap, not this one). `claim()` used to pick
    * the most recent attestation by timestamp alone, which is this one: there is only one.
+   *
+   * Built through `revoke()` then `bind()` again — the actual sequence a real failover takes
+   * (`BindingRegistry` has no method that rewrites a live assignment's generation in place), and
+   * `bind()` reuses this actor because the verified target is the one it already owns.
    */
-  const staleGenerationActor = (h: Harness): string => {
-    const actorId = "actor:stale-gen";
-    h.cp.db.run(
-      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
-       VALUES ('sess-old', 'inc-old', 'claude', 'opus', 'READY', ?, ?)`,
-      [NOW, NOW],
-    );
-    h.cp.db.run(
-      `INSERT INTO conversational_actors
-         (actor_id, kind, current_session_id, current_session_incarnation, created_at)
-       VALUES (?, 'CEO', 'sess-old', 'inc-old', ?)`,
-      [actorId, NOW],
-    );
-    h.cp.db.run(
-      `INSERT INTO actor_target_bindings
-         (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
-       VALUES ('bind:stale-gen', ?, 'hermes', 'loc-stale-gen', 'digest:stale-gen', ?)`,
-      [actorId, NOW],
-    );
-    h.cp.db.run(
-      `INSERT INTO actor_target_attestations
-         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-          executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-       VALUES ('att:stale-gen', 'bind:stale-gen', 'v1', 'digest:stale-gen', 'sess-old', 'inc-old', 1, ?)`,
-      [NOW],
-    );
-    // The role failed over: a new runtime, a new generation, recorded in `assignments` — the
-    // same source of truth `BindingRegistry` reads everywhere else. The old attestation is left
-    // exactly where it was, naming a generation the role has moved past.
-    h.cp.db.run(
-      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
-       VALUES ('sess-new', 'inc-new', 'claude', 'opus', 'READY', ?, ?)`,
-      [NOW, NOW],
-    );
-    h.cp.db.run(
-      `INSERT INTO assignments
-         (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
-          binding_generation, mode, status, created_at)
-       VALUES ('asg:stale-gen', 'CEO:stale-gen', 'CEO', ?, 'sess-new', 'inc-new', 2, 'PREFERRED', 'ACTIVE', ?)`,
-      [actorId, NOW],
-    );
-    h.cp.db.run(
-      `UPDATE conversational_actors SET current_session_id = 'sess-new', current_session_incarnation = 'inc-new'
-        WHERE actor_id = ?`,
-      [actorId],
-    );
-    return actorId;
+  const staleGenerationActor = (h: Harness): { actorId: string; targetBindingId: string } => {
+    readySession(h, "sess-old", "inc-old");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-old",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-stale-gen", targetLocatorDigest: "digest:stale-gen" },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+    attest(h, { id: "att:stale-gen", targetBindingId, sessionId: "sess-old", incarnation: "inc-old", generation: 1 });
+
+    // The role failed over: revoked, then bound again under a new runtime. The old attestation is
+    // left exactly where it was, naming a generation the role has moved past.
+    const revoked = h.cp.bindings.revoke(bound.value.roleKey, "test failover");
+    if (!revoked.allowed) throw new Error(`revoke refused: ${revoked.reasonCode}`);
+    readySession(h, "sess-new", "inc-new");
+    const rebound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-new",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-stale-gen", targetLocatorDigest: "digest:stale-gen" },
+    });
+    if (!rebound.allowed) throw new Error(`rebind refused: ${rebound.reasonCode}`);
+    return { actorId, targetBindingId };
   };
 
   it("refuses a claim whose only attestation names a generation the role has moved past", () => {
     const h = makeHarness();
-    const actorId = staleGenerationActor(h);
+    const { actorId } = staleGenerationActor(h);
 
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,
@@ -399,12 +427,125 @@ describe("an attestation must name the actor's current generation (#666)", () =>
 
   it("writes nothing when it refuses a stale-generation attestation", () => {
     const h = makeHarness();
-    const actorId = staleGenerationActor(h);
+    const { actorId } = staleGenerationActor(h);
 
     coordinatorOf(h).claim({ targetActorId: actorId, prompt: "hello", sources: [source(h, "m1")] });
 
     expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(0);
     expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_sources`)).toHaveLength(0);
+  });
+
+  it("refuses on generation alone, with the session and incarnation identical throughout", () => {
+    // A review's second finding: the test above changes generation *and* session/incarnation
+    // together, so deleting the generation condition alone left that case still refused by the
+    // session mismatch — the mutation row for it could not have killed anything. This isolates
+    // the one thing under test: revoked and bound again under the *same* session, so nothing
+    // about the runtime changes and only the generation the role is at moves.
+    const h = makeHarness();
+    readySession(h, "sess-fixed", "inc-fixed");
+    const first = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-fixed",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-isolated", targetLocatorDigest: "digest:isolated" },
+    });
+    if (!first.allowed) throw new Error(`bind refused: ${first.reasonCode}`);
+    const actorId = actorOf(h, first.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    const revoked = h.cp.bindings.revoke(first.value.roleKey, "test regeneration");
+    if (!revoked.allowed) throw new Error(`revoke refused: ${revoked.reasonCode}`);
+    const second = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-fixed",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-isolated", targetLocatorDigest: "digest:isolated" },
+    });
+    if (!second.allowed) throw new Error(`rebind refused: ${second.reasonCode}`);
+    expect(second.value.sessionId).toBe("sess-fixed");
+    expect(second.value.bindingGeneration).toBe(first.value.bindingGeneration + 1);
+
+    // The stale attestation names the exact same session and incarnation the role is *still* at —
+    // only the generation it names is the one the role has moved past.
+    attest(h, {
+      id: "att:isolated",
+      targetBindingId,
+      sessionId: "sess-fixed",
+      incarnation: "inc-fixed",
+      generation: first.value.bindingGeneration,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses a stale attestation matched through a different role's generation, not its own", () => {
+    // A review's first finding: the join found *any* ACTIVE assignment on the actor whose
+    // generation matched, and generation is minted per role_key — so a generation number means
+    // nothing without the role_key it belongs to. `bind()` can reuse one physical actor across
+    // different roles for the same verified target (#657); this builds exactly that reuse and
+    // shows a stale attestation for the actor's own (CEO) identity matched through an unrelated
+    // WORKER assignment whose own generation counter happened to coincide.
+    const h = makeHarness();
+    readySession(h, "sess-ceo-1", "inc-1");
+    const ceoBound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-ceo-1",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-reuse", targetLocatorDigest: "digest:reuse" },
+    });
+    if (!ceoBound.allowed) throw new Error(`ceo bind refused: ${ceoBound.reasonCode}`);
+    const actorId = actorOf(h, ceoBound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    // The CEO role replaces its runtime: `switchTo(REPLACED)` mints a fresh actor at generation 2
+    // and revokes this actor's own CEO assignment — but never touches `actor_target_bindings`, so
+    // this actor keeps the lifetime target it always owned.
+    readySession(h, "sess-ceo-2", "inc-2");
+    const replaced = h.cp.bindings.switchTo({
+      role: Role.CEO,
+      sessionId: "sess-ceo-2",
+      reason: "test replace",
+      conversation: "REPLACED",
+    });
+    expect(replaced.allowed).toBe(true);
+
+    // The same physical actor is reused for an unrelated WORKER binding, for the same verified
+    // target — the reuse this counterexample turns on.
+    readySession(h, "sess-worker", "inc-w");
+    const workerBound = h.cp.bindings.bind({
+      role: Role.WORKER,
+      sessionId: "sess-worker",
+      taskId: "t1",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-reuse", targetLocatorDigest: "digest:reuse" },
+    });
+    if (!workerBound.allowed) throw new Error(`worker bind refused: ${workerBound.reasonCode}`);
+    expect(actorOf(h, workerBound.value.roleKey)).toBe(actorId);
+
+    // A stale attestation for this actor's original CEO identity, at generation 1 — the CEO role
+    // has moved to generation 2, under a different actor entirely. It happens to equal the
+    // WORKER binding's own, unrelated, generation 1, and it names the session this actor's live
+    // pointer actually holds now (updated by the WORKER reuse) — so only the role scoping stands
+    // between this and admission.
+    attest(h, {
+      id: "att:reuse",
+      targetBindingId,
+      sessionId: "sess-worker",
+      incarnation: "inc-w",
+      generation: workerBound.value.bindingGeneration,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
   });
 
   it("refuses a retired actor's attestation even under its recorded generation", () => {
@@ -450,61 +591,43 @@ describe("an attestation must name the actor's current generation (#666)", () =>
    * A fresh attestation naming the new live session is exactly the current, honest state of this
    * actor — and `claim()` must admit it.
    */
-  const survivedFailoverActor = (h: Harness): string => {
-    const actorId = "actor:survived";
-    h.cp.db.run(
-      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
-       VALUES ('sess-original', 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
-      [NOW, NOW],
-    );
-    h.cp.db.run(
-      `INSERT INTO conversational_actors
-         (actor_id, kind, current_session_id, current_session_incarnation, created_at)
-       VALUES (?, 'CEO', 'sess-original', 'inc-1', ?)`,
-      [actorId, NOW],
-    );
-    h.cp.db.run(
-      `INSERT INTO actor_target_bindings
-         (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
-       VALUES ('bind:survived', ?, 'hermes', 'loc-survived', 'digest:survived', ?)`,
-      [actorId, NOW],
-    );
-    // One ACTIVE assignment, generation 1, bound at `sess-original`/`inc-1`. A SURVIVED failover
-    // never touches this row — that is the whole point of #449's split.
-    h.cp.db.run(
-      `INSERT INTO assignments
-         (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
-          binding_generation, mode, status, created_at)
-       VALUES ('asg:survived', 'CEO:survived', 'CEO', ?, 'sess-original', 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
-      [actorId, NOW],
-    );
+  const survivedFailoverActor = (h: Harness): { actorId: string; targetBindingId: string } => {
+    readySession(h, "sess-original", "inc-1");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-original",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-survived", targetLocatorDigest: "digest:survived" },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
     // The failover: only the live pointer moves, to a new session and incarnation. `assignments`
-    // above is untouched — same generation, same `session_id`, same `session_incarnation`.
-    h.cp.db.run(
-      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
-       VALUES ('sess-failover', 'inc-2', 'claude', 'opus', 'READY', ?, ?)`,
-      [NOW, NOW],
-    );
-    h.cp.db.run(
-      `UPDATE conversational_actors SET current_session_id = 'sess-failover', current_session_incarnation = 'inc-2'
-        WHERE actor_id = ?`,
-      [actorId],
-    );
+    // is untouched by `switchTo(SURVIVED)` — same generation, same `session_id`.
+    readySession(h, "sess-failover", "inc-2");
+    const survived = h.cp.bindings.switchTo({
+      role: Role.CEO,
+      sessionId: "sess-failover",
+      reason: "test survived failover",
+      conversation: "SURVIVED",
+    });
+    if (!survived.allowed) throw new Error(`switchTo refused: ${survived.reasonCode}`);
+
     // A fresh attestation from the surviving runtime, naming its own live session and the
     // generation that never changed.
-    h.cp.db.run(
-      `INSERT INTO actor_target_attestations
-         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-          executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-       VALUES ('att:survived', 'bind:survived', 'v1', 'digest:survived', 'sess-failover', 'inc-2', 1, ?)`,
-      [NOW],
-    );
-    return actorId;
+    attest(h, {
+      id: "att:survived",
+      targetBindingId,
+      sessionId: "sess-failover",
+      incarnation: "inc-2",
+      generation: survived.value.bindingGeneration,
+    });
+    return { actorId, targetBindingId };
   };
 
   it("admits a claim after a SURVIVED failover, under the live session and the generation that never changed", () => {
     const h = makeHarness();
-    const actorId = survivedFailoverActor(h);
+    const { actorId } = survivedFailoverActor(h);
 
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,
@@ -513,6 +636,43 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     });
 
     expect(decision.allowed).toBe(true);
+  });
+
+  it("refuses an attestation whose named session is no longer usable, though still the live pointer", () => {
+    // A review's third finding: "live" was checked as "still pointed at", not "still usable".
+    // `SessionRegistry.transition` moves `sessions.lifecycle` to `ERROR` or `STOPPED` without ever
+    // touching `conversational_actors.current_session_id` — #493 moved the live pointer off
+    // `assignments` for exactly the SURVIVED case above, and nothing sweeps it when the session it
+    // names stops being usable for a different reason.
+    const h = makeHarness();
+    readySession(h, "sess-errored", "inc-1");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-errored",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-error", targetLocatorDigest: "digest:error" },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+    attest(h, {
+      id: "att:error",
+      targetBindingId,
+      sessionId: "sess-errored",
+      incarnation: "inc-1",
+      generation: bound.value.bindingGeneration,
+    });
+
+    const errored = h.cp.sessions.transition("sess-errored", SessionLifecycle.ERROR, "test");
+    expect(errored.allowed).toBe(true);
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
   });
 });
 
