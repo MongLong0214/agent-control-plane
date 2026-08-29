@@ -446,6 +446,22 @@ const GUARDS = [
     ],
   },
   {
+    // Found by Sol's fourth review (#682, round 8's fourth pass): `ACP_TELEGRAM_TRANSPORT_RETENTION_MS`
+    // was added to the code's `TELEGRAM_ENVIRONMENT_VARIABLES` but never to
+    // `deploy/install-launchd.sh`'s Keychain-export loop — the only place a launchd deployment's
+    // environment actually comes from. An operator on that supported deployment could set the
+    // Keychain entry and it would never reach the daemon; the escape hatch this PR built did not
+    // work on the deployment shape that matters. Mutating the loop back to omit the name
+    // reintroduces exactly that drift.
+    what: "the launchd launcher exports every ACP_TELEGRAM_* variable the code reads, not a hand-kept subset",
+    file: "deploy/install-launchd.sh",
+    find: "  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS; do",
+    replace: "  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL; do",
+    killedBy: [
+      "tests/unit/telegram-env-launcher-drift.test.ts::TELEGRAM_ENVIRONMENT_VARIABLES is a subset of the launcher's optional-Keychain export loop",
+    ],
+  },
+  {
     // The #662 hole: a caller that dispatched, reported that nothing ran, and got attempt 2
     // admitted while attempt 1 was still in flight.
     what: "a dispatched turn cannot be reported as never started",
