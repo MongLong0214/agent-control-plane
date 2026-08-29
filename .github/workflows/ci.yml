@@ -10,15 +10,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `package.json` declares `"node": ">=22"`. `22` (bare) is a moving alias that resolves
-        # to whatever the newest 22.x is on the day the job runs — it can never fail at the
-        # declared range's actual edge, only at whatever is currently newest. `22.0.0` is that
-        # edge, pinned exactly rather than aliased: the version this repository promises to
-        # support and the one most likely to fall outside a build tool's own narrower engine
-        # range (ADR-0010 — `node-gyp` majors after 11.x each narrowed their own `engines.node`
-        # as a named breaking change, and `postinstall` now makes that toolchain's range
-        # everyone's `pnpm install` runs, not just CI's).
-        node-version: ["22.0.0", "22"]
+        # `package.json` declares `"node": ">=22.18.0"`. `22` (bare) is a moving alias that
+        # resolves to whatever the newest 22.x is on the day the job runs — it can never fail at
+        # the declared range's actual edge, only at whatever is currently newest. `22.18.0` is
+        # that edge, pinned exactly rather than aliased.
+        #
+        # It was originally `22.0.0`, matching the range this repository had merely written down.
+        # That entry is what found the real floor: `22.0.0` failed `pnpm migrations:check` with
+        # `ERR_UNKNOWN_FILE_EXTENSION` for `.ts` — `scripts/verify-migrations-are-immutable.mjs`
+        # does `await import(".../src/db/migrations.ts")` directly, under plain `node`, with no
+        # transpiler. Unflagged native TypeScript execution shipped in Node 22.18.0 (2025-07-31);
+        # `22.17.1` still throws that exact error, checked empirically with `nvm`. So `>=22` was
+        # never true for this repository's own tooling — nothing had ever tested the edge before
+        # this entry existed, and it found the gap on its first real use, not the one it went
+        # looking for (ADR-0010).
+        #
+        # `node-gyp`'s own range (ADR-0010: pinned to `11.5.0`, `^18.17.0 || >=20.5.0`) already
+        # covers `22.18.0` — moving the floor up did not require touching that pin again.
+        node-version: ["22.18.0", "22"]
     permissions:
       contents: read
       issues: read

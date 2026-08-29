@@ -46,20 +46,35 @@ This repository's native addons are built and consumed the way `better-sqlite3` 
   Node versions by design — this is the property the legacy regime's exact-version pin exists to
   work around, and adopting `node-addon-api` is what makes the pin unnecessary rather than
   something to also carry forward.
+- **`engines.node` is `>=22.18.0`, not `>=22`** — and this correction has nothing to do with
+  `node-gyp`. `package.json` declared `>=22` from the start, but nothing had ever tested that
+  floor: CI's `node-version: 22` is a moving alias that always resolves to the newest `22.x`, so
+  the declared edge was never exercised. Adding a matrix entry pinned to `22.0.0` (below) to test
+  the *node-gyp* concern found a different, pre-existing defect instead —
+  `scripts/verify-migrations-are-immutable.mjs` does
+  `await import(join(ROOT, "src/db/migrations.ts"))` directly, under plain `node`, with no
+  transpiler in front of it. That requires unflagged native TypeScript execution, which Node
+  shipped in **22.18.0** (2025-07-31), not 22.0.0. Verified empirically with `nvm`: `node -e
+  "import('./src/db/migrations.ts')"` throws `ERR_UNKNOWN_FILE_EXTENSION` on `22.17.1` and
+  succeeds on `22.18.0`; the full local gate suite (`lint`, `typecheck`, `migrations:check`,
+  `schema:*`, `build`, `test`, `trace`) was then run start-to-finish under `22.18.0` specifically
+  to confirm nothing else in the toolchain needs a still-newer floor. So `>=22` was false for this
+  repository's own scripts before any native addon existed — the matrix is what surfaced it, on
+  the first real edge it ever ran.
 - **`node-gyp` is pinned to `11.5.0`, not the latest major, because its own `engines` range must
-  not become this repository's engine range by accident.** `package.json` declares
-  `"node": ">=22"`. `node-gyp@12.0.0` and `@13.0.0` each narrowed that range as a deliberate,
-  named breaking change ("align to npm 11 node engine range"; "bump to new node engine range") —
-  13.0.2's is `^22.22.2 || ^24.15.0 || >=26.0.0`, which excludes Node 22.0–22.22.1, all of 23, and
-  24.0–24.14, all inside `>=22`. `postinstall` (below) makes this the toolchain every declared-
-  supported install runs, so that gap would be real, not theoretical, and CI's floating
-  `node-version: 22` would not catch it (see the CI matrix change below). `node-gyp@11.5.0`'s
-  range is `^18.17.0 || >=20.5.0` — a strict superset of `>=22` with no internal gap. Checked the
-  changelog between 11.5.0 and 13.0.2 for anything besides the engine bumps: Windows/VS2026
-  support and CI-only changes, plus one dependency bump relevant off Windows — `tar` to `7.5.4` in
-  `12.2.0`, for `CVE-2026-23950` (a macOS-relevant Unicode-collision race in tar extraction).
-  Pinning `node-gyp` to `11.5.0` does not reintroduce that: `node-gyp@11.5.0` depends on
-  `tar: ^7.4.3`, and pnpm's resolver already picks `7.5.22` for it in this lockfile — checked with
+  not become this repository's engine range by accident.** `node-gyp@12.0.0` and `@13.0.0` each
+  narrowed their supported range as a deliberate, named breaking change ("align to npm 11 node
+  engine range"; "bump to new node engine range") — 13.0.2's is
+  `^22.22.2 || ^24.15.0 || >=26.0.0`, which excludes the corrected floor `22.18.0` just as it
+  excluded `22.0.0`. `postinstall` (below) makes this the toolchain every declared-supported
+  install runs, so that gap would be real, not theoretical. `node-gyp@11.5.0`'s range is
+  `^18.17.0 || >=20.5.0` — a strict superset of `>=22.18.0` with no internal gap, so moving the
+  floor up did not require revisiting this pin. Checked the changelog between 11.5.0 and 13.0.2
+  for anything besides the engine bumps: Windows/VS2026 support and CI-only changes, plus one
+  dependency bump relevant off Windows — `tar` to `7.5.4` in `12.2.0`, for `CVE-2026-23950` (a
+  macOS-relevant Unicode-collision race in tar extraction). Pinning `node-gyp` to `11.5.0` does
+  not reintroduce that: `node-gyp@11.5.0` depends on `tar: ^7.4.3`, and pnpm's resolver already
+  picks `7.5.22` for it in this lockfile — checked with
   `grep -A11 "node-gyp@11.5.0(supports-color" pnpm-lock.yaml`. So this pin costs nothing found in
   the diff between the two versions that applies to this repository's build.
 - **No compile-on-load.** The addon is built by an explicit step
@@ -107,7 +122,7 @@ was the other option discovery raised and it is not the one this ADR approves.
   would need to be called out as its own decision rather than follow from a build-tool version
   bump. Pinning the build tool keeps the declared contract unchanged and costs nothing measured
   above; this is the option to revisit only if a future `node-gyp` fix this repository actually
-  needs is gated behind a narrower range than `>=22` can absorb.
+  needs is gated behind a narrower range than `>=22.18.0` can absorb.
 
 ## Consequences
 
@@ -125,6 +140,13 @@ version bump can silently narrow what `pnpm install` will do on a declared-suppo
 `.github/workflows/ci.yml`'s `node-version: 22` is a moving alias that resolves to whatever the
 latest `22.x` is on the day the job runs, so it cannot catch a regression at the *edges* of the
 declared range — it never runs the boundary that would fail. The CI matrix now also pins the
-declared range's floor (`22.0.0`) alongside the moving alias, so a future `node-gyp` bump (or
+declared range's floor (`22.18.0`) alongside the moving alias, so a future `node-gyp` bump (or
 any other change that narrows what this repository can build on) fails at the version this
 repository actually promises to support, not only on whatever Node happens to be newest.
+
+**User-visible consequence, stated plainly rather than left as a build detail:** the supported
+floor moved from `22.0.0` to `22.18.0`. This is not a cost of the native addon or of pinning
+`node-gyp` — it is a correction of a claim (`>=22`) that this repository had never checked and
+that was already false for its own scripts. The floor entry in the matrix is what checked it, on
+the first edge it ever ran. It stays in the matrix going forward: it is the only thing that tests
+the declared floor, and it has already found one real defect there.
