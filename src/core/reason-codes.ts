@@ -451,6 +451,32 @@ export const ReasonCode = {
    */
   CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE:
     "CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE",
+  /**
+   * A reconciled receipt names a different target binding than the one this turn was claimed
+   * against. Kept apart from the generation/runtime checks because it is a distinct fact: which
+   * Hermes conversation this turn belongs to, not which execution of it.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_BINDING: "CONVERSATION_TURN_RECEIPT_WRONG_BINDING",
+  /**
+   * A reconciled receipt names a different attestation than the one that verified this turn's
+   * target at claim time. A stale or replaced attestation is not evidence about a turn claimed
+   * under a different one, even when the binding and generation both still agree.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_ATTESTATION: "CONVERSATION_TURN_RECEIPT_WRONG_ATTESTATION",
+  /**
+   * A reconciled receipt names a different executor session or incarnation than the one this
+   * turn was claimed under — the gap `bindingGeneration` alone cannot close.
+   *
+   * `BindingRegistry.switchTo`'s `SURVIVED` failover moves an actor's live runtime to a new
+   * session while deliberately keeping the same `bindingGeneration` ("the binding is not
+   * rewritten, which is why `binding_generation` cannot advance here"). So a turn claimed under
+   * one runtime can have its actor's session move to another while the turn is still `IN_DOUBT`,
+   * and a receipt describing the *new* runtime's work would pass turn, actor, prompt and
+   * generation checks alike while being evidence about an execution this turn was never
+   * dispatched under. Left `IN_DOUBT`, for the same reason every other identity mismatch is: the
+   * receipt is not evidence about this claim, not a contradiction of it.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME: "CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME",
   // --- disposable acceptance realm ------------------------------------------
   /**
    * A path the acceptance realm would use resolves inside production, or outside its own state

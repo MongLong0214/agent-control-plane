@@ -65,17 +65,29 @@ export interface TurnReceipt {
 /**
  * What a reconciler asks a target about one turn it is still holding.
  *
- * The four fields a receipt has to be matched against (#639 contract 1). `bindingGeneration`
- * is carried apart from `TurnPermit` on purpose: a permit proves "the same process that claimed
- * this also speaks for it", which says nothing about which CEO generation asked, because inside
- * one process that never changes. A reconciler runs after the claiming process may be gone, and
- * a receipt minted under a later generation has to be told apart from evidence about this one.
+ * Every field `canonical_turns` pins for this turn, not only the four contract 1 names first
+ * (`turnRequestId`, `targetActorId`, `promptDigest`, `bindingGeneration`). A review found the
+ * ledger also fixes `targetBindingId`, `targetAttestationId`, `executorSessionId` and
+ * `executorSessionIncarnation` at claim time, and none of the first four catch a receipt that
+ * describes the wrong one of those: `BindingRegistry.switchTo` can move an actor's live runtime
+ * to an entirely new session while a `SURVIVED` failover **keeps the same `bindingGeneration`**
+ * ("the binding is not rewritten, which is why `binding_generation` cannot advance here" —
+ * `binding-registry.ts`, the `conversation === "SURVIVED"` branch). So a turn claimed under
+ * session S1 can have its actor's runtime move to S2 while the turn is still `IN_DOUBT`, and a
+ * receipt attesting to S2's execution would pass every one of the original four checks — turn,
+ * actor, prompt and generation all genuinely unchanged — while describing work a different
+ * runtime did. `bindingGeneration` is the fence against a *later CEO*; it was never the fence
+ * against a *later runtime under the same CEO*, and nothing else was checking that one.
  */
 export interface ReceiptLookupQuery {
   readonly turnRequestId: string;
   readonly targetActorId: string;
   readonly promptDigest: string;
   readonly bindingGeneration: number;
+  readonly targetBindingId: string;
+  readonly targetAttestationId: string;
+  readonly executorSessionId: string;
+  readonly executorSessionIncarnation: string;
 }
 
 /**
@@ -92,24 +104,30 @@ export type ReceiptLookupResult =
       readonly evidenceDigest: string;
       readonly reasonCode: string;
       /**
-       * The identity the receipt itself attests to — which turn, which actor, which prompt, which
-       * CEO generation. Not an echo of the query.
+       * The identity the receipt itself attests to — every field `ReceiptLookupQuery` names, not
+       * an echo of the query.
        *
-       * This is the untrusted half of contract 6: all four of `ReceiptLookupQuery`'s fields, and
-       * a caller must compare every one of them against the stored turn rather than assume they
-       * matched because they were asked about. `turnRequestId` is here for the same reason the
-       * other three are — a review found it was the one field still taken from the query that sent
-       * the lookup rather than from this answer, so a port that confused two turns sharing the
-       * same actor, prompt and generation (an earlier completed turn and a later one, say) could
-       * have its receipt settle the wrong one and nothing would notice. `reconcileUnresolved`
-       * checks all four against the row it settles, so a caller that rebuilds any of them from its
-       * own query instead of from this answer makes that check compare the database against
-       * itself for that field.
+       * This is the untrusted half of contract 6: all eight fields, and a caller must compare
+       * every one of them against the stored turn rather than assume they matched because they
+       * were asked about. `turnRequestId` was added first — a port that confused two turns
+       * sharing the same actor, prompt and generation could otherwise settle the wrong one.
+       * `targetBindingId`, `targetAttestationId`, `executorSessionId` and
+       * `executorSessionIncarnation` were added next, for the gap `bindingGeneration` alone
+       * cannot close: a `SURVIVED` failover moves an actor's runtime to a new session while
+       * keeping the same generation, so a receipt describing the *new* runtime's work would
+       * satisfy every one of the first four fields while being evidence about an execution this
+       * turn was never dispatched under. `reconcileUnresolved` checks all eight against the row
+       * it settles, so a caller that rebuilds any of them from its own query instead of from this
+       * answer makes that check compare the database against itself for that field.
        */
       readonly turnRequestId: string;
       readonly targetActorId: string;
       readonly promptDigest: string;
       readonly bindingGeneration: number;
+      readonly targetBindingId: string;
+      readonly targetAttestationId: string;
+      readonly executorSessionId: string;
+      readonly executorSessionIncarnation: string;
     };
 
 /**
@@ -138,6 +156,22 @@ export interface ReceiptPort {
 export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = Object.freeze({
   lookup: (): ReceiptLookupResult => ({ found: false }),
 });
+
+/**
+ * How long `reconcileUnresolved()` waits for one `ReceiptPort.lookup()` before treating it as
+ * `found: false` rather than evidence of anything.
+ *
+ * A review found the sweep awaited each lookup with no bound at all: a port that never settles —
+ * not a misbehaving one, a slow network call is a legitimate implementation of the interface —
+ * would hang the sweep on that one turn forever, and every candidate after it in the same pass
+ * along with it. Ten seconds is comfortably longer than an ordinary receipt-store round trip (the
+ * daemon's own network collectors budget 20–45s for a much heavier call, `usage-collectors.ts`'s
+ * `COLLECTOR_TIMEOUT_MS`/`NON_INTERACTIVE_TIMEOUT_MS`) while staying well inside the periodic
+ * sweep's own interval, so a handful of slow turns in one pass do not by themselves run into the
+ * next. A port that is *routinely* this slow is a `runPeriodic` failure the daemon already
+ * surfaces through its backoff and audit trail, not something a longer timeout should paper over.
+ */
+export const RECEIPT_LOOKUP_TIMEOUT_MS = 10_000;
 
 export interface TurnObservation {
   readonly outcome: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
@@ -1047,9 +1081,15 @@ export class ConversationTurnCoordinator {
         target_actor_id: string;
         prompt_digest: string;
         binding_generation: number;
+        target_binding_id: string;
+        target_attestation_id: string;
+        executor_session_id: string;
+        executor_session_incarnation: string;
         claimed_at: string;
       }>(
-        `SELECT turn_request_id, target_actor_id, prompt_digest, binding_generation, claimed_at
+        `SELECT turn_request_id, target_actor_id, prompt_digest, binding_generation,
+                target_binding_id, target_attestation_id, executor_session_id,
+                executor_session_incarnation, claimed_at
            FROM canonical_turns WHERE lifecycle_state = 'IN_DOUBT' ORDER BY claimed_at ASC`,
       )
       .map((row) => ({
@@ -1057,6 +1097,10 @@ export class ConversationTurnCoordinator {
         targetActorId: row.target_actor_id,
         promptDigest: row.prompt_digest,
         bindingGeneration: row.binding_generation,
+        targetBindingId: row.target_binding_id,
+        targetAttestationId: row.target_attestation_id,
+        executorSessionId: row.executor_session_id,
+        executorSessionIncarnation: row.executor_session_incarnation,
         claimedAt: row.claimed_at,
       }));
   }
@@ -1091,10 +1135,15 @@ export class ConversationTurnCoordinator {
    * outside.
    *
    * One call per turn, not one `Promise.all`: a lookup that throws must not stop the sweep from
-   * asking about the rest, so each is awaited and caught independently. A lookup failure and a
-   * `found: false` answer are not distinguished in the counts below — both leave the turn exactly
-   * where it was, `IN_DOUBT` and visible as `OUTCOME_UNKNOWN`, and contract 6 forbids treating
-   * either as evidence for re-execution.
+   * asking about the rest, so each is awaited and caught independently. A review found that
+   * "awaited" needed a bound: `ReceiptPort.lookup` may return a `Promise`, and one that never
+   * settles — a legitimate implementation of the interface, not a misbehaving one — used to hang
+   * this whole method on that single turn, forever, with every candidate after it never asked.
+   * Every lookup now races against `RECEIPT_LOOKUP_TIMEOUT_MS` and a timeout is treated exactly
+   * like a thrown lookup: never evidence, never stopping the rest of the sweep. A lookup failure,
+   * a timeout and a `found: false` answer are not distinguished in the counts below — all three
+   * leave the turn exactly where it was, `IN_DOUBT` and visible as `OUTCOME_UNKNOWN`, and contract
+   * 6 forbids treating any of them as evidence for re-execution.
    *
    * **What this does and does not do in the deployed system, stated as two separate facts rather
    * than one, because a third review (#691) found the first draft's disclosure let the second one
@@ -1134,11 +1183,15 @@ export class ConversationTurnCoordinator {
     for (const candidate of candidates) {
       let result: ReceiptLookupResult;
       try {
-        result = await this.#receiptPort.lookup({
+        result = await this.#lookupWithTimeout({
           turnRequestId: candidate.turnRequestId,
           targetActorId: candidate.targetActorId,
           promptDigest: candidate.promptDigest,
           bindingGeneration: candidate.bindingGeneration,
+          targetBindingId: candidate.targetBindingId,
+          targetAttestationId: candidate.targetAttestationId,
+          executorSessionId: candidate.executorSessionId,
+          executorSessionIncarnation: candidate.executorSessionIncarnation,
         });
       } catch {
         continue;
@@ -1156,6 +1209,10 @@ export class ConversationTurnCoordinator {
         targetActorId: result.targetActorId,
         promptDigest: result.promptDigest,
         bindingGeneration: result.bindingGeneration,
+        targetBindingId: result.targetBindingId,
+        targetAttestationId: result.targetAttestationId,
+        executorSessionId: result.executorSessionId,
+        executorSessionIncarnation: result.executorSessionIncarnation,
       }, { outcome: result.outcome, receiptId: result.receiptId, evidenceDigest: result.evidenceDigest, reasonCode: result.reasonCode });
       if (decision.allowed) settled += 1;
       // A denial here — wrong generation, mismatched identity, or an already-settled turn a
@@ -1166,13 +1223,52 @@ export class ConversationTurnCoordinator {
   }
 
   /**
+   * `this.#receiptPort.lookup()`, bounded to `RECEIPT_LOOKUP_TIMEOUT_MS`.
+   *
+   * `Promise.race` against a timer that rejects, not one that resolves `found: false` — resolving
+   * would make a timeout indistinguishable from the port's own answer in a stack trace or a log,
+   * and the caller above already treats a thrown lookup as `found: false`'s equivalent, so
+   * rejecting reuses that path instead of adding a second one. The timer is `unref()`d so a lookup
+   * that outlives this call cannot itself keep the process alive; a straggling `lookup()` promise
+   * is a leaked handle either way; `#638`'s real implementation is what actually stops it.
+   */
+  #lookupWithTimeout(query: ReceiptLookupQuery): Promise<ReceiptLookupResult> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`receipt lookup for ${query.turnRequestId} timed out`)),
+        RECEIPT_LOOKUP_TIMEOUT_MS,
+      );
+      timer.unref();
+      Promise.resolve(this.#receiptPort.lookup(query)).then(
+        (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  /**
    * `reconcileUnresolved`'s settlement half, kept private so a receipt can only ever reach it from
    * this coordinator's own `this.#receiptPort.lookup()` call — never from a caller-supplied
    * argument. See that method's docstring for why a public version of this was #691's finding.
    */
   #settleFromReceipt(
     turnRequestId: string,
-    attested: { turnRequestId: string; targetActorId: string; promptDigest: string; bindingGeneration: number },
+    attested: {
+      turnRequestId: string;
+      targetActorId: string;
+      promptDigest: string;
+      bindingGeneration: number;
+      targetBindingId: string;
+      targetAttestationId: string;
+      executorSessionId: string;
+      executorSessionIncarnation: string;
+    },
     receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
   ): Decision<TurnMaterialization> {
     // Contract 6's atomic pair, and the half this build cannot perform: a matched receipt must
@@ -1202,8 +1298,16 @@ export class ConversationTurnCoordinator {
       );
     }
     return this.db.tx(() => {
-      const row = this.db.get<{ binding_generation: number }>(
-        `SELECT binding_generation FROM canonical_turns WHERE turn_request_id = ?`,
+      const row = this.db.get<{
+        binding_generation: number;
+        target_binding_id: string;
+        target_attestation_id: string;
+        executor_session_id: string;
+        executor_session_incarnation: string;
+      }>(
+        `SELECT binding_generation, target_binding_id, target_attestation_id,
+                executor_session_id, executor_session_incarnation
+           FROM canonical_turns WHERE turn_request_id = ?`,
         [turnRequestId],
       );
       if (!row) {
@@ -1226,6 +1330,44 @@ export class ConversationTurnCoordinator {
           ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_GENERATION,
           "this receipt names a different CEO generation than the one that claimed this turn",
           { turnRequestId, claimedGeneration: row.binding_generation, receiptGeneration: attested.bindingGeneration },
+        );
+      }
+      // The fence a matching generation does not provide: `bindingGeneration` distinguishes CEO
+      // generations, and a `SURVIVED` failover deliberately keeps the generation unchanged while
+      // moving the actor's live runtime to a new session (`binding-registry.ts`, the
+      // `conversation === "SURVIVED"` branch — "the binding is not rewritten, which is why
+      // `binding_generation` cannot advance here"). So these three are checked separately, each
+      // against the row this turn was actually claimed against.
+      if (row.target_binding_id !== attested.targetBindingId) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_BINDING,
+          "this receipt names a different target binding than the one this turn was claimed against",
+          { turnRequestId, claimedBindingId: row.target_binding_id, receiptBindingId: attested.targetBindingId },
+        );
+      }
+      if (row.target_attestation_id !== attested.targetAttestationId) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_ATTESTATION,
+          "this receipt names a different attestation than the one that verified this turn's target",
+          {
+            turnRequestId,
+            claimedAttestationId: row.target_attestation_id,
+            receiptAttestationId: attested.targetAttestationId,
+          },
+        );
+      }
+      if (
+        row.executor_session_id !== attested.executorSessionId ||
+        row.executor_session_incarnation !== attested.executorSessionIncarnation
+      ) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME,
+          "this receipt names a different executor session or incarnation than the one this turn was claimed under",
+          {
+            turnRequestId,
+            claimedSession: { id: row.executor_session_id, incarnation: row.executor_session_incarnation },
+            receiptSession: { id: attested.executorSessionId, incarnation: attested.executorSessionIncarnation },
+          },
         );
       }
       return this.#observeVerified(

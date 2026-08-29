@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -6,6 +6,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import {
   ConversationTurnCoordinator,
   NEVER_FOUND_RECEIPT_PORT,
+  RECEIPT_LOOKUP_TIMEOUT_MS,
   type ReceiptLookupQuery,
   type ReceiptLookupResult,
   type ReceiptPort,
@@ -172,34 +173,83 @@ const stateOf = (c: Coordinator, turnRequestId: string) =>
   );
 
 /**
+ * What `canonical_turns` actually stored for this turn at claim time — read back from the row
+ * rather than re-derived from fixture naming conventions, so a test's idea of "the right binding /
+ * attestation / runtime" can never silently drift from what the coordinator itself recorded.
+ */
+const rowIdentity = (
+  c: Coordinator,
+  turnRequestId: string,
+): {
+  targetBindingId: string;
+  targetAttestationId: string;
+  executorSessionId: string;
+  executorSessionIncarnation: string;
+} => {
+  const row = c.db.get<{
+    target_binding_id: string;
+    target_attestation_id: string;
+    executor_session_id: string;
+    executor_session_incarnation: string;
+  }>(
+    `SELECT target_binding_id, target_attestation_id, executor_session_id, executor_session_incarnation
+       FROM canonical_turns WHERE turn_request_id = ?`,
+    [turnRequestId],
+  )!;
+  return {
+    targetBindingId: row.target_binding_id,
+    targetAttestationId: row.target_attestation_id,
+    executorSessionId: row.executor_session_id,
+    executorSessionIncarnation: row.executor_session_incarnation,
+  };
+};
+
+/**
  * A receipt found for a turn, stating its own identity rather than echoing the caller's.
  *
- * `overrides` is where a test injects a wrong actor, prompt or generation — the receipt's own
- * claim, which is exactly what the sweep must act on unchanged. There is no way to call this and
- * *not* state an identity, unlike the shape the first draft shipped with, where a caller who
- * forgot to override anything got the query's own values for free.
+ * `overrides` is where a test injects a wrong actor, prompt, generation, binding, attestation or
+ * runtime — the receipt's own claim, which is exactly what the sweep must act on unchanged. There
+ * is no way to call this and *not* state an identity, unlike the shape the first draft shipped
+ * with, where a caller who forgot to override anything got the query's own values for free.
+ *
+ * All eight fields are required in `identity`, not defaulted — a fourth review found that
+ * `bindingGeneration` alone does not fence a `SURVIVED` runtime failover (see the tests below), so
+ * a helper that let a caller omit `targetBindingId`/`targetAttestationId`/`executorSessionId`/
+ * `executorSessionIncarnation` would make it easy to write a new test that "matches" without ever
+ * exercising those fields, the same gap the whole file exists to close.
  *
  * Defaults to `outcome: "ABORTED"`, not `"COMPLETED"` — a third review found that `#settleFromReceipt`
  * now refuses every `COMPLETED` unconditionally (contract 6's atomic reply-outbox insert has
- * nothing to write into yet), so a test using the default to prove an *identity* check — wrong
- * actor, wrong prompt, wrong generation, wrong turn — would have passed for the wrong reason: the
- * completion refusal fires before any identity is even compared, so it would mask the very check
- * the test claims to exercise. `ABORTED` carries no reply obligation and reaches those checks
- * unaffected; the one test about `COMPLETED` itself overrides this explicitly.
+ * nothing to write into yet), so a test using the default to prove an *identity* check would have
+ * passed for the wrong reason: the completion refusal fires before any identity is even compared.
+ * `ABORTED` carries no reply obligation and reaches those checks unaffected; the one test about
+ * `COMPLETED` itself overrides this explicitly.
  */
 const matchingReceipt = (
-  permit: { turnRequestId: string; targetActorId: string; promptDigest: string },
+  identity: {
+    turnRequestId: string;
+    targetActorId: string;
+    promptDigest: string;
+    targetBindingId: string;
+    targetAttestationId: string;
+    executorSessionId: string;
+    executorSessionIncarnation: string;
+  },
   overrides: Partial<Extract<ReceiptLookupResult, { found: true }>> = {},
 ): ReceiptLookupResult => ({
   found: true,
   outcome: "ABORTED",
-  receiptId: `hermes:${permit.turnRequestId}`,
-  evidenceDigest: `sha256:${permit.turnRequestId}`,
+  receiptId: `hermes:${identity.turnRequestId}`,
+  evidenceDigest: `sha256:${identity.turnRequestId}`,
   reasonCode: ReasonCode.OK,
-  turnRequestId: permit.turnRequestId,
-  targetActorId: permit.targetActorId,
-  promptDigest: permit.promptDigest,
+  turnRequestId: identity.turnRequestId,
+  targetActorId: identity.targetActorId,
+  promptDigest: identity.promptDigest,
   bindingGeneration: 1,
+  targetBindingId: identity.targetBindingId,
+  targetAttestationId: identity.targetAttestationId,
+  executorSessionId: identity.executorSessionId,
+  executorSessionIncarnation: identity.executorSessionIncarnation,
   ...overrides,
 });
 
@@ -235,7 +285,10 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     const receipted = claim(c, actorA, "m1");
     const silent = claim(c, actorB, "m2");
 
-    port.answer(receipted.turnRequestId, matchingReceipt({ ...receipted, targetActorId: actorA }));
+    port.answer(
+      receipted.turnRequestId,
+      matchingReceipt({ ...receipted, ...rowIdentity(c, receipted.turnRequestId), targetActorId: actorA }),
+    );
 
     const result = await c.coordinator.reconcileUnresolved();
 
@@ -277,7 +330,10 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     port.answer(
       held.turnRequestId,
-      matchingReceipt({ ...held, targetActorId: actorId }, { outcome: "COMPLETED" }),
+      matchingReceipt(
+        { ...held, ...rowIdentity(c, held.turnRequestId), targetActorId: actorId },
+        { outcome: "COMPLETED" },
+      ),
     );
 
     const summary = await c.coordinator.reconcileUnresolved();
@@ -298,9 +354,15 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     // under — the cross-generation completion contract 1 exists to refuse.
     port.answer(
       held.turnRequestId,
-      matchingReceipt({ ...held, targetActorId: actorId }, { bindingGeneration: 2 }),
+      matchingReceipt(
+        { ...held, ...rowIdentity(c, held.turnRequestId), targetActorId: actorId },
+        { bindingGeneration: 2 },
+      ),
     );
-    port.answer(alsoHeld.turnRequestId, matchingReceipt({ ...alsoHeld, targetActorId: other }));
+    port.answer(
+      alsoHeld.turnRequestId,
+      matchingReceipt({ ...alsoHeld, ...rowIdentity(c, alsoHeld.turnRequestId), targetActorId: other }),
+    );
 
     const summary = await c.coordinator.reconcileUnresolved();
 
@@ -318,7 +380,10 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     // The port is asked about `held` (actor "right-actor"), and answers with a receipt that
     // attests to a different actor entirely.
-    port.answer(held.turnRequestId, matchingReceipt({ ...held, targetActorId: impostor }));
+    port.answer(
+      held.turnRequestId,
+      matchingReceipt({ ...held, ...rowIdentity(c, held.turnRequestId), targetActorId: impostor }),
+    );
 
     const summary = await c.coordinator.reconcileUnresolved();
 
@@ -335,7 +400,10 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     port.answer(
       held.turnRequestId,
-      matchingReceipt({ ...held, targetActorId: actorId }, { promptDigest: "sha256:not-what-was-asked" }),
+      matchingReceipt(
+        { ...held, ...rowIdentity(c, held.turnRequestId), targetActorId: actorId },
+        { promptDigest: "sha256:not-what-was-asked" },
+      ),
     );
 
     const summary = await c.coordinator.reconcileUnresolved();
@@ -353,11 +421,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     const port: ReceiptPort = {
       lookup: (query) => {
         if (query.turnRequestId === brokenId) throw new Error("network is down");
-        return matchingReceipt({
-          turnRequestId: query.turnRequestId,
-          targetActorId: query.targetActorId,
-          promptDigest: query.promptDigest,
-        });
+        return matchingReceipt(query);
       },
     };
     const c = withCoordinator(port);
@@ -422,7 +486,15 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
   it("attack 2 — tampering with the exported NEVER_FOUND_RECEIPT_PORT singleton throws, and its answer is unchanged", async () => {
     const attempt = () => {
       (NEVER_FOUND_RECEIPT_PORT as unknown as { lookup: ReceiptPort["lookup"] }).lookup = () =>
-        matchingReceipt({ turnRequestId: "tr_anything", targetActorId: "actor:anything", promptDigest: "sha256:anything" });
+        matchingReceipt({
+          turnRequestId: "tr_anything",
+          targetActorId: "actor:anything",
+          promptDigest: "sha256:anything",
+          targetBindingId: "bind:anything",
+          targetAttestationId: "att:anything",
+          executorSessionId: "runtime:anything",
+          executorSessionIncarnation: "inc-1",
+        });
     };
     expect(attempt).toThrow(TypeError);
 
@@ -432,6 +504,10 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
       targetActorId: "y",
       promptDigest: "z",
       bindingGeneration: 1,
+      targetBindingId: "bind:x",
+      targetAttestationId: "att:x",
+      executorSessionId: "runtime:x",
+      executorSessionIncarnation: "inc-1",
     })).toEqual({ found: false });
 
     const c = withCoordinator(NEVER_FOUND_RECEIPT_PORT);
@@ -456,24 +532,172 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     const actorId = target(c, "same-actor-twice", 1);
 
     const first = claim(c, actorId, "m1");
-    port.answer(first.turnRequestId, matchingReceipt({ ...first, targetActorId: actorId }));
+    port.answer(
+      first.turnRequestId,
+      matchingReceipt({ ...first, ...rowIdentity(c, first.turnRequestId), targetActorId: actorId }),
+    );
     await c.coordinator.reconcileUnresolved();
     expect(stateOf(c, first.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "ABORTED" });
 
     // A second turn on the same actor is claimable now that the first is settled — same prompt
-    // text ("hello"), same generation (1), so only the turn id differs from the first.
+    // text ("hello"), same generation (1), same binding/attestation/runtime (same actor, never
+    // failed over), so only the turn id differs from the first.
     const second = claim(c, actorId, "m2");
     port.answer(
       second.turnRequestId,
-      matchingReceipt({ ...second, targetActorId: actorId }, {
-        turnRequestId: first.turnRequestId,
-        receiptId: "hermes:mixed-up",
-      }),
+      matchingReceipt(
+        { ...second, ...rowIdentity(c, second.turnRequestId), targetActorId: actorId },
+        { turnRequestId: first.turnRequestId, receiptId: "hermes:mixed-up" },
+      ),
     );
 
     const summary = await c.coordinator.reconcileUnresolved();
 
     expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
     expect(stateOf(c, second.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+  });
+
+  /**
+   * A fifth review found the ledger pins more than the four fields above: `canonical_turns` also
+   * fixes `target_binding_id`, `target_attestation_id`, `executor_session_id` and
+   * `executor_session_incarnation` at claim time, and none of the original four catch a receipt
+   * that describes the wrong one of those.
+   *
+   * The counterexample is `BindingRegistry.switchTo`'s own `SURVIVED` failover: an actor's live
+   * runtime moves to an entirely new session while `binding_generation` is deliberately left
+   * unchanged ("the binding is not rewritten, which is why `binding_generation` cannot advance
+   * here" — the `conversation === "SURVIVED"` branch). This test reproduces exactly that move —
+   * a fresh session, `conversational_actors.current_session_id` repointed to it, no new binding,
+   * attestation or assignment row — while the turn is still `IN_DOUBT`. The receipt that follows
+   * then attests to turn, actor, prompt and generation exactly as claimed, and to the *new*
+   * runtime — passing every one of the original four checks while describing an execution this
+   * turn was never dispatched under.
+   */
+  it("does not complete a turn when the receipt attests to a different runtime than the one this turn was claimed under, after a SURVIVED failover keeps the generation unchanged", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c, "survived-failover", 1);
+    const held = claim(c, actorId, "m1");
+    const claimedIdentity = rowIdentity(c, held.turnRequestId);
+
+    // `BindingRegistry.switchTo`'s `SURVIVED` branch, reproduced directly: a new session, the
+    // actor's runtime pointer moved to it, binding_generation untouched.
+    const failoverSessionId = "runtime:survived-failover-2";
+    c.db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES (?, 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
+      [failoverSessionId, NOW, NOW],
+    );
+    c.db.run(
+      `UPDATE conversational_actors
+          SET current_session_id = ?, current_session_incarnation = 'inc-1'
+        WHERE actor_id = ?`,
+      [failoverSessionId, actorId],
+    );
+
+    port.answer(
+      held.turnRequestId,
+      matchingReceipt({
+        ...held,
+        ...claimedIdentity,
+        targetActorId: actorId,
+        executorSessionId: failoverSessionId,
+      }),
+    );
+
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+  });
+
+  /** Same defect class as the runtime check above: the receipt names the wrong target binding. */
+  it("does not complete a turn when the receipt attests to the wrong target binding", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c, "right-binding", 1);
+    const held = claim(c, actorId, "m1");
+
+    port.answer(
+      held.turnRequestId,
+      matchingReceipt(
+        { ...held, ...rowIdentity(c, held.turnRequestId), targetActorId: actorId },
+        { targetBindingId: "bind:some-other-conversation" },
+      ),
+    );
+
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+  });
+
+  /** Same defect class: the receipt names an attestation other than the one that verified this
+   *  turn's target at claim time — a stale or replaced attestation is not evidence about this one. */
+  it("does not complete a turn when the receipt attests to the wrong attestation", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c, "right-attestation", 1);
+    const held = claim(c, actorId, "m1");
+
+    port.answer(
+      held.turnRequestId,
+      matchingReceipt(
+        { ...held, ...rowIdentity(c, held.turnRequestId), targetActorId: actorId },
+        { targetAttestationId: "att:stale-or-replaced" },
+      ),
+    );
+
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+  });
+
+  /**
+   * A sixth review: `ReceiptPort.lookup` may return a `Promise`, and the sweep used to await each
+   * one with no bound at all. A port that never settles is not a misbehaving implementation of the
+   * interface — a slow network call to a real receipt store is exactly this shape — so a hang
+   * there used to hang this whole method on one turn, forever, with every remaining candidate in
+   * the same pass never asked about at all. Uses fake timers rather than a real multi-second wait:
+   * the port's promise genuinely never resolves or rejects on its own, and the timeout is what
+   * must move the sweep past it.
+   */
+  it("treats a lookup that never settles as no evidence after its timeout, and keeps sweeping the rest", async () => {
+    vi.useFakeTimers();
+    try {
+      // `swept` in the summary is `unresolvedIdentities().length`, computed before the loop even
+      // starts — it would read 2 whether or not the sweep ever got past the first hang. What
+      // actually proves the second candidate was reached is that its `lookup` was *called*, so
+      // this counts calls rather than trusting the summary's shape.
+      let calls = 0;
+      const port: ReceiptPort = {
+        // Never resolves, never rejects — the shape a slow-but-honest network call takes right up
+        // until it eventually answers, and the shape a truly hung one takes forever.
+        lookup: () => {
+          calls += 1;
+          return new Promise<ReceiptLookupResult>(() => {});
+        },
+      };
+      const c = withCoordinator(port);
+      const actorA = target(c, "hangs-forever", 1);
+      const actorB = target(c, "after-the-hang", 1);
+      const hung = claim(c, actorA, "m1");
+      const fine = claim(c, actorB, "m2");
+
+      const summaryPromise = c.coordinator.reconcileUnresolved();
+      // Advances past both candidates' timeouts; `hung`'s lookup never settles regardless of how
+      // far time advances, so if the timeout did not exist this `await` would hang instead of the
+      // daemon it stands in for.
+      await vi.advanceTimersByTimeAsync(RECEIPT_LOOKUP_TIMEOUT_MS * 2);
+      const summary = await summaryPromise;
+
+      expect(calls).toBe(2);
+      expect(summary).toEqual({ swept: 2, settled: 0, unresolved: 2 });
+      expect(stateOf(c, hung.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+      expect(stateOf(c, fine.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1373,6 +1373,55 @@ const GUARDS = [
       "tests/unit/binding-hardening.test.ts::switchTo denies a takeover that would strand a live, unabandonable execution, and rolls back its own writes",
     ],
   },
+  {
+    // Sol's fifth review of #691: `bindingGeneration` alone does not fence a `SURVIVED` failover,
+    // which moves an actor's live runtime to a new session while deliberately keeping the same
+    // generation. Removing this check reopens exactly that: a receipt naming the wrong target
+    // binding would still settle the turn as long as turn, actor, prompt and generation agreed.
+    what: "a receipt naming a different target binding than the one this turn was claimed against is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (row.target_binding_id !== attested.targetBindingId) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong target binding",
+    ],
+  },
+  {
+    // Same review, the attestation field: a stale or replaced attestation is not evidence about a
+    // turn claimed under a different one, even when the binding and generation both still agree.
+    what: "a receipt naming a different attestation than the one that verified this turn's target is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (row.target_attestation_id !== attested.targetAttestationId) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong attestation",
+    ],
+  },
+  {
+    // The field that actually catches a `SURVIVED` failover: `BindingRegistry.switchTo` moves the
+    // actor's runtime to a new session while leaving `binding_generation` untouched, so this is
+    // the one check standing between that failover and a wrongly settled turn.
+    what: "a receipt naming a different executor session or incarnation than the one this turn was claimed under is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        row.executor_session_id !== attested.executorSessionId ||",
+    replace: "        false ||",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to a different runtime than the one this turn was claimed under, after a SURVIVED failover keeps the generation unchanged",
+    ],
+  },
+  {
+    // Sol's sixth review: `ReceiptPort.lookup` may return a `Promise` that never settles — a
+    // legitimate slow implementation, not a misbehaving one — and the sweep used to await it with
+    // no bound. Reverting to the bare port call here reopens that hang for every candidate after
+    // the stuck one, and for the daemon startup call this sweep runs from.
+    what: "a receipt lookup that never settles is bounded by a timeout, not awaited indefinitely",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        result = await this.#lookupWithTimeout({",
+    replace: "        result = await this.#receiptPort.lookup({",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::treats a lookup that never settles as no evidence after its timeout, and keeps sweeping the rest",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

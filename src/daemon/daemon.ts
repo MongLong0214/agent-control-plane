@@ -960,7 +960,17 @@ export class Daemon {
       // production writes to yet, so it always finds nothing to sweep; and (2) even once
       // something is found, a `COMPLETED` receipt is refused unconditionally, because no
       // reply-outbox mechanism is wired to this ledger. Resolving (1) does not resolve (2).
-      await this.cp.conversation.reconcileUnresolved();
+      //
+      // Not awaited. A review found this call had no bound on how long one lookup could run —
+      // `reconcileUnresolved()` now times out each one internally, but a *sequence* of several
+      // slow (not hung) lookups could still add up to real seconds, and startup has no reason to
+      // spend them: the periodic timer below finds exactly the same unresolved rows within
+      // `turnReconcileIntervalMs` regardless of whether this call ever ran. Fire-and-forget
+      // through `runPeriodic` for the same backoff/audit treatment the timer gets, rather than a
+      // bare `void` that would let a repeatedly-failing sweep fail silently forever.
+      void this.runPeriodic("turn_reconcile", async () => {
+        await this.cp.conversation.reconcileUnresolved();
+      });
       this.writeHealth(report);
       this.startTimers();
       this.clearCrashLoop();
