@@ -120,6 +120,25 @@ describe("what doctor says about a wedged conversation", () => {
     });
   });
 
+  it("#682: does not report a turn resolved by noReplyAt as still outstanding", async () => {
+    // Found by Sol's review of #682: this file's own predicate was rewritten by #685 to read
+    // `turn_claim_json` instead of `result_json`, but kept `repliedAt IS NULL` as the only
+    // "still outstanding" test. A no-reply resolution (#682) closes a claim with `noReplyAt`,
+    // not `repliedAt` — a different, deliberately separate terminal fact — so a doctor that only
+    // knows the older field would report a finished turn as unresolved, escalating to ERROR after
+    // `UNRESOLVED_TURN_ESCALATION_MINUTES` for nothing anyone is waiting on. This is the fourth
+    // reader of `repliedAt`-as-"is this turn finished"; `unresolvedClaim`, `IngressGuard.
+    // unresolvedTurns` and `IngressGuard.prune` are the other three, and all four now agree.
+    const harness = makeHarness();
+    const nonce = "update:no-reply";
+    claim(harness, nonce, harness.cp.clock.nowIso());
+    const guard = guardFor(harness);
+
+    expect(guard.completeNoReplyAndResolveTurn("telegram", nonce).allowed).toBe(true);
+
+    expect(turnFinding(await harness.cp.doctor.run("system"))).toBeUndefined();
+  });
+
   it("ignores a message that was admitted but never claimed", async () => {
     // Admitted-and-running is not outstanding. Counting it would make every message in flight
     // look wedged, and the finding would stop meaning anything.

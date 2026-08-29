@@ -212,6 +212,22 @@ const GUARDS = [
     ],
   },
   {
+    // The fourth reader of `repliedAt`-as-"is this turn finished" (#682, Sol's review): #685
+    // repointed this check at `turn_claim_json` after #671 split the lifecycles, but kept
+    // `repliedAt IS NULL` as the only "still outstanding" test — the same collapse the ingress
+    // rows above guard against, arriving through a reader nobody had enumerated. Without the
+    // `noReplyAt` clause, a turn a handler genuinely decided not to reply to reports
+    // `TURN_OUTCOME_UNKNOWN` to `agentctl doctor system` forever, escalating to ERROR after
+    // `UNRESOLVED_TURN_ESCALATION_MINUTES` for a turn nothing is waiting on.
+    what: "doctor agrees with ingress that a no-reply resolution closes a claim",
+    file: "src/doctor/doctor.ts",
+    find: "          AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL",
+    replace: "",
+    killedBy: [
+      "tests/unit/doctor-sees-unresolved-turns.test.ts::#682: does not report a turn resolved by noReplyAt as still outstanding",
+    ],
+  },
+  {
     // Found by Sol's review of #672's own PR (#682): `route()` reports `reply: null` for two
     // different facts, and this guard is what keeps them apart. A replayed admission of a
     // claimed turn whose reply reservation is still PENDING after a crash also comes back with
