@@ -468,6 +468,25 @@ export class ConversationTurnCoordinator {
       // `ERROR` or `STOPPED` (`SessionRegistry.transition`) leaves the pointer exactly where it
       // was — a review matched an attestation through a session already in `ERROR`. Pointing at
       // *a* session is not the same fact as pointing at one still capable of running anything.
+      //
+      // The incarnation is checked against `sess.incarnation` — `sessions`' own column, immutable
+      // by trigger (`sessions_incarnation_immutable`) — not against
+      // `conversational_actors.current_session_incarnation`. A sixth review found that column is
+      // itself a copy, one table further out than the last two rounds looked: `current_session_id`
+      // is the live pointer and does not need a second source, because nothing else claims to know
+      // "the actor's current session" — but `current_session_incarnation` claims to know
+      // `sessions.incarnation` for whatever session that pointer names, and nothing enforced that
+      // the two stayed equal. A plain `UPDATE conversational_actors SET
+      // current_session_incarnation = ?` — no trigger fired, because
+      // `conversational_actors_runtime_ready` watches `current_session_id` alone — let an
+      // incarnation that never existed sit beside a real, READY session id, and this query
+      // compared the attestation only against that copy. Comparing against `sess.incarnation`
+      // instead makes the copy irrelevant to this decision rather than merely rechecked: since
+      // `sess` is already joined on `sess.session_id = ca.current_session_id`, and a session's
+      // incarnation is immutable for its lifetime, `sess.incarnation` is the one value this could
+      // ever honestly be. A write-time trigger
+      // (`conversational_actors_incarnation_matches_session`) now refuses the corrupting write at
+      // its source too.
       const attestation = this.db.get<{
         target_attestation_id: string;
         executor_session_id: string;
@@ -495,7 +514,7 @@ export class ConversationTurnCoordinator {
             AND ca.retired_at IS NULL
             AND sess.lifecycle = 'READY'
             AND ca.current_session_id = att.executor_session_id
-            AND ca.current_session_incarnation = att.executor_session_incarnation
+            AND sess.incarnation = att.executor_session_incarnation
           ORDER BY att.attested_at DESC, att.rowid DESC
           LIMIT 1`,
         [target.target_binding_id, input.targetActorId],

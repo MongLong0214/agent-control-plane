@@ -760,9 +760,9 @@ const GUARDS = [
     // comparison back.
     what: "attestation currency is judged against the live session, not the one at binding time",
     file: "src/conversation/turn-coordinator.ts",
-    find: "            AND ca.current_session_incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
+    find: "            AND sess.incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
     replace:
-      "            AND ca.current_session_incarnation = att.executor_session_incarnation\n            AND asg.session_id = att.executor_session_id\n            AND asg.session_incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
+      "            AND sess.incarnation = att.executor_session_incarnation\n            AND asg.session_id = att.executor_session_id\n            AND asg.session_incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
     killedBy: [
       "tests/unit/turn-coordinator.test.ts::admits a claim after a SURVIVED failover, under the live session and the generation that never changed",
     ],
@@ -822,6 +822,42 @@ const GUARDS = [
     replace: "",
     killedBy: [
       "tests/unit/turn-coordinator.test.ts::refuses an attestation whose assignment_id names a different actor's assignment entirely",
+    ],
+  },
+  {
+    // `conversational_actors.current_session_incarnation` is itself a copy of
+    // `sessions.incarnation`, one table further out than the assignment's own generation. Nothing
+    // compared it to that authority — only to another copy on the attestation, which is exactly
+    // what let a fabricated incarnation, quietly written straight into the actor's column, sail
+    // through unnoticed.
+    what: "the incarnation is judged against the session's own column, not only the actor's copy of it",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND sess.incarnation = att.executor_session_incarnation\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an attestation whose incarnation was never the session's own, though the actor's copy agrees",
+    ],
+  },
+  {
+    // The write-time half, on the insert path `mintActor` takes.
+    what: "an actor cannot be created pointing at a session under an incarnation that session never had",
+    file: "src/db/schema.sql",
+    find: "CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert\nBEFORE INSERT ON conversational_actors\nWHEN NEW.current_session_id IS NOT NULL\n AND EXISTS (",
+    replace:
+      "CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert\nBEFORE INSERT ON conversational_actors\nWHEN 0\n AND EXISTS (",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses to insert an actor whose incarnation was never the session's own",
+    ],
+  },
+  {
+    // The write-time half, on the update path a later switch or a raw write takes.
+    what: "an actor's incarnation copy cannot be moved away from the session it names",
+    file: "src/db/schema.sql",
+    find: "CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_update\nBEFORE UPDATE OF current_session_id, current_session_incarnation ON conversational_actors\nWHEN NEW.current_session_id IS NOT NULL\n AND EXISTS (",
+    replace:
+      "CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_update\nBEFORE UPDATE OF current_session_id, current_session_incarnation ON conversational_actors\nWHEN 0\n AND EXISTS (",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses to move the actor's incarnation copy away from the session it names",
     ],
   },
   {

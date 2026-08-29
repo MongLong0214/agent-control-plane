@@ -1746,6 +1746,18 @@ const attestationGenerationTriggerDdl = (): string =>
     "the attestation generation trigger",
   );
 
+const actorIncarnationTriggersDdl = (): string =>
+  [
+    schemaObject(
+      /CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert\n[\s\S]*?\nEND;/,
+      "the actor incarnation insert trigger",
+    ),
+    schemaObject(
+      /CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_update\n[\s\S]*?\nEND;/,
+      "the actor incarnation update trigger",
+    ),
+  ].join("\n\n");
+
 const observationsIndexDdl = (): string =>
   schemaObject(
     /CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn[^;]*;/,
@@ -2065,6 +2077,12 @@ const v31: SchemaMigration = {
     // fresh schema ships rather than a window without it.
     raw.exec(`DROP TRIGGER IF EXISTS attestation_generation_matches_assignment`);
     raw.exec(attestationGenerationTriggerDdl());
+    // A second write-time backstop, one table further out: `conversational_actors`'s own copy of
+    // a session's incarnation must agree with `sessions.incarnation` itself, not only with
+    // whatever an attestation separately claims.
+    raw.exec(`DROP TRIGGER IF EXISTS conversational_actors_incarnation_matches_session_on_insert`);
+    raw.exec(`DROP TRIGGER IF EXISTS conversational_actors_incarnation_matches_session_on_update`);
+    raw.exec(actorIncarnationTriggersDdl());
   },
   checksum: () => migrationChecksum("v31-a-generation-means-nothing-without-its-role-key"),
 };
@@ -2194,6 +2212,8 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "actor_target_bindings_immutable", sentinel: "ACTOR_TARGET_BINDING_IMMUTABLE", introducedIn: 24 },
   { name: "actor_target_bindings_no_delete", sentinel: "ACTOR_TARGET_BINDING_IMMUTABLE", introducedIn: 24 },
   { name: "attestation_generation_matches_assignment", sentinel: "ATTESTATION_GENERATION_MISMATCH", introducedIn: 31 },
+  { name: "conversational_actors_incarnation_matches_session_on_insert", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
+  { name: "conversational_actors_incarnation_matches_session_on_update", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [

@@ -316,6 +316,15 @@ export const ReasonCode = {
    */
   ATTESTATION_GENERATION_MISMATCH: "ATTESTATION_GENERATION_MISMATCH",
   /**
+   * `conversational_actors.current_session_incarnation` disagrees with `sessions.incarnation`
+   * for the session `current_session_id` names (#666 round 7). The actor's column is a copy;
+   * `sessions.incarnation` is the immutable authority. A write that moves one without the other —
+   * an insert or an update — is refused by
+   * `conversational_actors_incarnation_matches_session_on_insert` /
+   * `_on_update` before the copy can drift from what it claims to mirror.
+   */
+  ACTOR_SESSION_INCARNATION_MISMATCH: "ACTOR_SESSION_INCARNATION_MISMATCH",
+  /**
    * A source names a channel and nonce that ingress never admitted.
    *
    * `claim()` used to write whatever channel/nonce a caller supplied straight into

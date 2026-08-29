@@ -245,6 +245,42 @@ BEGIN
   SELECT RAISE(ABORT, 'ACTOR_RUNTIME_NOT_READY');
 END;
 
+-- CP-HI-04 / #666 round 7 — `current_session_incarnation` is a copy of `sessions.incarnation`
+-- for whatever session `current_session_id` names; nothing enforced that the two stayed equal.
+-- A plain `UPDATE conversational_actors SET current_session_incarnation = ?` fires no existing
+-- trigger — `conversational_actors_runtime_ready` above watches `current_session_id` alone — so
+-- an incarnation that never existed could sit beside a real, READY session id, and a query
+-- trusting the copy would admit through it. `sessions.incarnation` is immutable for a session's
+-- lifetime (`sessions_incarnation_immutable`), so this is the one value the copy could ever
+-- honestly be; refused at both the insert that first sets the pointer and any later update of
+-- either column together, since only comparing both against the same session catches a caller
+-- that moves one without the other.
+CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert
+BEFORE INSERT ON conversational_actors
+WHEN NEW.current_session_id IS NOT NULL
+ AND EXISTS (
+   SELECT 1 FROM sessions
+    WHERE session_id = NEW.current_session_id
+      AND incarnation <> NEW.current_session_incarnation
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_SESSION_INCARNATION_MISMATCH');
+END;
+
+-- CP-HI-04 — the update half of the same rule: a later write must not move the pointer away
+-- from the session's own incarnation either.
+CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_update
+BEFORE UPDATE OF current_session_id, current_session_incarnation ON conversational_actors
+WHEN NEW.current_session_id IS NOT NULL
+ AND EXISTS (
+   SELECT 1 FROM sessions
+    WHERE session_id = NEW.current_session_id
+      AND incarnation <> NEW.current_session_incarnation
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_SESSION_INCARNATION_MISMATCH');
+END;
+
 -- CP-HI-04 — retirement is terminal, for the same reason revocation is: an actor brought back
 -- after its bindings were fenced would make superseded authority current again.
 CREATE TRIGGER IF NOT EXISTS conversational_actors_retirement_terminal

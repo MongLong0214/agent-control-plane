@@ -803,6 +803,110 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
   });
 
+  it("refuses an attestation whose incarnation was never the session's own, though the actor's copy agrees", () => {
+    // A sixth review's counterexample, one table further out than the last two rounds looked:
+    // `conversational_actors.current_session_incarnation` is itself a copy of
+    // `sessions.incarnation`, and nothing compared it to that authority — only to another copy
+    // on the attestation. `conversational_actors_incarnation_matches_session_on_update` now
+    // refuses the corrupting write at its source (see the write-time test below); this test
+    // drops that trigger first, through the same second-connection escape hatch used for the
+    // generation counterexample two rounds ago, so it proves the read-time join is independently
+    // sufficient for a row that reached the table by any other path.
+    const h = makeHarness();
+    readySession(h, "sess-copy", "inc-real");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-copy",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-copy", targetLocatorDigest: "digest:copy" },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    // The corrupting write: only the actor's copy moves, not the session it names.
+    const foreign = new Database(join(h.root, "state.sqlite"));
+    try {
+      foreign.exec(`DROP TRIGGER conversational_actors_incarnation_matches_session_on_update`);
+      foreign
+        .prepare(`UPDATE conversational_actors SET current_session_incarnation = ? WHERE actor_id = ?`)
+        .run("inc-fake", actorId);
+    } finally {
+      foreign.close();
+    }
+
+    attest(h, {
+      id: "att:copy-drift",
+      targetBindingId,
+      sessionId: "sess-copy",
+      incarnation: "inc-fake",
+      generation: bound.value.bindingGeneration,
+      assignmentId: bound.value.assignmentId,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses to move the actor's incarnation copy away from the session it names", () => {
+    // The write-time half: the trigger itself, reached the ordinary way rather than by dropping
+    // it first.
+    const h = makeHarness();
+    readySession(h, "sess-write-copy", "inc-real");
+    const bound = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-write-copy",
+      verifiedTarget: {
+        executorKind: "hermes",
+        targetLocator: "loc-write-copy",
+        targetLocatorDigest: "digest:write-copy",
+      },
+    });
+    if (!bound.allowed) throw new Error(`bind refused: ${bound.reasonCode}`);
+    const actorId = actorOf(h, bound.value.roleKey);
+
+    let thrown: unknown;
+    try {
+      h.cp.db.run(`UPDATE conversational_actors SET current_session_incarnation = ? WHERE actor_id = ?`, [
+        "inc-fake",
+        actorId,
+      ]);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isAcpError(thrown)).toBe(true);
+    if (isAcpError(thrown)) {
+      expect(thrown.reasonCode).toBe(ReasonCode.ACTOR_SESSION_INCARNATION_MISMATCH);
+    }
+  });
+
+  it("refuses to insert an actor whose incarnation was never the session's own", () => {
+    // The insert half of the same rule — `mintActor` goes through this path too.
+    const h = makeHarness();
+    readySession(h, "sess-insert-copy", "inc-real");
+
+    let thrown: unknown;
+    try {
+      h.cp.db.run(
+        `INSERT INTO conversational_actors
+           (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+         VALUES ('actor:insert-copy', 'CEO', 'sess-insert-copy', 'inc-fake', ?)`,
+        [NOW],
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    expect(isAcpError(thrown)).toBe(true);
+    if (isAcpError(thrown)) {
+      expect(thrown.reasonCode).toBe(ReasonCode.ACTOR_SESSION_INCARNATION_MISMATCH);
+    }
+  });
+
   it("refuses a retired actor's attestation even under its recorded generation", () => {
     // Retirement is terminal (`conversational_actors_retirement_terminal`); admitting a turn for
     // a retired actor would make superseded authority current again.
