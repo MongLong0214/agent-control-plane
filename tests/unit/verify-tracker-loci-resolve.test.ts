@@ -1263,31 +1263,37 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
-  it("[round 10] a fenced citation whose plainly-vanished code trips no prior code heuristic is still STALE", () => {
+  it("[round 10, reverted round 11] a fenced bare statement with no distinguishing identifier or boundary is a disclosed gap, not silently correct", () => {
     // `return null;` is unmistakably code and unmistakably gone from `README.md:1` — but it has no
-    // mixed-case identifier and no call/dot/assignment/brace boundary immediately after "return",
-    // so it tripped none of `looksLikeCode`'s three prior checks and read as ADVISORY, contradicting
-    // this script's own header, which claims a vanished fenced quote is STALE. The same content
-    // inline (see the round 8 test above) was already caught; this is the fenced form of the exact
-    // same gap.
+    // mixed-case identifier and no call/dot/assignment/brace boundary immediately after "return".
+    // Round 10 added a fourth check (a trailing `;`/`{`/`}`) to catch exactly this; round 11
+    // reverted it — true of most English prose, not all of it (a set enumeration or a deliberate
+    // semicolon-ended clause trips it too), and there is no authority this script already trusts
+    // that answers "is this fenced quote prose or code" the way `git ls-files`/`readCode` answer
+    // "is this a file"/"is this a comment". So this stays ADVISORY, disclosed rather than hidden:
+    // the same content *inline* (see the round 8 test above) is still caught, because an inline
+    // citation trusts its explicit delimiter unconditionally and never needed this heuristic at
+    // all — the gap is specific to the fenced branch, where neither "trust the fence" nor "guess
+    // at trailing punctuation" turned out to be a substitute for a real signal.
     const body = ["```ts", "README.md:1  return null;", "```"].join("\n");
-    const { path, cleanup } = withIssues([{ number: 91004, title: "fenced statement heuristic gap counterexample", body }]);
+    const { path, cleanup } = withIssues([{ number: 91004, title: "fenced statement disclosed-gap control", body }]);
     try {
       const result = run(path);
-      expect(result.status).toBe(1);
-      expect(result.stdout).toContain("STALE");
-      expect(result.stdout).toContain("return null;");
-      expect(result.stdout).toContain("no longer appears");
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
     } finally {
       cleanup();
     }
   });
 
-  it("[round 10] a fenced description ending in a statement terminator by coincidence is still not manufactured — regression guard", () => {
-    // The exact #649 shapes round 8 protects: neither of these ends in `;`, `{`, or `}` once the
-    // `(#619)`-style aside is stripped, so widening `looksLikeCode` for a trailing statement
-    // terminator must not reopen the false STALE round 8 fixed by keeping the heuristic on this
-    // branch at all.
+  it("[round 10/11] a fenced description ending in a statement terminator by coincidence is still not manufactured — regression guard", () => {
+    // The exact #649 shapes round 8 protects. Round 10 briefly widened `looksLikeCode` to catch a
+    // trailing statement terminator and verified neither of these two real fenced lines ends in
+    // `;`/`{`/`}` once the `(#619)`-style aside is stripped; round 11 reverted that widening
+    // entirely for being too blunt in the other direction. This guard stays regardless of which
+    // state `looksLikeCode` is in, because it pins the thing that must never happen on this
+    // branch: a plain description manufactured into a false STALE.
     const descriptionBody = ["```", "hermes-bootstrap.ts:121-146   reconstitution is allowed when no active CEO exists (#619)", "```"].join(
       "\n",
     );
@@ -1314,6 +1320,117 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.stdout).not.toContain("STALE (");
     } finally {
       paraCleanup();
+    }
+  });
+
+  // --- Round 11: an eleventh independent review found two round-10 regressions (both from
+  // suggestions the reviewer made and then flagged as too coarse) plus this check's original
+  // defect reappearing for a quoted snippet instead of a bare symbol.
+
+  it("[round 11] a port number or an HTTP status code is not read as a file citation", () => {
+    // Round 10 loosened the extensionless branch to accept *any* bare word with a line number —
+    // `localhost:3000` and `HTTP:404` are the same `word:number` shape as a real citation and both
+    // matched, reporting "localhost does not exist" / "HTTP does not exist". A line number alone
+    // was never a strong enough signal; restored the second one round 6 established: every
+    // extensionless file this repository tracks either sits under a directory or carries a
+    // leading dot at the root (confirmed against `git ls-files` directly), and neither word here
+    // has either.
+    const body = "The dev server runs on localhost:3000 and returns HTTP:404 on a bad route.";
+    const { path, cleanup } = withIssues([{ number: 92001, title: "port and status code counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 11] an extensionless root-level dotfile and a directory-qualified extensionless path still resolve — positive controls", () => {
+    // The disambiguator is "directory separator OR leading dot", not "line number alone" — these
+    // two are the positive side of the round 10 regression fix above, confirming the fix did not
+    // overcorrect back to round 7's own gap.
+    const dotfileBody = "See `.gitignore:1` for the ignore rules.";
+    const { path: dotPath, cleanup: dotCleanup } = withIssues([
+      { number: 92002, title: "root dotfile still resolves control", body: dotfileBody },
+    ]);
+    try {
+      const result = run(dotPath);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      dotCleanup();
+    }
+
+    const dirBody = "See `.githooks/pre-commit:1` for the guard.";
+    const { path: dirPath, cleanup: dirCleanup } = withIssues([
+      { number: 92003, title: "directory-qualified extensionless still resolves control", body: dirBody },
+    ]);
+    try {
+      const result = run(dirPath);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      dirCleanup();
+    }
+  });
+
+  it("[round 11] quoted content surviving only inside a comment is STALE, not credited as the code surviving", () => {
+    // The check's own original defect, reappearing in the direction it was fixed for: the content
+    // search read `readText`'s raw output, comments included, while the symbol search has used
+    // `readCode` (comment/string-stripped) since round 2. `server.close()` is real text in
+    // `src/daemon/agentcpd.ts` — but only inside a comment about it, ~30 lines from the citation;
+    // the actual call happens 901 lines away, far outside the ±60 window. Before this fix, the raw
+    // text still contained the phrase (inside the comment) and this read ADVISORY.
+    const body = "The fix is at `src/daemon/agentcpd.ts:1420` — `server.close()` for the shutdown guard.";
+    const { path, cleanup } = withIssues([{ number: 92004, title: "comment-only survival counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("server.close()");
+      expect(result.stdout).toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 11] quoted content that is real, current code (not a comment) still resolves — positive control", () => {
+    const body = ["```", "src/bootstrap/hermes-bootstrap.ts:341   cp.bindings.bind({...})", "```"].join("\n");
+    const { path, cleanup } = withIssues([{ number: 92005, title: "real code content still resolves control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 11] a multi-line block comment ahead of the cited line does not desynchronize the content-search window from the real file", () => {
+    // Found while verifying the readCode fix above against the real corpus (#630), not
+    // constructed first: `stripSlashComments`/`stripSqlComments` used to replace a matched
+    // `/* ... */` block comment — which can legitimately span several lines — with a single
+    // fixed-width string, collapsing every newline the comment contained. That was invisible for
+    // as long as `readCode`'s only caller asked "does this symbol appear anywhere", never "at
+    // which line" — the content-search window above is the first caller that slices `readCode`'s
+    // output by line number, and a multi-line docstring ahead of the cited line silently shifted
+    // every line after it out of sync with the real file, making the window look at the wrong
+    // span entirely. `src/runtime/hermes-ceo.ts` has several multi-line `/** ... */` blocks before
+    // line 341; the real call this citation names sits nine lines below it, comfortably inside the
+    // ±60 window — but only if the window's line numbers still mean what the real file's do.
+    const body = ["```", "src/runtime/hermes-ceo.ts:341   void askReplySource(options.replyCommand, …)", "```"].join("\n");
+    const { path, cleanup } = withIssues([{ number: 92006, title: "multi-line comment desync counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
     }
   });
 

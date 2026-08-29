@@ -32,13 +32,19 @@
  *     quote from a plain-English description sharing the same fence (#649's own body does both;
  *     see round 8), so a fenced line is additionally required to read as code by `looksLikeCode`
  *     (a mixed-case identifier; a call, member, or assignment boundary right after the first word;
- *     a declaration's trailing `{`; or a statement/block ending in `;`, `{`, or `}` — round 10) —
- *     no longer appears within `CONTENT_SEARCH_WINDOW` (±60) lines of the cited line, not the whole
- *     file (see round 8 for why the window is bounded rather than unbounded, and why an earlier
- *     version of this paragraph said "anywhere in the file" when the code never searched further
- *     than that) (elision-tolerant: `...`/`()` stand for "and more")        → STALE, *if* the
- *     fenced line clears `looksLikeCode` — a fenced line that reads as a plain description rather
- *     than code is not checked at all, by design (round 8), and stays ADVISORY
+ *     or a declaration's trailing `{` — a fourth check, a line ending in `;`/`{`/`}`, was tried in
+ *     round 10 and reverted in round 11 for being too blunt in the opposite direction; see
+ *     `looksLikeCode`'s own comment) — searched against `readCode` (comment- and string-stripped,
+ *     round 11 — the raw text let old code survive inside a comment near its own vanished call
+ *     site pass as still-current, this check's original defect reappearing for a quoted snippet
+ *     instead of a bare symbol) — no longer appears within `CONTENT_SEARCH_WINDOW` (±60) lines of
+ *     the cited line, not the whole file (see round 8 for why the window is bounded rather than
+ *     unbounded, and why an earlier version of this paragraph said "anywhere in the file" when the
+ *     code never searched further than that) (elision-tolerant: `...`/`()` stand for "and more")
+ *     → STALE, *if* the fenced line clears `looksLikeCode` — a fenced line that reads as a plain
+ *     description rather than code is not checked at all, by design (round 8), and stays ADVISORY,
+ *     and a fenced statement that reads as code but trips none of the three checks above (round 11's
+ *     disclosed gap) is also not checked, and also stays ADVISORY
  *
  * The last one is the one that actually catches #649's real citation. `binding-registry.ts:163`
  * is still in range — that file is 973 lines long — so the length check alone passes it. What
@@ -442,6 +448,11 @@
  *   adjacent `:digit` or `#Ldigit` that is not a real citation; ordinary prose never places a
  *   colon-digit directly against a word with no separating space.
  *
+ *   Retracted in round 11: "zero new false positives" was true of the corpus measured, not of the
+ *   shape in general — `localhost:3000` and `HTTP:404` are the same `word:number` shape and the
+ *   corpus at the time simply did not happen to contain either. A clean corpus diff is evidence
+ *   about the corpus, not a proof about the regex; see round 11 for the actual fix.
+ *
  *   Second: this docstring's own "What counts as stale" section claimed a fenced citation's
  *   vanished code is caught because "the fence itself is the delimiter", the same unconditional
  *   trust round 8 gave an inline citation's explicit delimiter — but the code never matched that
@@ -462,6 +473,71 @@
  *   does not reopen. The docstring bullet above is corrected to say what the code actually does:
  *   a fenced line is checked only if it clears `looksLikeCode`, plainly, rather than claiming the
  *   fence alone is decisive.
+ *
+ *   Reverted in round 11: the reasoning was true of most English prose, not all of it — a
+ *   description enumerating a set (`role ∈ {ADMIN, USER}`) or ending a clause with a semicolon by
+ *   choice trips the same check a real statement does. See round 11 for what replaced it (nothing;
+ *   the gap is disclosed instead) and why.
+ *
+ * ## Round 11: an eleventh independent review, both of the reviewer's own suggestions from round
+ * 10 landing badly, plus this script's original defect reappearing in the direction it was fixed
+ * for
+ *
+ *   `localhost:3000` and `HTTP:404` both matched `PATH_RE`'s extensionless branch and reported
+ *   STALE — "localhost does not exist" — because round 10 loosened the directory requirement to
+ *   zero-or-more for *any* bare word once a line number followed, on the theory that the number
+ *   alone was signal enough. It is not: `word:number` is also a port, a status code, or any other
+ *   colon-separated pair, and round 7's own corpus measurement had already found that shape in
+ *   abundance the last time a requirement was dropped here (`READY/DRAINING`, `16/580`). The fix is
+ *   not a stopword list excluding "localhost" and "HTTP" — the shape this PR has paid for four
+ *   times already — it is restoring the second signal round 6 established and round 10 discarded:
+ *   every extensionless file this repository actually tracks either sits under a directory
+ *   (`.githooks/pre-commit`) or carries a leading dot at the root (`.gitignore`); confirmed against
+ *   `git ls-files` directly (`grep -v '/'` over the tracked list has exactly one extensionless
+ *   entry, `.gitignore`, and it has the dot), not assumed from one example. So the extensionless
+ *   branch now requires *either* a directory separator *or* a leading dot with no separator — never
+ *   a bare undotted word on the strength of a line number alone. `.gitignore:999999` and
+ *   `.definitely-missing:42` both keep matching; `localhost:3000` and `HTTP:404` no longer do.
+ *
+ *   Second: the content-search window (the code line bullet above) read `readText`'s raw output —
+ *   comments and strings included — never `readCode`, the comment/string-stripped view the symbol
+ *   search has used since round 2. `` `src/daemon/agentcpd.ts:1420` — `server.close()` `` — a real
+ *   citation whose literal text survives only inside a comment 30+ lines from where the actual call
+ *   happens (confirmed against the real file: `server.close(` appears once as code, 901 lines away
+ *   from that comment, far outside the ±60 window) — passed as ADVISORY, because the raw text still
+ *   contained the phrase. This is the check's own original defect (a comment mentioning old code
+ *   read as evidence the code survives) reappearing for a quoted snippet instead of a bare symbol,
+ *   in the one place that still searched raw text after every other search had already moved to
+ *   `readCode`. Fixed by searching `readCode(resolved.path)` instead of `text`: every stripper
+ *   blanks a comment or string in place without removing a line, so the window's line arithmetic
+ *   above is untouched by the swap.
+ *
+ *   Third: `looksLikeCode`'s round-10 fourth check — a fenced line ending in `;`, `{`, or `}` reads
+ *   as code — was too blunt in the opposite direction, per the same reviewer who suggested it: true
+ *   of most English prose, not all of it. Rather than narrow it (excluding a brace-enumeration, say
+ *   — a fifth check for a case found today, blind to the next one, the exact shape round 5 already
+ *   named and rejected), it is dropped. Checked before dropping it, not assumed safe: neither
+ *   authority this script already trusts — `git ls-files` for what is a file, `readCode` for what
+ *   is code within a *known* file — answers "is this fenced quote prose or code" at all, because
+ *   both questions are about the tracked tree and a citation's quoted text is not in it; verified
+ *   directly against #649's own fixture that the prose lines this heuristic protects
+ *   ("reconstitution is allowed when no active CEO exists (#619)") do not appear anywhere in the
+ *   current file, raw or `readCode`-stripped, so dropping the heuristic entirely (tried first, per
+ *   the reviewer's "fewer rules" framing) would reopen the exact false STALE round 8 fixed by
+ *   keeping it. The disclosed cost: a fenced bare statement with no distinguishing capitalization
+ *   and no boundary immediately after its first word (`return null;` chief among them) is not
+ *   recognised as code and stays ADVISORY even when genuinely gone. The same content *inline* is
+ *   still caught (round 8's unconditional delimiter trust does not depend on this heuristic at
+ *   all); the gap is specific to the fenced branch, where neither "trust the fence" nor "guess at
+ *   punctuation" turned out to be a substitute for a real signal.
+ *
+ *   Corpus diff (fresh snapshot, before/after, every changed line checked against the real issue
+ *   text): none. Each of the three fixes above was proven by a constructed counterexample against
+ *   real tracked files (`.gitignore`, `src/daemon/agentcpd.ts`, `src/bootstrap/hermes-bootstrap.ts`)
+ *   rather than a corpus shift, because none of these three defects happened to match anything in
+ *   the corpus at the time of this snapshot — which is itself the lesson of finding one and three
+ *   this round: a clean corpus diff proves the corpus does not currently contain the shape, not
+ *   that the shape is handled.
  *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
@@ -525,6 +601,24 @@ const countLines = (text) => {
 };
 
 /**
+ * Blanks every non-newline character in a matched span, for use as a `String.replace` callback.
+ * Round 11: `stripSlashComments`/`stripSqlComments`/`stripStrings` used to replace a whole matched
+ * span — a block comment or a quoted string, either of which can legitimately span several lines
+ * — with one fixed short string (`" "`, `'""'`, `"''"`). That collapses every internal newline the
+ * match contained, shifting every line *after* the match one-for-one out of sync with the real
+ * file — invisible for as long as `readCode`'s only consumer (`symbolPattern.test`) never asked
+ * "which line", only "does this appear anywhere". It stopped being invisible the moment a second
+ * consumer *did* ask which line: the content-search window (below) slices `readCode`'s output by
+ * the cited line number, and a multi-line `/** ... *\/` docstring ahead of the cited line silently
+ * moved every line after it, making the window look at the wrong span of the file entirely. Found
+ * against the real corpus, not a constructed case — see the round 11 commit. Preserving every
+ * newline (blanking everything else) keeps both properties at once: the match still cannot fuse
+ * the tokens on either side of it (there is exactly as much blank space as there was match), and
+ * every line number downstream of it still means the same real line it always did.
+ */
+const blankKeepingNewlines = (match) => match.replace(/[^\n]/g, " ");
+
+/**
  * Removes `//` line comments and `/* ... *\/` block comments before a symbol search, so a symbol
  * mentioned only in prose about the code — a comment explaining what a mechanism used to do, or
  * warning about a related concept — does not count toward it. A comment mentioning a word is a
@@ -535,7 +629,7 @@ const countLines = (text) => {
  */
 const stripSlashComments = (text) =>
   text
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, blankKeepingNewlines)
     .split("\n")
     .map((line) => line.replace(/(?<!:)\/\/.*$/, ""))
     .join("\n");
@@ -550,18 +644,19 @@ const stripHashComments = (text) =>
 /** SQL's own comment forms: `--` to end of line, and the same `/* ... *\/` block form as JS. */
 const stripSqlComments = (text) =>
   text
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, blankKeepingNewlines)
     .split("\n")
     .map((line) => line.replace(/--.*$/, ""))
     .join("\n");
 
 /**
- * Removes the contents of single- and double-quoted string literals (kept as empty pairs, so
- * this does not fuse the tokens on either side together). `"utf8"` as an encoding argument is not
- * a citation's enforcing symbol resolving — it is a string that happens to spell the same word,
- * and without this a row pairing any file with any common string constant used in it would pass.
- * Applies across every language this check handles: Python, shell, YAML, and SQL all use the same
- * two quote characters for a string, and JS/TS's own `"`/`'` strings are the same shape.
+ * Removes the contents of single- and double-quoted string literals (the opening and closing
+ * quote characters are kept, so this does not fuse the tokens on either side together). `"utf8"`
+ * as an encoding argument is not a citation's enforcing symbol resolving — it is a string that
+ * happens to spell the same word, and without this a row pairing any file with any common string
+ * constant used in it would pass. Applies across every language this check handles: Python, shell,
+ * YAML, and SQL all use the same two quote characters for a string, and JS/TS's own `"`/`'`
+ * strings are the same shape.
  *
  * A measured gap, not a guessed one: a regex literal with a quote inside a character class
  * (`` /(["\\])/g `` — this repository has one, in `cli-adapters.ts`) is not told apart from a real
@@ -572,7 +667,9 @@ const stripSqlComments = (text) =>
  * a second verified fact.
  */
 const stripStrings = (text) =>
-  text.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/'(?:[^'\\]|\\.)*'/g, "''");
+  text
+    .replace(/"(?:[^"\\]|\\.)*"/g, (m) => `"${blankKeepingNewlines(m.slice(1, -1))}"`)
+    .replace(/'(?:[^'\\]|\\.)*'/g, (m) => `'${blankKeepingNewlines(m.slice(1, -1))}'`);
 
 /**
  * Template literals (`` `...` ``) hold two different things at once: literal text the author
@@ -853,13 +950,28 @@ const resolvePath = (cited) => {
 // disambiguator for a *bare mention with nothing else to anchor it* — right there, because
 // `src/github` alone is no more a citation than `Node.js` alone is. It was never the reason a
 // *line-numbered* extensionless path was accepted; the line number already was, the same way it
-// already is for the with-extension branch. Loosening `+` to `*` here extracts a root-level
-// dotfile the same way `.githooks/pre-commit:999999` already was — a line number is the anchor in
-// both, a directory separator is incidental. Measured against the real corpus before trusting
-// this (round 10 commit): zero new false positives — nothing in the corpus pairs a bare word with
-// an immediately-adjacent `:digit` or `#Ldigit` that is not a real citation.
+// already is for the with-extension branch. Round 10 loosened the directory requirement to zero-
+// or-more for *any* bare word, on the theory that a line number alone was signal enough.
+//
+// Round 11: that theory was wrong, and a real corpus diff would not have shown it — the round 10
+// corpus at the time simply did not contain the shape. `localhost:3000` and `HTTP:404` both
+// matched and both reported STALE ("localhost does not exist"): a line number distinguishes a
+// *file* citation from a *bare product mention* only when there is nothing else competing for
+// the same shape, and `word:number` is also how a port, a status code, or a ratio is written —
+// shapes round 7's own corpus measurement already found in abundance (`READY/DRAINING`,
+// `16/580`) once the directory requirement was dropped for a related reason. The fix is not a
+// finer version of the same rule (a stopword list of "localhost", "HTTP", … is the shape this PR
+// has already paid for four times); it is restoring the second signal round 6 established:
+// `.githooks/pre-commit` and `.gitignore` are recognisable *as paths* not because of the line
+// number but because of what git already knows a real file looks like here — every extensionless
+// file this repository tracks either sits under a directory (`.githooks/pre-commit`) or carries a
+// leading dot at the root (`.gitignore`); nothing tracked is a bare, undotted word (confirmed
+// against `git ls-files` directly, not assumed). So the extensionless branch now requires *either*
+// a directory separator (unchanged from round 7) *or* a leading dot with no separator (round 10's
+// actual target, kept) — never a bare word on the strength of a line number alone. `localhost` and
+// `HTTP` have neither and are excluded; `.gitignore` and `.definitely-missing` both have the dot.
 const PATH_RE = new RegExp(
-  `(?<![\\w.])(\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*(?=:\\d|#L\\d)|\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*)\\b` +
+  `(?<![\\w.])(\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)+(?=:\\d|#L\\d)|\\.[A-Za-z_][\\w-]*(?=:\\d|#L\\d)|\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*)\\b` +
     `(?::(?<cs>\\d+)(?:-(?<ce>\\d+))?|#L(?<as>\\d+)(?:-L?(?<ae>\\d+))?)?`,
   "g",
 );
@@ -1101,20 +1213,27 @@ const looksLikeCode = (text) => {
   const braceScope = stripped.match(/^(?:[A-Za-z_$][\w$]*\s+){0,2}[A-Za-z_$][\w$]*/);
   if (braceScope && /^\s*\{/.test(stripped.slice(braceScope[0].length))) return true;
 
-  // Round 10: a line ending in a statement terminator or a block boundary — `;`, `{`, or `}` — is
-  // a shape English prose essentially never produces (a sentence ends in a period, a question
-  // mark, a closing paren, or a word; `;`/`{`/`}` are not sentence-final punctuation in English at
-  // all), while it is exactly how a real line of JS/TS-shaped code, statement or block, tends to
-  // end. `return null;` — real, vanished code from #649's own shape, tripped none of the checks
-  // above (no mixed-case identifier; "return" and "null" are both ordinary lowercase words with no
-  // call/dot/assignment/brace sitting immediately after the first one) — passed as ADVISORY in a
-  // fence until this was added, violating this script's own header claim that a vanished fenced
-  // quote is STALE. Checked against #649's real fixture before trusting this: neither of its own
-  // fenced prose lines ("reconstitution is allowed when no active CEO exists (#619)", "calls
-  // bindings.bind()") ends in `;`, `{`, or `}` once the `(#619)`-style aside is stripped above, so
-  // this does not reopen the false STALE round 8 fixed by keeping the heuristic on this branch.
-  if (/[;{}]$/.test(stripped)) return true;
-
+  // Round 10 added a fourth check here — a line ending in `;`, `{`, or `}` reads as code — to
+  // catch `return null;` (real, vanished code that trips none of the three checks above: no
+  // mixed-case identifier, no call/dot/assignment/brace immediately after "return"). Reverted in
+  // round 11: it was too blunt in the direction of manufacturing code out of prose. The reasoning
+  // that motivated it ("a sentence essentially never ends in `;`/`{`/`}`") is true of most English
+  // prose and not all of it — a description enumerating a set (`role ∈ {ADMIN, USER}`) or ending a
+  // clause with a semicolon by choice reads exactly like this check would need to see, and this
+  // round's own reviewer flagged it as a suggestion that landed badly rather than one to narrow
+  // further. Narrowing it again (excluding brace-enumerations, say) is the same shape this PR has
+  // already rejected four times for a keyword list: a finite patch for a case found today, blind
+  // to the next one. There is no authority this script already trusts — `git ls-files`, `readCode`
+  // — that answers "is this quoted fragment prose or code" the way they answer "is this a file" or
+  // "is this a comment": both questions are about the *tracked tree*, and a fenced citation's
+  // quoted text is not in it. So this is dropped rather than refined, and the gap is named instead
+  // of patched: a fenced statement with no distinguishing capitalization and no boundary
+  // immediately after its first word — `return null;` chief among them — is not recognised as code
+  // and stays ADVISORY even when genuinely gone. The same content *inline* is still caught (round
+  // 8 trusts the explicit delimiter there unconditionally); this gap is specific to the fenced
+  // branch, where the fence alone was never a strong enough signal to drop the heuristic entirely
+  // (see the false-STALE round 8 found and fixed by keeping it) but is not strong enough either to
+  // license guessing at punctuation as a substitute for it.
   return false;
 };
 
@@ -1401,7 +1520,18 @@ for (const issue of issues) {
       // still-current citation exactly `CONTENT_SEARCH_WINDOW` lines past the cited line —
       // `README.md:121` cited as `README.md:61`, +60, the boundary the contract names — read as
       // vanished, because the slice stopped one line before it.
-      const windowLines = text.split("\n");
+      //
+      // Round 11: this searched `text` — the raw file, comments and strings included — not
+      // `readCode(resolved.path)`, the same comment/string-stripped view the symbol search has
+      // used since round 2. That is this check's own original defect, reappearing in the
+      // direction it started in rather than the one it was fixed for: a citation whose code was
+      // deleted but whose *old text survives inside a comment nearby* — the exact #649 shape,
+      // just for a quoted snippet instead of a bare symbol — passed as ADVISORY, because the raw
+      // text still contained it. `readCode` preserves every line exactly (each stripper blanks a
+      // comment or string in place, never removing a line), so swapping it in here costs nothing
+      // for the bounds already established above and closes the gap the same way it already did
+      // for symbols: a comment mentioning old code is a sentence about it, not code that holds it.
+      const windowLines = readCode(resolved.path).split("\n");
       const from = Math.max(0, citation.startLine - 1 - CONTENT_SEARCH_WINDOW);
       const to = Math.min(windowLines.length, citedEnd + CONTENT_SEARCH_WINDOW);
       const nearby = windowLines.slice(from, to).join("\n");
