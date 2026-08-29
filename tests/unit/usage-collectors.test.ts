@@ -1327,6 +1327,11 @@ setInterval(() => {}, 1_000);
     const root = tempDir("acp-usage-pty-");
     const binary = join(root, "codex-usage-stub.mjs");
     writeFileSync(binary, `#!${process.execPath}
+// Unconditional readiness banner, written before anything is typed and independent of what
+// arrives on stdin — the real CLI's own startup line, in miniature. This exists solely so a
+// failure below can tell "the process was alive and the pty carried its output" apart from
+// "nothing ever arrived": every real CLI says something on launch before a user types.
+process.stdout.write("Codex CLI ready\\n");
 let received = "";
 let opened = false;
 process.stdin.on("data", (chunk) => {
@@ -1370,53 +1375,61 @@ setInterval(() => {}, 1_000);
     const captured = `${capturedStdout}\n${capturedStderr}\n${capturedError ?? ""}`;
 
     // A fixed-budget real pty that fails to complete in time is not, by itself, evidence of
-    // which of two different things happened, and an earlier commit on this same branch
-    // (superseded by this one, #644) conflated them by keying off whether an unrelated
-    // `codex` process happened to be running anywhere on the host:
+    // which of several different things happened, and two earlier commits on this same
+    // branch (superseded by this one, #644) each conflated causes a single boolean cannot
+    // tell apart:
     //
-    //   the stub never emitted a byte before the budget elapsed   — an environment/scheduling
-    //                                                                 miss: the host did not
-    //                                                                 run this pty in time.
-    //                                                                 Real on this machine
-    //                                                                 (#644's own follow-up):
-    //                                                                 the deployment's CEO
-    //                                                                 runtime and reviewer
-    //                                                                 sessions share host CPU
-    //                                                                 with real Codex CLI
-    //                                                                 activity, and a
-    //                                                                 full-suite run adds its
-    //                                                                 own sandboxed children.
+    //   commit 1 asked the process table whether an unrelated `codex` process existed
+    //   anywhere on the host. Measured wrong: a stub answering immediately with
+    //   `"5-hour limit: 62% consumed"` (a shape `parseUsageOutput` refuses by design — see
+    //   the mutation test above) resolves with `timedOut: false` regardless of any other
+    //   `codex` process, so that check reported an unrelated live regression as
+    //   "another Codex session is active" — confidently wrong.
     //
-    //   the stub answered and the collector still failed            — a real regression in the
-    //                                                                 navigation or the parser
-    //                                                                 this test exists to
-    //                                                                 catch, and must never be
-    //                                                                 reported as anything else.
+    //   commit 2 asked only "did the chooser ever open" (`CLI.gpt`'s own `waitFor`,
+    //   `/show usage|press enter to confirm/i`). Also measured wrong: with production's
+    //   Codex step's `input` mutated from `"/usage\r"` to the typo `"/usag\r"` — an
+    //   ordinary navigation regression, entirely a collector defect — the stub never sees
+    //   its trigger string and the chooser never opens, which is *indistinguishable from*
+    //   a genuinely slow host under that check alone. Both produce zero chooser text.
     //
-    // Naming a *specific* competing process was measured to be unsound rather than merely
-    // theoretically risky: a stub answering immediately with `"5-hour limit: 62% consumed"`
-    // (a shape `parseUsageOutput` refuses by design — see the mutation test above) resolves
-    // with `timedOut: false` regardless of whether a real `codex` process is present
-    // elsewhere on the host, so a check keyed on process presence reported that unrelated
-    // regression as "another Codex session is active" — confidently wrong, and worse than
-    // the bare timeout it replaced. The pty layer already knows whether it delivered a byte;
-    // this reads that instead of asking the process table a question it cannot answer.
+    // The fix is the stub's own unconditional banner above, which needs no input to appear.
+    // It turns one boolean into a real three-way split instead of an inferred one:
     //
-    // "Never emitted a byte" cannot be read off raw stdout emptiness either — measured: a
-    // pty echoes back whatever this test's own harness typed (`/usage\r\n`, 8 bytes) even
-    // when the stub writes nothing at all, so `capturedStdout` is non-empty on every run
-    // regardless of whether the target ever responded. The signal that actually means "the
-    // chooser answered" is the same one the collector itself gates its second keystroke on
-    // — `CLI.gpt`'s own `waitFor`, `/show usage|press enter to confirm/i` — so that is what
-    // is checked here, not raw byte count.
-    const respondedAtAll = /show usage|press enter to confirm/i.test(capturedStdout);
-    if (reading.error === "interactive /usage timed out" && !respondedAtAll) {
-      throw new Error(
-        "the pty never showed the usage chooser opening before the 5s budget elapsed; this " +
-          "is an environment/scheduling miss — the host did not run this real pty in time — " +
-          "not a collector defect. On this deployment the CEO runtime and reviewer sessions " +
-          `routinely share host Codex CLI activity with whatever runs the suite (#644). ${captured}`,
-      );
+    //   banner never seen                    — environment/scheduling miss: the host did
+    //                                            not run this real pty in time at all. Real
+    //                                            on this machine (#644's own follow-up): the
+    //                                            deployment's CEO runtime and reviewer
+    //                                            sessions share host Codex CLI activity, and
+    //                                            a full-suite run adds sandboxed children.
+    //   banner seen, chooser never seen       — a genuine navigation regression: the
+    //                                            process was alive and the pty was carrying
+    //                                            its output the whole time, so whatever was
+    //                                            typed did not open the chooser.
+    //   chooser seen, reading still unhealthy — a real parser/second-step regression,
+    //                                            already caught unmodified by the assertion
+    //                                            below — never reported as anything else.
+    const sawReadiness = /codex cli ready/i.test(capturedStdout);
+    const sawChooser = /show usage|press enter to confirm/i.test(capturedStdout);
+    if (reading.error === "interactive /usage timed out") {
+      if (!sawReadiness) {
+        throw new Error(
+          "the pty never showed even the stub's own startup banner before the 5s budget " +
+            "elapsed; this is an environment/scheduling miss — the host did not run this " +
+            "real pty in time at all — not a collector defect. On this deployment the CEO " +
+            "runtime and reviewer sessions routinely share host Codex CLI activity with " +
+            `whatever runs the suite (#644). ${captured}`,
+        );
+      }
+      if (!sawChooser) {
+        throw new Error(
+          "the stub's startup banner arrived and the pty was carrying its output the whole " +
+            "time, but the usage chooser never opened before the 5s budget elapsed; this " +
+            "points at a navigation regression in the collector's Codex steps (a keystroke " +
+            "or a waitFor pattern that no longer matches what the CLI expects), not host " +
+            `scheduling (#644). ${captured}`,
+        );
+      }
     }
 
     expect(reading, `${JSON.stringify(reading)}\n${captured}`).toMatchObject({
@@ -1425,8 +1438,8 @@ setInterval(() => {}, 1_000);
     });
     // If the collector stops sending /usage or blindly removes Codex's bounded second
     // navigation step, this real PTY fixture times out or yields no routable bucket — and,
-    // whenever the stub did answer, still reports that failure directly above rather than
-    // behind an environment story it did not earn.
+    // whenever the stub's chooser did open, still reports that failure directly above
+    // rather than behind an environment or navigation story it did not earn.
   });
 
   it("turns a collector exception into an ERROR reading rather than throwing or reusing quota", async () => {
