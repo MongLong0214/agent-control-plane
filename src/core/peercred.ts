@@ -59,8 +59,18 @@ const loadAddon = (): PeercredAddon | null => {
  * `AF_LOCAL` socket). Fail-closed for the same reason `processStartedAt` (#505) is: an
  * unverifiable peer is treated as absent, not as verified.
  */
+/**
+ * The addon's N-API binding reads `fd` with `Napi::Number::Int32Value()`, which applies
+ * ECMAScript `ToInt32` — reduction mod 2^32, not a range check. A `Number.isSafeInteger` value
+ * above this bound (e.g. `2**32 + 5`) would silently wrap to a small, possibly valid fd (`5`),
+ * so a caller expecting "obviously out of range" to mean "rejected" would instead get another
+ * fd's real credentials back. Bounding to `int32` here, before the addon ever sees the value,
+ * is what makes that wraparound unreachable rather than merely unlikely.
+ */
+const MAX_FD = 0x7fffffff;
+
 export const getPeerCredentials = (fd: number): PeerCredentials | null => {
-  if (!Number.isSafeInteger(fd) || fd < 0) return null;
+  if (!Number.isSafeInteger(fd) || fd < 0 || fd > MAX_FD) return null;
   const native = loadAddon();
   if (native === null) return null;
   try {

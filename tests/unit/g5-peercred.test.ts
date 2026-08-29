@@ -63,6 +63,15 @@ describe("getPeerCredentials", () => {
     expect(getPeerCredentials(999_999)).toBeNull();
   });
 
+  it("refuses a fd above int32 range rather than letting it wrap, on every platform", () => {
+    // The addon reads fd with Napi::Number::Int32Value(), which is ECMAScript ToInt32 —
+    // reduction mod 2^32, not a range check. `2**32 + 5` is a Number.isSafeInteger value that
+    // would wrap to `5`, a small, possibly real fd. This must be refused before the addon ever
+    // sees it, not merely "usually not a socket".
+    expect(getPeerCredentials(2 ** 32 + 5)).toBeNull();
+    expect(getPeerCredentials(0x7fffffff + 1)).toBeNull();
+  });
+
   if (process.platform === "darwin") {
     it("reads the real peer credentials off a connected AF_UNIX socket pair", async () => {
       const dir = tempDir("g5-peercred-");
@@ -78,6 +87,13 @@ describe("getPeerCredentials", () => {
         expect(credentials?.effectivePid).toBe(process.pid);
         expect(credentials?.uid).toBe(process.getuid?.());
         expect(credentials?.gid).toBe(process.getgid?.());
+
+        // The wraparound this repository's own fd-range guard exists to close: without it,
+        // `fd + 2**32` would reach the addon, ToInt32 would fold it right back down to `fd`,
+        // and the caller would silently get this real socket's credentials back for a number
+        // that looks nothing like a small fd. The guard must refuse it before that happens.
+        const wrapped = fd + 2 ** 32;
+        expect(getPeerCredentials(wrapped)).toBeNull();
       } finally {
         cleanup();
       }

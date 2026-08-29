@@ -13,6 +13,7 @@
     "agentcpd-state": "./dist/db/state-admin.js"
   },
   "scripts": {
+    "postinstall": "node scripts/build-native-peercred.mjs",
     "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
