@@ -695,6 +695,173 @@ describe("Telegram production ingress", () => {
     }
   });
 
+  it("parks a resend instead of running a second CEO turn while the conversation's first is unresolved", async () => {
+    // #641: the crash above leaves an unresolved turn, but the owner does not know that — Telegram
+    // will not resend the lost update, so what arrives next is the owner typing the same words
+    // again. That is a genuinely new update: its own nonce, its own turn id. Nothing about its
+    // *identity* says it is a duplicate of the first — the duplication is that a person meant it
+    // as one, and only a lookup by conversation (not by nonce) can see that.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const turns: string[] = [];
+    const crashingTurn = async (input: { text: string }): Promise<string> => {
+      turns.push(input.text);
+      throw new TelegramInterruption("after-dispatch");
+    };
+
+    const firstTransport = new FakeTelegramTransport();
+    const lost = update("배포 상태 알려줘", {}, 710);
+    firstTransport.updates = [lost];
+    const first = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: firstTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      await expect(first.service.pollOnce()).rejects.toBeInstanceOf(TelegramInterruption);
+    } finally {
+      await first.close();
+    }
+    expect(turns).toEqual(["배포 상태 알려줘"]);
+
+    // The resend: same words, a fresh Telegram update id — exactly what a person retyping (or
+    // Telegram's client resending on "send again") produces.
+    const resendTransport = new FakeTelegramTransport();
+    const resent = update("배포 상태 알려줘", {}, 711);
+    resendTransport.updates = [resent];
+    const resendListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: resendTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      const outcome = await resendListener.service.pollOnce();
+
+      // The assertion that matters, as above: the handler count. A fix that refused the resend's
+      // *reply* while still invoking the CEO handler would pass a reason-code-only check and
+      // still duplicate the transcript.
+      expect(turns, "a second, honest CEO turn started for a conversation with an unresolved one")
+        .toEqual(["배포 상태 알려줘"]);
+      expect(outcome.outcomes[0]?.reasonCode).toBe(ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION);
+      expect(outcome.outcomes[0]?.admitted).toBe(true);
+      expect(outcome.outcomes[0]?.reply?.text).toContain("/again");
+
+      // Parked, not silently swallowed: the row exists and was never claimed, so it remains
+      // reachable — the owner's words were not dropped.
+      const parkedRow = harness.cp.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+        ["update:711"],
+      );
+      expect(parkedRow?.turn_claim_json).toBeNull();
+    } finally {
+      await resendListener.close();
+    }
+  });
+
+  it("does not park a DIRECT message from an unrelated conversation", async () => {
+    // The lookup is scoped by sessionDigest = digestOf({ channel, conversation }). An unresolved
+    // turn in one chat must never hold up a different chat that happens to share nothing but a
+    // poll cycle.
+    const secondChat = "-100777";
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const turns: string[] = [];
+    const crashingTurn = async (input: { text: string }): Promise<string> => {
+      turns.push(input.text);
+      throw new TelegramInterruption("after-dispatch");
+    };
+    const config = { ...telegramConfig, allowedChatIds: [CHAT_ID, secondChat] };
+
+    const firstTransport = new FakeTelegramTransport();
+    const lost = update("첫번째 대화", {}, 712);
+    firstTransport.updates = [lost];
+    const first = await startDaemonTelegramListener(harness.cp, config, daemonStub, {
+      transport: firstTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      await expect(first.service.pollOnce()).rejects.toBeInstanceOf(TelegramInterruption);
+    } finally {
+      await first.close();
+    }
+
+    const otherTransport = new FakeTelegramTransport();
+    const otherChat = update("다른 대화의 새 메시지", { chat: { id: Number(secondChat) } }, 713);
+    otherTransport.updates = [otherChat];
+    const otherListener = await startDaemonTelegramListener(harness.cp, config, daemonStub, {
+      transport: otherTransport,
+      start: false,
+      onDirect: () => "답",
+    });
+    try {
+      const outcome = await otherListener.service.pollOnce();
+      expect(outcome.outcomes[0]?.reasonCode).toBe(ReasonCode.OK);
+      expect(outcome.outcomes[0]?.reply?.text).not.toContain("parked");
+    } finally {
+      await otherListener.close();
+    }
+  });
+
+  it("/again lets the owner deliberately run a second turn over an unresolved one, and records the choice", async () => {
+    // A fix that only ever refuses would make an unresolved turn a lockout: #672 already
+    // establishes that a claimed turn whose handler never replies stays unresolved with no
+    // operator door today. This is the escape that does not depend on #672 landing first — the
+    // owner chooses explicitly, and the choice is written onto the new claim itself.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const turns: string[] = [];
+    const crashingTurn = async (input: { text: string }): Promise<string> => {
+      turns.push(input.text);
+      throw new TelegramInterruption("after-dispatch");
+    };
+
+    const firstTransport = new FakeTelegramTransport();
+    const lost = update("배포 다시 확인해줘", {}, 720);
+    firstTransport.updates = [lost];
+    const first = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: firstTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      await expect(first.service.pollOnce()).rejects.toBeInstanceOf(TelegramInterruption);
+    } finally {
+      await first.close();
+    }
+    expect(turns).toEqual(["배포 다시 확인해줘"]);
+
+    const againTransport = new FakeTelegramTransport();
+    const again = update("/again 배포 다시 확인해줘", {}, 721);
+    againTransport.updates = [again];
+    const againListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: againTransport,
+      start: false,
+      onDirect: (input: { text: string }) => {
+        turns.push(input.text);
+        return "확인함";
+      },
+    });
+    try {
+      const outcome = await againListener.service.pollOnce();
+      expect(turns).toEqual(["배포 다시 확인해줘", "배포 다시 확인해줘"]);
+      expect(outcome.outcomes[0]?.reasonCode).toBe(ReasonCode.OK);
+
+      const claimRow = harness.cp.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+        ["update:721"],
+      );
+      const claim = claimRow?.turn_claim_json ? JSON.parse(claimRow.turn_claim_json) : null;
+      expect(claim?.overriddenUnresolvedNonce, "the deliberate override was not recorded on the claim")
+        .toBe("update:720");
+    } finally {
+      await againListener.close();
+    }
+  });
+
   it("tells an unknown outcome apart from an ordinary replay", async () => {
     // Both are "this update came back". They need different responses: a replay means the work
     // was done and this copy is redundant, an unknown outcome means nobody knows whether it was.

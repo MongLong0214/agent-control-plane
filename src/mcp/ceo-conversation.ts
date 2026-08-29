@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 
 import {
   CEO_CONVERSATION_BUDGET_MS,
@@ -235,9 +236,48 @@ export class CeoConversationPort {
     } catch (error) {
       // The peer's own message is not repeated into the chat: it is written by the CEO
       // runtime and may quote whatever it was handling when it failed.
+      //
+      // `createMessage` rejects with one of three distinct shapes, and folding them into one
+      // reason code (#633) told the owner "did not answer in time" for two outcomes that are
+      // not a timeout at all:
+      //   - `McpError` with `ErrorCode.RequestTimeout`: this port's own budget expired. A real
+      //     timeout — the peer may still be working, it just did not finish in time.
+      //   - `McpError` with `ErrorCode.ConnectionClosed`, or a plain "Not connected" error: the
+      //     transport closed or was already gone. Neither side finished the round trip.
+      //   - Any other `McpError`: the peer received the turn and answered with a JSON-RPC
+      //     error. It was reached; it is the one that failed.
+      // Anything else is left unclassified rather than guessed into one of the three above.
+      if (error instanceof McpError) {
+        if (error.code === ErrorCode.RequestTimeout) {
+          return deny(
+            ReasonCode.CEO_CONVERSATION_TIMEOUT,
+            "the CEO peer did not answer within the conversation budget",
+            { budgetMs: this.#budgetMs },
+          );
+        }
+        if (error.code === ErrorCode.ConnectionClosed) {
+          return deny(
+            ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED,
+            "the connection to the CEO peer closed before it answered",
+            { budgetMs: this.#budgetMs },
+          );
+        }
+        return deny(
+          ReasonCode.CEO_CONVERSATION_PEER_FAILED,
+          "the CEO peer received the turn and returned an error instead of an answer",
+          { budgetMs: this.#budgetMs, peerErrorCode: error.code },
+        );
+      }
+      if (error instanceof Error && error.message === "Not connected") {
+        return deny(
+          ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED,
+          "the connection to the CEO peer was not available when the turn was sent",
+          { budgetMs: this.#budgetMs },
+        );
+      }
       return deny(
-        ReasonCode.CEO_CONVERSATION_TIMEOUT,
-        "the CEO peer did not answer within the conversation budget",
+        ReasonCode.INTERNAL_ERROR,
+        "the CEO peer turn failed in a way this port does not classify as a timeout, a transport failure, or a peer error",
         { budgetMs: this.#budgetMs, error: error instanceof Error ? error.name : "unknown" },
       );
     } finally {

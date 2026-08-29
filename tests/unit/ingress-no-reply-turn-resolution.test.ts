@@ -45,6 +45,13 @@ const SECRET = "no-reply-webhook-secret";
  * `tests/unit/telegram-ingress.test.ts`'s "#682: a claimed turn's PENDING reply survives a
  * redelivery" is the real-router reproduction: a genuine DIRECT claim, a genuine crash after send
  * and before completion, a genuine restart — the case this fixture could never manufacture.
+ *
+ * A second review of that same fix found a further collapse: the first test asserted on
+ * `unresolvedTurns` and on a redelivery's reason code, both of which go through `repliedAt` OR
+ * `noReplyAt` and so cannot tell the two apart — a version of this fix that wrote `repliedAt`
+ * for a no-reply outcome (claiming the transport accepted a reply it never produced) would have
+ * passed both assertions. The first test now also reads the stored `turn_claim_json` directly and
+ * checks which field actually moved.
  */
 const identity = (turnRequestId = "turn-1"): TurnIdentity => ({
   turnRequestId,
@@ -78,6 +85,15 @@ const telegramUpdate = (updateId: number): TelegramUpdate => ({
     chat: { id: 999 },
   },
 });
+
+/** The raw stored claim, so a test can check which terminal fact actually moved. */
+const storedClaim = (harness: ReturnType<typeof makeHarness>, nonce: string): Record<string, unknown> => {
+  const row = harness.cp.db.get<{ turn_claim_json: string | null }>(
+    "SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
+    [nonce],
+  );
+  return JSON.parse(row?.turn_claim_json ?? "{}") as Record<string, unknown>;
+};
 
 class FakeTransport implements TelegramBotTransport {
   constructor(private updates: TelegramUpdate[]) {}
@@ -127,9 +143,17 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
 
     await service.pollOnce();
 
-    // The claim must reach a terminal state — the same one `resolveTurn` produces for a reply
-    // that was actually sent — so a later redelivery of this nonce is an ordinary replay, and the
-    // owner is not left with a message the daemon will refuse forever with no way to clear it.
+    // The claim must reach a terminal state — the same *kind* of terminal state `resolveTurn`
+    // produces for a reply that was actually sent, but not the *same field* (#682): this handler
+    // never produced a reply, so the row must carry `noReplyAt`, and must not carry `repliedAt` —
+    // that field means specifically that the transport accepted a reply, and nothing here sent
+    // one. `unresolvedTurns` and a redelivery's reason code both close over either field, so
+    // neither assertion below can tell a wrongly-written `repliedAt` apart from a correct
+    // `noReplyAt`; only reading the row can.
+    const claim = storedClaim(harness, nonce);
+    expect(claim["noReplyAt"]).toBeTruthy();
+    expect(claim["repliedAt"]).toBeUndefined();
+
     expect(guard.unresolvedTurns("telegram", "session-digest")).toEqual([]);
     const redelivered = guard.admit({
       channel: "telegram",
@@ -199,5 +223,46 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
 
     expect(pendingResultJson()).toBe(before);
     expect(guard.unresolvedTurns("telegram", "session-digest").map((turn) => turn.nonce)).toEqual([nonce]);
+  });
+
+  it("#682: never writes noReplyAt over a turn whose reply already resolved", async () => {
+    // The guard `completeNoReplyAndResolveTurn` states in its own docstring: it must never move
+    // a claim that already carries a terminal fact, most importantly a real `repliedAt`. This
+    // drives that directly — resolve the turn through the ordinary reply path first, then call
+    // the no-reply path on the same nonce, and confirm it is a no-op rather than a second write.
+    const harness = makeHarness();
+    const { guard, ingress } = buildRouter(harness);
+    const nonce = "update:3";
+
+    expect(
+      guard.admit({ channel: "telegram", actor: "owner", conversation: "chat", nonce, payload: { text: "hi" } })
+        .allowed,
+    ).toBe(true);
+    expect(guard.claimTurn("telegram", nonce, identity()).allowed).toBe(true);
+    expect(
+      ingress.recordResultIf(
+        nonce,
+        { kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply: "answered", sent: false, deliveryStatus: "PENDING" },
+        "AVAILABLE",
+      ).allowed,
+    ).toBe(true);
+    expect(
+      ingress.completeReplyAndResolveTurn(nonce, {
+        kind: "TELEGRAM_WORKFLOW",
+        phase: "REPLIED",
+        reply: "answered",
+        sent: true,
+        deliveryStatus: "APPLIED",
+      }).allowed,
+    ).toBe(true);
+    const resolved = storedClaim(harness, nonce);
+    expect(resolved["repliedAt"]).toBeTruthy();
+    expect(resolved["noReplyAt"]).toBeUndefined();
+
+    expect(guard.completeNoReplyAndResolveTurn("telegram", nonce).allowed).toBe(true);
+
+    const afterNoReplyCall = storedClaim(harness, nonce);
+    expect(afterNoReplyCall["repliedAt"]).toBe(resolved["repliedAt"]);
+    expect(afterNoReplyCall["noReplyAt"]).toBeUndefined();
   });
 });

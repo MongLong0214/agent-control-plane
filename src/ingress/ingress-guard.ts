@@ -548,6 +548,7 @@ export class IngressGuard {
         WHERE channel = ?
           AND turn_claim_json IS NOT NULL
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
+          AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
           AND json_extract(turn_claim_json, '$.sessionDigest') IS ?
         ORDER BY received_at ASC`,
       [channel, sessionDigest],
@@ -604,21 +605,36 @@ export class IngressGuard {
   }
 
   /**
-   * The no-reply counterpart of `completeReplyAndResolveTurn` (#672).
+   * The no-reply counterpart of `completeReplyAndResolveTurn` (#672) — and, since a blind review
+   * of that fix found the collapse, its own terminal fact rather than `repliedAt` (#682).
    *
-   * `resolveTurn` alone is not enough for a handler that produced no reply: it never reserves or
-   * completes anything, so `result_json` stays exactly what it was the moment the turn was
-   * claimed — usually null. `isRecoverableIngressResult(null)` reads that as "never ran", which is
-   * true for an ordinary crash and false here — this handler ran and finished. Left that way, a
-   * later replay would see a *resolved* claim and a *recoverable* result and take the recovery
-   * branch, re-admitting and re-running a turn that already happened — worse than #672's original
-   * bug, which at least refused the redelivery outright.
+   * `repliedAt` is not "this turn is resolved, generically" — it is specifically evidence that
+   * the transport accepted a reply (see `resolveTurn`'s docstring; #638's later receipt match
+   * depends on that staying a narrow, true claim). A handler that decided not to reply produced
+   * no such evidence, so writing `repliedAt` for it would tell a later reader — a person, or a
+   * future receipt comparison — that Telegram has a message it never received. `turn_claim_json`
+   * was split apart from `result_json` for exactly this shape of mistake (#671: two different
+   * facts sharing one field, so advancing one silently erased the other); reusing `repliedAt` as
+   * a generic "closed" marker collapses two facts back into one field from the other direction.
+   * So this writes `noReplyAt` instead — its own fact, checked apart from `repliedAt` everywhere
+   * a claim's resolution matters: `unresolvedClaim`, `unresolvedTurns`, and `prune`.
+   *
+   * `resolveTurn` alone is not enough either way: it never reserves or completes anything, so
+   * `result_json` stays exactly what it was the moment the turn was claimed — usually null.
+   * `isRecoverableIngressResult(null)` reads that as "never ran", which is true for an ordinary
+   * crash and false here — this handler ran and finished. Left that way, a later replay would see
+   * a *resolved* claim and a *recoverable* result and take the recovery branch, re-admitting and
+   * re-running a turn that already happened — worse than #672's original bug, which at least
+   * refused the redelivery outright.
    *
    * So this writes a result marker `isRecoverableIngressResult` reads as finished, in the same
    * transaction as the resolution, for the reason `completeReplyAndResolveTurn`'s docstring
    * already gives: any ordering of two separate commits has a window where a crash lands between
    * them, and here that window would leave the claim resolved but the result still recoverable —
    * the exact state that reopens the duplicate.
+   *
+   * Refuses to move a claim that already carries either terminal fact — most importantly, this
+   * must never write `noReplyAt` over a claim that already has a real `repliedAt`.
    */
   completeNoReplyAndResolveTurn(channel: string, nonce: string): Decision<void> {
     return this.db.tx(() => {
@@ -630,6 +646,12 @@ export class IngressGuard {
         // No claim, nothing to resolve — the ordinary non-CEO path, same as `resolveTurn`.
         return allow(ReasonCode.OK, undefined);
       }
+      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };
+      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {
+        // Already resolved, one way or the other. Idempotent-safe, and the guard that keeps a
+        // real `repliedAt` from ever being overwritten by this path.
+        return allow(ReasonCode.OK, undefined);
+      }
       // No `kind: "TELEGRAM_WORKFLOW"`, deliberately: that shape's `sent` and `phase` describe
       // the reply lifecycle, and there is no reply to describe. `isRecoverableIngressResult`'s
       // fallback for any other kind is `sent === false`, which a marker with no `sent` field
@@ -639,7 +661,13 @@ export class IngressGuard {
         channel,
         nonce,
       ]);
-      return this.#resolveTurnHere(channel, nonce);
+      this.db.run(
+        `UPDATE inbound_messages
+            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)
+          WHERE channel = ? AND nonce = ?`,
+        [this.clock.nowIso(), channel, nonce],
+      );
+      return allow(ReasonCode.OK, undefined);
     });
   }
 
@@ -680,12 +708,21 @@ export class IngressGuard {
     // the moment a reply was reserved — so the row a timeout produced was pruned like any other,
     // and the nonce it held was freed (#646).
     //
-    // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` in the audit log is
-    // where they are visible.
+    // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` is written to the
+    // audit log, and `agentctl doctor system` reports the same outstanding claim as a
+    // `TURN_OUTCOME_UNKNOWN` finding (`Doctor.checkUnresolvedTurns`) — so the runbook's first
+    // command surfaces it too, not only someone tailing `audit_events`.
+    //
+    // `noReplyAt`, not only `repliedAt`: a turn a handler genuinely decided not to reply to is
+    // exactly as finished as one whose reply the transport accepted, and is just as prunable —
+    // but it is a *different* fact (#682), so it gets its own check rather than being folded
+    // into `repliedAt`'s.
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
-          AND (turn_claim_json IS NULL OR json_extract(turn_claim_json, '$.repliedAt') IS NOT NULL)`,
+          AND (turn_claim_json IS NULL
+            OR json_extract(turn_claim_json, '$.repliedAt') IS NOT NULL
+            OR json_extract(turn_claim_json, '$.noReplyAt') IS NOT NULL)`,
       [channel, new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString()],
     );
   }
@@ -736,6 +773,17 @@ export interface TurnIdentity {
   promptDigest: string;
   /** Which CEO generation asked it. */
   bindingDigest: string;
+  /**
+   * The nonce of the unresolved turn this one was deliberately claimed alongside (#641).
+   *
+   * Undefined for the ordinary case: no unresolved turn existed for this conversation when this
+   * one was claimed. Set only when the owner explicitly chose to run a second turn while an
+   * earlier one from the same conversation had no recorded outcome — `unresolvedTurns` is what
+   * finds that earlier one, and this is where the choice is recorded, so a later reader (a
+   * person resolving the #672 lockout question, or a receipt match from #638) can tell a
+   * deliberate second turn apart from a message that simply never saw the first one.
+   */
+  overriddenUnresolvedNonce?: string;
 }
 
 export interface TurnClaim extends TurnIdentity {
@@ -803,15 +851,17 @@ const isRecoverableIngressResult = (resultJson: string | null): boolean => {
 /**
  * Whether a stored claim is still waiting on an outcome.
  *
- * A claim with `repliedAt` produced a reply the transport accepted, which is the closest thing to
- * an outcome this layer can observe. Without the distinction the claim would survive forever and
- * every replay of a finished turn would report an unknown outcome — the hold #651 warned that
- * fixing #646 would create.
+ * A claim with `repliedAt` produced a reply the transport accepted; a claim with `noReplyAt` had a
+ * handler that decided not to reply (#682) — different facts, but either is the closest thing to
+ * an outcome this layer can observe, and either one closes the claim. Without the distinction the
+ * claim would survive forever and every replay of a finished turn would report an unknown outcome
+ * — the hold #651 warned that fixing #646 would create.
  */
 const unresolvedClaim = (turnClaimJson: string | null): boolean => {
   if (!turnClaimJson) return false;
   try {
-    return (JSON.parse(turnClaimJson) as { repliedAt?: unknown }).repliedAt === undefined;
+    const claim = JSON.parse(turnClaimJson) as { repliedAt?: unknown; noReplyAt?: unknown };
+    return claim.repliedAt === undefined && claim.noReplyAt === undefined;
   } catch {
     // Unparseable is treated as outstanding. A claim nobody can read is not a claim that resolved.
     return true;

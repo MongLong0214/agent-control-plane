@@ -25,6 +25,12 @@ export interface TelegramDirectInput {
   nonce: string;
   correlationId: string;
   forwarded: boolean;
+  /**
+   * The owner explicitly asked, via `/again`, to run this turn even though this conversation may
+   * still have an unresolved one (#641). Absent (not `false`) for every ordinary DIRECT message —
+   * the field only exists on the path where the choice was actually offered and taken.
+   */
+  overridesUnresolved?: true;
 }
 
 export interface TelegramManagedInput extends Omit<TelegramDirectInput, "kind"> {
@@ -228,6 +234,19 @@ export const classifyTelegramMessage = (
       });
     }
     return allow(ReasonCode.OK, { kind: "DIRECT", text: command.args, ...base });
+  }
+
+  if (command?.name === "again") {
+    // The owner's explicit escape from a parked resend (#641): they were told an earlier turn
+    // in this conversation is unresolved and chose to run this one anyway, aware the first may
+    // still land. `/direct` and `/again` are otherwise identical parses; only the router's
+    // unresolved-turn check treats the second differently, and only this flag tells it to.
+    if (command.args.length === 0) {
+      return deny(ReasonCode.INVALID_ARGUMENT, "/again requires a message", {
+        updateId: update.update_id,
+      });
+    }
+    return allow(ReasonCode.OK, { kind: "DIRECT", text: command.args, overridesUnresolved: true, ...base });
   }
 
   if (command?.name !== "managed") {
@@ -494,9 +513,43 @@ export class TelegramHermesRouter {
         // Fixed here rather than inside the guard: the identity says what *this* turn is, and
         // only the router knows the text and the binding it is running under. The guard's job is
         // to store it atomically with the claim, not to invent it.
+        const identity = this.ingress.turnIdentityFor(update, classified.value.text, this.bindingGeneration());
+
+        // The claim above stops the *same* message from starting a second CEO turn. It cannot
+        // stop a resend: a different nonce, a fresh turn id, honestly claimable on its own (#641).
+        // So before claiming, ask whether this conversation already has a turn nobody has
+        // recorded an outcome for. A refusal here would be safe against the duplicate and wrong
+        // in the other direction — the owner locked out of a conversation whose earlier turn may
+        // never resolve (#672 has no operator door for that yet) — so an unresolved turn parks
+        // the message instead of claiming or dropping it, and tells the owner exactly how to get
+        // unstuck, unless they already made that choice via `/again`.
+        const unresolved = this.ingress.unresolvedTurns(identity.sessionDigest);
+        if (unresolved.length > 0 && !classified.value.overridesUnresolved) {
+          const oldest = unresolved[0]!;
+          return this.outcomeWithReply(
+            update,
+            true,
+            false,
+            classified.value,
+            this.replyFor(
+              update,
+              [
+                `DIRECT parked: an earlier message in this conversation is still unresolved (received ${oldest.receivedAt}).`,
+                "ACP does not know whether that one reached the CEO, so this one was not run — nothing was appended twice.",
+                "Reply with /again <your message> to run this one anyway, knowing the earlier turn may still land too.",
+              ].join("\n"),
+            ),
+            ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION,
+          );
+        }
+
+        // Reached without an unresolved turn, or with one the owner deliberately overrode via
+        // `/again`. When it's the latter, the choice is recorded on the claim itself — not only
+        // in this reply — so a later reader does not have to trust that it was made honestly.
+        const overriddenUnresolvedNonce = unresolved[0]?.nonce;
         const claimed = this.ingress.claimTurn(
           this.ingress.nonceFor(update),
-          this.ingress.turnIdentityFor(update, classified.value.text, this.bindingGeneration()),
+          overriddenUnresolvedNonce ? { ...identity, overriddenUnresolvedNonce } : identity,
         );
         if (!claimed.allowed) {
           return this.outcomeWithReply(

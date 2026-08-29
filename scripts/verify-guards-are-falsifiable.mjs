@@ -157,10 +157,58 @@ const GUARDS = [
       "        channel,\n" +
       "        nonce,\n" +
       "      ]);\n" +
-      "      return this.#resolveTurnHere(channel, nonce);",
-    replace: "      return this.#resolveTurnHere(channel, nonce);",
+      "      this.db.run(\n" +
+      "        `UPDATE inbound_messages\n" +
+      "            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)\n" +
+      "          WHERE channel = ? AND nonce = ?`,\n" +
+      "        [this.clock.nowIso(), channel, nonce],\n" +
+      "      );",
+    replace:
+      "      this.db.run(\n" +
+      "        `UPDATE inbound_messages\n" +
+      "            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)\n" +
+      "          WHERE channel = ? AND nonce = ?`,\n" +
+      "        [this.clock.nowIso(), channel, nonce],\n" +
+      "      );",
     killedBy: [
       "tests/unit/ingress-no-reply-turn-resolution.test.ts::is resolved by pollOnce even though the route call returned no reply",
+    ],
+  },
+  {
+    // The exact collapse Sol's review found (#682): `repliedAt` means the transport accepted a
+    // reply, and `completeNoReplyAndResolveTurn` produced no reply — writing `repliedAt` here
+    // would tell a later reader Telegram has a message it never received. Retargeting the write
+    // at `repliedAt` instead of `noReplyAt` reproduces exactly the field collapse that was
+    // reviewed and blocked; the row-level assertion this kills is the one Sol asked for, because
+    // `unresolvedTurns` and a redelivery's reason code both close over either field and cannot
+    // tell this mutation apart from the correct write.
+    what: "a no-reply turn is marked by its own field, not by reusing the reply's",
+    file: "src/ingress/ingress-guard.ts",
+    find: "            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)",
+    replace: "            SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::is resolved by pollOnce even though the route call returned no reply",
+    ],
+  },
+  {
+    // The idempotency half of the same guard: a no-reply resolution must never move a claim that
+    // already carries a terminal fact, most importantly a real `repliedAt` from a reply the
+    // transport actually accepted. Removing the check lets a stray or duplicate call overwrite
+    // that evidence — unreachable through the router today (`resolveNoReplyOutcome` never calls
+    // this for a replayed outcome, and a fresh claim cannot already have `repliedAt`), which is
+    // exactly why it needs its own row rather than resting on that being true forever.
+    what: "a no-reply resolution never moves a claim that already has a terminal fact",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };\n" +
+      "      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {\n" +
+      "        // Already resolved, one way or the other. Idempotent-safe, and the guard that keeps a\n" +
+      "        // real `repliedAt` from ever being overwritten by this path.\n" +
+      "        return allow(ReasonCode.OK, undefined);\n" +
+      "      }\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: never writes noReplyAt over a turn whose reply already resolved",
     ],
   },
   {
@@ -1168,6 +1216,19 @@ const GUARDS = [
     find: "  for (const inline of body.matchAll(/^\\s*(\\w+)\\s+[A-Z][^\\n]*?\\bUNIQUE\\b[^\\n]*$/gm)) {",
     replace: "  for (const inline of []) {",
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // #649 part A: `bind()` minted a fresh actor unconditionally, so re-bootstrapping against the
+    // same Hermes transcript produced a second owner beside the first — two actors that collide on
+    // nothing, so the alias was silent. Without this line the reuse path is computed and then
+    // discarded, which is exactly that regression.
+    what: "bind reuses the actor that already owns a verified target instead of minting a second one",
+    file: "src/session/binding-registry.ts",
+    find: "      const actorId = reused.value ?? this.mintActor(input.role, input.sessionId, session.incarnation);",
+    replace: "      const actorId = this.mintActor(input.role, input.sessionId, session.incarnation);",
+    killedBy: [
+      "tests/unit/reconstitution-needs-a-verified-target.test.ts::reuses the actor rather than minting a second owner",
+    ],
   },
 ];
 
