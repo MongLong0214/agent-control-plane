@@ -76,7 +76,7 @@ class FakeTransport implements TelegramBotTransport {
 }
 
 describe("#672 a claimed turn whose handler produces no reply", () => {
-  it("is resolved by pollOnce even though route() returned no reply", async () => {
+  it("is resolved by pollOnce even though the route call returned no reply", async () => {
     const harness = makeHarness();
     const { guard, router } = buildRouter(harness);
     const nonce = "update:1";

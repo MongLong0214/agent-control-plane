@@ -98,12 +98,42 @@ const GUARDS = [
   {
     // Without it a finished turn's claim is never cleared, and every replay of a completed
     // exchange reports an unknown outcome — a hold created by the fix above.
+    //
+    // The anchor carries the line above the mutated one on purpose: `completeNoReplyAndResolveTurn`
+    // ends in the same `return this.#resolveTurnHere(channel, nonce);` (#672's no-reply path shares
+    // the same terminal resolution), and a one-line anchor matched both — a row that is not about
+    // one specific guard. `if (!completed.allowed) return completed;` exists only in this method's
+    // reply-completion transaction, so pairing it with the mutated line is what makes this row
+    // about the reply path and not the no-reply one below.
     what: "a turn whose reply the transport accepted stops being outstanding",
     file: "src/ingress/ingress-guard.ts",
-    find: "      return this.#resolveTurnHere(channel, nonce);",
-    replace: "      return completed;",
+    find: "      if (!completed.allowed) return completed;\n      return this.#resolveTurnHere(channel, nonce);",
+    replace: "      if (!completed.allowed) return completed;\n      return completed;",
     killedBy: [
       "tests/unit/a-turn-and-a-reply-are-two-lifecycles.test.ts::resolves the turn in the same transaction that records the reply",
+    ],
+  },
+  {
+    // The no-reply counterpart of the row above: `completeNoReplyAndResolveTurn` never reserves
+    // or completes a reply, so `result_json` stays whatever it was when the turn was claimed —
+    // usually null. `isRecoverableIngressResult(null)` reads null as "never ran", so a claim that
+    // is resolved but whose result was never marked non-recoverable looks, to a later replay,
+    // exactly like a message that only got as far as being admitted. `recoverInFlight` then
+    // re-admits it and the handler runs a second time — worse than #672's original bug, which at
+    // least refused the redelivery outright. This is the mutation that removes the marker write
+    // and keeps only the resolution, reproducing exactly that.
+    what: "a turn with no reply is marked non-recoverable, not only resolved",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      this.db.run(`UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`, [\n" +
+      "        JSON.stringify({ kind: \"TELEGRAM_NO_REPLY\" }),\n" +
+      "        channel,\n" +
+      "        nonce,\n" +
+      "      ]);\n" +
+      "      return this.#resolveTurnHere(channel, nonce);",
+    replace: "      return this.#resolveTurnHere(channel, nonce);",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::is resolved by pollOnce even though the route call returned no reply",
     ],
   },
   {
