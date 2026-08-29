@@ -5,7 +5,15 @@ on:
   pull_request:
     branches: [main, 'feature/**', 'release/**']
 jobs:
-  verify:
+  # This job's id used to be `verify`, which is also the literal string branch protection
+  # requires (contexts: ["verify"]). Adding the matrix below made every check GitHub reports for
+  # this job get the matrix value appended — "verify (22.18.0)", "verify (22)" — and a check
+  # literally named `verify` stopped existing. Branch protection then waits for a check that can
+  # never appear, on every PR in the repository, not just this one. `name: verify` here keeps the
+  # per-leg checks reading the same as before ("verify (22.18.0)", "verify (22)"); `verify-gate`
+  # below is what now produces the bare `verify` check branch protection actually requires.
+  verify-matrix:
+    name: verify
     runs-on: macos-15
     strategy:
       fail-fast: false
@@ -114,3 +122,41 @@ jobs:
       - run: node scripts/ssot-report.mjs
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # Branch protection requires the check named exactly `verify` (app_id 15368, GitHub Actions) —
+  # confirmed against this repository's live protection settings, not assumed. `verify-matrix`
+  # above cannot ever produce that name once it carries a matrix: GitHub always appends the
+  # matrix values to a matrixed job's check name, so its checks are "verify (22.18.0)" and
+  # "verify (22)", never bare "verify". This job carries no matrix, so its own check name is
+  # exactly its `name:` — `verify` — with nothing appended. It is what makes the required check
+  # exist again, without touching the required-check string itself.
+  #
+  # `if: always()` is load-bearing, not decoration. Without it, this job's default condition is
+  # "the jobs it needs all succeeded" — so the moment either matrix leg fails or the run is
+  # cancelled, this job would not run at all, and GitHub reports a job that never ran as
+  # `skipped`, not `failure`. A `skipped` required check is treated as satisfied on this platform
+  # (the same "coverage implied, not observed" shape this whole effort has been about), so a gate
+  # that only runs on the happy path would be a green light exactly when it must not be one.
+  # `always()` forces this job to run in every case, so it is this step's own `run:` that decides
+  # pass or fail — never GitHub's default treatment of an unrun job.
+  #
+  # The check itself must read `== 'success'` (an allow-list), not `!= 'failure'` (a deny-list):
+  # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`, and the matrix's
+  # own `fail-fast: false` means one leg failing does not cancel the other — but a job's overall
+  # result is still `failure` if any matrix combination failed, so this does not need to inspect
+  # individual legs to know that. An allow-list means `cancelled` and `skipped` fail closed too,
+  # with no separate case for either needed.
+  verify-gate:
+    name: verify
+    needs: verify-matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: require every verify-matrix leg to have actually succeeded
+        run: |
+          result="${{ needs.verify-matrix.result }}"
+          if [ "$result" != "success" ]; then
+            echo "verify-matrix result was '$result', not 'success' — failing the required verify check"
+            exit 1
+          fi
+          echo "verify-matrix succeeded on every leg"
