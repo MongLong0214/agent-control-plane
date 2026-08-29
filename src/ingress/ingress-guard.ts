@@ -658,6 +658,17 @@ export interface TurnIdentity {
   promptDigest: string;
   /** Which CEO generation asked it. */
   bindingDigest: string;
+  /**
+   * The nonce of the unresolved turn this one was deliberately claimed alongside (#641).
+   *
+   * Undefined for the ordinary case: no unresolved turn existed for this conversation when this
+   * one was claimed. Set only when the owner explicitly chose to run a second turn while an
+   * earlier one from the same conversation had no recorded outcome — `unresolvedTurns` is what
+   * finds that earlier one, and this is where the choice is recorded, so a later reader (a
+   * person resolving the #672 lockout question, or a receipt match from #638) can tell a
+   * deliberate second turn apart from a message that simply never saw the first one.
+   */
+  overriddenUnresolvedNonce?: string;
 }
 
 export interface TurnClaim extends TurnIdentity {

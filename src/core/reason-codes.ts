@@ -225,6 +225,17 @@ export const ReasonCode = {
    * hide every occurrence of the second inside the first.
    */
   INGRESS_TURN_OUTCOME_UNKNOWN: "INGRESS_TURN_OUTCOME_UNKNOWN",
+  /**
+   * A fresh message (its own nonce, its own turn id) arrived for a conversation that already has
+   * a claimed turn nobody has recorded an outcome for.
+   *
+   * Distinct from `INGRESS_TURN_OUTCOME_UNKNOWN`: that code is about *this same message* coming
+   * back. This one is about a different message — a resend in the owner's own words, or an
+   * unrelated new one — landing while the conversation's previous turn is still open. The turn id
+   * cannot tell those apart (#641); this code is what a resend gets instead of a second, silently
+   * duplicated CEO turn. The message is parked, not dropped: `/again` claims it anyway.
+   */
+  INGRESS_TURN_UNRESOLVED_CONVERSATION: "INGRESS_TURN_UNRESOLVED_CONVERSATION",
   INGRESS_NONCE_EXPIRED: "INGRESS_NONCE_EXPIRED",
   UNTRUSTED_CONTENT_IS_DATA: "UNTRUSTED_CONTENT_IS_DATA",
   MCP_PEER_UNAUTHENTICATED: "MCP_PEER_UNAUTHENTICATED",
