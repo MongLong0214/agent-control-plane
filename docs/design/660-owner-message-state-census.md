@@ -408,18 +408,16 @@ the CEO's own execution, which no table in this schema observes at all. Not one 
 states (it is a transition, in the shape C2 already named for a different sentence), and not
 embargoed — it is live in production behavior today, on the same path S2 traced.
 
-**Is this a fact about the system (C1's proper subject) or an outstanding item that needs its own
-ticket (`docs/ACCEPTANCE.md:3`)? An earlier round of this document filed a ticket (#696) on an
-incomplete reading, and the corrected answer is: it is a fact, already owned by #639 — the ticket
-is closed as a duplicate of #639's recorded scope, and this row cites the commit record directly.**
+**This question turned out to be two questions, and answering them with one source was itself the
+mistake.** `docs/ACCEPTANCE.md:3` and this repository's PRD split two authorities that do not
+overlap: **what was decided, known, or ruled out** — the commit record is authority for that,
+independent of what an issue's prose later says; and **what remains to be done, and who owns
+it** — the *issue tracker* is authority for that, and a commit trailer recording a limitation is
+not, by itself, a ticket owning the work.
 
-The earlier round tested this against #638's and #639's **issue bodies** only, which discuss three
-ACP-owned contracts (stable turn id, no auto re-run, no `TURN_COMPLETED` without a matched
-receipt) scoped to `canonical_turns`, and concluded neither states the ingress consequence above —
-so it filed #696. What that round did not check was the **commit record**: `686281a`'s own
-trailers, which this repository treats as its decision authority independent of what an issue's
-prose later says. Read in full, two adjacent `Limit:` trailers on that exact commit — the one that
-introduced `resolveTurn`/`completeReplyAndResolveTurn` — say:
+Two adjacent `Limit:` trailers on `686281a` (the commit that introduced
+`resolveTurn`/`completeReplyAndResolveTurn`) answer the first question — this consequence was
+*known* at #671's merge:
 
 ```
 Limit: `resolveTurn` records that Telegram accepted the reply, which is not the CEO proving a
@@ -431,19 +429,19 @@ Limit: this is the ingress representation, not the canonical one. #639's coordin
   canonical id rather than a copy of the state.
 ```
 
-The first trailer names this row's exact consequence, at the moment it was introduced. The
-second, immediately adjacent and about the same functions, records **#639** — not a new ticket —
-as owning its replacement, and says so more broadly than #639's issue body does: "replace this
-seam entirely" is a claim about the whole ingress mechanism, not only the separate canonical
-ledger #639's issue text describes. That is exactly the shape the coordinator's test named: the
-record can claim more than the issue body it points at, and where it does, the record wins. Under
-either mechanism #639 might use to close it — building the canonical coordinator's own
-`ACP_OBSERVED_HERMES_REPLY`/`HERMES_TARGET` distinction and wiring ingress through it, per the
-same trailer — this consequence is closed as a side effect of #639's stated scope, not something
-needing separate tracking.
+That much held from the moment this row was written and was never in question. What was wrong
+was treating the second trailer's *intent* ("meant to replace this seam entirely") as already
+*answering* the ownership question — an unticketed intent in a trailer is not the same thing as a
+tracked commitment, and closing #696 on the trailer alone put outstanding work back exactly where
+`docs/ACCEPTANCE.md:3` forbids it living: in a document (or a commit message) instead of the
+tracker.
 
-So: **fact, not outstanding item** — reversing the previous round's judgement, on primary-source
-evidence that round did not check. #696 is closed as a duplicate; no ticket needed here.
+**Resolved by making the tracker true rather than routing around it: #639's issue body was
+amended** to state this scope in its own text — that it owns the ingress reply lifecycle
+(`completeReplyAndResolveTurn`/`repliedAt`), not only the canonical ledger's three contracts —
+quoting `686281a`'s trailers as the evidence that this was already known, not as the source of the
+commitment itself. With that amendment, #639 is a real ticket for this consequence, and #696 is
+now correctly closed as a duplicate of tracked work rather than of a trailer.
 
 **Path traced:** for the first half, `.claim()`'s absence of any caller (`grep -rn "\.conversation\b" src/`,
 exhaustive, not sampled) and `daemon.ts`'s four operator-method call sites, all read directly. For
@@ -454,7 +452,10 @@ CommitLore index, which returned zero records for both `src/ingress/ingress-guar
 `src/db/schema.sql` with an explicit diagnostic that the zero was uninformative (no matching blob
 in its walked history), and a repo-wide query returned two unrelated records from what appears to
 be a different repository entirely. The commit's own embedded trailers, read directly with plain
-`git`, were the reliable source here, not the indexing tool.
+`git`, were the reliable source here, not the indexing tool. The ownership question was settled by
+reading `docs/ACCEPTANCE.md:3` and this repository's PRD statement that CommitLore is decision
+memory, not operational authority, against how #696 had actually been closed — a re-read of policy
+already on file, not a new code path.
 
 ### C2 — the sentence the original C2 cited has since been rewritten twice more, and no longer says what C2 quoted
 
@@ -597,10 +598,13 @@ re-derivation).
 **Independent, still open, embargoed by #638:** S5.
 **Mechanism closed independently (#669); state stays embargoed by #638:** S4.
 **Context, carried but not scheduled:** C1's first half (the two ledgers not meeting —
-unchanged), C1's second half (the ingress ledger resolving a turn on a timeout apology — a
-ticket was filed on an incomplete reading and then closed as a duplicate of #639's recorded
-scope, per `686281a`'s trailers), C2 (citation corrected, underlying point holds), C3 (mechanism
-corrected — the embargo is an absence of a writer, not a schema guarantee; #638 still open).
+unchanged), C2 (citation corrected, underlying point holds), C3 (mechanism corrected — the
+embargo is an absence of a writer, not a schema guarantee; #638 still open).
+**Context that turned out to be outstanding work, now tracked in an existing ticket's own text:**
+C1's second half — the ingress ledger resolving a turn on a timeout apology — was known at
+`686281a` but not previously *owned* by any ticket's own text; **#639's body was amended** to
+state this scope explicitly, and #696 (filed, then briefly closed on the trailer alone, which was
+itself wrong) now stays closed as a genuine duplicate of that tracked commitment.
 
 Cross-references for the still-open gaps: S2 is **#695** (*"A repeated `/again` names and records
 only the oldest unresolved turn, so a second one accumulates silently"*) — a review found this
@@ -613,10 +617,11 @@ because no existing ticket owned it — #641 (closed) named only the ingress-sid
 #666 (open) covers source integrity at claim time rather than adding a source after it, and #639
 (open) covers receipt-matched completion rather than extending a turn's inputs while it runs.
 #638 (open) and #639 (open) are the reconciliation tickets #693 sits behind, alongside S4 and
-S5's reachability. C1's second half is **not** a separate ticket: **#696** was filed for it on a
-reading of #638's and #639's issue bodies alone, then closed as a duplicate once `686281a`'s own
-commit trailers were read — they record #639 as already meant to "replace this seam entirely,"
-which is this exact consequence, more broadly than #639's issue text states it.
+S5's reachability. C1's second half is **not** a separate ticket: **#696** was filed for it, then
+closed once on `686281a`'s commit trailers alone (wrong — a trailer records what was *known*, not
+who *owns* the outstanding work, and `docs/ACCEPTANCE.md:3` makes the tracker the authority on the
+latter), then correctly closed after **#639's own body was amended** to state this scope in its
+own text rather than leaving the commitment implicit in a trailer.
 
 **The durable-handler re-execution risk the original S3 misattributed is real, and already has
 its own ticket: #673.** `prune` (`src/ingress/ingress-guard.ts`) deletes a row once its claim is
@@ -630,10 +635,11 @@ same prune path) is the adjacent gap on the other side of the same mechanism. Ev
 gap in this census — S2, S4/S5's reachability, S7, and the real re-execution risk in #673 — now
 resolves to a ticket rather than to this document alone, which is the rule `docs/ACCEPTANCE.md:3`
 states and this document was at risk of breaking for S2 and S7 until #695 and #693 were filed. C1's
-second half is the exception that proves the rule works in both directions: a ticket (#696) was
-filed for it, then closed once the primary source showed an existing ticket (#639, per `686281a`'s
-recorded scope) already owned it — the rule caught the gap and a closer read caught the
-over-correction.
+second half took three passes to land correctly: a ticket (#696) was filed for it, closed once on
+the belief that `686281a`'s trailer alone settled ownership (wrong — a trailer is decision memory,
+not the tracker), and closed correctly only after **#639's own body was amended** to state the
+scope in its own text. The rule was right every time; what moved was which source answers which
+half of it.
 
 ## Verification
 
@@ -823,19 +829,37 @@ an untracked outstanding item. #696 is closed as a duplicate, with the correctio
 issue and here in C1, including that filing it was encouraged on the same incomplete reading this
 round corrected.
 
-Re-ran `pnpm typecheck`, `pnpm lint`, `pnpm guards:anchors` and `pnpm terminology` after every edit
-across all nine rounds — all still pass. Did not re-run `pnpm test` this round: the edit was prose
-only (no `src/` change landed between this round and the last), so the `1442 passed | 9 failed |
-2 skipped` measurement from the seventh round stands.
+**A tenth round found the ninth round's conclusion was itself wrong, on the same question a third
+time — this one reversing round nine, not merely refining it.** Round nine closed #696 on the
+strength that `686281a`'s trailer "records #639... as owning its replacement" and treated that as
+settling *ownership*. It does not: `docs/ACCEPTANCE.md:3` and this repository's PRD (CommitLore is
+decision memory, not operational authority) split the question round nine answered with one
+source into two that need different ones — **what was known** (the commit record answers this;
+round nine's reading of the trailers was correct and stands) and **what is tracked, and by whom**
+(only the issue tracker answers this; a trailer is not a ticket, however clearly it names an
+intent). Round nine's error was answering the second question with evidence for the first. The
+fix was not a third reading of the same two sources — it was making the tracker true: **#639's
+issue body was amended** to state the ingress scope in its own text, with `686281a`'s trailers
+cited in the amendment as evidence the consequence was already known, not as the grounds for
+closure. #696 stays closed, but now as a duplicate of a real ticket rather than of a trailer's
+intent. Reopening #696 (the safer, immediate option offered) was not needed because the more
+thorough option — making #639 state its own scope — was doable cleanly: #639 is this repository's
+own ticket, its existing text was extended rather than overwritten, and the amendment is
+attributed to this census's finding rather than presented as though #639 always said this.
 
-**On the rounds themselves.** The eighth round was a judgement call settled, not an error found —
-that stood on its own terms at the time. The ninth round shows why that distinction has to be
-provisional rather than final: a judgement call is only "settled" relative to the sources actually
-checked, and this one turned out to have a source neither the eighth round nor the coordinator's
-original framing of the test had named. Both rounds one through seven and round nine found this
-document, or an intervening judgement about it, stating something a primary source contradicts;
-round eight is the one round so far where the sources checked at the time did support the
-conclusion drawn, and a later round found a better source. That is a real distinction — not every
-correction is the same kind of miss — but it argues for treating any "this is now settled" claim
-in this document as bounded by what was actually read, not as a claim that no further primary
-source could exist.
+Re-ran `pnpm typecheck`, `pnpm lint`, `pnpm guards:anchors` and `pnpm terminology` after every edit
+across all ten rounds — all still pass. Did not re-run `pnpm test` this round: the edit was prose
+and one issue-tracker amendment, not a `src/` change, so the `1442 passed | 9 failed | 2 skipped`
+measurement from the seventh round stands.
+
+**On the rounds themselves.** This one question — is C1's second half a fact or outstanding work —
+took three rounds to land: round eight said outstanding and filed #696; round nine said fact and
+closed #696 on a trailer; round ten said outstanding-but-now-tracked and closed #696 on an amended
+#639. Round eight's sources supported its conclusion at the time; round nine's did not — it had a
+source (`docs/ACCEPTANCE.md:3`'s own split of authority) that was available all along and was not
+checked. That is the actual lesson, stated plainly rather than left to infer: reversing a
+conclusion on a better source is not the same act as reversing one because a check was skipped,
+and this document had one of each in two consecutive rounds. Both are corrections; only one of
+them means the previous round's method was sound and the ground moved. Any reader treating a
+"settled" judgement in this document as final should weigh it against how many sources were
+actually checked, not against how many rounds have already passed.
