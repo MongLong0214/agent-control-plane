@@ -295,7 +295,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
    * Nothing the caller read can turn into a completion, because nothing the caller supplies ever
    * reaches the settlement logic — only what `this.receiptPort.lookup()` itself returns does.
    */
-  it("cannot be forged: reading unresolvedIdentities() and re-running the sweep never settles a turn the production port never receipted", async () => {
+  it("cannot be forged: reading unresolvedIdentities and re-running the sweep never settles a turn the production port never receipted", async () => {
     const c = withCoordinator(NEVER_FOUND_RECEIPT_PORT);
     const actorId = target(c, "unforgeable", 1);
     const held = claim(c, actorId, "m1");

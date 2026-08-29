@@ -1143,7 +1143,7 @@ const GUARDS = [
     find: "  async reconcileUnresolved(): Promise<{",
     replace: "  reconcileWithReceipt(query, receipt) { return this.#settleFromReceipt(query.turnRequestId, query, receipt); }\n\n  async reconcileUnresolved(): Promise<{",
     killedBy: [
-      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::cannot be forged: reading unresolvedIdentities() and re-running the sweep never settles a turn the production port never receipted",
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::cannot be forged: reading unresolvedIdentities and re-running the sweep never settles a turn the production port never receipted",
     ],
   },
 ];
