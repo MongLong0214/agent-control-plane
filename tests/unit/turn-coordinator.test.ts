@@ -638,6 +638,158 @@ describe("an attestation must name the actor's current generation (#666)", () =>
     expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
   });
 
+  it("refuses an attestation whose claimed generation disagrees with the assignment it names", () => {
+    // A third review's counterexample: `assignment_id` pins *which* assignment an attestation
+    // speaks for; on its own it does not check what the attestation *says* about that
+    // assignment. An attestation could cite a real, currently ACTIVE assignment_id while
+    // claiming generation 1, when that very assignment's own row already reads 2 — the join
+    // matched on identity alone, admitted the claim, and `canonical_turns` recorded generation 2
+    // for a turn no attestation ever attested. `attestation_generation_matches_assignment`
+    // refuses this shape at the source (write time); this test drops that trigger first, so it
+    // proves the read-time join is independently sufficient for a row that reached the table by
+    // any other path — not merely that the trigger caught it before the query had to.
+    const h = makeHarness();
+    readySession(h, "sess-mismatch-1", "inc-1");
+    const first = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-mismatch-1",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-mismatch", targetLocatorDigest: "digest:mismatch" },
+    });
+    if (!first.allowed) throw new Error(`bind refused: ${first.reasonCode}`);
+    const actorId = actorOf(h, first.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    const revoked = h.cp.bindings.revoke(first.value.roleKey, "test regeneration");
+    if (!revoked.allowed) throw new Error(`revoke refused: ${revoked.reasonCode}`);
+    readySession(h, "sess-mismatch-2", "inc-2");
+    const second = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-mismatch-2",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-mismatch", targetLocatorDigest: "digest:mismatch" },
+    });
+    if (!second.allowed) throw new Error(`rebind refused: ${second.reasonCode}`);
+    expect(second.value.bindingGeneration).toBe(2);
+
+    // The one row a trigger would refuse: a real, ACTIVE assignment_id, claiming a generation
+    // that is not the one on that row. `Db.run` is DML-only by design (it cannot drop a
+    // trigger), so this uses a second, unrestricted connection to the same file — the same
+    // escape hatch `a-dispatch-is-a-fact.test.ts` names: "that handle can also DROP TRIGGER".
+    const foreign = new Database(join(h.root, "state.sqlite"));
+    try {
+      foreign.exec(`DROP TRIGGER attestation_generation_matches_assignment`);
+    } finally {
+      foreign.close();
+    }
+    attest(h, {
+      id: "att:mismatch",
+      targetBindingId,
+      sessionId: "sess-mismatch-2",
+      incarnation: "inc-2",
+      generation: 1,
+      assignmentId: second.value.assignmentId,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
+  it("refuses to record an attestation whose generation disagrees with the assignment it names", () => {
+    // The write-time half: the trigger itself, reached the ordinary way rather than by dropping
+    // it first.
+    const h = makeHarness();
+    readySession(h, "sess-write-1", "inc-1");
+    const first = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-write-1",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-write", targetLocatorDigest: "digest:write" },
+    });
+    if (!first.allowed) throw new Error(`bind refused: ${first.reasonCode}`);
+    const actorId = actorOf(h, first.value.roleKey);
+    const targetBindingId = bindingOf(h, actorId);
+
+    const revoked = h.cp.bindings.revoke(first.value.roleKey, "test regeneration");
+    if (!revoked.allowed) throw new Error(`revoke refused: ${revoked.reasonCode}`);
+    readySession(h, "sess-write-2", "inc-2");
+    const second = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-write-2",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-write", targetLocatorDigest: "digest:write" },
+    });
+    if (!second.allowed) throw new Error(`rebind refused: ${second.reasonCode}`);
+    expect(second.value.bindingGeneration).toBe(2);
+
+    expect(() =>
+      attest(h, {
+        id: "att:write-mismatch",
+        targetBindingId,
+        sessionId: "sess-write-2",
+        incarnation: "inc-2",
+        generation: 1,
+        assignmentId: second.value.assignmentId,
+      }),
+    ).toThrow(/ATTESTATION_GENERATION_MISMATCH/);
+  });
+
+  it("refuses an attestation whose assignment_id names a different actor's assignment entirely", () => {
+    // The audit this round asked for: what else on the row is a copy of something authoritative
+    // elsewhere, unchecked? `target_binding_id` implies an actor (via `actor_target_bindings`);
+    // `assignment_id` implies one too (via `assignments.actor_id`), and nothing before this
+    // asked whether they agree. The generation trigger above does not catch this shape — the
+    // cited assignment's generation is exactly right, for its *own* actor — only
+    // `asg.actor_id = ca.actor_id` in the query does. This constructs a real, ACTIVE, correctly
+    // generationed assignment that simply belongs to someone else, and asks `claim()` to admit
+    // through it anyway.
+    const h = makeHarness();
+    readySession(h, "sess-owner", "inc-owner");
+    const owner = h.cp.bindings.bind({
+      role: Role.CEO,
+      sessionId: "sess-owner",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-owner", targetLocatorDigest: "digest:owner" },
+    });
+    if (!owner.allowed) throw new Error(`owner bind refused: ${owner.reasonCode}`);
+    const ownerActorId = actorOf(h, owner.value.roleKey);
+    const targetBindingId = bindingOf(h, ownerActorId);
+
+    // A second, unrelated actor — a different verified target, so no reuse — with its own
+    // real, ACTIVE assignment at its own real generation.
+    readySession(h, "sess-stranger", "inc-stranger");
+    const stranger = h.cp.bindings.bind({
+      role: Role.WORKER,
+      sessionId: "sess-stranger",
+      taskId: "task-stranger",
+      verifiedTarget: { executorKind: "hermes", targetLocator: "loc-stranger", targetLocatorDigest: "digest:stranger" },
+    });
+    if (!stranger.allowed) throw new Error(`stranger bind refused: ${stranger.reasonCode}`);
+    expect(actorOf(h, stranger.value.roleKey)).not.toBe(ownerActorId);
+
+    // An attestation for the owner's binding, naming the owner's own live session (so every
+    // other condition reads as current) but citing the stranger's assignment_id — generation
+    // matches that assignment exactly, so only the actor identity is wrong.
+    attest(h, {
+      id: "att:stranger",
+      targetBindingId,
+      sessionId: "sess-owner",
+      incarnation: "inc-owner",
+      generation: stranger.value.bindingGeneration,
+      assignmentId: stranger.value.assignmentId,
+    });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: ownerActorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE);
+  });
+
   it("refuses a retired actor's attestation even under its recorded generation", () => {
     // Retirement is terminal (`conversational_actors_retirement_terminal`); admitting a turn for
     // a retired actor would make superseded authority current again.

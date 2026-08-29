@@ -1959,6 +1959,29 @@ BEGIN
   SELECT RAISE(ABORT, 'ACTOR_TARGET_ATTESTATION_APPEND_ONLY');
 END;
 
+-- CP-HI-04 / #666 round 5 — `assignment_id` pins which assignment an attestation speaks for; on its own it
+-- says nothing about what the attestation *claims* about that assignment. A row could cite a
+-- real, ACTIVE assignment_id while recording a generation that assignment's own row does not
+-- carry — the two are supposed to always agree (an honest writer reads both off the same
+-- assignment), and an unchecked copy is exactly the hazard: `claim()`'s join matched on identity
+-- alone, admitted the claim, and `canonical_turns` recorded a generation no attestation ever
+-- attested. Refused here, at the one point the row can still be stopped, rather than left to a
+-- read-time comparison alone. Named `attestation_…`, not `actor_target_attestations_…`, on
+-- purpose: it is not an append-only ledger trigger, and `LEDGER_TRIGGER_NAMES`' repair migration
+-- would try to create it (referencing the `assignment_id` column) on a database still migrating
+-- through versions where that column does not exist yet.
+CREATE TRIGGER IF NOT EXISTS attestation_generation_matches_assignment
+BEFORE INSERT ON actor_target_attestations
+WHEN NEW.assignment_id IS NOT NULL
+ AND EXISTS (
+   SELECT 1 FROM assignments
+    WHERE assignment_id = NEW.assignment_id
+      AND binding_generation <> NEW.binding_generation
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'ATTESTATION_GENERATION_MISMATCH');
+END;
+
 -- CP-HI-06 — REPLACE is refused by the schema, not by a connection setting.
 --
 -- SQLite performs REPLACE's implicit delete without firing DELETE triggers unless

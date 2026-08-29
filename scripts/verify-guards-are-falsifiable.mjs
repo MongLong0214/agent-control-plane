@@ -786,6 +786,45 @@ const GUARDS = [
     ],
   },
   {
+    // `assignment_id` pins *which* assignment an attestation speaks for; on its own it does not
+    // check what the attestation *claims* about that assignment. A third review found this left
+    // open: an attestation citing a real, currently ACTIVE assignment_id while recording a
+    // generation that assignment's own row does not carry — the join matched on identity alone,
+    // admitted the claim, and `canonical_turns` recorded a generation no attestation ever
+    // attested.
+    what: "an attestation's own generation must agree with the assignment it names, not just its identity",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND asg.binding_generation = att.binding_generation\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an attestation whose claimed generation disagrees with the assignment it names",
+    ],
+  },
+  {
+    // The write-time half of the same fix: refused at the source, not only read back out.
+    what: "an attestation whose generation disagrees with its assignment is refused at write time",
+    file: "src/db/schema.sql",
+    find: "WHEN NEW.assignment_id IS NOT NULL\n AND EXISTS (\n   SELECT 1 FROM assignments\n    WHERE assignment_id = NEW.assignment_id\n      AND binding_generation <> NEW.binding_generation\n )\nBEGIN",
+    replace: "WHEN 0\nBEGIN",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses to record an attestation whose generation disagrees with the assignment it names",
+    ],
+  },
+  {
+    // `target_binding_id` implies an actor (via `actor_target_bindings`); `assignment_id` implies
+    // one too (via `assignments.actor_id`). Nothing but this condition checks that they agree —
+    // without it, an attestation can cite a real, correctly-generationed assignment that simply
+    // belongs to someone else, and the generation trigger has no way to see the mismatch because
+    // there isn't one: the cited assignment's generation is exactly right, for its own actor.
+    what: "the assignment consulted for currency must belong to this binding's own actor",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND asg.actor_id = ca.actor_id\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an attestation whose assignment_id names a different actor's assignment entirely",
+    ],
+  },
+  {
     // The runtime-ready trigger only checks READY at the moment the pointer is written
     // (`conversational_actors_runtime_ready`); nothing re-checks it afterwards.
     // `SessionRegistry.transition` can move a session to ERROR or STOPPED without ever touching

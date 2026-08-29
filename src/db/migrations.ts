@@ -1740,6 +1740,12 @@ const dispatchesDdl = (): string =>
     "the dispatches table",
   );
 
+const attestationGenerationTriggerDdl = (): string =>
+  schemaObject(
+    /CREATE TRIGGER IF NOT EXISTS attestation_generation_matches_assignment\n[\s\S]*?\nEND;/,
+    "the attestation generation trigger",
+  );
+
 const observationsIndexDdl = (): string =>
   schemaObject(
     /CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn[^;]*;/,
@@ -2054,6 +2060,11 @@ const v31: SchemaMigration = {
     if (!columns.includes("assignment_id")) {
       raw.exec(`ALTER TABLE actor_target_attestations ADD COLUMN assignment_id TEXT REFERENCES assignments(assignment_id)`);
     }
+    // A write-time backstop for the same round: an attestation's own copy of `binding_generation`
+    // must agree with the assignment it names, so a database mid-migration gets the guard the
+    // fresh schema ships rather than a window without it.
+    raw.exec(`DROP TRIGGER IF EXISTS attestation_generation_matches_assignment`);
+    raw.exec(attestationGenerationTriggerDdl());
   },
   checksum: () => migrationChecksum("v31-a-generation-means-nothing-without-its-role-key"),
 };
@@ -2182,6 +2193,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "actor_target_attestations_no_delete", sentinel: "ACTOR_TARGET_ATTESTATION_APPEND_ONLY", introducedIn: 24 },
   { name: "actor_target_bindings_immutable", sentinel: "ACTOR_TARGET_BINDING_IMMUTABLE", introducedIn: 24 },
   { name: "actor_target_bindings_no_delete", sentinel: "ACTOR_TARGET_BINDING_IMMUTABLE", introducedIn: 24 },
+  { name: "attestation_generation_matches_assignment", sentinel: "ATTESTATION_GENERATION_MISMATCH", introducedIn: 31 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [

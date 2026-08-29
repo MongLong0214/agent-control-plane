@@ -433,10 +433,10 @@ export class ConversationTurnCoordinator {
       // the live pointer says one session, the frozen binding-time column says another, and no
       // attestation can equal both at once. The live pointer is what "current" means here.
       //
-      // Currency is judged on `asg.assignment_id = att.assignment_id`, not on role or generation
-      // read separately. Two reviews found the same shape twice over, at finer and finer grain:
-      // `asg.role = ca.kind` (an earlier version of this check) scoped to the actor's own role,
-      // and that still was not enough, because generation is minted per `role_key`
+      // Currency is judged on `asg.assignment_id = att.assignment_id`, not on role read alone.
+      // Two reviews found the same shape twice over, at finer and finer grain: `asg.role =
+      // ca.kind` (an earlier version of this check) scoped to the actor's own role, and that
+      // still was not enough, because generation is minted per `role_key`
       // (`nextGeneration(roleKey)`) and `bind()` can reuse one physical actor across *different*
       // role_keys that share one `role` (#657) — `WORKER:task-A` and `WORKER:task-B` are both
       // `role = 'WORKER'` and each counts its own generation from 1. A stale attestation for
@@ -444,11 +444,23 @@ export class ConversationTurnCoordinator {
       // `role`-only check cannot tell the two role_keys apart because nothing about `role` names
       // which role_key a generation belongs to. `assignment_id` has no such ambiguity: it is
       // minted once per bind or rebind and never reused, so naming it *is* naming the exact
-      // role_key and generation together — there is no bare number or bare role left to read
-      // separately, and so nothing left to match by coincidence. `asg.binding_generation` is read
-      // from the matched assignment itself (not compared against a copy on the attestation) for
-      // the same reason: once the assignment is pinned by id, its own generation is the only
-      // honest source for what generation this turn is claimed under.
+      // role_key and generation together.
+      //
+      // `asg.binding_generation = att.binding_generation` stayed in the WHERE clause through
+      // that rewrite, and it must. `assignment_id` pins *which* assignment the attestation speaks
+      // for; it does not vouch for what the attestation *says* about it. A third review built the
+      // counterexample this leaves open without it: an attestation citing a real, currently
+      // ACTIVE assignment_id but claiming generation 1 while that assignment's own row already
+      // reads 2 — the join matched on identity alone, admitted the claim, and `canonical_turns`
+      // recorded generation 2 for a turn no attestation ever attested. The two columns are
+      // supposed to always agree (an honest writer reads both off the same assignment row), which
+      // is exactly why an *unchecked* copy is the hazard: nothing enforced that they still did.
+      // `asg.binding_generation` is still what gets stored — once both identity and content are
+      // verified, the assignment's own value is the authoritative one to record, not the
+      // attestation's copy of it — but "authoritative to store" and "not worth comparing" are two
+      // different claims, and only the first one is true. A write-time trigger
+      // (`attestation_generation_matches_assignment`) now refuses this shape at the source; this
+      // condition is what stops it here too, for a row that reached the table by any other path.
       //
       // `sess.lifecycle = 'READY'` closes the other half of "current": the runtime-ready trigger
       // (`conversational_actors_runtime_ready`) only checks READY at the moment the pointer is
@@ -477,6 +489,7 @@ export class ConversationTurnCoordinator {
              ON asg.assignment_id = att.assignment_id
             AND asg.actor_id = ca.actor_id
             AND asg.status = 'ACTIVE'
+            AND asg.binding_generation = att.binding_generation
           WHERE att.target_binding_id = ?
             AND tb.target_actor_id = ?
             AND ca.retired_at IS NULL
