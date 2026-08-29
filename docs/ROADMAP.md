@@ -188,8 +188,9 @@ completion authority.
    as #693) is the other open critical-path item, alongside the real durable-handler re-run
    risk this list's item 9 already tracks as #673; the census's C1 also surfaced that the ingress
    ledger resolves a turn on a timeout apology with no record the CEO may still be executing —
-   checked against #638/#639 (neither states this consequence, and closing them would not
-   obviously close it) and filed as **#696**. Full re-derivation with evidence:
+   a ticket (#696) was filed and then closed as a duplicate once `686281a`'s own commit trailers
+   were read: they record #639 as already meant to replace this exact seam, more broadly than
+   #639's issue text states. Full re-derivation with evidence:
    `docs/design/660-owner-message-state-census.md`;
 8. settlement authority, contradiction escalation, and source/attestation truth close #662 and #666;
 9. unresolved-turn operator recovery and durable duplicate retention close #672–#673.
