@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
+import { IngressGuard, type TurnIdentity } from "../../src/ingress/ingress-guard.ts";
 import type { DoctorReport } from "../../src/doctor/doctor.ts";
 
 afterAll(cleanupTempDirs);
@@ -16,12 +17,46 @@ afterAll(cleanupTempDirs);
  * conversation was visible only to someone tailing `audit_events`, and the tool the operator
  * actually reaches for reported a healthy CEO route.
  */
+const guardFor = (harness: ReturnType<typeof makeHarness>) =>
+  new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+    telegram: { allowedActors: ["owner"], allowedConversations: ["chat"], recoverInFlight: true },
+  });
+
+const identity = (turnRequestId: string): TurnIdentity => ({
+  turnRequestId,
+  sessionDigest: "session-digest",
+  promptDigest: "prompt-digest",
+  bindingDigest: "binding-digest",
+});
+
+/**
+ * Claims a turn the way production does — `IngressGuard.admit` then `claimTurn` — rather than
+ * hand-inserting a row. The claim's `deliveryStatus` lives in `turn_claim_json`; `result_json`
+ * is the reply-delivery lifecycle and never holds it (#671). A fixture that wrote it into
+ * `result_json` would pass against a query that reads the wrong column and never catch the bug.
+ *
+ * `receivedAt` is stamped by `admit` from the harness clock, so the clock is moved there and
+ * back rather than threaded through as a parameter `admit` does not take.
+ */
 const claim = (harness: ReturnType<typeof makeHarness>, nonce: string, receivedAt: string): void => {
-  harness.cp.db.run(
-    `INSERT INTO inbound_messages (channel, nonce, actor, received_at, result_json)
-     VALUES ('telegram', ?, 'owner', ?, ?)`,
-    [nonce, receivedAt, JSON.stringify({ deliveryStatus: "TURN_CLAIMED", turnRequestId: nonce })],
-  );
+  const guard = guardFor(harness);
+  const restoreAt = harness.clock.now();
+  harness.clock.set(receivedAt);
+  const admitted = guard.admit({
+    channel: "telegram",
+    actor: "owner",
+    conversation: "chat",
+    nonce,
+    payload: { text: "…" },
+  });
+  if (!admitted.allowed) {
+    throw new Error(`fixture setup failed: admit refused (${JSON.stringify(admitted)})`);
+  }
+  const claimed = guard.claimTurn("telegram", nonce, identity(nonce));
+  if (!claimed.allowed) {
+    throw new Error(`fixture setup failed: claimTurn refused (${JSON.stringify(claimed)})`);
+  }
+  harness.clock.set(restoreAt);
 };
 
 const turnFinding = (report: DoctorReport) =>
@@ -89,10 +124,14 @@ describe("what doctor says about a wedged conversation", () => {
     // Admitted-and-running is not outstanding. Counting it would make every message in flight
     // look wedged, and the finding would stop meaning anything.
     const harness = makeHarness();
-    harness.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'plain', 'owner', ?)`,
-      [harness.cp.clock.nowIso()],
-    );
+    const admitted = guardFor(harness).admit({
+      channel: "telegram",
+      actor: "owner",
+      conversation: "chat",
+      nonce: "plain",
+      payload: { text: "…" },
+    });
+    expect(admitted.allowed).toBe(true);
 
     expect(turnFinding(await harness.cp.doctor.run("system"))).toBeUndefined();
   });
