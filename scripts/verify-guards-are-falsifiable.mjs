@@ -334,7 +334,7 @@ const GUARDS = [
       "        : TRANSPORT_RETENTION_MS[channel];",
     replace: "      const retention = TRANSPORT_RETENTION_MS[channel];",
     killedBy: [
-      "tests/unit/ingress-retention-derives-from-transport.test.ts::IngressGuard derives its floor from a longer-than-24h transportRetentionMs, not the channel name",
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::raises the effective floor to a longer-than-24h transportRetentionMs rather than refusing, when nonceTtlMs is not explicit",
     ],
   },
   {
