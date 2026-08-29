@@ -577,8 +577,11 @@ describe("round-2 ops regressions", () => {
 
   it("#122: short Telegram pruning cannot delete a long-lived signed Buzz nonce", () => {
     const harness = makeHarness();
+    // Telegram's nonceTtlMs is left at its (24h) default rather than shortened: #673 refuses a
+    // shorter one, and the property under test — pruning is scoped to the admitting channel — does
+    // not depend on how short either channel's ttl is.
     const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
-      telegram: { allowedActors: ["owner"], allowedConversations: ["chat"], nonceTtlMs: 1 },
+      telegram: { allowedActors: ["owner"], allowedConversations: ["chat"] },
       buzz: { allowedActors: ["buzz-owner"], secret: "buzz-secret", nonceTtlMs: 60_000 },
     });
     const buzz = { channel: "buzz" as const, actor: "buzz-owner", nonce: "buzz-once", payload: { action: "x" } };

@@ -304,4 +304,9 @@ export class TelegramIngress {
   completeReplyAndResolveTurn(nonce: string, result: unknown): Decision<void> {
     return this.guard.completeReplyAndResolveTurn("telegram", nonce, result);
   }
+
+  /** The no-reply counterpart: a claimed turn whose handler decided not to reply (#672). */
+  completeNoReplyAndResolveTurn(nonce: string): Decision<void> {
+    return this.guard.completeNoReplyAndResolveTurn("telegram", nonce);
+  }
 }

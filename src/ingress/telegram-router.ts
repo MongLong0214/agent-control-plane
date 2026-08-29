@@ -543,6 +543,32 @@ export class TelegramHermesRouter {
     }
   }
 
+  /**
+   * A claimed turn whose handler decided not to reply is itself an outcome, and this is the
+   * point that knows it: `route()` has already returned, no reply exists to reserve, send or
+   * complete, and every one of `reserveResponse` / `completeResponse` / `releaseResponse` begins
+   * `if (!outcome.reply) return` for exactly that reason — a null reply carries nothing for the
+   * reply lifecycle to act on.
+   *
+   * Without this, nothing ever calls `resolveTurn` for that claim: `admit` refuses the nonce
+   * forever as `INGRESS_TURN_OUTCOME_UNKNOWN`, and `prune` exempts the row on purpose (correctly —
+   * see ingress-turn-claim.test.ts), so a turn that is, in fact, done stays outstanding for good
+   * (#672). No handler on the current DIRECT path produces this outcome, but nothing about the
+   * mechanism depends on which handler does — `pollOnce` calls this whenever `route()` returns a
+   * null reply, so any future no-reply handler is covered by construction rather than by whoever
+   * remembers to resolve it.
+   *
+   * `completeNoReplyAndResolveTurn`, not `resolveTurn` alone: a no-reply outcome never reserves or
+   * completes a reply, so `result_json` would otherwise stay null — indistinguishable from a
+   * message that never ran — and a later redelivery's recovery check would re-admit and re-run a
+   * turn that already finished. See that method's docstring.
+   */
+  resolveNoReplyOutcome(outcome: TelegramRouteOutcome): void {
+    if (outcome.reply || !outcome.admitted) return;
+    const resolved = this.ingress.completeNoReplyAndResolveTurn(outcome.nonce);
+    if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
+  }
+
   /** Reserve a response before the external Telegram send. */
   reserveResponse(outcome: TelegramRouteOutcome): void {
     if (!outcome.reply || !outcome.admitted) return;

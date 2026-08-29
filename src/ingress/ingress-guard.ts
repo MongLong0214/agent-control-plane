@@ -92,6 +92,29 @@ export const buzzActorBindingSigningRequest = (
 const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * How long each transport itself may still redeliver an update whose receipt was never
+ * confirmed — not a guess, and not the same thing as `nonceTtlMs`.
+ *
+ * Telegram's long-poll `getUpdates` is measured against the code that drives it
+ * (`telegram-polling.ts`): ACP confirms receipt by calling `getUpdates` with an offset one past
+ * the highest `update_id` it has seen, and Telegram will not resend an update once that happens
+ * — this bound only matters for an update whose offset never advanced (a crash, a long outage),
+ * which Telegram queues for up to 24 hours from creation before dropping it. `received_at` is
+ * stamped no earlier than Telegram's own creation time, so `received_at + nonceTtlMs >=
+ * created_at + retention` whenever `nonceTtlMs >= retention` — the nonce window cannot close
+ * before Telegram itself stops redelivering (#673).
+ *
+ * `buzz`, `mcp` and `cli` have no entry: there is no equivalent measurement for any of them —
+ * they are not Telegram's queue, and inventing a number for "how long could a redelivery still
+ * arrive" would be exactly the guess this file's own history warns against. A transport added
+ * here later without a measured entry is simply not checked, and carries this issue's original
+ * defect until one is added.
+ */
+const TRANSPORT_RETENTION_MS: Readonly<Partial<Record<string, number>>> = {
+  telegram: 24 * 60 * 60 * 1000,
+};
+
+/**
  * PRD §27.
  *
  * One place decides whether an inbound message may act. Allowlist, authenticity and
@@ -136,6 +159,21 @@ export class IngressGuard {
       }
       if (channel === "telegram" && (!policy.allowedConversations || policy.allowedConversations.length === 0)) {
         throw new Error("Telegram ingress requires a non-empty conversation allowlist");
+      }
+      const retention = TRANSPORT_RETENTION_MS[channel];
+      if (retention !== undefined) {
+        const ttl = policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS;
+        if (ttl < retention) {
+          // The relationship, not the number, is the property (#673): a nonce pruned before the
+          // transport itself stops redelivering reopens the exact duplicate-turn window the
+          // claim mechanism exists to close. Refusing construction makes that relationship hold
+          // by construction instead of by two constants that happen to agree today.
+          throw new Error(
+            `ingress policy for '${channel}' sets nonceTtlMs (${ttl}ms) shorter than the transport's own ` +
+              `redelivery retention (${retention}ms); a nonce could be pruned before a late redelivery stops ` +
+              `arriving, which would let its turn be claimed and run a second time (#673)`,
+          );
+        }
       }
     }
   }
@@ -561,6 +599,46 @@ export class IngressGuard {
     return this.db.tx(() => {
       const completed = this.#recordResultHere(channel, nonce, result, "PENDING");
       if (!completed.allowed) return completed;
+      return this.#resolveTurnHere(channel, nonce);
+    });
+  }
+
+  /**
+   * The no-reply counterpart of `completeReplyAndResolveTurn` (#672).
+   *
+   * `resolveTurn` alone is not enough for a handler that produced no reply: it never reserves or
+   * completes anything, so `result_json` stays exactly what it was the moment the turn was
+   * claimed — usually null. `isRecoverableIngressResult(null)` reads that as "never ran", which is
+   * true for an ordinary crash and false here — this handler ran and finished. Left that way, a
+   * later replay would see a *resolved* claim and a *recoverable* result and take the recovery
+   * branch, re-admitting and re-running a turn that already happened — worse than #672's original
+   * bug, which at least refused the redelivery outright.
+   *
+   * So this writes a result marker `isRecoverableIngressResult` reads as finished, in the same
+   * transaction as the resolution, for the reason `completeReplyAndResolveTurn`'s docstring
+   * already gives: any ordering of two separate commits has a window where a crash lands between
+   * them, and here that window would leave the claim resolved but the result still recoverable —
+   * the exact state that reopens the duplicate.
+   */
+  completeNoReplyAndResolveTurn(channel: string, nonce: string): Decision<void> {
+    return this.db.tx(() => {
+      const current = this.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [channel, nonce],
+      );
+      if (!current?.turn_claim_json) {
+        // No claim, nothing to resolve — the ordinary non-CEO path, same as `resolveTurn`.
+        return allow(ReasonCode.OK, undefined);
+      }
+      // No `kind: "TELEGRAM_WORKFLOW"`, deliberately: that shape's `sent` and `phase` describe
+      // the reply lifecycle, and there is no reply to describe. `isRecoverableIngressResult`'s
+      // fallback for any other kind is `sent === false`, which a marker with no `sent` field
+      // satisfies as `false` — recoverable only when a workflow explicitly says it has not sent.
+      this.db.run(`UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`, [
+        JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }),
+        channel,
+        nonce,
+      ]);
       return this.#resolveTurnHere(channel, nonce);
     });
   }

@@ -470,6 +470,12 @@ export class TelegramLongPollService {
           }
           throw error;
         }
+      } else {
+        // A claimed turn does not stop being claimed just because its handler produced no
+        // reply — nothing else in this loop will ever revisit the nonce, so the resolution has
+        // to happen here, at the one place that knows the reply is genuinely absent rather than
+        // merely not yet sent (#672).
+        this.router.resolveNoReplyOutcome(outcome);
       }
       if (Number.isSafeInteger(update.update_id)) {
         this.#offset = Math.max(this.#offset ?? 0, update.update_id + 1);
