@@ -228,6 +228,40 @@
  *   not a list this check forgot to extend — and the alternative, tuning the list a fourth time,
  *   is the failure mode this round exists to stop.
  *
+ * ## Round 6: the same shape twice more — a bypass, and the extension list again
+ *
+ *   A GitHub blob permalink stored `content: null` unconditionally, so a permalink citing the
+ *   exact line #649 quotes (`binding-registry.ts#L163` next to
+ *   `` `const actorId = this.mintActor(...)` ``) passed as ADVISORY while the identical content
+ *   cited as a plain path was correctly STALE. The URL's shape governs how a citation is *parsed*
+ *   (`GITHUB_BLOB_RE` instead of `PATH_RE`); it has nothing to do with whether the text right
+ *   after it gets checked, and treating the two together is what let the bypass in. Fixed by
+ *   sharing one `contentAfter` helper between both extraction paths.
+ *
+ *   `FILE_EXT` was a hand-maintained extension list once more — evidence-first (every entry added
+ *   because a real issue cited it), and still too narrow (`tests/fixtures/buzz-cli/cli-version.txt`,
+ *   a real tracked file, was invisible because `.txt` was never added) and too broad ("runs on
+ *   Node.js 22" matched and reported STALE because `.js` was). `git ls-files` is already this
+ *   script's authority on what a file is (`trackedFiles`, `resolvePath`); the extension list was a
+ *   hand-maintained gate standing in front of that authority rather than deferring to it.
+ *
+ *   The fix is the same move as round 5, applied to a different pair of categories: the extension
+ *   is now generic (any `.word`), and what makes a bare mention worth resolving at all is a
+ *   directory separator or an explicit line number — a signal specific enough not to be an
+ *   ordinary word that happens to contain a dot. `deploy/egress/allowlist-proxy.py` and
+ *   `Node.js:12` both qualify; bare `Node.js` does not, for the same reason bare `README.md` and
+ *   `Node.js` are not distinguishable from each other on sight alone.
+ *
+ *   Measured against every open issue, snapshotted once and run through the version before this
+ *   fix and the version after it, so the diff is this change and nothing else: five previously-
+ *   flagged bare mentions disappear (`test_raw_sink_census.py`, `derive3.py`, `ARCHITECTURE.md`,
+ *   `CLAUDE.md`, `AGENTS.md` — all directory-free, line-number-free), and two directory-qualified
+ *   paths with extensions the old list never had newly resolve as STALE (`agent-control-plane/
+ *   state.sqlite`, `hermes/state.db` — both real deployment paths this repository does not track,
+ *   correctly reported as absent from it). Zero change to ADVISORY or NON_DURABLE. Reported here
+ *   rather than only in the commit, because a change that only adds findings has not been checked
+ *   for the kind it can also cause to disappear.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -505,24 +539,31 @@ const resolvePath = (cited) => {
 };
 
 // --- extraction --------------------------------------------------------------------------------
-// Longer alternatives that share a prefix with a shorter one must come first: JS regex
-// alternation takes the first branch that matches and does not backtrack for a longer one, so
-// "js|json" would match only "package.js" out of "package.json" and silently drop the "on".
-// `py` and `plist` are here because they are real, measured citation forms in this tracker's own
-// issues (#675, #676 cite `.py` scripts; #395/#400/#559/#564 cite the deploy `.plist`) — not a
-// guess at what else might show up. Extensions that looked plausible but turned out to collide
-// with ordinary property access (`process.env`, `console.log`, `cp.db`) were deliberately left
-// out after checking: adding them would misread prose as a citation of a file that was never cited.
-// `mts` is here because this repository tracks one (`scripts/lib/collapse-trailer-paragraphs.d.mts`)
-// — a real extension in this tree, not a guess; `cts` is not tracked anywhere and stays out on the
-// same evidence-first basis.
-const FILE_EXT = "tsx|ts|mts|mjs|cjs|json|js|plist|py|sh|sql|md|yaml|yml";
-// The line-number suffix comes in the two forms this tracker's issues actually use: `:123` /
-// `:123-456` (the convention #649 and #597's own table use), and a GitHub-style `path#L123` /
-// `path#L123-L456` anchor. Both land in the same two named groups so extraction does not care
-// which form a citation used.
+// Round 6: this used to be a hand-maintained list of specific extensions (`tsx|ts|mts|mjs|cjs|
+// json|js|plist|py|sh|sql|md|yaml|yml`) — evidence-first (each one added because a real issue
+// cited it), but still a list, and a fourth counterexample found the shape again: a real tracked
+// file (`tests/fixtures/buzz-cli/cli-version.txt`) went unrecognized because `.txt` was never
+// added, while `Node.js` — a product name, not a path — matched because `.js` was.
+//
+// `git ls-files` is the authority on what is a file here, and the script already uses it
+// (`trackedFiles`, `resolvePath`) for resolution — a hand-maintained extension list was standing
+// in front of that authority rather than deferring to it. So the extension is now generic (any
+// `.word`, not an enumerated set): what makes a bare mention a candidate worth resolving at all is
+// no longer "is this a known extension" but the same move as round 5's quoted/unquoted split —
+// **does the text carry a signal specific enough to not be an ordinary word that happens to
+// contain a dot.** A path with a directory separator (`deploy/egress/allowlist-proxy.py`) is that
+// signal; so is an explicit line number (`README.md:1`, `Node.js:12` — the number makes even a
+// bare name a citation, not a product mention). A bare, directory-free name with no line number
+// (`Node.js`, `React.js`) is exactly as ambiguous as `Node.js` and `HANDOFF-CEO-RESUME.md` are to
+// each other with no other context — both are "Capitalized-Word.ext" — so it is not extracted as
+// a citation at all, the same way round 5 stopped guessing at unquoted prose rather than refining
+// the guess. Measured against every open issue (see the round 6 docstring note): this drops five
+// previously-flagged bare mentions (`CLAUDE.md`, `AGENTS.md`, `SSOT.md`, `ARCHITECTURE.md`,
+// `HANDOFF-CEO-RESUME.md`) and adds none — a real cost, reported rather than hidden, in exchange
+// for deleting a category of false STALE this check cannot actually tell apart from a real one
+// without a directory or a line number to anchor it.
 const PATH_RE = new RegExp(
-  `\\b([A-Za-z0-9_][\\w-]*(?:/[\\w.-]+)*\\.(?:${FILE_EXT}))\\b` +
+  `\\b([A-Za-z0-9_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*)\\b` +
     `(?::(?<cs>\\d+)(?:-(?<ce>\\d+))?|#L(?<as>\\d+)(?:-L?(?<ae>\\d+))?)?`,
   "g",
 );
@@ -703,6 +744,30 @@ const extractFromBody = (body) => {
     // something re-deriving cannot fix.
     const insideNonDurable = (idx) => nonDurableSpans.some(([s, e]) => idx >= s && idx < e);
 
+    // Round 4 opened content-checking to inline citations (not just fenced ones) — the #649
+    // shape itself, written the ordinary way people actually write one, was never checked at
+    // all before that. Round 5 narrows *how* an inline citation's content is found: only an
+    // *explicit* delimiter (backticks or quotes right after the citation) counts as quoted at
+    // all — a fenced line's content needs no such delimiter, because the fence itself is the
+    // quotation mark. Guessing at unquoted prose is what let "This describes the banner text
+    // and its return value has changed" read as a quote of code that was never there; requiring
+    // an explicit delimiter removes that guess rather than refining it. `looksLikeCode` runs
+    // only after a span is already known to be quoted, deciding whether *that* text reads as
+    // code or as a description — never whether unquoted prose should be treated as a quote.
+    //
+    // Round 6: this has to run for *every* citation form, a GitHub permalink included. A
+    // permalink was stored with `content: null` unconditionally — a URL's own shape has nothing
+    // to do with whether the text right after it is a quote — so `binding-registry.ts#L163` next
+    // to the exact same vanished line #649's plain-path form catches passed in silence. The parse
+    // differs by form (a URL's match end sits after the whole link, a bare citation's after just
+    // the path:line); what happens with the text following it does not.
+    const contentAfter = (matchEnd, startLine) => {
+      if (startLine === null) return null;
+      const afterCitation = stripCitationSeparator(rawLine.slice(matchEnd));
+      const candidate = inFence ? afterCitation : readDelimitedSpan(afterCitation);
+      return candidate && candidate.length > 0 && looksLikeCode(candidate) ? candidate : null;
+    };
+
     // A GitHub blob permalink to *this* repository is a precise, structured citation and is
     // parsed as one directly — see `GITHUB_BLOB_RE`'s comment for why the generic path regex
     // must not also be let loose on this text. A permalink to a different repository names
@@ -714,11 +779,11 @@ const extractFromBody = (body) => {
         const path = m[3].replace(/[.,;:)]+$/, "");
         const startLine = m[4] ? Number(m[4]) : null;
         const endLine = m[5] ? Number(m[5]) : null;
-        // Content is always null for a URL citation (see below for why this field matters).
-        const key = `${path}:${startLine ?? ""}:${endLine ?? ""}:`;
+        const content = contentAfter(m.index + m[0].length, startLine);
+        const key = `${path}:${startLine ?? ""}:${endLine ?? ""}:${content ?? ""}`;
         if (seenPath.has(key)) continue;
         seenPath.add(key);
-        pathCitations.push({ raw: m[0], path, startLine, endLine, content: null });
+        pathCitations.push({ raw: m[0], path, startLine, endLine, content });
       }
     }
 
@@ -733,22 +798,13 @@ const extractFromBody = (body) => {
       const groups = m.groups ?? {};
       const startLine = groups.cs ? Number(groups.cs) : groups.as ? Number(groups.as) : null;
       const endLine = groups.ce ? Number(groups.ce) : groups.ae ? Number(groups.ae) : null;
-      // Round 4 opened content-checking to inline citations (not just fenced ones) — the #649
-      // shape itself, written the ordinary way people actually write one, was never checked at
-      // all before that. Round 5 narrows *how* an inline citation's content is found: only an
-      // *explicit* delimiter (backticks or quotes right after the citation) counts as quoted at
-      // all — a fenced line's content needs no such delimiter, because the fence itself is the
-      // quotation mark. Guessing at unquoted prose is what let "This describes the banner text
-      // and its return value has changed" read as a quote of code that was never there; requiring
-      // an explicit delimiter removes that guess rather than refining it. `looksLikeCode` runs
-      // only after a span is already known to be quoted, deciding whether *that* text reads as
-      // code or as a description — never whether unquoted prose should be treated as a quote.
-      let content = null;
-      if (startLine !== null) {
-        const afterCitation = stripCitationSeparator(rawLine.slice(m.index + m[0].length));
-        const candidate = inFence ? afterCitation : readDelimitedSpan(afterCitation);
-        if (candidate && candidate.length > 0 && looksLikeCode(candidate)) content = candidate;
-      }
+      // A bare citation with neither a directory separator nor a line number is exactly as
+      // ambiguous as an unquoted trailing sentence was in round 5 — "Node.js" and
+      // "deploy/egress/allowlist-proxy.py" both end in a real-looking extension, but only the
+      // second says anything about *this repository's tree* rather than a product name that
+      // happens to contain a dot. See round 6's docstring note for the corpus evidence.
+      if (startLine === null && !path.includes("/")) continue;
+      const content = contentAfter(m.index + m[0].length, startLine);
       // The quoted content is part of the identity, not decoration on top of it. Two citations of
       // the same `path:line` are two different claims when one of them also quotes code — a bare
       // `README.md:1` and a fenced `README.md:1  const definitelyGone = true` are not the same

@@ -717,6 +717,103 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
+  // --- Round 6: a sixth independent review, run against the shipped script. Two
+  // counterexamples — a content-check bypass, and the extension list problem once more.
+
+  it("[round 6] a GitHub permalink with vanished quoted content is STALE, not silently ADVISORY", () => {
+    // The exact #649 stale content (`binding-registry.ts:163`), cited as a permalink with a `#L`
+    // anchor and an explicit backtick quote right after it instead of the plain-path form. The
+    // permalink extraction path stored `content: null` unconditionally, so this passed as
+    // ADVISORY ("still resolves") while the identical content cited as a plain path was correctly
+    // STALE — the same fact, checked or not depending only on which citation form named it.
+    const body =
+      "See https://github.com/MongLong0214/agent-control-plane/blob/main/src/session/binding-registry.ts#L163 " +
+      "— `const actorId = this.mintActor(...)` for the mint call.";
+    const { path, cleanup } = withIssues([{ number: 9401, title: "permalink vanished content counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("binding-registry.ts");
+      expect(result.stdout).toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 6] a permalink whose quoted content still holds remains ADVISORY", () => {
+    const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#L1 — `# agent-control-plane`.";
+    const { path, cleanup } = withIssues([{ number: 9402, title: "permalink current content control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 6] a real tracked file with an uncommon extension is recognized, not invisible", () => {
+    // `.txt` was never in the old enumerated extension list, so a real, tracked citation of it
+    // was silently never even considered — indistinguishable from silence on a valid citation.
+    const body = "See `tests/fixtures/buzz-cli/cli-version.txt:1` for the format.";
+    const { path, cleanup } = withIssues([{ number: 9403, title: "txt extension counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).toContain("cli-version.txt");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 6] an ordinary product name with no directory or line number is not read as a citation", () => {
+    // "Node.js" ends in a real extension (`.js`) and, with the old enumerated list, matched and
+    // was reported STALE — a sentence about a runtime, not a citation of this repository's tree.
+    const body = "This runs on Node.js 22 and nothing else.";
+    const { path, cleanup } = withIssues([{ number: 9404, title: "product name counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 6] a bare product name and a real bare filename are not told apart, and neither is now checked", () => {
+    // The disambiguator (directory separator or line number) is uniform: it does not special-case
+    // markdown or any other extension. A bare `HANDOFF-CEO-RESUME.md` mention — no directory, no
+    // line number — is exactly as syntactically ambiguous as `Node.js`, and this is the traded-off
+    // cost reported in the round 6 docstring rather than hidden: it is no longer flagged even
+    // though (unlike Node.js) it would in fact resolve to nothing.
+    const body = "See HANDOFF-CEO-RESUME.md for the full context.";
+    const { path, cleanup } = withIssues([{ number: 9405, title: "bare markdown mention control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 6] a directory-qualified bare mention with an uncommon extension is still checked", () => {
+    // The positive control for the disambiguator itself: a directory separator is enough to
+    // qualify a bare mention (no line number) as a real citation, regardless of extension.
+    const body = "The fixture lives at `tests/fixtures/buzz-cli/cli-version.txt`.";
+    const { path, cleanup } = withIssues([{ number: 9406, title: "directory-qualified bare mention control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);
