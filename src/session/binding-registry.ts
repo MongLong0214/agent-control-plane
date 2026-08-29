@@ -264,7 +264,11 @@ export class BindingRegistry {
       expectedCurrentGeneration?: number;
     },
   ): Decision<RoleBinding> {
-    return this.db.tx(() => {
+    // #664 — this body's writes (the runtime move, the revoke+mint+insert, the run
+    // repoint) are the switch being decided; a denial anywhere below must not leave any
+    // of them behind, including the "the transaction rolls back" the comment two writes
+    // down already promised and `tx()` alone could not keep.
+    return this.db.txDecision(() => {
       const key = this.resolveRoleKey(input);
       if (!key.allowed) return key as Decision<RoleBinding>;
       const roleKey = key.value;
