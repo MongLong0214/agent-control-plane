@@ -406,17 +406,41 @@ above — a ledger recording a state the thing it describes has not actually rea
 different pair than `canonical_turns`/`inbound_messages`: here it is the ingress ledger against
 the CEO's own execution, which no table in this schema observes at all. Not one of the seven
 states (it is a transition, in the shape C2 already named for a different sentence), and not
-embargoed — it is live in production behavior today, on the same path S2 traced. No open ticket
-names it under this description; whoever picks this up should check `#638`/`#639` first; a durable
-receipt is exactly the mechanism that would let ingress tell "answered" apart from "gave up
-waiting."
+embargoed — it is live in production behavior today, on the same path S2 traced.
+
+**Is this a fact about the system (C1's proper subject) or an outstanding item that needs its own
+ticket (`docs/ACCEPTANCE.md:3`)? Checked, rather than assumed: it is an outstanding item, and it
+is now ticketed as #696.** Read #638 and #639 in full looking for this exact consequence before
+filing. Neither states it:
+
+- **#638** is scoped to the **canonical ledger** — Hermes committing a receipt atomically with
+  `COMPLETED`, so that `spawn`/`exit 0`/`stdout`/Telegram delivery are not mistaken for durable
+  commit evidence. That is the closest existing language, and it names Telegram delivery as
+  non-evidence for the *same reason* this fact does — but its subject is
+  `canonical_turns`/`TURN_CLAIMED → TURN_COMPLETED`, which (per this row's first half) has no
+  production writer at all today. It says nothing about the *ingress* ledger's
+  `completeReplyAndResolveTurn` resolving early.
+- **#639** is ACP's three matching contracts for the same canonical ledger, explicit that until
+  #638 lands, "every claimed turn resolves to unknown. That is the intended state" — for
+  `canonical_turns`. That intended state (`OUTCOME_UNKNOWN`, not resolved) is what the *canonical*
+  ledger does today, precisely because nothing writes it. It is not what the *ingress* ledger
+  does — the ingress ledger resolves immediately, unconditionally, regardless of #638/#639.
+- **Closing both would not obviously close this.** Both build a receipt-matching mechanism for
+  `canonical_turns`. Neither states an intent to gate the *ingress* reply's resolution on that
+  receipt once it exists — wiring the two together is a distinct integration step neither issue
+  names. That is the test this document is applying: a fact belongs in C1 when an existing ticket
+  already owns making it not true; this one had no such ticket, so by the same rule that produced
+  #693 and #695, it gets one rather than staying unique to this document.
+
+Filed as **#696** (*"The ingress ledger resolves a turn on a timeout apology, with no record the
+CEO may still be executing"*), with the full argument above written into its body.
 
 **Path traced:** for the first half, `.claim()`'s absence of any caller (`grep -rn "\.conversation\b" src/`,
 exhaustive, not sampled) and `daemon.ts`'s four operator-method call sites, all read directly. For
 the second half, the same `answerAsCeo`/`ceo-conversation.ts`/`telegram-router.ts`/
-`telegram-polling.ts` chain S2 traces. Neither half claims anything about whether a receipt
-mechanism (#638) would actually distinguish the two cases correctly once built — only that
-nothing today does.
+`telegram-polling.ts` chain S2 traces, plus a full read of #638's and #639's bodies to check
+whether either already states this consequence — neither does, which is the basis for filing
+rather than merely citing.
 
 ### C2 — the sentence the original C2 cited has since been rewritten twice more, and no longer says what C2 quoted
 
@@ -558,9 +582,12 @@ the original row, but genuinely open, not embargoed), S7 (**#693**, filed from t
 re-derivation).
 **Independent, still open, embargoed by #638:** S5.
 **Mechanism closed independently (#669); state stays embargoed by #638:** S4.
-**Context, carried but not scheduled:** C1 (unchanged), C2 (citation corrected, underlying point
-holds), C3 (mechanism corrected — the embargo is an absence of a writer, not a schema guarantee;
-#638 still open).
+**Context, carried but not scheduled:** C1's first half (the two ledgers not meeting — unchanged),
+C2 (citation corrected, underlying point holds), C3 (mechanism corrected — the embargo is an
+absence of a writer, not a schema guarantee; #638 still open).
+**Context that turned out to be an outstanding item, now ticketed:** C1's second half — the
+ingress ledger resolving a turn on a timeout apology — checked against #638/#639 and found
+uncovered by either; filed as **#696**.
 
 Cross-references for the still-open gaps: S2 is **#695** (*"A repeated `/again` names and records
 only the oldest unresolved turn, so a second one accumulates silently"*) — a review found this
@@ -573,7 +600,11 @@ because no existing ticket owned it — #641 (closed) named only the ingress-sid
 #666 (open) covers source integrity at claim time rather than adding a source after it, and #639
 (open) covers receipt-matched completion rather than extending a turn's inputs while it runs.
 #638 (open) and #639 (open) are the reconciliation tickets #693 sits behind, alongside S4 and
-S5's reachability.
+S5's reachability. C1's second half is now **#696** (*"The ingress ledger resolves a turn on a
+timeout apology, with no record the CEO may still be executing"*) — read #638 and #639 in full
+first; both are scoped to the canonical ledger's receipt-matching mechanism, neither states an
+intent to gate the *ingress* reply's resolution on that receipt, so closing them would not
+obviously close this.
 
 **The durable-handler re-execution risk the original S3 misattributed is real, and already has
 its own ticket: #673.** `prune` (`src/ingress/ingress-guard.ts`) deletes a row once its claim is
@@ -584,9 +615,10 @@ the actual shape of a re-run S3's wording gestured at, correctly assigned to #67
 than to S3's `ADMITTED`-and-unclaimed state, which the claim gate already covers. #672 (open — a
 claimed turn whose handler returns no reply is never resolved, so it is never eligible for that
 same prune path) is the adjacent gap on the other side of the same mechanism. Every still-open
-gap in this census — S2, S4/S5's reachability, S7, and the real re-execution risk in #673 — now
-resolves to a ticket rather than to this document alone, which is the rule `docs/ACCEPTANCE.md:3`
-states and this document was at risk of breaking for S2 and S7 until #695 and #693 were filed.
+gap in this census — S2, S4/S5's reachability, S7, C1's second half, and the real re-execution
+risk in #673 — now resolves to a ticket rather than to this document alone, which is the rule
+`docs/ACCEPTANCE.md:3` states and this document was at risk of breaking for S2, S7 and C1's
+second half until #695, #693 and #696 were filed.
 
 ## Verification
 
@@ -751,8 +783,27 @@ I trace, which am I implying" question to every row added an explicit **Path tra
 each of S1–S7 and C1–C3, naming what was read directly versus inherited from another row versus
 not checked at all.
 
+**An eighth round settled a judgement call the seventh round's C1 addition left open: fact or
+outstanding item?** Read #638 and #639 in full to check whether either already states the
+consequence C1's second half describes. Neither does — both are scoped to the canonical ledger's
+receipt-matching mechanism, and neither claims an intent to gate the *ingress* ledger's
+resolution on it once built, so closing them would not obviously close this. That makes it an
+outstanding item by the same test that produced #693 and #695, not a fact this document could
+carry on its own — filed as **#696**, and C1 now states which judgement applies and why, so a
+later reader does not have to redo it.
+
 Re-ran `pnpm typecheck`, `pnpm lint`, `pnpm guards:anchors` and `pnpm terminology` after every edit
-across all seven rounds — all still pass. Re-ran `pnpm test` this round specifically, since two
-unrelated upstream merges had changed `src/` since the last run: `1442 passed | 9 failed |
-2 skipped`, same nine `deploy-launchd` failures, same shape as every prior measurement on this
-branch.
+across all eight rounds — all still pass. Did not re-run `pnpm test` this round: the edit was
+prose only (no `src/` change landed between this round and the last), so the `1442 passed | 9
+failed | 2 skipped` measurement from the seventh round stands.
+
+**On the rounds themselves: this one is a judgement call settled, not an error found.** Every
+round from the first through the seventh turned up something this document had stated wrong —
+S1 through S7's dispositions, C2's and C3's citations, a producing mechanism that doesn't exist,
+an over-claimed test, an untracked gap. This round is different in kind: nothing in the document
+was factually incorrect going into it: it asked a real judgement question (does this fact need a
+ticket) that had two defensible answers, and settled it by reading the two candidate tickets
+rather than by re-deriving a claim about the code. That is a distinct activity from the first
+seven rounds, and it is worth naming as such rather than folding it into the same "found an
+error" framing — the document's substance was not wrong before this round; it was one open
+question short of complete.
