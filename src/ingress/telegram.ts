@@ -10,6 +10,7 @@ import {
   type IngressRequest,
   type TurnClaim,
   type TurnIdentity,
+  type UnresolvedTurn,
   type OwnerApprovalIngress,
 } from "./ingress-guard.ts";
 
@@ -303,5 +304,15 @@ export class TelegramIngress {
   /** The reply's terminal transition and the turn's resolution, in one transaction. */
   completeReplyAndResolveTurn(nonce: string, result: unknown): Decision<void> {
     return this.guard.completeReplyAndResolveTurn("telegram", nonce, result);
+  }
+
+  /**
+   * Every unresolved turn on this conversation. See `IngressGuard.unresolvedTurns`.
+   *
+   * Named here for the same reason `claimTurn` is: the channel string is fixed to "telegram"
+   * alongside the other channel-scoped calls, and cannot be supplied inconsistently by a caller.
+   */
+  unresolvedTurns(sessionDigest: string): readonly UnresolvedTurn[] {
+    return this.guard.unresolvedTurns("telegram", sessionDigest);
   }
 }
