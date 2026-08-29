@@ -27,6 +27,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
+      # ADR-0010: this repository's own binding.gyp + node-addon-api convention for native
+      # addons, prebuilt here rather than compiled on load. macos-15 is the only runner this job
+      # uses, so this is also where #539's Darwin-only peercred addon gets its one build.
+      - run: pnpm native:peercred:build
       - run: pnpm lint
       - run: pnpm terminology
       # Reports, never fails: stale evidence is a fact to see, and a check that fails on a
@@ -43,6 +47,9 @@ jobs:
       # operand of a refusal does no falsifiability row name. The harness answers "is this guard
       # tested" for the lines someone wrote a row for; it cannot answer which lines nobody did.
       - run: pnpm guards:operands
+      # #539 lands src/core/peercred.ts unreachable from every live surface on purpose — a new
+      # call site (or a ControlPlane export) is a RED mutant here, not a deliverable.
+      - run: pnpm guards:peercred-unreachable
       # Two defect classes this branch hit twice each, turned into checks so the third time
       # is a failing step rather than a review finding.
       #
