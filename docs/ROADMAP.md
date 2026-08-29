@@ -176,14 +176,16 @@ completion authority.
 5. owner resend is a deliberate decision path, not a text-equality shortcut (#641);
 6. `OUTCOME_UNKNOWN` is visible in doctor and metrics (#650);
 7. the #660 state census, re-derived against current source and represented here rather than
-   left standalone: S1/S2/S3/S6 closed (#671, #680 — #680's park-before-claim also covers S2's
-   concurrent-claim case for real messages, though the pure-concurrency case rests on reading
-   `claimTurn`, not on a test; S3's "re-execution hazard" verdict was backwards — `claimTurn`
-   gates every DIRECT dispatch before it runs, closed by #635 the day *before* the census's own
-   baseline, not something that changed since); S4's permit-dead-`IN_DOUBT` exit mechanism closed
-   independently (#669) while the state itself stays embargoed behind #638, same as S5; S7 (a
+   left standalone: S1/S3/S6 closed (#671, #680; S3's "re-execution hazard" verdict was
+   backwards — `claimTurn` gates every DIRECT dispatch before it runs, closed by #635 the day
+   *before* the census's own baseline, not something that changed since); S4's
+   permit-dead-`IN_DOUBT` exit mechanism closed independently (#669) while the state itself stays
+   embargoed behind #638, same as S5; **S2 is not closed** — #680's park-before-claim covers the
+   single-unresolved case, but `unresolvedTurns`'s result is read only at its first element on
+   both the park and the override-recording paths, so a second unresolved turn (an overriding
+   `/again` that itself fails to resolve) is never disclosed or recorded, filed as **#695**; S7 (a
    later message cannot join or supersede a canonical turn's batch while it is `IN_DOUBT`, filed
-   as #693) remains the one open critical-path item, alongside the real durable-handler re-run
+   as #693) is the other open critical-path item, alongside the real durable-handler re-run
    risk this list's item 9 already tracks as #673. Full re-derivation with evidence:
    `docs/design/660-owner-message-state-census.md`;
 8. settlement authority, contradiction escalation, and source/attestation truth close #662 and #666;

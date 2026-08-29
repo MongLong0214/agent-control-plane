@@ -14,9 +14,12 @@ quoted, `grep`-able comment fragment instead, per the rule #597 states for exact
 
 Each row is `state tuple / producer transition / current terminal or gap / critical-path
 disposition`, as the original census defined it. Where a row's judgment still holds, this
-document says so — confirming a row is as valuable as overturning one, and four of the seven
-needed neither: they closed between the census being opened and this re-derivation, or (S3) were
-never actually open to begin with.
+document says so — confirming a row is as valuable as overturning one, and three of the seven
+needed neither: S1 and S6 closed between the census being opened and this re-derivation, and S3
+(unlike this document's own first pass on it) was never actually open to begin with. S2 looked
+like a fourth on an earlier pass of this document and is not — a review found the "closed"
+verdict itself wrong, and it is written up in full below as the reminder that this document's own
+claims need the same check as the issue's.
 
 **Every row below states which commit or code path would have closed it, and whether one
 already did — including the rows that stayed open.** A row's own re-derivation is not complete
@@ -28,7 +31,7 @@ skipping that check for an "open" row carried a defect forward rather than catch
 | # | 2026-08-21 judgment | 2026-08-29 measurement | Closed by |
 |---|---|---|---|
 | S1 | gap — reply reservation erases the claim | **closed** | #671 |
-| S2 | gap — nothing bounds one session to one claim | **closed for the reachable case; pure concurrency is inferred, not tested** | #680, not #671 alone |
+| S2 | gap — nothing bounds one session to one claim | **still open — #680 discloses/records only the single oldest unresolved turn, a second one silently accumulates** | partially narrowed by #680, not closed |
 | S3 | absorb — re-admission race for a durable handler | **never actually a hazard — the original verdict was backwards** | #635, merged *before* the census's own baseline |
 | S4 | gap — no exit for a permit that died with its process | **mechanism closed; state stays unreachable** | #669, discovered independently of this task's brief |
 | S5 | independent — schema state with no writer | **checked, unchanged, still open** | — (no writer exists to close it) |
@@ -58,7 +61,7 @@ richer story than "closed" or "open" captures, and it is given in full below.
   guard, not merely by trusting the issue's own comment.
 - **Disposition:** no longer on the critical path — nothing to absorb.
 
-### S2 — many `TURN_CLAIMED` rows on one session — CLOSED, but not by what the issue thread says
+### S2 — many `TURN_CLAIMED` rows on one session — OPEN, narrower than originally described, and not closed by #680
 
 - **State (as of 2026-08-21):** two or more rows claimed on the same channel and session digest,
   with nothing naming which one is "the" outstanding turn.
@@ -96,20 +99,62 @@ richer story than "closed" or "open" captures, and it is given in full below.
   path should cover the pure-concurrency case too. But that is this document's inference from the
   guard's SQL, not a claim the test suite backs, and it should be read as such rather than as
   something #680 was proven against.
-- **The residual case, precisely:** the owner can still produce two unresolved claims on one
-  session — by replying `/again <text>` to the park notice. That path is deliberate: the claim
-  carries `overriddenUnresolvedNonce` (`TurnIdentity`, `src/ingress/ingress-guard.ts`) naming
-  which earlier turn the owner knowingly ran alongside. So the *state* S2 described (multiple
-  unresolved claims, ambiguous which is "the" one) is no longer produced silently; it is produced
-  only on an explicit, recorded choice, which is exactly the distinction the original row asked
-  for when it said *"the design in #641 assumes exactly one."* #680 does not enforce "exactly
-  one" — it enforces "exactly one, unless the owner said otherwise and that is on the record."
-- **Disposition:** closed for the critical path, on a code-reading argument rather than a test
-  result — no test in the suite exercises two genuinely concurrent, non-crash claims on one
-  session, so that specific case is unverified rather than proven. Worth a correction on the
-  issue thread regardless: the 2026-08-29 comment's attribution to #671 is measurably incomplete,
-  and if the concurrent case is load-bearing for whatever absorbs this, it is worth its own test
-  before being called closed with confidence rather than with an inference.
+- **This document's previous round called this "closed" and that was wrong — a real, minimal
+  sequence still reaches S2's state with an undisclosed second claim.** `/again` was checked as a
+  single-shot override and it is not one. Both places the router touches an unresolved list read
+  only its first element:
+
+  ```
+  telegram-router.ts ~526   const unresolved = this.ingress.unresolvedTurns(identity.sessionDigest);
+                            if (unresolved.length > 0 && !overridesUnresolved) { … park, name
+                            unresolved[0] only … }
+  telegram-router.ts ~549   const overriddenUnresolvedNonce = unresolved[0]?.nonce;
+  ```
+
+  Walk the sequence Sol's review named:
+
+  ```
+  A     crashes (TelegramInterruption) → unresolved, oldest on the session
+  /again→B   owner overrides; claim records overriddenUnresolvedNonce = A's nonce (unresolved[0])
+  B     also crashes → now unresolved too. Session has TWO unresolved rows: A, B.
+  C     arrives (an ordinary message, no /again)
+        unresolvedTurns(sessionDigest) returns [A, B], oldest first
+        oldest = unresolved[0] = A
+        park reply: "an earlier message … is still unresolved (received {A.receivedAt})"
+        — singular, names only A. B is never mentioned.
+  ```
+
+  If the owner now sends `/again` for C, `overriddenUnresolvedNonce = unresolved[0]?.nonce` is
+  still **A's** nonce — the code has no way to reach B, because it never looks past index 0. C's
+  claim is recorded as a deliberate override of A. B is not named on C's claim, not disclosed in
+  any reply the owner sees, and not distinguishable from an ordinary crash nobody chose to run
+  alongside. At this point the session carries (at least) three claimed rows — A, B, C — under
+  exactly the ambiguity the original row described: multiple `TURN_CLAIMED` rows exist and nothing
+  names which one is "the" outstanding turn beyond the single oldest one. #680 makes the *first*
+  override explicit and recorded; it does not make a *second* one visible, because
+  `unresolvedTurns`'s full result is computed but only its head is ever read.
+- **No test exercises this, on either side of the guard.** The production round trip
+  (`tests/unit/telegram-ingress.test.ts`, *"/again lets the owner deliberately run a second turn
+  over an unresolved one, and records the choice"*, ~808) constructs exactly one unresolved turn
+  (`A`) and its overriding handler (`B`) returns a reply immediately rather than crashing — `B`
+  resolves, so the test never reaches a state with two simultaneously unresolved rows, and never
+  sends a third message. The guard-level test that does construct two unresolved claims directly
+  (`tests/unit/ingress-turn-claim.test.ts`, *"returns the oldest first, because that is the one
+  unanswered longest"*, ~269) calls `claimTurn` on the guard twice with two identities, bypassing
+  the router entirely, and asserts only the ordering `unresolvedTurns` returns — it does not go
+  through `TelegramHermesRouter`, does not check what a third arrival's park reply would name, and
+  does not check what a third `/again` would record. Neither test is the sequence above; nothing
+  in the suite is.
+- **Disposition:** open, narrower than the original row. The common case — one prior unresolved
+  turn, one park, one disclosed and recorded override — is real and #680 built it correctly; that
+  part is closed. What remains open is the shape above: `unresolvedTurns`'s result is truncated to
+  its first element at both read sites, so a second (or later) unresolved row on the same session
+  is never surfaced to the owner and never named on any claim, silently reproducing "the design
+  assumes exactly one" one layer past where #680 addressed it. Filed as **#695**
+  (*"A repeated `/again` names and records only the oldest unresolved turn, so a second one
+  accumulates silently"*), not embargoed and not dependent on #638/#639/#693 — it is live on the
+  ingress ledger today and testable with the existing harness. `docs/ROADMAP.md`'s C4 item 7 is
+  corrected alongside this row rather than left claiming S2 closed.
 
 ### S3 — `ADMITTED` and not claimed — CLOSED, and its "open" verdict was backwards
 
@@ -380,22 +425,29 @@ confirmation of anything the schema enforces.
 
 ## Disposition summary
 
-**Closed, nothing to absorb:** S1, S2 (mechanism closed; the pure-concurrency case is a
-code-reading argument, not a tested one — see S2), S3 (never actually a hazard; closed by #635
-before this census's own baseline), S6.
-**Absorb — real work, still open:** S7 (**#693**, filed from this re-derivation).
+**Closed, nothing to absorb:** S1, S3 (never actually a hazard; closed by #635 before this
+census's own baseline), S6.
+**Absorb — real work, still open:** S2 (**#695**, filed from this re-derivation — narrower than
+the original row, but genuinely open, not embargoed), S7 (**#693**, filed from this
+re-derivation).
 **Independent, still open, embargoed by #638:** S5.
 **Mechanism closed independently (#669); state stays embargoed by #638:** S4.
 **Context, carried but not scheduled:** C1 (unchanged), C2 (citation corrected, underlying point
-holds), C3 (unchanged; #638 still open).
+holds), C3 (mechanism corrected — the embargo is an absence of a writer, not a schema guarantee;
+#638 still open).
 
-Cross-references for the still-open gap: S7 is **#693** (*"A later message cannot join a
-canonical turn's batch or start its own while the incumbent is IN_DOUBT"*), filed by this
-re-derivation because no existing ticket owned it — #641 (closed) named only the ingress-side
-framing gap, #666 (open) covers source integrity at claim time rather than adding a source after
-it, and #639 (open) covers receipt-matched completion rather than extending a turn's inputs while
-it runs. #638 (open) and #639 (open) are the reconciliation tickets #693 sits behind, alongside
-S4 and S5's reachability.
+Cross-references for the still-open gaps: S2 is **#695** (*"A repeated `/again` names and records
+only the oldest unresolved turn, so a second one accumulates silently"*) — a review found this
+document's earlier "closed" verdict wrong: `unresolvedTurns`'s full result is read only at index
+0 by both the park reply and the override record in `telegram-router.ts`, so a second unresolved
+row on one session is never disclosed or named once one override has already been made. Not
+embargoed; live and testable today. S7 is **#693** (*"A later message cannot join a canonical
+turn's batch or start its own while the incumbent is IN_DOUBT"*), filed by this re-derivation
+because no existing ticket owned it — #641 (closed) named only the ingress-side framing gap,
+#666 (open) covers source integrity at claim time rather than adding a source after it, and #639
+(open) covers receipt-matched completion rather than extending a turn's inputs while it runs.
+#638 (open) and #639 (open) are the reconciliation tickets #693 sits behind, alongside S4 and
+S5's reachability.
 
 **The durable-handler re-execution risk the original S3 misattributed is real, and already has
 its own ticket: #673.** `prune` (`src/ingress/ingress-guard.ts`) deletes a row once its claim is
@@ -406,9 +458,9 @@ the actual shape of a re-run S3's wording gestured at, correctly assigned to #67
 than to S3's `ADMITTED`-and-unclaimed state, which the claim gate already covers. #672 (open — a
 claimed turn whose handler returns no reply is never resolved, so it is never eligible for that
 same prune path) is the adjacent gap on the other side of the same mechanism. Every still-open
-gap in this census — S4/S5's reachability, S7, and the real re-execution risk in #673 — now
+gap in this census — S2, S4/S5's reachability, S7, and the real re-execution risk in #673 — now
 resolves to a ticket rather than to this document alone, which is the rule `docs/ACCEPTANCE.md:3`
-states and this document was at risk of breaking for S7 until #693 was filed.
+states and this document was at risk of breaking for S2 and S7 until #695 and #693 were filed.
 
 ## Verification
 
@@ -441,12 +493,11 @@ A second review of the fixed commit found S3's verdict was backwards: it called
 (`src/ingress/telegram-router.ts`) and is transactionally serialized, so that state cannot
 produce a re-run — closed by `0d12bf2` (#635), merged 2026-08-20, the day *before* this issue's
 own baseline. The review also asked for the same "which commit closed this" check to be applied
-to every row still marked open; S5 and S7 were re-checked and confirmed genuinely open (no
-writer for `replacement_turn_request_id` exists anywhere, and no second writer of
-`canonical_turn_sources` exists on `main` — a commit adding one, `1bd1b81`, is on an unmerged
-branch, confirmed by `git merge-base --is-ancestor 1bd1b81 157aeed` returning false). That sweep
-also located the real re-execution risk S3's wording had been gesturing at: it is #673's
-prune-then-late-redelivery path, not S3's state, and the disposition summary above now says so.
+to every row still marked open; S5 and S7 were re-checked and confirmed genuinely open — no
+writer for `replacement_turn_request_id` exists anywhere, and (as then described) no second
+writer of `canonical_turn_sources` exists on `main` either. That sweep also located the real
+re-execution risk S3's wording had been gesturing at: it is #673's prune-then-late-redelivery
+path, not S3's state, and the disposition summary above now says so.
 
 A third review found C3 got its conclusion right (a canonical turn is currently impossible in
 production) from the wrong mechanism: this document had quoted `schema.sql`'s own comment —
@@ -463,9 +514,53 @@ conclusion, C3 stated a true conclusion resting on a mechanism that does not pro
 in the document (S1's atomic transaction, S2's early-return ordering, S4's
 `MATERIALIZING_AUTHORITIES`/`materialize()` path that actually clears `IN_DOUBT`, S5/S7's writer
 absence, C1's caller absence) — each was already backed by a direct code read rather than a quoted
-comment, and none needed a further correction.
+comment, and none needed a further correction **at that pass**. Round four, below, found that
+"the mechanism is real" and "the mechanism closes the state" are not the same check, and S2's
+early-return ordering had only had the first one done.
 
-Re-ran `pnpm typecheck`, `pnpm lint` and `pnpm guards:anchors` after every edit across all three
+**A fourth review found two more of this same general shape, one in S2 and one in this
+Verification log itself.**
+
+*S2 was reopened.* The third round's sweep confirmed `unresolvedTurns`'s early-return ordering is
+real — a direct code read — but stopped at confirming the mechanism exists, not at confirming it
+covers every reachable case. It does not: `telegram-router.ts` reads only `unresolved[0]` at both
+the park site and the override-recording site, so a *second* unresolved row on one session (an
+overriding `/again` that itself fails to resolve) is never disclosed to the owner and never named
+on any claim. The reproduction needs no concurrency, only two ordinary crashes:
+`A` crashes → unresolved; owner sends `/again` → `B` claimed, recorded as overriding `A`; `B` also
+crashes → now `A` and `B` are both unresolved; a third message `C` arrives and its park reply
+names only `A` (`unresolved[0]`), never `B`. Neither existing test reaches this: the production
+`/again` test (`tests/unit/telegram-ingress.test.ts` ~808) resolves its override turn instead of
+crashing it, so only one unresolved row ever exists; the guard-level ordering test
+(`tests/unit/ingress-turn-claim.test.ts` ~269) constructs two unresolved claims directly on the
+guard, bypassing the router, and checks only ordering. S2's row above now says this in full and
+is marked open; filed as **#695**. `docs/ROADMAP.md`'s C4 item 7 no longer claims S2 closed.
+
+*The `1bd1b81` description in round two, above, was itself wrong* — inferred from the fact that
+the commit touches `turn-coordinator.ts`, not from reading its diff. Reading the diff: `1bd1b81`
+adds two validation checks *inside* the existing `claim()` — an attestation-freshness join against
+`actor_target_bindings`/`assignments`, and a check that every source's channel/nonce was actually
+admitted into `inbound_messages` before `claim()` accepts it (both closing halves of #666's own
+findings). It touches neither `replacement_turn_request_id` nor the `INSERT INTO
+canonical_turn_sources` statement, which is unchanged. The conclusion round two drew — S5 and S7
+stay open on `main` regardless, and `1bd1b81`'s unmerged status (`git merge-base --is-ancestor
+1bd1b81 157aeed` → false) was checked correctly — was never wrong; only the description of what
+the commit *contains* was invented rather than read, corrected above in round two's own paragraph
+rather than left standing next to a retraction.
+
+Applying "was this inferred from a file-touched signal or read from the diff" to every other
+commit citation in this document: `f1cdde9` (#657, cited in C3) was spot-checked against its
+actual diff for this round and confirms the claim already made — it introduces
+`VerifiedTargetBinding` itself and its own commit message states *"Limit: nothing produces a
+VerifiedTargetBinding... until #638 exists every real reconstitution takes the mint path"*,
+matching C3 exactly. `0d12bf2` (#635, S3) was likewise spot-checked against its diff and confirms
+`claimTurn` was added before the handler dispatch exactly where S3 says. `97f5d0a` (#643, C2) was
+spot-checked and its diff's removed line is character-for-character the sentence C2 quotes as
+stale. `73328c0` (#669, S4) matches the `resolveInDoubt` behavior already read directly from the
+current source. None of the other citations rested on an inferred description; `1bd1b81` was the
+one case where a citation was written from a file list instead of a diff, and it is fixed above.
+
+Re-ran `pnpm typecheck`, `pnpm lint` and `pnpm guards:anchors` after every edit across all four
 rounds — all still pass. Did not re-run `pnpm test` after any round, since no edit touched
 anything but prose and Markdown; the `1404 passed | 9 failed | 2 skipped` baseline above is from
 the unmodified checkout and stands unchanged.
