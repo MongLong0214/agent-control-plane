@@ -19,8 +19,7 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 afterAll(cleanupTempDirs);
 
 /**
- * The active half of #639 contract 6 — and the shape a second review (Sol, on #691) found it had
- * to take.
+ * The active half of #639 contract 6 — and the shape three rounds of review found it had to take.
  *
  * The schema and the coordinator's settlement logic already refuse to complete a turn without a
  * matching receipt — that much has stood since #665. What was still missing is anything that
@@ -28,8 +27,6 @@ afterAll(cleanupTempDirs);
  * commits a receipt for it, and contract 6 without a harvester is vacuously true, exactly the
  * hole a blind review found on this issue. `reconcileUnresolved()` is the harvester; `#638` is
  * what makes a real port answer anything but `found: false`.
- *
- * Two rounds of review reshaped this file:
  *
  * 1. The first draft's fake port echoed the query's own actor/prompt back as the receipt's
  *    identity, so a "mismatch" case had to be constructed by calling a settlement method directly
@@ -42,13 +39,20 @@ afterAll(cleanupTempDirs);
  *    everything the first object needs. Anyone holding the coordinator could read a turn's
  *    identity and fabricate a completion with no receipt lookup at all — a forgery the identity
  *    fix from round 1 did nothing to close, because a caller supplying *both* the query and the
- *    receipt satisfies any comparison between them.
- *
- * The fix for round 2 is structural rather than a check: the receipt never arrives as a public
- * argument. `ReceiptPort` is bound once, at construction, and the only method that can act on one
- * is `reconcileUnresolved()`, which performs the lookup itself. There is no public method left
- * that takes a receipt from a caller, so the forgery this file used to demonstrate through direct
- * calls is not a bug the tests below refute — it is a call that no longer type-checks.
+ *    receipt satisfies any comparison between them. Fixed structurally: the receipt never arrives
+ *    as a public argument, `ReceiptPort` is bound once at construction (a true `#`-private field,
+ *    since `private readonly` erases at compile time), and the exported default port is frozen so
+ *    its `lookup` cannot be overwritten in place either.
+ * 3. Round 2's fixes made the sweep sound but exposed two things it was never asked to be: it
+ *    sweeps `canonical_turns`, which nothing in production writes to (`claim()` has no caller in
+ *    `src/`; the live Telegram path claims through `IngressGuard` into a different table) — so
+ *    this sweep runs, and asks, over an empty set, until #683/#639's other half wires a production
+ *    writer. And every settlement below only ever moves `canonical_turns` — contract 6 also
+ *    requires a reply-outbox insert in the same transaction, which nothing wired to this ledger can
+ *    perform, so `#settleFromReceipt` now refuses `COMPLETED` outright and unconditionally.
+ *    `ABORTED` carries no reply obligation and is what most tests below use to exercise the
+ *    identity checks without that refusal masking them; the one test about `COMPLETED` itself says
+ *    so explicitly.
  */
 type Coordinator = {
   db: ReturnType<typeof openDb>;
@@ -123,13 +127,21 @@ const stateOf = (c: Coordinator, turnRequestId: string) =>
  * claim, which is exactly what the sweep must act on unchanged. There is no way to call this and
  * *not* state an identity, unlike the shape the first draft shipped with, where a caller who
  * forgot to override anything got the query's own values for free.
+ *
+ * Defaults to `outcome: "ABORTED"`, not `"COMPLETED"` — a third review found that `#settleFromReceipt`
+ * now refuses every `COMPLETED` unconditionally (contract 6's atomic reply-outbox insert has
+ * nothing to write into yet), so a test using the default to prove an *identity* check — wrong
+ * actor, wrong prompt, wrong generation, wrong turn — would have passed for the wrong reason: the
+ * completion refusal fires before any identity is even compared, so it would mask the very check
+ * the test claims to exercise. `ABORTED` carries no reply obligation and reaches those checks
+ * unaffected; the one test about `COMPLETED` itself overrides this explicitly.
  */
 const matchingReceipt = (
   permit: { turnRequestId: string; targetActorId: string; promptDigest: string },
   overrides: Partial<Extract<ReceiptLookupResult, { found: true }>> = {},
 ): ReceiptLookupResult => ({
   found: true,
-  outcome: "COMPLETED",
+  outcome: "ABORTED",
   receiptId: `hermes:${permit.turnRequestId}`,
   evidenceDigest: `sha256:${permit.turnRequestId}`,
   reasonCode: ReasonCode.OK,
@@ -177,7 +189,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     const result = await c.coordinator.reconcileUnresolved();
 
     expect(result).toEqual({ swept: 2, settled: 1, unresolved: 1 });
-    expect(stateOf(c, receipted.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(stateOf(c, receipted.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "ABORTED" });
     expect(stateOf(c, silent.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
     // Every unresolved turn was asked about, not just the one that happened to settle — the whole
     // claim this describe block makes. Silence in the settlement count does not distinguish
@@ -191,6 +203,31 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     const c = withCoordinator(NEVER_FOUND_RECEIPT_PORT);
     const actorId = target(c, "untouched", 1);
     const held = claim(c, actorId, "m1");
+
+    const summary = await c.coordinator.reconcileUnresolved();
+
+    expect(summary).toEqual({ swept: 1, settled: 0, unresolved: 1 });
+    expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
+  });
+
+  /**
+   * A third review (Sol, on #691's own fix) found the atomicity gap contract 6 names explicitly:
+   * a matched receipt must move `TURN_COMPLETED` and insert one reply-outbox item in the same
+   * transaction, and nothing wired to `canonical_turns` performs the second half. Every field here
+   * matches perfectly — actor, prompt, generation, turn id — precisely so this refusal cannot be
+   * mistaken for any of the identity checks above; the only thing wrong with this receipt is that
+   * this build cannot yet act on `COMPLETED` at all.
+   */
+  it("does not complete a turn even when every identity field matches, because the reply obligation cannot yet be discharged", async () => {
+    const port = new FakeReceiptPort();
+    const c = withCoordinator(port);
+    const actorId = target(c, "perfect-match-completed", 1);
+    const held = claim(c, actorId, "m1");
+
+    port.answer(
+      held.turnRequestId,
+      matchingReceipt({ ...held, targetActorId: actorId }, { outcome: "COMPLETED" }),
+    );
 
     const summary = await c.coordinator.reconcileUnresolved();
 
@@ -218,7 +255,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     expect(summary).toEqual({ swept: 2, settled: 1, unresolved: 1 });
     expect(stateOf(c, held.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
-    expect(stateOf(c, alsoHeld.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(stateOf(c, alsoHeld.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "ABORTED" });
   });
 
   it("does not complete a turn when the receipt attests to the wrong actor, even though the query it was asked under was correct", async () => {
@@ -283,7 +320,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
 
     expect(summary).toEqual({ swept: 2, settled: 1, unresolved: 1 });
     expect(stateOf(c, broken.turnRequestId)).toEqual({ lifecycle_state: "IN_DOUBT", outcome_kind: null });
-    expect(stateOf(c, fine.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(stateOf(c, fine.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "ABORTED" });
   });
 
   /**
@@ -370,7 +407,7 @@ describe("ConversationTurnCoordinator.reconcileUnresolved", () => {
     const first = claim(c, actorId, "m1");
     port.answer(first.turnRequestId, matchingReceipt({ ...first, targetActorId: actorId }));
     await c.coordinator.reconcileUnresolved();
-    expect(stateOf(c, first.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "COMPLETED" });
+    expect(stateOf(c, first.turnRequestId)).toEqual({ lifecycle_state: "SETTLED", outcome_kind: "ABORTED" });
 
     // A second turn on the same actor is claimable now that the first is settled — same prompt
     // text ("hello"), same generation (1), so only the turn id differs from the first.

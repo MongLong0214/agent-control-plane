@@ -368,7 +368,9 @@ export class ControlPlane {
       this.audit = new AuditLog(this.db, this.clock);
       // The always-empty port, named explicitly rather than left to the default: this is the
       // real, running state before #638 supplies a port that can answer `found: true` — a sweep
-      // that runs and asks, and today always hears nothing back.
+      // that runs and asks, and today always hears nothing back. It also sweeps a table nothing in
+      // production writes to yet (`canonical_turns`; see `ConversationTurnCoordinator.claim()`'s
+      // docstring) — two separate gaps, both named where the sweep is defined, not hidden here.
       this.conversation = new ConversationTurnCoordinator(
         this.db,
         this.clock,

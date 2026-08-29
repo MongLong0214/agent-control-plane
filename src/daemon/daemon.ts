@@ -954,7 +954,11 @@ export class Daemon {
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
       // #639 contract 6, at the moment it matters most: right after a restart, before the first
-      // periodic sweep would otherwise get to it.
+      // periodic sweep would otherwise get to it. This genuinely runs and asks — it is not a
+      // no-op by omission — but it sweeps `canonical_turns`, which nothing in production writes
+      // to today (`ConversationTurnCoordinator.claim()` has no caller in this codebase yet; the
+      // live Telegram path claims through `IngressGuard` into a different table). So today, in
+      // this deployment, it always finds nothing to sweep. See `reconcileUnresolved`'s docstring.
       await this.cp.conversation.reconcileUnresolved();
       this.writeHealth(report);
       this.startTimers();
@@ -1306,9 +1310,12 @@ export class Daemon {
     capacitySensor.unref();
     this.#timers.push(capacitySensor);
 
-    // #639 contract 6's active half: ask, on a schedule, rather than wait to be told. Before
-    // #638 this always asks a port that answers `found: false` — a real sweep that genuinely
-    // runs and finds nothing, not the absence of one.
+    // #639 contract 6's active half: ask, on a schedule, rather than wait to be told. Before #638
+    // this always asks a port that answers `found: false` — a real sweep that genuinely runs, not
+    // the absence of one. It also has nothing to sweep yet: `canonical_turns` has no production
+    // writer until `ConversationTurnCoordinator.claim()` gets one (#683/#639's other half), so
+    // `unresolvedIdentities()` returns empty here regardless of what the port would say. Both gaps
+    // are named, not hidden, in `reconcileUnresolved`'s docstring.
     const turnReconcileMs = this.options.turnReconcileIntervalMs ?? 60_000;
     const turnReconcile = setInterval(() => {
       void this.runPeriodic("turn_reconcile", async () => {

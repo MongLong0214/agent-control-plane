@@ -386,6 +386,21 @@ export const ReasonCode = {
    * generation is: the receipt is simply not evidence about this claim, not a contradiction of it.
    */
   CONVERSATION_TURN_RECEIPT_WRONG_TURN: "CONVERSATION_TURN_RECEIPT_WRONG_TURN",
+  /**
+   * A reconciled receipt says `COMPLETED`, and this build has no way to discharge the reply
+   * obligation that transition carries alongside it.
+   *
+   * #639's contract: a matched receipt must move the turn to `TURN_COMPLETED` and insert one
+   * reply-outbox item atomically, in the same transaction — not as two facts that could disagree.
+   * A review found the reconciler only did the first: `canonical_turns` moved, nothing else did,
+   * and `COMPLETED` cannot be walked back through the ordinary API once recorded. There is no
+   * reply-outbox mechanism wired to this ledger to insert into — `src/outbox/outbox.ts` exists,
+   * but its `MessageKind`s are role-to-role task dispatch, not a reply to the owner who asked — so
+   * recording `COMPLETED` today would be exactly the false positive contract 6 exists to prevent.
+   * `ABORTED` carries no such obligation and is unaffected.
+   */
+  CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE:
+    "CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE",
   // --- disposable acceptance realm ------------------------------------------
   /**
    * A path the acceptance realm would use resolves inside production, or outside its own state

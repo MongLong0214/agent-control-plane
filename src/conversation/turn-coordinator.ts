@@ -468,6 +468,15 @@ export class ConversationTurnCoordinator {
    * Refuses rather than queues. A queue here would hold the caller for the length of a turn,
    * which is the stall the design exists to remove; ordering belongs where the message is
    * durable, not in a caller's stack frame.
+   *
+   * **Nothing in production calls this method.** The live Telegram path claims its turn through
+   * `IngressGuard.claimTurn()`, which writes `inbound_messages.turn_claim_json` — a different
+   * table this class never reads or writes. `canonical_turns`, the table this method and
+   * `reconcileUnresolved()` both work against, has no production writer today: every row in it
+   * this build will ever see comes from a test calling `claim()` directly. A review (#691) named
+   * this precisely, and it is a correct description of the current system rather than a defect in
+   * this one — wiring a production caller here is #683/#639's other half, deliberately not done in
+   * this change (see `reconcileUnresolved`'s docstring for what that means for the sweep).
    */
   claim(input: {
     targetActorId: string;
@@ -900,6 +909,27 @@ export class ConversationTurnCoordinator {
    * `found: false` answer are not distinguished in the counts below — both leave the turn exactly
    * where it was, `IN_DOUBT` and visible as `OUTCOME_UNKNOWN`, and contract 6 forbids treating
    * either as evidence for re-execution.
+   *
+   * **What this does and does not do in the deployed system, stated exactly rather than deferred
+   * as "wiring is follow-up" (#691).** This sweep observes `canonical_turns`, which nothing in
+   * production currently populates, so it is a no-op in the deployed system until `claim()` has a
+   * caller — see that method's docstring. The design is kept rather than pointed at the ledger
+   * production does write (`inbound_messages.turn_claim_json`, via `IngressGuard`) because that is
+   * a different table with a different shape and its own review, and silently retargeting this
+   * sweep at it would change what this change *is* without saying so. Wiring a production writer
+   * for `canonical_turns` is #683/#639's other half.
+   *
+   * **What this does and does not do about contract 6's atomicity, also stated exactly (#691).**
+   * The contract requires a matched receipt to move `TURN_COMPLETED` and insert one reply-outbox
+   * item atomically — not as two facts that could disagree. This method only ever performs the
+   * first half: nothing here inserts anywhere a reply could be delivered from, because no such
+   * mechanism is wired to this ledger (`src/outbox/outbox.ts` exists, but its message kinds are
+   * role-to-role task dispatch, not a reply to the owner who asked). Building that mechanism now
+   * would be exactly the "much larger change" the previous paragraph declines for the same reason.
+   * So `#settleFromReceipt` refuses `COMPLETED` outright, for every receipt, until that mechanism
+   * exists — a refusal is recoverable; a `COMPLETED` recorded with no way to prove the reply went
+   * anywhere is not, since `canonical_turns`' settlement is one-way through the ordinary API.
+   * `ABORTED` carries no reply obligation and is unaffected.
    */
   async reconcileUnresolved(): Promise<{
     readonly swept: number;
@@ -952,7 +982,21 @@ export class ConversationTurnCoordinator {
     attested: { turnRequestId: string; targetActorId: string; promptDigest: string; bindingGeneration: number },
     receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
   ): Decision<TurnMaterialization> {
-    // Checked first, and against no table: a receipt attesting to a different turn than the one
+    // Contract 6's atomic pair, and the half this build cannot perform: a matched receipt must
+    // move `TURN_COMPLETED` and insert one reply-outbox item in the same transaction, and nothing
+    // wired to `canonical_turns` can do the second half today (see `reconcileUnresolved`'s
+    // docstring). Checked first and unconditionally — no identity or generation match makes this
+    // safe, because the gap is not about which turn the receipt names, it is about what recording
+    // `COMPLETED` here would fail to guarantee for any turn. `ABORTED` carries no reply obligation
+    // and reaches the checks below unaffected.
+    if (receipt.outcome === "COMPLETED") {
+      return deny(
+        ReasonCode.CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE,
+        "this receipt reports completion, but no reply-outbox insert can be performed atomically with it yet",
+        { turnRequestId },
+      );
+    }
+    // Checked next, and against no table: a receipt attesting to a different turn than the one
     // this sweep asked about is not evidence about this row at all, whatever else it says. A port
     // that confused two turns sharing the same actor, prompt and generation — an earlier completed
     // one and a later one, say — is exactly what this catches; every other field here could agree
