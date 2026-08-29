@@ -632,6 +632,19 @@ const GUARDS = [
     killedBy: ["tests/unit/ceo-conversation.test.ts"],
   },
   {
+    // #630: this is the single-flight guard the stack frame's sequential `await` used to provide
+    // by accident. Made explicit in #634 so it still holds once that `await` is removed. Without
+    // it, a second turn reaches `createMessage` while the first is still open and both land on
+    // the same `--resume` session — the interleaving that cannot be unwound.
+    what: "at most one turn is ever open on the CEO's canonical session",
+    file: "src/mcp/ceo-conversation.ts",
+    find: "    if (this.#inFlight) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/ceo-conversation.test.ts::refuses a second turn while the first is still open",
+    ],
+  },
+  {
     what: "the grok billing read refuses to carry a bearer through a proxy or an unchecked certificate",
     file: "src/capacity/usage-collectors.ts",
     find: "    const unsafe = unsafeGrokTransport(process.env);",
