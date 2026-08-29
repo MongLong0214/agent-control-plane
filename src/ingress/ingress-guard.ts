@@ -99,10 +99,30 @@ const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
  * (`telegram-polling.ts`): ACP confirms receipt by calling `getUpdates` with an offset one past
  * the highest `update_id` it has seen, and Telegram will not resend an update once that happens
  * — this bound only matters for an update whose offset never advanced (a crash, a long outage),
- * which Telegram queues for up to 24 hours from creation before dropping it. `received_at` is
- * stamped no earlier than Telegram's own creation time, so `received_at + nonceTtlMs >=
- * created_at + retention` whenever `nonceTtlMs >= retention` — the nonce window cannot close
- * before Telegram itself stops redelivering (#673).
+ * which Telegram queues for up to 24 hours from creation before dropping it.
+ *
+ * `received_at + nonceTtlMs >= created_at + retention` whenever `nonceTtlMs >= retention` — but
+ * that inequality assumes `received_at` and the `now` `prune` later compares it against come from
+ * a clock that only ever moves forward at the rate real time passes. It does not (found by
+ * review, #682): `received_at` is `clock.nowIso()`, which in production is `new Date()`
+ * (`clock.ts`) — the local wall clock, which NTP, a manual change, or a suspended VM can step
+ * forward by some δ between admission and the later prune that reads `now()` again. A forward
+ * step shortens the effective window by exactly δ, so a redelivery landing inside that δ, at the
+ * very edge of the 24h retention, could find the row already pruned.
+ *
+ * Not fixed with a monotonic clock, because a monotonic source cannot do this job: `received_at`
+ * has to survive a process restart — the daemon may crash and restart at any point inside the 24h
+ * window, and `prune` compares a timestamp one process incarnation wrote against `now()` another
+ * reads, potentially days apart. A monotonic clock's value means nothing outside the process that
+ * produced it; it is not a fact `inbound_messages` can store and read back across a restart the
+ * way an ISO wall-clock string is. `Clock` (`clock.ts`) exposes no monotonic source today, and
+ * adding one would not close this gap — only a wall-clock timestamp survives the restart this
+ * comparison has to survive.
+ *
+ * So the residual is real and is exactly this: bounded by whatever forward step the host clock
+ * is adjusted by during the pruning window, not by the unbounded gap a genuinely unmeasured
+ * retention number would leave, and not zero either. `nonce-clock-adjustment-residual.test.ts`
+ * demonstrates the mechanism directly, since a unit test cannot drive a real NTP step.
  *
  * `buzz`, `mcp` and `cli` have no entry: there is no equivalent measurement for any of them —
  * they are not Telegram's queue, and inventing a number for "how long could a redelivery still

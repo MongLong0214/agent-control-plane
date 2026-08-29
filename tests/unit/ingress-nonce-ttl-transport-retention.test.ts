@@ -19,6 +19,16 @@ afterAll(cleanupTempDirs);
  * + retention` whenever `nonceTtlMs >= retention`. At the *default* `nonceTtlMs` (also 24h) that
  * inequality already holds — the defect is that nothing enforces it, so a deployment (or a test)
  * that configures a shorter `nonceTtlMs` opens the window this issue describes, silently.
+ *
+ * That inequality is not an absolute guarantee (found by review, #682): both timestamps come from
+ * the local wall clock (`clock.ts`'s `new Date()` in production), and a forward clock step
+ * between admission and a later prune shortens the effective window by the size of the step —
+ * `nonce-clock-adjustment-residual.test.ts` demonstrates the mechanism directly, and
+ * `TRANSPORT_RETENTION_MS`'s docstring in `ingress-guard.ts` explains why a monotonic clock
+ * cannot close it (`received_at` has to survive a daemon restart, which a monotonic value does
+ * not). The floor this file tests is still real: it is the relationship between two configured
+ * numbers holding regardless of what either is set to, and the residual is a disclosed,
+ * clock-adjustment-sized gap, not an unmeasured one.
  */
 const identity = (turnRequestId = "turn-1"): TurnIdentity => ({
   turnRequestId,
