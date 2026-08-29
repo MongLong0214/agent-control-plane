@@ -175,23 +175,12 @@ completion authority.
 4. a durable reply outbox preserves the exact origin route without replaying the model turn;
 5. owner resend is a deliberate decision path, not a text-equality shortcut (#641);
 6. `OUTCOME_UNKNOWN` is visible in doctor and metrics (#650);
-7. the #660 state census, re-derived against current source and represented here rather than
-   left standalone: S1/S3/S6 closed (#671, #680; S3's "re-execution hazard" verdict was
-   backwards — `claimTurn` gates every DIRECT dispatch before it runs, closed by #635 the day
-   *before* the census's own baseline, not something that changed since); S4's
-   permit-dead-`IN_DOUBT` exit mechanism closed independently (#669) while the state itself stays
-   embargoed behind #638, same as S5; **S2 is not closed** — #680's park-before-claim covers the
-   single-unresolved case, but `unresolvedTurns`'s result is read only at its first element on
-   both the park and the override-recording paths, so a second unresolved turn (an overriding
-   `/again` that itself fails to resolve) is never disclosed or recorded, filed as **#695**; S7 (a
-   later message cannot join or supersede a canonical turn's batch while it is `IN_DOUBT`, filed
-   as #693) is the other open critical-path item, alongside the real durable-handler re-run
-   risk this list's item 9 already tracks as #673; the census's C1 also surfaced that the ingress
-   ledger resolves a turn on a timeout apology with no record the CEO may still be executing —
-   known since `686281a`'s trailers but not previously owned by any ticket's own text; **#639's
-   body was amended** to state this scope explicitly, and #696 stays closed as a duplicate of
-   that tracked commitment rather than of the trailer alone. Full re-derivation with evidence:
-   `docs/design/660-owner-message-state-census.md`;
+7. the #660 owner-message state census enumerates seven ingress states and three context facts,
+   each with its producing transition and current terminal-or-gap derived from source; S2's
+   second-unresolved-turn disclosure gap and S7's coalesced-batch gap are the two still on this
+   critical path, tracked in #695 and #693. Full derivation, re-derivable against current source:
+   `docs/design/660-owner-message-state-census.md` (see that document, not this line, for current
+   status — this roadmap does not restate it);
 8. settlement authority, contradiction escalation, and source/attestation truth close #662 and #666;
 9. unresolved-turn operator recovery and durable duplicate retention close #672–#673.
 
