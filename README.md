@@ -55,6 +55,11 @@ pnpm trace
 node scripts/ssot-report.mjs
 ```
 
+`pnpm install` also builds `native/peercred` (Darwin only, no-op elsewhere) via its own
+`postinstall` script — see ADR-0010. `pnpm rebuild better-sqlite3` stays a separate, explicit
+step above because the same pnpm build-approval gate that requires it for that dependency does
+not apply to this project's own `postinstall`, which pnpm always runs.
+
 After a build, inspect the CLI surface and the daemon lock without invoking a project
 mutation:
 

@@ -176,6 +176,27 @@ export type TurnOutcome =
  * a target binding and an attestation, and only an authenticated preflight bind produces those
  * (#638). The activation embargo is therefore a property of the schema this reads, not a rule
  * somebody follows.
+ *
+ * **What this covers today, stated plainly rather than left to be inferred from the test suite.**
+ * `src/app/control-plane.ts` constructs one instance, but nothing in `src/` outside this file
+ * calls `claim()`, `dispatch()`, or any of the `ports.*` settlement entry points — `grep -rn
+ * "\.claim(\|conversation\.ports"` outside `tests/` finds nothing. The production Telegram path
+ * (`telegram-router.ts`) claims a turn through `IngressGuard.claimTurn()` and its own
+ * `inbound_messages.turn_claim_json`, a different lifecycle entirely; it never reaches this
+ * ledger. What *is* wired to production is the read/write half a daemon operator can already
+ * reach — `contradictions()`, `unresolvedAcrossActors()`, `resolveInDoubt()`, `adjudicate()` — and
+ * those operate correctly on whatever rows this class holds, but nothing in production creates
+ * one. So this suite is a real, exercised contract with no production caller yet: every property
+ * above is true of the code and false of the running system until something calls `claim()`.
+ * Wiring a production entry point is a separate, larger change (tracked alongside #639's turn
+ * reconciliation work) and is deliberately not attempted here.
+ *
+ * The currency check this file leans on hardest — the exact `assignments` row an attestation was
+ * made under, that row's own generation, its own actor, and a live `READY` session whose own
+ * `incarnation` column agrees with the actor's copy of it — answers the same way. Every layer of
+ * it, including the two write-time triggers added alongside it, exists for an attestation nothing
+ * writes yet (`#638`). Tested and correct is not the same claim as reachable, and this file does
+ * not get to keep the first word only by going quiet about the second.
  */
 export class ConversationTurnCoordinator {
   /** Never persisted, never exported. See `TurnPermit.issuance`. */
@@ -402,28 +423,192 @@ export class ConversationTurnCoordinator {
         );
       }
 
+      // The most recent attestation *that is still current*, checked from the same admission
+      // snapshot rather than trusted on its timestamp alone (#666): the actor must not have
+      // retired, its live runtime pointer must still be the one this attestation named and that
+      // runtime must still be usable, and the *exact assignment* this attestation was made under
+      // must still be active.
+      //
+      // The session/incarnation currency is checked against `conversational_actors.current_*`
+      // only, never against `assignments.session_id`/`session_incarnation`. Those columns are
+      // the runtime *at binding time* (schema.sql says so in those words); #449 moved the live
+      // pointer to the actor row precisely so a surviving counterpart's runtime could move
+      // without rewriting the binding. A review built the counterexample this used to produce:
+      // `BindingRegistry.switchTo({ conversation: "SURVIVED" })` moves `current_session_id` and
+      // leaves `assignments` untouched, so comparing the attestation against the binding-time
+      // session made every fresh, honest attestation from a survived counterpart unmatchable —
+      // the live pointer says one session, the frozen binding-time column says another, and no
+      // attestation can equal both at once. The live pointer is what "current" means here.
+      //
+      // Currency is judged on `asg.assignment_id = att.assignment_id`, not on role read alone.
+      // Two reviews found the same shape twice over, at finer and finer grain: `asg.role =
+      // ca.kind` (an earlier version of this check) scoped to the actor's own role, and that
+      // still was not enough, because generation is minted per `role_key`
+      // (`nextGeneration(roleKey)`) and `bind()` can reuse one physical actor across *different*
+      // role_keys that share one `role` (#657) — `WORKER:task-A` and `WORKER:task-B` are both
+      // `role = 'WORKER'` and each counts its own generation from 1. A stale attestation for
+      // task-A's retired generation 1 was revived by task-B's own, unrelated, generation 1, and a
+      // `role`-only check cannot tell the two role_keys apart because nothing about `role` names
+      // which role_key a generation belongs to. `assignment_id` has no such ambiguity: it is
+      // minted once per bind or rebind and never reused, so naming it *is* naming the exact
+      // role_key and generation together.
+      //
+      // `asg.binding_generation = att.binding_generation` stayed in the WHERE clause through
+      // that rewrite, and it must. `assignment_id` pins *which* assignment the attestation speaks
+      // for; it does not vouch for what the attestation *says* about it. A third review built the
+      // counterexample this leaves open without it: an attestation citing a real, currently
+      // ACTIVE assignment_id but claiming generation 1 while that assignment's own row already
+      // reads 2 — the join matched on identity alone, admitted the claim, and `canonical_turns`
+      // recorded generation 2 for a turn no attestation ever attested. The two columns are
+      // supposed to always agree (an honest writer reads both off the same assignment row), which
+      // is exactly why an *unchecked* copy is the hazard: nothing enforced that they still did.
+      // `asg.binding_generation` is still what gets stored — once both identity and content are
+      // verified, the assignment's own value is the authoritative one to record, not the
+      // attestation's copy of it — but "authoritative to store" and "not worth comparing" are two
+      // different claims, and only the first one is true. A write-time trigger
+      // (`attestation_generation_matches_assignment`) now refuses this shape at the source; this
+      // condition is what stops it here too, for a row that reached the table by any other path.
+      //
+      // `sess.lifecycle = 'READY'` closes the other half of "current": the runtime-ready trigger
+      // (`conversational_actors_runtime_ready`) only checks READY at the moment the pointer is
+      // *written*. Nothing re-checks it afterwards, so a session that later transitions to
+      // `ERROR` or `STOPPED` (`SessionRegistry.transition`) leaves the pointer exactly where it
+      // was — a review matched an attestation through a session already in `ERROR`. Pointing at
+      // *a* session is not the same fact as pointing at one still capable of running anything.
+      //
+      // The incarnation is checked against `sess.incarnation` — `sessions`' own column, immutable
+      // by trigger (`sessions_incarnation_immutable`) — not against
+      // `conversational_actors.current_session_incarnation`. A sixth review found that column is
+      // itself a copy, one table further out than the last two rounds looked: `current_session_id`
+      // is the live pointer and does not need a second source, because nothing else claims to know
+      // "the actor's current session" — but `current_session_incarnation` claims to know
+      // `sessions.incarnation` for whatever session that pointer names, and nothing enforced that
+      // the two stayed equal. A plain `UPDATE conversational_actors SET
+      // current_session_incarnation = ?` — no trigger fired, because
+      // `conversational_actors_runtime_ready` watches `current_session_id` alone — let an
+      // incarnation that never existed sit beside a real, READY session id, and this query
+      // compared the attestation only against that copy. Comparing against `sess.incarnation`
+      // instead makes the copy irrelevant to this decision rather than merely rechecked: since
+      // `sess` is already joined on `sess.session_id = ca.current_session_id`, and a session's
+      // incarnation is immutable for its lifetime, `sess.incarnation` is the one value this could
+      // ever honestly be. A write-time trigger
+      // (`conversational_actors_incarnation_matches_session`) now refuses the corrupting write at
+      // its source too.
       const attestation = this.db.get<{
         target_attestation_id: string;
         executor_session_id: string;
         executor_session_incarnation: string;
         binding_generation: number;
       }>(
-        `SELECT target_attestation_id, executor_session_id, executor_session_incarnation,
-                binding_generation
-           FROM actor_target_attestations
-          WHERE target_binding_id = ?
-          ORDER BY attested_at DESC, rowid DESC
+        `SELECT att.target_attestation_id AS target_attestation_id,
+                att.executor_session_id AS executor_session_id,
+                att.executor_session_incarnation AS executor_session_incarnation,
+                asg.binding_generation AS binding_generation
+           FROM actor_target_attestations att
+           JOIN actor_target_bindings tb
+             ON tb.target_binding_id = att.target_binding_id
+           JOIN conversational_actors ca
+             ON ca.actor_id = tb.target_actor_id
+           JOIN sessions sess
+             ON sess.session_id = ca.current_session_id
+           JOIN assignments asg
+             ON asg.assignment_id = att.assignment_id
+            AND asg.actor_id = ca.actor_id
+            AND asg.status = 'ACTIVE'
+            AND asg.binding_generation = att.binding_generation
+          WHERE att.target_binding_id = ?
+            AND tb.target_actor_id = ?
+            AND ca.retired_at IS NULL
+            AND sess.lifecycle = 'READY'
+            AND ca.current_session_id = att.executor_session_id
+            AND sess.incarnation = att.executor_session_incarnation
+          ORDER BY att.attested_at DESC, att.rowid DESC
           LIMIT 1`,
-        [target.target_binding_id],
+        [target.target_binding_id, input.targetActorId],
       );
       if (!attestation) {
-        // A binding says which conversation; an attestation says a runtime verified it under a
-        // named authority generation. Admitting on the first alone would trust a claim that has
-        // not been checked since it was made.
+        // Which refusal to report depends on whether an attestation exists at all: one that
+        // never happened is a different fact from one that happened and has since gone stale,
+        // and the two point an operator somewhere different.
+        const everAttested = this.db.get<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM actor_target_attestations WHERE target_binding_id = ?`,
+          [target.target_binding_id],
+        );
+        if (!everAttested || everAttested.n === 0) {
+          // A binding says which conversation; an attestation says a runtime verified it under a
+          // named authority generation. Admitting on the first alone would trust a claim that has
+          // not been checked since it was made.
+          return deny(
+            ReasonCode.CONVERSATION_TARGET_UNATTESTED,
+            "this actor's target has never been attested by a runtime, so a turn cannot be claimed",
+            { targetActorId: input.targetActorId, targetBindingId: target.target_binding_id },
+          );
+        }
+        // An attestation exists, but nothing ties it to the actor's current generation: the
+        // actor may have retired, its runtime may have moved, or the role's active assignment may
+        // have advanced past the generation this attestation named. The value stored as proof
+        // that a named generation verified the target may be from a generation that is gone.
         return deny(
-          ReasonCode.CONVERSATION_TARGET_UNATTESTED,
-          "this actor's target has never been attested by a runtime, so a turn cannot be claimed",
+          ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,
+          "this actor's target was attested, but not by anything the current generation can verify",
           { targetActorId: input.targetActorId, targetBindingId: target.target_binding_id },
+        );
+      }
+
+      const unadmitted = input.sources.find(
+        (candidate) =>
+          !this.db.get<{ 1: number }>(
+            `SELECT 1 FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+            [candidate.channel, candidate.nonce],
+          ),
+      );
+      if (unadmitted) {
+        // A source names which inbound message a turn consumed. Without this, a caller's word
+        // that a channel and nonce exist would be written straight into `canonical_turn_sources`
+        // — the ledger would record that a turn consumed a message that was never admitted, and
+        // the retry chain would reason about attempts of a message with no admission record.
+        return deny(
+          ReasonCode.CONVERSATION_TURN_SOURCE_UNADMITTED,
+          "a source names a channel and nonce that ingress never admitted",
+          {
+            targetActorId: input.targetActorId,
+            channel: unadmitted.channel,
+            nonce: unadmitted.nonce,
+          },
+        );
+      }
+
+      // Existence is not identity. The check above only asks "did ingress admit *something*
+      // under this (channel, nonce)" — a caller could have ingress admit `{text:"A"}` for a
+      // nonce and then claim that same nonce with `{text:"B"}`, and the row's mere existence
+      // would pass. `canonical_turn_sources.source_digest` below is computed from the caller's
+      // payload, so without this check B's digest would be recorded as what the nonce carried —
+      // permanently, since that table is append-only. `INGRESS_ADMITTED` is the one place a
+      // payload digest is recorded at admission time, keyed by the (channel, nonce) it was
+      // admitted under; read it rather than trusting the caller's payload for both "did this
+      // happen" and "what happened". `inbound_messages` itself stores no payload — the admit
+      // writer's audit record is the only durable copy.
+      const mismatched = input.sources.find((candidate) => {
+        const admitted = this.db.get<{ payload_digest: string | null }>(
+          `SELECT json_extract(evidence_json, '$.payloadDigest') AS payload_digest
+             FROM audit_events
+            WHERE kind = 'INGRESS_ADMITTED'
+              AND json_extract(evidence_json, '$.channel') = ?
+              AND json_extract(evidence_json, '$.nonce') = ?
+            ORDER BY event_id DESC LIMIT 1`,
+          [candidate.channel, candidate.nonce],
+        );
+        return admitted?.payload_digest !== digestOf(candidate.payload);
+      });
+      if (mismatched) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH,
+          "a source's payload does not match what ingress recorded admitting for this channel and nonce",
+          {
+            targetActorId: input.targetActorId,
+            channel: mismatched.channel,
+            nonce: mismatched.nonce,
+          },
         );
       }
 
