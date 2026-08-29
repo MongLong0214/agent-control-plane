@@ -14,8 +14,14 @@ quoted, `grep`-able comment fragment instead, per the rule #597 states for exact
 
 Each row is `state tuple / producer transition / current terminal or gap / critical-path
 disposition`, as the original census defined it. Where a row's judgment still holds, this
-document says so — confirming a row is as valuable as overturning one, and three of the seven
-needed neither: they closed between the census being opened and this re-derivation.
+document says so — confirming a row is as valuable as overturning one, and four of the seven
+needed neither: they closed between the census being opened and this re-derivation, or (S3) were
+never actually open to begin with.
+
+**Every row below states which commit or code path would have closed it, and whether one
+already did — including the rows that stayed open.** A row's own re-derivation is not complete
+just because it repeats the original verdict; S3 is the case in this document's own history where
+skipping that check for an "open" row carried a defect forward rather than catching one.
 
 ## What closed since the census was opened, and what did not
 
@@ -23,13 +29,13 @@ needed neither: they closed between the census being opened and this re-derivati
 |---|---|---|---|
 | S1 | gap — reply reservation erases the claim | **closed** | #671 |
 | S2 | gap — nothing bounds one session to one claim | **closed for the reachable case; pure concurrency is inferred, not tested** | #680, not #671 alone |
-| S3 | absorb — re-admission race for a durable handler | **unchanged, still open** | — |
+| S3 | absorb — re-admission race for a durable handler | **never actually a hazard — the original verdict was backwards** | #635, merged *before* the census's own baseline |
 | S4 | gap — no exit for a permit that died with its process | **mechanism closed; state stays unreachable** | #669, discovered independently of this task's brief |
-| S5 | independent — schema state with no writer | **unchanged, still open** | — |
+| S5 | independent — schema state with no writer | **checked, unchanged, still open** | — (no writer exists to close it) |
 | S6 | gap in framing — refuses a non-resend the same as a resend | **closed** | #680 |
-| S7 | gap — no API extends a turn in flight | **unchanged, still open — now ticketed** | #693 (filed by this re-derivation) |
+| S7 | gap — no API extends a turn in flight | **checked, unchanged, still open — now ticketed** | #693 (filed by this re-derivation) |
 
-S2 and S4 are the two rows worth reading carefully before trusting a summary table: both have a
+S2, S3 and S4 are the rows worth reading carefully before trusting a summary table: each has a
 richer story than "closed" or "open" captures, and it is given in full below.
 
 ## Seven message states
@@ -105,23 +111,51 @@ richer story than "closed" or "open" captures, and it is given in full below.
   and if the concurrent case is load-bearing for whatever absorbs this, it is worth its own test
   before being called closed with confidence rather than with an inference.
 
-### S3 — `ADMITTED` and not claimed — unchanged, still open
+### S3 — `ADMITTED` and not claimed — CLOSED, and its "open" verdict was backwards
 
-- **State:** let in, handler not yet run.
-- **Produced by:** a crash between `admit` and `claimTurn` (both `src/ingress/ingress-guard.ts`).
-  `admit` writes `phase: "ADMITTED"`, and `isRecoverableIngressResult` / `isClaimable`
-  (`src/ingress/ingress-guard.ts`) are exactly the predicates that treat that state as
-  re-admittable.
-- **Measured now:** unchanged. `isClaimable`'s own comment still states the mechanism plainly:
-  *"Claiming what recovery would otherwise re-run is the whole mechanism: after the claim the
-  same reader sees a state it will not re-run, so the handler cannot execute twice."* Nothing
-  about the admit/claim split changed across #671 or #680 — both touched the claimed side of the
-  lifecycle, not the pre-claim recovery path.
-- **Terminal:** re-admitted and claimed on the next poll. Correct for a handler that only formats
-  a reply; still the re-execution hazard for one that writes durably, same as the original row
-  said.
-- **Disposition:** absorb. Named by the claim mechanism itself — this state is the reason
-  `claimTurn` exists, and it is still reachable exactly as described.
+- **State:** let in, handler not yet run. Still reachable — a crash between `admit` and
+  `claimTurn` (both `src/ingress/ingress-guard.ts`), or simply the ordinary moment between the
+  two calls in a live request, leaves a row with `phase: "ADMITTED"` and `turn_claim_json IS
+  NULL`.
+- **Produced by:** the same reachable moment the original row named. `isRecoverableIngressResult`
+  / `isClaimable` (`src/ingress/ingress-guard.ts`) are exactly the predicates that treat that
+  state as re-admittable, unchanged.
+- **This row was wrong, not merely stale, and it was wrong at the moment it was written.** The
+  original text called the terminal state "the re-execution hazard for one that writes durably,"
+  and this document's first pass repeated that verdict without checking it against the code path
+  that actually dispatches the handler — the same check applied to S1/S2/S4/S6 and skipped here.
+  Doing that check: `TelegramHermesRouter`'s DIRECT branch (`src/ingress/telegram-router.ts`)
+  calls `this.ingress.admit(...)`, then (after classification and the S6 unresolved-turn check)
+  `this.ingress.claimTurn(...)`, and only *after* `claimed.allowed` is true does it
+  `await this.directHandler(...)`. The claim is not a courtesy check performed near the handler —
+  it structurally gates every DIRECT dispatch. `claimTurn` (`src/ingress/ingress-guard.ts`) runs
+  the read-then-write as one `db.tx()`, so a second attempt to claim the same nonce cannot
+  observe the pre-claim state and race the first; it is refused outright
+  (`ReasonCode.INGRESS_TURN_OUTCOME_UNKNOWN`). Two tests exercise exactly this at the guard level:
+  *"succeeds once and refuses the second claimer"* and *"stops the recovery path from re-admitting
+  a claimed message"* (`tests/unit/ingress-turn-claim.test.ts`), the second asserting the specific
+  case S3 is about — a message `isRecoverableIngressResult` would treat as re-admittable is
+  refused the moment it is *also* already claimed.
+- **So "ADMITTED and not claimed" cannot be a re-execution hazard for a durable handler, by
+  construction:** the handler runs only after a successful claim, a successful claim can happen
+  at most once per nonce, and a message still sitting in "ADMITTED, not claimed" is, by
+  definition, one whose handler has never run yet — reaching it and claiming it *is* the first
+  (and only) execution, not a re-run. This document's own quote of `isClaimable`'s comment two
+  paragraphs up already said as much — *"Claiming what recovery would otherwise re-run is the
+  whole mechanism: after the claim the same reader sees a state it will not re-run, so the
+  handler cannot execute twice"* — and the previous draft of this row asserted the opposite
+  conclusion in the same breath. That contradiction, not a code change, is the defect a review
+  caught.
+- **What closed it, and when:** `0d12bf2` (#635, *"claim a message's turn before running it,
+  once"*), merged **2026-08-20 18:34** — the day before this issue's own "normalized 2026-08-21"
+  text was written, and the commit that introduced `claimTurn` as a mandatory pre-dispatch gate in
+  the first place. The original census's S3 was describing a hazard that had already been
+  designed out before the census existed to describe it; this document's first pass inherited
+  that error rather than checking #635 against it.
+- **Disposition:** closed — nothing to absorb. The reachable state itself (a transient or
+  crash-truncated `ADMITTED`-not-claimed row) is ordinary and safe; the concern the original row
+  attached to it does not hold under the claim-before-dispatch ordering that predates this
+  census.
 
 ### S4 — permit-dead `IN_DOUBT` — mechanism closed, state stays unreachable
 
@@ -301,30 +335,34 @@ The reasoning still holds: their absence from any log is silence, not confirmati
 ## Disposition summary
 
 **Closed, nothing to absorb:** S1, S2 (mechanism closed; the pure-concurrency case is a
-code-reading argument, not a tested one — see S2), S6.
-**Absorb — real work, still open:** S3 (no ticket of its own; tracked under #639/#638's
-reconciliation umbrella), S7 (**#693**, filed from this re-derivation).
+code-reading argument, not a tested one — see S2), S3 (never actually a hazard; closed by #635
+before this census's own baseline), S6.
+**Absorb — real work, still open:** S7 (**#693**, filed from this re-derivation).
 **Independent, still open, embargoed by #638:** S5.
 **Mechanism closed independently (#669); state stays embargoed by #638:** S4.
 **Context, carried but not scheduled:** C1 (unchanged), C2 (citation corrected, underlying point
 holds), C3 (unchanged; #638 still open).
 
-Cross-references for the still-open gaps: S3 is the residual ingress recovery-vs-durable-handler
-race, tracked under #639/#638's reconciliation umbrella rather than its own ticket. S7 is now
-**#693** (*"A later message cannot join a canonical turn's batch or start its own while the
-incumbent is IN_DOUBT"*), filed by this re-derivation because no existing ticket owned it — #641
-(closed) named only the ingress-side framing gap, #666 (open) covers source integrity at claim
-time rather than adding a source after it, and #639 (open) covers receipt-matched completion
-rather than extending a turn's inputs while it runs. #638 (open) and #639 (open) are the
-reconciliation tickets both S3 and #693 sit behind. #672 (open — a claimed turn whose handler
-returns no reply is never resolved) and #673 (open — a resolved row is pruned before a late
-redelivery can arrive) are adjacent gaps this same code surfaced along the way; they are not
-additional numbered states here because neither is a state distinct from S3's claim/recovery
-mechanism — #672 and #673 are, respectively, what happens after a claim resolves with no reply
-and what happens after a resolved row's TTL expires. Every still-open gap in this census — S3,
-S4/S5's reachability, S7 — now resolves to a ticket rather than to this document alone, which is
-the rule `docs/ACCEPTANCE.md:3` states and this document was at risk of breaking for S7 until
-#693 was filed.
+Cross-references for the still-open gap: S7 is **#693** (*"A later message cannot join a
+canonical turn's batch or start its own while the incumbent is IN_DOUBT"*), filed by this
+re-derivation because no existing ticket owned it — #641 (closed) named only the ingress-side
+framing gap, #666 (open) covers source integrity at claim time rather than adding a source after
+it, and #639 (open) covers receipt-matched completion rather than extending a turn's inputs while
+it runs. #638 (open) and #639 (open) are the reconciliation tickets #693 sits behind, alongside
+S4 and S5's reachability.
+
+**The durable-handler re-execution risk the original S3 misattributed is real, and already has
+its own ticket: #673.** `prune` (`src/ingress/ingress-guard.ts`) deletes a row once its claim is
+resolved (`turn_claim_json`'s `repliedAt` is set) *and* its TTL has passed — deletes it entirely,
+not merely un-claims it. A redelivery after that point finds no row at all, `admit` treats it as
+genuinely new, and it is claimed and run again with no record that it already happened. That is
+the actual shape of a re-run S3's wording gestured at, correctly assigned to #673 (open) rather
+than to S3's `ADMITTED`-and-unclaimed state, which the claim gate already covers. #672 (open — a
+claimed turn whose handler returns no reply is never resolved, so it is never eligible for that
+same prune path) is the adjacent gap on the other side of the same mechanism. Every still-open
+gap in this census — S4/S5's reachability, S7, and the real re-execution risk in #673 — now
+resolves to a ticket rather than to this document alone, which is the rule `docs/ACCEPTANCE.md:3`
+states and this document was at risk of breaking for S7 until #693 was filed.
 
 ## Verification
 
@@ -343,12 +381,28 @@ Every code citation in this document was located by symbol name or by a quoted c
 re-`grep`ed against `157aeed` while writing this file — not carried forward from the original
 issue's line numbers.
 
-**Corrected after independent review.** An xhigh read-only review of this document (21 files)
-returned two findings, both accepted: S2's "closed" claim originally implied more than any test
-in this repository exercises — no test constructs two genuinely concurrent, non-crash claims on
-one session, only the crash/restart reconstruction #680's own tests use — and that section now
-says so explicitly rather than calling it proven. And S7 named a gap with no owning ticket, which
-`docs/ACCEPTANCE.md:3`'s rule forbids; #693 was filed to close that, with the state tuple,
-producing transition, and ticket-coverage argument written into its body. Re-ran `pnpm lint` and
-`pnpm guards:anchors` after both edits — both still pass — and did not need to re-run `pnpm test`
-or `pnpm typecheck`, since neither edit touched anything but prose.
+**Corrected after independent review, twice.** An xhigh read-only review of this document (21
+files) returned two findings, both accepted: S2's "closed" claim originally implied more than any
+test in this repository exercises — no test constructs two genuinely concurrent, non-crash
+claims on one session, only the crash/restart reconstruction #680's own tests use — and that
+section now says so explicitly rather than calling it proven. And S7 named a gap with no owning
+ticket, which `docs/ACCEPTANCE.md:3`'s rule forbids; #693 was filed to close that, with the state
+tuple, producing transition, and ticket-coverage argument written into its body.
+
+A second review of the fixed commit found S3's verdict was backwards: it called
+`ADMITTED`-and-unclaimed "the re-execution hazard for one that writes durably," when
+`claimTurn` (`src/ingress/ingress-guard.ts`) is called strictly before the handler dispatches
+(`src/ingress/telegram-router.ts`) and is transactionally serialized, so that state cannot
+produce a re-run — closed by `0d12bf2` (#635), merged 2026-08-20, the day *before* this issue's
+own baseline. The review also asked for the same "which commit closed this" check to be applied
+to every row still marked open; S5 and S7 were re-checked and confirmed genuinely open (no
+writer for `replacement_turn_request_id` exists anywhere, and no second writer of
+`canonical_turn_sources` exists on `main` — a commit adding one, `1bd1b81`, is on an unmerged
+branch, confirmed by `git merge-base --is-ancestor 1bd1b81 157aeed` returning false). That sweep
+also located the real re-execution risk S3's wording had been gesturing at: it is #673's
+prune-then-late-redelivery path, not S3's state, and the disposition summary above now says so.
+
+Re-ran `pnpm typecheck`, `pnpm lint` and `pnpm guards:anchors` after every edit in both rounds —
+all still pass. Did not re-run `pnpm test` after either round, since no edit touched anything but
+prose and Markdown; the `1404 passed | 9 failed | 2 skipped` baseline above is from the
+unmodified checkout and stands unchanged.
