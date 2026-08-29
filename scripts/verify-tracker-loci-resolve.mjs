@@ -70,11 +70,34 @@
  * `--issues-file` is a fixture seam for this gate's own regression tests; normal CI and operator
  * use must query GitHub directly.
  *
+ * ## Fixed after an independent review found the check had the blind spot it exists to catch
+ *
+ * Four counterexamples, each a citation this script passed in total silence:
+ *
+ *   1. `graveyard/continuity-kernel.ts` — a fabricated directory, real basename. The basename
+ *      fallback (needed — see `resolvePath`) resolved it with no signal that the directory it
+ *      named was wrong. Fixed: a basename-only resolution is now ADVISORY, always, whether or
+ *      not the citation carries a line number.
+ *   2. `README.md:1-999999` — a valid start line hid an end line no file could have. Fixed: the
+ *      end of a cited range is checked against the file's length too, not just the start.
+ *   3. `.py` citations (real, in #675/#676) and GitHub `path#L123` anchors were not recognized at
+ *      all, so a citation in either form was silently never checked — indistinguishable from a
+ *      citation that resolved. Fixed: both are now extracted (see `FILE_EXT` and `PATH_RE`).
+ *   4. `` `src/core/reason-codes.ts` — `failover` `` — a real symbol paired with the wrong file
+ *      passed, because the symbol was searched for anywhere under `src/`, not in the file the row
+ *      names. That defeats #597's actual rule, which is that the *named* site holds the symbol.
+ *      Fixed: a symbol citation now resolves the row's own path first and searches only that file.
+ *
+ * Fixing (3) surfaced a fifth defect on its own: once `.py` was recognized, a `/private/tmp/…/x.py`
+ * citation matched twice — once as NON_DURABLE (correct) and once as an ordinary path citation
+ * STALE ("does not exist", true but redundant and pointing at the wrong fix). Fixed by excluding
+ * path-citation extraction inside a NON_DURABLE span.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const defaultRepoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -110,19 +133,12 @@ const listIssues = () => {
 const issues = JSON.parse(listIssues());
 
 // --- source tree, read once -------------------------------------------------------------------
-const SRC = join(repoRoot, "src");
-const walk = (dir) =>
-  existsSync(dir)
-    ? readdirSync(dir).flatMap((entry) => {
-        const path = join(dir, entry);
-        return statSync(path).isDirectory() ? walk(path) : path.endsWith(".ts") ? [path] : [];
-      })
-    : [];
-const srcFiles = walk(SRC).map((path) => ({ path, text: readFileSync(path, "utf8") }));
-
-const symbolResolves = (symbol) => {
-  const pattern = new RegExp(`\\b${symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
-  return srcFiles.some((f) => pattern.test(f.text));
+const fileTextCache = new Map();
+const readText = (relPath) => {
+  if (!fileTextCache.has(relPath)) {
+    fileTextCache.set(relPath, readFileSync(resolve(repoRoot, relPath), "utf8"));
+  }
+  return fileTextCache.get(relPath);
 };
 
 /**
@@ -141,33 +157,56 @@ const trackedFiles = execFileSync("git", ["ls-files"], { cwd: repoRoot, encoding
  * Resolves a cited path against the tracked tree, tolerating a citation that names less than the
  * full path.
  *
- *   1. the literal cited path, if it is tracked
+ *   1. the literal cited path, if it is tracked                                    → "exact"
  *   2. exactly one tracked file whose path ends with `/<cited>` — the citation named a suffix of
  *      the real path (a wrong or missing leading directory, e.g. `continuity/continuity-kernel.ts`
- *      for `src/continuity/continuity-kernel.ts`)
- *   3. exactly one tracked file with the same basename — the citation named only the filename
+ *      for `src/continuity/continuity-kernel.ts`)                                  → "suffix"
+ *   3. exactly one tracked file with the same basename — the citation named only the filename,
+ *      or named a directory that is not the real one at all                       → "basename"
  *
  * More than one match at a step is reported as its own reason: the citation is not wrong, it is
  * ambiguous, and ambiguity is a fact about the citation the same way missing is.
+ *
+ * `matchKind` matters past this function: a "basename" resolution is the weakest of the three —
+ * it ignores every directory component the citation gave, so a fabricated, wrong directory with
+ * a real filename (`graveyard/continuity-kernel.ts`) resolves exactly as readily as an honest bare
+ * filename (`continuity-kernel.ts`) does. The caller reports "basename" resolutions as ADVISORY
+ * even with no line number at all — the citation resolved, but not the way it was written, and
+ * that is worth a reader's attention the same way a rotting line number is. A "suffix" match kept
+ * every directory the citation specified and only lacked a prefix, which is a far stronger
+ * signal that the citation actually meant this file, so it stays silent.
  */
 const resolvePath = (cited) => {
-  if (trackedFiles.includes(cited)) return { path: cited, ambiguous: null };
+  if (trackedFiles.includes(cited)) return { path: cited, ambiguous: null, matchKind: "exact" };
   const bySuffix = trackedFiles.filter((f) => f.endsWith(`/${cited}`));
-  if (bySuffix.length === 1) return { path: bySuffix[0], ambiguous: null };
-  if (bySuffix.length > 1) return { path: null, ambiguous: bySuffix };
+  if (bySuffix.length === 1) return { path: bySuffix[0], ambiguous: null, matchKind: "suffix" };
+  if (bySuffix.length > 1) return { path: null, ambiguous: bySuffix, matchKind: null };
   const base = cited.split("/").pop();
   const byBasename = trackedFiles.filter((f) => f.split("/").pop() === base);
-  if (byBasename.length === 1) return { path: byBasename[0], ambiguous: null };
-  if (byBasename.length > 1) return { path: null, ambiguous: byBasename };
-  return { path: null, ambiguous: null };
+  if (byBasename.length === 1) return { path: byBasename[0], ambiguous: null, matchKind: "basename" };
+  if (byBasename.length > 1) return { path: null, ambiguous: byBasename, matchKind: null };
+  return { path: null, ambiguous: null, matchKind: null };
 };
 
 // --- extraction --------------------------------------------------------------------------------
 // Longer alternatives that share a prefix with a shorter one must come first: JS regex
 // alternation takes the first branch that matches and does not backtrack for a longer one, so
 // "js|json" would match only "package.js" out of "package.json" and silently drop the "on".
-const FILE_EXT = "tsx|ts|mjs|cjs|json|js|sh|sql|md|yaml|yml";
-const PATH_RE = new RegExp(`\\b([A-Za-z0-9_][\\w-]*(?:/[\\w.-]+)*\\.(?:${FILE_EXT}))\\b(?::(\\d+)(?:-(\\d+))?)?`, "g");
+// `py` and `plist` are here because they are real, measured citation forms in this tracker's own
+// issues (#675, #676 cite `.py` scripts; #395/#400/#559/#564 cite the deploy `.plist`) — not a
+// guess at what else might show up. Extensions that looked plausible but turned out to collide
+// with ordinary property access (`process.env`, `console.log`, `cp.db`) were deliberately left
+// out after checking: adding them would misread prose as a citation of a file that was never cited.
+const FILE_EXT = "tsx|ts|mjs|cjs|json|js|plist|py|sh|sql|md|yaml|yml";
+// The line-number suffix comes in the two forms this tracker's issues actually use: `:123` /
+// `:123-456` (the convention #649 and #597's own table use), and a GitHub-style `path#L123` /
+// `path#L123-L456` anchor. Both land in the same two named groups so extraction does not care
+// which form a citation used.
+const PATH_RE = new RegExp(
+  `\\b([A-Za-z0-9_][\\w-]*(?:/[\\w.-]+)*\\.(?:${FILE_EXT}))\\b` +
+    `(?::(?<cs>\\d+)(?:-(?<ce>\\d+))?|#L(?<as>\\d+)(?:-L?(?<ae>\\d+))?)?`,
+  "g",
+);
 const URL_RE = /https?:\/\/\S+/g;
 const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`[\w.$]+`,?\s*)+)/g;
 const NON_DURABLE_RE = /(\/private\/tmp\/[^\s`)]+|(?<![\w/])\/tmp\/[^\s`)]+)/g;
@@ -248,8 +287,10 @@ const extractFromBody = (body) => {
       continue;
     }
 
+    const nonDurableSpans = [];
     for (const m of rawLine.matchAll(NON_DURABLE_RE)) {
       const path = m[0].replace(/[.,;:)]+$/, "");
+      nonDurableSpans.push([m.index, m.index + path.length]);
       if (!seenNonDurable.has(path)) {
         seenNonDurable.add(path);
         nonDurable.push({ path });
@@ -258,12 +299,24 @@ const extractFromBody = (body) => {
 
     const urlSpans = [...rawLine.matchAll(URL_RE)].map((m) => [m.index, m.index + m[0].length]);
     const insideUrl = (idx) => urlSpans.some(([s, e]) => idx >= s && idx < e);
+    // A citation under `/private/tmp` or `/tmp` is already reported, once, as NON_DURABLE — its
+    // message is the right one ("the filesystem will delete this"). Extracting the same text a
+    // second time as an ordinary path citation double-reports it as STALE too ("does not exist"),
+    // which is true but redundant and points a reader at "re-derive the claim from the code" for
+    // something re-deriving cannot fix.
+    const insideNonDurable = (idx) => nonDurableSpans.some(([s, e]) => idx >= s && idx < e);
 
     for (const m of rawLine.matchAll(PATH_RE)) {
-      if (insideUrl(m.index)) continue;
+      if (insideNonDurable(m.index)) continue;
       const path = m[1];
-      const startLine = m[2] ? Number(m[2]) : null;
-      const endLine = m[3] ? Number(m[3]) : null;
+      const groups = m.groups ?? {};
+      const startLine = groups.cs ? Number(groups.cs) : groups.as ? Number(groups.as) : null;
+      const endLine = groups.ce ? Number(groups.ce) : groups.ae ? Number(groups.ae) : null;
+      // A bare path mention inside an unrelated hyperlink is noise (a link to some other repo's
+      // README, say) and is skipped. A citation that also carries a specific line — `:123` or a
+      // GitHub `#L123` anchor — is a deliberate, precise pointer even when it rides inside a URL,
+      // and is kept rather than thrown away with the noise.
+      if (insideUrl(m.index) && startLine === null) continue;
       let content = null;
       if (inFence && startLine !== null) {
         const rest = rawLine.slice(m.index + m[0].length).replace(/←.*$/, "").trim();
@@ -319,16 +372,36 @@ for (const issue of issues) {
       });
       continue;
     }
-    if (citation.startLine === null) continue; // bare path, resolves, nothing more to say
 
-    const abs = resolve(repoRoot, resolved.path);
-    const text = readFileSync(abs, "utf8");
+    // Fix (Sol counterexample 1): a citation that only resolved by matching a filename, ignoring
+    // every directory it actually named, resolved *something* but not necessarily the thing it
+    // meant — `graveyard/continuity-kernel.ts` is not a real location, and silently mapping it
+    // onto `src/continuity/continuity-kernel.ts` hides that the citation was wrong about where
+    // the file lives. Surfaced regardless of whether a line number is even present.
+    const advisoryReasons = [];
+    if (resolved.matchKind === "basename") {
+      advisoryReasons.push(
+        `${citation.path} resolved to ${resolved.path} only by matching its filename — the ` +
+          "citation may name the wrong location; name the enforcing symbol or the full path instead",
+      );
+    }
+
+    if (citation.startLine === null) {
+      if (advisoryReasons.length > 0) advisory.push({ issue, citation: citation.raw, reason: advisoryReasons.join("; ") });
+      continue; // bare path, resolves, nothing more to say
+    }
+
+    const text = readText(resolved.path);
     const fileLines = text.split("\n").length;
-    if (citation.startLine > fileLines) {
+    // Fix (Sol counterexample 2): the end of a cited range has to resolve too. `README.md:1-999999`
+    // has a perfectly valid start line and an end line the file could never have; checking only
+    // `startLine` let the whole range through on the strength of its first number.
+    const citedEnd = citation.endLine ?? citation.startLine;
+    if (citation.startLine > fileLines || citedEnd > fileLines) {
       stale.push({
         issue,
         citation: citation.raw,
-        reason: `${resolved.path} has ${fileLines} line(s); line ${citation.startLine} is beyond it`,
+        reason: `${resolved.path} has ${fileLines} line(s); line ${citedEnd} is beyond it`,
       });
       continue;
     }
@@ -344,7 +417,7 @@ for (const issue of issues) {
       // file with keeping this one's claim true.
       const windowLines = text.split("\n");
       const from = Math.max(0, citation.startLine - 1 - CONTENT_SEARCH_WINDOW);
-      const to = Math.min(windowLines.length, (citation.endLine ?? citation.startLine) - 1 + CONTENT_SEARCH_WINDOW);
+      const to = Math.min(windowLines.length, citedEnd - 1 + CONTENT_SEARCH_WINDOW);
       const nearby = windowLines.slice(from, to).join("\n");
       if (pattern && !pattern.test(nearby)) {
         stale.push({
@@ -358,22 +431,51 @@ for (const issue of issues) {
       }
     }
 
-    advisory.push({
-      issue,
-      citation: citation.raw,
-      reason: `${resolved.path} still resolves at line ${citation.startLine} — line numbers rot; name the symbol instead (#597)`,
-    });
+    advisoryReasons.push(
+      `${resolved.path} still resolves at line ${citation.startLine} — line numbers rot; name the symbol instead (#597)`,
+    );
+    advisory.push({ issue, citation: citation.raw, reason: advisoryReasons.join("; ") });
   }
 
   for (const symbolCitation of symbolCitations) {
+    const resolved = resolvePath(symbolCitation.path);
+    if (resolved.ambiguous) {
+      stale.push({
+        issue,
+        citation: symbolCitation.raw,
+        reason: `${symbolCitation.path} names ${resolved.ambiguous.length} different tracked files — ambiguous, not a locus`,
+      });
+      continue;
+    }
+    if (resolved.path === null) {
+      stale.push({
+        issue,
+        citation: symbolCitation.raw,
+        reason: `${symbolCitation.path} does not exist`,
+      });
+      continue;
+    }
+
+    // Fix (Sol counterexample 4): #597's rule is that the *named enforcement site* holds the
+    // symbol — pairing `src/core/reason-codes.ts` with `failover` claims that file contains
+    // `failover`, not that `failover` is spelled correctly somewhere in the codebase. Searching
+    // every file under `src/` was satisfied by the symbol existing anywhere, which is exactly the
+    // defeat: it credited a row for a symbol that lives in a completely different enforcement
+    // site than the one the row names.
+    const targetText = readText(resolved.path);
     for (const symbol of symbolCitation.symbols) {
-      if (!symbolResolves(symbol)) {
-        stale.push({
-          issue,
-          citation: symbolCitation.raw,
-          reason: `symbol \`${symbol}\` does not resolve anywhere under src/`,
-        });
-      }
+      const pattern = new RegExp(`\\b${escapeRegex(symbol)}\\b`);
+      if (pattern.test(targetText)) continue;
+      const elsewhere = trackedFiles
+        .filter((f) => f.startsWith("src/") && f.endsWith(".ts") && f !== resolved.path)
+        .find((f) => pattern.test(readText(f)));
+      stale.push({
+        issue,
+        citation: symbolCitation.raw,
+        reason: elsewhere
+          ? `symbol \`${symbol}\` does not resolve in ${resolved.path} — it is defined in ${elsewhere} instead, a different file than cited`
+          : `symbol \`${symbol}\` does not resolve in ${resolved.path}, or anywhere else under src/`,
+      });
     }
   }
 }
