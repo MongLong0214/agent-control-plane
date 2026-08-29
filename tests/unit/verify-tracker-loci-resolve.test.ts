@@ -814,6 +814,105 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
+  // --- Round 7: a seventh independent review. One of these findings had already been published
+  // and acted on — see the round 7 docstring for the retraction this caused on #576.
+
+  it("[round 7] a real, extensionless, dotfile-directory path resolves and is checked", () => {
+    // `.githooks/pre-commit` is real, tracked, and has no extension at all — the old extension
+    // requirement made it invisible regardless of what it resolved to.
+    const body = "See `.githooks/pre-commit:999999` for the guard.";
+    const { path, cleanup } = withIssues([{ number: 9601, title: "dotfile no-extension counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain(".githooks/pre-commit");
+      expect(result.stdout).toContain("beyond it");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 7] a genuinely missing extensionless dotfile path is STALE, not silent", () => {
+    const body = "See `.githooks/definitely-gone:42` for the guard.";
+    const { path, cleanup } = withIssues([{ number: 9602, title: "dotfile no-extension missing counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain(".githooks/definitely-gone does not exist");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 7] a leading dot on a path is kept, not dropped and read as a different path", () => {
+    // This is the exact shape that produced a real, published false finding: `\b` cannot fire at
+    // a dot preceded by whitespace (both sides non-word), so the match silently started one
+    // character late and `.github/workflows/ci.yml` read as `github/workflows/ci.yml` — which then
+    // resolved only by basename, and was reported as "missing its leading dot" when the real
+    // citation had the dot correctly. There must be no basename-fallback advisory here at all: the
+    // literal, dotted path has to match exactly.
+    const body = "See `.github/workflows/ci.yml:1` for CI.";
+    const { path, cleanup } = withIssues([{ number: 9603, title: "leading dot preserved counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).toContain(".github/workflows/ci.yml");
+      expect(result.stdout).not.toContain("only by matching its filename");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 7] a bare directory or a state/status pair with no line number is not read as a citation", () => {
+    // Found while verifying the fix above: dropping the extension requirement for *any* path with
+    // a directory separator (tried first) added 46 false "citations" to the real corpus — GitHub
+    // route fragments, state-pair notation, bare directories, digit/digit counts. None of these
+    // carry a line number, which is exactly what distinguishes a real extensionless file citation
+    // (`.githooks/pre-commit:999999`) from a fragment of running prose.
+    const body =
+      "The transition goes READY/DRAINING, and the route is /repos/:o/:r/check-runs/:id under src/github.";
+    const { path, cleanup } = withIssues([{ number: 9604, title: "extensionless prose counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 7] a private JavaScript field cited as a symbol resolves when it is really declared", () => {
+    // `#observe` is a real private method on `turn-coordinator.ts`. The old symbol regex did not
+    // allow `#` at all, so this row matched nothing and produced no output whether the symbol was
+    // present or fictitious — unable to tell the two apart.
+    const body = "`src/conversation/turn-coordinator.ts` — `#observe`";
+    const { path, cleanup } = withIssues([{ number: 9605, title: "private symbol positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 7] a fictitious private JavaScript field is STALE, distinguishing it from a real one", () => {
+    const body = "`src/conversation/turn-coordinator.ts` — `#definitelyMissing`";
+    const { path, cleanup } = withIssues([{ number: 9606, title: "private symbol counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("#definitelyMissing");
+      expect(result.stdout).toContain("does not appear");
+    } finally {
+      cleanup();
+    }
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);

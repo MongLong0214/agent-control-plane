@@ -256,11 +256,60 @@
  *   fix and the version after it, so the diff is this change and nothing else: five previously-
  *   flagged bare mentions disappear (`test_raw_sink_census.py`, `derive3.py`, `ARCHITECTURE.md`,
  *   `CLAUDE.md`, `AGENTS.md` — all directory-free, line-number-free), and two directory-qualified
- *   paths with extensions the old list never had newly resolve as STALE (`agent-control-plane/
- *   state.sqlite`, `hermes/state.db` — both real deployment paths this repository does not track,
- *   correctly reported as absent from it). Zero change to ADVISORY or NON_DURABLE. Reported here
- *   rather than only in the commit, because a change that only adds findings has not been checked
- *   for the kind it can also cause to disappear.
+ *   paths with extensions the old list never had newly resolve as STALE — reported at the time as
+ *   `agent-control-plane/state.sqlite` and `hermes/state.db`; round 7 found and fixed the bug that
+ *   made those two citations themselves wrong (both are actually `.agent-control-plane/state.sqlite`
+ *   and `.hermes/state.db` — this text is corrected here for the same reason #576's retraction
+ *   matters: a wrong citation reported as a finding is not a smaller version of a right one).
+ *   Zero change to ADVISORY or NON_DURABLE. Reported here rather than only in the commit, because
+ *   a change that only adds findings has not been checked for the kind it can also cause to
+ *   disappear.
+ *
+ * ## Round 7: two more counterexamples, one of them already published as a real finding elsewhere
+ *
+ *   The generic extension in round 6 still required *an* extension, and a leading dot was still
+ *   dropped by `\b`'s word/non-word transition — a dot with whitespace on the other side is
+ *   non-word on both sides, so `\b` never fired there and the match silently began one character
+ *   late. `.githooks/pre-commit` (real, tracked, no extension) was invisible regardless of what it
+ *   resolved to, and `.github/workflows/ci.yml` read as `github/workflows/ci.yml`.
+ *
+ *   That dot-dropping is not hypothetical: round 6's own corpus report called
+ *   `` `#576`'s `github/workflows/ci.yml` missing its leading dot `` a genuine catch, and that
+ *   finding was repeated in a real comment closing #576. The actual line reads
+ *   `` `.github/workflows/ci.yml` ``, correct, dot included — the checker had manufactured the
+ *   "missing dot" itself by dropping one from a citation that had it. #576 has a posted retraction.
+ *   A checker's first finding is the best opportunity to test the checker, not evidence it is
+ *   right, and this round is the corrective measure: every "surfaced" claim below was checked
+ *   against the actual issue text before being written down, including going back through this
+ *   docstring's own round 6 entry, which turned out to carry the same bug (see above).
+ *
+ *   Fixed: `(?<![\w.])` replaces the leading `\b` (a lookbehind caring only whether the character
+ *   before the match is a word character or a dot, so a dot after whitespace is included rather
+ *   than skipped). An extensionless path is recognised only when a line number immediately follows
+ *   it (a lookahead, `(?=:\d|#L\d)`) — *not* merely for having a directory separator, which was
+ *   tried first and cost real precision: measured before trusting it, that version added 46 new
+ *   "citations" to the same snapshot, almost none of them files — GitHub route fragments
+ *   (`/repos/:o/:r/check-runs/:id` read as `r/check-runs`), state-pair notation
+ *   (`READY/DRAINING`, `pending/failed`), bare directories with no filename (`src/github`), and
+ *   digit/digit fractions (`16/580`, `22/22`). A directory separator alone is not specific enough;
+ *   a line number is, the same way it already was for the with-extension case.
+ *
+ *   Separately: the symbol regex did not allow `#`, JavaScript's private-field/method sigil, which
+ *   this codebase declares heavily (`turn-coordinator.ts`'s `#observe` among them) — so a citation
+ *   of `#observe` and a citation of the fictitious `#definitelyMissing` produced identical output
+ *   (nothing), unable to tell present from absent for an entire class of symbol. Fixed by allowing
+ *   `#` in the symbol pattern, and by giving `symbolPattern` a lookbehind in place of `\b` for the
+ *   same reason the path fix needed one — `#` is non-word on both sides of where it is actually
+ *   written (`this.#observe(`, or `#observe(...) {` at a declaration), so `\b#observe` could never
+ *   match a real declaration or call either.
+ *
+ *   Corpus diff (same snapshot, before and after, and every changed line checked against the real
+ *   issue text before being trusted): the two mis-cited paths above corrected; zero new false
+ *   positives from either fix, confirmed by re-running the directory-separator-only version first,
+ *   measuring the flood it produced, and reverting to the line-number-gated version before this
+ *   commit. The `#` symbol fix and the two dotfile counterexamples matched no existing symbol-row
+ *   or path citation in the corpus at the time of this snapshot, so they change nothing there; they
+ *   are proven by the constructed counterexamples and tests instead.
  *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
@@ -562,8 +611,36 @@ const resolvePath = (cited) => {
 // `HANDOFF-CEO-RESUME.md`) and adds none — a real cost, reported rather than hidden, in exchange
 // for deleting a category of false STALE this check cannot actually tell apart from a real one
 // without a directory or a line number to anchor it.
+// Round 7: "`git ls-files` is the authority" was not true yet — an extension requirement still
+// sat in front of it. `.githooks/pre-commit` (real, tracked, no extension at all) was invisible
+// regardless of what it resolved to, and a leading dot on any path (`.github/workflows/ci.yml`)
+// was dropped by the `\b` boundary before the character class ever got to see it — `\b` requires
+// a word/non-word transition, and "." next to whitespace is non-word on both sides, so the match
+// silently started one character late and read `.github/…` as `github/…`. That produced a real,
+// published false finding: a "missing leading dot" the checker itself had manufactured by
+// dropping the dot from a citation that had it correctly.
+//
+// Fixed with two independent changes, not one that happens to cover both:
+//   - `(?<![\w.])` replaces the leading `\b` — a lookbehind that only cares whether the character
+//     before the match is a word character or another dot, so a dot preceded by whitespace (or
+//     start of string) is included in the match rather than skipped past.
+//   - An extensionless path is recognised *only when a line number immediately follows it*
+//     (`(?=:\d|#L\d)`, a zero-width lookahead — the number is still captured normally afterward).
+//     The first version of this fix dropped the extension requirement outright for anything with
+//     a "/" in it, on the theory that a directory separator alone was signal enough. Measured
+//     against every open issue before trusting that: 46 new "citations", nearly all of them
+//     nothing to do with a file — GitHub route fragments (`/repos/:o/:r/check-runs/:id` reads as
+//     `r/check-runs`), state-pair notation (`READY/DRAINING`, `pending/failed`), directories with
+//     no filename (`src/github`), and the digit/digit fractions and counts a plain directory
+//     check does not rule out either (`16/580`, `22/22`). A directory separator is not, on its
+//     own, specific enough — a line number is, the same way it already is for the *with-extension*
+//     case below, and requiring it for the extensionless case too is what actually distinguishes
+//     `.githooks/pre-commit:999999` from `src/github` rather than merely hoping to.
+// The first segment still has to start with a letter or underscore (never a bare digit) in both
+// branches, for the same digit/digit reason. Every real path in this repository's own tree starts
+// with a letter or a dot, so this costs nothing real.
 const PATH_RE = new RegExp(
-  `\\b([A-Za-z0-9_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*)\\b` +
+  `(?<![\\w.])(\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)+(?=:\\d|#L\\d)|\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*)\\b` +
     `(?::(?<cs>\\d+)(?:-(?<ce>\\d+))?|#L(?<as>\\d+)(?:-L?(?<ae>\\d+))?)?`,
   "g",
 );
@@ -577,10 +654,29 @@ const GITHUB_BLOB_RE = /https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/blob\/[^/\s
 // method, not literal text to search for (a call site rarely has empty arguments); the extraction
 // below captures the identifier alone and drops them, the same way `snippetPattern`'s elision
 // treats an empty `()` as "a call, arguments omitted" rather than a literal empty parameter list.
-const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`[\w.$]+(?:\(\))?`,?\s*)+)/g;
+// A leading `#` (round 7) is JavaScript's own private-field/method sigil, not decoration to strip —
+// `#observe` and `observe` name two different things, and this codebase declares private members
+// heavily (`turn-coordinator.ts`'s `#observe` among them), so the symbol pattern allows it directly.
+const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`#?[\w.$]+(?:\(\))?`,?\s*)+)/g;
 const NON_DURABLE_RE = /(\/private\/tmp\/[^\s`)]+|(?<![\w/])\/tmp\/[^\s`)]+)/g;
 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * A word-boundary search pattern for a cited symbol — except `\b` does not work in front of `#`.
+ * `\b` is a transition between a word character and a non-word one, and `#` is non-word on both
+ * sides in the shape this actually appears (`this.#observe(`, or `#observe(...) {` at the start of
+ * a declaration): the character before it is `.`, `{`, or whitespace, all non-word, so `\b#observe`
+ * never matches anywhere a private field is genuinely declared or called. A negative lookbehind
+ * for a word character or another `#` does the same job `\b` does for an ordinary identifier —
+ * refuses a match in the middle of a longer name — without requiring a boundary `#` cannot have.
+ */
+const symbolPattern = (symbol) => {
+  const escaped = escapeRegex(symbol);
+  return symbol.startsWith("#")
+    ? new RegExp(`(?<![\\w#])${escaped}\\b`)
+    : new RegExp(`\\b${escaped}\\b`);
+};
 
 /** How far from the cited line a quoted snippet may still be found and count as "present". */
 const CONTENT_SEARCH_WINDOW = 60;
@@ -819,7 +915,7 @@ const extractFromBody = (body) => {
 
   for (const m of body.matchAll(SYMBOL_ROW_RE)) {
     const path = m[1];
-    const symbols = [...m[2].matchAll(/`([\w.$]+)(?:\(\))?`/g)].map((s) => s[1]);
+    const symbols = [...m[2].matchAll(/`(#?[\w.$]+)(?:\(\))?`/g)].map((s) => s[1]);
     const key = `${path}:${symbols.join(",")}`;
     if (seenSymbolRow.has(key)) continue;
     seenSymbolRow.add(key);
@@ -1015,7 +1111,7 @@ for (const issue of issues) {
     // text search rather than silently getting JavaScript's rules applied to it.
     const targetCode = readCode(resolved.path);
     for (const symbol of symbolCitation.symbols) {
-      const pattern = new RegExp(`\\b${escapeRegex(symbol)}\\b`);
+      const pattern = symbolPattern(symbol);
       if (pattern.test(targetCode)) continue;
       // Scoped to files this check can actually apply a code-aware search to — the same set
       // `codeSearchScope` names. A match in an unsupported file (README.md's own prose, say) is
