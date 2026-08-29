@@ -8,10 +8,19 @@ that the repository protect itself before any later wave's "green" means anythin
 - force-push and branch deletion are refused
 - there are **no bypass actors** — the review is explicit that this count is zero
 
-The CI workflow is `project-ci` (`.github/workflows/ci.yml`) and its single job is `verify`, so
-**`verify` is the required status check context** — that is the name GitHub reports, not
-`project-ci`. It runs `pnpm lint`, `pnpm typecheck`, `pnpm build`, `pnpm test`, `pnpm trace` and
-`node scripts/ssot-report.mjs`.
+The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **`verify` is the required
+status check context** — that is the name GitHub reports, not `project-ci`. It used to be true
+because the workflow's one job had that id; it is no longer, and stating it that way would be
+exactly the kind of stale claim this repository keeps finding elsewhere. As of #539's CI-matrix
+fix, the workflow has two jobs: `verify-matrix` (`node-version: ["22.18.0", "22"]`, running
+`pnpm lint`, `pnpm typecheck`, `pnpm build`, `pnpm test`, `pnpm trace`, `node scripts/ssot-report.mjs`
+and the rest of the step list) and `verify-gate`, which needs it and runs unconditionally
+(`if: always()`) to fail closed on anything but a fully successful matrix. Both jobs carry
+`name: verify`; GitHub appends the matrix value to a matrixed job's check name regardless of that
+field, so `verify-matrix`'s checks read `verify (22.18.0)` / `verify (22)`, and `verify-gate` —
+unmatrixed — is what produces the bare `verify` check this section's required-status-check
+configuration actually matches. The required context string itself did not change, so nothing in
+this document's `gh api` commands or `app_id`/`integration_id` pins needs updating for this.
 
 Applying this is an owner action: it changes repository settings.
 

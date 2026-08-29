@@ -1,3 +1,12 @@
+# `project-ci` here is this workflow's own display name (the Actions-tab label) — it has never
+# been a job id or a check-run name in this file, so it is not at risk from the defect below by
+# itself. The defect is generic, though: GitHub always names a check run after the *job* (or a
+# job's explicit `name:`), never the workflow, and always appends matrix values to whichever name
+# that job has. `verify-matrix` hit this because branch protection, `docs/ops/branch-protection.md`,
+# and `tests/e2e/real-component-integration.test.ts` all pin the literal string `verify` — the full
+# audit of what depends on that string is in PR #694's body. If any *other* job here (or
+# `verify-gate` itself) is ever given a matrix while something still depends on its bare name, it
+# breaks the identical way: the name that dependants expect stops being producible, silently.
 name: project-ci
 on:
   push:
@@ -5,8 +14,37 @@ on:
   pull_request:
     branches: [main, 'feature/**', 'release/**']
 jobs:
-  verify:
+  # This job's id used to be `verify`, which is also the literal string branch protection
+  # requires (contexts: ["verify"]). Adding the matrix below made every check GitHub reports for
+  # this job get the matrix value appended — "verify (22.18.0)", "verify (22)" — and a check
+  # literally named `verify` stopped existing. Branch protection then waits for a check that can
+  # never appear, on every PR in the repository, not just this one. `name: verify` here keeps the
+  # per-leg checks reading the same as before ("verify (22.18.0)", "verify (22)"); `verify-gate`
+  # below is what now produces the bare `verify` check branch protection actually requires.
+  verify-matrix:
+    name: verify
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        # `package.json` declares `"node": ">=22.18.0"`. `22` (bare) is a moving alias that
+        # resolves to whatever the newest 22.x is on the day the job runs — it can never fail at
+        # the declared range's actual edge, only at whatever is currently newest. `22.18.0` is
+        # that edge, pinned exactly rather than aliased.
+        #
+        # It was originally `22.0.0`, matching the range this repository had merely written down.
+        # That entry is what found the real floor: `22.0.0` failed `pnpm migrations:check` with
+        # `ERR_UNKNOWN_FILE_EXTENSION` for `.ts` — `scripts/verify-migrations-are-immutable.mjs`
+        # does `await import(".../src/db/migrations.ts")` directly, under plain `node`, with no
+        # transpiler. Unflagged native TypeScript execution shipped in Node 22.18.0 (2025-07-31);
+        # `22.17.1` still throws that exact error, checked empirically with `nvm`. So `>=22` was
+        # never true for this repository's own tooling — nothing had ever tested the edge before
+        # this entry existed, and it found the gap on its first real use, not the one it went
+        # looking for (ADR-0010).
+        #
+        # `node-gyp`'s own range (ADR-0010: pinned to `11.5.0`, `^18.17.0 || >=20.5.0`) already
+        # covers `22.18.0` — moving the floor up did not require touching that pin again.
+        node-version: ["22.18.0", "22"]
     permissions:
       contents: read
       issues: read
@@ -23,10 +61,14 @@ jobs:
           version: 10
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm rebuild better-sqlite3
+      # ADR-0010: this repository's own binding.gyp + node-addon-api convention for native
+      # addons, prebuilt here rather than compiled on load. macos-15 is the only runner this job
+      # uses, so this is also where #539's Darwin-only peercred addon gets its one build.
+      - run: pnpm native:peercred:build
       - run: pnpm lint
       - run: pnpm terminology
       # Reports, never fails: stale evidence is a fact to see, and a check that fails on a
@@ -43,6 +85,9 @@ jobs:
       # operand of a refusal does no falsifiability row name. The harness answers "is this guard
       # tested" for the lines someone wrote a row for; it cannot answer which lines nobody did.
       - run: pnpm guards:operands
+      # #539 lands src/core/peercred.ts unreachable from every live surface on purpose — a new
+      # call site (or a ControlPlane export) is a RED mutant here, not a deliverable.
+      - run: pnpm guards:peercred-unreachable
       # Two defect classes this branch hit twice each, turned into checks so the third time
       # is a failing step rather than a review finding.
       #
@@ -86,3 +131,41 @@ jobs:
       - run: node scripts/ssot-report.mjs
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # Branch protection requires the check named exactly `verify` (app_id 15368, GitHub Actions) —
+  # confirmed against this repository's live protection settings, not assumed. `verify-matrix`
+  # above cannot ever produce that name once it carries a matrix: GitHub always appends the
+  # matrix values to a matrixed job's check name, so its checks are "verify (22.18.0)" and
+  # "verify (22)", never bare "verify". This job carries no matrix, so its own check name is
+  # exactly its `name:` — `verify` — with nothing appended. It is what makes the required check
+  # exist again, without touching the required-check string itself.
+  #
+  # `if: always()` is load-bearing, not decoration. Without it, this job's default condition is
+  # "the jobs it needs all succeeded" — so the moment either matrix leg fails or the run is
+  # cancelled, this job would not run at all, and GitHub reports a job that never ran as
+  # `skipped`, not `failure`. A `skipped` required check is treated as satisfied on this platform
+  # (the same "coverage implied, not observed" shape this whole effort has been about), so a gate
+  # that only runs on the happy path would be a green light exactly when it must not be one.
+  # `always()` forces this job to run in every case, so it is this step's own `run:` that decides
+  # pass or fail — never GitHub's default treatment of an unrun job.
+  #
+  # The check itself must read `== 'success'` (an allow-list), not `!= 'failure'` (a deny-list):
+  # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`, and the matrix's
+  # own `fail-fast: false` means one leg failing does not cancel the other — but a job's overall
+  # result is still `failure` if any matrix combination failed, so this does not need to inspect
+  # individual legs to know that. An allow-list means `cancelled` and `skipped` fail closed too,
+  # with no separate case for either needed.
+  verify-gate:
+    name: verify
+    needs: verify-matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: require every verify-matrix leg to have actually succeeded
+        run: |
+          result="${{ needs.verify-matrix.result }}"
+          if [ "$result" != "success" ]; then
+            echo "verify-matrix result was '$result', not 'success' — failing the required verify check"
+            exit 1
+          fi
+          echo "verify-matrix succeeded on every leg"
