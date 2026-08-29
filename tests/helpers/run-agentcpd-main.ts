@@ -17,6 +17,10 @@ class StartupAdapter extends ScriptedAdapter {
 }
 
 class StartupTelegramTransport implements TelegramBotTransport {
+  // This transport runs through `main()` -> `startTelegramLongPollListener`, which now derives
+  // IngressGuard's retention floor from this value (#682, round 8). Declared as the real
+  // measured figure since this stand-in behaves like ordinary Telegram long-polling.
+  readonly redeliveryRetentionMs = 24 * 60 * 60 * 1000;
   polls = 0;
   promptObserved = false;
   approvalSent = false;

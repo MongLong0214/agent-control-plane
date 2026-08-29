@@ -44,6 +44,10 @@ const update = (text: string, over: Record<string, unknown> = {}, updateId = 100
 });
 
 class FakeTelegramTransport implements TelegramBotTransport {
+  // Used through `startDaemonTelegramListener` / `startTelegramLongPollListener`, which now
+  // derives IngressGuard's retention floor from this value (#682, round 8) — declared as the
+  // real measured figure since this fake is standing in for ordinary Telegram behavior.
+  readonly redeliveryRetentionMs = 24 * 60 * 60 * 1000;
   readonly sent: Array<{
     chatId: string;
     text: string;

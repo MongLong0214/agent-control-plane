@@ -319,6 +319,66 @@ const GUARDS = [
     ],
   },
   {
+    // Found by Sol's review (#682, round 8): the constructor's floor was keyed by the channel's
+    // name (`TRANSPORT_RETENTION_MS["telegram"]`) alone, so any transport answering to that
+    // channel — a custom one that genuinely retains longer than 24h, or one nobody has measured
+    // at all — got the same 24h figure as the officially-measured `api.telegram.org` client.
+    // Mutating the derivation back to the bare channel-name lookup removes exactly that: a
+    // transport that declares a longer `transportRetentionMs` no longer raises the floor it is
+    // constructed against.
+    what: "the retention floor is derived from the transport's own declared retention, not the channel's name",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      const retention = policy.transportRetentionMs !== undefined\n" +
+      "        ? policy.transportRetentionMs\n" +
+      "        : TRANSPORT_RETENTION_MS[channel];",
+    replace: "      const retention = TRANSPORT_RETENTION_MS[channel];",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::IngressGuard derives its floor from a longer-than-24h transportRetentionMs, not the channel name",
+    ],
+  },
+  {
+    // The other half of the same review comment: a caller stating explicitly that a transport's
+    // retention is not known (`transportRetentionMs: null`) must refuse construction rather than
+    // silently fall back to a measured figure that described a different server. Removing the
+    // check restores exactly the assumption #682 (round 8) found: an unmeasured transport gets
+    // the 24h floor anyway.
+    what: "construction refuses a policy that states its transport's retention is unknown",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      if (retention === null) {\n" +
+      "        // The caller stated explicitly that this channel's transport retention is not known —\n" +
+      "        // a self-hosted endpoint nobody has measured, or a stand-in for one. Assuming the\n" +
+      "        // measured `api.telegram.org` figure applies anyway would be this issue's original\n" +
+      "        // mistake in a new place, so this refuses rather than guesses.\n" +
+      "        throw new Error(\n" +
+      "          `ingress policy for '${channel}' does not know its transport's redelivery retention ` +\n" +
+      "            `(transportRetentionMs is null); refusing to assume a measured default applies to a ` +\n" +
+      "            `transport that has not stated its own (#682)`,\n" +
+      "        );\n" +
+      "      }\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::refuses to construct when the transport's retention is unmeasured, regardless of nonceTtlMs",
+    ],
+  },
+  {
+    // Production's own wiring, not just the guard's constructor: `startTelegramLongPollListener`
+    // used to build `IngressGuard` *before* choosing the real transport, so nothing there could
+    // ever have supplied this fact even after the guard learned to ask for it. Removing the wire
+    // (leaving `transportRetentionMs` unset) silently falls back to the old channel-keyed 24h
+    // default regardless of what transport was actually selected — including a custom one, or
+    // Telegram's own client pointed at a self-hosted `ACP_TELEGRAM_API_BASE_URL` this repository
+    // has never measured.
+    what: "production wiring threads the chosen transport's own declared retention into the guard",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      transportRetentionMs: transport.redeliveryRetentionMs,\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::production wiring refuses to start against a transport whose retention is unknown, chosen before this fix constructed the guard",
+    ],
+  },
+  {
     // The #662 hole: a caller that dispatched, reported that nothing ran, and got attempt 2
     // admitted while attempt 1 was still in flight.
     what: "a dispatched turn cannot be reported as never started",

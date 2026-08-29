@@ -52,6 +52,15 @@ export interface TelegramBotTransport {
     replyToMessageId?: number;
     correlationId: string;
   }): Promise<TelegramSentMessage | void>;
+  /**
+   * How long, in milliseconds, this transport may still redeliver an update whose receipt was
+   * never confirmed. `IngressGuard`'s nonce-retention floor (#673) has to be bound to this fact,
+   * not to a number picked from the channel's name alone (#682, round 8) — every transport now
+   * has to state it. `null` means this transport's redelivery behavior has not been measured and
+   * must not be assumed; `IngressGuard` refuses to construct a policy it cannot bound in that
+   * case rather than silently reuse a figure that described a different server.
+   */
+  readonly redeliveryRetentionMs: number | null;
 }
 
 /**
@@ -202,16 +211,30 @@ export const configuredTelegramLongPollConfig = (
   };
 };
 
+/** The endpoint #673's ~24h `getUpdates` retention figure was actually measured against. */
+const OFFICIAL_TELEGRAM_API_BASE_URL = "https://api.telegram.org";
+
 /** Real outbound Telegram Bot API transport. The token never appears in an error message. */
 export class TelegramBotApi implements TelegramBotTransport {
   private readonly baseUrl: string;
+  /**
+   * 24h only when this instance talks to the official endpoint that figure was measured
+   * against. `ACP_TELEGRAM_API_BASE_URL` can point this same class at a self-hosted Bot API
+   * server or any other endpoint, whose queue retention nobody here has measured — reusing the
+   * official number for it would be #673's original mistake in a new place (#682, round 8), so
+   * this reports unknown instead.
+   */
+  readonly redeliveryRetentionMs: number | null;
 
   constructor(
     private readonly botToken: string,
     options: { apiBaseUrl?: string; fetcher?: typeof fetch } = {},
   ) {
     if (botToken.trim().length === 0) throw new Error("Telegram Bot API requires a non-empty bot token");
-    this.baseUrl = (options.apiBaseUrl ?? "https://api.telegram.org").replace(/\/$/u, "");
+    this.baseUrl = (options.apiBaseUrl ?? OFFICIAL_TELEGRAM_API_BASE_URL).replace(/\/$/u, "");
+    this.redeliveryRetentionMs = this.baseUrl === OFFICIAL_TELEGRAM_API_BASE_URL
+      ? 24 * 60 * 60 * 1000
+      : null;
     this.fetcher = options.fetcher ?? fetch;
   }
 
@@ -571,11 +594,18 @@ export const startTelegramLongPollListener = async (
   options: TelegramLongPollStartOptions = {},
 ): Promise<TelegramLongPollListener> => {
   validateLongPollConfig(config);
+  // Chosen before the guard, not after (#682, round 8): the guard's retention floor has to be
+  // derived from the transport that will actually run this channel, and it cannot derive from a
+  // transport nobody has picked yet.
+  const transport = options.transport ?? new TelegramBotApi(config.botToken, {
+    ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+  });
   const guard = new IngressGuard(cp.db, cp.clock, cp.audit, {
     telegram: {
       allowedActors: config.allowedOwnerIds,
       allowedConversations: config.allowedChatIds,
       recoverInFlight: true,
+      transportRetentionMs: transport.redeliveryRetentionMs,
     },
   });
   const ingress = new TelegramIngress(guard, { webhookSecret: config.webhookSecret });
@@ -598,9 +628,6 @@ export const startTelegramLongPollListener = async (
     getStoredState: (nonce) => storedState(cp, nonce),
     getStoredResponse: (nonce) => storedResponse(cp, nonce),
     ...(options.onInterrupt ? { onInterrupt: options.onInterrupt } : {}),
-  });
-  const transport = options.transport ?? new TelegramBotApi(config.botToken, {
-    ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
   });
   const service = new TelegramLongPollService(transport, router, config.webhookSecret, {
     pollTimeoutSeconds: config.pollTimeoutSeconds,

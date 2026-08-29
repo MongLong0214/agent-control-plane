@@ -96,6 +96,10 @@ const storedClaim = (harness: ReturnType<typeof makeHarness>, nonce: string): Re
 };
 
 class FakeTransport implements TelegramBotTransport {
+  // Not under test here — this suite builds its guard manually with a literal policy rather
+  // than through `startTelegramLongPollListener`, so nothing reads this. Declared anyway to
+  // satisfy `TelegramBotTransport`, honestly: this fake stands in for the real 24h endpoint.
+  readonly redeliveryRetentionMs = 24 * 60 * 60 * 1000;
   constructor(private updates: TelegramUpdate[]) {}
   async getUpdates(_options: TelegramGetUpdatesOptions): Promise<readonly TelegramUpdate[]> {
     const batch = this.updates;

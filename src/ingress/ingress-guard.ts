@@ -34,6 +34,31 @@ export interface IngressPolicy {
   nonceTtlMs?: number;
   /** Telegram may resume a durable in-flight update after a process crash. */
   recoverInFlight?: boolean;
+  /**
+   * How long, in milliseconds, the transport actually backing this channel may still redeliver
+   * an update whose receipt was never confirmed — supplied by the caller who chose that
+   * transport, not looked up from the channel's name.
+   *
+   * Found missing by review (#682, round 8): `TRANSPORT_RETENTION_MS` below is keyed by
+   * `"telegram"` alone, so any transport that answers to that channel name — the measured
+   * `api.telegram.org` client, a self-hosted Bot API server reached through
+   * `ACP_TELEGRAM_API_BASE_URL`, or a test double — got the same 24h floor whether or not it
+   * actually redelivers for that long. A transport that genuinely retains longer reopens #673's
+   * duplicate-turn window: the nonce is pruned on the assumption redelivery has stopped, the
+   * transport redelivers anyway, and a fresh admission runs the handler a second time.
+   *
+   * `undefined` (the field omitted entirely) keeps this guard's original behaviour — the
+   * channel-keyed default in `TRANSPORT_RETENTION_MS` — for construction sites that have not
+   * been threaded through to a real transport instance; every unit test that only exercises
+   * unrelated ingress mechanics falls here and is unaffected. `null` is a caller stating
+   * explicitly that the transport's retention is *not* known — a self-hosted endpoint nobody has
+   * measured, or a test double standing in for one — and construction is refused rather than
+   * silently reusing a number that described a different server. A concrete number is the real
+   * fix: it overrides the channel-keyed default with the actual transport's own fact, so a
+   * longer-retaining transport carries a correspondingly longer floor rather than the same fixed
+   * one every "telegram" policy used to get regardless of what backed it.
+   */
+  transportRetentionMs?: number | null;
 }
 
 export interface OwnerApprovalIngress {
@@ -198,7 +223,25 @@ export class IngressGuard {
         throw new Error("Telegram ingress requires a non-empty conversation allowlist");
       }
       const ttl = policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS;
-      const retention = TRANSPORT_RETENTION_MS[channel];
+      // The transport's own declared fact overrides the channel-keyed default (#682, round 8):
+      // a policy that threads through a real transport instance's `redeliveryRetentionMs` gets
+      // a floor derived from what that transport actually does, not from what channel it is
+      // named. `undefined` (the field left out) falls back to the old per-channel default, for
+      // construction sites that do not yet know their transport's retention.
+      const retention = policy.transportRetentionMs !== undefined
+        ? policy.transportRetentionMs
+        : TRANSPORT_RETENTION_MS[channel];
+      if (retention === null) {
+        // The caller stated explicitly that this channel's transport retention is not known —
+        // a self-hosted endpoint nobody has measured, or a stand-in for one. Assuming the
+        // measured `api.telegram.org` figure applies anyway would be this issue's original
+        // mistake in a new place, so this refuses rather than guesses.
+        throw new Error(
+          `ingress policy for '${channel}' does not know its transport's redelivery retention ` +
+            `(transportRetentionMs is null); refusing to assume a measured default applies to a ` +
+            `transport that has not stated its own (#682)`,
+        );
+      }
       if (retention !== undefined && ttl < retention) {
         // The relationship, not the number, is the property (#673): a nonce pruned before the
         // transport itself stops redelivering reopens the exact duplicate-turn window the
