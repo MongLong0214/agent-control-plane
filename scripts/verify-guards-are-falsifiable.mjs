@@ -1120,6 +1120,29 @@ const GUARDS = [
       "tests/unit/reconstitution-needs-a-verified-target.test.ts::reuses the actor rather than minting a second owner",
     ],
   },
+  {
+    // #664/#679 — acknowledgeHandoff's ACKED write must not survive a denial from the
+    // nested bindings.switchTo call underneath it.
+    what: "acknowledgeHandoff's ACKED write rolls back when switchTo denies underneath it",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "    // #664 — this body's own ACKED write must not survive a denial, including one\n    // that comes back from the nested `bindings.switchTo` call below.\n    return this.db.txDecision(() => {",
+    replace: "    // #664 — this body's own ACKED write must not survive a denial, including one\n    // that comes back from the nested `bindings.switchTo` call below.\n    return this.db.tx(() => {",
+    killedBy: [
+      "tests/scenarios/registry-cto.test.ts::#664 — acknowledgeHandoff's own ACKED write rolls back when switchTo denies underneath it",
+    ],
+  },
+  {
+    // A takeover that cannot repoint every live execution to the new generation must not
+    // leave the old generation revoked and a new one minted — the guard that keeps a
+    // run from being pinned to a revoked generation.
+    what: "switchTo refuses a takeover that would strand a live, unabandonable execution",
+    file: "src/session/binding-registry.ts",
+    find: "        if (staleExecutions.length > 0 && !this.#tasks) {",
+    replace: "        if (false) {",
+    killedBy: [
+      "tests/unit/binding-hardening.test.ts::switchTo denies a takeover that would strand a live, unabandonable execution, and rolls back its own writes",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

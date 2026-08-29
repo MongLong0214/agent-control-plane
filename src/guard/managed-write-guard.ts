@@ -919,6 +919,9 @@ export class ManagedWriteGuard {
   private renewRequiredClaims(grant: GuardGrant): Decision<void> {
     if (!grant.repositoryIdentity || !grant.runId) return allow(ReasonCode.OK, undefined);
 
+    // #664 — deliberately plain `tx()`, not `txDecision`, same reasoning as
+    // github-kernel.ts's assertClaim: the expiry sweep below is unconditional
+    // housekeeping a later denial must not undo.
     return this.db.tx(() => {
       // The partial unique indexes define a HELD row as occupied. Sweep before reading so
       // the guard never treats an expired row as absent while SQLite still reserves it.

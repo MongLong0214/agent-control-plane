@@ -913,13 +913,19 @@ export class RunEngine {
   /**
    * A source or participant change makes every candidate-bound claim unusable. The
    * immutable records remain for audit, but none may be selected as current evidence.
+   *
+   * #664 — `invalidateCandidateInTx` below writes unconditionally, and the REVISION_REQUIRED
+   * / ACTIVE transitions that follow it can each deny (a state-machine or owner-pin race).
+   * A denial there must not leave the candidate invalidated without ever requesting the
+   * revision it was invalidated for, so this body's own decision has to roll everything
+   * back, the same as a throw would.
    */
   invalidateCandidate(
     runId: string,
     reason: string,
     evidence: Record<string, unknown> = {},
   ): Decision<RunRow> {
-    return this.db.tx(() => {
+    return this.db.txDecision(() => {
       const run = this.require(runId);
       if (run.state === RunState.READY_FOR_CEO_REVIEW) {
         if (!run.ownerSessionId || run.ownerBindingGeneration == null) {
