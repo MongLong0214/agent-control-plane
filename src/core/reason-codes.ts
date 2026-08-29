@@ -249,6 +249,26 @@ export const ReasonCode = {
   CEO_CONVERSATION_UNSUPPORTED: "CEO_CONVERSATION_UNSUPPORTED",
   /** The CEO peer accepted the turn but did not answer within the conversation budget. */
   CEO_CONVERSATION_TIMEOUT: "CEO_CONVERSATION_TIMEOUT",
+  /**
+   * The turn never completed a round trip — the socket closed mid-request, or was already gone
+   * when it was sent — rather than the daemon's own budget expiring.
+   *
+   * Distinguished from `CEO_CONVERSATION_TIMEOUT` because a timeout is this daemon giving up on
+   * its own clock; this is the transport itself failing, which is a different repair (reconnect)
+   * from a different owner (whoever runs the peer process). Folding both into one code was
+   * #633: every `createMessage` rejection reported as "did not answer in time" even when the
+   * peer was never reachable at all.
+   */
+  CEO_CONVERSATION_TRANSPORT_FAILED: "CEO_CONVERSATION_TRANSPORT_FAILED",
+  /**
+   * The turn reached the peer and the peer rejected it with a JSON-RPC error, rather than
+   * timing out or the transport failing.
+   *
+   * The peer's own error code travels as evidence; its message does not — the same reason the
+   * timeout path never repeated one (it is written by the CEO runtime and may quote whatever it
+   * was handling when it failed).
+   */
+  CEO_CONVERSATION_PEER_FAILED: "CEO_CONVERSATION_PEER_FAILED",
   /** The CEO peer answered with content this text-only seam cannot deliver. */
   CEO_CONVERSATION_NOT_TEXT: "CEO_CONVERSATION_NOT_TEXT",
   /** The connected peer no longer holds the CEO role its socket was admitted under. */

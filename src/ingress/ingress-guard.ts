@@ -602,8 +602,10 @@ export class IngressGuard {
     // the moment a reply was reserved — so the row a timeout produced was pruned like any other,
     // and the nonce it held was freed (#646).
     //
-    // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` in the audit log is
-    // where they are visible.
+    // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` is written to the
+    // audit log, and `agentctl doctor system` reports the same outstanding claim as a
+    // `TURN_OUTCOME_UNKNOWN` finding (`Doctor.checkUnresolvedTurns`) — so the runbook's first
+    // command surfaces it too, not only someone tailing `audit_events`.
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
