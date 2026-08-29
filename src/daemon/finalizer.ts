@@ -451,7 +451,9 @@ export class ApprovedRunFinalizer {
   }
 
   private acquireAttempt(runId: string, candidateDigest: string): Decision<string> {
-    return this.cp.db.tx(() => {
+    // #664 — the upsert below is the reservation itself; a denial means the reservation
+    // did not happen and must not leave a row behind.
+    return this.cp.db.txDecision(() => {
       const now = this.cp.clock.now();
       const startedAt = now.toISOString();
       const deadlineAt = new Date(now.getTime() + FINALIZATION_LEASE_TTL_MS).toISOString();

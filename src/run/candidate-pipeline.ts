@@ -441,7 +441,9 @@ export class CandidatePipeline {
 
   /** Durable, per-run fence for the whole asynchronous verification/review attempt. */
   private acquireAttempt(input: SubmitResultInput, attemptId: string): Decision<void> {
-    return this.db.tx(() => {
+    // #664 — the upsert below is the reservation itself; a denial means the reservation
+    // did not happen and must not leave a row behind.
+    return this.db.txDecision(() => {
       const acquiredAt = this.clock.now();
       const startedAt = acquiredAt.toISOString();
       const deadlineAt = new Date(acquiredAt.getTime() + ATTEMPT_LEASE_TTL_MS).toISOString();
