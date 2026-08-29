@@ -712,14 +712,11 @@ export class IngressGuard {
     // audit log, and `agentctl doctor system` reports the same outstanding claim as a
     // `TURN_OUTCOME_UNKNOWN` finding (`Doctor.checkUnresolvedTurns`) — so the runbook's first
     // command surfaces it too, not only someone tailing `audit_events`.
-<<<<<<< HEAD
     //
     // `noReplyAt`, not only `repliedAt`: a turn a handler genuinely decided not to reply to is
     // exactly as finished as one whose reply the transport accepted, and is just as prunable —
     // but it is a *different* fact (#682), so it gets its own check rather than being folded
     // into `repliedAt`'s.
-=======
->>>>>>> origin/main
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
