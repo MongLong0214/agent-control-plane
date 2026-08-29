@@ -34,6 +34,30 @@ afterAll(cleanupTempDirs);
 
 const clock = () => new ManualClock("2026-08-13T00:00:00.000Z");
 
+/**
+ * The real production Codex binary's short name (`resolveExecutable`'s default for `gpt`,
+ * `cli-adapters.ts:1666`) — never the stub script this suite spawns, which runs under `node`
+ * and never carries this name. A live Codex process on the same host competes for CPU with
+ * this test's own real `/usr/bin/expect` pty, and a fixed navigation timeout is not something
+ * that competition reliably survives (#644): this deployment's CEO runtime is itself a Codex
+ * session, so the collision is structural here rather than incidental.
+ *
+ * `pgrep -x` matches the short command name regardless of which vendored path launched it —
+ * measured: `ps -o comm=` reports the full vendor-store path, but `pgrep -x codex` still finds
+ * it. `pgrep` exits 1 with empty stdout when nothing matches, which is "none running", not a
+ * failure to ask, so that exit is swallowed rather than thrown.
+ */
+const hostCodexPids = (): readonly string[] => {
+  try {
+    return execFileSync("pgrep", ["-x", "codex"], { encoding: "utf8" })
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+};
+
 /** Captured from the live Codex `/usage` view on this machine, reduced to its stable text. */
 const CODEX_ACTIVITY_ONLY = `
 /usage daily
@@ -1346,6 +1370,7 @@ setInterval(() => {}, 1_000);
 
     const realTerminal = new ExpectUsageTerminal();
     let captured = "";
+    const before = hostCodexPids();
     const reading = await new CodexUsageCollector({
       clock: clock(),
       binary,
@@ -1359,12 +1384,30 @@ setInterval(() => {}, 1_000);
       },
     }).collect();
 
+    // A real Codex process seen on this host, either before the pty ran or still there once it
+    // finished, is named before the assertion below runs — not after a bare `toMatchObject`
+    // failure sends the next person hunting through their own diff for a cause that is not in
+    // it (#644). Checked only when the reading itself already failed: a Codex process merely
+    // being present is not evidence of anything when the test passed anyway.
+    if (reading.sensorHealth !== "HEALTHY") {
+      const concurrent = before.length > 0 ? before : hostCodexPids();
+      if (concurrent.length > 0) {
+        throw new Error(
+          `another Codex session is active on this host (pid ${concurrent.join(", ")}); this ` +
+            "test drives a real pseudo-terminal and its fixed navigation timing cannot be " +
+            "trusted while a real Codex CLI process is competing for the machine — see #644. " +
+            `Underlying reading: ${JSON.stringify(reading)}\n${captured}`,
+        );
+      }
+    }
+
     expect(reading, `${JSON.stringify(reading)}\n${captured}`).toMatchObject({
       sensorHealth: "HEALTHY",
       buckets: [expect.objectContaining({ id: "5-hour", remainingPercent: 77 })],
     });
     // If the collector stops sending /usage or blindly removes Codex's bounded second
-    // navigation step, this real PTY fixture times out or yields no routable bucket.
+    // navigation step, this real PTY fixture times out or yields no routable bucket — and,
+    // absent a concurrent Codex process, still reports that failure directly above.
   });
 
   it("turns a collector exception into an ERROR reading rather than throwing or reusing quota", async () => {
