@@ -60,6 +60,12 @@ richer story than "closed" or "open" captures, and it is given in full below.
 - **Closed by:** #671 (`686281a`). Confirmed independently by reading the current schema and
   guard, not merely by trusting the issue's own comment.
 - **Disposition:** no longer on the critical path — nothing to absorb.
+- **Path traced:** `schema.sql`'s `inbound_messages` definition (the `turn_claim_json` column and
+  its comment), `ingress-guard.ts`'s `recordResultIf`, `#resolveTurnHere` and
+  `completeReplyAndResolveTurn` — all read directly, and `686281a`'s diff confirmed the same. Not
+  traced beyond the ingress ledger: this row makes no claim about `canonical_turns` (see C1) or
+  about whether the CEO's own execution actually completed (see C1's second half) — only that the
+  *ingress* claim can no longer be silently erased by a reply reservation.
 
 ### S2 — many `TURN_CLAIMED` rows on one session — OPEN, narrower than originally described, and not closed by #680
 
@@ -84,31 +90,60 @@ document's own usage.**
   *crash* window between two writes on the *same* message. S2 is not about a crash — it is about
   two *different* messages, each claimed honestly, arriving before either turn resolves. Nothing
   in `claimTurn` (`src/ingress/ingress-guard.ts`) checks the session digest before claiming; it
-  checks only `turn_claim_json IS NULL` for *that message's own row*. So, by inspection of
-  `claimTurn` alone, two concurrent DIRECT messages on one conversation — arriving inside the same
-  in-flight window #646 measured at "a measured 3m15s turn against a 120s inner deadline" — would
-  each pass that check and claim cleanly under #671 alone. **This is a reading of the guard's
-  code, not something any test in this repository exercises or this document ran**: no test here
-  constructs two genuinely concurrent, non-crash claims on one session and asserts the second is
-  refused. The claim rests on `claimTurn`'s own logic having no session-scoped check, which is
-  checkable by inspection but is not the same thing as a passing (or failing) test naming this
-  scenario.
-- **What actually closes it:** #680 (`157aeed`), which the issue's own comment does not mention.
-  `TelegramHermesRouter`'s DIRECT branch (`src/ingress/telegram-router.ts`) now calls
+  checks only `turn_claim_json IS NULL` for *that message's own row*.
+- **A review found the scenario this row previously cited here does not occur.** An earlier
+  version of this paragraph cited #646's *"a measured 3m15s turn against a 120s inner deadline"*
+  as an example of an in-flight window a second claim could land inside. Traced end to end, an
+  ordinary CEO turn — timed out or not — does not stay unresolved for anything like that long,
+  because a timeout is not silence:
+  ```
+  ceo-conversation.ts ~243   McpError(RequestTimeout) → deny(CEO_CONVERSATION_TIMEOUT, …) —
+                             a refusal, not a hang; the peer may still be running server-side
+  agentcpd.ts ~1256         answerAsCeo: `if (answered.allowed) return answered.value; return
+                            ceoUnavailableSentence(...)` — deny or allow, the return type is
+                            the same Promise<string>, indistinguishable to the caller
+  agentcpd.ts ~1515        production wiring: onDirect: (input) => answerAsCeo(ceoConversation,
+                           input.text)
+  telegram-router.ts ~564  const directText = await this.directHandler(...); … outcome with
+                           ReasonCode.OK — a timeout apology is a successful DIRECT outcome
+  telegram-polling.ts ~462 reserveResponse(outcome) → sendMessage(outcome.reply) →
+                           completeResponse(outcome) on success, calling
+                           completeReplyAndResolveTurn — the claim resolves the moment the
+                           reply is accepted by Telegram, independent of whether the CEO's own
+                           `createMessage` call ever actually finished
+  ```
+  So a slow turn that hits the CEO port's own budget is answered with a sentence and resolved
+  immediately once that sentence is sent — it does not sit as an unresolved claim for the
+  duration of the external turn, and #646's 3m15s figure describes a pre-#671 world where the
+  reply reservation *overwrote* the claim (S1), not a window a second claim could race into
+  today. That citation is dropped rather than corrected in place, since nothing replaces it as a
+  *slow-turn* mechanism for reaching S2 — there is not one.
+- **What does leave a row genuinely unresolved without a full process crash, traced through the
+  same file:** `telegram-polling.ts`'s `pollOnce` (~462–472) calls `reserveResponse` before every
+  Telegram send and `completeResponse` — the only call that sets `repliedAt` — only after
+  `sendMessage` succeeds. If `sendMessage` throws, `completeResponse` never runs, the claim stays
+  unresolved, and the exception propagates out of `pollOnce` to `loop()` (~498–510), which
+  catches it, calls `onError`, waits `retryDelayMs`, and polls again — the daemon process
+  survives and keeps running. So a Telegram delivery failure — not a crash, not a slow CEO turn,
+  and not simulated by any test here — is a second, real, code-verified path to an unresolved
+  claim, alongside the process-crash path `TelegramInterruption` simulates. Whether the CEO
+  answered instantly or timed out is irrelevant to this path; what matters is whether Telegram
+  accepted the reply.
+- **What actually closes the common case:** #680 (`157aeed`), which the issue's own comment does
+  not mention. `TelegramHermesRouter`'s DIRECT branch (`src/ingress/telegram-router.ts`) now calls
   `this.ingress.unresolvedTurns(identity.sessionDigest)` **before** `claimTurn`, for every DIRECT
-  message, not only a suspected resend — this part is a direct reading of the current source, not
-  an inference. What is *not* directly tested is the concurrent case: all three of #680's own
+  message, not only a suspected resend — a direct reading of the current source, not an
+  inference. What is *not* directly tested is the concurrent case: all three of #680's own
   tests (`tests/unit/telegram-ingress.test.ts`, "parks a resend...", "does not park a DIRECT
   message from an unrelated conversation", "/again lets the owner...") construct the unresolved
-  row the same way — one poller throws `TelegramInterruption` to leave a claim unresolved, that
-  listener closes, and a *second, later* listener processes the next update. None of them start
-  two claims genuinely concurrently, in one live process, with no crash between them. The
-  park-before-claim check itself does not read `result_json` or anything else that would
-  distinguish "unresolved because of a crash" from "unresolved because a slow turn is still
-  running" — both are just `turn_claim_json IS NOT NULL AND repliedAt IS NULL` — so the same code
-  path should cover the pure-concurrency case too. But that is this document's inference from the
-  guard's SQL, not a claim the test suite backs, and it should be read as such rather than as
-  something #680 was proven against.
+  row by having a poller throw `TelegramInterruption` (simulating a process crash) and then a
+  *second, later* listener process the next update — none of them use the delivery-failure path
+  above, and none start two claims genuinely concurrently in one live process. The
+  park-before-claim check itself does not read `result_json` or anything that would distinguish
+  "unresolved because of a crash" from "unresolved because Telegram never confirmed delivery" —
+  both are just `turn_claim_json IS NOT NULL AND repliedAt IS NULL` — so the same code path
+  should cover the delivery-failure case too. That is this document's inference from the guard's
+  SQL, not a claim the test suite backs for either producing mechanism.
 - **This document's previous round called this "closed" and that was wrong — a real, minimal
   sequence still reaches S2's state with an undisclosed second claim.** `/again` was checked as a
   single-shot override and it is not one. Both places the router touches an unresolved list read
@@ -166,6 +201,15 @@ document's own usage.**
   accumulates silently"*), not embargoed and not dependent on #638/#639/#693 — it is live on the
   ingress ledger today and testable with the existing harness. `docs/ROADMAP.md`'s C4 item 7 is
   corrected alongside this row rather than left claiming S2 closed.
+- **Path traced:** `claimTurn`, `unresolvedTurns`, and both `telegram-router.ts` read sites
+  (`~526`, `~549`) for the disclosure gap; `ceo-conversation.ts` (~243), `agentcpd.ts` (~1256,
+  ~1515), `telegram-router.ts` (~564) and `telegram-polling.ts` (~462–510) for ruling out a slow
+  turn as a producing mechanism and establishing a Telegram delivery failure as a real one instead.
+  **Not traced, and stated as such above rather than assumed:** whether a delivery failure has
+  ever actually occurred in this deployment's history, and whether two such failures on one
+  session have ever coincided — this row asserts the code *permits* the state, not that it has
+  been *observed*. The crash-based reproduction (`TelegramInterruption`) is what the test suite
+  exercises; the delivery-failure reproduction is read from source only.
 
 ### S3 — `ADMITTED` and not claimed — CLOSED, and its "open" verdict was backwards
 
@@ -212,6 +256,12 @@ document's own usage.**
   crash-truncated `ADMITTED`-not-claimed row) is ordinary and safe; the concern the original row
   attached to it does not hold under the claim-before-dispatch ordering that predates this
   census.
+- **Path traced:** `telegram-router.ts`'s DIRECT branch, in order — `admit` → S6's unresolved
+  check → `claimTurn` → `directHandler` — read directly to confirm the ordering; `claimTurn`'s
+  `db.tx()` read directly for the serialization claim; `0d12bf2`'s diff read directly for the
+  closing commit. `isRecoverableIngressResult`/`isClaimable` read directly for what makes a row
+  re-admittable. Not traced beyond the DIRECT path specifically: whether every non-Telegram or
+  non-DIRECT ingress path also claims before dispatch is not asserted here.
 
 ### S4 — permit-dead `IN_DOUBT` — mechanism closed, state stays unreachable
 
@@ -247,6 +297,12 @@ document's own usage.**
   measured against the code, that assertion is itself stale by a week.
 - **Disposition:** the mechanism no longer needs absorbing into a wiring ticket — it shipped
   independently. The reachability question (C3, #638) is unchanged and belongs there, not here.
+- **Path traced:** `resolveInDoubt`'s full body, `MATERIALIZING_AUTHORITIES`'s set contents, and
+  `73328c0`'s diff — all read directly, plus `OPERATOR_METHOD.CONVERSATION_RESOLVE`'s wiring in
+  `daemon.ts`. The reachability half rests on `claim()`'s `CONVERSATION_TARGET_UNVERIFIED` refusal
+  (C3) rather than being re-derived here. Not traced: whether `resolveInDoubt` has ever actually
+  been invoked outside a test — like S2's delivery-failure path, this is "the mechanism exists and
+  is wired to an operator command," not "an operator has used it."
 
 ### S5 — `replacement_turn_request_id` set while still `IN_DOUBT` — unchanged, still open
 
@@ -261,6 +317,9 @@ document's own usage.**
   the original row said.
 - **Disposition:** independent, as before. Nothing on the critical path reaches it, and like S4
   it sits behind the same #638 embargo before it could ever be produced.
+- **Path traced:** an exhaustive symbol search (`grep -rn "replacementTurnRequestId\|replacement_turn_request_id"`)
+  across `src/`, not a sample — this is an absence claim, checkable by rerunning the same search
+  rather than by tracing a path. The embargo half is inherited from C3, not re-derived here.
 
 ### S6 — a different question during the window — CLOSED
 
@@ -278,6 +337,11 @@ document's own usage.**
   turn resolved," and the owner — not a text comparison — decides whether to proceed anyway.
 - **Closed by:** #680 (`157aeed`).
 - **Disposition:** no longer on the critical path.
+- **Path traced:** the DIRECT branch's `unresolvedTurns` call and its lack of any text comparison,
+  read directly. This row assumes an unresolved turn already exists on the session and is only
+  about what happens to the *next* message given that precondition — it does not depend on, and
+  is not affected by, the S2 correction to how that precondition arises (crash or delivery
+  failure, not a slow turn).
 
 ### S7 — a later message against a coalesced batch — unchanged, still open
 
@@ -302,6 +366,9 @@ document's own usage.**
   the ticket-coverage argument above written into its body rather than left as a placeholder — the
   rule this document itself states two sections down (a gap gets its own ticket) applies to its
   own rows, not only to the ones it is reporting on.
+- **Path traced:** `ConversationTurnCoordinator.claim`'s body and the search for a second writer
+  of `canonical_turn_sources` — both read directly. The unreachability claim is inherited from C3
+  (`CONVERSATION_TARGET_UNVERIFIED`), not independently re-derived here.
 
 ## Three context facts, not states
 
@@ -323,6 +390,33 @@ Present tense: it still does not. This is why S4's mechanism fix (#669) and S1/S
 fixes (#671, #680) are independent repairs to independent ledgers, not one fix reaching both —
 and why S4, S5 and S7 remain unreachable in production regardless of what ships on the ingress
 side.
+
+**A second, related divergence, found while re-checking S2: the ingress ledger can mark a turn
+"resolved" and "answered" while the CEO's own execution may still be running.** `answerAsCeo`
+(`src/daemon/agentcpd.ts` ~1256) returns `Promise<string>` whether `port.ask` allowed or denied —
+a `CEO_CONVERSATION_TIMEOUT` deny (`src/mcp/ceo-conversation.ts` ~243, on `McpError`'s
+`RequestTimeout`) becomes an apology sentence with exactly the same shape as a real answer.
+`TelegramHermesRouter` (`src/ingress/telegram-router.ts` ~564) has no way to tell the two apart —
+both are just a string returned from `directHandler` — so it reports `ReasonCode.OK`, and
+`telegram-polling.ts`'s `completeResponse` (~466) resolves the turn (`completeReplyAndResolveTurn`)
+the moment that sentence is accepted by Telegram. Nothing here asked the CEO's `createMessage`
+call to stop, and nothing observes whether it later completes, writes into the transcript, or
+fails — the ingress ledger's `repliedAt` is set regardless. This is the same family as the fact
+above — a ledger recording a state the thing it describes has not actually reached — but it is a
+different pair than `canonical_turns`/`inbound_messages`: here it is the ingress ledger against
+the CEO's own execution, which no table in this schema observes at all. Not one of the seven
+states (it is a transition, in the shape C2 already named for a different sentence), and not
+embargoed — it is live in production behavior today, on the same path S2 traced. No open ticket
+names it under this description; whoever picks this up should check `#638`/`#639` first; a durable
+receipt is exactly the mechanism that would let ingress tell "answered" apart from "gave up
+waiting."
+
+**Path traced:** for the first half, `.claim()`'s absence of any caller (`grep -rn "\.conversation\b" src/`,
+exhaustive, not sampled) and `daemon.ts`'s four operator-method call sites, all read directly. For
+the second half, the same `answerAsCeo`/`ceo-conversation.ts`/`telegram-router.ts`/
+`telegram-polling.ts` chain S2 traces. Neither half claims anything about whether a receipt
+mechanism (#638) would actually distinguish the two cases correctly once built — only that
+nothing today does.
 
 ### C2 — the sentence the original C2 cited has since been rewritten twice more, and no longer says what C2 quoted
 
@@ -383,6 +477,9 @@ it shows the citation was stale on arrival, not merely stale by 2026-08-29:
 - **Still correct, unchanged:** the underlying point C2 was making — that this is a transition
   producing a state, not a state itself — holds regardless of which reason code says it, or how
   many now exist. It is just not the reason code, nor the wording, the original row named.
+- **Path traced:** every commit named in this row (`97f5d0a`, `7b5490f`, `1285e81`, `f2497ec`,
+  `3136292`) by its own diff, listed in full in the Verification section's commit table below —
+  not by title or message alone, after this row's own history of getting that wrong twice.
 
 ### C3 — the embargo still makes S4, S5 and S7 unreachable, but not for the reason this document first gave
 
@@ -443,6 +540,15 @@ production writer exists for either table, `claim()` therefore still cannot mint
 that S4, S5 and S7 are all states *of*, and their absence from any log is silence, not
 confirmation of anything the schema enforces.
 
+**Path traced:** `BindingRegistry.bind`, `recordTargetBinding`, `VerifiedTargetBinding`'s
+definition, `claim()`'s two refusal branches, and an exhaustive grep for
+`INSERT INTO actor_target_attestations` across the repository (eleven hits, all under
+`tests/unit/`) — all read directly, plus `f1cdde9`'s diff for `VerifiedTargetBinding`'s origin.
+This traces *that* nothing writes these tables in production; it does not trace every possible
+future call site, and the note in the row above about a caller wiring one up unauthenticated is a
+structural argument from the schema's constraints, not an enumeration of every way it could
+happen.
+
 ## Disposition summary
 
 **Closed, nothing to absorb:** S1, S3 (never actually a hazard; closed by #635 before this
@@ -489,12 +595,13 @@ and unchanged by writing it (docs-only):
 
 - `pnpm typecheck` — clean.
 - `pnpm lint` — clean.
-- `pnpm test` — `1404 passed | 9 failed | 2 skipped`, all nine failures in
-  `tests/unit/deploy-launchd.test.ts`, matching the environment-specific shape #680's own PR
-  description records (`1396 passed / 9 failed / 2 skipped` at that point in history; the passed
-  count has grown with intervening merges, the nine failures have not changed in kind).
-- `pnpm guards:anchors` — `RESULT: PASS`, `117 anchor(s) still match, exactly once each` (count
-  moved from 115 after an unrelated upstream merge landed on this branch, see below).
+- `pnpm test` — `1442 passed | 9 failed | 2 skipped` (measured on this round; `1404 passed` on an
+  earlier round of this same branch, before two unrelated upstream merges landed on it), all nine
+  failures in `tests/unit/deploy-launchd.test.ts`, matching the environment-specific shape #680's
+  own PR description records (`1396 passed / 9 failed / 2 skipped` at that point in history; the
+  passed count keeps growing with intervening merges, the nine failures have not changed in kind).
+- `pnpm guards:anchors` — `RESULT: PASS`, `119 anchor(s) still match, exactly once each` (count
+  has moved twice, from 115, as unrelated upstream merges landed on this branch — see below).
 - `pnpm terminology` — `9 enforced rules over 119 files, 0 violations, 0 waived`.
 
 Every code citation in this document was located by symbol name or by a quoted comment fragment,
@@ -625,7 +732,27 @@ are quotes, not this document's own usage. A full sweep of every remaining "sess
 in the file found no other match for the check's patterns and no other case of the two senses
 being conflated; `pnpm terminology` now reports `0 violations, 0 waived`.
 
-Re-ran `pnpm typecheck`, `pnpm lint`, `pnpm guards:anchors` and `pnpm terminology` after every
-edit across all six rounds — all still pass. Did not re-run `pnpm test` after any round, since no
-edit touched anything but prose and Markdown; the `1404 passed | 9 failed | 2 skipped` baseline
-above is from the unmodified checkout and stands unchanged.
+**A seventh round found S2's disposition assumed a producing mechanism production does not have.**
+S2 (and the "3m15s turn" citation specifically) implied an ordinary slow CEO turn leaves a row
+unresolved long enough for a second claim to land beside it. Traced end to end — `ceo-conversation.ts`'s
+timeout deny, `agentcpd.ts`'s `answerAsCeo` collapsing allow/deny into the same `Promise<string>`,
+`telegram-router.ts` reporting `ReasonCode.OK` for a timeout apology, `telegram-polling.ts`
+calling `completeResponse` immediately once Telegram accepts that reply — a slow turn is
+*answered* and its row *resolves*, so it never reaches `unresolvedTurns` at all. That citation is
+retracted rather than repaired, since no slow-turn mechanism replaces it. In its place: a
+Telegram delivery failure (`sendMessage` throwing inside `pollOnce`) is a second, real,
+code-verified path to a genuinely unresolved row, distinct from the crash path every test in the
+suite uses — `loop()` catches the exception and keeps polling, so the process survives while the
+claim stays open. Separately, tracing this surfaced a fact worth keeping regardless of S2: the
+ingress ledger resolves a turn the moment Telegram accepts *any* reply, including a timeout
+apology, with no way to tell whether the CEO's own execution actually finished — appended to C1
+as its own paragraph rather than folded into S2's fix. Finally, applying the same "which path did
+I trace, which am I implying" question to every row added an explicit **Path traced** statement to
+each of S1–S7 and C1–C3, naming what was read directly versus inherited from another row versus
+not checked at all.
+
+Re-ran `pnpm typecheck`, `pnpm lint`, `pnpm guards:anchors` and `pnpm terminology` after every edit
+across all seven rounds — all still pass. Re-ran `pnpm test` this round specifically, since two
+unrelated upstream merges had changed `src/` since the last run: `1442 passed | 9 failed |
+2 skipped`, same nine `deploy-launchd` failures, same shape as every prior measurement on this
+branch.
