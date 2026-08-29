@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
 import {
   acpError,
+  allow,
+  deny,
   errorPayload,
   fromErrorPayload,
   isAcpError,
@@ -216,6 +218,145 @@ describe("transactions must be synchronous", () => {
     expect(db.get<{ goal: string }>(`SELECT goal FROM runs WHERE run_id = ?`, [runId])?.goal).toBe(
       "committed",
     );
+  });
+});
+
+describe("#664 — a transaction whose body decides 'no' still commits its writes", () => {
+  it("plain tx() commits a write even when the body returns a denied Decision", () => {
+    // This is the exact shape the issue reproduced: a Decision denial is a normal
+    // return, and tx() cannot tell it apart from any other value a body hands back.
+    // Bodies that write unconditional housekeeping a later decision only reads (see
+    // github-kernel.ts's claim-expiry sweep) rely on exactly this: `tx()` is documented
+    // and kept this way on purpose, not fixed here — `txDecision` is the opt-in.
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664";
+    const decision = db.tx(() => {
+      db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+        [actorId, clock.nowIso()],
+      );
+      return deny(ReasonCode.CONFLICT, "changed my mind");
+    });
+    expect(decision.allowed).toBe(false);
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeTruthy();
+  });
+
+  it("txDecision() rolls back a write when the body returns a denied Decision", () => {
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664_txdecision";
+    const decision = db.txDecision(() => {
+      db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+        [actorId, clock.nowIso()],
+      );
+      return deny(ReasonCode.CONFLICT, "changed my mind");
+    });
+    expect(decision.allowed).toBe(false);
+    if (!decision.allowed) expect(decision.reasonCode).toBe(ReasonCode.CONFLICT);
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("txDecision() still commits a write when the body returns an allowed Decision", () => {
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664_allow";
+    const decision = db.txDecision(() => {
+      db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+        [actorId, clock.nowIso()],
+      );
+      return allow(ReasonCode.OK, actorId);
+    });
+    expect(decision.allowed).toBe(true);
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeTruthy();
+  });
+
+  it("txDecision() still rolls back on a thrown error, same as tx()", () => {
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664_throw";
+    expect(() =>
+      db.txDecision((): ReturnType<typeof allow<string>> => {
+        db.run(
+          `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+          [actorId, clock.nowIso()],
+        );
+        throw new Error("boom");
+      }),
+    ).toThrowError("boom");
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("a nested txDecision() hands its denial back as data; it cannot roll back on its own", () => {
+    // There is no SAVEPOINT here — a nested call has no physical boundary of its own.
+    // Whether a nested denial rolls anything back is entirely up to whoever owns the
+    // outermost transaction, exactly as it already is for a nested tx().
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664_nested_under_plain_tx";
+    const outerResult = db.tx(() => {
+      const inner = db.txDecision(() => {
+        db.run(
+          `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+          [actorId, clock.nowIso()],
+        );
+        return deny(ReasonCode.CONFLICT, "changed my mind");
+      });
+      // The outer body is a plain tx(): it does not inspect `inner.allowed`, so it
+      // commits regardless, the same way it would for any other returned value.
+      return inner;
+    });
+    expect(outerResult.allowed).toBe(false);
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeTruthy();
+  });
+
+  it("a nested txDecision() rolls back when its outer frame is txDecision too", () => {
+    // This is the shape CtoLifecycle.acknowledgeHandoff/recoveryTakeover actually use:
+    // an outer write (the handoff record) plus a nested BindingRegistry.switchTo call,
+    // and the outer denial must undo both.
+    const { db, clock } = makeCore();
+    const outerActorId = "actor_probe_664_nested_outer";
+    const innerActorId = "actor_probe_664_nested_inner";
+    const outerResult = db.txDecision(() => {
+      db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+        [outerActorId, clock.nowIso()],
+      );
+      const inner = db.txDecision(() => {
+        db.run(
+          `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+          [innerActorId, clock.nowIso()],
+        );
+        return deny(ReasonCode.CONFLICT, "changed my mind");
+      });
+      if (!inner.allowed) return inner;
+      return allow(ReasonCode.OK, undefined);
+    });
+    expect(outerResult.allowed).toBe(false);
+    for (const actorId of [outerActorId, innerActorId]) {
+      expect(
+        db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+          actorId,
+        ]),
+      ).toBeUndefined();
+    }
   });
 });
 

@@ -390,7 +390,9 @@ export class CtoLifecycle {
     handoffId: string,
     acknowledgement: HandoffAcknowledgement | string,
   ): Decision<RoleBinding> {
-    return this.db.tx(() => {
+    // #664 — this body's own ACKED write must not survive a denial, including one
+    // that comes back from the nested `bindings.switchTo` call below.
+    return this.db.txDecision(() => {
       const row = this.db.get<RawHandoff>(`SELECT * FROM handoffs WHERE handoff_id = ?`, [handoffId]);
       if (!row) return deny(ReasonCode.NOT_FOUND, "unknown handoff", { handoffId });
       if (row.status !== "PENDING") {
@@ -543,7 +545,9 @@ export class CtoLifecycle {
     const incoming = await this.spawn(projectId, "acting-cto-recovery");
     if (!incoming.allowed) return incoming as Decision<RoleBinding>;
 
-    const takeover = this.db.tx(() => {
+    // #664 — this body's own handoff-record write must not survive a denial, including
+    // one that comes back from the nested `bindings.switchTo` call below.
+    const takeover = this.db.txDecision(() => {
       // `spawn` awaits provider work. Do not let a session that recovered, or a binding
       // that moved in that interval, be displaced by a stale emergency decision.
       const currentNow = this.bindings.active(roleKey);
