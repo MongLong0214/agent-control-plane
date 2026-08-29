@@ -53,8 +53,16 @@ Napi::Value PeerCred(const Napi::CallbackInfo& info) {
     return env.Null();
   }
 
-  // xucred carries the primary gid as cr_groups[0], not a standalone cr_gid field — there is
-  // always at least one group when the credential is populated at all.
+  // xucred carries the primary gid as cr_groups[0], not a standalone cr_gid field (<sys/ucred.h>
+  // even #defines cr_gid to cr_groups[0]) — there is always at least one group when the
+  // credential is populated at all.
+  //
+  // Both fields below are the *effective* identity, not the real one: <sys/ucred.h> documents
+  // cr_uid itself as "effective user id", and cr_groups (cr_gid's expansion) is read off that
+  // same snapshot. A caller comparing this uid/gid against a process's real ids (getuid/getgid)
+  // rather than its effective ones (geteuid/getegid) is asserting a property xucred does not
+  // carry — it happens to hold for an unprivileged process where real === effective, and silently
+  // stops holding the moment one differs.
   const gid_t gid = cred.cr_ngroups > 0 ? cred.cr_groups[0] : static_cast<gid_t>(-1);
 
   Napi::Object result = Napi::Object::New(env);

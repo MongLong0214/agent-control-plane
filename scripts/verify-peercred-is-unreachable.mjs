@@ -7,26 +7,51 @@
  * externally supplied actor-attachment call site needs a separately authorized ticket, not this
  * one. So the gate is not "does the primitive work", it is "does production code reach it".
  *
- * Scans every `.ts` file under `src/` except the primitive's own file for:
- *   - an import whose specifier resolves to `src/core/peercred.ts`
- *   - the identifiers `getPeerCredentials` or `PeerCredentials` (word-boundary matched, so the
- *     unrelated `PeerCredential` — singular, the session-handshake type in `src/daemon/agentcpd.ts`
- *     — is not a false hit)
+ * Scans every `.ts` file under `src/` except the primitive's own file for two independent things:
  *
- * A hit means a live call site exists and this must fail. Empty means the boundary holds.
+ *   1. A `from "<specifier>"` clause (static import/export, including `export * from` and
+ *      `export * as X from`) or a string-literal dynamic `import("<specifier>")`/`require(
+ *      "<specifier>")` whose specifier *resolves* — following relative paths and this project's
+ *      `@/` → `src/` alias the way Node/TS module resolution actually would, not by matching a
+ *      literal path substring — to `src/core/peercred.ts`.
  *
- * What this does NOT do: run anything, or notice a re-export under a different name. It is a
- * textual census, in the shape of `verify-acceptance-adapter-source.mjs` and
- * `verify-refusal-operands-are-watched.mjs` — narrow, dependency-free, and closed to interpretation
- * about what counts as "reachable".
+ *      This is what closed the hole an earlier version of this script's own docstring admitted:
+ *      that version matched a specifier only if it *textually contained* `core/peercred`, which
+ *      is true from anywhere outside `src/core/` but false for a reference written from inside
+ *      it (`./peercred.ts`, or `../peercred.ts` from a subdirectory) — a namespace re-export
+ *      (`export * as PC from "./peercred.ts"`) living in `src/core/` passed silently: no
+ *      `core/peercred` substring, and no literal `getPeerCredentials`/`PeerCredentials` text on
+ *      that line either, since a namespace export names nothing. Verified empirically before
+ *      this fix landed: that exact file made the previous version print PASS.
+ *
+ *   2. The identifiers `getPeerCredentials` or `PeerCredentials` appearing literally in a file
+ *      (word-boundary matched, so the unrelated `PeerCredential` — singular, the
+ *      session-handshake type in `src/daemon/agentcpd.ts` — is not a false hit). This still
+ *      catches a named re-export or a call site even when check 1 above does not apply to that
+ *      exact line (e.g. a consumer importing a re-exporting module and then writing
+ *      `mod.getPeerCredentials(fd)`).
+ *
+ * A hit from either check means a live reference exists and this must fail. Empty means the
+ * boundary holds.
+ *
+ * What this still does NOT do, stated rather than implied: resolve a specifier assembled at
+ * runtime (string concatenation, a computed property access built from parts, a bare dynamic
+ * `import(someVariable)`), and it does not run anything or type-check. Those would need an actual
+ * module graph (TypeScript's compiler API or a bundler) to resolve, which this dependency-free
+ * census — in the shape of `verify-acceptance-adapter-source.mjs` and
+ * `verify-refusal-operands-are-watched.mjs` — deliberately does not carry. Nothing in this
+ * repository writes an import that way today; if that ever changes, this gate needs to change
+ * with it rather than being trusted past what it actually inspects.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SRC = join(ROOT, "src");
 const OWNED_FILE = join(SRC, "core", "peercred.ts");
+/** `OWNED_FILE` with any of the extensions a resolved specifier might carry stripped, once. */
+const OWNED_FILE_STEM = OWNED_FILE.replace(/\.(?:ts|js)$/u, "");
 
 /** Every `.ts` file under `src/`, depth-first, in the shape the other census scripts use. */
 const walk = (dir) => {
@@ -43,17 +68,53 @@ const walk = (dir) => {
   return out;
 };
 
-const IMPORT_PATTERN = /from\s+["'][^"']*core\/peercred(?:\.ts)?["']/;
 const IDENTIFIER_PATTERN = /\bgetPeerCredentials\b|\bPeerCredentials\b/;
+
+/**
+ * Every `from "<specifier>"`, `import("<specifier>")`, or `require("<specifier>")` in `source`,
+ * scanned across the whole file rather than line by line — a brace-list import/export spans
+ * multiple lines, and the specifier is what identifies the target regardless of which line the
+ * keyword landed on.
+ */
+const SPECIFIER_PATTERN = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["']([^"']+)["']/gu;
+
+const extractSpecifiers = (source) => {
+  const hits = [];
+  for (const match of source.matchAll(SPECIFIER_PATTERN)) {
+    const line = source.slice(0, match.index).split("\n").length;
+    hits.push({ specifier: match[1], line });
+  }
+  return hits;
+};
+
+/**
+ * Resolves an import specifier written in `fromFile` to an absolute path, following relative
+ * specifiers and this project's `@/` → `src/` alias (`tsconfig.json`'s `paths`). Returns `null`
+ * for a bare package specifier (`vitest`, `node:fs`, …), which cannot resolve to a local file.
+ */
+const resolveSpecifier = (specifier, fromFile) => {
+  if (specifier.startsWith("@/")) return resolvePath(SRC, specifier.slice(2));
+  if (specifier.startsWith(".")) return resolvePath(dirname(fromFile), specifier);
+  return null;
+};
 
 const hits = [];
 for (const file of walk(SRC)) {
   if (file === OWNED_FILE) continue;
   const source = readFileSync(file, "utf8");
+
+  for (const { specifier, line } of extractSpecifiers(source)) {
+    const resolved = resolveSpecifier(specifier, file);
+    if (resolved === null) continue;
+    if (resolved.replace(/\.(?:ts|js)$/u, "") === OWNED_FILE_STEM) {
+      hits.push({ file: relative(ROOT, file), line, text: `specifier "${specifier}" resolves to core/peercred.ts` });
+    }
+  }
+
   const lines = source.split("\n");
-  lines.forEach((line, index) => {
-    if (IMPORT_PATTERN.test(line) || IDENTIFIER_PATTERN.test(line)) {
-      hits.push({ file: relative(ROOT, file), line: index + 1, text: line.trim() });
+  lines.forEach((text, index) => {
+    if (IDENTIFIER_PATTERN.test(text)) {
+      hits.push({ file: relative(ROOT, file), line: index + 1, text: text.trim() });
     }
   });
 }
@@ -65,12 +126,14 @@ if (hits.length > 0) {
   }
   process.stdout.write(
     "\n#539 lands this primitive unreachable on purpose — a live call site (including a\n" +
-      "`ControlPlane` field or export) needs a separately authorized ticket, not this one.\n" +
+      "`ControlPlane` field or export, or a re-export under a different name) needs a separately\n" +
+      "authorized ticket, not this one.\n" +
       `RESULT: FAIL — ${hits.length} reference(s) outside src/core/peercred.ts.\n`,
   );
   process.exit(1);
 }
 
 process.stdout.write(
-  "RESULT: PASS — no reference to getPeerCredentials/PeerCredentials outside src/core/peercred.ts\n",
+  "RESULT: PASS — no reference to getPeerCredentials/PeerCredentials, and no import/export/require\n" +
+    "specifier resolving to core/peercred.ts, outside src/core/peercred.ts\n",
 );

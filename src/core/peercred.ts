@@ -15,7 +15,15 @@ import { join } from "node:path";
 export interface PeerCredentials {
   peerPid: number;
   effectivePid: number;
+  /**
+   * The peer's *effective* uid, not its real one. `xucred` (`<sys/ucred.h>`) documents `cr_uid`
+   * itself as "effective user id"; there is no real-id field in the struct to read instead. A
+   * caller that needs to compare this against a specific identity must compare it against that
+   * process's effective uid (`geteuid`), not its real uid (`getuid`) — the two coincide for an
+   * unprivileged process, which is exactly the case that hides the distinction.
+   */
   uid: number;
+  /** Same effective-vs-real caveat as `uid`: `xucred` defines `cr_gid` as `cr_groups[0]`, off the same effective-credential snapshot. */
   gid: number;
 }
 
