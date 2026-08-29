@@ -1358,9 +1358,12 @@ setInterval(() => {}, 1_000);
       binary,
       // A test-only budget for a stub that answers instantly — large enough that this
       // suite's own sandboxed process load does not itself trip it in the ordinary case,
-      // small enough that a genuinely hung stub fails in seconds. It models this test's own
-      // patience, not a production round trip: production times a live host CLI on
-      // `COLLECTOR_TIMEOUT_MS` (45s), nine times this value, for exactly that reason.
+      // small enough that a genuinely hung stub fails in seconds. It has no production
+      // counterpart to be sized against: no production site injects `terminal` for Codex
+      // (`cli-adapters.ts` ~1761 constructs `CodexUsageCollector` with `{clock, binary}`
+      // only), so the live path never runs this pty at all — it reads
+      // `account/rateLimits/read` instead, on its own unrelated `NON_INTERACTIVE_TIMEOUT_MS`
+      // (20s). This 5s is purely this test's own patience with a stub that answers at once.
       timeoutMs: 5_000,
       terminal: {
         async run(input) {
@@ -1374,62 +1377,50 @@ setInterval(() => {}, 1_000);
     }).collect();
     const captured = `${capturedStdout}\n${capturedStderr}\n${capturedError ?? ""}`;
 
-    // A fixed-budget real pty that fails to complete in time is not, by itself, evidence of
-    // which of several different things happened, and two earlier commits on this same
-    // branch (superseded by this one, #644) each conflated causes a single boolean cannot
-    // tell apart:
+    // A fixed-budget real pty that fails to complete in time is an *ordering of outputs*,
+    // and an ordering of outputs is not proof of a cause — a slow host and a broken
+    // keystroke produce the identical trace, and no amount of extra signal read from the
+    // same stream changes that, because the ambiguity is in the world being observed, not
+    // in the check. Two earlier commits on this same branch (superseded by this one, #644)
+    // each tried to name a specific cause from this trace and were each measured wrong:
     //
-    //   commit 1 asked the process table whether an unrelated `codex` process existed
-    //   anywhere on the host. Measured wrong: a stub answering immediately with
-    //   `"5-hour limit: 62% consumed"` (a shape `parseUsageOutput` refuses by design — see
-    //   the mutation test above) resolves with `timedOut: false` regardless of any other
-    //   `codex` process, so that check reported an unrelated live regression as
-    //   "another Codex session is active" — confidently wrong.
+    //   commit 1 asked whether an unrelated `codex` process existed anywhere on the host.
+    //   Wrong direction: a stub answering immediately with `"5-hour limit: 62% consumed"`
+    //   (parseUsageOutput refuses that shape by design — see the mutation test above)
+    //   resolves with `timedOut: false` regardless of any other `codex` process, so it
+    //   reported an unrelated live regression as "another Codex session is active".
     //
-    //   commit 2 asked only "did the chooser ever open" (`CLI.gpt`'s own `waitFor`,
-    //   `/show usage|press enter to confirm/i`). Also measured wrong: with production's
-    //   Codex step's `input` mutated from `"/usage\r"` to the typo `"/usag\r"` — an
-    //   ordinary navigation regression, entirely a collector defect — the stub never sees
-    //   its trigger string and the chooser never opens, which is *indistinguishable from*
-    //   a genuinely slow host under that check alone. Both produce zero chooser text.
+    //   commit 2 added the stub's own unconditional startup banner (kept below — it is
+    //   still useful as an observed milestone) and inferred a cause from which milestones
+    //   were seen: banner-but-no-chooser was called "a navigation regression", chooser-seen
+    //   was treated as ruling out the host. Also wrong: a stub that only ever gets to print
+    //   its banner — because the host never scheduled it again in time to react to
+    //   `/usage` — produces exactly the same banner-but-no-chooser trace as production's
+    //   `CLI.gpt` step 1 `input` mutated to the typo `"/usag\r"`, an ordinary keystroke
+    //   regression (reproduced directly against this file, see the commit that added this
+    //   comment). And a broken `waitFor` pattern can leave the chooser text sitting in the
+    //   captured stream even though the collector's own step never advanced past it, which
+    //   defeats "chooser seen" as proof the first step was fine.
     //
-    // The fix is the stub's own unconditional banner above, which needs no input to appear.
-    // It turns one boolean into a real three-way split instead of an inferred one:
-    //
-    //   banner never seen                    — environment/scheduling miss: the host did
-    //                                            not run this real pty in time at all. Real
-    //                                            on this machine (#644's own follow-up): the
-    //                                            deployment's CEO runtime and reviewer
-    //                                            sessions share host Codex CLI activity, and
-    //                                            a full-suite run adds sandboxed children.
-    //   banner seen, chooser never seen       — a genuine navigation regression: the
-    //                                            process was alive and the pty was carrying
-    //                                            its output the whole time, so whatever was
-    //                                            typed did not open the chooser.
-    //   chooser seen, reading still unhealthy — a real parser/second-step regression,
-    //                                            already caught unmodified by the assertion
-    //                                            below — never reported as anything else.
+    // So this reports the milestone reached and states the ambiguity as a fact, rather than
+    // resolving it. That is less satisfying than a verdict, and it is the honest answer.
     const sawReadiness = /codex cli ready/i.test(capturedStdout);
     const sawChooser = /show usage|press enter to confirm/i.test(capturedStdout);
     if (reading.error === "interactive /usage timed out") {
-      if (!sawReadiness) {
-        throw new Error(
-          "the pty never showed even the stub's own startup banner before the 5s budget " +
-            "elapsed; this is an environment/scheduling miss — the host did not run this " +
-            "real pty in time at all — not a collector defect. On this deployment the CEO " +
-            "runtime and reviewer sessions routinely share host Codex CLI activity with " +
-            `whatever runs the suite (#644). ${captured}`,
-        );
-      }
-      if (!sawChooser) {
-        throw new Error(
-          "the stub's startup banner arrived and the pty was carrying its output the whole " +
-            "time, but the usage chooser never opened before the 5s budget elapsed; this " +
-            "points at a navigation regression in the collector's Codex steps (a keystroke " +
-            "or a waitFor pattern that no longer matches what the CLI expects), not host " +
-            `scheduling (#644). ${captured}`,
-        );
-      }
+      const milestone = !sawReadiness
+        ? "before the stub's own startup banner ever appeared"
+        : !sawChooser
+          ? "after the stub's startup banner appeared but before the usage chooser did"
+          : "after the usage chooser appeared to open";
+      throw new Error(
+        `the pty timed out ${milestone} (5s budget). Two different causes produce this ` +
+          "same trace, and this test cannot separate them from the trace alone: the host " +
+          "may have been too loaded to complete the round trip inside the budget, or the " +
+          "collector's Codex steps may have sent input, or be waiting on a pattern, that " +
+          "this stub's protocol no longer satisfies. To tell them apart: re-run this file " +
+          "alone on an otherwise idle machine — if it passes there, the budget was the " +
+          `limit, not the collector (#644). ${captured}`,
+      );
     }
 
     expect(reading, `${JSON.stringify(reading)}\n${captured}`).toMatchObject({
@@ -1438,8 +1429,9 @@ setInterval(() => {}, 1_000);
     });
     // If the collector stops sending /usage or blindly removes Codex's bounded second
     // navigation step, this real PTY fixture times out or yields no routable bucket — and,
-    // whenever the stub's chooser did open, still reports that failure directly above
-    // rather than behind an environment or navigation story it did not earn.
+    // when the failure completed rather than timing out (a real response the parser could
+    // not read, for instance), still reports that unmodified above rather than folded into
+    // the ambiguity message this timeout branch alone owns.
   });
 
   it("turns a collector exception into an ERROR reading rather than throwing or reusing quota", async () => {
