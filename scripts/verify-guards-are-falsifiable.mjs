@@ -509,6 +509,19 @@ const GUARDS = [
     killedBy: ["tests/unit/ceo-conversation.test.ts"],
   },
   {
+    // #630: this is the single-flight guard the stack frame's sequential `await` used to provide
+    // by accident. Made explicit in #634 so it still holds once that `await` is removed. Without
+    // it, a second turn reaches `createMessage` while the first is still open and both land on
+    // the same `--resume` session — the interleaving that cannot be unwound.
+    what: "at most one turn is ever open on the CEO's canonical session",
+    file: "src/mcp/ceo-conversation.ts",
+    find: "    if (this.#inFlight) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/ceo-conversation.test.ts::refuses a second turn while the first is still open",
+    ],
+  },
+  {
     what: "the grok billing read refuses to carry a bearer through a proxy or an unchecked certificate",
     file: "src/capacity/usage-collectors.ts",
     find: "    const unsafe = unsafeGrokTransport(process.env);",
@@ -1093,6 +1106,19 @@ const GUARDS = [
     find: "  for (const inline of body.matchAll(/^\\s*(\\w+)\\s+[A-Z][^\\n]*?\\bUNIQUE\\b[^\\n]*$/gm)) {",
     replace: "  for (const inline of []) {",
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
+  },
+  {
+    // #649 part A: `bind()` minted a fresh actor unconditionally, so re-bootstrapping against the
+    // same Hermes transcript produced a second owner beside the first — two actors that collide on
+    // nothing, so the alias was silent. Without this line the reuse path is computed and then
+    // discarded, which is exactly that regression.
+    what: "bind reuses the actor that already owns a verified target instead of minting a second one",
+    file: "src/session/binding-registry.ts",
+    find: "      const actorId = reused.value ?? this.mintActor(input.role, input.sessionId, session.incarnation);",
+    replace: "      const actorId = this.mintActor(input.role, input.sessionId, session.incarnation);",
+    killedBy: [
+      "tests/unit/reconstitution-needs-a-verified-target.test.ts::reuses the actor rather than minting a second owner",
+    ],
   },
   {
     // #664/#679 — acknowledgeHandoff's ACKED write must not survive a denial from the

@@ -541,7 +541,16 @@ export class Db {
     if (this.#depth > 0) return this.guardSync(fn());
     try {
       return this.tx(() => {
-        const result = fn();
+        // `guardSync` here, before `.allowed` is ever read, is load-bearing: an async
+        // body returns a pending Promise, which has no `.allowed` and so reads as
+        // `undefined` — indistinguishable from a denial unless the thenable is caught
+        // first. Checking `.allowed` first would wrap that Promise in the rollback
+        // signal below, hand it back through the catch as if it were a real `Decision`,
+        // and let the still-running callback's writes after its first `await` land as
+        // autocommit outside any transaction, on a handle `tx()`'s own guard would have
+        // poisoned. This mirrors `tx()`'s own `guardSync(fn())` exactly, so an async
+        // body throws and poisons here the same way it does there.
+        const result = this.guardSync(fn());
         if (!result.allowed) throw txDenialSignal(result);
         return result;
       });

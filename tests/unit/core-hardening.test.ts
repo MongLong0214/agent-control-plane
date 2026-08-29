@@ -26,7 +26,9 @@ import {
   candidateSnapshotDigest,
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
-import { cleanupTempDirs, makeCore, tempDir , seedActor} from "../helpers/fixtures.ts";
+import { BaselineRecordKind } from "../../src/export/baseline-contract.ts";
+import { BaselineRecorder } from "../../src/export/baseline-recorder.ts";
+import { cleanupTempDirs, makeCore, makeRepo, tempDir, seedActor, seedRun } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -357,6 +359,83 @@ describe("#664 — a transaction whose body decides 'no' still commits its write
         ]),
       ).toBeUndefined();
     }
+  });
+
+  it("an async txDecision() body is refused instead of being misread as a denial", () => {
+    // The type signature promises a synchronous `Decision<T>`, exactly like `tx()`
+    // promises a synchronous `T` — and, exactly like `tx()`, a caller that bypasses the
+    // type system with an async callback must be refused, not silently misread. An
+    // async body returns a pending Promise, which has no `.allowed`; reading `.allowed`
+    // before checking for a thenable turns that `undefined` into "denied", hands the raw
+    // Promise back through the catch as if it were a real `Decision`, and never poisons
+    // the handle — the still-running callback's writes after its first `await` would
+    // then land as autocommit outside any transaction. Mirrors the identical `tx()` test
+    // above ("an async transaction body is refused instead of committing early").
+    const { db } = makeCore();
+    expect(() =>
+      db.txDecision((() => Promise.resolve(allow(ReasonCode.OK, "done"))) as unknown as () => ReturnType<
+        typeof allow<string>
+      >),
+    ).toThrowError(/transaction bodies must be synchronous/);
+  });
+
+  it("#664/#679 — a second, independent recorder call denying does not save the first recorder's write", () => {
+    // TaskGraph.finishExecution's real shape: `#baseline.recordInvocationFinished(...)`
+    // writes and commits, and `#baseline.recordTaskClassification(...)` right after it is
+    // an unrelated call that can independently deny — Sol's counterexample to the census
+    // (BaselineRecorder.record() is reached by name, not by a literal `.run(`/`.exec(`, so
+    // the census cannot see this shape and never claims to — see the header comment in
+    // scripts/verify-tx-denial-sites.mjs).
+    //
+    // finishExecution's own two denials in BaselineRecorder.record() ("unknown run",
+    // "prohibited/credential field") are not reachable through finishExecution's own
+    // parameters — every field task-graph.ts passes is a fixed key name, not caller data,
+    // and the run/execution existence is already reverified by finishExecution's own
+    // preflight moments earlier with no `await` in between. So this proves the shared
+    // mechanism finishExecution's fix now relies on directly against the real
+    // `BaselineRecorder` and the real `Db.txDecision`, using `record()`'s one naturally
+    // reachable denial (an unknown run id) rather than a synthetic table.
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const baseline = new BaselineRecorder(core.db, core.clock, core.audit);
+
+    const result = core.db.txDecision(() => {
+      const first = baseline.record(seeded.runId, BaselineRecordKind.INVOCATION_FINISHED, {
+        probe: "first-write-must-not-survive",
+      });
+      if (!first.allowed) return first;
+      // A second, independent recorder call — same shape as recordTaskClassification
+      // right after recordInvocationFinished — denying on an unrelated ground.
+      return baseline.record("run_does_not_exist", BaselineRecordKind.TASK_CLASSIFICATION, {
+        probe: "second-call-denies-independently",
+      });
+    });
+
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
+    // Read the table directly, not the returned Decision, to prove the first recorder's
+    // write did not survive the second, independent call's denial.
+    expect(
+      core.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM baseline_records WHERE run_id = ?`,
+        [seeded.runId],
+      )?.n,
+    ).toBe(0);
+  });
+
+  it("an async txDecision() body poisons the handle, the same as an async tx() body", () => {
+    const { db } = makeCore();
+    expect(() =>
+      db.txDecision((() => Promise.resolve(allow(ReasonCode.OK, "done"))) as unknown as () => ReturnType<
+        typeof allow<string>
+      >),
+    ).toThrowError(/transaction bodies must be synchronous/);
+    // Nothing on this handle may run again — not a query, not a fresh transaction —
+    // because the callback that returned the promise is still running unobserved and
+    // may still be mid-write when something else tries to use the same connection.
+    expect(() => db.get(`SELECT 1`)).toThrowError(/poisoned/);
+    expect(() => db.tx(() => undefined)).toThrowError(/poisoned/);
   });
 });
 

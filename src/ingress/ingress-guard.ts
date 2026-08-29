@@ -602,8 +602,10 @@ export class IngressGuard {
     // the moment a reply was reserved — so the row a timeout produced was pruned like any other,
     // and the nonce it held was freed (#646).
     //
-    // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` in the audit log is
-    // where they are visible.
+    // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` is written to the
+    // audit log, and `agentctl doctor system` reports the same outstanding claim as a
+    // `TURN_OUTCOME_UNKNOWN` finding (`Doctor.checkUnresolvedTurns`) — so the runbook's first
+    // command surfaces it too, not only someone tailing `audit_events`.
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
@@ -658,6 +660,17 @@ export interface TurnIdentity {
   promptDigest: string;
   /** Which CEO generation asked it. */
   bindingDigest: string;
+  /**
+   * The nonce of the unresolved turn this one was deliberately claimed alongside (#641).
+   *
+   * Undefined for the ordinary case: no unresolved turn existed for this conversation when this
+   * one was claimed. Set only when the owner explicitly chose to run a second turn while an
+   * earlier one from the same conversation had no recorded outcome — `unresolvedTurns` is what
+   * finds that earlier one, and this is where the choice is recorded, so a later reader (a
+   * person resolving the #672 lockout question, or a receipt match from #638) can tell a
+   * deliberate second turn apart from a message that simply never saw the first one.
+   */
+  overriddenUnresolvedNonce?: string;
 }
 
 export interface TurnClaim extends TurnIdentity {

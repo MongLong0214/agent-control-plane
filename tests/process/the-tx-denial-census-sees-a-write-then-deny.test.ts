@@ -115,6 +115,11 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     file: "session/binding-registry.ts",
     anchor: 'down already promised and `tx()` alone could not keep.\n    return this.db.txDecision(() => {',
   },
+  {
+    label: "TaskGraph.finishExecution (post-preflight)",
+    file: "run/task-graph.ts",
+    anchor: "underneath this second transaction.\n    return this.db.txDecision(() => {\n      const execution = this.execution(executionId)!;",
+  },
 ];
 
 /** Every EXEMPT and DEFERRED entry, so a marker drifting out of its body is caught for all of them, not just one. */
@@ -149,6 +154,36 @@ const NAMED_ENTRIES: Array<{ label: string; file: string; marker: string; expect
     marker: "the CTO binding changed while runtime shutdown was in progress",
     expectStdout: "stale deferral",
   },
+  {
+    label: "RunEngine.dispatch's applyRunStateTransition callback (EXEMPT)",
+    file: "run/run-engine.ts",
+    marker: "§29/§30.3 — activation, its envelope and its audit record are one operation",
+    expectStdout: "stale exemption",
+  },
+  {
+    label: "RunEngine.transition's applyRunStateTransition callback (EXEMPT)",
+    file: "run/run-engine.ts",
+    marker: "§29 — the state edge, its evidence and its envelope are one operation",
+    expectStdout: "stale exemption",
+  },
+  {
+    label: "TaskGraph.startExecution's recordInvocationStarted guard (EXEMPT)",
+    file: "run/task-graph.ts",
+    marker: "const invocationBaseline = this.#baseline.recordInvocationStarted(",
+    expectStdout: "stale exemption",
+  },
+  {
+    label: "BindingRegistry.bind's recordTargetBinding guard (EXEMPT)",
+    file: "session/binding-registry.ts",
+    marker: "const recorded = this.recordTargetBinding(actorId, input.verifiedTarget)",
+    expectStdout: "stale exemption",
+  },
+  {
+    label: "TaskGraph.finishExecution's preflight audit write (EXEMPT)",
+    file: "run/task-graph.ts",
+    marker: "TASK_EXECUTION_LATE_RESULT_IGNORED",
+    expectStdout: "stale exemption",
+  },
 ];
 
 describe("the tx-denial census sees a plain tx() body that writes and can deny", () => {
@@ -161,8 +196,11 @@ describe("the tx-denial census sees a plain tx() body that writes and can deny",
     // Pin the counts so a site silently moving from one bucket to another (e.g. a
     // DEFERRED defect quietly becoming an EXEMPT "this is safe" without anyone updating
     // the census's own reasoning) fails this test rather than passing unnoticed.
+    const exemptCount = NAMED_ENTRIES.filter((e) => e.expectStdout === "stale exemption").length;
+    const deferredCount = NAMED_ENTRIES.filter((e) => e.expectStdout === "stale deferral").length;
     expect(done.stdout).toContain(
-      `${CONVERTED_SITES.length} using txDecision, 4 documented exemption(s), 1 deferred known defect(s), 0 undocumented trap(s)`,
+      `${CONVERTED_SITES.length} using txDecision, ${exemptCount} documented exemption(s), ` +
+        `${deferredCount} deferred known defect(s), 0 undocumented trap(s)`,
     );
     expect(done.stdout).toContain("cto/cto-lifecycle.ts:732 (#692)");
   });
