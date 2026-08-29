@@ -1146,21 +1146,14 @@ const GUARDS = [
       "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::attack 1 — reassigning the coordinator's bound receipt port has no effect: the real field is not reachable by that name",
     ],
   },
-  {
-    // Sol's review of #691's own fix: `private readonly receiptPort` is TypeScript-only and
-    // erases to a plain writable property, so anything holding the coordinator could reassign it
-    // to a forged port. Reverting `#receiptPort` to a non-private field here reopens exactly that
-    // — the attack test reassigns `receiptPort` from outside the class and expects it to do
-    // nothing; with the field public, the reassignment reaches the real slot and the forged port
-    // settles the turn.
-    what: "the receipt port is a true private field, not merely a TypeScript-private one",
-    file: "src/conversation/turn-coordinator.ts",
-    find: "  readonly #receiptPort: ReceiptPort;",
-    replace: "  receiptPort: ReceiptPort;",
-    killedBy: [
-      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::attack 1 — reassigning the coordinator's bound receipt port has no effect: the real field is not reachable by that name",
-    ],
-  },
+  // No mutation row for "#receiptPort is a true private field": the only mechanical mutation that
+  // removes it — un-prefixing the declaration while every read site still says `this.#receiptPort`
+  // — does not compile. Measured: esbuild refuses it (`Private name "#receiptPort" must be
+  // declared in an enclosing class`), vitest collects zero tests, and the harness would have
+  // reported that as a "kill" without the named test's own assertion ever running — a collection
+  // error standing in for a RED. The guard is real and is demonstrated by hand instead: reverting
+  // this field and the exported singleton's freeze together (both are needed to keep the file
+  // compiling) reopens attack 1 and attack 2 below, and restoring them closes it again.
   {
     // The other half of the same review: even a private field does not help if the *object* it
     // defaults to is exported, shared and mutable. Un-freezing here reopens overwriting
