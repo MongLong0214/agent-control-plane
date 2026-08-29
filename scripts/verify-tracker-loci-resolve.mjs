@@ -24,13 +24,21 @@
  *     per extension, and an extension with no supported comment syntax is disclosed as a plain
  *     text search rather than silently inheriting another language's rules → STALE (this is a
  *     text search, not declaration verification; see rounds 3 and 4 below for why)
- *   - a cited code line — quoted with an explicit delimiter right after an inline citation, or
- *     the rest of a fenced citation's line (the fence itself is the delimiter there; see round 5
- *     below for why an inline citation needs its own) — no longer appears within
- *     `CONTENT_SEARCH_WINDOW` (±60) lines of the cited line, not the whole file (see round 8 for
- *     why the window is bounded rather than unbounded, and why an earlier version of this
- *     paragraph said "anywhere in the file" when the code never searched further than that)
- *     (elision-tolerant: `...`/`()` stand for "and more")                   → STALE
+ *   - a cited code line — quoted with an explicit delimiter right after an inline citation
+ *     (trusted unconditionally once that delimiter is found; see round 5 below for why an inline
+ *     citation needs its own, and round 8 for why the heuristic below is dropped entirely for
+ *     this branch), or the rest of a fenced citation's line, where the fence marks the *block* as
+ *     code-shaped but — unlike an inline delimiter — does not by itself distinguish a literal
+ *     quote from a plain-English description sharing the same fence (#649's own body does both;
+ *     see round 8), so a fenced line is additionally required to read as code by `looksLikeCode`
+ *     (a mixed-case identifier; a call, member, or assignment boundary right after the first word;
+ *     a declaration's trailing `{`; or a statement/block ending in `;`, `{`, or `}` — round 10) —
+ *     no longer appears within `CONTENT_SEARCH_WINDOW` (±60) lines of the cited line, not the whole
+ *     file (see round 8 for why the window is bounded rather than unbounded, and why an earlier
+ *     version of this paragraph said "anywhere in the file" when the code never searched further
+ *     than that) (elision-tolerant: `...`/`()` stand for "and more")        → STALE, *if* the
+ *     fenced line clears `looksLikeCode` — a fenced line that reads as a plain description rather
+ *     than code is not checked at all, by design (round 8), and stays ADVISORY
  *
  * The last one is the one that actually catches #649's real citation. `binding-registry.ts:163`
  * is still in range — that file is 973 lines long — so the length check alone passes it. What
@@ -416,6 +424,45 @@
  *   corrected bound; the lower bound was already right (verified by construction, not merely by
  *   symmetry) and untouched.
  *
+ * ## Round 10: a tenth independent review, both findings a place where this script's own stated
+ * contract and its actual behaviour had drifted apart
+ *
+ *   `.gitignore:999999` (real, tracked, no extension, root-level — the file this repository would
+ *   actually cite) and `.definitely-missing:42` (does not exist) both matched nothing: the
+ *   extensionless branch of `PATH_RE` required a directory separator (`(?:/[\w.-]+)+`) on top of
+ *   the line number, so a citation with nothing before the first `/` — the common case for a
+ *   dotfile living at the repo root — was invisible regardless of what it resolved to. That
+ *   requirement was round 6's own disambiguator for a *bare mention with nothing else to anchor
+ *   it*; it was never the reason a *line-numbered* extensionless path was accepted; the line
+ *   number already was, the same way it already is for the with-extension branch and already was
+ *   for `.githooks/pre-commit:999999` (round 7) — that test only ever covered the directory-
+ *   qualified case, not the root-level one. Fixed by loosening `+` to `*`: the directory segment
+ *   is now optional wherever a line number follows. Measured against the real corpus before
+ *   trusting this: zero new false positives — nothing pairs a bare word with an immediately-
+ *   adjacent `:digit` or `#Ldigit` that is not a real citation; ordinary prose never places a
+ *   colon-digit directly against a word with no separating space.
+ *
+ *   Second: this docstring's own "What counts as stale" section claimed a fenced citation's
+ *   vanished code is caught because "the fence itself is the delimiter", the same unconditional
+ *   trust round 8 gave an inline citation's explicit delimiter — but the code never matched that
+ *   claim. A fenced line still runs through `looksLikeCode` (round 8 kept it there deliberately,
+ *   because #649's own body mixes a literal quote and a plain description in the *same* fence, so
+ *   the fence alone cannot tell the two apart the way an inline backtick can). `` ```ts\nREADME.md:1
+ *   return null;\n``` `` — unmistakably code, unmistakably vanished — passed as ADVISORY because
+ *   `return null;` tripped none of `looksLikeCode`'s prior checks: no mixed-case identifier, and no
+ *   call/dot/assignment/brace sitting immediately after "return" (a word, not a boundary). Fixing
+ *   this is not "drop the heuristic" (round 8 already tried and reverted that exact move for this
+ *   branch) and not "add a fifth keyword" (round 5's whole point); it is a fourth structural
+ *   question, in the same non-lexical family as the first three: does the line end in `;`, `{`, or
+ *   `}` — a statement terminator or a block boundary, which is not how an English sentence ends
+ *   (a sentence ends in a period, a question mark, a closing paren, or a word) but is exactly how
+ *   a real line of JS/TS-shaped code tends to. Checked directly against #649's own fixture before
+ *   trusting it: neither of its real fenced prose lines ends in `;`, `{`, or `}` once the
+ *   `(#619)`-style aside is stripped, so the round 8 false-STALE this heuristic exists to prevent
+ *   does not reopen. The docstring bullet above is corrected to say what the code actually does:
+ *   a fenced line is checked only if it clears `looksLikeCode`, plainly, rather than claiming the
+ *   fence alone is decisive.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -798,8 +845,21 @@ const resolvePath = (cited) => {
 // The first segment still has to start with a letter or underscore (never a bare digit) in both
 // branches, for the same digit/digit reason. Every real path in this repository's own tree starts
 // with a letter or a dot, so this costs nothing real.
+//
+// Round 10: the extensionless branch still required a directory separator on top of the line
+// number — `.gitignore:999999` (real, tracked, no extension, no directory: it lives at the repo
+// root) and `.definitely-missing:42` (does not exist) both matched nothing, silently, because
+// `(?:/[\w.-]+)+` demanded at least one `/segment`. That requirement was round 6's own
+// disambiguator for a *bare mention with nothing else to anchor it* — right there, because
+// `src/github` alone is no more a citation than `Node.js` alone is. It was never the reason a
+// *line-numbered* extensionless path was accepted; the line number already was, the same way it
+// already is for the with-extension branch. Loosening `+` to `*` here extracts a root-level
+// dotfile the same way `.githooks/pre-commit:999999` already was — a line number is the anchor in
+// both, a directory separator is incidental. Measured against the real corpus before trusting
+// this (round 10 commit): zero new false positives — nothing in the corpus pairs a bare word with
+// an immediately-adjacent `:digit` or `#Ldigit` that is not a real citation.
 const PATH_RE = new RegExp(
-  `(?<![\\w.])(\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)+(?=:\\d|#L\\d)|\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*)\\b` +
+  `(?<![\\w.])(\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*(?=:\\d|#L\\d)|\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*)\\b` +
     `(?::(?<cs>\\d+)(?:-(?<ce>\\d+))?|#L(?<as>\\d+)(?:-L?(?<ae>\\d+))?)?`,
   "g",
 );
@@ -1040,6 +1100,20 @@ const looksLikeCode = (text) => {
   // dotted call two words in.
   const braceScope = stripped.match(/^(?:[A-Za-z_$][\w$]*\s+){0,2}[A-Za-z_$][\w$]*/);
   if (braceScope && /^\s*\{/.test(stripped.slice(braceScope[0].length))) return true;
+
+  // Round 10: a line ending in a statement terminator or a block boundary — `;`, `{`, or `}` — is
+  // a shape English prose essentially never produces (a sentence ends in a period, a question
+  // mark, a closing paren, or a word; `;`/`{`/`}` are not sentence-final punctuation in English at
+  // all), while it is exactly how a real line of JS/TS-shaped code, statement or block, tends to
+  // end. `return null;` — real, vanished code from #649's own shape, tripped none of the checks
+  // above (no mixed-case identifier; "return" and "null" are both ordinary lowercase words with no
+  // call/dot/assignment/brace sitting immediately after the first one) — passed as ADVISORY in a
+  // fence until this was added, violating this script's own header claim that a vanished fenced
+  // quote is STALE. Checked against #649's real fixture before trusting this: neither of its own
+  // fenced prose lines ("reconstitution is allowed when no active CEO exists (#619)", "calls
+  // bindings.bind()") ends in `;`, `{`, or `}` once the `(#619)`-style aside is stripped above, so
+  // this does not reopen the false STALE round 8 fixed by keeping the heuristic on this branch.
+  if (/[;{}]$/.test(stripped)) return true;
 
   return false;
 };

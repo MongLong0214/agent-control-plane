@@ -1214,6 +1214,109 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
+  // --- Round 10: an independent review found two places where this script's own stated contract
+  // and its actual behaviour had drifted apart — an extensionless root-level file invisible for
+  // want of a directory separator it never needed, and a fenced citation's vanished code passing
+  // because the header claimed the fence alone decides while the code still ran a heuristic.
+
+  it("[round 10] an extensionless, root-level, real tracked file with a line past its end is STALE", () => {
+    // `.gitignore` is real, tracked, has no extension, and lives at the repo root — no directory
+    // separator at all. The extensionless branch of `PATH_RE` required one on top of the line
+    // number, so this matched nothing regardless of what it resolved to; only the directory-
+    // qualified case (`.githooks/pre-commit:999999`, round 7) was ever covered.
+    const body = "See `.gitignore:999999` for the ignore rules.";
+    const { path, cleanup } = withIssues([{ number: 91001, title: "root dotfile line-past-end counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain(".gitignore has");
+      expect(result.stdout).toContain("beyond it");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 10] a genuinely missing extensionless, root-level path with a line number is STALE, not silent", () => {
+    const body = "See `.definitely-missing:42` for the detail.";
+    const { path, cleanup } = withIssues([{ number: 91002, title: "root dotfile missing counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain(".definitely-missing does not exist");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 10] an extensionless, root-level, real tracked file that resolves is ADVISORY, the positive control", () => {
+    const body = "See `.gitignore:1` for the ignore rules.";
+    const { path, cleanup } = withIssues([{ number: 91003, title: "root dotfile positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 10] a fenced citation whose plainly-vanished code trips no prior code heuristic is still STALE", () => {
+    // `return null;` is unmistakably code and unmistakably gone from `README.md:1` — but it has no
+    // mixed-case identifier and no call/dot/assignment/brace boundary immediately after "return",
+    // so it tripped none of `looksLikeCode`'s three prior checks and read as ADVISORY, contradicting
+    // this script's own header, which claims a vanished fenced quote is STALE. The same content
+    // inline (see the round 8 test above) was already caught; this is the fenced form of the exact
+    // same gap.
+    const body = ["```ts", "README.md:1  return null;", "```"].join("\n");
+    const { path, cleanup } = withIssues([{ number: 91004, title: "fenced statement heuristic gap counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("return null;");
+      expect(result.stdout).toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 10] a fenced description ending in a statement terminator by coincidence is still not manufactured — regression guard", () => {
+    // The exact #649 shapes round 8 protects: neither of these ends in `;`, `{`, or `}` once the
+    // `(#619)`-style aside is stripped, so widening `looksLikeCode` for a trailing statement
+    // terminator must not reopen the false STALE round 8 fixed by keeping the heuristic on this
+    // branch at all.
+    const descriptionBody = ["```", "hermes-bootstrap.ts:121-146   reconstitution is allowed when no active CEO exists (#619)", "```"].join(
+      "\n",
+    );
+    const { path: descPath, cleanup: descCleanup } = withIssues([
+      { number: 91005, title: "fenced description regression guard", body: descriptionBody },
+    ]);
+    try {
+      const result = run(descPath);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      descCleanup();
+    }
+
+    const paraphraseBody = ["```", "hermes-bootstrap.ts:341       calls bindings.bind()", "```"].join("\n");
+    const { path: paraPath, cleanup: paraCleanup } = withIssues([
+      { number: 91006, title: "fenced paraphrase regression guard", body: paraphraseBody },
+    ]);
+    try {
+      const result = run(paraPath);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      paraCleanup();
+    }
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);
