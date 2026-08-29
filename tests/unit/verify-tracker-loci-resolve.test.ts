@@ -783,12 +783,14 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
-  it("[round 6] a bare product name and a real bare filename are not told apart, and neither is now checked", () => {
+  it("[round 6] an undelimited bare product name and an undelimited real bare filename are not told apart, and neither is checked", () => {
     // The disambiguator (directory separator or line number) is uniform: it does not special-case
-    // markdown or any other extension. A bare `HANDOFF-CEO-RESUME.md` mention — no directory, no
-    // line number — is exactly as syntactically ambiguous as `Node.js`, and this is the traded-off
-    // cost reported in the round 6 docstring rather than hidden: it is no longer flagged even
-    // though (unlike Node.js) it would in fact resolve to nothing.
+    // markdown or any other extension. An undelimited bare `HANDOFF-CEO-RESUME.md` mention — no
+    // backticks, no directory, no line number — is exactly as syntactically ambiguous as an
+    // undelimited `Node.js` is, and this is the traded-off cost reported in the round 6 docstring
+    // rather than hidden: it is no longer flagged even though (unlike Node.js) it would in fact
+    // resolve to nothing. This remains true after round 9 — see the round 9 tests below for the
+    // *delimited* case, which is a different, now-fixed defect, not this one.
     const body = "See HANDOFF-CEO-RESUME.md for the full context.";
     const { path, cleanup } = withIssues([{ number: 9405, title: "bare markdown mention control", body }]);
     try {
@@ -1043,6 +1045,170 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.status).toBe(0);
       expect(result.stdout).toContain("ADVISORY");
       expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // --- Round 9: an independent review found two silently-skipped citation forms — one pinned
+  // by a test that read the gap as intended behaviour — plus an off-by-one at the ±60 window's
+  // upper edge. Fixed below; the corpus diff that shaped `knownExtensions` is in the commit.
+
+  it("[round 9] a backtick-delimited bare filename mention is a citation, not skipped as prose", () => {
+    // The delimiter is the author's own act of quoting — the same decisive signal round 5 already
+    // trusts for an inline citation's *content* (see `readDelimitedSpan`) — so a bare mention set
+    // apart with backticks is a real citation even with no directory and no line number, unlike
+    // the undelimited case in the round 6 test above. `HANDOFF-CEO-RESUME.md` has never existed in
+    // this tree; this was the exact shape an independent review found passing in total silence.
+    const body = "See `HANDOFF-CEO-RESUME.md` for the full context.";
+    const { path, cleanup } = withIssues([{ number: 9901, title: "delimited bare mention counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("HANDOFF-CEO-RESUME.md does not exist");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 9] a backtick-delimited product name is checked exactly like every other delimited bare mention", () => {
+    // The disambiguator was never really "does this look like a real path" — it is "did the
+    // author mark this as a citation" — so a backtick-quoted `Node.js` is treated the same as a
+    // backtick-quoted `HANDOFF-CEO-RESUME.md`, even though "js" happens to be a real extension in
+    // this tree and "Node.js" is not a real citation of anything in it. This is the accepted cost
+    // of trusting the delimiter, stated rather than hidden: an author who backtick-quotes a
+    // product name pays for the same rule that lets a backtick-quoted stale filename be caught.
+    const body = "This runs on `Node.js` and nothing else.";
+    const { path, cleanup } = withIssues([{ number: 9902, title: "delimited product name counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("Node.js does not exist");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 9] a backtick-quoted SQL column or Class.method reference is not read as a file citation", () => {
+    // Measured against the real open-issue corpus before trusting the delimiter fix above: a
+    // delimiter alone also passed `` `inbound_messages.turn_claim_json` `` (a real SQL column,
+    // #695) and `` `ConversationTurnCoordinator.claim` `` (a class.method reference, #693) as if
+    // either were a path citation — neither is one, and neither's dotted suffix is an extension
+    // this repository's tracked tree actually uses. `knownExtensions` closes that gap the same
+    // git-ls-files-is-the-authority way round 6 closed the last one.
+    const body = "The ingress ledger (`inbound_messages.turn_claim_json`) is unaffected by this change.";
+    const { path, cleanup } = withIssues([{ number: 9903, title: "sql column false positive counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 9] a backtick-quoted mention of a real but untracked runtime file is not read as a file citation", () => {
+    // `state.db` is a real, live artifact this repository deliberately does not track — a check
+    // over the tracked tree has no basis to call it "missing" just because git does not carry it.
+    // "db" is not an extension anything committed here uses, so `knownExtensions` excludes it the
+    // same way it excludes a SQL column's fake "extension" above — same gate, different reason.
+    const body = "If contention on the shared Hermes `state.db` appears, the run stops.";
+    const { path, cleanup } = withIssues([{ number: 9904, title: "untracked runtime file counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 9] a symbol cited the ordinary prose way (`symbol` in `path`) is recognized, not only the table form", () => {
+    // The repo's own `` `path` — `symbol` `` table convention was the only form `SYMBOL_ROW_RE`
+    // recognized; a citation written the ordinary way people write English about code — reversed
+    // order, connected by "in" instead of "—" — matched nothing and produced no output, unable to
+    // tell a present symbol from a fictitious one. Both spans here are already backtick-delimited,
+    // the same explicit-quoting signal the table form itself relies on.
+    const body = "missing symbol is `definitelyMissing()` in `src/session/session-registry.ts`";
+    const { path, cleanup } = withIssues([{ number: 9905, title: "prose symbol form counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("definitelyMissing");
+      expect(result.stdout).toContain("does not appear");
+      expect(result.stdout).toContain("src/session/session-registry.ts");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 9] a real symbol cited the prose way resolves silently, same as the table form", () => {
+    const body = "The private method `#observe` in `src/conversation/turn-coordinator.ts` handles this.";
+    const { path, cleanup } = withIssues([{ number: 9906, title: "prose symbol form positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 9] a quoted line exactly at the ±60 window boundary is ADVISORY, not STALE", () => {
+    // The window's own comment and header both claim ±60; the code checked one line narrower at
+    // the far edge. Real text from `README.md:121` cited at line 61 — exactly +60, inside the
+    // stated window — returned STALE before this fix. Reproduced here against README.md's real,
+    // current content (not a fixture) so a future edit cannot silently make this test meaningless
+    // — the same discipline the round 3 boundary tests already use.
+    const lines = readFileSync(join(repoRoot, "README.md"), "utf8").split("\n");
+    const WINDOW = 60;
+    let citedLine = null;
+    let content = null;
+    for (let start = 1; start + WINDOW <= lines.length; start++) {
+      const candidate = (lines[start + WINDOW - 1] ?? "").trim();
+      if (candidate.length > 15 && !/[`"'/\\]/.test(candidate)) {
+        citedLine = start;
+        content = candidate;
+        break;
+      }
+    }
+    expect(citedLine).not.toBeNull();
+    const body = `See \`README.md:${citedLine}\` — \`${content}\` for the detail.`;
+    const { path, cleanup } = withIssues([{ number: 9907, title: "window boundary exact counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 9] a quoted line one line past the ±60 window boundary is STALE (the corrected boundary's other side)", () => {
+    const lines = readFileSync(join(repoRoot, "README.md"), "utf8").split("\n");
+    const WINDOW = 60;
+    let citedLine = null;
+    let content = null;
+    for (let start = 1; start + WINDOW + 1 <= lines.length; start++) {
+      const candidate = (lines[start + WINDOW] ?? "").trim(); // one line past the boundary
+      if (candidate.length > 15 && !/[`"'/\\]/.test(candidate)) {
+        citedLine = start;
+        content = candidate;
+        break;
+      }
+    }
+    expect(citedLine).not.toBeNull();
+    const body = `See \`README.md:${citedLine}\` — \`${content}\` for the detail.`;
+    const { path, cleanup } = withIssues([{ number: 9908, title: "window boundary one-past counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("no longer appears");
     } finally {
       cleanup();
     }

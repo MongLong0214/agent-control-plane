@@ -370,6 +370,52 @@
  *   proven by the constructed counterexamples and tests rather than a corpus shift, because none
  *   of these three bugs happened to match anything in the corpus at the time of this snapshot.
  *
+ * ## Round 9: a ninth independent review, two of the three findings a test had itself pinned as
+ * intended, plus a second look at the off-by-one shape round 8 had already fixed once
+ *
+ *   `` `HANDOFF-CEO-RESUME.md` `` — a real, missing file, backtick-quoted the ordinary way people
+ *   actually cite one — passed in total silence: round 6's bare-mention skip (no directory, no
+ *   line number) fires unconditionally, delimited or not. That was right for genuinely unquoted
+ *   prose ("runs on Node.js 22") — nothing on sight tells that apart from a real bare filename —
+ *   but round 5 already decided an explicit delimiter is decisive for an inline citation's
+ *   *content*, and this is the same author act of quoting applied to the citation itself.
+ *   `isExplicitlyDelimited` asks exactly that: a backtick or quote pair sitting right against the
+ *   match, not a guess about the text's shape.
+ *
+ *   Measured against the real corpus before trusting that alone: it also passed
+ *   `` `inbound_messages.turn_claim_json` `` (a real SQL column, #695) and
+ *   `` `ConversationTurnCoordinator.claim` `` (a class.method reference, #693) as if either named a
+ *   file — ten of sixteen corpus-diff additions were this shape, not a constructed edge case.
+ *   Neither one's dotted suffix is an extension anything in this tracked tree actually uses, so
+ *   `knownExtensions` — `trackedFiles` turned into the set of extensions this repository is really
+ *   built from, the same authority-derived move round 6 made for "any .word" generally — gates the
+ *   delimiter check rather than replacing it. The same gate also correctly excludes a real but
+ *   deliberately untracked runtime file bare-cited the same way (`` `state.db` `` — "db" is not a
+ *   tracked extension here), which is the right side to fall on: a check over the tracked tree has
+ *   no basis to call a live, gitignored file "missing". Final corpus diff: five additions
+ *   (`test_raw_sink_census.py`, `derive3.py`, `ARCHITECTURE.md`, `CLAUDE.md`, `AGENTS.md` — the same
+ *   five round 6's own docstring named as the traded-off cost of the original skip), zero removed,
+ *   every one checked against its real issue body before being trusted.
+ *
+ *   Second: the repo's own `` `path` — `symbol` `` table convention was the only symbol-row form
+ *   `SYMBOL_ROW_RE` recognized. `` `definitelyMissing()` in `src/session/session-registry.ts` `` —
+ *   the ordinary way people write English about code, reversed order, connected by "in" instead of
+ *   "—" — matched nothing, unable to tell a present symbol from a fictitious one. `SYMBOL_PROSE_RE`
+ *   recognizes it as a second, independent form rather than widening the first: both spans are
+ *   already backtick-delimited, the same explicit-quoting signal the table form itself relies on,
+ *   not a keyword scan of unquoted prose. Measured against the real corpus first: two genuine
+ *   citations matched (`resolveEscalation` in `src/ceo/production-gate.ts`, #692;
+ *   `completeReplyAndResolveTurn` in `src/ingress/ingress-guard.ts`, #639), zero incidental matches
+ *   on anything else.
+ *
+ *   Third: `CONTENT_SEARCH_WINDOW`'s own upper bound was one line short of the ±60 it claims — a
+ *   real, still-current citation exactly 60 lines past the one cited (`README.md:121` cited as
+ *   `README.md:61`) read as vanished, because `citedEnd - 1 + CONTENT_SEARCH_WINDOW` folded the
+ *   line-index-to-line-number `- 1` into the same term as the window width, one line short of
+ *   where the slice's exclusive end needed to land. `citedEnd + CONTENT_SEARCH_WINDOW` is the
+ *   corrected bound; the lower bound was already right (verified by construction, not merely by
+ *   symmetry) and untouched.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -593,6 +639,28 @@ const trackedFiles = execFileSync("git", ["ls-files"], { cwd: repoRoot, encoding
   .filter(Boolean);
 
 /**
+ * Every extension this repository's own tracked tree actually uses, lowercased — `trackedFiles`
+ * turned into the set of what is structurally plausible as a *file* extension, rather than a
+ * hand-maintained list of ones. Needed for exactly one thing: a backtick- or quote-delimited bare
+ * mention (see `isExplicitlyDelimited`, below) is extracted as a citation candidate the same way a
+ * real path is, but "delimited" alone does not tell a real filename apart from a SQL column or a
+ * `Class.method` reference the issue author also, and just as legitimately, wrote in backticks —
+ * `` `inbound_messages.turn_claim_json` `` and `` `ConversationTurnCoordinator.claim` `` both
+ * cleared every other gate once the delimiter one was added, and neither is a path at all.
+ * Requiring the dotted suffix to be an extension this repository's tree actually has is the same
+ * git-ls-files-is-the-authority move round 6 already made generally for "any .word" extensions:
+ * "turn_claim_json", "claim", "actor_id", "pollOnce", "os_pid", and "merge_order" are none of them
+ * extensions anything here is tracked under, while "md", "py", and "js" all are — measured against
+ * the real corpus before trusting this (round 9 commit), not guessed at; every false positive this
+ * gate removes was a real citation in a real open issue, not a constructed case. It also excludes
+ * a genuine but untracked runtime artifact bare-cited the same way (`` `state.db` ``, `.hermes/`'s
+ * own — "db" is not an extension anything committed here uses), which is the correct side to fall
+ * on: a check over the *tracked* tree has no basis to call a live, deliberately gitignored file
+ * "missing" just because git does not carry it.
+ */
+const knownExtensions = new Set(trackedFiles.map((f) => extensionOf(f)).filter(Boolean));
+
+/**
  * Every local branch, remote-tracking branch, and tag this repository knows about — the authority
  * for where a GitHub blob permalink's `<ref>` ends, independent of whether the file it cites still
  * exists. That independence is the reason this exists rather than reusing `trackedFiles` for the
@@ -801,6 +869,17 @@ const resolveBlobRefAndPath = (refAndPath) => {
 // `#observe` and `observe` name two different things, and this codebase declares private members
 // heavily (`turn-coordinator.ts`'s `#observe` among them), so the symbol pattern allows it directly.
 const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`#?[\w.$]+(?:\(\))?`,?\s*)+)/g;
+// A symbol may also be cited the ordinary way people write English about code rather than the
+// repo's own table convention — reversed order, `` `symbol` in `path` `` instead of `` `path` —
+// `symbol` ``. This is not the keyword scan of unquoted prose round 5 ruled out: both spans here
+// are already backtick-delimited, the same explicit-quoting signal the table form itself relies
+// on, and "in" is the connector word in place of "—" rather than a guess about what looks like
+// code. Measured against the real corpus before trusting it, the same way every extraction change
+// in this file has been: two real citations matched (`resolveEscalation` in
+// `src/ceo/production-gate.ts`, `completeReplyAndResolveTurn` in `src/ingress/ingress-guard.ts`),
+// both genuine, zero incidental matches on anything else in the corpus at the time of that
+// snapshot — see the round 9 commit for the full diff.
+const SYMBOL_PROSE_RE = /`(#?[\w.$]+)(?:\(\))?`\s+in\s+`([\w./-]+\.\w+)`/g;
 const NON_DURABLE_RE = /(\/private\/tmp\/[^\s`)]+|(?<![\w/])\/tmp\/[^\s`)]+)/g;
 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -859,6 +938,23 @@ const stripCitationSeparator = (text) => {
   t = t.replace(/^\s*[`'"]/, ""); // the citation's own closing delimiter, if it had one
   t = t.replace(/^[\s:—–-]+/, ""); // the separator between a citation and what follows
   return t;
+};
+
+/**
+ * Whether a match is wrapped in an explicit backtick or quote pair — the delimiter sitting right
+ * before the match starts and the identical one right after it ends. This is a different question
+ * from `readDelimitedSpan`'s (that reads content *after* a citation; this asks about the citation
+ * itself), but the same decisive-delimiter reasoning round 5 already established for inline
+ * content applies here too: a bare mention with no directory and no line number is exactly as
+ * ambiguous as "Node.js" is against a real citation like "HANDOFF-CEO-RESUME.md" (round 6) —
+ * *unless* the author set it apart with backticks or quotes, which is the same deliberate act of
+ * quoting that already makes an inline citation's trailing content decisive rather than guessed
+ * at. Not asking "does this look like a path" (a heuristic); asking "did the author mark this",
+ * which is a fact about the text, not a guess about its shape.
+ */
+const isExplicitlyDelimited = (line, matchStart, matchEnd) => {
+  const before = line[matchStart - 1];
+  return (before === "`" || before === '"' || before === "'") && line[matchEnd] === before;
 };
 
 /**
@@ -1068,7 +1164,26 @@ const extractFromBody = (body) => {
       // "deploy/egress/allowlist-proxy.py" both end in a real-looking extension, but only the
       // second says anything about *this repository's tree* rather than a product name that
       // happens to contain a dot. See round 6's docstring note for the corpus evidence.
-      if (startLine === null && !path.includes("/")) continue;
+      //
+      // Round 9: that holds for prose, not for a citation the author explicitly set apart with a
+      // delimiter. `` `HANDOFF-CEO-RESUME.md` `` in backticks is exactly the #649 shape this check
+      // exists for — a real, missing file — and it passed in total silence because this line
+      // skipped every bare mention unconditionally, delimited or not. Round 5 already decided an
+      // explicit delimiter is decisive for an inline citation's *content*; `isExplicitlyDelimited`
+      // asks the same question of the citation itself, so a backtick- or quote-wrapped bare
+      // mention is no longer skipped, while genuinely unquoted prose ("runs on Node.js 22") still
+      // is — the ambiguity that skip exists for is real only in the absence of a delimiter.
+      //
+      // A delimiter alone proved too wide once measured against the real corpus: it also passed
+      // `` `inbound_messages.turn_claim_json` `` and `` `ConversationTurnCoordinator.claim` `` —
+      // a SQL column and a `Class.method` reference, both legitimately backtick-quoted, neither a
+      // path. `knownExtensions` closes that gap the same authority-derived way round 6 closed the
+      // last one: the dotted suffix has to be an extension this tracked tree actually uses.
+      const bareDelimited =
+        isExplicitlyDelimited(rawLine, m.index, m.index + m[0].length) && knownExtensions.has(extensionOf(path));
+      if (startLine === null && !path.includes("/") && !bareDelimited) {
+        continue;
+      }
       const content = contentAfter(m.index + m[0].length, startLine);
       // The quoted content is part of the identity, not decoration on top of it. Two citations of
       // the same `path:line` are two different claims when one of them also quotes code — a bare
@@ -1089,6 +1204,18 @@ const extractFromBody = (body) => {
     if (seenSymbolRow.has(key)) continue;
     seenSymbolRow.add(key);
     symbolCitations.push({ raw: m[0], path, symbols });
+  }
+
+  // See `SYMBOL_PROSE_RE`'s own comment for why this reversed-order form is recognised rather than
+  // disclosed as a limitation. Same dedup key shape as the table form above (`path:symbol`), so a
+  // symbol cited both ways collapses to one row instead of being reported twice.
+  for (const m of body.matchAll(SYMBOL_PROSE_RE)) {
+    const symbol = m[1];
+    const path = m[2];
+    const key = `${path}:${symbol}`;
+    if (seenSymbolRow.has(key)) continue;
+    seenSymbolRow.add(key);
+    symbolCitations.push({ raw: m[0], path, symbols: [symbol] });
   }
 
   return { pathCitations, symbolCitations, nonDurable };
@@ -1192,9 +1319,17 @@ for (const issue of issues) {
       // The window is generous enough to tolerate the citation's line drifting from an ordinary
       // nearby edit; it is not generous enough to credit an unrelated function elsewhere in the
       // file with keeping this one's claim true.
+      // `citedEnd - 1` is the 0-indexed array position of the cited line itself; `slice`'s end
+      // bound is exclusive, so including everything up to and including `CONTENT_SEARCH_WINDOW`
+      // lines past it needs `+ CONTENT_SEARCH_WINDOW` on top of that position, not folded into
+      // the same `- 1` the start bound uses. Writing it as `citedEnd - 1 + CONTENT_SEARCH_WINDOW`
+      // (as an earlier version of this line did) is one line short at the far edge: a real,
+      // still-current citation exactly `CONTENT_SEARCH_WINDOW` lines past the cited line —
+      // `README.md:121` cited as `README.md:61`, +60, the boundary the contract names — read as
+      // vanished, because the slice stopped one line before it.
       const windowLines = text.split("\n");
       const from = Math.max(0, citation.startLine - 1 - CONTENT_SEARCH_WINDOW);
-      const to = Math.min(windowLines.length, citedEnd - 1 + CONTENT_SEARCH_WINDOW);
+      const to = Math.min(windowLines.length, citedEnd + CONTENT_SEARCH_WINDOW);
       const nearby = windowLines.slice(from, to).join("\n");
       if (pattern && !pattern.test(nearby)) {
         stale.push({
