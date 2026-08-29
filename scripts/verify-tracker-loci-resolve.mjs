@@ -19,11 +19,14 @@
  *   - a cited line is beyond the file's current length                      → STALE (weak signal:
  *     a file can stay long after the cited region is rewritten, see below)
  *   - a cited symbol (the repo's own `` `path` — `symbol` `` table convention, e.g. #597's own
- *     migration table) does not appear as code — outside a comment or quoted string — in the
- *     named file                                                            → STALE (this is a
- *     text search, not declaration verification; see round 3 below for why)
- *   - a cited code line, quoted alongside its file:line, no longer appears
- *     anywhere in that file (elision-tolerant: `...`/`()` stand for "and more") → STALE
+ *     migration table) does not appear in the named file, outside whatever that file's own
+ *     language treats as a comment or a quoted string — `codeSearchScope` names the exact scope
+ *     per extension, and an extension with no supported comment syntax is disclosed as a plain
+ *     text search rather than silently inheriting another language's rules → STALE (this is a
+ *     text search, not declaration verification; see rounds 3 and 4 below for why)
+ *   - a cited code line, quoted alongside its file:line — inline in a sentence or inside a fenced
+ *     block, both are read the same way — no longer appears anywhere in that file (elision-
+ *     tolerant: `...`/`()` stand for "and more")                            → STALE
  *
  * The last one is the one that actually catches #649's real citation. `binding-registry.ts:163`
  * is still in range — that file is 973 lines long — so the length check alone passes it. What
@@ -147,6 +150,39 @@
  *   verification. `stripStrings` closes the concrete counterexample; the wording of what STALE
  *   means for a symbol row changed from "does not resolve" to "does not appear as code" to match.
  *
+ * ## Round 4: the claim was still ahead of the code — by less, but still ahead
+ *
+ *   Round 3's "outside a comment or quoted string" was true only for JavaScript's syntax, while
+ *   `.py`/`.sh`/`.sql`/YAML were declared supported by being in `FILE_EXT` at all, and template
+ *   literals were deliberately left unstripped in full. Two counterexamples, both run against the
+ *   real script: `` `allowlist-proxy.py` — `Digest` `` passed with `Digest` sitting in a Python
+ *   `#` comment (never stripped — round 2 only knew `//` and `/* *\/`); `` `session-registry.ts`
+ *   — `legal` `` passed with `legal` sitting in a template literal's plain prose, not its `${…}`
+ *   code (round 3 left every template literal untouched to protect its `${…}` expressions, and in
+ *   doing so protected its prose too).
+ *
+ *   Decided by making the stripping match what is declared, rather than narrowing what is
+ *   declared to match the stripping — both were offered as acceptable; this one keeps `.py`/
+ *   `.sh`/`.sql`/YAML genuinely useful instead of downgrading them to a raw search. `readCode` now
+ *   dispatches per extension (`codeSearchScope` names exactly what is excluded, per language: `#`
+ *   for Python/shell/YAML, `--`/`` /* *\/ `` for SQL, the full JS set plus template-literal prose
+ *   for the JS/TS family), and every extension with no supported comment syntax is disclosed as a
+ *   plain text search in the report itself rather than silently inheriting JavaScript's rules.
+ *   `stripTemplateLiteralProse` walks a template literal rather than stripping it whole: text
+ *   outside `${…}` is blanked, a `${…}` span is copied through untouched (brace-balanced, so a
+ *   nested object literal inside the expression does not end it early).
+ *
+ *   Separately: quoted content was only ever captured inside a fenced code block, so a citation
+ *   written the ordinary way people actually write one — inline, mid-sentence, no ``` around it —
+ *   was never content-checked at all. That is the #649 shape itself, the case this check exists
+ *   for. Fixed by removing the fence requirement; `looksLikeCode` was already what kept ordinary
+ *   prose from being read as a quote, so the fence was never doing separate work once that guard
+ *   existed. Verifying this against the real tracker found one more thing the fence had been
+ *   accidentally shielding: `looksLikeCode`'s dotted-access check only asked whether a dot
+ *   followed the first word, and an ordinary sentence ending "...SSOT.md:99 structurally.**" (a
+ *   markdown bold-close right after the period) matched it. Fixed by requiring a real identifier
+ *   character after the dot, not just the dot itself.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -217,11 +253,26 @@ const countLines = (text) => {
  * `://` is protected explicitly so a URL inside a comment or string (`https://…`) is not itself
  * misread as the start of a line comment.
  */
-const stripComments = (text) =>
+const stripSlashComments = (text) =>
   text
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .split("\n")
     .map((line) => line.replace(/(?<!:)\/\/.*$/, ""))
+    .join("\n");
+
+/** `#` line comments — Python, shell, and YAML, the three `#`-comment extensions this checks. */
+const stripHashComments = (text) =>
+  text
+    .split("\n")
+    .map((line) => line.replace(/(?<!:)#.*$/, ""))
+    .join("\n");
+
+/** SQL's own comment forms: `--` to end of line, and the same `/* ... *\/` block form as JS. */
+const stripSqlComments = (text) =>
+  text
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n")
+    .map((line) => line.replace(/--.*$/, ""))
     .join("\n");
 
 /**
@@ -229,29 +280,115 @@ const stripComments = (text) =>
  * this does not fuse the tokens on either side together). `"utf8"` as an encoding argument is not
  * a citation's enforcing symbol resolving — it is a string that happens to spell the same word,
  * and without this a row pairing any file with any common string constant used in it would pass.
+ * Applies across every language this check handles: Python, shell, YAML, and SQL all use the same
+ * two quote characters for a string, and JS/TS's own `"`/`'` strings are the same shape.
  *
- * Template literals (`` `...` ``) are deliberately left alone: a `${…}` interpolation inside one
- * is real code, and stripping the whole literal would throw that away along with its string parts.
- * The narrower gap that leaves — a symbol appearing only in a backtick string's non-interpolated
- * text — is not the shape this was built to catch and is left for the same reason declaration
- * detection was: a heuristic here risks becoming exactly the kind of narrow, incomplete rule this
- * whole check exists to name.
- *
- * A second, measured gap: a regex literal with a quote inside a character class
+ * A measured gap, not a guessed one: a regex literal with a quote inside a character class
  * (`` /(["\\])/g `` — this repository has one, in `cli-adapters.ts`) is not told apart from a real
  * string boundary, because this is a text pass and does not know a regex literal from division.
- * Found while verifying this fix: it did not change the primary verdict for any cited file, only
- * widened the "it also appears in" diagnostic aside on an unrelated file to include a false hit.
- * That aside is disclosed as a heuristic below for exactly this reason — it is a pointer to go
- * look, not a second verified fact.
+ * Found while verifying an earlier fix: it did not change the primary verdict for any cited file,
+ * only widened the "it also appears in" diagnostic aside on an unrelated file to include a false
+ * hit. That aside is disclosed as a heuristic for exactly this reason — a pointer to go look, not
+ * a second verified fact.
  */
 const stripStrings = (text) =>
   text.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/'(?:[^'\\]|\\.)*'/g, "''");
 
+/**
+ * Template literals (`` `...` ``) hold two different things at once: literal text the author
+ * wrote, and `${…}` expressions that are ordinary code. Stripping the whole literal (the earlier
+ * approach) throws the code away with the prose; leaving it alone (the approach before that) reads
+ * `` `session lifecycle ${a} -> ${b} is not legal` `` as *containing* the symbol `legal`, when
+ * `legal` is prose the author wrote, not a reference to anything.
+ *
+ * So a template literal is walked, not stripped: everything between backticks that is *not*
+ * inside a `${…}` becomes blank space, and a `${…}` span — brace-balanced, so a nested object
+ * literal inside the expression does not end it early — passes through untouched, to be searched
+ * as the real code it is. A stray, unterminated backtick (this is a text pass, not a lexer, so one
+ * can appear from a markdown code span or a mismatched edit elsewhere) stops the walk at end of
+ * string rather than consuming the rest of the file as one giant "literal".
+ */
+const stripTemplateLiteralProse = (text) => {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== "`") {
+      out += text[i];
+      i++;
+      continue;
+    }
+    out += "`";
+    i++;
+    while (i < text.length && text[i] !== "`") {
+      if (text[i] === "\\" && i + 1 < text.length) {
+        out += "  "; // an escape sequence in literal text; neither char is a symbol reference
+        i += 2;
+        continue;
+      }
+      if (text[i] === "$" && text[i + 1] === "{") {
+        let depth = 1;
+        const start = i;
+        i += 2;
+        while (i < text.length && depth > 0) {
+          if (text[i] === "{") depth++;
+          else if (text[i] === "}") depth--;
+          i++;
+        }
+        out += text.slice(start, i); // the ${...} expression, verbatim: this is real code
+        continue;
+      }
+      out += text[i] === "\n" ? "\n" : " ";
+      i++;
+    }
+    if (i < text.length) {
+      out += "`";
+      i++;
+    }
+  }
+  return out;
+};
+
+/**
+ * What "does not appear as code" means, per language — see the round-4 note beside this
+ * function's callers for why this is stated explicitly rather than left implicit. Only the
+ * extensions listed here get a comment/string-aware search; everything else is disclosed as a
+ * plain text search with no exclusions, rather than silently applying JavaScript's rules to a
+ * file that does not use them.
+ */
+const JS_FAMILY_EXTS = new Set(["ts", "tsx", "js", "mjs", "cjs", "mts"]);
+const HASH_COMMENT_EXTS = new Set(["py", "sh", "yaml", "yml"]);
+const SQL_EXTS = new Set(["sql"]);
+
+const extensionOf = (relPath) => {
+  const dot = relPath.lastIndexOf(".");
+  return dot === -1 ? "" : relPath.slice(dot + 1).toLowerCase();
+};
+
+/** A short, human-readable name for what a symbol search excludes in this file's language. */
+const codeSearchScope = (relPath) => {
+  const ext = extensionOf(relPath);
+  if (JS_FAMILY_EXTS.has(ext)) return "outside a `//`/`/* */` comment, a quoted string, or template-literal prose";
+  if (HASH_COMMENT_EXTS.has(ext)) return "outside a `#` comment or quoted string";
+  if (SQL_EXTS.has(ext)) return "outside a `--`/`/* */` comment or quoted string";
+  return `as plain text (no comment or string exclusion applies to .${ext} files)`;
+};
+
 const codeTextCache = new Map();
 const readCode = (relPath) => {
   if (!codeTextCache.has(relPath)) {
-    codeTextCache.set(relPath, stripStrings(stripComments(readText(relPath))));
+    const raw = readText(relPath);
+    const ext = extensionOf(relPath);
+    let code;
+    if (JS_FAMILY_EXTS.has(ext)) {
+      code = stripStrings(stripTemplateLiteralProse(stripSlashComments(raw)));
+    } else if (HASH_COMMENT_EXTS.has(ext)) {
+      code = stripStrings(stripHashComments(raw));
+    } else if (SQL_EXTS.has(ext)) {
+      code = stripStrings(stripSqlComments(raw));
+    } else {
+      code = raw; // no supported comment syntax for this extension — see codeSearchScope
+    }
+    codeTextCache.set(relPath, code);
   }
   return codeTextCache.get(relPath);
 };
@@ -388,6 +525,33 @@ const CODE_KEYWORDS = new Set([
 ]);
 
 /**
+ * Extracts an inline citation's quoted content from the rest of its line — not just trims it. An
+ * inline citation is written mid-sentence, with its own code span closing right where the match
+ * ends: "`binding-registry.ts:163` — `const actorId = this.mintActor(...)` no longer holds." The
+ * text after the match is `` ` — `const actorId = this.mintActor(...)` no longer holds. ``, and a
+ * plain trim would keep the trailing sentence as if it were quoted code, checking a citation
+ * against a string that was never a line in any file.
+ *
+ * So: drop the citation's own closing delimiter, drop the markdown separator (whitespace, a dash,
+ * a colon) between citation and quote, then — if what is left opens with a backtick or quote —
+ * read only up to its matching close and discard everything after. A citation with no wrapping
+ * quote around its content (the fenced convention: `path:line   bare code`, nothing else on the
+ * line) falls through unchanged, which is the behaviour this replaces and must not disturb.
+ */
+const cleanInlineTail = (text) => {
+  let t = text.replace(/←.*$/, "").trimEnd();
+  t = t.replace(/^\s*[`'"]/, ""); // the citation's own closing delimiter, if it had one
+  t = t.replace(/^[\s:—–-]+/, ""); // the separator between a citation and what follows
+  for (const quote of ["`", '"', "'"]) {
+    if (t.startsWith(quote)) {
+      const closing = t.indexOf(quote, 1);
+      return (closing === -1 ? t.slice(1) : t.slice(1, closing)).trim();
+    }
+  }
+  return t.replace(/[`'"]\s*$/, "").trim();
+};
+
+/**
  * A trailing description is only checkable as literal content if the citation itself opens with
  * code, not with a description that merely mentions some. Requiring only *some* code-shaped
  * fragment anywhere in the text is not enough — "calls bindings.bind()" contains a real call, but
@@ -408,14 +572,19 @@ const looksLikeCode = (text) => {
   const rest = stripped.slice(word.length);
   if (CODE_KEYWORDS.has(word)) return true;
   if (/^\s*\(/.test(rest)) return true; // identifier( — a call, first thing cited
-  if (/^\./.test(rest)) return true; // identifier.member — dotted access, first thing cited
+  // identifier.member — dotted access, first thing cited. The character right after the dot has
+  // to start a real member name: a dot followed by anything else (end of string, whitespace,
+  // punctuation) is an ordinary sentence-ending period, not code. Found live, once inline citations
+  // started being read the same way fenced ones are: "...violates SSOT.md:99 structurally.**" —
+  // a real citation, real prose — matched `/^\./` on "structurally.**" and was almost read as
+  // quoted code because a markdown bold-close sat right after the period.
+  if (/^\.[A-Za-z_$]/.test(rest)) return true;
   if (/^\s*=[^=]/.test(rest)) return true; // identifier = value — assignment, first thing cited
   return false;
 };
 
 const extractFromBody = (body) => {
   const lines = body.split("\n");
-  let inFence = false;
   const seenPath = new Set();
   const seenSymbolRow = new Set();
   const seenNonDurable = new Set();
@@ -424,10 +593,10 @@ const extractFromBody = (body) => {
   const nonDurable = [];
 
   for (const rawLine of lines) {
-    if (/^\s*```/.test(rawLine)) {
-      inFence = !inFence;
-      continue;
-    }
+    // A fence delimiter line never itself matches a citation; skipped so nothing downstream has
+    // to know whether it is inside or outside a fence — quoted content is read the same way
+    // either side (see the `looksLikeCode` call below and round 4's note on inline citations).
+    if (/^\s*```/.test(rawLine)) continue;
 
     const nonDurableSpans = [];
     for (const m of rawLine.matchAll(NON_DURABLE_RE)) {
@@ -478,9 +647,17 @@ const extractFromBody = (body) => {
       const groups = m.groups ?? {};
       const startLine = groups.cs ? Number(groups.cs) : groups.as ? Number(groups.as) : null;
       const endLine = groups.ce ? Number(groups.ce) : groups.ae ? Number(groups.ae) : null;
+      // Round 4: this only ran inside a fenced block, so a citation written the ordinary way
+      // people actually write them — inline, in a sentence, no ``` around it — was never
+      // content-checked at all. That is the #649 shape itself: the real citation this check was
+      // built against, `` `binding-registry.ts:163` ... `const actorId = this.mintActor(...)` ``,
+      // could just as easily have been written as one inline sentence, and would have gone
+      // unchecked. `looksLikeCode` is what already keeps this from reading ordinary prose
+      // ("still resolves at line 121, reconstitution is allowed when...") as quoted code; the
+      // fence was never doing separate work once that guard exists.
       let content = null;
-      if (inFence && startLine !== null) {
-        const rest = rawLine.slice(m.index + m[0].length).replace(/←.*$/, "").trim();
+      if (startLine !== null) {
+        const rest = cleanInlineTail(rawLine.slice(m.index + m[0].length));
         if (rest.length > 0 && looksLikeCode(rest)) content = rest;
       }
       // The quoted content is part of the identity, not decoration on top of it. Two citations of
@@ -682,24 +859,42 @@ for (const issue of issues) {
     // failure mode: a symbol renamed away or deleted outright, which is what #649 and #657 were.
     // What it cannot catch: a symbol referenced but not declared in the cited file (an import, a
     // parameter of the same name) reading as present. That gap is disclosed, not hidden.
+    //
+    // Round 4: the claim above was still ahead of the code. Comment- and string-stripping only
+    // understood JavaScript's syntax, while `.py`/`.sh`/`.sql`/YAML were declared supported by
+    // being in `FILE_EXT` at all — so `` `allowlist-proxy.py` — `Digest` `` passed with `Digest`
+    // sitting in a Python `#` comment, and `` `session-registry.ts` — `legal` `` passed with
+    // `legal` sitting in a template literal's plain prose, not its `${…}` code. `readCode` now
+    // dispatches by extension (`codeSearchScope` names exactly what it excludes, per language),
+    // and a symbol row for an extension with no supported comment syntax is disclosed as a plain
+    // text search rather than silently getting JavaScript's rules applied to it.
     const targetCode = readCode(resolved.path);
     for (const symbol of symbolCitation.symbols) {
       const pattern = new RegExp(`\\b${escapeRegex(symbol)}\\b`);
       if (pattern.test(targetCode)) continue;
+      // Scoped to files this check can actually apply a code-aware search to — the same set
+      // `codeSearchScope` names. A match in an unsupported file (README.md's own prose, say) is
+      // no more informative than the original miss: both are "the word appears somewhere", and
+      // pointing at a doc page as if it were a competing enforcement site would be misleading
+      // rather than helpful.
       const elsewhere = trackedFiles
-        .filter((f) => f.startsWith("src/") && f.endsWith(".ts") && f !== resolved.path)
+        .filter((f) => f !== resolved.path)
+        .filter((f) => {
+          const ext = extensionOf(f);
+          return JS_FAMILY_EXTS.has(ext) || HASH_COMMENT_EXTS.has(ext) || SQL_EXTS.has(ext);
+        })
         .find((f) => pattern.test(readCode(f)));
       stale.push({
         issue,
         citation: symbolCitation.raw,
         reason: elsewhere
-          ? `\`${symbol}\` does not appear as code in ${resolved.path} (outside a comment or quoted string) — ` +
+          ? `\`${symbol}\` does not appear ${codeSearchScope(resolved.path)} in ${resolved.path} — ` +
             // A pointer to go look, not a second verified fact: the same heuristic that catches
             // most strings and comments does not tell a regex literal's quote from a real one
             // (see `stripStrings`), so this hit is worth checking rather than trusting outright.
             `the same search also matches in ${elsewhere}, a different file than cited`
-          : `\`${symbol}\` does not appear as code anywhere under src/ (outside a comment or quoted string), ` +
-            `including in ${resolved.path}`,
+          : `\`${symbol}\` does not appear ${codeSearchScope(resolved.path)} in ${resolved.path}, ` +
+            `or in any other tracked file`,
       });
     }
   }

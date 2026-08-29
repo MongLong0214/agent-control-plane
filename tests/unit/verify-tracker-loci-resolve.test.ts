@@ -151,7 +151,7 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("STALE");
       expect(result.stdout).toContain("definitelyNotARealSymbolXYZ");
-      expect(result.stdout).toContain("does not appear as code");
+      expect(result.stdout).toContain("does not appear");
       expect(result.stdout).toContain("src/continuity/continuity-kernel.ts");
     } finally {
       cleanup();
@@ -246,7 +246,8 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("STALE");
       expect(result.stdout).toContain("failover");
-      expect(result.stdout).toContain("does not appear as code in src/core/reason-codes.ts");
+      expect(result.stdout).toContain("does not appear");
+      expect(result.stdout).toContain("in src/core/reason-codes.ts");
       // Diagnostic aside: it says where the symbol actually lives, which is what made the
       // original defeat possible in the first place.
       expect(result.stdout).toContain("continuity-kernel.ts");
@@ -324,7 +325,7 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.status).toBe(1);
       expect(result.stdout).toContain("STALE");
       expect(result.stdout).toContain("reconstitution");
-      expect(result.stdout).toContain("does not appear as code");
+      expect(result.stdout).toContain("does not appear");
       expect(result.stdout).toContain("src/session/binding-registry.ts");
     } finally {
       cleanup();
@@ -460,8 +461,162 @@ describe("verify-tracker-loci-resolve", () => {
       expect(result.stdout).toContain("utf8");
       // Renamed per the round-3 decision: this is a text-occurrence check, not declaration
       // verification, and the report says so rather than claiming "resolve".
-      expect(result.stdout).toContain("does not appear as code");
+      expect(result.stdout).toContain("does not appear");
       expect(result.stdout).not.toContain("does not resolve");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // --- Round 4: a fourth independent review, run against the shipped script through
+  // --issues-file, same as every prior round.
+
+  it("[round 4] a symbol mentioned only in a Python # comment is not code", () => {
+    // Round 2 stripped JS-style `//` and `/* */` comments, but `.py` is declared supported by
+    // being in FILE_EXT at all — Python's own comment marker is `#`, and it was never stripped.
+    const body = "`deploy/egress/allowlist-proxy.py` — `Digest`";
+    const { path, cleanup } = withIssues([{ number: 8801, title: "python comment counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("Digest");
+      expect(result.stdout).toContain("outside a `#` comment or quoted string");
+      expect(result.stdout).toContain("deploy/egress/allowlist-proxy.py");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 4] a real Python identifier used as code (not a comment) still resolves silently", () => {
+    const body = "`deploy/egress/allowlist-proxy.py` — `ALLOWLIST_DIGEST`";
+    const { path, cleanup } = withIssues([{ number: 8802, title: "python positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 4] a symbol appearing only in a template literal's prose text is not code", () => {
+    // `` `session lifecycle ${session.lifecycle} -> ${to} is not legal` `` — "legal" is the
+    // author's own sentence, not a reference to anything. Round 3 stripped quoted strings but
+    // deliberately left template literals alone entirely (a `${…}` interpolation is real code),
+    // which meant the literal's *prose* half was still read as code too.
+    const body = "`src/session/session-registry.ts` — `legal`";
+    const { path, cleanup } = withIssues([{ number: 8803, title: "template literal counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("legal");
+      expect(result.stdout).toContain("template-literal prose");
+      expect(result.stdout).toContain("src/session/session-registry.ts");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 4] a symbol referenced inside a template literal's ${...} expression still resolves", () => {
+    // `lifecycle` is used throughout this file as ordinary code, including as the
+    // `${session.lifecycle}` expression inside the very template literal `legal` (above) is
+    // prose in. Stripping a template literal's prose text must not take its `${…}` expressions
+    // down with it — confirmed directly against `stripTemplateLiteralProse` too: given
+    // `` `session lifecycle ${session.lifecycle} -> ${to} is not legal` ``, it returns
+    // `` `                  ${session.lifecycle}    ${to}             ` `` — "legal" gone,
+    // both expressions untouched, including the nested-brace case (an object literal inside a
+    // `${…}`) and an unterminated backtick (blanks to end of string rather than running away).
+    const body = "`src/session/session-registry.ts` — `lifecycle`";
+    const { path, cleanup } = withIssues([{ number: 8804, title: "template literal expression positive control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 4] the report states per-language scope, not one blanket claim", () => {
+    // Sol's ask directly: the script's own output has to say what it inspects, per language,
+    // rather than one sentence ("outside a comment or quoted string") standing in for all of
+    // them when the code underneath only understood one language's syntax.
+    const pyBody = "`deploy/egress/allowlist-proxy.py` — `Digest`";
+    const { path: pyPath, cleanup: pyCleanup } = withIssues([{ number: 8805, title: "py scope", body: pyBody }]);
+    try {
+      expect(run(pyPath).stdout).toContain("outside a `#` comment or quoted string");
+    } finally {
+      pyCleanup();
+    }
+
+    // A missing *file* short-circuits before the language line ever gets to print, so this uses
+    // a real TS file with a symbol that is not there, rather than a missing path.
+    const tsBody = "`src/session/session-registry.ts` — `definitelyNotARealSymbolABC`";
+    const { path: tsPath, cleanup: tsCleanup } = withIssues([{ number: 8806, title: "ts scope", body: tsBody }]);
+    try {
+      expect(run(tsPath).stdout).toContain("outside a `//`/`/* */` comment, a quoted string, or template-literal prose");
+    } finally {
+      tsCleanup();
+    }
+  });
+
+  it("[round 4] an inline citation (no code fence) is content-checked, not just a fenced one", () => {
+    // The #649 shape itself, written the ordinary way people actually write a citation: inline,
+    // mid-sentence, no ``` around it. Content was only ever captured inside a fenced block, so
+    // this — the case this whole check exists for — was never checked at all.
+    const body =
+      "The rule at `binding-registry.ts:163` — `const actorId = this.mintActor(...)` no longer holds; " +
+      "the reuse path runs first now.";
+    const { path, cleanup } = withIssues([{ number: 8807, title: "inline stale citation counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("binding-registry.ts:163");
+      expect(result.stdout).toContain('quoted content "const actorId = this.mintActor(...)"');
+      expect(result.stdout).toContain("no longer appears");
+      // The citer's own sentence after the closing backtick must not have been swept into the
+      // quoted content — that would check the citation against a string no file ever contained.
+      expect(result.stdout).not.toContain("no longer holds");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 4] an inline citation whose quoted content still holds is ADVISORY, not STALE", () => {
+    const body = "The banner text is set in `README.md:1` — `# agent-control-plane` — right at the top.";
+    const { path, cleanup } = withIssues([{ number: 8808, title: "inline current citation control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 4] an ordinary sentence-ending period after a bare citation is not read as code", () => {
+    // Found live, on the real corpus, while verifying the inline-citation fix: opening content
+    // capture to every citation (not just fenced ones) meant `looksLikeCode`'s dotted-access
+    // check — "a dot right after the word" — started firing on ordinary prose. #627's real body
+    // cites `SSOT.md:99` twice; the second time bare, ending "...violates SSOT.md:99
+    // structurally.**" — a markdown bold-close sitting right after the sentence's period. That
+    // matched `/^\./` on "structurally.**" and came within one check of being read as member
+    // access, which would have manufactured quoted content no file ever contained and produced a
+    // duplicate, wrongly-STALE report for a citation that was in fact merely repeated. Fixed by
+    // requiring a real identifier character after the dot, not just the dot itself.
+    const body = "The path violates `README.md:1` structurally.**";
+    const { path, cleanup } = withIssues([{ number: 8809, title: "sentence-ending period counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+      // Never manufactured "structurally.**" (or anything else) as quoted content to check.
+      expect(result.stdout).not.toContain("no longer appears");
     } finally {
       cleanup();
     }
