@@ -1107,6 +1107,19 @@ const GUARDS = [
     replace: "  for (const inline of []) {",
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
+  {
+    // #649 part A: `bind()` minted a fresh actor unconditionally, so re-bootstrapping against the
+    // same Hermes transcript produced a second owner beside the first — two actors that collide on
+    // nothing, so the alias was silent. Without this line the reuse path is computed and then
+    // discarded, which is exactly that regression.
+    what: "bind reuses the actor that already owns a verified target instead of minting a second one",
+    file: "src/session/binding-registry.ts",
+    find: "      const actorId = reused.value ?? this.mintActor(input.role, input.sessionId, session.incarnation);",
+    replace: "      const actorId = this.mintActor(input.role, input.sessionId, session.incarnation);",
+    killedBy: [
+      "tests/unit/reconstitution-needs-a-verified-target.test.ts::reuses the actor rather than minting a second owner",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
