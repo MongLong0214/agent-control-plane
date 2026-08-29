@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -23,18 +23,38 @@ type Harness = ReturnType<typeof makeHarness>;
 const NOW = "2026-08-21T00:00:00.000Z";
 
 const target = (h: Harness): string => {
-  h.cp.db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES ('a','CEO',?)`, [NOW]);
+  h.cp.db.run(
+    `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+     VALUES ('ses','inc','claude','opus','READY',?,?)`,
+    [NOW, NOW],
+  );
+  h.cp.db.run(
+    `INSERT INTO conversational_actors
+       (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+     VALUES ('a','CEO','ses','inc',?)`,
+    [NOW],
+  );
   h.cp.db.run(
     `INSERT INTO actor_target_bindings
        (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
      VALUES ('b','a','hermes','locator','digest',?)`,
     [NOW],
   );
+  // The active role binding the attestation's generation names, so `claim()`'s currency check
+  // (#666) has a current generation to find.
+  h.cp.db.run(
+    `INSERT INTO assignments
+       (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+        binding_generation, mode, status, created_at)
+     VALUES ('asg','CEO:a','CEO','a','ses','inc',1,'PREFERRED','ACTIVE',?)`,
+    [NOW],
+  );
   h.cp.db.run(
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-        executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-     VALUES ('t','b','v1','att','ses','inc',1,?)`,
+        executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+        attested_at)
+     VALUES ('t','b','v1','att','ses','inc',1,'asg',?)`,
     [NOW],
   );
   return "a";
@@ -42,8 +62,12 @@ const target = (h: Harness): string => {
 
 const settledTurn = (h: Harness): string => {
   const coordinator = h.cp.conversation;
+  const actorId = target(h);
+  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with
+  // the same payload it names (#666).
+  admitInbound(h, { nonce: "n1", payload: {} });
   const claimed = coordinator.claim({
-    targetActorId: target(h),
+    targetActorId: actorId,
     prompt: "question",
     sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
   });
@@ -101,8 +125,10 @@ describe("a settlement cannot be rewritten", () => {
     // pull a completed turn back into a state that permits a re-run.
     const h = makeHarness();
     const coordinator = h.cp.conversation;
+    const actorId = target(h);
+    admitInbound(h, { nonce: "n1", payload: {} });
     const claimed = coordinator.claim({
-      targetActorId: target(h),
+      targetActorId: actorId,
       prompt: "q",
       sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
     });
@@ -173,8 +199,10 @@ describe("a settlement cannot be rewritten", () => {
     // leaves nothing behind that says so.
     const h = makeHarness();
     const coordinator = h.cp.conversation;
+    const actorId = target(h);
+    admitInbound(h, { nonce: "n1", payload: {} });
     const claimed = coordinator.claim({
-      targetActorId: target(h),
+      targetActorId: actorId,
       prompt: "q",
       sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
     });
@@ -385,8 +413,10 @@ describe("an outcome may only be recorded under an authority that could have obs
     // it only guards a row that was already settled.
     const h = makeHarness();
     const coordinator = h.cp.conversation;
+    const actorId = target(h);
+    admitInbound(h, { nonce: "n1", payload: {} });
     const claimed = coordinator.claim({
-      targetActorId: target(h),
+      targetActorId: actorId,
       prompt: "q",
       sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
     });
@@ -415,8 +445,10 @@ describe("an outcome may only be recorded under an authority that could have obs
     // and left no audit row — so the sanctioned repair was an unaudited hand-edit.
     const h = makeHarness();
     const coordinator = h.cp.conversation;
+    const actorId = target(h);
+    admitInbound(h, { nonce: "n1", payload: {} });
     const claimed = coordinator.claim({
-      targetActorId: target(h),
+      targetActorId: actorId,
       prompt: "q",
       sources: [{ channel: "telegram", nonce: "n1", attempt: 1, payload: {} }],
     });

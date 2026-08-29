@@ -1035,6 +1035,139 @@ const GUARDS = [
     killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
   },
   {
+    // The existence check alone let a caller admit `{text:"A"}` for a nonce and claim it with
+    // `{text:"B"}`; `source_digest` recorded B's digest as what the nonce carried, permanently.
+    what: "a source's payload must match what ingress recorded admitting for that nonce",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        return admitted?.payload_digest !== digestOf(candidate.payload);",
+    replace: "        return false;",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses a source whose payload is not the one ingress admitted for that nonce",
+    ],
+  },
+  {
+    // `assignments.session_id`/`session_incarnation` are the runtime *at binding time*; a
+    // SURVIVED failover (#493) moves only `conversational_actors.current_session_id` and leaves
+    // `assignments` untouched. Comparing the attestation against the binding-time session made a
+    // fresh, honest attestation from a survived counterpart unmatchable — this mutation puts that
+    // comparison back.
+    what: "attestation currency is judged against the live session, not the one at binding time",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND sess.incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
+    replace:
+      "            AND sess.incarnation = att.executor_session_incarnation\n            AND asg.session_id = att.executor_session_id\n            AND asg.session_incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::admits a claim after a SURVIVED failover, under the live session and the generation that never changed",
+    ],
+  },
+  {
+    // Two reviews found this at finer and finer grain. `role = kind` (an intermediate version of
+    // this join) scoped to the actor's own role and was still not enough: generation is minted
+    // per role_key, and `bind()` can reuse one physical actor across *different* role_keys that
+    // share one role (#657) — `WORKER:task-A` and `WORKER:task-B` both have `role = 'WORKER'` and
+    // each counts its own generation from 1. A `role`-only fix cannot tell them apart, so a stale
+    // attestation for task-A's retired generation 1 is revived by task-B's own, unrelated,
+    // generation 1. `assignment_id` has no such ambiguity — it names the exact role_key and
+    // generation together, which a bare role name (or a bare generation number) cannot.
+    what: "currency is judged on the exact assignment this attestation was made under, not on role alone",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "           JOIN assignments asg\n             ON asg.assignment_id = att.assignment_id\n            AND asg.actor_id = ca.actor_id\n            AND asg.status = 'ACTIVE'",
+    replace:
+      "           JOIN assignments asg\n             ON asg.actor_id = ca.actor_id\n            AND asg.status = 'ACTIVE'\n            AND asg.role = ca.kind",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an unrelated role_key's generation reviving a retired one under the same role",
+    ],
+  },
+  {
+    // `assignment_id` pins *which* assignment an attestation speaks for; on its own it does not
+    // check what the attestation *claims* about that assignment. A third review found this left
+    // open: an attestation citing a real, currently ACTIVE assignment_id while recording a
+    // generation that assignment's own row does not carry — the join matched on identity alone,
+    // admitted the claim, and `canonical_turns` recorded a generation no attestation ever
+    // attested.
+    what: "an attestation's own generation must agree with the assignment it names, not just its identity",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND asg.binding_generation = att.binding_generation\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an attestation whose claimed generation disagrees with the assignment it names",
+    ],
+  },
+  {
+    // The write-time half of the same fix: refused at the source, not only read back out.
+    what: "an attestation whose generation disagrees with its assignment is refused at write time",
+    file: "src/db/schema.sql",
+    find: "WHEN NEW.assignment_id IS NOT NULL\n AND EXISTS (\n   SELECT 1 FROM assignments\n    WHERE assignment_id = NEW.assignment_id\n      AND binding_generation <> NEW.binding_generation\n )\nBEGIN",
+    replace: "WHEN 0\nBEGIN",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses to record an attestation whose generation disagrees with the assignment it names",
+    ],
+  },
+  {
+    // `target_binding_id` implies an actor (via `actor_target_bindings`); `assignment_id` implies
+    // one too (via `assignments.actor_id`). Nothing but this condition checks that they agree —
+    // without it, an attestation can cite a real, correctly-generationed assignment that simply
+    // belongs to someone else, and the generation trigger has no way to see the mismatch because
+    // there isn't one: the cited assignment's generation is exactly right, for its own actor.
+    what: "the assignment consulted for currency must belong to this binding's own actor",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND asg.actor_id = ca.actor_id\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an attestation whose assignment_id names a different actor's assignment entirely",
+    ],
+  },
+  {
+    // `conversational_actors.current_session_incarnation` is itself a copy of
+    // `sessions.incarnation`, one table further out than the assignment's own generation. Nothing
+    // compared it to that authority — only to another copy on the attestation, which is exactly
+    // what let a fabricated incarnation, quietly written straight into the actor's column, sail
+    // through unnoticed.
+    what: "the incarnation is judged against the session's own column, not only the actor's copy of it",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND sess.incarnation = att.executor_session_incarnation\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an attestation whose incarnation was never the session's own, though the actor's copy agrees",
+    ],
+  },
+  {
+    // The write-time half, on the insert path `mintActor` takes.
+    what: "an actor cannot be created pointing at a session under an incarnation that session never had",
+    file: "src/db/schema.sql",
+    find: "CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert\nBEFORE INSERT ON conversational_actors\nWHEN NEW.current_session_id IS NOT NULL\n AND EXISTS (",
+    replace:
+      "CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert\nBEFORE INSERT ON conversational_actors\nWHEN 0\n AND EXISTS (",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses to insert an actor whose incarnation was never the session's own",
+    ],
+  },
+  {
+    // The write-time half, on the update path a later switch or a raw write takes.
+    what: "an actor's incarnation copy cannot be moved away from the session it names",
+    file: "src/db/schema.sql",
+    find: "CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_update\nBEFORE UPDATE OF current_session_id, current_session_incarnation ON conversational_actors\nWHEN NEW.current_session_id IS NOT NULL\n AND EXISTS (",
+    replace:
+      "CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_update\nBEFORE UPDATE OF current_session_id, current_session_incarnation ON conversational_actors\nWHEN 0\n AND EXISTS (",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses to move the actor's incarnation copy away from the session it names",
+    ],
+  },
+  {
+    // The runtime-ready trigger only checks READY at the moment the pointer is written
+    // (`conversational_actors_runtime_ready`); nothing re-checks it afterwards.
+    // `SessionRegistry.transition` can move a session to ERROR or STOPPED without ever touching
+    // the actor's live pointer, so pointing at *a* session is not the same fact as pointing at one
+    // still usable.
+    what: "the live pointer's session must still be usable, not merely still pointed at",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND sess.lifecycle = 'READY'\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses an attestation whose named session is no longer usable, though still the live pointer",
+    ],
+  },
+  {
     // The wide version: releasing by file let a bystander's close hand the owner's slot away.
     what: "closing a handle frees only the capability slots that handle issued",
     file: "src/db/database.ts",
