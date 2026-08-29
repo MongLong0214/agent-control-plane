@@ -147,12 +147,29 @@ export const ingressSignature = (
 ): string => createHmac("sha256", secret).update(ingressSigningInput(request)).digest("hex");
 
 export class IngressGuard {
+  /**
+   * The nonce TTL this guard actually uses, per channel — copied out of the caller's
+   * `IngressPolicy` at construction, not read from it again.
+   *
+   * `policies` is typed `Readonly<Record<string, IngressPolicy>>`, and that readonly is shallow:
+   * it stops `this.policies["telegram"] = …`, not `somePolicy.nonceTtlMs = 1`. The object each
+   * entry points at is the caller's own, and ordinary TypeScript can still write to it after this
+   * constructor returns — the constructor validated `nonceTtlMs` against the transport's
+   * retention floor (#673) exactly once, and `admit` used to re-read `policy.nonceTtlMs` from
+   * that same object on every call. A check that runs once on a value someone else still owns is
+   * not a guarantee; it is a check that ran once. Copying the validated number into a field this
+   * class alone holds closes that — the floor now holds for the object's whole lifetime, not
+   * only at the instant it was constructed.
+   */
+  readonly #nonceTtlMsByChannel: Readonly<Record<string, number>>;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly policies: Readonly<Record<string, IngressPolicy>>,
   ) {
+    const nonceTtlMsByChannel: Record<string, number> = {};
     for (const [channel, policy] of Object.entries(policies)) {
       if (policy.allowedActors.length === 0) {
         throw new Error(`ingress policy for '${channel}' has no allowed actors`);
@@ -160,22 +177,22 @@ export class IngressGuard {
       if (channel === "telegram" && (!policy.allowedConversations || policy.allowedConversations.length === 0)) {
         throw new Error("Telegram ingress requires a non-empty conversation allowlist");
       }
+      const ttl = policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS;
       const retention = TRANSPORT_RETENTION_MS[channel];
-      if (retention !== undefined) {
-        const ttl = policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS;
-        if (ttl < retention) {
-          // The relationship, not the number, is the property (#673): a nonce pruned before the
-          // transport itself stops redelivering reopens the exact duplicate-turn window the
-          // claim mechanism exists to close. Refusing construction makes that relationship hold
-          // by construction instead of by two constants that happen to agree today.
-          throw new Error(
-            `ingress policy for '${channel}' sets nonceTtlMs (${ttl}ms) shorter than the transport's own ` +
-              `redelivery retention (${retention}ms); a nonce could be pruned before a late redelivery stops ` +
-              `arriving, which would let its turn be claimed and run a second time (#673)`,
-          );
-        }
+      if (retention !== undefined && ttl < retention) {
+        // The relationship, not the number, is the property (#673): a nonce pruned before the
+        // transport itself stops redelivering reopens the exact duplicate-turn window the
+        // claim mechanism exists to close. Refusing construction makes that relationship hold
+        // by construction instead of by two constants that happen to agree today.
+        throw new Error(
+          `ingress policy for '${channel}' sets nonceTtlMs (${ttl}ms) shorter than the transport's own ` +
+            `redelivery retention (${retention}ms); a nonce could be pruned before a late redelivery stops ` +
+            `arriving, which would let its turn be claimed and run a second time (#673)`,
+        );
       }
+      nonceTtlMsByChannel[channel] = ttl;
     }
+    this.#nonceTtlMsByChannel = Object.freeze(nonceTtlMsByChannel);
   }
 
   /**
@@ -295,7 +312,11 @@ export class IngressGuard {
       `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES (?, ?, ?, ?)`,
       [request.channel, request.nonce, request.actor, this.clock.nowIso()],
     );
-    this.prune(request.channel, policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS);
+    // From the field this constructor populated, not `policy.nonceTtlMs` — the caller's own
+    // `IngressPolicy` object can still be mutated after construction, and the transport-retention
+    // floor (#673) was only ever checked once, at construction. Reading the copy is what makes
+    // that check still true here.
+    this.prune(request.channel, this.#nonceTtlMsByChannel[request.channel] ?? DEFAULT_NONCE_TTL_MS);
 
     this.audit.record({
       kind: "INGRESS_ADMITTED",
@@ -682,10 +703,20 @@ export class IngressGuard {
         // the ordinary non-CEO path, and there is nothing to resolve.
         return allow(ReasonCode.OK, undefined);
       }
+      // `noReplyAt IS NULL`, not only `repliedAt IS NULL` (#682, second review): the two terminal
+      // facts have two writers now, and a guard on only one of them is not a guard on the field.
+      // Without this half, a turn `completeNoReplyAndResolveTurn` already closed with `noReplyAt`
+      // could still take `repliedAt` here — through the ordinary public API, no malformed state
+      // required — leaving one row asserting both "no reply was produced" and "the transport
+      // accepted a reply". The second is the one #638's later receipt match is meant to trust;
+      // a false version of it, permanently recorded, is worse than the unresolved state #672
+      // started from.
       this.db.run(
         `UPDATE inbound_messages
             SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)
-          WHERE channel = ? AND nonce = ? AND json_extract(turn_claim_json, '$.repliedAt') IS NULL`,
+          WHERE channel = ? AND nonce = ?
+            AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
+            AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL`,
         [this.clock.nowIso(), channel, nonce],
       );
       return allow(ReasonCode.OK, undefined);

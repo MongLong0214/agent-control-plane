@@ -265,4 +265,36 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
     expect(afterNoReplyCall["repliedAt"]).toBe(resolved["repliedAt"]);
     expect(afterNoReplyCall["noReplyAt"]).toBeUndefined();
   });
+
+  it("#682: never writes repliedAt over a turn a no-reply resolution already closed", async () => {
+    // The other order, found by a second review of the guard above: it covers reply-then-
+    // no-reply, but `resolveTurn` — reachable directly through the public API, not only through
+    // `completeReplyAndResolveTurn` — had no matching refusal for no-reply-then-reply. Without it,
+    // a turn `completeNoReplyAndResolveTurn` already closed with `noReplyAt` could still take
+    // `repliedAt` here, leaving one row asserting both "no reply was produced" and "the transport
+    // accepted a reply" — the second being exactly what #638's later receipt match is meant to
+    // trust. A guard on only one of the two writers is not a guard on the field.
+    const harness = makeHarness();
+    const { guard } = buildRouter(harness);
+    const nonce = "update:4";
+
+    expect(
+      guard.admit({ channel: "telegram", actor: "owner", conversation: "chat", nonce, payload: { text: "hi" } })
+        .allowed,
+    ).toBe(true);
+    expect(guard.claimTurn("telegram", nonce, identity()).allowed).toBe(true);
+    expect(guard.completeNoReplyAndResolveTurn("telegram", nonce).allowed).toBe(true);
+    const resolved = storedClaim(harness, nonce);
+    expect(resolved["noReplyAt"]).toBeTruthy();
+    expect(resolved["repliedAt"]).toBeUndefined();
+
+    // `resolveTurn` directly — the path `completeReplyAndResolveTurn` wraps, and the one this
+    // guard has to hold on its own since a caller can reach it without going through the reply
+    // lifecycle's own PENDING precondition at all.
+    expect(guard.resolveTurn("telegram", nonce).allowed).toBe(true);
+
+    const afterResolveTurnCall = storedClaim(harness, nonce);
+    expect(afterResolveTurnCall["noReplyAt"]).toBe(resolved["noReplyAt"]);
+    expect(afterResolveTurnCall["repliedAt"]).toBeUndefined();
+  });
 });

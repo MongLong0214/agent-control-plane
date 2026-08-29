@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { IngressGuard, type TurnIdentity } from "../../src/ingress/ingress-guard.ts";
+import { IngressGuard, type IngressPolicy, type TurnIdentity } from "../../src/ingress/ingress-guard.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
@@ -122,5 +122,56 @@ describe("#673 the nonce window must not close before the transport's own retent
     // anything a unit test can drive.
     const redelivered = admit();
     expect(redelivered.allowed).toBe(true);
+  });
+
+  it("#682: holds the floor even if the caller mutates the policy object after construction", () => {
+    // Sol's review: `policies` is typed `Readonly<Record<string, IngressPolicy>>`, and that
+    // readonly is shallow — it stops reassigning the record's own entries, not writing to the
+    // `IngressPolicy` object one of those entries points at. The constructor validated
+    // `nonceTtlMs` against the retention floor exactly once; `admit` used to re-read
+    // `policy.nonceTtlMs` from that same object on every call, so mutating it after construction
+    // silently reopened the window the constructor had just refused to allow.
+    //
+    // Built with a valid ttl, then mutated to something the constructor would have refused
+    // outright — proving the floor is enforced from a value this guard copied out, not from the
+    // object the caller still holds a reference to.
+    // `recoverInFlight` is deliberately left unset: with it on, a replay of an unclaimed,
+    // never-completed row is legitimately re-admitted through the *recovery* path regardless of
+    // whether the row still exists — `allowed: true` there proves nothing about pruning. Leaving
+    // it off makes `admit`'s only path to `allowed: true` for a still-existing, unclaimed row be
+    // "the row is gone" — the one fact this test needs to observe.
+    const harness = makeHarness();
+    const policy: { telegram: IngressPolicy } = {
+      telegram: { allowedActors: ["owner"], allowedConversations: ["chat"] },
+    };
+    const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, policy);
+    // Well under the retention floor — exactly the value the constructor throws on if given it
+    // directly (see the first test in this file).
+    policy.telegram.nonceTtlMs = 1;
+
+    const nonce = "mutated-policy-update";
+    expect(
+      guard.admit({ channel: "telegram", actor: "owner", conversation: "chat", nonce, payload: {} }).allowed,
+    ).toBe(true);
+    // Past the mutated 1ms ttl, nowhere near the 24h default this guard actually validated.
+    harness.clock.advance(10);
+    expect(
+      guard.admit({ channel: "telegram", actor: "owner", conversation: "chat", nonce: "unrelated", payload: {} })
+        .allowed,
+    ).toBe(true);
+
+    // A pruned row is re-admitted as fresh; a row the floor still protects is refused as an
+    // ordinary replay (`recoverInFlight` is off, so there is no other way to reach `allowed: true`
+    // for a row that still exists). If `admit` had re-read the mutated `nonceTtlMs`, this row
+    // would already be gone and this call would be `allowed: true`.
+    const replay = guard.admit({
+      channel: "telegram",
+      actor: "owner",
+      conversation: "chat",
+      nonce,
+      payload: {},
+    });
+    expect(replay.allowed, "the mutated nonceTtlMs must not have pruned this row after only 10ms").toBe(false);
+    expect(replay.reasonCode).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
   });
 });

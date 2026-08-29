@@ -212,6 +212,30 @@ const GUARDS = [
     ],
   },
   {
+    // The other order of the same guard (#682, second review): the row above covers
+    // reply-then-no-reply, but `#resolveTurnHere` — reachable directly through `resolveTurn`,
+    // not only through `completeReplyAndResolveTurn`'s own PENDING precondition — had no
+    // matching refusal for no-reply-then-reply. Without the `noReplyAt IS NULL` clause, a claim
+    // `completeNoReplyAndResolveTurn` already closed could still take `repliedAt` here, leaving
+    // one row asserting both "no reply was produced" and "the transport accepted a reply". A
+    // guard on only one of a field's two writers is not a guard on the field.
+    what: "resolveTurn never moves a claim that already has a terminal fact",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "        `UPDATE inbound_messages\n" +
+      "            SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)\n" +
+      "          WHERE channel = ? AND nonce = ?\n" +
+      "            AND json_extract(turn_claim_json, '$.repliedAt') IS NULL\n" +
+      "            AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL`,",
+    replace:
+      "        `UPDATE inbound_messages\n" +
+      "            SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)\n" +
+      "          WHERE channel = ? AND nonce = ? AND json_extract(turn_claim_json, '$.repliedAt') IS NULL`,",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: never writes repliedAt over a turn a no-reply resolution already closed",
+    ],
+  },
+  {
     // The fourth reader of `repliedAt`-as-"is this turn finished" (#682, Sol's review): #685
     // repointed this check at `turn_claim_json` after #671 split the lifecycles, but kept
     // `repliedAt IS NULL` as the only "still outstanding" test — the same collapse the ingress
@@ -243,6 +267,23 @@ const GUARDS = [
     replace: "    if (outcome.reply || !outcome.admitted) return;",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::#682: a claimed turn's PENDING reply survives a redelivery instead of becoming a false no-reply",
+    ],
+  },
+  {
+    // Found by Sol's review (#682): the constructor validates `nonceTtlMs` against the transport
+    // retention floor (#673) exactly once, but `policies` is a `Readonly<Record<...>>` whose
+    // readonly is shallow — it stops reassigning an entry, not writing to the `IngressPolicy`
+    // object that entry points at. Reading `policy.nonceTtlMs` again here re-reads a value the
+    // caller still owns and can still mutate, so the floor the constructor just refused to allow
+    // could reopen silently after construction. Reading a value this guard copied out at
+    // construction, and never re-reads from the caller's object, is what makes the floor hold for
+    // the object's whole lifetime rather than only at the instant it was built.
+    what: "the nonce ttl floor holds even if the caller mutates the policy object afterward",
+    file: "src/ingress/ingress-guard.ts",
+    find: "    this.prune(request.channel, this.#nonceTtlMsByChannel[request.channel] ?? DEFAULT_NONCE_TTL_MS);",
+    replace: "    this.prune(request.channel, policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS);",
+    killedBy: [
+      "tests/unit/ingress-nonce-ttl-transport-retention.test.ts::#682: holds the floor even if the caller mutates the policy object after construction",
     ],
   },
   {
