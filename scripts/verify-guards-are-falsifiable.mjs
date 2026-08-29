@@ -1276,6 +1276,20 @@ const GUARDS = [
       "tests/unit/binding-hardening.test.ts::switchTo denies a takeover that would strand a live, unabandonable execution, and rolls back its own writes",
     ],
   },
+  {
+    // #695: both places the DIRECT branch read `unresolvedTurns()` used only its first (oldest)
+    // element. A second unresolved turn accumulates whenever an overriding claim itself goes
+    // unresolved (A crashes, `/again` claims B, B also crashes) — and the override record must
+    // name every outstanding nonce at claim time, not only the oldest, or a later `/again` is
+    // recorded as overriding a turn that was never actually the only one outstanding.
+    what: "the override record captures every unresolved nonce, not only the oldest",
+    file: "src/ingress/telegram-router.ts",
+    find: "        const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;",
+    replace: "        const overriddenUnresolvedNonces = unresolved[0] ? [unresolved[0].nonce] : undefined;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::#695: names every unresolved turn, not only the oldest, once a second one accumulates",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

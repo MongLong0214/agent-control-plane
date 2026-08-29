@@ -525,7 +525,10 @@ export class TelegramHermesRouter {
         // unstuck, unless they already made that choice via `/again`.
         const unresolved = this.ingress.unresolvedTurns(identity.sessionDigest);
         if (unresolved.length > 0 && !classified.value.overridesUnresolved) {
-          const oldest = unresolved[0]!;
+          // #695: every unresolved row is named, not only the oldest. A second one accumulates
+          // whenever an overriding claim itself goes unresolved (A crashes, `/again` claims B, B
+          // also crashes) — the owner has to be told what is actually outstanding, not just the
+          // one this router used to bother reading.
           return this.outcomeWithReply(
             update,
             true,
@@ -534,22 +537,27 @@ export class TelegramHermesRouter {
             this.replyFor(
               update,
               [
-                `DIRECT parked: an earlier message in this conversation is still unresolved (received ${oldest.receivedAt}).`,
-                "ACP does not know whether that one reached the CEO, so this one was not run — nothing was appended twice.",
-                "Reply with /again <your message> to run this one anyway, knowing the earlier turn may still land too.",
+                unresolved.length === 1
+                  ? `DIRECT parked: an earlier message in this conversation is still unresolved (received ${unresolved[0]!.receivedAt}).`
+                  : `DIRECT parked: ${unresolved.length} earlier messages in this conversation are still unresolved (received ${unresolved.map((turn) => turn.receivedAt).join(", ")}).`,
+                "ACP does not know whether any of those reached the CEO, so this one was not run — nothing was appended twice.",
+                "Reply with /again <your message> to run this one anyway, knowing the earlier turn(s) may still land too.",
               ].join("\n"),
             ),
             ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION,
           );
         }
 
-        // Reached without an unresolved turn, or with one the owner deliberately overrode via
-        // `/again`. When it's the latter, the choice is recorded on the claim itself — not only
-        // in this reply — so a later reader does not have to trust that it was made honestly.
-        const overriddenUnresolvedNonce = unresolved[0]?.nonce;
+        // Reached without an unresolved turn, or with one or more the owner deliberately
+        // overrode via `/again`. When it's the latter, the choice is recorded on the claim
+        // itself — not only in this reply — so a later reader does not have to trust that it was
+        // made honestly. Every outstanding nonce is captured, not only the oldest (#695): a
+        // `/again` shown N unresolved turns and recording only one would silently override the
+        // rest, the same defect this issue closes in a new place.
+        const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;
         const claimed = this.ingress.claimTurn(
           this.ingress.nonceFor(update),
-          overriddenUnresolvedNonce ? { ...identity, overriddenUnresolvedNonce } : identity,
+          overriddenUnresolvedNonces ? { ...identity, overriddenUnresolvedNonces } : identity,
         );
         if (!claimed.allowed) {
           return this.outcomeWithReply(

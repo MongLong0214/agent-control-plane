@@ -661,16 +661,24 @@ export interface TurnIdentity {
   /** Which CEO generation asked it. */
   bindingDigest: string;
   /**
-   * The nonce of the unresolved turn this one was deliberately claimed alongside (#641).
+   * Every unresolved turn's nonce this one was deliberately claimed alongside (#641, #695).
    *
    * Undefined for the ordinary case: no unresolved turn existed for this conversation when this
-   * one was claimed. Set only when the owner explicitly chose to run a second turn while an
-   * earlier one from the same conversation had no recorded outcome — `unresolvedTurns` is what
-   * finds that earlier one, and this is where the choice is recorded, so a later reader (a
-   * person resolving the #672 lockout question, or a receipt match from #638) can tell a
-   * deliberate second turn apart from a message that simply never saw the first one.
+   * one was claimed. Set only when the owner explicitly chose to run another turn while one or
+   * more earlier ones from the same conversation had no recorded outcome — `unresolvedTurns` is
+   * what finds them, and this is where the choice is recorded, so a later reader (a person
+   * resolving the #672 lockout question, or a receipt match from #638) can tell a deliberate
+   * extra turn apart from a message that simply never saw the others.
+   *
+   * A plural array, not the single nonce #680 originally recorded here. `unresolvedTurns` can
+   * return more than one row — a second unresolved turn accumulates whenever an overriding claim
+   * itself goes unresolved (#695's reproduction: A crashes, `/again` claims B and B also
+   * crashes) — and a field that can only ever name the oldest silently drops every row after
+   * it, both from what the owner is shown and from what the claim records. The array is written
+   * whole, in the order `unresolvedTurns` returns it (oldest first), so it names all of them, not
+   * just how many there were.
    */
-  overriddenUnresolvedNonce?: string;
+  overriddenUnresolvedNonces?: readonly string[];
 }
 
 export interface TurnClaim extends TurnIdentity {
