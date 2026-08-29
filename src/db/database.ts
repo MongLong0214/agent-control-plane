@@ -513,6 +513,54 @@ export class Db {
   }
 
   /**
+   * `tx()` treats a denied `Decision` as an ordinary return value and commits it — a
+   * body that writes and then decides against itself leaves the write behind (#664).
+   * `txDecision` closes that gap for bodies whose *entire* return value is the decision
+   * being made: a denial rolls back exactly as a throw would, but is still handed back
+   * to the caller as data rather than surfacing as an exception.
+   *
+   * This is deliberately a separate, opt-in primitive rather than a change to `tx()`
+   * itself. Some transaction bodies write unconditional housekeeping that a later
+   * decision only *reads* — `github-kernel.ts`'s claim-expiry sweep is why the guard and
+   * a partial unique index agree inside one transaction, and it must survive regardless
+   * of what gets decided afterward. Rolling back on every denial would undo that
+   * housekeeping too, so callers opt in per call site instead of inheriting a blanket
+   * behaviour change.
+   *
+   * Nesting joins the outer transaction exactly as `tx()` already does — there is no
+   * SAVEPOINT here, so a nested call has no physical boundary of its own to roll back
+   * to. A nested `txDecision` therefore hands its `Decision` straight back to its caller
+   * without throwing: the caller (and everything above it, up to whichever frame owns
+   * the real transaction) decides what a denial there means, the same as it would for
+   * any other return value. Only the outermost `txDecision` can turn a denial into an
+   * actual ROLLBACK, so a body that must roll back on a nested denial has to be
+   * `txDecision` itself, all the way up — see `CtoLifecycle.acknowledgeHandoff`, whose
+   * own write must not survive `BindingRegistry.switchTo` denying underneath it.
+   */
+  txDecision<T>(fn: () => Decision<T>): Decision<T> {
+    if (this.#depth > 0) return this.guardSync(fn());
+    try {
+      return this.tx(() => {
+        // `guardSync` here, before `.allowed` is ever read, is load-bearing: an async
+        // body returns a pending Promise, which has no `.allowed` and so reads as
+        // `undefined` — indistinguishable from a denial unless the thenable is caught
+        // first. Checking `.allowed` first would wrap that Promise in the rollback
+        // signal below, hand it back through the catch as if it were a real `Decision`,
+        // and let the still-running callback's writes after its first `await` land as
+        // autocommit outside any transaction, on a handle `tx()`'s own guard would have
+        // poisoned. This mirrors `tx()`'s own `guardSync(fn())` exactly, so an async
+        // body throws and poisons here the same way it does there.
+        const result = this.guardSync(fn());
+        if (!result.allowed) throw txDenialSignal(result);
+        return result;
+      });
+    } catch (err) {
+      if (isTxDenialSignal(err)) return err.decision as Decision<T>;
+      throw err;
+    }
+  }
+
+  /**
    * A transaction body must be synchronous. An async callback would return a pending
    * promise, COMMIT would run before the work finished, and writes after the first await
    * would land outside the transaction with no way to roll them back — silently voiding
@@ -815,6 +863,20 @@ const isAsyncTransactionError = (err: unknown): err is AsyncTransactionError =>
       (err as { [ASYNC_TRANSACTION]?: unknown })[ASYNC_TRANSACTION] === true,
   );
 
+const TX_DENIAL = Symbol("tx-denial");
+
+type TxDenialSignal = Error & { [TX_DENIAL]: true; decision: Decision<unknown> };
+
+/** Thrown by `txDecision` to force `tx()` down its ROLLBACK path, then caught right back. */
+const txDenialSignal = (decision: Decision<unknown>): TxDenialSignal =>
+  Object.assign(new Error("transaction body denied; rolling back"), {
+    [TX_DENIAL]: true as const,
+    decision,
+  });
+
+const isTxDenialSignal = (err: unknown): err is TxDenialSignal =>
+  Boolean(err && typeof err === "object" && TX_DENIAL in err);
+
 /**
  * Turn the DB-level guard rails into the same reason codes the service layer uses,
  * so a constraint violation is never reported as an opaque SQLITE_CONSTRAINT.
@@ -875,6 +937,8 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   ACTOR_TARGET_BINDING_NO_REPLACE: ReasonCode.CONFLICT,
   ACTOR_TARGET_ATTESTATION_APPEND_ONLY: ReasonCode.CONFLICT,
   ACTOR_TARGET_ATTESTATION_NO_REPLACE: ReasonCode.CONFLICT,
+  ATTESTATION_GENERATION_MISMATCH: ReasonCode.ATTESTATION_GENERATION_MISMATCH,
+  ACTOR_SESSION_INCARNATION_MISMATCH: ReasonCode.ACTOR_SESSION_INCARNATION_MISMATCH,
   CONVERSATIONAL_ACTOR_NO_REPLACE: ReasonCode.CONFLICT,
   MANIFEST_NO_REPLACE: ReasonCode.CONFLICT,
   AUDIT_NO_REPLACE: ReasonCode.CONFLICT,

@@ -297,6 +297,56 @@ export const ReasonCode = {
    * that claim. Admitting on the binding alone trusts an assertion nothing has rechecked since.
    */
   CONVERSATION_TARGET_UNATTESTED: "CONVERSATION_TARGET_UNATTESTED",
+  /**
+   * An attestation exists for this binding, but none names the actor's current generation.
+   *
+   * A binding is a lifetime relation; an attestation is scoped to a runtime generation. The most
+   * recent attestation by time is not necessarily the current one: the actor may have retired, its
+   * runtime session and incarnation may have moved, or the role's active binding generation may
+   * have advanced past the one this attestation named. Admitting on the latest timestamp alone
+   * trusts a generation nothing has confirmed is still in force.
+   */
+  CONVERSATION_TARGET_ATTESTATION_STALE: "CONVERSATION_TARGET_ATTESTATION_STALE",
+  /**
+   * An attestation's own `binding_generation` disagrees with the assignment it names (#666
+   * round 5). The two are supposed to always agree — an honest writer reads both off the same
+   * `assignments` row — so this is `attestation_generation_matches_assignment` refusing the
+   * write, not `claim()` refusing a read: a database-level contradiction caught before it
+   * becomes a durable, self-inconsistent record.
+   */
+  ATTESTATION_GENERATION_MISMATCH: "ATTESTATION_GENERATION_MISMATCH",
+  /**
+   * `conversational_actors.current_session_incarnation` disagrees with `sessions.incarnation`
+   * for the session `current_session_id` names (#666 round 7). The actor's column is a copy;
+   * `sessions.incarnation` is the immutable authority. A write that moves one without the other —
+   * an insert or an update — is refused by
+   * `conversational_actors_incarnation_matches_session_on_insert` /
+   * `_on_update` before the copy can drift from what it claims to mirror.
+   */
+  ACTOR_SESSION_INCARNATION_MISMATCH: "ACTOR_SESSION_INCARNATION_MISMATCH",
+  /**
+   * A source names a channel and nonce that ingress never admitted.
+   *
+   * `claim()` used to write whatever channel/nonce a caller supplied straight into
+   * `canonical_turn_sources`, with nothing checking it against `inbound_messages`. So a source
+   * could name a message nobody admitted, and the retry chain would then reason about attempts of
+   * a message with no admission record.
+   */
+  CONVERSATION_TURN_SOURCE_UNADMITTED: "CONVERSATION_TURN_SOURCE_UNADMITTED",
+  /**
+   * A source names a channel and nonce ingress admitted, but the payload it carries is not the
+   * one `INGRESS_ADMITTED` recorded for that (channel, nonce).
+   *
+   * The existence check above stops at "did ingress admit *something* under this nonce" — it
+   * never compared *what*. So a caller could have ingress admit `{text:"A"}` for a nonce, then
+   * claim that same nonce with `{text:"B"}`, and the existence check alone would pass: the row is
+   * there, whatever payload names it. `canonical_turn_sources.source_digest` would then record
+   * B's digest as what the nonce carried — permanently, since the table is append-only. Read
+   * from `INGRESS_ADMITTED`'s own evidence, the one place a payload digest is recorded at
+   * admission time, rather than trusting the caller's payload for both "did this happen" and
+   * "what happened".
+   */
+  CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH: "CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH",
   /** This conversation already holds a turn whose outcome nobody established. */
   CONVERSATION_TURN_IN_DOUBT: "CONVERSATION_TURN_IN_DOUBT",
   /** A retry numbered past its predecessor, which does not exist — nothing says the earlier
@@ -510,6 +560,7 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
   ReasonCode.CAPACITY_PROBE_STALE,
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,
+  ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,
   ReasonCode.EVIDENCE_STALE,
   ReasonCode.FINALIZATION_ATTEMPT_STALE,
   ReasonCode.MERGE_BASE_STALE,

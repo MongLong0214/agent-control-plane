@@ -14,6 +14,7 @@ import {
 import { AuditLog } from "../../src/db/audit.ts";
 import { openDb } from "../../src/db/database.ts";
 import { ManualClock } from "../../src/core/clock.ts";
+import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -62,6 +63,7 @@ afterAll(cleanupTempDirs);
 type Coordinator = {
   db: ReturnType<typeof openDb>;
   clock: ManualClock;
+  audit: AuditLog;
   coordinator: ConversationTurnCoordinator;
 };
 
@@ -83,37 +85,81 @@ const stateDir = (): string => {
 const withCoordinator = (port: ReceiptPort = NEVER_FOUND_RECEIPT_PORT): Coordinator => {
   const db = openDb(join(stateDir(), "state.sqlite"));
   const clock = new ManualClock(NOW);
-  const coordinator = new ConversationTurnCoordinator(db, clock, new AuditLog(db, clock), port);
-  return { db, clock, coordinator };
+  const audit = new AuditLog(db, clock);
+  const coordinator = new ConversationTurnCoordinator(db, clock, audit, port);
+  return { db, clock, audit, coordinator };
 };
 
+/**
+ * #683/#666, likewise merged after this file's earlier rounds: `claim()` now refuses a source
+ * whose `(channel, nonce)` names no row in `inbound_messages` — a caller-built `TurnSource` is no
+ * longer enough on its own. Admits it through the real `IngressGuard.admit` path, the same
+ * production entry point, rather than inserting the row by hand: a hand-inserted row would be
+ * exactly the "test enters where production does not" shape this repository has shipped twice.
+ */
+const admitInbound = (c: Coordinator, nonce: string, payload: unknown): void => {
+  const guard = new IngressGuard(c.db, c.clock, c.audit, {
+    telegram: { allowedActors: ["owner"], allowedConversations: ["convo"] },
+  });
+  const admitted = guard.admit({ channel: "telegram", actor: "owner", conversation: "convo", nonce, payload });
+  if (!admitted.allowed) throw new Error(`fixture could not admit telegram:${nonce}: ${admitted.reasonCode}`);
+};
+
+/**
+ * #683/#666, merged into `origin/main` after this file's earlier rounds: `claim()`'s attestation
+ * lookup now joins `actor_target_attestations → actor_target_bindings → conversational_actors →
+ * assignments`, requiring a live session, the actor's current runtime incarnation, and an ACTIVE
+ * assignment whose generation and session match the attestation — a currency check, not just an
+ * existence one. This fixture was written before that landed and inserted only the binding and
+ * attestation rows; it now also creates the session and assignment those rows are checked against.
+ */
 const target = (c: Coordinator, name: string, bindingGeneration = 1): string => {
   const actorId = `actor:${name}`;
-  c.db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'CEO', ?)`, [
-    actorId,
-    NOW,
-  ]);
+  const sessionId = `runtime:${name}`;
+  c.db.run(
+    `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+     VALUES (?, 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
+    [sessionId, NOW, NOW],
+  );
+  c.db.run(
+    `INSERT INTO conversational_actors
+       (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+     VALUES (?, 'CEO', ?, 'inc-1', ?)`,
+    [actorId, sessionId, NOW],
+  );
   c.db.run(
     `INSERT INTO actor_target_bindings
        (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
      VALUES (?, ?, 'hermes', ?, ?, ?)`,
     [`bind:${name}`, actorId, `locator:${name}`, `digest:${name}`, NOW],
   );
+  // The active role binding the attestation's generation names, so `claim()`'s currency check
+  // has a current generation to find rather than reading an attestation nothing backs.
+  c.db.run(
+    `INSERT INTO assignments
+       (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+        binding_generation, mode, status, created_at)
+     VALUES (?, ?, 'CEO', ?, ?, 'inc-1', ?, 'PREFERRED', 'ACTIVE', ?)`,
+    [`asg:${name}`, `CEO:${name}`, actorId, sessionId, bindingGeneration, NOW],
+  );
   c.db.run(
     `INSERT INTO actor_target_attestations
        (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-        executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-     VALUES (?, ?, 'v1', ?, 'ses', 'inc', ?, ?)`,
-    [`att:${name}`, `bind:${name}`, `attd:${name}`, bindingGeneration, NOW],
+        executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+        attested_at)
+     VALUES (?, ?, 'v1', ?, ?, 'inc-1', ?, ?, ?)`,
+    [`att:${name}`, `bind:${name}`, `attd:${name}`, sessionId, bindingGeneration, `asg:${name}`, NOW],
   );
   return actorId;
 };
 
 const claim = (c: Coordinator, actorId: string, nonce: string): TurnPermit => {
+  const payload = { text: `message ${nonce}` };
+  admitInbound(c, nonce, payload);
   const decision = c.coordinator.claim({
     targetActorId: actorId,
     prompt: "hello",
-    sources: [{ channel: "telegram", nonce, attempt: 1, payload: {} }],
+    sources: [{ channel: "telegram", nonce, attempt: 1, payload }],
   });
   if (!decision.allowed) throw new Error(`claim refused: ${decision.reasonCode}`);
   return decision.value;

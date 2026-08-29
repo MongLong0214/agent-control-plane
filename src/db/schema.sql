@@ -245,6 +245,42 @@ BEGIN
   SELECT RAISE(ABORT, 'ACTOR_RUNTIME_NOT_READY');
 END;
 
+-- CP-HI-04 / #666 round 7 — `current_session_incarnation` is a copy of `sessions.incarnation`
+-- for whatever session `current_session_id` names; nothing enforced that the two stayed equal.
+-- A plain `UPDATE conversational_actors SET current_session_incarnation = ?` fires no existing
+-- trigger — `conversational_actors_runtime_ready` above watches `current_session_id` alone — so
+-- an incarnation that never existed could sit beside a real, READY session id, and a query
+-- trusting the copy would admit through it. `sessions.incarnation` is immutable for a session's
+-- lifetime (`sessions_incarnation_immutable`), so this is the one value the copy could ever
+-- honestly be; refused at both the insert that first sets the pointer and any later update of
+-- either column, since watching only one would let a caller move it alone and leave the other
+-- disagreeing with the row `current_session_id` names.
+CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert
+BEFORE INSERT ON conversational_actors
+WHEN NEW.current_session_id IS NOT NULL
+ AND EXISTS (
+   SELECT 1 FROM sessions
+    WHERE session_id = NEW.current_session_id
+      AND incarnation <> NEW.current_session_incarnation
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_SESSION_INCARNATION_MISMATCH');
+END;
+
+-- CP-HI-04 — the update half of the same rule: a later write must not move the pointer away
+-- from the session's own incarnation either.
+CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_update
+BEFORE UPDATE OF current_session_id, current_session_incarnation ON conversational_actors
+WHEN NEW.current_session_id IS NOT NULL
+ AND EXISTS (
+   SELECT 1 FROM sessions
+    WHERE session_id = NEW.current_session_id
+      AND incarnation <> NEW.current_session_incarnation
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'ACTOR_SESSION_INCARNATION_MISMATCH');
+END;
+
 -- CP-HI-04 — retirement is terminal, for the same reason revocation is: an actor brought back
 -- after its bindings were fenced would make superseded authority current again.
 CREATE TRIGGER IF NOT EXISTS conversational_actors_retirement_terminal
@@ -1517,6 +1553,18 @@ CREATE TABLE IF NOT EXISTS actor_target_attestations (
   executor_session_id           TEXT NOT NULL,
   executor_session_incarnation  TEXT NOT NULL,
   binding_generation            INTEGER NOT NULL,
+  -- The specific `assignments` row this attestation was made under (#666 round 4). Neither
+  -- `role` nor `role_key` said enough on their own: generation is minted per role_key
+  -- (`BindingRegistry.nextGeneration`), and one physical actor can hold, in sequence or at once,
+  -- assignments under *different* role_keys that share one `role` (#657's reuse), each counting
+  -- its own generation from 1. A bare `role = kind` match let a stale attestation for one
+  -- role_key be revived by an unrelated role_key's identical, unrelated generation number. The
+  -- assignment id has no such ambiguity: it is minted once per bind/rebind and never reused, so
+  -- naming it *is* naming the exact role_key and generation this attestation speaks about.
+  -- Nullable for a legacy row this migration cannot back-fill (nothing writes an attestation in
+  -- production yet, so none exists to lose) — `claim()` cannot match a NULL to any assignment,
+  -- so an unfilled row is correctly read as unverifiable rather than current.
+  assignment_id                 TEXT REFERENCES assignments(assignment_id),
   attested_at                   TEXT NOT NULL,
   UNIQUE (target_binding_id, attestation_digest),
   UNIQUE (target_attestation_id, target_binding_id)
@@ -1945,6 +1993,29 @@ CREATE TRIGGER IF NOT EXISTS actor_target_attestations_no_delete
 BEFORE DELETE ON actor_target_attestations
 BEGIN
   SELECT RAISE(ABORT, 'ACTOR_TARGET_ATTESTATION_APPEND_ONLY');
+END;
+
+-- CP-HI-04 / #666 round 5 — `assignment_id` pins which assignment an attestation speaks for; on its own it
+-- says nothing about what the attestation *claims* about that assignment. A row could cite a
+-- real, ACTIVE assignment_id while recording a generation that assignment's own row does not
+-- carry — the two are supposed to always agree (an honest writer reads both off the same
+-- assignment), and an unchecked copy is exactly the hazard: `claim()`'s join matched on identity
+-- alone, admitted the claim, and `canonical_turns` recorded a generation no attestation ever
+-- attested. Refused here, at the one point the row can still be stopped, rather than left to a
+-- read-time comparison alone. Named `attestation_…`, not `actor_target_attestations_…`, on
+-- purpose: it is not an append-only ledger trigger, and `LEDGER_TRIGGER_NAMES`' repair migration
+-- would try to create it (referencing the `assignment_id` column) on a database still migrating
+-- through versions where that column does not exist yet.
+CREATE TRIGGER IF NOT EXISTS attestation_generation_matches_assignment
+BEFORE INSERT ON actor_target_attestations
+WHEN NEW.assignment_id IS NOT NULL
+ AND EXISTS (
+   SELECT 1 FROM assignments
+    WHERE assignment_id = NEW.assignment_id
+      AND binding_generation <> NEW.binding_generation
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'ATTESTATION_GENERATION_MISMATCH');
 END;
 
 -- CP-HI-06 — REPLACE is refused by the schema, not by a connection setting.

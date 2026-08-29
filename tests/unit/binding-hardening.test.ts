@@ -446,12 +446,16 @@ describe("an actor's runtime can only ever be a READY session (CP-HI-08, #493)",
       [bindings.require(roleKey).assignmentId],
     );
     // The raw-SQL bypass the trigger exists for. Going through switchTo would be refused earlier
-    // by SESSION_NOT_READY, which proves the service layer and not the database backstop.
+    // by SESSION_NOT_READY, which proves the service layer and not the database backstop. Both
+    // columns move together, matching what a real repoint always does (#666 round 7) — the READY
+    // trigger is what this test is about, and the incarnation is set to the real one so its own
+    // guard has nothing to say.
     expect(() =>
-      db.run(`UPDATE conversational_actors SET current_session_id = ? WHERE actor_id = ?`, [
-        "ses_draining",
-        actor!.actor_id,
-      ]),
+      db.run(
+        `UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = ?
+          WHERE actor_id = ?`,
+        ["ses_draining", "inc-draining", actor!.actor_id],
+      ),
     ).toThrow(/ACTOR_RUNTIME_NOT_READY/);
   });
 
@@ -465,10 +469,11 @@ describe("an actor's runtime can only ever be a READY session (CP-HI-08, #493)",
       `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
       [bindings.require(roleKey).assignmentId],
     );
-    db.run(`UPDATE conversational_actors SET current_session_id = ? WHERE actor_id = ?`, [
-      ready,
-      actor!.actor_id,
-    ]);
+    db.run(
+      `UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = ?
+        WHERE actor_id = ?`,
+      [ready, `inc-${ready}`, actor!.actor_id],
+    );
     expect(bindings.require(roleKey).sessionId).toBe(ready);
   });
 });
@@ -507,7 +512,9 @@ describe("a reused pid does not make an innocent session a producer (#505)", () 
        VALUES ('tsk_reuse', ?, 'work', 'implementation', 'READY', '{}', 't', 't')`,
       [core.seeded.runId],
     );
-    const actorId = seedActor(core.db, "WORKER", producer);
+    // `producer`'s real incarnation, not the default — the actor's live pointer has to name the
+    // session it actually points to (#666 round 7).
+    const actorId = seedActor(core.db, "WORKER", producer, `inc-${producer}`);
     core.db.run(
       `INSERT INTO assignments (assignment_id, role_key, role, run_id, task_id, actor_id, session_id,
                                 session_incarnation, binding_generation, mode, status, created_at)
@@ -547,5 +554,99 @@ describe("a reused pid does not make an innocent session a producer (#505)", () 
       runId: seeded.runId,
     });
     expect(decision.allowed).toBe(false);
+  });
+});
+
+describe("#664 — a takeover's revoke-and-mint rolls back when it cannot repoint every run", () => {
+  /**
+   * `CtoLifecycle.recoveryTakeover` calls `BindingRegistry.switchTo` with exactly this
+   * shape (mode: FALLBACK, takeover: true, conversation: REPLACED) after its own
+   * handoffs INSERT. Driving it through the full daemon is not possible for this
+   * specific denial: `ControlPlane` always calls `bindings.attach({ tasks: this.tasks })`
+   * during normal construction (src/app/control-plane.ts), so `!this.#tasks` can never be
+   * true there. `makeCore()` builds a `BindingRegistry` the same way core-hardening.test.ts
+   * and the rest of this file already do — without attaching a `TaskGraph` — which is
+   * exactly the configuration this guard exists for, so this exercises the real
+   * `switchTo` body (not a substitute) under the one precondition that reaches it.
+   */
+  it("switchTo denies a takeover that would strand a live, unabandonable execution, and rolls back its own writes", () => {
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+
+    // A worker is bound and mid-execution on the run the dying CTO owns.
+    const worker = "ses_worker_recovery_race";
+    core.db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES (?, 'inc-1', 'scripted', 'm', 'READY', ?, ?)`,
+      [worker, core.clock.nowIso(), core.clock.nowIso()],
+    );
+    const taskId = "tsk_recovery_race";
+    const workerBinding = core.bindings.bind({
+      role: Role.WORKER,
+      sessionId: worker,
+      taskId,
+      runId: seeded.runId,
+      projectId: seeded.projectId,
+    });
+    expect(workerBinding.allowed).toBe(true);
+    core.db.run(
+      `INSERT INTO tasks (task_id, run_id, title, category, state, spec_json, created_at, updated_at)
+       VALUES (?, ?, 'recovery race task', 'implementation', 'READY', '{}', ?, ?)`,
+      [taskId, seeded.runId, core.clock.nowIso(), core.clock.nowIso()],
+    );
+    core.db.run(
+      `INSERT INTO task_executions (execution_id, run_id, task_id, attempt, owner_binding_generation,
+                                    worker_session_id, provider, model, started_at, status)
+       VALUES (?, ?, ?, 1, ?, ?, 'scripted', 'worker', ?, 'RUNNING')`,
+      [`${taskId}#1`, seeded.runId, taskId, seeded.generation, worker, core.clock.nowIso()],
+    );
+
+    const replacement = "ses_recovery_replacement";
+    core.db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES (?, 'inc-1', 'scripted', 'm', 'READY', ?, ?)`,
+      [replacement, core.clock.nowIso(), core.clock.nowIso()],
+    );
+
+    const before = core.db.get<{ assignment_id: string; status: string }>(
+      `SELECT assignment_id, status FROM assignments
+        WHERE role_key = ? AND binding_generation = ? AND status = 'ACTIVE'`,
+      [seeded.roleKey, seeded.generation],
+    );
+    expect(before?.status).toBe("ACTIVE");
+
+    const result = core.bindings.switchTo({
+      roleKey: seeded.roleKey,
+      role: Role.PRIMARY_CTO,
+      sessionId: replacement,
+      projectId: seeded.projectId,
+      mode: "FALLBACK",
+      reason: "recovery takeover race",
+      conversation: "REPLACED",
+      takeover: true,
+    });
+
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.BINDING_GENERATION_STALE);
+
+    // The whole point of #664: switchTo's own revoke-and-mint had already written by the
+    // time the stale-execution guard denied. Read the table directly, not the returned
+    // Decision, to prove neither write survived.
+    const original = core.db.get<{ status: string }>(
+      `SELECT status FROM assignments WHERE assignment_id = ?`,
+      [before!.assignment_id],
+    );
+    expect(original?.status).toBe("ACTIVE");
+
+    const minted = core.db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM assignments WHERE role_key = ? AND binding_generation <> ?`,
+      [seeded.roleKey, seeded.generation],
+    );
+    expect(minted?.n).toBe(0);
+
+    const current = core.bindings.active(seeded.roleKey);
+    expect(current?.sessionId).toBe(seeded.sessionId);
+    expect(current?.bindingGeneration).toBe(seeded.generation);
   });
 });

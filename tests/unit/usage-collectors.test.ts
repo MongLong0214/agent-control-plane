@@ -1327,6 +1327,11 @@ setInterval(() => {}, 1_000);
     const root = tempDir("acp-usage-pty-");
     const binary = join(root, "codex-usage-stub.mjs");
     writeFileSync(binary, `#!${process.execPath}
+// Unconditional readiness banner, written before anything is typed and independent of what
+// arrives on stdin — the real CLI's own startup line, in miniature. This exists solely so a
+// failure below can tell "the process was alive and the pty carried its output" apart from
+// "nothing ever arrived": every real CLI says something on launch before a user types.
+process.stdout.write("Codex CLI ready\\n");
 let received = "";
 let opened = false;
 process.stdin.on("data", (chunk) => {
@@ -1345,26 +1350,90 @@ setInterval(() => {}, 1_000);
     chmodSync(binary, 0o700);
 
     const realTerminal = new ExpectUsageTerminal();
-    let captured = "";
+    let capturedStdout = "";
+    let capturedStderr = "";
+    let capturedError: string | null = null;
     const reading = await new CodexUsageCollector({
       clock: clock(),
       binary,
+      // A test-only budget for a stub that answers instantly — large enough that this
+      // suite's own sandboxed process load does not itself trip it in the ordinary case,
+      // small enough that a genuinely hung stub fails in seconds. It has no production
+      // counterpart to be sized against: no production site injects `terminal` for Codex
+      // (`cli-adapters.ts` ~1761 constructs `CodexUsageCollector` with `{clock, binary}`
+      // only), so the live path never runs this pty at all — it reads
+      // `account/rateLimits/read` instead, on its own unrelated `NON_INTERACTIVE_TIMEOUT_MS`
+      // (20s). This 5s is purely this test's own patience with a stub that answers at once.
       timeoutMs: 5_000,
       terminal: {
         async run(input) {
           const result = await realTerminal.run(input);
-          captured = `${result.stdout}\n${result.stderr}\n${result.error ?? ""}`;
+          capturedStdout = result.stdout;
+          capturedStderr = result.stderr;
+          capturedError = result.error;
           return result;
         },
       },
     }).collect();
+    const captured = `${capturedStdout}\n${capturedStderr}\n${capturedError ?? ""}`;
+
+    // A fixed-budget real pty that fails to complete in time is an *ordering of outputs*,
+    // and an ordering of outputs is not proof of a cause — a slow host and a broken
+    // keystroke produce the identical trace, and no amount of extra signal read from the
+    // same stream changes that, because the ambiguity is in the world being observed, not
+    // in the check. Two earlier commits on this same branch (superseded by this one, #644)
+    // each tried to name a specific cause from this trace and were each measured wrong:
+    //
+    //   commit 1 asked whether an unrelated `codex` process existed anywhere on the host.
+    //   Wrong direction: a stub answering immediately with `"5-hour limit: 62% consumed"`
+    //   (parseUsageOutput refuses that shape by design — see the mutation test above)
+    //   resolves with `timedOut: false` regardless of any other `codex` process, so it
+    //   reported an unrelated live regression as "another Codex session is active".
+    //
+    //   commit 2 added the stub's own unconditional startup banner (kept below — it is
+    //   still useful as an observed milestone) and inferred a cause from which milestones
+    //   were seen: banner-but-no-chooser was called "a navigation regression", chooser-seen
+    //   was treated as ruling out the host. Also wrong: a stub that only ever gets to print
+    //   its banner — because the host never scheduled it again in time to react to
+    //   `/usage` — produces exactly the same banner-but-no-chooser trace as production's
+    //   `CLI.gpt` step 1 `input` mutated to the typo `"/usag\r"`, an ordinary keystroke
+    //   regression (reproduced directly against this file, see the commit that added this
+    //   comment). And a broken `waitFor` pattern can leave the chooser text sitting in the
+    //   captured stream even though the collector's own step never advanced past it, which
+    //   defeats "chooser seen" as proof the first step was fine.
+    //
+    // So this reports the milestone reached and states the ambiguity as a fact, rather than
+    // resolving it. That is less satisfying than a verdict, and it is the honest answer.
+    const sawReadiness = /codex cli ready/i.test(capturedStdout);
+    const sawChooser = /show usage|press enter to confirm/i.test(capturedStdout);
+    if (reading.error === "interactive /usage timed out") {
+      const milestone = !sawReadiness
+        ? "before the stub's own startup banner ever appeared"
+        : !sawChooser
+          ? "after the stub's startup banner appeared but before the usage chooser did"
+          : "after the usage chooser appeared to open";
+      throw new Error(
+        `the pty timed out ${milestone} (5s budget). Two different causes produce this ` +
+          "same trace, and this test cannot separate them from the trace alone: the host " +
+          "may have been too loaded to complete the round trip inside the budget, or the " +
+          "collector's Codex steps may have sent input, or be waiting on a pattern, that " +
+          "this stub's protocol no longer satisfies. Next step: re-run this file alone on " +
+          "an otherwise idle machine. A pass there is consistent with the budget having " +
+          "been the limit, not proof of it — intermittent pty or collector contention " +
+          `would also pass on a re-run; a repeat failure there is the stronger signal ` +
+          `(#644). ${captured}`,
+      );
+    }
 
     expect(reading, `${JSON.stringify(reading)}\n${captured}`).toMatchObject({
       sensorHealth: "HEALTHY",
       buckets: [expect.objectContaining({ id: "5-hour", remainingPercent: 77 })],
     });
     // If the collector stops sending /usage or blindly removes Codex's bounded second
-    // navigation step, this real PTY fixture times out or yields no routable bucket.
+    // navigation step, this real PTY fixture times out or yields no routable bucket — and,
+    // when the failure completed rather than timing out (a real response the parser could
+    // not read, for instance), still reports that unmodified above rather than folded into
+    // the ambiguity message this timeout branch alone owns.
   });
 
   it("turns a collector exception into an ERROR reading rather than throwing or reusing quota", async () => {
