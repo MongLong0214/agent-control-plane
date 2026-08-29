@@ -34,30 +34,6 @@ afterAll(cleanupTempDirs);
 
 const clock = () => new ManualClock("2026-08-13T00:00:00.000Z");
 
-/**
- * The real production Codex binary's short name (`resolveExecutable`'s default for `gpt`,
- * `cli-adapters.ts:1666`) — never the stub script this suite spawns, which runs under `node`
- * and never carries this name. A live Codex process on the same host competes for CPU with
- * this test's own real `/usr/bin/expect` pty, and a fixed navigation timeout is not something
- * that competition reliably survives (#644): this deployment's CEO runtime is itself a Codex
- * session, so the collision is structural here rather than incidental.
- *
- * `pgrep -x` matches the short command name regardless of which vendored path launched it —
- * measured: `ps -o comm=` reports the full vendor-store path, but `pgrep -x codex` still finds
- * it. `pgrep` exits 1 with empty stdout when nothing matches, which is "none running", not a
- * failure to ask, so that exit is swallowed rather than thrown.
- */
-const hostCodexPids = (): readonly string[] => {
-  try {
-    return execFileSync("pgrep", ["-x", "codex"], { encoding: "utf8" })
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-  } catch {
-    return [];
-  }
-};
-
 /** Captured from the live Codex `/usage` view on this machine, reduced to its stable text. */
 const CODEX_ACTIVITY_ONLY = `
 /usage daily
@@ -1369,36 +1345,78 @@ setInterval(() => {}, 1_000);
     chmodSync(binary, 0o700);
 
     const realTerminal = new ExpectUsageTerminal();
-    let captured = "";
-    const before = hostCodexPids();
+    let capturedStdout = "";
+    let capturedStderr = "";
+    let capturedError: string | null = null;
     const reading = await new CodexUsageCollector({
       clock: clock(),
       binary,
+      // A test-only budget for a stub that answers instantly — large enough that this
+      // suite's own sandboxed process load does not itself trip it in the ordinary case,
+      // small enough that a genuinely hung stub fails in seconds. It models this test's own
+      // patience, not a production round trip: production times a live host CLI on
+      // `COLLECTOR_TIMEOUT_MS` (45s), nine times this value, for exactly that reason.
       timeoutMs: 5_000,
       terminal: {
         async run(input) {
           const result = await realTerminal.run(input);
-          captured = `${result.stdout}\n${result.stderr}\n${result.error ?? ""}`;
+          capturedStdout = result.stdout;
+          capturedStderr = result.stderr;
+          capturedError = result.error;
           return result;
         },
       },
     }).collect();
+    const captured = `${capturedStdout}\n${capturedStderr}\n${capturedError ?? ""}`;
 
-    // A real Codex process seen on this host, either before the pty ran or still there once it
-    // finished, is named before the assertion below runs — not after a bare `toMatchObject`
-    // failure sends the next person hunting through their own diff for a cause that is not in
-    // it (#644). Checked only when the reading itself already failed: a Codex process merely
-    // being present is not evidence of anything when the test passed anyway.
-    if (reading.sensorHealth !== "HEALTHY") {
-      const concurrent = before.length > 0 ? before : hostCodexPids();
-      if (concurrent.length > 0) {
-        throw new Error(
-          `another Codex session is active on this host (pid ${concurrent.join(", ")}); this ` +
-            "test drives a real pseudo-terminal and its fixed navigation timing cannot be " +
-            "trusted while a real Codex CLI process is competing for the machine — see #644. " +
-            `Underlying reading: ${JSON.stringify(reading)}\n${captured}`,
-        );
-      }
+    // A fixed-budget real pty that fails to complete in time is not, by itself, evidence of
+    // which of two different things happened, and an earlier commit on this same branch
+    // (superseded by this one, #644) conflated them by keying off whether an unrelated
+    // `codex` process happened to be running anywhere on the host:
+    //
+    //   the stub never emitted a byte before the budget elapsed   — an environment/scheduling
+    //                                                                 miss: the host did not
+    //                                                                 run this pty in time.
+    //                                                                 Real on this machine
+    //                                                                 (#644's own follow-up):
+    //                                                                 the deployment's CEO
+    //                                                                 runtime and reviewer
+    //                                                                 sessions share host CPU
+    //                                                                 with real Codex CLI
+    //                                                                 activity, and a
+    //                                                                 full-suite run adds its
+    //                                                                 own sandboxed children.
+    //
+    //   the stub answered and the collector still failed            — a real regression in the
+    //                                                                 navigation or the parser
+    //                                                                 this test exists to
+    //                                                                 catch, and must never be
+    //                                                                 reported as anything else.
+    //
+    // Naming a *specific* competing process was measured to be unsound rather than merely
+    // theoretically risky: a stub answering immediately with `"5-hour limit: 62% consumed"`
+    // (a shape `parseUsageOutput` refuses by design — see the mutation test above) resolves
+    // with `timedOut: false` regardless of whether a real `codex` process is present
+    // elsewhere on the host, so a check keyed on process presence reported that unrelated
+    // regression as "another Codex session is active" — confidently wrong, and worse than
+    // the bare timeout it replaced. The pty layer already knows whether it delivered a byte;
+    // this reads that instead of asking the process table a question it cannot answer.
+    //
+    // "Never emitted a byte" cannot be read off raw stdout emptiness either — measured: a
+    // pty echoes back whatever this test's own harness typed (`/usage\r\n`, 8 bytes) even
+    // when the stub writes nothing at all, so `capturedStdout` is non-empty on every run
+    // regardless of whether the target ever responded. The signal that actually means "the
+    // chooser answered" is the same one the collector itself gates its second keystroke on
+    // — `CLI.gpt`'s own `waitFor`, `/show usage|press enter to confirm/i` — so that is what
+    // is checked here, not raw byte count.
+    const respondedAtAll = /show usage|press enter to confirm/i.test(capturedStdout);
+    if (reading.error === "interactive /usage timed out" && !respondedAtAll) {
+      throw new Error(
+        "the pty never showed the usage chooser opening before the 5s budget elapsed; this " +
+          "is an environment/scheduling miss — the host did not run this real pty in time — " +
+          "not a collector defect. On this deployment the CEO runtime and reviewer sessions " +
+          `routinely share host Codex CLI activity with whatever runs the suite (#644). ${captured}`,
+      );
     }
 
     expect(reading, `${JSON.stringify(reading)}\n${captured}`).toMatchObject({
@@ -1407,7 +1425,8 @@ setInterval(() => {}, 1_000);
     });
     // If the collector stops sending /usage or blindly removes Codex's bounded second
     // navigation step, this real PTY fixture times out or yields no routable bucket — and,
-    // absent a concurrent Codex process, still reports that failure directly above.
+    // whenever the stub did answer, still reports that failure directly above rather than
+    // behind an environment story it did not earn.
   });
 
   it("turns a collector exception into an ERROR reading rather than throwing or reusing quota", async () => {
