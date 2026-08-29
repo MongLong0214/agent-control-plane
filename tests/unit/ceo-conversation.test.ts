@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -87,15 +88,20 @@ describe("CEO conversation port", () => {
     expect(peer.calls).toEqual([]);
   });
 
-  it("treats a peer that never answers as a timeout without repeating its error text", async () => {
+  it("treats the SDK's own request timeout as a timeout without repeating its error text", async () => {
     // Both sides are stated, not just the budget. The port checks that its own deadline
     // outlasts the peer's, and a test that shortened only one of them would be asking for the
     // inverted arrangement the check exists to refuse.
+    //
+    // The real SDK rejects a request that outlives its budget with `McpError(RequestTimeout,
+    // ...)` (`shared/protocol.js`'s `timeoutHandler`), never a plain `Error` — so that is what
+    // this fake peer throws too, rather than standing in with something the real rejection
+    // never produces.
     const port = new CeoConversationPort({ budgetMs: 5, peerReplyTimeoutMs: 1 });
     const peer: FakePeer = {
       capabilities: { sampling: {} },
       answer: async () => {
-        throw new Error("secret-bearing internal detail");
+        throw new McpError(ErrorCode.RequestTimeout, "secret-bearing internal detail");
       },
       calls: [],
     };
@@ -106,6 +112,105 @@ describe("CEO conversation port", () => {
     expect(answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_TIMEOUT);
     expect(answered.allowed).toBe(false);
     expect(JSON.stringify(answered)).not.toContain("secret-bearing internal detail");
+  });
+
+  it("attributes a dropped connection to the transport, not the conversation budget", async () => {
+    // #633: before this, every `createMessage` rejection — a genuine timeout, a dropped
+    // connection, a peer-side error — reported `CEO_CONVERSATION_TIMEOUT`. The daemon's own
+    // clock did not expire here; the socket did. This is what the SDK rejects with when its
+    // transport closes mid-request (`Protocol._onclose`), and it must not read as a timeout.
+    const port = new CeoConversationPort();
+    const peer: FakePeer = {
+      capabilities: { sampling: {} },
+      answer: async () => {
+        throw new McpError(ErrorCode.ConnectionClosed, "Connection closed");
+      },
+      calls: [],
+    };
+    port.attach(fakePeer(peer), stillCeo());
+
+    const answered = await port.ask("어떻게 돼가?");
+
+    expect(answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED);
+    expect(answered.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_TIMEOUT);
+  });
+
+  it("attributes a connection that was never there to the transport as well", async () => {
+    // The SDK's `request()` also rejects synchronously with a plain `Error('Not connected')`
+    // when its own transport is already gone — a second shape of the same "we never reached the
+    // peer" outcome, not a JSON-RPC error and not the budget expiring.
+    const port = new CeoConversationPort();
+    const peer: FakePeer = {
+      capabilities: { sampling: {} },
+      answer: async () => {
+        throw new Error("Not connected");
+      },
+      calls: [],
+    };
+    port.attach(fakePeer(peer), stillCeo());
+
+    const answered = await port.ask("어떻게 돼가?");
+
+    expect(answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED);
+  });
+
+  it("attributes a peer's JSON-RPC error response to the peer, not the budget or the transport", async () => {
+    // The runtime distinguishes this on its own side already — it answers with `CEO reply
+    // source failed: <message>` (`hermes-ceo.ts`'s `.catch` on `askReplySource`), sent back as a
+    // JSON-RPC error. The SDK's `Protocol._onresponse` turns that into `McpError(response.error
+    // .code, response.error.message, ...)`. The turn reached the peer; the peer is the one that
+    // failed, and that has to travel as a third code, not vanish into the timeout one.
+    const port = new CeoConversationPort();
+    const peer: FakePeer = {
+      capabilities: { sampling: {} },
+      answer: async () => {
+        throw new McpError(ErrorCode.InternalError, "CEO reply source failed: something private");
+      },
+      calls: [],
+    };
+    port.attach(fakePeer(peer), stillCeo());
+
+    const answered = await port.ask("어떻게 돼가?");
+
+    expect(answered.reasonCode).toBe(ReasonCode.CEO_CONVERSATION_PEER_FAILED);
+    expect(answered.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_TIMEOUT);
+    expect(answered.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED);
+    // The peer's own error code is evidence; its message is not, for the same reason the
+    // timeout path never repeated one — it may quote whatever the runtime was handling.
+    expect(JSON.stringify(answered)).not.toContain("something private");
+  });
+
+  it("does not classify an unrecognized rejection as a timeout, transport failure, or peer error", async () => {
+    // A rejection this port cannot place is left unclassified (`INTERNAL_ERROR`) rather than
+    // guessed into one of the three named outcomes — the guess would be exactly the kind of
+    // false attribution #633 is about.
+    const port = new CeoConversationPort();
+    const peer: FakePeer = {
+      capabilities: { sampling: {} },
+      answer: async () => {
+        throw new Error("neither an McpError nor 'Not connected'");
+      },
+      calls: [],
+    };
+    port.attach(fakePeer(peer), stillCeo());
+
+    const answered = await port.ask("어떻게 돼가?");
+
+    expect(answered.reasonCode).toBe(ReasonCode.INTERNAL_ERROR);
+    expect(answered.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_TIMEOUT);
+    expect(answered.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED);
+    expect(answered.reasonCode).not.toBe(ReasonCode.CEO_CONVERSATION_PEER_FAILED);
+  });
+
+  it("gives a timeout, a transport failure, and a peer error three different reason codes", () => {
+    // The bug in one assertion: before #633's fix these three were the same string.
+    const codes = new Set([
+      ReasonCode.CEO_CONVERSATION_TIMEOUT,
+      ReasonCode.CEO_CONVERSATION_TRANSPORT_FAILED,
+      ReasonCode.CEO_CONVERSATION_PEER_FAILED,
+    ]);
+
+    expect(codes.size).toBe(3);
   });
 
   it("refuses non-text content rather than delivering an empty message", async () => {
@@ -317,7 +422,7 @@ describe("one turn at a time on the CEO's canonical session", () => {
     const failing: FakePeer = {
       capabilities: { sampling: {} },
       answer: async () => {
-        throw new Error("no answer");
+        throw new McpError(ErrorCode.RequestTimeout, "no answer");
       },
       calls: [],
     };
@@ -380,7 +485,7 @@ describe("whether a refusal reached the CEO", () => {
     const peer: FakePeer = {
       capabilities: { sampling: {} },
       answer: async () => {
-        throw new Error("budget expired");
+        throw new McpError(ErrorCode.RequestTimeout, "budget expired");
       },
       calls: [],
     };
