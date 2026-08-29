@@ -7,6 +7,7 @@ import { AuditLog } from "../../src/db/audit.ts";
 import { ConversationTurnCoordinator } from "../../src/conversation/turn-coordinator.ts";
 import { openDb } from "../../src/db/database.ts";
 import { ManualClock } from "../../src/core/clock.ts";
+import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -104,20 +105,47 @@ describe("a database whose trigger bodies came from an earlier head", () => {
 
       const clock = new ManualClock(NOW);
       const coordinator = new ConversationTurnCoordinator(db, clock, new AuditLog(db, clock));
-      db.run(`INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES ('a','CEO',?)`, [NOW]);
+      db.run(
+        `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+         VALUES ('s','i','claude','opus','READY',?,?)`,
+        [NOW, NOW],
+      );
+      db.run(
+        `INSERT INTO conversational_actors
+           (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+         VALUES ('a','CEO','s','i',?)`,
+        [NOW],
+      );
       db.run(
         `INSERT INTO actor_target_bindings
            (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
          VALUES ('b','a','hermes','L','D',?)`,
         [NOW],
       );
+      // The active role binding the attestation's generation names, so `claim()`'s currency check
+      // (#666) has a current generation to find.
+      db.run(
+        `INSERT INTO assignments
+           (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+            binding_generation, mode, status, created_at)
+         VALUES ('asg:a','CEO:a','CEO','a','s','i',1,'PREFERRED','ACTIVE',?)`,
+        [NOW],
+      );
       db.run(
         `INSERT INTO actor_target_attestations
            (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
-            executor_session_id, executor_session_incarnation, binding_generation, attested_at)
-         VALUES ('t','b','v1','AD','s','i',1,?)`,
+            executor_session_id, executor_session_incarnation, binding_generation, assignment_id,
+            attested_at)
+         VALUES ('t','b','v1','AD','s','i',1,'asg:a',?)`,
         [NOW],
       );
+      // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with
+      // the same payload it names (#666) — so the fixture admits through the real path rather
+      // than inserting the row by hand.
+      const admitted = new IngressGuard(db, clock, new AuditLog(db, clock), {
+        telegram: { allowedActors: ["owner"], allowedConversations: ["convo"] },
+      }).admit({ channel: "telegram", actor: "owner", conversation: "convo", nonce: "m1", payload: {} });
+      expect(admitted.allowed).toBe(true);
 
       const claimed = coordinator.claim({
         targetActorId: "a",
