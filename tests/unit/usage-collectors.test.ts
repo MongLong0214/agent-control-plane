@@ -1417,9 +1417,11 @@ setInterval(() => {}, 1_000);
           "same trace, and this test cannot separate them from the trace alone: the host " +
           "may have been too loaded to complete the round trip inside the budget, or the " +
           "collector's Codex steps may have sent input, or be waiting on a pattern, that " +
-          "this stub's protocol no longer satisfies. To tell them apart: re-run this file " +
-          "alone on an otherwise idle machine — if it passes there, the budget was the " +
-          `limit, not the collector (#644). ${captured}`,
+          "this stub's protocol no longer satisfies. Next step: re-run this file alone on " +
+          "an otherwise idle machine. A pass there is consistent with the budget having " +
+          "been the limit, not proof of it — intermittent pty or collector contention " +
+          `would also pass on a re-run; a repeat failure there is the stronger signal ` +
+          `(#644). ${captured}`,
       );
     }
 
