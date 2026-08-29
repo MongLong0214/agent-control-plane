@@ -316,6 +316,20 @@ export const ReasonCode = {
    * a message with no admission record.
    */
   CONVERSATION_TURN_SOURCE_UNADMITTED: "CONVERSATION_TURN_SOURCE_UNADMITTED",
+  /**
+   * A source names a channel and nonce ingress admitted, but the payload it carries is not the
+   * one `INGRESS_ADMITTED` recorded for that (channel, nonce).
+   *
+   * The existence check above stops at "did ingress admit *something* under this nonce" — it
+   * never compared *what*. So a caller could have ingress admit `{text:"A"}` for a nonce, then
+   * claim that same nonce with `{text:"B"}`, and the existence check alone would pass: the row is
+   * there, whatever payload names it. `canonical_turn_sources.source_digest` would then record
+   * B's digest as what the nonce carried — permanently, since the table is append-only. Read
+   * from `INGRESS_ADMITTED`'s own evidence, the one place a payload digest is recorded at
+   * admission time, rather than trusting the caller's payload for both "did this happen" and
+   * "what happened".
+   */
+  CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH: "CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH",
   /** This conversation already holds a turn whose outcome nobody established. */
   CONVERSATION_TURN_IN_DOUBT: "CONVERSATION_TURN_IN_DOUBT",
   /** A retry numbered past its predecessor, which does not exist — nothing says the earlier

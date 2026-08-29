@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -62,11 +62,9 @@ const target = (h: Harness): string => {
 const settledTurn = (h: Harness): string => {
   const coordinator = h.cp.conversation;
   const actorId = target(h);
-  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
-  h.cp.db.run(
-    `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'n1', 'owner', ?)`,
-    [NOW],
-  );
+  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with
+  // the same payload it names (#666).
+  admitInbound(h, { nonce: "n1", payload: {} });
   const claimed = coordinator.claim({
     targetActorId: actorId,
     prompt: "question",
@@ -127,10 +125,7 @@ describe("a settlement cannot be rewritten", () => {
     const h = makeHarness();
     const coordinator = h.cp.conversation;
     const actorId = target(h);
-    h.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'n1', 'owner', ?)`,
-      [NOW],
-    );
+    admitInbound(h, { nonce: "n1", payload: {} });
     const claimed = coordinator.claim({
       targetActorId: actorId,
       prompt: "q",
@@ -204,10 +199,7 @@ describe("a settlement cannot be rewritten", () => {
     const h = makeHarness();
     const coordinator = h.cp.conversation;
     const actorId = target(h);
-    h.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'n1', 'owner', ?)`,
-      [NOW],
-    );
+    admitInbound(h, { nonce: "n1", payload: {} });
     const claimed = coordinator.claim({
       targetActorId: actorId,
       prompt: "q",
@@ -421,10 +413,7 @@ describe("an outcome may only be recorded under an authority that could have obs
     const h = makeHarness();
     const coordinator = h.cp.conversation;
     const actorId = target(h);
-    h.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'n1', 'owner', ?)`,
-      [NOW],
-    );
+    admitInbound(h, { nonce: "n1", payload: {} });
     const claimed = coordinator.claim({
       targetActorId: actorId,
       prompt: "q",
@@ -456,10 +445,7 @@ describe("an outcome may only be recorded under an authority that could have obs
     const h = makeHarness();
     const coordinator = h.cp.conversation;
     const actorId = target(h);
-    h.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'n1', 'owner', ?)`,
-      [NOW],
-    );
+    admitInbound(h, { nonce: "n1", payload: {} });
     const claimed = coordinator.claim({
       targetActorId: actorId,
       prompt: "q",

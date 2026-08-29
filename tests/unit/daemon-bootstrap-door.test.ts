@@ -17,7 +17,7 @@ import type { Decision } from "../../src/core/errors.ts";
 import type { AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import type { DoctorReport, Finding } from "../../src/doctor/doctor.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { makeHarness, TEST_MCP_TOKEN, TEST_OPERATOR_TOKEN } from "../helpers/harness.ts";
+import { admitInbound, makeHarness, TEST_MCP_TOKEN, TEST_OPERATOR_TOKEN } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -800,11 +800,9 @@ describe("the adjudication door promotes the daemon, not just the ledger", () =>
        VALUES ('t','b','v1','AD','s','i',1,?)`,
       [NOW],
     );
-    // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
-    db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'm1', 'owner', ?)`,
-      [NOW],
-    );
+    // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with
+    // the same payload it names (#666).
+    admitInbound(harness, { nonce: "m1", payload: {} });
     const claimed = harness.cp.conversation.claim({
       targetActorId: "a",
       prompt: "m1",

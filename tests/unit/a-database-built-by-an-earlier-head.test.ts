@@ -7,6 +7,7 @@ import { AuditLog } from "../../src/db/audit.ts";
 import { ConversationTurnCoordinator } from "../../src/conversation/turn-coordinator.ts";
 import { openDb } from "../../src/db/database.ts";
 import { ManualClock } from "../../src/core/clock.ts";
+import { IngressGuard } from "../../src/ingress/ingress-guard.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -137,11 +138,13 @@ describe("a database whose trigger bodies came from an earlier head", () => {
          VALUES ('t','b','v1','AD','s','i',1,?)`,
         [NOW],
       );
-      // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
-      db.run(
-        `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'm1', 'owner', ?)`,
-        [NOW],
-      );
+      // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with
+      // the same payload it names (#666) — so the fixture admits through the real path rather
+      // than inserting the row by hand.
+      const admitted = new IngressGuard(db, clock, new AuditLog(db, clock), {
+        telegram: { allowedActors: ["owner"], allowedConversations: ["convo"] },
+      }).admit({ channel: "telegram", actor: "owner", conversation: "convo", nonce: "m1", payload: {} });
+      expect(admitted.allowed).toBe(true);
 
       const claimed = coordinator.claim({
         targetActorId: "a",

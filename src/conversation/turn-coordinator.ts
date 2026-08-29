@@ -176,6 +176,20 @@ export type TurnOutcome =
  * a target binding and an attestation, and only an authenticated preflight bind produces those
  * (#638). The activation embargo is therefore a property of the schema this reads, not a rule
  * somebody follows.
+ *
+ * **What this covers today, stated plainly rather than left to be inferred from the test suite.**
+ * `src/app/control-plane.ts` constructs one instance, but nothing in `src/` outside this file
+ * calls `claim()`, `dispatch()`, or any of the `ports.*` settlement entry points — `grep -rn
+ * "\.claim(\|conversation\.ports"` outside `tests/` finds nothing. The production Telegram path
+ * (`telegram-router.ts`) claims a turn through `IngressGuard.claimTurn()` and its own
+ * `inbound_messages.turn_claim_json`, a different lifecycle entirely; it never reaches this
+ * ledger. What *is* wired to production is the read/write half a daemon operator can already
+ * reach — `contradictions()`, `unresolvedAcrossActors()`, `resolveInDoubt()`, `adjudicate()` — and
+ * those operate correctly on whatever rows this class holds, but nothing in production creates
+ * one. So this suite is a real, exercised contract with no production caller yet: every property
+ * above is true of the code and false of the running system until something calls `claim()`.
+ * Wiring a production entry point is a separate, larger change (tracked alongside #639's turn
+ * reconciliation work) and is deliberately not attempted here.
  */
 export class ConversationTurnCoordinator {
   /** Never persisted, never exported. See `TurnPermit.issuance`. */
@@ -409,6 +423,19 @@ export class ConversationTurnCoordinator {
       // reusing `assignments.binding_generation`, the fencing token every other authority
       // decision in the system already reads (`BindingRegistry`), rather than inventing a
       // parallel one scoped to this table alone.
+      //
+      // The session/incarnation currency is checked against `conversational_actors.current_*`
+      // only, never against `assignments.session_id`/`session_incarnation`. Those columns are
+      // the runtime *at binding time* (schema.sql says so in those words); #449 moved the live
+      // pointer to the actor row precisely so a surviving counterpart's runtime could move
+      // without rewriting the binding. A review built the counterexample this used to produce:
+      // `BindingRegistry.switchTo({ conversation: "SURVIVED" })` moves `current_session_id` and
+      // leaves `assignments` untouched, so comparing the attestation against the binding-time
+      // session made every fresh, honest attestation from a survived counterpart unmatchable —
+      // the live pointer says one session, the frozen binding-time column says another, and no
+      // attestation can equal both at once. The live pointer is what "current" means here; the
+      // assignment contributes only its generation, which is the one field `switchTo` leaves
+      // unchanged on that path.
       const attestation = this.db.get<{
         target_attestation_id: string;
         executor_session_id: string;
@@ -433,8 +460,6 @@ export class ConversationTurnCoordinator {
             AND ca.current_session_id = att.executor_session_id
             AND ca.current_session_incarnation = att.executor_session_incarnation
             AND asg.binding_generation = att.binding_generation
-            AND asg.session_id = att.executor_session_id
-            AND asg.session_incarnation = att.executor_session_incarnation
           ORDER BY att.attested_at DESC, att.rowid DESC
           LIMIT 1`,
         [target.target_binding_id, input.targetActorId],
@@ -487,6 +512,40 @@ export class ConversationTurnCoordinator {
             targetActorId: input.targetActorId,
             channel: unadmitted.channel,
             nonce: unadmitted.nonce,
+          },
+        );
+      }
+
+      // Existence is not identity. The check above only asks "did ingress admit *something*
+      // under this (channel, nonce)" — a caller could have ingress admit `{text:"A"}` for a
+      // nonce and then claim that same nonce with `{text:"B"}`, and the row's mere existence
+      // would pass. `canonical_turn_sources.source_digest` below is computed from the caller's
+      // payload, so without this check B's digest would be recorded as what the nonce carried —
+      // permanently, since that table is append-only. `INGRESS_ADMITTED` is the one place a
+      // payload digest is recorded at admission time, keyed by the (channel, nonce) it was
+      // admitted under; read it rather than trusting the caller's payload for both "did this
+      // happen" and "what happened". `inbound_messages` itself stores no payload — the admit
+      // writer's audit record is the only durable copy.
+      const mismatched = input.sources.find((candidate) => {
+        const admitted = this.db.get<{ payload_digest: string | null }>(
+          `SELECT json_extract(evidence_json, '$.payloadDigest') AS payload_digest
+             FROM audit_events
+            WHERE kind = 'INGRESS_ADMITTED'
+              AND json_extract(evidence_json, '$.channel') = ?
+              AND json_extract(evidence_json, '$.nonce') = ?
+            ORDER BY event_id DESC LIMIT 1`,
+          [candidate.channel, candidate.nonce],
+        );
+        return admitted?.payload_digest !== digestOf(candidate.payload);
+      });
+      if (mismatched) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH,
+          "a source's payload does not match what ingress recorded admitting for this channel and nonce",
+          {
+            targetActorId: input.targetActorId,
+            channel: mismatched.channel,
+            nonce: mismatched.nonce,
           },
         );
       }

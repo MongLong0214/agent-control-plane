@@ -4,7 +4,7 @@ import type { ConversationTurnCoordinator} from "../../src/conversation/turn-coo
 import { type TurnPermit } from "../../src/conversation/turn-coordinator.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -66,12 +66,9 @@ const target = (h: Harness, name = "ceo"): string => {
 const coordinatorOf = (h: Harness): ConversationTurnCoordinator => h.cp.conversation;
 
 const claim = (h: Harness, actorId: string, nonce: string): TurnPermit => {
-  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
-  h.cp.db.run(
-    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at)
-     VALUES ('telegram', ?, 'owner', ?)`,
-    [nonce, NOW],
-  );
+  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with the
+  // same payload it names (#666).
+  admitInbound(h, { nonce, payload: {} });
   const claimed = coordinatorOf(h).claim({
     targetActorId: actorId,
     prompt: nonce,
@@ -322,10 +319,7 @@ describe("what an adjudication survives, and what re-opens it", () => {
     const permit = disputed(h, actorId);
     adjudicate(h, actorId, permit);
 
-    h.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'm2', 'owner', ?)`,
-      [NOW],
-    );
+    admitInbound(h, { nonce: "m2", payload: {} });
     expect(
       coordinatorOf(h).claim({
         targetActorId: actorId,
@@ -381,10 +375,7 @@ describe("what an adjudication survives, and what re-opens it", () => {
       reasonCode: ReasonCode.OK,
     });
 
-    h.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'm3', 'owner', ?)`,
-      [NOW],
-    );
+    admitInbound(h, { nonce: "m3", payload: {} });
     expect(
       coordinatorOf(h).claim({
         targetActorId: actorId,

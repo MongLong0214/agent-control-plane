@@ -5,7 +5,7 @@ import { type TurnPermit } from "../../src/conversation/turn-coordinator.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import type { DoctorReport } from "../../src/doctor/doctor.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -73,12 +73,9 @@ const coordinatorOf = (h: Harness): ConversationTurnCoordinator => h.cp.conversa
 
 const claim = (h: Harness, actorId: string, nonce: string): TurnPermit => {
   const coordinator = coordinatorOf(h);
-  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
-  h.cp.db.run(
-    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at)
-     VALUES ('telegram', ?, 'owner', ?)`,
-    [nonce, NOW],
-  );
+  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with the
+  // same payload it names (#666).
+  admitInbound(h, { nonce, payload: {} });
   const claimed = coordinator.claim({
     targetActorId: actorId,
     prompt: "question",

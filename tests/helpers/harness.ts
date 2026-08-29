@@ -706,3 +706,47 @@ export const ownerDecisionReceipt = (
   if (!admitted.allowed) throw new Error(admitted.message);
   return admitted.value;
 };
+
+/**
+ * Admits one message through the real ingress path, so a `TurnSource` a fixture builds names a
+ * payload `claim()` can verify against `INGRESS_ADMITTED`'s own record — not one only the fixture
+ * typed into `inbound_messages` by hand.
+ *
+ * `claim()` used to check only that a `(channel, nonce)` row existed, so a fixture's raw `INSERT`
+ * and a fixture's independently-constructed `TurnSource.payload` were never the same claim a real
+ * caller has to make — the fixture built exactly the counterexample the admission check exists to
+ * refuse (a source whose payload nothing ties to what was admitted), and every positive test in
+ * the file passed anyway because nothing compared the two. Going through `IngressGuard.admit`
+ * closes that: the row and the `INGRESS_ADMITTED` audit event it writes are the one durable
+ * record of what this nonce carries, and a fixture that later builds a `TurnSource` for the same
+ * nonce has to supply that same payload or `claim()` refuses it, same as production.
+ *
+ * Idempotent by design, not by an `INSERT OR IGNORE`: a retry (`attempt > 1`) names the same
+ * nonce, and re-admitting it is a no-op the same way a genuine replay is.
+ */
+export const admitInbound = (
+  harness: Harness,
+  input: {
+    nonce: string;
+    payload: unknown;
+    channel?: "telegram" | "buzz" | "mcp" | "cli";
+    actor?: string;
+    conversation?: string;
+  },
+): void => {
+  const channel = input.channel ?? "telegram";
+  const already = harness.cp.db.get<{ 1: number }>(
+    `SELECT 1 FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+    [channel, input.nonce],
+  );
+  if (already) return;
+  const actor = input.actor ?? "owner";
+  const conversation = input.conversation ?? "convo";
+  const guard = new IngressGuard(harness.cp.db, harness.cp.clock, harness.cp.audit, {
+    [channel]: { allowedActors: [actor], allowedConversations: [conversation] },
+  });
+  const admitted = guard.admit({ channel, actor, conversation, nonce: input.nonce, payload: input.payload });
+  if (!admitted.allowed) {
+    throw new Error(`fixture could not admit ${channel}:${input.nonce}: ${admitted.reasonCode}`);
+  }
+};

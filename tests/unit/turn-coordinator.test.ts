@@ -12,7 +12,7 @@ import {
 import { isAcpError, type Decision } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -29,20 +29,19 @@ type Harness = ReturnType<typeof makeHarness>;
 const NOW = "2026-08-21T00:00:00.000Z";
 
 /**
- * Admits the message this source names, then builds the source that refers to it.
+ * Admits the message this source names through the real ingress path, then builds the source
+ * that refers to it.
  *
- * `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666) —
- * so a fixture that only built the `TurnSource` object, without a matching `inbound_messages`
- * row, would be building exactly the unadmitted source the fix refuses. `INSERT OR IGNORE`
- * because a retry (`attempt > 1`) reuses the same nonce, and re-admitting it is a no-op.
+ * `claim()` now requires ingress to have admitted the (channel, nonce) a source names, *with the
+ * same payload* (#666) — so a fixture that only built the `TurnSource` object, or that admitted
+ * one payload and named another, would be building exactly the substitution the fix refuses.
+ * `admitInbound` is idempotent because a retry (`attempt > 1`) reuses the same nonce, and
+ * re-admitting it is a no-op.
  */
 const source = (h: Harness, nonce: string, attempt = 1): TurnSource => {
-  h.cp.db.run(
-    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at)
-     VALUES ('telegram', ?, 'owner', ?)`,
-    [nonce, NOW],
-  );
-  return { channel: "telegram", nonce, attempt, payload: { text: `message ${nonce}` } };
+  const payload = { text: `message ${nonce}` };
+  admitInbound(h, { nonce, payload });
+  return { channel: "telegram", nonce, attempt, payload };
 };
 
 /** An actor with a verified, attested target — everything a turn needs before it can exist. */
@@ -288,6 +287,43 @@ describe("a source must name a message ingress actually admitted (#666)", () => 
 
     expect(decision.allowed).toBe(true);
   });
+
+  it("refuses a source whose payload is not the one ingress admitted for that nonce", () => {
+    // The counterexample the existence-only check let through: ingress admits `{text:"A"}` for a
+    // nonce, and a caller then claims with `{text:"B"}` for that same nonce. The `(channel,
+    // nonce)` row exists either way, so a check that stops at existence cannot tell them apart —
+    // and `canonical_turn_sources.source_digest` would then record B's digest as what that nonce
+    // carried, permanently, in an append-only table. `claim()` has to read the digest
+    // `INGRESS_ADMITTED` itself recorded, not trust the caller's payload for both "did this
+    // happen" and "what happened".
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    admitInbound(h, { nonce: "m1", payload: { text: "A" } });
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload: { text: "B" } }],
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_SOURCE_PAYLOAD_MISMATCH);
+  });
+
+  it("writes nothing when it refuses a substituted payload", () => {
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    admitInbound(h, { nonce: "m1", payload: { text: "A" } });
+
+    coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [{ channel: "telegram", nonce: "m1", attempt: 1, payload: { text: "B" } }],
+    });
+
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turns`)).toHaveLength(0);
+    expect(h.cp.db.all(`SELECT 1 FROM canonical_turn_sources`)).toHaveLength(0);
+  });
 });
 
 describe("an attestation must name the actor's current generation (#666)", () => {
@@ -394,6 +430,81 @@ describe("an attestation must name the actor's current generation (#666)", () =>
   it("admits a claim under an attestation that still names the actor's current generation", () => {
     const h = makeHarness();
     const actorId = target(h, "ceo");
+
+    const decision = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "hello",
+      sources: [source(h, "m1")],
+    });
+
+    expect(decision.allowed).toBe(true);
+  });
+
+  /**
+   * A role whose counterpart *survived* a failover (#493): only the runtime moved, so
+   * `BindingRegistry.switchTo({ conversation: "SURVIVED" })` never rewrites `assignments` — the
+   * same generation, the same binding row, the same `assignments.session_id` it was created with
+   * (schema's own words: "The runtime at binding time, not the live one"). The live pointer moves
+   * only on `conversational_actors.current_session_id`.
+   *
+   * A fresh attestation naming the new live session is exactly the current, honest state of this
+   * actor — and `claim()` must admit it.
+   */
+  const survivedFailoverActor = (h: Harness): string => {
+    const actorId = "actor:survived";
+    h.cp.db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES ('sess-original', 'inc-1', 'claude', 'opus', 'READY', ?, ?)`,
+      [NOW, NOW],
+    );
+    h.cp.db.run(
+      `INSERT INTO conversational_actors
+         (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+       VALUES (?, 'CEO', 'sess-original', 'inc-1', ?)`,
+      [actorId, NOW],
+    );
+    h.cp.db.run(
+      `INSERT INTO actor_target_bindings
+         (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
+       VALUES ('bind:survived', ?, 'hermes', 'loc-survived', 'digest:survived', ?)`,
+      [actorId, NOW],
+    );
+    // One ACTIVE assignment, generation 1, bound at `sess-original`/`inc-1`. A SURVIVED failover
+    // never touches this row — that is the whole point of #449's split.
+    h.cp.db.run(
+      `INSERT INTO assignments
+         (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+          binding_generation, mode, status, created_at)
+       VALUES ('asg:survived', 'CEO:survived', 'CEO', ?, 'sess-original', 'inc-1', 1, 'PREFERRED', 'ACTIVE', ?)`,
+      [actorId, NOW],
+    );
+    // The failover: only the live pointer moves, to a new session and incarnation. `assignments`
+    // above is untouched — same generation, same `session_id`, same `session_incarnation`.
+    h.cp.db.run(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES ('sess-failover', 'inc-2', 'claude', 'opus', 'READY', ?, ?)`,
+      [NOW, NOW],
+    );
+    h.cp.db.run(
+      `UPDATE conversational_actors SET current_session_id = 'sess-failover', current_session_incarnation = 'inc-2'
+        WHERE actor_id = ?`,
+      [actorId],
+    );
+    // A fresh attestation from the surviving runtime, naming its own live session and the
+    // generation that never changed.
+    h.cp.db.run(
+      `INSERT INTO actor_target_attestations
+         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+          executor_session_id, executor_session_incarnation, binding_generation, attested_at)
+       VALUES ('att:survived', 'bind:survived', 'v1', 'digest:survived', 'sess-failover', 'inc-2', 1, ?)`,
+      [NOW],
+    );
+    return actorId;
+  };
+
+  it("admits a claim after a SURVIVED failover, under the live session and the generation that never changed", () => {
+    const h = makeHarness();
+    const actorId = survivedFailoverActor(h);
 
     const decision = coordinatorOf(h).claim({
       targetActorId: actorId,

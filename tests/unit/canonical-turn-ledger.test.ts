@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { cleanupTempDirs, makeCore } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -124,12 +124,9 @@ const inDoubtTurn = (
  * is exactly what the capability exists to refuse.
  */
 const settleThroughCoordinator = (h: Harness, actorId: string, nonce: string, outcome: "COMPLETED" | "NEVER_ADMITTED"): string => {
-  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
-  h.cp.db.run(
-    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at)
-     VALUES ('telegram', ?, 'owner', ?)`,
-    [nonce, NOW],
-  );
+  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with the
+  // same payload it names (#666).
+  admitInbound(h, { nonce, payload: {} });
   const claimed = h.cp.conversation.claim({
     targetActorId: actorId,
     prompt: nonce,

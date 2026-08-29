@@ -7,7 +7,7 @@ import {
 } from "../../src/daemon/daemon.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
-import { makeHarness } from "../helpers/harness.ts";
+import { admitInbound, makeHarness } from "../helpers/harness.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -69,12 +69,9 @@ const target = (h: Harness, name: string): string => {
 
 /** A turn whose records disagree: the target says it committed, pre-dispatch says nothing ran. */
 const contradicted = (h: Harness, actorId: string): string => {
-  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
-  h.cp.db.run(
-    `INSERT OR IGNORE INTO inbound_messages (channel, nonce, actor, received_at)
-     VALUES ('telegram', 'm1', 'owner', ?)`,
-    [NOW],
-  );
+  // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with the
+  // same payload it names (#666).
+  admitInbound(h, { nonce: "m1", payload: {} });
   const claimed = h.cp.conversation.claim({
     targetActorId: actorId,
     prompt: "m1",
@@ -140,11 +137,9 @@ describe("a contradicted conversation can be cleared from outside the process", 
     const actorId = target(h, "cleared");
     const turnRequestId = contradicted(h, actorId);
 
-    // `claim()` now requires ingress to have admitted the (channel, nonce) a source names (#666).
-    h.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES ('telegram', 'm2', 'owner', ?)`,
-      [NOW],
-    );
+    // `claim()` now requires ingress to have admitted the (channel, nonce) a source names, with
+    // the same payload it names (#666).
+    admitInbound(h, { nonce: "m2", payload: {} });
     const blockedWhileContradicted = h.cp.conversation.claim({
       targetActorId: actorId,
       prompt: "m2",

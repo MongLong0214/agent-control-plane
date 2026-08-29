@@ -729,6 +729,32 @@ const GUARDS = [
     killedBy: ["tests/unit/adjudicating-a-disagreement.test.ts"],
   },
   {
+    // The existence check alone let a caller admit `{text:"A"}` for a nonce and claim it with
+    // `{text:"B"}`; `source_digest` recorded B's digest as what the nonce carried, permanently.
+    what: "a source's payload must match what ingress recorded admitting for that nonce",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        return admitted?.payload_digest !== digestOf(candidate.payload);",
+    replace: "        return false;",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::refuses a source whose payload is not the one ingress admitted for that nonce",
+    ],
+  },
+  {
+    // `assignments.session_id`/`session_incarnation` are the runtime *at binding time*; a
+    // SURVIVED failover (#493) moves only `conversational_actors.current_session_id` and leaves
+    // `assignments` untouched. Comparing the attestation against the binding-time session made a
+    // fresh, honest attestation from a survived counterpart unmatchable — this mutation puts that
+    // comparison back.
+    what: "attestation currency is judged against the live session, not the one at binding time",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "            AND asg.binding_generation = att.binding_generation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
+    replace:
+      "            AND asg.binding_generation = att.binding_generation\n            AND asg.session_id = att.executor_session_id\n            AND asg.session_incarnation = att.executor_session_incarnation\n          ORDER BY att.attested_at DESC, att.rowid DESC",
+    killedBy: [
+      "tests/unit/turn-coordinator.test.ts::admits a claim after a SURVIVED failover, under the live session and the generation that never changed",
+    ],
+  },
+  {
     // The wide version: releasing by file let a bystander's close hand the owner's slot away.
     what: "closing a handle frees only the capability slots that handle issued",
     file: "src/db/database.ts",
