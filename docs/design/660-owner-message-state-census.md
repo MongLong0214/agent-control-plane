@@ -63,6 +63,16 @@ richer story than "closed" or "open" captures, and it is given in full below.
 
 ### S2 — many `TURN_CLAIMED` rows on one session — OPEN, narrower than originally described, and not closed by #680
 
+**"Session" in this row, and everywhere below it uses the word loosely, means the ingress
+`sessionDigest` — `digestOf({channel, conversation})` (`src/ingress/telegram.ts`), a per-chat
+grouping key `unresolvedTurns` and `claimTurn` key on. It is not `TERMINOLOGY.md`'s "session" (the
+replaceable model runtime a role is bound to), and it is not a `conversational actor` either —
+this digest exists and is read entirely on the ingress ledger, before any actor binding exists
+(see C1, C3). Where this document quotes a production string that uses "session" in
+`TERMINOLOGY.md`'s confirmed sense — C2's `CEO_CONVERSATION_TIMEOUT`/`STALE` sentences, both
+about the CEO's bound runtime — it is quoted verbatim and marked as a quote, not asserted as this
+document's own usage.**
+
 - **State (as of 2026-08-21):** two or more rows claimed on the same channel and session digest,
   with nothing naming which one is "the" outstanding turn.
 - **Produced by:** two updates admitted and claimed before either recorded an outcome. The
@@ -148,9 +158,10 @@ richer story than "closed" or "open" captures, and it is given in full below.
 - **Disposition:** open, narrower than the original row. The common case — one prior unresolved
   turn, one park, one disclosed and recorded override — is real and #680 built it correctly; that
   part is closed. What remains open is the shape above: `unresolvedTurns`'s result is truncated to
-  its first element at both read sites, so a second (or later) unresolved row on the same session
-  is never surfaced to the owner and never named on any claim, silently reproducing "the design
-  assumes exactly one" one layer past where #680 addressed it. Filed as **#695**
+  its first element at both read sites, so a second (or later) unresolved row sharing that
+  conversation's `sessionDigest` is never surfaced to the owner and never named on any claim,
+  silently reproducing "the design assumes exactly one" one layer past where #680 addressed it.
+  Filed as **#695**
   (*"A repeated `/again` names and records only the oldest unresolved turn, so a second one
   accumulates silently"*), not embargoed and not dependent on #638/#639/#693 — it is live on the
   ingress ledger today and testable with the existing harness. `docs/ROADMAP.md`'s C4 item 7 is
@@ -482,7 +493,9 @@ and unchanged by writing it (docs-only):
   `tests/unit/deploy-launchd.test.ts`, matching the environment-specific shape #680's own PR
   description records (`1396 passed / 9 failed / 2 skipped` at that point in history; the passed
   count has grown with intervening merges, the nine failures have not changed in kind).
-- `pnpm guards:anchors` — `RESULT: PASS`, `115 anchor(s) still match, exactly once each`.
+- `pnpm guards:anchors` — `RESULT: PASS`, `117 anchor(s) still match, exactly once each` (count
+  moved from 115 after an unrelated upstream merge landed on this branch, see below).
+- `pnpm terminology` — `9 enforced rules over 119 files, 0 violations, 0 waived`.
 
 Every code citation in this document was located by symbol name or by a quoted comment fragment,
 re-`grep`ed against `157aeed` while writing this file — not carried forward from the original
@@ -591,7 +604,28 @@ introduce another inferred one — the next person adding a citation owes it the
 "was this diff actually opened" is now the standing question for any commit hash this document
 names.
 
-Re-ran `pnpm typecheck`, `pnpm lint` and `pnpm guards:anchors` after every edit across all five
-rounds — all still pass. Did not re-run `pnpm test` after any round, since no edit touched
-anything but prose and Markdown; the `1404 passed | 9 failed | 2 skipped` baseline above is from
-the unmodified checkout and stands unchanged.
+**A sixth round: CI, not a semantic review, caught a real ambiguity a review had passed.**
+`pnpm terminology` (CI job `verify-terminology`) flagged a sentence in S2's disposition — the
+phrase paired "the same" with "session," describing a row as sharing one — under its
+`session-identity-continuity` rule: `session` described as something that stays the same, which
+`TERMINOLOGY.md` reserves for a `conversational actor`, not a `session` (a replaceable model
+runtime). Checked which sense was meant by reading how
+`sessionDigest` is built (`digestOf({channel, conversation})`, `src/ingress/telegram.ts`) and
+what S2 actually asserts: the ingress ledger's grouping key for "these rows are the same
+conversation," entirely pre-actor-binding (C1/C3) — neither the runtime-session sense nor the
+conversational-actor sense `TERMINOLOGY.md` is policing. Substituting `conversational actor` into
+the sentence does not hold — no conversational actor is reachable from the ingress ledger at all
+today — confirming this is a homonym, not the forbidden usage. Rather than suppress the check with
+`terminology-ok`, the sentence was reworded to name `sessionDigest` directly and drop the
+ambiguous phrase, and a disambiguation note was added at the top of S2 (this document's heaviest
+concentration of the word) stating explicitly which sense is meant everywhere below it, and that
+the two places this document quotes production text using the *confirmed* `TERMINOLOGY.md` sense
+(C2's `CEO_CONVERSATION_TIMEOUT`/`STALE` sentences, both correctly about the CEO's bound runtime)
+are quotes, not this document's own usage. A full sweep of every remaining "session" occurrence
+in the file found no other match for the check's patterns and no other case of the two senses
+being conflated; `pnpm terminology` now reports `0 violations, 0 waived`.
+
+Re-ran `pnpm typecheck`, `pnpm lint`, `pnpm guards:anchors` and `pnpm terminology` after every
+edit across all six rounds — all still pass. Did not re-run `pnpm test` after any round, since no
+edit touched anything but prose and Markdown; the `1404 passed | 9 failed | 2 skipped` baseline
+above is from the unmodified checkout and stands unchanged.
