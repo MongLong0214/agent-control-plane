@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { canonicalJson, digestOf } from "../../src/core/digest.ts";
 import {
   acpError,
+  allow,
+  deny,
   errorPayload,
   fromErrorPayload,
   isAcpError,
@@ -24,7 +26,9 @@ import {
   candidateSnapshotDigest,
   type CandidateSnapshot,
 } from "../../src/snapshot/candidate-snapshot.ts";
-import { cleanupTempDirs, makeCore, tempDir , seedActor} from "../helpers/fixtures.ts";
+import { BaselineRecordKind } from "../../src/export/baseline-contract.ts";
+import { BaselineRecorder } from "../../src/export/baseline-recorder.ts";
+import { cleanupTempDirs, makeCore, makeRepo, tempDir, seedActor, seedRun } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
 
@@ -216,6 +220,222 @@ describe("transactions must be synchronous", () => {
     expect(db.get<{ goal: string }>(`SELECT goal FROM runs WHERE run_id = ?`, [runId])?.goal).toBe(
       "committed",
     );
+  });
+});
+
+describe("#664 — a transaction whose body decides 'no' still commits its writes", () => {
+  it("plain tx() commits a write even when the body returns a denied Decision", () => {
+    // This is the exact shape the issue reproduced: a Decision denial is a normal
+    // return, and tx() cannot tell it apart from any other value a body hands back.
+    // Bodies that write unconditional housekeeping a later decision only reads (see
+    // github-kernel.ts's claim-expiry sweep) rely on exactly this: `tx()` is documented
+    // and kept this way on purpose, not fixed here — `txDecision` is the opt-in.
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664";
+    const decision = db.tx(() => {
+      db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+        [actorId, clock.nowIso()],
+      );
+      return deny(ReasonCode.CONFLICT, "changed my mind");
+    });
+    expect(decision.allowed).toBe(false);
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeTruthy();
+  });
+
+  it("txDecision() rolls back a write when the body returns a denied Decision", () => {
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664_txdecision";
+    const decision = db.txDecision(() => {
+      db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+        [actorId, clock.nowIso()],
+      );
+      return deny(ReasonCode.CONFLICT, "changed my mind");
+    });
+    expect(decision.allowed).toBe(false);
+    if (!decision.allowed) expect(decision.reasonCode).toBe(ReasonCode.CONFLICT);
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("txDecision() still commits a write when the body returns an allowed Decision", () => {
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664_allow";
+    const decision = db.txDecision(() => {
+      db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+        [actorId, clock.nowIso()],
+      );
+      return allow(ReasonCode.OK, actorId);
+    });
+    expect(decision.allowed).toBe(true);
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeTruthy();
+  });
+
+  it("txDecision() still rolls back on a thrown error, same as tx()", () => {
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664_throw";
+    expect(() =>
+      db.txDecision((): ReturnType<typeof allow<string>> => {
+        db.run(
+          `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+          [actorId, clock.nowIso()],
+        );
+        throw new Error("boom");
+      }),
+    ).toThrowError("boom");
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("a nested txDecision() hands its denial back as data; it cannot roll back on its own", () => {
+    // There is no SAVEPOINT here — a nested call has no physical boundary of its own.
+    // Whether a nested denial rolls anything back is entirely up to whoever owns the
+    // outermost transaction, exactly as it already is for a nested tx().
+    const { db, clock } = makeCore();
+    const actorId = "actor_probe_664_nested_under_plain_tx";
+    const outerResult = db.tx(() => {
+      const inner = db.txDecision(() => {
+        db.run(
+          `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+          [actorId, clock.nowIso()],
+        );
+        return deny(ReasonCode.CONFLICT, "changed my mind");
+      });
+      // The outer body is a plain tx(): it does not inspect `inner.allowed`, so it
+      // commits regardless, the same way it would for any other returned value.
+      return inner;
+    });
+    expect(outerResult.allowed).toBe(false);
+    expect(
+      db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+        actorId,
+      ]),
+    ).toBeTruthy();
+  });
+
+  it("a nested txDecision() rolls back when its outer frame is txDecision too", () => {
+    // This is the shape CtoLifecycle.acknowledgeHandoff/recoveryTakeover actually use:
+    // an outer write (the handoff record) plus a nested BindingRegistry.switchTo call,
+    // and the outer denial must undo both.
+    const { db, clock } = makeCore();
+    const outerActorId = "actor_probe_664_nested_outer";
+    const innerActorId = "actor_probe_664_nested_inner";
+    const outerResult = db.txDecision(() => {
+      db.run(
+        `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+        [outerActorId, clock.nowIso()],
+      );
+      const inner = db.txDecision(() => {
+        db.run(
+          `INSERT INTO conversational_actors (actor_id, kind, created_at) VALUES (?, 'WORKER', ?)`,
+          [innerActorId, clock.nowIso()],
+        );
+        return deny(ReasonCode.CONFLICT, "changed my mind");
+      });
+      if (!inner.allowed) return inner;
+      return allow(ReasonCode.OK, undefined);
+    });
+    expect(outerResult.allowed).toBe(false);
+    for (const actorId of [outerActorId, innerActorId]) {
+      expect(
+        db.get<{ actor_id: string }>(`SELECT actor_id FROM conversational_actors WHERE actor_id = ?`, [
+          actorId,
+        ]),
+      ).toBeUndefined();
+    }
+  });
+
+  it("an async txDecision() body is refused instead of being misread as a denial", () => {
+    // The type signature promises a synchronous `Decision<T>`, exactly like `tx()`
+    // promises a synchronous `T` — and, exactly like `tx()`, a caller that bypasses the
+    // type system with an async callback must be refused, not silently misread. An
+    // async body returns a pending Promise, which has no `.allowed`; reading `.allowed`
+    // before checking for a thenable turns that `undefined` into "denied", hands the raw
+    // Promise back through the catch as if it were a real `Decision`, and never poisons
+    // the handle — the still-running callback's writes after its first `await` would
+    // then land as autocommit outside any transaction. Mirrors the identical `tx()` test
+    // above ("an async transaction body is refused instead of committing early").
+    const { db } = makeCore();
+    expect(() =>
+      db.txDecision((() => Promise.resolve(allow(ReasonCode.OK, "done"))) as unknown as () => ReturnType<
+        typeof allow<string>
+      >),
+    ).toThrowError(/transaction bodies must be synchronous/);
+  });
+
+  it("#664/#679 — a second, independent recorder call denying does not save the first recorder's write", () => {
+    // TaskGraph.finishExecution's real shape: `#baseline.recordInvocationFinished(...)`
+    // writes and commits, and `#baseline.recordTaskClassification(...)` right after it is
+    // an unrelated call that can independently deny — Sol's counterexample to the census
+    // (BaselineRecorder.record() is reached by name, not by a literal `.run(`/`.exec(`, so
+    // the census cannot see this shape and never claims to — see the header comment in
+    // scripts/verify-tx-denial-sites.mjs).
+    //
+    // finishExecution's own two denials in BaselineRecorder.record() ("unknown run",
+    // "prohibited/credential field") are not reachable through finishExecution's own
+    // parameters — every field task-graph.ts passes is a fixed key name, not caller data,
+    // and the run/execution existence is already reverified by finishExecution's own
+    // preflight moments earlier with no `await` in between. So this proves the shared
+    // mechanism finishExecution's fix now relies on directly against the real
+    // `BaselineRecorder` and the real `Db.txDecision`, using `record()`'s one naturally
+    // reachable denial (an unknown run id) rather than a synthetic table.
+    const core = makeCore();
+    const repo = makeRepo();
+    const seeded = seedRun({ db: core.db, clock: core.clock, repoPath: repo });
+    const baseline = new BaselineRecorder(core.db, core.clock, core.audit);
+
+    const result = core.db.txDecision(() => {
+      const first = baseline.record(seeded.runId, BaselineRecordKind.INVOCATION_FINISHED, {
+        probe: "first-write-must-not-survive",
+      });
+      if (!first.allowed) return first;
+      // A second, independent recorder call — same shape as recordTaskClassification
+      // right after recordInvocationFinished — denying on an unrelated ground.
+      return baseline.record("run_does_not_exist", BaselineRecordKind.TASK_CLASSIFICATION, {
+        probe: "second-call-denies-independently",
+      });
+    });
+
+    expect(result.allowed).toBe(false);
+    if (!result.allowed) expect(result.reasonCode).toBe(ReasonCode.NOT_FOUND);
+    // Read the table directly, not the returned Decision, to prove the first recorder's
+    // write did not survive the second, independent call's denial.
+    expect(
+      core.db.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM baseline_records WHERE run_id = ?`,
+        [seeded.runId],
+      )?.n,
+    ).toBe(0);
+  });
+
+  it("an async txDecision() body poisons the handle, the same as an async tx() body", () => {
+    const { db } = makeCore();
+    expect(() =>
+      db.txDecision((() => Promise.resolve(allow(ReasonCode.OK, "done"))) as unknown as () => ReturnType<
+        typeof allow<string>
+      >),
+    ).toThrowError(/transaction bodies must be synchronous/);
+    // Nothing on this handle may run again — not a query, not a fresh transaction —
+    // because the callback that returned the promise is still running unobserved and
+    // may still be mid-write when something else tries to use the same connection.
+    expect(() => db.get(`SELECT 1`)).toThrowError(/poisoned/);
+    expect(() => db.tx(() => undefined)).toThrowError(/poisoned/);
   });
 });
 

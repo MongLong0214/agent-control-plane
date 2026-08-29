@@ -1195,6 +1195,9 @@ export class GitHubKernel {
    * question, and held under the generation the owner currently has.
    */
   private assertClaim(runId: string, repositoryIdentity: string, branch: string): Decision<void> {
+    // #664 — deliberately plain `tx()`, not `txDecision`. The expiry sweep below is
+    // unconditional housekeeping the decision only reads; it must survive every denial
+    // in this body, so an opt-in rollback-on-denial would be a regression here, not a fix.
     return this.db.tx(() => {
       // The partial unique index treats only HELD rows as occupying a resource. Mark
       // overdue rows before the guard reads them so the decision and the index agree in
