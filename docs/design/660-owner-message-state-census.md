@@ -22,12 +22,12 @@ needed neither: they closed between the census being opened and this re-derivati
 | # | 2026-08-21 judgment | 2026-08-29 measurement | Closed by |
 |---|---|---|---|
 | S1 | gap — reply reservation erases the claim | **closed** | #671 |
-| S2 | gap — nothing bounds one session to one claim | **closed, differently than the record on this issue says** | #680, not #671 alone |
+| S2 | gap — nothing bounds one session to one claim | **closed for the reachable case; pure concurrency is inferred, not tested** | #680, not #671 alone |
 | S3 | absorb — re-admission race for a durable handler | **unchanged, still open** | — |
 | S4 | gap — no exit for a permit that died with its process | **mechanism closed; state stays unreachable** | #669, discovered independently of this task's brief |
 | S5 | independent — schema state with no writer | **unchanged, still open** | — |
 | S6 | gap in framing — refuses a non-resend the same as a resend | **closed** | #680 |
-| S7 | gap — no API extends a turn in flight | **unchanged, still open** | — |
+| S7 | gap — no API extends a turn in flight | **unchanged, still open — now ticketed** | #693 (filed by this re-derivation) |
 
 S2 and S4 are the two rows worth reading carefully before trusting a summary table: both have a
 richer story than "closed" or "open" captures, and it is given in full below.
@@ -61,20 +61,35 @@ richer story than "closed" or "open" captures, and it is given in full below.
   as though it expects more than one live row, and nothing in `claimTurn` bounded the count.
 - **The issue thread's 2026-08-29 comment attributes this closure to #671 alone**, on the same
   reasoning as S1: splitting `turn_claim_json` from `result_json` removed the crash window. That
-  reasoning proves S1. It does not prove S2, and measuring it shows why: #671 closes a *crash*
-  window between two writes on the *same* message. S2 is not about a crash — it is about two
-  *different* messages, each claimed honestly, arriving before either turn resolves. Nothing in
-  `claimTurn` (`src/ingress/ingress-guard.ts`) checks the session digest before claiming; it
-  checks only `turn_claim_json IS NULL` for *that message's own row*. Two concurrent DIRECT
-  messages on one conversation, arriving inside the same in-flight window #646 measured at "a
-  measured 3m15s turn against a 120s inner deadline," would each claim cleanly under #671 alone —
-  S2's state, reproduced, with no crash anywhere in the sequence.
+  reasoning proves S1. It does not prove S2, and reading the code shows why: #671 closes a
+  *crash* window between two writes on the *same* message. S2 is not about a crash — it is about
+  two *different* messages, each claimed honestly, arriving before either turn resolves. Nothing
+  in `claimTurn` (`src/ingress/ingress-guard.ts`) checks the session digest before claiming; it
+  checks only `turn_claim_json IS NULL` for *that message's own row*. So, by inspection of
+  `claimTurn` alone, two concurrent DIRECT messages on one conversation — arriving inside the same
+  in-flight window #646 measured at "a measured 3m15s turn against a 120s inner deadline" — would
+  each pass that check and claim cleanly under #671 alone. **This is a reading of the guard's
+  code, not something any test in this repository exercises or this document ran**: no test here
+  constructs two genuinely concurrent, non-crash claims on one session and asserts the second is
+  refused. The claim rests on `claimTurn`'s own logic having no session-scoped check, which is
+  checkable by inspection but is not the same thing as a passing (or failing) test naming this
+  scenario.
 - **What actually closes it:** #680 (`157aeed`), which the issue's own comment does not mention.
   `TelegramHermesRouter`'s DIRECT branch (`src/ingress/telegram-router.ts`) now calls
   `this.ingress.unresolvedTurns(identity.sessionDigest)` **before** `claimTurn`, for every DIRECT
-  message, not only a suspected resend. An unresolved turn on the session parks the new message
-  (`ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION`) instead of claiming it, so a second
-  concurrent claim on one session no longer happens by accident.
+  message, not only a suspected resend — this part is a direct reading of the current source, not
+  an inference. What is *not* directly tested is the concurrent case: all three of #680's own
+  tests (`tests/unit/telegram-ingress.test.ts`, "parks a resend...", "does not park a DIRECT
+  message from an unrelated conversation", "/again lets the owner...") construct the unresolved
+  row the same way — one poller throws `TelegramInterruption` to leave a claim unresolved, that
+  listener closes, and a *second, later* listener processes the next update. None of them start
+  two claims genuinely concurrently, in one live process, with no crash between them. The
+  park-before-claim check itself does not read `result_json` or anything else that would
+  distinguish "unresolved because of a crash" from "unresolved because a slow turn is still
+  running" — both are just `turn_claim_json IS NOT NULL AND repliedAt IS NULL` — so the same code
+  path should cover the pure-concurrency case too. But that is this document's inference from the
+  guard's SQL, not a claim the test suite backs, and it should be read as such rather than as
+  something #680 was proven against.
 - **The residual case, precisely:** the owner can still produce two unresolved claims on one
   session — by replying `/again <text>` to the park notice. That path is deliberate: the claim
   carries `overriddenUnresolvedNonce` (`TurnIdentity`, `src/ingress/ingress-guard.ts`) naming
@@ -83,8 +98,12 @@ richer story than "closed" or "open" captures, and it is given in full below.
   only on an explicit, recorded choice, which is exactly the distinction the original row asked
   for when it said *"the design in #641 assumes exactly one."* #680 does not enforce "exactly
   one" — it enforces "exactly one, unless the owner said otherwise and that is on the record."
-- **Disposition:** closed for the critical path. Worth a correction on the issue thread: the
-  2026-08-29 comment's attribution to #671 is measurably incomplete.
+- **Disposition:** closed for the critical path, on a code-reading argument rather than a test
+  result — no test in the suite exercises two genuinely concurrent, non-crash claims on one
+  session, so that specific case is unverified rather than proven. Worth a correction on the
+  issue thread regardless: the 2026-08-29 comment's attribution to #671 is measurably incomplete,
+  and if the concurrent case is load-bearing for whatever absorbs this, it is worth its own test
+  before being called closed with confidence rather than with an inference.
 
 ### S3 — `ADMITTED` and not claimed — unchanged, still open
 
@@ -184,11 +203,15 @@ richer story than "closed" or "open" captures, and it is given in full below.
   this row, like S4 and S5, is unreachable in production today (C3): `claim()` refuses before it
   can ever accumulate sources to begin with.
 - **Disposition:** absorb, as originally dispositioned — this is real design work still to do,
-  distinct from the ingress-side parking #680 built. No open ticket names it directly today; the
-  nearest is #641 (closed — its resend framing is what named the gap, per the original census)
-  and the #638/#639 reconciliation work this whole mechanism sits behind. Flagging that gap here
-  is this document doing the job the disposition summary asks for: naming what a future DIRECT
-  wiring ticket has to pick up, since nothing currently open is titled for it.
+  distinct from the ingress-side parking #680 built. No open ticket owned it at the time of this
+  re-derivation: #641 (closed) named the framing gap on the ingress side only; #666 (open) is
+  about the integrity of sources `claim()` is *handed*, not about adding one *after* claim time;
+  #639 (open) is about receipt-matched completion, not about extending a turn's inputs while it
+  runs. Filed as **#693** (*"A later message cannot join a canonical turn's batch or start its own
+  while the incumbent is IN_DOUBT"*), with the state tuple, producing transition, terminal/gap and
+  the ticket-coverage argument above written into its body rather than left as a placeholder — the
+  rule this document itself states two sections down (a gap gets its own ticket) applies to its
+  own rows, not only to the ones it is reporting on.
 
 ## Three context facts, not states
 
@@ -277,23 +300,31 @@ The reasoning still holds: their absence from any log is silence, not confirmati
 
 ## Disposition summary
 
-**Closed, nothing to absorb:** S1, S2, S6.
-**Absorb — real work, still open:** S3, S7.
+**Closed, nothing to absorb:** S1, S2 (mechanism closed; the pure-concurrency case is a
+code-reading argument, not a tested one — see S2), S6.
+**Absorb — real work, still open:** S3 (no ticket of its own; tracked under #639/#638's
+reconciliation umbrella), S7 (**#693**, filed from this re-derivation).
 **Independent, still open, embargoed by #638:** S5.
 **Mechanism closed independently (#669); state stays embargoed by #638:** S4.
 **Context, carried but not scheduled:** C1 (unchanged), C2 (citation corrected, underlying point
 holds), C3 (unchanged; #638 still open).
 
-Cross-references for the still-open gaps: S3 and S7 are the residual ingress/canonical-ledger
-work; #638 (open) and #639 (open) are the reconciliation tickets both sit behind. #672 (open —
-a claimed turn whose handler returns no reply is never resolved) and #673 (open — a resolved row
-is pruned before a late redelivery can arrive) are adjacent gaps this same code surfaced along
-the way; they are not additional numbered states here because neither is a state distinct from
-S3's claim/recovery mechanism — #672 and #673 are, respectively, what happens after a claim
-resolves with no reply and what happens after a resolved row's TTL expires. They are tracked on
-their own issues rather than folded into this census, consistent with the disposition rule this
-document is following: a gap gets its own ticket, and this document points at it rather than
-becoming a second source of truth for it.
+Cross-references for the still-open gaps: S3 is the residual ingress recovery-vs-durable-handler
+race, tracked under #639/#638's reconciliation umbrella rather than its own ticket. S7 is now
+**#693** (*"A later message cannot join a canonical turn's batch or start its own while the
+incumbent is IN_DOUBT"*), filed by this re-derivation because no existing ticket owned it — #641
+(closed) named only the ingress-side framing gap, #666 (open) covers source integrity at claim
+time rather than adding a source after it, and #639 (open) covers receipt-matched completion
+rather than extending a turn's inputs while it runs. #638 (open) and #639 (open) are the
+reconciliation tickets both S3 and #693 sit behind. #672 (open — a claimed turn whose handler
+returns no reply is never resolved) and #673 (open — a resolved row is pruned before a late
+redelivery can arrive) are adjacent gaps this same code surfaced along the way; they are not
+additional numbered states here because neither is a state distinct from S3's claim/recovery
+mechanism — #672 and #673 are, respectively, what happens after a claim resolves with no reply
+and what happens after a resolved row's TTL expires. Every still-open gap in this census — S3,
+S4/S5's reachability, S7 — now resolves to a ticket rather than to this document alone, which is
+the rule `docs/ACCEPTANCE.md:3` states and this document was at risk of breaking for S7 until
+#693 was filed.
 
 ## Verification
 
@@ -311,3 +342,13 @@ and unchanged by writing it (docs-only):
 Every code citation in this document was located by symbol name or by a quoted comment fragment,
 re-`grep`ed against `157aeed` while writing this file — not carried forward from the original
 issue's line numbers.
+
+**Corrected after independent review.** An xhigh read-only review of this document (21 files)
+returned two findings, both accepted: S2's "closed" claim originally implied more than any test
+in this repository exercises — no test constructs two genuinely concurrent, non-crash claims on
+one session, only the crash/restart reconstruction #680's own tests use — and that section now
+says so explicitly rather than calling it proven. And S7 named a gap with no owning ticket, which
+`docs/ACCEPTANCE.md:3`'s rule forbids; #693 was filed to close that, with the state tuple,
+producing transition, and ticket-coverage argument written into its body. Re-ran `pnpm lint` and
+`pnpm guards:anchors` after both edits — both still pass — and did not need to re-run `pnpm test`
+or `pnpm typecheck`, since neither edit touched anything but prose.

@@ -175,7 +175,14 @@ completion authority.
 4. a durable reply outbox preserves the exact origin route without replaying the model turn;
 5. owner resend is a deliberate decision path, not a text-equality shortcut (#641);
 6. `OUTCOME_UNKNOWN` is visible in doctor and metrics (#650);
-7. the S2–S7/direct-wiring state census is represented in the acceptance matrix (#660);
+7. the #660 state census, re-derived against current source and represented here rather than
+   left standalone: S1/S2/S6 closed (#671, #680 — #680's park-before-claim also covers S2's
+   concurrent-claim case for real messages, though the pure-concurrency case rests on reading
+   `claimTurn`, not on a test); S4's permit-dead-`IN_DOUBT` exit mechanism closed independently
+   (#669) while the state itself stays embargoed behind #638, same as S5; S3 (ingress re-admission
+   race for a durable handler) and S7 (a later message cannot join or supersede a canonical
+   turn's batch while it is `IN_DOUBT`, filed as #693) remain open critical-path work. Full
+   re-derivation with evidence: `docs/design/660-owner-message-state-census.md`;
 8. settlement authority, contradiction escalation, and source/attestation truth close #662 and #666;
 9. unresolved-turn operator recovery and durable duplicate retention close #672–#673.
 
