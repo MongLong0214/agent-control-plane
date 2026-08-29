@@ -5,8 +5,10 @@
  * opts into `txDecision()` instead, which rolls back on a denial exactly as a throw would.
  *
  * "I looked" is not the same as a check (the issue's own words). This is the check: it
- * finds every `db.tx(() => { ... })` body in `src/` that writes and later returns a
- * denied `Decision`, and requires each one to be either:
+ * finds every `db.tx(...)`/`db.txDecision(...)` call site this census can open — a braced
+ * body (`() => { ... }`) or a concise body that is one call resolved to a same-file
+ * definition (`() => this.foo(...)`) — that writes and later returns a denied `Decision`,
+ * and requires each one to be either:
  *
  *   - converted to `txDecision()`, or
  *   - named in EXEMPT below, with the reason the write must survive a denial anyway
@@ -78,6 +80,34 @@
  * something else in the body can still deny, is invisible here. Widen this list — and
  * re-run it against the whole tree, the way this round was, before trusting the result —
  * when another such site turns up; do not read a passing run as proof none remain.
+ *
+ * A third review found the same gap one axis over: not the *write* inside a body, but the
+ * *opener* that finds the body at all. Two real production sites — `ManagedWriteGuard`'s
+ * `decideWrite` (called as `db.tx(() => this.decideWrite(request))`) and `Outbox`'s
+ * `acknowledgeInTx` (called as `db.tx(() => this.acknowledgeInTx(...))`) — write unconditional
+ * housekeeping that must survive the denials right after it, the identical shape the
+ * existing EXEMPT entries already document, but the census could not even *count* them:
+ * a zero-argument arrow whose body is one call, not a brace, matched nothing at all.
+ *
+ * Both turned out to be deliberate, not bugs — confirmed by reading each callee, not
+ * assumed: `decideWrite` opens with `this.expireOverdueClaims()`, the identical
+ * partial-unique-index expiry sweep already exempted elsewhere in this file, and
+ * `acknowledgeInTx`'s two early branches each write an `OUTBOX_ACK_REJECTED` audit record
+ * immediately before the deny it explains — an audit trail for the rejection, not a write
+ * that outlives an unrelated later denial. Both are in EXEMPT below.
+ *
+ * Rather than widen the opener detection to match this one new shape and leave the
+ * output's own claim exactly where it was — the pattern this file's last three rounds
+ * fell into, each round finding a wider set of sites while the printed "every" stayed
+ * equally absolute — this round changes the claim first: `findTxSites` now returns which
+ * shapes it actually resolved, an opener it *saw* but could not classify fails the census
+ * by name instead of being silently skipped (see `unresolvedOpeners` below), and the PASS
+ * message says what was actually inspected — a braced body or a concise single-call body
+ * resolved to a same-file definition — rather than asserting coverage of every shape a
+ * zero-argument arrow can legally take in TypeScript. A concise body that calls something
+ * other than a single same-file name (a ternary, a chained expression, a name defined in
+ * another file) is exactly such a shape, and is meant to surface as unresolved, not pass
+ * silently, until it actually needs handling.
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -90,10 +120,14 @@ const SRC = join(ROOT, "src");
 // and why this is not a general helper-write detector. `.transition(` is
 // `SessionRegistry.transition` / `RunEngine.transition`; `.record`-family is
 // `AuditLog.record` and `BaselineRecorder.record`/`recordInvocationFinished`/
-// `recordTaskClassification`/etc; `.enqueue(` is `Outbox.enqueue`. Each wraps its own
-// `db.run(...)` and is called by name, not inlined, so a literal `.run(`/`.exec(` search
-// alone is blind to a write performed this way.
-const WRITE_PATTERN = /\.run\(|\.exec\(|\.transition\(|\.record\w*\(|\.enqueue\(/;
+// `recordTaskClassification`/etc; `.enqueue(` is `Outbox.enqueue`; `expireOverdueClaims(`
+// is `ManagedWriteGuard`'s own claim-expiry sweep (confirmed by reading it: a literal
+// `UPDATE resource_claims SET status = 'EXPIRED'`, the same write
+// `renewRequiredClaims` already does inline, called instead through `decideWrite`, which
+// only the opener fix below can even reach). Each wraps its own `db.run(...)` and is
+// called by name, not inlined, so a literal `.run(`/`.exec(` search alone is blind to a
+// write performed this way.
+const WRITE_PATTERN = /\.run\(|\.exec\(|\.transition\(|\.record\w*\(|\.enqueue\(|\.expireOverdueClaims\(/;
 // A denial-shaped return is either a literal `deny(...)` call (optionally generic, as in
 // `deny<RoleBinding>(...)`), or the `if (!x.allowed) return x;` idiom this codebase uses
 // everywhere to propagate a Decision produced by an earlier call without re-wrapping it in
@@ -188,6 +222,29 @@ const EXEMPT = [
       "(the part #664 actually traps) was split into its own txDecision() instead of " +
       "folding this preflight into it.",
   },
+  {
+    file: "guard/managed-write-guard.ts",
+    marker: "this.expireOverdueClaims();\n\n    const operation = request.operation as WriteOperation;",
+    reason:
+      "decideWrite (reached only via the concise opener `db.tx(() => this.decideWrite(request))` " +
+      "— confirmed by reading it, not assumed) opens with the identical claim-expiry sweep " +
+      "renewRequiredClaims already does inline a few hundred lines above (also EXEMPT here, " +
+      "same reason): the sweep must land regardless of which of decideWrite's ~30 validation " +
+      "denials follows. decideWrite never writes to the database anywhere else — every " +
+      "GuardGrant it returns is an in-memory object; `#grants.set(...)` happens in a different " +
+      "method, after decide() returns, against an in-process Map, not a SQLite transaction.",
+  },
+  {
+    file: "outbox/outbox.ts",
+    marker: "kind: \"OUTBOX_ACK_REJECTED\",",
+    reason:
+      "acknowledgeInTx (reached only via `db.tx(() => this.acknowledgeInTx(...))`, another " +
+      "concise opener) writes an OUTBOX_ACK_REJECTED audit record immediately before each of " +
+      "its two early denies — confirmed by reading it: the record is the forensic explanation " +
+      "for the rejection, not a write that outlives a later, unrelated denial, and both denies " +
+      "are self-contained (write-and-deny in the same branch). The success path's own write " +
+      "(`UPDATE outbox SET status = 'ACKED'`) is unconditional and nothing denies after it.",
+  },
 ];
 
 /**
@@ -224,36 +281,113 @@ const listTsFiles = (dir) => {
   return out;
 };
 
-/** Find `db.tx(() => {` / `db.txDecision(() => {` call sites and their bracket-balanced body. */
+/**
+ * Locates a function or method definition by name in `text` and returns its
+ * bracket-balanced body, or null if the name cannot be found or its body cannot be
+ * matched. Handles both a class member (`private foo(`, `async foo(`, `#foo(`) and a free
+ * function (`function foo(`, `const foo = (`) — the two shapes this file's own concise
+ * `tx(() => callee(...))` openers actually call into (see CONCISE_OPENER below).
+ *
+ * A multi-line parameter list puts the opening `{` on a later line than the name (see
+ * `Outbox.acknowledgeInTx`), so this does not assume the definition line itself ends in
+ * `{`: it finds the name, then the matching close-paren of *its own* parameter list by
+ * paren-depth, then the first `{` after that (skipping any return-type annotation), then
+ * brace-balances from there.
+ */
+const findNamedBody = (text, name) => {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const defPattern = new RegExp(
+    `(?:^|\\n)[ \\t]*(?:export\\s+)?(?:private\\s+|public\\s+|protected\\s+|static\\s+|readonly\\s+|` +
+      `async\\s+|override\\s+|const\\s+|let\\s+|var\\s+)*` +
+      `(?:function\\s+)?${escaped}\\s*(?:=\\s*(?:async\\s*)?)?\\(`,
+  );
+  const defMatch = defPattern.exec(text);
+  if (!defMatch) return null;
+  // `defMatch[0]` already consumes the opening "(" of the parameter list — its last
+  // character — so paren-depth starts there, already at 1.
+  let parenDepth = 0;
+  let i = defMatch.index + defMatch[0].length - 1;
+  for (; i < text.length; i += 1) {
+    if (text[i] === "(") parenDepth += 1;
+    else if (text[i] === ")") {
+      parenDepth -= 1;
+      if (parenDepth === 0) {
+        i += 1;
+        break;
+      }
+    }
+  }
+  const openBrace = text.indexOf("{", i);
+  if (openBrace === -1) return null;
+  let braceDepth = 0;
+  let j = openBrace;
+  for (; j < text.length; j += 1) {
+    if (text[j] === "{") braceDepth += 1;
+    else if (text[j] === "}") {
+      braceDepth -= 1;
+      if (braceDepth === 0) {
+        j += 1;
+        break;
+      }
+    }
+  }
+  if (braceDepth !== 0) return null;
+  return text.slice(openBrace, j);
+};
+
+// The braced-body opener this census has always recognised: `.tx(() => { ... })`.
+const BLOCK_OPENER = /\.(tx|txDecision)\(\(\)\s*=>\s*\{\s*$/;
+// The *other* shape a zero-argument arrow can take: a concise body that is itself one
+// call — `.tx(() => this.decideWrite(request))`, `.tx(() => this.#resolveTurnHere(...))`,
+// or `.tx(() => someFreeFunction(...))`. An adversarial review of #679 found two real
+// production sites in exactly this shape (managed-write-guard.ts, outbox.ts) that the
+// census could not even see, let alone classify — this is the same "helper carries the
+// real body" gap `WRITE_PATTERN`'s widening closed on the *write* axis, on the *opener*
+// axis instead. `(?!\{)` keeps this from ever double-matching the block form above.
+const CONCISE_OPENER = /\.(tx|txDecision)\(\(\)\s*=>\s*(?!\{)((?:this\.)?#?[A-Za-z_$][\w$]*)\(/;
+
+/** Find `db.tx(...)` / `db.txDecision(...)` call sites and their bracket-balanced body. */
 const findTxSites = (text) => {
   const lines = text.split("\n");
   const sites = [];
-  const opener = /\.(tx|txDecision)\(\(\)\s*=>\s*\{\s*$/;
+  const unresolved = [];
   for (let i = 0; i < lines.length; i += 1) {
-    const match = opener.exec(lines[i]);
-    if (!match) continue;
-    let depth = 1;
-    let end = i;
-    for (let j = i + 1; j < lines.length && depth > 0; j += 1) {
-      const line = lines[j];
-      for (const ch of line) {
-        if (ch === "{") depth += 1;
-        else if (ch === "}") depth -= 1;
-        if (depth === 0) {
-          end = j;
-          break;
+    const blockMatch = BLOCK_OPENER.exec(lines[i]);
+    if (blockMatch) {
+      let depth = 1;
+      let end = i;
+      for (let j = i + 1; j < lines.length && depth > 0; j += 1) {
+        const line = lines[j];
+        for (const ch of line) {
+          if (ch === "{") depth += 1;
+          else if (ch === "}") depth -= 1;
+          if (depth === 0) {
+            end = j;
+            break;
+          }
         }
+        if (depth === 0) end = j;
       }
-      if (depth === 0) end = j;
+      sites.push({
+        kind: blockMatch[1],
+        startLine: i + 1,
+        endLine: end + 1,
+        body: lines.slice(i, end + 1).join("\n"),
+      });
+      continue;
     }
-    sites.push({
-      kind: match[1],
-      startLine: i + 1,
-      endLine: end + 1,
-      body: lines.slice(i, end + 1).join("\n"),
-    });
+
+    const conciseMatch = CONCISE_OPENER.exec(lines[i]);
+    if (!conciseMatch) continue;
+    const callee = conciseMatch[2].replace(/^this\./, "");
+    const body = findNamedBody(text, callee);
+    if (body === null) {
+      unresolved.push({ startLine: i + 1, callee });
+      continue;
+    }
+    sites.push({ kind: conciseMatch[1], startLine: i + 1, endLine: i + 1, body });
   }
-  return sites;
+  return { sites, unresolved };
 };
 
 const files = listTsFiles(SRC);
@@ -263,11 +397,18 @@ const deferred = [];
 const converted = [];
 const matchedExemptMarkers = new Set();
 const matchedDeferredMarkers = new Set();
+// A concise opener (`.tx(() => someCall(...))`) this census *saw* but could not resolve
+// to a body — a stale/unhandled shape, not silence. Reported and failed on, the same as
+// an undocumented trap: a call shape the scanner cannot classify is exactly what "every"
+// must not be true over.
+const unresolvedOpeners = [];
 
 for (const path of files) {
   const rel = relative(SRC, path);
   const text = readFileSync(path, "utf8");
-  for (const site of findTxSites(text)) {
+  const { sites, unresolved } = findTxSites(text);
+  for (const u of unresolved) unresolvedOpeners.push({ file: rel, line: u.startLine, callee: u.callee });
+  for (const site of sites) {
     // The first write is the earliest point at which a rollback would have something to
     // undo. Any denial reachable after it — not just the textually-first denial in the
     // body — is the trap, so this checks "does some denial follow the first write",
@@ -352,16 +493,36 @@ if (unmatchedDeferrals.length > 0) {
   );
 }
 
-if (trapped.length > 0 || unmatchedExemptions.length > 0 || unmatchedDeferrals.length > 0) {
+if (unresolvedOpeners.length > 0) {
+  process.stdout.write(
+    "\nSeen but not classified: a concise-body opener this census could not resolve to a " +
+      "definition in the same file (not a literal call, or the name lives elsewhere):\n",
+  );
+  for (const u of unresolvedOpeners) process.stdout.write(`  ${u.file}:${u.line} -> ${u.callee}(...)\n`);
+  process.stdout.write(
+    "\nAn opener this census can see but cannot classify is not silence — it fails here rather " +
+      "than being read as covered.\n",
+  );
+}
+
+if (
+  trapped.length > 0 ||
+  unmatchedExemptions.length > 0 ||
+  unmatchedDeferrals.length > 0 ||
+  unresolvedOpeners.length > 0
+) {
   process.stdout.write(
     `\nRESULT: FAIL — ${trapped.length} undocumented tx-denial trap(s), ` +
       `${unmatchedExemptions.length} stale exemption(s), ${unmatchedDeferrals.length} stale ` +
-      `deferral(s).\n`,
+      `deferral(s), ${unresolvedOpeners.length} unresolved opener(s).\n`,
   );
   process.exit(1);
 }
 
 process.stdout.write(
-  `RESULT: PASS — every tx() body that writes and can deny is either txDecision, a named, ` +
-    `matched exemption, or a named, matched, tracked deferral.\n`,
+  `RESULT: PASS — every tx()/txDecision() body this census can open (a braced body, or a ` +
+    `concise body that is one call resolved to a same-file definition) that writes — by a ` +
+    `pattern in WRITE_PATTERN, a closed list, not every write a helper might perform — and ` +
+    `can still deny is either txDecision, a named, matched exemption, or a named, matched, ` +
+    `tracked deferral.\n`,
 );

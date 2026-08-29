@@ -184,6 +184,18 @@ const NAMED_ENTRIES: Array<{ label: string; file: string; marker: string; expect
     marker: "TASK_EXECUTION_LATE_RESULT_IGNORED",
     expectStdout: "stale exemption",
   },
+  {
+    label: "ManagedWriteGuard.decideWrite's expiry sweep, reached only through the concise opener (EXEMPT)",
+    file: "guard/managed-write-guard.ts",
+    marker: "this.expireOverdueClaims();\n\n    const operation = request.operation as WriteOperation;",
+    expectStdout: "stale exemption",
+  },
+  {
+    label: "Outbox.acknowledgeInTx's rejection audit, reached only through the concise opener (EXEMPT)",
+    file: "outbox/outbox.ts",
+    marker: 'kind: "OUTBOX_ACK_REJECTED",',
+    expectStdout: "stale exemption",
+  },
 ];
 
 describe("the tx-denial census sees a plain tx() body that writes and can deny", () => {
@@ -205,7 +217,7 @@ describe("the tx-denial census sees a plain tx() body that writes and can deny",
     expect(done.stdout).toContain("cto/cto-lifecycle.ts:732 (#692)");
   });
 
-  it("fails on a new, undocumented write-then-deny tx() body", () => {
+  it("fails on a new, undocumented write-then-deny tx() body (block form)", () => {
     const repo = scratchRepo();
     const path = join(repo, "src/daemon/finalizer.ts");
     const original = readFileSync(path, "utf8");
@@ -225,6 +237,59 @@ class CensusProbeDenialTrap {
     const done = censusIn(repo);
 
     expect(done.stdout).toContain("daemon/finalizer.ts");
+    expect(done.status).toBe(1);
+  });
+
+  it("fails on a new, undocumented write-then-deny tx() body (concise form) — the real shape a third review found invisible", () => {
+    // A Sol review of #679 found the census matched only `tx(() => { ... })` — the braced
+    // body — and could not even *see* `db.tx(() => this.decideWrite(request))` /
+    // `db.tx(() => this.acknowledgeInTx(...))`, the concise-body shape two real production
+    // sites (managed-write-guard.ts, outbox.ts) actually use. The block-form probe above
+    // would have passed against the *pre-fix* scanner even after that finding, because it
+    // injects the one shape already recognised — exactly the gap this test closes: it
+    // feeds the real, other call shape, not a restatement of the one already covered.
+    const repo = scratchRepo();
+    const path = join(repo, "src/daemon/finalizer.ts");
+    const original = readFileSync(path, "utf8");
+    const injected = `${original}
+class CensusProbeConciseDenialTrap {
+  probe(db: import("../db/database.ts").Db) {
+    return db.tx(() => this.probeInTx(db));
+  }
+  private probeInTx(db: import("../db/database.ts").Db) {
+    db.run("INSERT INTO census_probe_table (probe_id) VALUES ('x')");
+    return deny(ReasonCode.CONFLICT, "concise-form probe");
+  }
+}
+`;
+    writeFileSync(path, injected);
+    const done = censusIn(repo);
+
+    expect(done.stdout).toContain("daemon/finalizer.ts");
+    expect(done.status).toBe(1);
+  });
+
+  it("fails, rather than silently passing, on a concise opener it cannot resolve to a definition", () => {
+    // A concise body that is not a single call to a same-file name — here, a call to a
+    // name this census will never find because it is never defined — must not be read as
+    // "nothing to see": it is an opener the scanner *saw* and could not classify, and
+    // "seen but not classified" has to fail the same as an undocumented trap, or the
+    // output's "every" would again be wider than what the code actually inspects.
+    const repo = scratchRepo();
+    const path = join(repo, "src/daemon/finalizer.ts");
+    const original = readFileSync(path, "utf8");
+    const injected = `${original}
+class CensusProbeUnresolvableOpener {
+  probe(db: import("../db/database.ts").Db) {
+    return db.tx(() => this.methodThatIsNeverDefinedAnywhereInThisFile());
+  }
+}
+`;
+    writeFileSync(path, injected);
+    const done = censusIn(repo);
+
+    expect(done.stdout).toContain("methodThatIsNeverDefinedAnywhereInThisFile");
+    expect(done.stdout).toContain("Seen but not classified");
     expect(done.status).toBe(1);
   });
 
@@ -277,7 +342,11 @@ class CensusProbeDenialTrap {
         const path = join(repo, "src", entry.file);
         const original = readFileSync(path, "utf8");
         expect(original).toContain(entry.marker);
-        writeFileSync(path, original.replace(entry.marker, "A_MARKER_NOTHING_MATCHES"));
+        // `replaceAll`, not `replace`: a marker that (legitimately) occurs more than once in
+        // its file — outbox.ts's rejection-audit `kind` field is written in two identical
+        // early-deny branches — must have *every* occurrence corrupted, or the untouched
+        // second copy keeps `site.body.includes(marker)` true and this test asserts nothing.
+        writeFileSync(path, original.split(entry.marker).join("A_MARKER_NOTHING_MATCHES"));
 
         const done = censusIn(repo);
 
