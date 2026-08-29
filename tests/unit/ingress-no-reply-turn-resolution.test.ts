@@ -29,6 +29,22 @@ const SECRET = "no-reply-webhook-secret";
  * outstanding forever: `admit` refuses the nonce as `INGRESS_TURN_OUTCOME_UNKNOWN` and `prune`
  * exempts the row on purpose (that exemption is correct — see ingress-turn-claim.test.ts — the
  * defect is that nothing ever clears it for a turn that is, in fact, done).
+ *
+ * The first test below stubs `route()` because no handler the current classifier can reach
+ * produces `admitted: true, replayed: false, reply: null` — DIRECT always replies, even to say
+ * a run was refused. That is an honest limit of this fixture, not a hidden one: the mechanism it
+ * exercises (`resolveNoReplyOutcome` / `completeNoReplyAndResolveTurn`) is real and load-bearing
+ * the moment such a handler exists, but this file cannot prove the branch is *reachable* today,
+ * only that it behaves correctly if it is reached.
+ *
+ * A blind review (#682) found the shape this fixture could not see: `route()` already produces
+ * `reply: null` for a *replayed* admission — a claimed turn's PENDING reply reservation,
+ * rediscovered after a restart — and that shape reaches `pollOnce`'s no-reply branch through
+ * completely ordinary production traffic, no future handler required. The second test below pins
+ * the guard that distinguishes the two (`outcome.replayed`), and
+ * `tests/unit/telegram-ingress.test.ts`'s "#682: a claimed turn's PENDING reply survives a
+ * redelivery" is the real-router reproduction: a genuine DIRECT claim, a genuine crash after send
+ * and before completion, a genuine restart — the case this fixture could never manufacture.
  */
 const identity = (turnRequestId = "turn-1"): TurnIdentity => ({
   turnRequestId,
@@ -124,5 +140,64 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
     });
     expect(redelivered.allowed).toBe(false);
     expect(redelivered.reasonCode).toBe(ReasonCode.INGRESS_REPLAY_IGNORED);
+  });
+
+  it("#682: leaves a replayed, ambiguous outcome untouched instead of reading it as a no-reply", async () => {
+    // The two shapes `route()` reports as `reply: null` and why they must not share a path:
+    //
+    //   fresh, reply: null      the handler ran just now and chose not to reply — resolve it
+    //   replayed, reply: null   `admit` saw this nonce before; a PENDING reply reservation was
+    //                           deliberately not resent — the outcome is unknown, not absent
+    //
+    // Reserve a PENDING reply the same way the router does after a real send, so there is real
+    // durable state to protect — then drive the exact outcome `route()` produces on restart for
+    // a claimed turn whose reply is still PENDING (`replayed: true, reply: null`) and confirm
+    // nothing overwrites it.
+    const harness = makeHarness();
+    const { guard, ingress, router } = buildRouter(harness);
+    const nonce = "update:2";
+
+    expect(
+      guard.admit({ channel: "telegram", actor: "owner", conversation: "chat", nonce, payload: { text: "hi" } })
+        .allowed,
+    ).toBe(true);
+    expect(guard.claimTurn("telegram", nonce, identity()).allowed).toBe(true);
+    const reply = {
+      chatId: "chat",
+      text: "an answer that may or may not have reached Telegram",
+      replyToMessageId: 1,
+      correlationId: "no-reply-correlation",
+    };
+    expect(
+      ingress.recordResultIf(
+        nonce,
+        { kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply, sent: false, deliveryStatus: "PENDING" },
+        "AVAILABLE",
+      ).allowed,
+    ).toBe(true);
+    const pendingResultJson = () =>
+      harness.cp.db.get<{ result_json: string | null }>(
+        "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
+        [nonce],
+      )?.result_json;
+    const before = pendingResultJson();
+    expect(before).toContain('"deliveryStatus":"PENDING"');
+
+    const replayedOutcome: TelegramRouteOutcome = {
+      updateId: 2,
+      nonce,
+      correlationId: "no-reply-correlation",
+      admitted: true,
+      replayed: true,
+      classification: null,
+      input: null,
+      reply: null,
+      reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+    };
+
+    router.resolveNoReplyOutcome(replayedOutcome);
+
+    expect(pendingResultJson()).toBe(before);
+    expect(guard.unresolvedTurns("telegram", "session-digest").map((turn) => turn.nonce)).toEqual([nonce]);
   });
 });

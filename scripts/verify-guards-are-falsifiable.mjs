@@ -141,6 +141,24 @@ const GUARDS = [
     ],
   },
   {
+    // Found by Sol's review of #672's own PR (#682): `route()` reports `reply: null` for two
+    // different facts, and this guard is what keeps them apart. A replayed admission of a
+    // claimed turn whose reply reservation is still PENDING after a crash also comes back with
+    // `reply: null` — `storedResponseOutcome` omits it on purpose, so the poller does not resend
+    // into Telegram — and without `outcome.replayed` in this condition, that ambiguous "we do not
+    // know if this was sent" state was overwritten with a confident "nothing was sent", losing
+    // the durable evidence that Telegram may have already delivered it. Removing the clause
+    // restores exactly that: a replayed, still-PENDING reply reaches `completeNoReplyAndResolveTurn`
+    // and is destroyed.
+    what: "a replayed outcome is never read as a fresh no-reply, even when both carry reply: null",
+    file: "src/ingress/telegram-router.ts",
+    find: "    if (outcome.reply || !outcome.admitted || outcome.replayed) return;",
+    replace: "    if (outcome.reply || !outcome.admitted) return;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::#682: a claimed turn's PENDING reply survives a redelivery instead of becoming a false no-reply",
+    ],
+  },
+  {
     // The #662 hole: a caller that dispatched, reported that nothing ran, and got attempt 2
     // admitted while attempt 1 was still in flight.
     what: "a dispatched turn cannot be reported as never started",
