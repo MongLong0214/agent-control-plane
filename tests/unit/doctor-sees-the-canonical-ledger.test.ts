@@ -141,8 +141,10 @@ describe("doctor reads the canonical ledger, not only the ingress claim", () => 
     // count in one hide a wedge in the other, which is the exact state this check exists for.
     const h = makeHarness();
     claim(h, target(h, "ceo"), "n1");
+    // The claim lives in `turn_claim_json`, not `result_json` — that column is the reply-delivery
+    // lifecycle and never holds it (#671).
     h.cp.db.run(
-      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, result_json)
+      `INSERT INTO inbound_messages (channel, nonce, actor, received_at, turn_claim_json)
        VALUES ('telegram', 'ingress-only', 'owner', ?, ?)`,
       [NOW, JSON.stringify({ deliveryStatus: "TURN_CLAIMED", turnRequestId: "ingress-only" })],
     );

@@ -666,9 +666,17 @@ export class Doctor {
    * is the same reason `prune` exempts these rows.
    */
   private checkUnresolvedTurns(): Finding[] {
+    // Read from `turn_claim_json`, not `result_json`. The claim and the reply are two lifecycles
+    // that used to share one field; #671 split them into their own columns because the reply
+    // reservation writes `result_json` whole and was erasing the claim on every ordinary timeout
+    // (#646). `result_json` is the reply-delivery lifecycle only — `claimTurn` never writes
+    // `TURN_CLAIMED` there, so a query against it can never see an outstanding claim again.
+    // `repliedAt IS NULL` is the same "still outstanding" test `unresolvedClaim` and
+    // `IngressGuard.unresolvedTurns` use, kept in agreement rather than redefined here.
     const rows = this.db.all<{ nonce: string; channel: string; received_at: string }>(
       `SELECT channel, nonce, received_at FROM inbound_messages
-        WHERE json_extract(result_json, '$.deliveryStatus') IS 'TURN_CLAIMED'
+        WHERE turn_claim_json IS NOT NULL
+          AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
         ORDER BY received_at ASC`,
     );
     if (rows.length === 0) return [];
