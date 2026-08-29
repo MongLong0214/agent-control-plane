@@ -446,12 +446,16 @@ describe("an actor's runtime can only ever be a READY session (CP-HI-08, #493)",
       [bindings.require(roleKey).assignmentId],
     );
     // The raw-SQL bypass the trigger exists for. Going through switchTo would be refused earlier
-    // by SESSION_NOT_READY, which proves the service layer and not the database backstop.
+    // by SESSION_NOT_READY, which proves the service layer and not the database backstop. Both
+    // columns move together, matching what a real repoint always does (#666 round 7) — the READY
+    // trigger is what this test is about, and the incarnation is set to the real one so its own
+    // guard has nothing to say.
     expect(() =>
-      db.run(`UPDATE conversational_actors SET current_session_id = ? WHERE actor_id = ?`, [
-        "ses_draining",
-        actor!.actor_id,
-      ]),
+      db.run(
+        `UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = ?
+          WHERE actor_id = ?`,
+        ["ses_draining", "inc-draining", actor!.actor_id],
+      ),
     ).toThrow(/ACTOR_RUNTIME_NOT_READY/);
   });
 
@@ -465,10 +469,11 @@ describe("an actor's runtime can only ever be a READY session (CP-HI-08, #493)",
       `SELECT actor_id FROM assignments WHERE assignment_id = ?`,
       [bindings.require(roleKey).assignmentId],
     );
-    db.run(`UPDATE conversational_actors SET current_session_id = ? WHERE actor_id = ?`, [
-      ready,
-      actor!.actor_id,
-    ]);
+    db.run(
+      `UPDATE conversational_actors SET current_session_id = ?, current_session_incarnation = ?
+        WHERE actor_id = ?`,
+      [ready, `inc-${ready}`, actor!.actor_id],
+    );
     expect(bindings.require(roleKey).sessionId).toBe(ready);
   });
 });
@@ -507,7 +512,9 @@ describe("a reused pid does not make an innocent session a producer (#505)", () 
        VALUES ('tsk_reuse', ?, 'work', 'implementation', 'READY', '{}', 't', 't')`,
       [core.seeded.runId],
     );
-    const actorId = seedActor(core.db, "WORKER", producer);
+    // `producer`'s real incarnation, not the default — the actor's live pointer has to name the
+    // session it actually points to (#666 round 7).
+    const actorId = seedActor(core.db, "WORKER", producer, `inc-${producer}`);
     core.db.run(
       `INSERT INTO assignments (assignment_id, role_key, role, run_id, task_id, actor_id, session_id,
                                 session_incarnation, binding_generation, mode, status, created_at)

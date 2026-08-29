@@ -836,6 +836,7 @@ describe("baseline boundary contracts", () => {
       "v28-an-operator-can-settle-a-turn-nobody-observed",
       "v29-a-dispatch-is-a-fact",
       "v30-a-turn-and-a-reply-are-two-lifecycles",
+      "v31-a-generation-means-nothing-without-its-role-key",
     ]);
   });
 

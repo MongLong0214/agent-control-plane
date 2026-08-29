@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 30;
+export const SCHEMA_VERSION = 31;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -1740,6 +1740,24 @@ const dispatchesDdl = (): string =>
     "the dispatches table",
   );
 
+const attestationGenerationTriggerDdl = (): string =>
+  schemaObject(
+    /CREATE TRIGGER IF NOT EXISTS attestation_generation_matches_assignment\n[\s\S]*?\nEND;/,
+    "the attestation generation trigger",
+  );
+
+const actorIncarnationTriggersDdl = (): string =>
+  [
+    schemaObject(
+      /CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_insert\n[\s\S]*?\nEND;/,
+      "the actor incarnation insert trigger",
+    ),
+    schemaObject(
+      /CREATE TRIGGER IF NOT EXISTS conversational_actors_incarnation_matches_session_on_update\n[\s\S]*?\nEND;/,
+      "the actor incarnation update trigger",
+    ),
+  ].join("\n\n");
+
 const observationsIndexDdl = (): string =>
   schemaObject(
     /CREATE INDEX IF NOT EXISTS canonical_turn_observations_by_turn[^;]*;/,
@@ -2024,6 +2042,51 @@ const v30: SchemaMigration = {
   checksum: () => migrationChecksum("v30-a-turn-and-a-reply-are-two-lifecycles"),
 };
 
+/**
+ * Gives an attestation the one identity that has no ambiguity: the specific `assignments` row it
+ * was made under.
+ *
+ * Neither `role` nor a bare generation number said enough on their own (#666 round 4). Generation
+ * is minted per `role_key`, and `bind()` can reuse one physical actor across *different*
+ * role_keys that share one `role` (#657) — each counting its own generation from 1. A stale
+ * attestation for one role_key's now-superseded generation could be revived by an unrelated
+ * role_key's identical, unrelated generation number, because nothing named which role_key a
+ * generation belonged to. The assignment id has no such ambiguity: minted once per bind or
+ * rebind and never reused, naming it names the exact role_key and generation together.
+ *
+ * Nullable, and left that way rather than backfilled: nothing in production writes an attestation
+ * yet (the activation embargo's writer is a separate gap, #638), so there is no existing row to
+ * lose. `claim()` cannot match a NULL to any assignment, so an unfilled row reads as unverifiable
+ * rather than as current — the fail-closed direction.
+ */
+const v31: SchemaMigration = {
+  id: "v31-a-generation-means-nothing-without-its-role-key",
+  fromVersion: 30,
+  toVersion: 31,
+  apply: (raw) => {
+    const columns = (
+      raw.prepare(`SELECT name FROM pragma_table_info('actor_target_attestations')`).all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+    if (!columns.includes("assignment_id")) {
+      raw.exec(`ALTER TABLE actor_target_attestations ADD COLUMN assignment_id TEXT REFERENCES assignments(assignment_id)`);
+    }
+    // A write-time backstop for the same round: an attestation's own copy of `binding_generation`
+    // must agree with the assignment it names, so a database mid-migration gets the guard the
+    // fresh schema ships rather than a window without it.
+    raw.exec(`DROP TRIGGER IF EXISTS attestation_generation_matches_assignment`);
+    raw.exec(attestationGenerationTriggerDdl());
+    // A second write-time backstop, one table further out: `conversational_actors`'s own copy of
+    // a session's incarnation must agree with `sessions.incarnation` itself, not only with
+    // whatever an attestation separately claims.
+    raw.exec(`DROP TRIGGER IF EXISTS conversational_actors_incarnation_matches_session_on_insert`);
+    raw.exec(`DROP TRIGGER IF EXISTS conversational_actors_incarnation_matches_session_on_update`);
+    raw.exec(actorIncarnationTriggersDdl());
+  },
+  checksum: () => migrationChecksum("v31-a-generation-means-nothing-without-its-role-key"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2044,6 +2107,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v28,
   v29,
   v30,
+  v31,
 ]);
 
 interface RequiredTrigger {
@@ -2147,6 +2211,9 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "actor_target_attestations_no_delete", sentinel: "ACTOR_TARGET_ATTESTATION_APPEND_ONLY", introducedIn: 24 },
   { name: "actor_target_bindings_immutable", sentinel: "ACTOR_TARGET_BINDING_IMMUTABLE", introducedIn: 24 },
   { name: "actor_target_bindings_no_delete", sentinel: "ACTOR_TARGET_BINDING_IMMUTABLE", introducedIn: 24 },
+  { name: "attestation_generation_matches_assignment", sentinel: "ATTESTATION_GENERATION_MISMATCH", introducedIn: 31 },
+  { name: "conversational_actors_incarnation_matches_session_on_insert", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
+  { name: "conversational_actors_incarnation_matches_session_on_update", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
