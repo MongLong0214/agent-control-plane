@@ -416,9 +416,10 @@ export class TelegramHermesRouter {
     const stored = this.getStoredState(this.ingress.nonceFor(update));
     if (stored?.reply && this.deliveryStatus(stored) === "PENDING") {
       // A PENDING reservation means an earlier process may already have reached Telegram.
-      // It is deliberately not retried: an ambiguous external result is safer as a single
-      // possibly-lost response than as a duplicate owner-facing message.
-      return this.storedResponseOutcome(update, stored, false);
+      // Replay the exact stored reply rather than rerunning its work. This chooses at-least-once
+      // owner-facing delivery: a process death or ambiguous transport result can duplicate a
+      // reply Telegram already accepted, but cannot strand a possibly-lost answer forever.
+      return this.storedResponseOutcome(update, stored, true);
     }
     if (stored?.reply && this.deliveryStatus(stored) === "RETRYABLE") {
       return this.storedResponseOutcome(update, stored, true);
@@ -600,6 +601,9 @@ export class TelegramHermesRouter {
   reserveResponse(outcome: TelegramRouteOutcome): void {
     if (!outcome.reply || !outcome.admitted) return;
     const prior = this.getStoredState(outcome.nonce);
+    // A replayed PENDING reply already owns its durable reservation. Keep it PENDING until the
+    // new send either completes it or proves rejection and releases it to RETRYABLE.
+    if (this.deliveryStatus(prior) === "PENDING") return;
     const runId = outcome.runId ?? prior?.runId;
     const reserved = this.ingress.recordResultIf(outcome.nonce, {
       kind: "TELEGRAM_WORKFLOW",
@@ -818,8 +822,8 @@ export class TelegramHermesRouter {
   private deliveryStatus(stored: TelegramStoredState | null): TelegramDeliveryStatus | null {
     if (!stored?.reply) return null;
     if (stored.deliveryStatus) return stored.deliveryStatus;
-    // Rows written by the previous release had only `sent`. Treat an unfinished row as an
-    // ambiguous reservation and fail closed rather than replaying a possibly delivered reply.
+    // Rows written by the previous release had only `sent`. Treat an unfinished row as the same
+    // ambiguous reservation the current at-least-once reply protocol will replay.
     return stored.sent === true ? "APPLIED" : "PENDING";
   }
 

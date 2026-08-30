@@ -56,8 +56,9 @@ export interface TelegramBotTransport {
 
 /**
  * A send failure must distinguish a confirmed rejection from an ambiguous external result.
- * Only `accepted === false` may release a durable reservation; null means Telegram may have
- * accepted the request and the reservation must remain PENDING across a restart.
+ * Only `accepted === false` proves a durable reservation is safe to release immediately; null
+ * means Telegram may have accepted the request, so the caller keeps it PENDING and stops the
+ * current batch. The reply replay path later retries that exact PENDING response at duplicate risk.
  */
 export class TelegramDeliveryError extends Error {
   constructor(
@@ -452,33 +453,35 @@ export class TelegramLongPollService {
       signal: this.#controller?.signal,
     });
     const outcomes: TelegramRouteOutcome[] = [];
-    // A send failure on one update must not cost every later update in this same batch its
-    // turn (#699): the offset would never advance past it, so Telegram would redeliver the
-    // whole batch forever and every message behind it looked like silence. Only a genuine
-    // `TelegramDeliveryError` is deferred this way — a `TelegramInterruption` (or any other
-    // unexpected error) still throws immediately, because that stands in for the process
-    // dying right there, and a real crash would not go on to answer the next update either.
-    // The offset must still never skip past the update whose delivery is unresolved, or a
-    // redelivery-based recovery could never reach it again — so once one update is deferred,
-    // no later update's offset in this same poll is allowed to advance past it.
+    // A *confirmed* rejection on one update must not cost every later update in this same batch
+    // its turn (#699): `accepted === false` means Telegram itself told us the message was not
+    // delivered, so `releaseResponse` marks it RETRYABLE and a later poll resends exactly that
+    // reply — no work is redone and nothing is lost by letting later updates in this batch run
+    // now. `accepted === null` is a different fact: delivery is *unknown*, so the reservation
+    // stays PENDING and this poll stops before later updates run their work into the same outage.
+    // A later poll replays that exact PENDING reply. This at-least-once choice can duplicate a
+    // reply Telegram accepted before a timeout, but it cannot strand the answer forever. So only
+    // `accepted === false` is deferred with `continue`; `accepted === null` (like any other
+    // unexpected error) still throws immediately. The offset must still never skip past the
+    // update whose delivery is unresolved, or a redelivery-based recovery could never reach it
+    // again — so once a rejected update is deferred, no later update's offset in this same poll
+    // is allowed to advance past it either.
     let firstDeliveryError: unknown;
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
       const outcome = await this.router.route(update, this.webhookSecret);
       outcomes.push(outcome);
       if (outcome.reply) {
-        // Reserve before the external call. A reservation left PENDING after an ambiguous
-        // return is never replayed; only a confirmed pre-send rejection is released.
+        // Reserve before the external call. A confirmed rejection releases the reservation to
+        // RETRYABLE; an ambiguous result leaves it PENDING for the exact-reply replay path.
         this.router.reserveResponse(outcome);
         try {
           await this.transport.sendMessage(outcome.reply);
           await this.options.onInterrupt?.("after-reply-send", update, outcome.runId);
           this.router.completeResponse(outcome);
         } catch (error) {
-          if (!(error instanceof TelegramDeliveryError)) throw error;
-          if (error.accepted === false) {
-            this.router.releaseResponse(outcome);
-          }
+          if (!(error instanceof TelegramDeliveryError) || error.accepted !== false) throw error;
+          this.router.releaseResponse(outcome);
           if (firstDeliveryError === undefined) firstDeliveryError = error;
           continue;
         }

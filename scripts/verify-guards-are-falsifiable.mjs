@@ -1483,7 +1483,44 @@ const GUARDS = [
     find: "      if (firstDeliveryError === undefined && Number.isSafeInteger(update.update_id)) {",
     replace: "      if (Number.isSafeInteger(update.update_id)) {",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::does not let one update's undeliverable reply block a later update in the same poll (#699)",
+      "tests/unit/telegram-ingress.test.ts::does not let one rejected reply block a later update in the same poll #699",
+    ],
+  },
+  {
+    // #699 follow-up: `false` and `null` are not the same fact. `accepted === false` is a
+    // confirmed rejection — safe to defer past, because `releaseResponse` marks it RETRYABLE
+    // and a later poll resends that exact reply. `accepted === null` is an unknown outcome, so
+    // it stays PENDING for exact-reply replay and stops the batch before later work enters the
+    // same outage. Removing the distinction below releases the unknown reservation as though
+    // Telegram had rejected it and runs every later update immediately.
+    what: "an ambiguous null delivery outcome stops the poll instead of following a confirmed rejection",
+    file: "src/ingress/telegram-polling.ts",
+    find: "          if (!(error instanceof TelegramDeliveryError) || error.accepted !== false) throw error;",
+    replace: "          if (!(error instanceof TelegramDeliveryError)) throw error;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::stops later update work on an ambiguous null send and replays the pending reply",
+    ],
+  },
+  {
+    // The unknown result above deliberately stays PENDING. If router replay suppresses its stored
+    // reply, nothing can ever move that reservation to APPLIED and the answer is lost forever.
+    what: "a pending reply is replayed after an ambiguous result or process death",
+    file: "src/ingress/telegram-router.ts",
+    find: "    if (stored?.reply && this.deliveryStatus(stored) === \"PENDING\") {",
+    replace: "    if (stored?.reply && this.deliveryStatus(stored) === \"APPLIED\") {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::stops later update work on an ambiguous null send and replays the pending reply",
+    ],
+  },
+  {
+    // A replayed PENDING reply already owns a reservation. Trying to reserve it from AVAILABLE
+    // again refuses the recovery send before it reaches Telegram.
+    what: "a replayed pending reply reuses its durable reservation",
+    file: "src/ingress/telegram-router.ts",
+    find: "    if (this.deliveryStatus(prior) === \"PENDING\") return;",
+    replace: "    if (this.deliveryStatus(prior) === \"APPLIED\") return;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::replays a pending reply after process death before the completion checkpoint",
     ],
   },
 ];
