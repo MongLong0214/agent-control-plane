@@ -509,7 +509,13 @@ class SyntheticTelegramTransport implements TelegramBotTransport {
   }): Promise<TelegramSentMessage> {
     this.sends += 1;
     if (this.fault === "AMBIGUOUS_FIRST_SEND" && this.sends === 1) {
-      throw new TelegramDeliveryError("synthetic transport result is ambiguous", null);
+      throw new TelegramDeliveryError("synthetic transport result is ambiguous", {
+        kind: "UNKNOWN",
+        statusCode: null,
+        description: null,
+        migrateToChatId: null,
+        retryAfterSeconds: null,
+      });
     }
     const recordedText = this.fault === "FABRICATED_REPLY" && this.sends === 2
       ? "a fabricated reply"
@@ -931,7 +937,7 @@ export const runSyntheticDisposableRealmProbe = async (
           settledNextOffset: settled.nextOffset,
         });
       } catch (error) {
-        const signal = error instanceof TelegramDeliveryError && error.accepted === null
+        const signal = error instanceof TelegramDeliveryError && error.failure.kind === "UNKNOWN"
           ? "TELEGRAM_SEND_AMBIGUOUS"
           : "SOCKET_CLOSED";
         if (classifyProbeSignal(signal) === "INCONCLUSIVE") {
