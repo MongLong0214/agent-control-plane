@@ -30,6 +30,7 @@ on:
 jobs:
   loci:
     runs-on: macos-15
+    timeout-minutes: 10
     permissions:
       contents: read
       issues: read

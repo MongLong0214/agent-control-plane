@@ -311,6 +311,11 @@ describe("verify-tracker-loci-resolve", () => {
     expect(tracker).toBeGreaterThan(install);
   });
 
+  it("scheduled workflow has a ten minute timeout", () => {
+    const trackerYaml = readFileSync(join(repoRoot, ".github", "workflows", "tracker-loci.yml"), "utf8");
+    expect(trackerYaml).toContain("timeout-minutes: 10");
+  });
+
   it("scheduled entrypoint resolves every import from the dependencies the workflow installs", () => {
     const trackerYaml = readFileSync(join(repoRoot, ".github", "workflows", "tracker-loci.yml"), "utf8");
     const entrypoint = [...trackerYaml.matchAll(/^\s*- run: (node scripts\/verify-tracker-loci-resolve\.mjs)$/gm)]
@@ -893,7 +898,7 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
-  it("[round 6] an undelimited bare product name and an undelimited real bare filename are not told apart, and neither is checked", () => {
+  it("an undelimited root filename with no line number is explicitly documented as ignored", () => {
     // The disambiguator (directory separator or line number) is uniform: it does not special-case
     // markdown or any other extension. An undelimited bare `HANDOFF-CEO-RESUME.md` mention — no
     // backticks, no directory, no line number — is exactly as syntactically ambiguous as an
@@ -901,7 +906,11 @@ describe("verify-tracker-loci-resolve", () => {
     // rather than hidden: it is no longer flagged even though (unlike Node.js) it would in fact
     // resolve to nothing. This remains true after round 9 — see the round 9 tests below for the
     // *delimited* case, which is a different, now-fixed defect, not this one.
-    const body = "See HANDOFF-CEO-RESUME.md for the full context.";
+    const contract = readFileSync(scriptPath, "utf8");
+    expect(contract).toContain("## Intentionally ignored formats");
+    expect(contract).toContain("an undelimited root filename with no line number");
+
+    const body = "The handoff remains in HANDOFF-CEO-RESUME.md";
     const { path, cleanup } = withIssues([{ number: 9405, title: "bare markdown mention control", body }]);
     try {
       const result = run(path);
@@ -2224,6 +2233,30 @@ describe("verify-tracker-loci-resolve", () => {
         const result = run(path);
         expect(result.status, result.stdout || result.stderr).toBe(0);
         expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  describe("round 22 bounded citation work", () => {
+    it("adversarial elision fragments complete within two seconds", () => {
+      // The reviewer supplied this through the real CLI: twelve common one-character fragments
+      // followed by a character absent from the 121-line search window. The old `.*?` chain
+      // reconsidered combinations of every preceding `e`; the production path did not finish in
+      // six seconds. The ordered literal scan visits each fragment once and reports the miss.
+      const quoted = `${Array.from({ length: 12 }, () => "e").join("...")}...\u{10ffff}`;
+      const body = `The old line is at \`README.md:1\` — \`${quoted}\`.`;
+      const { path, cleanup } = withIssues([{ number: 68960, title: "adversarial elision", body }]);
+      try {
+        const startedAt = performance.now();
+        const result = run(path);
+        const elapsedMs = performance.now() - startedAt;
+
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("no longer appears");
+        expect(elapsedMs).toBeLessThan(2_000);
       } finally {
         cleanup();
       }

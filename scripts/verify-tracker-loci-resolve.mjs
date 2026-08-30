@@ -1,15 +1,48 @@
 #!/usr/bin/env node
 /**
- * #597's rule, turned into a script: an issue that cites a locus is making a claim about the
- * repository other than itself, and that claim goes stale the moment the code moves — silently,
- * because nothing about the issue changes when it does. Measured three times in one working day
- * (#650, #649, #630): work got dispatched from an issue body whose cited loci had already moved,
- * and every one of those was a citation nobody re-checked before acting on it.
+ * Every supported explicit citation in an open issue body is checked against the tracked tree;
+ * unsupported and ignored forms are listed below instead of being claimed as coverage.
  *
  * #597's own rule for the one classification that asserts something about a system other than
  * the one being edited: "Loci are named by symbol, never by line number... a renamed symbol
- * makes the search return nothing, and nothing is a visible failure." This script is the general
- * form of that, applied to every open issue's own citations rather than one migration table.
+ * makes the search return nothing, and nothing is a visible failure." This script applies that
+ * check to the supported citation forms in every open issue body rather than claiming to
+ * understand every filename-shaped phrase in prose.
+ *
+ * ## Supported explicit citation formats
+ *
+ *   - a same-repository GitHub blob URL, with or without a `#L…` line fragment
+ *   - a path with a filename extension and a directory separator; a line number is optional
+ *   - a filename with an extension and an explicit `:line[-end]` or `#Lline[-Lend]`
+ *   - a directory-qualified extensionless path with an explicit line number
+ *   - a root extensionless dotfile with an explicit line number
+ *   - a root filename, without a line number, only when backtick- or quote-delimited and its
+ *     extension occurs in the tracked tree
+ *   - a `/private/tmp` or `/tmp` path, reported separately as non-durable
+ *   - a backtick-delimited symbol paired with a backtick-delimited path, either as
+ *     `` `path` — `symbol` `` or `` `symbol` in `path` ``
+ *
+ * Only issue bodies are read. An inline line citation's trailing content is checked only when it
+ * is explicitly backtick- or quote-delimited; fenced content is checked only when it reads as
+ * code under `looksLikeCode`.
+ *
+ * ## Intentionally ignored formats
+ *
+ *   - issue comments
+ *   - an undelimited root filename with no line number, including
+ *     `The handoff remains in HANDOFF-CEO-RESUME.md`
+ *   - an extensionless path with no line number, including a bare directory
+ *   - a symbol not paired with a path in one of the two supported backtick forms
+ *   - URLs other than same-repository GitHub blob URLs
+ *   - unquoted prose after an inline citation, and fenced prose that does not read as code
+ *
+ * The undelimited-root omission is deliberate, not silent coverage. On the 2026-08-29 snapshot
+ * of all 503 open issues, admitting undelimited root names with extensions present in the tracked
+ * tree added seven findings and every one was false: `STATUS.json`, a `.test.ts` glob fragment,
+ * `verify.js` twice, hypothetical `large.ts`, object field `result.json`, and traversal example
+ * `outside.yml`. It added no true repository-root citation. The broader version that admitted any
+ * dotted word added 336 findings, dominated by member and column names. Explicit delimiting or a
+ * line number is therefore the boundary this check can enforce without calling prose stale.
  *
  * ## What counts as stale
  *
@@ -1391,7 +1424,7 @@ const resolveBlobRefAndPath = (segments) => {
 };
 // A symbol may be cited as `name` or `name()` — the parens are the citer marking it a function or
 // method, not literal text to search for (a call site rarely has empty arguments); the extraction
-// below captures the identifier alone and drops them, the same way `snippetPattern`'s elision
+// below captures the identifier alone and drops them, the same way `snippetFragments`' elision
 // treats an empty `()` as "a call, arguments omitted" rather than a literal empty parameter list.
 // A leading `#` (round 7) is JavaScript's own private-field/method sigil, not decoration to strip —
 // `#observe` and `observe` name two different things, and this codebase declares private members
@@ -1432,26 +1465,54 @@ const symbolPattern = (symbol) => {
 const CONTENT_SEARCH_WINDOW = 60;
 
 /**
- * Turns a quoted code snippet into a regex that still matches after elision. `...` (or `…`)
- * stands for "omitted", the same convention the repository's own issue bodies use when quoting a
- * call with its arguments left out. Empty parens `()` get the same treatment — a citation writing
- * `bindings.bind()` to mean "calls bind" should not be refuted by the call actually taking
- * arguments, only by the call not existing at all.
+ * Collapses whitespace without constructing a source-sized regular-expression match. The old
+ * snippet matcher turned every whitespace run into `\s+`; normalizing both sides preserves that
+ * equivalence while keeping the later search literal.
  */
-const snippetPattern = (snippet) => {
-  const trimmed = snippet.trim();
-  if (trimmed.length === 0) return null;
-  const parts = trimmed.split(/\.\.\.|…/);
-  const escaped = parts.map((part) =>
-    escapeRegex(part.trim()).split("\\(\\)").join("\\([^)]*\\)").replace(/\s+/g, "\\s+"),
-  );
-  const source = escaped.filter((p) => p.length > 0).join(".*?");
-  // "s" (dotall): an ellipsis in a quoted citation stands for omitted *lines* as often as omitted
-  // arguments — `for (…) { … await this.router.route(…) }` elides the loop body, not one call's
-  // args — so the wildcard between fragments has to be able to cross a newline, or a perfectly
-  // current multi-line quote is reported stale for a reason that is about this checker, not the
-  // tree.
-  return source.length > 0 ? new RegExp(source, "s") : null;
+const collapseWhitespace = (text) => {
+  const normalized = [];
+  let pendingSpace = false;
+  for (const char of text.trim()) {
+    if (char.trim().length === 0) {
+      pendingSpace = normalized.length > 0;
+      continue;
+    }
+    if (pendingSpace) normalized.push(" ");
+    normalized.push(char);
+    pendingSpace = false;
+  }
+  return normalized.join("");
+};
+
+/**
+ * Turns a quoted snippet into ordered literal fragments. `...` (or `…`) stands for omitted text,
+ * including omitted lines. Empty parens get the same treatment inside literal parens, so
+ * `bindings.bind()` becomes the two fragments `bindings.bind(` and `)`: arguments may differ, but
+ * a call boundary must still exist.
+ */
+const snippetFragments = (snippet) => {
+  const fragments = snippet
+    .replaceAll("()", "(...)")
+    .replaceAll("…", "...")
+    .split("...")
+    .map(collapseWhitespace)
+    .filter((fragment) => fragment.length > 0);
+  return fragments.length > 0 ? fragments : null;
+};
+
+/**
+ * Finds each literal fragment after the previous one. The cursor only moves forward, so hostile
+ * issue text cannot make the matcher backtrack or reconsider earlier fragment choices.
+ */
+const containsSnippetFragments = (haystack, fragments) => {
+  const normalized = collapseWhitespace(haystack);
+  let from = 0;
+  for (const fragment of fragments) {
+    const at = normalized.indexOf(fragment, from);
+    if (at === -1) return false;
+    from = at + fragment.length;
+  }
+  return true;
 };
 
 /**
@@ -1923,11 +1984,11 @@ for (const issue of issues) {
       // strips to itself unchanged, so a citation whose old code now survives only inside the
       // file's comment still fails to match the (comment-stripped) haystack exactly as before. A
       // needle that quotes a comment *including its own marker* strips to nothing and yields no
-      // pattern (`snippetPattern("")` is already `null`) — an unverifiable quote is treated the
+      // fragments (`snippetFragments("")` is already `null`) — an unverifiable quote is treated the
       // same as no quoted content at all, falling through to ADVISORY rather than asserting a
       // fact this check cannot check.
       const needle = stripCommentsForContentView(citation.content, extensionOf(resolved.path));
-      const pattern = snippetPattern(needle);
+      const fragments = snippetFragments(needle);
       // Searched near the cited line, not across the whole file. A file this size legitimately
       // repeats a shape — `binding-registry.ts` has a second, deliberate unconditional
       // `this.mintActor(...)` in an unrelated method 225 lines from the one #649 cited — and
@@ -1958,7 +2019,7 @@ for (const issue of issues) {
       const from = Math.max(0, citation.startLine - 1 - CONTENT_SEARCH_WINDOW);
       const to = Math.min(windowLines.length, citedEnd + CONTENT_SEARCH_WINDOW);
       const nearby = windowLines.slice(from, to).join("\n");
-      if (pattern && !pattern.test(nearby)) {
+      if (fragments && !containsSnippetFragments(nearby, fragments)) {
         stale.push({
           issue,
           citation: citation.raw,
