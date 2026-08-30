@@ -2414,6 +2414,96 @@ const GUARDS = [
       "tests/unit/database-migration-restore.test.ts::migrates pinned v11 and restores it after the injected post-v12 failure",
     ],
   },
+  {
+    what: "the script caller census includes every regular direct child regardless of extension",
+    file: "scripts/verify-every-script-has-a-caller.mjs",
+    find:
+      "const scriptFiles = readdirSync(scriptsDir)\n" +
+      "  .filter((name) => statSync(join(scriptsDir, name)).isFile())\n" +
+      "  .sort();",
+    replace:
+      "const scriptFiles = readdirSync(scriptsDir)\n" +
+      "  .filter((name) => statSync(join(scriptsDir, name)).isFile())\n" +
+      "  .filter((name) => /\\.(mjs|ts|js|cjs)$/.test(name))\n" +
+      "  .sort();",
+    killedBy: [
+      "tests/process/every-script-has-a-caller.test.ts::finds shell Python and extensionless orphan scripts",
+    ],
+  },
+  {
+    what: "an interpreter argument that is not its executable operand is not counted as a script caller",
+    file: "scripts/verify-every-script-has-a-caller.mjs",
+    find: "  return entrypoint !== null && isScriptOperand(entrypoint, needle);",
+    replace: "  return words.includes(needle);",
+    killedBy: [
+      "tests/process/every-script-has-a-caller.test.ts::rejects interpreter arguments that are not executable positions",
+    ],
+  },
+  {
+    what: "a suite child process that executes a script is counted as that script's caller",
+    file: "scripts/verify-every-script-has-a-caller.mjs",
+    find:
+      "  for (const test of testSources) {\n" +
+      "    if (testFileSpawns(test.text, name)) {\n" +
+      "      callers.push({ type: \"test\", file: test.source, ciReachable: true });\n" +
+      "    }\n" +
+      "  }",
+    replace: "  for (const test of []) void test;",
+    killedBy: [
+      "tests/process/every-script-has-a-caller.test.ts::classifies the four existing suite entrypoints as test callers",
+    ],
+  },
+  {
+    what: "package script CI reachability flows from a reached caller to the alias it invokes",
+    file: "scripts/verify-every-script-has-a-caller.mjs",
+    find:
+      "const queue = [...ciReachablePackageScripts];\n" +
+      "while (queue.length > 0) {\n" +
+      "  const caller = queue.shift();\n" +
+      "  for (const called of packageCallsIn(packageScripts[caller], packageScriptNames)) {\n" +
+      "    if (ciReachablePackageScripts.has(called)) continue;\n" +
+      "    ciReachablePackageScripts.add(called);\n" +
+      "    queue.push(called);\n" +
+      "  }\n" +
+      "}",
+    replace:
+      "const queue = [];\n" +
+      "let grew = true;\n" +
+      "while (grew) {\n" +
+      "  grew = false;\n" +
+      "  for (const [caller, command] of packageScriptEntries) {\n" +
+      "    if (ciReachablePackageScripts.has(caller)) continue;\n" +
+      "    const callsReachedAlias = [...packageCallsIn(command, packageScriptNames)].some((called) =>\n" +
+      "      ciReachablePackageScripts.has(called),\n" +
+      "    );\n" +
+      "    if (!callsReachedAlias) continue;\n" +
+      "    ciReachablePackageScripts.add(caller);\n" +
+      "    grew = true;\n" +
+      "  }\n" +
+      "}",
+    killedBy: [
+      "tests/process/every-script-has-a-caller.test.ts::does not propagate CI reachability from callee back to an unused caller",
+    ],
+  },
+  {
+    what: "any CI reached package alias confirms a script that has multiple aliases",
+    file: "scripts/verify-every-script-has-a-caller.mjs",
+    find:
+      "    wired.push({\n" +
+      "      name,\n" +
+      "      callers,\n" +
+      "      ciConfirmed: callers.some((caller) => caller.ciReachable),\n" +
+      "    });",
+    replace:
+      "    wired.push({\n" +
+      "      name,\n" +
+      "      callers,\n" +
+      "      ciConfirmed: callers[0].ciReachable,\n" +
+      "    });",
+    killedBy: [
+      "tests/process/every-script-has-a-caller.test.ts::uses any CI reached package alias for a multiply aliased script",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

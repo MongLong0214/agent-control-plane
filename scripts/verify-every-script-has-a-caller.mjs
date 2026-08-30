@@ -1,99 +1,78 @@
 #!/usr/bin/env node
 /**
- * #705 — `verify-reason-codes.mjs` was correct and reachable from nowhere: not a `pnpm`
- * script, not a CI step, not called by any other script. It had been reporting a real
- * defect into an empty room for as long as that defect existed. This check is what makes
- * that shape recur loudly instead of quietly: every file directly under `scripts/` must be
- * named — as a `pnpm` script in `package.json`, or in an actually-executed `run:` step of a
- * workflow under `.github/workflows/` — or it must be named in EXEMPT below, with a reason.
+ * #705 — a correct verification script was never invoked, so the defect it found reported
+ * into an empty room. A direct child of `scripts/` has a caller when this dependency-free
+ * census can prove at least one of these execution paths:
  *
- * `scripts/lib/` is out of scope by construction, not by exemption: this only reads the
- * direct children of `scripts/`, so a shared module imported by other scripts (not meant to
- * be invoked on its own) is never a candidate in the first place — the same way `src/`
- * helper modules are never asked to justify not being a CLI entry point.
+ *   - a workflow `run:` command executes the file directly;
+ *   - a package.json command executes the file (and CI reachability is reported by following
+ *     package-script calls forward from workflow `run:` commands); or
+ *   - a test selected by CI's full `pnpm test` run statically spawns the file.
  *
- * What "named" means here, narrowed after #709's review found the first cut too wide: a
- * plain substring search over an entire workflow file, or over every `package.json` field,
- * treats a YAML comment and a shell `echo scripts/x.mjs` the same as a real invocation — a
- * mention counted as a caller. Neither is one. So this only searches:
+ * The third path matters because a test that spawns a script executes its real entrypoint; it
+ * is not a weaker kind of caller merely because the workflow spells `pnpm test` instead of the
+ * script's filename. The static scan is deliberately conservative. It recognizes literal paths,
+ * literal `join`/`resolve` paths, and constants made from those forms in `spawn`, `spawnSync`,
+ * `execFile`, or `execFileSync`. A path assembled dynamically, an imported helper that spawns a
+ * script, dynamic Vitest selection, dynamic shell, or an unrecognized interpreter option is not
+ * credited. Every human-readable run prints that limit instead of turning "not detected" into
+ * "does not exist".
  *
- *   - the actual command text of `run:` steps in `.github/workflows/*.yml` (single-line and
- *     block-scalar `run: |` alike), with bash-style `#...` comments stripped first, and
- *   - the command strings under `package.json`'s `scripts`,
+ * Every regular file directly under `scripts/` is a candidate, including `.sh`, `.py`, and
+ * extensionless files. `scripts/lib/` remains out of scope because its files are not direct
+ * children. Command matching is about the entrypoint operand, not a filename appearing somewhere
+ * after an interpreter: `node --eval 0 scripts/x`, `sh -c true scripts/x`, and
+ * `npx echo scripts/x` do not execute `scripts/x` and therefore do not count.
  *
- * and within that text, a mention counts only when it sits in a position that would
- * actually execute it: the first word of its shell segment (split on `&&`, `||`, `;`, `|`,
- * and newlines) is a known interpreter (`node`, `npx`, `tsx`, `sh`, `bash`, `python`,
- * `python3`) with the script named after it, or the segment's first word *is* the script
- * itself (a direct, executable invocation). `echo scripts/x.mjs`, a bare mention in a
- * comment, or the filename appearing only as an argument to something that does not run it
- * (`cat`, `grep`, a commit message) does not count. `tests/process/every-script-has-a-
- * caller.test.ts` proves both directions: a comment-only mention and a dead `echo` mention
- * are rejected, and a genuine invocation still passes.
- *
- * A second narrowing: a script named only inside a `package.json` command is wired, but
- * whether *that* `pnpm` entry itself ever runs in CI is a separate question this check
- * answers as far as it can and no further. It marks an entry `ciConfirmed` when a workflow
- * `run:` step actually invokes it (`pnpm <name>`, `pnpm run <name>`, or `npm run <name>`),
- * propagated one further step through any `package.json` script that itself invokes another
- * by name. Anything short of that — a step gated behind a dynamic `if:`, a reusable workflow
- * call, a name assembled at runtime from a shell variable — is not something a dependency-
- * free text scan can decide, so it is not claimed: those entries print as "package.json
- * entry only, CI-reachability not confirmed" rather than being asserted as run. A `pnpm`
- * script that only a human ever types by hand is still a caller in the sense #705's closing
- * conditions asked for ("`package.json` **or** `ci.yml` reaches it") — this just stops
- * saying more than that about it.
- *
- * EXEMPT is keyed by filename, not by file:line — a line number goes stale the moment
- * something above it grows, which is the exact failure this repository has already shipped
- * once (`scripts/verify-tx-denial-sites.mjs`'s own EXEMPT, before it was widened). An
- * exemption list nothing consults is the same defect one level up: the mutation proof in
- * `tests/process/every-script-has-a-caller.test.ts` requires that removing a script's only
- * caller fails this check, and that naming it in EXEMPT — with a reason — is what suppresses
- * that failure. Neither direction is assumed. Nor is a blank reason: an EXEMPT entry whose
- * reason is empty or whitespace records nothing a reviewer could later check, so it fails
- * the same way a stale entry does.
+ * sol-simplify: this exists for #705's silent, user-visible verification gap; remove it when
+ * `scripts/` stops being an entrypoint inventory or another caller graph supplies this evidence.
  *
  * Usage: node scripts/verify-every-script-has-a-caller.mjs [--json]
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const asJson = process.argv.includes("--json");
 
-/**
- * Scripts with no caller in `package.json` or `.github/workflows/*.yml`, and the reason
- * each is deliberately left that way rather than wired. Every entry here must name a file
- * that actually exists in `scripts/` — an exemption for a script that was since deleted or
- * renamed is exactly the "nothing consults it" trap this file exists to avoid, so a stale
- * entry fails the same as a missing wire (see the census below). Every entry must also carry
- * a real, non-empty reason — an exemption nobody could explain if asked is the same trap.
- */
+/** Deliberately manual entrypoints may be named here. Stale entries and blank reasons fail. */
 const EXEMPT = {
-  // (currently empty — every script under scripts/ has a package.json entry; see #705's
-  // report for the reachability of each, including the ones deliberately excluded from CI.)
+  // (currently empty)
 };
 
-const KNOWN_INTERPRETERS = new Set(["node", "npx", "tsx", "sh", "bash", "python", "python3"]);
 const PACKAGE_MANAGERS = new Set(["pnpm", "npm", "yarn"]);
+const NODE_NO_ENTRYPOINT = new Set(["-e", "--eval", "-p", "--print", "-c", "--check"]);
+const NODE_OPTIONS_WITH_VALUE = new Set([
+  "-r",
+  "--require",
+  "--import",
+  "--loader",
+  "--conditions",
+  "--input-type",
+  "--inspect-port",
+  "--redirect-warnings",
+  "--test-name-pattern",
+  "--test-reporter",
+  "--test-reporter-destination",
+]);
+const NODE_OPTIONS_WITHOUT_VALUE = new Set([
+  "--experimental-transform-types",
+  "--no-warnings",
+  "--enable-source-maps",
+  "--trace-warnings",
+  "--use-strict",
+]);
+const TSX_OPTIONS_WITH_VALUE = new Set(["--tsconfig"]);
+const TSX_OPTIONS_WITHOUT_VALUE = new Set(["--no-cache"]);
 
-/** Strips a bash-style `#...` comment from one line: from a `#` that starts the line or is
- * preceded by whitespace, to end of line. Does not understand quoting, so a `#` inside a
- * quoted string could in principle be stripped in error — an accepted limit for a
- * dependency-free scan, and not a shape any script name in this repository takes. */
 const stripBashComment = (line) => line.replace(/(^|\s)#.*$/, "$1").trimEnd();
-
 const indentOf = (line) => (/^(\s*)/.exec(line) ?? ["", ""])[1].length;
 
-/** Extracts the command text of every `run:` step in a workflow file — single-line
- * (`run: pnpm lint`) and block-scalar (`run: |` followed by more-indented lines) alike —
- * with comments stripped, so downstream matching never sees YAML prose or bash comments as
- * if they were commands. */
-const extractRunCommands = (yamlText) => {
+/** Extracts actual `run:` command text while retaining the workflow source for reporting. */
+const extractRunCommands = (yamlText, source) => {
   const lines = yamlText.split(/\r?\n/);
-  const commands = [];
+  const runs = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const match = /^(\s*(?:-\s+)?)run:\s*(.*)$/.exec(line);
@@ -101,7 +80,6 @@ const extractRunCommands = (yamlText) => {
     const keyIndent = indentOf(line);
     const rest = match[2].trim();
     if (rest === "" || /^[|>][+-]?\d*$/.test(rest)) {
-      // Block scalar: gather every following line indented past this `run:` line.
       const blockLines = [];
       let j = i + 1;
       for (; j < lines.length; j++) {
@@ -113,167 +91,486 @@ const extractRunCommands = (yamlText) => {
         if (indentOf(next) <= keyIndent) break;
         blockLines.push(stripBashComment(next));
       }
-      commands.push(blockLines.join("\n"));
+      runs.push({ source, command: blockLines.join("\n") });
       i = j - 1;
     } else {
-      commands.push(stripBashComment(rest));
+      runs.push({ source, command: stripBashComment(rest) });
     }
   }
-  return commands;
+  return runs;
 };
 
-/** Splits a command block into the shell segments an operator would actually separate at
- * execution time, so each segment can be checked for its own leading word. */
 const splitSegments = (commandText) =>
   commandText
     .split(/\r?\n|&&|\|\||;|\|/)
-    .map((s) => s.trim())
+    .map((segment) => segment.trim())
     .filter(Boolean);
 
-/** Whether `segment` actually executes `needle` (e.g. `scripts/foo.mjs`) rather than merely
- * mentioning it — the leading word (past any `FOO=bar` env assignments) must be a known
- * interpreter with `needle` following, or `needle` itself must be the thing being run. */
-const segmentInvokes = (segment, needle) => {
-  if (!segment.includes(needle)) return false;
-  const withoutEnv = segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, "");
-  const words = withoutEnv.split(/\s+/).filter(Boolean);
-  const [first] = words;
-  if (!first) return false;
-  if (KNOWN_INTERPRETERS.has(first)) return words.slice(1).includes(needle);
-  // Direct execution: the command *is* the script, optionally with a leading `./`.
-  return first === needle || first === `./${needle}`;
+/** Enough shell tokenization for repository commands; dynamic shell remains an admitted limit. */
+const shellWords = (segment) =>
+  (segment.match(/"(?:\\.|[^"])*"|'[^']*'|[^\s]+/g) ?? []).map((word) => {
+    if ((word.startsWith('"') && word.endsWith('"')) || (word.startsWith("'") && word.endsWith("'"))) {
+      return word.slice(1, -1);
+    }
+    return word;
+  });
+
+const withoutLeadingEnvironment = (words) => {
+  let at = 0;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[at] ?? "")) at++;
+  if (basename(words[at] ?? "") === "env") {
+    at++;
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[at] ?? "")) at++;
+  }
+  return words.slice(at);
 };
 
-/** Whether any segment in `commands` executes `needle`. */
-const anyCommandInvokes = (commands, needle) =>
-  commands.some((command) => splitSegments(command).some((segment) => segmentInvokes(segment, needle)));
+const isScriptOperand = (operand, needle) => operand === needle || operand === `./${needle}`;
+
+/** Returns the file operand executed by node, or null when the command does not execute one. */
+const nodeEntrypoint = (words, start) => {
+  for (let at = start; at < words.length; at++) {
+    const word = words[at];
+    if (word === "--") return words[at + 1] ?? null;
+    if (!word.startsWith("-")) return word;
+    const option = word.split("=", 1)[0];
+    if (NODE_NO_ENTRYPOINT.has(option)) return null;
+    if (word.includes("=")) continue;
+    if (NODE_OPTIONS_WITH_VALUE.has(option)) {
+      at++;
+      continue;
+    }
+    if (NODE_OPTIONS_WITHOUT_VALUE.has(option)) continue;
+    return null;
+  }
+  return null;
+};
+
+const tsxEntrypoint = (words, start) => {
+  for (let at = start; at < words.length; at++) {
+    const word = words[at];
+    if (word === "--") return words[at + 1] ?? null;
+    if (!word.startsWith("-")) return word;
+    if (word === "-e" || word === "--eval") return null;
+    const option = word.split("=", 1)[0];
+    if (word.includes("=")) continue;
+    if (TSX_OPTIONS_WITH_VALUE.has(option)) {
+      at++;
+      continue;
+    }
+    if (TSX_OPTIONS_WITHOUT_VALUE.has(option)) continue;
+    return null;
+  }
+  return null;
+};
+
+const shellEntrypoint = (words, start) => {
+  for (let at = start; at < words.length; at++) {
+    const word = words[at];
+    if (word === "--") return words[at + 1] ?? null;
+    if (!word.startsWith("-")) return word;
+    // With `-c`, later operands become $0/$1; they are not files executed by the shell.
+    if (/^-[^-]*c/.test(word) || word === "--command") return null;
+    if (word === "-o") at++;
+  }
+  return null;
+};
+
+const pythonEntrypoint = (words, start) => {
+  for (let at = start; at < words.length; at++) {
+    const word = words[at];
+    if (word === "--") return words[at + 1] ?? null;
+    if (!word.startsWith("-")) return word;
+    if (word === "-c" || word === "-m") return null;
+  }
+  return null;
+};
+
+const npxEntrypoint = (words, start) => {
+  let at = start;
+  while (at < words.length && words[at].startsWith("-")) {
+    if (!["-y", "--yes", "--no-install"].includes(words[at]) && !words[at].includes("=")) return null;
+    at++;
+  }
+  const runner = basename(words[at] ?? "");
+  if (runner === "tsx") return tsxEntrypoint(words, at + 1);
+  if (runner === "node") return nodeEntrypoint(words, at + 1);
+  return null;
+};
+
+/** True only when the script is the command's entrypoint operand, not an arbitrary argument. */
+const segmentInvokes = (segment, needle) => {
+  if (!segment.includes(needle)) return false;
+  const words = withoutLeadingEnvironment(shellWords(segment));
+  const command = basename(words[0] ?? "");
+  if (!command) return false;
+  if (isScriptOperand(words[0], needle)) return true;
+  let entrypoint = null;
+  if (command === "node" || command === "node.exe") entrypoint = nodeEntrypoint(words, 1);
+  else if (command === "tsx") entrypoint = tsxEntrypoint(words, 1);
+  else if (command === "sh" || command === "bash") entrypoint = shellEntrypoint(words, 1);
+  else if (command === "python" || command === "python3") entrypoint = pythonEntrypoint(words, 1);
+  else if (command === "npx") entrypoint = npxEntrypoint(words, 1);
+  return entrypoint !== null && isScriptOperand(entrypoint, needle);
+};
+
+const commandInvokes = (command, needle) =>
+  splitSegments(command).some((segment) => segmentInvokes(segment, needle));
+
+const packageCallsIn = (command, packageScriptNames) => {
+  const called = new Set();
+  for (const segment of splitSegments(command)) {
+    const words = withoutLeadingEnvironment(shellWords(segment));
+    const manager = basename(words[0] ?? "");
+    if (!PACKAGE_MANAGERS.has(manager)) continue;
+    let at = 1;
+    if (words[at] === "run") at++;
+    const candidate = words[at];
+    if (candidate && packageScriptNames.has(candidate)) called.add(candidate);
+  }
+  return called;
+};
 
 const scriptsDir = join(repoRoot, "scripts");
 const scriptFiles = readdirSync(scriptsDir)
   .filter((name) => statSync(join(scriptsDir, name)).isFile())
-  .filter((name) => /\.(mjs|ts|js|cjs)$/.test(name))
   .sort();
+const scriptFileSet = new Set(scriptFiles);
 
-const packageJsonRaw = readFileSync(join(repoRoot, "package.json"), "utf8");
-const packageScripts = JSON.parse(packageJsonRaw).scripts ?? {};
+const packageScripts = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")).scripts ?? {};
 const packageScriptEntries = Object.entries(packageScripts);
 const packageScriptNames = new Set(Object.keys(packageScripts));
 
 const workflowsDir = join(repoRoot, ".github", "workflows");
-const workflowCommandsByFile = readdirSync(workflowsDir)
+const workflowRuns = readdirSync(workflowsDir)
   .filter((name) => /\.ya?ml$/.test(name))
-  .map((name) => extractRunCommands(readFileSync(join(workflowsDir, name), "utf8")));
-const workflowCommands = workflowCommandsByFile.flat();
+  .flatMap((name) =>
+    extractRunCommands(readFileSync(join(workflowsDir, name), "utf8"), `.github/workflows/${name}`),
+  );
 
-/** Package.json script names that a workflow `run:` step actually invokes — `pnpm <name>`,
- * `pnpm run <name>`, or `npm run <name>` — found directly, then propagated one further step
- * through any package.json script whose own command invokes another by the same shorthand.
- * Anything short of this (a dynamic `if:`, a reusable workflow call, a name assembled at
- * runtime) is outside what a dependency-free text scan can decide, so it is not claimed. */
-const ciInvokedScriptNames = new Set();
-for (const command of workflowCommands) {
-  for (const segment of splitSegments(command)) {
-    const words = segment.split(/\s+/).filter(Boolean);
-    if (!PACKAGE_MANAGERS.has(words[0])) continue;
-    const candidate = words[1] === "run" ? words[2] : words[1];
-    if (candidate && packageScriptNames.has(candidate)) ciInvokedScriptNames.add(candidate);
+/** Follow the real direction: CI-called package script -> package scripts that command calls. */
+const ciReachablePackageScripts = new Set();
+for (const { command } of workflowRuns) {
+  for (const called of packageCallsIn(command, packageScriptNames)) ciReachablePackageScripts.add(called);
+}
+const queue = [...ciReachablePackageScripts];
+while (queue.length > 0) {
+  const caller = queue.shift();
+  for (const called of packageCallsIn(packageScripts[caller], packageScriptNames)) {
+    if (ciReachablePackageScripts.has(called)) continue;
+    ciReachablePackageScripts.add(called);
+    queue.push(called);
   }
 }
-// Propagate one further step: a script not itself found in any workflow `run:` step may
-// still be invoked by another package.json script's command (chaining), and that script's
-// own runner (a human, or a further CI step) would then reach it transitively. Not the
-// shape this repository's package.json uses today, but a script chained this way is
-// exactly as reachable as the thing it chains to.
-let grew = true;
-while (grew) {
-  grew = false;
-  for (const [name, command] of packageScriptEntries) {
-    if (ciInvokedScriptNames.has(name)) continue;
-    const invokesReachable = splitSegments(command).some((segment) => {
-      const words = segment.split(/\s+/).filter(Boolean);
-      if (!PACKAGE_MANAGERS.has(words[0])) return false;
-      const candidate = words[1] === "run" ? words[2] : words[1];
-      return Boolean(candidate) && ciInvokedScriptNames.has(candidate);
-    });
-    if (invokesReachable) {
-      ciInvokedScriptNames.add(name);
-      grew = true;
+
+const commandRunsFullVitestSuite = (command) =>
+  splitSegments(command).some((segment) => {
+    const words = withoutLeadingEnvironment(shellWords(segment));
+    if (basename(words[0] ?? "") === "vitest") {
+      return words.length === 1 || (words.length === 2 && words[1] === "run");
+    }
+    return basename(words[0] ?? "") === "npx" && basename(words[1] ?? "") === "vitest" &&
+      (words.length === 2 || (words.length === 3 && words[2] === "run"));
+  });
+
+const ciFullTestScripts = [...ciReachablePackageScripts].filter((name) =>
+  commandRunsFullVitestSuite(packageScripts[name]),
+);
+const workflowRunsFullTests = workflowRuns.some(({ command }) => commandRunsFullVitestSuite(command));
+
+/** Replaces strings and comments with spaces, preserving offsets for a small static call scan. */
+const maskNonCode = (source) => {
+  const chars = [...source];
+  let state = "code";
+  for (let i = 0; i < chars.length; i++) {
+    const char = source[i];
+    const next = source[i + 1];
+    if (state === "code") {
+      if (char === "/" && next === "/") {
+        chars[i] = chars[i + 1] = " ";
+        i++;
+        state = "line";
+      } else if (char === "/" && next === "*") {
+        chars[i] = chars[i + 1] = " ";
+        i++;
+        state = "block";
+      } else if (char === "'" || char === '"' || char === "`") {
+        chars[i] = " ";
+        state = char;
+      }
+    } else if (state === "line") {
+      if (char === "\n") state = "code";
+      else chars[i] = " ";
+    } else if (state === "block") {
+      chars[i] = char === "\n" ? "\n" : " ";
+      if (char === "*" && next === "/") {
+        chars[i + 1] = " ";
+        i++;
+        state = "code";
+      }
+    } else {
+      chars[i] = char === "\n" ? "\n" : " ";
+      if (char === "\\") {
+        if (i + 1 < chars.length) chars[++i] = " ";
+      } else if (char === state) {
+        state = "code";
+      }
     }
   }
-}
+  return chars.join("");
+};
 
-/** Where (if anywhere) a script under `scripts/` is actually invoked. A script can be named
- * in `package.json` *and* run directly from a workflow (`node scripts/x.mjs`, bypassing the
- * `pnpm` entry entirely) — that direct call confirms it regardless of whether anything
- * invokes the `pnpm` shorthand by name, so it is checked independently of which one is
- * reported as the primary `via`. */
-const wiredIn = (name) => {
+const splitTopLevel = (source) => {
+  const masked = maskNonCode(source);
+  const parts = [];
+  let start = 0;
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] === "(") round++;
+    else if (masked[i] === ")") round--;
+    else if (masked[i] === "[") square++;
+    else if (masked[i] === "]") square--;
+    else if (masked[i] === "{") curly++;
+    else if (masked[i] === "}") curly--;
+    else if (masked[i] === "," && round === 0 && square === 0 && curly === 0) {
+      parts.push(source.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  parts.push(source.slice(start).trim());
+  return parts.filter(Boolean);
+};
+
+const findClosingParen = (masked, openAt) => {
+  let depth = 0;
+  for (let i = openAt; i < masked.length; i++) {
+    if (masked[i] === "(") depth++;
+    else if (masked[i] === ")" && --depth === 0) return i;
+  }
+  return -1;
+};
+
+const constantsIn = (source, masked) => {
+  const constants = new Map();
+  const declaration = /\bconst\s+([A-Za-z_$][\w$]*)(?:\s*:[^=;\n]+)?\s*=/g;
+  for (const match of masked.matchAll(declaration)) {
+    const start = match.index + match[0].length;
+    const end = masked.indexOf(";", start);
+    if (end !== -1) constants.set(match[1], source.slice(start, end).trim());
+  }
+  return constants;
+};
+
+const literalValue = (expression) => {
+  const match = /^(["'`])([^\n]*?)\1$/.exec(expression.trim());
+  if (!match || (match[1] === "`" && match[2].includes("${"))) return null;
+  return match[2].replace(/\\([\\"'])/g, "$1");
+};
+
+const expressionResolvesToScript = (expression, name, constants, seen = new Set()) => {
+  const trimmed = expression.trim();
+  if (/^[A-Za-z_$][\w$]*$/.test(trimmed)) {
+    if (seen.has(trimmed) || !constants.has(trimmed)) return false;
+    seen.add(trimmed);
+    return expressionResolvesToScript(constants.get(trimmed), name, constants, seen);
+  }
+  const literal = literalValue(trimmed);
+  if (literal !== null) {
+    const normalized = literal.replaceAll("\\", "/").replace(/^\.\//, "");
+    return normalized === `scripts/${name}` || normalized.endsWith(`/scripts/${name}`);
+  }
+  const isPathBuilder = /^(?:(?:[A-Za-z_$][\w$]*)\.)?(?:join|resolve)\s*\(/.test(trimmed);
+  const isFileUrl = /^fileURLToPath\s*\(\s*new\s+URL\s*\(/.test(trimmed);
+  if (!isPathBuilder && !isFileUrl) return false;
+  const values = [...trimmed.matchAll(/(["'`])([^\n]*?)\1/g)].map((match) => match[2].replaceAll("\\", "/"));
+  if (values.some((value) => value === `scripts/${name}` || value.endsWith(`/scripts/${name}`))) return true;
+  return values.some((value, index) => value === "scripts" && values[index + 1] === name);
+};
+
+const arrayElements = (expression) => {
+  const trimmed = expression.trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return null;
+  return splitTopLevel(trimmed.slice(1, -1));
+};
+
+const staticArgvEntrypoint = (executable, argv, name, constants) => {
+  if (expressionResolvesToScript(executable, name, constants)) return true;
+  const executableLiteral = literalValue(executable);
+  const executableName = executable.trim() === "process.execPath" ? "node" : basename(executableLiteral ?? "");
+  const elements = arrayElements(argv);
+  if (!elements) return false;
+  const values = elements.map((element) => literalValue(element));
+  let entryAt = 0;
+  if (executableName === "node" || executableName === "node.exe") {
+    while (entryAt < elements.length) {
+      const value = values[entryAt];
+      if (value === null) break;
+      if (value === "--") {
+        entryAt++;
+        break;
+      }
+      if (!value.startsWith("-")) break;
+      const option = value.split("=", 1)[0];
+      if (NODE_NO_ENTRYPOINT.has(option)) return false;
+      if (value.includes("=")) entryAt++;
+      else if (NODE_OPTIONS_WITH_VALUE.has(option)) entryAt += 2;
+      else if (NODE_OPTIONS_WITHOUT_VALUE.has(option)) entryAt++;
+      else return false;
+    }
+  } else if (executableName === "sh" || executableName === "bash") {
+    while (entryAt < elements.length && values[entryAt]?.startsWith("-")) {
+      if (/^-[^-]*c/.test(values[entryAt]) || values[entryAt] === "--command") return false;
+      entryAt++;
+    }
+  } else if (executableName === "python" || executableName === "python3") {
+    while (entryAt < elements.length && values[entryAt]?.startsWith("-")) {
+      if (values[entryAt] === "-c" || values[entryAt] === "-m") return false;
+      entryAt++;
+    }
+  } else if (executableName === "tsx") {
+    while (entryAt < elements.length && values[entryAt]?.startsWith("-")) {
+      if (values[entryAt] === "-e" || values[entryAt] === "--eval") return false;
+      entryAt++;
+    }
+  } else if (executableName === "npx") {
+    if (values[entryAt] === "tsx" || values[entryAt] === "node") entryAt++;
+    else return false;
+  } else {
+    return false;
+  }
+  return Boolean(elements[entryAt]) && expressionResolvesToScript(elements[entryAt], name, constants);
+};
+
+const testFileSpawns = (source, scriptName) => {
+  const masked = maskNonCode(source);
+  const constants = constantsIn(source, masked);
+  const call = /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(/g;
+  for (const match of masked.matchAll(call)) {
+    const openAt = match.index + match[0].lastIndexOf("(");
+    const closeAt = findClosingParen(masked, openAt);
+    if (closeAt === -1) continue;
+    const args = splitTopLevel(source.slice(openAt + 1, closeAt));
+    if (args.length >= 2 && staticArgvEntrypoint(args[0], args[1], scriptName, constants)) return true;
+  }
+  return false;
+};
+
+const filesBelow = (dir) => {
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...filesBelow(path));
+    else if (entry.isFile()) found.push(path);
+  }
+  return found;
+};
+
+const vitestConfigPath = join(repoRoot, "vitest.config.ts");
+const vitestConfig = readFileSync(vitestConfigPath, "utf8");
+const staticTestSelectionKnown = /include\s*:\s*\[\s*["']tests\/\*\*\/\*\.test\.ts["']\s*\]/.test(vitestConfig);
+const fullTestsAreCiReachable = workflowRunsFullTests || ciFullTestScripts.length > 0;
+const testFiles = staticTestSelectionKnown && fullTestsAreCiReachable
+  ? filesBelow(join(repoRoot, "tests")).filter((path) => /\.test\.ts$/.test(path))
+  : [];
+const testSources = testFiles.map((path) => ({
+  source: relative(repoRoot, path).replaceAll("\\", "/"),
+  text: readFileSync(path, "utf8"),
+}));
+
+const callersFor = (name) => {
   const needle = `scripts/${name}`;
-  const directWorkflowInvocation = anyCommandInvokes(workflowCommands, needle);
-  const viaPackageJson = packageScriptEntries.find(([, command]) => anyCommandInvokes([command], needle));
-  if (viaPackageJson) {
-    const [scriptName] = viaPackageJson;
-    return {
-      via: "package.json",
-      ciConfirmed: directWorkflowInvocation || ciInvokedScriptNames.has(scriptName),
-    };
+  const callers = [];
+  for (const { source, command } of workflowRuns) {
+    if (commandInvokes(command, needle)) callers.push({ type: "workflow", file: source, ciReachable: true });
   }
-  if (directWorkflowInvocation) {
-    return { via: ".github/workflows", ciConfirmed: true };
+  for (const [scriptName, command] of packageScriptEntries) {
+    if (commandInvokes(command, needle)) {
+      callers.push({
+        type: "package.json",
+        script: scriptName,
+        ciReachable: ciReachablePackageScripts.has(scriptName),
+      });
+    }
   }
-  return null;
+  for (const test of testSources) {
+    if (testFileSpawns(test.text, name)) {
+      callers.push({ type: "test", file: test.source, ciReachable: true });
+    }
+  }
+  return callers;
 };
 
 const failures = [];
 const wired = [];
 const exempted = [];
-
 for (const name of scriptFiles) {
-  const via = wiredIn(name);
-  if (via) {
-    wired.push({ name, ...via });
-    continue;
-  }
-  if (Object.prototype.hasOwnProperty.call(EXEMPT, name)) {
+  const callers = callersFor(name);
+  if (callers.length > 0) {
+    wired.push({
+      name,
+      callers,
+      ciConfirmed: callers.some((caller) => caller.ciReachable),
+    });
+  } else if (Object.prototype.hasOwnProperty.call(EXEMPT, name)) {
     exempted.push({ name, reason: EXEMPT[name] });
-    continue;
+  } else {
+    failures.push(name);
   }
-  failures.push(name);
 }
 
-// A stale exemption — naming a script no longer in scripts/ — is silently unreachable code
-// in the census itself: it looks like coverage and checks nothing. Fail on it the same as a
-// missing wire, so EXEMPT cannot accumulate entries nobody can any longer verify.
-const scriptFileSet = new Set(scriptFiles);
 const staleExemptions = Object.keys(EXEMPT).filter((name) => !scriptFileSet.has(name));
-
-// An exemption with no real reason records nothing a reviewer could later check — the same
-// "looks like coverage, checks nothing" trap as a stale entry.
 const emptyReasonExemptions = Object.entries(EXEMPT)
   .filter(([name]) => scriptFileSet.has(name))
   .filter(([, reason]) => typeof reason !== "string" || reason.trim().length === 0)
   .map(([name]) => name);
-
 const hasFailures = failures.length > 0 || staleExemptions.length > 0 || emptyReasonExemptions.length > 0;
+const staticLimit =
+  "test-spawn detection is static: only CI-selected tests/**/*.test.ts calls to spawn, spawnSync, " +
+  "execFile, or execFileSync with a literal or statically joined script path are counted; dynamic " +
+  "paths assembled at runtime, imported spawning helpers, dynamic test selection, dynamic shell, and unrecognized " +
+  "interpreter options are not detected";
 
 if (asJson) {
   console.log(
-    JSON.stringify({ wired, exempted, failures, staleExemptions, emptyReasonExemptions }, null, 2),
+    JSON.stringify(
+      {
+        inspected: scriptFiles.length,
+        wired,
+        exempted,
+        withoutDetectedCaller: failures,
+        staleExemptions,
+        emptyReasonExemptions,
+        limitations: [staticLimit],
+        testScan: {
+          staticTestSelectionKnown,
+          fullTestsAreCiReachable,
+          ciFullTestScripts,
+          filesScanned: testFiles.length,
+          limitation: staticLimit,
+        },
+      },
+      null,
+      2,
+    ),
   );
-} else if (hasFailures) {
+} else {
   if (failures.length > 0) {
-    console.error(`verify-every-script-has-a-caller: ${failures.length} script(s) with no caller`);
-    for (const name of failures) {
-      console.error(`  scripts/${name} — not a pnpm script, not named in any .github/workflows/*.yml step`);
-    }
     console.error(
-      "\nAdd a pnpm script or a workflow step that invokes it, or name it in EXEMPT above with a reason.",
+      `verify-every-script-has-a-caller: ${failures.length} script(s) with no statically detected caller`,
     );
+    for (const name of failures) {
+      console.error(
+        `  scripts/${name} — no statically detected caller from a workflow, package.json command, or CI-run test`,
+      );
+    }
+    console.error("\nAdd a real caller, or name the deliberately manual file in EXEMPT with a reason.");
   }
   if (staleExemptions.length > 0) {
     console.error(`verify-every-script-has-a-caller: ${staleExemptions.length} stale EXEMPT entr(y/ies)`);
     for (const name of staleExemptions) {
-      console.error(`  EXEMPT["${name}"] names a file that is not in scripts/ — remove the entry`);
+      console.error(`  EXEMPT["${name}"] names no direct child of scripts/ — remove the entry`);
     }
   }
   if (emptyReasonExemptions.length > 0) {
@@ -284,20 +581,35 @@ if (asJson) {
       console.error(`  EXEMPT["${name}"] has an empty reason — state why it is deliberately unreached`);
     }
   }
-} else {
-  const ciConfirmedCount = wired.filter((w) => w.ciConfirmed).length;
-  const packageJsonOnlyCount = wired.length - ciConfirmedCount;
-  console.log(
-    `verify-every-script-has-a-caller: ${wired.length} script(s) wired ` +
-      `(${ciConfirmedCount} confirmed run from a workflow step, ${packageJsonOnlyCount} package.json ` +
-      `entry only — CI-reachability not confirmed), ${exempted.length} named exemption(s), 0 orphaned`,
-  );
-  for (const { name, via, ciConfirmed } of wired) {
-    if (!ciConfirmed) console.log(`  package.json entry only, not confirmed CI-reachable: scripts/${name} (via ${via})`);
+  if (!hasFailures) {
+    const ciConfirmedCount = wired.filter((entry) => entry.ciConfirmed).length;
+    const notCiConfirmedCount = wired.length - ciConfirmedCount;
+    const directWorkflowCount = wired.filter((entry) =>
+      entry.callers.some((caller) => caller.type === "workflow"),
+    ).length;
+    const ciPackageCount = wired.filter((entry) =>
+      entry.callers.some((caller) => caller.type === "package.json" && caller.ciReachable),
+    ).length;
+    const testSpawnedCount = wired.filter((entry) => entry.callers.some((caller) => caller.type === "test")).length;
+    console.log(
+      `verify-every-script-has-a-caller: ${wired.length} script(s) with detected caller(s) ` +
+        `(${ciConfirmedCount} CI-confirmed, ${notCiConfirmedCount} package entry only with CI reachability ` +
+        `not confirmed), ${exempted.length} named exemption(s), 0 without a statically detected caller`,
+    );
+    console.log(
+      `  detected CI routes: ${directWorkflowCount} direct workflow, ${ciPackageCount} CI-reached package.json, ` +
+        `${testSpawnedCount} test-spawn`,
+    );
+    for (const entry of wired.filter((candidate) => !candidate.ciConfirmed)) {
+      const aliases = entry.callers
+        .filter((caller) => caller.type === "package.json")
+        .map((caller) => caller.script)
+        .join(", ");
+      console.log(`  package entry only, not confirmed CI-reachable: scripts/${entry.name} (via ${aliases})`);
+    }
+    for (const { name, reason } of exempted) console.log(`  exempt: scripts/${name} — ${reason}`);
   }
-  for (const { name, reason } of exempted) {
-    console.log(`  exempt: scripts/${name} — ${reason}`);
-  }
+  console.log(`  static limit: ${staticLimit}`);
 }
 
 process.exit(hasFailures ? 1 : 0);

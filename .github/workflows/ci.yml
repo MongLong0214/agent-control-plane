@@ -81,15 +81,9 @@ jobs:
       - run: pnpm evidence:freshness
       - run: pnpm invariants
       - run: pnpm typecheck
-      # #705 — dependency-free, in the shape of `verify-reason-codes.mjs` (PRD §17.4): each had
-      # a package.json script already and no caller in this file, so wiring them here is the
-      # same fix at the same width, not three separate ones.
-      - run: pnpm release:version
-      - run: pnpm symbols
-      - run: pnpm adapter:source
       # #705's own self-check: a script under scripts/ with no pnpm entry and no workflow
-      # step is the exact shape this whole issue was about. Failing this is how the next
-      # orphaned script is a red CI run instead of a silent gap someone finds by accident.
+      # step or suite caller is the exact shape this whole issue was about. Failing this is
+      # how the next script with no detected caller is a red CI run instead of a silent gap.
       - run: pnpm scripts:callers
       # Seconds, and it answers the question that actually goes stale: does every mutation row
       # still name a line that exists. Editing a guarded line renames its anchor and the row
@@ -100,11 +94,6 @@ jobs:
       # operand of a refusal does no falsifiability row name. The harness answers "is this guard
       # tested" for the lines someone wrote a row for; it cannot answer which lines nobody did.
       - run: pnpm guards:operands
-      # #664/#679 — a body that writes and then returns a denied Decision through plain `tx()`
-      # commits the write anyway. This census requires each such site to be `txDecision()`, a
-      # named exemption, or a named, tracked deferral — never silently allowed. #705 found it
-      # had no package.json script and no caller here either.
-      - run: pnpm guards:tx-denials
       # #539 lands src/core/peercred.ts unreachable from every live surface on purpose — a new
       # call site (or a ControlPlane export) is a RED mutant here, not a deliverable.
       - run: pnpm guards:peercred-unreachable
