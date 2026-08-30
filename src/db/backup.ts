@@ -58,6 +58,11 @@ export interface RestoreResult {
   preservedSidecars: string[];
 }
 
+export interface RestoreOptions {
+  /** Test-only fault injection at the last point before the staged image is installed. */
+  afterPreservingExisting?: () => void;
+}
+
 const hashFile = (path: string): string => {
   const hash = createHash("sha256");
   const fd = openSync(path, "r");
@@ -232,7 +237,10 @@ const readManifest = (backupPath: string): BackupManifest => {
   }
 };
 
-const validateBackup = (backupPath: string): BackupManifest => {
+const validateBackup = (
+  backupPath: string,
+  options: { assertSchemaInvariants: boolean } = { assertSchemaInvariants: true },
+): BackupManifest => {
   const manifest = readManifest(backupPath);
   const actual = hashFile(backupPath);
   if (actual !== manifest.databaseSha256) {
@@ -261,16 +269,44 @@ const validateBackup = (backupPath: string): BackupManifest => {
       });
     }
     if (version < SCHEMA_VERSION) migrationChainFrom(version);
-    assertLoadBearingInvariants(raw, {
-      includeMigrationLedger: version >= 12,
-      includeBaselineLedger: version >= 14,
-      schemaVersion: version,
-      // The prompt triggers arrive with v17, so a v16 image is not rejected for lacking them.
-      includeTelegramOwnerPrompts: version >= 17,
-    });
-    if (version >= 12) assertMigrationLedgerAt(raw, version);
+    if (options.assertSchemaInvariants) {
+      assertLoadBearingInvariants(raw, {
+        includeMigrationLedger: version >= 12,
+        includeBaselineLedger: version >= 14,
+        schemaVersion: version,
+        // The prompt triggers arrive with v17, so a v16 image is not rejected for lacking them.
+        includeTelegramOwnerPrompts: version >= 17,
+      });
+      if (version >= 12) assertMigrationLedgerAt(raw, version);
+    }
   } finally {
     raw.close();
+  }
+  return manifest;
+};
+
+/**
+ * A rollback snapshot is allowed to contain the defect that made its migration fail. It still has
+ * to be the exact private, checksummed, integral image this process made before changing schema.
+ * Operator restores keep the stronger invariant and ledger validation in validateBackup above.
+ */
+const validateMigrationRollbackBackup = (backup: DatabaseBackup): BackupManifest => {
+  if (backup.manifestPath !== backupManifestPath(backup.path)) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "migration backup manifest path changed before rollback", {
+      backupPath: backup.path,
+      expected: backupManifestPath(backup.path),
+      actual: backup.manifestPath,
+    });
+  }
+  const manifest = validateBackup(backup.path, { assertSchemaInvariants: false });
+  if (manifest.databaseSha256 !== backup.sha256 || manifest.schemaVersion !== backup.schemaVersion) {
+    throw acpError(ReasonCode.INTERNAL_ERROR, "migration backup identity changed before rollback", {
+      backupPath: backup.path,
+      expectedSha256: backup.sha256,
+      actualSha256: manifest.databaseSha256,
+      expectedSchemaVersion: backup.schemaVersion,
+      actualSchemaVersion: manifest.schemaVersion,
+    });
   }
   return manifest;
 };
@@ -294,12 +330,37 @@ const validateRestoredTemporary = (path: string, expectedSha256: string): void =
 };
 
 /**
+ * Once the writer is stopped, fold committed WAL pages into the main file before detaching its
+ * sidecars. A process death after this point can therefore reopen the old main file by itself.
+ */
+const checkpointExistingWal = (databasePath: string): void => {
+  if (!databaseSidecarPaths(databasePath).some((sidecar) => existsSync(sidecar))) return;
+  const raw = new Database(databasePath, { fileMustExist: true });
+  try {
+    raw.pragma("busy_timeout = 10000");
+    const [checkpoint] = raw.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number }>;
+    if (checkpoint?.busy !== 0) {
+      throw acpError(ReasonCode.CONFLICT, "database still has a writer during restore", {
+        databasePath,
+      });
+    }
+  } finally {
+    raw.close();
+  }
+};
+
+/**
  * Restore only accepts a manifest-checked, owner-private snapshot and stages it in the
  * destination directory before replacement. The old database and sidecars are preserved
  * under backups/ for forensic recovery; this is intentionally not a delete-and-copy flow.
  * The caller must first stop the daemon, which the maintenance CLI enforces.
  */
-export const restoreDatabase = (databasePath: string, backupPath: string): RestoreResult => {
+const restoreValidatedDatabase = (
+  databasePath: string,
+  backupPath: string,
+  manifest: BackupManifest,
+  options: RestoreOptions = {},
+): RestoreResult => {
   if (!isAbsolute(databasePath) || !isAbsolute(backupPath)) {
     throw acpError(ReasonCode.STATE_PATH_INSECURE, "database and backup paths must be absolute", {
       databasePath,
@@ -308,11 +369,12 @@ export const restoreDatabase = (databasePath: string, backupPath: string): Resto
   }
   ensurePrivateDirectory(dirname(databasePath));
   const hadDatabase = existsSync(databasePath);
-  const existingSidecars = databaseSidecarPaths(databasePath).filter((sidecar) => existsSync(sidecar));
   if (hadDatabase) assertPrivateDatabaseFiles(databasePath);
-  else for (const sidecar of existingSidecars) assertPrivatePath(sidecar, "file");
-
-  const manifest = validateBackup(backupPath);
+  else {
+    for (const sidecar of databaseSidecarPaths(databasePath).filter((path) => existsSync(path))) {
+      assertPrivatePath(sidecar, "file");
+    }
+  }
   const temporary = join(dirname(databasePath), `.${basename(databasePath)}.restore-${process.pid}-${randomUUID()}.tmp`);
   if (existsSync(temporary)) {
     throw acpError(ReasonCode.CONFLICT, "restore temporary path unexpectedly exists", { temporary });
@@ -325,6 +387,10 @@ export const restoreDatabase = (databasePath: string, backupPath: string): Resto
     chmodSync(temporary, PRIVATE_FILE_MODE);
     validateRestoredTemporary(temporary, manifest.databaseSha256);
 
+    if (hadDatabase) checkpointExistingWal(databasePath);
+    const existingSidecars = databaseSidecarPaths(databasePath).filter((sidecar) => existsSync(sidecar));
+    for (const sidecar of existingSidecars) assertPrivatePath(sidecar, "file");
+
     const backupDirectory = defaultBackupDirectory(databasePath);
     ensurePrivateDirectory(backupDirectory);
     const preservedDatabasePath = hadDatabase
@@ -336,27 +402,35 @@ export const restoreDatabase = (databasePath: string, backupPath: string): Resto
       `${basename(databasePath)}-orphaned-sidecar-pre-restore-${Date.now()}-${randomUUID()}.sqlite`,
     );
 
+    let installed = false;
     try {
       if (preservedDatabasePath) {
-        renameSync(databasePath, preservedDatabasePath);
+        // The old inode remains reachable at databasePath until the single atomic replacement
+        // below. SIGKILL at any earlier point leaves a complete database at the live path.
+        linkSync(databasePath, preservedDatabasePath);
       }
       for (const sidecar of existingSidecars) {
         const suffix = sidecar.slice(databasePath.length);
         const preserved = `${sidecarPreservationBase}${suffix}`;
-        renameSync(sidecar, preserved);
+        linkSync(sidecar, preserved);
+        unlinkSync(sidecar);
         preservedSidecars.push({ from: sidecar, to: preserved });
       }
+      options.afterPreservingExisting?.();
+      // rename over an existing entry is one atomic directory operation: readers see either the
+      // checkpointed pre-restore inode or the already-validated restored inode, never no database.
       renameSync(temporary, databasePath);
+      installed = true;
       assertPrivateDatabaseFiles(databasePath);
     } catch (error) {
-      // A failed final rename must leave a recoverable old database, never an empty state
-      // path that launchd could restart against.
-      if (!existsSync(databasePath)) {
-        if (preservedDatabasePath && existsSync(preservedDatabasePath)) {
-          renameSync(preservedDatabasePath, databasePath);
+      if (!installed) {
+        for (const sidecar of preservedSidecars.reverse()) {
+          if (!existsSync(sidecar.from) && existsSync(sidecar.to)) {
+            renameSync(sidecar.to, sidecar.from);
+          }
         }
-        for (const sidecar of preservedSidecars) {
-          if (existsSync(sidecar.to)) renameSync(sidecar.to, sidecar.from);
+        if (preservedDatabasePath && existsSync(preservedDatabasePath)) {
+          unlinkSync(preservedDatabasePath);
         }
       }
       throw error;
@@ -372,6 +446,27 @@ export const restoreDatabase = (databasePath: string, backupPath: string): Resto
     removePartialBackup(temporary);
   }
 };
+
+/** Operator restore: the snapshot must already satisfy every invariant for its recorded version. */
+export const restoreDatabase = (
+  databasePath: string,
+  backupPath: string,
+  options: RestoreOptions = {},
+): RestoreResult =>
+  restoreValidatedDatabase(databasePath, backupPath, validateBackup(backupPath), options);
+
+/** Automatic rollback: restores the exact image captured immediately before this migration. */
+export const restoreMigrationBackup = (
+  databasePath: string,
+  backup: DatabaseBackup,
+  options: RestoreOptions = {},
+): RestoreResult =>
+  restoreValidatedDatabase(
+    databasePath,
+    backup.path,
+    validateMigrationRollbackBackup(backup),
+    options,
+  );
 
 /** Keeps generated automatic backups bounded without touching operator-named snapshots. */
 export const pruneAutomaticBackups = (databasePath: string, retention = DEFAULT_BACKUP_RETENTION): void => {

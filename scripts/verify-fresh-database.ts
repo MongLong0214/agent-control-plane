@@ -13,10 +13,10 @@
  *      three-wave merge the only trustworthy statement about the schema is one made by
  *      creating a database and interrogating it.
  *
- *   2. `Db.applySchema` (src/db/database.ts) has an explicit ordered path for the released
- *      older version, while a newer or pre-versioning file is refused. This script opens
- *      tampered copies at each of those `user_version` cases and records what the code
- *      actually does with each.
+ *   2. `Db.applySchema` (src/db/database.ts) has an explicit ordered path from the pinned v11
+ *      release, while a newer or pre-versioning file is refused. This script opens that genuine
+ *      release schema and tampered current copies, then records what the code does with each.
+ *      It also injects a failure after v12 commits and proves the original v11 image is restored.
  *
  * Everything happens in a throwaway directory under the OS temp dir; the script never
  * touches a real deployment state directory, and every probe insert is rolled back.
@@ -26,7 +26,7 @@
  */
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, copyFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +38,7 @@ import { isAcpError } from "../src/core/errors.ts";
 const asJson = process.argv.includes("--json");
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const schemaText = readFileSync(join(repoRoot, "src/db/schema.sql"), "utf8");
+const releasedSchemaText = readFileSync(join(repoRoot, "tests/fixtures/schema-v11.sql"), "utf8");
 
 const problems: string[] = [];
 const notes: string[] = [];
@@ -49,7 +50,7 @@ const observed: Record<string, unknown> = {};
  * specific pair of files rather than about "the repository, some time ago".
  */
 observed["inputs"] = Object.fromEntries(
-  ["src/db/schema.sql", "src/db/database.ts"].map((rel) => [
+  ["src/db/schema.sql", "src/db/database.ts", "tests/fixtures/schema-v11.sql"].map((rel) => [
     rel,
     createHash("sha256").update(readFileSync(join(repoRoot, rel))).digest("hex").slice(0, 16),
   ]),
@@ -453,9 +454,9 @@ db.close();
 inspection = null;
 
 // --------------------------------------------------------------------------
-// Re-opening the *same* version must stay clean, an older ordered version must migrate,
-// and a newer or pre-versioning version must be refused. This is check 2: the version
-// contract is deliberately asymmetric.
+// Re-opening the *same* version must stay clean, the pinned released v11 shape must migrate,
+// a failed migration must restore that exact older shape, and newer or pre-versioning versions
+// must be refused. This is check 2: the version contract is deliberately asymmetric.
 // --------------------------------------------------------------------------
 cp!.close();
 cp = null;
@@ -483,17 +484,82 @@ const tamper = (label: string, mutate: (raw: Database.Database) => void) => {
   return outcome;
 };
 
-const older = tamper("olderVersion", (raw) => {
-  // A v11 file predates the v12 ledger; stamping a current ledger-bearing file to 11
-  // would make the migration fail on its duplicate receipt rather than test the path.
-  raw.exec("DROP TABLE schema_migrations");
-  raw.pragma(`user_version = ${SCHEMA_VERSION - 1}`);
+const createPinnedV11 = (path: string, mutate?: (raw: Database.Database) => void): void => {
+  const raw = new Database(path);
+  try {
+    raw.exec(releasedSchemaText);
+    mutate?.(raw);
+    raw.pragma("user_version = 11");
+  } finally {
+    raw.close();
+  }
+  chmodSync(path, 0o600);
+};
+
+const olderPath = join(root, "olderVersion.sqlite");
+createPinnedV11(olderPath);
+const older = attempt(() => {
+  const handle = new Db(olderPath);
+  handle.close();
 });
+observed["olderVersion"] = older;
+
+const migrationRestorePath = join(root, "migrationRestore.sqlite");
+createPinnedV11(migrationRestorePath, (raw) => {
+  // v12 genuinely repairs this released-schema guard. The injected failure happens after that
+  // commit, so rollback has to accept and restore the pre-migration image that still lacks it.
+  raw.exec("DROP TRIGGER github_receipts_no_delete");
+});
+const migrationRestore = attempt(() => {
+  let injectedFailure: unknown;
+  try {
+    const handle = new Db(migrationRestorePath, {
+      afterMigration: (migration) => {
+        if (migration.toVersion === 12) {
+          throw new Error("injected failure after v12 committed its invariant replay");
+        }
+      },
+    });
+    handle.close();
+  } catch (error) {
+    injectedFailure = error;
+  }
+  if (
+    !isAcpError(injectedFailure) ||
+    injectedFailure.message !==
+      "migration failed; the original database was restored from its automatic backup"
+  ) {
+    throw injectedFailure ?? new Error("the injected migration failure did not stop the upgrade");
+  }
+
+  const restored = new Database(migrationRestorePath, { readonly: true, fileMustExist: true });
+  try {
+    const restoredVersion = Number(restored.pragma("user_version", { simple: true }));
+    const restoredMissingGuard = restored
+      .prepare(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name = 'github_receipts_no_delete'",
+      )
+      .get() as { n: number };
+    if (restoredVersion !== 11 || restoredMissingGuard.n !== 0) {
+      throw new Error(
+        `automatic rollback did not restore the original v11 shape ` +
+          `(user_version=${restoredVersion}, missing_guard=${restoredMissingGuard.n === 0})`,
+      );
+    }
+  } finally {
+    restored.close();
+  }
+});
+observed["migrationRestore"] = migrationRestore;
+
 const newer = tamper("newerVersion", (raw) => raw.pragma(`user_version = ${SCHEMA_VERSION + 1}`));
 const preVersioning = tamper("preVersioningVersion", (raw) => raw.pragma("user_version = 0"));
 
 if (!older.ok) {
-  problems.push(`an older schema version failed to migrate: ${older.message}`);
+  problems.push(`the pinned v11 schema failed to migrate: ${older.message}`);
+}
+if (!migrationRestore.ok) {
+  problems.push(`a failed migration did not restore the original pinned v11 image: ${migrationRestore.message}`);
 }
 for (const [label, outcome] of [
   ["newer", newer],
@@ -572,14 +638,22 @@ function report(): void {
   }
   console.log("");
   console.log("version handling:");
-  for (const key of ["reopenSameVersion", "olderVersion", "newerVersion", "preVersioningVersion"]) {
+  for (const key of [
+    "reopenSameVersion",
+    "olderVersion",
+    "migrationRestore",
+    "newerVersion",
+    "preVersioningVersion",
+  ]) {
     console.log(`  ${key.padEnd(22)} ${JSON.stringify(observed[key])}`);
   }
   console.log("");
   for (const note of notes) console.log(`note: ${note}`);
   console.log("");
   if (problems.length === 0) {
-    console.log("OK — fresh database applies cleanly, older schemas migrate, and newer/pre-versioning schemas are refused");
+    console.log(
+      "OK — fresh database applies cleanly, pinned v11 migrates, its injected post-v12 failure restores v11, and newer/pre-versioning schemas are refused",
+    );
   } else {
     console.log(`${problems.length} problem(s):`);
     for (const problem of problems) console.log(`  - ${problem}`);

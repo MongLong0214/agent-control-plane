@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   chmodSync,
@@ -702,6 +703,39 @@ describe("versioned SQLite migration", () => {
       recovered.close();
     }
   });
+
+  it("restores a pinned v11 image whose missing guard was repaired before a later migration failure", () => {
+    const path = join(tempDir("acp-migration-repair-failure-"), "state.sqlite");
+    const before = asV11Fixture(path, true);
+    if (!before) throw new Error("v11 fixture history was not seeded");
+    const raw = new Database(path);
+    raw.exec("DROP TRIGGER github_receipts_no_delete");
+    raw.close();
+
+    expect(
+      () =>
+        new Db(path, {
+          afterMigration: () => {
+            throw new Error("injected failure after invariant replay committed");
+          },
+        }),
+    ).toThrowError(/original database was restored/);
+
+    const restored = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(Number(restored.pragma("user_version", { simple: true }))).toBe(11);
+      expect(
+        restored
+          .prepare(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name = 'github_receipts_no_delete'",
+          )
+          .get(),
+      ).toEqual({ n: 0 });
+      expect(history(restored)).toEqual(before);
+    } finally {
+      restored.close();
+    }
+  });
 });
 
 describe("backup and restore drill", () => {
@@ -728,6 +762,48 @@ describe("backup and restore drill", () => {
       expect(codeOf(() => recovered.run("DELETE FROM github_receipts"))).toBe(ReasonCode.CONFLICT);
     } finally {
       recovered.close();
+    }
+  });
+
+  it("keeps the original database at its path when the restore process dies before replacement", async () => {
+    const path = join(tempDir("acp-restore-crash-"), "state.sqlite");
+    const source = new Db(path);
+    seedHistory(source);
+    const backup = await source.backup();
+    source.run(
+      `INSERT INTO runs (run_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+       VALUES ('run_after_backup', 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'QUEUED',
+               'must remain before replacement', 'sha256:after-backup', ?)`,
+      [NOW],
+    );
+    source.close();
+
+    const backupModule = new URL("../../src/db/backup.ts", import.meta.url).href;
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `const { restoreDatabase } = await import(${JSON.stringify(backupModule)});
+         restoreDatabase(${JSON.stringify(path)}, ${JSON.stringify(backup.path)}, {
+           afterPreservingExisting: () => process.kill(process.pid, "SIGKILL"),
+         });`,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(child.signal).toBe("SIGKILL");
+    expect(existsSync(path)).toBe(true);
+    const survived = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(survived.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(
+        survived.prepare("SELECT COUNT(*) AS n FROM runs WHERE run_id = 'run_after_backup'").get(),
+      ).toEqual({ n: 1 });
+    } finally {
+      survived.close();
     }
   });
 
@@ -814,5 +890,24 @@ describe("backup and restore drill", () => {
     } finally {
       migrated.close();
     }
+  });
+});
+
+describe("fresh database recovery verifier", () => {
+  it("migrates pinned v11 and restores it after the injected post-v12 failure", () => {
+    const script = fileURLToPath(new URL("../../scripts/verify-fresh-database.ts", import.meta.url));
+    const result = spawnSync(process.execPath, ["--import", "tsx", script, "--json"], {
+      cwd: fileURLToPath(new URL("../..", import.meta.url)),
+      encoding: "utf8",
+    });
+    const report = JSON.parse(result.stdout) as {
+      observed: Record<string, { ok?: boolean }>;
+      problems: string[];
+    };
+
+    expect(report.observed["olderVersion"]).toEqual({ ok: true });
+    expect(report.observed["migrationRestore"]).toEqual({ ok: true });
+    expect(report.problems).toEqual([]);
+    expect(result.status, result.stderr).toBe(0);
   });
 });

@@ -1531,6 +1531,39 @@ const GUARDS = [
       "tests/unit/canonical-turn-ledger.test.ts::refuses a source citing a fresh audit event instead of the turn's own claim event",
     ],
   },
+  {
+    // The rollback image can carry the very missing guard that made an upgrade fail. Operator
+    // restore still requires that guard; this process-owned, exact-checksum snapshot must not.
+    what: "automatic migration rollback validates the captured image without requiring the invariant that migration was repairing",
+    file: "src/db/backup.ts",
+    find: "  const manifest = validateBackup(backup.path, { assertSchemaInvariants: false });",
+    replace: "  const manifest = validateBackup(backup.path, { assertSchemaInvariants: true });",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::restores a pinned v11 image whose missing guard was repaired before a later migration failure",
+    ],
+  },
+  {
+    // Renaming the old main file away before installing the staged image leaves no database for a
+    // restart to open if the process dies between those operations.
+    what: "restore preserves the old inode by link so the live database path exists until atomic replacement",
+    file: "src/db/backup.ts",
+    find: "        linkSync(databasePath, preservedDatabasePath);",
+    replace: "        renameSync(databasePath, preservedDatabasePath);",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::keeps the original database at its path when the restore process dies before replacement",
+    ],
+  },
+  {
+    // A current database stamped one version back is not a released schema. The pinned SQL is v11,
+    // so the verifier must enter the migration chain at the version that actually produced it.
+    what: "the fresh database verifier opens its pinned released schema at v11",
+    file: "scripts/verify-fresh-database.ts",
+    find: "    raw.pragma(\"user_version = 11\");",
+    replace: "    raw.pragma(`user_version = ${SCHEMA_VERSION - 1}`);",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::migrates pinned v11 and restores it after the injected post-v12 failure",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
