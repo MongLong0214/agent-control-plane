@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -18,13 +19,26 @@ const SCRIPT = "scripts/verify-turn-fence-writer-census.mjs";
 const CLAIM =
   "Every inline-SQL direct call whose TypeScript property symbol is exactly Db.run and that names a turn-fence table is in that table's declared application owner.";
 
-const scratchRepo = (): string => {
+/**
+ * Follow the replace-census process test's clone-then-copy shape: the scratch repository owns
+ * every input it runs. Most cases need only the census's TypeScript dependency; the three probes
+ * that typecheck and execute get the complete installed dependency tree. Neither form leaves pnpm
+ * looking at a modules directory whose resolved target is outside the scratch repository.
+ */
+const scratchRepo = (dependencies: "typescript" | "all" = "typescript"): string => {
   const dir = join(tempDir("acp-writer-census-"), "repo");
   execFileSync("git", ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir]);
   execFileSync("cp", [join(ROOT, SCRIPT), join(dir, SCRIPT)]);
   rmSync(join(dir, "src"), { recursive: true, force: true });
   execFileSync("cp", ["-R", join(ROOT, "src"), join(dir, "src")]);
-  symlinkSync(join(ROOT, "node_modules"), join(dir, "node_modules"), "dir");
+  if (dependencies === "all") {
+    cpSync(join(ROOT, "node_modules"), join(dir, "node_modules"), { recursive: true });
+  } else {
+    mkdirSync(join(dir, "node_modules"), { recursive: true });
+    cpSync(realpathSync(join(ROOT, "node_modules/typescript")), join(dir, "node_modules/typescript"), {
+      recursive: true,
+    });
+  }
   return dir;
 };
 
@@ -32,6 +46,11 @@ const censusOn = (dir: string): { status: number | null; stdout: string } => {
   const done = spawnSync("node", [SCRIPT], { cwd: dir, encoding: "utf8" });
   return { status: done.status, stdout: done.stdout };
 };
+
+const esbuildBin = (repo: string): string =>
+  createRequire(realpathSync(join(repo, "node_modules/tsx/package.json"))).resolve(
+    "esbuild/bin/esbuild",
+  );
 
 const writeProbe = (repo: string, name: string, body: string, imports: string[] = []): void => {
   mkdirSync(join(repo, "src/probe"), { recursive: true });
@@ -88,7 +107,7 @@ describe(CLAIM, () => {
   });
 
   it("reports Array join SQL outside the inline SQL boundary", () => {
-    const repo = scratchRepo();
+    const repo = scratchRepo("all");
     writeProbe(
       repo,
       "rogue-array-join-676.ts",
@@ -148,12 +167,13 @@ describe(CLAIM, () => {
 
     // The counterexample typechecks and actually inserts through the real Db.run implementation.
     // The old shadow probe called a nonexistent Db.exec and could pass without either property.
-    const typed = spawnSync("pnpm", ["typecheck"], { cwd: repo, encoding: "utf8" });
+    const typed = spawnSync(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
     const built = spawnSync(
-      "pnpm",
+      esbuildBin(repo),
       [
-        "exec",
-        "esbuild",
         "tests/execute-array-join-probe.ts",
         "--bundle",
         "--platform=node",
@@ -181,7 +201,7 @@ describe(CLAIM, () => {
   });
 
   it("documents that a RunPort alias is outside the exact symbol boundary", () => {
-    const repo = scratchRepo();
+    const repo = scratchRepo("all");
     writeProbe(
       repo,
       "rogue-run-port-676.ts",
@@ -205,12 +225,13 @@ describe(CLAIM, () => {
       ].join("\n"),
     );
 
-    const typed = spawnSync("pnpm", ["typecheck"], { cwd: repo, encoding: "utf8" });
+    const typed = spawnSync(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
     const built = spawnSync(
-      "pnpm",
+      esbuildBin(repo),
       [
-        "exec",
-        "esbuild",
         "tests/execute-run-port-probe.ts",
         "--bundle",
         "--platform=node",
@@ -319,7 +340,7 @@ describe(CLAIM, () => {
   });
 
   it("refuses Db run captured by object binding destructuring", () => {
-    const repo = scratchRepo();
+    const repo = scratchRepo("all");
     writeProbe(
       repo,
       "rogue-run-destructure.ts",
@@ -342,12 +363,13 @@ describe(CLAIM, () => {
       ].join("\n"),
     );
 
-    const typed = spawnSync("pnpm", ["typecheck"], { cwd: repo, encoding: "utf8" });
+    const typed = spawnSync(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
     const built = spawnSync(
-      "pnpm",
+      esbuildBin(repo),
       [
-        "exec",
-        "esbuild",
         "tests/execute-run-destructure-probe.ts",
         "--bundle",
         "--platform=node",
