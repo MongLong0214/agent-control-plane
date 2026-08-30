@@ -1483,22 +1483,51 @@ const GUARDS = [
     find: "      if (firstDeliveryError === undefined && Number.isSafeInteger(update.update_id)) {",
     replace: "      if (Number.isSafeInteger(update.update_id)) {",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::does not let one rejected reply block a later update in the same poll #699",
+      "tests/unit/telegram-ingress.test.ts::a 400 content rejection continues later replies and owner gate prompts while only its reply retries",
     ],
   },
   {
-    // #699 follow-up: `false` and `null` are not the same fact. `accepted === false` is a
-    // confirmed rejection — safe to defer past, because `releaseResponse` marks it RETRYABLE
-    // and a later poll resends that exact reply. `accepted === null` is an unknown outcome, so
-    // it stays PENDING without reply replay and stops the batch before later work enters the
-    // same outage. Removing the distinction below releases the unknown reservation as though
-    // Telegram had rejected it and runs every later update immediately.
-    what: "an ambiguous null delivery outcome stops the poll instead of following a confirmed rejection",
+    // Only a Telegram code 400 says this request's content was unacceptable. Treating it as a
+    // batch failure restores the original wedge by stopping before later independent updates.
+    what: "a Telegram 400 rejection is message scoped",
     file: "src/ingress/telegram-polling.ts",
-    find: "          if (!(error instanceof TelegramDeliveryError) || error.accepted !== false) throw error;",
+    find: "  if (statusCode === 400) {",
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a 400 content rejection continues later replies and owner gate prompts while only its reply retries",
+    ],
+  },
+  {
+    // Telegram's response body is the only source of retry_after. Reading only the HTTP status
+    // stops the current storm but schedules the next attempt earlier than Telegram requested.
+    what: "a Telegram 429 preserves its retry after instruction",
+    file: "src/ingress/telegram-polling.ts",
+    find: "    retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,",
+    replace: "    retryAfterSeconds: null,",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a 429 rate limit stops the batch before later replies and owner gate prompts",
+    ],
+  },
+  {
+    // A known-not-sent result is not enough to continue: 429 and 5xx describe the batch's
+    // current ability to send, so later replies and owner prompts must wait for another poll.
+    what: "a batch scoped Telegram rejection stops later sends in the poll",
+    file: "src/ingress/telegram-polling.ts",
+    find: "          if (error.failure.scope === \"BATCH\") throw error;",
+    replace: "          if (false) throw error;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a 5xx outage stops the batch before later replies and owner gate prompts",
+    ],
+  },
+  {
+    // An unknown outcome may already have delivered the reply. Removing the distinction below
+    // releases the reservation as RETRYABLE and makes a later poll send it again.
+    what: "an unknown Telegram delivery outcome stays pending and stops the poll",
+    file: "src/ingress/telegram-polling.ts",
+    find: "          if (!(error instanceof TelegramDeliveryError) || error.failure.delivery !== \"NOT_SENT\") throw error;",
     replace: "          if (!(error instanceof TelegramDeliveryError)) throw error;",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::stops later update work on an ambiguous null send without resending the pending reply",
+      "tests/unit/telegram-ingress.test.ts::an unknown send outcome stops later work and remains pending without resend",
     ],
   },
   {

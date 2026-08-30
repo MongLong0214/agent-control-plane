@@ -54,21 +54,78 @@ export interface TelegramBotTransport {
   }): Promise<TelegramSentMessage | void>;
 }
 
-/**
- * A send failure must distinguish a confirmed rejection from an ambiguous external result.
- * Only `accepted === false` proves a durable reservation is safe to release immediately; null
- * means Telegram may have accepted the request, so the caller keeps it PENDING, stops the current
- * batch, and leaves the unknown outcome visible to doctor without resending it.
- */
+export type TelegramDeliveryFailure =
+  | {
+    delivery: "NOT_SENT";
+    scope: "MESSAGE";
+    statusCode: 400;
+    retryAfterSeconds: null;
+  }
+  | {
+    delivery: "NOT_SENT";
+    scope: "BATCH";
+    statusCode: number;
+    retryAfterSeconds: number | null;
+  }
+  | {
+    delivery: "UNKNOWN";
+    scope: "BATCH";
+    statusCode: null;
+    retryAfterSeconds: null;
+  };
+
+/** Carries the delivery and batch-scope facts the Bot API adapter actually observed. */
 export class TelegramDeliveryError extends Error {
   constructor(
     message: string,
-    readonly accepted: boolean | null,
+    readonly failure: TelegramDeliveryFailure,
   ) {
     super(message);
     this.name = "TelegramDeliveryError";
   }
 }
+
+const unknownDeliveryFailure = (): TelegramDeliveryFailure => ({
+  delivery: "UNKNOWN",
+  scope: "BATCH",
+  statusCode: null,
+  retryAfterSeconds: null,
+});
+
+const telegramStatusCode = (httpStatus: number, payload: unknown): number => {
+  const telegramCode = isRecord(payload) ? payload["error_code"] : undefined;
+  return Number.isSafeInteger(telegramCode) && Number(telegramCode) > 0
+    ? Number(telegramCode)
+    : httpStatus;
+};
+
+const telegramRetryAfterSeconds = (payload: unknown): number | null => {
+  if (!isRecord(payload) || !isRecord(payload["parameters"])) return null;
+  const retryAfter = payload["parameters"]["retry_after"];
+  return Number.isSafeInteger(retryAfter) && Number(retryAfter) > 0
+    ? Number(retryAfter)
+    : null;
+};
+
+const rejectedDeliveryFailure = (
+  statusCode: number,
+  payload: unknown,
+): TelegramDeliveryFailure => {
+  if (statusCode === 400) {
+    return {
+      delivery: "NOT_SENT",
+      scope: "MESSAGE",
+      statusCode,
+      retryAfterSeconds: null,
+    };
+  }
+  return {
+    delivery: "NOT_SENT",
+    scope: "BATCH",
+    statusCode,
+    retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,
+  };
+};
 
 export interface TelegramLongPollListener {
   service: TelegramLongPollService;
@@ -243,7 +300,7 @@ export class TelegramBotApi implements TelegramBotTransport {
       allow_sending_without_reply: true,
     });
     if (!result || typeof result !== "object" || !Number.isSafeInteger((result as { message_id?: unknown }).message_id)) {
-      throw new TelegramDeliveryError("Telegram Bot API sendMessage returned no message id", null);
+      throw new TelegramDeliveryError("Telegram Bot API sendMessage returned no message id", unknownDeliveryFailure());
     }
     return { messageId: (result as { message_id: number }).message_id };
   }
@@ -267,25 +324,33 @@ export class TelegramBotApi implements TelegramBotTransport {
         body: JSON.stringify(body),
         signal: controller.signal,
       });
+      let parsed: unknown = null;
+      try {
+        parsed = await response.json() as unknown;
+      } catch (error) {
+        if (response.ok) throw error;
+      }
       if (!response.ok) {
         throw new TelegramDeliveryError(
           `Telegram Bot API ${method} returned HTTP ${response.status}`,
-          false,
+          rejectedDeliveryFailure(telegramStatusCode(response.status, parsed), parsed),
         );
       }
-      const parsed = await response.json() as unknown;
       if (!parsed || typeof parsed !== "object" || (parsed as { ok?: unknown }).ok !== true) {
-        throw new TelegramDeliveryError(`Telegram Bot API ${method} refused the request`, false);
+        throw new TelegramDeliveryError(
+          `Telegram Bot API ${method} refused the request`,
+          rejectedDeliveryFailure(telegramStatusCode(response.status, parsed), parsed),
+        );
       }
       return (parsed as { result?: unknown }).result;
     } catch (error) {
       if (error instanceof TelegramDeliveryError) throw error;
       if (controller.signal.aborted && !signal?.aborted) {
-        throw new TelegramDeliveryError(`Telegram Bot API ${method} timed out`, null);
+        throw new TelegramDeliveryError(`Telegram Bot API ${method} timed out`, unknownDeliveryFailure());
       }
       throw new TelegramDeliveryError(
         error instanceof Error ? error.message : `Telegram Bot API ${method} failed`,
-        null,
+        unknownDeliveryFailure(),
       );
     } finally {
       clearTimeout(timeout);
@@ -406,7 +471,7 @@ export class TelegramLongPollService {
         correlationId: prepared.value.correlationId,
       });
     } catch (error) {
-      if (error instanceof TelegramDeliveryError && error.accepted === false) {
+      if (error instanceof TelegramDeliveryError && error.failure.delivery === "NOT_SENT") {
         const released = this.options.ownerPromptStore?.release(reservation);
         if (released && !released.allowed) throw new Error(`${released.reasonCode}: ${released.message}`);
       }
@@ -453,19 +518,13 @@ export class TelegramLongPollService {
       signal: this.#controller?.signal,
     });
     const outcomes: TelegramRouteOutcome[] = [];
-    // A *confirmed* rejection on one update must not cost every later update in this same batch
-    // its turn (#699): `accepted === false` means Telegram itself told us the message was not
-    // delivered, so `releaseResponse` marks it RETRYABLE and a later poll resends exactly that
-    // reply — no work is redone and nothing is lost by letting later updates in this batch run
-    // now. `accepted === null` is a different fact: delivery is *unknown*, so the reservation
-    // stays PENDING and this poll stops before later updates run their work into the same outage.
-    // It is not resent: a later poll advances past the stored PENDING fact without a second
-    // Telegram call, while doctor keeps the unresolved delivery operator-visible. So only
-    // `accepted === false` is deferred with `continue`; `accepted === null` (like any other
-    // unexpected error) still throws immediately. The offset must still never skip past the
-    // update whose delivery is unresolved, or a redelivery-based recovery could never reach it
-    // again — so once a rejected update is deferred, no later update's offset in this same poll
-    // is allowed to advance past it either.
+    // Policy: a message-specific rejection continues the batch, while a batch-scoped rejection
+    // or unknown outcome stops it; only a reply known not to have been sent becomes RETRYABLE.
+    // HTTP or Telegram error code 400 is message-scoped. Rate limits, server failures, and every
+    // other definite rejection are batch-scoped, so they release this reply for a later retry and
+    // throw before another update or owner-gate send. An unknown outcome keeps the reservation
+    // PENDING and throws without replay. Once a message-scoped rejection is deferred, the offset
+    // still cannot advance past it even if later updates succeed in this same poll.
     let firstDeliveryError: unknown;
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
@@ -480,8 +539,9 @@ export class TelegramLongPollService {
           await this.options.onInterrupt?.("after-reply-send", update, outcome.runId);
           this.router.completeResponse(outcome);
         } catch (error) {
-          if (!(error instanceof TelegramDeliveryError) || error.accepted !== false) throw error;
+          if (!(error instanceof TelegramDeliveryError) || error.failure.delivery !== "NOT_SENT") throw error;
           this.router.releaseResponse(outcome);
+          if (error.failure.scope === "BATCH") throw error;
           if (firstDeliveryError === undefined) firstDeliveryError = error;
           continue;
         }
@@ -520,7 +580,10 @@ export class TelegramLongPollService {
       } catch (error) {
         if (!this.#running && this.#controller.signal.aborted) break;
         this.options.onError?.(error);
-        await delay(this.options.retryDelayMs ?? 5_000);
+        const retryAfterMs = error instanceof TelegramDeliveryError && error.failure.retryAfterSeconds !== null
+          ? Math.min(error.failure.retryAfterSeconds * 1_000, 2_147_483_647)
+          : 0;
+        await delay(Math.max(this.options.retryDelayMs ?? 5_000, retryAfterMs));
       } finally {
         this.#controller = null;
       }
