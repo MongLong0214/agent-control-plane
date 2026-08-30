@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Clock } from "../core/clock.ts";
+import { canonicalJson, digestOf, isDigest } from "../core/digest.ts";
 import { type Decision, allow, deny, fail } from "../core/errors.ts";
 import { newAssignmentId } from "../core/ids.ts";
 import { processStartedAt } from "../core/process-identity.ts";
@@ -52,7 +53,39 @@ export interface AuthenticatedTargetBinding {
   claimed: VerifiedTargetBinding;
   protocolVersion: string;
   attestationDigest: string;
+  /** The raw, closed Hermes target-bind response; generic executor protocols omit this. */
+  targetBindReceipt?: unknown;
   verify(tuple: AuthenticatedTargetTuple): VerifiedTargetBinding | null;
+}
+
+/** The eight fields Hermes emits after it has authenticated the planned binding tuple. */
+export interface HermesTargetBindReceipt {
+  domain: "hermes.target-bind";
+  version: 1;
+  actor_id: string;
+  binding_generation: number;
+  executor_runtime_identity: string;
+  requested_session_id: string;
+  lineage_root_digest: string;
+  receipt_digest: string;
+}
+
+const HERMES_TARGET_BIND_PROTOCOL = "hermes.target-bind/v1";
+const HERMES_TARGET_BIND_RECEIPT_KEYS = [
+  "actor_id",
+  "binding_generation",
+  "domain",
+  "executor_runtime_identity",
+  "lineage_root_digest",
+  "receipt_digest",
+  "requested_session_id",
+  "version",
+] as const;
+
+interface ValidatedHermesTargetBindReceipt {
+  receipt: HermesTargetBindReceipt;
+  canonicalJson: string;
+  attestationDigest: string;
 }
 
 export interface BindInput {
@@ -215,6 +248,7 @@ export class BindingRegistry {
       // Plan a new id before verification so target authentication is the last pre-write step.
       const freshCandidate = `actor:${newAssignmentId()}`;
       const provisionalActorId = reused.value ?? freshCandidate;
+      let hermesReceipt: ValidatedHermesTargetBindReceipt | null = null;
       if (input.authenticatedTarget) {
         let authenticated: VerifiedTargetBinding | null;
         try {
@@ -236,6 +270,17 @@ export class BindingRegistry {
             authenticated,
           });
         }
+        const validatedReceipt = this.validateHermesTargetBindReceipt(
+          input.authenticatedTarget,
+          {
+            actorId: provisionalActorId,
+            generation,
+            requestedSessionId: claimedTarget.targetLocator,
+            lineageRootDigest: claimedTarget.targetLocatorDigest,
+          },
+        );
+        if (!validatedReceipt.allowed) return validatedReceipt as Decision<RoleBinding>;
+        hermesReceipt = validatedReceipt.value;
       }
       // Reuse when the target says which actor owns it; mint otherwise.
       //
@@ -289,7 +334,8 @@ export class BindingRegistry {
           sessionId: input.sessionId,
           incarnation: session.incarnation,
           protocolVersion: input.authenticatedTarget.protocolVersion,
-          attestationDigest: input.authenticatedTarget.attestationDigest,
+          attestationDigest: hermesReceipt?.attestationDigest ?? input.authenticatedTarget.attestationDigest,
+          targetBindReceiptJson: hermesReceipt?.canonicalJson ?? null,
         });
         if (!attested.allowed) return attested as Decision<RoleBinding>;
       }
@@ -873,6 +919,74 @@ export class BindingRegistry {
   }
 
   /**
+   * Returns only raw Hermes evidence that still names the exact live role/session incarnation.
+   * It deliberately reparses and rechecks the stored evidence rather than rebuilding it from
+   * configuration, and it never asks Hermes to bind again while serving a read.
+   */
+  currentHermesTargetBindReceipt(input: {
+    roleKey: string;
+    sessionId: string;
+    sessionIncarnation: string;
+  }): HermesTargetBindReceipt | null {
+    const rows = this.db.all<{
+      actor_id: string;
+      binding_generation: number;
+      target_locator: string;
+      target_locator_digest: string;
+      attestation_digest: string;
+      target_bind_receipt_json: string;
+    }>(
+      `SELECT a.actor_id, a.binding_generation, b.target_locator, b.target_locator_digest,
+              t.attestation_digest, t.target_bind_receipt_json
+         FROM assignments a
+         JOIN conversational_actors c
+           ON c.actor_id = a.actor_id
+          AND c.current_session_id = a.session_id
+          AND c.current_session_incarnation = a.session_incarnation
+         JOIN sessions s
+           ON s.session_id = a.session_id
+          AND s.incarnation = a.session_incarnation
+          AND s.lifecycle = 'READY'
+         JOIN actor_target_bindings b
+           ON b.target_actor_id = a.actor_id
+          AND b.executor_kind = 'hermes'
+         JOIN actor_target_attestations t
+           ON t.target_binding_id = b.target_binding_id
+          AND t.assignment_id = a.assignment_id
+          AND t.executor_session_id = a.session_id
+          AND t.executor_session_incarnation = a.session_incarnation
+          AND t.binding_generation = a.binding_generation
+          AND t.protocol_version = ?
+          AND t.target_bind_receipt_json IS NOT NULL
+        WHERE a.role_key = ?
+          AND a.status = 'ACTIVE'
+          AND a.session_id = ?
+          AND a.session_incarnation = ?`,
+      [HERMES_TARGET_BIND_PROTOCOL, input.roleKey, input.sessionId, input.sessionIncarnation],
+    );
+    if (rows.length !== 1) return null;
+    const row = rows[0]!;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.target_bind_receipt_json);
+    } catch {
+      return null;
+    }
+    const receipt = this.parseHermesTargetBindReceipt(parsed, {
+      actorId: row.actor_id,
+      generation: row.binding_generation,
+      requestedSessionId: row.target_locator,
+      lineageRootDigest: row.target_locator_digest,
+    });
+    if (!receipt || receipt.receipt_digest !== row.attestation_digest) return null;
+    try {
+      return canonicalJson(receipt) === row.target_bind_receipt_json ? receipt : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Authenticates a runtime and fences its authority in one check. The session secret
    * proves the session identity; the active binding tuple proves its current generation.
    */
@@ -945,6 +1059,99 @@ export class BindingRegistry {
       left.targetLocatorDigest === right.targetLocatorDigest;
   }
 
+  /** Validates executor evidence before bind() writes its actor, assignment, or attestation. */
+  private validateHermesTargetBindReceipt(
+    authenticated: AuthenticatedTargetBinding,
+    expected: {
+      actorId: string;
+      generation: number;
+      requestedSessionId: string;
+      lineageRootDigest: string;
+    },
+  ): Decision<ValidatedHermesTargetBindReceipt | null> {
+    if (authenticated.protocolVersion !== HERMES_TARGET_BIND_PROTOCOL) return allow(ReasonCode.OK, null);
+    if (authenticated.claimed.executorKind !== "hermes") {
+      return deny(ReasonCode.CONFLICT, "Hermes target receipt does not name a Hermes target", {});
+    }
+    let receipt: HermesTargetBindReceipt | null;
+    try {
+      receipt = this.parseHermesTargetBindReceipt(authenticated.targetBindReceipt, expected);
+    } catch {
+      receipt = null;
+    }
+    if (!receipt) {
+      return deny(ReasonCode.CONFLICT, "Hermes target receipt is malformed or does not match the planned tuple", {});
+    }
+    let attestationDigest: string;
+    try {
+      attestationDigest = authenticated.attestationDigest;
+    } catch (error) {
+      return deny(ReasonCode.CONFLICT, "Hermes target receipt has no readable attestation digest", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (attestationDigest !== receipt.receipt_digest) {
+      return deny(ReasonCode.CONFLICT, "Hermes target receipt digest disagrees with its attestation", {});
+    }
+    return allow(ReasonCode.OK, {
+      receipt,
+      canonicalJson: canonicalJson(receipt),
+      attestationDigest,
+    });
+  }
+
+  /** Parses the closed protocol object and recomputes the digest over its seven public fields. */
+  private parseHermesTargetBindReceipt(
+    input: unknown,
+    expected: {
+      actorId: string;
+      generation: number;
+      requestedSessionId: string;
+      lineageRootDigest: string;
+    },
+  ): HermesTargetBindReceipt | null {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+    const record = input as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (
+      keys.length !== HERMES_TARGET_BIND_RECEIPT_KEYS.length ||
+      HERMES_TARGET_BIND_RECEIPT_KEYS.some((key) => !Object.hasOwn(record, key))
+    ) return null;
+    if (
+      record.domain !== "hermes.target-bind" ||
+      record.version !== 1 ||
+      record.actor_id !== expected.actorId ||
+      record.binding_generation !== expected.generation ||
+      record.requested_session_id !== expected.requestedSessionId ||
+      record.lineage_root_digest !== expected.lineageRootDigest ||
+      typeof record.executor_runtime_identity !== "string" ||
+      record.executor_runtime_identity.length === 0 ||
+      !Number.isSafeInteger(record.binding_generation) ||
+      !isDigest(record.lineage_root_digest) ||
+      !isDigest(record.receipt_digest)
+    ) return null;
+    const receipt: HermesTargetBindReceipt = {
+      domain: record.domain,
+      version: record.version,
+      actor_id: record.actor_id,
+      binding_generation: record.binding_generation,
+      executor_runtime_identity: record.executor_runtime_identity,
+      requested_session_id: record.requested_session_id,
+      lineage_root_digest: record.lineage_root_digest,
+      receipt_digest: record.receipt_digest,
+    };
+    const publicFields = {
+      domain: receipt.domain,
+      version: receipt.version,
+      actor_id: receipt.actor_id,
+      binding_generation: receipt.binding_generation,
+      executor_runtime_identity: receipt.executor_runtime_identity,
+      requested_session_id: receipt.requested_session_id,
+      lineage_root_digest: receipt.lineage_root_digest,
+    };
+    return receipt.receipt_digest === digestOf(publicFields) ? receipt : null;
+  }
+
   /** Finds the exact existing target-binding id or records a new one for this actor. */
   private targetBindingId(actorId: string, target: VerifiedTargetBinding): Decision<string> {
     const existing = this.db.get<{ target_binding_id: string; target_actor_id: string }>(
@@ -997,13 +1204,14 @@ export class BindingRegistry {
     incarnation: string;
     protocolVersion: string;
     attestationDigest: string;
+    targetBindReceiptJson: string | null;
   }): Decision<void> {
     try {
       this.db.run(
         `INSERT INTO actor_target_attestations
            (target_attestation_id, target_binding_id, binding_generation, assignment_id, executor_session_id,
-            executor_session_incarnation, protocol_version, attestation_digest, attested_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            executor_session_incarnation, protocol_version, attestation_digest, target_bind_receipt_json, attested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           `ta_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
           input.targetBindingId,
@@ -1013,6 +1221,7 @@ export class BindingRegistry {
           input.incarnation,
           input.protocolVersion,
           input.attestationDigest,
+          input.targetBindReceiptJson,
           this.clock.nowIso(),
         ],
       );

@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { isAcpError } from "../../src/core/errors.ts";
-import { digestOf } from "../../src/core/digest.ts";
+import { canonicalJson, digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PRODUCER_ROLES, ROLE_CLASS, Role, SessionLifecycle } from "../../src/domain/types.ts";
 import type { AuthenticatedTargetTuple } from "../../src/session/binding-registry.ts";
@@ -657,7 +657,7 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
   const claimed = {
     executorKind: "hermes",
     targetLocator: "target:conversation-649",
-    targetLocatorDigest: "sha256:conversation-649",
+    targetLocatorDigest: digestOf({ target: "conversation-649" }),
   };
   const attestationDigestFor = (tuple: AuthenticatedTargetTuple) => digestOf({
     domain: "acp.target-attestation",
@@ -679,6 +679,47 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
         const target = verify(tuple);
         if (target) attested = tuple;
         return target;
+      },
+    };
+  };
+  type HermesReceipt = {
+    domain: "hermes.target-bind";
+    version: 1;
+    actor_id: string;
+    binding_generation: number;
+    executor_runtime_identity: string;
+    requested_session_id: string;
+    lineage_root_digest: string;
+    receipt_digest: string;
+  };
+  const hermesAuthenticated = (
+    mutate: (receipt: HermesReceipt) => unknown = (receipt) => receipt,
+  ) => {
+    let receipt: unknown;
+    return {
+      claimed,
+      protocolVersion: "hermes.target-bind/v1",
+      get targetBindReceipt() {
+        return receipt as HermesReceipt;
+      },
+      get attestationDigest() {
+        if (!receipt || typeof receipt !== "object" || typeof (receipt as Record<string, unknown>).receipt_digest !== "string") {
+          throw new Error("attestation digest read before Hermes target receipt verification");
+        }
+        return (receipt as HermesReceipt).receipt_digest;
+      },
+      verify: (tuple: AuthenticatedTargetTuple) => {
+        const publicFields = {
+          domain: "hermes.target-bind" as const,
+          version: 1 as const,
+          actor_id: tuple.actorId,
+          binding_generation: tuple.generation,
+          executor_runtime_identity: "hermes:runtime-649",
+          requested_session_id: claimed.targetLocator,
+          lineage_root_digest: claimed.targetLocatorDigest,
+        };
+        receipt = mutate({ ...publicFields, receipt_digest: digestOf(publicFields) });
+        return claimed;
       },
     };
   };
@@ -737,7 +778,7 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
     });
     const before = counts(db);
     try {
-      const result = bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: authenticated(() => claimed) });
+      const result = bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: hermesAuthenticated() });
       expect(result.allowed).toBe(false);
       expect(counts(db)).toEqual(before);
     } finally {
@@ -783,5 +824,95 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
       assignment_id: second.value.assignmentId,
       attestation_digest: attestationDigestFor(seen),
     });
+  });
+
+  it("persists one canonical Hermes receipt and exposes it only for its current active tuple", () => {
+    const { bindings, db, session } = setup();
+    const sessionId = session("ses_hermes_receipt_current");
+    const result = bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: hermesAuthenticated() });
+    expect(result.allowed).toBe(true);
+    if (!result.allowed) return;
+
+    const stored = db.get<{ target_bind_receipt_json: string }>(
+      `SELECT target_bind_receipt_json
+         FROM actor_target_attestations WHERE assignment_id = ?`,
+      [result.value.assignmentId],
+    );
+    expect(stored?.target_bind_receipt_json).toBeTypeOf("string");
+    const expected = JSON.parse(stored!.target_bind_receipt_json) as HermesReceipt;
+    expect(stored?.target_bind_receipt_json).toBe(canonicalJson(expected));
+    expect(bindings.currentHermesTargetBindReceipt({
+      roleKey: result.value.roleKey,
+      sessionId,
+      sessionIncarnation: `inc-${sessionId}`,
+    })).toEqual(expected);
+    expect(bindings.currentHermesTargetBindReceipt({
+      roleKey: result.value.roleKey,
+      sessionId,
+      sessionIncarnation: "wrong-incarnation",
+    })).toBeNull();
+
+    db.run(`UPDATE assignments SET status = 'REVOKED' WHERE assignment_id = ?`, [result.value.assignmentId]);
+    expect(bindings.currentHermesTargetBindReceipt({
+      roleKey: result.value.roleKey,
+      sessionId,
+      sessionIncarnation: `inc-${sessionId}`,
+    })).toBeNull();
+  });
+
+  it("fails closed before writes for an invalid Hermes receipt and on corrupted receipt reads", () => {
+    for (const mutate of [
+      () => null,
+      (receipt: HermesReceipt) => ({ ...receipt, unexpected: true }),
+      (receipt: HermesReceipt) => ({ ...receipt, actor_id: "actor:forged" }),
+      (receipt: HermesReceipt) => ({ ...receipt, binding_generation: receipt.binding_generation + 1 }),
+      (receipt: HermesReceipt) => ({ ...receipt, requested_session_id: "target:wrong" }),
+      (receipt: HermesReceipt) => ({ ...receipt, lineage_root_digest: digestOf({ wrong: true }) }),
+      (receipt: HermesReceipt) => ({ ...receipt, receipt_digest: digestOf({ forged: true }) }),
+    ]) {
+      const { bindings, db, session } = setup();
+      const before = counts(db);
+      const result = bindings.bind({
+        role: Role.CEO,
+        sessionId: session(`ses_hermes_receipt_invalid_${Math.random()}`),
+        authenticatedTarget: hermesAuthenticated(mutate),
+      });
+      expect(result.allowed).toBe(false);
+      expect(counts(db)).toEqual(before);
+    }
+
+    const { bindings, db, session } = setup();
+    const sessionId = session("ses_hermes_receipt_corrupt");
+    const result = bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: hermesAuthenticated() });
+    expect(result.allowed).toBe(true);
+    if (!result.allowed) return;
+    const tuple = { roleKey: result.value.roleKey, sessionId, sessionIncarnation: `inc-${sessionId}` };
+    const original = db.get<{ target_bind_receipt_json: string }>(
+      "SELECT target_bind_receipt_json FROM actor_target_attestations WHERE assignment_id = ?",
+      [result.value.assignmentId],
+    )!.target_bind_receipt_json;
+    const actorId = db.get<{ actor_id: string }>(
+      "SELECT actor_id FROM assignments WHERE assignment_id = ?",
+      [result.value.assignmentId],
+    )!.actor_id;
+    const all = vi.spyOn(db, "all");
+    const corruptRead = (targetBindReceiptJson: string | null) => {
+      all.mockReturnValueOnce([{
+        actor_id: actorId,
+        binding_generation: result.value.bindingGeneration,
+        target_locator: claimed.targetLocator,
+        target_locator_digest: claimed.targetLocatorDigest,
+        attestation_digest: (JSON.parse(original) as HermesReceipt).receipt_digest,
+        target_bind_receipt_json: targetBindReceiptJson,
+      }] as never);
+      expect(bindings.currentHermesTargetBindReceipt(tuple)).toBeNull();
+    };
+    try {
+      corruptRead(null);
+      corruptRead(canonicalJson({ ...JSON.parse(original), unexpected: true }));
+      corruptRead("{");
+    } finally {
+      all.mockRestore();
+    }
   });
 });
