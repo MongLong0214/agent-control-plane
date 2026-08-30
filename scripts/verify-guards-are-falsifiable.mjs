@@ -494,6 +494,36 @@ const GUARDS = [
     ],
   },
   {
+    what: "the disposable realm requests in-memory SQLite temporary storage",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: '  databaseTemporaryStorage: "MEMORY",',
+    replace: "",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::runs two synthetic messages through the production Telegram entry and removes the realm",
+    ],
+  },
+  {
+    what: "the control plane passes its SQLite temporary-storage policy to the database",
+    file: "src/app/control-plane.ts",
+    find:
+      "      config.databaseTemporaryStorage === undefined\n" +
+      "        ? {}\n" +
+      "        : { temporaryStorage: config.databaseTemporaryStorage },",
+    replace: "      {},",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::runs two synthetic messages through the production Telegram entry and removes the realm",
+    ],
+  },
+  {
+    what: "the database applies the requested in-memory SQLite temporary-storage policy",
+    file: "src/db/database.ts",
+    find: '        this.#raw.pragma("temp_store = MEMORY");',
+    replace: "        void this.options.temporaryStorage;",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::runs two synthetic messages through the production Telegram entry and removes the realm",
+    ],
+  },
+  {
     what: "the periodic capacity sweep gets a budget sized against the sweep, not against startup",
     symbols: ["sweepBudgetMs"],
     file: "src/daemon/daemon.ts",

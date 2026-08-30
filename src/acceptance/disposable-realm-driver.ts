@@ -109,6 +109,12 @@ const SYNTHETIC_EVIDENCE_STEPS: readonly SyntheticEvidenceStep[] = [
       "The janitor exclusively created the workspace below a per-account owner-only root derived from a fixed OS path, outside live ACP production state and without inherited environment or cwd placement.",
   },
   {
+    id: "SQLITE_TEMPORARY_STORAGE_ESTABLISHED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "Both synthetic control planes used in-memory SQLite temporary storage instead of native TMPDIR or SQLITE_TMPDIR file placement.",
+  },
+  {
     id: "REALM_PATHS_ISOLATED",
     status: "CHECKED_BY_RUN",
     statement:
@@ -201,7 +207,7 @@ const SYNTHETIC_SAFETY_CONDITIONS: readonly SyntheticSafetyCondition[] = [
     condition: "A realm that shares a path with production is not a realm",
     status: "CHECKED_BY_RUN",
     detail:
-      "The driver derived a per-account allocator from a fixed OS path, verified it owner-only and disjoint from live ACP state, and planned every generated path against both live ACP state and the synthetic baseline before and after creation.",
+      "The driver derived a per-account allocator from a fixed OS path, verified it owner-only and disjoint from live ACP state, forced SQLite temporary storage into memory, and planned every generated path against both live ACP state and the synthetic baseline before and after creation.",
   },
   {
     condition: "The probe may not address the canonical conversation",
@@ -406,6 +412,7 @@ const controlPlaneConfig = (
   ownerIdentities: ControlPlaneConfig["ownerIdentities"] = [],
 ): ControlPlaneConfig => ({
   databasePath: join(root, "state.sqlite"),
+  databaseTemporaryStorage: "MEMORY",
   worktreeRoot: join(root, "worktrees"),
   capacityDir: join(root, "capacity"),
   secretsDir: join(root, "secrets"),
@@ -777,6 +784,20 @@ export const runSyntheticDisposableRealmProbe = async (
     executedEvidenceSteps.add("NONCANONICAL_PROBE_TARGET");
 
     realm = new ControlPlane(controlPlaneConfig(paths.stateDir, [{ channel: "telegram", actor: OWNER_ID }]));
+    if (
+      production.db.temporaryStorage !== "MEMORY" ||
+      realm.db.temporaryStorage !== "MEMORY"
+    ) {
+      return deny(
+        ReasonCode.STATE_PATH_INSECURE,
+        "the synthetic control planes did not establish in-memory SQLite temporary storage",
+        {
+          productionTemporaryStorage: production.db.temporaryStorage,
+          realmTemporaryStorage: realm.db.temporaryStorage,
+        },
+      );
+    }
+    executedEvidenceSteps.add("SQLITE_TEMPORARY_STORAGE_ESTABLISHED");
     const session = realm.sessions.create({
       provider: "synthetic-acceptance",
       model: "synthetic-disposable-target",

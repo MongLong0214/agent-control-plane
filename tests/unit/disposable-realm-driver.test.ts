@@ -74,6 +74,12 @@ describe("the disposable realm driver", () => {
     expect(result.value.syntheticBaselineUnchanged).toBe(true);
     expect(result.value.workspaceRemoved).toBe(true);
     expect(result.value.residue).toEqual([]);
+    expect(result.value.steps).toContainEqual({
+      id: "SQLITE_TEMPORARY_STORAGE_ESTABLISHED",
+      status: "CHECKED_BY_RUN",
+      statement:
+        "Both synthetic control planes used in-memory SQLite temporary storage instead of native TMPDIR or SQLITE_TMPDIR file placement.",
+    });
   });
 
   it("names every actor and durability gap as unproven in the artifact", async () => {
