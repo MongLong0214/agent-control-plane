@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 32;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2087,6 +2087,52 @@ const v31: SchemaMigration = {
   checksum: () => migrationChecksum("v31-a-generation-means-nothing-without-its-role-key"),
 };
 
+/**
+ * #674 — a session's ad hoc, session-local poll for Buzz mentions can die silently, and a
+ * silent poller and "nothing new arrived" produce the exact same observable fact: nothing.
+ * Measured three times in one incident, each a different bug in the same poller, each
+ * indistinguishable from health until read after the fact.
+ *
+ * This table is the durable half of the fix (Option C from the issue's review): a per-channel
+ * cursor plus bookkeeping for whether the last attempt to read it even succeeded, so
+ * `Doctor.checkBuzzMentions` can tell "N behind since T" apart from "never checked" apart from
+ * "could not reach the relay" — see `src/buzz/mention-watch.ts` for the full lifecycle this
+ * feeds, and `doctor.ts` for the three-way distinction it makes possible.
+ *
+ * Numbered v32, the true next contiguous step from `origin/main`'s v31 — not v34, despite that
+ * being the number this change was briefed to use. v32 and v33 are claimed by other open,
+ * unmerged PRs against this same head, but `tests/unit/database-migration-restore.test.ts:440`
+ * enforces `fromVersion === toVersion - 1` for every migration in this array, so a
+ * `fromVersion: 31, toVersion: 34` jump fails that invariant outright, and a v31 database (what
+ * `origin/main` actually ships) could never reach it because nothing here defines the v32/v33
+ * steps in between. Reserving a number ahead of the gap does not avoid the eventual collision;
+ * a strictly-linear, single-step schema chain means whichever of these three PRs merges last
+ * renumbers regardless of what it started as. That renumbering is the single-canonical-lane WIP
+ * discipline #674 itself names as the actual blocker, not a technical dependency this migration
+ * can design around.
+ */
+const v32: SchemaMigration = {
+  id: "v32-a-silent-poller-and-no-new-mentions-look-the-same",
+  fromVersion: 31,
+  toVersion: 32,
+  apply: (raw) => {
+    raw.exec(`
+      CREATE TABLE IF NOT EXISTS buzz_mention_watch (
+        channel_id       TEXT PRIMARY KEY,
+        baseline_at      INTEGER,
+        latest_event_id  TEXT,
+        latest_seen_at   INTEGER,
+        pending_count    INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at  TEXT,
+        last_success_at  TEXT,
+        last_error       TEXT,
+        last_error_at    TEXT
+      )
+    `);
+  },
+  checksum: () => migrationChecksum("v32-a-silent-poller-and-no-new-mentions-look-the-same"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2108,6 +2154,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v29,
   v30,
   v31,
+  v32,
 ]);
 
 interface RequiredTrigger {

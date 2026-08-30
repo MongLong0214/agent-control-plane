@@ -42,6 +42,10 @@ const INVOCATIONS = [
   { name: "channelsList", argv: BUZZ_CLI_INVOCATIONS.channelsList() },
   { name: "channelsGet", argv: BUZZ_CLI_INVOCATIONS.channelsGet("00000000-0000-0000-0000-000000000000") },
   { name: "messagesGet", argv: BUZZ_CLI_INVOCATIONS.messagesGet("00000000-0000-0000-0000-000000000000", 10) },
+  {
+    name: "messagesGetSince",
+    argv: BUZZ_CLI_INVOCATIONS.messagesGetSince("00000000-0000-0000-0000-000000000000", 0, 10),
+  },
   { name: "messagesSend", argv: BUZZ_CLI_INVOCATIONS.messagesSend("00000000-0000-0000-0000-000000000000") },
 ];
 

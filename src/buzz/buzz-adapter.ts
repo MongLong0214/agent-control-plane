@@ -199,6 +199,22 @@ export class BuzzCliTransport implements BuzzTransport {
     return messages as BuzzCliMessage[];
   }
 
+  /**
+   * `messages get --since` — feeds `BuzzMentionWatch` (#674). A count, not a feed: the CLI's
+   * `--since` is what makes a durable "N behind" cheap to ask for repeatedly, rather than
+   * re-reading a channel's whole history on every tick.
+   */
+  async messagesSince(channel: string, sinceEpochSeconds: number, limit: number): Promise<BuzzCliMessage[]> {
+    const { stdout } = await exec(
+      this.binary,
+      BUZZ_CLI_INVOCATIONS.messagesGetSince(channel, sinceEpochSeconds, limit),
+      { encoding: "utf8", timeout: 30_000 },
+    );
+    const messages = parseJson(stdout, "messages get --since");
+    if (!Array.isArray(messages)) throw new Error("buzz messages get --since did not return a list");
+    return messages as BuzzCliMessage[];
+  }
+
   async #listChannels(): Promise<BuzzCliChannel[]> {
     // No `--json`: the installed CLI rejects the flag and already emits JSON without it.
     const { stdout } = await exec(this.binary, BUZZ_CLI_INVOCATIONS.channelsList(), {
@@ -316,9 +332,20 @@ export const BUZZ_CLI_INVOCATIONS = {
   channelsGet: (channelId: string) => ["channels", "get", "--channel", channelId],
   messagesGet: (channel: string, limit: number) =>
     ["messages", "get", "--channel", channel, "--limit", String(limit)],
+  messagesGetSince: (channel: string, sinceEpochSeconds: number, limit: number) =>
+    ["messages", "get", "--channel", channel, "--since", String(sinceEpochSeconds), "--limit", String(limit)],
   messagesSend: (channel: string) =>
     ["messages", "send", "--channel", channel, "--content", "-"],
 } as const;
+
+/**
+ * What `BuzzAdapter.connect()` needs from `BuzzMentionWatch` (#674) — spelled out narrowly
+ * here, rather than imported, so this module does not import from `mention-watch.ts` while
+ * that module imports `BuzzCliMessage` from this one.
+ */
+export interface MentionCursorReset {
+  resetCursor(channelId: string): void;
+}
 
 export class BuzzAdapter {
   constructor(
@@ -329,6 +356,8 @@ export class BuzzAdapter {
     private readonly bindings: BindingRegistry,
     private readonly outbox: Outbox,
     private readonly transport: BuzzTransport,
+    /** Optional so every existing caller keeps compiling; wired in production (#674). */
+    private readonly mentionWatch?: MentionCursorReset,
   ) {}
 
   async connect(sessionId: string, purpose: string): Promise<Decision<string>> {
@@ -338,6 +367,10 @@ export class BuzzAdapter {
     try {
       const address = await this.transport.openChannel(purpose);
       this.sessions.setBuzzAddress(sessionId, address);
+      // The mention-watch cursor's one way back (#674): a session is (re)confirmed alive and
+      // watching this channel right here, so its baseline re-arms at "now". A harness restart
+      // that reconnects clears an accumulated backlog nobody would otherwise ever look at again.
+      this.mentionWatch?.resetCursor(address);
       this.audit.record({
         kind: "BUZZ_CONNECTED",
         sessionId,

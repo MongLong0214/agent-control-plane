@@ -16,6 +16,7 @@ import {
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
+import { BuzzMentionWatch } from "../buzz/mention-watch.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
@@ -1397,6 +1398,14 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     throw err;
   }
 
+  const buzzTransport = new BuzzCliTransport(
+    process.env["ACP_BUZZ_BINARY"] ?? "buzz",
+    process.env["ACP_BUZZ_CHANNEL"] ?? null,
+  );
+  // #674 — the measurement half of the mention watch. Shares the same CLI transport `buzz`
+  // sends through; `messagesSince` resolves the channel argument it is given directly and does
+  // not consult `defaultChannel`, so there is no cross-talk between delivery and this.
+  const mentionWatch = new BuzzMentionWatch(cp.db, cp.clock, cp.audit, buzzTransport);
   const buzz = new BuzzAdapter(
     cp.db,
     cp.clock,
@@ -1404,7 +1413,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     cp.sessions,
     cp.bindings,
     cp.outbox,
-    new BuzzCliTransport(process.env["ACP_BUZZ_BINARY"] ?? "buzz", process.env["ACP_BUZZ_CHANNEL"] ?? null),
+    buzzTransport,
+    mentionWatch,
   );
   cp.cto.attach({
     buzz: {
@@ -1415,7 +1425,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     sessionLaunch,
   });
 
-  const daemon = cp.createDaemon({ stateDir, buzz });
+  const daemon = cp.createDaemon({ stateDir, buzz, mentionWatch });
 
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;

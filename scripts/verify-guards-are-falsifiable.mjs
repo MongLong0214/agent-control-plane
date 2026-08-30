@@ -495,6 +495,33 @@ const GUARDS = [
     killedBy: ["tests/unit/buzz-cli-surface.test.ts"],
   },
   {
+    // #674 — the row-exists-but-never-attempted state (a session just connected and reset the
+    // cursor, but the periodic tick has not run yet) must read the same as no row at all, not as
+    // a verified zero. Dropping this disjunct is exactly the fold #636 corrected for capacity:
+    // an absence of observation reported as a healthy measurement.
+    what: "a buzz mention watch row with no attempt yet is never-checked, not a verified zero",
+    file: "src/doctor/doctor.ts",
+    find: "      if (!row || row.last_attempt_at === null) {",
+    replace: "      if (!row) {",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::a session that just connected but was never ticked is never-checked, not a verified zero",
+    ],
+  },
+  {
+    // #674 — the middle case between "never checked" and "behind": the most recent tick failed,
+    // so `pending_count` on record cannot be trusted as current. Folding this into "behind" or
+    // into silence would state a stale count as though it were fresh — the same shape #636 fixed
+    // for CAPACITY_LOW firing on a reading nobody could take.
+    what: "a buzz mention watch tick that just failed is reported unavailable, not folded into a stale count",
+    file: "src/doctor/doctor.ts",
+    find:
+      "      const lastAttemptFailed =\n        row.last_error_at !== null &&\n        (row.last_success_at === null || Date.parse(row.last_error_at) >= Date.parse(row.last_success_at));",
+    replace: "      const lastAttemptFailed = false;",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::a failed check reports unavailable, never a false zero standing in for it",
+    ],
+  },
+  {
     what: "a CEO socket admitted under a superseded binding is not still the owner's conversation",
     file: "src/mcp/ceo-conversation.ts",
     find: "    const current = peer.authenticate();\n    if (!current.allowed) {",

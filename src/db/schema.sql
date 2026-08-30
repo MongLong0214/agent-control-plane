@@ -1167,6 +1167,25 @@ CREATE INDEX IF NOT EXISTS outbox_role ON outbox(role_key, binding_generation, s
 CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE status = 'PENDING';
 
 -- ---------------------------------------------------------------------------
+-- buzz_mention_watch (v32, #674)
+--   A per-channel cursor plus tick health, so a session's ad hoc poll dying silently and
+--   "nothing new arrived" no longer read as the same fact. See src/buzz/mention-watch.ts
+--   for the full lifecycle: `baseline_at` moves only via an explicit reset on reconnect,
+--   never on an ordinary tick, which only recomputes `pending_count` fresh each time.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS buzz_mention_watch (
+  channel_id       TEXT PRIMARY KEY,
+  baseline_at      INTEGER,
+  latest_event_id  TEXT,
+  latest_seen_at   INTEGER,
+  pending_count    INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at  TEXT,
+  last_success_at  TEXT,
+  last_error       TEXT,
+  last_error_at    TEXT
+);
+
+-- ---------------------------------------------------------------------------
 -- inbound_messages
 --   Lifecycle: ingress replay defence (§27.1 nonce/idempotency, §27.3 MCP).
 --   Integrity: unique nonce per channel is the whole point.

@@ -107,6 +107,11 @@ const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, provide
   }
 };
 
+/** What the periodic tick needs from `BuzzMentionWatch` (#674) — see `src/buzz/mention-watch.ts`. */
+export interface BuzzMentionTicker {
+  tick(channels: readonly string[]): Promise<void>;
+}
+
 export interface DaemonOptions {
   stateDir: string;
   watchdogIntervalMs?: number;
@@ -114,6 +119,14 @@ export interface DaemonOptions {
   /** Keeps the daemon-owned structured capacity sensors inside their freshness window. */
   capacityRefreshIntervalMs?: number;
   buzz?: BuzzAdapter;
+  /**
+   * #674 — the periodic measurement half of the buzz mention watch. Optional, like `buzz`
+   * itself: without a live relay there is nothing to tick, and `Doctor.checkBuzzMentions` then
+   * reports `BUZZ_MENTIONS_NEVER_CHECKED` rather than a silently-stale count.
+   */
+  mentionWatch?: BuzzMentionTicker;
+  /** How often the buzz mention watch re-measures every channel a live session is bound to. */
+  buzzMentionsIntervalMs?: number;
   /** Consecutive start failures before the supervisor should back off harder. */
   crashLoopThreshold?: number;
   /** How long the whole capacity refresh may hold startup before it is abandoned. */
@@ -1367,6 +1380,27 @@ export class Daemon {
       }, deliveryMs);
       delivery.unref();
       this.#timers.push(delivery);
+    }
+
+    // #674 — measures, never delivers: one `messages get --since` per live session's channel,
+    // so a dead session-local poller stops being indistinguishable from "no new messages".
+    if (this.options.mentionWatch) {
+      const mentionsMs = this.options.buzzMentionsIntervalMs ?? deliveryMs;
+      const mentionsWatch = setInterval(() => {
+        void this.runPeriodic("buzz_mentions_watch", async () => {
+          const channels = [
+            ...new Set(
+              this.cp.sessions
+                .live()
+                .map((session) => session.buzzAddress)
+                .filter((address): address is string => address !== null),
+            ),
+          ];
+          await this.options.mentionWatch!.tick(channels);
+        });
+      }, mentionsMs);
+      mentionsWatch.unref();
+      this.#timers.push(mentionsWatch);
     }
   }
 

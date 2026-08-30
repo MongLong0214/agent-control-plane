@@ -309,6 +309,24 @@ describe("#423 BuzzCliTransport against the installed CLI surface", () => {
     expect(messages[0]).toHaveProperty("pubkey");
   });
 
+  /** #674 — the buzz mention watch's read side; same subcommand, one more declared option. */
+  it("reads messages since a point in time with `messages get --since`", async () => {
+    const messages = await new BuzzCliTransport(stub.binary).messagesSince(ceo.channel_id, 1786255000, 200);
+
+    expect(stub.calls()).toContainEqual([
+      "messages",
+      "get",
+      "--channel",
+      ceo.channel_id,
+      "--since",
+      "1786255000",
+      "--limit",
+      "200",
+    ]);
+    expect(messages[0]).toHaveProperty("id");
+    expect(messages[0]).toHaveProperty("created_at");
+  });
+
   it("sends with the argv the CLI accepts and refuses unparseable output", async () => {
     await new BuzzCliTransport(stub.binary).send(ceo.channel_id, "body");
     expect(stub.calls()).toContainEqual([

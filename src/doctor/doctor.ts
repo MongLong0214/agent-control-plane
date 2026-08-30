@@ -127,6 +127,7 @@ export class Doctor {
     }
     if (scope === "system" || scope === "session") {
       findings.push(...this.checkSessions(target ?? null));
+      findings.push(...this.checkBuzzMentions(target ?? null));
     }
     if (scope === "system" || scope === "capacity") {
       findings.push(...this.checkCapacitySensorFiles());
@@ -439,6 +440,111 @@ export class Doctor {
           confidence: "HIGH",
           observedEvidence: { pid: session.osPid, lifecycle: session.lifecycle },
           recommendedAction: "mark the session ERROR and recover its bindings",
+        });
+      }
+    }
+    return findings;
+  }
+
+  /**
+   * #674 — the gap this closes is not delivery, it is that a dead session-local poller and "no
+   * new messages" were the same observable fact. `buzz_mention_watch` (written only by
+   * `BuzzMentionWatch`, `src/buzz/mention-watch.ts`) is read here, never written — this stays a
+   * pure `SELECT`, consistent with Doctor's read-only construction.
+   *
+   * Three outcomes, deliberately not collapsed into one:
+   *
+   *   `BUZZ_MENTIONS_NEVER_CHECKED`   the watch has never ticked this channel at all
+   *   `BUZZ_MENTIONS_WATCH_UNAVAILABLE`  the most recent attempt failed; the count on record
+   *                                      cannot be trusted as current
+   *   `BUZZ_MENTIONS_BEHIND`          a successful check found channel traffic since baseline
+   *
+   * The middle one exists for the same reason #636 split `CAPACITY_SENSOR_FAILED` from
+   * `CAPACITY_LOW`: reporting a stale `pending_count` as though it were a fresh "N behind" would
+   * state a false, definite value in place of "could not look" — the exact fold #636 corrected.
+   * A count of zero is never emitted on its own; it is silence, and silence here is backed by a
+   * `last_success_at` that proves a check actually ran, which is what tells it apart from having
+   * never looked.
+   */
+  private checkBuzzMentions(sessionId: string | null): Finding[] {
+    const findings: Finding[] = [];
+    const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.live();
+
+    for (const session of sessions) {
+      if (!session || !session.buzzAddress) continue;
+      const channel = session.buzzAddress;
+      const row = this.db.get<{
+        baseline_at: number | null;
+        pending_count: number;
+        last_attempt_at: string | null;
+        last_success_at: string | null;
+        last_error: string | null;
+        last_error_at: string | null;
+      }>(
+        `SELECT baseline_at, pending_count, last_attempt_at, last_success_at, last_error, last_error_at
+           FROM buzz_mention_watch WHERE channel_id = ?`,
+        [channel],
+      );
+
+      if (!row || row.last_attempt_at === null) {
+        findings.push({
+          code: "BUZZ_MENTIONS_NEVER_CHECKED",
+          severity: "WARN",
+          scope: `session:${session.sessionId}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: { sessionId: session.sessionId, channel },
+          recommendedAction:
+            "the periodic buzz mention watch has not observed this channel yet; confirm the watch tick is running",
+        });
+        continue;
+      }
+
+      // The most recent attempt against this channel failed if a failure was recorded no
+      // earlier than the last success — including "failed and never succeeded since".
+      const lastAttemptFailed =
+        row.last_error_at !== null &&
+        (row.last_success_at === null || Date.parse(row.last_error_at) >= Date.parse(row.last_success_at));
+      if (lastAttemptFailed) {
+        findings.push({
+          code: "BUZZ_MENTIONS_WATCH_UNAVAILABLE",
+          severity: "ERROR",
+          scope: `session:${session.sessionId}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: {
+            sessionId: session.sessionId,
+            channel,
+            error: row.last_error,
+            lastErrorAt: row.last_error_at,
+            lastKnownGoodAt: row.last_success_at,
+          },
+          recommendedAction:
+            "restore buzz CLI/relay reachability; the mention count cannot be verified until a check succeeds",
+        });
+        continue;
+      }
+
+      if (row.pending_count > 0) {
+        findings.push({
+          code: "BUZZ_MENTIONS_BEHIND",
+          severity: "WARN",
+          scope: `session:${session.sessionId}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: {
+            sessionId: session.sessionId,
+            channel,
+            // Unit and object, named plainly: every message the channel received since the
+            // baseline, per `messages get --since` — not a verified @-mention of this session.
+            // No `#p`-tag matching is wired anywhere in this codebase (#674's own audit), so
+            // this is a proxy for unacknowledged channel traffic, not a mention count.
+            channelMessagesSinceBaseline: row.pending_count,
+            sinceIso: new Date((row.baseline_at ?? 0) * 1000).toISOString(),
+            checkedAt: row.last_success_at,
+          },
+          recommendedAction:
+            "read the buzz channel since the reported time; this session's mention watch has not accounted for these messages",
         });
       }
     }
