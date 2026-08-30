@@ -1,13 +1,13 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 import { ControlPlane, type ControlPlaneConfig } from "../app/control-plane.ts";
 import { digestOf } from "../core/digest.ts";
-import { type Decision, allow, deny } from "../core/errors.ts";
+import { disposableWorkspaceLocation } from "../core/disposable-workspace-root.ts";
+import { acpError, type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { ensurePrivateDirectory, inspectPrivatePath } from "../db/state-preflight.ts";
 import { Role, SessionLifecycle } from "../domain/types.ts";
 import {
   TelegramDeliveryError,
@@ -23,6 +23,7 @@ import {
   type OwnedProcess,
   type ProductionCensus,
   type RealmPaths,
+  assertDisposableWorkspaceRoot,
   assertProductionUnchanged,
   censusProduction,
   classifyProbeSignal,
@@ -102,10 +103,16 @@ export interface SyntheticEvidenceStep {
 
 const SYNTHETIC_EVIDENCE_STEPS: readonly SyntheticEvidenceStep[] = [
   {
+    id: "WORKSPACE_DISPOSABILITY_ESTABLISHED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "The janitor exclusively created the workspace below a per-account owner-only root derived from a fixed OS path, outside live ACP production state and without inherited environment or cwd placement.",
+  },
+  {
     id: "REALM_PATHS_ISOLATED",
     status: "CHECKED_BY_RUN",
     statement:
-      "The generated realm paths passed isolation planning before and after creation inside the janitor-owned OS-temp workspace.",
+      "The generated realm paths passed live-production and synthetic-baseline isolation planning before and after creation inside the janitor-owned private workspace.",
   },
   {
     id: "NONCANONICAL_PROBE_TARGET",
@@ -194,19 +201,19 @@ const SYNTHETIC_SAFETY_CONDITIONS: readonly SyntheticSafetyCondition[] = [
     condition: "A realm that shares a path with production is not a realm",
     status: "CHECKED_BY_RUN",
     detail:
-      "The generated paths passed planning before and after creation against the synthetic production root; no live production path was supplied.",
+      "The driver derived a per-account allocator from a fixed OS path, verified it owner-only and disjoint from live ACP state, and planned every generated path against both live ACP state and the synthetic baseline before and after creation.",
   },
   {
     condition: "The probe may not address the canonical conversation",
-    status: "CHECKED_BY_RUN",
+    status: "ASSERTED_ONLY",
     detail:
-      "The generated probe root passed the canonical-root containment refusal before and after creation.",
+      "The generated probe root passed containment checks against the generated canonical root; the live canonical conversation root was not discovered or exercised by this artifact.",
   },
   {
     condition: "Production has to be the same set of facts afterwards",
-    status: "CHECKED_BY_RUN",
+    status: "ASSERTED_ONLY",
     detail:
-      "Before and after censuses matched for the generated synthetic baseline; live production was deliberately not read and is not covered.",
+      "Before and after censuses matched for the generated synthetic baseline; live production records were deliberately not read and an unchanged live production census is unproven.",
   },
   {
     condition: "A failure to look is not an observation of absence",
@@ -476,26 +483,57 @@ class SyntheticTelegramTransport implements TelegramBotTransport {
 }
 
 const JANITOR_SOURCE = String.raw`
-const { mkdirSync, rmSync } = require("node:fs");
-const target = process.argv[1];
+const { chmodSync, existsSync, lstatSync, mkdtempSync, rmSync } = require("node:fs");
+const { join } = require("node:path");
+const root = process.argv[1];
+let workspace = null;
 let cleaning = false;
 const clean = () => {
   if (cleaning) return;
   cleaning = true;
   try {
-    rmSync(target, { recursive: true, force: true });
+    if (workspace !== null) rmSync(workspace, { recursive: true, force: true });
     process.exit(0);
   } catch (error) {
     process.stderr.write(String(error && error.message ? error.message : error));
     process.exit(1);
   }
 };
-mkdirSync(target, { recursive: true, mode: 0o700 });
 process.stdin.resume();
 process.stdin.once("end", clean);
 process.stdin.once("error", clean);
 process.once("SIGTERM", clean);
-process.stdout.write("READY\n");
+try {
+  if (process.cwd() !== root) throw new Error("the janitor cwd was not the established allocator root");
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const rootStat = lstatSync(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error("the established allocator root is not a direct directory");
+  }
+  if (uid === null || rootStat.uid !== uid || (rootStat.mode & 0o777) !== 0o700) {
+    throw new Error("the established allocator root is not owned privately by this account");
+  }
+  workspace = mkdtempSync(join(root, "acp-655-synthetic-"));
+  chmodSync(workspace, 0o700);
+  const workspaceStat = lstatSync(workspace);
+  if (!workspaceStat.isDirectory() || workspaceStat.isSymbolicLink()) {
+    throw new Error("the exclusively created workspace is not a direct directory");
+  }
+  if (workspaceStat.uid !== uid || (workspaceStat.mode & 0o777) !== 0o700) {
+    throw new Error("the exclusively created workspace is not owned privately by this account");
+  }
+  process.stdout.write("READY " + JSON.stringify(workspace) + "\n");
+} catch (error) {
+  try {
+    if (workspace !== null && existsSync(workspace)) {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  } catch (cleanupError) {
+    process.stderr.write(String(cleanupError && cleanupError.message ? cleanupError.message : cleanupError));
+  }
+  process.stderr.write(String(error && error.message ? error.message : error));
+  process.exit(1);
+}
 `;
 
 export interface RealmJanitor {
@@ -504,23 +542,56 @@ export interface RealmJanitor {
 
 export interface JanitorOwnedRealmWorkspace {
   readonly workspace: string;
+  readonly workspaceRoot: string;
+  readonly accountHome: string;
   readonly janitor: RealmJanitor;
 }
 
+const establishDisposableWorkspaceRoot = (): { accountHome: string; workspaceRoot: string } => {
+  const location = disposableWorkspaceLocation();
+  if (!isAbsolute(location.accountHome) || !isAbsolute(location.workspaceRoot)) {
+    throw acpError(
+      ReasonCode.STATE_PATH_INSECURE,
+      "the OS account record and fixed system root did not establish absolute allocator paths",
+      { ...location },
+    );
+  }
+  const { accountHome, workspaceRoot } = location;
+  const before = assertDisposableWorkspaceRoot(accountHome, workspaceRoot);
+  if (!before.allowed) throw acpError(before.reasonCode, before.message, before.evidence);
+
+  ensurePrivateDirectory(workspaceRoot);
+  const inspection = inspectPrivatePath(workspaceRoot, "directory");
+  if (!inspection.secure) {
+    throw acpError(
+      ReasonCode.STATE_PATH_INSECURE,
+      `refusing a disposable allocator root that is not private: ${inspection.reason ?? "unknown reason"}`,
+      { ...inspection },
+    );
+  }
+
+  const after = assertDisposableWorkspaceRoot(accountHome, workspaceRoot);
+  if (!after.allowed) throw acpError(after.reasonCode, after.message, after.evidence);
+  return { accountHome, workspaceRoot };
+};
+
 /**
- * A separate process creates and owns the outer synthetic workspace.
+ * A separate process exclusively creates and owns the outer synthetic workspace.
  *
- * The path does not exist before spawn. The janitor creates it only after its ownership pipe is
- * established, then reports READY. Normal completion closes the pipe after every database handle
- * is closed; parent death closes it in the kernel, so SIGKILL cannot strand a realm between mkdir
- * and janitor setup. A machine-wide death can still leave the OS temp entry until the host cleans
- * its temp volume; no evidence is returned in that case, and a later live driver still does not
- * exist.
+ * The allocator root comes from a fixed OS path plus the effective account's uid, not HOME, TMPDIR
+ * or cwd. It is outside live ACP state and must be a direct owner-only directory before the janitor
+ * starts. The child receives an empty environment and that root as its explicit cwd, then uses
+ * mkdtemp so it cannot adopt a pre-existing path. Its ownership pipe is already established.
+ * Normal completion closes the pipe after every database handle is closed; parent death closes it
+ * in the kernel. If the janitor itself or the whole machine dies after creation, the exclusive
+ * directory can remain, but that run returns no evidence and no later run adopts or removes it.
  */
 export const createJanitorOwnedRealmWorkspace = async (): Promise<JanitorOwnedRealmWorkspace> => {
-  const workspace = join(tmpdir(), `acp-655-synthetic-${randomUUID()}`);
-  const janitor = await new Promise<RealmJanitor>((resolveJanitor, reject) => {
-    const child = spawn(process.execPath, ["-e", JANITOR_SOURCE, workspace], {
+  const { accountHome, workspaceRoot } = establishDisposableWorkspaceRoot();
+  const owned = await new Promise<{ workspace: string; janitor: RealmJanitor }>((resolveOwned, reject) => {
+    const child = spawn(process.execPath, ["-e", JANITOR_SOURCE, workspaceRoot], {
+      cwd: workspaceRoot,
+      env: {},
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stderr = "";
@@ -532,31 +603,66 @@ export const createJanitorOwnedRealmWorkspace = async (): Promise<JanitorOwnedRe
     const exited = new Promise<number | null>((resolveExit) => {
       child.once("exit", (code) => {
         resolveExit(code);
-        if (!ready) reject(new Error(`the synthetic workspace janitor exited before READY: ${code}`));
+        if (!ready) {
+          reject(acpError(
+            ReasonCode.STATE_PATH_INSECURE,
+            "the synthetic workspace janitor exited before establishing a disposable workspace",
+            { code, stderr },
+          ));
+        }
       });
     });
     child.once("error", reject);
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
-      if (!stdout.split("\n").includes("READY")) return;
-      ready = true;
-      resolveJanitor({
-        release: async () => {
-          child.stdin.end();
-          const code = await exited;
-          if (code === 0 && !existsSync(workspace)) {
-            return allow(ReasonCode.OK, undefined);
-          }
-          return deny(
-            ReasonCode.ACCEPTANCE_REALM_RESIDUE,
-            "the crash janitor did not remove the synthetic workspace",
-            { code, stderr, workspacePresent: existsSync(workspace) },
-          );
-        },
-      });
+      const line = stdout.split("\n").find((candidate) => candidate.startsWith("READY "));
+      if (!line || ready) return;
+      try {
+        const parsed = JSON.parse(line.slice("READY ".length)) as unknown;
+        if (typeof parsed !== "string" || dirname(parsed) !== workspaceRoot) {
+          throw new Error("the janitor reported a workspace outside the established allocator root");
+        }
+        const inspection = inspectPrivatePath(parsed, "directory");
+        if (!inspection.secure) {
+          throw new Error(`the janitor reported an insecure workspace: ${inspection.reason}`);
+        }
+        const workspace = parsed;
+        ready = true;
+        resolveOwned({
+          workspace,
+          janitor: {
+            release: async () => {
+              child.stdin.end();
+              const code = await exited;
+              const rootInspection = inspectPrivatePath(workspaceRoot, "directory");
+              if (code === 0 && !existsSync(workspace) && rootInspection.secure) {
+                return allow(ReasonCode.OK, undefined);
+              }
+              return deny(
+                ReasonCode.ACCEPTANCE_REALM_RESIDUE,
+                "the crash janitor did not remove the synthetic workspace",
+                {
+                  code,
+                  stderr,
+                  workspacePresent: existsSync(workspace),
+                  allocatorRootSecure: rootInspection.secure,
+                },
+              );
+            },
+          },
+        });
+      } catch (error) {
+        child.stdin.end();
+        reject(acpError(
+          ReasonCode.STATE_PATH_INSECURE,
+          "the synthetic workspace janitor did not establish the workspace it reported",
+          { error: error instanceof Error ? error.message : String(error) },
+        ));
+        return;
+      }
     });
   });
-  return { workspace, janitor };
+  return { ...owned, workspaceRoot, accountHome };
 };
 
 /**
@@ -569,25 +675,31 @@ export const runSyntheticDisposableRealmProbe = async (
 ): Promise<Decision<SyntheticDisposableRealmEvidence>> => {
   const claim = assertEvidenceClaim(options.evidenceClaim ?? REALM_EVIDENCE_CLAIM);
   if (!claim.allowed) return claim;
+  const executedEvidenceSteps = new Set<string>();
 
-  // The caller cannot name this path. That is the synthetic-first embargo in the API: there is no
-  // option through which ~/.hermes, ~/.agent-control-plane or Telegram credentials can enter.
+  // The caller cannot name this path. The driver derives it from a fixed OS path and the effective
+  // account uid, proves it is outside live ACP state and has the janitor create one private child.
+  // There is no option through which HOME, TMPDIR, cwd, ~/.hermes, ~/.agent-control-plane or
+  // Telegram credentials can enter.
   let ownedWorkspace: JanitorOwnedRealmWorkspace;
   try {
     ownedWorkspace = await createJanitorOwnedRealmWorkspace();
   } catch (error) {
+    if (isAcpError(error)) {
+      return deny(error.reasonCode, error.message, error.evidence);
+    }
     return deny(
       ReasonCode.INTERNAL_ERROR,
-      "the synthetic workspace janitor could not start",
+      "the synthetic workspace janitor could not establish a disposable workspace",
       { error: error instanceof Error ? error.message : String(error) },
     );
   }
-  const { workspace, janitor } = ownedWorkspace;
+  const { workspace, accountHome, janitor } = ownedWorkspace;
+  executedEvidenceSteps.add("WORKSPACE_DISPOSABILITY_ESTABLISHED");
   let production: ControlPlane | null = null;
   let realm: ControlPlane | null = null;
   let listener: Awaited<ReturnType<typeof startTelegramLongPollListener>> | null = null;
   let residueWasPresent = false;
-  const executedEvidenceSteps = new Set<string>();
 
   const execute = async (): Promise<Decision<SyntheticDisposableRealmObservation>> => {
     try {
@@ -611,14 +723,23 @@ export const runSyntheticDisposableRealmProbe = async (
     mkdirSync(canonicalTargetRoot, { recursive: true, mode: 0o700 });
     production = new ControlPlane(controlPlaneConfig(fakeProductionRoot));
 
-    const planned = planDisposableRealm({
+    const livePlanned = planDisposableRealm({
+      home: accountHome,
+      paths,
+      probeTargetRoot,
+      canonicalTargetRoot,
+    });
+    if (!livePlanned.allowed) {
+      return livePlanned as Decision<SyntheticDisposableRealmObservation>;
+    }
+    const syntheticPlanned = planDisposableRealm({
       home: fakeHome,
       paths,
       probeTargetRoot,
       canonicalTargetRoot,
     });
-    if (!planned.allowed) {
-      return planned as Decision<SyntheticDisposableRealmObservation>;
+    if (!syntheticPlanned.allowed) {
+      return syntheticPlanned as Decision<SyntheticDisposableRealmObservation>;
     }
 
     const before = options.fault === "BEFORE_CENSUS_UNOBSERVABLE"
@@ -634,14 +755,23 @@ export const runSyntheticDisposableRealmProbe = async (
     mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
     // Re-plan after creation. The safety module names a link introduced between plan and use as a
     // limit; closing the ordinary create-time window here keeps this driver on the checked side.
-    const createdPlan = planDisposableRealm({
+    const liveCreatedPlan = planDisposableRealm({
+      home: accountHome,
+      paths,
+      probeTargetRoot,
+      canonicalTargetRoot,
+    });
+    if (!liveCreatedPlan.allowed) {
+      return liveCreatedPlan as Decision<SyntheticDisposableRealmObservation>;
+    }
+    const syntheticCreatedPlan = planDisposableRealm({
       home: fakeHome,
       paths,
       probeTargetRoot,
       canonicalTargetRoot,
     });
-    if (!createdPlan.allowed) {
-      return createdPlan as Decision<SyntheticDisposableRealmObservation>;
+    if (!syntheticCreatedPlan.allowed) {
+      return syntheticCreatedPlan as Decision<SyntheticDisposableRealmObservation>;
     }
     executedEvidenceSteps.add("REALM_PATHS_ISOLATED");
     executedEvidenceSteps.add("NONCANONICAL_PROBE_TARGET");

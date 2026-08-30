@@ -377,6 +377,48 @@ export const planDisposableRealm = (request: RealmRequest): Decision<RealmPaths>
   }
 };
 
+/**
+ * Whether the allocator above a realm is separate from the host's live ACP state.
+ *
+ * The realm planner checks every path the realm will write, but the allocator matters too: it is
+ * the directory a janitor is allowed to create children in and the authority from which a caller
+ * could otherwise substitute a live tree. Check containment in both directions so neither an
+ * allocator inside production nor an allocator broad enough to contain production can be called
+ * disposable. Both paths are settled before comparison; an inherited spelling is not evidence
+ * about where either path actually lands.
+ */
+export const assertDisposableWorkspaceRoot = (
+  home: string,
+  workspaceRoot: string,
+): Decision<void> => {
+  if (!isAbsolute(home) || !isAbsolute(workspaceRoot)) {
+    return deny(
+      ReasonCode.INVALID_ARGUMENT,
+      "the account home and disposable workspace root have to be absolute paths",
+      { home, workspaceRoot },
+    );
+  }
+  try {
+    const production = settled(productionRoot(home));
+    const workspace = settled(workspaceRoot);
+    if (within(production, workspace) || within(workspace, production)) {
+      return deny(
+        ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED,
+        "the disposable workspace allocator shares a path with live ACP production state",
+        { production, workspace },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
+  } catch (error) {
+    if (!(error instanceof UnresolvablePath)) throw error;
+    return deny(
+      ReasonCode.ACCEPTANCE_REALM_UNRESOLVABLE,
+      "the disposable workspace allocator could not be resolved, so its isolation is unknown",
+      { path: error.path, code: error.code },
+    );
+  }
+};
+
 const planResolvedRealm = (request: RealmRequest): Decision<RealmPaths> => {
   const production = settled(productionRoot(request.home));
   // The sidecars are where a WAL database's writes land — this file says so itself, in the census
@@ -624,7 +666,8 @@ export const mayTerminate = (owned: readonly OwnedProcess[], candidate: OwnedPro
  * was observed and what gets claimed is where an acceptance run stops being evidence.
  */
 export const REALM_EVIDENCE_CLAIM =
-  "A disposable ACP instance in a UUID OS-temp workspace admitted and DIRECT-classified two " +
+  "A disposable ACP instance in an exclusively created, driver-established private workspace " +
+  "outside live ACP production state admitted and DIRECT-classified two " +
   "synthetic Telegram updates through the production poll-and-router entry, invoked a " +
   "driver-owned direct callback, sent both callback replies through an injected transport, and " +
   "persisted matching APPLIED ingress reply records. The bound actor, production CEO path, " +

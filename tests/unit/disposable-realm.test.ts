@@ -11,6 +11,7 @@ import {
   type ProductionCensus,
   type RealmPaths,
   REALM_EVIDENCE_CLAIM,
+  assertDisposableWorkspaceRoot,
   assertProductionUnchanged,
   censusDatabaseFamily,
   censusProduction,
@@ -72,6 +73,35 @@ const request = (home: string, overrides: Partial<Parameters<typeof planDisposab
 };
 
 describe("a realm that shares a path with production is not a realm", () => {
+  it("refuses a workspace allocator root inside production", () => {
+    const home = fakeHome();
+    const decision = assertDisposableWorkspaceRoot(
+      home,
+      join(productionRoot(home), "disposable-realms"),
+    );
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+
+  it("refuses a workspace allocator root that contains production", () => {
+    const home = fakeHome();
+    const decision = assertDisposableWorkspaceRoot(home, home);
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe(ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED);
+  });
+
+  it("accepts a workspace allocator root beside production", () => {
+    const home = fakeHome();
+    const decision = assertDisposableWorkspaceRoot(
+      home,
+      join(home, ".agent-control-plane-disposable-realms"),
+    );
+
+    expect(decision.allowed).toBe(true);
+  });
+
   it("accepts a realm that is separate in every path", () => {
     const home = fakeHome();
     expect(planDisposableRealm(request(home)).allowed).toBe(true);
@@ -558,6 +588,7 @@ describe("cleanup terminates only what this run started", () => {
 
 describe("the evidence claim is bounded in the code, not in the write-up", () => {
   it("says what was observed and what was not", () => {
+    expect(REALM_EVIDENCE_CLAIM).toContain("driver-established private workspace");
     expect(REALM_EVIDENCE_CLAIM).toContain("driver-owned direct callback");
     expect(REALM_EVIDENCE_CLAIM).toContain("APPLIED ingress reply records");
     expect(REALM_EVIDENCE_CLAIM).toContain("bound actor");

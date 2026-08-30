@@ -1,8 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
+import { dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { describe, expect, it } from "vitest";
+
+import { disposableWorkspaceLocation } from "../../src/core/disposable-workspace-root.ts";
 
 const driver = fileURLToPath(
   new URL("../../src/acceptance/disposable-realm-driver.ts", import.meta.url),
@@ -53,14 +56,17 @@ describe("the disposable realm crash janitor", () => {
       { cwd: fileURLToPath(new URL("../..", import.meta.url)) },
     );
 
+    let workspace: string | null = null;
     try {
-      const workspace = await waitForWorkspace(child);
+      workspace = await waitForWorkspace(child);
+      expect(dirname(workspace)).toBe(disposableWorkspaceLocation().workspaceRoot);
       expect(existsSync(workspace)).toBe(true);
       child.kill("SIGKILL");
 
       expect(await waitUntilAbsent(workspace)).toBe(true);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      if (workspace && existsSync(workspace)) rmSync(workspace, { recursive: true, force: true });
     }
   });
 });

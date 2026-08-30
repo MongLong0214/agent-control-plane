@@ -4,7 +4,8 @@
  *
  * There is intentionally no live mode, credential option, target selector or state-directory
  * argument. The driver generates two updates, a fake production baseline and a noncanonical
- * target inside one OS-temp workspace, then removes the workspace before printing evidence.
+ * target inside one exclusively-created private workspace outside live ACP state, then removes
+ * the workspace before printing evidence.
  */
 import { runSyntheticDisposableRealmProbe } from "../src/acceptance/disposable-realm-driver.ts";
 

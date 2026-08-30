@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { userInfo } from "node:os";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
@@ -6,12 +8,15 @@ import { describe, expect, it } from "vitest";
 import {
   REALM_EVIDENCE_CLAIM,
   type OwnedProcess,
+  productionRoot,
 } from "../../src/acceptance/disposable-realm.ts";
 import {
   assertCleanupCandidatesOwned,
   assertEvidenceStepsExecuted,
+  createJanitorOwnedRealmWorkspace,
   runSyntheticDisposableRealmProbe,
 } from "../../src/acceptance/disposable-realm-driver.ts";
+import { disposableWorkspaceLocation } from "../../src/core/disposable-workspace-root.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 
 describe("the disposable realm driver", () => {
@@ -21,7 +26,36 @@ describe("the disposable realm driver", () => {
       "utf8",
     );
 
-    expect(source).not.toMatch(/process\.env|ACP_TELEGRAM_|TelegramBotApi/);
+    expect(source).not.toMatch(/process\.env|\b(?:tmpdir|homedir)\s*\(|ACP_TELEGRAM_|TelegramBotApi/);
+  });
+
+  it("establishes workspace placement without inherited HOME TMPDIR NODE_OPTIONS or cwd", async () => {
+    const hostileRoot = dirname(fileURLToPath(new URL("../../package.json", import.meta.url)));
+    const inherited = {
+      HOME: process.env["HOME"],
+      TMPDIR: process.env["TMPDIR"],
+      NODE_OPTIONS: process.env["NODE_OPTIONS"],
+    };
+    process.env["HOME"] = hostileRoot;
+    process.env["TMPDIR"] = hostileRoot;
+    process.env["NODE_OPTIONS"] = "--this-option-must-not-reach-the-janitor";
+
+    let owned: Awaited<ReturnType<typeof createJanitorOwnedRealmWorkspace>> | null = null;
+    try {
+      owned = await createJanitorOwnedRealmWorkspace();
+      expect(process.cwd()).toBe(hostileRoot);
+      expect(owned.accountHome).toBe(userInfo().homedir);
+      expect(owned.workspaceRoot).toBe(disposableWorkspaceLocation().workspaceRoot);
+      expect(dirname(owned.workspace)).toBe(owned.workspaceRoot);
+      expect(owned.workspace.startsWith(`${productionRoot(owned.accountHome)}/`)).toBe(false);
+      expect(owned.workspace.startsWith(`${hostileRoot}/`)).toBe(false);
+    } finally {
+      if (owned) expect((await owned.janitor.release()).allowed).toBe(true);
+      for (const [name, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   it("runs two synthetic messages through the production Telegram entry and removes the realm", async () => {
@@ -94,11 +128,11 @@ describe("the disposable realm driver", () => {
         },
         {
           condition: "The probe may not address the canonical conversation",
-          status: "CHECKED_BY_RUN",
+          status: "ASSERTED_ONLY",
         },
         {
           condition: "Production has to be the same set of facts afterwards",
-          status: "CHECKED_BY_RUN",
+          status: "ASSERTED_ONLY",
         },
         {
           condition: "A failure to look is not an observation of absence",

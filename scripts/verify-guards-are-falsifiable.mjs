@@ -231,6 +231,15 @@ const GUARDS = [
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
   {
+    what: "a disposable workspace allocator that shares a path with live ACP state is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    if (within(production, workspace) || within(workspace, production)) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm.test.ts::refuses a workspace allocator root inside production",
+    ],
+  },
+  {
     // Comparing declared paths passes a scratch directory that is a symlink into production.
     what: "isolation is judged on the resolved path, not the one that was typed",
     file: "src/acceptance/disposable-realm.ts",
@@ -413,8 +422,8 @@ const GUARDS = [
   {
     what: "the janitor creates the synthetic workspace after taking ownership of its cleanup pipe",
     file: "src/acceptance/disposable-realm-driver.ts",
-    find: "mkdirSync(target, { recursive: true, mode: 0o700 });",
-    replace: "void target;",
+    find: '  workspace = mkdtempSync(join(root, "acp-655-synthetic-"));',
+    replace: '  workspace = join(root, "not-created");',
     killedBy: [
       "tests/process/disposable-realm-janitor.test.ts::removes the workspace when the process holding its pipe is killed",
     ],
@@ -422,10 +431,46 @@ const GUARDS = [
   {
     what: "the crash janitor removes the synthetic workspace when its owner pipe closes",
     file: "src/acceptance/disposable-realm-driver.ts",
-    find: "    rmSync(target, { recursive: true, force: true });",
-    replace: "    void target;",
+    find: "    if (workspace !== null) rmSync(workspace, { recursive: true, force: true });",
+    replace: "    if (false) rmSync(workspace, { recursive: true, force: true });",
     killedBy: [
       "tests/process/disposable-realm-janitor.test.ts::removes the workspace when the process holding its pipe is killed",
+    ],
+  },
+  {
+    what: "the disposable workspace root comes from a fixed OS path and not live ACP state",
+    file: "src/core/disposable-workspace-root.ts",
+    find: "    workspaceRoot: join(\n      systemTemporaryRoot,\n      `.agent-control-plane-disposable-realms-${account.uid}`,\n    ),",
+    replace: '    workspaceRoot: join(account.homedir, ".agent-control-plane"),',
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::establishes workspace placement without inherited HOME TMPDIR NODE_OPTIONS or cwd",
+    ],
+  },
+  {
+    what: "the workspace janitor inherits no caller environment",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "      env: {},",
+    replace: "      env: { ...process.env },",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::establishes workspace placement without inherited HOME TMPDIR NODE_OPTIONS or cwd",
+    ],
+  },
+  {
+    what: "the workspace janitor starts in the established allocator root instead of caller cwd",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "      cwd: workspaceRoot,",
+    replace: "      cwd: undefined,",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::establishes workspace placement without inherited HOME TMPDIR NODE_OPTIONS or cwd",
+    ],
+  },
+  {
+    what: "the reviewer cannot read the disposable realm allocator",
+    file: "src/runtime/cli-adapters.ts",
+    find: "    disposableWorkspaceRoot,",
+    replace: "",
+    killedBy: [
+      "tests/unit/reviewer-transcript-isolation.test.ts::places disposable allocator denials after the temporary write allowance",
     ],
   },
   {
