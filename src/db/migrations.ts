@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 32;
+export const SCHEMA_VERSION = 33;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2138,21 +2138,8 @@ const v31: SchemaMigration = {
  * above it), and `resumeProject` performs the identical check inline so it self-heals even
  * before the next restart, rather than depending on reconcile() having already run.
  *
- * The id is `v33`, not `v32`, while `fromVersion`/`toVersion` below still read 31/32: #701
- * (id `v32-a-source-can-only-cite-its-turns-own-claim-event`) is ahead of this PR in the merge
- * queue and will land on `main` as the real v31->32 step first. The id string is the part
- * `verify-migrations-are-immutable.mjs` freezes once a database has actually run it — nothing
- * has, yet, so renaming it now is free, and it is the last moment that is true. The numeric
- * fields cannot be bumped to 32/33 in the same commit: nothing in this branch bridges 31->32
- * (that bridge is #701's migration, which does not exist here until #701 merges and this branch
- * merges `main` again on top of it), and `migrationChainFrom` throws "no ordered migration is
- * defined" for exactly that gap — confirmed by trying it: 6 of 13
- * `database-migration-restore.test.ts` cases fail with that message the moment `fromVersion`
- * here reads 32 instead of 31. Whoever resolves the merge conflict this creates once #701 lands
- * must bump `fromVersion` to 32 and `toVersion` to 33 (and `SCHEMA_VERSION` to 33) then, not
- * before — that is a distinct, later step, not a rename.
  */
-const V32_DDL = `
+const V33_DDL = `
   ALTER TABLE sessions ADD COLUMN draining_cause TEXT
     CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT'));
   ALTER TABLE sessions ADD COLUMN draining_stop_pid INTEGER;
@@ -2160,8 +2147,8 @@ const V32_DDL = `
 
 const v33: SchemaMigration = {
   id: "v33-draining-remembers-its-cause",
-  fromVersion: 31,
-  toVersion: 32,
+  fromVersion: 32,
+  toVersion: 33,
   apply: (raw) => {
     // The v12/v19 replay trap: a database reconstructed through the migration chain may already
     // carry this column from a replayed CREATE TABLE, and a bare ALTER then fails with
@@ -2182,7 +2169,7 @@ const v33: SchemaMigration = {
       raw.exec(`ALTER TABLE sessions ADD COLUMN draining_stop_pid INTEGER;`);
     }
   },
-  checksum: () => sha256(`v33-draining-remembers-its-cause\n${V32_DDL}`),
+  checksum: () => sha256(`v33-draining-remembers-its-cause\n${V33_DDL}`),
 };
 
 /**
@@ -2238,8 +2225,8 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v29,
   v30,
   v31,
-  v33,
   v32,
+  v33,
 ]);
 
 interface RequiredTrigger {
