@@ -2460,6 +2460,39 @@ const GUARDS = [
     ],
   },
   {
+    // Runtime status reaches health through this value. Pinning it to running recreates the
+    // invisible stop even though the listener still emits its exact UNKNOWN state.
+    what: "UNKNOWN stop changes daemon health to stopped",
+    file: "src/daemon/agentcpd.ts",
+    find: "          running: status.running,",
+    replace: "          running: true,",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::UNKNOWN stop changes daemon health to stopped",
+    ],
+  },
+  {
+    // The durable acknowledgement is not recovery by itself. Removing this live-listener action
+    // recreates the issue: Doctor's database warning closes while the existing poller stays down.
+    what: "the exact UNKNOWN reply acknowledgement resumes the existing Telegram listener",
+    file: "src/daemon/daemon.ts",
+    find: "            await this.#telegramIngressController?.resumeAfterAcknowledgement(nonce.value);",
+    replace: "            await Promise.resolve(false);",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::exact nonce acknowledge restarts the existing listener",
+    ],
+  },
+  {
+    // Restarting the poller is not enough for Doctor to become truthful again. The recovered
+    // listener must publish that it is running so daemon health leaves the stopped state.
+    what: "Doctor stays truthful after acknowledge because ingress is running",
+    file: "src/ingress/telegram-polling.ts",
+    find: "    this.options.onRuntimeStatus?.({ running: true, stopReason: null, recoveryNonce: null });",
+    replace: "",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::Doctor stays truthful after acknowledge because ingress is running",
+    ],
+  },
+  {
     // Terminal delivery states are useful only if the inbound acknowledgement moves past them.
     // Removing this update leaves the unanswerable row visible but restores the 100-update wedge.
     what: "a terminal Telegram reply advances the inbound offset",

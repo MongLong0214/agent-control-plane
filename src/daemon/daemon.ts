@@ -359,6 +359,13 @@ export interface IngressChannelStatus {
   configured: boolean;
   running: boolean;
   disabledReason: string | null;
+  /** Exact terminal reply whose acknowledgement can resume this live listener, when there is one. */
+  recoveryNonce?: string | null;
+}
+
+/** The one live ingress action an authenticated terminal-reply acknowledgement may trigger. */
+export interface TelegramIngressController {
+  resumeAfterAcknowledgement(nonce: string): Promise<boolean>;
 }
 
 /**
@@ -386,6 +393,7 @@ export class Daemon {
   // Unset until `main`'s composition root reports Telegram's outcome — `null` renders in
   // `health.json` as "this daemon has no opinion yet", distinct from `configured: false`.
   #telegramIngress: IngressChannelStatus | null = null;
+  #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
@@ -510,7 +518,11 @@ export class Daemon {
           if (target !== undefined && target !== null && typeof target !== "string") {
             return invalidOperatorParam("target", target);
           }
-          return allow(ReasonCode.OK, await this.cp.doctor.run(scope, target as string | undefined));
+          return allow(ReasonCode.OK, await this.cp.doctor.run(
+            scope,
+            target as string | undefined,
+            scope === "system" ? this.telegramIngressFindings() : [],
+          ));
         }
 
         case OPERATOR_METHOD.RUN_SHOW: {
@@ -688,12 +700,26 @@ export class Daemon {
           if (!reasonCode.allowed) return reasonCode;
           const evidenceDigest = requiredOperatorString(request.params, "evidenceDigest");
           if (!evidenceDigest.allowed) return evidenceDigest;
-          return acknowledgeTerminalTelegramReply(this.cp.db, this.cp.clock, this.cp.audit, {
+          const acknowledged = acknowledgeTerminalTelegramReply(this.cp.db, this.cp.clock, this.cp.audit, {
             nonce: nonce.value,
             resolvedBy: peer.actor,
             reasonCode: reasonCode.value,
             evidenceDigest: evidenceDigest.value,
           });
+          if (!acknowledged.allowed) return acknowledged;
+
+          // Choose recovery over process exit here because this authenticated, exact-nonce
+          // acknowledgement is already the operator decision UNKNOWN delivery requires. The
+          // listener keeps the live daemon composition and can safely redeliver the inbound
+          // update: its terminal reply remains UNRESOLVED and is never sent again. If the process
+          // dies after the durable acknowledgement but before this call, its supervisor starts a
+          // fresh listener, which reaches the same durable no-resend state and advances normally.
+          // A different nonce must not revive this stop: it says nothing about the ambiguous send
+          // that caused it.
+          if (acknowledged.value.deliveryStatus === "UNRESOLVED") {
+            await this.#telegramIngressController?.resumeAfterAcknowledgement(nonce.value);
+          }
+          return acknowledged;
         }
 
         case OPERATOR_METHOD.CONVERSATION_ADJUDICATE: {
@@ -1498,14 +1524,43 @@ export class Daemon {
   }
 
   /**
-   * Recorded once, right after `main`'s composition root decides Telegram's outcome (started,
-   * refused, or never configured), and written into `health.json` immediately rather than
-   * waiting for the next periodic `writeHealth` — a daemon that comes up and sits idle for a
-   * while must not report a stale "no opinion yet" the whole time.
+   * Recorded whenever the composition root or live listener changes Telegram's state, and
+   * written into `health.json` immediately rather than waiting for the next periodic tick. A
+   * listener that stops after startup must replace its earlier running state just as promptly.
    */
   setTelegramIngressStatus(status: IngressChannelStatus): void {
     this.#telegramIngress = status;
     this.writeHealth(null);
+  }
+
+  /** Installs the controller before operator acknowledgement can be used to recover this listener. */
+  attachTelegramIngressController(controller: TelegramIngressController): void {
+    this.#telegramIngressController = controller;
+  }
+
+  /** A closing old listener cannot detach a replacement installed after it. */
+  detachTelegramIngressController(controller: TelegramIngressController): void {
+    if (this.#telegramIngressController === controller) this.#telegramIngressController = null;
+  }
+
+  private telegramIngressFindings(): Finding[] {
+    const status = this.#telegramIngress;
+    if (!status?.configured || status.running) return [];
+    return [{
+      code: "TELEGRAM_INGRESS_STOPPED",
+      severity: "ERROR",
+      scope: "telegram",
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: {
+        running: false,
+        disabledReason: status.disabledReason,
+        ...(status.recoveryNonce ? { recoveryNonce: status.recoveryNonce } : {}),
+      },
+      recommendedAction: status.recoveryNonce
+        ? `inspect the UNKNOWN Telegram send, then run agentctl telegram reply acknowledge ${status.recoveryNonce} <reason-code> <evidence-digest> to resume this listener`
+        : "correct the reported Telegram ingress condition and restart the daemon",
+    }];
   }
 
   /**
