@@ -579,6 +579,24 @@ describe("attested continuity survival (#649 S2)", () => {
   it("replaces when the actor runtime moves after planning but before the switch transaction", async () => {
     const plane = makePlane();
     const before = bindCeoSessionWithTarget(plane);
+    const runId = "run_pre_switch_bound";
+    plane.cp.db.run(
+      `INSERT INTO runs (run_id, project_id, kind, execution_mode, priority, state, goal, contract_digest,
+                         owner_session_id, owner_binding_generation, owner_session_incarnation, owner_role_key,
+                         created_at, dispatched_at)
+       VALUES (?, NULL, 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        runId,
+        "pre-switch bound run",
+        "sha256:pre-switch-bound-run",
+        before.boundSessionId,
+        before.bindingGeneration,
+        before.boundSessionIncarnation,
+        before.roleKey,
+        plane.clock.nowIso(),
+        plane.clock.nowIso(),
+      ],
+    );
     const racedRuntime = plane.cp.sessions.create({ provider: "gpt", model: "race" });
     plane.cp.sessions.transition(racedRuntime.sessionId, SessionLifecycle.READY, "test race runtime");
     plane.gpt.setCapacity(reading("gpt", plane.clock, [{ id: "rolling", remainingPercent: 90, resetAt: null, capabilities: FULL }]));
@@ -605,6 +623,18 @@ describe("attested continuity survival (#649 S2)", () => {
       const after = plane.cp.bindings.active(roleKeyFor(Role.CEO))!;
       expect(after.bindingGeneration).toBe(before.bindingGeneration + 1);
       expect(after.assignmentId).not.toBe(before.assignmentId);
+      const repointed = plane.cp.runs.require(runId);
+      expect(repointed).toMatchObject({
+        state: "ACTIVE",
+        ownerSessionId: after.boundSessionId,
+        ownerSessionIncarnation: after.boundSessionIncarnation,
+        ownerBindingGeneration: after.bindingGeneration,
+        ownerRoleKey: after.roleKey,
+      });
+      expect(repointed).not.toMatchObject({
+        ownerSessionId: before.boundSessionId,
+        ownerBindingGeneration: before.bindingGeneration,
+      });
     } finally {
       switchTo.mockRestore();
     }

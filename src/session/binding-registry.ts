@@ -1094,7 +1094,7 @@ export class BindingRegistry {
       `SELECT run_id, state FROM runs
         WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
           AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
-      [binding.sessionId, binding.bindingGeneration, binding.roleKey, ...LIVE_RUN_STATES],
+      [binding.boundSessionId, binding.bindingGeneration, binding.roleKey, ...LIVE_RUN_STATES],
     );
   }
 }
