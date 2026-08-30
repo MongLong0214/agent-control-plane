@@ -235,15 +235,27 @@ const unquoteIdent = (raw) => {
  * asked this side the same question and a hand check of the real schema.sql found none of these
  * forms currently in use, which is exactly the situation a check that only recognises them by luck
  * is supposed to outlive.
+ *
+ * v4 (post-review, round 4): a blind review confirmed two declarations SQLite accepts and this
+ * regex missed outright — `CREATE/**\/TABLE foo (` (a comment is whitespace to SQLite at *any*
+ * keyword boundary, exactly the "Finding 1" lesson `WS` already encodes for writes, but this
+ * regex still required literal `\s+`) and `CREATE TABLE main.foo (` (a schema-qualified name,
+ * which `TABLE_REF` already tolerates on the write side). Either form used to declare a new
+ * satellite meant that table entered nothing: not `governedTables`, not the `OWNERS` census, not
+ * the writer scan — a silent blind spot one step upstream of the writer regex it took three
+ * rounds to harden. Matched here against `stripSqlComments(schema)` (comments blanked to spaces,
+ * so a literal `\s+` now sees what SQLite sees) with an optional schema qualifier before the name,
+ * mirroring `TABLE_REF`.
  */
 const schema = readFileSync(join(ROOT, "src/db/schema.sql"), "utf8");
+const strippedSchema = stripSqlComments(schema);
 const CREATE_TABLE = new RegExp(
-  String.raw`CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(${IDENT})\s*\(`,
+  String.raw`CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:${IDENT}\s*\.\s*)?(${IDENT})\s*\(`,
   "gi",
 );
 const governedTables = [
   ...new Set(
-    [...schema.matchAll(CREATE_TABLE)]
+    [...strippedSchema.matchAll(CREATE_TABLE)]
       .map((m) => unquoteIdent(m[1]))
       .filter((name) => /^(?:canonical_turn\w*|actor_target_\w+)$/i.test(name)),
   ),
@@ -284,6 +296,30 @@ if (unowned.length > 0) {
   process.stdout.write(
     `RESULT: FAIL — the schema declares ${unowned.join(", ")} and this census has no owner entry ` +
       "for it. A table this file has never heard of is a table nothing here is watching.\n",
+  );
+  process.exit(1);
+}
+
+/**
+ * v4 (post-review, round 4), the other half of the same one-directional check the blind review
+ * named: the loop below (`staleOwners`) only visits tables still in `governedTables`, so it can
+ * only notice an owner that stopped writing a table the schema *still declares*. It never visits
+ * an `OWNERS` key for a table the schema no longer declares at all — that key just sits here,
+ * unexamined, for as long as nobody happens to delete it by hand. The risk that names is concrete:
+ * if a table is dropped and the same name is reintroduced later (a rename undone, a satellite
+ * rebuilt), this stale key would let the *previous* table's owner list stand as if it had already
+ * been reviewed for the new table — no fresh review required, because nothing here ever asked
+ * whether the key it was trusting still corresponded to a real table. So this checks the reverse
+ * direction explicitly: every `OWNERS` key must name a table the schema currently declares, empty
+ * writer list (`actor_target_attestations`) included, because an empty list is still a key someone
+ * would have to have decided to keep.
+ */
+const orphanedOwners = Object.keys(OWNERS).filter((table) => !governedTables.includes(table));
+if (orphanedOwners.length > 0) {
+  process.stdout.write(
+    `RESULT: FAIL — OWNERS names ${orphanedOwners.join(", ")}, which the schema no longer declares. ` +
+      "An owner entry for a table that no longer exists is unreviewed cover for whatever table gets " +
+      "that name next. Delete the entry, or rename it to the table that replaced it.\n",
   );
   process.exit(1);
 }
@@ -359,6 +395,22 @@ const unresolvable = [];
  * Scans one file's already-comment-stripped content for `WRITE` matches and records them, shared
  * between the `.ts` walk below and `schema.sql` (Finding 2) so both go through one path rather
  * than two copies of the same match-handling logic drifting apart.
+ *
+ * v4 (post-review, round 4): `IDENT`'s bare-identifier alternative is `[A-Za-z_]\w*` — a character
+ * class that does not, and cannot, include `$`. Fed a template literal whose table name has a
+ * *static prefix* followed by an interpolation — `` `UPDATE canonical_turn_${suffix} SET …` `` —
+ * the regex does not fail to match, the way it does for a name with no static prefix at all
+ * (`` `${table}` ``, already routed to `unresolvable` below). It succeeds, greedily, capturing only
+ * the prefix (`canonical_turn_`) and stopping exactly where `$` breaks the character class. That
+ * prefix does not equal any governed table's name, so the write was previously dropped as a
+ * resolved-but-unmatched reference — indistinguishable from a typo or an unrelated table — even
+ * though `suffix === "s"` makes it a live write to `canonical_turns` in production
+ * (`src/db/database.ts`'s `Db.run`). A blind review reproduced this and named it precisely: being
+ * confidently wrong about a truncated name is worse than the honest "cannot resolve" this file
+ * already prints for a name with no static part, because a wrong-but-plausible answer does not
+ * look like a gap. So a captured identifier immediately followed by `${` is not a different,
+ * smaller table name — it is the same truncation-at-`$`, one interpolation later than the
+ * no-static-prefix case, and is routed to the same `unresolvable` path rather than resolved.
  */
 const scanForWrites = (file, content) => {
   for (const match of content.matchAll(WRITE)) {
@@ -366,8 +418,14 @@ const scanForWrites = (file, content) => {
     // own group number (1-4) rather than sharing one — only the branch that actually matched has a
     // defined group, so the table name is whichever of the four is not `undefined`.
     const capturedTable = match[1] ?? match[2] ?? match[3] ?? match[4];
-    if (capturedTable === undefined) {
-      const after = content.slice(match.index + match[0].length, match.index + match[0].length + 40).replace(/\s+/g, " ").trim();
+    const matchEnd = match.index + match[0].length;
+    // `IDENT`'s bare alternative stops at `$` rather than failing outright, so a name like
+    // `canonical_turn_${suffix}` reads as a complete match on the static prefix alone unless this
+    // checks what comes right after it. No other legal SQL token follows a table reference with
+    // `${` glued on with zero separating whitespace, so this is unambiguous, not a heuristic guess.
+    const truncatedByInterpolation = capturedTable !== undefined && content.slice(matchEnd, matchEnd + 2) === "${";
+    if (capturedTable === undefined || truncatedByInterpolation) {
+      const after = content.slice(matchEnd, matchEnd + 40).replace(/\s+/g, " ").trim();
       unresolvable.push({ file, verb: match[0].trim(), after });
       continue;
     }
@@ -389,7 +447,7 @@ for (const file of files) {
  * so this file's own trigger doc comments — which quote past defective SQL verbatim — do not read
  * as a live write.
  */
-scanForWrites("src/db/schema.sql", stripSqlComments(schema));
+scanForWrites("src/db/schema.sql", strippedSchema);
 
 const residual = [];
 const staleOwners = [];
@@ -413,9 +471,30 @@ const report = governedTables
   })
   .join("\n");
 
+/**
+ * v4 (post-review, round 4): a blind review named a shape no static regex can close — a write
+ * whose keyword is assembled at the source-text level rather than written contiguously, e.g.
+ * `"UP" + "DATE canonical_turns "` (which SQLite still executes as `UPDATE canonical_turns …`
+ * once the strings concatenate at runtime, but which never contains the contiguous substring
+ * `UPDATE` for `WRITE` to match). This is a different defect shape from every fix above: those
+ * were all cases where the *table name* could not be resolved even though the *statement* was
+ * plainly visible as a write. This is a case where the statement itself is not visible as
+ * contiguous SQL-shaped text at all, so `WRITE` never fires and nothing is added to `residual`,
+ * `unresolvable`, or the counts above — a silent zero indistinguishable from a real one. Actually
+ * catching it would mean evaluating string concatenation (and arbitrary computation feeding it),
+ * which is not a regex problem and is explicitly out of scope for this fix. Printed on every run,
+ * pass or fail, so "0 writes found" here is never read as "0 writes exist, in every shape a write
+ * could take."
+ */
+const SCOPE_NOTE =
+  "SCOPE: this census matches SQL keywords and table names as contiguous source text. A write " +
+  'whose keyword is assembled from parts (e.g. `"UP" + "DATE " + table`) rather than written as ' +
+  "one contiguous token is not visible to this scan and is not represented in the counts above — " +
+  "this file finds zero writers for a statement built that way, not zero writers of that shape.";
+
 if (unresolvable.length > 0) {
   process.stdout.write(
-    `${report}\n\n` +
+    `${report}\n${SCOPE_NOTE}\n\n` +
       unresolvable
         .map(
           ({ file, verb, after }) =>
@@ -434,7 +513,7 @@ if (unresolvable.length > 0) {
 
 if (staleOwners.length > 0) {
   process.stdout.write(
-    `${report}\n\n` +
+    `${report}\n${SCOPE_NOTE}\n\n` +
       staleOwners
         .map(
           ({ table, owner }) =>
@@ -450,7 +529,7 @@ if (staleOwners.length > 0) {
 
 if (residual.length > 0) {
   process.stdout.write(
-    `${report}\n\n` +
+    `${report}\n${SCOPE_NOTE}\n\n` +
       residual
         .map(
           ({ table, file }) =>
@@ -470,7 +549,7 @@ if (residual.length > 0) {
 
 const totalWriters = governedTables.reduce((n, t) => n + new Set(writesByTable.get(t)).size, 0);
 process.stdout.write(
-  `${report}\n\n` +
+  `${report}\n${SCOPE_NOTE}\n\n` +
     `RESULT: PASS — ${governedTables.length} governed table(s), ${totalWriters} writer file ` +
     "reference(s), every one inside its table's owner list, 0 unresolved write(s). residual: 0.\n",
 );

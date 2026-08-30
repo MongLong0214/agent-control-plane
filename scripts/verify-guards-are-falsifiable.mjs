@@ -1283,8 +1283,20 @@ const GUARDS = [
     // real all-clear; this census has to say the write exists and could not be verified.
     what: "the turn-fence writer census reports a write it could not resolve to a static table name",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: "    if (capturedTable === undefined) {",
+    find: "    if (capturedTable === undefined || truncatedByInterpolation) {",
     replace: "    if (false) {",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // Round 4 of #676: `IDENT`'s bare alternative cannot include `$`, so `canonical_turn_${suffix}`
+    // matched as a complete, static `canonical_turn_` — a table no census table equals — rather
+    // than failing to resolve at all. Disabling this check reopens exactly that: a table name
+    // truncated by a template placeholder silently resolves to whatever it happens to share
+    // letters with instead of landing in `unresolvable`.
+    what: "the turn-fence writer census treats a table name truncated by a template placeholder as unresolved",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: 'const truncatedByInterpolation = capturedTable !== undefined && content.slice(matchEnd, matchEnd + 2) === "${";',
+    replace: "const truncatedByInterpolation = false;",
     killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
   },
   {
@@ -1327,7 +1339,7 @@ const GUARDS = [
     // a writer this census can never see no matter how long it sits in a trigger body.
     what: "the turn-fence writer census also scans schema.sql, not just src/**.ts",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: 'scanForWrites("src/db/schema.sql", stripSqlComments(schema));',
+    find: 'scanForWrites("src/db/schema.sql", strippedSchema);',
     replace: "",
     killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
   },
@@ -1337,8 +1349,44 @@ const GUARDS = [
     // schema.sql without stripping its own comments first reads that prose as a live write.
     what: "the turn-fence writer census strips schema.sql's own comments before scanning it",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: 'scanForWrites("src/db/schema.sql", stripSqlComments(schema));',
+    find: 'scanForWrites("src/db/schema.sql", strippedSchema);',
     replace: 'scanForWrites("src/db/schema.sql", schema);',
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // Round 4, finding 2: `CREATE_TABLE` used to be matched against raw `schema`, so a comment
+    // sitting between `CREATE` and `TABLE` (whitespace to SQLite, confirmed against system SQLite)
+    // defeated the literal `\s+` this pattern requires, and the table it declared entered nothing
+    // — not `governedTables`, not `OWNERS`, not the writer scan. Matching against raw `schema`
+    // again reopens exactly that blind spot for table *discovery*, one step upstream of the writer
+    // regex `WS` already protects.
+    what: "the turn-fence writer census discovers a CREATE TABLE with a comment at a keyword boundary",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "[...strippedSchema.matchAll(CREATE_TABLE)]",
+    replace: "[...schema.matchAll(CREATE_TABLE)]",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // Round 4, finding 2, the other missed spelling: `CREATE TABLE main.foo (` is a schema-qualified
+    // declaration SQLite accepts identically to an unqualified one. Without the optional qualifier
+    // here, a satellite declared that way is invisible to table discovery the same way an
+    // unqualified writer reference would be invisible without `TABLE_REF`'s own qualifier support.
+    what: "the turn-fence writer census discovers a schema-qualified CREATE TABLE declaration",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "(?:${IDENT}\\s*\\.\\s*)?(${IDENT})\\s*\\(`,",
+    replace: "(${IDENT})\\s*\\(`,",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // Round 4, finding 3: the `staleOwners` loop only ever visits tables still in `governedTables`,
+    // so an `OWNERS` key for a table the schema no longer declares at all was never visited by
+    // anything — it would sit unexamined, and if the same table name were ever reintroduced, that
+    // stale key would stand in as if a fresh review had already covered it. Disabling this check
+    // reopens exactly that.
+    what: "the turn-fence writer census fails when OWNERS names a table the schema no longer declares",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "if (orphanedOwners.length > 0) {",
+    replace: "if (false) {",
     killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
   },
   {

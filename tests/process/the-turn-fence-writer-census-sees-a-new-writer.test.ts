@@ -325,4 +325,114 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
     expect(done.stdout).toContain("residual: 0");
     expect(done.status).toBe(0);
   });
+
+  /**
+   * Round 4 of #676: a blind review found the "unresolvable" path itself defeatable. `IDENT`'s bare
+   * alternative (`[A-Za-z_]\w*`) cannot include `$`, so a table name with a *static prefix* followed
+   * by a template placeholder — `canonical_turn_${suffix}` — does not fail to match the way a name
+   * with no static part at all does (`${table}`, already covered above). It matches the prefix alone,
+   * which does not equal any governed table's name, so the write used to vanish as a silently
+   * unresolved-but-not-reported reference. With `suffix === "s"` in production this is a live write to
+   * `canonical_turns`. A truncated prefix must land in the same loud `unresolvable` path as a name
+   * with no static part, not resolve to whatever it happens to share letters with.
+   */
+  it("treats a table name truncated by a template placeholder as unresolved, not a coincidentally similar table", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "rogue-truncated-template-676.ts",
+      'const suffix = "s"; db.run(`UPDATE canonical_turn_${suffix} SET lifecycle_state = ?`, [turnRequestId]);',
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("src/probe/rogue-truncated-template-676.ts");
+    expect(done.stdout).toContain("not a static table name this census can read");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.stdout).toContain("could not resolve");
+    expect(done.status).toBe(1);
+  });
+
+  /**
+   * Round 4, finding 2: `CREATE_TABLE`'s old pattern required literal `\s+` at every keyword
+   * boundary and a bare identifier with no schema qualifier — so a table declared as
+   * `CREATE/**\/TABLE foo (` (a comment is whitespace to SQLite at any boundary, confirmed against
+   * system SQLite the same way the writer-side `WS` fix was) or `CREATE TABLE main.foo (`
+   * (schema-qualified, which the writer side already tolerates via `TABLE_REF`) entered nothing:
+   * not `governedTables`, not `OWNERS`, not the writer scan. Both forms are probed here — the new
+   * table must at least be *seen* (and, having no `OWNERS` entry, must fail as unowned) rather than
+   * silently absent from an 8-table PASS.
+   */
+  it("discovers a governed table declared with an SQL comment between CREATE and TABLE", () => {
+    const repo = scratchRepo();
+    appendFileSync(
+      join(repo, "src/db/schema.sql"),
+      "\nCREATE/**/TABLE IF NOT EXISTS canonical_turn_probe_676a (\n  turn_request_id TEXT PRIMARY KEY\n);\n",
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("canonical_turn_probe_676a");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.stdout).toContain("no owner entry");
+    expect(done.status).toBe(1);
+  });
+
+  it("discovers a governed table declared with a schema-qualified name", () => {
+    const repo = scratchRepo();
+    appendFileSync(
+      join(repo, "src/db/schema.sql"),
+      "\nCREATE TABLE main.canonical_turn_probe_676b (\n  turn_request_id TEXT PRIMARY KEY\n);\n",
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("canonical_turn_probe_676b");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.stdout).toContain("no owner entry");
+    expect(done.status).toBe(1);
+  });
+
+  /**
+   * Round 4, finding 3: the `staleOwners` loop only ever visits tables still in `governedTables`, so
+   * it can only notice an owner that stopped writing a table the schema *still declares*. An `OWNERS`
+   * key for a table the schema no longer declares at all was never visited by anything — it would sit
+   * unexamined until someone happened to delete it by hand, and if the same table name were ever
+   * reintroduced, that stale key would stand in as if a fresh review had already covered it. This
+   * removes the `CREATE TABLE` backing the one owner entry that is easiest to isolate
+   * (`actor_target_attestations`, already declared with zero writers) without touching `OWNERS`, so
+   * the only change is that the schema stops declaring the table the entry names.
+   */
+  it("fails when OWNERS names a table the schema no longer declares", () => {
+    const repo = scratchRepo();
+    execFileSync("node", [
+      "-e",
+      `const fs=require('fs');const p='src/db/schema.sql';let s=fs.readFileSync(p,'utf8');` +
+        `s=s.replace('CREATE TABLE IF NOT EXISTS actor_target_attestations (', ` +
+        `'CREATE TABLE IF NOT EXISTS zzz_676_removed_attestations (');` +
+        `fs.writeFileSync(p,s);`,
+    ], { cwd: repo });
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("actor_target_attestations");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.stdout).toContain("no longer declares");
+    expect(done.status).toBe(1);
+  });
+
+  it("states in its own output what it cannot see: a write whose keyword is assembled from parts", () => {
+    // The one gap round 4 chose not to close: detecting this would mean evaluating string
+    // concatenation, not matching SQL-shaped text, and is out of scope for a source-text scan. The
+    // honest response, per the review, is to say so in the check's own output rather than let a
+    // silent zero read as "no such write exists." Printed on every run, so it is checked here on the
+    // unmodified source tree's own PASS rather than a synthetic probe.
+    const repo = scratchRepo();
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("RESULT: PASS");
+    expect(done.stdout).toContain("SCOPE:");
+    expect(done.stdout).toContain("assembled from parts");
+  });
 });
