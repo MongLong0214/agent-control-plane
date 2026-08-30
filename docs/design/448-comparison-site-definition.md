@@ -1,9 +1,10 @@
 # #448 comparison site definition — stage 1 census
 
 Measured against `8622195` (`origin/main` at the start of this work). The census covered the 88
-tracked production TypeScript files under `src/`; tests, documents, scripts, and the two existing
-untracked files were not treated as production callables. The exploratory AST scripts are not part
-of this change.
+tracked production TypeScript files under `src/`; tests, documents, scripts, and untracked files
+were not treated as production callables. Run C2 is reproducible with
+`node docs/design/448-comparison-site-census.mjs --json`. That script only reports candidates E and
+F: it has no baseline or failure result and is not a package or CI entry point.
 
 ## 1. Definition
 
@@ -18,18 +19,20 @@ is no accepted site count or file:line set to turn into a static check.
 
 ## 2. Why this is the result
 
-One AST census run (`C1`, temporary uncommitted `.tmp-candidate-census.mjs`) found 2,911 callables.
-Candidate C's “controls” means an `if` or conditional expression contains a binary comparison and
-its selected branch contains `allow()` or `deny()`; this is narrower than merely finding unrelated
-expressions in one large function.
+The exact A–D counts came from C1, a temporary uncommitted script. They cannot be reproduced from
+this tree and are withdrawn rather than repeated as measurements. Their inspected samples remain
+below because each source expression is reviewable. Candidate C's “controls” means an `if` or
+conditional expression contains a binary comparison and its selected branch contains `allow()` or
+`deny()`; this is narrower than merely finding unrelated expressions in one large function.
 
 | candidate | measured population | count | disposition |
 |---|---|---:|---|
-| A | callable with an explicit return annotation containing `Decision<T>` | 343 | Too broad and annotation-dependent. |
-| B | callable that directly calls either `allow()` or `deny()` | 374 | Too broad; 231 call both. It misses boolean, drift-valued, and throwing comparators. |
-| C | callable that calls both and has a comparison controlling a decision branch | 184 | Still admits pure validation and misses delegated comparisons. |
-| D | C-like decision callable with a raw comparison spelling `generation`, `digest`, `sha`, or `head` | 67 | Names are proxies: they admit type/null checks and miss neutral names such as `incarnation`, `changes`, and object entries. |
-| E | direct `deny()`/`fail()` call using a member of `STALENESS_REASON_CODES` | 69 sites | An output classification, not a comparison definition: 65 return denials and 4 throw; 67 have a controlling condition, but only 42 expose both compared operands in evidence. |
+| A | callable with an explicit return annotation containing `Decision<T>` | C1 count withdrawn | Too broad and annotation-dependent. |
+| B | callable that directly calls either `allow()` or `deny()` | C1 count withdrawn | Too broad. It misses boolean, drift-valued, and throwing comparators. |
+| C | callable that calls both and has a comparison controlling a decision branch | C1 count withdrawn | Still admits pure validation and misses delegated comparisons. |
+| D | C-like decision callable with a raw comparison spelling `generation`, `digest`, `sha`, or `head` | C1 count withdrawn | Names are proxies: they admit type/null checks and miss neutral names such as `incarnation`, `changes`, and object entries. |
+| E | direct `deny()`/`fail()` call using a member of `STALENESS_REASON_CODES` | 70 sites | An output classification, not a comparison definition: 66 return denials and 4 throw; 67 have a direct controlling condition, and at least 43 expose both compared operands in evidence. |
+| F | non-literal binary or `has`/`includes` predicate with a parameter-reachable operand; classify the other operand by origin | 844 predicates | 283 parameter/parameter pairs are compliant, 530 parameter/ambient-reachable asymmetries are flagged, and 31 cannot be resolved. The inspected false-positive rate is 5/5. |
 
 ### Candidate A samples
 
@@ -106,13 +109,58 @@ compare, including `staleClaim` (`src/outbox/outbox.ts:613`) and missing-worktre
 (`src/snapshot/candidate-snapshot.ts:309`). A reason family cannot define the operation that
 produced it.
 
+Candidate E's corrected count comes from C2. The previously omitted site is the conditional
+`MERGE_BASE_STALE` denial in `GitHubKernel.assertPreparedBaseRef`
+(`src/github/github-kernel.ts:1912`). It records `expected: prepared.base` and
+`observed: observedBaseRef`; including its preceding success guard raises the evidence-pair floor
+from 42 to 43.
+
+### Candidate F samples
+
+For C2, an operand is parameter-reachable when it is a parameter or a local derived from one.
+`this`/`super`, module-level declarations, imports, globals, and locals derived from them are
+ambient-reachable. An operand reachable from both is still ambient-reachable for the asymmetry.
+Literals are excluded; unresolved origins are reported separately. The predicates are ordinary
+binary relations plus one-argument `has()` and `includes()` membership checks.
+
+The required positive fixture is found. C2 recognizes three predicates in
+`validateChunkCoverage` (`src/review/blind-review.ts:1651`), including
+`assigned.has(claim)`, and classifies all three as parameter/parameter. `assigned` derives from
+`chunk`, while `claim` derives from `claims`, so the caller supplies every dynamic value the
+function compares.
+
+Five flagged asymmetries were inspected:
+
+- `outcome.updateId !== UPDATE_IDS[index]`
+  (`src/acceptance/disposable-realm-driver.ts:362`) checks a synthetic fixture result.
+- `runtimeNonce.length < NONCE_MIN_LENGTH` (`src/bootstrap/hermes-bootstrap.ts:574`) is an input
+  shape limit.
+- `value.length > MAX_UNKNOWN_AUDIT_STRING` (`src/db/audit.ts:239`) is a storage policy limit.
+- `version > SCHEMA_VERSION` (`src/db/backup.ts:264`) is static schema compatibility.
+- `TERMINAL_RUN_STATES.includes(state)` (`src/domain/run-state.ts:63`) is enum classification.
+
+All five are true parameter-versus-ambient syntax and false comparison-site positives: the
+ambient side is immutable policy, not an independently mutable observation. The observed sample
+false-positive rate is therefore **5/5 (100%)**. This is a measured sample rate, not a claim that
+all 530 findings were manually classified.
+
+Five misses were also inspected: repository `inspect` compares the live and accepted heads
+(`src/registry/repository-registry.ts:251`), repository `observed` repeats that comparison in its
+diagnostic path (`:285`), the materialized head and tree comparisons in `WorktreeManager.create`
+remain unresolved after the `Promise.all` destructure (`src/verify/worktree.ts:93`, `:94`), and
+`markSent` exposes only `changes !== 1` in TypeScript while its generation fence is in SQL
+(`src/outbox/outbox.ts:265`). F therefore misses ambient/ambient state, data flow it cannot resolve,
+and comparisons below TypeScript. Distinguishing immutable ambient policy from mutable ambient
+state would require the semantic classification F was meant to discover, so adding another name
+or type proxy would only recreate D. Candidate F does not survive and is not installed.
+
 ## 3. Current count
 
 The accepted-definition count is **unmeasured, not zero**, because no candidate survived the
 boundary tests. Reporting 0 would mean “looked and found none”; that is not what happened.
 
-For auditability, the closest enumerable proxy, candidate E, produced these 69 direct sites in
-run C1. This is a rejected proxy, not the comparison-site list:
+For auditability, the closest enumerable proxy, candidate E, produced these 70 direct sites in
+run C2. This is a rejected proxy, not the comparison-site list:
 
 - `src/ceo/owner-authority.ts:111`, `:192`, `:265`
 - `src/ceo/production-gate.ts:182`, `:202`, `:521`, `:656`, `:902`, `:1163`
@@ -123,8 +171,8 @@ run C1. This is a rejected proxy, not the comparison-site list:
 - `src/daemon/finalizer.ts:387`, `:399`
 - `src/github/confirmed-merge-operation.ts:124`
 - `src/github/github-kernel.ts:403`, `:452`, `:660`, `:955`, `:977`, `:1047`, `:1082`,
-  `:1114`, `:1136`, `:1142`, `:1569`, `:1704`, `:1712`, `:1787`, `:1950`, `:1969`,
-  `:1987`, `:2028`, `:2089`
+  `:1114`, `:1136`, `:1142`, `:1569`, `:1704`, `:1712`, `:1787`, `:1912`, `:1950`,
+  `:1969`, `:1987`, `:2028`, `:2089`
 - `src/guard/managed-write-guard.ts:881`, `:1824`, `:1854`, `:1929`
 - `src/ingress/telegram-router.ts:395`
 - `src/mcp/ceo-conversation.ts:205`
@@ -154,7 +202,7 @@ Caught but ambiguous under candidate E:
 - `src/session/binding-registry.ts:416` refuses a missing task port when stale executions exist;
   the local condition is capability plus count, not two generations.
 
-Missed but ambiguous under candidates A–E:
+Missed but ambiguous under candidates A–F:
 
 - `src/guard/managed-write-guard.ts:894` compares complete authorization records; generation is
   one field among many, and the denial is at its caller.
@@ -188,12 +236,24 @@ TypeScript comparison sites, and the two code cases are not loci in this reposit
 This comparison is not a successful nine-of-nine detector result. It is evidence that a checker
 over `src/**/*.ts` is aimed at a layer containing none of the issue's original defect loci.
 
-## 6. Next step
+## 6. Existing decision, naming gap, and next step
 
-Do not write the static check from any of these populations. The next implementable step is to
-introduce an explicit declaration only when the first in-tree generation-binding defect supplies a
-negative fixture: one operation or wrapper must name both observations and both generations, while
-an explicitly cross-generation operation must state that intent. A later static check can enumerate
-that declaration and require its four operands without guessing from return types, helper names, or
-reason codes. Until such a production consumer exists, the honest check count and implementation
-are both **unmeasured**.
+The handoff agreement in `docs/handoff/20260815-acp-state.md` remains valid and this census does not
+replace it: the rule applies to **new staleness denials**, while the existing 75 no-pair raise sites
+form a baseline that must not grow and are repaired when touched. The 75 is that handoff's broader
+raise-site inventory, not candidate E's 70 direct TypeScript calls; this document does not silently
+rebaseline one to the other. The earlier proposal to wait for a future first defect conflicts with
+that agreement and is withdrawn.
+
+The exact naming request said to have been made on 2026-08-19 could not be recovered from `docs/`
+or the local commit history. The closest record is the handoff's “Two decisions waiting on the
+총괄”: A1 item 3 asked how the two staleness sides should be represented when existing sites used
+inconsistent names. Its later ratchet section settles when enforcement begins and fixes 75 as the
+baseline, but it does not state canonical operand names. Therefore the unresolved item is the
+canonical naming contract for the two recorded sides, blocked on the 총괄/issue authority; the exact
+alternatives and any more specific recipient are **unmeasured from the local record**.
+
+The next implementation pass must start from the settled new-denial/75-baseline agreement after
+that naming decision, not wait for another production defect. This change installs none of A–F:
+the accepted comparison-site count and a mechanism implementing the agreement remain
+**unmeasured**.

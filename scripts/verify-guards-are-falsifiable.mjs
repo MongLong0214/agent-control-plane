@@ -125,39 +125,6 @@ const GUARDS = [
     ],
   },
   {
-    what: "the generation comparison census refuses an empty discovery",
-    file: "scripts/verify-generation-bound-comparisons.mjs",
-    find: "if (sites.length === 0) {",
-    replace: "if (false) {",
-    killedBy: [
-      "tests/process/the-generation-comparison-census-requires-both-operands.test.ts::fails when comparison discovery returns an empty list",
-    ],
-  },
-  {
-    what: "the generation comparison census requires both comparison operands",
-    file: "scripts/verify-generation-bound-comparisons.mjs",
-    find:
-      "          const boundComparison = comparisons.find(\n" +
-      "            ({ left, right }) => values.has(left) && values.has(right),\n" +
-      "          );",
-    replace:
-      "          const boundComparison = comparisons.find(\n" +
-      "            ({ left }) => values.has(left),\n" +
-      "          );",
-    killedBy: [
-      "tests/process/the-generation-comparison-census-requires-both-operands.test.ts::fails when one comparison generation argument is removed",
-    ],
-  },
-  {
-    what: "the generation comparison census refuses a stale exemption",
-    file: "scripts/verify-generation-bound-comparisons.mjs",
-    find: "if (staleExemptions.length > 0) {",
-    replace: "if (false) {",
-    killedBy: [
-      "tests/process/the-generation-comparison-census-requires-both-operands.test.ts::fails when an exemption no longer names a comparison site",
-    ],
-  },
-  {
     // Two lifecycles in one field: the reply reservation writes `result_json` whole, and an
     // ordinary timeout produces a reply, so the claim and the turn identity went with it.
     what: "the turn claim is stored apart from the reply it will produce",
