@@ -1,37 +1,45 @@
 #!/usr/bin/env -S npx tsx
 /**
- * Answers one question with evidence instead of inference: can `agentcpd` still reach a
- * listening state, and what must be true of its environment first?
+ * Reports how the production-composed daemon classifies an App credential, provider capacity,
+ * daemon-owned mirrors, and the retry backoff caused by a refused start.
  *
  * WHY this check exists
  *
- *   `main()` in src/daemon/agentcpd.ts fails closed in four separate places — a missing
- *   `ACP_MCP_TOKEN`, a single-instance lock, a startup doctor that reports BLOCKED or
- *   ERROR, and a crash-loop backoff that a *previous* failed start armed. On top of that
- *   `startLocalMcpListeners` now demands a per-connection session credential, so a token
- *   alone no longer produces a usable socket. None of these preconditions is documented,
- *   and each of them is invisible until the daemon refuses to start in production.
+ *   `Daemon.start()` fails closed on its single-instance lock, startup doctor, and crash-loop
+ *   backoff. Production also supplies a bootstrap door: when capacity is the only missing
+ *   prerequisite, startup parks behind that door instead of returning a doctor refusal.
  *
- *   This probe runs the real startup path against throwaway state directories under the OS
- *   temp dir — never a real deployment — and records what each stage actually did. Its
- *   output is the deployment requirement list.
+ *   The checked scenarios retain the production adapters but inject an unavailable usage
+ *   collector. That keeps the result independent of provider login state and proves that a
+ *   prewritten daemon mirror cannot create coverage. The GitHub prerequisite enters through the
+ *   production App env/private-key files, and the daemon enters through
+ *   `ControlPlane.createDaemon()` with a bootstrap door. The probe observes the park and releases
+ *   it immediately; it does not claim to exercise `agentcpd.main` socket plumbing.
  *
- * The probe writes only inside its own temp directories and always removes them.
+ *   An ordinary operator run adds one clearly labelled live-collector observation. Only that
+ *   stage uses the production collectors' normal credential paths and may make the Grok billing
+ *   request. `--isolated` skips it and is the mode used by automated tests.
  *
- * Run: npx tsx scripts/probe-daemon-startup.ts [--json]
- * Exits non-zero if a fully provisioned deployment cannot reach a listening state.
+ * Every state, generated App credential, and mirror write stays under a throwaway directory and
+ * is removed on completion or a handled failure. An uncatchable process death may leave that
+ * generated probe state under the OS temp directory; no operator credential is copied into it.
+ *
+ * Run: npx tsx scripts/probe-daemon-startup.ts [--json] [--isolated]
+ * Exits non-zero if an isolated scenario does not reach its named startup state, if the live
+ * observation reaches neither normal startup nor the capacity bootstrap park, or if a scenario
+ * errors. Listening sockets are deliberately unmeasured here.
  */
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { connect } from "node:net";
+import { generateKeyPairSync } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { ControlPlane, defaultConfig, type ControlPlaneConfig } from "../src/app/control-plane.ts";
-import { Daemon } from "../src/daemon/daemon.ts";
-import { startLocalMcpListeners } from "../src/daemon/agentcpd.ts";
-import { SessionLifecycle } from "../src/domain/types.ts";
+import { type UsageCollector, type UsageProvider, USAGE_PROVIDERS } from "../src/capacity/usage-collectors.ts";
+import { ReasonCode } from "../src/core/reason-codes.ts";
 
 const asJson = process.argv.includes("--json");
+const isolatedOnly = process.argv.includes("--isolated");
 const stages: Array<Record<string, unknown>> = [];
 const problems: string[] = [];
 
@@ -43,258 +51,327 @@ const watchdog = setTimeout(() => {
 watchdog.unref();
 
 const summarise = (findings: readonly { code: string; severity: string; blocking: boolean }[]) =>
-  findings.map((f) => `${f.code}/${f.severity}${f.blocking ? "/blocking" : ""}`);
+  findings.map((finding) => `${finding.code}/${finding.severity}${finding.blocking ? "/blocking" : ""}`);
+
+type CreatedDaemon = ReturnType<ControlPlane["createDaemon"]>;
+type StartDecision = Awaited<ReturnType<CreatedDaemon["start"]>>;
+type StartupState = "STARTED" | "BOOTSTRAP_PARKED" | "REFUSED";
+
+interface StartupObservation {
+  state: StartupState;
+  decision: StartDecision;
+  report: Record<string, unknown>;
+}
+
+const startSummary = (started: StartDecision): Record<string, unknown> => {
+  const summary: Record<string, unknown> = {
+    allowed: started.allowed,
+    reasonCode: started.reasonCode,
+  };
+  if (!started.allowed) summary["message"] = started.message;
+
+  const reconcile = started.allowed ? started.value : started.evidence["reconcile"];
+  if (typeof reconcile === "object" && reconcile !== null) {
+    const report = reconcile as Record<string, unknown>;
+    summary["doctorStatus"] = report["doctorStatus"];
+    summary["blockingFindings"] = report["blockingFindings"];
+    if (report["bootstrapParked"] !== undefined) summary["bootstrapParked"] = report["bootstrapParked"];
+  } else if (!started.allowed && Object.keys(started.evidence).length > 0) {
+    summary["evidence"] = started.evidence;
+  }
+  return summary;
+};
+
+/**
+ * Production supplies a socket-backed door. This probe needs only to observe that startup chose
+ * the door, then release the park so the throwaway process can finish without binding a socket.
+ */
+const observeStartup = async (daemon: CreatedDaemon): Promise<StartupObservation> => {
+  let opened = false;
+  let closed = false;
+  const decision = await daemon.start({
+    bootstrapDoor: async () => {
+      opened = true;
+      await daemon.stop();
+      return {
+        close: async () => {
+          closed = true;
+        },
+      };
+    },
+  });
+  if (decision.allowed) await daemon.stop();
+
+  const state: StartupState = decision.allowed ? "STARTED" : opened ? "BOOTSTRAP_PARKED" : "REFUSED";
+  return {
+    state,
+    decision,
+    report: {
+      state,
+      decision: startSummary(decision),
+      bootstrapDoor: { opened, closed },
+    },
+  };
+};
+
+const wait = (milliseconds: number): Promise<void> =>
+  new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+
+const probeAppPrivateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+  .privateKey.export({ type: "pkcs1", format: "pem" });
+
+/** Writes the same owner-provisioned App files that `TrustedCredentialStore.availability()` reads. */
+const provisionAppCredential = (config: ControlPlaneConfig): void => {
+  const envFile = config.githubAppEnvFile;
+  if (!envFile) throw new Error("probe configuration did not name a GitHub App env file");
+  const credentialsDir = dirname(envFile);
+  const privateKeyPath = join(credentialsDir, "github-app.private-key.pem");
+  mkdirSync(credentialsDir, { recursive: true, mode: 0o700 });
+  chmodSync(credentialsDir, 0o700);
+  writeFileSync(privateKeyPath, probeAppPrivateKey, { mode: 0o600 });
+  chmodSync(privateKeyPath, 0o600);
+  writeFileSync(
+    envFile,
+    [
+      "GITHUB_APP_ID=4586878",
+      "GITHUB_APP_INSTALLATION_ID=153553922",
+      `GITHUB_APP_PRIVATE_KEY_PATH=${privateKeyPath}`,
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+  chmodSync(envFile, 0o600);
+};
+
+const isolatedUsageCollector = (provider: UsageProvider): UsageCollector => ({
+  collect: async () => ({
+    provider,
+    sensorHealth: "HEALTHY",
+    runtimeHealth: "UNAVAILABLE",
+    observedAt: new Date().toISOString(),
+    source: `daemon-startup-probe-isolated:${provider}`,
+    buckets: [],
+  }),
+});
+
+const isolatedAdapterOptions = (): NonNullable<ControlPlaneConfig["adapterOptions"]> => ({
+  claude: { usageCollector: isolatedUsageCollector("claude") },
+  gpt: { usageCollector: isolatedUsageCollector("gpt") },
+  grok: { usageCollector: isolatedUsageCollector("grok") },
+});
+
+type CollectorMode = "isolated" | "live";
+
+/** Host credential overrides must never redirect a throwaway probe into the deployment's App key. */
+const probeConfig = (root: string, collectorMode: CollectorMode): ControlPlaneConfig => {
+  const config = defaultConfig(root);
+  config.githubAppEnvFile = join(root, "credentials", "github-app.env");
+  delete config.githubAppPrivateKeyPath;
+  if (collectorMode === "isolated") config.adapterOptions = isolatedAdapterOptions();
+  return config;
+};
+
+/**
+ * Writes the shape the daemon owns after a sensor refresh. Production adapters do not read this
+ * as quota input; the isolated collector must overwrite it with its unavailable observation.
+ */
+const writeCapacityMirrors = (directory: string): void => {
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  for (const provider of USAGE_PROVIDERS) {
+    writeFileSync(
+      join(directory, `${provider}.json`),
+      JSON.stringify({
+        provider,
+        observedAt: new Date().toISOString(),
+        sensorHealth: "HEALTHY",
+        runtimeHealth: "HEALTHY",
+        source: "prewritten-daemon-mirror",
+        buckets: [
+          {
+            id: `${provider}-5h`,
+            remainingPercent: 90,
+            resetAt: null,
+            capabilities: ["ceo", "cto", "blind-review", "worker", "luna-worker", "adversarial-review"],
+          },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+  }
+};
+
+const capacitySources = (cp: ControlPlane): Record<string, string> =>
+  Object.fromEntries(cp.capacity.all().map((reading) => [reading.provider, reading.source]));
+
+const expectStartup = (
+  label: string,
+  observed: StartupObservation,
+  expectedStates: readonly StartupState[],
+  expectedReasonCodes: readonly ReasonCode[] = [],
+): void => {
+  if (!expectedStates.includes(observed.state)) {
+    problems.push(`${label} expected ${expectedStates.join(" or ")}, got ${JSON.stringify(observed.report)}`);
+    return;
+  }
+  if (expectedReasonCodes.length > 0 && !expectedReasonCodes.includes(observed.decision.reasonCode)) {
+    problems.push(
+      `${label} expected ${expectedReasonCodes.join(" or ")}, got ${JSON.stringify(observed.report)}`,
+    );
+  }
+};
+
+interface ScenarioOptions {
+  collectorMode: CollectorMode;
+  credential: boolean;
+  mirrors?: boolean;
+  expectedStates: readonly StartupState[];
+  expectedReasonCodes?: readonly ReasonCode[];
+}
 
 /** One scenario = one pristine state directory, so no earlier failure can leak into it. */
-const scenario = async (
-  label: string,
-  prepare: (cp: ControlPlane, config: ControlPlaneConfig) => void,
-): Promise<void> => {
+const scenario = async (label: string, options: ScenarioOptions): Promise<void> => {
   const root = mkdtempSync(join(tmpdir(), "acp-daemon-probe-"));
-  const config = defaultConfig(root);
-  const stage: Record<string, unknown> = { label, ownerIdentities: config.ownerIdentities?.length ?? 0 };
-  const cp = new ControlPlane(config);
+  const config = probeConfig(root, options.collectorMode);
+  const stage: Record<string, unknown> = {
+    label,
+    collectorMode: options.collectorMode,
+    ownerIdentities: config.ownerIdentities?.length ?? 0,
+  };
+  let cp: ControlPlane | null = null;
   try {
-    prepare(cp, config);
+    if (options.credential) provisionAppCredential(config);
+    if (options.mirrors) writeCapacityMirrors(config.capacityDir);
+    cp = new ControlPlane(config);
+    stage["credentialAvailable"] = cp.credentials.available();
 
     const doctor = await cp.doctor.run("system");
-    stage["doctorStatus"] = doctor.status;
-    stage["doctorFindings"] = summarise(doctor.findings);
+    stage["doctorStatusBeforeStart"] = doctor.status;
+    stage["doctorFindingsBeforeStart"] = summarise(doctor.findings);
 
     const stateDir = dirname(config.databasePath);
-    const daemon = new Daemon(cp, { stateDir });
-    const started = await daemon.start();
-    stage["daemonStart"] = started.allowed
-      ? { allowed: true, reasonCode: started.reasonCode }
-      : { allowed: false, reasonCode: started.reasonCode, message: started.message };
-
-    if (started.allowed) {
-      stage["mcp"] = await probeListeners(cp, stateDir);
-      await daemon.stop();
-    }
-  } catch (err) {
-    stage["error"] = err instanceof Error ? err.message : String(err);
+    const daemon = cp.createDaemon({ stateDir });
+    const observed = await observeStartup(daemon);
+    stage["startup"] = observed.report;
+    stage["capacitySources"] = capacitySources(cp);
+    expectStartup(label, observed, options.expectedStates, options.expectedReasonCodes);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    stage["error"] = message;
+    problems.push(`${label} errored: ${message}`);
   } finally {
-    cp.close();
+    cp?.close();
     rmSync(root, { recursive: true, force: true });
   }
   stages.push(stage);
 };
 
-/**
- * The listening state is not "a socket file exists": a peer must get past the deployment
- * token *and* a per-session secret before an MCP server is attached to its connection.
- * All three cases are exercised on the real listener.
- */
-const probeListeners = async (cp: ControlPlane, stateDir: string): Promise<Record<string, unknown>> => {
-  const result: Record<string, unknown> = {};
+const doctorReasons = [ReasonCode.DOCTOR_BLOCKED, ReasonCode.DOCTOR_ERROR] as const;
 
-  try {
-    await startLocalMcpListeners(cp, stateDir, "");
-    result["emptyToken"] = "accepted — the token requirement is not enforced";
-    problems.push("startLocalMcpListeners accepted an empty ACP_MCP_TOKEN");
-  } catch (err) {
-    result["emptyToken"] = `refused: ${err instanceof Error ? err.message : String(err)}`;
-  }
-
-  const token = "probe-deployment-token";
-  const listeners = await startLocalMcpListeners(cp, stateDir, token);
-  result["socketPaths"] = listeners.socketPaths;
-  result["socketsPresent"] = listeners.socketPaths.every(
-    (path) => existsSync(path) && lstatSync(path).isSocket(),
-  );
-  result["socketModes"] = listeners.socketPaths.map(
-    (path) => `0${(lstatSync(path).mode & 0o777).toString(8)}`,
-  );
-
-  const target = listeners.socketPaths[0]!;
-
-  // A session that exists and is READY is the only peer identity the transport accepts.
-  const session = cp.sessions.create({ provider: "claude", model: "opus" });
-  cp.sessions.transition(session.sessionId, SessionLifecycle.READY);
-  result["sessionSecretIssued"] = session.sessionSecret !== null;
-
-  result["tokenOnly"] = await handshake(target, { token });
-  result["wrongToken"] = await handshake(target, {
-    token: "not-the-token",
-    sessionId: session.sessionId,
-    sessionSecret: session.sessionSecret ?? "",
-  });
-  result["wrongSecret"] = await handshake(target, {
-    token,
-    sessionId: session.sessionId,
-    sessionSecret: "not-the-secret",
-  });
-  result["tokenAndSessionSecret"] = await handshake(target, {
-    token,
-    sessionId: session.sessionId,
-    sessionSecret: session.sessionSecret ?? "",
-  });
-
-  await listeners.close();
-  result["socketsRemovedOnClose"] = listeners.socketPaths.every((path) => !existsSync(path));
-
-  if (!String(result["tokenAndSessionSecret"]).startsWith("initialized")) {
-    problems.push(
-      `a token plus a valid session secret did not reach an MCP server: ${String(
-        result["tokenAndSessionSecret"],
-      )}`,
-    );
-  }
-  for (const key of ["tokenOnly", "wrongToken", "wrongSecret"] as const) {
-    if (String(result[key]).startsWith("initialized")) {
-      problems.push(`${key} handshake reached an MCP server; the credential check is not effective`);
-    }
-  }
-  return result;
-};
-
-/** Presents a handshake line, then one MCP `initialize`, and reports what came back. */
-const handshake = (path: string, credential: Record<string, string>): Promise<string> =>
-  new Promise((resolveOutcome) => {
-    const socket = connect(path);
-    let buffer = "";
-    let settled = false;
-    const done = (outcome: string): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolveOutcome(outcome);
-    };
-    const timer = setTimeout(() => done("no response within 4s"), 4000);
-    timer.unref();
-
-    socket.on("connect", () => {
-      socket.write(`${JSON.stringify(credential)}\n`);
-      socket.write(
-        `${JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "initialize",
-          params: {
-            protocolVersion: "2024-11-05",
-            capabilities: {},
-            clientInfo: { name: "acp-startup-probe", version: "0" },
-          },
-        })}\n`,
-      );
-    });
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
-      const boundary = buffer.indexOf("\n");
-      if (boundary === -1) return;
-      const line = buffer.slice(0, boundary);
-      try {
-        const parsed = JSON.parse(line) as { result?: { serverInfo?: { name?: string } } };
-        const name = parsed.result?.serverInfo?.name;
-        done(name ? `initialized by '${name}'` : `initialized: ${line.slice(0, 120)}`);
-      } catch {
-        done(`unparsable reply: ${line.slice(0, 120)}`);
-      }
-    });
-    socket.on("error", (err) => done(`socket error: ${err.message}`));
-    socket.on("close", () => done("connection closed with no reply"));
-  });
-
-// --------------------------------------------------------------------------
-
-/**
- * §14.2's structured local capacity file. Buckets exist *only* in this file — the CLI
- * probe contributes runtime health and nothing else — so without one no provider is
- * routable, the CEO role cannot be covered, and the startup doctor blocks. The daemon
- * cannot manufacture it either: its own sensor refresh writes back whatever the file
- * says, so an absent file stays absent.
- */
-const writeCapacityFile = (directory: string, provider: string): void => {
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  writeFileSync(
-    join(directory, `${provider}.json`),
-    JSON.stringify({
-      provider,
-      observedAt: new Date().toISOString(),
-      runtimeHealth: "HEALTHY",
-      buckets: [
-        {
-          id: `${provider}-5h`,
-          remainingPercent: 90,
-          resetAt: null,
-          capabilities: ["ceo", "cto", "blind-review", "worker"],
-        },
-      ],
-    }),
-    { mode: 0o600 },
-  );
-};
-
-await scenario("bare state directory (nothing provisioned)", () => undefined);
-
-await scenario("trusted GitHub credential installed", (cp) => {
-  cp.credentials.install({ token: "probe-token-not-a-real-credential", creatorIdentity: "probe-bot" });
+await scenario("isolated bare state directory", {
+  collectorMode: "isolated",
+  credential: false,
+  expectedStates: ["REFUSED"],
+  expectedReasonCodes: doctorReasons,
 });
 
-await scenario("credential + structured capacity files for both providers", (cp, config) => {
-  cp.credentials.install({ token: "probe-token-not-a-real-credential", creatorIdentity: "probe-bot" });
-  for (const provider of cp.providers.production().map((adapter) => adapter.provider)) {
-    writeCapacityFile(config.capacityDir, provider);
-  }
+await scenario("isolated production App credential", {
+  collectorMode: "isolated",
+  credential: true,
+  expectedStates: ["BOOTSTRAP_PARKED"],
+  expectedReasonCodes: doctorReasons,
+});
+
+await scenario("isolated production App credential with prewritten daemon mirrors", {
+  collectorMode: "isolated",
+  credential: true,
+  mirrors: true,
+  expectedStates: ["BOOTSTRAP_PARKED"],
+  expectedReasonCodes: doctorReasons,
 });
 
 /**
- * A refused start is not free: it writes `crash-loop.json` with a `retryNotBefore`, so the
- * *next* start is refused on backoff even when the operator has already fixed the cause.
- * Recorded because it changes what a deployment runbook has to say.
+ * A refused start writes `crash-loop.json` with a `retryNotBefore`. Rebuild the production
+ * composition after provisioning the App files, observe the immediate backoff, then wait until
+ * the returned timestamp before asking whether startup reaches its capacity bootstrap park.
  */
 {
   const root = mkdtempSync(join(tmpdir(), "acp-daemon-probe-"));
-  const config = defaultConfig(root);
-  const stage: Record<string, unknown> = { label: "restart immediately after a refused start" };
-  const cp = new ControlPlane(config);
+  const config = probeConfig(root, "isolated");
+  const stage: Record<string, unknown> = {
+    label: "isolated restart after a refused start and enforced backoff",
+    collectorMode: "isolated",
+  };
+  let cp: ControlPlane | null = null;
   try {
     const stateDir = dirname(config.databasePath);
-    const daemon = new Daemon(cp, { stateDir });
-    const first = await daemon.start();
-    stage["firstStart"] = { allowed: first.allowed, reasonCode: first.reasonCode };
-
-    cp.credentials.install({ token: "probe-token-not-a-real-credential", creatorIdentity: "probe-bot" });
-    for (const provider of cp.providers.production().map((adapter) => adapter.provider)) {
-      writeCapacityFile(config.capacityDir, provider);
-    }
-    const second = await daemon.start();
-    stage["secondStartAfterFixingTheCause"] = {
-      allowed: second.allowed,
-      reasonCode: second.reasonCode,
-      message: second.message,
-      evidence: second.evidence,
-    };
-    if (second.allowed) await daemon.stop();
-  } catch (err) {
-    stage["error"] = err instanceof Error ? err.message : String(err);
-  } finally {
+    cp = new ControlPlane(config);
+    const unprovisionedDaemon = cp.createDaemon({ stateDir });
+    const first = await observeStartup(unprovisionedDaemon);
+    stage["firstStart"] = first.report;
+    expectStartup("the unprovisioned first start", first, ["REFUSED"], doctorReasons);
     cp.close();
+    cp = null;
+
+    provisionAppCredential(config);
+    writeCapacityMirrors(config.capacityDir);
+    cp = new ControlPlane(config);
+    const retryDaemon = cp.createDaemon({ stateDir });
+    const immediate = await observeStartup(retryDaemon);
+    stage["immediateRestart"] = immediate.report;
+    expectStartup("the immediate restart", immediate, ["REFUSED"], [ReasonCode.DAEMON_BACKOFF_ACTIVE]);
+
+    const retryNotBefore = immediate.decision.allowed
+      ? null
+      : typeof immediate.decision.evidence["retryNotBefore"] === "string"
+        ? immediate.decision.evidence["retryNotBefore"]
+        : null;
+    if (!retryNotBefore) throw new Error("startup backoff did not return retryNotBefore");
+    const waitStartedAt = Date.now();
+    await wait(Math.max(0, Date.parse(retryNotBefore) - waitStartedAt + 25));
+    stage["backoffWait"] = {
+      retryNotBefore,
+      waitedMs: Date.now() - waitStartedAt,
+    };
+
+    const retried = await observeStartup(retryDaemon);
+    stage["retryAfterBackoff"] = retried.report;
+    stage["capacitySources"] = capacitySources(cp);
+    expectStartup("the retry after backoff", retried, ["BOOTSTRAP_PARKED"], doctorReasons);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    stage["error"] = message;
+    problems.push(`restart scenario errored: ${message}`);
+  } finally {
+    cp?.close();
     rmSync(root, { recursive: true, force: true });
   }
   stages.push(stage);
 }
 
-if (!stages.some((stage) => stage["mcp"])) {
-  const reasons = stages.map((stage) => JSON.stringify(stage["daemonStart"])).join(" | ");
-  problems.push(`no scenario reached a listening state; daemon.start() outcomes were: ${reasons}`);
+if (!isolatedOnly) {
+  await scenario("operator live provider collector outcomes", {
+    collectorMode: "live",
+    credential: true,
+    expectedStates: ["STARTED", "BOOTSTRAP_PARKED"],
+  });
 }
 
 if (asJson) {
-  process.stdout.write(`${JSON.stringify({ stages, problems }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ mode: isolatedOnly ? "isolated" : "operator", stages, problems }, null, 2)}\n`);
 } else {
   for (const stage of stages) {
     console.log(`--- ${stage["label"]}`);
     for (const [key, value] of Object.entries(stage)) {
       if (key === "label") continue;
-      console.log(`  ${key.padEnd(22)} ${JSON.stringify(value)}`);
+      console.log(`  ${key.padEnd(24)} ${JSON.stringify(value)}`);
     }
     console.log("");
   }
   if (problems.length === 0) {
-    console.log("OK — a provisioned deployment reaches a listening, credential-gated MCP state");
+    console.log(
+      isolatedOnly
+        ? "OK — isolated production-composed startup kept provider login paths out and daemon mirrors out of capacity"
+        : "OK — isolated startup prerequisites were checked and live collector outcomes were recorded separately",
+    );
   } else {
     console.log(`${problems.length} problem(s):`);
     for (const problem of problems) console.log(`  - ${problem}`);
