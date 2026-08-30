@@ -771,16 +771,9 @@ export class VerificationEngine {
     state: "ACTIVE" | "DESTROYING" | "DESTROYED" | "FAILED",
     timestampColumn?: "active_at" | "ended_at",
   ): void {
-    if (timestampColumn === "active_at") {
+    if (timestampColumn) {
       this.db.run(
-        `UPDATE verification_worktrees SET state = ?, active_at = ? WHERE worktree_id = ?`,
-        [state, this.clock.nowIso(), worktreeId],
-      );
-      return;
-    }
-    if (timestampColumn === "ended_at") {
-      this.db.run(
-        `UPDATE verification_worktrees SET state = ?, ended_at = ? WHERE worktree_id = ?`,
+        `UPDATE verification_worktrees SET state = ?, ${timestampColumn} = ? WHERE worktree_id = ?`,
         [state, this.clock.nowIso(), worktreeId],
       );
       return;

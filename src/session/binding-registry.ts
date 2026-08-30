@@ -427,7 +427,7 @@ export class BindingRegistry {
           `UPDATE runs SET owner_session_id = ?, owner_binding_generation = ?,
                            owner_session_incarnation = ?, owner_role_key = ?
             WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
-              AND state IN (?,?,?,?,?,?,?,?,?)`,
+              AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
           [
             // Both sides are identity: the new row's own binding-time runtime, and the outgoing
             // binding's. `current.sessionId` is the live view and would fail to match the tuple

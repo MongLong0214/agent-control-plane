@@ -240,34 +240,7 @@ export class Outbox {
         const updated = this.db.run(
           `UPDATE outbox SET status = 'IN_FLIGHT', claim_token = ?, claimed_at = ?
             WHERE message_id = ? AND status = 'PENDING'
-              AND (
-                EXISTS (
-                  SELECT 1 FROM assignments a
-                    JOIN sessions s ON s.session_id = a.session_id
-                   WHERE a.role_key = outbox.role_key
-                     AND a.binding_generation = outbox.binding_generation
-                     AND a.session_id = outbox.target_session_id
-                     AND a.status = 'ACTIVE'
-                     AND s.lifecycle IN ('READY','DRAINING')
-                )
-                OR EXISTS (
-                  SELECT 1 FROM handoffs h
-                    JOIN sessions recipient ON recipient.session_id = h.to_session_id
-                    JOIN sessions outgoing ON outgoing.session_id = h.from_session_id
-                    JOIN assignments a ON a.role_key = outbox.role_key
-                                       AND a.binding_generation = outbox.binding_generation
-                                       AND a.session_id = h.from_session_id
-                                       AND a.status = 'ACTIVE'
-                   WHERE outbox.kind = 'HANDOFF_PACKAGE'
-                     AND h.kind = 'HANDOFF'
-                     AND h.to_session_id = outbox.target_session_id
-                     AND h.from_generation = outbox.binding_generation
-                     AND h.status = 'PENDING'
-                     AND outbox.idempotency_key = 'handoff:' || h.handoff_id
-                     AND recipient.lifecycle = 'READY'
-                     AND outgoing.lifecycle IN ('READY','DRAINING')
-                )
-              )`,
+              AND ${liveDeliveryTarget("outbox")}`,
           [token, now, row.message_id],
         );
         // Compare-and-set: another loop may have taken it between the select and here.
@@ -283,34 +256,7 @@ export class Outbox {
     return this.db.run(
       `UPDATE outbox SET status = 'PENDING', claim_token = NULL, claimed_at = NULL
         WHERE status = 'IN_FLIGHT' AND claimed_at <= ?
-          AND (
-            EXISTS (
-              SELECT 1 FROM assignments a
-                JOIN sessions s ON s.session_id = a.session_id
-               WHERE a.role_key = outbox.role_key
-                 AND a.binding_generation = outbox.binding_generation
-                 AND a.session_id = outbox.target_session_id
-                 AND a.status = 'ACTIVE'
-                 AND s.lifecycle IN ('READY','DRAINING')
-            )
-            OR EXISTS (
-              SELECT 1 FROM handoffs h
-                JOIN sessions recipient ON recipient.session_id = h.to_session_id
-                JOIN sessions outgoing ON outgoing.session_id = h.from_session_id
-                JOIN assignments a ON a.role_key = outbox.role_key
-                                   AND a.binding_generation = outbox.binding_generation
-                                   AND a.session_id = h.from_session_id
-                                   AND a.status = 'ACTIVE'
-               WHERE outbox.kind = 'HANDOFF_PACKAGE'
-                 AND h.kind = 'HANDOFF'
-                 AND h.to_session_id = outbox.target_session_id
-                 AND h.from_generation = outbox.binding_generation
-                 AND h.status = 'PENDING'
-                 AND outbox.idempotency_key = 'handoff:' || h.handoff_id
-                 AND recipient.lifecycle = 'READY'
-                 AND outgoing.lifecycle IN ('READY','DRAINING')
-            )
-          )`,
+          AND ${liveDeliveryTarget("outbox")}`,
       [new Date(new Date(this.clock.nowIso()).getTime() - leaseMs).toISOString()],
     ).changes;
   }
@@ -322,34 +268,7 @@ export class Outbox {
                          claim_token = NULL, claimed_at = NULL,
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
-          AND (
-            EXISTS (
-              SELECT 1 FROM assignments a
-                JOIN sessions s ON s.session_id = a.session_id
-               WHERE a.role_key = outbox.role_key
-                 AND a.binding_generation = outbox.binding_generation
-                 AND a.session_id = outbox.target_session_id
-                 AND a.status = 'ACTIVE'
-                 AND s.lifecycle IN ('READY','DRAINING')
-            )
-            OR EXISTS (
-              SELECT 1 FROM handoffs h
-                JOIN sessions recipient ON recipient.session_id = h.to_session_id
-                JOIN sessions outgoing ON outgoing.session_id = h.from_session_id
-                JOIN assignments a ON a.role_key = outbox.role_key
-                                   AND a.binding_generation = outbox.binding_generation
-                                   AND a.session_id = h.from_session_id
-                                   AND a.status = 'ACTIVE'
-               WHERE outbox.kind = 'HANDOFF_PACKAGE'
-                 AND h.kind = 'HANDOFF'
-                 AND h.to_session_id = outbox.target_session_id
-                 AND h.from_generation = outbox.binding_generation
-                 AND h.status = 'PENDING'
-                 AND outbox.idempotency_key = 'handoff:' || h.handoff_id
-                 AND recipient.lifecycle = 'READY'
-                 AND outgoing.lifecycle IN ('READY','DRAINING')
-            )
-          )`,
+          AND ${liveDeliveryTarget("outbox")}`,
       [this.clock.nowIso(), messageId, claimToken],
     ).changes;
     if (changes !== 1) {
@@ -412,34 +331,7 @@ export class Outbox {
                          retry_eligible = ?, next_attempt_at = ?, reason_code = ?,
                          claim_token = NULL, claimed_at = NULL
         WHERE message_id = ? AND status = 'IN_FLIGHT' AND claim_token = ?
-          AND (
-            EXISTS (
-              SELECT 1 FROM assignments a
-                JOIN sessions s ON s.session_id = a.session_id
-               WHERE a.role_key = outbox.role_key
-                 AND a.binding_generation = outbox.binding_generation
-                 AND a.session_id = outbox.target_session_id
-                 AND a.status = 'ACTIVE'
-                 AND s.lifecycle IN ('READY','DRAINING')
-            )
-            OR EXISTS (
-              SELECT 1 FROM handoffs h
-                JOIN sessions recipient ON recipient.session_id = h.to_session_id
-                JOIN sessions outgoing ON outgoing.session_id = h.from_session_id
-                JOIN assignments a ON a.role_key = outbox.role_key
-                                   AND a.binding_generation = outbox.binding_generation
-                                   AND a.session_id = h.from_session_id
-                                   AND a.status = 'ACTIVE'
-               WHERE outbox.kind = 'HANDOFF_PACKAGE'
-                 AND h.kind = 'HANDOFF'
-                 AND h.to_session_id = outbox.target_session_id
-                 AND h.from_generation = outbox.binding_generation
-                 AND h.status = 'PENDING'
-                 AND outbox.idempotency_key = 'handoff:' || h.handoff_id
-                 AND recipient.lifecycle = 'READY'
-                 AND outgoing.lifecycle IN ('READY','DRAINING')
-            )
-          )`,
+          AND ${liveDeliveryTarget("outbox")}`,
       [
         retryable ? "PENDING" : "REJECTED",
         attempts,
@@ -667,34 +559,7 @@ export class Outbox {
       `UPDATE outbox SET status = 'REJECTED', reason_code = ?, claim_token = NULL, claimed_at = NULL,
                          retry_eligible = 0, next_attempt_at = NULL
         WHERE status IN ('PENDING','IN_FLIGHT')
-          AND NOT (
-            EXISTS (
-              SELECT 1 FROM assignments a
-                JOIN sessions s ON s.session_id = a.session_id
-               WHERE a.role_key = outbox.role_key
-                 AND a.binding_generation = outbox.binding_generation
-                 AND a.session_id = outbox.target_session_id
-                 AND a.status = 'ACTIVE'
-                 AND s.lifecycle IN ('READY','DRAINING')
-            )
-            OR EXISTS (
-              SELECT 1 FROM handoffs h
-                JOIN sessions recipient ON recipient.session_id = h.to_session_id
-                JOIN sessions outgoing ON outgoing.session_id = h.from_session_id
-                JOIN assignments a ON a.role_key = outbox.role_key
-                                   AND a.binding_generation = outbox.binding_generation
-                                   AND a.session_id = h.from_session_id
-                                   AND a.status = 'ACTIVE'
-               WHERE outbox.kind = 'HANDOFF_PACKAGE'
-                 AND h.kind = 'HANDOFF'
-                 AND h.to_session_id = outbox.target_session_id
-                 AND h.from_generation = outbox.binding_generation
-                 AND h.status = 'PENDING'
-                 AND outbox.idempotency_key = 'handoff:' || h.handoff_id
-                 AND recipient.lifecycle = 'READY'
-                 AND outgoing.lifecycle IN ('READY','DRAINING')
-            )
-          )`,
+          AND NOT ${liveDeliveryTarget("outbox")}`,
       [ReasonCode.OUTBOX_STALE_GENERATION_REJECTED],
     ).changes;
   }

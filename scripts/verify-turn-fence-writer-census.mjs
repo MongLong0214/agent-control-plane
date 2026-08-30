@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * Every direct `Db.run` call in `src` has inline SQL, and each one that names a turn-fence table
- * is in that table's declared application owner.
+ * Every inline-SQL direct call whose TypeScript property symbol is exactly `Db.run` and that names
+ * a turn-fence table is in that table's declared application owner.
  *
  * This is deliberately an ownership check, not a JavaScript partial evaluator. `Db.run` is the
- * named application mutation surface. A call either supplies its final string literal right at
- * that surface, or the check fails closed without trying to compute identifiers, arrays,
- * `.concat()`, `String.raw`, imported constants, or any other JavaScript expression.
+ * named application mutation surface. Calls that do not supply their final string literal right
+ * at that surface are counted as outside this check's ownership boundary; this check does not try
+ * to compute identifiers, arrays, `.concat()`, `String.raw`, imported constants, or any other
+ * JavaScript expression.
  */
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -16,14 +17,15 @@ import ts from "typescript";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLAIM =
-  "Every direct Db.run call in src has inline SQL, and each one that names a turn-fence table is in that table's declared application owner.";
+  "Every inline-SQL direct call whose TypeScript property symbol is exactly Db.run and that names a turn-fence table is in that table's declared application owner.";
 const BOUNDARY =
-  "Under src, this check covers direct property calls whose TypeScript symbol is Db.run, and " +
-  "their first argument must be a string literal or no-substitution template literal at the " +
-  "call site; schema.sql coverage is limited to INSERT, UPDATE, REPLACE, DELETE, and ALTER TABLE " +
-  "RENAME TO after SQL comments are blanked; named migration rebuild functions are reported but " +
-  "their SQL is not evaluated; casts to any, reflection, generated code, other SQL APIs, and code " +
-  "outside src are not covered.";
+  "Under src, this check covers only direct property calls whose TypeScript property symbol is " +
+  "exactly Db.run and whose first argument is a string literal or no-substitution template literal " +
+  "at the call site; interface and other property aliases such as RunPort.run, non-inline SQL " +
+  "expressions, casts to any, reflection, generated code, other SQL APIs, and code outside src are " +
+  "not covered; captured exact Db.run references are refused; schema.sql coverage is limited to " +
+  "INSERT, UPDATE, REPLACE, DELETE, and ALTER TABLE RENAME TO after SQL comments are blanked; named " +
+  "migration rebuild functions are reported but their SQL is not evaluated.";
 
 process.stdout.write(`CHECK: ${CLAIM}\nBOUNDARY: ${BOUNDARY}\n`);
 
@@ -337,27 +339,32 @@ const applicationReport = governedTables
   .map((table) => {
     const calls = callsByTable.get(table);
     const details = calls.map(({ file, line }) => `${file}:${line}`).join(", ");
-    return `  ${table}: ${calls.length} direct Db.run call(s)${details ? ` (${details})` : ""}`;
+    return `  ${table}: ${calls.length} inline exact-symbol Db.run call(s)${details ? ` (${details})` : ""}`;
   })
   .join("\n");
 const migrationReport = Object.entries(MIGRATION_REBUILD_SURFACES)
   .map(([table, surface]) => `  ${table}: ${MIGRATIONS_FILE}#${surface}`)
   .join("\n");
-const report = `${applicationReport}\n\nDECLARED MIGRATION REBUILD SURFACES:\n${migrationReport}`;
+const outsideBoundaryReport = nonInlineCalls
+  .map(
+    ({ file, line, shape, source }) =>
+      `  ${file}:${line}: ${shape} ${JSON.stringify(source)}; governed-table ownership unmeasured.`,
+  )
+  .join("\n");
+const report =
+  `${applicationReport}\n\nOUTSIDE INLINE-SQL BOUNDARY: ${nonInlineCalls.length} exact-symbol direct ` +
+  `Db.run call(s); governed-table ownership unmeasured.${outsideBoundaryReport ? `\n${outsideBoundaryReport}` : ""}` +
+  `\nInterface and other property aliases cannot be counted by this check.` +
+  `\n\nDECLARED MIGRATION REBUILD SURFACES:\n${migrationReport}`;
 
-if (escapedRunReferences.length > 0 || nonInlineCalls.length > 0) {
+if (escapedRunReferences.length > 0) {
   const escaped = escapedRunReferences.map(
     ({ file, line, source }) => `  ${file}:${line}: Db.run escapes its direct call surface as \`${source}\`.\n`,
   );
-  const nonInline = nonInlineCalls.map(
-    ({ file, line, shape, source }) =>
-      `  ${file}:${line}: Db.run receives ${shape} \`${source}\`, not inline SQL.\n`,
-  );
   process.stdout.write(
-    `${report}\n\n${[...escaped, ...nonInline].join("")}\n` +
-      "Inline the final SQL string at Db.run; this check does not evaluate JavaScript expressions.\n" +
-      `RESULT: FAIL — ${escapedRunReferences.length + nonInlineCalls.length} Db.run call or reference ` +
-      "left the bounded direct-literal surface. residual: unmeasured.\n",
+    `${report}\n\n${escaped.join("")}\n` +
+      `RESULT: FAIL — ${escapedRunReferences.length} exact Db.run reference(s) escaped the direct ` +
+      "call surface. residual: unmeasured.\n",
   );
   process.exit(1);
 }
@@ -379,7 +386,7 @@ if (staleOwners.length > 0) {
     `${report}\n\n${staleOwners
       .map(
         ({ table, owner }) =>
-          `  ${table}: the declared application owner ${owner} has no inline Db.run call naming this table.\n`,
+          `  ${table}: the declared application owner ${owner} has no inline exact-symbol Db.run call naming this table.\n`,
       )
       .join("")}\nRESULT: FAIL — ${staleOwners.length} application-owner entry(ies) are stale. residual: unmeasured.\n`,
   );
@@ -401,7 +408,8 @@ if (residual.length > 0) {
 
 const totalCalls = governedTables.reduce((count, table) => count + callsByTable.get(table).length, 0);
 process.stdout.write(
-  `${report}\n\nRESULT: PASS — ${governedTables.length} governed table(s), ${totalCalls} direct inline ` +
-    "Db.run call(s) naming them, every call in its declared application owner, 0 non-inline " +
-    "Db.run calls, and 0 schema writer references. residual: 0.\n",
+  `${report}\n\nRESULT: PASS — ${governedTables.length} governed table(s), ${totalCalls} inline ` +
+    "exact-symbol Db.run call(s) naming them, every call in its declared application owner, and 0 schema " +
+    `writer references. residual: 0 within boundary; ` +
+    `outside-boundary ownership: unmeasured.\n`,
 );

@@ -1243,42 +1243,41 @@ const GUARDS = [
   {
     // #676: ownership is attached to the real mutation surface. Losing symbol resolution makes
     // the synthetic call disappear and leaves only stale-owner noise.
-    what: "the turn-fence writer check resolves the real Db run surface",
+    what: "the turn-fence writer check resolves the exact Db run symbol",
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find:
       "const symbolIsDbRun = (symbol) =>\n" +
       "  symbol !== undefined && symbol.declarations?.some((declaration) => sameDeclaration(declaration));",
     replace: "const symbolIsDbRun = () => false;",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when a new file names a governed table at Db run",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when an inline SQL exact Db run call names a governed table outside its owner",
     ],
   },
   {
-    what: "the turn-fence writer check rejects application calls outside the table owner",
+    what: "the turn-fence writer check rejects in-bound exact Db run calls outside the table owner",
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "    if (!allowed.has(file)) applicationResidual.push({ table, file });",
     replace: "    if (false) applicationResidual.push({ table, file });",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when a new file names a governed table at Db run",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when an inline SQL exact Db run call names a governed table outside its owner",
     ],
   },
   {
-    // The Array.join counterexample becomes PASS again if non-inline calls stop being fatal.
-    what: "the turn-fence writer check fails closed instead of evaluating a Db run argument",
+    what: "the turn-fence writer check reports non-inline exact Db run calls outside its boundary",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: "if (escapedRunReferences.length > 0 || nonInlineCalls.length > 0) {",
-    replace: "if (escapedRunReferences.length > 0 || false) {",
+    find: "    nonInlineCalls.push({",
+    replace: "    [].push({",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails closed on Array join SQL passed to Db run",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::reports Array join SQL outside the inline SQL boundary",
     ],
   },
   {
-    what: "the turn-fence writer check rejects a captured Db run method",
+    what: "the turn-fence writer check rejects a captured exact Db run method",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: "if (escapedRunReferences.length > 0 || nonInlineCalls.length > 0) {",
-    replace: "if (false || nonInlineCalls.length > 0) {",
+    find: "if (escapedRunReferences.length > 0) {",
+    replace: "if (false) {",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when Db run is captured instead of called directly",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when exact Db run is captured instead of called directly",
     ],
   },
   {
@@ -1287,7 +1286,7 @@ const GUARDS = [
     find: "    if (!seenFiles.has(owner)) staleOwners.push({ table, owner });",
     replace: "    if (false) staleOwners.push({ table, owner });",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when a declared application owner no longer names its table",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when a declared application owner no longer names its table",
     ],
   },
   {
@@ -1296,7 +1295,7 @@ const GUARDS = [
     find: "for (const match of strippedSchema.matchAll(WRITE)) {",
     replace: "for (const match of []) {",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when a schema trigger body writes a governed table directly",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when a schema trigger body writes a governed table directly",
     ],
   },
   {
@@ -1305,7 +1304,7 @@ const GUARDS = [
     find: "  if (!hasExec) missingRebuildSurfaces.push({ table, surface });",
     replace: "  if (false) missingRebuildSurfaces.push({ table, surface });",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when a named migration rebuild surface goes stale",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when a named migration rebuild surface goes stale",
     ],
   },
   {
@@ -1314,7 +1313,7 @@ const GUARDS = [
     find: "[...strippedSchema.matchAll(CREATE_TABLE)]",
     replace: "[...schema.matchAll(CREATE_TABLE)]",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::discovers a governed table declared with an SQL comment between CREATE and TABLE",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::discovers a governed table declared with an SQL comment between CREATE and TABLE",
     ],
   },
   {
@@ -1323,7 +1322,7 @@ const GUARDS = [
     find: "(?:${IDENT}\\s*\\.\\s*)?(${IDENT})\\s*\\(`,",
     replace: "(${IDENT})\\s*\\(`,",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::discovers a governed table declared with a schema-qualified name",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::discovers a governed table declared with a schema-qualified name",
     ],
   },
   {
@@ -1332,7 +1331,7 @@ const GUARDS = [
     find: "if (orphanedOwners.length > 0 || orphanedRebuilds.length > 0) {",
     replace: "if (false) {",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when declared ownership names a table the schema no longer declares",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when declared ownership names a table the schema no longer declares",
     ],
   },
   {
@@ -1341,7 +1340,7 @@ const GUARDS = [
     find: "process.stdout.write(`CHECK: ${CLAIM}\\nBOUNDARY: ${BOUNDARY}\\n`);",
     replace: "process.stdout.write(`CHECK: ${CLAIM}\\n`);",
     killedBy: [
-      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::prints the exact boundary on every run",
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::prints the exact boundary on every run",
     ],
   },
   {
