@@ -600,7 +600,7 @@ describe(CLAIM, () => {
     expect(done.status).toBe(0);
   });
 
-  it("fails when an inline exact Db run call names a table with no application owner", async () => {
+  it("fails when an inline exact Db run call names a table outside its declared application owner", async () => {
     const repo = await scratchRepo();
     writeProbe(
       repo,
@@ -611,7 +611,7 @@ describe(CLAIM, () => {
     const done = await censusOn(repo);
 
     expect(done.stdout).toContain("actor_target_attestations");
-    expect(done.stdout).toContain("outside its declared application owner list (none)");
+    expect(done.stdout).toContain("outside its declared application owner list (src/session/binding-registry.ts)");
     expect(done.status).toBe(1);
   });
 

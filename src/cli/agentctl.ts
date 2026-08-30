@@ -48,7 +48,7 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
                                            settle an unobserved turn ABORTED, which permits a retry.
                                            --fenced only when its executor incarnation is still
                                            current: you are stating the execution cannot still write
-  agentctl bootstrap hermes -- <command>  launch Hermes and establish CEO generation 1
+  agentctl bootstrap hermes --target-bind-executable <path> --hermes-profile <profile> --hermes-home <path> --requested-session-id <id> --expected-lineage-root-digest <sha256> --executor-runtime-identity <identity> -- <command>
   agentctl daemon status                  daemon mode and health; falls back to the lock file
 `;
 
@@ -164,14 +164,51 @@ export const dispatch = async (
   if (command === "bootstrap") {
     if (args[0] !== "hermes") return fail(`unknown bootstrap subcommand: ${args[0] ?? ""}`);
     const separator = args.indexOf("--", 1);
-    const hermesCommand = separator === -1 ? args.slice(1) : args.slice(separator + 1);
+    if (separator === -1) {
+      return fail("bootstrap hermes requires explicit target selectors followed by -- and a command");
+    }
+    const selectorArgs = args.slice(1, separator);
+    if (selectorArgs.length % 2 !== 0) return fail("bootstrap hermes selectors must be option/value pairs");
+    const selectorFields = {
+      "--target-bind-executable": "hermesExecutable",
+      "--hermes-profile": "hermesProfile",
+      "--hermes-home": "hermesHome",
+      "--requested-session-id": "requestedSessionId",
+      "--expected-lineage-root-digest": "expectedLineageRootDigest",
+      "--executor-runtime-identity": "executorRuntimeIdentity",
+    } as const;
+    const selectors: Record<string, string> = {};
+    for (let index = 0; index < selectorArgs.length; index += 2) {
+      const option = selectorArgs[index]!;
+      const value = selectorArgs[index + 1]!;
+      const field = selectorFields[option as keyof typeof selectorFields];
+      if (!field) return fail(`unknown bootstrap hermes selector: ${option}`);
+      if (selectors[field]) return fail(`duplicate bootstrap hermes selector: ${option}`);
+      if (!value || !value.trim() || value.includes("\0")) {
+        return fail(`bootstrap hermes selector requires a non-empty value: ${option}`);
+      }
+      selectors[field] = value;
+    }
+    if (Object.values(selectorFields).some((field) => !selectors[field])) {
+      return fail("bootstrap hermes requires every authenticated target selector");
+    }
+    const hermesCommand = args.slice(separator + 1);
     if (hermesCommand.length === 0) {
       return fail("bootstrap hermes requires -- followed by a command and its arguments");
     }
+    const payload = {
+      command: hermesCommand,
+      hermesExecutable: selectors["hermesExecutable"]!,
+      hermesProfile: selectors["hermesProfile"]!,
+      hermesHome: selectors["hermesHome"]!,
+      requestedSessionId: selectors["requestedSessionId"]!,
+      expectedLineageRootDigest: selectors["expectedLineageRootDigest"]!,
+      executorRuntimeIdentity: selectors["executorRuntimeIdentity"]!,
+    };
     return call(
       "bootstrap.hermes",
-      { command: hermesCommand },
-      `hermes-bootstrap:${digestOf(hermesCommand)}`,
+      payload,
+      `hermes-bootstrap:${digestOf(payload)}`,
     );
   }
 

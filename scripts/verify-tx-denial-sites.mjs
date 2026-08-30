@@ -205,14 +205,6 @@ const EXEMPT = [
       "Nothing later in this body denies after the two INSERTs that follow.",
   },
   {
-    file: "session/binding-registry.ts",
-    marker: "const recorded = this.recordTargetBinding(actorId, input.verifiedTarget)",
-    reason:
-      "recordTargetBinding's only write is the INSERT it attempts, caught in a try/catch " +
-      "that turns a UNIQUE-constraint failure into this deny — the write and the deny are " +
-      "the same statement failing, not an earlier write surviving a later, independent one.",
-  },
-  {
     file: "run/task-graph.ts",
     marker: "TASK_EXECUTION_LATE_RESULT_IGNORED",
     reason:
