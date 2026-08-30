@@ -1,8 +1,10 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { isAcpError } from "../../src/core/errors.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { PRODUCER_ROLES, ROLE_CLASS, Role, SessionLifecycle } from "../../src/domain/types.ts";
+import type { AuthenticatedTargetTuple } from "../../src/session/binding-registry.ts";
 import { cleanupTempDirs, makeCore, makeRepo, seedActor, seedRun } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -648,5 +650,138 @@ describe("#664 — a takeover's revoke-and-mint rolls back when it cannot repoin
     const current = core.bindings.active(seeded.roleKey);
     expect(current?.sessionId).toBe(seeded.sessionId);
     expect(current?.bindingGeneration).toBe(seeded.generation);
+  });
+});
+
+describe("#649 — bootstrap target attestations are authenticated and atomic", () => {
+  const claimed = {
+    executorKind: "hermes",
+    targetLocator: "target:conversation-649",
+    targetLocatorDigest: "sha256:conversation-649",
+  };
+  const attestationDigestFor = (tuple: AuthenticatedTargetTuple) => digestOf({
+    domain: "acp.target-attestation",
+    protocolVersion: "acp/1",
+    executorKind: claimed.executorKind,
+    targetLocatorDigest: claimed.targetLocatorDigest,
+    ...tuple,
+  });
+  const authenticated = (verify: (tuple: AuthenticatedTargetTuple) => typeof claimed | null) => {
+    let attested: AuthenticatedTargetTuple | undefined;
+    return {
+      claimed,
+      protocolVersion: "acp/1",
+      get attestationDigest() {
+        if (!attested) throw new Error("attestation digest read before tuple verification");
+        return attestationDigestFor(attested);
+      },
+      verify: (tuple: AuthenticatedTargetTuple) => {
+        const target = verify(tuple);
+        if (target) attested = tuple;
+        return target;
+      },
+    };
+  };
+  const counts = (db: ReturnType<typeof makeCore>["db"]) => db.get<{
+    actors: number; assignments: number; bindings: number; attestations: number;
+  }>(`SELECT (SELECT COUNT(*) FROM conversational_actors) AS actors,
+             (SELECT COUNT(*) FROM assignments) AS assignments,
+             (SELECT COUNT(*) FROM actor_target_bindings) AS bindings,
+             (SELECT COUNT(*) FROM actor_target_attestations) AS attestations`)!;
+
+  it("persists the verified target's exact actor-generation-assignment-session tuple", () => {
+    const { bindings, db, session } = setup();
+    const sessionId = session("ses_authenticated_target_success");
+    let seen: AuthenticatedTargetTuple | undefined;
+    const result = bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: authenticated((tuple) => {
+      seen = tuple;
+      return claimed;
+    }) });
+    expect(result.allowed).toBe(true);
+    if (!result.allowed) return;
+    if (!seen) throw new Error("target was not verified");
+    const joined = db.get<Record<string, unknown>>(
+      `SELECT a.actor_id, a.binding_generation, a.assignment_id, t.executor_session_id,
+              t.executor_session_incarnation, t.protocol_version, t.attestation_digest,
+              b.executor_kind, b.target_locator_digest
+         FROM assignments a JOIN actor_target_bindings b ON b.target_actor_id = a.actor_id
+         JOIN actor_target_attestations t ON t.target_binding_id = b.target_binding_id
+        WHERE a.assignment_id = ?`, [result.value.assignmentId]);
+    expect(joined).toMatchObject({
+      actor_id: seen.actorId, binding_generation: seen.generation, assignment_id: seen.assignmentId,
+      executor_session_id: sessionId, executor_session_incarnation: `inc-${sessionId}`,
+      protocol_version: "acp/1", attestation_digest: attestationDigestFor(seen),
+      executor_kind: claimed.executorKind, target_locator_digest: claimed.targetLocatorDigest,
+    });
+    expect(seen).toMatchObject({ sessionId, incarnation: `inc-${sessionId}` });
+  });
+
+  it("leaves no writes when the authenticated target denies the planned tuple", () => {
+    const { bindings, db, session } = setup();
+    const sessionId = session("ses_authenticated_target_denied");
+    const before = counts(db);
+    const result = bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: authenticated(() => null) });
+    expect(result.allowed).toBe(false);
+    expect(counts(db)).toEqual(before);
+  });
+
+  it("rolls back actor, target binding, and assignment when attestation insertion fails", () => {
+    const { bindings, db, session } = setup();
+    const sessionId = session("ses_authenticated_target_attestation_failure");
+    const run = db.run.bind(db);
+    const insertionFailure = vi.spyOn(db, "run").mockImplementation((sql, params) => {
+      if (sql.includes("INSERT INTO actor_target_attestations")) {
+        throw new Error("forced attestation failure");
+      }
+      return run(sql, params);
+    });
+    const before = counts(db);
+    try {
+      const result = bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: authenticated(() => claimed) });
+      expect(result.allowed).toBe(false);
+      expect(counts(db)).toEqual(before);
+    } finally {
+      insertionFailure.mockRestore();
+    }
+  });
+
+  it("attests a reused target actor at the current binding generation", () => {
+    const { bindings, db, session } = setup();
+    const first = bindings.bind({ role: Role.CEO, sessionId: session("ses_authenticated_target_first"),
+      authenticatedTarget: authenticated(() => claimed) });
+    expect(first.allowed).toBe(true);
+    if (!first.allowed) return;
+    db.run(`UPDATE assignments SET status = 'REVOKED' WHERE assignment_id = ?`, [first.value.assignmentId]);
+    let seen: AuthenticatedTargetTuple | undefined;
+    const second = bindings.bind({ role: Role.CEO, sessionId: session("ses_authenticated_target_reused"),
+      authenticatedTarget: authenticated((tuple) => {
+        seen = tuple;
+        return claimed;
+      }) });
+    expect(second.allowed).toBe(true);
+    if (!second.allowed) return;
+    if (!seen) throw new Error("reused target was not verified");
+    const firstActorId = db.get<{ actor_id: string }>(
+      `SELECT actor_id FROM assignments WHERE assignment_id = ?`, [first.value.assignmentId])!.actor_id;
+    expect(seen).toEqual({
+      actorId: firstActorId,
+      generation: second.value.bindingGeneration,
+      assignmentId: second.value.assignmentId,
+      sessionId: "ses_authenticated_target_reused",
+      incarnation: "inc-ses_authenticated_target_reused",
+    });
+    const row = db.get<{
+      actor_id: string; binding_generation: number; assignment_id: string; attestation_digest: string;
+    }>(
+      `SELECT a.actor_id, t.binding_generation, a.assignment_id, t.attestation_digest FROM assignments a
+         JOIN actor_target_bindings b ON b.target_actor_id = a.actor_id
+         JOIN actor_target_attestations t ON t.target_binding_id = b.target_binding_id
+        WHERE a.assignment_id = ? AND t.binding_generation = a.binding_generation`, [second.value.assignmentId]);
+    expect(row).toEqual({
+      actor_id: firstActorId,
+      binding_generation: second.value.bindingGeneration,
+      assignment_id: second.value.assignmentId,
+      attestation_digest: attestationDigestFor(seen),
+    });
   });
 });
