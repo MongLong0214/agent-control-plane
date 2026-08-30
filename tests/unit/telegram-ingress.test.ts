@@ -855,8 +855,220 @@ describe("Telegram production ingress", () => {
         ["update:721"],
       );
       const claim = claimRow?.turn_claim_json ? JSON.parse(claimRow.turn_claim_json) : null;
-      expect(claim?.overriddenUnresolvedNonce, "the deliberate override was not recorded on the claim")
-        .toBe("update:720");
+      expect(claim?.overriddenUnresolvedNonces, "the deliberate override was not recorded on the claim")
+        .toEqual(["update:720"]);
+    } finally {
+      await againListener.close();
+    }
+  });
+
+  it("#695: names both unresolved turns, not only the oldest, once a second one accumulates", async () => {
+    // #680 built the park-before-claim mechanism and #695 is the gap a review found in it
+    // afterward: both places the router reads `unresolvedTurns()` used only its first element.
+    // Reproduction, entirely sequential — no concurrency required. A crashes; /again overrides A
+    // to claim B, and B *also* crashes, so the conversation now carries two unresolved rows (A,
+    // B) at once. An ordinary message C must then be parked with both named, not only A — and a
+    // later /again for C must record both as overridden, not only A.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const turns: string[] = [];
+    const crashingTurn = async (input: { text: string }): Promise<string> => {
+      turns.push(input.text);
+      throw new TelegramInterruption("after-dispatch");
+    };
+
+    // A crashes.
+    const firstTransport = new FakeTelegramTransport();
+    const first = update("A 확인해줘", {}, 730);
+    firstTransport.updates = [first];
+    const firstListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: firstTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      await expect(firstListener.service.pollOnce()).rejects.toBeInstanceOf(TelegramInterruption);
+    } finally {
+      await firstListener.close();
+    }
+
+    // Advance the clock so A and B get distinct received_at values — otherwise a frozen
+    // ManualClock would make them identical strings and the "names both" assertion below would
+    // pass by coincidence rather than by the fix actually naming two distinct rows.
+    harness.clock.advance(60_000);
+
+    // /again claims B over A's override — and B also crashes, so it too stays unresolved.
+    const againBTransport = new FakeTelegramTransport();
+    const againB = update("/again B 확인해줘", {}, 731);
+    againBTransport.updates = [againB];
+    const againBListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: againBTransport,
+      start: false,
+      onDirect: crashingTurn,
+    });
+    try {
+      await expect(againBListener.service.pollOnce()).rejects.toBeInstanceOf(TelegramInterruption);
+    } finally {
+      await againBListener.close();
+    }
+    expect(turns).toEqual(["A 확인해줘", "B 확인해줘"]);
+
+    const rowsBefore = harness.cp.db.all<{ nonce: string; received_at: string }>(
+      `SELECT nonce, received_at FROM inbound_messages WHERE channel = 'telegram' AND nonce IN (?, ?)`,
+      ["update:730", "update:731"],
+    );
+    const receivedAtA = rowsBefore.find((r) => r.nonce === "update:730")!.received_at;
+    const receivedAtB = rowsBefore.find((r) => r.nonce === "update:731")!.received_at;
+
+    // C, an ordinary message with no /again, must be parked with BOTH A and B named — not only
+    // the oldest (A). Before the fix, the reply names only A and B is never mentioned anywhere
+    // the owner can see.
+    const cTransport = new FakeTelegramTransport();
+    const cUpdate = update("C 새 메시지", {}, 732);
+    cTransport.updates = [cUpdate];
+    const cListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: cTransport,
+      start: false,
+      onDirect: () => "실행되면 안 됨",
+    });
+    try {
+      const outcome = await cListener.service.pollOnce();
+      expect(outcome.outcomes[0]?.reasonCode).toBe(ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION);
+      const replyText = outcome.outcomes[0]?.reply?.text ?? "";
+      expect(replyText, "park reply must name A's received time").toContain(receivedAtA);
+      expect(replyText, "park reply must name B's received time too, not only A's").toContain(receivedAtB);
+    } finally {
+      await cListener.close();
+    }
+
+    // Owner sends /again for C. The override record must capture BOTH A's and B's nonces — not
+    // only A's, which is all index-0 code can ever see.
+    const againCTransport = new FakeTelegramTransport();
+    const againC = update("/again C 새 메시지", {}, 733);
+    againCTransport.updates = [againC];
+    const againCListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: againCTransport,
+      start: false,
+      onDirect: (input: { text: string }) => {
+        turns.push(input.text);
+        return "확인함";
+      },
+    });
+    try {
+      const outcome = await againCListener.service.pollOnce();
+      expect(outcome.outcomes[0]?.reasonCode).toBe(ReasonCode.OK);
+
+      const claimRow = harness.cp.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+        ["update:733"],
+      );
+      const claim = claimRow?.turn_claim_json ? JSON.parse(claimRow.turn_claim_json) : null;
+      expect(claim?.overriddenUnresolvedNonces, "the override must record every unresolved nonce, not only the oldest")
+        .toEqual(["update:730", "update:731"]);
+    } finally {
+      await againCListener.close();
+    }
+  });
+
+  it("#695: bounds the park reply's enumeration past the cap, and still records every overridden nonce", async () => {
+    // Sol's BLOCK on the naive "name all of them" fix: `IngressGuard.prune` deliberately never
+    // removes an unresolved claim (it needs a person, not a timer), so a conversation that keeps
+    // crashing and keeps getting `/again`'d grows this list without bound. Measured directly:
+    // 146 real unresolved rows already produce a 4,099-character joined line, past Telegram's
+    // 4,096-character sendMessage limit, and relying on the generic `truncateTelegramText` slice
+    // to save it cuts the reply off mid-list — carrying away the very instructions that tell the
+    // owner `/again` exists. This drives MAX_NAMED_UNRESOLVED_TURNS(10) + 2 = 12 unresolved rows
+    // through the real production path (impractical to reach the literal 146 that way — this
+    // exercises the same cap-then-summarize mechanism at a size fast enough for a unit test) and
+    // checks both halves of the fix: the *reply* stays short and still actionable, and the
+    // *override record* — durable storage, not a wire message — still names every one of the 12.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const turns: string[] = [];
+    const crashingTurn = async (input: { text: string }): Promise<string> => {
+      turns.push(input.text);
+      throw new TelegramInterruption("after-dispatch");
+    };
+
+    const ROWS_BEYOND_CAP = 12;
+    const baseUpdateId = 900;
+    for (let i = 0; i < ROWS_BEYOND_CAP; i++) {
+      const text = i === 0 ? `turn ${i}` : `/again turn ${i}`;
+      const transport = new FakeTelegramTransport();
+      transport.updates = [update(text, {}, baseUpdateId + i)];
+      const listener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+        transport,
+        start: false,
+        onDirect: crashingTurn,
+      });
+      try {
+        await expect(listener.service.pollOnce()).rejects.toBeInstanceOf(TelegramInterruption);
+      } finally {
+        await listener.close();
+      }
+      // Distinct received_at per row: a frozen clock would make every row's timestamp identical
+      // and SQLite's tie-break order is not a property this test should lean on.
+      harness.clock.advance(60_000);
+    }
+    expect(turns).toHaveLength(ROWS_BEYOND_CAP);
+
+    // An ordinary message, no /again: the reply must stay well under Telegram's 4,096-character
+    // limit and must still contain the /again instructions — the point of a deliberate cap
+    // instead of leaving it to a blind truncator that would cut them off.
+    const cUpdateId = baseUpdateId + ROWS_BEYOND_CAP;
+    const cTransport = new FakeTelegramTransport();
+    cTransport.updates = [update("ordinary message", {}, cUpdateId)];
+    const cListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: cTransport,
+      start: false,
+      onDirect: () => "실행되면 안 됨",
+    });
+    try {
+      const outcome = await cListener.service.pollOnce();
+      expect(outcome.outcomes[0]?.reasonCode).toBe(ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION);
+      const replyText = outcome.outcomes[0]?.reply?.text ?? "";
+      expect(
+        replyText.length,
+        "the park reply must stay well under Telegram's 4,096-char sendMessage limit",
+      ).toBeLessThan(2000);
+      expect(replyText, "a bounded reply must still tell the owner how to override").toContain("/again");
+      expect(replyText, `must count all ${ROWS_BEYOND_CAP} unresolved turns, not only the named ones`).toContain(
+        `${ROWS_BEYOND_CAP} earlier messages`,
+      );
+      expect(replyText, "must summarize the rows past the cap rather than enumerate all of them").toContain("more");
+    } finally {
+      await cListener.close();
+    }
+
+    // Owner overrides via /again. The durable record must capture every one of the 12 unresolved
+    // nonces — not only the MAX_NAMED_UNRESOLVED_TURNS the reply named.
+    const againUpdateId = cUpdateId + 1;
+    const againTransport = new FakeTelegramTransport();
+    againTransport.updates = [update("/again ordinary message", {}, againUpdateId)];
+    const againListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: againTransport,
+      start: false,
+      onDirect: (input: { text: string }) => {
+        turns.push(input.text);
+        return "확인함";
+      },
+    });
+    try {
+      const outcome = await againListener.service.pollOnce();
+      expect(outcome.outcomes[0]?.reasonCode).toBe(ReasonCode.OK);
+
+      const claimRow = harness.cp.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+        [`update:${againUpdateId}`],
+      );
+      const claim = claimRow?.turn_claim_json ? JSON.parse(claimRow.turn_claim_json) : null;
+      const expectedNonces = Array.from({ length: ROWS_BEYOND_CAP }, (_, i) => `update:${baseUpdateId + i}`);
+      expect(
+        claim?.overriddenUnresolvedNonces,
+        "the record must capture every unresolved nonce, not only the ones the reply named",
+      ).toEqual(expectedNonces);
     } finally {
       await againListener.close();
     }
