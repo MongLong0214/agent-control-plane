@@ -1565,6 +1565,20 @@ const GUARDS = [
       "tests/unit/doctor-daemon-r2.test.ts::#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger",
     ],
   },
+  {
+    // #692 round 3 — a cause is not a lock. Without this, resumeProject reverses a
+    // SUSPEND-caused DRAINING the moment it sees the cause, regardless of whether
+    // suspendProject's own stopSession() await for it is still running — reopening both
+    // of dispatch's blocking conditions (project.suspended, CTO draining) while the
+    // original suspend has not finished. The bare file is named rather than one test by
+    // name: the round-3 test's title contains literal parentheses ("stopSession()"),
+    // which `vitest -t` would read as a regex group rather than the runtime call it names.
+    what: "resumeProject refuses to reverse a suspend whose stopSession() is still in flight",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "          if (isAlive(session.drainingStopPid)) {",
+    replace: "          if (false) {",
+    killedBy: ["tests/unit/cto-registry-r2.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

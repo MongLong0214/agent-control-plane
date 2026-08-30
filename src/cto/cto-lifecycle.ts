@@ -734,11 +734,17 @@ export class CtoLifecycle {
       }
 
       if (session.lifecycle === SessionLifecycle.READY) {
+        // #692 round 3 — the fence: `process.pid` is this daemon process, the one about to
+        // await `stopSession()` below. `resumeProject` refuses to reverse DRAINING/SUSPEND
+        // while this pid is set and alive, closing the window where it previously reversed
+        // a suspend that had not actually finished. See the migration comment (v33,
+        // migrations.ts) for the crash-reclamation half of this.
         const draining = this.sessions.transition(
           current.sessionId,
           SessionLifecycle.DRAINING,
           "project suspended",
           DrainingCause.SUSPEND,
+          process.pid,
         );
         if (!draining.allowed) return draining as Decision<void>;
       }
@@ -896,6 +902,16 @@ export class CtoLifecycle {
    * non-SUSPEND cause — including the fail-closed null a pre-#692 row would carry — refuses
    * the whole call, rolling back the `projects.suspended` flag flip above with it: there is
    * nothing here for this call to have legitimately resumed.
+   *
+   * #692 round 3 — a cause is not a lock, either. `suspendProject` commits `draining_cause =
+   * SUSPEND` and *then* awaits `stopSession()`; a call landing in that window found the cause
+   * already SUSPEND and reversed a suspend that had not actually finished, reopening both of
+   * `dispatch`'s blocking conditions (project.suspended, CTO draining) while the original
+   * suspend was still running. `session.drainingStopPid` — the pid of the daemon process
+   * inside that await, stamped atomically with the DRAINING transition — is the fence: set
+   * and alive refuses; set and dead means the process that owned it crashed, and this
+   * self-heals to ERROR instead of resuming as if nothing had happened (see the `isAlive`
+   * helper below and the migration comment in migrations.ts, v33).
    */
   resumeProject(projectId: string): Decision<void> {
     return this.db.txDecision(() => {
@@ -915,6 +931,37 @@ export class CtoLifecycle {
             { projectId, sessionId: current.sessionId, drainingCause: session.drainingCause },
           );
         }
+
+        // #692 round 3 — a cause is not a lock. `drainingCause === SUSPEND` alone does not
+        // say whether the suspend that set it is still running: `suspendProject` commits
+        // this cause and *then* awaits `stopSession()`, so this call can land in that exact
+        // window. `drainingStopPid` is the fence for it — the pid of the daemon process
+        // currently inside that await, stamped atomically with the DRAINING transition.
+        if (session.drainingStopPid != null) {
+          if (isAlive(session.drainingStopPid)) {
+            return deny(
+              ReasonCode.RESUME_BLOCKED_SUSPEND_IN_FLIGHT,
+              "a suspend is still stopping this session's runtime; resuming now would race " +
+                "its own compensation",
+              { projectId, sessionId: current.sessionId, drainingStopPid: session.drainingStopPid },
+            );
+          }
+          // The daemon process that stamped this fence is gone: a crash mid-suspend, not a
+          // suspend still running. Whether stopSession's own call reached the external
+          // runtime before that crash is unknown, so this self-heals to ERROR exactly the
+          // way daemon.ts's own startup `reconcile()` resolves the identical shape (see its
+          // `os_pid` dead-session sweep) rather than resuming as if the suspend had cleanly
+          // never happened. Doing it here, inline, means an orphaned fence does not wedge
+          // the project until the next daemon restart.
+          const errored = this.sessions.transition(
+            current.sessionId,
+            SessionLifecycle.ERROR,
+            "suspend stop process gone",
+          );
+          if (!errored.allowed) return errored as Decision<void>;
+          return allow(ReasonCode.OK, undefined);
+        }
+
         const restored = this.sessions.transition(current.sessionId, SessionLifecycle.READY, "project resumed");
         if (!restored.allowed) return restored as Decision<void>;
       }
@@ -1161,6 +1208,26 @@ const probeSessionHealth = async (
     });
   }
   return allow(ReasonCode.OK, undefined);
+};
+
+/**
+ * #692 round 3 — whether the daemon process that stamped a `draining_stop_pid` fence is
+ * still running. A plain liveness check, not the stricter `(pid, startedAt)` tuple
+ * `assertReviewerIndependence` needs for a security-sensitive lookup: the same tolerance for
+ * pid reuse daemon.ts's own startup `reconcile()` already accepts for its `os_pid` dead-session
+ * sweep is enough for this fence too. Not shared with daemon.ts's or single-instance.ts's own
+ * copies of this exact check — copying eight lines is cheaper than a shared dependency between
+ * modules that otherwise do not know about each other (src/core/process-identity.ts explains
+ * the same tradeoff for `processStartedAt`).
+ */
+const isAlive = (pid: number): boolean => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 };
 
 export const missingHandoffFields = (handoff: HandoffPackage): string[] => {

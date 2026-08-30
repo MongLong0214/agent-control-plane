@@ -19,6 +19,12 @@ export interface SessionRecord {
   lifecycle: SessionLifecycle;
   /** #692 — which caller drained this session. Non-null only while lifecycle = DRAINING. */
   drainingCause: DrainingCause | null;
+  /**
+   * #692 round 3 — the OS pid of the daemon process currently awaiting suspendProject's
+   * stopSession() for this session. Non-null only while lifecycle = DRAINING and
+   * drainingCause = SUSPEND; it is the fence resumeProject checks before reversing the drain.
+   */
+  drainingStopPid: number | null;
   buzzAddress: string | null;
   /** §27.2 — the authenticated Buzz channel identity identity this session speaks as, if bound. */
   buzzActorId: string | null;
@@ -171,12 +177,20 @@ export class SessionRegistry {
    * any write, so a second drain request layered on an existing one (e.g. requestReplacement
    * called against a session a suspend already parked in DRAINING) can never overwrite the
    * cause the first one recorded.
+   *
+   * `drainingStopPid` (#692 round 3) follows the identical rule and for the identical reason:
+   * only meaningful while `to` is DRAINING, cleared to null on every other destination, and
+   * never overwritten by a second drain request layered on an existing DRAINING (the
+   * short-circuit above covers it the same way it already covers `drainingCause`). It is the
+   * in-flight fence `suspendProject` stamps atomically with `DrainingCause.SUSPEND` and
+   * `resumeProject` reads before reversing the drain.
    */
   transition(
     sessionId: string,
     to: SessionLifecycle,
     reason?: string,
     drainingCause?: DrainingCause,
+    drainingStopPid?: number | null,
   ): Decision<SessionRecord> {
     const session = this.get(sessionId);
     if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });
@@ -189,18 +203,21 @@ export class SessionRegistry {
       );
     }
     const nextDrainingCause = to === SessionLifecycle.DRAINING ? (drainingCause ?? null) : null;
+    const nextDrainingStopPid = to === SessionLifecycle.DRAINING ? (drainingStopPid ?? null) : null;
     // The lifecycle write and the outbox fence are one transaction: a message left claimed
     // for a session that has just died would otherwise stay IN_FLIGHT until some later
     // delivery loop happened to sweep it, and a crash between the two writes would leave it
     // there permanently.
     return this.db.tx(() => {
       this.db.run(
-        `UPDATE sessions SET lifecycle = ?, updated_at = ?, stopped_at = ?, draining_cause = ? WHERE session_id = ?`,
+        `UPDATE sessions SET lifecycle = ?, updated_at = ?, stopped_at = ?, draining_cause = ?,
+                             draining_stop_pid = ? WHERE session_id = ?`,
         [
           to,
           this.clock.nowIso(),
           to === SessionLifecycle.STOPPED ? this.clock.nowIso() : session.stoppedAt,
           nextDrainingCause,
+          nextDrainingStopPid,
           sessionId,
         ],
       );
@@ -208,7 +225,13 @@ export class SessionRegistry {
       this.audit.record({
         kind: "SESSION_LIFECYCLE",
         sessionId,
-        evidence: { from: session.lifecycle, to, reason: reason ?? null, drainingCause: nextDrainingCause },
+        evidence: {
+          from: session.lifecycle,
+          to,
+          reason: reason ?? null,
+          drainingCause: nextDrainingCause,
+          drainingStopPid: nextDrainingStopPid,
+        },
       });
       if (fenced.length > 0) {
         this.audit.record({
@@ -396,6 +419,7 @@ interface RawSession {
   effort: string | null;
   lifecycle: SessionLifecycle;
   draining_cause: DrainingCause | null;
+  draining_stop_pid: number | null;
   buzz_address: string | null;
   buzz_actor_id: string | null;
   os_pid: number | null;
@@ -413,6 +437,7 @@ const hydrate = (row: RawSession): SessionRecord => ({
   effort: row.effort,
   lifecycle: row.lifecycle,
   drainingCause: row.draining_cause ?? null,
+  drainingStopPid: row.draining_stop_pid ?? null,
   buzzAddress: row.buzz_address,
   buzzActorId: row.buzz_actor_id,
   osPid: row.os_pid,

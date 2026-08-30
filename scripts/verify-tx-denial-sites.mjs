@@ -245,9 +245,15 @@ const EXEMPT = [
       "rolling STOPPED back would leave the session record disagreeing with reality — the " +
       "write is deliberately left to survive the denial. That denial is not silently " +
       "accepted, though: the call site checks for exactly REVOCATION_BLOCKED_ACTIVE_RUNS, " +
-      "marks the project UNAVAILABLE, records a PROJECT_SUSPEND_BINDING_REVOKE_FAILED " +
-      "audit event, and returns SESSION_STOPPED_BINDING_REVOKE_FAILED instead of the bare " +
-      "denial — see #692.",
+      "records a PROJECT_SUSPEND_BINDING_REVOKE_FAILED audit event, and returns " +
+      "SESSION_STOPPED_BINDING_REVOKE_FAILED instead of the bare denial. It deliberately " +
+      "does not also mark the project UNAVAILABLE (confirmed by reading the branch: only " +
+      "the sibling stopSession()-throws catch above does that) — doctor.ts's " +
+      "CTO_BINDING_POINTS_AT_DEAD_SESSION check (CRITICAL) already reads the exact join an " +
+      "active binding pointing at a STOPPED session forms, so there is nothing left for a " +
+      "separate flag to make visible, and nothing to remember to clear once a later retry's " +
+      "revoke succeeds and the join stops matching — see #692's docstring on this branch " +
+      "for the full reasoning.",
   },
   {
     file: "outbox/outbox.ts",

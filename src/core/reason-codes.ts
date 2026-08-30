@@ -116,6 +116,14 @@ export const ReasonCode = {
   REVOCATION_BLOCKED_ACTIVE_RUNS: "REVOCATION_BLOCKED_ACTIVE_RUNS",
   /** #692 — resumeProject refuses a DRAINING session whose cause was not suspendProject. */
   RESUME_BLOCKED_NON_SUSPEND_DRAINING: "RESUME_BLOCKED_NON_SUSPEND_DRAINING",
+  /**
+   * #692 round 3 — resumeProject refuses a SUSPEND-caused DRAINING session while
+   * suspendProject's own stopSession() is still in flight (the daemon process that
+   * stamped the fence is still alive). Distinct from RESUME_BLOCKED_NON_SUSPEND_DRAINING,
+   * which refuses a different *cause* altogether; this refuses the same cause while its
+   * operation has not yet finished.
+   */
+  RESUME_BLOCKED_SUSPEND_IN_FLIGHT: "RESUME_BLOCKED_SUSPEND_IN_FLIGHT",
   /** #692 — requestReplacement refuses to drain a session out from under an owner suspend. */
   REPLACEMENT_BLOCKED_PROJECT_SUSPENDED: "REPLACEMENT_BLOCKED_PROJECT_SUSPENDED",
   PRODUCER_HISTORY_UNAVAILABLE: "PRODUCER_HISTORY_UNAVAILABLE",

@@ -2088,7 +2088,8 @@ const v31: SchemaMigration = {
 };
 
 /**
- * v33 records why a session is DRAINING, not just that it is (#692 round 2).
+ * v33 records why a session is DRAINING, not just that it is (#692 round 2), and — round 3 —
+ * whether the operation that caused it is still running.
  *
  * `resumeProject` reversed *any* DRAINING session back to READY, keyed on the bare lifecycle
  * state. A replacement drains the same way a suspend does (requestReplacement, DRAIN_REQUEST) —
@@ -2101,6 +2102,19 @@ const v31: SchemaMigration = {
  * suspend". Nothing production writes today reaches a DRAINING session with this column unset
  * except through the exact crash this migration is too late to have recorded, which is why the
  * fail-closed reading is the only one available for pre-migration rows.
+ *
+ * `draining_stop_pid` is round 3's addition: a cause is not a lock. `suspendProject` commits
+ * `draining_cause = SUSPEND` and *then* awaits `stopSession()` — a `resumeProject` landing in
+ * that window read only the cause, saw SUSPEND, and reversed a suspend that was still running.
+ * The pid (the daemon process currently awaiting that stop) is the fence: `resumeProject`
+ * refuses whenever it is set and that process is still alive, exactly the way
+ * `daemon.ts reconcile()`'s existing dead-session sweep already treats `sessions.os_pid` — the
+ * same tolerance for pid reuse (a plain liveness check, not the stricter `(pid, startedAt)`
+ * tuple `assertReviewerIndependence` needs for a security-sensitive lookup) is enough here too.
+ * A crash that kills the daemon mid-await leaves this pid stamped but dead; `reconcile()` sweeps
+ * exactly that shape to ERROR on the next startup (mirroring its `os_pid` loop immediately
+ * above it), and `resumeProject` performs the identical check inline so it self-heals even
+ * before the next restart, rather than depending on reconcile() having already run.
  *
  * The id is `v33`, not `v32`, while `fromVersion`/`toVersion` below still read 31/32: #701
  * (id `v32-a-source-can-only-cite-its-turns-own-claim-event`) is ahead of this PR in the merge
@@ -2119,6 +2133,7 @@ const v31: SchemaMigration = {
 const V32_DDL = `
   ALTER TABLE sessions ADD COLUMN draining_cause TEXT
     CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT'));
+  ALTER TABLE sessions ADD COLUMN draining_stop_pid INTEGER;
 `;
 
 const v33: SchemaMigration = {
@@ -2128,10 +2143,22 @@ const v33: SchemaMigration = {
   apply: (raw) => {
     // The v12/v19 replay trap: a database reconstructed through the migration chain may already
     // carry this column from a replayed CREATE TABLE, and a bare ALTER then fails with
-    // `duplicate column name`. Adding it only when absent keeps both routes working.
-    const present = (raw.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>)
-      .some((column) => column.name === "draining_cause");
-    if (!present) raw.exec(V32_DDL);
+    // `duplicate column name`. Adding it only when absent keeps both routes working. The two
+    // columns are checked (and, if necessary, added) independently: a database that already
+    // replayed a CREATE TABLE carrying `draining_cause` but not yet `draining_stop_pid` (or vice
+    // versa, mid-migration-history) must not skip the one it is actually missing.
+    const columns = (raw.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>).map(
+      (column) => column.name,
+    );
+    if (!columns.includes("draining_cause")) {
+      raw.exec(
+        `ALTER TABLE sessions ADD COLUMN draining_cause TEXT
+           CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT'));`,
+      );
+    }
+    if (!columns.includes("draining_stop_pid")) {
+      raw.exec(`ALTER TABLE sessions ADD COLUMN draining_stop_pid INTEGER;`);
+    }
   },
   checksum: () => sha256(`v33-draining-remembers-its-cause\n${V32_DDL}`),
 };

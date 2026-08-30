@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import { type HandoffAcknowledgement, type HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
@@ -340,6 +341,105 @@ describe("round-2 CTO lifecycle regressions", () => {
       const dispatched = await harness.cp.runs.dispatch(run.value.runId);
       expect(dispatched.allowed).toBe(true);
       expect(harness.cp.bindings.activePrimaryCto(projectId)?.sessionId).toBe(binding.sessionId);
+    },
+  );
+
+  it(
+    "#692 round 3 — resumeProject must not reverse a suspend whose stopSession() is " +
+      "still in flight, and a run must not dispatch in that window",
+    async () => {
+      // Unlike the test above, this drives the interleaving through the *real*
+      // suspendProject/resumeProject methods rather than assembling the DRAINING state by
+      // hand — round 3's review found that hand-assembly cannot distinguish "a suspend
+      // whose stopSession() await is still pending" from "a crash that left DRAINING
+      // behind", which is exactly the gap this test closes.
+      const harness = makeHarness();
+      const { projectId, repositoryId } = await registerFixtureProject(harness);
+      await createActiveRun(harness, projectId, repositoryId);
+      const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+
+      // A second, still-QUEUED run: dispatch's two blocking conditions (project.suspended,
+      // CTO draining) are exactly what a same-window resumeProject would clear.
+      const queuedRun = harness.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!queuedRun.allowed) throw new Error(queuedRun.message);
+
+      let resumeDuringWindow: ReturnType<typeof harness.cp.cto.resumeProject> | undefined;
+      let dispatchDuringWindow: Awaited<ReturnType<typeof harness.cp.runs.dispatch>> | undefined;
+      const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+      harness.scripted.stopSession = async (handle) => {
+        // suspendProject has already committed suspended=true and DRAINING/SUSPEND by the
+        // time this runs (it only awaits the provider stop after that commit) — the exact
+        // window sol's review named.
+        resumeDuringWindow = harness.cp.cto.resumeProject(projectId);
+        dispatchDuringWindow = await harness.cp.runs.dispatch(queuedRun.value.runId);
+        return originalStop(handle);
+      };
+
+      const suspended = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
+
+      expect(resumeDuringWindow?.allowed).toBe(false);
+      expect(resumeDuringWindow?.reasonCode).toBe(ReasonCode.RESUME_BLOCKED_SUSPEND_IN_FLIGHT);
+      expect(dispatchDuringWindow?.allowed).toBe(false);
+      // The suspend itself is unaffected by the window closing around it and completes normally.
+      expect(suspended.allowed).toBe(true);
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+      expect(harness.cp.projects.get(projectId)?.suspended).toBe(true);
+      expect(harness.cp.runs.require(queuedRun.value.runId).state).toBe(RunState.QUEUED);
+    },
+  );
+
+  it(
+    "#692 round 3 — a fence stamped by a process that no longer exists self-heals to " +
+      "ERROR instead of resuming as if the suspend had cleanly never happened",
+    async () => {
+      // A crash mid-suspend leaves exactly this shape behind: DRAINING/SUSPEND committed,
+      // draining_stop_pid stamped, and the process that stamped it gone. `spawnSync` blocks
+      // until its child has exited, so its pid is dead by the time this reads it back —
+      // deterministic, not a race, and the same tolerance for pid reuse daemon.ts's own
+      // startup reconcile() already accepts for `os_pid` (see the pid comment on `isAlive`
+      // in cto-lifecycle.ts).
+      const harness = makeHarness();
+      const { projectId, repositoryId } = await registerFixtureProject(harness);
+      await createActiveRun(harness, projectId, repositoryId);
+      const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+
+      const deadPid = spawnSync(process.execPath, ["-e", "process.exit(0)"]).pid!;
+      expect(deadPid).toBeGreaterThan(0);
+
+      const drained = harness.cp.sessions.transition(
+        binding.sessionId,
+        SessionLifecycle.DRAINING,
+        "test: simulate a crash between suspendProject's commit and its stopSession() call",
+        DrainingCause.SUSPEND,
+        deadPid,
+      );
+      expect(drained.allowed).toBe(true);
+      expect(harness.cp.sessions.require(binding.sessionId).drainingStopPid).toBe(deadPid);
+
+      const resumed = harness.cp.cto.resumeProject(projectId);
+
+      expect(resumed.allowed).toBe(true);
+      // Self-heals to ERROR, not READY: whether the crashed process's stopSession() call
+      // ever reached the provider is unknown, so this does not resume as if it hadn't.
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
+      expect(harness.cp.projects.get(projectId)?.suspended).toBe(false);
+
+      // A fresh CTO spawns on the next dispatch, exactly like any other dead binding.
+      const run = harness.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!run.allowed) throw new Error(run.message);
+      const dispatched = await harness.cp.runs.dispatch(run.value.runId);
+      expect(dispatched.allowed).toBe(true);
     },
   );
 

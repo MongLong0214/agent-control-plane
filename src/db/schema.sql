@@ -105,6 +105,12 @@ CREATE TABLE IF NOT EXISTS sessions (
   -- clears it to NULL on every other destination and never overwrites it on a no-op transition
   -- (lifecycle already DRAINING). See domain/types.ts DrainingCause for why this exists.
   draining_cause TEXT CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT')),
+  -- #692 round 3 — the in-flight fence: the OS pid of the daemon process currently awaiting
+  -- suspendProject's stopSession() for this session. Meaningful only while lifecycle = 'DRAINING'
+  -- and draining_cause = 'SUSPEND'; resumeProject refuses to reverse the drain while this pid is
+  -- set and alive, and SessionRegistry.transition clears it to NULL on every destination other
+  -- than DRAINING, the same way draining_cause is cleared.
+  draining_stop_pid INTEGER,
   buzz_address   TEXT,
   -- §27.2 — the Buzz *actor* identity this session speaks as, which is not the same fact
   -- as `buzz_address`: an address is a shared routing destination anybody can name, so it

@@ -13,7 +13,7 @@ import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-c
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
 import type { DoctorScope, Finding } from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
-import { RunState, SessionLifecycle } from "../domain/types.ts";
+import { DrainingCause, RunState, SessionLifecycle } from "../domain/types.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
 import { IngressGuard, ownerApprovalPayload } from "../ingress/ingress-guard.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
@@ -1008,6 +1008,26 @@ export class Daemon {
     for (const session of this.cp.sessions.live()) {
       if (session.osPid && !isAlive(session.osPid)) {
         this.cp.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "process gone after restart");
+        sessionsMarkedError.push(session.sessionId);
+        continue;
+      }
+      // #692 round 3 — the same shape, one level in: a session can be alive by its own
+      // os_pid while the fence on its DRAINING/SUSPEND is not. `suspendProject` commits
+      // that DRAINING transition and *then* awaits `stopSession()`; `draining_stop_pid` is
+      // the pid of the daemon process performing that await, not of the session's own
+      // runtime, so a daemon crash mid-suspend leaves it stamped and dead regardless of
+      // whether the CTO's own process is still up. `resumeProject` performs the identical
+      // check inline (cto-lifecycle.ts) so this does not depend on this sweep having run
+      // first, but a fence nothing has yet touched must still be resolved on every
+      // restart, exactly like the os_pid sweep just above it — an unknown post-crash
+      // runtime state resolves to ERROR, not to READY.
+      if (
+        session.lifecycle === SessionLifecycle.DRAINING &&
+        session.drainingCause === DrainingCause.SUSPEND &&
+        session.drainingStopPid != null &&
+        !isAlive(session.drainingStopPid)
+      ) {
+        this.cp.sessions.transition(session.sessionId, SessionLifecycle.ERROR, "suspend stop process gone after restart");
         sessionsMarkedError.push(session.sessionId);
       }
     }
