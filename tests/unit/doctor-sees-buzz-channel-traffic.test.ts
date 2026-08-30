@@ -52,8 +52,8 @@ const waitFor = async (condition: () => boolean, description: string, timeoutMs 
 
 /**
  * A deterministic source behind the real watch. It preserves relay history, applies the CLI's
- * exclusive `--since` and `--limit`, and can hold one call so a real daemon tick overlaps a real
- * adapter channel change.
+ * exclusive `--since` and `--limit`, snapshots before delaying its response, and can hold one call
+ * so a real daemon tick overlaps an event arrival or a real adapter channel change.
  */
 class ScriptedChannelSource implements BuzzChannelTrafficSource {
   readonly calls: Array<{ channel: string; since: number; limit: number }> = [];
@@ -88,13 +88,14 @@ class ScriptedChannelSource implements BuzzChannelTrafficSource {
       this.#nextError = null;
       throw error;
     }
+    const snapshot = this.#messages.filter((entry) => entry.created_at > since).slice(0, limit);
     if (this.#blocker) {
       const blocker = this.#blocker;
       this.#blocker = null;
       blocker.started();
       await blocker.release;
     }
-    return this.#messages.filter((entry) => entry.created_at > since).slice(0, limit);
+    return snapshot;
   }
 }
 
@@ -228,6 +229,10 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
       expect(measured?.observedEvidence).toMatchObject({
         measurementScope: "RAW_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_WATCH_CHECKS",
         eventIdentity: "BUZZ_EVENT_ID",
+        cursorResumeCapability: "TIMESTAMP_ONLY_NO_STABLE_RELAY_ORDER_TOKEN",
+        cursorBoundary: "LOCAL_QUERY_START_WITH_ONE_SECOND_OVERLAP",
+        cursorBlindGapMs: 0,
+        confidenceBasis: "NO_LOCAL_CURSOR_GAP_AND_UNCAPPED_READ",
         sourceBlindSpot: "EVENTS_EXCLUDED_BY_RELAY_SINCE_TIMESTAMP_ARE_UNMEASURED",
         unmeasured: "MENTION_CLASSIFICATION_NEEDS_ACTION_AND_CANONICAL_TURN_DELIVERY",
         remainder: "ISSUE_674_REQUIRES_RELAY_SIDE_TELEMETRY",
@@ -330,6 +335,137 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
 });
 
 describe("Buzz channel traffic cursor boundaries", () => {
+  it("a slow watch read stays single flight inside the Buzz watch", async () => {
+    const runtime = await runningWatch();
+    try {
+      const session = await connectSession(runtime, "watch-single-flight");
+      const target = [{ sessionId: session.sessionId, channelId: session.channel }];
+      await runtime.watch.tick(target);
+      const callsBeforeSlowRead = runtime.source.calls.length;
+
+      runtime.harness.clock.advance(1_000);
+      const blocked = runtime.source.blockNextRead();
+      const slowRead = runtime.watch.tick(target);
+      await blocked.started;
+      await runtime.watch.tick(target);
+
+      expect(runtime.source.calls).toHaveLength(callsBeforeSlowRead + 1);
+      blocked.release();
+      await slowRead;
+    } finally {
+      await stop(runtime);
+    }
+  });
+
+  it("an event arriving after a slow baseline snapshot is observed in the next window", async () => {
+    const runtime = await runningWatch();
+    try {
+      const session = await connectSession(runtime, "slow-baseline");
+      const blocked = runtime.source.blockNextRead();
+      await start(runtime);
+      await blocked.started;
+
+      runtime.harness.clock.advance(2_000);
+      const arrivedDuringRead = message(
+        Math.floor(runtime.harness.clock.now().getTime() / 1000),
+        "arrived-during-baseline-read",
+      );
+      runtime.source.respondWith([arrivedDuringRead]);
+      runtime.harness.clock.advance(8_000);
+      blocked.release();
+
+      await waitForBaseline(runtime, session.sessionId);
+      const baseline = watchRow(runtime, session.sessionId)?.baseline_at;
+      if (baseline === null || baseline === undefined) {
+        throw new Error("slow baseline did not complete");
+      }
+      const firstResponseCount = watchRow(runtime, session.sessionId)?.observed_count;
+      const baselineReport = await runtime.harness.cp.doctor.run("session", session.sessionId);
+      const baselineFinding = finding(
+        baselineReport,
+        "BUZZ_CHANNEL_TRAFFIC_BASELINE_ESTABLISHED",
+        session.sessionId,
+      );
+      expect(baselineFinding?.confidence).toBe("HIGH");
+      expect(baselineFinding?.observedEvidence).toMatchObject({
+        cursorBlindGapMs: 0,
+        queryLatencyOverlapMs: 10_000,
+        confidenceBasis: "NO_LOCAL_CURSOR_GAP_AND_UNCAPPED_READ",
+      });
+
+      await waitFor(
+        () => watchRow(runtime, session.sessionId)?.window_started_at === baseline,
+        "the first measured window after the slow baseline",
+      );
+      const secondResponseCount = watchRow(runtime, session.sessionId)?.observed_count;
+
+      expect([firstResponseCount, secondResponseCount]).toEqual([0, 1]);
+    } finally {
+      await stop(runtime);
+    }
+  });
+
+  it("an event arriving after a slow measured snapshot is observed in the next window", async () => {
+    const runtime = await runningWatch();
+    try {
+      const session = await connectSession(runtime, "slow-measured-window");
+      await start(runtime);
+      await waitForBaseline(runtime, session.sessionId);
+      const initialBaseline = watchRow(runtime, session.sessionId)?.baseline_at;
+      if (initialBaseline === null || initialBaseline === undefined) {
+        throw new Error("fixture baseline was not established");
+      }
+
+      runtime.harness.clock.advance(1_000);
+      const blocked = runtime.source.blockNextRead();
+      await blocked.started;
+      runtime.harness.clock.advance(2_000);
+      const arrivedDuringRead = message(
+        Math.floor(runtime.harness.clock.now().getTime() / 1000),
+        "arrived-during-measured-read",
+      );
+      runtime.source.respondWith([arrivedDuringRead]);
+      runtime.harness.clock.advance(8_000);
+      blocked.release();
+
+      await waitFor(
+        () => {
+          const row = watchRow(runtime, session.sessionId);
+          return row?.window_started_at === initialBaseline && row.attempt_in_progress === 0;
+        },
+        "the slow measured window to complete",
+      );
+      const firstResponseCount = watchRow(runtime, session.sessionId)?.observed_count;
+      const nextBaseline = watchRow(runtime, session.sessionId)?.baseline_at;
+      if (nextBaseline === null || nextBaseline === undefined) {
+        throw new Error("slow measured window did not advance");
+      }
+      const firstReport = await runtime.harness.cp.doctor.run("session", session.sessionId);
+      const firstFinding = finding(
+        firstReport,
+        "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS",
+        session.sessionId,
+      );
+      expect(firstFinding?.confidence).toBe("HIGH");
+      expect(firstFinding?.observedEvidence).toMatchObject({
+        rawChannelEventIdsFirstObservedBetweenCompletedChecks: 0,
+        cursorBlindGapMs: 0,
+        queryLatencyOverlapMs: 10_000,
+        confidenceBasis: "NO_LOCAL_CURSOR_GAP_AND_UNCAPPED_READ",
+      });
+
+      await waitFor(
+        () => watchRow(runtime, session.sessionId)?.window_started_at === nextBaseline,
+        "the window after the slow measured read",
+      );
+      const secondResponseCount = watchRow(runtime, session.sessionId)?.observed_count;
+
+      expect([firstResponseCount, secondResponseCount]).toEqual([0, 1]);
+    } finally {
+      await stop(runtime);
+    }
+  });
+
   it("a future dated event is counted once across two consecutive windows", async () => {
     const runtime = await runningWatch();
     try {

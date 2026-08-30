@@ -2206,9 +2206,14 @@ const v32: SchemaMigration = {
 
 /**
  * #674 — durable, per-session results for raw Buzz channel reads. The CLI surface can verify
- * event ids first observed by completed reads and read availability; it cannot expose mention
- * classification, `needs_action`, or canonical-turn delivery, so the table does not name or model
- * those stronger states.
+ * event ids first observed by completed reads and read availability; it exposes no stable ordering
+ * cursor, mention classification, `needs_action`, or canonical-turn delivery, so the table does not
+ * name or model those stronger states. `baseline_at` stores the local query start, not response
+ * completion, so query latency remains inside the next overlapping read.
+ *
+ * Rollback is not a code-only operation after this migration opens a database: a v33 binary
+ * refuses schema v34. Restoring the automatic pre-migration backup is the downgrade path, and it
+ * discards state written after the upgrade.
  *
  * Keyed on `session_id` rather than `channel_id` (#710): production sessions can share one
  * `ACP_BUZZ_CHANNEL`, while each daemon target still owns an independent measurement window.

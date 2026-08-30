@@ -378,13 +378,6 @@ export class Daemon {
   #bootstrapAbandoned = false;
   #bootstrapWaiter: (() => void) | null = null;
   #timerFailures = new Map<string, TimerFailure>();
-  // #710 — `runPeriodic` had no protection against a slower-than-its-own-interval action still
-  // running when the next `setInterval` fire arrives. Two overlapping firings of the same named
-  // timer can then commit their writes out of order — an older, slower success landing after a
-  // newer, faster failure and silently erasing the failure's error fields is the exact shape a
-  // blind review found for `buzz_channel_traffic_watch`. Named by timer, not global, so one timer
-  // running long never blocks a different timer's own firing.
-  readonly #periodicInFlight = new Set<string>();
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
@@ -1598,57 +1591,43 @@ export class Daemon {
    * §33.1 crash-loop backoff. The supervisor restarts the process; the daemon records
    * consecutive failures so the supervisor's throttle has evidence, and so a loop is
    * visible in the audit trail rather than silent.
-   *
-   * §710 in-flight guard: a named timer whose `action` is still running when the next
-   * `setInterval` fire arrives is skipped rather than run again concurrently. Without this, two
-   * overlapping firings write their outcomes in whatever order their own async work happens to
-   * finish — an older, slower call landing after a newer, faster one and overwriting its result
-   * is exactly the race a blind review found downstream of this method (`buzz_channel_traffic_watch`'s
-   * shared mutable row). Skipping keeps every named timer's own writes strictly serial, which
-   * every caller downstream of this method is entitled to assume.
    */
   private async runPeriodic(name: string, action: () => Promise<void>): Promise<void> {
-    if (this.#periodicInFlight.has(name)) return;
-    this.#periodicInFlight.add(name);
-    try {
-      const now = this.cp.clock.nowIso();
-      const previous = this.#timerFailures.get(name);
-      if (previous && Date.parse(previous.retryNotBefore) > Date.parse(now)) return;
+    const now = this.cp.clock.nowIso();
+    const previous = this.#timerFailures.get(name);
+    if (previous && Date.parse(previous.retryNotBefore) > Date.parse(now)) return;
 
+    try {
+      await action();
+      if (previous) {
+        this.#timerFailures.delete(name);
+        this.cp.audit.record({
+          kind: "DAEMON_TIMER_RECOVERED",
+          reasonCode: ReasonCode.OK,
+          evidence: { timer: name, recoveredAfterFailures: previous.consecutiveFailures },
+        });
+        this.writeHealth(null);
+      }
+    } catch (err) {
+      const failures = (previous?.consecutiveFailures ?? 0) + 1;
+      const backoffSeconds = Math.min(300, 2 ** failures);
+      const retryNotBefore = new Date(Date.parse(now) + backoffSeconds * 1000).toISOString();
+      const failure = { consecutiveFailures: failures, lastError: safeErrorMessage(err), retryNotBefore };
+      this.#timerFailures.set(name, failure);
+      this.cp.audit.record({
+        kind: "DAEMON_TIMER_FAILED",
+        reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
+        evidence: { timer: name, ...failure, backoffSeconds },
+      });
       try {
-        await action();
-        if (previous) {
-          this.#timerFailures.delete(name);
-          this.cp.audit.record({
-            kind: "DAEMON_TIMER_RECOVERED",
-            reasonCode: ReasonCode.OK,
-            evidence: { timer: name, recoveredAfterFailures: previous.consecutiveFailures },
-          });
-          this.writeHealth(null);
-        }
-      } catch (err) {
-        const failures = (previous?.consecutiveFailures ?? 0) + 1;
-        const backoffSeconds = Math.min(300, 2 ** failures);
-        const retryNotBefore = new Date(Date.parse(now) + backoffSeconds * 1000).toISOString();
-        const failure = { consecutiveFailures: failures, lastError: safeErrorMessage(err), retryNotBefore };
-        this.#timerFailures.set(name, failure);
+        this.writeHealth(null);
+      } catch (healthError) {
         this.cp.audit.record({
           kind: "DAEMON_TIMER_FAILED",
           reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
-          evidence: { timer: name, ...failure, backoffSeconds },
+          evidence: { timer: "health", error: safeErrorMessage(healthError) },
         });
-        try {
-          this.writeHealth(null);
-        } catch (healthError) {
-          this.cp.audit.record({
-            kind: "DAEMON_TIMER_FAILED",
-            reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
-            evidence: { timer: "health", error: safeErrorMessage(healthError) },
-          });
-        }
       }
-    } finally {
-      this.#periodicInFlight.delete(name);
     }
   }
 

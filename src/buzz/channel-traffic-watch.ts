@@ -26,7 +26,7 @@ export interface BuzzChannelTrafficWatchRow {
   sessionId: string;
   channelId: string;
   cursorGeneration: string;
-  /** End of the last complete watch check and start of the next window, in epoch milliseconds. */
+  /** Latest local instant the completed read can conservatively account through, in epoch ms. */
   baselineAt: number | null;
   /** Event ids observed by completed reads since this session acquired this channel route. */
   seenEventIds: readonly string[];
@@ -55,6 +55,19 @@ const OVERFETCH_LIMIT = MAX_MESSAGES_PER_CHECK + 1;
 const inclusiveSince = (baselineAt: number): number =>
   Math.max(0, Math.floor(baselineAt / 1000) - 1);
 
+/**
+ * A row written by the former completion-time cursor can still exist across a daemon restart.
+ * Its last attempt started before its stored baseline, so rewind to that start before reading.
+ * Failed, capped, and interrupted attempts start after the preserved baseline and leave it alone.
+ */
+const conservativeAccountedThrough = (row: BuzzChannelTrafficWatchRow): number | null => {
+  if (row.baselineAt === null || row.lastAttemptAt === null) return row.baselineAt;
+  const lastAttemptStartedAt = Date.parse(row.lastAttemptAt);
+  return Number.isFinite(lastAttemptStartedAt)
+    ? Math.min(row.baselineAt, lastAttemptStartedAt)
+    : row.baselineAt;
+};
+
 /** Relay order and relay timestamps are not identity; a repeated event id is still one event. */
 const uniqueByEventId = (messages: readonly BuzzCliMessage[]): BuzzCliMessage[] => {
   const unique = new Map<string, BuzzCliMessage>();
@@ -80,20 +93,24 @@ const safeErrorMessage = (err: unknown): string => {
  * - `bindChannel` establishes scope. Repeating an identical binding is a no-op, so reconnect
  *   cannot erase evidence. A real channel change clears the old channel's measurement
  *   and mints a generation because that evidence does not describe the new channel.
- * - The first successful, uncapped tick establishes a baseline and seeds its returned event ids but
- *   reports no historical traffic.
+ * - The first successful, uncapped tick establishes a baseline at the local instant immediately
+ *   before the query and seeds its returned event ids but reports no historical traffic.
  * - Every later successful, uncapped tick counts ids absent from every earlier completed read on
- *   this channel route, stores those ids durably, and advances the baseline to the read's local
- *   completion time. Relay timestamps only select the CLI fetch range; future, tied, or overlapping
- *   timestamps cannot make an already-seen id new again.
+ *   this channel route, stores those ids durably, and advances the baseline to the local query
+ *   start. A relay snapshot cannot predate the request that asks for it, so the whole response-
+ *   latency interval remains inside the next overlapping read instead of becoming a blind gap.
+ *   Relay timestamps only select the CLI fetch range; future, tied, or overlapping timestamps
+ *   cannot make an already-seen id new again.
  * - A failed or capped read does not advance. Doctor reports unavailable or incomplete instead of
  *   treating the preserved boundary as a verified zero.
  * - If the process dies during the CLI read, the attempt timestamp remains without a completed
  *   read. Doctor reports that unfinished attempt, and the next tick reuses the durable boundary.
  * - Generation-conditioned writes prevent an old-channel read from overwriting a newer binding.
- *   Daemon also serializes this timer against itself.
+ *   The watch serializes ticks against itself so timer overlap cannot reorder completed writes.
  */
 export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
+  #tickInProgress = false;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
@@ -129,8 +146,14 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
 
   /** One production measurement pass over every live session-channel pair. */
   async tick(targets: readonly WatchTarget[]): Promise<void> {
-    for (const target of targets) {
-      await this.#tickOne(target.sessionId, target.channelId);
+    if (this.#tickInProgress) return;
+    this.#tickInProgress = true;
+    try {
+      for (const target of targets) {
+        await this.#tickOne(target.sessionId, target.channelId);
+      }
+    } finally {
+      this.#tickInProgress = false;
     }
   }
 
@@ -151,7 +174,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
 
   async #establishBaseline(existing: BuzzChannelTrafficWatchRow): Promise<void> {
     const attemptStartedAt = this.clock.now().getTime();
-    const attemptAt = this.clock.nowIso();
+    const attemptAt = new Date(attemptStartedAt).toISOString();
     const attempt = this.db.run(
       `UPDATE buzz_channel_traffic_watch SET last_attempt_at = ?, attempt_in_progress = 1
         WHERE session_id = ? AND cursor_generation = ?`,
@@ -177,7 +200,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
                 last_error = NULL, last_error_at = NULL
           WHERE session_id = ? AND cursor_generation = ?`,
         [
-          incomplete ? null : completedAt,
+          incomplete ? null : attemptStartedAt,
           JSON.stringify(incomplete ? [] : eventIds(messages)),
           completedAt,
           incomplete ? 1 : 0,
@@ -192,9 +215,10 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
   }
 
   async #measureWindow(existing: BuzzChannelTrafficWatchRow): Promise<void> {
-    const baselineAt = existing.baselineAt;
+    const baselineAt = conservativeAccountedThrough(existing);
     if (baselineAt === null) return;
-    const attemptAt = this.clock.nowIso();
+    const attemptStartedAt = this.clock.now().getTime();
+    const attemptAt = new Date(attemptStartedAt).toISOString();
     const attempt = this.db.run(
       `UPDATE buzz_channel_traffic_watch SET last_attempt_at = ?, attempt_in_progress = 1
         WHERE session_id = ? AND cursor_generation = ?`,
@@ -227,7 +251,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
                 last_error = NULL, last_error_at = NULL
           WHERE session_id = ? AND cursor_generation = ?`,
         [
-          incomplete ? baselineAt : completedAt,
+          incomplete ? baselineAt : attemptStartedAt,
           JSON.stringify(incomplete ? existing.seenEventIds : completedSeenEventIds),
           baselineAt,
           completedAt,

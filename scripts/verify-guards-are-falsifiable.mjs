@@ -504,6 +504,15 @@ const GUARDS = [
     ],
   },
   {
+    what: "the buzz watch serializes its own ticks without changing unrelated daemon timers",
+    file: "src/buzz/channel-traffic-watch.ts",
+    find: "    if (this.#tickInProgress) return;",
+    replace: "    if (false) return;",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a slow watch read stays single flight inside the Buzz watch",
+    ],
+  },
+  {
     what: "the buzz cursor counts event ids rather than repeated relay rows",
     file: "src/buzz/channel-traffic-watch.ts",
     find: "      const uniqueMessages = uniqueByEventId(messages);",
@@ -519,6 +528,15 @@ const GUARDS = [
     replace: "          JSON.stringify([]),",
     killedBy: [
       "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::event ids present at baseline are not first observed in the next window",
+    ],
+  },
+  {
+    what: "the buzz baseline cursor stops at query start so response latency remains observable",
+    file: "src/buzz/channel-traffic-watch.ts",
+    find: "          incomplete ? null : attemptStartedAt,",
+    replace: "          incomplete ? null : completedAt,",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an event arriving after a slow baseline snapshot is observed in the next window",
     ],
   },
   {
@@ -577,12 +595,12 @@ const GUARDS = [
     ],
   },
   {
-    what: "a complete buzz channel watch check advances the next measurement window",
+    what: "a complete buzz channel watch cursor stops at query start so response latency remains observable",
     file: "src/buzz/channel-traffic-watch.ts",
-    find: "          incomplete ? baselineAt : completedAt,",
-    replace: "          baselineAt,",
+    find: "          incomplete ? baselineAt : attemptStartedAt,",
+    replace: "          incomplete ? baselineAt : completedAt,",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a complete watch check advances the raw event identity window",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an event arriving after a slow measured snapshot is observed in the next window",
     ],
   },
   {

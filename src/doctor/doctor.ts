@@ -452,10 +452,12 @@ export class Doctor {
    * `buzz_channel_traffic_watch`; the watch owns every write.
    *
    * A successful complete check always emits INFO, including a measured zero. The evidence says
-   * on every outcome that events excluded by the relay's timestamp cursor, mention classification,
-   * `needs_action`, and canonical-turn delivery are unmeasured by this CLI surface. A message can
-   * therefore be present in the raw feed while the CEO incident remains invisible; closing that
-   * remainder requires relay-side telemetry on #674.
+   * on every outcome that the CLI has no stable relay ordering token and that events excluded by
+   * its timestamp cursor, mention classification, `needs_action`, and canonical-turn delivery are
+   * unmeasured by this surface. HIGH confidence is derived only when the durable cursor did not
+   * advance past the local query start and the read was uncapped. A message can therefore be
+   * present in the raw feed while the CEO incident remains invisible; closing that remainder
+   * requires relay-side telemetry on #674.
    */
   private checkBuzzChannelTraffic(sessionId: string | null): Finding[] {
     const findings: Finding[] = [];
@@ -463,6 +465,8 @@ export class Doctor {
     const measurementBoundary = {
       measurementScope: "RAW_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_WATCH_CHECKS",
       eventIdentity: "BUZZ_EVENT_ID",
+      cursorResumeCapability: "TIMESTAMP_ONLY_NO_STABLE_RELAY_ORDER_TOKEN",
+      cursorBoundary: "LOCAL_QUERY_START_WITH_ONE_SECOND_OVERLAP",
       sourceBlindSpot: "EVENTS_EXCLUDED_BY_RELAY_SINCE_TIMESTAMP_ARE_UNMEASURED",
       unmeasured: "MENTION_CLASSIFICATION_NEEDS_ACTION_AND_CANONICAL_TURN_DELIVERY",
       remainder: "ISSUE_674_REQUIRES_RELAY_SIDE_TELEMETRY",
@@ -568,13 +572,60 @@ export class Doctor {
         continue;
       }
 
+      const readStartedAtMs = Date.parse(row.last_attempt_at);
+      const cursorBlindGapMs = row.baseline_at === null || !Number.isFinite(readStartedAtMs)
+        ? null
+        : Math.max(0, row.baseline_at - readStartedAtMs);
+      const queryLatencyOverlapMs = row.window_ended_at === null || !Number.isFinite(readStartedAtMs)
+        ? null
+        : Math.max(0, row.window_ended_at - readStartedAtMs);
+      const measurementConfidence: Finding["confidence"] = cursorBlindGapMs === 0
+        ? "HIGH"
+        : "LOW";
+      const cursorEvidence = {
+        cursorAdvancedTo: row.baseline_at === null
+          ? null
+          : new Date(row.baseline_at).toISOString(),
+        readStartedAt: row.last_attempt_at,
+        readCompletedAt: row.window_ended_at === null
+          ? null
+          : new Date(row.window_ended_at).toISOString(),
+        cursorBlindGapMs,
+        queryLatencyOverlapMs,
+        confidenceBasis: cursorBlindGapMs === 0
+          ? "NO_LOCAL_CURSOR_GAP_AND_UNCAPPED_READ"
+          : "LOCAL_CURSOR_GAP_OR_UNVERIFIABLE_BOUNDARY",
+      } as const;
+
+      // Rows written by the former completion-time cursor can survive a daemon restart. Until
+      // the watch rewinds that row to its last local query start and completes another read, its
+      // stored zero or count is not a measurement Doctor may report as healthy.
+      if (measurementConfidence !== "HIGH") {
+        findings.push({
+          code: "BUZZ_CHANNEL_TRAFFIC_CURSOR_GAP",
+          severity: "WARN",
+          scope: `session:${session.sessionId}`,
+          blocking: false,
+          confidence: measurementConfidence,
+          observedEvidence: {
+            sessionId: session.sessionId,
+            channel,
+            ...measurementBoundary,
+            ...cursorEvidence,
+          },
+          recommendedAction:
+            "complete a raw channel-traffic watch read from the last local query-start boundary before interpreting a count",
+        });
+        continue;
+      }
+
       if (row.window_started_at === null) {
         findings.push({
           code: "BUZZ_CHANNEL_TRAFFIC_BASELINE_ESTABLISHED",
           severity: "INFO",
           scope: `session:${session.sessionId}`,
           blocking: false,
-          confidence: "HIGH",
+          confidence: measurementConfidence,
           observedEvidence: {
             sessionId: session.sessionId,
             channel,
@@ -583,6 +634,7 @@ export class Doctor {
               ? null
               : new Date(row.baseline_at).toISOString(),
             lastReadSuccessAt: row.last_read_success_at,
+            ...cursorEvidence,
           },
           recommendedAction:
             "no action; the raw channel baseline is established and the next complete watch check will report a window",
@@ -595,7 +647,7 @@ export class Doctor {
         severity: "INFO",
         scope: `session:${session.sessionId}`,
         blocking: false,
-        confidence: "HIGH",
+        confidence: measurementConfidence,
         observedEvidence: {
           sessionId: session.sessionId,
           channel,
@@ -608,6 +660,7 @@ export class Doctor {
             ? null
             : new Date(row.window_ended_at).toISOString(),
           lastReadSuccessAt: row.last_read_success_at,
+          ...cursorEvidence,
         },
         recommendedAction:
           "first-observed raw channel event ids alone imply no health action; arrived-but-unclassified or undelivered messages require relay-side telemetry under #674",
