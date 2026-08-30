@@ -2297,6 +2297,34 @@ describe("verify-tracker-loci-resolve", () => {
     });
   });
 
+  it("a separator cannot consume the opening backtick of quoted citation content", () => {
+    const body = "README.md:1 `definitelyGoneXYZ`";
+    const { path, cleanup } = withIssues([{ number: 68961, title: "adjacent quoted content", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("definitelyGoneXYZ");
+      expect(result.stdout).toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("a word found only inside a multiline Bash string is stale", () => {
+    const body = "`expect` in `deploy/install-launchd.sh`";
+    const { path, cleanup } = withIssues([{ number: 68962, title: "multiline shell string", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("expect");
+      expect(result.stdout).toContain("does not appear");
+    } finally {
+      cleanup();
+    }
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);

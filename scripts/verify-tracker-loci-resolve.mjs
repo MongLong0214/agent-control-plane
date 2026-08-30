@@ -838,23 +838,11 @@
  *   sentence and the stripper's actual behavior were never checked against each other as one
  *   claim.
  *
- *   The resolution keeps "search the heredoc verbatim" and "a comment inside a heredoc is not
- *   code" both true, rather than picking one: `consumeHeredocBody`
- *   (`scripts/lib/tracker-loci-strip.mjs`) now recurses into the body with `stripShellSource(...,
- *   false)` — `blankStrings: false` is forced regardless of the outer call's own view, which,
- *   because a `#` comment is stripped unconditionally in this same function's dispatch (`#` is
- *   never gated on `blankStrings`), strips only the body's own comments and leaves every quoted
- *   string's content exactly as it was in both views. Narrower than treating the whole body as
- *   code of its content language: `required_keychain_value`'s own call site inside the same
- *   heredoc reaches it through `"$(required_keychain_value …)"`, a command substitution inside a
- *   double-quoted string — real code, not string prose — and forcing `blankStrings: true` into the
- *   recursive call would have blanked that call out of the symbol view, trading one false green
- *   for a false negative on a real, currently-passing corpus assertion
- *   (`tests/unit/tracker-loci-strip-invariants.test.ts`'s `required_keychain_value` row, which
- *   still asserts all three real occurrences survive both views). `codeSearchScope`'s SH_EXTS
- *   sentence, above, is rewritten to say exactly this: a `#` comment excludes at a word boundary
- *   including inside a heredoc body, a quoted string excludes outside one, and a heredoc body's
- *   own quoted-string content does not.
+ *   Round 18's resolution recursed into the body with `blankStrings: false`, stripping comments but
+ *   retaining quoted content in both views so a `$()` call inside a double quote stayed visible.
+ *   The later P1 review superseded that incomplete model: heredoc bodies now honor the caller's
+ *   symbol/content view, and balanced `$()` bodies are searched recursively as code. That keeps the
+ *   real `required_keychain_value` call visible while excluding ordinary multiline string prose.
  *
  *   The same review flagged shell's `#` word-boundary rule (round 16: comment only at
  *   start-of-line or after whitespace) as narrower than real shell grammar: `;# comment` and
@@ -897,9 +885,9 @@
  *   prefixes lead into the same quote scanner); f-string replacement fields are currently blanked
  *   with their containing literal, and the one tracked `.py` file has no f-string. Shell opens
  *   word-boundary `#` comments, plain single/double and ANSI-C `$'...'` strings, and heredocs;
- *   command/arithmetic substitutions are code rather than literal spans, but a substitution inside
- *   an ordinary quoted string is currently excluded with that string (heredoc bodies are the
- *   explicit exception). YAML opens word-boundary `#` comments and single/double quoted scalars;
+ *   balanced `$()` command/arithmetic substitutions inside double quotes are searched recursively
+ *   as code, while the surrounding string prose is excluded. YAML opens word-boundary `#` comments
+ *   and single/double quoted scalars;
  *   indentation-delimited `|`/`>` block bodies stay plain searched text because schema is needed
  *   to tell embedded programs from prose. SQLite opens `--`/`/* *\/` comments, `'...'` value
  *   strings, and `"..."`/`` `...` ``/`[...]` quoted identifiers; PostgreSQL dollar quotes remain
@@ -1041,9 +1029,8 @@ const codeSearchScope = (relPath) => {
     );
   if (SH_EXTS.has(ext))
     return (
-      "outside a `#` comment (at a word boundary — this applies inside a heredoc body too) or a " +
-      "quoted string (a heredoc body's own quoted-string content is not excluded; it is searched " +
-      "as the code it contains; command substitutions inside ordinary quoted strings are excluded)"
+      "outside a `#` comment (at a word boundary — this applies inside a heredoc body too) or " +
+      "quoted-string prose (balanced `$()` substitutions inside double quotes are searched as code)"
     );
   if (YAML_EXTS.has(ext))
     return (
@@ -1524,7 +1511,7 @@ const containsSnippetFragments = (haystack, fragments) => {
  */
 const stripCitationSeparator = (text) => {
   let t = text.replace(/←.*$/, "").trimEnd();
-  t = t.replace(/^\s*[)`'"]/, ""); // the citation's own closing delimiter, if it had one
+  t = t.replace(/^[)`'"]/, ""); // a citation close is adjacent; whitespace means the quote opens content
   t = t.replace(/^[\s:—–-]+/, ""); // the separator between a citation and what follows
   return t;
 };

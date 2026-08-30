@@ -2353,10 +2353,21 @@ const GUARDS = [
     // genuinely vanished line from STALE to ADVISORY.
     what: "a Markdown link closing delimiter is removed before its quoted content is read",
     file: "scripts/verify-tracker-loci-resolve.mjs",
-    find: "  t = t.replace(/^\\s*[)`'\"]/, \"\"); // the citation's own closing delimiter, if it had one",
-    replace: "  t = t.replace(/^\\s*[`'\"]/, \"\"); // the citation's own closing delimiter, if it had one",
+    find: "  t = t.replace(/^[)`'\"]/, \"\"); // a citation close is adjacent; whitespace means the quote opens content",
+    replace: "  t = t.replace(/^[`'\"]/, \"\"); // a citation close is adjacent; whitespace means the quote opens content",
     killedBy: [
       "tests/unit/verify-tracker-loci-resolve.test.ts::bare and Markdown linked loci give vanished quoted content the same STALE verdict",
+    ],
+  },
+  {
+    // Whitespace means the citation already ended. Crossing it consumes the opening backtick of
+    // the quoted content and turns a real stale-content finding back into a line-number advisory.
+    what: "a separator cannot consume the opening backtick of quoted citation content",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  t = t.replace(/^[)`'\"]/, \"\"); // a citation close is adjacent; whitespace means the quote opens content",
+    replace: "  t = t.replace(/^\\s*[)`'\"]/, \"\"); // a citation close is adjacent; whitespace means the quote opens content",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a separator cannot consume the opening backtick of quoted citation content",
     ],
   },
   {
