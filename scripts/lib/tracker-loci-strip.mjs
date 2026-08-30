@@ -25,12 +25,31 @@
  * `collapse-trailer-paragraphs.mjs` does — inside the main script, this transform's only proof was
  * whatever citation the corpus happened to exercise, which is exactly how round 11's bug survived
  * nine rounds unnoticed.
+ *
+ * Its adjacent `.d.mts` is generated from the JSDoc in this file by `pnpm
+ * declarations:tracker-loci-strip`; do not edit that declaration by hand. sol-simplify: this
+ * generation step exists because TypeScript tests import a directly runnable `.mjs`; remove it if
+ * the module moves to TypeScript or no TypeScript consumer imports it.
  */
 
 import ts from "typescript";
 
-/** Blanks every non-newline character in a matched span, for use as a `String.replace` callback. */
+/**
+ * Blanks every non-newline character in a matched span, for use as a `String.replace` callback.
+ *
+ * @param {string} match
+ * @returns {string}
+ */
 export const blankKeepingNewlines = (match) => match.replace(/[^\n]/g, " ");
+
+/**
+ * @typedef {object} StringBoundaryRule
+ * @property {string} form
+ * @property {string} open
+ * @property {string} close
+ * @property {"any" | readonly string[]} backslashEscapes
+ * @property {boolean} rawNewlineEndsSpan
+ */
 
 /**
  * Quote boundaries for the two dispatches whose review counterexamples depend on delimiter width
@@ -43,6 +62,8 @@ export const blankKeepingNewlines = (match) => match.replace(/[^\n]/g, " ");
  * newline ends an unterminated quoted span: Python's short strings do; Python triple strings and
  * all three Bash quote forms do not. Python's `f`/`r` prefixes sit before these delimiters and do
  * not change their boundary rules; f-string replacement fields remain part of the blanked span.
+ *
+ * @type {Readonly<{python: readonly StringBoundaryRule[], shell: readonly StringBoundaryRule[]}>}
  */
 export const STRING_BOUNDARY_RULES = Object.freeze({
   python: Object.freeze([
@@ -50,21 +71,39 @@ export const STRING_BOUNDARY_RULES = Object.freeze({
       form: "triple double quote",
       open: '"""',
       close: '"""',
-      backslashEscapes: "any",
+      backslashEscapes: /** @type {const} */ ("any"),
       rawNewlineEndsSpan: false,
     },
     {
       form: "triple single quote",
       open: "'''",
       close: "'''",
-      backslashEscapes: "any",
+      backslashEscapes: /** @type {const} */ ("any"),
       rawNewlineEndsSpan: false,
     },
-    { form: "short double quote", open: '"', close: '"', backslashEscapes: "any", rawNewlineEndsSpan: true },
-    { form: "short single quote", open: "'", close: "'", backslashEscapes: "any", rawNewlineEndsSpan: true },
+    {
+      form: "short double quote",
+      open: '"',
+      close: '"',
+      backslashEscapes: /** @type {const} */ ("any"),
+      rawNewlineEndsSpan: true,
+    },
+    {
+      form: "short single quote",
+      open: "'",
+      close: "'",
+      backslashEscapes: /** @type {const} */ ("any"),
+      rawNewlineEndsSpan: true,
+    },
   ]),
   shell: Object.freeze([
-    { form: "ANSI C quote", open: "$'", close: "'", backslashEscapes: "any", rawNewlineEndsSpan: false },
+    {
+      form: "ANSI C quote",
+      open: "$'",
+      close: "'",
+      backslashEscapes: /** @type {const} */ ("any"),
+      rawNewlineEndsSpan: false,
+    },
     { form: "single quote", open: "'", close: "'", backslashEscapes: Object.freeze([]), rawNewlineEndsSpan: false },
     {
       form: "double quote",
@@ -228,6 +267,9 @@ const renderShellQuotedSpan = (span, rule, closed, blankStrings) => {
  *
  * `://` is protected explicitly so a URL inside a comment or string (`https://…`) is not itself
  * misread as the start of a line comment.
+ *
+ * @param {string} text
+ * @returns {string}
  */
 export const stripSlashComments = (text) =>
   text
@@ -236,14 +278,24 @@ export const stripSlashComments = (text) =>
     .map((line) => line.replace(/(?<!:)\/\/.*$/, ""))
     .join("\n");
 
-/** `#` line comments — Python, shell, and YAML, the three `#`-comment extensions this checks. */
+/**
+ * `#` line comments — Python, shell, and YAML, the three `#`-comment extensions this checks.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
 export const stripHashComments = (text) =>
   text
     .split("\n")
     .map((line) => line.replace(/(?<!:)#.*$/, ""))
     .join("\n");
 
-/** SQL's own comment forms: `--` to end of line, and the same `/* ... *\/` block form as JS. */
+/**
+ * SQL's own comment forms: `--` to end of line, and the same `/* ... *\/` block form as JS.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
 export const stripSqlComments = (text) =>
   text
     .replace(/\/\*[\s\S]*?\*\//g, blankKeepingNewlines)
@@ -261,6 +313,10 @@ export const stripSqlComments = (text) =>
  * This helper only resolves quote boundaries; it does not resolve comments. Production dispatches
  * still own the ordered comment/string walk so a comment marker inside a string, or a quote inside
  * a comment, cannot be interpreted out of order.
+ *
+ * @param {string} text
+ * @param {readonly StringBoundaryRule[]} [rules=STRING_BOUNDARY_RULES.python]
+ * @returns {string}
  */
 export const stripStrings = (text, rules = STRING_BOUNDARY_RULES.python) => {
   let out = "";
@@ -308,6 +364,10 @@ export const stripStrings = (text, rules = STRING_BOUNDARY_RULES.python) => {
  *   - `false` — the content/snippet-comparison view: comments are stripped but string content is
  *     left untouched, so a citation quoting a line whose string literal no longer matches the
  *     real one still reads STALE, rather than every string being an unconditional wildcard.
+ *
+ * @param {string} text
+ * @param {boolean} blankStrings
+ * @returns {string}
  */
 export const stripPythonSource = (text, blankStrings) => {
   let out = "";
@@ -396,6 +456,10 @@ export const stripPythonSource = (text, blankStrings) => {
  * the same adversarial shape the property test below exercises) is blanked up to wherever it
  * actually ends, rather than left completely unrecognized the way the old regex-based
  * `stripStrings` silently did — a defined, testable answer instead of an accidental one.
+ *
+ * @param {string} text
+ * @param {boolean} blankStrings
+ * @returns {string}
  */
 export const stripJsSource = (text, blankStrings) => {
   const n = text.length;
@@ -609,6 +673,9 @@ export const stripJsSource = (text, blankStrings) => {
  * as the real code it is. A stray, unterminated backtick (this is a text pass, not a lexer, so one
  * can appear from a markdown code span or a mismatched edit elsewhere) stops the walk at end of
  * string rather than consuming the rest of the file as one giant "literal".
+ *
+ * @param {string} text
+ * @returns {string}
  */
 export const stripTemplateLiteralProse = (text) => {
   let out = "";
@@ -723,6 +790,10 @@ export const stripTemplateLiteralProse = (text) => {
  * neither shape appears in this repository's own tracked `.sh` file, confirmed by grep. Multiple
  * heredocs opened on one line (`cmd <<A <<B`) are queued and consumed in order, which this
  * repository's tracked file does not exercise either, but is handled rather than assumed away.
+ *
+ * @param {string} text
+ * @param {boolean} blankStrings
+ * @returns {string}
  */
 export const stripShellSource = (text, blankStrings) => {
   const n = text.length;
@@ -851,6 +922,10 @@ export const stripShellSource = (text, blankStrings) => {
  * inside one is still only a comment at a word boundary, which happens to be the right answer for
  * the one block scalar this repository currently tracks (an embedded shell step with no `#` in
  * it), but is not full block-scalar indentation tracking and does not claim to be.
+ *
+ * @param {string} text
+ * @param {boolean} blankStrings
+ * @returns {string}
  */
 export const stripYamlSource = (text, blankStrings) => {
   const n = text.length;
@@ -982,6 +1057,10 @@ export const stripYamlSource = (text, blankStrings) => {
  * that do appear are all inside ordinary `'...'` strings, `json_extract`'s own `'$.path'`
  * argument syntax, not a quoting delimiter), and SQLite itself does not support the feature, so
  * there is nothing in this corpus or this engine to verify a dollar-quote implementation against.
+ *
+ * @param {string} text
+ * @param {boolean} blankStrings
+ * @returns {string}
  */
 export const stripSqlSource = (text, blankStrings) => {
   const n = text.length;

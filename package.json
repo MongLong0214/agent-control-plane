@@ -15,7 +15,8 @@
   "scripts": {
     "postinstall": "node scripts/build-native-peercred.mjs",
     "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql",
-    "typecheck": "tsc --noEmit",
+    "declarations:tracker-loci-strip": "tsc --allowJs --checkJs --declaration --emitDeclarationOnly --skipLibCheck --module ESNext --target ES2023 --moduleResolution bundler --outDir scripts/lib scripts/lib/tracker-loci-strip.mjs",
+    "typecheck": "pnpm declarations:tracker-loci-strip && git diff --exit-code -- scripts/lib/tracker-loci-strip.d.mts && tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",
