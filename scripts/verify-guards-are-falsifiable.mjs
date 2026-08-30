@@ -1290,6 +1290,20 @@ const GUARDS = [
       "tests/unit/telegram-ingress.test.ts::#695: names every unresolved turn, not only the oldest, once a second one accumulates",
     ],
   },
+  {
+    // Sol's BLOCK on the #695 fix above: `unresolvedTurns` rows are never pruned, so naming all
+    // of them without a cap is unbounded — 146 real unresolved rows already produce a
+    // 4,099-character joined line, past Telegram's 4,096-character sendMessage limit, and a
+    // send failure there wedges the poller (it throws before the offset advances). Without the
+    // cap, the reply reverts to enumerating every row.
+    what: "the park reply names at most MAX_NAMED_UNRESOLVED_TURNS rows, summarizing the rest",
+    file: "src/ingress/telegram-router.ts",
+    find: "  const shown = unresolved.slice(0, MAX_NAMED_UNRESOLVED_TURNS);",
+    replace: "  const shown = unresolved;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::#695: bounds the park reply's enumeration past the cap, and still records every overridden nonce",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
