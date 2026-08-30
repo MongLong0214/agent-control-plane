@@ -125,6 +125,11 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     file: "cto/cto-lifecycle.ts",
     anchor: "  resumeProject(projectId: string): Decision<void> {\n    return this.db.txDecision(() => {",
   },
+  {
+    label: "IngressGuard.completeNoReplyAndResolveTurn",
+    file: "ingress/ingress-guard.ts",
+    anchor: "reasoning #664 exists to stop trusting by hand.\n    return this.db.txDecision(() => {",
+  },
 ];
 
 /** Every EXEMPT and DEFERRED entry, so a marker drifting out of its body is caught for all of them, not just one. */

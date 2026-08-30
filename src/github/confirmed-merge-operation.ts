@@ -83,7 +83,9 @@ export const deriveConfirmedMergePlan = (
     return deny(ReasonCode.RUN_OWNER_NOT_PINNED, "CEO-approved run has no pinned owner", { runId: input.runId });
   }
   if (!run.pinnedManifestDigest) {
-    return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "CEO-approved run has no pinned manifest", { runId: input.runId });
+    // #448: nothing to compare against — the run simply never pinned a manifest — not a
+    // disagreement between two known digests.
+    return deny(ReasonCode.CONTRACT_UNVERIFIED, "CEO-approved run has no pinned manifest", { runId: input.runId });
   }
 
   const candidateDigest = ports.runs.currentCandidate(input.runId);
@@ -151,7 +153,10 @@ export const deriveConfirmedMergePlan = (
   }
   const manifest = ports.projects.manifest(run.pinnedManifestDigest);
   if (!manifest?.branchProfile) {
-    return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "CEO-approved run's branch contract is unavailable", {
+    // #448: the pinned digest exists, but the manifest it names cannot be produced to compare
+    // against during finalization — the same fact `branchProfile()` reports during PR
+    // preparation, and it must read the same way here.
+    return deny(ReasonCode.CONTRACT_UNVERIFIED, "CEO-approved run's branch contract is unavailable", {
       runId: input.runId,
       pinnedManifestDigest: run.pinnedManifestDigest,
     });

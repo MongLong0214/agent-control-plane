@@ -67,9 +67,9 @@ describe("what the owner is told when the CEO route refuses", () => {
     expect(sentence).toMatch(/not started/i);
     // Third correction to this shape. #633 removed a claim the seam could not observe, #643
     // removed an invitation that was itself the duplicate path, and this removes the last copy.
-    // It is true today — the turn genuinely did not start — and becomes wrong the moment BUSY is
-    // reachable in production (#630), because a held message is waiting rather than discarded.
-    expect(sentence).not.toMatch(/send it again|ask again|try again/i);
+    // BUSY is now reachable in production, but the port refuses rather than queues. #631 may add
+    // durable ordering later; this sentence cannot promise that work before it exists.
+    expect(sentence).not.toMatch(/send it again|ask again|try again|will be taken|will wait|queued/i);
   });
 
   it("attributes a dropped connection to the transport, not to the CEO not answering in time", () => {

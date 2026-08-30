@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { digestOf, sha256 } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -518,6 +518,29 @@ describe("daemon-owned approved-run finalization", () => {
     expect(attempt).toBeUndefined();
     expect(github.mergeCount).toBe(0);
     await daemon.stop();
+  });
+
+  // #448: `deriveConfirmedMergePlan` used to report CONTRACT_DIGEST_MISMATCH here too, the same
+  // code `prPrepare()`'s `branchProfile()` reported before it was fixed. The manifest not being
+  // retrievable during post-CEO-approval finalization is exactly the same fact as during PR
+  // preparation — nothing was compared, so a reader who trusts the reason code learns "the
+  // candidate and the run disagree" when what actually happened is "there was nothing to check
+  // it against". It must read the same way at both entry points.
+  it("#448 reports CONTRACT_UNVERIFIED when a CEO-approved run's pinned manifest cannot be retrieved during finalization", async () => {
+    const { github, harness, driven } = await approvedFixture();
+    const manifest = vi.spyOn(harness.cp.projects, "manifest").mockReturnValue(null);
+    try {
+      const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-finalizer-unverified-manifest-") });
+      const started = await daemon.start();
+      expect(started.allowed).toBe(true);
+      const finalized = await daemon.finalizeApprovedRun(driven.runId);
+      expect(finalized.allowed).toBe(false);
+      expect(finalized.reasonCode).toBe(ReasonCode.CONTRACT_UNVERIFIED);
+      expect(github.mergeCount).toBe(0);
+      await daemon.stop();
+    } finally {
+      manifest.mockRestore();
+    }
   });
 
   it("finalizes one repository through the production daemon entry point and replays with zero external writes", async () => {

@@ -34,6 +34,31 @@ export interface IngressPolicy {
   nonceTtlMs?: number;
   /** Telegram may resume a durable in-flight update after a process crash. */
   recoverInFlight?: boolean;
+  /**
+   * How long, in milliseconds, the transport actually backing this channel may still redeliver
+   * an update whose receipt was never confirmed — supplied by the caller who chose that
+   * transport, not looked up from the channel's name.
+   *
+   * Found missing by review (#682, round 8): `TRANSPORT_RETENTION_MS` below is keyed by
+   * `"telegram"` alone, so any transport that answers to that channel name — the measured
+   * `api.telegram.org` client, a self-hosted Bot API server reached through
+   * `ACP_TELEGRAM_API_BASE_URL`, or a test double — got the same 24h floor whether or not it
+   * actually redelivers for that long. A transport that genuinely retains longer reopens #673's
+   * duplicate-turn window: the nonce is pruned on the assumption redelivery has stopped, the
+   * transport redelivers anyway, and a fresh admission runs the handler a second time.
+   *
+   * `undefined` (the field omitted entirely) keeps this guard's original behaviour — the
+   * channel-keyed default in `TRANSPORT_RETENTION_MS` — for construction sites that have not
+   * been threaded through to a real transport instance; every unit test that only exercises
+   * unrelated ingress mechanics falls here and is unaffected. `null` is a caller stating
+   * explicitly that the transport's retention is *not* known — a self-hosted endpoint nobody has
+   * measured, or a test double standing in for one — and construction is refused rather than
+   * silently reusing a number that described a different server. A concrete number is the real
+   * fix: it overrides the channel-keyed default with the actual transport's own fact, so a
+   * longer-retaining transport carries a correspondingly longer floor rather than the same fixed
+   * one every "telegram" policy used to get regardless of what backed it.
+   */
+  transportRetentionMs?: number | null;
 }
 
 export interface OwnerApprovalIngress {
@@ -92,6 +117,49 @@ export const buzzActorBindingSigningRequest = (
 const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * How long each transport itself may still redeliver an update whose receipt was never
+ * confirmed — not a guess, and not the same thing as `nonceTtlMs`.
+ *
+ * Telegram's long-poll `getUpdates` is measured against the code that drives it
+ * (`telegram-polling.ts`): ACP confirms receipt by calling `getUpdates` with an offset one past
+ * the highest `update_id` it has seen, and Telegram will not resend an update once that happens
+ * — this bound only matters for an update whose offset never advanced (a crash, a long outage),
+ * which Telegram queues for up to 24 hours from creation before dropping it.
+ *
+ * `received_at + nonceTtlMs >= created_at + retention` whenever `nonceTtlMs >= retention` — but
+ * that inequality assumes `received_at` and the `now` `prune` later compares it against come from
+ * a clock that only ever moves forward at the rate real time passes. It does not (found by
+ * review, #682): `received_at` is `clock.nowIso()`, which in production is `new Date()`
+ * (`clock.ts`) — the local wall clock, which NTP, a manual change, or a suspended VM can step
+ * forward by some δ between admission and the later prune that reads `now()` again. A forward
+ * step shortens the effective window by exactly δ, so a redelivery landing inside that δ, at the
+ * very edge of the 24h retention, could find the row already pruned.
+ *
+ * Not fixed with a monotonic clock, because a monotonic source cannot do this job: `received_at`
+ * has to survive a process restart — the daemon may crash and restart at any point inside the 24h
+ * window, and `prune` compares a timestamp one process incarnation wrote against `now()` another
+ * reads, potentially days apart. A monotonic clock's value means nothing outside the process that
+ * produced it; it is not a fact `inbound_messages` can store and read back across a restart the
+ * way an ISO wall-clock string is. `Clock` (`clock.ts`) exposes no monotonic source today, and
+ * adding one would not close this gap — only a wall-clock timestamp survives the restart this
+ * comparison has to survive.
+ *
+ * So the residual is real and is exactly this: bounded by whatever forward step the host clock
+ * is adjusted by during the pruning window, not by the unbounded gap a genuinely unmeasured
+ * retention number would leave, and not zero either. `nonce-clock-adjustment-residual.test.ts`
+ * demonstrates the mechanism directly, since a unit test cannot drive a real NTP step.
+ *
+ * `buzz`, `mcp` and `cli` have no entry: there is no equivalent measurement for any of them —
+ * they are not Telegram's queue, and inventing a number for "how long could a redelivery still
+ * arrive" would be exactly the guess this file's own history warns against. A transport added
+ * here later without a measured entry is simply not checked, and carries this issue's original
+ * defect until one is added.
+ */
+const TRANSPORT_RETENTION_MS: Readonly<Partial<Record<string, number>>> = {
+  telegram: 24 * 60 * 60 * 1000,
+};
+
+/**
  * PRD §27.
  *
  * One place decides whether an inbound message may act. Allowlist, authenticity and
@@ -123,13 +191,51 @@ export const ingressSignature = (
   request: Parameters<typeof ingressSigningInput>[0],
 ): string => createHmac("sha256", secret).update(ingressSigningInput(request)).digest("hex");
 
+/**
+ * Marker on the `Error` `IngressGuard`'s constructor throws when a channel's
+ * `transportRetentionMs` is explicitly `null` — a caller stating its transport's redelivery
+ * retention is not known.
+ *
+ * A property, not a subclass: this constructor throws several plain `Error`s already (an
+ * empty allowlist, a missing conversation list), and this reason needs to be told apart from
+ * those by whoever catches it, not renamed into its own hierarchy. `isTransportRetentionUnknown`
+ * below is the narrow, structural way to ask "is this that reason" — `startDaemonTelegramListener`'s
+ * caller (`agentcpd.ts`) checks it specifically so an operator running a *supported*,
+ * deliberately-configured self-hosted transport gets "Telegram ingress refused, here is why,
+ * everything else is running" rather than the whole daemon going down (#682, round 8's follow-up).
+ */
+const TRANSPORT_RETENTION_UNKNOWN = "TRANSPORT_RETENTION_UNKNOWN";
+
+/** Structural check for the marker above — the one place that knows its shape. */
+export const isTransportRetentionUnknown = (error: unknown): error is Error & { channel: string } =>
+  error instanceof Error &&
+  (error as { code?: unknown }).code === TRANSPORT_RETENTION_UNKNOWN &&
+  typeof (error as { channel?: unknown }).channel === "string";
+
 export class IngressGuard {
+  /**
+   * The nonce TTL this guard actually uses, per channel — copied out of the caller's
+   * `IngressPolicy` at construction, not read from it again.
+   *
+   * `policies` is typed `Readonly<Record<string, IngressPolicy>>`, and that readonly is shallow:
+   * it stops `this.policies["telegram"] = …`, not `somePolicy.nonceTtlMs = 1`. The object each
+   * entry points at is the caller's own, and ordinary TypeScript can still write to it after this
+   * constructor returns — the constructor validated `nonceTtlMs` against the transport's
+   * retention floor (#673) exactly once, and `admit` used to re-read `policy.nonceTtlMs` from
+   * that same object on every call. A check that runs once on a value someone else still owns is
+   * not a guarantee; it is a check that ran once. Copying the validated number into a field this
+   * class alone holds closes that — the floor now holds for the object's whole lifetime, not
+   * only at the instant it was constructed.
+   */
+  readonly #nonceTtlMsByChannel: Readonly<Record<string, number>>;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
     private readonly policies: Readonly<Record<string, IngressPolicy>>,
   ) {
+    const nonceTtlMsByChannel: Record<string, number> = {};
     for (const [channel, policy] of Object.entries(policies)) {
       if (policy.allowedActors.length === 0) {
         throw new Error(`ingress policy for '${channel}' has no allowed actors`);
@@ -137,7 +243,62 @@ export class IngressGuard {
       if (channel === "telegram" && (!policy.allowedConversations || policy.allowedConversations.length === 0)) {
         throw new Error("Telegram ingress requires a non-empty conversation allowlist");
       }
+      // The transport's own declared fact overrides the channel-keyed default (#682, round 8):
+      // a policy that threads through a real transport instance's `redeliveryRetentionMs` gets
+      // a floor derived from what that transport actually does, not from what channel it is
+      // named. `undefined` (the field left out) falls back to the old per-channel default, for
+      // construction sites that do not yet know their transport's retention.
+      const retention = policy.transportRetentionMs !== undefined
+        ? policy.transportRetentionMs
+        : TRANSPORT_RETENTION_MS[channel];
+      if (retention === null) {
+        // The caller stated explicitly that this channel's transport retention is not known —
+        // a self-hosted endpoint nobody has measured, or a stand-in for one. Assuming the
+        // measured `api.telegram.org` figure applies anyway would be this issue's original
+        // mistake in a new place, so this refuses rather than guesses. Marked with `code` and
+        // `channel` (see `isTransportRetentionUnknown` above) so a caller can tell this refusal
+        // apart from every other reason this constructor throws.
+        throw Object.assign(
+          new Error(
+            `ingress policy for '${channel}' does not know its transport's redelivery retention ` +
+              `(transportRetentionMs is null); refusing to assume a measured default applies to a ` +
+              `transport that has not stated its own (#682)`,
+          ),
+          { code: TRANSPORT_RETENTION_UNKNOWN, channel },
+        );
+      }
+      let ttl: number;
+      if (policy.nonceTtlMs !== undefined) {
+        // An explicit choice, kept literal rather than silently raised. Refusing a too-short
+        // explicit value (#673) still matters here — Sol's review (#682, round 8's third pass):
+        // an operator who explicitly configured a short `nonceTtlMs` alongside a transport (or an
+        // operator-asserted `transportRetentionMs`) that turns out to need a longer one must be
+        // told, not have their choice silently overridden into a floor they never asked for.
+        ttl = policy.nonceTtlMs;
+        if (retention !== undefined && ttl < retention) {
+          // The relationship, not the number, is the property (#673): a nonce pruned before the
+          // transport itself stops redelivering reopens the exact duplicate-turn window the
+          // claim mechanism exists to close. Refusing construction makes that relationship hold
+          // by construction instead of by two constants that happen to agree today.
+          throw new Error(
+            `ingress policy for '${channel}' sets nonceTtlMs (${ttl}ms) shorter than the transport's own ` +
+              `redelivery retention (${retention}ms); a nonce could be pruned before a late redelivery stops ` +
+              `arriving, which would let its turn be claimed and run a second time (#673)`,
+          );
+        }
+      } else {
+        // No explicit choice — the effective floor tracks whichever is larger: the system
+        // default, or the transport's own (possibly longer) retention. Found by review (#682,
+        // round 8's second follow-up): refusing construction outright for a transport that
+        // genuinely retains *longer* than the default, exactly as it does for one whose retention
+        // is *unknown*, conflated two different situations under one refusal — a known, longer
+        // window is a fact this guard can act on by raising the floor to match, not a reason to
+        // make the feature unreachable for anyone who did not also hand-tune `nonceTtlMs`.
+        ttl = retention !== undefined ? Math.max(DEFAULT_NONCE_TTL_MS, retention) : DEFAULT_NONCE_TTL_MS;
+      }
+      nonceTtlMsByChannel[channel] = ttl;
     }
+    this.#nonceTtlMsByChannel = Object.freeze(nonceTtlMsByChannel);
   }
 
   /**
@@ -257,7 +418,11 @@ export class IngressGuard {
       `INSERT INTO inbound_messages (channel, nonce, actor, received_at) VALUES (?, ?, ?, ?)`,
       [request.channel, request.nonce, request.actor, this.clock.nowIso()],
     );
-    this.prune(request.channel, policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS);
+    // From the field this constructor populated, not `policy.nonceTtlMs` — the caller's own
+    // `IngressPolicy` object can still be mutated after construction, and the transport-retention
+    // floor (#673) was only ever checked once, at construction. Reading the copy is what makes
+    // that check still true here.
+    this.prune(request.channel, this.#nonceTtlMsByChannel[request.channel] ?? DEFAULT_NONCE_TTL_MS);
 
     this.audit.record({
       kind: "INGRESS_ADMITTED",
@@ -434,7 +599,28 @@ export class IngressGuard {
     return this.db.tx(() => this.#recordResultHere(channel, nonce, result, expected));
   }
 
-  /** `recordResultIf` without its transaction, so it can share one with the turn's resolution. */
+  /**
+   * `recordResultIf` without its transaction, so it can share one with the turn's resolution.
+   *
+   * Refuses outright when the claim already carries `noReplyAt` (#682, third review). Found by a
+   * counterexample that reserved a reply (`expected: "AVAILABLE"`) against a turn
+   * `completeNoReplyAndResolveTurn` had already closed: the reservation's own precondition reads
+   * only `result_json`'s delivery status, and the `TELEGRAM_NO_REPLY` marker has none, so it read
+   * as available. The reservation lands, `completeReplyAndResolveTurn` later moves it to
+   * `APPLIED`, and one row now asserts both "no reply was produced" (`noReplyAt`) and "the
+   * transport accepted a reply" (`result_json.sent: true`) — the same collapse #682's other
+   * guards exist to refuse, arriving through a field (`result_json`) neither of them reads.
+   *
+   * Refused here rather than left to roll back later: even the reservation alone, on its own,
+   * reopens the vulnerability #672 exists to close — it overwrites the non-recoverable
+   * `TELEGRAM_NO_REPLY` marker with a `sent: false` reservation, and `isRecoverableIngressResult`
+   * reads `sent: false` as recoverable, so a redelivery would re-run a turn that already finished
+   * before `completeReplyAndResolveTurn` is ever reached. There is no legitimate reason to
+   * reserve or complete a reply for a turn already resolved as no-reply, so refusing the
+   * transition outright — rather than letting it proceed and rolling the whole completion back
+   * later — is not just simpler, it is the only place that also protects the reservation taken on
+   * its own.
+   */
   #recordResultHere(
     channel: string,
     nonce: string,
@@ -442,12 +628,22 @@ export class IngressGuard {
     expected: "AVAILABLE" | "PENDING",
   ): Decision<void> {
     {
-      const current = this.db.get<{ result_json: string | null }>(
-        `SELECT result_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+        `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
         [channel, nonce],
       );
       if (!current) {
         return deny(ReasonCode.NOT_FOUND, "cannot transition a missing ingress result", { channel, nonce });
+      }
+      if (current.turn_claim_json) {
+        const claim = JSON.parse(current.turn_claim_json) as { noReplyAt?: unknown };
+        if (claim.noReplyAt !== undefined) {
+          return deny(
+            ReasonCode.RESOURCE_COLLISION,
+            "cannot transition an ingress result for a turn already resolved as no-reply",
+            { channel, nonce },
+          );
+        }
       }
       const deliveryStatus = resultDeliveryStatus(current.result_json);
       const allowed = expected === "PENDING"
@@ -510,6 +706,7 @@ export class IngressGuard {
         WHERE channel = ?
           AND turn_claim_json IS NOT NULL
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
+          AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
           AND json_extract(turn_claim_json, '$.sessionDigest') IS ?
         ORDER BY received_at ASC`,
       [channel, sessionDigest],
@@ -565,6 +762,116 @@ export class IngressGuard {
     });
   }
 
+  /**
+   * The no-reply counterpart of `completeReplyAndResolveTurn` (#672) — and, since a blind review
+   * of that fix found the collapse, its own terminal fact rather than `repliedAt` (#682).
+   *
+   * `repliedAt` is not "this turn is resolved, generically" — it is specifically evidence that
+   * the transport accepted a reply (see `resolveTurn`'s docstring; #638's later receipt match
+   * depends on that staying a narrow, true claim). A handler that decided not to reply produced
+   * no such evidence, so writing `repliedAt` for it would tell a later reader — a person, or a
+   * future receipt comparison — that Telegram has a message it never received. `turn_claim_json`
+   * was split apart from `result_json` for exactly this shape of mistake (#671: two different
+   * facts sharing one field, so advancing one silently erased the other); reusing `repliedAt` as
+   * a generic "closed" marker collapses two facts back into one field from the other direction.
+   * So this writes `noReplyAt` instead — its own fact, checked apart from `repliedAt` everywhere
+   * a claim's resolution matters: `unresolvedClaim`, `unresolvedTurns`, and `prune`.
+   *
+   * `resolveTurn` alone is not enough either way: it never reserves or completes anything, so
+   * `result_json` stays exactly what it was the moment the turn was claimed — usually null.
+   * `isRecoverableIngressResult(null)` reads that as "never ran", which is true for an ordinary
+   * crash and false here — this handler ran and finished. Left that way, a later replay would see
+   * a *resolved* claim and a *recoverable* result and take the recovery branch, re-admitting and
+   * re-running a turn that already happened — worse than #672's original bug, which at least
+   * refused the redelivery outright.
+   *
+   * So this writes a result marker `isRecoverableIngressResult` reads as finished, in the same
+   * transaction as the resolution, for the reason `completeReplyAndResolveTurn`'s docstring
+   * already gives: any ordering of two separate commits has a window where a crash lands between
+   * them, and here that window would leave the claim resolved but the result still recoverable —
+   * the exact state that reopens the duplicate.
+   *
+   * Refuses to move a claim that already carries either terminal fact — most importantly, this
+   * must never write `noReplyAt` over a claim that already has a real `repliedAt`.
+   *
+   * Also refuses — found by a fourth review of #682 — unless `result_json` is still exactly the
+   * fresh `ADMITTED` marker `admit` wrote, the same shape `isClaimable` calls "nothing has
+   * happened yet". The `turn_claim_json` checks above are not enough on their own: they see
+   * whether *this* turn resolved, not whether a reply was reserved or sent for it. `outcome.
+   * replayed` at the call site (`telegram-router.ts`) is a snapshot taken when `route()` returned,
+   * and cannot see a reservation another poller commits after that snapshot and before this
+   * transaction starts — `reserveResponse` writes `result_json` but never touches
+   * `turn_claim_json`, so the checks above would still see a claim with neither terminal fact and
+   * proceed to destroy that reservation.
+   *
+   * Enforced by the write's own WHERE clause below, not by a separate read-then-branch. A first
+   * draft also carried a standalone `if (!isClaimable(current.result_json)) return deny(...)`
+   * ahead of the write — the same predicate, expressed twice: once as a JS branch and once as the
+   * WHERE clause's `json_extract` conditions. Removing the JS branch and keeping only the WHERE
+   * clause changed no observable behaviour (the mutation test for the JS branch still passed,
+   * because the WHERE clause's own row-count check below already denies the identical case) — a
+   * measured instance of a redundant check reporting coverage it did not independently have. One
+   * enforcement site, the one that actually participates in the write, is what stays.
+   */
+  completeNoReplyAndResolveTurn(channel: string, nonce: string): Decision<void> {
+    // `txDecision`, not plain `tx` (#664 tx-denial discipline, caught by
+    // `scripts/verify-tx-denial-sites.mjs`'s own census): the `updated.changes !== 1` guard below
+    // writes `result_json` and can then deny in the same body, and a plain `tx()` treats that
+    // `Decision` as an ordinary return value rather than something to roll back on. The write
+    // itself is a no-op whenever that branch denies (`changes !== 1` means the WHERE clause
+    // matched zero rows), but nothing about that is visible to the census's static check, and
+    // relying on "this particular write happens to be harmless when denied" is exactly the
+    // reasoning #664 exists to stop trusting by hand.
+    return this.db.txDecision(() => {
+      const current = this.db.get<{ turn_claim_json: string | null }>(
+        `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+        [channel, nonce],
+      );
+      if (!current?.turn_claim_json) {
+        // No claim, nothing to resolve — the ordinary non-CEO path, same as `resolveTurn`.
+        return allow(ReasonCode.OK, undefined);
+      }
+      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };
+      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {
+        // Already resolved, one way or the other. Idempotent-safe, and the guard that keeps a
+        // real `repliedAt` from ever being overwritten by this path.
+        return allow(ReasonCode.OK, undefined);
+      }
+      // No `kind: "TELEGRAM_WORKFLOW"`, deliberately: that shape's `sent` and `phase` describe
+      // the reply lifecycle, and there is no reply to describe. `isRecoverableIngressResult`'s
+      // fallback for any other kind is `sent === false`, which a marker with no `sent` field
+      // satisfies as `false` — recoverable only when a workflow explicitly says it has not sent.
+      const updated = this.db.run(
+        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (
+           result_json IS NULL OR (
+             json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND
+             json_extract(result_json, '$.phase') = 'ADMITTED'
+           )
+         )`,
+        [JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }), channel, nonce],
+      );
+      if (updated.changes !== 1) {
+        // The read above passed but the write's own WHERE clause did not match — belt-and-braces
+        // against the same class of collapse `#recordResultHere`'s row-count check guards (#682,
+        // third review): a mismatch here means `result_json` changed between the read and this
+        // write, and reporting success regardless would be exactly the wrong-answer-with-
+        // confidence this method exists to refuse.
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "ingress result changed underneath the no-reply resolution",
+          { channel, nonce },
+        );
+      }
+      this.db.run(
+        `UPDATE inbound_messages
+            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)
+          WHERE channel = ? AND nonce = ?`,
+        [this.clock.nowIso(), channel, nonce],
+      );
+      return allow(ReasonCode.OK, undefined);
+    });
+  }
+
   #resolveTurnHere(channel: string, nonce: string): Decision<void> {
     {
       const current = this.db.get<{ turn_claim_json: string | null }>(
@@ -576,13 +883,49 @@ export class IngressGuard {
         // the ordinary non-CEO path, and there is nothing to resolve.
         return allow(ReasonCode.OK, undefined);
       }
-      this.db.run(
+      // `noReplyAt`, not only `repliedAt` (#682, second review): the two terminal facts have two
+      // writers now, and a guard on only one of them is not a guard on the field. Checked here,
+      // explicitly, rather than left to the UPDATE's WHERE clause alone (third review) — a WHERE
+      // clause that matches nothing is silent, and the write below used to be followed by an
+      // unconditional `allow(OK)` regardless of whether it changed a row. `#recordResultHere`
+      // now refuses the reservation that would let a caller reach this state through the reply
+      // lifecycle, but `resolveTurn` is also called directly, bypassing that gate entirely — so
+      // this function has to refuse the conflict on its own rather than rely on an earlier guard.
+      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };
+      if (claim.repliedAt !== undefined) {
+        // Already resolved by an earlier reply. Idempotent, not a conflict: an ordinary redelivery
+        // of a completed turn reaches this on the reply path, and refusing it here would make
+        // every replay of a finished turn fail where it used to quietly do nothing.
+        return allow(ReasonCode.OK, undefined);
+      }
+      if (claim.noReplyAt !== undefined) {
+        // A *different* terminal fact already closed this claim. Writing `repliedAt` now would
+        // assert both "no reply was produced" and "the transport accepted a reply" on one row —
+        // refuse rather than silently do nothing and report success.
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "cannot record a reply for a turn already resolved as no-reply",
+          { channel, nonce },
+        );
+      }
+      const updated = this.db.run(
         `UPDATE inbound_messages
             SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)
           WHERE channel = ? AND nonce = ? AND json_extract(turn_claim_json, '$.repliedAt') IS NULL`,
         [this.clock.nowIso(), channel, nonce],
       );
-      return allow(ReasonCode.OK, undefined);
+      // The row count is checked (#682, third review) rather than returning `allow(OK)`
+      // unconditionally: an UPDATE that changes nothing is not evidence the write happened, and
+      // this function used to return success regardless — exactly the counterexample that found
+      // the `noReplyAt` branch above missing. The two checks above should make this WHERE clause
+      // unreachable in a false state now, the same claim `claimTurn`'s own WHERE-clause comment
+      // makes about itself: `tx` serialises the read this depends on, so no test here can produce
+      // the interleaving this would catch. It is a second statement of the same fact, kept as a
+      // last line rather than trusted to be one, not a second guard with its own falsifiability
+      // row — there is nothing left for a test to construct that reaches it in a false state.
+      return updated.changes === 1
+        ? allow(ReasonCode.OK, undefined)
+        : deny(ReasonCode.RESOURCE_COLLISION, "turn resolution raced another writer", { channel, nonce });
     }
   }
 
@@ -606,10 +949,17 @@ export class IngressGuard {
     // audit log, and `agentctl doctor system` reports the same outstanding claim as a
     // `TURN_OUTCOME_UNKNOWN` finding (`Doctor.checkUnresolvedTurns`) — so the runbook's first
     // command surfaces it too, not only someone tailing `audit_events`.
+    //
+    // `noReplyAt`, not only `repliedAt`: a turn a handler genuinely decided not to reply to is
+    // exactly as finished as one whose reply the transport accepted, and is just as prunable —
+    // but it is a *different* fact (#682), so it gets its own check rather than being folded
+    // into `repliedAt`'s.
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
-          AND (turn_claim_json IS NULL OR json_extract(turn_claim_json, '$.repliedAt') IS NOT NULL)`,
+          AND (turn_claim_json IS NULL
+            OR json_extract(turn_claim_json, '$.repliedAt') IS NOT NULL
+            OR json_extract(turn_claim_json, '$.noReplyAt') IS NOT NULL)`,
       [channel, new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString()],
     );
   }
@@ -782,15 +1132,17 @@ const isRecoverableIngressResult = (resultJson: string | null): boolean => {
 /**
  * Whether a stored claim is still waiting on an outcome.
  *
- * A claim with `repliedAt` produced a reply the transport accepted, which is the closest thing to
- * an outcome this layer can observe. Without the distinction the claim would survive forever and
- * every replay of a finished turn would report an unknown outcome — the hold #651 warned that
- * fixing #646 would create.
+ * A claim with `repliedAt` produced a reply the transport accepted; a claim with `noReplyAt` had a
+ * handler that decided not to reply (#682) — different facts, but either is the closest thing to
+ * an outcome this layer can observe, and either one closes the claim. Without the distinction the
+ * claim would survive forever and every replay of a finished turn would report an unknown outcome
+ * — the hold #651 warned that fixing #646 would create.
  */
 const unresolvedClaim = (turnClaimJson: string | null): boolean => {
   if (!turnClaimJson) return false;
   try {
-    return (JSON.parse(turnClaimJson) as { repliedAt?: unknown }).repliedAt === undefined;
+    const claim = JSON.parse(turnClaimJson) as { repliedAt?: unknown; noReplyAt?: unknown };
+    return claim.repliedAt === undefined && claim.noReplyAt === undefined;
   } catch {
     // Unparseable is treated as outstanding. A claim nobody can read is not a claim that resolved.
     return true;
