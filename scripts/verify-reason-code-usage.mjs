@@ -1,19 +1,18 @@
 #!/usr/bin/env node
 /**
- * Verifies a static census of reason-code references and trigger mappings.
+ * Verifies a census of reason-code producers and trigger mappings.
  *
  * `verify-reason-codes.mjs` already checks the catalogue's internal shape (value equals
  * key, nothing published was removed). This census additionally detects a declaration with
- * no static reference in src and a raised SQLite trigger name with no TRIGGER_CODES mapping.
- * It does not establish that a reference is reachable at runtime: comments and dead code are
- * source text too.
+ * no production producer in src and a raised SQLite trigger name with no TRIGGER_CODES mapping.
  *
  * Checks:
- *   1. every declared code has a static `ReasonCode.X` or `reasonCode`-literal reference in
- *      `src/**` outside its declaration
- *   2. every code referenced in `tests/**` is declared
+ *   1. every declared code has a production reference that can produce it: a denial/error,
+ *      Decision, return, event, persisted reason or another executable value selection
+ *   2. every `ReasonCode.X` member used in `src/**`/`tests/**` is declared
  *   3. every string literal used as a `reasonCode` in `src/**`/`tests/**` is declared
- *   4. every `RAISE(ABORT, 'X')` name in production schema or migration DDL has a
+ *   4. every staleness-classification member is declared
+ *   5. every `RAISE(ABORT, 'X')` name in production schema or migration DDL has a
  *      TRIGGER_CODES mapping in `src/db/database.ts`
  *
  * Nothing here deletes or edits a code: `src/core/reason-codes.ts` is append-only by
@@ -25,13 +24,72 @@
  * Usage: node scripts/verify-reason-code-usage.mjs [--json]
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const asJson = process.argv.includes("--json");
 
 const read = (rel) => readFileSync(join(repoRoot, rel), "utf8");
+
+/**
+ * Replaces comments, and optionally strings, with spaces while preserving lines.
+ * A comment or quoted mention cannot produce a reason code. String contents stay visible to the
+ * separate reason-code-literal scan, where only a literal bound to `reasonCode` is accepted.
+ */
+const codeSource = (source, maskStrings) => {
+  const chars = [...source];
+  let state = "code";
+  let escaped = false;
+  for (let i = 0; i < chars.length; i += 1) {
+    const char = chars[i];
+    const next = chars[i + 1];
+    if (state === "code") {
+      if (char === "/" && next === "/") {
+        chars[i] = chars[i + 1] = " ";
+        state = "line-comment";
+        i += 1;
+      } else if (char === "/" && next === "*") {
+        chars[i] = chars[i + 1] = " ";
+        state = "block-comment";
+        i += 1;
+      } else if (char === "'" || char === '"' || char === "`") {
+        if (maskStrings) chars[i] = " ";
+        state = char === "'" ? "single" : char === '"' ? "double" : "template";
+        escaped = false;
+      }
+      continue;
+    }
+    if (state === "line-comment") {
+      if (char === "\n") state = "code";
+      else chars[i] = " ";
+      continue;
+    }
+    if (state === "block-comment") {
+      if (char === "*" && next === "/") {
+        chars[i] = chars[i + 1] = " ";
+        state = "code";
+        i += 1;
+      } else if (char !== "\n") {
+        chars[i] = " ";
+      }
+      continue;
+    }
+    if (maskStrings && char !== "\n") chars[i] = " ";
+    if (escaped) {
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (
+      (state === "single" && char === "'") ||
+      (state === "double" && char === '"') ||
+      (state === "template" && char === "`")
+    ) {
+      state = "code";
+    }
+  }
+  return chars.join("");
+};
 
 const walk = (dir, out = []) => {
   for (const entry of readdirSync(join(repoRoot, dir)).sort()) {
@@ -64,28 +122,38 @@ if (declared.size === 0) {
 
 // --- references ------------------------------------------------------------
 const srcFiles = walk("src");
+const productionFiles = srcFiles.filter((file) => file !== catalogueRel);
 const testFiles = walk("tests");
 
-/** The catalogue declaration is not its own consumer; the rest of its module still is. */
-const referenceSource = (file) =>
-  file === catalogueRel
-    ? `${catalogueSource.slice(0, catalogueBody.index)}${catalogueSource.slice(
-        catalogueBody.index + catalogueBody[0].length,
-      )}`
-    : read(file);
-
-/** Textual `ReasonCode.FOO` matches, including comments and unreachable code. */
-const memberRefs = (files) => {
+/** Executable `ReasonCode.FOO` matches; comments and quoted mentions are masked. */
+const memberRefs = (files, accepts = () => true) => {
   const hits = new Map();
   for (const file of files) {
-    const text = referenceSource(file);
+    const text = codeSource(read(file), true);
     for (const match of text.matchAll(/ReasonCode\.([A-Z0-9_]+)/g)) {
+      if (!accepts(text, match.index, match[0].length)) continue;
       const line = text.slice(0, match.index).split("\n").length;
       if (!hits.has(match[1])) hits.set(match[1], []);
       hits.get(match[1]).push(`${file}:${line}`);
     }
   }
   return hits;
+};
+
+/**
+ * A production reference selects a code as a value that can leave the site. Pure consumers do
+ * not: an equality check, membership query or switch label only asks about a code produced
+ * elsewhere. The whole catalogue module is excluded by `productionFiles`; declarations and
+ * classification entries are metadata, so the catalogue cannot vouch for itself.
+ */
+const producesReasonCode = (text, index, length) => {
+  const before = text.slice(Math.max(0, index - 120), index);
+  const after = text.slice(index + length, index + length + 120);
+  if (/\bcase\s*$/.test(before)) return false;
+  if (/(?:===|!==|==|!=)\s*\(*\s*$/.test(before)) return false;
+  if (/^\s*\)*\s*(?:===|!==|==|!=)/.test(after)) return false;
+  if (/\b(?:has|includes|indexOf)\s*\(\s*$/.test(before)) return false;
+  return true;
 };
 
 /**
@@ -99,11 +167,11 @@ const REASON_LITERAL = [
   /reason[_C]ode\s*\)?\s*\.\s*(?:toBe|toEqual)\(\s*"([A-Z][A-Z0-9_]{2,})"/g,
 ];
 
-const literalRefs = (files) => {
+const literalRefs = (files, patterns = REASON_LITERAL) => {
   const hits = new Map();
   for (const file of files) {
-    const text = referenceSource(file);
-    for (const pattern of REASON_LITERAL) {
+    const text = codeSource(read(file), false);
+    for (const pattern of patterns) {
       for (const match of text.matchAll(pattern)) {
         const line = text.slice(0, match.index).split("\n").length;
         if (!hits.has(match[1])) hits.set(match[1], []);
@@ -114,21 +182,23 @@ const literalRefs = (files) => {
   return hits;
 };
 
-const srcMembers = memberRefs(srcFiles);
+const srcMembers = memberRefs(productionFiles);
+const productionMembers = memberRefs(productionFiles, producesReasonCode);
 const testMembers = memberRefs(testFiles);
 const srcLiterals = literalRefs(srcFiles);
+const productionLiterals = literalRefs(productionFiles, [REASON_LITERAL[0]]);
 const testLiterals = literalRefs(testFiles);
 
-/** Extra diagnostic: a plain-text source mention does not satisfy the static-reference check. */
-const srcText = srcFiles.map(referenceSource).join("\n");
+/** Extra diagnostic: a plain-text source mention does not satisfy the production-reference check. */
+const srcText = productionFiles.map(read).join("\n");
 
 const problems = [];
 const notes = [];
 
-// 1 — declared but never referenced in src.
+// 1 — declared but never produced in src.
 const unreferenced = [];
 for (const [code, meta] of declared) {
-  if (srcMembers.has(code) || srcLiterals.has(code)) continue;
+  if (productionMembers.has(code) || productionLiterals.has(code)) continue;
   unreferenced.push({
     code,
     declaredAt: `${catalogueRel}:${meta.line}`,
@@ -138,12 +208,16 @@ for (const [code, meta] of declared) {
 }
 for (const entry of unreferenced) {
   problems.push(
-    `declared but referenced nowhere in src/**: ${entry.code} (${entry.declaredAt})` +
+    `declared but produced nowhere in src/**: ${entry.code} (${entry.declaredAt})` +
       (entry.alsoUsedInTests ? " — asserted by tests/** with no producer" : ""),
   );
 }
 
-// 2 — referenced by tests but not declared.
+// 2 — a ReasonCode member used in source or tests must be declared.
+for (const [code, sites] of srcMembers) {
+  if (declared.has(code)) continue;
+  problems.push(`src/** references an undeclared ReasonCode member: ${code} (${sites[0]})`);
+}
 for (const [code, sites] of [...testMembers, ...testLiterals]) {
   if (declared.has(code)) continue;
   problems.push(`referenced in tests/** but not declared: ${code} (${sites[0]})`);
@@ -155,7 +229,25 @@ for (const [code, sites] of srcLiterals) {
   problems.push(`src/** uses an undeclared reason-code literal: ${code} (${sites[0]})`);
 }
 
-// 4 — every trigger abort name must translate into a reason code.
+// 4 — a classification entry must name an existing code.
+const stalenessBody =
+  /export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set\(\[([\s\S]*?)\n\]\);/.exec(
+    catalogueSource,
+  );
+if (!stalenessBody) {
+  problems.push(`${catalogueRel}: could not locate STALENESS_REASON_CODES`);
+} else {
+  const bodyOffset = stalenessBody.index + stalenessBody[0].indexOf(stalenessBody[1]);
+  for (const match of stalenessBody[1].matchAll(/ReasonCode\.([A-Z0-9_]+)/g)) {
+    if (declared.has(match[1])) continue;
+    const line = catalogueSource.slice(0, bodyOffset + match.index).split("\n").length;
+    problems.push(
+      `STALENESS_REASON_CODES classifies undeclared code ${match[1]} (${catalogueRel}:${line})`,
+    );
+  }
+}
+
+// 5 — every trigger abort name must translate into a reason code.
 const triggerSources = [
   ["src/db/schema.sql", read("src/db/schema.sql")],
   ["src/db/migrations.ts", read("src/db/migrations.ts")],
@@ -212,7 +304,7 @@ if (asJson) {
   console.log(`src files scanned:     ${srcFiles.length}`);
   console.log(`test files scanned:    ${testFiles.length}`);
   console.log("");
-  console.log(`declared but unreferenced in src/** (${unreferenced.length}):`);
+  console.log(`declared but unproduced in src/** (${unreferenced.length}):`);
   for (const entry of unreferenced) {
     console.log(
       `  ${entry.code}  ${entry.declaredAt}` +
@@ -224,7 +316,7 @@ if (asJson) {
   for (const note of notes) console.log(`note: ${note}`);
   console.log("");
   if (problems.length === 0) {
-    console.log("OK — static reason-code references and production trigger DDL mappings agree");
+    console.log("OK — production reason-code references and trigger DDL mappings agree");
   } else {
     console.log(`${problems.length} problem(s):`);
     for (const problem of problems) console.log(`  - ${problem}`);

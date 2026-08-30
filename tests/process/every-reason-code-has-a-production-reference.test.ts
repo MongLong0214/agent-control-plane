@@ -30,13 +30,21 @@ const census = (): Census => {
   }
 };
 
-/** Every declared reason code has a static reference in src. */
-it("every declared reason code has a static reference in src", () => {
+/** Every declared reason code has a production reference. */
+it("every declared reason code has a production reference", () => {
   const result = census();
 
-  expect(result.exitCode).toBe(0);
-  expect(result.problems).toEqual([]);
   expect(result.unreferenced).toEqual([]);
+  expect(result.problems).toEqual([]);
+  expect(result.exitCode).toBe(0);
+});
+
+/** Staleness classifications name declared reason codes. */
+it("staleness classifications name declared reason codes", () => {
+  const result = census();
+
+  expect(result.problems).toEqual([]);
+  expect(result.exitCode).toBe(0);
 });
 
 /** Production trigger denials and mappings agree. */

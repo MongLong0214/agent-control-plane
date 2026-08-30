@@ -85,12 +85,23 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
-    what: "every declared reason code has a static reference in src",
+    // This is the one production reference for the code. Its catalogue classification remains,
+    // proving that membership metadata cannot satisfy the producer census.
+    what: "every declared reason code has a production reference",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,\n",
+    replace: "          ReasonCode.CONVERSATION_TARGET_UNATTESTED,\n",
+    killedBy: [
+      "tests/process/every-reason-code-has-a-production-reference.test.ts::every declared reason code has a production reference",
+    ],
+  },
+  {
+    what: "staleness classifications name declared reason codes",
     file: "src/core/reason-codes.ts",
-    find: "  ReasonCode.CAPACITY_PROBE_STALE,\n",
+    find: '  CONVERSATION_TARGET_ATTESTATION_STALE: "CONVERSATION_TARGET_ATTESTATION_STALE",\n',
     replace: "",
     killedBy: [
-      "tests/process/every-reason-code-has-a-production-reference.test.ts::every declared reason code has a static reference in src",
+      "tests/process/every-reason-code-has-a-production-reference.test.ts::staleness classifications name declared reason codes",
     ],
   },
   {
