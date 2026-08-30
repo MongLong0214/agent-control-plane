@@ -2337,7 +2337,11 @@ describe("verify-tracker-loci-resolve", () => {
         body: `\`${witness}\` in \`${relPath}\``,
       }));
 
-      expect(jsIssues).toHaveLength(254);
+      // The corpus held 259 tracked JS-family files after #718 and #721 merged. Keep 200 as a
+      // deliberately one-way lower bound: additions must remain harmless, while a missing or
+      // accidentally trivialized corpus must fail visibly.
+      expect(jsFiles.length).toBeGreaterThan(200);
+      expect(jsIssues).toHaveLength(jsFiles.length);
       const { path, cleanup } = withIssues([...jsIssues, ...otherIssues]);
       try {
         const result = run(path);
