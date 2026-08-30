@@ -174,20 +174,23 @@ const telegramMigrateToChatId = (payload: unknown): string | null => {
   return Number.isSafeInteger(migrateToChatId) ? String(migrateToChatId) : null;
 };
 
+/**
+ * Telegram exposes no structured error-scope field. Treat a 4xx as request-local only when its
+ * description affirmatively identifies the unchanged request or destination as the problem.
+ * Unrecognised descriptions deliberately return false so a shared fault cannot consume a reply.
+ */
+const isTelegramRequestLocalRejection = (payload: unknown): boolean => {
+  const description = telegramDescription(payload);
+  return telegramMigrateToChatId(payload) !== null
+    || description === "Bad Request: reply message not found"
+    || description === "Forbidden: bot was blocked by the user";
+};
+
 const rejectedDeliveryFailure = (
   statusCode: number,
   payload: unknown,
 ): TelegramDeliveryFailure => {
-  // These are the two verified Telegram 4xx exceptions whose scope is broader than one request.
-  if (statusCode === 401) {
-    return {
-      kind: "GLOBAL_REJECTION",
-      statusCode,
-      description: telegramDescription(payload),
-      migrateToChatId: null,
-      retryAfterSeconds: null,
-    };
-  }
+  // A retry instruction is shared service state, not evidence that this request is unusable.
   if (statusCode === 429) {
     return {
       kind: "RETRYABLE",
@@ -198,9 +201,9 @@ const rejectedDeliveryFailure = (
     };
   }
 
-  // An otherwise unlisted 4xx in a verified Telegram error envelope rejects this request, so
-  // terminalizing this message prevents one bad chat or reply from holding every later update.
-  if (statusCode >= 400 && statusCode < 500) {
+  // Status alone cannot establish scope: the self-hosted Bot API uses 421 for a token-range
+  // configuration fault. Terminalize only descriptions that identify this request or destination.
+  if (statusCode >= 400 && statusCode < 500 && isTelegramRequestLocalRejection(payload)) {
     return {
       kind: "PERMANENT_REJECTION",
       statusCode,
@@ -221,8 +224,8 @@ const rejectedDeliveryFailure = (
     };
   }
 
-  // Outside the protocol's client/server error classes there is no evidence that one message is
-  // permanently bad. Preserve it as a batch/global failure instead of silently consuming it.
+  // No scope evidence means the failure may affect every request. Holding the ordered offset is
+  // recoverable; terminalizing an unrecognised shared fault would silently lose the reply.
   return {
     kind: "GLOBAL_REJECTION",
     statusCode,
@@ -870,8 +873,8 @@ export class TelegramLongPollService {
     }
 
     // Reserve before the external call. A reservation left PENDING after an ambiguous return is
-    // never replayed. A verified per-message Telegram 4xx is terminal; intermediary responses,
-    // batch/global rejections and 429/5xx release the reservation and keep the update retryable.
+    // never replayed. A verified request-local rejection is terminal; intermediary responses,
+    // shared/global rejections and 429/5xx release the reservation and keep the update retryable.
     this.router.reserveResponse(outcome);
     await this.options.onInterrupt?.("after-reply-reserve", update, outcome.runId);
     try {

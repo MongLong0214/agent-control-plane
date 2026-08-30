@@ -1952,7 +1952,7 @@ describe("Telegram production ingress", () => {
     const later = update("later turn", { message_id: laterMessageId }, 471);
     const fixture = telegramBotApiFixture([first, later], {
       status: 400,
-      body: { ok: false, error_code: 400, description: "Bad Request: reply rejected" },
+      body: { ok: false, error_code: 400, description: "Bad Request: reply message not found" },
     }, { persistentlyRejectReplyToMessageId: laterMessageId });
     let releaseFirst!: () => void;
     const firstTurn = new Promise<void>((resolve) => { releaseFirst = resolve; });
@@ -2198,6 +2198,56 @@ describe("Telegram production ingress", () => {
     const row = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
       `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
       ["update:481"],
+    );
+    expect(row?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
+    expect(row?.result_json).not.toContain('"deliveryStatus":"UNANSWERABLE"');
+    expect(row?.turn_claim_json).not.toContain("settledAt");
+  });
+
+  it("a structured 421 token-range rejection is global and holds the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const fixture = telegramBotApiFixture([update("token outside server range", {}, 489)], {
+      status: 421,
+      body: {
+        ok: false,
+        error_code: 421,
+        description: "Misdirected Request: forbidden token specified",
+      },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: () => "reply that must survive server reconfiguration",
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    expect(deliveryError).toMatchObject({
+      failure: {
+        kind: "GLOBAL_REJECTION",
+        statusCode: 421,
+        description: "Misdirected Request: forbidden token specified",
+      },
+    });
+    expect(listener.service.offset).toBeUndefined();
+    const row = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:489"],
     );
     expect(row?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
     expect(row?.result_json).not.toContain('"deliveryStatus":"UNANSWERABLE"');

@@ -1885,17 +1885,6 @@ const GUARDS = [
     ],
   },
   {
-    // Treating a revoked bot token as one bad message would consume updates while the entire
-    // credential remains unusable, so 401 is the explicit global exception to the 4xx default.
-    what: "a 401 remains a global retryable failure and does not terminalize the reply",
-    file: "src/ingress/telegram-polling.ts",
-    find: "  if (statusCode === 401) {",
-    replace: "  if (false) {",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a 401 remains a global retryable failure and does not terminalize the reply",
-    ],
-  },
-  {
     // Without the envelope boundary, an HTML/plain-text proxy rejection falls through to the
     // status classifier and a 403 is consumed as if Telegram had rejected this one message.
     what: "an HTML 403 is a global retryable transport fault and holds the ordered offset",
@@ -1921,14 +1910,47 @@ const GUARDS = [
     ],
   },
   {
-    // Narrowing the verified Telegram class default back to one enumerated code recreates the 403
-    // wedge: the rejected row stays retryable and the ordered offset cannot drain past it.
+    // migrate_to_chat_id identifies this request's destination as obsolete. Removing that
+    // structured signal leaves a message-specific 400 retryable and wedges 101 later updates.
+    what: "a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    file: "src/ingress/telegram-polling.ts",
+    find: "  return telegramMigrateToChatId(payload) !== null",
+    replace: "  return false",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // Telegram names the request's reply target as missing. Removing that semantic signal leaves
+    // a message-specific 400 retryable and prevents the earlier pending turn from draining.
+    what: "a later permanent 400 cannot advance the offset past an earlier pending CEO turn",
+    file: "src/ingress/telegram-polling.ts",
+    find: "    || description === \"Bad Request: reply message not found\"",
+    replace: "    || false",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a later permanent 400 cannot advance the offset past an earlier pending CEO turn",
+    ],
+  },
+  {
+    // This description confines the refusal to the destination user. Removing it makes one
+    // blocked chat hold unrelated updates even though the shared Bot API remains usable.
     what: "a structured Telegram 403 is terminal and advances the ordered offset",
     file: "src/ingress/telegram-polling.ts",
-    find: "  if (statusCode >= 400 && statusCode < 500) {",
-    replace: "  if (statusCode === 400) {",
+    find: "    || description === \"Forbidden: bot was blocked by the user\";",
+    replace: "    || false;",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::a structured Telegram 403 is terminal and advances the ordered offset",
+    ],
+  },
+  {
+    // Telegram has no structured scope field. Dropping the request-local predicate recreates the
+    // 421 loss by consuming a self-hosted server's token-range configuration rejection.
+    what: "a structured 421 token-range rejection is global and holds the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "  if (statusCode >= 400 && statusCode < 500 && isTelegramRequestLocalRejection(payload)) {",
+    replace: "  if (statusCode >= 400 && statusCode < 500) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a structured 421 token-range rejection is global and holds the ordered offset",
     ],
   },
   {
@@ -1943,18 +1965,18 @@ const GUARDS = [
     ],
   },
   {
-    // A status outside 4xx/5xx provides no evidence that this one message is permanently bad;
+    // An unrecognised response provides no evidence that this one request is permanently bad;
     // consuming it instead of holding the batch would silently discard the unexplained request.
     what: "an unrecognisable status is global and holds its ordered offset",
     file: "src/ingress/telegram-polling.ts",
     find:
-      "  // Outside the protocol's client/server error classes there is no evidence that one message is\n" +
-      "  // permanently bad. Preserve it as a batch/global failure instead of silently consuming it.\n" +
+      "  // No scope evidence means the failure may affect every request. Holding the ordered offset is\n" +
+      "  // recoverable; terminalizing an unrecognised shared fault would silently lose the reply.\n" +
       "  return {\n" +
       "    kind: \"GLOBAL_REJECTION\",",
     replace:
-      "  // Outside the protocol's client/server error classes there is no evidence that one message is\n" +
-      "  // permanently bad. Preserve it as a batch/global failure instead of silently consuming it.\n" +
+      "  // No scope evidence means the failure may affect every request. Holding the ordered offset is\n" +
+      "  // recoverable; terminalizing an unrecognised shared fault would silently lose the reply.\n" +
       "  return {\n" +
       "    kind: \"PERMANENT_REJECTION\",",
     killedBy: [
