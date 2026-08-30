@@ -1049,7 +1049,11 @@ export class IngressGuard {
     // only evidence that an accepted send must not be attempted again.
     //
     // Terminal reply failures need a person, not a timer. `agentctl doctor system` reads these
-    // exact rows and reports the unanswerable or unknown delivery state.
+    // exact rows and reports the unanswerable or unknown delivery state. Once that person records
+    // NO_RETRY, however, the row can expire at the ordinary nonce floor: the floor is constrained
+    // to the transport's redelivery retention, so the update can no longer come back and re-run.
+    // Keeping an acknowledged row forever would make it invisible to Doctor but permanently
+    // exempt from pruning — an unbounded archive with no remaining operational purpose.
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
@@ -1063,11 +1067,10 @@ export class IngressGuard {
             json_valid(result_json) = 1
             AND json_type(result_json, '$.reply') = 'object'
             AND (
-              json_extract(result_json, '$.deliveryStatus') IN (
-                'PENDING',
-                'UNKNOWN_RETRYABLE',
-                'UNANSWERABLE',
-                'UNRESOLVED'
+              json_extract(result_json, '$.deliveryStatus') IN ('PENDING', 'UNKNOWN_RETRYABLE')
+              OR (
+                json_extract(result_json, '$.deliveryStatus') IN ('UNANSWERABLE', 'UNRESOLVED')
+                AND json_type(result_json, '$.operatorResolution') IS NULL
               )
               OR (
                 json_type(result_json, '$.deliveryStatus') IS NULL

@@ -16,9 +16,9 @@ afterAll(cleanupTempDirs);
  * about ingress, and `agentctl doctor system`'s checks are all derived from durable DB state,
  * which a live-process refusal decision never touches.
  *
- * `Daemon.setTelegramIngressStatus` closes the gap `health.json` can close: `main`'s composition
- * root calls it once, right after Telegram's outcome is known, and it is written into
- * `health.json` immediately (`OPERATOR_METHOD.DAEMON_STATUS`, which backs `agentctl daemon
+ * `Daemon.setTelegramIngressStatus` closes the gap `health.json` can close: the production
+ * Telegram factory calls it on start, terminal stop, and acknowledgement-driven resume, and each
+ * transition is written immediately (`OPERATOR_METHOD.DAEMON_STATUS`, which backs `agentctl daemon
  * status`, reads that file verbatim — see `handleOperatorRequest`'s `DAEMON_STATUS` case).
  *
  * `agentctl doctor system` has no equivalent: `Doctor`'s checks all read `cp.db`/host state, and

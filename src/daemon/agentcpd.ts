@@ -1237,16 +1237,44 @@ export type DaemonTelegramStartOptions = Omit<TelegramLongPollStartOptions, "onC
   transport?: TelegramBotTransport;
 };
 
-export const startDaemonTelegramListener = (
+type DaemonTelegramRuntime = Pick<Daemon, "setTelegramIngressStatus" | "attachTelegramIngressRecovery"> & {
+  finalizeApprovedRun(runId: string): void | Promise<unknown>;
+};
+
+export const startDaemonTelegramListener = async (
   cp: ControlPlane,
   config: Parameters<typeof startTelegramLongPollListener>[1],
-  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown> },
+  daemon: DaemonTelegramRuntime,
   options: DaemonTelegramStartOptions = {},
-): Promise<TelegramLongPollListener> =>
-  startTelegramLongPollListener(cp, config, {
+): Promise<TelegramLongPollListener> => {
+  // Attach recovery before polling begins. An immediate backlog can reach an UNKNOWN send before
+  // this factory returns, and the operator door must never observe a stopped listener with no
+  // recovery control attached.
+  const listener = await startTelegramLongPollListener(cp, config, {
     ...options,
+    start: false,
     onCeoApproved: (runId) => daemon.finalizeApprovedRun(runId),
+    onStateChange: (state) => {
+      daemon.setTelegramIngressStatus({
+        configured: true,
+        running: state.running,
+        disabledReason: state.stoppedReason,
+      });
+      options.onStateChange?.(state);
+    },
   });
+  daemon.attachTelegramIngressRecovery((nonce) => listener.service.resumeAfterAcknowledgement(nonce));
+  if (options.start === false) {
+    daemon.setTelegramIngressStatus({
+      configured: true,
+      running: false,
+      disabledReason: "Telegram ingress listener is constructed but not started",
+    });
+  } else {
+    listener.service.start();
+  }
+  return listener;
+};
 
 /**
  * `startDaemonTelegramListener`, but a transport whose redelivery retention `IngressGuard`
@@ -1268,7 +1296,7 @@ export const startDaemonTelegramListener = (
 const startDaemonTelegramListenerOrRefuse = async (
   cp: ControlPlane,
   config: Parameters<typeof startTelegramLongPollListener>[1],
-  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown> },
+  daemon: DaemonTelegramRuntime,
   options: DaemonTelegramStartOptions,
 ): Promise<{ listener: TelegramLongPollListener | null; disabledReason: string | null }> => {
   try {
@@ -1562,11 +1590,13 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
         },
       });
       telegram = outcome.listener;
-      daemon.setTelegramIngressStatus({
-        configured: true,
-        running: outcome.listener !== null,
-        disabledReason: outcome.disabledReason,
-      });
+      if (!outcome.listener) {
+        daemon.setTelegramIngressStatus({
+          configured: true,
+          running: false,
+          disabledReason: outcome.disabledReason,
+        });
+      }
     } else {
       process.stderr.write("Telegram ingress not configured; continuing without Telegram ingress\n");
       daemon.setTelegramIngressStatus({ configured: false, running: false, disabledReason: null });
