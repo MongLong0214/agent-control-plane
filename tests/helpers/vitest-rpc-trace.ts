@@ -543,7 +543,16 @@ export const prepareVitestRpcTrace = (
         ? setting
         : resolve(root, setting);
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, "");
+  try {
+    writeFileSync(file, "", { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(`Refusing to overwrite existing Vitest RPC trace: ${file}`, {
+        cause: error,
+      });
+    }
+    throw error;
+  }
   process.env[INTERNAL_TRACE_FILE_ENV] = file;
   process.env[INTERNAL_TRACE_RUN_ENV] = runId;
   return { file, runId, reporter: new VitestRpcTraceReporter(file, runId) };

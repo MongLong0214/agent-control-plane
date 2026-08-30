@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -28,12 +28,14 @@ interface TraceFixtureRun {
   status: number | null;
   stdout: string;
   stderr: string;
+  traceFile: string;
   measurements: VitestRpcMeasurement[];
 }
 
 interface TraceFixtureOptions {
   blockMainMs?: number;
   delayRpcResponseMs?: number;
+  existingTraceContent?: string;
 }
 
 const fixtureConfig = (blockMainMs?: number, delaySetup?: string): string => {
@@ -60,6 +62,8 @@ export default {
   test: {
     ...baseTest,
     include: ["tests/**/*.test.ts"],
+    minWorkers: 1,
+    maxWorkers: 1,
     reporters: [...(baseTest.reporters ?? [])${appendedReporter}],
     setupFiles: [...(baseTest.setupFiles ?? [])${
       delaySetup === undefined ? "" : `, ${JSON.stringify(delaySetup)}`
@@ -109,6 +113,9 @@ const runTraceFixture = (
     ),
   );
   writeFileSync(join(testsDir, "probe.test.ts"), testSource);
+  if (options.existingTraceContent !== undefined) {
+    writeFileSync(traceFile, options.existingTraceContent);
+  }
 
   const done = spawnSync(process.execPath, [VITEST, "run", "tests/probe.test.ts"], {
     cwd: dir,
@@ -125,6 +132,7 @@ const runTraceFixture = (
     status: done.status,
     stdout: done.stdout,
     stderr: done.stderr,
+    traceFile,
     measurements: records.filter(
       (record): record is VitestRpcMeasurement => record.type === "measurement",
     ),
@@ -492,5 +500,20 @@ it("occupies the worker event loop after a real task update", () => {
     expect(workerStall?.mainReturnToResponseArrival.durationMs).toBeNull();
     expect(workerStall?.responseArrivalToWorkerPickup.durationMs).toBeNull();
     expect(workerStall?.classification).toBe("insufficient");
+  });
+
+  it("rejects an existing custom trace file without changing it", () => {
+    const existingTraceContent = "existing user content\n";
+    const run = runTraceFixture(
+      `
+import { expect, it } from "vitest";
+it("would run if trace setup succeeded", () => expect(true).toBe(true));
+`,
+      { existingTraceContent },
+    );
+
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toContain("Refusing to overwrite existing Vitest RPC trace");
+    expect(readFileSync(run.traceFile, "utf8")).toBe(existingTraceContent);
   });
 });
