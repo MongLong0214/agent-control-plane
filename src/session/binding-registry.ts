@@ -88,6 +88,8 @@ interface ValidatedHermesTargetBindReceipt {
   receipt: HermesTargetBindReceipt;
   canonicalJson: string;
   attestationDigest: string;
+  /** The bootstrap expectation, persisted independently from the executor-controlled receipt. */
+  expectedExecutorRuntimeIdentity: string;
 }
 
 export interface BindInput {
@@ -338,6 +340,7 @@ export class BindingRegistry {
           protocolVersion: input.authenticatedTarget.protocolVersion,
           attestationDigest: hermesReceipt?.attestationDigest ?? input.authenticatedTarget.attestationDigest,
           targetBindReceiptJson: hermesReceipt?.canonicalJson ?? null,
+          targetBindExecutorRuntimeIdentity: hermesReceipt?.expectedExecutorRuntimeIdentity ?? null,
         });
         if (!attested.allowed) return attested as Decision<RoleBinding>;
       }
@@ -937,9 +940,10 @@ export class BindingRegistry {
       target_locator_digest: string;
       attestation_digest: string;
       target_bind_receipt_json: string;
+      target_bind_executor_runtime_identity: string;
     }>(
       `SELECT a.actor_id, a.binding_generation, b.target_locator, b.target_locator_digest,
-              t.attestation_digest, t.target_bind_receipt_json
+              t.attestation_digest, t.target_bind_receipt_json, t.target_bind_executor_runtime_identity
          FROM assignments a
          JOIN conversational_actors c
            ON c.actor_id = a.actor_id
@@ -960,6 +964,7 @@ export class BindingRegistry {
           AND t.binding_generation = a.binding_generation
           AND t.protocol_version = ?
           AND t.target_bind_receipt_json IS NOT NULL
+          AND t.target_bind_executor_runtime_identity IS NOT NULL
         WHERE a.role_key = ?
           AND a.status = 'ACTIVE'
           AND a.session_id = ?
@@ -979,6 +984,7 @@ export class BindingRegistry {
       generation: row.binding_generation,
       requestedSessionId: row.target_locator,
       lineageRootDigest: row.target_locator_digest,
+      executorRuntimeIdentity: row.target_bind_executor_runtime_identity,
     });
     if (!receipt || receipt.receipt_digest !== row.attestation_digest) return null;
     try {
@@ -1106,6 +1112,7 @@ export class BindingRegistry {
       receipt,
       canonicalJson: canonicalJson(receipt),
       attestationDigest,
+      expectedExecutorRuntimeIdentity,
     });
   }
 
@@ -1217,13 +1224,15 @@ export class BindingRegistry {
     protocolVersion: string;
     attestationDigest: string;
     targetBindReceiptJson: string | null;
+    targetBindExecutorRuntimeIdentity: string | null;
   }): Decision<void> {
     try {
       this.db.run(
         `INSERT INTO actor_target_attestations
            (target_attestation_id, target_binding_id, binding_generation, assignment_id, executor_session_id,
-            executor_session_incarnation, protocol_version, attestation_digest, target_bind_receipt_json, attested_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            executor_session_incarnation, protocol_version, attestation_digest, target_bind_receipt_json,
+            target_bind_executor_runtime_identity, attested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           `ta_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
           input.targetBindingId,
@@ -1234,6 +1243,7 @@ export class BindingRegistry {
           input.protocolVersion,
           input.attestationDigest,
           input.targetBindReceiptJson,
+          input.targetBindExecutorRuntimeIdentity,
           this.clock.nowIso(),
         ],
       );

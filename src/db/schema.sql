@@ -1570,6 +1570,11 @@ CREATE TABLE IF NOT EXISTS actor_target_attestations (
   target_bind_receipt_json      TEXT CHECK (
     target_bind_receipt_json IS NULL OR json_valid(target_bind_receipt_json)
   ),
+  -- Bootstrap's expected executor identity is durable authority, independent of executor JSON.
+  -- v33 rows cannot prove the expectation and remain NULL, which current readers reject.
+  target_bind_executor_runtime_identity TEXT CHECK (
+    target_bind_executor_runtime_identity IS NULL OR length(target_bind_executor_runtime_identity) > 0
+  ),
   attested_at                   TEXT NOT NULL,
   UNIQUE (target_binding_id, attestation_digest),
   UNIQUE (target_attestation_id, target_binding_id)

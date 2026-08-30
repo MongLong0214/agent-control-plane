@@ -361,10 +361,12 @@ const asV33Fixture = (path: string): void => {
 
   const raw = new Database(path);
   try {
-    const hasReceiptColumn = raw
-      .prepare("SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_receipt_json'")
-      .get();
-    if (hasReceiptColumn) raw.exec("ALTER TABLE actor_target_attestations DROP COLUMN target_bind_receipt_json");
+    for (const column of ["target_bind_executor_runtime_identity", "target_bind_receipt_json"]) {
+      const present = raw
+        .prepare("SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = ?")
+        .get(column);
+      if (present) raw.exec(`ALTER TABLE actor_target_attestations DROP COLUMN ${column}`);
+    }
     raw.function("acp_schema_migration_authorized", () => 1);
     raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
     raw.exec("DELETE FROM schema_migrations");
@@ -488,9 +490,19 @@ describe("versioned SQLite migration", () => {
       if (!receipt?.backup_file) throw new Error("v34 receipt did not name its automatic backup");
       backupPath = receipt.backup_file;
       expect(existsSync(backupPath)).toBe(true);
-      expect(migrated.get<{ target_bind_receipt_json: string | null }>(
-        "SELECT target_bind_receipt_json FROM actor_target_attestations WHERE target_attestation_id = 'v33-legacy-attestation'",
-      )).toEqual({ target_bind_receipt_json: null });
+      expect(migrated.get<{
+        target_bind_receipt_json: string | null;
+        target_bind_executor_runtime_identity: string | null;
+      }>(
+        `SELECT target_bind_receipt_json, target_bind_executor_runtime_identity
+           FROM actor_target_attestations WHERE target_attestation_id = 'v33-legacy-attestation'`,
+      )).toEqual({
+        target_bind_receipt_json: null,
+        target_bind_executor_runtime_identity: null,
+      });
+      expect(migrated.get(
+        "SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_executor_runtime_identity'",
+      )).toEqual({ present: 1 });
     } finally {
       migrated.close();
     }
@@ -507,6 +519,9 @@ describe("versioned SQLite migration", () => {
       expect(rollbackSnapshot.prepare(
         "SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_receipt_json'",
       ).get()).toBeUndefined();
+      expect(rollbackSnapshot.prepare(
+        "SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_executor_runtime_identity'",
+      ).get()).toBeUndefined();
     } finally {
       rollbackSnapshot.close();
     }
@@ -519,8 +534,20 @@ describe("versioned SQLite migration", () => {
       expect(restoredRollbackBoundary.prepare(
         "SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_receipt_json'",
       ).get()).toBeUndefined();
+      expect(restoredRollbackBoundary.prepare(
+        "SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_executor_runtime_identity'",
+      ).get()).toBeUndefined();
     } finally {
       restoredRollbackBoundary.close();
+    }
+
+    const fresh = new Db(join(tempDir("acp-v34-fresh-hermes-receipt-"), "state.sqlite"));
+    try {
+      expect(fresh.get(
+        "SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_executor_runtime_identity'",
+      )).toEqual({ present: 1 });
+    } finally {
+      fresh.close();
     }
   });
 

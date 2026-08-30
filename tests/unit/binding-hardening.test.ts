@@ -835,12 +835,16 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
     expect(result.allowed).toBe(true);
     if (!result.allowed) return;
 
-    const stored = db.get<{ target_bind_receipt_json: string }>(
-      `SELECT target_bind_receipt_json
+    const stored = db.get<{
+      target_bind_receipt_json: string;
+      target_bind_executor_runtime_identity: string;
+    }>(
+      `SELECT target_bind_receipt_json, target_bind_executor_runtime_identity
          FROM actor_target_attestations WHERE assignment_id = ?`,
       [result.value.assignmentId],
     );
     expect(stored?.target_bind_receipt_json).toBeTypeOf("string");
+    expect(stored?.target_bind_executor_runtime_identity).toBe("hermes:runtime-649");
     const expected = JSON.parse(stored!.target_bind_receipt_json) as HermesReceipt;
     expect(stored?.target_bind_receipt_json).toBe(canonicalJson(expected));
     expect(bindings.currentHermesTargetBindReceipt({
@@ -860,6 +864,66 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
       sessionId,
       sessionIncarnation: `inc-${sessionId}`,
     })).toBeNull();
+  });
+
+  it("rejects a re-signed stored receipt when its durable executor authority remains bootstrap-bound", () => {
+    const { bindings, db, session } = setup();
+    const sessionId = session("ses_hermes_receipt_durable_executor_authority");
+    const result = bindings.bind({ role: Role.CEO, sessionId, authenticatedTarget: hermesAuthenticated() });
+    expect(result.allowed).toBe(true);
+    if (!result.allowed) return;
+
+    const tuple = { roleKey: result.value.roleKey, sessionId, sessionIncarnation: `inc-${sessionId}` };
+    const stored = db.get<{ target_bind_receipt_json: string }>(
+      "SELECT target_bind_receipt_json FROM actor_target_attestations WHERE assignment_id = ?",
+      [result.value.assignmentId],
+    )!;
+    const original = JSON.parse(stored.target_bind_receipt_json) as HermesReceipt;
+    const reSignedPublicFields = {
+      domain: original.domain,
+      version: original.version,
+      actor_id: original.actor_id,
+      binding_generation: original.binding_generation,
+      executor_runtime_identity: "attacker:re-signed-runtime",
+      requested_session_id: original.requested_session_id,
+      lineage_root_digest: original.lineage_root_digest,
+    };
+    const reSigned = {
+      ...reSignedPublicFields,
+      receipt_digest: digestOf(reSignedPublicFields),
+    };
+    const actorId = db.get<{ actor_id: string }>(
+      "SELECT actor_id FROM assignments WHERE assignment_id = ?",
+      [result.value.assignmentId],
+    )!.actor_id;
+    const row = {
+      actor_id: actorId,
+      binding_generation: result.value.bindingGeneration,
+      target_locator: claimed.targetLocator,
+      target_locator_digest: claimed.targetLocatorDigest,
+      target_bind_executor_runtime_identity: "hermes:runtime-649",
+    };
+    const all = vi.spyOn(db, "all");
+    try {
+      // This foreign-read seam mirrors an attacker rewriting only the raw evidence and its digest;
+      // the independent expected executor identity remains the bootstrap value stored at bind time.
+      all.mockReturnValueOnce([{
+        ...row,
+        attestation_digest: reSigned.receipt_digest,
+        target_bind_receipt_json: canonicalJson(reSigned),
+      }] as never);
+      expect(bindings.currentHermesTargetBindReceipt(tuple)).toBeNull();
+
+      all.mockReturnValueOnce([{
+        ...row,
+        target_bind_executor_runtime_identity: null,
+        attestation_digest: original.receipt_digest,
+        target_bind_receipt_json: stored.target_bind_receipt_json,
+      }] as never);
+      expect(bindings.currentHermesTargetBindReceipt(tuple)).toBeNull();
+    } finally {
+      all.mockRestore();
+    }
   });
 
   it("rejects a re-signed Hermes receipt with wrong or missing expected runtime identity before persistence", () => {

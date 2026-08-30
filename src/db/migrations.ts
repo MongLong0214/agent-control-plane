@@ -2160,11 +2160,13 @@ const v33: SchemaMigration = {
 };
 
 /**
- * Persists the raw Hermes target-bind receipt beside the attestation that cites its digest.
+ * Persists the raw Hermes target-bind receipt and bootstrap executor expectation beside the
+ * attestation that cites its digest.
  *
- * The column is deliberately nullable and receives no backfill. A v33 attestation does not carry
- * an executor response, and fabricating one from ACP's configuration would turn a missing proof
- * into a false one. Current-receipt readers therefore treat a NULL legacy value as unverifiable.
+ * Both columns are deliberately nullable and receive no backfill. A v33 attestation has neither
+ * raw executor response nor the independent bootstrap expectation, and fabricating either from
+ * ACP configuration would turn missing proof into false authority. Current-receipt readers
+ * therefore treat either NULL legacy value as unverifiable.
  */
 const v34: SchemaMigration = {
   id: "v34-persist-hermes-target-bind-receipt-evidence",
@@ -2181,6 +2183,14 @@ const v34: SchemaMigration = {
         ALTER TABLE actor_target_attestations
         ADD COLUMN target_bind_receipt_json TEXT CHECK (
           target_bind_receipt_json IS NULL OR json_valid(target_bind_receipt_json)
+        )
+      `);
+    }
+    if (!columns.includes("target_bind_executor_runtime_identity")) {
+      raw.exec(`
+        ALTER TABLE actor_target_attestations
+        ADD COLUMN target_bind_executor_runtime_identity TEXT CHECK (
+          target_bind_executor_runtime_identity IS NULL OR length(target_bind_executor_runtime_identity) > 0
         )
       `);
     }
