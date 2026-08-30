@@ -137,6 +137,7 @@ export class Doctor {
       findings.push(...(await this.checkHostResources()));
       findings.push(...this.checkClaims());
       findings.push(...this.checkOutbox());
+      findings.push(...this.checkPendingTelegramReplies());
       findings.push(...this.checkUnresolvedTurns());
       findings.push(...this.checkCanonicalTurns());
       findings.push(...(await this.checkRepositories()));
@@ -644,6 +645,65 @@ export class Doctor {
       },
       recommendedAction: "expire the claim if the holder is gone",
     }));
+  }
+
+  /**
+   * Telegram replies whose external outcome cannot be established.
+   *
+   * This reads the reply-delivery lifecycle directly rather than inferring it from a turn claim:
+   * managed commands and routing failures also produce owner-facing replies, but never claim a
+   * CEO turn. PENDING is deliberately terminal under the at-most-once ambiguity policy, so a
+   * durable doctor finding is the operator-facing half of choosing not to resend it.
+   */
+  private checkPendingTelegramReplies(): Finding[] {
+    const rows = this.db.all<{
+      nonce: string;
+      received_at: string;
+      correlation_id: string | null;
+      reply_to_message_id: number | null;
+    }>(
+      `SELECT nonce,
+              received_at,
+              json_extract(result_json, '$.reply.correlationId') AS correlation_id,
+              json_extract(result_json, '$.reply.replyToMessageId') AS reply_to_message_id
+         FROM inbound_messages
+        WHERE channel = 'telegram'
+          AND json_valid(result_json) = 1
+          AND json_type(result_json, '$.reply') = 'object'
+          AND (
+            json_extract(result_json, '$.deliveryStatus') = 'PENDING'
+            OR (
+              json_type(result_json, '$.deliveryStatus') IS NULL
+              AND json_extract(result_json, '$.sent') IS NOT 1
+            )
+          )
+        ORDER BY received_at ASC`,
+    );
+    if (rows.length === 0) return [];
+
+    const oldest = rows[0]!;
+    const ageMs = Date.parse(this.clock.nowIso()) - Date.parse(oldest.received_at);
+    const ageMinutes = Math.max(0, Math.round(ageMs / 60_000));
+    return [{
+      code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
+      severity: ageMinutes >= UNRESOLVED_TURN_ESCALATION_MINUTES ? "ERROR" : "WARN",
+      scope: "telegram",
+      blocking: false,
+      confidence: "HIGH",
+      observedEvidence: {
+        outstanding: rows.length,
+        oldestAgeMinutes: ageMinutes,
+        oldest: {
+          nonce: oldest.nonce,
+          receivedAt: oldest.received_at,
+          correlationId: oldest.correlation_id,
+          replyToMessageId: oldest.reply_to_message_id,
+          deliveryStatus: "PENDING",
+        },
+      },
+      recommendedAction:
+        "inspect whether Telegram received the reply; ACP preserves the unknown outcome and will not resend it",
+    }];
   }
 
   /**

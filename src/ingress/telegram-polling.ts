@@ -57,8 +57,8 @@ export interface TelegramBotTransport {
 /**
  * A send failure must distinguish a confirmed rejection from an ambiguous external result.
  * Only `accepted === false` proves a durable reservation is safe to release immediately; null
- * means Telegram may have accepted the request, so the caller keeps it PENDING and stops the
- * current batch. The reply replay path later retries that exact PENDING response at duplicate risk.
+ * means Telegram may have accepted the request, so the caller keeps it PENDING, stops the current
+ * batch, and leaves the unknown outcome visible to doctor without resending it.
  */
 export class TelegramDeliveryError extends Error {
   constructor(
@@ -459,8 +459,8 @@ export class TelegramLongPollService {
     // reply — no work is redone and nothing is lost by letting later updates in this batch run
     // now. `accepted === null` is a different fact: delivery is *unknown*, so the reservation
     // stays PENDING and this poll stops before later updates run their work into the same outage.
-    // A later poll replays that exact PENDING reply. This at-least-once choice can duplicate a
-    // reply Telegram accepted before a timeout, but it cannot strand the answer forever. So only
+    // It is not resent: a later poll advances past the stored PENDING fact without a second
+    // Telegram call, while doctor keeps the unresolved delivery operator-visible. So only
     // `accepted === false` is deferred with `continue`; `accepted === null` (like any other
     // unexpected error) still throws immediately. The offset must still never skip past the
     // update whose delivery is unresolved, or a redelivery-based recovery could never reach it
@@ -473,7 +473,7 @@ export class TelegramLongPollService {
       outcomes.push(outcome);
       if (outcome.reply) {
         // Reserve before the external call. A confirmed rejection releases the reservation to
-        // RETRYABLE; an ambiguous result leaves it PENDING for the exact-reply replay path.
+        // RETRYABLE; an ambiguous result leaves it PENDING and operator-visible without replay.
         this.router.reserveResponse(outcome);
         try {
           await this.transport.sendMessage(outcome.reply);

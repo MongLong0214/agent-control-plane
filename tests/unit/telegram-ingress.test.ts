@@ -44,6 +44,12 @@ const update = (text: string, over: Record<string, unknown> = {}, updateId = 100
 });
 
 class FakeTelegramTransport implements TelegramBotTransport {
+  readonly sendAttempts: Array<{
+    chatId: string;
+    text: string;
+    replyToMessageId?: number;
+    correlationId: string;
+  }> = [];
   readonly sent: Array<{
     chatId: string;
     text: string;
@@ -69,6 +75,7 @@ class FakeTelegramTransport implements TelegramBotTransport {
     replyToMessageId?: number;
     correlationId: string;
   }): Promise<{ messageId: number }> {
+    this.sendAttempts.push(input);
     if (this.failOwnerGateSends && input.correlationId.startsWith("telegram:owner-gate:")) {
       throw new TelegramDeliveryError("simulated owner-gate prompt delivery failure", false);
     }
@@ -1017,7 +1024,7 @@ describe("Telegram production ingress", () => {
     expect(completed?.result_json).toContain('"sent":true');
   });
 
-  it("replays a pending reply after process death before the completion checkpoint", async () => {
+  it("An ambiguous Telegram reply is not resent and remains visible as PENDING", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1062,20 +1069,107 @@ describe("Telegram production ingress", () => {
     try {
       const resumed = (await secondListener.service.pollOnce()).outcomes[0]!;
       expect(resumed.replayed).toBe(true);
-      expect(resumed.reply).toBeTruthy();
+      expect(resumed.reply).toBeNull();
     } finally {
       await secondListener.close();
     }
-    // The first send may have reached Telegram before the process died. Replaying can therefore
-    // duplicate the owner-facing reply, but it closes the durable PENDING reservation instead of
-    // leaving a possibly-lost answer unresendable forever.
-    expect(secondTransport.sent).toHaveLength(1);
-    expect(firstTransport.sent.length + secondTransport.sent.length).toBe(2);
-    const completed = harness.cp.db.get<{ result_json: string | null }>(
+    expect(secondTransport.sendAttempts).toHaveLength(0);
+    expect(firstTransport.sendAttempts.length + secondTransport.sendAttempts.length).toBe(1);
+    const unresolved = harness.cp.db.get<{ result_json: string | null }>(
       `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
       ["update:302"],
     );
-    expect(completed?.result_json).toContain('"deliveryStatus":"APPLIED"');
+    expect(unresolved?.result_json).toContain('"deliveryStatus":"PENDING"');
+
+    const doctor = await harness.cp.doctor.run("system");
+    expect(doctor.findings).toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
+      observedEvidence: expect.objectContaining({ outstanding: 1 }),
+    }));
+  });
+
+  it("persistent response loss does not resend the same pending reply", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const firstUpdate = update(`/managed ${registered.projectId} inspect the project`, {}, 303);
+    const firstTransport = new FakeTelegramTransport();
+    firstTransport.updates = [firstUpdate];
+    firstTransport.failSendsAmbiguous = 1;
+    const firstListener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      { transport: firstTransport, start: false },
+    );
+    try {
+      await expect(firstListener.service.pollOnce()).rejects.toThrow("simulated Telegram outage (no response)");
+    } finally {
+      await firstListener.close();
+    }
+
+    let sendAttempts = firstTransport.sendAttempts.length;
+    let restartErrors = 0;
+    for (let restart = 0; restart < 3; restart += 1) {
+      const transport = new FakeTelegramTransport();
+      transport.updates = [firstUpdate];
+      // If the router calls Telegram again, the response is lost again: the review's persistent
+      // response-loss sequence. The safe policy never makes that second call.
+      transport.failSendsAmbiguous = 1;
+      const listener = await startDaemonTelegramListener(
+        harness.cp,
+        { ...telegramConfig, defaultProjectId: registered.projectId },
+        daemonStub,
+        { transport, start: false },
+      );
+      try {
+        const resumed = (await listener.service.pollOnce()).outcomes[0]!;
+        expect(resumed.replayed).toBe(true);
+        expect(resumed.reply).toBeNull();
+      } catch {
+        restartErrors += 1;
+      } finally {
+        await listener.close();
+      }
+      sendAttempts += transport.sendAttempts.length;
+    }
+
+    expect(sendAttempts, "one initial attempt plus no resend attempts after three restarts").toBe(1);
+    expect(restartErrors).toBe(0);
+    expect(harness.cp.runs.list()).toHaveLength(1);
+    const pending = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:303"],
+    );
+    expect(pending?.result_json).toContain('"deliveryStatus":"PENDING"');
+
+    // A durable unknown must outlive the ordinary nonce TTL. This later production admission
+    // drives IngressGuard.prune after 25 hours; it must not erase update 303 or its doctor fact.
+    harness.clock.advance(25 * 60 * 60 * 1_000);
+    const laterTransport = new FakeTelegramTransport();
+    laterTransport.updates = [update(`/managed ${registered.projectId} inspect later`, {}, 304)];
+    const laterListener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      { transport: laterTransport, start: false },
+    );
+    try {
+      await laterListener.service.pollOnce();
+    } finally {
+      await laterListener.close();
+    }
+    const preserved = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:303"],
+    );
+    expect(preserved?.result_json).toContain('"deliveryStatus":"PENDING"');
+    const doctor = await harness.cp.doctor.run("system");
+    expect(doctor.findings).toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
+      observedEvidence: expect.objectContaining({ outstanding: 1 }),
+    }));
   });
 
   // #699: a rejected sendMessage used to rethrow unconditionally from inside the per-update
@@ -1152,9 +1246,8 @@ describe("Telegram production ingress", () => {
   // An ambiguous send outcome (`accepted: null` — timeout, network error, no response) is not
   // the same fact as a confirmed rejection (`accepted: false`). Telegram may already have
   // delivered the reply, so this poll stops instead of running every later update's work into
-  // the same outage. The PENDING reply is replayed on the next poll: that can duplicate a reply
-  // Telegram accepted before the timeout, but it cannot silently lose the answer forever.
-  it("stops later update work on an ambiguous null send and replays the pending reply", async () => {
+  // the same outage. The PENDING reply remains visible and is not resent on the next poll.
+  it("stops later update work on an ambiguous null send without resending the pending reply", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1199,8 +1292,8 @@ describe("Telegram production ingress", () => {
     // The offset must not have advanced past `stuck`.
     expect(listener.service.offset === undefined || listener.service.offset <= stuck.update_id).toBe(true);
 
-    // A later poll redelivers both. It resends `stuck`'s exact stored reply before running
-    // `later`; no managed work is duplicated because both replies enter through router replay.
+    // A later poll redelivers both. `stuck` remains a visible PENDING fact with no second
+    // sendMessage call; `later` can then run as new work without duplicating the first reply.
     const retryTransport = new FakeTelegramTransport();
     retryTransport.updates = [stuck, later];
     const retryListener = await startDaemonTelegramListener(
@@ -1212,20 +1305,19 @@ describe("Telegram production ingress", () => {
     try {
       const resumed = await retryListener.service.pollOnce();
       expect(resumed.outcomes[0]?.replayed).toBe(true);
-      expect(resumed.outcomes[0]?.reply).toBeTruthy();
+      expect(resumed.outcomes[0]?.reply).toBeNull();
       expect(resumed.outcomes[1]?.replayed).toBe(false);
-      expect(retryTransport.sent).toHaveLength(2);
-      expect(retryTransport.sent[0]?.correlationId).toContain("501");
-      expect(retryTransport.sent[1]?.correlationId).toContain("502");
+      expect(retryTransport.sent).toHaveLength(1);
+      expect(retryTransport.sent[0]?.correlationId).toContain("502");
     } finally {
       await retryListener.close();
     }
 
-    const completed = harness.cp.db.get<{ result_json: string | null }>(
+    const unresolved = harness.cp.db.get<{ result_json: string | null }>(
       `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
       ["update:501"],
     );
-    expect(completed?.result_json).toContain('"deliveryStatus":"APPLIED"');
+    expect(unresolved?.result_json).toContain('"deliveryStatus":"PENDING"');
 
     // `stuck`'s run plus the new run `later`'s work created on the retry poll.
     expect(harness.cp.runs.list()).toHaveLength(2);

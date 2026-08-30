@@ -1490,7 +1490,7 @@ const GUARDS = [
     // #699 follow-up: `false` and `null` are not the same fact. `accepted === false` is a
     // confirmed rejection — safe to defer past, because `releaseResponse` marks it RETRYABLE
     // and a later poll resends that exact reply. `accepted === null` is an unknown outcome, so
-    // it stays PENDING for exact-reply replay and stops the batch before later work enters the
+    // it stays PENDING without reply replay and stops the batch before later work enters the
     // same outage. Removing the distinction below releases the unknown reservation as though
     // Telegram had rejected it and runs every later update immediately.
     what: "an ambiguous null delivery outcome stops the poll instead of following a confirmed rejection",
@@ -1498,29 +1498,42 @@ const GUARDS = [
     find: "          if (!(error instanceof TelegramDeliveryError) || error.accepted !== false) throw error;",
     replace: "          if (!(error instanceof TelegramDeliveryError)) throw error;",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::stops later update work on an ambiguous null send and replays the pending reply",
+      "tests/unit/telegram-ingress.test.ts::stops later update work on an ambiguous null send without resending the pending reply",
     ],
   },
   {
-    // The unknown result above deliberately stays PENDING. If router replay suppresses its stored
-    // reply, nothing can ever move that reservation to APPLIED and the answer is lost forever.
-    what: "a pending reply is replayed after an ambiguous result or process death",
+    // Telegram does not receive correlationId and offers no server-side de-duplication key for
+    // this sendMessage call. A PENDING replay must therefore stop in the router instead of
+    // re-entering the response-reservation path.
+    what: "a pending Telegram reply is replay-ignored before response reservation",
     file: "src/ingress/telegram-router.ts",
-    find: "    if (stored?.reply && this.deliveryStatus(stored) === \"PENDING\") {",
-    replace: "    if (stored?.reply && this.deliveryStatus(stored) === \"APPLIED\") {",
+    find: "      return this.storedResponseOutcome(update, stored, false);",
+    replace: "      return this.storedResponseOutcome(update, stored, true);",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::stops later update work on an ambiguous null send and replays the pending reply",
+      "tests/unit/telegram-ingress.test.ts::persistent response loss does not resend the same pending reply",
     ],
   },
   {
-    // A replayed PENDING reply already owns a reservation. Trying to reserve it from AVAILABLE
-    // again refuses the recovery send before it reaches Telegram.
-    what: "a replayed pending reply reuses its durable reservation",
-    file: "src/ingress/telegram-router.ts",
-    find: "    if (this.deliveryStatus(prior) === \"PENDING\") return;",
-    replace: "    if (this.deliveryStatus(prior) === \"APPLIED\") return;",
+    // A no-resend policy that only lives in SQLite is silence to an operator. Doctor is the
+    // authenticated read path every runbook starts with, and it must inspect reply PENDING
+    // directly because managed replies do not carry a CEO turn claim.
+    what: "doctor reports every ambiguous Telegram reply",
+    file: "src/doctor/doctor.ts",
+    find: "            json_extract(result_json, '$.deliveryStatus') = 'PENDING'",
+    replace: "            json_extract(result_json, '$.deliveryStatus') = 'APPLIED'",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::replays a pending reply after process death before the completion checkpoint",
+      "tests/unit/telegram-ingress.test.ts::An ambiguous Telegram reply is not resent and remains visible as PENDING",
+    ],
+  },
+  {
+    // Expiring a PENDING row after the ordinary nonce TTL removes the operator fact and permits a
+    // retained update to execute again. A durable ambiguity policy cannot have a timer back door.
+    what: "an ambiguous Telegram reply survives ordinary ingress pruning",
+    file: "src/ingress/ingress-guard.ts",
+    find: "              json_extract(result_json, '$.deliveryStatus') = 'PENDING'",
+    replace: "              false",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::persistent response loss does not resend the same pending reply",
     ],
   },
 ];

@@ -587,7 +587,8 @@ export class IngressGuard {
   }
 
   private prune(channel: string, ttlMs: number): void {
-    // A claimed turn whose outcome was never recorded is exempt.
+    // A claimed turn whose outcome was never recorded and a Telegram reply whose delivery is
+    // still PENDING are exempt.
     //
     // The nonce window exists so a replay of old traffic is refused cheaply, and for an ordinary
     // row expiry is right: after the TTL, the message is not coming back. A claimed row is not
@@ -602,6 +603,10 @@ export class IngressGuard {
     // the moment a reply was reserved — so the row a timeout produced was pruned like any other,
     // and the nonce it held was freed (#646).
     //
+    // A PENDING reply is the same kind of durable unknown even when its handler claimed no turn
+    // (for example, a managed-command acknowledgement). Deleting it would silence the doctor
+    // fact and let a retained Telegram update execute again after the nonce window.
+    //
     // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` is written to the
     // audit log, and `agentctl doctor system` reports the same outstanding claim as a
     // `TURN_OUTCOME_UNKNOWN` finding (`Doctor.checkUnresolvedTurns`) — so the runbook's first
@@ -609,7 +614,18 @@ export class IngressGuard {
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
-          AND (turn_claim_json IS NULL OR json_extract(turn_claim_json, '$.repliedAt') IS NOT NULL)`,
+          AND (turn_claim_json IS NULL OR json_extract(turn_claim_json, '$.repliedAt') IS NOT NULL)
+          AND NOT (
+            json_valid(result_json) = 1
+            AND json_type(result_json, '$.reply') = 'object'
+            AND (
+              json_extract(result_json, '$.deliveryStatus') = 'PENDING'
+              OR (
+                json_type(result_json, '$.deliveryStatus') IS NULL
+                AND json_extract(result_json, '$.sent') IS NOT 1
+              )
+            )
+          )`,
       [channel, new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString()],
     );
   }
