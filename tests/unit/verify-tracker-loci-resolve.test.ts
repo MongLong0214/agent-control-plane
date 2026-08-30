@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -28,6 +28,13 @@ const run = (issuesPath: string, extraArgs: string[] = []) =>
   spawnSync(process.execPath, [scriptPath, `--issues-file=${issuesPath}`, ...extraArgs], {
     cwd: repoRoot,
     encoding: "utf8",
+  });
+
+const runLive = (env: NodeJS.ProcessEnv) =>
+  spawnSync(process.execPath, [scriptPath], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: { ...process.env, ...env },
   });
 
 describe("verify-tracker-loci-resolve", () => {
@@ -1814,6 +1821,77 @@ describe("verify-tracker-loci-resolve", () => {
         expect(result.stdout).toBe("");
       } finally {
         cleanup();
+      }
+    });
+  });
+
+  describe("round 19 GitHub Markdown fences and complete issue pagination", () => {
+    it("all GitHub Markdown fence spellings make vanished code stale", () => {
+      const fences = [
+        { label: "triple backticks", opening: "```ts", closing: "```" },
+        { label: "triple tildes", opening: "~~~ts", closing: "~~~" },
+        { label: "four backticks", opening: "````ts", closing: "````" },
+        { label: "four tildes", opening: "~~~~ts", closing: "~~~~" },
+        { label: "three-space indentation", opening: "   ```ts", closing: "   ```" },
+        { label: "attributes in the info string", opening: "```ts {numberLines=3}", closing: "```" },
+        { label: "longer closing run", opening: "```ts", closing: "````" },
+      ];
+
+      for (const [index, fence] of fences.entries()) {
+        const body = [fence.opening, "README.md:1  const definitelyGone = true", fence.closing].join("\n");
+        const { path, cleanup } = withIssues([{ number: 68920 + index, title: fence.label, body }]);
+        try {
+          const result = run(path);
+          expect(result.status).toBe(1);
+          expect(result.stdout).toContain("STALE");
+          expect(result.stdout).toContain("definitelyGone");
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it("the GitHub API pagination includes a stale issue after the five hundredth", () => {
+      const issues = Array.from({ length: 501 }, (_, index) => ({
+        number: 94000 + index,
+        title: `page issue ${index + 1}`,
+        body:
+          index === 500
+            ? ["```ts", "README.md:1  const definitelyGone = true", "```"].join("\n")
+            : "See `README.md:1`.",
+      }));
+      const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-pages-"));
+      const bin = join(dir, "bin");
+      const fakeGh = join(bin, "gh");
+      mkdirSync(bin);
+      writeFileSync(
+        fakeGh,
+        [
+          "#!/usr/bin/env node",
+          `const issues = ${JSON.stringify(issues)};`,
+          "const args = process.argv.slice(2);",
+          'if (args[0] === "issue" && args[1] === "list") {',
+          "  process.stdout.write(JSON.stringify(issues.slice(0, 500)));",
+          "  process.exit(0);",
+          "}",
+          'if (args[0] === "api" && args.includes("--paginate") && args.includes("--slurp")) {',
+          "  process.stdout.write(JSON.stringify([issues.slice(0, 500), issues.slice(500)]));",
+          "  process.exit(0);",
+          "}",
+          "process.stderr.write('unexpected gh invocation: ' + args.join(' '));",
+          "process.exit(99);",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(fakeGh, 0o755);
+
+      try {
+        const result = runLive({ PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` });
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("#94500 page issue 501");
+        expect(result.stdout).toContain("across 501 open issue(s).");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
     });
   });

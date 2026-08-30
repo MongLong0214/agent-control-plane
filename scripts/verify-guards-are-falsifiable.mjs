@@ -1471,6 +1471,27 @@ const GUARDS = [
       "tests/unit/doctor-daemon-r2.test.ts::#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger",
     ],
   },
+  {
+    // GitHub Markdown permits tilde fences and variable-length markers. Returning no fence
+    // reopens the false green where a vanished quoted line becomes only an advisory citation.
+    what: "every GitHub Markdown fence form makes vanished fenced code stale",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  return { marker: match[1][0], length: match[1].length };",
+    replace: "  return null;",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::all GitHub Markdown fence spellings make vanished code stale",
+    ],
+  },
+  {
+    // Dropping pages after the first one is the old 500-item blind spot in another spelling.
+    what: "every open GitHub issue page is checked instead of silently truncating after five hundred",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "    return pages.flat().filter((issue) => !issue.pull_request);",
+    replace: "    return pages.slice(0, 1).flat().filter((issue) => !issue.pull_request);",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::the GitHub API pagination includes a stale issue after the five hundredth",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

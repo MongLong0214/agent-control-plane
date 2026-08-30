@@ -857,13 +857,23 @@ const strict = process.argv.includes("--strict");
 const issuesFile = process.argv.find((a) => a.startsWith("--issues-file="))?.slice("--issues-file=".length);
 
 const listIssues = () => {
-  if (issuesFile) return readFileSync(resolve(repoRoot, issuesFile), "utf8");
+  if (issuesFile) return JSON.parse(readFileSync(resolve(repoRoot, issuesFile), "utf8"));
   try {
-    return execFileSync(
-      "gh",
-      ["issue", "list", "--state", "open", "--json", "number,title,body,url", "--limit", "500"],
-      { cwd: repoRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] },
+    // `gh issue list --limit 500` is a hard ceiling, not a completeness check. `gh api
+    // --paginate --slurp` follows every Link page and returns an array for each page. The REST
+    // `/issues` endpoint also includes pull requests, unlike `gh issue list`, so discard those
+    // before checking citations.
+    const pages = JSON.parse(
+      execFileSync(
+        "gh",
+        ["api", "--paginate", "--slurp", "repos/{owner}/{repo}/issues?state=open&per_page=100"],
+        { cwd: repoRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] },
+      ),
     );
+    if (!Array.isArray(pages) || !pages.every(Array.isArray)) {
+      throw new Error("GitHub pagination did not return an array of issue pages");
+    }
+    return pages.flat().filter((issue) => !issue.pull_request);
   } catch (error) {
     const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "").trim() : "";
     console.error(
@@ -877,7 +887,7 @@ const listIssues = () => {
   }
 };
 
-const issues = JSON.parse(listIssues());
+const issues = listIssues();
 
 // --- source tree, read once -------------------------------------------------------------------
 const fileTextCache = new Map();
@@ -1498,9 +1508,24 @@ const looksLikeCode = (text) => {
   return false;
 };
 
+/**
+ * GitHub Markdown accepts fences of either marker, three or more characters long, with up to
+ * three leading spaces. The closer must use the opening marker and be at least as long, with
+ * only trailing whitespace. An opening fence may have any info string; backtick fences are the
+ * one exception where a backtick in that string is invalid Markdown.
+ */
+const openingFence = (line) => {
+  const match = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+  if (!match || (match[1][0] === "`" && match[2].includes("`"))) return null;
+  return { marker: match[1][0], length: match[1].length };
+};
+
+const closesFence = (line, fence) =>
+  new RegExp(`^ {0,3}${fence.marker}{${fence.length},}[\\t ]*$`).test(line);
+
 const extractFromBody = (body) => {
   const lines = body.split("\n");
-  let inFence = false;
+  let fence = null;
   const seenPath = new Set();
   const seenSymbolRow = new Set();
   const seenNonDurable = new Set();
@@ -1509,9 +1534,17 @@ const extractFromBody = (body) => {
   const nonDurable = [];
 
   for (const rawLine of lines) {
-    if (/^\s*```/.test(rawLine)) {
-      inFence = !inFence;
-      continue;
+    if (fence) {
+      if (closesFence(rawLine, fence)) {
+        fence = null;
+        continue;
+      }
+    } else {
+      const opened = openingFence(rawLine);
+      if (opened) {
+        fence = opened;
+        continue;
+      }
     }
 
     const nonDurableSpans = [];
@@ -1575,7 +1608,7 @@ const extractFromBody = (body) => {
     const contentAfter = (matchEnd, startLine) => {
       if (startLine === null) return null;
       const afterCitation = stripCitationSeparator(rawLine.slice(matchEnd));
-      if (inFence) {
+      if (fence) {
         return afterCitation.length > 0 && looksLikeCode(afterCitation) ? afterCitation : null;
       }
       const delimited = readDelimitedSpan(afterCitation);
