@@ -11,11 +11,11 @@
  * as an opaque SQLITE_CONSTRAINT instead of a reason.
  *
  * Checks:
- *   1. every declared code is referenced somewhere in `src/**` outside the catalogue
+ *   1. every declared code is referenced somewhere in `src/**` outside its declaration
  *   2. every code referenced in `tests/**` is declared
  *   3. every string literal used as a `reasonCode` in `src/**`/`tests/**` is declared
- *   4. every `RAISE(ABORT, 'X')` name in schema.sql is mapped by TRIGGER_CODES in
- *      `src/db/database.ts`, so a trigger abort becomes a reason code
+ *   4. every `RAISE(ABORT, 'X')` name in production schema or migration DDL is mapped by
+ *      TRIGGER_CODES in `src/db/database.ts`, so a trigger abort becomes a reason code
  *
  * Nothing here deletes or edits a code: `src/core/reason-codes.ts` is append-only by
  * contract, so an unused code is reported for a human decision, never removed.
@@ -64,14 +64,22 @@ if (declared.size === 0) {
 }
 
 // --- references ------------------------------------------------------------
-const srcFiles = walk("src").filter((f) => f !== catalogueRel);
+const srcFiles = walk("src");
 const testFiles = walk("tests");
+
+/** The catalogue declaration is not its own consumer; the rest of its module still is. */
+const referenceSource = (file) =>
+  file === catalogueRel
+    ? `${catalogueSource.slice(0, catalogueBody.index)}${catalogueSource.slice(
+        catalogueBody.index + catalogueBody[0].length,
+      )}`
+    : read(file);
 
 /** `ReasonCode.FOO` — the normal, type-checked way to reference a code. */
 const memberRefs = (files) => {
   const hits = new Map();
   for (const file of files) {
-    const text = read(file);
+    const text = referenceSource(file);
     for (const match of text.matchAll(/ReasonCode\.([A-Z0-9_]+)/g)) {
       const line = text.slice(0, match.index).split("\n").length;
       if (!hits.has(match[1])) hits.set(match[1], []);
@@ -96,7 +104,7 @@ const REASON_LITERAL = [
 const literalRefs = (files) => {
   const hits = new Map();
   for (const file of files) {
-    const text = read(file);
+    const text = referenceSource(file);
     for (const pattern of REASON_LITERAL) {
       for (const match of text.matchAll(pattern)) {
         const line = text.slice(0, match.index).split("\n").length;
@@ -114,7 +122,7 @@ const srcLiterals = literalRefs(srcFiles);
 const testLiterals = literalRefs(testFiles);
 
 /** Plain-text mention anywhere in src, which is how a code reaches a doc comment or SQL. */
-const srcText = srcFiles.map((f) => read(f)).join("\n");
+const srcText = srcFiles.map(referenceSource).join("\n");
 
 const problems = [];
 const notes = [];
@@ -150,11 +158,16 @@ for (const [code, sites] of srcLiterals) {
 }
 
 // 4 — every trigger abort name must translate into a reason code.
-const schemaSource = read("src/db/schema.sql");
+const triggerSources = [
+  ["src/db/schema.sql", read("src/db/schema.sql")],
+  ["src/db/migrations.ts", read("src/db/migrations.ts")],
+];
 const raised = new Map();
-for (const match of schemaSource.matchAll(/RAISE\(ABORT,\s*'([A-Z0-9_]+)'\)/g)) {
-  const line = schemaSource.slice(0, match.index).split("\n").length;
-  if (!raised.has(match[1])) raised.set(match[1], `src/db/schema.sql:${line}`);
+for (const [file, source] of triggerSources) {
+  for (const match of source.matchAll(/RAISE\(ABORT,\s*'([A-Z0-9_]+)'\)/g)) {
+    const line = source.slice(0, match.index).split("\n").length;
+    if (!raised.has(match[1])) raised.set(match[1], `${file}:${line}`);
+  }
 }
 const databaseSource = read("src/db/database.ts");
 const triggerCodesBody = /const TRIGGER_CODES: Record<string, ReasonCode> = \{([\s\S]*?)\n\};/.exec(
@@ -176,7 +189,7 @@ if (!triggerCodesBody) {
   }
   for (const name of mapped) {
     if (!raised.has(name)) {
-      notes.push(`TRIGGER_CODES maps '${name}', which no trigger in schema.sql raises`);
+      notes.push(`TRIGGER_CODES maps '${name}', which no production trigger raises`);
     }
   }
 }
@@ -214,7 +227,7 @@ if (asJson) {
   for (const note of notes) console.log(`note: ${note}`);
   console.log("");
   if (problems.length === 0) {
-    console.log("OK — catalogue is coherent with src/**, tests/** and schema.sql");
+    console.log("OK — catalogue is coherent with src/**, tests/** and production trigger DDL");
   } else {
     console.log(`${problems.length} problem(s):`);
     for (const problem of problems) console.log(`  - ${problem}`);

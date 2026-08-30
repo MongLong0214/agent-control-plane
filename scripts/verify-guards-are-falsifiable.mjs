@@ -85,6 +85,24 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    what: "every declared reason code has a production reference",
+    file: "src/core/reason-codes.ts",
+    find: "  ReasonCode.CAPACITY_PROBE_STALE,\n",
+    replace: "",
+    killedBy: [
+      "tests/process/every-reason-code-has-a-production-reference.test.ts::every declared reason code has a production reference",
+    ],
+  },
+  {
+    what: "every mapped trigger denial is raised by production DDL",
+    file: "scripts/verify-reason-code-usage.mjs",
+    find: '  ["src/db/migrations.ts", read("src/db/migrations.ts")],\n',
+    replace: "",
+    killedBy: [
+      "tests/process/every-reason-code-has-a-production-reference.test.ts::every mapped trigger denial is raised by production DDL",
+    ],
+  },
+  {
     // Two lifecycles in one field: the reply reservation writes `result_json` whole, and an
     // ordinary timeout produces a reply, so the claim and the turn identity went with it.
     what: "the turn claim is stored apart from the reply it will produce",
