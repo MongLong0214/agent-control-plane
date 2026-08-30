@@ -1281,6 +1281,36 @@ const GUARDS = [
     ],
   },
   {
+    what: "the turn-fence writer check refuses a literal bracket capture of Db run",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: 'node.argumentExpression.text === "run" &&',
+    replace: 'node.argumentExpression.text === "not-run" &&',
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::refuses Db run captured through literal bracket access",
+    ],
+  },
+  {
+    what: "the turn-fence writer check refuses object binding destructuring of Db run",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find:
+      "if (ts.isBindingElement(node) && bindingCapturesRun(node) && typeHasDbRun(node.parent)) {",
+    replace: "if (false) {",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::refuses Db run captured by object binding destructuring",
+    ],
+  },
+  {
+    what: "the turn-fence writer check refuses object assignment destructuring of Db run",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find:
+      "      assignmentCapturesRun(node.left) &&\n" +
+      "      typeHasDbRun(node.right)",
+    replace: "      false",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::refuses Db run captured by object assignment destructuring",
+    ],
+  },
+  {
     what: "the turn-fence writer check reports a stale application owner",
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "    if (!seenFiles.has(owner)) staleOwners.push({ table, owner });",
@@ -1296,6 +1326,15 @@ const GUARDS = [
     replace: "for (const match of []) {",
     killedBy: [
       "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when a schema trigger body writes a governed table directly",
+    ],
+  },
+  {
+    what: "the turn-fence writer check scans both table names in schema renames",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "  for (const captured of [match[1], match[2]]) {",
+    replace: "  for (const captured of [match[2]]) {",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::scans source and destination table names in schema renames",
     ],
   },
   {

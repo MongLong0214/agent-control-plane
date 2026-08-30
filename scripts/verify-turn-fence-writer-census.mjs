@@ -19,13 +19,15 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLAIM =
   "Every inline-SQL direct call whose TypeScript property symbol is exactly Db.run and that names a turn-fence table is in that table's declared application owner.";
 const BOUNDARY =
-  "Under src, this check covers only direct property calls whose TypeScript property symbol is " +
-  "exactly Db.run and whose first argument is a string literal or no-substitution template literal " +
-  "at the call site; interface and other property aliases such as RunPort.run, non-inline SQL " +
-  "expressions, casts to any, reflection, generated code, other SQL APIs, and code outside src are " +
-  "not covered; captured exact Db.run references are refused; schema.sql coverage is limited to " +
-  "INSERT, UPDATE, REPLACE, DELETE, and ALTER TABLE RENAME TO after SQL comments are blanked; named " +
-  "migration rebuild functions are reported but their SQL is not evaluated.";
+  "Under src, this check counts only dot-property calls whose TypeScript property symbol is exactly " +
+  "Db.run and whose first argument is a string literal or no-substitution template literal at the " +
+  "call site; exact Db.run references through dot-property access, literal run-key bracket access, " +
+  "object binding destructuring, and object assignment destructuring are refused; interface and " +
+  "other property aliases such as RunPort.run, non-inline SQL expressions, casts to any, reflection, " +
+  "generated JavaScript, other SQL APIs, object rest or spread, and code outside src are not covered; " +
+  "schema.sql coverage is limited to INSERT, UPDATE, REPLACE, DELETE, and both table names in ALTER " +
+  "TABLE RENAME TO after SQL comments are blanked; named migration rebuild functions are reported but " +
+  "their SQL is not evaluated.";
 
 process.stdout.write(`CHECK: ${CLAIM}\nBOUNDARY: ${BOUNDARY}\n`);
 
@@ -193,6 +195,7 @@ const sameDeclaration = (declaration) =>
   declaration.pos === dbRunDeclaration.pos;
 const symbolIsDbRun = (symbol) =>
   symbol !== undefined && symbol.declarations?.some((declaration) => sameDeclaration(declaration));
+const typeHasDbRun = (node) => symbolIsDbRun(checker.getTypeAtLocation(node).getProperty("run"));
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const tablePattern = new Map(
@@ -215,6 +218,35 @@ const directLiteral = (expression) => {
 const locationOf = (sourceFile, node) => {
   const point = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
   return { file: relativeSourceFile(sourceFile), line: point.line + 1 };
+};
+const staticPropertyName = (name) => {
+  if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
+    return name.text;
+  }
+  if (ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) {
+    return name.expression.text;
+  }
+  return undefined;
+};
+const recordEscapedRun = (sourceFile, node) => {
+  escapedRunReferences.push({
+    ...locationOf(sourceFile, node),
+    source: node.getText(sourceFile).replace(/\s+/g, " ").slice(0, 100),
+  });
+};
+const bindingCapturesRun = (binding) => {
+  if (!ts.isObjectBindingPattern(binding.parent) || binding.dotDotDotToken !== undefined) return false;
+  const property = binding.propertyName ?? binding.name;
+  return !ts.isBindingPattern(property) && staticPropertyName(property) === "run";
+};
+const assignmentCapturesRun = (left) => {
+  let target = left;
+  while (ts.isParenthesizedExpression(target)) target = target.expression;
+  if (!ts.isObjectLiteralExpression(target)) return false;
+  return target.properties.some((property) => {
+    if (ts.isSpreadAssignment(property)) return false;
+    return staticPropertyName(property.name) === "run";
+  });
 };
 
 const inspectRunCall = (sourceFile, call) => {
@@ -242,16 +274,31 @@ for (const sourceFile of program.getSourceFiles()) {
       if (ts.isCallExpression(node.parent) && node.parent.expression === node) {
         inspectRunCall(sourceFile, node.parent);
       } else {
-        escapedRunReferences.push({ ...locationOf(sourceFile, node), source: node.getText(sourceFile) });
+        recordEscapedRun(sourceFile, node);
       }
       return;
     }
-    if (ts.isElementAccessExpression(node)) {
-      const member = checker.getTypeAtLocation(node.expression).getProperty("run");
-      if (symbolIsDbRun(member)) {
-        escapedRunReferences.push({ ...locationOf(sourceFile, node), source: node.getText(sourceFile) });
-        return;
-      }
+    if (
+      ts.isElementAccessExpression(node) &&
+      ts.isStringLiteralLike(node.argumentExpression) &&
+      node.argumentExpression.text === "run" &&
+      typeHasDbRun(node.expression)
+    ) {
+      recordEscapedRun(sourceFile, node);
+      return;
+    }
+    if (ts.isBindingElement(node) && bindingCapturesRun(node) && typeHasDbRun(node.parent)) {
+      recordEscapedRun(sourceFile, node);
+      return;
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      assignmentCapturesRun(node.left) &&
+      typeHasDbRun(node.right)
+    ) {
+      recordEscapedRun(sourceFile, node.left);
+      return;
     }
     ts.forEachChild(node, visit);
   };
@@ -283,8 +330,10 @@ for (const match of strippedSchema.matchAll(WRITE)) {
   if (table !== undefined) schemaWrites.push({ table, file: "src/db/schema.sql" });
 }
 for (const match of strippedSchema.matchAll(RENAME)) {
-  const table = governedByLower.get(unquoteIdent(match[2]).toLowerCase());
-  if (table !== undefined) schemaWrites.push({ table, file: "src/db/schema.sql" });
+  for (const captured of [match[1], match[2]]) {
+    const table = governedByLower.get(unquoteIdent(captured).toLowerCase());
+    if (table !== undefined) schemaWrites.push({ table, file: "src/db/schema.sql" });
+  }
 }
 
 const migrationsSource = program.getSourceFile(join(ROOT, MIGRATIONS_FILE));

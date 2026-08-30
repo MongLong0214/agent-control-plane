@@ -66,6 +66,27 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
+  it("counts string and no substitution template literal calls", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "rogue-string-literal.ts",
+      'db.run("UPDATE canonical_turns SET lifecycle_state = \'IN_DOUBT\'");',
+    );
+    writeProbe(
+      repo,
+      "rogue-template-literal.ts",
+      "db.run(`DELETE FROM canonical_turns WHERE 1 = 0`);",
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("src/probe/rogue-string-literal.ts");
+    expect(done.stdout).toContain("src/probe/rogue-template-literal.ts");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
   it("reports Array join SQL outside the inline SQL boundary", () => {
     const repo = scratchRepo();
     writeProbe(
@@ -281,6 +302,131 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
+  it("refuses Db run captured through literal bracket access", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "rogue-run-bracket.ts",
+      'const captured = db["run"]; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("src/probe/rogue-run-bracket.ts");
+    expect(done.stdout).toContain("escapes its direct call surface");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
+  it("refuses Db run captured by object binding destructuring", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "rogue-run-destructure.ts",
+      [
+        "const { run } = db;",
+        'const result = run.call(db, "UPDATE canonical_turns SET lifecycle_state = ?", ["IN_DOUBT"]);',
+        'if (result.changes !== 0) throw new Error("destructured writer changed a row");',
+      ].join("\n  "),
+    );
+    writeFileSync(
+      join(repo, "tests/execute-run-destructure-probe.ts"),
+      [
+        'import { Db } from "../src/db/database.ts";',
+        'import { rogueWrite } from "../src/probe/rogue-run-destructure.ts";',
+        "",
+        'const db = new Db(":memory:");',
+        'rogueWrite(db, "turn:probe");',
+        "db.close();",
+        "",
+      ].join("\n"),
+    );
+
+    const typed = spawnSync("pnpm", ["typecheck"], { cwd: repo, encoding: "utf8" });
+    const built = spawnSync(
+      "pnpm",
+      [
+        "exec",
+        "esbuild",
+        "tests/execute-run-destructure-probe.ts",
+        "--bundle",
+        "--platform=node",
+        "--format=esm",
+        "--packages=external",
+        "--outfile=src/db/execute-run-destructure-probe.mjs",
+      ],
+      { cwd: repo, encoding: "utf8" },
+    );
+    const executed = spawnSync("node", ["src/db/execute-run-destructure-probe.mjs"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    const done = censusOn(repo);
+
+    expect(typed.status, typed.stdout + typed.stderr).toBe(0);
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    expect(executed.status, executed.stdout + executed.stderr).toBe(0);
+    expect(done.stdout).toContain("escapes its direct call surface");
+    expect(done.stdout).toContain("src/probe/rogue-run-destructure.ts");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
+  it("refuses Db run captured by object assignment destructuring", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "rogue-run-assignment.ts",
+      [
+        'let captured: Db["run"] | undefined;',
+        "({ run: captured } = db);",
+        'captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      ].join("\n  "),
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("src/probe/rogue-run-assignment.ts");
+    expect(done.stdout).toContain("escapes its direct call surface");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
+  it("leaves the stated excluded reference forms outside coverage", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "excluded-reference-forms.ts",
+      [
+        '(db as any).run("DELETE FROM canonical_turns WHERE 1 = 0");',
+        'Reflect.get(db, "run").call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+        'const { ...rest } = db; void rest;',
+        'const spread = { ...db }; void spread;',
+        'db.get("SELECT * FROM canonical_turns WHERE 1 = 0");',
+      ].join("\n  "),
+    );
+    writeFileSync(
+      join(repo, "src/probe/generated-writer.js"),
+      'export const generatedWrite = (db) => db.run("DELETE FROM canonical_turns WHERE 1 = 0");\n',
+    );
+    writeFileSync(
+      join(repo, "tests/outside-src-writer.ts"),
+      [
+        'import type { Db } from "../src/db/database.ts";',
+        'export const outsideSrcWrite = (db: Db) => db.run("DELETE FROM canonical_turns WHERE 1 = 0");',
+        "",
+      ].join("\n"),
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).not.toContain("excluded-reference-forms.ts");
+    expect(done.stdout).not.toContain("generated-writer.js");
+    expect(done.stdout).not.toContain("outside-src-writer.ts");
+    expect(done.stdout).toContain("RESULT: PASS");
+    expect(done.status).toBe(0);
+  });
+
   it("fails when an inline exact Db run call names a table with no application owner", () => {
     const repo = scratchRepo();
     writeProbe(
@@ -345,6 +491,40 @@ describe(CLAIM, () => {
 
     expect(done.stdout).toContain("src/db/schema.sql");
     expect(done.stdout).toContain("canonical_turn_sources");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
+  it("scans source and destination table names in schema renames", () => {
+    const repo = scratchRepo();
+    appendFileSync(
+      join(repo, "src/db/schema.sql"),
+      [
+        "",
+        "INSERT INTO canonical_turn_sources (turn_request_id) VALUES ('turn:probe');",
+        "UPDATE canonical_turns SET lifecycle_state = 'IN_DOUBT';",
+        "REPLACE INTO actor_target_attestations (target_attestation_id) VALUES ('attestation:probe');",
+        "DELETE FROM canonical_turn_adjudications WHERE 1 = 0;",
+        "ALTER TABLE canonical_turn_dispatches RENAME TO archived_turn_dispatches;",
+        "ALTER TABLE archived_turn_observations RENAME TO canonical_turn_observations;",
+        "",
+      ].join("\n"),
+    );
+
+    const done = censusOn(repo);
+
+    for (const table of [
+      "canonical_turn_sources",
+      "canonical_turns",
+      "actor_target_attestations",
+      "canonical_turn_adjudications",
+      "canonical_turn_dispatches",
+      "canonical_turn_observations",
+    ]) {
+      expect(done.stdout).toContain(
+        `${table}: src/db/schema.sql is outside its declared application owner list`,
+      );
+    }
     expect(done.stdout).toContain("RESULT: FAIL");
     expect(done.status).toBe(1);
   });
@@ -431,13 +611,45 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
+  it("reports named migration rebuild functions without evaluating their SQL", () => {
+    const repo = scratchRepo();
+    execFileSync(
+      "node",
+      [
+        "-e",
+        `const fs=require('fs');const p='src/db/migrations.ts';let s=fs.readFileSync(p,'utf8');` +
+          `s=s.replace('export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {', ` +
+          `'export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {\\n` +
+          `  const unevaluatedProbeSql = "UPDATE canonical_turns SET lifecycle_state = ?";\\n` +
+          `  void unevaluatedProbeSql;');fs.writeFileSync(p,s);`,
+      ],
+      { cwd: repo },
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain(
+      "canonical_turns: src/db/migrations.ts#rebuildCanonicalTurnsIfStale",
+    );
+    expect(done.stdout).toContain("RESULT: PASS");
+    expect(done.status).toBe(0);
+  });
+
   it("prints the exact boundary on every run", () => {
     const done = censusOn(scratchRepo());
 
     expect(done.stdout).toContain("BOUNDARY:");
     expect(done.stdout).toContain("TypeScript property symbol is exactly Db.run");
+    expect(done.stdout).toContain("string literal or no-substitution template literal");
+    expect(done.stdout).toContain("literal run-key bracket access");
+    expect(done.stdout).toContain("object binding destructuring");
+    expect(done.stdout).toContain("object assignment destructuring");
     expect(done.stdout).toContain("interface and other property aliases such as RunPort.run");
     expect(done.stdout).toContain("non-inline SQL expressions");
+    expect(done.stdout).toContain("casts to any, reflection, generated JavaScript, other SQL APIs");
+    expect(done.stdout).toContain("object rest or spread");
+    expect(done.stdout).toContain("both table names in ALTER TABLE RENAME TO");
+    expect(done.stdout).toContain("after SQL comments are blanked");
     expect(done.stdout).toContain("named migration rebuild functions are reported but their SQL is not evaluated");
     expect(done.stdout).toContain("outside src are not covered");
   });
