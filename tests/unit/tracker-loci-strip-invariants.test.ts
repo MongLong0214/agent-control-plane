@@ -15,6 +15,15 @@ import {
   STRING_BOUNDARY_RULES,
 } from "../../scripts/lib/tracker-loci-strip.mjs";
 
+/** Finds a real corpus anchor while failing visibly if it disappears or stops being unique. */
+const indexOfUniqueAnchor = (text: string, anchor: string): number => {
+  const matches = text.split("\n").flatMap((line, index) => (line.includes(anchor) ? [index] : []));
+  if (matches.length !== 1) {
+    throw new Error(`Expected exactly one line containing ${JSON.stringify(anchor)}, found ${matches.length}`);
+  }
+  return matches[0]!;
+};
+
 /**
  * Round 11 fixed one instance of a general defect: `readCode`'s output is sliced by line number
  * (the content-search window) as well as searched as a whole (the symbol search), so every one of
@@ -442,7 +451,7 @@ describe("tracker-loci strip invariants", () => {
       expect(out.startsWith('x = """')).toBe(true);
     });
 
-    it("the real deploy/egress/allowlist-proxy.py: line 77 survives the module docstring above it", () => {
+    it("the real ALLOWLIST_DIGEST assignment survives the module docstring above it", () => {
       // The concrete counterexample #700 reported: ALLOWLIST_DIGEST's own declaration, corrupted
       // by the module's triple-quoted docstring under the old pipeline.
       const fs = require("node:fs");
@@ -451,10 +460,14 @@ describe("tracker-loci strip invariants", () => {
         path.join(__dirname, "..", "..", "deploy", "egress", "allowlist-proxy.py"),
         "utf8",
       );
+      const lineIndex = indexOfUniqueAnchor(
+        text,
+        'ALLOWLIST_DIGEST = "sha256:" + hashlib.sha256(_f.read()).hexdigest()',
+      );
       const symbolView = stripPythonSource(text, true);
-      expect(symbolView.split("\n")[76]).toContain("ALLOWLIST_DIGEST");
+      expect(symbolView.split("\n")[lineIndex]).toContain("ALLOWLIST_DIGEST");
       const contentView = stripPythonSource(text, false);
-      expect(contentView.split("\n")[76]).toBe(
+      expect(contentView.split("\n")[lineIndex]).toBe(
         '    ALLOWLIST_DIGEST = "sha256:" + hashlib.sha256(_f.read()).hexdigest()',
       );
     });
@@ -588,7 +601,7 @@ describe("tracker-loci strip invariants", () => {
       expect(out.split("\n")[1]).toBe("const liveHashbangFollower = 16;");
     });
 
-    it("the real tests/integration/pipeline.test.ts:184 shape: module.exports inside a string with an embedded // is blanked, not left visible", () => {
+    it("the real pipeline fixture shape with module.exports inside a string containing // is blanked, not left visible", () => {
       const fs = require("node:fs");
       const path = require("node:path");
       const text = fs.readFileSync(
@@ -721,25 +734,25 @@ describe("tracker-loci strip invariants", () => {
     });
 
     it("$# (positional parameter count) is not misread as a comment", () => {
-      // The real shape in deploy/install-launchd.sh:49.
+      // The real shape in deploy/install-launchd.sh's argument loop.
       const input = "while [[ $# -gt 0 ]]; do\nx=4";
       expect(stripShellSource(input, true)).toBe(input);
     });
 
     it("## (suffix-removal parameter expansion) is not misread as a comment", () => {
-      // The real shape in deploy/install-launchd.sh:95 and :106.
+      // The real shape in deploy/install-launchd.sh's metadata parsing.
       const input = 'mode="${metadata##* }"\nx=5';
       expect(stripShellSource(input, true)).toBe('mode="               "\nx=5');
     });
 
     it("8# (arithmetic base notation) is not misread as a comment", () => {
-      // The real shape in deploy/install-launchd.sh:121.
+      // The real shape in deploy/install-launchd.sh's permission check.
       const input = "[[ $((8#22)) -eq 0 ]]\nx=6";
       expect(stripShellSource(input, true)).toBe(input);
     });
 
     it("// inside a string is not read as a comment marker", () => {
-      // The real shape in deploy/install-launchd.sh:173: printf '#!/bin/bash\\n...\\n' — the # is
+      // The real shape in deploy/install-launchd.sh's printf '#!/bin/bash\\n...\\n' — the # is
       // preceded by the opening quote, not whitespace, and is string content either way.
       const input = "printf '#!/bin/bash\\nset -e\\n'\nx=7";
       expect(stripShellSource(input, true)).toBe("printf '                     '\nx=7");
@@ -779,8 +792,8 @@ describe("tracker-loci strip invariants", () => {
     it("#689 round 18: a heredoc body's own # comment (at a word boundary) IS stripped now — the false green the real corpus reproduced", () => {
       // Round 16 shipped this exact input as "not a comment, just data": the whole heredoc body
       // passed through verbatim, so a symbol mentioned only in a comment *inside* a heredoc read
-      // as a real occurrence. `deploy/install-launchd.sh:268` is exactly this shape for real —
-      // `CODEX_HOME` appears nowhere else in that file — and the production CLI returned exit 0
+      // as a real occurrence. The sole `CODEX_HOME` mention in deploy/install-launchd.sh is
+      // exactly this shape for real, and the production CLI returned exit 0
       // with empty findings for it before this fix (see the real-corpus test below).
       const input = "cat <<'EOF'\n# a real comment now\nnot_a_comment#still_mid_word\nEOF\nx=13";
       const expected = "cat <<'EOF'\n\nnot_a_comment#still_mid_word\nEOF\nx=13";
@@ -813,7 +826,7 @@ describe("tracker-loci strip invariants", () => {
       const path = require("node:path");
       const text = fs.readFileSync(path.join(__dirname, "..", "..", "deploy", "install-launchd.sh"), "utf8");
       const count = (s: string) => (s.match(/CODEX_HOME/g) ?? []).length;
-      expect(count(text)).toBe(1); // the file's only mention, deploy/install-launchd.sh:268
+      expect(count(text)).toBe(1); // the file's only mention
       expect(count(stripShellSource(text, true))).toBe(0);
       expect(count(stripShellSource(text, false))).toBe(0);
     });
@@ -839,8 +852,8 @@ describe("tracker-loci strip invariants", () => {
 
     it("the real deploy/install-launchd.sh: required_keychain_value survives all three real occurrences", () => {
       // The concrete counterexample round 16 found: the old stripStrings(stripHashComments(text))
-      // pipeline desynchronized every quote pairing after line 173's embedded #!/bin/bash, and
-      // required_keychain_value (declared 191, called 249 and 250) survived none of them.
+      // pipeline desynchronized every quote pairing after the embedded #!/bin/bash, and none of
+      // the three required_keychain_value occurrences survived.
       const fs = require("node:fs");
       const path = require("node:path");
       const text = fs.readFileSync(path.join(__dirname, "..", "..", "deploy", "install-launchd.sh"), "utf8");

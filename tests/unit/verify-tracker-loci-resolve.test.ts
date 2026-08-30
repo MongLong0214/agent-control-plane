@@ -29,6 +29,19 @@ const scriptPath = join(repoRoot, "scripts", "verify-tracker-loci-resolve.mjs");
 const issue649Fixture = join(repoRoot, "tests", "fixtures", "tracker-loci-issue-649.json");
 const symbolFixturePath = "tests/fixtures/tracker-loci-symbols.ts";
 
+/** Resolves a real repository locus while failing visibly if its identifying text stops being unique. */
+const lineNumberOfUniqueAnchor = (relativePath: string, anchor: string): number => {
+  const matches = readFileSync(join(repoRoot, relativePath), "utf8")
+    .split("\n")
+    .flatMap((line, index) => (line.includes(anchor) ? [index + 1] : []));
+  if (matches.length !== 1) {
+    throw new Error(
+      `Expected exactly one line in ${relativePath} containing ${JSON.stringify(anchor)}, found ${matches.length}`,
+    );
+  }
+  return matches[0]!;
+};
+
 /** Writes a throwaway `--issues-file` fixture and returns its path plus a cleanup function. */
 const withIssues = (issues: IssueFixture[]) => {
   const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-"));
@@ -702,7 +715,8 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("[round 4] an inline citation whose quoted content still holds is ADVISORY, not STALE", () => {
-    const body = "The banner text is set in `README.md:1` — `# Agent Control Plane` — right at the top.";
+    const line = lineNumberOfUniqueAnchor("README.md", "# Agent Control Plane");
+    const body = `The banner text is set in \`README.md:${line}\` — \`# Agent Control Plane\` — right at the top.`;
     const { path, cleanup } = withIssues([{ number: 8808, title: "inline current citation control", body }]);
     try {
       const result = run(path);
@@ -807,7 +821,11 @@ describe("verify-tracker-loci-resolve", () => {
     // check, and "calls" is not in the source — a false STALE manufactured by the fix meant to
     // remove false ADVISORYs. Reverted to requiring the boundary right after word one; `{` stays
     // the one exception (see the docstring beside `looksLikeCode`).
-    const body = ["```", "hermes-bootstrap.ts:341       calls bindings.bind()", "```"].join("\n");
+    const line = lineNumberOfUniqueAnchor(
+      "src/bootstrap/hermes-bootstrap.ts",
+      "const bound = cp.bindings.bind({",
+    );
+    const body = ["```", `hermes-bootstrap.ts:${line}       calls bindings.bind()`, "```"].join("\n");
     const { path, cleanup } = withIssues([{ number: 9204, title: "paraphrase call counterexample", body }]);
     try {
       const result = run(path);
@@ -821,7 +839,11 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("[round 5] a fenced literal call is still checked and found current", () => {
-    const body = ["```", "src/bootstrap/hermes-bootstrap.ts:341   cp.bindings.bind({...})", "```"].join("\n");
+    const line = lineNumberOfUniqueAnchor(
+      "src/bootstrap/hermes-bootstrap.ts",
+      "const bound = cp.bindings.bind({",
+    );
+    const body = ["```", `src/bootstrap/hermes-bootstrap.ts:${line}   cp.bindings.bind({...})`, "```"].join("\n");
     const { path, cleanup } = withIssues([{ number: 9205, title: "fenced literal call positive control", body }]);
     try {
       const result = run(path);
@@ -882,8 +904,12 @@ describe("verify-tracker-loci-resolve", () => {
       ["this.definitelyMissing()", 1, "STALE"],
     ] as const;
 
+    const line = lineNumberOfUniqueAnchor(
+      "src/session/binding-registry.ts",
+      "const actorId = reused.value ?? this.mintActor(",
+    );
     for (const [quotedCall, status, verdict] of cases) {
-      const body = `[source](src/session/binding-registry.ts:206) — \`${quotedCall}\``;
+      const body = `[source](src/session/binding-registry.ts:${line}) — \`${quotedCall}\``;
       const { path, cleanup } = withIssues([{ number: 9406, title: `quoted ${quotedCall}`, body }]);
       try {
         const result = run(path);
@@ -897,7 +923,8 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("[round 6] a permalink whose quoted content still holds remains ADVISORY", () => {
-    const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#L1 — `# Agent Control Plane`.";
+    const line = lineNumberOfUniqueAnchor("README.md", "# Agent Control Plane");
+    const body = `See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#L${line} — \`# Agent Control Plane\`.`;
     const { path, cleanup } = withIssues([{ number: 9402, title: "permalink current content control", body }]);
     try {
       const result = run(path);
@@ -1184,7 +1211,8 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("[round 8] explicitly quoted prose that is still current is ADVISORY, not asserted stale on a technicality", () => {
-    const body = "The banner text is set in `README.md:1` — `# Agent Control Plane` — right at the top.";
+    const line = lineNumberOfUniqueAnchor("README.md", "# Agent Control Plane");
+    const body = `The banner text is set in \`README.md:${line}\` — \`# Agent Control Plane\` — right at the top.`;
     const { path, cleanup } = withIssues([{ number: 9807, title: "explicit quote positive control", body }]);
     try {
       const result = run(path);
@@ -1201,7 +1229,15 @@ describe("verify-tracker-loci-resolve", () => {
     // #649's real body proves the fence alone is not a reliable "this row is a literal quote"
     // signal — it mixes exactly this kind of plain description with a literal quote in one fence.
     // Dropping the heuristic here would reintroduce a false STALE for this real citation.
-    const body = ["```", "hermes-bootstrap.ts:121-146   reconstitution is allowed when no active CEO exists (#619)", "```"].join("\n");
+    const line = lineNumberOfUniqueAnchor(
+      "src/bootstrap/hermes-bootstrap.ts",
+      "A binding that appeared and was revoked between the precheck and here leaves no active CEO",
+    );
+    const body = [
+      "```",
+      `hermes-bootstrap.ts:${line}   reconstitution is allowed when no active CEO exists (#619)`,
+      "```",
+    ].join("\n");
     const { path, cleanup } = withIssues([{ number: 9808, title: "fenced description positive control", body }]);
     try {
       const result = run(path);
@@ -1322,10 +1358,10 @@ describe("verify-tracker-loci-resolve", () => {
 
   it("[round 9] a quoted line exactly at the ±60 window boundary is ADVISORY, not STALE", () => {
     // The window's own comment and header both claim ±60; the code checked one line narrower at
-    // the far edge. Real text from `README.md:121` cited at line 61 — exactly +60, inside the
-    // stated window — returned STALE before this fix. Reproduced here against README.md's real,
-    // current content (not a fixture) so a future edit cannot silently make this test meaningless
-    // — the same discipline the round 3 boundary tests already use.
+    // the far edge. Real text chosen at runtime and cited exactly +60 lines away returned STALE
+    // before this fix. Reproduced here against README.md's real, current content (not a fixture)
+    // so a future edit cannot silently make this test meaningless — the same discipline the round
+    // 3 boundary tests already use.
     const lines = readFileSync(join(repoRoot, "README.md"), "utf8").split("\n");
     const WINDOW = 60;
     let citedLine = null;
@@ -1457,9 +1493,15 @@ describe("verify-tracker-loci-resolve", () => {
     // entirely for being too blunt in the other direction. This guard stays regardless of which
     // state `looksLikeCode` is in, because it pins the thing that must never happen on this
     // branch: a plain description manufactured into a false STALE.
-    const descriptionBody = ["```", "hermes-bootstrap.ts:121-146   reconstitution is allowed when no active CEO exists (#619)", "```"].join(
-      "\n",
+    const descriptionLine = lineNumberOfUniqueAnchor(
+      "src/bootstrap/hermes-bootstrap.ts",
+      "A binding that appeared and was revoked between the precheck and here leaves no active CEO",
     );
+    const descriptionBody = [
+      "```",
+      `hermes-bootstrap.ts:${descriptionLine}   reconstitution is allowed when no active CEO exists (#619)`,
+      "```",
+    ].join("\n");
     const { path: descPath, cleanup: descCleanup } = withIssues([
       { number: 91005, title: "fenced description regression guard", body: descriptionBody },
     ]);
@@ -1472,7 +1514,15 @@ describe("verify-tracker-loci-resolve", () => {
       descCleanup();
     }
 
-    const paraphraseBody = ["```", "hermes-bootstrap.ts:341       calls bindings.bind()", "```"].join("\n");
+    const paraphraseLine = lineNumberOfUniqueAnchor(
+      "src/bootstrap/hermes-bootstrap.ts",
+      "const bound = cp.bindings.bind({",
+    );
+    const paraphraseBody = [
+      "```",
+      `hermes-bootstrap.ts:${paraphraseLine}       calls bindings.bind()`,
+      "```",
+    ].join("\n");
     const { path: paraPath, cleanup: paraCleanup } = withIssues([
       { number: 91006, title: "fenced paraphrase regression guard", body: paraphraseBody },
     ]);
@@ -1544,10 +1594,14 @@ describe("verify-tracker-loci-resolve", () => {
     // The check's own original defect, reappearing in the direction it was fixed for: the content
     // search read `readText`'s raw output, comments included, while the symbol search has used
     // `readCode` (comment/string-stripped) since round 2. `server.close()` is real text in
-    // `src/daemon/agentcpd.ts` — but only inside a comment about it, ~30 lines from the citation;
-    // the actual call happens 901 lines away, far outside the ±60 window. Before this fix, the raw
-    // text still contained the phrase (inside the comment) and this read ADVISORY.
-    const body = "The fix is at `src/daemon/agentcpd.ts:1420` — `server.close()` for the shutdown guard.";
+    // `src/daemon/agentcpd.ts` — but only inside a comment. The citation is derived from that
+    // comment itself, keeping it inside the ±60 window without pinning its position. Before this
+    // fix, the raw text still contained the phrase and this read ADVISORY.
+    const line = lineNumberOfUniqueAnchor(
+      "src/daemon/agentcpd.ts",
+      "the listener handles have no closing guard, and Node rejects a second `server.close()`",
+    );
+    const body = `The fix is at \`src/daemon/agentcpd.ts:${line}\` — \`server.close()\` for the shutdown guard.`;
     const { path, cleanup } = withIssues([{ number: 92004, title: "comment-only survival counterexample", body }]);
     try {
       const result = run(path);
@@ -1561,7 +1615,11 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("[round 11] quoted content that is real, current code (not a comment) still resolves — positive control", () => {
-    const body = ["```", "src/bootstrap/hermes-bootstrap.ts:341   cp.bindings.bind({...})", "```"].join("\n");
+    const line = lineNumberOfUniqueAnchor(
+      "src/bootstrap/hermes-bootstrap.ts",
+      "const bound = cp.bindings.bind({",
+    );
+    const body = ["```", `src/bootstrap/hermes-bootstrap.ts:${line}   cp.bindings.bind({...})`, "```"].join("\n");
     const { path, cleanup } = withIssues([{ number: 92005, title: "real code content still resolves control", body }]);
     try {
       const result = run(path);
@@ -1583,9 +1641,17 @@ describe("verify-tracker-loci-resolve", () => {
     // output by line number, and a multi-line docstring ahead of the cited line silently shifted
     // every line after it out of sync with the real file, making the window look at the wrong
     // span entirely. `src/runtime/hermes-ceo.ts` has several multi-line `/** ... */` blocks before
-    // line 341; the real call this citation names sits nine lines below it, comfortably inside the
-    // ±60 window — but only if the window's line numbers still mean what the real file's do.
-    const body = ["```", "src/runtime/hermes-ceo.ts:341   void askReplySource(options.replyCommand, …)", "```"].join("\n");
+    // the real call this citation names is located at runtime — but only resolves if the stripped
+    // view's line numbers still mean what the real file's do.
+    const line = lineNumberOfUniqueAnchor(
+      "src/runtime/hermes-ceo.ts",
+      "void askReplySource(options.replyCommand, promptFrom(value[\"params\"]), replyTimeoutMs)",
+    );
+    const body = [
+      "```",
+      `src/runtime/hermes-ceo.ts:${line}   void askReplySource(options.replyCommand, …)`,
+      "```",
+    ].join("\n");
     const { path, cleanup } = withIssues([{ number: 92006, title: "multi-line comment desync counterexample", body }]);
     try {
       const result = run(path);
@@ -1603,14 +1669,14 @@ describe("verify-tracker-loci-resolve", () => {
   // citation that happens to quote a line containing a string literal read STALE.
 
   it("[round 13] an exact, current citation whose quoted code contains a string literal is ADVISORY, not STALE", () => {
-    // The real, current line at `session-registry.ts:148`, quoted verbatim including its string
-    // literal argument. Before this fix: the raw needle still had `"unknown session"` intact, the
+    // A real, current line, quoted verbatim including its string literal argument. Before this
+    // fix: the raw needle still had `"unknown session"` intact, the
     // `readCode`-stripped haystack had that same span blanked to spaces, and a literal match
     // against real, unchanged code failed on the one part of it that was never supposed to compare
     // literally in the first place.
-    const body =
-      "The check is at `src/session/session-registry.ts:148` — " +
-      '`if (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });` for the guard.';
+    const content = 'if (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });';
+    const line = lineNumberOfUniqueAnchor("src/session/session-registry.ts", content);
+    const body = `The check is at \`src/session/session-registry.ts:${line}\` — \`${content}\` for the guard.`;
     const { path, cleanup } = withIssues([{ number: 93001, title: "string literal in needle counterexample", body }]);
     try {
       const result = run(path);
@@ -1623,10 +1689,12 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   it("[round 13] the same real line's shape without a string literal was already ADVISORY — the paired control", () => {
-    // The line immediately after the one above, real and current, with no string literal in it.
-    // This already worked before the fix; pinned here so the two tests read as the pair Sol's
-    // report described rather than one fix looking isolated.
-    const body = "The check is at `src/session/session-registry.ts:150` — `const expected = hashSessionSecret(sessionSecret);` for the guard.";
+    // A nearby real, current line with no string literal in it. This already worked before the
+    // fix; paired here so the two tests read as the pair Sol's report described rather than one
+    // fix looking isolated.
+    const content = "const expected = hashSessionSecret(sessionSecret);";
+    const line = lineNumberOfUniqueAnchor("src/session/session-registry.ts", content);
+    const body = `The check is at \`src/session/session-registry.ts:${line}\` — \`${content}\` for the guard.`;
     const { path, cleanup } = withIssues([{ number: 93002, title: "no string literal in needle control", body }]);
     try {
       const result = run(path);
@@ -1661,7 +1729,11 @@ describe("verify-tracker-loci-resolve", () => {
     // so stripping it changes nothing — it still fails to match the (comment-stripped) haystack
     // exactly as round 11 intended. This is the regression guard that would have failed if the
     // fix here had been "stop stripping the haystack" instead of "also strip the needle".
-    const body = "The fix is at `src/daemon/agentcpd.ts:1420` — `server.close()` for the shutdown guard.";
+    const line = lineNumberOfUniqueAnchor(
+      "src/daemon/agentcpd.ts",
+      "the listener handles have no closing guard, and Node rejects a second `server.close()`",
+    );
+    const body = `The fix is at \`src/daemon/agentcpd.ts:${line}\` — \`server.close()\` for the shutdown guard.`;
     const { path, cleanup } = withIssues([{ number: 93004, title: "comment-survival regression guard", body }]);
     try {
       const result = run(path);
@@ -1686,28 +1758,34 @@ describe("verify-tracker-loci-resolve", () => {
     {
       label: "TypeScript, a double-quoted string argument",
       path: "src/session/session-registry.ts",
-      line: 148,
+      line: lineNumberOfUniqueAnchor(
+        "src/session/session-registry.ts",
+        'if (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });',
+      ),
       content: 'if (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });',
     },
     {
       label: "SQL, a single-quoted string argument",
       path: "src/db/schema.sql",
-      line: 32,
+      line: lineNumberOfUniqueAnchor("src/db/schema.sql", "SELECT RAISE(ABORT, 'MANIFEST_IMMUTABLE');"),
       content: "SELECT RAISE(ABORT, 'MANIFEST_IMMUTABLE');",
     },
     {
       label: "shell, a double-quoted assignment",
       path: "deploy/install-launchd.sh",
-      line: 5,
+      line: lineNumberOfUniqueAnchor("deploy/install-launchd.sh", 'readonly LABEL="com.agentcontrolplane.agentcpd"'),
       content: 'readonly LABEL="com.agentcontrolplane.agentcpd"',
     },
     {
-      // #700's own concrete counterexample: this is the occurrence the corrupted triple-quote
-      // pairing was eating (line 77), not the coincidental one 7 lines later (line 84) that let
-      // the pre-existing round-4 symbol-search test pass for the wrong reason the whole time.
+      // #700's own concrete counterexample: this is the assignment the corrupted triple-quote
+      // pairing was eating, not a later coincidental occurrence that let the pre-existing round-4
+      // symbol-search test pass for the wrong reason the whole time.
       label: "Python, a double-quoted string literal, after a triple-quoted module docstring (#700)",
       path: "deploy/egress/allowlist-proxy.py",
-      line: 77,
+      line: lineNumberOfUniqueAnchor(
+        "deploy/egress/allowlist-proxy.py",
+        'ALLOWLIST_DIGEST = "sha256:" + hashlib.sha256(_f.read()).hexdigest()',
+      ),
       content: 'ALLOWLIST_DIGEST = "sha256:" + hashlib.sha256(_f.read()).hexdigest()',
     },
   ];
@@ -1731,14 +1809,16 @@ describe("verify-tracker-loci-resolve", () => {
 
   describe("[round 14] #700 finding 2: string content is compared literally, not skipped", () => {
     it("a citation whose quoted string literal no longer matches the real one reads STALE", () => {
-      // The real, current line at session-registry.ts:148 says "unknown session"; this citation
+      // The real, current line says "unknown session"; this citation
       // quotes the same line with the string literal's content swapped for something else
       // entirely. Round 13's own fix (stripToCodeView on both sides) blanked string content out of
       // the comparison, which made this pass as ADVISORY — the check reporting coverage over
       // string content it was not actually comparing. Round 14's `stripCommentsForContentView`
       // leaves string content in place, so a changed string is a changed citation.
+      const currentContent = 'if (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });';
+      const line = lineNumberOfUniqueAnchor("src/session/session-registry.ts", currentContent);
       const body =
-        'See `src/session/session-registry.ts:148` — ' +
+        `See \`src/session/session-registry.ts:${line}\` — ` +
         '`if (!row) return deny(ReasonCode.NOT_FOUND, "totally different text", { sessionId });` for the detail.';
       const { path, cleanup } = withIssues([{ number: 70002, title: "finding 2: swapped string content", body }]);
       try {
@@ -1758,12 +1838,16 @@ describe("verify-tracker-loci-resolve", () => {
       // that is ordinary code with no comment syntax in it strips to itself unchanged on both
       // sides, so this is really the same regression guard as the round-13 property tests above,
       // named explicitly here as the "comments still don't count" half of the round 14 decision.
-      const body = "The fix is at `src/daemon/agentcpd.ts:1420` — `server.close()` for the shutdown guard.";
+      const line = lineNumberOfUniqueAnchor(
+        "src/daemon/agentcpd.ts",
+        "the listener handles have no closing guard, and Node rejects a second `server.close()`",
+      );
+      const body = `The fix is at \`src/daemon/agentcpd.ts:${line}\` — \`server.close()\` for the shutdown guard.`;
       const { path, cleanup } = withIssues([{ number: 70003, title: "finding 2: comment still excluded", body }]);
       try {
         const result = run(path);
-        // This is the exact round-11 regression guard fixture: the real call moved away from this
-        // line and now only survives in a nearby comment, so it correctly stays STALE — comments
+        // This is the exact round-11 regression guard fixture: the phrase occurs only in the
+        // comment whose location supplied the citation, so it correctly stays STALE — comments
         // are not part of "content" either before or after round 14.
         expect(result.status).toBe(1);
         expect(result.stdout).toContain("STALE");
@@ -1774,12 +1858,12 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   describe("[round 15] #689: the JS/TS comment stripper was never string-aware — the third instance of this script's own most-repeated defect", () => {
-    it("module.exports in tests/integration/pipeline.test.ts:184 occurs only inside a string containing an embedded //, and reads STALE — the real repo citation, not a constructed fixture", () => {
-      // The real shape found in this repository, not hand-built: `tests/integration/
-      // pipeline.test.ts:184` writes `"module.exports = () => 2; // addressed review\n"` as a
-      // string. `module.exports` appears nowhere else in the file as real code — both of its
-      // occurrences (line 184 and line 372) are inside string literals that each contain their own
-      // embedded `//`. Before this fix, `stripSlashComments` ran first, blind to the string
+    it("module.exports in tests/integration/pipeline.test.ts occurs only inside strings containing embedded //, and reads STALE — the real repo citation, not a constructed fixture", () => {
+      // The real shape found in this repository, not hand-built: `tests/integration/pipeline.test.ts`
+      // writes `"module.exports = () => 2; // addressed review\n"` as a string. `module.exports`
+      // appears nowhere else in the file as real code — both occurrences are inside string literals
+      // that each contain their own embedded `//`. Before this fix, `stripSlashComments` ran first,
+      // blind to the string
       // boundary; the embedded `//` (no `:` right before it, the one shape its lookbehind
       // protected) truncated the line and destroyed the string's own closing quote before
       // `stripStrings` ever ran, leaving `module.exports = () => 2; ` looking like ordinary code
@@ -1815,15 +1899,15 @@ describe("verify-tracker-loci-resolve", () => {
 
   describe("[round 16] #689: shell and YAML had the identical defect and were shipped anyway — the fourth instance", () => {
     it("required_keychain_value in deploy/install-launchd.sh resolves silently — the real repo citation, not a constructed fixture", () => {
-      // The real shape found in this repository, worse than round 15's JS/TS instance: line 173
+      // The real shape found in this repository, worse than round 15's JS/TS instance: the script
       // writes printf '#!/bin/bash\nset -euo pipefail\n' as a single-quoted string. The old
       // stripHashComments ran first, blind to the string boundary; the # right after the opening
       // quote (preceded by ', not ':', the old regex's only guard) started a "comment" that ate
       // the rest of the line, including the string's own closing quote. stripStrings' single-quote
       // regex then paired that surviving lone quote with the *next* quote anywhere later in the
       // file, desynchronizing every quote pairing after it for the rest of the file — not just one
-      // string. required_keychain_value (declared line 191, called lines 249 and 250 — three real,
-      // current occurrences) survived none of them in the old stripped view.
+      // string. All three real, current required_keychain_value occurrences survived none of them
+      // in the old stripped view.
       const body = "`required_keychain_value` in `deploy/install-launchd.sh`";
       const { path, cleanup } = withIssues([
         { number: 68903, title: "round 16: the shell quote/comment ordering defect", body },
@@ -1979,8 +2063,8 @@ describe("verify-tracker-loci-resolve", () => {
     it("CODEX_HOME in deploy/install-launchd.sh reads STALE — it appears only inside a # comment inside a heredoc body", () => {
       // The real CLI invocation a blind review ran and got exit 0 / empty findings from, before
       // this fix: `` `CODEX_HOME` in `deploy/install-launchd.sh` ``. CODEX_HOME appears exactly
-      // once in that file, at line 268 — a # comment (word-boundary, start of line) inside the
-      // heredoc deploy/install-launchd.sh:187-287 writes. Round 16 passed the whole heredoc body
+      // once in that file — a # comment (word-boundary, start of line) inside a heredoc the script
+      // writes. Round 16 passed the whole heredoc body
       // through untouched, on the stated theory that a heredoc's content is "genuinely part of
       // what the file contains" — true of the code inside it, but a comment inside a heredoc is
       // still a comment, not code, the same way a comment at the top level of the file is. This is
@@ -2002,7 +2086,7 @@ describe("verify-tracker-loci-resolve", () => {
 
     it("required_keychain_value in deploy/install-launchd.sh still resolves silently — a heredoc's own quoted-string content is not blanked by this fix", () => {
       // The regression guard for the narrower reading of the fix: required_keychain_value's own
-      // call sites (deploy/install-launchd.sh:249-250) are reached through
+      // call sites are reached through
       // `"$(required_keychain_value …)"` — a command substitution inside a double-quoted string,
       // itself inside the same heredoc CODEX_HOME's comment lives in. Blanking heredoc
       // quoted-string content the way an ordinary string's content is blanked for the symbol view
