@@ -704,3 +704,148 @@ export const stripYamlSource = (text, blankStrings) => {
 
   return out;
 };
+
+/**
+ * #689 round 17: the fifth instance of the same defect, disclosed and left unfixed at the end of
+ * round 16 and sent back for exactly that reason. SQL's dispatch
+ * (`stripStrings(stripSqlComments(text))` for the symbol view, `stripSqlComments(text)` alone for
+ * the content view) has the identical two-pass, comment-blind-to-strings shape round 15 fixed for
+ * JS/TS and round 16 fixed for shell/YAML.
+ *
+ * Measured against this repository's own tracked SQL, not assumed: neither `src/db/schema.sql`
+ * nor `tests/fixtures/schema-v11.sql` contains a `--` or `/* *\/` literally inside a `'...'`
+ * string (checked with a proper quote-aware walk, not a naive regex — a naive one falsely
+ * "finds" several, all of them an English possessive apostrophe inside a `--` comment pairing
+ * with a real string quote many lines later, the identical mirror-case trap round 16's own
+ * corpus check for YAML ran into and had to walk past). So the cascading-desync shape round 16
+ * found in `deploy/install-launchd.sh` has no live instance in this repository's SQL today — a
+ * fact about this corpus, not a reason to leave the ordering defect itself unfixed, since the
+ * pipeline is exactly as blind to string boundaries as the shell one was.
+ *
+ * `stripSqlSource` replaces that pipeline with one ordered walk, the same shape as the other four:
+ *
+ *   - `--` starts a line comment unconditionally — unlike shell's `#`, SQL's `--` has no other
+ *     meaning outside a string/identifier, so there is no word-boundary rule to get right here.
+ *   - `/* ... *\/` block comments do not nest — confirmed against SQLite's own documented
+ *     behavior (this repository's actual engine, via `better-sqlite3`: "SQL comments... do not
+ *     nest" — the first `*\/` ends the comment regardless of an intervening `/*`), matching what
+ *     the existing (non-ordered) `stripSqlComments` already assumed.
+ *   - a `'...'` value string literal escapes its own delimiter by *doubling* it (`''`), not with a
+ *     backslash — standard SQL and SQLite both treat `\` as a literal character inside a string.
+ *     This is a real correction from `stripStrings`'s generic single-quote regex (which assumes
+ *     backslash-escaping), not just a reordering; this repository's own corpus has no
+ *     backslash-adjacent-to-quote case to have exposed the difference, confirmed by grep.
+ *   - `"..."`, `` `...` ``, and `[...]` are *identifier* quoting, not value quoting — a quoted
+ *     column or table name is a real reference the same way a bareword identifier is, so unlike a
+ *     `'...'` string's content it is never blanked in either view; each is still recognized as its
+ *     own atomic span so its content cannot desynchronize the comment/string walk around it (the
+ *     same reason a template literal's prose gets walked rather than ignored in `stripJsSource`).
+ *     `"..."`/`` `...` `` escape their own delimiter by doubling, the same convention as `'...'`;
+ *     `[...]` has no escape convention in real SQL Server/Access either, so a literal `]` inside
+ *     one cannot be represented and this does not try to guess one. None of the three appears as
+ *     a real identifier anywhere in this repository's tracked SQL (only inside `--` comments, as
+ *     Markdown code-spans referencing a column name in prose) — confirmed by grep, disclosed
+ *     rather than assumed covered.
+ *   - the mirror case holds the same way it does for every other language here: once a `--` or
+ *     `/* *\/` comment has started, a `'`/`"`/`` ` ``/`[` inside it is just comment text and never
+ *     opens a string or identifier.
+ *
+ * Disclosed, not silently scored, per explicit instruction rather than left implicit: dollar-
+ * quoting (`$tag$...$tag$`, PostgreSQL's own arbitrary-delimiter string form) is not implemented —
+ * this repository's SQLite schema has no dollar-quoted string anywhere (the four `$` characters
+ * that do appear are all inside ordinary `'...'` strings, `json_extract`'s own `'$.path'`
+ * argument syntax, not a quoting delimiter), and SQLite itself does not support the feature, so
+ * there is nothing in this corpus or this engine to verify a dollar-quote implementation against.
+ */
+export const stripSqlSource = (text, blankStrings) => {
+  const n = text.length;
+  let out = "";
+  let i = 0;
+
+  /** Consumes an identifier quoted with a single repeated delimiter char, doubled to escape it. */
+  const scanDoubledIdentifier = (delim) => {
+    const start = i;
+    let j = i + 1;
+    while (j < n) {
+      if (text[j] === delim && text[j + 1] === delim) {
+        j += 2;
+        continue;
+      }
+      if (text[j] === delim) {
+        j++;
+        break;
+      }
+      j++;
+    }
+    i = j;
+    return text.slice(start, j); // verbatim, never blanked — a name, not a value
+  };
+
+  while (i < n) {
+    const ch = text[i];
+
+    if (ch === "-" && text[i + 1] === "-") {
+      while (i < n && text[i] !== "\n") i++;
+      continue; // deleted outright, matching stripSqlComments' existing behavior
+    }
+
+    if (ch === "/" && text[i + 1] === "*") {
+      // Non-nesting, matching SQLite's own documented behavior: the first */ ends it.
+      const start = i;
+      let j = i + 2;
+      while (j < n && !(text[j] === "*" && text[j + 1] === "/")) j++;
+      if (j < n) j += 2;
+      out += blankKeepingNewlines(text.slice(start, j));
+      i = j;
+      continue;
+    }
+
+    if (ch === "'") {
+      const start = i;
+      let j = i + 1;
+      let closed = false;
+      while (j < n) {
+        if (text[j] === "'" && text[j + 1] === "'") {
+          j += 2;
+          continue;
+        }
+        if (text[j] === "'") {
+          j++;
+          closed = true;
+          break;
+        }
+        j++;
+      }
+      const span = text.slice(start, j);
+      if (blankStrings) {
+        const closeLen = closed ? 1 : 0;
+        const interior = span.slice(1, span.length - closeLen);
+        out += span.slice(0, 1) + blankKeepingNewlines(interior) + (closeLen ? "'" : "");
+      } else {
+        out += span;
+      }
+      i = j;
+      continue;
+    }
+
+    if (ch === '"' || ch === "`") {
+      out += scanDoubledIdentifier(ch);
+      continue;
+    }
+
+    if (ch === "[") {
+      const start = i;
+      let j = i + 1;
+      while (j < n && text[j] !== "]") j++;
+      if (j < n) j++;
+      out += text.slice(start, j); // verbatim, never blanked — a name, not a value
+      i = j;
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+
+  return out;
+};

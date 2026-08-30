@@ -16,3 +16,4 @@ export declare const stripPythonSource: (text: string, blankStrings: boolean) =>
 export declare const stripJsSource: (text: string, blankStrings: boolean) => string;
 export declare const stripShellSource: (text: string, blankStrings: boolean) => string;
 export declare const stripYamlSource: (text: string, blankStrings: boolean) => string;
+export declare const stripSqlSource: (text: string, blankStrings: boolean) => string;

@@ -7,6 +7,7 @@ import {
   stripShellSource,
   stripSlashComments,
   stripSqlComments,
+  stripSqlSource,
   stripStrings,
   stripTemplateLiteralProse,
   stripYamlSource,
@@ -128,6 +129,18 @@ const ADVERSARIAL_INPUTS: Array<{ label: string; text: string }> = [
     label: "a YAML single-quoted scalar with a doubled '' escape, multi-line",
     text: ["key: 'it''s", "still one scalar'", "key2: value"].join("\n"),
   },
+  {
+    label: "a SQL /* */ block comment that does not nest (#689 round 17)",
+    text: ["SELECT 1;", "/* outer /* inner */ still-code", "*/", "SELECT 2;"].join("\n"),
+  },
+  {
+    label: "a SQL '...' string spanning multiple raw lines (valid SQLite, unlike JS/shell)",
+    text: ["SELECT 'line one", "line two' AS v;", "SELECT 2;"].join("\n"),
+  },
+  {
+    label: "an unterminated SQL string literal",
+    text: ["SELECT 'never closes", "line 2", "line 3"].join("\n"),
+  },
 ];
 
 const strippers: Array<{ name: string; fn: (text: string) => string }> = [
@@ -152,6 +165,10 @@ const strippers: Array<{ name: string; fn: (text: string) => string }> = [
   { name: "stripShellSource(blankStrings=false)", fn: (text) => stripShellSource(text, false) },
   { name: "stripYamlSource(blankStrings=true)", fn: (text) => stripYamlSource(text, true) },
   { name: "stripYamlSource(blankStrings=false)", fn: (text) => stripYamlSource(text, false) },
+  // #689/round 17: SQL gets its own ordered walk too — the fifth and last dispatch, same reason
+  // as every row above, not just one call site each.
+  { name: "stripSqlSource(blankStrings=true)", fn: (text) => stripSqlSource(text, true) },
+  { name: "stripSqlSource(blankStrings=false)", fn: (text) => stripSqlSource(text, false) },
 ];
 
 describe("tracker-loci strip invariants", () => {
@@ -474,6 +491,134 @@ describe("tracker-loci strip invariants", () => {
       const input = "key: 'a''";
       const out = stripYamlSource(input, true);
       expect(out).toBe("key: '   "); // no closing quote appended — genuinely unterminated
+    });
+  });
+
+  describe("stripSqlSource (#689, round 17 — the fifth and last dispatch)", () => {
+    // Every delimiter-ordering shape this class of bug can take, for SQL's own delimiter set —
+    // `--` and `/* */` comments, `'...'` value strings, `"..."`/`` ` ``/`[...]` identifier
+    // quoting — each its own row, the same discipline every prior round used.
+
+    it("-- starts a comment unconditionally — SQL has no word-boundary rule, unlike shell's #", () => {
+      const input = "SELECT 1;--no space before this\nx=2";
+      expect(stripSqlSource(input, true)).toBe("SELECT 1;\nx=2");
+    });
+
+    it("/* */ does not nest — confirmed against SQLite's own documented behavior", () => {
+      const input = "/* outer /* inner */ still-code */\nx=4";
+      // The first */ ends the comment; "still-code */" is left as ordinary (uncommented) text.
+      expect(stripSqlSource(input, true)).toBe("                     still-code */\nx=4");
+    });
+
+    it("-- inside a '...' string is not read as a comment marker", () => {
+      const input = "SELECT 'a--b';\nx=5";
+      expect(stripSqlSource(input, true)).toBe("SELECT '    ';\nx=5");
+      expect(stripSqlSource(input, false)).toBe(input);
+    });
+
+    it("/* */ inside a '...' string is not read as a comment", () => {
+      const input = "SELECT 'a/*b*/c';\nx=6";
+      expect(stripSqlSource(input, true)).toBe("SELECT '       ';\nx=6");
+    });
+
+    it("a quote inside a -- comment does not open a string", () => {
+      const input = "-- this isn't \"real\" code\nx=7";
+      expect(stripSqlSource(input, true)).toBe("\nx=7");
+    });
+
+    it("a quote inside a /* */ comment does not open a string", () => {
+      const input = "/* say 'hi' and \"bye\" */\nx=8";
+      expect(stripSqlSource(input, true)).toBe("                        \nx=8");
+    });
+
+    it("'' doubles as the escaped literal quote in a value string, not backslash", () => {
+      const input = "SELECT 'it''s here';\nx=9";
+      expect(stripSqlSource(input, true)).toBe("SELECT '          ';\nx=9");
+    });
+
+    it("backslash is a literal character inside a SQL string, not an escape", () => {
+      // Confirmed against the real engine (better-sqlite3): a backslash does not escape a quote.
+      const input = "SELECT 'a\\\\';\nx=10"; // interior is the 3 literal chars a, \, \
+      expect(stripSqlSource(input, true)).toBe("SELECT '   ';\nx=10");
+    });
+
+    it('a "..." quoted identifier is never blanked — it is a name, not a value', () => {
+      const input = 'SELECT "col""name" FROM t;\nx=11';
+      expect(stripSqlSource(input, true)).toBe(input);
+      expect(stripSqlSource(input, false)).toBe(input);
+    });
+
+    it("a `...` quoted identifier is never blanked — it is a name, not a value", () => {
+      const input = "SELECT `col``name` FROM t;\nx=12";
+      expect(stripSqlSource(input, true)).toBe(input);
+    });
+
+    it("a [...] quoted identifier is never blanked — it is a name, not a value", () => {
+      const input = "SELECT [col name] FROM t;\nx=13";
+      expect(stripSqlSource(input, true)).toBe(input);
+    });
+
+    it("a '...' string containing embedded double quotes (JSON) is one atomic span, not a nested string", () => {
+      const input = "SELECT '{\"pending\":true}';\nx=14";
+      expect(stripSqlSource(input, true)).toBe('SELECT \'                \';\nx=14');
+    });
+
+    it("an unterminated string is blanked to end of file — a raw newline does not end a SQL string", () => {
+      // Unlike JS/shell, a real SQL string literal can legitimately contain a raw newline
+      // (confirmed against better-sqlite3 directly), so an unterminated one is not cut off at the
+      // first line break — it consumes to true end of input, the same disclosed answer
+      // `stripJsSource`/`stripShellSource` give an unterminated template literal/heredoc.
+      const input = "SELECT 'never closes\nx=15";
+      const out = stripSqlSource(input, true);
+      expect(out).toBe("SELECT '            \n    ");
+    });
+
+    it("dollar-quoting is not implemented — disclosed, not silently scored (no corpus, no engine support)", () => {
+      // This repository's SQLite schema has no dollar-quoted string, and SQLite itself does not
+      // support the PostgreSQL feature — a $ is just an ordinary character here.
+      const input = "SELECT $tag$ raw text $tag$;\nx=16";
+      expect(stripSqlSource(input, true)).toBe(input);
+    });
+
+    it("the real src/db/schema.sql and tests/fixtures/schema-v11.sql: old and new pipelines agree, both views", () => {
+      // Measured, not assumed: this repository's tracked SQL has no `--`/`/* */` literally inside
+      // a '...' string (verified with a proper quote-aware walk, not a naive regex — see this
+      // function's own comment for why a naive one falsely finds several), so the cascading-desync
+      // shape round 16 found in deploy/install-launchd.sh has no live instance here. The fix still
+      // matters (a constructed instance below proves the old pipeline was just as blind), but this
+      // asserts the honest fact about this corpus: no observable regression, no observable fix.
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const schemaPath = path.join(__dirname, "..", "..", "src", "db", "schema.sql");
+      const fixturePath = path.join(__dirname, "..", "fixtures", "schema-v11.sql");
+      for (const p of [schemaPath, fixturePath]) {
+        const text = fs.readFileSync(p, "utf8");
+        const oldSym = stripStrings(stripSqlComments(text));
+        const newSym = stripSqlSource(text, true);
+        const oldContent = stripSqlComments(text);
+        const newContent = stripSqlSource(text, false);
+        expect(newSym).toBe(oldSym);
+        expect(newContent).toBe(oldContent);
+      }
+    });
+
+    it("a constructed instance of the cascading defect: a symbol only inside a string with an embedded -- reads STALE only after the fix", () => {
+      // The real corpus has no live instance of this (see the test above), so this constructs the
+      // same shape round 16 found for real in deploy/install-launchd.sh: a -- embedded in a
+      // '...' string destroys that string's closing quote under the old pipeline, and
+      // stripStrings' whole-file regex pairs the orphaned quote with the next ' in the file,
+      // desynchronizing everything after it.
+      const text = [
+        "SELECT 'note: value--marker still a string' AS explanation;",
+        "SELECT 'first' AS a;",
+        "SELECT 'onlyInsideThisSqlString' AS b;",
+        "CREATE TABLE real_table_marker (id INTEGER);",
+      ].join("\n");
+      const oldSym = stripStrings(stripSqlComments(text));
+      const newSym = stripSqlSource(text, true);
+      expect(oldSym).toContain("onlyInsideThisSqlString"); // the old bug, reproduced
+      expect(newSym).not.toContain("onlyInsideThisSqlString"); // fixed: correctly blanked
+      expect(newSym).toContain("real_table_marker"); // real code still resolves
     });
   });
 });

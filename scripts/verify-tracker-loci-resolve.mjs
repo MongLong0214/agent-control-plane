@@ -742,8 +742,49 @@
  *   outside `[A-Za-z0-9_]` is not recognized — neither shape appears in this repository's own
  *   tracked files, confirmed by grep rather than assumed.
  *
- *   SQL (`stripStrings(stripSqlComments(text))`) has the same latent shape and was not touched —
- *   named here, not fixed, out of this round's stated scope.
+ *   SQL (`stripStrings(stripSqlComments(text))`) had the same latent shape and was not touched in
+ *   this round — named, not fixed, and sent back for exactly that reason. See round 17.
+ *
+ * ## Round 17: the fifth instance — SQL, disclosed at the end of round 16 and fixed here
+ *
+ *   Every extension dispatch in this script, enumerated rather than recalled from memory (there
+ *   are exactly five — `JS_FAMILY_EXTS`, `PY_EXTS`, `SH_EXTS`, `YAML_EXTS`, `SQL_EXTS` — everything
+ *   else falls through to a plain-text search, disclosed as such by `codeSearchScope`'s own final
+ *   branch): JS/TS, Python, shell, and YAML each now run one ordered character walk (rounds 14–16).
+ *   SQL alone still ran `stripStrings(stripSqlComments(text))` for the symbol view and
+ *   `stripSqlComments(text)` alone for the content view — the same two-pass, comment-blind-to-
+ *   strings pipeline every prior round fixed for its own language, still present here because
+ *   round 16's own closing note named it and stopped.
+ *
+ *   Measured against this repository's own tracked SQL before fixing it, not assumed broken by
+ *   analogy: neither `src/db/schema.sql` nor `tests/fixtures/schema-v11.sql` contains a `--` or
+ *   `/* *\/` literally inside a `'...'` string (verified with a proper quote-aware walk — a naive
+ *   regex check falsely "finds" several, every one of them an English possessive apostrophe inside
+ *   a `--` comment pairing with a real string quote many lines later, exactly the trap round 16's
+ *   own YAML corpus check had to walk past). The old pipeline and the new `stripSqlSource` produce
+ *   byte-identical output for both real files, in both views — this defect had no live corpus
+ *   instance in this repository's SQL, unlike the shell one. That is a fact about this corpus, not
+ *   a reason the fix was unnecessary: the pipeline was exactly as blind to string boundaries as the
+ *   shell one was, and a RED test built from a constructed instance of the same shape (a `--`
+ *   inside a `'...'` string desynchronizing a later real symbol, `tests/unit/tracker-loci-strip-
+ *   invariants.test.ts`) failed against the old pipeline and passes against the new one.
+ *
+ *   `stripSqlSource` (`scripts/lib/tracker-loci-strip.mjs`) gives SQL the same single ordered walk:
+ *   `--` starts a comment unconditionally (unlike shell's `#`, SQL's `--` has no other meaning, so
+ *   there is no word-boundary rule needed); `/* *\/` does not nest, confirmed against SQLite's own
+ *   documented behavior (this repository's actual engine, via `better-sqlite3`); a `'...'` value
+ *   string escapes its own delimiter by *doubling* it, not backslash — a real semantic correction
+ *   from `stripStrings`'s backslash-based regex, standard SQL and SQLite both treat `\` as a
+ *   literal character in a string; `"..."`/`` `...` ``/`[...]` are *identifier* quoting, not value
+ *   quoting, so unlike `'...'` they are recognized as atomic spans but never blanked in either view
+ *   — a quoted column or table name is a real reference the same way a bareword identifier is. The
+ *   mirror case holds the same way it does for every other language here: a quote inside a `--` or
+ *   `/* *\/` comment is just comment text and never opens a string or identifier. Dollar-quoting
+ *   (PostgreSQL's `$tag$...$tag$`) is disclosed as unimplemented, not silently scored: this
+ *   repository's SQLite schema has no dollar-quoted string anywhere, and SQLite itself does not
+ *   support the feature, so there is nothing in this corpus or this engine to verify it against.
+ *
+ *   All five dispatches now run one ordered walk each. None remains on the old two-pass shape.
  *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
@@ -755,8 +796,7 @@ import {
   stripJsSource,
   stripPythonSource,
   stripShellSource,
-  stripSqlComments,
-  stripStrings,
+  stripSqlSource,
   stripYamlSource,
 } from "./lib/tracker-loci-strip.mjs";
 
@@ -855,7 +895,7 @@ const codeSearchScope = (relPath) => {
   if (PY_EXTS.has(ext)) return "outside a `#` comment or quoted string";
   if (SH_EXTS.has(ext)) return "outside a `#` comment (at a word boundary), a quoted string, or a heredoc body";
   if (YAML_EXTS.has(ext)) return "outside a `#` comment (at a word boundary) or a quoted scalar";
-  if (SQL_EXTS.has(ext)) return "outside a `--`/`/* */` comment or quoted string";
+  if (SQL_EXTS.has(ext)) return "outside a `--`/`/* */` comment or a quoted string (a quoted identifier is code)";
   return `as plain text (no comment or string exclusion applies to .${ext} files)`;
 };
 
@@ -876,7 +916,7 @@ const stripToCodeView = (text, ext) => {
   if (PY_EXTS.has(ext)) return stripPythonSource(text, true);
   if (SH_EXTS.has(ext)) return stripShellSource(text, true);
   if (YAML_EXTS.has(ext)) return stripYamlSource(text, true);
-  if (SQL_EXTS.has(ext)) return stripStrings(stripSqlComments(text));
+  if (SQL_EXTS.has(ext)) return stripSqlSource(text, true);
   return text; // no supported comment syntax for this extension — see codeSearchScope
 };
 
@@ -927,7 +967,7 @@ const stripCommentsForContentView = (text, ext) => {
   if (PY_EXTS.has(ext)) return stripPythonSource(text, false);
   if (SH_EXTS.has(ext)) return stripShellSource(text, false);
   if (YAML_EXTS.has(ext)) return stripYamlSource(text, false);
-  if (SQL_EXTS.has(ext)) return stripSqlComments(text);
+  if (SQL_EXTS.has(ext)) return stripSqlSource(text, false);
   return text;
 };
 

@@ -1696,6 +1696,82 @@ describe("verify-tracker-loci-resolve", () => {
     });
   });
 
+  describe("[round 17] #689: SQL — the fifth and last dispatch, disclosed at the end of round 16 and fixed here", () => {
+    it("sessions_incarnation_immutable in src/db/schema.sql resolves silently — the real repo citation", () => {
+      // A real, current trigger name declared in this repository's own tracked SQL. Measured
+      // before writing this test, not assumed: the old and new SQL pipelines produce byte-
+      // identical output for this file (see tests/unit/tracker-loci-strip-invariants.test.ts's own
+      // "old and new pipelines agree" test) — this repository's SQL corpus has no live instance of
+      // the cascading-desync shape round 16 found in shell, so this citation already resolved
+      // before the fix and still does after it. It is here as the positive control the fixed
+      // dispatch is checked against, not as RED evidence (see the next test for that).
+      const body = "`sessions_incarnation_immutable` in `src/db/schema.sql`";
+      const { path, cleanup } = withIssues([
+        { number: 68905, title: "round 17: real SQL trigger name still resolves", body },
+      ]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a symbol spelled only inside a SQL string with an embedded -- reads STALE — constructed RED evidence, this repo's SQL has no live instance", () => {
+      // The real corpus check (above, and in tracker-loci-strip-invariants.test.ts) confirms this
+      // repository's tracked SQL has no `--`/`/* */` literally inside a '...' string, so unlike
+      // round 16's real deploy/install-launchd.sh citation, this round's RED evidence has to be
+      // constructed — a fact about this corpus's coverage, not a weaker fix. This is the same
+      // shape round 16 found for real: a -- embedded in a string destroys that string's closing
+      // quote under the old stripStrings(stripSqlComments(text)) pipeline, and the whole-file
+      // string regex then pairs the orphaned quote with the next real one in the file,
+      // desynchronizing everything after it — proven directly against the old pipeline in
+      // tracker-loci-strip-invariants.test.ts's own constructed-instance test.
+      const sqlText = [
+        "SELECT 'note: value--marker still a string' AS explanation;",
+        "SELECT 'first' AS a;",
+        "SELECT 'onlyInsideThisSqlStringXYZ' AS b;",
+        "CREATE TABLE real_table_marker_xyz (id INTEGER);",
+        "",
+      ].join("\n");
+      // The script's authority for "what is a file" is `git ls-files` (see its own header) — a
+      // synthetic --repo-root has to be a real git repo with the fixture actually tracked, the
+      // same requirement every other --repo-root test in this file already meets.
+      const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-sql-"));
+      try {
+        writeFileSync(join(dir, "sample.sql"), sqlText);
+        spawnSync("git", ["init", "-q", "."], { cwd: dir });
+        spawnSync("git", ["add", "-A"], { cwd: dir });
+        spawnSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
+          cwd: dir,
+        });
+        const issuesPath = join(dir, "issues.json");
+        writeFileSync(
+          issuesPath,
+          JSON.stringify(
+            [
+              {
+                number: 68906,
+                title: "round 17: SQL string/comment ordering, constructed",
+                body: "`onlyInsideThisSqlStringXYZ` in `sample.sql`",
+              },
+            ],
+            null,
+            2,
+          ),
+        );
+        const result = run(issuesPath, [`--repo-root=${dir}`]);
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("onlyInsideThisSqlStringXYZ");
+        expect(result.stdout).toContain("does not appear");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);
