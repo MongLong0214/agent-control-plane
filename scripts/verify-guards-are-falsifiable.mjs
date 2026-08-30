@@ -2805,12 +2805,20 @@ const GUARDS = [
     ],
   },
   {
-    what: "a collected file without a completed interval is an incomplete run",
+    what: "a reporter-pending assertion is incomplete rather than a completed skip",
     file: "scripts/run-vitest-gate.mjs",
-    find: "  if (incompleteFiles.length > 0) {",
-    replace: "  if (incompleteFiles.length < 0) {",
+    find:
+      "  const pendingAssertions = assertions.filter(\n" +
+      '    (assertion) => assertion?.status === "pending",\n' +
+      "  ).length;\n" +
+      "  const skippedAssertions = assertions.filter(\n" +
+      '    (assertion) => assertion?.status === "skipped",\n' +
+      "  ).length;",
+    replace:
+      "  const pendingAssertions = 0;\n" +
+      "  const skippedAssertions = report.numPendingTests;",
     killedBy: [
-      "tests/process/vitest-result-gate.test.ts::fails when a collected file is incomplete",
+      "tests/process/vitest-result-gate.test.ts::classifies a reporter pending assertion as incomplete",
     ],
   },
   {
@@ -2827,7 +2835,7 @@ const GUARDS = [
     file: "scripts/run-vitest-gate.mjs",
     find:
       '      out(\n' +
-      '        "VITEST GATE: FAIL — two consecutive infrastructure-classified runs; product tests passed in both runs, but infrastructure stayed nonzero",\n' +
+      '        "VITEST GATE: FAIL — two consecutive infrastructure-classified runs; neither run had a product test failure, but infrastructure stayed nonzero",\n' +
       "      );\n" +
       "      return 1;",
     replace:

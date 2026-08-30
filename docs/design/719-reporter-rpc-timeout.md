@@ -270,6 +270,13 @@ There is still no repository configuration key for this timer. Vitest 4.1.11 dis
 the standard transport. Consequently the exact `[vitest-worker]: Timeout calling "onTaskUpdate"`
 failure cannot be produced by waiting 60 seconds on that worker RPC in 4.1.11.
 
+The 4.1.11 JSON reporter's `StatusMap` keeps the evidence needed by the gate: task states `run`
+and `queued` become assertion status `pending`, while mode/state `skip` becomes `skipped` and
+`todo` remains `todo`. Its top-level `numPendingTests` counter is less precise: it combines
+`run`/`queued` tests with skipped tests. The gate therefore reads assertion status to distinguish
+unfinished work from intentional non-execution and does not add `numPendingTests` to its count of
+completed outcomes.
+
 The npm artifact does not bundle a changelog. External release-note review was unavailable in the
 networkless sandbox and is **unmeasured**. The locally available package and source did expose the
 relevant compatibility changes: Vitest now requires Node 20.x, 22.x, or 24 and newer; this repository
@@ -292,31 +299,38 @@ contained a completed interval for the one collected file and consistent 6/6 cou
 report files, runs the normal Vitest production entry point, and classifies the new JSON result:
 
 - any failed assertion or failed-test counter is a product failure;
-- a collected file without a finite, ordered start/end interval is incomplete and fails;
+- a collected file without a finite, ordered start/end interval, or with any `pending` assertion,
+  is incomplete and fails;
 - missing, malformed, empty, inconsistent, or unsuccessful result data fails closed;
-- a complete all-passing result plus exit zero passes; and
-- a complete all-passing result plus a nonzero exit is explicitly infrastructure, not a product
-  failure.
+- a complete result with no product failure plus exit zero passes; and
+- a complete result with no product failure plus a nonzero exit is explicitly infrastructure,
+  not a product failure.
 
 Only that last classification is retried, exactly once. A second infrastructure classification
-fails the gate and prints both that the product tests passed and that infrastructure remained
-nonzero. Product, incomplete, and invalid results are never retried or converted to success.
+fails the gate and prints both that neither run had a product test failure and that infrastructure
+remained nonzero. Product, incomplete, and invalid results are never retried or converted to
+success.
 
-Four synthetic counterexamples are permanent tests and mutation rows. Each mutation was applied
+The incomplete fixture is an actual 4.1.11 JSON report. A forked test first waited 100 ms so its
+`run` update reached the main process, then sent `SIGTERM` to its own worker. Vitest exited 1 and
+warned that a test was still running, but wrote `success: true`, `numPendingTests: 1`, a `pending`
+assertion, and equal finite file start/end times. That saved output drives both the classification
+test and the no-retry test; the latter supplies a successful second attempt and proves it is never
+called.
+
+Four classification counterexamples are permanent tests and mutation rows. Each mutation was applied
 individually, its named test was run as a regular-expression-safe selector, the test failed, and
 the source was restored:
 
 | mutation | named test result |
 |---|---|
 | ignore a failed-test count | failed: expected `product-failure`, received `run-failure` |
-| ignore an incomplete collected file | failed: expected `incomplete`, received `run-failure` |
+| conflate a pending assertion with a completed skip | failed: expected `incomplete`, received `infrastructure` |
 | treat nonzero after complete pass as zero | failed: expected `infrastructure`, received `pass` |
 | let a second infrastructure result pass | failed: expected exit 1, received exit 0 |
 
-The restored test file passed 6/6 under both the installed 3.2.7 runner and the exact 4.1.11
-runner. The actual gate entry point, exercised against the installed runner, wrote JSON and JUnit
-and printed `PASS` for one completed file and six passing tests. A 4.1.11 JSON result for that same
-file classified as `pass` with exit zero and `infrastructure` with exit one.
+The restored test file passed 8/8 under the exact installed 4.1.11 runner. The actual gate entry
+point wrote JSON and JUnit and printed `PASS` for one completed file and eight passing tests.
 
 ### Independent downstream jobs and cost
 

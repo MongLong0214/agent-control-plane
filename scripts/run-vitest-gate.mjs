@@ -42,16 +42,17 @@ export const classifyVitestRun = (exitCode, report) => {
     return invalid("the result file names no collected test files");
   }
 
+  const assertions = [];
+  for (const file of report.testResults) {
+    if (!file || typeof file !== "object" || !Array.isArray(file.assertionResults)) {
+      return invalid("a collected test file has no assertion results");
+    }
+    assertions.push(...file.assertionResults);
+  }
+
   const files = report.testResults.length;
   const tests = report.numTotalTests;
-  const failedAssertions = report.testResults.reduce(
-    (total, file) =>
-      total +
-      (Array.isArray(file?.assertionResults)
-        ? file.assertionResults.filter((assertion) => assertion?.status === "failed").length
-        : 0),
-    0,
-  );
+  const failedAssertions = assertions.filter((assertion) => assertion?.status === "failed").length;
   const failedTests = Math.max(report.numFailedTests, failedAssertions);
   if (failedTests > 0) {
     return {
@@ -68,17 +69,40 @@ export const classifyVitestRun = (exitCode, report) => {
       !Number.isFinite(file?.endTime) ||
       file.endTime < file.startTime,
   );
-  if (incompleteFiles.length > 0) {
+  const pendingAssertions = assertions.filter(
+    (assertion) => assertion?.status === "pending",
+  ).length;
+  const skippedAssertions = assertions.filter(
+    (assertion) => assertion?.status === "skipped",
+  ).length;
+  if (incompleteFiles.length > 0 || pendingAssertions > 0) {
+    const reasons = [];
+    if (incompleteFiles.length > 0) {
+      reasons.push(
+        `${incompleteFiles.length} collected test file${incompleteFiles.length === 1 ? " has" : "s have"} no completed interval`,
+      );
+    }
+    if (pendingAssertions > 0) {
+      reasons.push(
+        `${pendingAssertions} assertion${pendingAssertions === 1 ? " is" : "s are"} still pending`,
+      );
+    }
     return {
       kind: "incomplete",
-      reason: `${incompleteFiles.length} collected test file${incompleteFiles.length === 1 ? " has" : "s have"} no completed interval`,
+      reason: reasons.join("; "),
       files,
       tests,
     };
   }
 
+  if (report.numPendingTests !== skippedAssertions) {
+    return invalid(
+      `Vitest's pending counter reports ${report.numPendingTests}, but ${skippedAssertions} completed assertions were skipped`,
+    );
+  }
+
   const accountedTests =
-    report.numPassedTests + report.numFailedTests + report.numPendingTests + report.numTodoTests;
+    report.numPassedTests + report.numFailedTests + skippedAssertions + report.numTodoTests;
   if (accountedTests !== report.numTotalTests) {
     return invalid(
       `test counters account for ${accountedTests} of ${report.numTotalTests} collected tests`,
@@ -96,14 +120,14 @@ export const classifyVitestRun = (exitCode, report) => {
   if (exitCode !== 0) {
     return {
       kind: "infrastructure",
-      reason: `all ${files} collected files completed and all ${tests} tests passed, but Vitest exited ${exitCode}`,
+      reason: `all ${files} collected files completed; ${report.numPassedTests} passed, ${skippedAssertions} skipped, ${report.numTodoTests} todo, but Vitest exited ${exitCode}`,
       files,
       tests,
     };
   }
   return {
     kind: "pass",
-    reason: `all ${files} collected files completed and all ${tests} tests passed`,
+    reason: `all ${files} collected files completed; ${report.numPassedTests} passed, ${skippedAssertions} skipped, ${report.numTodoTests} todo`,
     files,
     tests,
   };
@@ -157,7 +181,7 @@ export const runGate = (runAttempt, out = console.log) => {
     if (result.classification.kind !== "infrastructure") return 1;
     if (attempt === 2) {
       out(
-        "VITEST GATE: FAIL — two consecutive infrastructure-classified runs; product tests passed in both runs, but infrastructure stayed nonzero",
+        "VITEST GATE: FAIL — two consecutive infrastructure-classified runs; neither run had a product test failure, but infrastructure stayed nonzero",
       );
       return 1;
     }
