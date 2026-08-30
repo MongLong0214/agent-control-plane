@@ -474,6 +474,15 @@ const GUARDS = [
     ],
   },
   {
+    what: "the reviewer cannot write the disposable realm allocator through its temporary-directory allowance",
+    file: "src/runtime/cli-adapters.ts",
+    find: "  lines.push(`(deny file-write* (subpath ${quote(resolvePath(disposableWorkspaceRoot))}))`);",
+    replace: "  void disposableWorkspaceRoot;",
+    killedBy: [
+      "tests/unit/reviewer-transcript-isolation.test.ts::places disposable allocator denials after the temporary write allowance",
+    ],
+  },
+  {
     what: "the periodic capacity sweep gets a budget sized against the sweep, not against startup",
     symbols: ["sweepBudgetMs"],
     file: "src/daemon/daemon.ts",
