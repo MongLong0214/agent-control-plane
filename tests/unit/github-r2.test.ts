@@ -12,6 +12,9 @@ import { TrustedCredentialStore } from "../../src/github/credential-store.ts";
 import { validateBranchContract } from "../../src/github/branch-contract.ts";
 import type { GitHubClient } from "../../src/github/github-kernel.ts";
 import * as confirmedMergeOperation from "../../src/github/confirmed-merge-operation.ts";
+import type { ConfirmedMergePorts } from "../../src/github/confirmed-merge-operation.ts";
+import { ExecutionMode, RunKind, RunState } from "../../src/domain/types.ts";
+import type { RunRow } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { FakeGitHub } from "../helpers/fake-github.ts";
 import {
@@ -535,10 +538,66 @@ describe("round-two GitHub hardening", () => {
     try {
       const refused = await fixture.harness.cp.github.prPrepare(fixture.input);
       expect(refused.allowed).toBe(false);
-      expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_DIGEST_MISMATCH);
+      expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_UNVERIFIED);
     } finally {
       manifest.mockRestore();
     }
+  });
+
+  // #448: this is a defensive check on a state the schema and the dispatch flow are not known
+  // to produce for any run this call site is reachable for — a run's `pinned_manifest_digest`
+  // is immutable once set (`runs_pinned_manifest_digest_immutable`), and every path that
+  // dispatches a project-scoped run into `FINALIZATION_STATES` pins one first. It is unit-tested
+  // at the function's own boundary, the same way `#89/#200` above tests `branchProfile()`'s
+  // sibling check by mocking a port rather than contriving the state through the full daemon.
+  it("#448 reports CONTRACT_UNVERIFIED when a CEO-approved run has no pinned manifest at all", () => {
+    const baseRun: RunRow = {
+      runId: "run-448-no-manifest",
+      projectId: "proj-448",
+      kind: RunKind.STANDARD_WORK,
+      executionMode: ExecutionMode.STANDARD,
+      priority: "NORMAL",
+      state: RunState.CEO_APPROVED,
+      goal: "#448 unpinned manifest at finalization",
+      contractDigest: `sha256:${"1".repeat(64)}`,
+      pinnedManifestDigest: null,
+      ownerSessionId: "session-448",
+      ownerBindingGeneration: 1,
+      ownerSessionIncarnation: null,
+      ownerRoleKey: null,
+      humanGateRequired: false,
+      revisionCount: 0,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      dispatchedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: null,
+      stateReason: null,
+    };
+    const unreachable = (name: string) => () => {
+      throw new Error(`${name} must not be reached before the pinned-manifest check`);
+    };
+    const ports = {
+      github: {
+        gatePublish: unreachable("github.gatePublish"),
+        prPrepare: unreachable("github.prPrepare"),
+        mergeExecute: unreachable("github.mergeExecute"),
+      },
+      runs: {
+        get: () => baseRun,
+        currentCandidate: unreachable("runs.currentCandidate"),
+      },
+      artifacts: { latestForSnapshot: unreachable("artifacts.latestForSnapshot") },
+      projects: { manifest: unreachable("projects.manifest") },
+      clock: { nowIso: unreachable("clock.nowIso") },
+      daemonFinalizerAuthority: {},
+    } as unknown as ConfirmedMergePorts;
+
+    const result = confirmedMergeOperation.deriveConfirmedMergePlan(ports, {
+      runId: baseRun.runId,
+      repositoryIdentity: "github:acme/fixture",
+      head: "a".repeat(40),
+      title: "finalize without a pinned manifest",
+    });
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONTRACT_UNVERIFIED });
   });
 
   it("#90: refuses PR preparation when no frozen candidate exists", async () => {

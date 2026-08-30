@@ -32,13 +32,13 @@
  * Dependency-free, in the shape of the other verify scripts (PRD §17.4).
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
-
 /**
  * `symbols` ties a row to the enforcement loci named by the Buzz-transition gate; every symbol in
  * that list must be claimed by some row. `find` must match its file exactly once — a mutation
@@ -85,6 +85,46 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // This is the one static outflow for the code. Its catalogue classification remains,
+    // proving that membership metadata and prose cannot satisfy the outflow census.
+    what: "every declared reason code has a verified static outflow",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,\n",
+    replace:
+      '          ("CONVERSATION_TARGET_ATTESTATION_STALE is retained for a future consumer",\n' +
+      "            ReasonCode.CONVERSATION_TARGET_UNATTESTED),\n",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a verified static outflow",
+    ],
+  },
+  {
+    what: "a SQLite trigger reason code reaches the typed translator",
+    file: "src/db/database.ts",
+    find: "  SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,\n",
+    replace: "  SESSION_INCARNATION_IMMUTABLE: ReasonCode.CONFLICT,\n",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a verified static outflow",
+    ],
+  },
+  {
+    what: "catalogue metadata references are declared",
+    file: "src/core/reason-codes.ts",
+    find: '  CONVERSATION_TARGET_ATTESTATION_STALE: "CONVERSATION_TARGET_ATTESTATION_STALE",\n',
+    replace: "",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::catalogue metadata references are declared",
+    ],
+  },
+  {
+    what: "production trigger denials and mappings agree",
+    file: "scripts/verify-reason-code-usage.mjs",
+    find: '  ["src/db/migrations.ts", read("src/db/migrations.ts")],\n',
+    replace: "",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::production trigger denials and mappings agree",
+    ],
+  },
+  {
     // Two lifecycles in one field: the reply reservation writes `result_json` whole, and an
     // ordinary timeout produces a reply, so the claim and the turn identity went with it.
     what: "the turn claim is stored apart from the reply it will produce",
@@ -98,12 +138,356 @@ const GUARDS = [
   {
     // Without it a finished turn's claim is never cleared, and every replay of a completed
     // exchange reports an unknown outcome — a hold created by the fix above.
+    //
+    // The anchor carries the line above the mutated one on purpose: `completeNoReplyAndResolveTurn`
+    // ends in the same `return this.#resolveTurnHere(channel, nonce);` (#672's no-reply path shares
+    // the same terminal resolution), and a one-line anchor matched both — a row that is not about
+    // one specific guard. `if (!completed.allowed) return completed;` exists only in this method's
+    // reply-completion transaction, so pairing it with the mutated line is what makes this row
+    // about the reply path and not the no-reply one below.
     what: "a turn whose reply the transport accepted stops being outstanding",
     file: "src/ingress/ingress-guard.ts",
-    find: "      return this.#resolveTurnHere(channel, nonce);",
-    replace: "      return completed;",
+    find: "      if (!completed.allowed) return completed;\n      return this.#resolveTurnHere(channel, nonce);",
+    replace: "      if (!completed.allowed) return completed;\n      return completed;",
     killedBy: [
       "tests/unit/a-turn-and-a-reply-are-two-lifecycles.test.ts::resolves the turn in the same transaction that records the reply",
+    ],
+  },
+  {
+    // The no-reply counterpart of the row above: `completeNoReplyAndResolveTurn` never reserves
+    // or completes a reply, so `result_json` stays whatever it was when the turn was claimed —
+    // usually null. `isRecoverableIngressResult(null)` reads null as "never ran", so a claim that
+    // is resolved but whose result was never marked non-recoverable looks, to a later replay,
+    // exactly like a message that only got as far as being admitted. `recoverInFlight` then
+    // re-admits it and the handler runs a second time — worse than #672's original bug, which at
+    // least refused the redelivery outright. This is the mutation that removes the marker write
+    // and keeps only the resolution, reproducing exactly that.
+    what: "a turn with no reply is marked non-recoverable, not only resolved",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      const updated = this.db.run(\n" +
+      "        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (\n" +
+      "           result_json IS NULL OR (\n" +
+      "             json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND\n" +
+      "             json_extract(result_json, '$.phase') = 'ADMITTED'\n" +
+      "           )\n" +
+      "         )`,\n" +
+      "        [JSON.stringify({ kind: \"TELEGRAM_NO_REPLY\" }), channel, nonce],\n" +
+      "      );\n" +
+      "      if (updated.changes !== 1) {\n" +
+      "        // The read above passed but the write's own WHERE clause did not match — belt-and-braces\n" +
+      "        // against the same class of collapse `#recordResultHere`'s row-count check guards (#682,\n" +
+      "        // third review): a mismatch here means `result_json` changed between the read and this\n" +
+      "        // write, and reporting success regardless would be exactly the wrong-answer-with-\n" +
+      "        // confidence this method exists to refuse.\n" +
+      "        return deny(\n" +
+      "          ReasonCode.RESOURCE_COLLISION,\n" +
+      "          \"ingress result changed underneath the no-reply resolution\",\n" +
+      "          { channel, nonce },\n" +
+      "        );\n" +
+      "      }\n" +
+      "      this.db.run(\n" +
+      "        `UPDATE inbound_messages\n" +
+      "            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)\n" +
+      "          WHERE channel = ? AND nonce = ?`,\n" +
+      "        [this.clock.nowIso(), channel, nonce],\n" +
+      "      );",
+    replace:
+      "      this.db.run(\n" +
+      "        `UPDATE inbound_messages\n" +
+      "            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)\n" +
+      "          WHERE channel = ? AND nonce = ?`,\n" +
+      "        [this.clock.nowIso(), channel, nonce],\n" +
+      "      );",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::a synthetic fresh no-reply outcome is resolved by pollOnce",
+    ],
+  },
+  {
+    // The exact collapse Sol's review found (#682): `repliedAt` means the transport accepted a
+    // reply, and `completeNoReplyAndResolveTurn` produced no reply — writing `repliedAt` here
+    // would tell a later reader Telegram has a message it never received. Retargeting the write
+    // at `repliedAt` instead of `noReplyAt` reproduces exactly the field collapse that was
+    // reviewed and blocked; the row-level assertion this kills is the one Sol asked for, because
+    // `unresolvedTurns` and a redelivery's reason code both close over either field and cannot
+    // tell this mutation apart from the correct write.
+    what: "a no-reply turn is marked by its own field, not by reusing the reply's",
+    file: "src/ingress/ingress-guard.ts",
+    find: "            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)",
+    replace: "            SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::a synthetic fresh no-reply outcome is resolved by pollOnce",
+    ],
+  },
+  {
+    // The idempotency half of the same guard: a no-reply resolution must never move a claim that
+    // already carries a terminal fact, most importantly a real `repliedAt` from a reply the
+    // transport actually accepted. Removing the check lets a stray or duplicate call overwrite
+    // that evidence — unreachable through the router today (`resolveNoReplyOutcome` never calls
+    // this for a replayed outcome, and a fresh claim cannot already have `repliedAt`), which is
+    // exactly why it needs its own row rather than resting on that being true forever.
+    what: "a no-reply resolution never moves a claim that already has a terminal fact",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };\n" +
+      "      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {\n" +
+      "        // Already resolved, one way or the other. Idempotent-safe, and the guard that keeps a\n" +
+      "        // real `repliedAt` from ever being overwritten by this path.\n" +
+      "        return allow(ReasonCode.OK, undefined);\n" +
+      "      }\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: never writes noReplyAt over a turn whose reply already resolved",
+    ],
+  },
+  {
+    // The other order of the same guard (#682, second review): the row above covers
+    // reply-then-no-reply, but `#resolveTurnHere` — reachable directly through `resolveTurn`,
+    // not only through `completeReplyAndResolveTurn`'s own PENDING precondition — had no
+    // matching refusal for no-reply-then-reply. A *third* review found the first fix for this
+    // was itself a no-op: the WHERE clause silently matched zero rows and the function still
+    // returned `allow(OK)` regardless. This mutation removes the explicit, checked refusal that
+    // replaced it — writing `repliedAt` over a claim `completeNoReplyAndResolveTurn` already
+    // closed with `noReplyAt` would again leave one row asserting both "no reply was produced"
+    // and "the transport accepted a reply", and this time reporting success while doing it.
+    what: "resolveTurn refuses, rather than silently no-ops, over a claim a no-reply resolution already closed",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      if (claim.noReplyAt !== undefined) {\n" +
+      "        // A *different* terminal fact already closed this claim. Writing `repliedAt` now would\n" +
+      "        // assert both \"no reply was produced\" and \"the transport accepted a reply\" on one row —\n" +
+      "        // refuse rather than silently do nothing and report success.\n" +
+      "        return deny(\n" +
+      "          ReasonCode.RESOURCE_COLLISION,\n" +
+      "          \"cannot record a reply for a turn already resolved as no-reply\",\n" +
+      "          { channel, nonce },\n" +
+      "        );\n" +
+      "      }\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: resolveTurn refuses rather than silently no-ops over a turn a no-reply resolution already closed",
+    ],
+  },
+  {
+    // Found by Sol's counterexample (#682, third review): `reserveResponse` calls
+    // `recordResultIf(…, "AVAILABLE")` before the two rows above ever run, and that check reads
+    // only `result_json`'s own delivery status — the `TELEGRAM_NO_REPLY` marker has none, so a
+    // reservation against an already-no-reply-resolved turn read as available. Worse than the two
+    // rows above on its own: the reservation alone overwrites the non-recoverable marker with a
+    // `sent: false` reply reservation, which `isRecoverableIngressResult` reads as recoverable —
+    // reopening #672's exact vulnerability before `completeReplyAndResolveTurn` is ever reached.
+    // Refused here outright, rather than left to a later rollback, because this is the only place
+    // that also protects the reservation taken on its own.
+    what: "a reply reservation is refused for a turn already resolved as no-reply",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      if (current.turn_claim_json) {\n" +
+      "        const claim = JSON.parse(current.turn_claim_json) as { noReplyAt?: unknown };\n" +
+      "        if (claim.noReplyAt !== undefined) {\n" +
+      "          return deny(\n" +
+      "            ReasonCode.RESOURCE_COLLISION,\n" +
+      "            \"cannot transition an ingress result for a turn already resolved as no-reply\",\n" +
+      "            { channel, nonce },\n" +
+      "          );\n" +
+      "        }\n" +
+      "      }\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: reserveResponse refuses a reply for a turn already resolved as no-reply",
+    ],
+  },
+  {
+    // The fourth reader of `repliedAt`-as-"is this turn finished" (#682, Sol's review): #685
+    // repointed this check at `turn_claim_json` after #671 split the lifecycles, but kept
+    // `repliedAt IS NULL` as the only "still outstanding" test — the same collapse the ingress
+    // rows above guard against, arriving through a reader nobody had enumerated. Without the
+    // `noReplyAt` clause, a turn a handler genuinely decided not to reply to reports
+    // `TURN_OUTCOME_UNKNOWN` to `agentctl doctor system` forever, escalating to ERROR after
+    // `UNRESOLVED_TURN_ESCALATION_MINUTES` for a turn nothing is waiting on.
+    what: "doctor agrees with ingress that a no-reply resolution closes a claim",
+    file: "src/doctor/doctor.ts",
+    find: "          AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL",
+    replace: "",
+    killedBy: [
+      "tests/unit/doctor-sees-unresolved-turns.test.ts::#682: does not report a turn resolved by noReplyAt as still outstanding",
+    ],
+  },
+  {
+    // Found by Sol's review of #672's own PR (#682): `route()` reports `reply: null` for two
+    // different facts, and this guard is what keeps them apart. A replayed admission of a
+    // claimed turn whose reply reservation is still PENDING after a crash also comes back with
+    // `reply: null` — `storedResponseOutcome` omits it on purpose, so the poller does not resend
+    // into Telegram — and without `outcome.replayed` in this condition, that ambiguous "we do not
+    // know if this was sent" state was overwritten with a confident "nothing was sent", losing
+    // the durable evidence that Telegram may have already delivered it. Removing the clause
+    // restores exactly that: a replayed, still-PENDING reply reaches `completeNoReplyAndResolveTurn`
+    // and is destroyed.
+    what: "a replayed outcome is never read as a fresh no-reply, even when both carry reply: null",
+    file: "src/ingress/telegram-router.ts",
+    find: "    if (outcome.reply || !outcome.admitted || outcome.replayed) return;",
+    replace: "    if (outcome.reply || !outcome.admitted) return;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::#682: a claimed turn's PENDING reply survives a redelivery instead of becoming a false no-reply",
+    ],
+  },
+  {
+    // Found by Sol's review (#682): the constructor validates `nonceTtlMs` against the transport
+    // retention floor (#673) exactly once, but `policies` is a `Readonly<Record<...>>` whose
+    // readonly is shallow — it stops reassigning an entry, not writing to the `IngressPolicy`
+    // object that entry points at. Reading `policy.nonceTtlMs` again here re-reads a value the
+    // caller still owns and can still mutate, so the floor the constructor just refused to allow
+    // could reopen silently after construction. Reading a value this guard copied out at
+    // construction, and never re-reads from the caller's object, is what makes the floor hold for
+    // the object's whole lifetime rather than only at the instant it was built.
+    what: "the nonce ttl floor holds even if the caller mutates the policy object afterward",
+    file: "src/ingress/ingress-guard.ts",
+    find: "    this.prune(request.channel, this.#nonceTtlMsByChannel[request.channel] ?? DEFAULT_NONCE_TTL_MS);",
+    replace: "    this.prune(request.channel, policy.nonceTtlMs ?? DEFAULT_NONCE_TTL_MS);",
+    killedBy: [
+      "tests/unit/ingress-nonce-ttl-transport-retention.test.ts::#682: holds the floor even if the caller mutates the policy object after construction",
+    ],
+  },
+  {
+    // Found by Sol's review (#682, round 8): the constructor's floor was keyed by the channel's
+    // name (`TRANSPORT_RETENTION_MS["telegram"]`) alone, so any transport answering to that
+    // channel — a custom one that genuinely retains longer than 24h, or one nobody has measured
+    // at all — got the same 24h figure as the officially-measured `api.telegram.org` client.
+    // Mutating the derivation back to the bare channel-name lookup removes exactly that: a
+    // transport that declares a longer `transportRetentionMs` no longer raises the floor it is
+    // constructed against.
+    what: "the retention floor is derived from the transport's own declared retention, not the channel's name",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      const retention = policy.transportRetentionMs !== undefined\n" +
+      "        ? policy.transportRetentionMs\n" +
+      "        : TRANSPORT_RETENTION_MS[channel];",
+    replace: "      const retention = TRANSPORT_RETENTION_MS[channel];",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::raises the effective floor to a longer-than-24h transportRetentionMs rather than refusing, when nonceTtlMs is not explicit",
+    ],
+  },
+  {
+    // The other half of the same review comment: a caller stating explicitly that a transport's
+    // retention is not known (`transportRetentionMs: null`) must refuse construction rather than
+    // silently fall back to a measured figure that described a different server. Removing the
+    // check restores exactly the assumption #682 (round 8) found: an unmeasured transport gets
+    // the 24h floor anyway.
+    what: "construction refuses a policy that states its transport's retention is unknown",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "      if (retention === null) {\n" +
+      "        // The caller stated explicitly that this channel's transport retention is not known —\n" +
+      "        // a self-hosted endpoint nobody has measured, or a stand-in for one. Assuming the\n" +
+      "        // measured `api.telegram.org` figure applies anyway would be this issue's original\n" +
+      "        // mistake in a new place, so this refuses rather than guesses. Marked with `code` and\n" +
+      "        // `channel` (see `isTransportRetentionUnknown` above) so a caller can tell this refusal\n" +
+      "        // apart from every other reason this constructor throws.\n" +
+      "        throw Object.assign(\n" +
+      "          new Error(\n" +
+      "            `ingress policy for '${channel}' does not know its transport's redelivery retention ` +\n" +
+      "              `(transportRetentionMs is null); refusing to assume a measured default applies to a ` +\n" +
+      "              `transport that has not stated its own (#682)`,\n" +
+      "          ),\n" +
+      "          { code: TRANSPORT_RETENTION_UNKNOWN, channel },\n" +
+      "        );\n" +
+      "      }\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::refuses to construct when the transport's retention is unmeasured, regardless of nonceTtlMs",
+    ],
+  },
+  {
+    // Production's own wiring, not just the guard's constructor: `startTelegramLongPollListener`
+    // used to build `IngressGuard` *before* choosing the real transport, so nothing there could
+    // ever have supplied this fact even after the guard learned to ask for it. Removing the wire
+    // (leaving `transportRetentionMs` unset) silently falls back to the old channel-keyed 24h
+    // default regardless of what transport was actually selected — including a custom one, or
+    // Telegram's own client pointed at a self-hosted `ACP_TELEGRAM_API_BASE_URL` this repository
+    // has never measured.
+    what: "production wiring threads the chosen transport's own declared retention into the guard",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      transportRetentionMs: transport.redeliveryRetentionMs ?? config.transportRetentionMs ?? null,\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::production wiring refuses to start against a transport whose retention is unknown, chosen before this fix constructed the guard",
+    ],
+  },
+  {
+    // Found by Sol's second review (#682, round 8 follow-up): the derivation above is right, but
+    // `agentcpd.ts`'s `main()` wraps every listener it starts in one `try`/`catch` that tears all
+    // of them down on any failure — so `IngressGuard`'s refusal for an unmeasured transport used
+    // to take the *whole daemon* down, not just Telegram, for a deployment that configured a
+    // supported self-hosted Bot API server on purpose. Mutating the guard back to an
+    // unconditional rethrow removes exactly the narrow catch that keeps MCP, Buzz and the
+    // operator door running when only Telegram's transport retention is unknown.
+    what: "an unmeasured transport's retention refuses only Telegram ingress, not the whole daemon",
+    file: "src/daemon/agentcpd.ts",
+    find: "    if (!isTransportRetentionUnknown(error)) throw error;",
+    replace: "    throw error;",
+    killedBy: [
+      "tests/unit/daemon-startup.test.ts::#682 round 8 follow-up: starts the daemon but refuses Telegram ingress when the transport's retention is unknown",
+    ],
+  },
+  {
+    // Found by Sol's second review (#682, round 8's second follow-up): a transport whose
+    // retention is genuinely *longer* than the default was refused exactly like one whose
+    // retention is unknown, conflating "different" with "unknown". Mutating the auto-derived
+    // floor back to the bare default removes exactly the raise: a known 48h retention with no
+    // explicit `nonceTtlMs` would then get a silent, unsafe 24h floor instead of 48h.
+    what: "the effective floor is raised to a known, longer transport retention rather than left at the bare default",
+    file: "src/ingress/ingress-guard.ts",
+    find: "        ttl = retention !== undefined ? Math.max(DEFAULT_NONCE_TTL_MS, retention) : DEFAULT_NONCE_TTL_MS;",
+    replace: "        ttl = DEFAULT_NONCE_TTL_MS;",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::raises the effective floor to a longer-than-24h transportRetentionMs rather than refusing, when nonceTtlMs is not explicit",
+    ],
+  },
+  {
+    // Found by Sol's third review (#682, round 8's third pass): refusing an unmeasured
+    // transport left an operator who knows their self-hosted server's real redelivery window
+    // with no production way to say so. Mutating away just the `config.transportRetentionMs`
+    // fallback (leaving the transport's own report and the outright refusal intact) removes
+    // exactly the escape hatch, without also disabling the surrounding refusal-when-unknown
+    // guard a coarser mutation on this line would.
+    what: "ACP_TELEGRAM_TRANSPORT_RETENTION_MS fills the gap when the transport itself reports unknown",
+    file: "src/ingress/telegram-polling.ts",
+    find: "transport.redeliveryRetentionMs ?? config.transportRetentionMs ?? null",
+    replace: "transport.redeliveryRetentionMs ?? null",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::fills the gap for a transport that reports its own retention as unknown",
+    ],
+  },
+  {
+    // Without reading the environment variable at all, the escape hatch above has nothing to
+    // fill the gap with — `config.transportRetentionMs` would always be `undefined`, and an
+    // operator who set `ACP_TELEGRAM_TRANSPORT_RETENTION_MS` would see it silently ignored.
+    what: "ACP_TELEGRAM_TRANSPORT_RETENTION_MS is read and validated into the configured Telegram config",
+    file: "src/ingress/telegram-polling.ts",
+    find:
+      "  const transportRetentionMs = parseOptionalBoundedInteger(\n" +
+      "    environment[\"ACP_TELEGRAM_TRANSPORT_RETENTION_MS\"],\n" +
+      "    60_000,\n" +
+      "    30 * 24 * 60 * 60 * 1000,\n" +
+      "  );",
+    replace: "  const transportRetentionMs = undefined;",
+    killedBy: [
+      "tests/unit/ingress-retention-derives-from-transport.test.ts::is read into the configured config, validated the same way as the other Telegram integer settings",
+    ],
+  },
+  {
+    // Found by Sol's fourth review (#682, round 8's fourth pass): `ACP_TELEGRAM_TRANSPORT_RETENTION_MS`
+    // was added to the code's `TELEGRAM_ENVIRONMENT_VARIABLES` but never to
+    // `deploy/install-launchd.sh`'s Keychain-export loop — the only place a launchd deployment's
+    // environment actually comes from. An operator on that supported deployment could set the
+    // Keychain entry and it would never reach the daemon; the escape hatch this PR built did not
+    // work on the deployment shape that matters. Mutating the loop back to omit the name
+    // reintroduces exactly that drift.
+    what: "the launchd launcher exports every ACP_TELEGRAM_* variable the code reads, not a hand-kept subset",
+    file: "deploy/install-launchd.sh",
+    find: "  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL ACP_TELEGRAM_TRANSPORT_RETENTION_MS; do",
+    replace: "  ACP_TELEGRAM_DEFAULT_PROJECT_ID ACP_TELEGRAM_API_BASE_URL; do",
+    killedBy: [
+      "tests/unit/telegram-env-launcher-drift.test.ts::TELEGRAM_ENVIRONMENT_VARIABLES is a subset of the launcher's optional-Keychain export loop",
     ],
   },
   {
@@ -519,6 +903,29 @@ const GUARDS = [
     replace: "    if (false) {",
     killedBy: [
       "tests/unit/ceo-conversation.test.ts::refuses a second turn while the first is still open",
+    ],
+  },
+  {
+    // A detached turn is not complete when pollOnce returns. Omitting it from the route list
+    // restores the old return type's lie in a new form: the work is still running, but the cycle
+    // says nothing was handed off and gives callers no promise to settle.
+    what: "pollOnce names a detached CEO turn as pending instead of returning an empty cycle",
+    file: "src/ingress/telegram-polling.ts",
+    find: '        routes.push({ status: "CEO_TURN_PENDING", outcome: route });',
+    replace: "",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::returns a pending CEO turn while refusing a second and reports the final offset when settled",
+    ],
+  },
+  {
+    // Detachment also removes the loop catch that used to impose retryDelayMs. Making a failed
+    // update immediately retryable reopens the hot loop while its Telegram offset is held.
+    what: "a detached Telegram route waits for retryDelayMs before it is attempted again",
+    file: "src/ingress/telegram-polling.ts",
+    find: "        retryAt: Date.now() + (this.options.retryDelayMs ?? 5_000),",
+    replace: "        retryAt: Date.now(),",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::waits for retryDelayMs before a detached route is attempted again",
     ],
   },
   {
@@ -1374,6 +1781,31 @@ const GUARDS = [
     ],
   },
   {
+    // #682 (fourth review): `completeNoReplyAndResolveTurn` used to overwrite `result_json`
+    // unconditionally, gated only by `turn_claim_json` checks that cannot see a reply reservation
+    // — `outcome.replayed` at the call site is a snapshot taken when `route()` returned, and
+    // cannot see a reservation another poller commits after that snapshot and before this
+    // transaction starts: `reserveResponse` writes `result_json` but never touches
+    // `turn_claim_json`, so the checks above would still see a claim with neither terminal fact
+    // and proceed to destroy a PENDING reservation — durable evidence that Telegram may already
+    // have accepted a reply. Widening the WHERE clause back to an unconditional match (the
+    // original bug) restores exactly that: a reservation lands, the no-reply path runs on the same
+    // nonce, and the reservation is gone.
+    what: "a no-reply resolution's write is bound to the row still being fresh ADMITTED, not any row for this nonce",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (\n" +
+      "           result_json IS NULL OR (\n" +
+      "             json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND\n" +
+      "             json_extract(result_json, '$.phase') = 'ADMITTED'\n" +
+      "           )\n" +
+      "         )`,",
+    replace: "        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`,",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682, fourth review: a reservation that lands after the router's snapshot survives the no-reply path",
+    ],
+  },
+  {
     // #695: both places the DIRECT branch read `unresolvedTurns()` used only its first (oldest)
     // element. A second unresolved turn accumulates whenever an overriding claim itself goes
     // unresolved (A crashes, `/again` claims B, B also crashes) — and the override record must
@@ -1569,6 +2001,50 @@ const GUARDS = [
       "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
     ],
   },
+  {
+    // The rollback image can carry the very missing guard that made an upgrade fail. Operator
+    // restore still requires that guard; this process-owned, exact-checksum snapshot must not.
+    what: "automatic migration rollback validates the captured image without requiring the invariant that migration was repairing",
+    file: "src/db/backup.ts",
+    find: "  const manifest = validateBackup(backup.path, { assertSchemaInvariants: false });",
+    replace: "  const manifest = validateBackup(backup.path, { assertSchemaInvariants: true });",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::restores a pinned v11 image whose missing guard was repaired before a later migration failure",
+    ],
+  },
+  {
+    // Renaming the old main file away while taking its forensic copy leaves no database for a
+    // restart to open if the process dies before the staged image is installed.
+    what: "restore keeps the live database readable until atomic replacement",
+    file: "src/db/backup.ts",
+    find: "      if (preservedDatabasePath) copyForensicFile(databasePath, preservedDatabasePath);",
+    replace: "      if (preservedDatabasePath) renameSync(databasePath, preservedDatabasePath);",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::restore keeps the live database readable until atomic replacement",
+    ],
+  },
+  {
+    // Checkpointing first mutates the main file and can truncate the WAL before their forensic
+    // copies exist. A hard link would share the same mutation, so the source set must be copied.
+    what: "restore copies the original database and sidecars before checkpointing the live database",
+    file: "src/db/backup.ts",
+    find: "      preserveExisting();\n      preservationComplete = true;\n      if (hadDatabase) checkpointExistingWal(databasePath);",
+    replace: "      if (hadDatabase) checkpointExistingWal(databasePath);\n      preserveExisting();\n      preservationComplete = true;",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::restore copies the original database and sidecars before checkpointing the live database",
+    ],
+  },
+  {
+    // A current database stamped one version back is not a released schema. The pinned SQL is v11,
+    // so the verifier must enter the migration chain at the version that actually produced it.
+    what: "the fresh database verifier opens its pinned released schema at v11",
+    file: "scripts/verify-fresh-database.ts",
+    find: "    raw.pragma(\"user_version = 11\");",
+    replace: "    raw.pragma(`user_version = ${SCHEMA_VERSION - 1}`);",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::migrates pinned v11 and restores it after the injected post-v12 failure",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
@@ -1671,6 +2147,36 @@ if (anchorsOnly) {
   out("RESULT: PASS");
   process.exit(0);
 }
+
+/**
+ * Where each per-mutation run's JSON reporter writes, read back so a `killedBy` selector's
+ * *actual* match count can be checked rather than assumed from the exit code — see the
+ * dead-selector check below.
+ *
+ * Deliberately not `evidence/local/ci-vitest-results.json`, and not merely "not that path by
+ * default" — `--outputFile.json=` below pins it, so `vitest.config.ts`'s mapping of the `json`
+ * reporter to that path is never consulted for these runs. That path is where `pnpm test` writes
+ * the *full* suite's result for `pnpm trace` to read (CI runs the suite once, not twice, for
+ * exactly this reason). A mutation run only exercises `killedBy`'s one file or test, so had this
+ * shared the path, the last row processed would leave that shared file holding a partial result —
+ * `success: false`, a handful of tests, nothing else — and `pnpm trace` would read a `killed`
+ * mutation (the harness working correctly) as the whole suite having failed. Reproduced end to
+ * end in CI on this branch's own PR before this comment was written: `pnpm test` and
+ * `pnpm guards:falsifiable` both green, `pnpm trace` red, reporting all 59 scenarios missing.
+ *
+ * This setup is intentionally below the `anchorsOnly` return. That mode promises no mutation,
+ * no tests, and no writes; even an otherwise harmless temp directory breaks it in a read-only
+ * environment.
+ *
+ * A fresh temp directory rather than a fixed name beside it: two sweeps must never share a file,
+ * the same reason `INFLIGHT`'s sentinel is per-repository rather than per-row.
+ */
+const MUTATION_REPORT_DIR = mkdtempSync(join(tmpdir(), "acp-guards-falsifiable-"));
+const MUTATION_JSON_REPORT = join(MUTATION_REPORT_DIR, "vitest-results.json");
+// `process.on("exit", ...)` rather than a call at each full-sweep exit point, and a temp directory
+// outside the repo is cheap enough to leave for the OS to reclaim on a crash — this is tidiness,
+// not a correctness requirement the way `restoreOnce()` is.
+process.on("exit", () => rmSync(MUTATION_REPORT_DIR, { recursive: true, force: true }));
 
 // ---------------------------------------------------------------------------
 // Safety. This edits tracked files in place. A dirty guarded file means a crash
@@ -1911,12 +2417,29 @@ try {
     ours(path, original, guard.file, "before mutating");
     const mutated = original.replace(guard.find, guard.replace);
     writeFileSync(path, mutated);
-    const done = spawnSync(VITEST, ["run", ...vitestArgsFor(guard.killedBy), "--reporter=dot"], {
-      cwd: ROOT,
-      encoding: "utf8",
-      env: { ...process.env, CI: "" },
-      timeout: 600_000,
-    });
+    // Removed, not overwritten-on-read: a crash that exits with a status but never reaches the
+    // JSON reporter would otherwise leave the *previous* row's report on disk, and the dead-
+    // selector check below would silently score this row against a different guard's numbers.
+    rmSync(MUTATION_JSON_REPORT, { force: true });
+    const done = spawnSync(
+      VITEST,
+      [
+        "run",
+        ...vitestArgsFor(guard.killedBy),
+        "--reporter=dot",
+        "--reporter=json",
+        // Pinned explicitly rather than left to vitest.config.ts's `outputFile.json` mapping —
+        // that mapping points at the full-suite artifact `pnpm trace` reads, and a mutation run
+        // only ever exercises one row's `killedBy`. See MUTATION_JSON_REPORT's comment.
+        `--outputFile.json=${MUTATION_JSON_REPORT}`,
+      ],
+      {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: { ...process.env, CI: "" },
+        timeout: 600_000,
+      },
+    );
     ours(path, mutated, guard.file, "before restoring");
     writeFileSync(path, original);
 
@@ -1936,6 +2459,49 @@ try {
       out("\nA run that did not happen cannot kill a guard. Refusing to report it as one.");
       process.exit(1);
     }
+
+    /**
+     * A named `killedBy` entry (`path::test name`) runs as `-t "test name"` — a regex, not a
+     * literal string. A name that happens to contain a regex metacharacter (`()[]{}.*+?^$|\`)
+     * is parsed as one: an empty `()` group matches zero characters rather than the two literal
+     * parens, so the pattern silently selects nothing. Vitest still exits 0 for that — "0 tests
+     * ran" is not a failure to vitest — so `killed` above reads a `-t` that matched nothing the
+     * same as one that matched and passed: `SURVIVED`, which is at least loud. The dangerous
+     * direction is the other one: if some *other* test in the same file happens to fail (for any
+     * reason, related or not), the file's exit is non-zero, this row prints `killed`, and the
+     * test actually named by `killedBy` never ran at all. That row then claims coverage a
+     * completely different test produced.
+     *
+     * So the match count is checked directly from what vitest itself observed, not inferred from
+     * the exit code. `numPassedTests + numFailedTests` is how many tests the run actually
+     * executed under the `-t` filter; a filtered-out test is neither, so a selector matching zero
+     * tests is provable without guessing at what the name "should" match.
+     */
+    const namedSelectors = guard.killedBy.map(splitKilledBy).filter((p) => p.name !== null);
+    let deadSelector = null;
+    if (namedSelectors.length > 0) {
+      let report = null;
+      try {
+        report = JSON.parse(readFileSync(MUTATION_JSON_REPORT, "utf8"));
+      } catch {
+        report = null;
+      }
+      const selected = report ? report.numPassedTests + report.numFailedTests : 0;
+      if (selected === 0) {
+        deadSelector = report
+          ? `killedBy names "${namedSelectors[0].name}" as a -t pattern, and vitest ran 0 tests under it ` +
+            `(${report.numTotalTests} in the file, all skipped) — the selector matches nothing, so this ` +
+            "row's exit code is not evidence about the guard either way"
+          : `killedBy names "${namedSelectors[0].name}", but no JSON test report was produced to confirm ` +
+            "it selected anything";
+      }
+    }
+    if (deadSelector) {
+      out(`  DEAD SELECTOR  ${guard.file}  ${guard.what}`);
+      failures.push({ guard, why: deadSelector });
+      continue;
+    }
+
     const killed = done.status !== 0;
     out(`${killed ? "  killed " : "  SURVIVED"}  ${guard.file}  ${guard.what}`);
     if (!killed) {
