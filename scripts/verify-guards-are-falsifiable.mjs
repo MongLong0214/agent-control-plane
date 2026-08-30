@@ -1900,6 +1900,50 @@ const GUARDS = [
       "tests/unit/canonical-turn-ledger.test.ts::refuses a source citing a fresh audit event instead of the turn's own claim event",
     ],
   },
+  {
+    // The rollback image can carry the very missing guard that made an upgrade fail. Operator
+    // restore still requires that guard; this process-owned, exact-checksum snapshot must not.
+    what: "automatic migration rollback validates the captured image without requiring the invariant that migration was repairing",
+    file: "src/db/backup.ts",
+    find: "  const manifest = validateBackup(backup.path, { assertSchemaInvariants: false });",
+    replace: "  const manifest = validateBackup(backup.path, { assertSchemaInvariants: true });",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::restores a pinned v11 image whose missing guard was repaired before a later migration failure",
+    ],
+  },
+  {
+    // Renaming the old main file away while taking its forensic copy leaves no database for a
+    // restart to open if the process dies before the staged image is installed.
+    what: "restore keeps the live database readable until atomic replacement",
+    file: "src/db/backup.ts",
+    find: "      if (preservedDatabasePath) copyForensicFile(databasePath, preservedDatabasePath);",
+    replace: "      if (preservedDatabasePath) renameSync(databasePath, preservedDatabasePath);",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::restore keeps the live database readable until atomic replacement",
+    ],
+  },
+  {
+    // Checkpointing first mutates the main file and can truncate the WAL before their forensic
+    // copies exist. A hard link would share the same mutation, so the source set must be copied.
+    what: "restore copies the original database and sidecars before checkpointing the live database",
+    file: "src/db/backup.ts",
+    find: "      preserveExisting();\n      preservationComplete = true;\n      if (hadDatabase) checkpointExistingWal(databasePath);",
+    replace: "      if (hadDatabase) checkpointExistingWal(databasePath);\n      preserveExisting();\n      preservationComplete = true;",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::restore copies the original database and sidecars before checkpointing the live database",
+    ],
+  },
+  {
+    // A current database stamped one version back is not a released schema. The pinned SQL is v11,
+    // so the verifier must enter the migration chain at the version that actually produced it.
+    what: "the fresh database verifier opens its pinned released schema at v11",
+    file: "scripts/verify-fresh-database.ts",
+    find: "    raw.pragma(\"user_version = 11\");",
+    replace: "    raw.pragma(`user_version = ${SCHEMA_VERSION - 1}`);",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::migrates pinned v11 and restores it after the injected post-v12 failure",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
