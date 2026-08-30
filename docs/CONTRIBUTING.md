@@ -101,9 +101,13 @@ another test.
 rather than to the wrong session (#505). That answers *is this pid still the process we recorded*.
 
 It does **not** answer *is the peer on this socket that process*. Only a kernel credential check
-(`LOCAL_PEERCRED`) does, and #539 tracks absorbing one. That absorption is not done: the source it
-names is not reachable from this checkout, and writing the C from scratch would be new native code
-wearing the word "absorb".
+(`LOCAL_PEERCRED`) does, and #539 tracks absorbing one.
+
+**Update:** the owner has since approved this repository's own native-addon build convention
+(ADR-0010 — `binding.gyp` + `node-addon-api`, prebuilt on the `macos-15` CI runner, modelled on how
+`better-sqlite3` is consumed) rather than importing the pinned-toolchain regime found elsewhere on
+this machine. `src/core/peercred.ts` and `native/peercred/` now exist and build on Darwin. That is
+not the same event as the gap below closing — see the next paragraph.
 
 This pointed at #450 until that issue was closed on 2026-08-15 with the work unfinished. An expiry
 condition hanging off a closed ticket expires by accident — the same defect #538 fixed one layer

@@ -38,6 +38,23 @@ const git = (args: readonly string[], cwd: string): string =>
   execFileSync("git", [...args], { cwd, encoding: "utf8" }).trim();
 
 describe("the falsifiability harness runs from a linked worktree", () => {
+  it("keeps anchors-only read-only even when the temp root cannot contain a directory", () => {
+    const run = spawnSync(
+      process.execPath,
+      [join(REPO_ROOT, "scripts", "verify-guards-are-falsifiable.mjs"), "--anchors-only"],
+      {
+        cwd: REPO_ROOT,
+        encoding: "utf8",
+        env: { ...process.env, TMPDIR: "/dev/null" },
+      },
+    );
+
+    const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    expect(output).not.toContain("ENOTDIR");
+    expect(run.status).toBe(0);
+    expect(output).toContain("RESULT: PASS");
+  });
+
   it("resolves its sentinel into the worktree's own git directory and completes", () => {
     const parent = tempDir("acp-wt-regression-");
     const worktree = join(parent, "checkout");
