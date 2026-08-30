@@ -175,6 +175,22 @@ const portFor = (
   throw new Error(`no port reports ${kind} under ${authority}`);
 };
 
+/**
+ * A fresh, real audit event — not a copy of any turn's `claim_audit_event_id` — the way a second,
+ * later admission would actually mint one. Used to build the counter-example below: a source row
+ * that cites its own honest admission event rather than borrowing the claim's.
+ */
+const freshAuditEvent = (h: Harness): number => {
+  h.cp.db.run(`INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, 'FIXTURE', '{}')`, [NOW]);
+  return Number(
+    (
+      h.cp.db.get<{ event_id: number }>(`SELECT MAX(event_id) AS event_id FROM audit_events`) ?? {
+        event_id: 0,
+      }
+    ).event_id,
+  );
+};
+
 const claimOf = (h: Harness, actorId: string, sources: TurnSource[], prompt = "hello") => {
   const decision = coordinatorOf(h).claim({ targetActorId: actorId, prompt, sources });
   if (!decision.allowed) throw new Error(`expected a permit, got ${decision.reasonCode}`);
@@ -1156,6 +1172,128 @@ describe("one unresolved turn per conversation", () => {
     });
 
     expect(second.allowed).toBe(true);
+  });
+
+  it("a later message during an IN_DOUBT turn never joins it, and starts its own once free (#693)", () => {
+    // #693: a message that arrives while an earlier one's turn is IN_DOUBT is refused twice —
+    // not a legal extra source of the turn already claimed (no method attaches one), and not a
+    // legal new turn either (the one-unresolved-turn hold refuses it). Both are the intended
+    // answer, not a gap: a later message always becomes its own independent turn once the
+    // incumbent settles, and it never merges into the one that was already claimed. This test
+    // pins the whole shape in one place rather than the two halves the tests above pin
+    // separately.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const first = claimOf(h, actorId, [source(h, "m1")]);
+
+    const joinAttempt = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "m1 and m2 together",
+      sources: [source(h, "m2")],
+    });
+    expect(joinAttempt.allowed).toBe(false);
+    expect(joinAttempt.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_IN_DOUBT);
+
+    settle(coordinatorOf(h), first, {
+      kind: "NEVER_ADMITTED",
+      authority: "ACP_PRE_DISPATCH",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+    const second = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "m2 alone",
+      sources: [source(h, "m2")],
+    });
+    expect(second.allowed).toBe(true);
+    if (!second.allowed) throw new Error("unreachable");
+
+    // The first turn's sources are exactly what it was claimed with — the refused join attempt
+    // left no trace on it.
+    const firstSources = h.cp.db.all<{ source_nonce: string }>(
+      `SELECT source_nonce FROM canonical_turn_sources WHERE turn_request_id = ?`,
+      [first.turnRequestId],
+    );
+    expect(firstSources.map((r) => r.source_nonce)).toEqual(["m1"]);
+
+    // The second turn's sources are exactly m2, alone — not m1 carried over from the incumbent,
+    // and not chained to it as a retry. This is what "starts its own" means: an independent turn
+    // with its own batch, not a merge of the two messages.
+    const secondSources = h.cp.db.all<{
+      source_nonce: string;
+      batch_ordinal: number;
+      predecessor_turn_request_id: string | null;
+    }>(
+      `SELECT source_nonce, batch_ordinal, predecessor_turn_request_id
+         FROM canonical_turn_sources WHERE turn_request_id = ?`,
+      [second.value.turnRequestId],
+    );
+    expect(secondSources).toEqual([
+      { source_nonce: "m2", batch_ordinal: 0, predecessor_turn_request_id: null },
+    ]);
+  });
+
+  it("refuses a direct INSERT whose source cites a fresh audit event, not its turn's own claim", () => {
+    // The schema forbids REPLACE and UPDATE/DELETE of a source row, but nothing forbade a plain
+    // INSERT of a new batch_ordinal onto a turn that already exists, and `ControlPlane.db` +
+    // `Db.run()` are public enough to do it. This is that INSERT, executed directly rather than
+    // through the coordinator — with an honestly-produced, *fresh* audit event, the shape any real
+    // second admission or coalescing write would actually have. `canonical_turn_sources_admission_
+    // matches_claim` requires a source's admission event to equal its turn's own claim event, and a
+    // fresh event never does, so this is refused. It is a narrower property than "no later source
+    // can ever attach" — see the test right below, which shows the one case this equality check
+    // cannot catch.
+    const h = makeHarness();
+    const actorId = target(h, "coalesce-insert");
+    const first = claimOf(h, actorId, [source(h, "m1")]);
+    const second = source(h, "m2");
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT INTO canonical_turn_sources
+           (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,
+            source_digest, predecessor_turn_request_id, admission_audit_event_id)
+         VALUES (?, ?, ?, ?, 1, 'd:m2', NULL, ?)`,
+        [first.turnRequestId, second.channel, second.nonce, second.attempt, freshAuditEvent(h)],
+      ),
+    ).toThrow();
+
+    // And the ledger reads exactly what `claim()` wrote — m1 alone. `prompt_digest` was frozen
+    // over that set at claim time; a source list that could grow after the fact is the whole
+    // corruption this refusal exists to prevent.
+    const sources = h.cp.db.all<{ source_nonce: string }>(
+      `SELECT source_nonce FROM canonical_turn_sources WHERE turn_request_id = ?`,
+      [first.turnRequestId],
+    );
+    expect(sources.map((r) => r.source_nonce)).toEqual(["m1"]);
+  });
+
+  it("does NOT refuse a direct INSERT whose source copies its turn's own claim event — the guard's known limit", () => {
+    // The trigger enforces an equality, not a provenance proof: it cannot tell an honest
+    // claim-time write from a raw writer that reads `canonical_turns.claim_audit_event_id` back
+    // out and copies it into a new source row, because the two columns then genuinely agree. A
+    // blind review reproduced exactly this — claim m1, then INSERT m2-late copying the turn's own
+    // claim event — and both rows persisted. That is not a bug in the trigger; it is the residual
+    // every trigger in this schema carries against a sufficiently privileged raw-SQL writer (one
+    // can always `DROP TRIGGER`, too). Pinned here so it is not silently assumed away and is not
+    // re-discovered as a surprise: this INSERT is expected to succeed.
+    const h = makeHarness();
+    const actorId = target(h, "coalesce-copied-id");
+    const first = claimOf(h, actorId, [source(h, "m1")]);
+    const claimEvent = h.cp.db.get<{ claim_audit_event_id: number }>(
+      `SELECT claim_audit_event_id FROM canonical_turns WHERE turn_request_id = ?`,
+      [first.turnRequestId],
+    )!.claim_audit_event_id;
+    const second = source(h, "m2-late");
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT INTO canonical_turn_sources
+           (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,
+            source_digest, predecessor_turn_request_id, admission_audit_event_id)
+         VALUES (?, ?, ?, ?, 1, 'd:m2-late', NULL, ?)`,
+        [first.turnRequestId, second.channel, second.nonce, second.attempt, claimEvent],
+      ),
+    ).not.toThrow();
   });
 
   it("holds one conversation without blocking another", () => {

@@ -275,6 +275,113 @@ describe("verification hardening findings", () => {
     ).toThrow(/PINNED_RUN_SCOPED_COMMANDS_IMMUTABLE/);
   });
 
+  // #448: `pinRunScopedCommands` guards a persisted §17.5 contract with four checks before it
+  // ever compares a candidate against it — none of the four is that comparison. Each used to
+  // report CONTRACT_DIGEST_MISMATCH, which reads as "compared and disagrees"; none of them
+  // compared anything. They must report CONTRACT_UNVERIFIED instead, the same as the sibling
+  // "manifest is not retrievable" check a few lines above this block.
+  it("#448 reports CONTRACT_UNVERIFIED when the guarded run-scoped pin write does not durably take", async () => {
+    const { harness, run, snapshot } = await temporaryCandidate();
+    const originalRun = harness.cp.db.run.bind(harness.cp.db);
+    const raceSpy = vi.spyOn(harness.cp.db, "run").mockImplementation((sql: string, params: unknown[] = []) => {
+      // Simulate a concurrent writer stealing the guarded null->pinned slot between this
+      // body's read and its own write: the write below is made a no-op, so the re-select
+      // right after it still finds nothing durable.
+      if (sql.includes("SET pinned_run_scoped_commands_digest")) {
+        return { changes: 0, lastInsertRowid: 0 };
+      }
+      return originalRun(sql, params);
+    });
+    try {
+      const command = parseVerificationCommand({
+        id: "race-suite",
+        argv: ["node", "-e", "process.exit(0)"],
+        timeoutSeconds: 5,
+      });
+      const result = await harness.cp.verification.verify({
+        runId: run.runId,
+        snapshot,
+        commands: [command],
+        contractDigest: snapshot.contractDigest,
+        runScoped: true,
+      });
+      expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONTRACT_UNVERIFIED });
+    } finally {
+      raceSpy.mockRestore();
+    }
+  });
+
+  it("#448 reports CONTRACT_UNVERIFIED when the persisted run-scoped contract fails to parse as JSON", async () => {
+    const { harness, run, snapshot } = await temporaryCandidate();
+    harness.cp.db.run(
+      `UPDATE runs
+          SET pinned_run_scoped_commands_digest = ?, pinned_run_scoped_commands_json = ?
+        WHERE run_id = ?`,
+      [`sha256:${"a".repeat(64)}`, "not valid json{", run.runId],
+    );
+    const command = parseVerificationCommand({
+      id: "parse-fail-suite",
+      argv: ["node", "-e", "process.exit(0)"],
+      timeoutSeconds: 5,
+    });
+    const result = await harness.cp.verification.verify({
+      runId: run.runId,
+      snapshot,
+      commands: [command],
+      contractDigest: snapshot.contractDigest,
+      runScoped: true,
+    });
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONTRACT_UNVERIFIED });
+  });
+
+  it("#448 reports CONTRACT_UNVERIFIED when the persisted run-scoped contract fails schema validation", async () => {
+    const { harness, run, snapshot } = await temporaryCandidate();
+    harness.cp.db.run(
+      `UPDATE runs
+          SET pinned_run_scoped_commands_digest = ?, pinned_run_scoped_commands_json = ?
+        WHERE run_id = ?`,
+      [`sha256:${"b".repeat(64)}`, JSON.stringify([{ notACommand: true }]), run.runId],
+    );
+    const command = parseVerificationCommand({
+      id: "schema-fail-suite",
+      argv: ["node", "-e", "process.exit(0)"],
+      timeoutSeconds: 5,
+    });
+    const result = await harness.cp.verification.verify({
+      runId: run.runId,
+      snapshot,
+      commands: [command],
+      contractDigest: snapshot.contractDigest,
+      runScoped: true,
+    });
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONTRACT_UNVERIFIED });
+  });
+
+  it("#448 reports CONTRACT_UNVERIFIED when the persisted run-scoped contract's own digest does not match its content", async () => {
+    const { harness, run, snapshot } = await temporaryCandidate();
+    const stored = parseVerificationCommand({
+      id: "integrity-suite",
+      argv: ["node", "-e", "process.exit(0)"],
+      timeoutSeconds: 5,
+    });
+    const wrongDigest = `sha256:${"c".repeat(64)}`;
+    harness.cp.db.run(
+      `UPDATE runs
+          SET pinned_run_scoped_commands_digest = ?, pinned_run_scoped_commands_json = ?
+        WHERE run_id = ?`,
+      [wrongDigest, JSON.stringify([stored]), run.runId],
+    );
+    expect(digestOf([stored])).not.toBe(wrongDigest);
+    const result = await harness.cp.verification.verify({
+      runId: run.runId,
+      snapshot,
+      commands: [stored],
+      contractDigest: snapshot.contractDigest,
+      runScoped: true,
+    });
+    expect(result).toMatchObject({ allowed: false, reasonCode: ReasonCode.CONTRACT_UNVERIFIED });
+  });
+
   it("lets different-branch verifications obtain distinct disposable worktrees while a checkout claim is held", async () => {
     const { harness, manifest, repository, runA, runB, snapshotFor, storeSnapshot } = await concurrentProjectCandidates();
     const claim = harness.cp.claims.acquire({

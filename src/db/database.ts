@@ -11,7 +11,7 @@ import {
   backupOpenDatabaseSync,
   nextBackupPath,
   pruneAutomaticBackups,
-  restoreDatabase,
+  restoreMigrationBackup,
   type DatabaseBackup,
 } from "./backup.ts";
 import {
@@ -396,7 +396,7 @@ export class Db {
       const migrationError = error instanceof Error ? error.message : String(error);
       if (this.#raw.open) this.#raw.close();
       try {
-        restoreDatabase(filename, backup.path);
+        restoreMigrationBackup(filename, backup);
       } catch (restoreError) {
         throw acpError(
           ReasonCode.INTERNAL_ERROR,
@@ -928,6 +928,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   CANONICAL_TURN_OBSERVATION_NO_REPLACE: ReasonCode.CONFLICT,
   CANONICAL_TURN_SOURCE_IMMUTABLE: ReasonCode.CONFLICT,
   CANONICAL_TURN_SOURCE_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME: ReasonCode.CONFLICT,
   CANONICAL_TURN_ADJUDICATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   CANONICAL_TURN_ADJUDICATION_APPEND_ONLY: ReasonCode.CONFLICT,
   CANONICAL_TURN_ADJUDICATION_CITATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,

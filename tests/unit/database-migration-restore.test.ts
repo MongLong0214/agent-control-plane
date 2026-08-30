@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   chmodSync,
@@ -506,7 +507,8 @@ describe("versioned SQLite migration", () => {
         [28, "v28-an-operator-can-settle-a-turn-nobody-observed"],
         [29, "v29-a-dispatch-is-a-fact"],
         [30, "v30-a-turn-and-a-reply-are-two-lifecycles"],
-        [SCHEMA_VERSION, "v31-a-generation-means-nothing-without-its-role-key"],
+        [31, "v31-a-generation-means-nothing-without-its-role-key"],
+        [SCHEMA_VERSION, "v32-a-source-can-only-cite-its-turns-own-claim-event"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a
@@ -701,6 +703,39 @@ describe("versioned SQLite migration", () => {
       recovered.close();
     }
   });
+
+  it("restores a pinned v11 image whose missing guard was repaired before a later migration failure", () => {
+    const path = join(tempDir("acp-migration-repair-failure-"), "state.sqlite");
+    const before = asV11Fixture(path, true);
+    if (!before) throw new Error("v11 fixture history was not seeded");
+    const raw = new Database(path);
+    raw.exec("DROP TRIGGER github_receipts_no_delete");
+    raw.close();
+
+    expect(
+      () =>
+        new Db(path, {
+          afterMigration: () => {
+            throw new Error("injected failure after invariant replay committed");
+          },
+        }),
+    ).toThrowError(/original database was restored/);
+
+    const restored = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(Number(restored.pragma("user_version", { simple: true }))).toBe(11);
+      expect(
+        restored
+          .prepare(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'trigger' AND name = 'github_receipts_no_delete'",
+          )
+          .get(),
+      ).toEqual({ n: 0 });
+      expect(history(restored)).toEqual(before);
+    } finally {
+      restored.close();
+    }
+  });
 });
 
 describe("backup and restore drill", () => {
@@ -727,6 +762,133 @@ describe("backup and restore drill", () => {
       expect(codeOf(() => recovered.run("DELETE FROM github_receipts"))).toBe(ReasonCode.CONFLICT);
     } finally {
       recovered.close();
+    }
+  });
+
+  it("restore keeps the live database readable until atomic replacement", async () => {
+    const path = join(tempDir("acp-restore-crash-"), "state.sqlite");
+    const source = new Db(path);
+    seedHistory(source);
+    const backup = await source.backup();
+    source.run(
+      `INSERT INTO runs (run_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+       VALUES ('run_after_backup', 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'QUEUED',
+               'must remain before replacement', 'sha256:after-backup', ?)`,
+      [NOW],
+    );
+    source.close();
+
+    const backupModule = new URL("../../src/db/backup.ts", import.meta.url).href;
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `const { restoreDatabase } = await import(${JSON.stringify(backupModule)});
+         restoreDatabase(${JSON.stringify(path)}, ${JSON.stringify(backup.path)}, {
+           afterPreservingExisting: () => process.kill(process.pid, "SIGKILL"),
+         });`,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(child.signal).toBe("SIGKILL");
+    expect(existsSync(path)).toBe(true);
+    const survived = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(survived.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(
+        survived.prepare("SELECT COUNT(*) AS n FROM runs WHERE run_id = 'run_after_backup'").get(),
+      ).toEqual({ n: 1 });
+    } finally {
+      survived.close();
+    }
+  });
+
+  it("restore copies the original database and sidecars before checkpointing the live database", async () => {
+    const path = join(tempDir("acp-restore-wal-crash-"), "state.sqlite");
+    const source = new Db(path);
+    seedHistory(source);
+    const backup = await source.backup();
+    source.close();
+
+    const databaseModule = new URL("../../src/db/database.ts", import.meta.url).href;
+    const writer = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `const { Db } = await import(${JSON.stringify(databaseModule)});
+         const source = new Db(${JSON.stringify(path)});
+         source.run(
+           \`INSERT INTO runs (run_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+             VALUES ('run_in_wal_before_restore', 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'QUEUED',
+                     'must survive in the forensic WAL', 'sha256:forensic-wal', ?)\`,
+           [${JSON.stringify(NOW)}],
+         );
+         process.kill(process.pid, "SIGKILL");`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(writer.signal).toBe("SIGKILL");
+
+    const originalDatabase = readFileSync(path);
+    const originalSidecars = new Map(
+      ["-wal", "-shm", "-journal"]
+        .filter((suffix) => existsSync(`${path}${suffix}`))
+        .map((suffix) => [suffix, readFileSync(`${path}${suffix}`)]),
+    );
+    expect(originalSidecars.has("-wal")).toBe(true);
+
+    const backupModule = new URL("../../src/db/backup.ts", import.meta.url).href;
+    const restore = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `const { restoreDatabase } = await import(${JSON.stringify(backupModule)});
+         restoreDatabase(${JSON.stringify(path)}, ${JSON.stringify(backup.path)}, {
+           afterPreservingExisting: () => process.kill(process.pid, "SIGKILL"),
+         });`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(restore.signal).toBe("SIGKILL");
+
+    const preservedDatabaseNames = readdirSync(defaultBackupDirectory(path)).filter(
+      (entry) => entry.startsWith(`${basename(path)}-pre-restore-`) && entry.endsWith(".sqlite"),
+    );
+    expect(preservedDatabaseNames).toHaveLength(1);
+    const preservedDatabasePath = join(defaultBackupDirectory(path), preservedDatabaseNames[0]!);
+    expect(readFileSync(preservedDatabasePath)).toEqual(originalDatabase);
+    for (const [suffix, bytes] of originalSidecars) {
+      expect(readFileSync(`${preservedDatabasePath}${suffix}`)).toEqual(bytes);
+    }
+
+    const forensic = new Database(preservedDatabasePath, { readonly: true, fileMustExist: true });
+    try {
+      expect(forensic.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(
+        forensic.prepare("SELECT COUNT(*) AS n FROM runs WHERE run_id = 'run_in_wal_before_restore'").get(),
+      ).toEqual({ n: 1 });
+    } finally {
+      forensic.close();
+    }
+
+    const survived = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(survived.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(
+        survived.prepare("SELECT COUNT(*) AS n FROM runs WHERE run_id = 'run_in_wal_before_restore'").get(),
+      ).toEqual({ n: 1 });
+    } finally {
+      survived.close();
     }
   });
 
@@ -813,5 +975,24 @@ describe("backup and restore drill", () => {
     } finally {
       migrated.close();
     }
+  });
+});
+
+describe("fresh database recovery verifier", () => {
+  it("migrates pinned v11 and restores it after the injected post-v12 failure", () => {
+    const script = fileURLToPath(new URL("../../scripts/verify-fresh-database.ts", import.meta.url));
+    const result = spawnSync(process.execPath, ["--import", "tsx", script, "--json"], {
+      cwd: fileURLToPath(new URL("../..", import.meta.url)),
+      encoding: "utf8",
+    });
+    const report = JSON.parse(result.stdout) as {
+      observed: Record<string, { ok?: boolean }>;
+      problems: string[];
+    };
+
+    expect(report.observed["olderVersion"]).toEqual({ ok: true });
+    expect(report.observed["migrationRestore"]).toEqual({ ok: true });
+    expect(report.problems).toEqual([]);
+    expect(result.status, result.stderr).toBe(0);
   });
 });

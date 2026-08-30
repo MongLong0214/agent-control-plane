@@ -315,4 +315,9 @@ export class TelegramIngress {
   unresolvedTurns(sessionDigest: string): readonly UnresolvedTurn[] {
     return this.guard.unresolvedTurns("telegram", sessionDigest);
   }
+
+  /** The no-reply counterpart: a claimed turn whose handler decided not to reply (#672). */
+  completeNoReplyAndResolveTurn(nonce: string): Decision<void> {
+    return this.guard.completeNoReplyAndResolveTurn("telegram", nonce);
+  }
 }
