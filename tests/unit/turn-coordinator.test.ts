@@ -1158,6 +1158,64 @@ describe("one unresolved turn per conversation", () => {
     expect(second.allowed).toBe(true);
   });
 
+  it("a later message during an IN_DOUBT turn never joins it, and starts its own once free (#693)", () => {
+    // #693: a message that arrives while an earlier one's turn is IN_DOUBT is refused twice —
+    // not a legal extra source of the turn already claimed (no method attaches one), and not a
+    // legal new turn either (the one-unresolved-turn hold refuses it). Both are the intended
+    // answer, not a gap: a later message always becomes its own independent turn once the
+    // incumbent settles, and it never merges into the one that was already claimed. This test
+    // pins the whole shape in one place rather than the two halves the tests above pin
+    // separately.
+    const h = makeHarness();
+    const actorId = target(h, "ceo");
+    const first = claimOf(h, actorId, [source(h, "m1")]);
+
+    const joinAttempt = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "m1 and m2 together",
+      sources: [source(h, "m2")],
+    });
+    expect(joinAttempt.allowed).toBe(false);
+    expect(joinAttempt.reasonCode).toBe(ReasonCode.CONVERSATION_TURN_IN_DOUBT);
+
+    settle(coordinatorOf(h), first, {
+      kind: "NEVER_ADMITTED",
+      authority: "ACP_PRE_DISPATCH",
+      reasonCode: ReasonCode.CEO_CONVERSATION_UNAVAILABLE,
+    });
+    const second = coordinatorOf(h).claim({
+      targetActorId: actorId,
+      prompt: "m2 alone",
+      sources: [source(h, "m2")],
+    });
+    expect(second.allowed).toBe(true);
+    if (!second.allowed) throw new Error("unreachable");
+
+    // The first turn's sources are exactly what it was claimed with — the refused join attempt
+    // left no trace on it.
+    const firstSources = h.cp.db.all<{ source_nonce: string }>(
+      `SELECT source_nonce FROM canonical_turn_sources WHERE turn_request_id = ?`,
+      [first.turnRequestId],
+    );
+    expect(firstSources.map((r) => r.source_nonce)).toEqual(["m1"]);
+
+    // The second turn's sources are exactly m2, alone — not m1 carried over from the incumbent,
+    // and not chained to it as a retry. This is what "starts its own" means: an independent turn
+    // with its own batch, not a merge of the two messages.
+    const secondSources = h.cp.db.all<{
+      source_nonce: string;
+      batch_ordinal: number;
+      predecessor_turn_request_id: string | null;
+    }>(
+      `SELECT source_nonce, batch_ordinal, predecessor_turn_request_id
+         FROM canonical_turn_sources WHERE turn_request_id = ?`,
+      [second.value.turnRequestId],
+    );
+    expect(secondSources).toEqual([
+      { source_nonce: "m2", batch_ordinal: 0, predecessor_turn_request_id: null },
+    ]);
+  });
+
   it("holds one conversation without blocking another", () => {
     // The hold is per conversation. A single global lock would make two CTOs serialise against
     // each other for no reason, which is the scaling shape this design refuses.

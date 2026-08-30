@@ -563,6 +563,27 @@ export class ConversationTurnCoordinator {
    * this one — wiring a production caller here is #683/#639's other half, deliberately not done in
    * this change. See `reconcileUnresolved`'s docstring, fact 1 of 2, for what that means for the
    * sweep — and fact 2, which is independent of this one and does not resolve when this does.
+   *
+   * A later message that arrives once this method has already produced an `IN_DOUBT` turn is
+   * refused twice over, and both refusals are the intended answer, not a gap (#693). It is not a
+   * legal extra source of the turn already claimed: nothing here or anywhere else attaches a
+   * source to a turn after `claim()` returns, `canonical_turn_sources` is written once, in the
+   * same transaction as the turn, and everything downstream leans on that being final —
+   * `prompt_digest` is fixed at that moment, `TurnPermit.issuance` signs over it, and
+   * `#settleFromReceipt`'s identity match compares a target's receipt against that same frozen
+   * value. A coalescing write would have to either rewrite `prompt_digest` after the fact —
+   * breaking the receipt match for a turn the target may already be executing against the value
+   * that was there first — or leave it unchanged, which records the turn as having consumed a
+   * message it was never actually asked to answer. Neither is a fix; both corrupt what
+   * `prompt_digest` is for. And it is not a legal new turn either: refused below by
+   * `canonical_turns_one_unresolved` / `CONVERSATION_TURN_IN_DOUBT`, on purpose, not as an
+   * accidental side effect of the one-unresolved-turn hold. A later message is always its own
+   * independent turn, admitted once the incumbent settles — it never joins one already claimed.
+   * Recourse for the caller belongs where the message is received, not here: the ingress ledger
+   * already parks a resend behind an unresolved claim and tells the owner to `/again` past it if
+   * they mean it now (#680, `telegram-router.ts`). That is the pattern to extend once this method
+   * gets a production caller (#638/#639) — not a second, bespoke coalescing mechanism built on
+   * `canonical_turns`.
    */
   claim(input: {
     targetActorId: string;
@@ -808,6 +829,10 @@ export class ConversationTurnCoordinator {
       // refusal rather than an exception. `db.tx` holds a write lock from BEGIN IMMEDIATE, so
       // nothing can slip a turn in between this read and the insert below; the partial unique
       // index stays as the backstop for a bug, and firing it is a fault rather than a state.
+      //
+      // This is also the "not a legal new turn" half of #693's answer: a later message never
+      // joins the incumbent (see this method's docstring) and is refused here rather than queued
+      // or coalesced, deliberately, every time this fires.
       const incumbent = this.db.get<{ turn_request_id: string }>(
         `SELECT turn_request_id FROM canonical_turns
           WHERE target_actor_id = ? AND lifecycle_state = 'IN_DOUBT'`,
