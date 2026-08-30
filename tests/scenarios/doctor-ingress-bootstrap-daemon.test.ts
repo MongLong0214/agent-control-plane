@@ -1,9 +1,10 @@
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { digestOf } from "../../src/core/digest.ts";
+import { runHermesTargetBind } from "../../src/runtime/hermes-target-bind.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
@@ -39,7 +40,30 @@ import {
 import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 
+vi.mock("../../src/runtime/hermes-target-bind.ts", async (original) => ({
+  ...(await original<typeof import("../../src/runtime/hermes-target-bind.ts")>()),
+  runHermesTargetBind: vi.fn(),
+}));
+
 afterAll(cleanupTempDirs);
+
+const TARGET = {
+  hermesExecutable: "/opt/owner/hermes", hermesProfile: "owner-profile", hermesHome: "/opt/owner/home",
+  requestedSessionId: "hermes-owner-session", expectedLineageRootDigest: digestOf({ root: "owner" }),
+  executorRuntimeIdentity: "acp-runtime:owner",
+};
+const withTarget = (input: { command: readonly string[]; model?: string }) => ({ ...input, ...TARGET });
+
+beforeEach(() => {
+  vi.mocked(runHermesTargetBind).mockImplementation((input) => {
+    const receipt = {
+      domain: "hermes.target-bind" as const, version: 1 as const, actor_id: input.actorId,
+      binding_generation: input.bindingGeneration, executor_runtime_identity: input.executorRuntimeIdentity,
+      requested_session_id: input.sessionId, lineage_root_digest: input.expectedLineageRootDigest,
+    };
+    return { allowed: true, value: { ...receipt, receipt_digest: digestOf(receipt) } };
+  });
+});
 
 const CONTRACT: TaskContract = {
   goal: "scenario",
@@ -215,7 +239,7 @@ describe("Hermes CEO bootstrap authority", () => {
       authorityHeld: () => false,
     });
     try {
-      const result = await authority.bootstrap({ command: [process.execPath, "-e", "process.exit(0)"] });
+      const result = await authority.bootstrap(withTarget({ command: [process.execPath, "-e", "process.exit(0)"] }));
       expect(result.allowed).toBe(false);
       expect(result.reasonCode).toBe(ReasonCode.DAEMON_LOCK_LOST);
       expect(harness.cp.bindings.history(roleKeyFor(Role.CEO))).toHaveLength(0);
@@ -239,17 +263,17 @@ describe("Hermes CEO bootstrap authority", () => {
     const verifySecret = vi.spyOn(harness.cp.sessions, "verifySecret");
 
     try {
-      const invalid = await authority.bootstrap({
+      const invalid = await authority.bootstrap(withTarget({
         command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath, "invalid"],
-      });
+      }));
       expect(invalid.allowed).toBe(false);
       expect(invalid.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED);
       expect(harness.cp.bindings.history(roleKeyFor(Role.CEO))).toHaveLength(0);
 
-      const result = await authority.bootstrap({
+      const result = await authority.bootstrap(withTarget({
         command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath],
         model: "hermes-bootstrap-test",
-      });
+      }));
       expect(result).toMatchObject({
         allowed: true,
         value: { bindingGeneration: 1 },
@@ -284,9 +308,9 @@ describe("Hermes CEO bootstrap authority", () => {
       expect(spawnedCwd, "the CEO runtime did not start in the workdir its session row records")
         .toBe(realpathSync(managedRuntimeRoot));
 
-      const rerun = await authority.bootstrap({
+      const rerun = await authority.bootstrap(withTarget({
         command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath],
-      });
+      }));
       expect(rerun.allowed).toBe(false);
       expect(rerun.reasonCode).toBe(ReasonCode.BINDING_ALREADY_ACTIVE);
 
@@ -300,9 +324,9 @@ describe("Hermes CEO bootstrap authority", () => {
       // that. `bindings.history` was read only by the refusal itself, and no code treats
       // generation 1 as special; the guard above — a *live* CEO may not be replaced — is the
       // one carrying the safety.
-      const afterRevoke = await authority.bootstrap({
+      const afterRevoke = await authority.bootstrap(withTarget({
         command: [process.execPath, "-e", HERMES_BOOTSTRAP_RUNTIME, modePath, secretPath],
-      });
+      }));
       expect(afterRevoke).toMatchObject({ allowed: true, value: { bindingGeneration: 2 } });
       expect(harness.cp.bindings.history(roleKeyFor(Role.CEO)).map((binding) => binding.bindingGeneration))
         .toEqual([1, 2]);
@@ -332,9 +356,9 @@ describe("Hermes CEO bootstrap authority", () => {
     });
 
     try {
-      const result = await authority.bootstrap({
+      const result = await authority.bootstrap(withTarget({
         command: [process.execPath, "-e", DELAYED_SECRET_RUNTIME, secretPath, "75"],
-      });
+      }));
 
       expect(result.allowed).toBe(true);
       expect(readFileSync(secretPath, "utf8").length).toBeGreaterThan(20);
@@ -355,9 +379,9 @@ describe("Hermes CEO bootstrap authority", () => {
     });
 
     try {
-      const result = await authority.bootstrap({
+      const result = await authority.bootstrap(withTarget({
         command: [process.execPath, "-e", DELAYED_SECRET_RUNTIME, join(stateDir, "runtime-secret"), "2000"],
-      });
+      }));
 
       expect(result.allowed).toBe(false);
       expect(result.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED);
