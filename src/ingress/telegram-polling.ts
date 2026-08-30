@@ -15,6 +15,7 @@ import {
   type TelegramOwnerPromptRequest,
   type TelegramInterruptPoint,
   type TelegramRouteOutcome,
+  type TelegramRouteProgress,
   type TelegramStoredState,
   type TelegramStoredResponse,
   type TelegramStoredDeliveryFailure,
@@ -32,6 +33,23 @@ export interface TelegramLongPollConfig {
   retryDelayMs?: number;
   defaultProjectId?: string | null;
   apiBaseUrl?: string;
+  /**
+   * Operator-asserted redelivery retention (ms) for a transport this repository cannot measure
+   * on its own — the escape hatch for `apiBaseUrl` pointed anywhere but the official endpoint.
+   *
+   * Found missing by review (#682, round 8's third pass): refusing to construct `IngressGuard`
+   * for an unmeasured transport (the round-8 fix, kept — see `TelegramBotApi.redeliveryRetentionMs`)
+   * is the right default, but it leaves an operator who *does* know their self-hosted server's
+   * actual redelivery window with no production way to say so — the safety property was enforced
+   * by making the feature permanently unreachable for a deployment this repository supports,
+   * which is a much bigger operational change than "the floor tracks the transport". This is read
+   * and validated the same way every other `ACP_TELEGRAM_*` setting is (see
+   * `configuredTelegramLongPollConfig`), and it is still subject to the same #673 check as a
+   * transport-derived retention: an explicit `nonceTtlMs` shorter than this must still be refused
+   * — an operator can assert what their transport does, not that a too-short nonce window is
+   * safe anyway.
+   */
+  transportRetentionMs?: number;
 }
 
 export interface TelegramGetUpdatesOptions {
@@ -53,6 +71,15 @@ export interface TelegramBotTransport {
     replyToMessageId?: number;
     correlationId: string;
   }): Promise<TelegramSentMessage | void>;
+  /**
+   * How long, in milliseconds, this transport may still redeliver an update whose receipt was
+   * never confirmed. `IngressGuard`'s nonce-retention floor (#673) has to be bound to this fact,
+   * not to a number picked from the channel's name alone (#682, round 8) — every transport now
+   * has to state it. `null` means this transport's redelivery behavior has not been measured and
+   * must not be assumed; `IngressGuard` refuses to construct a policy it cannot bound in that
+   * case rather than silently reuse a figure that described a different server.
+   */
+  readonly redeliveryRetentionMs: number | null;
 }
 
 export type TelegramDeliveryFailure =
@@ -69,6 +96,13 @@ export type TelegramDeliveryFailure =
     description: string | null;
     migrateToChatId: null;
     retryAfterSeconds: number | null;
+  }
+  | {
+    kind: "GLOBAL_REJECTION";
+    statusCode: number;
+    description: string | null;
+    migrateToChatId: null;
+    retryAfterSeconds: null;
   }
   | {
     kind: "UNKNOWN";
@@ -137,11 +171,20 @@ const rejectedDeliveryFailure = (
       retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,
     };
   }
+  if (statusCode === 400) {
+    return {
+      kind: "PERMANENT_REJECTION",
+      statusCode,
+      description: telegramDescription(payload),
+      migrateToChatId: telegramMigrateToChatId(payload),
+      retryAfterSeconds: null,
+    };
+  }
   return {
-    kind: "PERMANENT_REJECTION",
+    kind: "GLOBAL_REJECTION",
     statusCode,
     description: telegramDescription(payload),
-    migrateToChatId: telegramMigrateToChatId(payload),
+    migrateToChatId: null,
     retryAfterSeconds: null,
   };
 };
@@ -180,6 +223,44 @@ export interface TelegramOwnerPromptDelivery {
   /** False means another attempt already owns or completed this reservation. */
   acquired: boolean;
   record: TelegramOwnerPromptRecord | null;
+}
+
+type TelegramTrackedTurnResult =
+  | { ok: true; outcome: TelegramRouteOutcome }
+  | { ok: false; error: unknown };
+
+interface TelegramTrackedTurn {
+  settled: Promise<void>;
+  result: TelegramTrackedTurnResult | null;
+}
+
+type TelegramUpdateState =
+  | { status: "RUNNING" }
+  | { status: "RETRYABLE"; retryAt: number }
+  | { status: "SETTLED" };
+
+type TelegramUpdateReservation =
+  | { reserved: true }
+  | { reserved: false; retryInMs?: number };
+
+export type TelegramPollRoute =
+  | { status: "COMPLETED"; outcome: TelegramRouteOutcome }
+  | { status: "CEO_TURN_PENDING"; outcome: Promise<TelegramRouteOutcome> };
+
+export interface TelegramSettledPollCycle {
+  outcomes: TelegramRouteOutcome[];
+  nextOffset?: number;
+}
+
+/**
+ * The honest boundary returned by `pollOnce`: ordinary routes are complete, while a CEO turn is
+ * named as pending. `settled()` observes this cycle's completed outcomes and the cursor after they
+ * finish; `nextOffsetAtReturn` is only the cursor snapshot taken when polling itself returned.
+ */
+export interface TelegramPollCycle {
+  routes: TelegramPollRoute[];
+  nextOffsetAtReturn?: number;
+  settled(): Promise<TelegramSettledPollCycle>;
 }
 
 /** Durable reservation port for owner prompts; production wires this to the CP database. */
@@ -266,6 +347,15 @@ export const configuredTelegramLongPollConfig = (
   );
   const defaultProjectId = environment["ACP_TELEGRAM_DEFAULT_PROJECT_ID"]?.trim() || null;
   const apiBaseUrl = environment["ACP_TELEGRAM_API_BASE_URL"]?.trim() || undefined;
+  // 1 minute to 30 days: below the floor a "retention" is not what that word means for a
+  // redelivery queue, and above it is far past anything #673's own measurement considered —
+  // both ends exist to catch a typo (seconds where milliseconds were meant, or the reverse)
+  // rather than to second-guess an operator's real number.
+  const transportRetentionMs = parseOptionalBoundedInteger(
+    environment["ACP_TELEGRAM_TRANSPORT_RETENTION_MS"],
+    60_000,
+    30 * 24 * 60 * 60 * 1000,
+  );
 
   return {
     botToken,
@@ -276,19 +366,34 @@ export const configuredTelegramLongPollConfig = (
     retryDelayMs,
     defaultProjectId,
     ...(apiBaseUrl ? { apiBaseUrl } : {}),
+    ...(transportRetentionMs !== undefined ? { transportRetentionMs } : {}),
   };
 };
+
+/** The endpoint #673's ~24h `getUpdates` retention figure was actually measured against. */
+const OFFICIAL_TELEGRAM_API_BASE_URL = "https://api.telegram.org";
 
 /** Real outbound Telegram Bot API transport. The token never appears in an error message. */
 export class TelegramBotApi implements TelegramBotTransport {
   private readonly baseUrl: string;
+  /**
+   * 24h only when this instance talks to the official endpoint that figure was measured
+   * against. `ACP_TELEGRAM_API_BASE_URL` can point this same class at a self-hosted Bot API
+   * server or any other endpoint, whose queue retention nobody here has measured — reusing the
+   * official number for it would be #673's original mistake in a new place (#682, round 8), so
+   * this reports unknown instead.
+   */
+  readonly redeliveryRetentionMs: number | null;
 
   constructor(
     private readonly botToken: string,
     options: { apiBaseUrl?: string; fetcher?: typeof fetch } = {},
   ) {
     if (botToken.trim().length === 0) throw new Error("Telegram Bot API requires a non-empty bot token");
-    this.baseUrl = (options.apiBaseUrl ?? "https://api.telegram.org").replace(/\/$/u, "");
+    this.baseUrl = (options.apiBaseUrl ?? OFFICIAL_TELEGRAM_API_BASE_URL).replace(/\/$/u, "");
+    this.redeliveryRetentionMs = this.baseUrl === OFFICIAL_TELEGRAM_API_BASE_URL
+      ? 24 * 60 * 60 * 1000
+      : null;
     this.fetcher = options.fetcher ?? fetch;
   }
 
@@ -383,6 +488,10 @@ export class TelegramLongPollService {
   #loopPromise: Promise<void> | null = null;
   #controller: AbortController | null = null;
   #offset: number | undefined;
+  readonly #pendingTurns = new Set<TelegramTrackedTurn>();
+  readonly #turnFailures: unknown[] = [];
+  readonly #updateStates = new Map<number, TelegramUpdateState>();
+  readonly #updateOrder: number[] = [];
 
   constructor(
     private readonly transport: TelegramBotTransport,
@@ -406,6 +515,25 @@ export class TelegramLongPollService {
 
   get offset(): number | undefined {
     return this.#offset;
+  }
+
+  /**
+   * Waits for every route already handed to the listener and rejects with any fault it recorded.
+   *
+   * CEO turns leave `pollOnce` in #630, so a caller cannot use that poll promise as evidence that
+   * a turn finished. Faults are retained until this method observes them; the rejection is
+   * not inferred from an empty outcome list, which would make "nothing failed" indistinguishable
+   * from "the test never looked".
+   */
+  async pendingTurnsSettled(): Promise<void> {
+    while (this.#pendingTurns.size > 0) {
+      await Promise.all([...this.#pendingTurns].map((turn) => turn.settled));
+    }
+    const failures = this.#turnFailures.splice(0);
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, `${failures.length} Telegram turns failed`);
+    }
   }
 
   /**
@@ -525,7 +653,7 @@ export class TelegramLongPollService {
     }, persisted.evidence);
   }
 
-  async pollOnce(): Promise<{ outcomes: TelegramRouteOutcome[]; nextOffset?: number }> {
+  async pollOnce(): Promise<TelegramPollCycle> {
     // Receive first. Owner-gate prompts are outbound and incidental to this loop; the inbound
     // batch is the owner's only way to reach the daemon. Delivering prompts first meant one
     // undeliverable prompt — a denied `sendOwnerPromptIfNeeded`, a Telegram 5xx — threw past
@@ -536,46 +664,73 @@ export class TelegramLongPollService {
       timeoutSeconds: this.options.pollTimeoutSeconds ?? 50,
       signal: this.#controller?.signal,
     });
-    const outcomes: TelegramRouteOutcome[] = [];
-    // One classification, made by the Bot API adapter, owns the batch decision:
-    // - 429/5xx releases the known-not-sent reply, stops this batch, and holds the offset;
-    // - a permanent rejection records UNANSWERABLE, continues, and advances;
-    // - an unknown result records UNRESOLVED without retry, continues, and advances;
-    // - acceptance completes the reply and advances normally.
+    const routes: TelegramPollRoute[] = [];
+    let retryInMs: number | undefined;
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
-      const outcome = await this.router.route(update, this.webhookSecret);
-      outcomes.push(outcome);
-      if (outcome.reply) {
-        // Reserve before the external call. A confirmed rejection releases the reservation to
-        // RETRYABLE; an ambiguous result leaves it PENDING and operator-visible without replay.
-        this.router.reserveResponse(outcome);
-        await this.options.onInterrupt?.("after-reply-reserve", update, outcome.runId);
-        try {
-          await this.transport.sendMessage(outcome.reply);
-          await this.options.onInterrupt?.("after-reply-send", update, outcome.runId);
-          this.router.completeResponse(outcome);
-        } catch (error) {
-          if (!(error instanceof TelegramDeliveryError)) throw error;
-          if (error.failure.kind === "RETRYABLE") {
-            this.router.releaseResponse(outcome);
-            throw error;
-          }
-          if (error.failure.kind === "PERMANENT_REJECTION") {
-            this.router.abandonResponse(outcome, error.failure);
-          } else {
-            this.router.recordUnknownResponse(outcome, error.failure);
-          }
+      const reservation = this.reserveUpdate(update.update_id);
+      if (!reservation.reserved) {
+        if (reservation.retryInMs !== undefined) {
+          retryInMs = Math.min(retryInMs ?? reservation.retryInMs, reservation.retryInMs);
         }
+        continue;
       }
-      if (Number.isSafeInteger(update.update_id)) {
-        this.#offset = Math.max(this.#offset ?? 0, update.update_id + 1);
+
+      try {
+        const progress = await this.routeUpdate(update);
+        if (progress.status === "COMPLETED") {
+          this.completeUpdate(update.update_id);
+          routes.push(progress);
+          continue;
+        }
+
+        const route = progress.outcome.then(
+          (outcome) => {
+            this.completeUpdate(update.update_id);
+            return outcome;
+          },
+          (error: unknown) => {
+            this.retryUpdate(update.update_id, error);
+            throw error;
+          },
+        );
+        routes.push({ status: "CEO_TURN_PENDING", outcome: route });
+        this.trackTurn(route);
+      } catch (error) {
+        // Non-CEO routes remain inside pollOnce, so their rejection still reaches loop()'s
+        // reporter and retry delay exactly as it did before the CEO turn was detached.
+        this.retryUpdate(update.update_id, error);
+        throw error;
       }
     }
 
-    // After the inbound batch, and never fatally.
+    // A pending CEO turn has been accepted into a tracked task before incidental outbound prompts
+    // run. Managed routes and owner decisions still finish here; only the CEO call leaves the poll.
     await this.deliverOwnerGatePrompts();
-    return { outcomes, ...(this.#offset === undefined ? {} : { nextOffset: this.#offset }) };
+    if (routes.length === 0 && updates.length > 0) {
+      if (retryInMs !== undefined) {
+        // A detached CEO failure no longer reaches loop()'s catch. Its update-local deadline is the
+        // replacement observer: keep the held offset, but do not ask Telegram for this update in
+        // a hot loop or schedule its route again before the configured backoff expires.
+        await delay(retryInMs);
+      } else if (this.#pendingTurns.size > 0) {
+        // Holding the offset makes Telegram return the running update immediately. A bounded pause
+        // prevents a hot loop without waiting for the CEO turn itself; a newly arrived update is
+        // delayed by at most 100ms before the next getUpdates call can schedule it.
+        await delay(Math.min(this.options.retryDelayMs ?? 5_000, 100));
+      }
+    }
+    return {
+      routes,
+      ...(this.#offset === undefined ? {} : { nextOffsetAtReturn: this.#offset }),
+      settled: async () => {
+        const outcomes = await Promise.all(routes.map((route) => route.outcome));
+        return {
+          outcomes,
+          ...(this.#offset === undefined ? {} : { nextOffset: this.#offset }),
+        };
+      },
+    };
   }
 
   start(): void {
@@ -588,6 +743,7 @@ export class TelegramLongPollService {
     this.#running = false;
     this.#controller?.abort();
     await this.#loopPromise;
+    await this.pendingTurnsSettled();
     this.#loopPromise = null;
     this.#controller = null;
   }
@@ -600,14 +756,130 @@ export class TelegramLongPollService {
       } catch (error) {
         if (!this.#running && this.#controller.signal.aborted) break;
         this.options.onError?.(error);
-        const retryAfterMs = error instanceof TelegramDeliveryError && error.failure.kind === "RETRYABLE"
-          && error.failure.retryAfterSeconds !== null
-          ? Math.min(error.failure.retryAfterSeconds * 1_000, 2_147_483_647)
-          : 0;
-        await delay(Math.max(this.options.retryDelayMs ?? 5_000, retryAfterMs));
+        await delay(deliveryRetryDelayMs(error, this.options.retryDelayMs ?? 5_000));
       } finally {
         this.#controller = null;
       }
+    }
+  }
+
+  private trackTurn(route: Promise<TelegramRouteOutcome>): TelegramTrackedTurn {
+    const turn: TelegramTrackedTurn = { settled: Promise.resolve(), result: null };
+    turn.settled = route.then(
+      (outcome) => {
+        turn.result = { ok: true, outcome };
+      },
+      (error: unknown) => {
+        turn.result = { ok: false, error };
+        if (this.options.onError) {
+          try {
+            this.options.onError(error);
+          } catch (reportingError) {
+            this.#turnFailures.push(new AggregateError(
+              [error, reportingError],
+              "Telegram turn and its error reporter both failed",
+            ));
+          }
+        } else {
+          this.#turnFailures.push(error);
+        }
+      },
+    ).finally(() => {
+      this.#pendingTurns.delete(turn);
+    });
+    this.#pendingTurns.add(turn);
+    return turn;
+  }
+
+  private async routeUpdate(update: TelegramUpdate): Promise<TelegramRouteProgress> {
+    const progress = await this.router.routeUntilCeoTurn(update, this.webhookSecret);
+    if (progress.status === "COMPLETED") {
+      return { status: "COMPLETED", outcome: await this.deliverRouteOutcome(update, progress.outcome) };
+    }
+    return {
+      status: "CEO_TURN_PENDING",
+      outcome: progress.outcome.then((outcome) => this.deliverRouteOutcome(update, outcome)),
+    };
+  }
+
+  private async deliverRouteOutcome(
+    update: TelegramUpdate,
+    outcome: TelegramRouteOutcome,
+  ): Promise<TelegramRouteOutcome> {
+    if (!outcome.reply) {
+      // A fresh claimed turn whose handler produced no reply is complete, and no later reply
+      // lifecycle step can resolve it. Replayed outcomes also carry reply: null when an earlier
+      // send remains PENDING; resolveNoReplyOutcome deliberately leaves those untouched (#682).
+      this.router.resolveNoReplyOutcome(outcome);
+      return outcome;
+    }
+
+    // Reserve before the external call. A reservation left PENDING after an ambiguous return is
+    // never replayed. A confirmed 400 is terminal for this request; batch/global rejections and
+    // 429/5xx release the reservation and keep the update retryable.
+    this.router.reserveResponse(outcome);
+    await this.options.onInterrupt?.("after-reply-reserve", update, outcome.runId);
+    try {
+      await this.transport.sendMessage(outcome.reply);
+      await this.options.onInterrupt?.("after-reply-send", update, outcome.runId);
+      this.router.completeResponse(outcome);
+    } catch (error) {
+      if (!(error instanceof TelegramDeliveryError)) throw error;
+      if (error.failure.kind === "RETRYABLE" || error.failure.kind === "GLOBAL_REJECTION") {
+        this.router.releaseResponse(outcome);
+        throw error;
+      }
+      if (error.failure.kind === "PERMANENT_REJECTION") {
+        this.router.abandonResponse(outcome, error.failure);
+      } else {
+        this.router.recordUnknownResponse(outcome, error.failure);
+      }
+    }
+    return outcome;
+  }
+
+  /**
+   * One update id has one live task. A repeated getUpdates response while its offset is held
+   * cannot fork the route; a failed task becomes retryable and is the only state admitted again.
+   */
+  private reserveUpdate(updateId: number): TelegramUpdateReservation {
+    if (!Number.isSafeInteger(updateId)) return { reserved: true };
+    const state = this.#updateStates.get(updateId);
+    if (state?.status === "RUNNING" || state?.status === "SETTLED") return { reserved: false };
+    if (state?.status === "RETRYABLE") {
+      const retryInMs = state.retryAt - Date.now();
+      if (retryInMs > 0) return { reserved: false, retryInMs };
+    }
+    this.#updateStates.set(updateId, { status: "RUNNING" });
+    if (state === undefined) {
+      this.#updateOrder.push(updateId);
+      this.#updateOrder.sort((left, right) => left - right);
+    }
+    return { reserved: true };
+  }
+
+  private retryUpdate(updateId: number, error?: unknown): void {
+    if (Number.isSafeInteger(updateId)) {
+      this.#updateStates.set(updateId, {
+        status: "RETRYABLE",
+        retryAt: Date.now() + deliveryRetryDelayMs(error, this.options.retryDelayMs ?? 5_000),
+      });
+    }
+  }
+
+  private completeUpdate(updateId: number): void {
+    if (!Number.isSafeInteger(updateId)) return;
+    this.#updateStates.set(updateId, { status: "SETTLED" });
+
+    // Telegram confirms every id below offset. A later task may finish first, but it cannot move
+    // the offset past an earlier turn that is still running or failed. #631 can make this queue
+    // durable; #630 does not open the process-death loss window while that work is pending.
+    while (this.#updateOrder.length > 0) {
+      const next = this.#updateOrder[0]!;
+      if (this.#updateStates.get(next)?.status !== "SETTLED") break;
+      this.#updateOrder.shift();
+      this.#updateStates.delete(next);
+      this.#offset = Math.max(this.#offset ?? 0, next + 1);
     }
   }
 
@@ -666,11 +938,22 @@ export const startTelegramLongPollListener = async (
   options: TelegramLongPollStartOptions = {},
 ): Promise<TelegramLongPollListener> => {
   validateLongPollConfig(config);
+  // Chosen before the guard, not after (#682, round 8): the guard's retention floor has to be
+  // derived from the transport that will actually run this channel, and it cannot derive from a
+  // transport nobody has picked yet.
+  const transport = options.transport ?? new TelegramBotApi(config.botToken, {
+    ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+  });
   const guard = new IngressGuard(cp.db, cp.clock, cp.audit, {
     telegram: {
       allowedActors: config.allowedOwnerIds,
       allowedConversations: config.allowedChatIds,
       recoverInFlight: true,
+      // The transport's own report wins when it has one (the official endpoint, or a fake that
+      // declares its own value); `config.transportRetentionMs` — `ACP_TELEGRAM_TRANSPORT_RETENTION_MS`
+      // — fills the gap only when the transport itself reports unknown (#682, round 8's third
+      // pass: the escape hatch for an operator who knows their self-hosted server's real window).
+      transportRetentionMs: transport.redeliveryRetentionMs ?? config.transportRetentionMs ?? null,
     },
   });
   const ingress = new TelegramIngress(guard, { webhookSecret: config.webhookSecret });
@@ -693,9 +976,6 @@ export const startTelegramLongPollListener = async (
     getStoredState: (nonce) => storedState(cp, nonce),
     getStoredResponse: (nonce) => storedResponse(cp, nonce),
     ...(options.onInterrupt ? { onInterrupt: options.onInterrupt } : {}),
-  });
-  const transport = options.transport ?? new TelegramBotApi(config.botToken, {
-    ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
   });
   const service = new TelegramLongPollService(transport, router, config.webhookSecret, {
     pollTimeoutSeconds: config.pollTimeoutSeconds,
@@ -1198,6 +1478,7 @@ const TELEGRAM_ENVIRONMENT_VARIABLES = [
   "ACP_TELEGRAM_RETRY_DELAY_MS",
   "ACP_TELEGRAM_DEFAULT_PROJECT_ID",
   "ACP_TELEGRAM_API_BASE_URL",
+  "ACP_TELEGRAM_TRANSPORT_RETENTION_MS",
 ] as const;
 
 const configuredValue = (
@@ -1237,6 +1518,38 @@ const parseBoundedInteger = (
   return parsed;
 };
 
+/**
+ * `parseBoundedInteger`, but absence means "not asserted" rather than a numeric default —
+ * `ACP_TELEGRAM_TRANSPORT_RETENTION_MS` has no safe fallback to assume for an operator who has
+ * not said anything, unlike the timeouts above.
+ */
+const parseOptionalBoundedInteger = (
+  value: string | undefined,
+  minimum: number,
+  maximum: number,
+): number | undefined => {
+  if (!value?.trim()) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`Telegram configuration integer must be between ${minimum} and ${maximum}`);
+  }
+  return parsed;
+};
+
 const delay = async (milliseconds: number): Promise<void> => {
   await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+};
+
+const deliveryRetryDelayMs = (error: unknown, fallbackMs: number): number => {
+  if (
+    error instanceof TelegramDeliveryError
+    && error.failure.kind === "RETRYABLE"
+    && error.failure.retryAfterSeconds !== null
+  ) {
+    return Math.max(
+      fallbackMs,
+      Math.min(error.failure.retryAfterSeconds * 1_000, 2_147_483_647),
+    );
+  }
+  return fallbackMs;
 };

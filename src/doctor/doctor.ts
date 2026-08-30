@@ -746,13 +746,19 @@ export class Doctor {
     // reservation writes `result_json` whole and was erasing the claim on every ordinary timeout
     // (#646). `result_json` is the reply-delivery lifecycle only — `claimTurn` never writes
     // `TURN_CLAIMED` there, so a query against it can never see an outstanding claim again.
-    // `repliedAt IS NULL` is the same "still outstanding" test `unresolvedClaim` and
-    // `IngressGuard.unresolvedTurns` use, kept in agreement rather than redefined here.
+    // `repliedAt IS NULL AND noReplyAt IS NULL` is the same "still outstanding" test
+    // `unresolvedClaim` and `IngressGuard.unresolvedTurns` use, kept in agreement rather than
+    // redefined here — `noReplyAt` is the terminal fact a claimed turn gets when its handler
+    // decided not to reply (#682): also finished, just not by the same fact as `repliedAt`, and
+    // a doctor that only knew the older field would report every one of those as still open,
+    // escalating to ERROR after `UNRESOLVED_TURN_ESCALATION_MINUTES` for a turn nothing is
+    // actually waiting on.
     const rows = this.db.all<{ nonce: string; channel: string; received_at: string }>(
       `SELECT channel, nonce, received_at FROM inbound_messages
         WHERE turn_claim_json IS NOT NULL
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
           AND json_extract(turn_claim_json, '$.settledAt') IS NULL
+          AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
         ORDER BY received_at ASC`,
     );
     if (rows.length === 0) return [];

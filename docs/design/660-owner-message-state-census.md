@@ -15,8 +15,8 @@ the functions each row names against whatever `origin/main` is when you read thi
 document and the code disagree, the code is right and this document is what has gone stale.
 
 **This document was last re-derived 2026-08-30 against `origin/main` at commit**
-**`ab0600222cccac18de42bc6c3d3f190e73bb0893` (#701, "a source can only cite the audit event its**
-**own turn claimed with"), plus this branch's Telegram reply-delivery changes.** This pinned SHA
+**`8ba6e271a39d2d627f2d041257a2678802eb276b` (#713, "the CEO turn leaves pollOnce, and the seven**
+**fault tests still observe what they name"), plus this branch's Telegram reply-delivery changes.** This pinned SHA
 is not the same kind of fact as a file:line locus above — it names *when this document's prose was checked*, not *where a
 claim lives in the code*, and it is the one piece of "current source" bookkeeping this document
 keeps, precisely because the alternative already failed once: an earlier version of this document
@@ -81,30 +81,43 @@ any actor binding exists (see C1, C3).
   and stops being an outstanding claim only once the reply reaches one of those durable terminal
   states — both are true, at different times. A settled claim does not assert that Telegram
   accepted the reply.
-- **Why an ordinary slow turn does not by itself produce a second unresolved row: the poll loop's
-  seriality, not the first row never existing.** `telegram-polling.ts`'s `pollOnce` routes each
-  update in a batch with `for (const update of updates) { await this.router.route(update, ...);
-  ... }` — sequential, one `await` at a time. A second update in the same batch cannot begin
-  routing (and so cannot reach `claimTurn`) until the first's entire `route()` call, including its
-  `directHandler` await, has returned. This is a claim about this one loop processing one batch
-  at a time; it says nothing about whether two listener processes could run concurrently, which
-  this row does not check. **Produced by a process crash before `reserveResponse` records the
-  handler's reply** — what the existing `TelegramInterruption` tests simulate, ending the process
-  (and the loop's serialization with it) after the claim but before a terminal reply record.
-  Delivery failure is no longer another producer: a confirmed-not-sent service failure leaves a
-  retryable reply and stops the batch, while a permanent rejection or unknown outcome atomically
-  settles the claim with its terminal reply state. A recovered `PENDING` is treated as
-  `UNRESOLVED` and is not resent, because it may be the durable record lagging a successful send.
-- **Terminal:** closed. `TelegramHermesRouter`'s DIRECT branch calls
-  `unresolvedTurns(identity.sessionDigest)` before `claimTurn` for every DIRECT message (not only a
-  suspected resend) and parks with an explicit reply. The park reply names up to 10 outstanding
-  turns and reports the full count; `/again` records every outstanding nonce in
-  `overriddenUnresolvedNonces`, not only the displayed subset. Closed by #697. Reply-delivery
-  `UNANSWERABLE`/`UNRESOLVED` rows remain operator-visible through Doctor, but their turn claims
-  carry `settledAt` and therefore do not inflate this state. An authenticated operator can record
-  a `NO_RETRY` acknowledgement without changing or overstating the delivery fact.
-- **Disposition:** off the critical path — no disclosure or duplicate-turn gap remains in this
-  state.
+- **Why an ordinary slow turn does not by itself produce a second unresolved row: the ingress
+  check, not poll-loop seriality.** `telegram-polling.ts` now waits through admission,
+  classification, and `claimTurn`, then detaches only the pending DIRECT handler that calls the
+  CEO. Managed commands and owner decisions remain inside `pollOnce`; a later DIRECT update can
+  reach the router while the first CEO handler is still open. Before it can claim, however, the
+  DIRECT branch reads `unresolvedTurns(identity.sessionDigest)` and parks an ordinary message.
+  `/again` is the explicit exception: it may claim a later turn while the first is unresolved,
+  after recording every overridden nonce. This is a claim about one listener's route policy; it
+  says nothing about whether two listener processes could run concurrently, which this row does
+  not check. **Produced by two paths that can leave unresolved rows:** (1) a process crash before
+  `reserveResponse` records the handler's reply; (2) a known retryable or batch/global rejection.
+  `deliverRouteOutcome` releases those reservations to `RETRYABLE`, and the route wrapper calls
+  `retryUpdate` so ordered offset advancement remains held. A 400 records `UNANSWERABLE`; an
+  unknown send result records `UNRESOLVED`; and a replay of a surviving `PENDING` reservation
+  records `UNRESOLVED` without another send. Each of those terminal transitions settles the claim
+  in the same database transaction as the reply state.
+- **Terminal or gap:** the single-unresolved-turn case is closed —
+  `TelegramHermesRouter`'s DIRECT branch calls `unresolvedTurns(identity.sessionDigest)` before
+  `claimTurn` for every DIRECT message (not only a suspected resend), parks with an explicit reply,
+  and records a deliberate override when the owner replies `/again`. The plural
+  `overriddenUnresolvedNonces` records every unresolved nonce, including a second row created when
+  an earlier `/again` turn also fails. The park reply names at most
+  `MAX_NAMED_UNRESOLVED_TURNS` rows, reports the total, and summarizes the rest so disclosure stays
+  within Telegram's message limit without narrowing the durable override record. The production
+  path tests construct both the two-row sequence and a sequence beyond the reply cap.
+- **Disposition:** closed for both one and multiple unresolved rows. The rows themselves remain
+  unresolved until a reply is accepted, a fresh no-reply outcome completes, a terminal delivery
+  result settles it, or a later authority reconciles it. The owner-visible park reply is bounded,
+  while `/again` records the full set it overrides. `UNANSWERABLE` and `UNRESOLVED` remain visible
+  through Doctor, and an authenticated operator may acknowledge `NO_RETRY` without changing the
+  delivery fact.
+- **Rollback compatibility:** `settledAt` is a new forward-only JSON state. The `origin/main`
+  reader at `8ba6e27` recognizes only `repliedAt` and `noReplyAt`, so a binary rollback after this
+  version has written `settledAt` will classify that claim as unresolved and may park later turns.
+  Dual-writing either older field would make a false claim about acceptance or no-reply. Roll back
+  only with a data-aware compatibility release that teaches the older reader `settledAt`; a plain
+  binary rollback is not safe.
 
 ### S3 — `ADMITTED` and not claimed
 
@@ -209,12 +222,10 @@ any actor binding exists (see C1, C3).
   "is this the same words" — the owner, not a text comparison, decides whether to proceed. Closed
   by #680. This row assumes an unresolved turn already exists and is only about what happens to
   the *next*, separately-routed message given that precondition. It does not depend on *how* the
-  earlier turn became unresolved: an ordinary in-flight turn is technically unresolved too (S2),
-  but the poll loop's seriality means no second message is routed while the first's handler is
-  still awaited, so in practice this row is reached via S2's crash-before-reply-record path,
-  which is what lets an unresolved claim persist long enough for a genuinely separate message to
-  arrive and be routed against it. Terminal delivery failures settle the claim and do not produce
-  this state.
+  earlier turn became unresolved: an ordinary in-flight turn is unresolved too (S2), and #713's
+  polling path can route the second message while the first CEO handler is still pending. The
+  ingress check parks that second route; it does not rely on poll-loop seriality. Terminal delivery
+  failures settle the claim and do not produce this state.
 - **Disposition:** off the critical path.
 
 ### S7 — a later message against a coalesced batch
