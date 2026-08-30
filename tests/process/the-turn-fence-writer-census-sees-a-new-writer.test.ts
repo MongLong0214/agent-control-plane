@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
@@ -18,7 +18,7 @@ afterAll(cleanupTempDirs);
  * synthetic second writer, and required to fail — then run again with the writer removed, and
  * required to pass. A check that has never failed is not known to work.
  *
- * A blind adversarial review of the first version found its detector recognised exactly one
+ * Earlier blind reviews found that its source-text detector recognised exactly one
  * spelling of each write statement — plain uppercase `INSERT INTO`/`UPDATE`/`DELETE FROM` followed
  * by a bare identifier — and missed `INSERT OR ABORT`, `INSERT OR IGNORE`, a quoted table name, a
  * schema-qualified one, and lowercase SQL outright, plus `REPLACE INTO` by name. A synthetic
@@ -29,6 +29,8 @@ afterAll(cleanupTempDirs);
  */
 const ROOT = process.cwd();
 const SCRIPT = "scripts/verify-turn-fence-writer-census.mjs";
+const CLAIM =
+  "The turn-fence writer census resolves statically knowable SQL and fails when a governed table is written or replaced outside its owner list, while reporting runtime-computed SQL it cannot resolve.";
 
 /** A throwaway clone carrying the working-tree census and source tree, so this measures the script being edited. */
 const scratchRepo = (): string => {
@@ -39,6 +41,7 @@ const scratchRepo = (): string => {
   execFileSync("cp", [join(ROOT, SCRIPT), join(dir, SCRIPT)]);
   rmSync(join(dir, "src"), { recursive: true, force: true });
   execFileSync("cp", ["-R", join(ROOT, "src"), join(dir, "src")]);
+  symlinkSync(join(ROOT, "node_modules"), join(dir, "node_modules"), "dir");
   return dir;
 };
 
@@ -63,7 +66,7 @@ const writeProbe = (repo: string, name: string, body: string): void => {
   );
 };
 
-describe("the turn-fence writer census sees a writer outside the coordinator", () => {
+describe(CLAIM, () => {
   it("fails when a new file writes canonical_turns directly", () => {
     const repo = scratchRepo();
     writeProbe(
@@ -75,6 +78,54 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("src/probe/rogue-writer-676.ts");
+    expect(done.stdout).toContain("canonical_turns");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
+  it("fails on JavaScript escaped newline whitespace after UPDATE", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "rogue-javascript-newline-escape-676.ts",
+      String.raw`db.run("UPDATE\ncanonical_turns SET observation_consistency = 'ADJUDICATED'");`,
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("src/probe/rogue-javascript-newline-escape-676.ts");
+    expect(done.stdout).toContain("canonical_turns");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
+  it("fails on JavaScript escaped hexadecimal whitespace after UPDATE", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "rogue-javascript-hex-escape-676.ts",
+      String.raw`db.run("UPDATE\x20canonical_turns SET observation_consistency = 'ADJUDICATED'");`,
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("src/probe/rogue-javascript-hex-escape-676.ts");
+    expect(done.stdout).toContain("canonical_turns");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
+  it("fails on adjacent literal concatenation that spells UPDATE", () => {
+    const repo = scratchRepo();
+    writeProbe(
+      repo,
+      "rogue-adjacent-literal-concatenation-676.ts",
+      String.raw`db.run("UP" + "DATE\ncanonical_turns SET observation_consistency = 'ADJUDICATED'");`,
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("src/probe/rogue-adjacent-literal-concatenation-676.ts");
     expect(done.stdout).toContain("canonical_turns");
     expect(done.stdout).toContain("RESULT: FAIL");
     expect(done.status).toBe(1);
@@ -96,11 +147,12 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
     expect(done.status).toBe(1);
   });
 
-  it("passes on the source tree as it stands, so the two failures above are about the probe", () => {
+  it("passes on the source tree as it stands, so the probe failures are about their added writers", () => {
     const repo = scratchRepo();
 
     const done = censusOn(repo);
 
+    expect(done.stdout).toContain(`CHECK: ${CLAIM}`);
     expect(done.stdout).toContain("RESULT: PASS");
     expect(done.stdout).toContain("residual: 0");
     expect(done.status).toBe(0);
@@ -122,7 +174,7 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("actor_target_bindings");
-    expect(done.stdout).toContain("no longer writes its table");
+    expect(done.stdout).toContain("no longer writes or replaces its table");
     expect(done.status).toBe(1);
   });
 
@@ -199,7 +251,7 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
   }
 
   it("reports a dynamically built table name as unresolved rather than silently scoring it zero", () => {
-    // No static regex can name a table built at runtime. The honest response is a loud, distinct
+    // Static analysis cannot name a table built at runtime. The honest response is a loud, distinct
     // failure — not a PASS that looks identical to a real all-clear.
     const repo = scratchRepo();
     writeProbe(
@@ -217,35 +269,32 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
     expect(done.status).toBe(1);
   });
 
-  it("fails when src/db/migrations.ts writes a governed table directly, not just src/**", () => {
-    // Finding 2 of the same review: migrations.ts was excluded on the claim that `schema:registry`
-    // and `schema:denials` already score its data-moving statements. Neither actually reads a line
-    // of migrations.ts — one confirms every declared trigger is in a required-trigger registry, the
-    // other confirms every trigger sentinel maps to a typed ReasonCode. So this appends a real
-    // write to the actual file the exclusion used to name, rather than a probe file, and requires
-    // the census to see it now that the exclusion is gone.
+  it("fails on shadow table replacement of canonical turns", () => {
+    // Finding 2 of review round 5: the production migration writes a `_rebuilt` shadow table,
+    // drops the governed table, and renames the shadow over the canonical name. The old direct
+    // INSERT probe exercised a path production does not use and let the real replacement score zero.
     const repo = scratchRepo();
-    appendFileSync(
-      join(repo, "src/db/migrations.ts"),
+    writeProbe(
+      repo,
+      "rogue-shadow-table-replacement-676.ts",
       [
-        "",
-        "// Synthetic probe for issue #676, round 2: migrations.ts is no longer exempt.",
-        "export const __rogueMigrationWrite676 = (db: import(\"./database.ts\").Db, turnRequestId: string): void => {",
-        "  db.run(`INSERT OR IGNORE INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);",
-        "};",
-        "",
-      ].join("\n"),
+        "db.exec(`CREATE TABLE canonical_turns_rebuilt AS SELECT * FROM canonical_turns WHERE 0;",
+        "INSERT INTO canonical_turns_rebuilt SELECT * FROM canonical_turns;",
+        "DROP TABLE canonical_turns;",
+        "ALTER TABLE canonical_turns_rebuilt RENAME TO canonical_turns`);",
+      ].join("\n  "),
     );
 
     const done = censusOn(repo);
 
-    expect(done.stdout).toContain("src/db/migrations.ts");
+    expect(done.stdout).toContain("src/probe/rogue-shadow-table-replacement-676.ts");
     expect(done.stdout).toContain("canonical_turns");
+    expect(done.stdout).toContain("replaces this table");
     expect(done.stdout).toContain("RESULT: FAIL");
     expect(done.status).toBe(1);
   });
 
-  it("does not fabricate a write from migrations.ts's own doc comments quoting old, defective SQL", () => {
+  it("does not fabricate a write from TypeScript migration comments", () => {
     // The reason migrations.ts used to be excluded wholesale: its comments document this ledger's
     // past defects by quoting the broken SQL verbatim, e.g. a plain `UPDATE canonical_turns SET
     // outcome_kind='ABORTED'`. Included-but-comment-blind would fail on prose, not code. Confirmed
@@ -270,7 +319,7 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
     expect(done.status).toBe(0);
   });
 
-  it("fails when a schema.sql trigger body writes a governed table directly, not just src/**.ts", () => {
+  it("fails when a schema trigger body writes a governed table directly", () => {
     // Finding 2, round 3: `migrations.ts`'s `schemaDdl()` reads `src/db/schema.sql` whole and
     // installs it into the real database, so a trigger body in that file is exactly as live a
     // write surface as a TypeScript module — and the walk above only ever reads `.ts` files.
@@ -299,7 +348,7 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
     expect(done.status).toBe(1);
   });
 
-  it("does not fabricate a write from schema.sql's own trigger doc comments quoting old, defective SQL", () => {
+  it("does not fabricate a write from SQL schema comments", () => {
     // schema.sql already carries this exact shape for real, above `canonical_turns_settlement_authority`:
     // "...an ordinary `UPDATE canonical_turns SET lifecycle_state='SETTLED', outcome_kind='ABORTED', …`
     // on a turn that had never been settled succeeded...". Scanning schema.sql without stripping its
@@ -421,18 +470,16 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
     expect(done.status).toBe(1);
   });
 
-  it("states in its own output what it cannot see: a write whose keyword is assembled from parts", () => {
-    // The one gap round 4 chose not to close: detecting this would mean evaluating string
-    // concatenation, not matching SQL-shaped text, and is out of scope for a source-text scan. The
-    // honest response, per the review, is to say so in the check's own output rather than let a
-    // silent zero read as "no such write exists." Printed on every run, so it is checked here on the
-    // unmodified source tree's own PASS rather than a synthetic probe.
+  it("states that SQL computed entirely at runtime is outside the census", () => {
+    // Parsing closes source spellings of a static value, but it cannot prove a string constructed
+    // only from runtime data. The check names that boundary on every run instead of letting its
+    // static count read as a claim about runtime-only construction.
     const repo = scratchRepo();
 
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("RESULT: PASS");
-    expect(done.stdout).toContain("SCOPE:");
-    expect(done.stdout).toContain("assembled from parts");
+    expect(done.stdout).toContain("LIMIT:");
+    expect(done.stdout).toContain("computed entirely at runtime");
   });
 });

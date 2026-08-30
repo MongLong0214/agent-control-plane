@@ -1247,25 +1247,29 @@ const GUARDS = [
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "    if (!allowed.has(file)) residual.push({ table, file });",
     replace: "    if (false) residual.push({ table, file });",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when a new file writes canonical_turns directly",
+    ],
   },
   {
     // The other direction of the same defect: an owner entry nothing consults reads as coverage.
-    what: "the turn-fence writer census reports an owner that no longer writes its table",
+    what: "the turn-fence writer census reports an owner that no longer writes or replaces its table",
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "    if (!seenFiles.includes(owner)) staleOwners.push({ table, owner });",
     replace: "    if (false) staleOwners.push({ table, owner });",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when a declared owner no longer writes its table",
+    ],
   },
   {
-    // Round 2 of #676: a blind review fed the old regex `INSERT OR ABORT INTO` and it read as
-    // MISSED — a writer only had to spell its INSERT slightly differently to become invisible.
-    // Dropping the conflict-resolution clause from the pattern reproduces exactly that.
+    // SQLite's conflict-resolution forms are separate accepted write spellings.
     what: "the turn-fence writer census recognises INSERT/UPDATE's OR conflict-clause forms",
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "const CONFLICT = String.raw`(?:OR${WS}(?:ABORT|FAIL|IGNORE|REPLACE|ROLLBACK)${WS})?`;",
     replace: 'const CONFLICT = "";',
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails on a INSERT OR ABORT write to canonical_turns",
+    ],
   },
   {
     // `Db` itself permits `REPLACE` as an ordinary mutation (`assertDataMutation` in
@@ -1275,83 +1279,107 @@ const GUARDS = [
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "String.raw`|REPLACE${WS}INTO(?:${WS}${TABLE_REF})?` +",
     replace: "",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails on a bare REPLACE INTO write to canonical_turns",
+    ],
   },
   {
-    // A write whose target is a template-interpolated or concatenated table name cannot be
-    // resolved by any static scan. Scoring it silently as zero writers is indistinguishable from a
-    // real all-clear; this census has to say the write exists and could not be verified.
+    // A visible write verb with a runtime-computed target is not a clean static result.
     what: "the turn-fence writer census reports a write it could not resolve to a static table name",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: "    if (capturedTable === undefined || truncatedByInterpolation) {",
+    find: "    if (capturedTable === undefined || truncatedByRuntimeValue) {",
     replace: "    if (false) {",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::reports a dynamically built table name as unresolved rather than silently scoring it zero",
+    ],
   },
   {
-    // Round 4 of #676: `IDENT`'s bare alternative cannot include `$`, so `canonical_turn_${suffix}`
-    // matched as a complete, static `canonical_turn_` — a table no census table equals — rather
-    // than failing to resolve at all. Disabling this check reopens exactly that: a table name
-    // truncated by a template placeholder silently resolves to whatever it happens to share
-    // letters with instead of landing in `unresolvable`.
+    // A static prefix before a runtime template value is still an unresolved target, not a smaller
+    // and unrelated static table name.
     what: "the turn-fence writer census treats a table name truncated by a template placeholder as unresolved",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: 'const truncatedByInterpolation = capturedTable !== undefined && content.slice(matchEnd, matchEnd + 2) === "${";',
-    replace: "const truncatedByInterpolation = false;",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    find:
+      "    const truncatedByRuntimeValue =\n" +
+      "      capturedTable !== undefined && content.slice(matchEnd, matchEnd + UNKNOWN.length) === UNKNOWN;",
+    replace: "    const truncatedByRuntimeValue = false;",
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::treats a table name truncated by a template placeholder as unresolved, not a coincidentally similar table",
+    ],
   },
   {
-    // `migrations.ts` used to be excluded on an unverified claim that other checks already cover
-    // its writes. Neither `schema:registry` nor `schema:denials` reads a line of it; re-excluding
-    // it here is the same exemption-nothing-consults shape one file up.
+    // Migrations contain two production replacement writers and must participate in the census.
     what: "the turn-fence writer census scans src/db/migrations.ts like every other file",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: 'const files = walk(SRC).map((f) => relative(ROOT, f));',
-    replace: 'const files = walk(SRC).map((f) => relative(ROOT, f)).filter((f) => f !== "src/db/migrations.ts");',
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    find: "const files = walk(SRC).map((file) => relative(ROOT, file));",
+    replace:
+      'const files = walk(SRC).map((file) => relative(ROOT, file)).filter((file) => file !== "src/db/migrations.ts");',
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::passes on the source tree as it stands, so the probe failures are about their added writers",
+    ],
   },
   {
-    // Without comment-stripping, migrations.ts's own doc comments — which quote past defective SQL
-    // verbatim as an example, e.g. a plain `UPDATE canonical_turns SET outcome_kind='ABORTED'` — read
-    // as a live write, and a census that cannot tell a quoted illustration of a bug from the bug
-    // itself would fail the file for prose, not code.
-    what: "the turn-fence writer census strips comments before scanning for writes",
+    // TypeScript comments are not string values. Adding a raw-source scan makes quoted defect
+    // examples in migration doc comments look like live writers again.
+    what: "the turn-fence writer census scans TypeScript values rather than raw source comments",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: "  scanForWrites(file, stripComments(raw));",
-    replace: "  scanForWrites(file, raw);",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    find: "  visit(sourceFile);\n};",
+    replace: "  visit(sourceFile);\n  scanSql(file, source);\n};",
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::does not fabricate a write from TypeScript migration comments",
+    ],
   },
   {
-    // Round 3, finding 1: SQLite treats a comment exactly like whitespace between two tokens
-    // (`INSERT/**/INTO` runs as an ordinary INSERT, confirmed against system SQLite), and the old
-    // `\s+` at every keyword boundary scored it zero. Reverting `WS` to bare whitespace reopens
-    // exactly that — a write is invisible again the moment a comment sits where the pattern
-    // required literal whitespace.
+    // SQL comments are token separators. Skipping the SQL-level stripper makes the plain
+    // whitespace grammar miss writes separated by either block or line comments.
     what: "the turn-fence writer census treats an SQL comment as whitespace at a keyword boundary",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: "const WS = String.raw`(?:\\s|${SQL_COMMENT})+`;",
-    replace: "const WS = String.raw`\\s+`;",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    find: "  const content = stripSqlComments(sql);",
+    replace: "  const content = sql;",
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails on a UPDATE--line comment before table write to canonical_turns",
+    ],
   },
   {
-    // Round 3, finding 2: `migrations.ts`'s `schemaDdl()` installs `schema.sql` whole into the real
-    // database, so a trigger body writing a governed table is exactly as live a writer as a `.ts`
-    // module — and the walk above only ever reads `.ts` files. Removing the schema.sql scan reopens
-    // a writer this census can never see no matter how long it sits in a trigger body.
+    // `schemaDdl()` installs schema.sql whole, including trigger-body writers.
     what: "the turn-fence writer census also scans schema.sql, not just src/**.ts",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: 'scanForWrites("src/db/schema.sql", strippedSchema);',
+    find: 'scanSql("src/db/schema.sql", strippedSchema);',
     replace: "",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when a schema trigger body writes a governed table directly",
+    ],
   },
   {
-    // schema.sql documents this ledger's past defects by quoting broken SQL verbatim in a trigger
-    // doc comment (`canonical_turns_settlement_authority`'s own comment above it). Scanning
-    // schema.sql without stripping its own comments first reads that prose as a live write.
-    what: "the turn-fence writer census strips schema.sql's own comments before scanning it",
+    // The TypeScript AST exposes cooked literal values: a source `\n` and a physical newline are
+    // the same character to the SQL scanner.
+    what: "the turn-fence writer census scans cooked JavaScript string values",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: 'scanForWrites("src/db/schema.sql", strippedSchema);',
-    replace: 'scanForWrites("src/db/schema.sql", schema);',
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    find: "    return { text: node.text, complete: true };",
+    replace: "    return { text: node.getText(), complete: true };",
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails on JavaScript escaped newline whitespace after UPDATE",
+    ],
+  },
+  {
+    // Adjacent literal pieces have one runtime value and must be scanned as that value.
+    what: "the turn-fence writer census folds adjacent literal concatenation",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "    return { text: left.text + right.text, complete: left.complete && right.complete };",
+    replace: "    return { text: left.text, complete: left.complete };",
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails on adjacent literal concatenation that spells UPDATE",
+    ],
+  },
+  {
+    // Rebuilding a table writes a shadow and renames it over the governed destination. Without
+    // rename attribution, both production replacement writers and rogue replacements score zero.
+    what: "the turn-fence writer census counts a table renamed over a governed name as a replacement writer",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "  for (const match of content.matchAll(RENAME)) {",
+    replace: "  for (const match of []) {",
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails on shadow table replacement of canonical turns",
+    ],
   },
   {
     // Round 4, finding 2: `CREATE_TABLE` used to be matched against raw `schema`, so a comment
@@ -1364,7 +1392,9 @@ const GUARDS = [
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "[...strippedSchema.matchAll(CREATE_TABLE)]",
     replace: "[...schema.matchAll(CREATE_TABLE)]",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::discovers a governed table declared with an SQL comment between CREATE and TABLE",
+    ],
   },
   {
     // Round 4, finding 2, the other missed spelling: `CREATE TABLE main.foo (` is a schema-qualified
@@ -1375,7 +1405,9 @@ const GUARDS = [
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "(?:${IDENT}\\s*\\.\\s*)?(${IDENT})\\s*\\(`,",
     replace: "(${IDENT})\\s*\\(`,",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::discovers a governed table declared with a schema-qualified name",
+    ],
   },
   {
     // Round 4, finding 3: the `staleOwners` loop only ever visits tables still in `governedTables`,
@@ -1387,7 +1419,19 @@ const GUARDS = [
     file: "scripts/verify-turn-fence-writer-census.mjs",
     find: "if (orphanedOwners.length > 0) {",
     replace: "if (false) {",
-    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::fails when OWNERS names a table the schema no longer declares",
+    ],
+  },
+  {
+    // The static boundary is part of the check's claim and must be present on successful runs.
+    what: "the turn-fence writer census states that runtime-only SQL is outside its static result",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "const HEADER = `CHECK: ${CLAIM}\\nLIMIT: ${LIMIT}\\n`;",
+    replace: "const HEADER = `CHECK: ${CLAIM}\\n`;",
+    killedBy: [
+      "tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts::states that SQL computed entirely at runtime is outside the census",
+    ],
   },
   {
     // Contract 1's whole point, landing here: a turn claimed under one CEO generation is a
