@@ -2348,6 +2348,18 @@ const GUARDS = [
     ],
   },
   {
+    // A Markdown link's closing parenthesis sits just after the lexical path or URL match. Leaving
+    // it in front of the following backtick makes the quoted content invisible and downgrades a
+    // genuinely vanished line from STALE to ADVISORY.
+    what: "a Markdown link closing delimiter is removed before its quoted content is read",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  t = t.replace(/^\\s*[)`'\"]/, \"\"); // the citation's own closing delimiter, if it had one",
+    replace: "  t = t.replace(/^\\s*[`'\"]/, \"\"); // the citation's own closing delimiter, if it had one",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::bare and Markdown linked loci give vanished quoted content the same STALE verdict",
+    ],
+  },
+  {
     // Dropping pages after the first one is the old 500-item blind spot in another spelling.
     what: "every open GitHub issue page is checked instead of silently truncating after five hundred",
     file: "scripts/verify-tracker-loci-resolve.mjs",

@@ -835,24 +835,58 @@ describe("verify-tracker-loci-resolve", () => {
   // --- Round 6: a sixth independent review, run against the shipped script. Two
   // counterexamples — a content-check bypass, and the extension list problem once more.
 
-  it("[round 6] a GitHub permalink with vanished quoted content is STALE, not silently ADVISORY", () => {
-    // The exact #649 stale content (`binding-registry.ts:163`), cited as a permalink with a `#L`
-    // anchor and an explicit backtick quote right after it instead of the plain-path form. The
-    // permalink extraction path stored `content: null` unconditionally, so this passed as
-    // ADVISORY ("still resolves") while the identical content cited as a plain path was correctly
-    // STALE — the same fact, checked or not depending only on which citation form named it.
-    const body =
-      "See https://github.com/MongLong0214/agent-control-plane/blob/main/src/session/binding-registry.ts#L163 " +
-      "— `const actorId = this.mintActor(...)` for the mint call.";
-    const { path, cleanup } = withIssues([{ number: 9401, title: "permalink vanished content counterexample", body }]);
-    try {
-      const result = run(path);
-      expect(result.status).toBe(1);
-      expect(result.stdout).toContain("STALE");
-      expect(result.stdout).toContain("binding-registry.ts");
-      expect(result.stdout).toContain("no longer appears");
-    } finally {
-      cleanup();
+  it("bare and Markdown linked loci give vanished quoted content the same STALE verdict", () => {
+    // The exact #649 stale content (`binding-registry.ts:163`) must be checked identically whether
+    // the locus is bare, the destination of a Markdown link, or a linked full blob permalink. A
+    // Markdown link leaves its closing `)` after the lexical path or URL match; if that delimiter
+    // reaches `readDelimitedSpan`, the explicit quote is missed and the same claim becomes only
+    // ADVISORY. Each form gets its own production CLI run so one STALE form cannot hide another.
+    const forms = [
+      ["bare path", "src/session/binding-registry.ts:163"],
+      ["Markdown path", "[source](src/session/binding-registry.ts:163)"],
+      [
+        "Markdown blob URL",
+        "[source](https://github.com/MongLong0214/agent-control-plane/blob/main/src/session/binding-registry.ts#L163)",
+      ],
+    ] as const;
+
+    for (const [label, citation] of forms) {
+      const body = `${citation} — \`const actorId = this.mintActor(...)\``;
+      const { path, cleanup } = withIssues([{ number: 9401, title: `${label} stale quote`, body }]);
+      try {
+        const result = run(path);
+        expect(result.status, `${label}: ${result.stdout || result.stderr}`).toBe(1);
+        expect(result.stdout).toContain("STALE (1)");
+        expect(result.stdout).toContain("binding-registry.ts");
+        expect(result.stdout).toContain("no longer appears");
+        expect(result.stdout).not.toContain("ADVISORY (");
+      } finally {
+        cleanup();
+      }
+    }
+  });
+
+  it("a Markdown link delimiter does not consume quoted call parentheses", () => {
+    // Only the leading `)` that closes the Markdown destination is syntax. The `)` inside the
+    // following backtick span is quoted content: `mintActor()` deliberately elides arguments and
+    // must still match the real call, while a made-up call in the same shape must be checked and
+    // rejected rather than falling back to ADVISORY.
+    const cases = [
+      ["this.mintActor()", 0, "ADVISORY"],
+      ["this.definitelyMissing()", 1, "STALE"],
+    ] as const;
+
+    for (const [quotedCall, status, verdict] of cases) {
+      const body = `[source](src/session/binding-registry.ts:206) — \`${quotedCall}\``;
+      const { path, cleanup } = withIssues([{ number: 9406, title: `quoted ${quotedCall}`, body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout || result.stderr).toBe(status);
+        expect(result.stdout).toContain(verdict);
+        if (verdict === "STALE") expect(result.stdout).toContain("no longer appears");
+      } finally {
+        cleanup();
+      }
     }
   });
 
