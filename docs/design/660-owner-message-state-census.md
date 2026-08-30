@@ -93,10 +93,11 @@ any actor binding exists (see C1, C3).
   not check. **Produced by two paths that can leave unresolved rows:** (1) a process crash before
   `reserveResponse` records the handler's reply; (2) a known retryable or batch/global rejection.
   `deliverRouteOutcome` releases those reservations to `RETRYABLE`, and the route wrapper calls
-  `retryUpdate` so ordered offset advancement remains held. A 400 records `UNANSWERABLE`; an
-  unknown send result records `UNRESOLVED`; and a replay of a surviving `PENDING` reservation
-  records `UNRESOLVED` without another send. Each of those terminal transitions settles the claim
-  in the same database transaction as the reply state.
+  `retryUpdate` so ordered offset advancement remains held. An unlisted 4xx records `UNANSWERABLE`
+  (with 401 and 429 as explicit global/retryable exceptions); an unknown send result records
+  `UNRESOLVED`; and a replay of a surviving `PENDING` reservation records `UNRESOLVED` without
+  another send. Each terminal transition settles the claim in the same database transaction as
+  the reply state.
 - **Terminal or gap:** the single-unresolved-turn case is closed —
   `TelegramHermesRouter`'s DIRECT branch calls `unresolvedTurns(identity.sessionDigest)` before
   `claimTurn` for every DIRECT message (not only a suspected resend), parks with an explicit reply,
@@ -115,9 +116,11 @@ any actor binding exists (see C1, C3).
 - **Rollback compatibility:** `settledAt` is a new forward-only JSON state. The `origin/main`
   reader at `8ba6e27` recognizes only `repliedAt` and `noReplyAt`, so a binary rollback after this
   version has written `settledAt` will classify that claim as unresolved and may park later turns.
-  Dual-writing either older field would make a false claim about acceptance or no-reply. Roll back
-  only with a data-aware compatibility release that teaches the older reader `settledAt`; a plain
-  binary rollback is not safe.
+  Dual-writing either older field would make a false claim about acceptance or no-reply. The no-op
+  v33 migration forces `Db` to create and record its automatic pre-migration v32 snapshot before
+  the daemon can process an update. Roll back by restoring that snapshot, or first deploy a
+  data-aware compatibility release that teaches the older reader `settledAt`; pointing a v32
+  binary at the post-v33 live database is not safe.
 
 ### S3 — `ADMITTED` and not claimed
 

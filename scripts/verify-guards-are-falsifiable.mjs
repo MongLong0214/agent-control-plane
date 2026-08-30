@@ -1885,14 +1885,66 @@ const GUARDS = [
     ],
   },
   {
-    // Only 400 is terminal for one request. Treating 401 as permanent consumes every update under
-    // a revoked bot token instead of holding the ordered offset for a configuration repair.
-    what: "only a Telegram 400 is a permanent per-request rejection",
+    // Treating a revoked bot token as one bad message would consume updates while the entire
+    // credential remains unusable, so 401 is the explicit global exception to the 4xx default.
+    what: "a 401 remains a global retryable failure and does not terminalize the reply",
     file: "src/ingress/telegram-polling.ts",
-    find: "  if (statusCode === 400) {",
-    replace: "  if (statusCode >= 400) {",
+    find: "  if (statusCode === 401) {",
+    replace: "  if (false) {",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::a 401 remains a global retryable failure and does not terminalize the reply",
+    ],
+  },
+  {
+    // Narrowing the class default back to one enumerated code recreates the 403 wedge: the
+    // rejected row stays retryable and the ordered offset cannot drain past it.
+    what: "an unlisted Telegram 4xx is terminal and advances the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "  if (statusCode >= 400 && statusCode < 500) {",
+    replace: "  if (statusCode === 400) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::an unlisted Telegram 4xx is terminal and advances the ordered offset",
+    ],
+  },
+  {
+    // Narrowing the server-error default to the familiar 503 makes an unlisted 502 look global
+    // rather than retryable and lets an enumeration stand in for the status class.
+    what: "a 5xx outage leaves its update retryable and holds the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "  if (statusCode >= 500 && statusCode < 600) {",
+    replace: "  if (statusCode === 503) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a 5xx outage leaves its update retryable and holds the ordered offset",
+    ],
+  },
+  {
+    // A status outside 4xx/5xx provides no evidence that this one message is permanently bad;
+    // consuming it instead of holding the batch would silently discard the unexplained request.
+    what: "an unrecognisable status is global and holds its ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find:
+      "  // Outside the protocol's client/server error classes there is no evidence that one message is\n" +
+      "  // permanently bad. Preserve it as a batch/global failure instead of silently consuming it.\n" +
+      "  return {\n" +
+      "    kind: \"GLOBAL_REJECTION\",",
+    replace:
+      "  // Outside the protocol's client/server error classes there is no evidence that one message is\n" +
+      "  // permanently bad. Preserve it as a batch/global failure instead of silently consuming it.\n" +
+      "  return {\n" +
+      "    kind: \"PERMANENT_REJECTION\",",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::an unrecognisable status is global and holds its ordered offset",
+    ],
+  },
+  {
+    // Removing the new boundary makes v32 current again, so opening it takes no pre-migration
+    // backup before this binary can begin writing the forward-only settledAt state.
+    what: "opening a v32 database takes an automatic rollback snapshot before Telegram settlement state",
+    file: "src/db/migrations.ts",
+    find: "export const SCHEMA_VERSION = 33;",
+    replace: "export const SCHEMA_VERSION = 32;",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::opening a v32 database takes an automatic rollback snapshot before Telegram settlement state",
     ],
   },
   {
@@ -1900,7 +1952,7 @@ const GUARDS = [
     // stops the current storm but schedules the next attempt earlier than Telegram requested.
     what: "a Telegram 429 preserves its retry after instruction",
     file: "src/ingress/telegram-polling.ts",
-    find: "      retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,",
+    find: "      retryAfterSeconds: telegramRetryAfterSeconds(payload),",
     replace: "      retryAfterSeconds: null,",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::a 429 rate limit leaves its update retryable and holds the ordered offset",

@@ -1990,6 +1990,59 @@ describe("Telegram production ingress", () => {
     }
   });
 
+  it("an unlisted Telegram 4xx is terminal and advances the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const rejected = update("blocked chat", {}, 483);
+    const later = update("later direct message", {}, 484);
+    const fixture = telegramBotApiFixture([rejected, later], {
+      status: 403,
+      body: { ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: (input) => `reply to ${input.text}`,
+      },
+    );
+
+    try {
+      const cycle = await listener.service.pollOnce();
+      const observers = await Promise.allSettled([
+        listener.service.pendingTurnsSettled(),
+        cycle.settled(),
+      ]);
+      expect({
+        observerStatuses: observers.map((result) => result.status),
+        offset: listener.service.offset,
+      }).toEqual({
+        observerStatuses: ["fulfilled", "fulfilled"],
+        offset: 485,
+      });
+    } finally {
+      await listener.close();
+    }
+
+    const rejectedRow = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:483"],
+    );
+    expect(rejectedRow?.result_json).toContain('"deliveryStatus":"UNANSWERABLE"');
+    expect(rejectedRow?.result_json).toContain('"statusCode":403');
+    expect(rejectedRow?.turn_claim_json).toContain('"settlement":"UNANSWERABLE"');
+    const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:484"],
+    );
+    expect(laterRow?.result_json).toContain('"sent":true');
+  });
+
   it("a 401 remains a global retryable failure and does not terminalize the reply", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
@@ -2084,7 +2137,7 @@ describe("Telegram production ingress", () => {
     });
     const first = update("first direct message", {}, 461);
     const fixture = telegramBotApiFixture([first], {
-      status: 503,
+      status: 502,
       body: { ok: false },
     });
     const listener = await startDaemonTelegramListener(
@@ -2111,7 +2164,7 @@ describe("Telegram production ingress", () => {
     expect(deliveryError).toMatchObject({
       failure: {
         kind: "RETRYABLE",
-        statusCode: 503,
+        statusCode: 502,
         retryAfterSeconds: null,
       },
     });
@@ -2122,6 +2175,47 @@ describe("Telegram production ingress", () => {
       ["update:461"],
     );
     expect(firstRow?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
+  });
+
+  it("an unrecognisable status is global and holds its ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const fixture = telegramBotApiFixture([update("unexpected rejection", {}, 462)], {
+      status: 302,
+      body: { ok: false, error_code: 302, description: "Unexpected redirect" },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: () => "reply that must remain retryable",
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    expect(deliveryError).toMatchObject({
+      failure: { kind: "GLOBAL_REJECTION", statusCode: 302 },
+    });
+    expect(listener.service.offset).toBeUndefined();
+    const row = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:462"],
+    );
+    expect(row?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
+    expect(row?.turn_claim_json).not.toContain("settledAt");
   });
 
   it("a claimed turn's PENDING reply becomes delivery-unknown on redelivery instead of false no-reply", async () => {

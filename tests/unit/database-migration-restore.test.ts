@@ -17,7 +17,12 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, ControlPlane } from "../../src/app/control-plane.ts";
 import { defaultBackupDirectory, restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
-import { MIGRATIONS, replayDdlWithoutPostV12Columns, schemaSql } from "../../src/db/migrations.ts";
+import {
+  installMigrationLedger,
+  MIGRATIONS,
+  replayDdlWithoutPostV12Columns,
+  schemaSql,
+} from "../../src/db/migrations.ts";
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { systemClock } from "../../src/core/clock.ts";
@@ -349,6 +354,29 @@ const asV14Fixture = (path: string): void => {
   }
 };
 
+/** Builds the immediately previous release boundary without copying current migration internals. */
+const asV32Fixture = (path: string): void => {
+  const current = new Db(path);
+  current.close();
+
+  const raw = new Database(path);
+  try {
+    raw.function("acp_schema_migration_authorized", () => 1);
+    raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
+    raw.exec("DELETE FROM schema_migrations");
+    const v32 = MIGRATIONS.find((migration) => migration.toVersion === 32);
+    if (!v32) throw new Error("v32 migration is absent from the ordered registry");
+    raw.prepare(
+      "INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (?, ?, ?, ?)",
+    ).run(32, v32.id, v32.checksum(), NOW);
+    installMigrationLedger(raw);
+    raw.pragma("user_version = 32");
+  } finally {
+    raw.close();
+    asPrivateStateFile(path);
+  }
+};
+
 const fileSha256 = (path: string): string =>
   `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 
@@ -404,6 +432,48 @@ const assertEmptyActorRegistry = (db: Db): void => {
 };
 
 describe("versioned SQLite migration", () => {
+  it("opening a v32 database takes an automatic rollback snapshot before Telegram settlement state", () => {
+    const path = join(tempDir("acp-v32-telegram-settlement-boundary-"), "state.sqlite");
+    asV32Fixture(path);
+
+    const migrated = new Db(path);
+    let backupPath: string;
+    try {
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(33);
+      const receipt = migrated.get<{
+        migration_id: string;
+        backup_file: string | null;
+        backup_checksum: string | null;
+      }>(
+        `SELECT migration_id, backup_file, backup_checksum
+           FROM schema_migrations WHERE version = 33`,
+      );
+      expect(receipt).toMatchObject({
+        migration_id: "v33-back-up-before-telegram-settlement-state",
+        backup_file: expect.stringContaining("-pre-migration-v32-"),
+        backup_checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      });
+      if (!receipt?.backup_file) throw new Error("v33 receipt did not name its automatic backup");
+      backupPath = receipt.backup_file;
+      expect(existsSync(backupPath)).toBe(true);
+    } finally {
+      migrated.close();
+    }
+
+    const rollbackSnapshot = new Database(backupPath, { readonly: true, fileMustExist: true });
+    try {
+      expect(Number(rollbackSnapshot.pragma("user_version", { simple: true }))).toBe(32);
+      expect(rollbackSnapshot.prepare(
+        "SELECT version, migration_id FROM schema_migrations ORDER BY version DESC LIMIT 1",
+      ).get()).toEqual({
+        version: 32,
+        migration_id: "v32-a-source-can-only-cite-its-turns-own-claim-event",
+      });
+    } finally {
+      rollbackSnapshot.close();
+    }
+  });
+
   it("upgrades a genuine v14 fixture through the whole chain and enforces workdir immutability", () => {
     const path = join(tempDir("acp-v14-migration-"), "state.sqlite");
     asV14Fixture(path);
@@ -508,7 +578,8 @@ describe("versioned SQLite migration", () => {
         [29, "v29-a-dispatch-is-a-fact"],
         [30, "v30-a-turn-and-a-reply-are-two-lifecycles"],
         [31, "v31-a-generation-means-nothing-without-its-role-key"],
-        [SCHEMA_VERSION, "v32-a-source-can-only-cite-its-turns-own-claim-event"],
+        [32, "v32-a-source-can-only-cite-its-turns-own-claim-event"],
+        [SCHEMA_VERSION, "v33-back-up-before-telegram-settlement-state"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

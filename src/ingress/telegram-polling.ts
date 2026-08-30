@@ -162,16 +162,29 @@ const rejectedDeliveryFailure = (
   statusCode: number,
   payload: unknown,
 ): TelegramDeliveryFailure => {
-  if (statusCode === 429 || statusCode >= 500) {
+  // These are the two 4xx exceptions whose scope is broader than one sendMessage request.
+  if (statusCode === 401) {
+    return {
+      kind: "GLOBAL_REJECTION",
+      statusCode,
+      description: telegramDescription(payload),
+      migrateToChatId: null,
+      retryAfterSeconds: null,
+    };
+  }
+  if (statusCode === 429) {
     return {
       kind: "RETRYABLE",
       statusCode,
       description: telegramDescription(payload),
       migrateToChatId: null,
-      retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,
+      retryAfterSeconds: telegramRetryAfterSeconds(payload),
     };
   }
-  if (statusCode === 400) {
+
+  // An otherwise unlisted 4xx rejects this request, so terminalizing this message prevents one
+  // bad chat or reply from holding every later update. Exceptions belong above this class default.
+  if (statusCode >= 400 && statusCode < 500) {
     return {
       kind: "PERMANENT_REJECTION",
       statusCode,
@@ -180,6 +193,20 @@ const rejectedDeliveryFailure = (
       retryAfterSeconds: null,
     };
   }
+
+  // An otherwise unlisted 5xx is server-side and may recover without changing this message.
+  if (statusCode >= 500 && statusCode < 600) {
+    return {
+      kind: "RETRYABLE",
+      statusCode,
+      description: telegramDescription(payload),
+      migrateToChatId: null,
+      retryAfterSeconds: null,
+    };
+  }
+
+  // Outside the protocol's client/server error classes there is no evidence that one message is
+  // permanently bad. Preserve it as a batch/global failure instead of silently consuming it.
   return {
     kind: "GLOBAL_REJECTION",
     statusCode,
@@ -815,8 +842,8 @@ export class TelegramLongPollService {
     }
 
     // Reserve before the external call. A reservation left PENDING after an ambiguous return is
-    // never replayed. A confirmed 400 is terminal for this request; batch/global rejections and
-    // 429/5xx release the reservation and keep the update retryable.
+    // never replayed. A per-message 4xx is terminal; batch/global rejections and 429/5xx release
+    // the reservation and keep the update retryable.
     this.router.reserveResponse(outcome);
     await this.options.onInterrupt?.("after-reply-reserve", update, outcome.runId);
     try {
