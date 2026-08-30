@@ -694,11 +694,13 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
   };
   const hermesAuthenticated = (
     mutate: (receipt: HermesReceipt) => unknown = (receipt) => receipt,
+    expectedExecutorRuntimeIdentity: string | undefined = "hermes:runtime-649",
   ) => {
     let receipt: unknown;
     return {
       claimed,
       protocolVersion: "hermes.target-bind/v1",
+      expectedExecutorRuntimeIdentity,
       get targetBindReceipt() {
         return receipt as HermesReceipt;
       },
@@ -858,6 +860,54 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
       sessionId,
       sessionIncarnation: `inc-${sessionId}`,
     })).toBeNull();
+  });
+
+  it("rejects a re-signed Hermes receipt with wrong or missing expected runtime identity before persistence", () => {
+    const attackerRuntimeIdentity = "attacker:unrelated-runtime";
+    const reSignedByAttacker = (receipt: HermesReceipt): HermesReceipt => {
+      const publicFields = {
+        domain: receipt.domain,
+        version: receipt.version,
+        actor_id: receipt.actor_id,
+        binding_generation: receipt.binding_generation,
+        executor_runtime_identity: attackerRuntimeIdentity,
+        requested_session_id: receipt.requested_session_id,
+        lineage_root_digest: receipt.lineage_root_digest,
+      };
+      return { ...publicFields, receipt_digest: digestOf(publicFields) };
+    };
+
+    for (const expectedExecutorRuntimeIdentity of ["hermes:runtime-649", undefined]) {
+      const { bindings, db, session } = setup();
+      const sessionId = session(`ses_hermes_runtime_identity_${expectedExecutorRuntimeIdentity ?? "missing"}`);
+      const result = bindings.bind({
+        role: Role.CEO,
+        sessionId,
+        authenticatedTarget: hermesAuthenticated(reSignedByAttacker, expectedExecutorRuntimeIdentity),
+      });
+
+      expect(result.allowed).toBe(false);
+      expect(db.get<{
+        assignments: number; bindings: number; attestations: number; rawReceipts: number;
+      }>(`SELECT
+            (SELECT COUNT(*) FROM assignments WHERE session_id = ?) AS assignments,
+            (SELECT COUNT(*) FROM actor_target_bindings
+              WHERE executor_kind = 'hermes' AND target_locator_digest = ?) AS bindings,
+            (SELECT COUNT(*) FROM actor_target_attestations t
+              JOIN actor_target_bindings b ON b.target_binding_id = t.target_binding_id
+              WHERE b.executor_kind = 'hermes' AND b.target_locator_digest = ?) AS attestations,
+            (SELECT COUNT(*) FROM actor_target_attestations t
+              JOIN actor_target_bindings b ON b.target_binding_id = t.target_binding_id
+              WHERE b.executor_kind = 'hermes' AND b.target_locator_digest = ?
+                AND t.target_bind_receipt_json IS NOT NULL) AS rawReceipts`,
+        [sessionId, claimed.targetLocatorDigest, claimed.targetLocatorDigest, claimed.targetLocatorDigest],
+      )).toEqual({ assignments: 0, bindings: 0, attestations: 0, rawReceipts: 0 });
+      expect(bindings.currentHermesTargetBindReceipt({
+        roleKey: "CEO",
+        sessionId,
+        sessionIncarnation: `inc-${sessionId}`,
+      })).toBeNull();
+    }
   });
 
   it("fails closed before writes for an invalid Hermes receipt and on corrupted receipt reads", () => {

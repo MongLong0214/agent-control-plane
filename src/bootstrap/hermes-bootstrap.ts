@@ -380,6 +380,7 @@ const constituteHermesAuthority = async (
     authenticatedTarget: {
       claimed: claimedTarget,
       protocolVersion: "hermes.target-bind/v1",
+      expectedExecutorRuntimeIdentity: request.executorRuntimeIdentity,
       get targetBindReceipt(): HermesTargetBindResponse | null {
         return targetBindReceipt;
       },

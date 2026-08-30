@@ -2393,14 +2393,14 @@ const GUARDS = [
     ],
   },
   {
-    // Removing the new boundary makes v32 current again, so opening it takes no pre-migration
-    // backup before this binary can begin writing the forward-only settledAt state.
-    what: "opening a v32 database takes an automatic rollback snapshot before Telegram settlement state",
+    // Removing the v34 boundary makes v33 current again, so opening it takes no pre-migration
+    // backup before this binary can begin writing Hermes target-bind receipt evidence.
+    what: "opening a v33 database takes an automatic rollback snapshot before v34 target-bind receipt state",
     file: "src/db/migrations.ts",
     find: "export const SCHEMA_VERSION = 34;",
-    replace: "export const SCHEMA_VERSION = 32;",
+    replace: "export const SCHEMA_VERSION = 33;",
     killedBy: [
-      "tests/unit/database-migration-restore.test.ts::opening a v32 database takes an automatic rollback snapshot before Telegram settlement state",
+      "tests/unit/database-migration-restore.test.ts::opening a v33 database takes an automatic rollback snapshot before v34 target-bind receipt state",
     ],
   },
   {

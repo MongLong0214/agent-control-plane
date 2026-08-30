@@ -55,6 +55,8 @@ export interface AuthenticatedTargetBinding {
   attestationDigest: string;
   /** The raw, closed Hermes target-bind response; generic executor protocols omit this. */
   targetBindReceipt?: unknown;
+  /** Required for Hermes target-bind so receipt identity is bound at persistence, not only at bootstrap. */
+  expectedExecutorRuntimeIdentity?: string;
   verify(tuple: AuthenticatedTargetTuple): VerifiedTargetBinding | null;
 }
 
@@ -1073,9 +1075,16 @@ export class BindingRegistry {
     if (authenticated.claimed.executorKind !== "hermes") {
       return deny(ReasonCode.CONFLICT, "Hermes target receipt does not name a Hermes target", {});
     }
+    const expectedExecutorRuntimeIdentity = authenticated.expectedExecutorRuntimeIdentity;
+    if (typeof expectedExecutorRuntimeIdentity !== "string" || expectedExecutorRuntimeIdentity.length === 0) {
+      return deny(ReasonCode.CONFLICT, "Hermes target receipt has no expected executor runtime identity", {});
+    }
     let receipt: HermesTargetBindReceipt | null;
     try {
-      receipt = this.parseHermesTargetBindReceipt(authenticated.targetBindReceipt, expected);
+      receipt = this.parseHermesTargetBindReceipt(authenticated.targetBindReceipt, {
+        ...expected,
+        executorRuntimeIdentity: expectedExecutorRuntimeIdentity,
+      });
     } catch {
       receipt = null;
     }
@@ -1108,6 +1117,7 @@ export class BindingRegistry {
       generation: number;
       requestedSessionId: string;
       lineageRootDigest: string;
+      executorRuntimeIdentity?: string;
     },
   ): HermesTargetBindReceipt | null {
     if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
@@ -1124,6 +1134,8 @@ export class BindingRegistry {
       record.binding_generation !== expected.generation ||
       record.requested_session_id !== expected.requestedSessionId ||
       record.lineage_root_digest !== expected.lineageRootDigest ||
+      (expected.executorRuntimeIdentity !== undefined &&
+        record.executor_runtime_identity !== expected.executorRuntimeIdentity) ||
       typeof record.executor_runtime_identity !== "string" ||
       record.executor_runtime_identity.length === 0 ||
       !Number.isSafeInteger(record.binding_generation) ||

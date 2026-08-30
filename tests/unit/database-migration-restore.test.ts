@@ -464,7 +464,7 @@ const assertEmptyActorRegistry = (db: Db): void => {
 };
 
 describe("versioned SQLite migration", () => {
-  it("upgrades v33 attestations without backfilling receipt evidence and snapshots before v34", () => {
+  it("opening a v33 database takes an automatic rollback snapshot before v34 target-bind receipt state", () => {
     const path = join(tempDir("acp-v33-hermes-receipt-boundary-"), "state.sqlite");
     asV33Fixture(path);
 
@@ -504,8 +504,23 @@ describe("versioned SQLite migration", () => {
         version: 33,
         migration_id: "v33-back-up-before-telegram-settlement-state",
       });
+      expect(rollbackSnapshot.prepare(
+        "SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_receipt_json'",
+      ).get()).toBeUndefined();
     } finally {
       rollbackSnapshot.close();
+    }
+
+    const restored = restoreDatabase(path, backupPath);
+    expect(restored.restoredFrom).toBe(backupPath);
+    const restoredRollbackBoundary = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(Number(restoredRollbackBoundary.pragma("user_version", { simple: true }))).toBe(33);
+      expect(restoredRollbackBoundary.prepare(
+        "SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_receipt_json'",
+      ).get()).toBeUndefined();
+    } finally {
+      restoredRollbackBoundary.close();
     }
   });
 
