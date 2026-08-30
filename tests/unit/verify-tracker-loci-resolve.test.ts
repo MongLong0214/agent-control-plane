@@ -2677,6 +2677,89 @@ describe("verify-tracker-loci-resolve", () => {
     });
   });
 
+  describe("round 25 unverified loci stay visible", () => {
+    it("an unprefixed private identifier citation does not match the prefixed symbol", () => {
+      const body = "`issuanceKey` in `src/conversation/turn-coordinator.ts`";
+      const { path, cleanup } = withIssues([{ number: 68980, title: "private sigil boundary", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout || result.stderr).toBe(1);
+        expect(result.stdout).toContain("STALE (1)");
+        expect(result.stdout).toContain("`issuanceKey` does not appear");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a parent relative symbol path is unresolved instead of matching only its basename", () => {
+      const body = "`../src/db/schema.sql` — `sessions_incarnation_immutable`";
+      const { path, cleanup } = withIssues([{ number: 68981, title: "parent relative symbol path", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout || result.stderr).toBe(1);
+        expect(result.stdout).toContain("UNRESOLVED (1)");
+        expect(result.stdout).toContain("../src/db/schema.sql is not a tracked path");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a root absolute symbol path is unresolved instead of matching only its basename", () => {
+      const body = "`/src/db/schema.sql` — `sessions_incarnation_immutable`";
+      const { path, cleanup } = withIssues([{ number: 68982, title: "root absolute symbol path", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout || result.stderr).toBe(1);
+        expect(result.stdout).toContain("UNRESOLVED (1)");
+        expect(result.stdout).toContain("/src/db/schema.sql is not a tracked path");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a local slash branch does not manufacture a known short ref", () => {
+      const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-local-ref-"));
+      try {
+        writeFileSync(join(dir, "tracked.txt"), "tracked\n");
+        expect(spawnSync("git", ["init", "-q", "."], { cwd: dir }).status).toBe(0);
+        expect(spawnSync("git", ["add", "-A"], { cwd: dir }).status).toBe(0);
+        expect(
+          spawnSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
+            cwd: dir,
+          }).status,
+        ).toBe(0);
+        expect(
+          spawnSync(
+            "git",
+            ["remote", "add", "origin", "https://github.com/MongLong0214/agent-control-plane.git"],
+            { cwd: dir },
+          ).status,
+        ).toBe(0);
+        expect(
+          spawnSync("git", ["update-ref", "refs/heads/tracker-loci-review/reviewer-short-ref", "HEAD"], {
+            cwd: dir,
+          }).status,
+        ).toBe(0);
+
+        const body =
+          "See https://github.com/MongLong0214/agent-control-plane/blob/" +
+          "reviewer-short-ref/scripts/does-not-exist.mjs#L1.";
+        const issuesPath = join(dir, "issues.json");
+        writeFileSync(issuesPath, JSON.stringify([{ number: 68983, title: "local branch short ref", body }]));
+        const result = run(issuesPath, [`--repo-root=${dir}`]);
+        expect(result.status, result.stdout || result.stderr).toBe(1);
+        expect(result.stdout).toContain("UNRESOLVED (1)");
+        expect(result.stdout).toContain("cannot determine where the ref ends and the path begins");
+        expect(result.stdout).not.toContain("does not exist");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("a separator cannot consume the opening backtick of quoted citation content", () => {
     const body = "README.md:1 `definitelyGoneXYZ`";
     const { path, cleanup } = withIssues([{ number: 68961, title: "adjacent quoted content", body }]);

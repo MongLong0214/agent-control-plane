@@ -30,7 +30,7 @@
  * | Form | Status | Grammar and result |
  * | --- | --- | --- |
  * | JavaScript/TypeScript identifier | SUPPORTED | The first character is Unicode `ID_Start`, `$`, or `_`; every remaining character is Unicode `ID_Continue`, `$`, `_`, ZWNJ, or ZWJ. |
- * | Private identifier or member reference | SUPPORTED | `#` may prefix a supported identifier; a reference may join supported identifier segments with `.`. Sigils and separators remain part of the searched symbol. |
+ * | Private identifier or member reference | SUPPORTED | `#` may prefix a supported identifier; a reference may join supported identifier segments with `.`. Sigils and separators remain part of the searched symbol, so an unprefixed citation does not match a `#`-prefixed identifier. |
  * | Callable shorthand | SUPPORTED | A supported identifier or member reference may be cited with a trailing `()`; the shorthand is removed before searching. |
  * | Other quoted token in a symbol-citation form | UNSUPPORTED | A token that is neither an identifier nor a member reference is reported and fails instead of disappearing or being guessed into one. |
  *
@@ -44,7 +44,9 @@
  * without a line only when backtick- or quote-delimited and its extension occurs in the tracked
  * tree. `/private/tmp` and `/tmp` are reported separately as non-durable. Backtick-delimited
  * symbols paired with backtick-delimited paths are supported as either `` `path` — `symbol` `` or
- * `` `symbol` in `path` ``.
+ * `` `symbol` in `path` ``. A symbol citation whose written path reaches a file only through the
+ * basename fallback is UNRESOLVED: that fallback did not verify the explicit path as the symbol's
+ * target.
  *
  * Only issue bodies are read. An inline line citation's trailing content is checked only when it
  * is explicitly backtick- or quote-delimited; fenced content is checked only when it reads as
@@ -1194,23 +1196,34 @@ const knownExtensions = new Set(trackedFiles.map((f) => extensionOf(f)).filter(B
  * tracked files at any split point, by definition, so a design that only trusts a split when the
  * resulting path exists cannot ever report that file gone — the one case this whole check is for.
  *
- * A remote-tracking branch's short name (`origin/main`) is indexed with the leading remote segment
- * stripped too (`main`), because a GitHub URL never spells the remote out.
+ * A remote-tracking branch under `origin` is indexed both as `origin/main` and with that one
+ * leading remote segment stripped (`main`), because a GitHub URL never spells the remote out.
+ * Local branch and tag names are already the names a GitHub URL spells, so none of their slash
+ * segments are aliases: local `feat/foo` proves only `feat/foo`, never an unrelated `foo` ref.
  */
 const knownRefs = (() => {
   try {
     const raw = execFileSync(
       "git",
-      ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes", "refs/tags"],
+      ["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"],
       { cwd: repoRoot, encoding: "utf8" },
     );
     const refs = new Set();
     for (const line of raw.split("\n")) {
-      const ref = line.trim();
-      if (!ref) continue;
-      refs.add(ref);
-      const slash = ref.indexOf("/");
-      if (slash !== -1) refs.add(ref.slice(slash + 1));
+      const refname = line.trim();
+      if (refname.startsWith("refs/heads/")) {
+        refs.add(refname.slice("refs/heads/".length));
+        continue;
+      }
+      if (refname.startsWith("refs/tags/")) {
+        refs.add(refname.slice("refs/tags/".length));
+        continue;
+      }
+      if (refname.startsWith("refs/remotes/")) {
+        const remoteRef = refname.slice("refs/remotes/".length);
+        refs.add(remoteRef);
+        if (remoteRef.startsWith("origin/")) refs.add(remoteRef.slice("origin/".length));
+      }
     }
     return refs;
   } catch {
@@ -1256,9 +1269,11 @@ const repoSlug = (() => {
  * a real filename (`graveyard/continuity-kernel.ts`) resolves exactly as readily as an honest bare
  * filename (`continuity-kernel.ts`) does. The caller reports "basename" resolutions as ADVISORY
  * even with no line number at all — the citation resolved, but not the way it was written, and
- * that is worth a reader's attention the same way a rotting line number is. A "suffix" match kept
- * every directory the citation specified and only lacked a prefix, which is a far stronger
- * signal that the citation actually meant this file, so it stays silent.
+ * that is worth a reader's attention the same way a rotting line number is. A symbol citation
+ * cannot use that fallback without changing which file is searched, so its caller reports the
+ * target UNRESOLVED instead. A "suffix" match kept every directory the citation specified and
+ * only lacked a prefix, which is a far stronger signal that the citation actually meant this file,
+ * so it stays silent.
  */
 const resolvePath = (cited) => {
   if (trackedFiles.includes(cited)) return { path: cited, ambiguous: null, matchKind: "exact" };
@@ -1528,7 +1543,8 @@ const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // One executable answer to "what is a symbol". JavaScript's `\w` and `\b` are ASCII definitions,
 // so they cannot model either Unicode identifiers or a `$` boundary. `ID_Continue` does not include
 // the two join controls that JavaScript permits after the first character, hence their explicit
-// inclusion. Extraction and `symbolPattern` both derive from these exact sources.
+// inclusion. Extraction and `symbolPattern` both derive from these exact sources, including the
+// private prefix in the search's left boundary so an unprefixed citation cannot enter after `#`.
 const SYMBOL_GRAMMAR_RULES = Object.freeze({
   support: "supported",
   identifierStartSource: "[\\p{ID_Start}$_]",
@@ -1586,7 +1602,7 @@ const parseSymbolReference = (raw) => SYMBOL_REFERENCE_RE.exec(raw)?.groups?.sym
 const symbolPattern = (symbol) => {
   const escaped = escapeRegex(symbol);
   return new RegExp(
-    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})` +
+    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource}|${escapeRegex(SYMBOL_GRAMMAR_RULES.privatePrefix)})` +
       `${escaped}` +
       `(?!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})`,
     "u",
@@ -2441,6 +2457,16 @@ for (const issue of issues) {
       });
       continue;
     }
+    if (resolved.matchKind === "basename") {
+      unresolved.push({
+        issue,
+        citation: symbolCitation.raw,
+        reason:
+          `${symbolCitation.path} is not a tracked path; only its filename matches ${resolved.path}, ` +
+          "so the cited symbol's target was not verified",
+      });
+      continue;
+    }
 
     // Fix (round 1): #597's rule is that the *named enforcement site* holds the symbol — pairing
     // `src/core/reason-codes.ts` with `failover` claims that file contains `failover`, not that
@@ -2584,7 +2610,7 @@ if (asJson) {
   if (stale.length > 0 || unresolved.length > 0 || unsupported.length > 0 || nonDurableFindings.length > 0) {
     console.log(
       "\nSTALE means the citation no longer describes the tree; re-derive the claim from the code, not the issue text.\n" +
-        "UNRESOLVED means the check could not prove a multi-segment blob ref's path boundary; it did not call the file absent.\n" +
+        "UNRESOLVED means the check could not prove a citation's target or a multi-segment blob ref's path boundary; it did not call the file absent.\n" +
         "UNSUPPORTED means an explicit citation-shaped form was seen but is outside the grammar above; rewrite it in a supported form.\n" +
         "NON_DURABLE means the citation names something the filesystem does not guarantee to keep;\n" +
         "commit it or accept it is gone. A contradictory issue edit does not repair any of these findings.",

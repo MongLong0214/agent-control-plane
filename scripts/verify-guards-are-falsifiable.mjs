@@ -2391,7 +2391,7 @@ const GUARDS = [
     file: "scripts/verify-tracker-loci-resolve.mjs",
     find:
       "  return new RegExp(\n" +
-      "    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})` +\n" +
+      "    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource}|${escapeRegex(SYMBOL_GRAMMAR_RULES.privatePrefix)})` +\n" +
       "      `${escaped}` +\n" +
       "      `(?!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})`,\n" +
       '    "u",\n' +
@@ -2399,6 +2399,38 @@ const GUARDS = [
     replace: '  return new RegExp(`\\\\b${escaped}\\\\b`, "u");',
     killedBy: [
       "tests/unit/verify-tracker-loci-resolve.test.ts::dollar prefixed identifiers resolve when present and are stale when absent",
+    ],
+  },
+  {
+    what: "a private identifier prefix is part of the symbol search boundary",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find:
+      "    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource}|${escapeRegex(SYMBOL_GRAMMAR_RULES.privatePrefix)})` +",
+    replace: "    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})` +",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::an unprefixed private identifier citation does not match the prefixed symbol",
+    ],
+  },
+  {
+    what: "a symbol citation is unresolved when its explicit path matches only an unrelated basename",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '    if (resolved.matchKind === "basename") {\n      unresolved.push({',
+    replace: "    if (false) {\n      unresolved.push({",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a parent relative symbol path is unresolved instead of matching only its basename",
+    ],
+  },
+  {
+    what: "a local slash branch does not register its final segment as a separate known ref",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '        refs.add(refname.slice("refs/heads/".length));',
+    replace:
+      '        const localRef = refname.slice("refs/heads/".length);\n' +
+      "        refs.add(localRef);\n" +
+      '        const slash = localRef.indexOf("/");\n' +
+      "        if (slash !== -1) refs.add(localRef.slice(slash + 1));",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a local slash branch does not manufacture a known short ref",
     ],
   },
   {
