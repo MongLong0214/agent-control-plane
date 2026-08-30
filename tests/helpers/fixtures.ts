@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { rm as rmAsync } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -64,6 +65,12 @@ export const tempDir = (prefix = "acp-test-"): string => {
 export const cleanupTempDirs = (): void => {
   for (const dir of tempRoots) rmSync(dir, { recursive: true, force: true });
   tempRoots = [];
+};
+
+export const cleanupTempDirsAsync = async (): Promise<void> => {
+  const roots = tempRoots;
+  tempRoots = [];
+  await Promise.all(roots.map((dir) => rmAsync(dir, { recursive: true, force: true })));
 };
 
 const GIT_ENV = {
