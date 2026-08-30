@@ -43,6 +43,17 @@ export const ReasonCode = {
 
   // --- CP-HI-03 Candidate Contract Pinning --------------------------------
   CONTRACT_DIGEST_MISMATCH: "CONTRACT_DIGEST_MISMATCH",
+  /**
+   * The pinned contract could not be produced to compare at all — the manifest is not
+   * retrievable, the run-scoped pin is absent/malformed, a stored record's own digest does
+   * not match its content, or a lookup meant to resolve to exactly one contract could not.
+   * #448: an unreadable record is not a verdict that it disagrees; folding "unknown" into
+   * "mismatch" told a caller a comparison happened and disagreed, when no comparison ever
+   * took place. This holds at every entry point that reaches this state — preparing a PR,
+   * post-CEO-approval finalization, and the CI-trust path alike — not only the first one
+   * that was fixed.
+   */
+  CONTRACT_UNVERIFIED: "CONTRACT_UNVERIFIED",
   CANDIDATE_CANNOT_WEAKEN_CONTRACT: "CANDIDATE_CANNOT_WEAKEN_CONTRACT",
   CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN: "CONTRACT_CHANGE_REQUIRES_DEDICATED_RUN",
   REPOSITORY_IDENTITY_MISMATCH: "REPOSITORY_IDENTITY_MISMATCH",
@@ -574,6 +585,7 @@ export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set([
   ReasonCode.BINDING_GENERATION_STALE,
   ReasonCode.CANDIDATE_PIPELINE_ATTEMPT_STALE,
   ReasonCode.CAPACITY_SENSOR_FILE_STALE,
+  ReasonCode.CEO_CONVERSATION_STALE,
   ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,
   ReasonCode.EVIDENCE_STALE,
   ReasonCode.FINALIZATION_ATTEMPT_STALE,

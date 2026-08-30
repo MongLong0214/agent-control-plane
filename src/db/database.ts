@@ -11,7 +11,7 @@ import {
   backupOpenDatabaseSync,
   nextBackupPath,
   pruneAutomaticBackups,
-  restoreDatabase,
+  restoreMigrationBackup,
   type DatabaseBackup,
 } from "./backup.ts";
 import {
@@ -396,7 +396,7 @@ export class Db {
       const migrationError = error instanceof Error ? error.message : String(error);
       if (this.#raw.open) this.#raw.close();
       try {
-        restoreDatabase(filename, backup.path);
+        restoreMigrationBackup(filename, backup);
       } catch (restoreError) {
         throw acpError(
           ReasonCode.INTERNAL_ERROR,

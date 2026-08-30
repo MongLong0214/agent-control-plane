@@ -1195,11 +1195,23 @@ export class BlindReviewGate {
     const contract = this.artifacts
       .list<TaskContract>(request.runId, ArtifactKind.TASK_CONTRACT)
       .find((artifact) => !artifact.superseded && artifact.digest === run.contract_digest);
-    if (!contract || digestOf(contract.content) !== run.contract_digest || digestOf(request.contract) !== run.contract_digest) {
-      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "the supplied task contract is not the run's immutable contract", {
+    if (!contract || digestOf(contract.content) !== run.contract_digest) {
+      // #448: nothing was compared — the artifact store has no contract that both matches the
+      // run's pinned digest by name and hashes to it. There is no trustworthy stored contract
+      // here to compare the caller's submission against.
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "the run's pinned task contract is not retrievable by digest", {
         runId: request.runId,
         expected: run.contract_digest,
         found: contract?.digest ?? null,
+      });
+    }
+    if (digestOf(request.contract) !== run.contract_digest) {
+      // A trustworthy stored contract is in hand; this is the actual comparison — the
+      // caller's submitted contract against the run's pinned one — and they disagree.
+      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "the supplied task contract is not the run's immutable contract", {
+        runId: request.runId,
+        expected: run.contract_digest,
+        found: contract.digest,
       });
     }
 
