@@ -1650,6 +1650,52 @@ describe("verify-tracker-loci-resolve", () => {
     });
   });
 
+  describe("[round 16] #689: shell and YAML had the identical defect and were shipped anyway — the fourth instance", () => {
+    it("required_keychain_value in deploy/install-launchd.sh resolves silently — the real repo citation, not a constructed fixture", () => {
+      // The real shape found in this repository, worse than round 15's JS/TS instance: line 173
+      // writes printf '#!/bin/bash\nset -euo pipefail\n' as a single-quoted string. The old
+      // stripHashComments ran first, blind to the string boundary; the # right after the opening
+      // quote (preceded by ', not ':', the old regex's only guard) started a "comment" that ate
+      // the rest of the line, including the string's own closing quote. stripStrings' single-quote
+      // regex then paired that surviving lone quote with the *next* quote anywhere later in the
+      // file, desynchronizing every quote pairing after it for the rest of the file — not just one
+      // string. required_keychain_value (declared line 191, called lines 249 and 250 — three real,
+      // current occurrences) survived none of them in the old stripped view.
+      const body = "`required_keychain_value` in `deploy/install-launchd.sh`";
+      const { path, cleanup } = withIssues([
+        { number: 68903, title: "round 16: the shell quote/comment ordering defect", body },
+      ]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a symbol spelled only inside a shell string with an embedded # word-boundary violation is still STALE — positive control the other direction", () => {
+      // The companion case: a symbol that only exists because a # mid-string was misread as
+      // opening real code must still read STALE after the fix, the same way round 3's `utf8`
+      // counterexample does for JS. `metadata` here only appears inside install-launchd.sh's own
+      // `${metadata##* }` parameter expansion — real code, not a comment or string — so it must
+      // resolve; a genuinely fictitious symbol must not.
+      const body = "`definitelyNotARealShellSymbolXYZ` in `deploy/install-launchd.sh`";
+      const { path, cleanup } = withIssues([
+        { number: 68904, title: "round 16: fictitious shell symbol still reads STALE", body },
+      ]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("definitelyNotARealShellSymbolXYZ");
+        expect(result.stdout).toContain("does not appear");
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);

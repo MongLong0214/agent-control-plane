@@ -707,6 +707,44 @@
  *   whose `${…}` contains a quote, an escaped quote, and an unterminated string — each has its own
  *   row, not folded into one broad assertion, the same discipline round 11's property test used.
  *
+ * ## Round 16: the fourth instance was pre-filed against this same round — shell and YAML had the
+ * identical defect and were shipped anyway
+ *
+ *   Round 15's own closing note flagged it directly: `.sh`/`.yaml`/`.yml` still ran
+ *   `stripStrings(stripHashComments(text))` — the same two-pass, string-blind pipeline round 15
+ *   fixed for JS/TS — for both the symbol view and (`stripHashComments` alone) the content view.
+ *   Shipping that unfixed under a commit claiming the stripper now resolves things in one ordered
+ *   walk would have been true for two of the four languages this script handles and false for the
+ *   other two.
+ *
+ *   Confirmed against the real corpus, worse than the JS/TS instance: `deploy/install-launchd.sh`
+ *   line 173 writes `printf '#!/bin/bash\nset -euo pipefail\n'`. The old `stripHashComments` ran
+ *   first, blind to the string boundary; the `#` right after the opening `'` (preceded by `'`, not
+ *   `:` — the old regex's only guard) started a "comment" that ate the rest of the line, including
+ *   the string's own closing `'`. `stripStrings`'s single-quote regex then paired that surviving
+ *   lone `'` with the *next* `'` anywhere later in the file — the opening quote of the following
+ *   line's own `printf '...'` — desynchronizing every quote pairing after it for the rest of the
+ *   file, not just one string. `required_keychain_value` (declared line 191, called lines 249 and
+ *   250 — three real, current occurrences) survived zero of them in the old stripped view.
+ *
+ *   `stripShellSource`/`stripYamlSource` (`scripts/lib/tracker-loci-strip.mjs`) give each language
+ *   its own ordered walk rather than reusing one generic pipeline for both — their quoting rules
+ *   differ too much to share one (shell's plain `'...'` has no escape character at all; YAML's
+ *   `'...'` escapes a literal quote by doubling it; shell alone has `$'...'` and heredocs). Both
+ *   add a `#` word-boundary rule (comment only at start-of-line or after whitespace) that neither
+ *   old pass implemented, which also fixes — as a side effect of the rule being right, not a
+ *   special case — three shapes this repository's own tracked `.sh` file already contains: `$#`,
+ *   `${x##suffix}`, and `8#22` (arithmetic base notation). A heredoc body is walked verbatim
+ *   (never comment- or string-scanned), so a `#` inside one — this file's own two heredocs, an
+ *   embedded second script — is not mistaken for a comment of the outer file. What cannot be
+ *   resolved statically is disclosed rather than silently scored: a YAML block scalar (`|`/`>`) is
+ *   walked as ordinary text, not full indentation-tracked; a quoted heredoc word with characters
+ *   outside `[A-Za-z0-9_]` is not recognized — neither shape appears in this repository's own
+ *   tracked files, confirmed by grep rather than assumed.
+ *
+ *   SQL (`stripStrings(stripSqlComments(text))`) has the same latent shape and was not touched —
+ *   named here, not fixed, out of this round's stated scope.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -714,11 +752,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  stripHashComments,
   stripJsSource,
   stripPythonSource,
+  stripShellSource,
   stripSqlComments,
   stripStrings,
+  stripYamlSource,
 } from "./lib/tracker-loci-strip.mjs";
 
 const defaultRepoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -792,13 +831,17 @@ const countLines = (text) => {
  * file that does not use them.
  */
 const JS_FAMILY_EXTS = new Set(["ts", "tsx", "js", "mjs", "cjs", "mts"]);
-const HASH_COMMENT_EXTS = new Set(["py", "sh", "yaml", "yml"]);
 const SQL_EXTS = new Set(["sql"]);
-// Python gets its own dedicated stripper (`stripPythonSource`), not the generic
-// `stripStrings(stripHashComments(text))` pipeline the other HASH_COMMENT_EXTS still use — see
-// #700 and round 14 below. `.sh`/`.yaml`/`.yml` have no triple-quote convention to get wrong the
-// same way, so they stay on the simpler pipeline.
+// Python, shell, and YAML each get their own dedicated stripper (`stripPythonSource`,
+// `stripShellSource`, `stripYamlSource`) — none of the three share a generic
+// `stripStrings(stripHashComments(text))` pipeline any more (round 14 for Python, round 16 for
+// shell/YAML — see both below). Each language's `#`-vs-quote-vs-comment ordering and quoting rules
+// differ enough (Python's triple quotes, shell's `#` word-boundary rule plus heredocs and
+// `$'...'`, YAML's doubled-`''` escape) that a shared pipeline kept re-introducing the same
+// ordering defect for whichever language did not get its own walk yet.
 const PY_EXTS = new Set(["py"]);
+const SH_EXTS = new Set(["sh"]);
+const YAML_EXTS = new Set(["yaml", "yml"]);
 
 const extensionOf = (relPath) => {
   const dot = relPath.lastIndexOf(".");
@@ -809,7 +852,9 @@ const extensionOf = (relPath) => {
 const codeSearchScope = (relPath) => {
   const ext = extensionOf(relPath);
   if (JS_FAMILY_EXTS.has(ext)) return "outside a `//`/`/* */` comment, a quoted string, or template-literal prose";
-  if (HASH_COMMENT_EXTS.has(ext)) return "outside a `#` comment or quoted string";
+  if (PY_EXTS.has(ext)) return "outside a `#` comment or quoted string";
+  if (SH_EXTS.has(ext)) return "outside a `#` comment (at a word boundary), a quoted string, or a heredoc body";
+  if (YAML_EXTS.has(ext)) return "outside a `#` comment (at a word boundary) or a quoted scalar";
   if (SQL_EXTS.has(ext)) return "outside a `--`/`/* */` comment or quoted string";
   return `as plain text (no comment or string exclusion applies to .${ext} files)`;
 };
@@ -823,12 +868,14 @@ const codeSearchScope = (relPath) => {
  * name that only happens to be spelled inside a string literal does not count as the file
  * declaring it (round 3's `utf8` counterexample). Round 14 splits this from the *content-search*
  * view (`stripCommentsForContentView`, below) — see that function's comment for why the two need
- * different answers about string content, and #700 for the Python-specific fix here.
+ * different answers about string content, #700 for the Python-specific fix here, and round 16 for
+ * the shell/YAML one.
  */
 const stripToCodeView = (text, ext) => {
   if (JS_FAMILY_EXTS.has(ext)) return stripJsSource(text, true);
   if (PY_EXTS.has(ext)) return stripPythonSource(text, true);
-  if (HASH_COMMENT_EXTS.has(ext)) return stripStrings(stripHashComments(text));
+  if (SH_EXTS.has(ext)) return stripShellSource(text, true);
+  if (YAML_EXTS.has(ext)) return stripYamlSource(text, true);
   if (SQL_EXTS.has(ext)) return stripStrings(stripSqlComments(text));
   return text; // no supported comment syntax for this extension — see codeSearchScope
 };
@@ -878,7 +925,8 @@ const readCode = (relPath) => {
 const stripCommentsForContentView = (text, ext) => {
   if (JS_FAMILY_EXTS.has(ext)) return stripJsSource(text, false);
   if (PY_EXTS.has(ext)) return stripPythonSource(text, false);
-  if (HASH_COMMENT_EXTS.has(ext)) return stripHashComments(text);
+  if (SH_EXTS.has(ext)) return stripShellSource(text, false);
+  if (YAML_EXTS.has(ext)) return stripYamlSource(text, false);
   if (SQL_EXTS.has(ext)) return stripSqlComments(text);
   return text;
 };
@@ -1777,7 +1825,13 @@ for (const issue of issues) {
         .filter((f) => f !== resolved.path)
         .filter((f) => {
           const ext = extensionOf(f);
-          return JS_FAMILY_EXTS.has(ext) || HASH_COMMENT_EXTS.has(ext) || SQL_EXTS.has(ext);
+          return (
+            JS_FAMILY_EXTS.has(ext) ||
+            PY_EXTS.has(ext) ||
+            SH_EXTS.has(ext) ||
+            YAML_EXTS.has(ext) ||
+            SQL_EXTS.has(ext)
+          );
         })
         .find((f) => pattern.test(readCode(f)));
       stale.push({

@@ -14,3 +14,5 @@ export declare const stripStrings: (text: string) => string;
 export declare const stripTemplateLiteralProse: (text: string) => string;
 export declare const stripPythonSource: (text: string, blankStrings: boolean) => string;
 export declare const stripJsSource: (text: string, blankStrings: boolean) => string;
+export declare const stripShellSource: (text: string, blankStrings: boolean) => string;
+export declare const stripYamlSource: (text: string, blankStrings: boolean) => string;

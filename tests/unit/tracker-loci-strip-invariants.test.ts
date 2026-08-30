@@ -4,10 +4,12 @@ import {
   stripHashComments,
   stripJsSource,
   stripPythonSource,
+  stripShellSource,
   stripSlashComments,
   stripSqlComments,
   stripStrings,
   stripTemplateLiteralProse,
+  stripYamlSource,
 } from "../../scripts/lib/tracker-loci-strip.mjs";
 
 /**
@@ -114,6 +116,18 @@ const ADVERSARIAL_INPUTS: Array<{ label: string; text: string }> = [
     label: "adjacent Python triple-quoted strings of different delimiter styles",
     text: ['a = """first"""', "b = '''second'''", "c = 3"].join("\n"),
   },
+  {
+    label: "a heredoc body spanning many lines (#689 round 16)",
+    text: ["cat <<'EOF'", "line one", "line two", "line three", "EOF", "x=1"].join("\n"),
+  },
+  {
+    label: "an unterminated heredoc (no matching delimiter line)",
+    text: ["cat <<'EOF'", "never", "terminates"].join("\n"),
+  },
+  {
+    label: "a YAML single-quoted scalar with a doubled '' escape, multi-line",
+    text: ["key: 'it''s", "still one scalar'", "key2: value"].join("\n"),
+  },
 ];
 
 const strippers: Array<{ name: string; fn: (text: string) => string }> = [
@@ -132,6 +146,12 @@ const strippers: Array<{ name: string; fn: (text: string) => string }> = [
   // walk — same reason `stripPythonSource` gets its own two rows above, not just one call site.
   { name: "stripJsSource(blankStrings=true)", fn: (text) => stripJsSource(text, true) },
   { name: "stripJsSource(blankStrings=false)", fn: (text) => stripJsSource(text, false) },
+  // #689/round 16: shell and YAML each get their own ordered walk — same reason as the two rows
+  // above, not just one call site each.
+  { name: "stripShellSource(blankStrings=true)", fn: (text) => stripShellSource(text, true) },
+  { name: "stripShellSource(blankStrings=false)", fn: (text) => stripShellSource(text, false) },
+  { name: "stripYamlSource(blankStrings=true)", fn: (text) => stripYamlSource(text, true) },
+  { name: "stripYamlSource(blankStrings=false)", fn: (text) => stripYamlSource(text, false) },
 ];
 
 describe("tracker-loci strip invariants", () => {
@@ -306,6 +326,154 @@ describe("tracker-loci strip invariants", () => {
       expect(symbolView).not.toContain("module.exports");
       const contentView = stripJsSource(text, false);
       expect(contentView).toContain('module.exports = () => 2; // addressed review');
+    });
+  });
+
+  describe("stripShellSource (#689, round 16)", () => {
+    // Every delimiter-ordering shape this class of bug can take, for shell's own delimiter set —
+    // `#` comments, single quotes, double quotes, `$'...'`, and heredocs — each its own row.
+
+    it("# starts a comment at the start of a line", () => {
+      const input = "# a real comment\nx=1";
+      expect(stripShellSource(input, true)).toBe("\nx=1");
+    });
+
+    it("# starts a comment after whitespace (a real word boundary)", () => {
+      const input = "echo foo # trailing comment\nx=2";
+      expect(stripShellSource(input, true)).toBe("echo foo \nx=2");
+    });
+
+    it("# does NOT start a comment mid-word — echo foo#bar is not a comment", () => {
+      const input = "echo foo#bar\nx=3";
+      expect(stripShellSource(input, true)).toBe(input); // untouched: no comment, no string
+    });
+
+    it("$# (positional parameter count) is not misread as a comment", () => {
+      // The real shape in deploy/install-launchd.sh:49.
+      const input = "while [[ $# -gt 0 ]]; do\nx=4";
+      expect(stripShellSource(input, true)).toBe(input);
+    });
+
+    it("## (suffix-removal parameter expansion) is not misread as a comment", () => {
+      // The real shape in deploy/install-launchd.sh:95 and :106.
+      const input = 'mode="${metadata##* }"\nx=5';
+      expect(stripShellSource(input, true)).toBe('mode="               "\nx=5');
+    });
+
+    it("8# (arithmetic base notation) is not misread as a comment", () => {
+      // The real shape in deploy/install-launchd.sh:121.
+      const input = "[[ $((8#22)) -eq 0 ]]\nx=6";
+      expect(stripShellSource(input, true)).toBe(input);
+    });
+
+    it("// inside a string is not read as a comment marker", () => {
+      // The real shape in deploy/install-launchd.sh:173: printf '#!/bin/bash\\n...\\n' — the # is
+      // preceded by the opening quote, not whitespace, and is string content either way.
+      const input = "printf '#!/bin/bash\\nset -e\\n'\nx=7";
+      expect(stripShellSource(input, true)).toBe("printf '                     '\nx=7");
+      expect(stripShellSource(input, false)).toBe(input);
+    });
+
+    it("a quote inside a genuine # comment does not open a string", () => {
+      const input = "# this isn't \"real\" code\nx=8";
+      expect(stripShellSource(input, true)).toBe("\nx=8");
+    });
+
+    it("a plain single-quoted string has no escape character — backslash is literal", () => {
+      const input = "echo 'a\\'\nx=9";
+      // The backslash does not escape the closing quote; the string is 'a\' (2 interior chars).
+      expect(stripShellSource(input, true)).toBe("echo '  '\nx=9");
+    });
+
+    it("$'...' (ANSI-C quoting) does recognize backslash escapes", () => {
+      const input = "echo $'a\\'b'\nx=10";
+      // Unlike a plain '...', the escaped quote here does not end the string early.
+      expect(stripShellSource(input, true)).toBe("echo $'    '\nx=10");
+    });
+
+    it("a double-quoted string recognizes backslash escapes", () => {
+      const input = 'echo "a\\"b"\nx=11';
+      expect(stripShellSource(input, true)).toBe('echo "    "\nx=11');
+    });
+
+    it("an unterminated single-quoted string is blanked to where it actually ends", () => {
+      const input = "echo 'never closes\nx=12";
+      const out = stripShellSource(input, true);
+      expect(out.split("\n")[0]).toBe("echo '            ");
+      expect(out.split("\n")[1]).toBe("x=12");
+    });
+
+    it("a heredoc body is passed through untouched — a # inside it is not a comment", () => {
+      const input = "cat <<'EOF'\n# not a comment, just data\nEOF\nx=13";
+      expect(stripShellSource(input, true)).toBe(input);
+      expect(stripShellSource(input, false)).toBe(input);
+    });
+
+    it("a <<- heredoc strips leading tabs only when matching the terminator line", () => {
+      const input = "cat <<-'EOF'\n\tbody line\n\tEOF\nx=14";
+      expect(stripShellSource(input, true)).toBe(input);
+    });
+
+    it("<<< (a here-string) is not mistaken for a heredoc", () => {
+      const input = 'cat <<< "$var"\nx=15';
+      expect(stripShellSource(input, true)).toBe('cat <<< "    "\nx=15');
+    });
+
+    it("an unterminated heredoc passes the rest of the file through verbatim", () => {
+      const input = "cat <<'EOF'\nnever\nterminates";
+      expect(stripShellSource(input, true)).toBe(input);
+    });
+
+    it("the real deploy/install-launchd.sh: required_keychain_value survives all three real occurrences", () => {
+      // The concrete counterexample round 16 found: the old stripStrings(stripHashComments(text))
+      // pipeline desynchronized every quote pairing after line 173's embedded #!/bin/bash, and
+      // required_keychain_value (declared 191, called 249 and 250) survived none of them.
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const text = fs.readFileSync(path.join(__dirname, "..", "..", "deploy", "install-launchd.sh"), "utf8");
+      const count = (s: string) => (s.match(/required_keychain_value/g) ?? []).length;
+      expect(count(text)).toBe(3);
+      expect(count(stripShellSource(text, true))).toBe(3);
+      expect(count(stripShellSource(text, false))).toBe(3);
+    });
+  });
+
+  describe("stripYamlSource (#689, round 16)", () => {
+    it("# starts a comment at the start of a line", () => {
+      expect(stripYamlSource("# comment\nkey: value", true)).toBe("\nkey: value");
+    });
+
+    it("# starts a comment after whitespace", () => {
+      expect(stripYamlSource("key: value # trailing\nkey2: value2", true)).toBe("key: value \nkey2: value2");
+    });
+
+    it("# does NOT start a comment mid-word", () => {
+      const input = "key: val#ue\nkey2: value2";
+      expect(stripYamlSource(input, true)).toBe(input);
+    });
+
+    it("an apostrophe inside a # comment (an English contraction) does not open a string", () => {
+      // The real shape in this repository's own .github/workflows/*.yml: "this job's id", "it's".
+      const input = "# this job's id\nkey: value";
+      expect(stripYamlSource(input, true)).toBe("\nkey: value");
+    });
+
+    it("a doubled '' inside a single-quoted scalar is a literal quote, not a terminator", () => {
+      const input = "key: 'it''s here'\nkey2: value2";
+      expect(stripYamlSource(input, true)).toBe("key: '          '\nkey2: value2");
+    });
+
+    it("a double-quoted scalar recognizes backslash escapes", () => {
+      const input = 'key: "a\\"b"\nkey2: value2';
+      expect(stripYamlSource(input, true)).toBe('key: "    "\nkey2: value2');
+    });
+
+    it("an unterminated single-quoted scalar whose tail is a doubled-escape at EOF is not miscounted as closed", () => {
+      // Adversarial edge case: the span "'a''" ends in a quote character, but that trailing pair
+      // is an escaped literal quote, not a real terminator — the string never actually closes.
+      const input = "key: 'a''";
+      const out = stripYamlSource(input, true);
+      expect(out).toBe("key: '   "); // no closing quote appended — genuinely unterminated
     });
   });
 });

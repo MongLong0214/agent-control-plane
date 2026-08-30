@@ -389,3 +389,318 @@ export const stripTemplateLiteralProse = (text) => {
   }
   return out;
 };
+
+/**
+ * #689 round 16: the shell/YAML pipeline (`stripStrings(stripHashComments(text))` for the symbol
+ * view, `stripHashComments(text)` alone for the content view) has the identical ordering defect
+ * round 15 fixed for JS/TS — plus a `#` word-boundary rule neither pass ever implemented. Real
+ * shell only treats `#` as a comment marker at the start of a word (preceded by whitespace, a
+ * tab, a newline, or the start of the file); `echo foo#bar` is not a comment. The old
+ * `(?<!:)#.*$` regex knew nothing about that — only about a `:` immediately before the `#`.
+ *
+ * Confirmed against the real corpus, not a constructed case: `deploy/install-launchd.sh:173`
+ * writes `printf '#!/bin/bash\nset -euo pipefail\n'` — a single-quoted string whose content
+ * starts with `#!/bin/bash`. The old `stripHashComments` ran first, blind to the string boundary;
+ * the `#` right after the opening `'` (preceded by `'`, not `:`) started a "comment" that consumed
+ * the rest of the line, including the string's own closing `'`. `stripStrings`'s single-quote
+ * regex (`/'(?:[^'\\]|\\.)*'/g`, which spans newlines) then paired that surviving lone `'` with
+ * the *next* `'` character anywhere later in the file — the opening quote of the following line's
+ * own `printf '...'` — and every quote pairing after that was one quote out of phase for the rest
+ * of the file. Confirmed directly: `required_keychain_value` (declared at line 191, called at 249
+ * and 250 — three real, current occurrences) does not survive a single one of them in the old
+ * stripped view; `stripStrings(stripHashComments(readFileSync("deploy/install-launchd.sh")))`
+ * contains zero matches for a symbol this file genuinely, currently declares and calls.
+ *
+ * `stripShellSource` replaces that two-function pipeline with one ordered character walk, the
+ * same shape `stripPythonSource`/`stripJsSource` already use:
+ *
+ *   - `#` starts a comment only at `i === 0` or when the previous character is a space, tab, or
+ *     newline. Getting the *rule* right, rather than patching the one shape a corpus citation
+ *     happened to expose, also fixes three shapes this same tracked file's real code already
+ *     contains, confirmed by grep rather than assumed: `$#` (the positional-parameter-count
+ *     variable, `while [[ $# -gt 0 ]]`), `##` (suffix-removal parameter expansion,
+ *     `${metadata##* }`), and `8#` (arithmetic base notation, `8#$mode`) — none of these are
+ *     comments, and none needed a dedicated branch once "preceded by whitespace" replaced
+ *     "preceded by `:`" as the actual rule.
+ *   - a plain single-quoted string (`'...'`) has *no* escape character at all — a backslash
+ *     inside one is a literal backslash, not an escape, and the closing delimiter is the very next
+ *     `'`, unconditionally. This is a real difference from `stripStrings`'s generic single-quote
+ *     regex (which treats every single-quoted string as backslash-escaped — only true for
+ *     `$'...'`, below) and from YAML's single-quoted scalar (a doubled `''` is a literal quote —
+ *     see `stripYamlSource`).
+ *   - `$'...'` (ANSI-C quoting) *does* recognize backslash escapes (`\n`, `\t`, `\'`, …), so it
+ *     gets its own branch rather than falling into the plain single-quote one.
+ *   - a double-quoted string (`"..."`) recognizes backslash escapes — the same generic "any `\X`
+ *     pair does not end the string" treatment `stripStrings`/`stripPythonSource`/`stripJsSource`
+ *     already use. Real shell only makes `\"`, `\\`, `` \` ``, `\$`, and an escaped newline special
+ *     inside double quotes; treating every `\X` pair as non-terminating is a safe superset for the
+ *     one thing this function needs to get right — where the string actually ends.
+ *   - a heredoc (`<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`) is recognized the moment it opens; a
+ *     bare-word delimiter must start with a letter or underscore, which excludes an arithmetic
+ *     left-shift (`$((1 << 2))`) from being misread as one — disclosed, not silently guessed,
+ *     because this repository's own tracked `.sh` file has no numeric or otherwise-unusual
+ *     heredoc word to test it against. `<<<` (a here-string, a single word/string argument, not a
+ *     multi-line body) is excluded explicitly so it falls through to ordinary quote handling
+ *     instead. The body — from the line after the opener to the line that is exactly the
+ *     delimiter word (leading tabs stripped first when the operator was `<<-`) — passes through
+ *     untouched: not comment-stripped, not string-scanned, not blanked, because it is not a string
+ *     literal or a comment, it is literal data (or, as in this file's own two heredocs, an embedded
+ *     second script) that is genuinely part of what the file contains. An unterminated heredoc (no
+ *     matching delimiter line before end of file) passes the remainder of the file through the
+ *     same way, rather than guessing where it would have ended. Content on the heredoc-opening
+ *     line *after* the operator (a trailing `# comment`, more of the command) is not treated as
+ *     part of the body — it is walked normally, through this same dispatch, before the body
+ *     consumption begins at the next newline — so a heredoc opened mid-pipeline is not mistaken
+ *     for one whose body starts immediately.
+ *
+ * Disclosed, not silently scored: a *quoted* heredoc word containing anything other than letters,
+ * digits, or underscore, and a delimiter word given with special characters, are not recognized —
+ * neither shape appears in this repository's own tracked `.sh` file, confirmed by grep. Multiple
+ * heredocs opened on one line (`cmd <<A <<B`) are queued and consumed in order, which this
+ * repository's tracked file does not exercise either, but is handled rather than assumed away.
+ */
+export const stripShellSource = (text, blankStrings) => {
+  const n = text.length;
+  let out = "";
+  let i = 0;
+  const pendingHeredocs = [];
+
+  const isWordBoundaryBefore = (idx) =>
+    idx === 0 || text[idx - 1] === " " || text[idx - 1] === "\t" || text[idx - 1] === "\n";
+
+  /**
+   * Renders a quoted span, honoring `blankStrings` the same way every other stripper here does.
+   * `openLen`/`closeLen` are given independently — `$'...'` opens with 2 characters (`$'`) and
+   * closes with 1 (`'`), which a single shared width would get wrong for one side or the other.
+   * `closed` says whether `span`'s last `closeLen` characters really are the closing delimiter
+   * (false for an unterminated string, where the whole remainder after the opener is interior).
+   */
+  const renderQuoted = (span, openLen, closeLen, closed) => {
+    if (!blankStrings) return span;
+    const actualCloseLen = closed ? closeLen : 0;
+    const interior = span.slice(openLen, span.length - actualCloseLen);
+    return (
+      span.slice(0, openLen) + blankKeepingNewlines(interior) + (actualCloseLen ? span.slice(-actualCloseLen) : "")
+    );
+  };
+
+  const consumeHeredocBody = ({ delim, stripTabs }) => {
+    // `i` is already past the newline that starts the body.
+    let cursor = i;
+    while (cursor <= n) {
+      const nextNl = text.indexOf("\n", cursor);
+      const lineEnd = nextNl === -1 ? n : nextNl;
+      const line = text.slice(cursor, lineEnd);
+      const compare = stripTabs ? line.replace(/^\t+/, "") : line;
+      if (compare === delim) {
+        out += text.slice(i, lineEnd); // body + delimiter line, verbatim
+        i = lineEnd;
+        return;
+      }
+      if (nextNl === -1) {
+        out += text.slice(i, n); // unterminated: rest of file is body, verbatim
+        i = n;
+        return;
+      }
+      cursor = nextNl + 1;
+    }
+  };
+
+  while (i < n) {
+    const ch = text[i];
+
+    if (ch === "\n" && pendingHeredocs.length > 0) {
+      out += "\n";
+      i++;
+      const queue = pendingHeredocs.splice(0);
+      for (const heredoc of queue) consumeHeredocBody(heredoc);
+      continue;
+    }
+
+    if (ch === "#" && isWordBoundaryBefore(i)) {
+      while (i < n && text[i] !== "\n") i++;
+      continue; // deleted outright, matching stripHashComments' existing behavior
+    }
+
+    if (ch === "$" && text[i + 1] === "'") {
+      const start = i;
+      let j = i + 2;
+      let closed = false;
+      while (j < n) {
+        if (text[j] === "\\" && j + 1 < n) {
+          j += 2;
+          continue;
+        }
+        if (text[j] === "'") {
+          j++;
+          closed = true;
+          break;
+        }
+        if (text[j] === "\n") break;
+        j++;
+      }
+      out += renderQuoted(text.slice(start, j), 2, 1, closed); // opens "$'" (2), closes "'" (1)
+      i = j;
+      continue;
+    }
+
+    if (ch === "'") {
+      const start = i;
+      let j = i + 1;
+      while (j < n && text[j] !== "'" && text[j] !== "\n") j++;
+      const closed = j < n && text[j] === "'";
+      if (closed) j++;
+      out += renderQuoted(text.slice(start, j), 1, 1, closed);
+      i = j;
+      continue;
+    }
+
+    if (ch === '"') {
+      const start = i;
+      let j = i + 1;
+      let closed = false;
+      while (j < n) {
+        if (text[j] === "\\" && j + 1 < n) {
+          j += 2;
+          continue;
+        }
+        if (text[j] === '"') {
+          j++;
+          closed = true;
+          break;
+        }
+        if (text[j] === "\n") break;
+        j++;
+      }
+      out += renderQuoted(text.slice(start, j), 1, 1, closed);
+      i = j;
+      continue;
+    }
+
+    if (ch === "<" && text[i + 1] === "<" && text[i + 2] !== "<") {
+      const match = /^<<(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)"|([A-Za-z_][A-Za-z0-9_]*))/.exec(
+        text.slice(i, i + 256),
+      );
+      if (match) {
+        pendingHeredocs.push({ delim: match[2] ?? match[3] ?? match[4], stripTabs: match[1] === "-" });
+        out += match[0];
+        i += match[0].length;
+        continue;
+      }
+    }
+
+    out += ch;
+    i++;
+  }
+
+  return out;
+};
+
+/**
+ * #689 round 16: YAML's own comment/quote rules, in the same one-ordered-walk shape. YAML shares
+ * shell's `#`-word-boundary rule (a `#` only starts a comment preceded by whitespace or at the
+ * start of a line — confirmed against this repository's own tracked `.github/workflows/*.yml`:
+ * every apostrophe inside an English contraction in a comment, `` job's ``/`` it's ``/`` PR's ``,
+ * sits *after* a `#` that already opened the comment at a word boundary, so it is never reached as
+ * a potential quote-opener — the same mirror case round 15 named for JS's `//`), but its quoting
+ * rules differ from both shell and JS:
+ *
+ *   - a single-quoted scalar (`'...'`) escapes a literal quote by *doubling* it (`''`), not with a
+ *     backslash — a backslash inside one is a literal backslash. Different from shell's plain
+ *     single-quote (no escape of any kind) and from `stripStrings`'s generic regex (backslash-
+ *     escaped, which is right for neither).
+ *   - a double-quoted scalar (`"..."`) recognizes backslash escapes, the same generic "any `\X`
+ *     pair does not end the string" treatment used throughout this file.
+ *   - unlike shell/JS (where a raw string literally cannot span an unescaped newline — that is a
+ *     syntax error in both, so stopping the scan at `\n` is the *correct*, not merely convenient,
+ *     answer), a YAML quoted scalar legitimately folds across multiple lines. This walk does not
+ *     cut a quoted scalar off at a raw newline the way `stripShellSource`/`stripJsSource` do;
+ *     confirmed safe against this repository's own tracked YAML rather than assumed: neither
+ *     tracked workflow file has a multi-line quoted scalar today, so this does not change any
+ *     current verdict, but a scalar that never closes is well-defined here (blanked to end of
+ *     file, the delimiter kept) rather than silently reinterpreted.
+ *
+ * Disclosed, not silently scored: a YAML block scalar (`|`/`>`, e.g. `run: |` in this repository's
+ * own `ci.yml`) is walked as ordinary text, not as an indentation-delimited literal block — a `#`
+ * inside one is still only a comment at a word boundary, which happens to be the right answer for
+ * the one block scalar this repository currently tracks (an embedded shell step with no `#` in
+ * it), but is not full block-scalar indentation tracking and does not claim to be.
+ */
+export const stripYamlSource = (text, blankStrings) => {
+  const n = text.length;
+  let out = "";
+  let i = 0;
+
+  const isWordBoundaryBefore = (idx) =>
+    idx === 0 || text[idx - 1] === " " || text[idx - 1] === "\t" || text[idx - 1] === "\n";
+
+  while (i < n) {
+    const ch = text[i];
+
+    if (ch === "#" && isWordBoundaryBefore(i)) {
+      while (i < n && text[i] !== "\n") i++;
+      continue;
+    }
+
+    if (ch === "'") {
+      const start = i;
+      let j = i + 1;
+      let closed = false;
+      while (j < n) {
+        if (text[j] === "'" && text[j + 1] === "'") {
+          j += 2;
+          continue;
+        }
+        if (text[j] === "'") {
+          j++;
+          closed = true;
+          break;
+        }
+        j++;
+      }
+      const span = text.slice(start, j);
+      if (blankStrings) {
+        const closeLen = closed ? 1 : 0;
+        const interior = span.slice(1, span.length - closeLen);
+        out += span.slice(0, 1) + blankKeepingNewlines(interior) + (closeLen ? "'" : "");
+      } else {
+        out += span;
+      }
+      i = j;
+      continue;
+    }
+
+    if (ch === '"') {
+      const start = i;
+      let j = i + 1;
+      let closed = false;
+      while (j < n) {
+        if (text[j] === "\\" && j + 1 < n) {
+          j += 2;
+          continue;
+        }
+        if (text[j] === '"') {
+          j++;
+          closed = true;
+          break;
+        }
+        j++;
+      }
+      const span = text.slice(start, j);
+      if (blankStrings) {
+        const closeLen = closed ? 1 : 0;
+        const interior = span.slice(1, span.length - closeLen);
+        out += span.slice(0, 1) + blankKeepingNewlines(interior) + (closeLen ? '"' : "");
+      } else {
+        out += span;
+      }
+      i = j;
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+
+  return out;
+};
