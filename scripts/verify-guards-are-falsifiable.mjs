@@ -483,6 +483,17 @@ const GUARDS = [
     ],
   },
   {
+    what: "the disposable realm launcher does not load a TMPDIR-backed TypeScript transform cache",
+    file: "package.json",
+    find:
+      '    "acceptance:disposable-realm": "NODE_DISABLE_COMPILE_CACHE=1 node --experimental-transform-types scripts/run-disposable-realm-probe.ts",',
+    replace:
+      '    "acceptance:disposable-realm": "NODE_DISABLE_COMPILE_CACHE=1 node --import tsx scripts/run-disposable-realm-probe.ts",',
+    killedBy: [
+      "tests/process/disposable-realm-janitor.test.ts::does not write through inherited TMPDIR before the disposable workspace is established",
+    ],
+  },
+  {
     what: "the periodic capacity sweep gets a budget sized against the sweep, not against startup",
     symbols: ["sweepBudgetMs"],
     file: "src/daemon/daemon.ts",

@@ -20,7 +20,7 @@
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",
     "test:e2e": "vitest run tests/e2e --testTimeout=600000",
-    "acceptance:disposable-realm": "node --import tsx scripts/run-disposable-realm-probe.ts",
+    "acceptance:disposable-realm": "NODE_DISABLE_COMPILE_CACHE=1 node --experimental-transform-types scripts/run-disposable-realm-probe.ts",
     "lint": "eslint .",
     "trace": "tsx src/tools/traceability.ts",
     "terminology": "node scripts/verify-terminology.mjs",
