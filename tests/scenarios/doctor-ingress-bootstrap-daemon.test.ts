@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { runHermesTargetBind } from "../../src/runtime/hermes-target-bind.ts";
+import type * as HermesTargetBindModule from "../../src/runtime/hermes-target-bind.ts";
 import { manifestDigest } from "../../src/contracts/manifest.ts";
 import { Daemon } from "../../src/daemon/daemon.ts";
 import { SingleInstanceLock } from "../../src/daemon/single-instance.ts";
@@ -41,7 +42,7 @@ import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 
 vi.mock("../../src/runtime/hermes-target-bind.ts", async (original) => ({
-  ...(await original<typeof import("../../src/runtime/hermes-target-bind.ts")>()),
+  ...(await original<typeof HermesTargetBindModule>()),
   runHermesTargetBind: vi.fn(),
 }));
 

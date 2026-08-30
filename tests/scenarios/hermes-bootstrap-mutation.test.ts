@@ -14,6 +14,7 @@ import { join } from "node:path";
 
 import { digestOf } from "../../src/core/digest.ts";
 import { runHermesTargetBind } from "../../src/runtime/hermes-target-bind.ts";
+import type * as HermesTargetBindModule from "../../src/runtime/hermes-target-bind.ts";
 import { createHermesBootstrapAuthority } from "../../src/bootstrap/hermes-bootstrap.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, roleKeyFor } from "../../src/domain/types.ts";
@@ -23,7 +24,7 @@ import { bindCeo, makeHarness, type Harness } from "../helpers/harness.ts";
 
 vi.mock("node:fs", { spy: true });
 vi.mock("../../src/runtime/hermes-target-bind.ts", async (original) => ({
-  ...(await original<typeof import("../../src/runtime/hermes-target-bind.ts")>()),
+  ...(await original<typeof HermesTargetBindModule>()),
   runHermesTargetBind: vi.fn(),
 }));
 
