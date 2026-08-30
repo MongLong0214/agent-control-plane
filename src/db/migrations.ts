@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 32;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -139,6 +139,7 @@ export const LEDGER_TRIGGER_NAMES: readonly string[] = [
     "canonical_turn_sources_immutable",
     "canonical_turn_sources_no_delete",
     "canonical_turn_sources_no_replace",
+    "canonical_turn_sources_admission_matches_claim",
     "actor_target_attestations_append_only",
     "actor_target_attestations_no_delete",
     "actor_target_attestations_no_replace",
@@ -1729,9 +1730,24 @@ export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
   );
   const columns = sharedColumns(raw, "canonical_turns", "canonical_turns_rebuilt").join(", ");
   raw.exec(`INSERT INTO canonical_turns_rebuilt (${columns}) SELECT ${columns} FROM canonical_turns`);
+  // `canonical_turn_sources_admission_matches_claim` lives on a *different* table
+  // (`canonical_turn_sources`) and reads `canonical_turns` in a subquery — so dropping
+  // `canonical_turns` does not drop it the way v26/v27's comment describes for `canonical_turns`'
+  // own triggers. Left in place, the very next schema-changing statement (the rename below) makes
+  // SQLite eagerly recompile every trigger's SQL and find `canonical_turns` momentarily gone:
+  // "no such table: main.canonical_turns", thrown from a rename that has nothing to do with
+  // sources. Dropped here and recreated once the rename has restored the table's real name, so no
+  // schema-changing statement ever runs while this trigger's referenced table does not exist.
+  // Guarded on `canonical_turn_sources` existing at all — a rebuild exercised on a bare
+  // `canonical_turns` fixture (no sibling table) has nothing to drop or recreate.
+  const hasSources = raw
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turn_sources'")
+    .get();
+  if (hasSources) raw.exec(`DROP TRIGGER IF EXISTS canonical_turn_sources_admission_matches_claim`);
   raw.exec("DROP TABLE canonical_turns");
   raw.exec("ALTER TABLE canonical_turns_rebuilt RENAME TO canonical_turns");
   raw.exec(canonicalTurnsIndexDdl());
+  if (hasSources) raw.exec(sourceAdmissionMatchesClaimTriggerDdl());
 };
 
 const dispatchesDdl = (): string =>
@@ -1757,6 +1773,12 @@ const actorIncarnationTriggersDdl = (): string =>
       "the actor incarnation update trigger",
     ),
   ].join("\n\n");
+
+const sourceAdmissionMatchesClaimTriggerDdl = (): string =>
+  schemaObject(
+    /CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_admission_matches_claim\n[\s\S]*?\nEND;/,
+    "the source admission-matches-claim trigger",
+  );
 
 const observationsIndexDdl = (): string =>
   schemaObject(
@@ -2087,6 +2109,25 @@ const v31: SchemaMigration = {
   checksum: () => migrationChecksum("v31-a-generation-means-nothing-without-its-role-key"),
 };
 
+/**
+ * #693 — a source could be attached to an already-claimed turn by a plain `INSERT`, because the
+ * no-replace trigger only refused a colliding or moved row, never a fresh one. This adds the
+ * write-time backstop for the invariant `canonical_turn_sources.admission_audit_event_id` already
+ * documented: every source `claim()` writes shares its turn's own `claim_audit_event_id`, because
+ * the whole batch is inserted in the same transaction as the turn. A source citing any other
+ * audit event — including one attached after the claim transaction has closed — is refused.
+ */
+const v32: SchemaMigration = {
+  id: "v32-a-source-cannot-be-attached-after-the-claim-that-admitted-it",
+  fromVersion: 31,
+  toVersion: 32,
+  apply: (raw) => {
+    raw.exec(`DROP TRIGGER IF EXISTS canonical_turn_sources_admission_matches_claim`);
+    raw.exec(sourceAdmissionMatchesClaimTriggerDdl());
+  },
+  checksum: () => migrationChecksum("v32-a-source-cannot-be-attached-after-the-claim-that-admitted-it"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2108,6 +2149,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v29,
   v30,
   v31,
+  v32,
 ]);
 
 interface RequiredTrigger {
@@ -2214,6 +2256,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "attestation_generation_matches_assignment", sentinel: "ATTESTATION_GENERATION_MISMATCH", introducedIn: 31 },
   { name: "conversational_actors_incarnation_matches_session_on_insert", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
   { name: "conversational_actors_incarnation_matches_session_on_update", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
+  { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [

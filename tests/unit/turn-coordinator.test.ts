@@ -175,6 +175,22 @@ const portFor = (
   throw new Error(`no port reports ${kind} under ${authority}`);
 };
 
+/**
+ * A fresh, real audit event — not a copy of any turn's `claim_audit_event_id` — the way a second,
+ * later admission would actually mint one. Used to build the counter-example below: a source row
+ * that cites its own honest admission event rather than borrowing the claim's.
+ */
+const freshAuditEvent = (h: Harness): number => {
+  h.cp.db.run(`INSERT INTO audit_events (at, kind, evidence_json) VALUES (?, 'FIXTURE', '{}')`, [NOW]);
+  return Number(
+    (
+      h.cp.db.get<{ event_id: number }>(`SELECT MAX(event_id) AS event_id FROM audit_events`) ?? {
+        event_id: 0,
+      }
+    ).event_id,
+  );
+};
+
 const claimOf = (h: Harness, actorId: string, sources: TurnSource[], prompt = "hello") => {
   const decision = coordinatorOf(h).claim({ targetActorId: actorId, prompt, sources });
   if (!decision.allowed) throw new Error(`expected a permit, got ${decision.reasonCode}`);
@@ -1214,6 +1230,39 @@ describe("one unresolved turn per conversation", () => {
     expect(secondSources).toEqual([
       { source_nonce: "m2", batch_ordinal: 0, predecessor_turn_request_id: null },
     ]);
+  });
+
+  it("refuses a direct INSERT that attaches a later message to an already-claimed turn", () => {
+    // The docstring above states the invariant as absolute: "canonical_turn_sources is written
+    // once, in the same transaction as the turn, and everything downstream leans on that being
+    // final." The test above only shows that a *second `claim()` call* cannot coalesce — it never
+    // attempts the counter-example a review raised: the schema forbids REPLACE and UPDATE/DELETE
+    // of a source row, but nothing forbade a plain INSERT of a new batch_ordinal onto a turn that
+    // already exists, and `ControlPlane.db` + `Db.run()` are public enough to do it. This is that
+    // INSERT, executed directly rather than through the coordinator.
+    const h = makeHarness();
+    const actorId = target(h, "coalesce-insert");
+    const first = claimOf(h, actorId, [source(h, "m1")]);
+    const second = source(h, "m2");
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT INTO canonical_turn_sources
+           (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,
+            source_digest, predecessor_turn_request_id, admission_audit_event_id)
+         VALUES (?, ?, ?, ?, 1, 'd:m2', NULL, ?)`,
+        [first.turnRequestId, second.channel, second.nonce, second.attempt, freshAuditEvent(h)],
+      ),
+    ).toThrow();
+
+    // And the ledger reads exactly what `claim()` wrote — m1 alone. `prompt_digest` was frozen
+    // over that set at claim time; a source list that could grow after the fact is the whole
+    // corruption this refusal exists to prevent.
+    const sources = h.cp.db.all<{ source_nonce: string }>(
+      `SELECT source_nonce FROM canonical_turn_sources WHERE turn_request_id = ?`,
+      [first.turnRequestId],
+    );
+    expect(sources.map((r) => r.source_nonce)).toEqual(["m1"]);
   });
 
   it("holds one conversation without blocking another", () => {
