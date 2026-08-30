@@ -164,7 +164,9 @@ const telegramDescription = (payload: unknown): string | null => {
 const isTelegramApiError = (payload: unknown): payload is Record<string, unknown> =>
   isRecord(payload)
   && payload["ok"] === false
-  && telegramDescription(payload) !== null;
+  && telegramDescription(payload) !== null
+  && Number.isSafeInteger(payload["error_code"])
+  && Number(payload["error_code"]) > 0;
 
 const telegramMigrateToChatId = (payload: unknown): string | null => {
   if (!isRecord(payload) || !isRecord(payload["parameters"])) return null;

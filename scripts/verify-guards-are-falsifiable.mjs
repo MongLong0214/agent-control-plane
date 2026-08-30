@@ -1907,6 +1907,20 @@ const GUARDS = [
     ],
   },
   {
+    // A proxy can return Telegram-shaped JSON without Telegram's integer error_code. Removing
+    // that discriminator consumes the request as a permanent Telegram rejection and drops it.
+    what: "a JSON 403 without an error code is a global retryable transport fault and holds the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find:
+      "  && telegramDescription(payload) !== null\n" +
+      "  && Number.isSafeInteger(payload[\"error_code\"])\n" +
+      "  && Number(payload[\"error_code\"]) > 0;",
+    replace: "  && telegramDescription(payload) !== null;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a JSON 403 without an error code is a global retryable transport fault and holds the ordered offset",
+    ],
+  },
+  {
     // Narrowing the verified Telegram class default back to one enumerated code recreates the 403
     // wedge: the rejected row stays retryable and the ordered offset cannot drain past it.
     what: "a structured Telegram 403 is terminal and advances the ordered offset",

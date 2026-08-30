@@ -2104,6 +2104,64 @@ describe("Telegram production ingress", () => {
     });
   });
 
+  it("a JSON 403 without an error code is a global retryable transport fault and holds the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const rejected = update("gateway-rejected reply", {}, 487);
+    const later = update("later direct message", {}, 488);
+    const fixture = telegramBotApiFixture([rejected, later], {
+      status: 403,
+      body: { ok: false, description: "request blocked by gateway" },
+    });
+    const reportedErrors: unknown[] = [];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: (input) => `reply to ${input.text}`,
+        onError: (error) => { reportedErrors.push(error); },
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    const rejectedRow = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:487"],
+    );
+    const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:488"],
+    );
+    expect({
+      failure: deliveryError instanceof TelegramDeliveryError ? deliveryError.failure : deliveryError,
+      operatorErrors: reportedErrors.map((error) => error instanceof Error ? error.message : String(error)),
+      offset: listener.service.offset,
+      rejectedResult: rejectedRow?.result_json,
+      rejectedTurn: rejectedRow?.turn_claim_json,
+      laterResult: laterRow?.result_json,
+    }).toMatchObject({
+      failure: { kind: "GLOBAL_REJECTION", statusCode: 403, description: null },
+      operatorErrors: ["Telegram Bot API sendMessage received a non-Telegram HTTP 403 response"],
+      offset: undefined,
+      rejectedResult: expect.stringContaining('"deliveryStatus":"RETRYABLE"'),
+      rejectedTurn: expect.not.stringContaining("settledAt"),
+      laterResult: expect.stringContaining('"sent":true'),
+    });
+  });
+
   it("a 401 remains a global retryable failure and does not terminalize the reply", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
