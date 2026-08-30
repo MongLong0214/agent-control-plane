@@ -14,6 +14,7 @@ import type {
   TelegramIngress,
   TelegramUpdate,
 } from "./telegram.ts";
+import type { UnresolvedTurn } from "./ingress-guard.ts";
 
 export interface TelegramDirectInput {
   kind: "DIRECT";
@@ -555,7 +556,15 @@ export class TelegramHermesRouter {
         // unstuck, unless they already made that choice via `/again`.
         const unresolved = this.ingress.unresolvedTurns(identity.sessionDigest);
         if (unresolved.length > 0 && !classified.value.overridesUnresolved) {
-          const oldest = unresolved[0]!;
+          // #695: every unresolved row is counted, and up to MAX_NAMED_UNRESOLVED_TURNS are
+          // named individually, not only the oldest. A second one accumulates whenever an
+          // overriding claim itself goes unresolved (A crashes, `/again` claims B, B also
+          // crashes) — the owner has to be told what is actually outstanding, not just the one
+          // this router used to bother reading. Bounded rather than exhaustive (see
+          // `unresolvedTurnsParkText`'s docstring): these rows are never pruned, so the list can
+          // grow without bound, and naming all of them risks the exact opposite failure — a
+          // reply so long it cannot be sent, or one truncated in a way that drops the
+          // instructions telling the owner `/again` exists at all.
           return this.outcomeWithReply(
             update,
             true,
@@ -564,22 +573,25 @@ export class TelegramHermesRouter {
             this.replyFor(
               update,
               [
-                `DIRECT parked: an earlier message in this conversation is still unresolved (received ${oldest.receivedAt}).`,
-                "ACP does not know whether that one reached the CEO, so this one was not run — nothing was appended twice.",
-                "Reply with /again <your message> to run this one anyway, knowing the earlier turn may still land too.",
+                unresolvedTurnsParkText(unresolved),
+                "ACP does not know whether any of those reached the CEO, so this one was not run — nothing was appended twice.",
+                "Reply with /again <your message> to run this one anyway, knowing the earlier turn(s) may still land too.",
               ].join("\n"),
             ),
             ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION,
           );
         }
 
-        // Reached without an unresolved turn, or with one the owner deliberately overrode via
-        // `/again`. When it's the latter, the choice is recorded on the claim itself — not only
-        // in this reply — so a later reader does not have to trust that it was made honestly.
-        const overriddenUnresolvedNonce = unresolved[0]?.nonce;
+        // Reached without an unresolved turn, or with one or more the owner deliberately
+        // overrode via `/again`. When it's the latter, the choice is recorded on the claim
+        // itself — not only in this reply — so a later reader does not have to trust that it was
+        // made honestly. Every outstanding nonce is captured, not only the oldest (#695): a
+        // `/again` shown N unresolved turns and recording only one would silently override the
+        // rest, the same defect this issue closes in a new place.
+        const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;
         const claimed = this.ingress.claimTurn(
           this.ingress.nonceFor(update),
-          overriddenUnresolvedNonce ? { ...identity, overriddenUnresolvedNonce } : identity,
+          overriddenUnresolvedNonces ? { ...identity, overriddenUnresolvedNonces } : identity,
         );
         if (!claimed.allowed) {
           return this.outcomeWithReply(
@@ -1145,6 +1157,39 @@ const asEvidence = (value: unknown): Record<string, unknown> =>
 
 const truncateTelegramText = (text: string): string =>
   text.length <= 3900 ? text : `${text.slice(0, 3880)}\n[response truncated]`;
+
+/**
+ * How many unresolved turns the park reply names individually before summarizing the rest.
+ *
+ * #695 named every unresolved row so a second one could no longer accumulate silently, but
+ * `unresolvedTurns` rows are deliberately never pruned (a claim needs a person, not a timer —
+ * see `IngressGuard.prune`), so a conversation that keeps crashing and keeps getting `/again`'d
+ * grows this list without bound. Measured directly: 146 unresolved rows already produces a
+ * 4,099-character joined line, past Telegram's 4,096-character `sendMessage` limit on its own,
+ * before `truncateTelegramText` even runs.
+ *
+ * `truncateTelegramText` *does* keep the literal send from failing — it hard-caps every reply
+ * at 3,900 characters — but a blind slice from the front is the wrong tool for this specific
+ * text: it cuts wherever 3,880 characters lands, which is inside the timestamp list itself, and
+ * carries away the two lines after it — the ones telling the owner `/again` exists at all. A
+ * reply that is technically under the wire limit but says nothing actionable is the same defect
+ * (#695's own gap: a fact the owner needs, dropped from what reaches them) with the length check
+ * satisfied. Naming a fixed, small number and summarizing the rest keeps the reply informative
+ * and bounded on its own terms, without depending on where a generic truncator happens to cut.
+ */
+const MAX_NAMED_UNRESOLVED_TURNS = 10;
+
+/** The park reply's summary of what is unresolved — every row is counted, only some are named. */
+const unresolvedTurnsParkText = (unresolved: readonly UnresolvedTurn[]): string => {
+  if (unresolved.length === 1) {
+    return `DIRECT parked: an earlier message in this conversation is still unresolved (received ${unresolved[0]!.receivedAt}).`;
+  }
+  const shown = unresolved.slice(0, MAX_NAMED_UNRESOLVED_TURNS);
+  const remaining = unresolved.length - shown.length;
+  const timestamps = shown.map((turn) => turn.receivedAt).join(", ");
+  const tail = remaining > 0 ? `, and ${remaining} more` : "";
+  return `DIRECT parked: ${unresolved.length} earlier messages in this conversation are still unresolved (received ${timestamps}${tail}).`;
+};
 
 const replyToMessageIdFor = (update: TelegramUpdate): number | null => {
   const message = update.message;
