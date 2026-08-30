@@ -11,6 +11,7 @@ import type { OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
+import { canTransition } from "../domain/run-state.ts";
 import {
   DrainingCause,
   Role,
@@ -898,40 +899,96 @@ export class CtoLifecycle {
           });
           return allow(ReasonCode.OK, undefined);
         }
-        // Suspension is the one deliberate exception to a normal revocation: every
-        // owned run was checkpointed to BLOCKED above and cannot regain authority from
-        // this revoked binding. Any runnable state still refuses the revocation.
+        // Ordinary suspension checkpointed every ACTIVE run found before the provider
+        // await. The normal revoke still refuses any non-BLOCKED state introduced during
+        // that await so the compensation below can classify it deliberately.
         let revoked = this.bindings.revoke(roleKey, `project suspended: ${reason}`, {
           allowBlockedRuns: true,
         });
         if (!revoked.allowed && revoked.reasonCode === ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) {
-          const blockers = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });
-          for (const blocker of blockers) {
-            const blocked = this.runs.transition(
-              blocker.run_id,
-              RunState.BLOCKED,
-              "project capacity suspended after runtime stop",
-              { compensation: "binding revoke retry", sessionId: current.sessionId },
-            );
-            if (!blocked.allowed) return blocked as Decision<void>;
+          const ownedRuns = this.bindings.revocationBlockers(roleKey);
+          const checkpointedRuns: string[] = [];
+          const preservedRuns: Array<{ runId: string; state: RunState; disposition: string }> = [];
+          for (const owned of ownedRuns) {
+            switch (owned.state) {
+              case RunState.ACTIVE: {
+                // ACTIVE is the only live state whose normative machine permits BLOCKED,
+                // and it is the only state that represents CTO work still executing.
+                const permitted = canTransition(owned.state, RunState.BLOCKED);
+                if (!permitted.allowed) return permitted as Decision<void>;
+                const blocked = this.runs.transition(
+                  owned.run_id,
+                  RunState.BLOCKED,
+                  "project capacity suspended after runtime stop",
+                  { compensation: "binding revoke retry", sessionId: current.sessionId },
+                );
+                if (!blocked.allowed) return blocked as Decision<void>;
+                checkpointedRuns.push(owned.run_id);
+                break;
+              }
+              case RunState.QUEUED:
+              case RunState.REVISION_REQUIRED:
+                // No execution is in flight. Preserve the dispatch boundary so a later
+                // primary CTO can be pinned by the ordinary dispatch path after resume.
+                preservedRuns.push({
+                  runId: owned.run_id,
+                  state: owned.state,
+                  disposition: "preserve for later dispatch",
+                });
+                break;
+              case RunState.READY_FOR_CEO_REVIEW:
+              case RunState.AWAITING_HUMAN:
+                // Moving either state would invent a CEO or owner decision. Keep the
+                // durable decision boundary and fence the stopped CTO's assignment.
+                preservedRuns.push({
+                  runId: owned.run_id,
+                  state: owned.state,
+                  disposition: "preserve decision boundary",
+                });
+                break;
+              case RunState.CEO_APPROVED:
+              case RunState.MERGING:
+              case RunState.POST_MERGE_VERIFYING:
+                // These states belong to the daemon finalizer, including any irreversible
+                // merge already under way. Suspending a CTO must not fabricate a rollback.
+                preservedRuns.push({
+                  runId: owned.run_id,
+                  state: owned.state,
+                  disposition: "preserve daemon finalization",
+                });
+                break;
+              case RunState.BLOCKED:
+                preservedRuns.push({
+                  runId: owned.run_id,
+                  state: owned.state,
+                  disposition: "already checkpointed",
+                });
+                break;
+            }
           }
-          revoked = this.bindings.revoke(roleKey, `project suspended after checkpoint retry: ${reason}`, {
-            allowBlockedRuns: true,
-          });
+          revoked = this.bindings.revokeUnavailableSuspension(
+            roleKey,
+            {
+              sessionId: current.sessionId,
+              bindingGeneration: current.bindingGeneration,
+            },
+            `project suspended after state-aware compensation: ${reason}`,
+          );
           if (revoked.allowed) {
             this.audit.record({
               kind: "PROJECT_SUSPEND_BINDING_REVOKE_RECOVERED",
               projectId,
               sessionId: current.sessionId,
               roleKey,
-              evidence: { reason, checkpointedRuns: blockers.map((blocker) => blocker.run_id) },
+              evidence: { reason, checkpointedRuns, preservedRuns },
             });
           }
         }
         if (!revoked.allowed && revoked.reasonCode === ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) {
           // This is no longer the compensation state. It is an invariant failure after
-          // every blocker reported by revoke was checkpointed synchronously in this same
-          // transaction, kept distinct from the first denial for forensic accuracy.
+          // ACTIVE work was checkpointed and every non-executing workflow boundary was
+          // preserved synchronously in this same transaction, kept distinct from the first
+          // denial for forensic accuracy.
           this.audit.record({
             kind: "PROJECT_SUSPEND_BINDING_REVOKE_FAILED",
             reasonCode: ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,

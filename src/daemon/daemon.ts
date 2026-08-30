@@ -1085,10 +1085,12 @@ export class Daemon {
     const strandedSuspendBindings = this.cp.db.all<{
       role_key: string;
       session_id: string;
+      binding_generation: number;
       lifecycle: string | null;
     }>(
       `SELECT a.role_key,
               COALESCE(c.current_session_id, a.session_id) AS session_id,
+              a.binding_generation,
               s.lifecycle
          FROM assignments a
          JOIN projects p ON p.project_id = a.project_id
@@ -1105,11 +1107,20 @@ export class Daemon {
         binding.lifecycle === SessionLifecycle.ERROR;
       if (!unavailable) continue;
 
-      const revoked = this.cp.bindings.revoke(
-        binding.role_key,
-        `startup reconciled unavailable session ${binding.session_id} (${lifecycle})`,
-        { allowBlockedRuns: true },
-      );
+      const revokeReason =
+        `startup reconciled unavailable session ${binding.session_id} (${lifecycle})`;
+      const revoked =
+        binding.lifecycle === SessionLifecycle.STOPPED ||
+        binding.lifecycle === SessionLifecycle.ERROR
+          ? this.cp.bindings.revokeUnavailableSuspension(
+              binding.role_key,
+              {
+                sessionId: binding.session_id,
+                bindingGeneration: binding.binding_generation,
+              },
+              revokeReason,
+            )
+          : this.cp.bindings.revoke(binding.role_key, revokeReason, { allowBlockedRuns: true });
       const evidence = {
         roleKey: binding.role_key,
         sessionId: binding.session_id,

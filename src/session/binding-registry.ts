@@ -11,6 +11,7 @@ import {
   ROLE_SCOPE,
   Role,
   type RoleBinding,
+  RunState,
   SessionLifecycle,
   roleKeyFor,
 } from "../domain/types.ts";
@@ -514,7 +515,7 @@ export class BindingRegistry {
   revocationBlockers(
     roleKey: string,
     options: { allowBlockedRuns?: boolean } = {},
-  ): Array<{ run_id: string; state: string }> {
+  ): Array<{ run_id: string; state: RunState }> {
     const current = this.active(roleKey);
     if (!current) return [];
     const ownedRuns = this.liveRunsOwnedBy(current);
@@ -537,30 +538,89 @@ export class BindingRegistry {
           { roleKey, runs: orphaned.map((run) => run.run_id) },
         );
       }
-      this.db.run(
-        `UPDATE assignments SET status = 'REVOKED', revoked_at = ?, revoked_reason = ?
-          WHERE assignment_id = ?`,
-        [this.clock.nowIso(), reason, current.assignmentId],
-      );
-      const fence = this.outbox.retargetOrReject(
-        roleKey,
-        current.bindingGeneration,
-        current.bindingGeneration,
-        current.sessionId,
-      );
-      // Nothing to retarget onto — everything pending for a revoked role is stale.
-      for (const id of fence.retargeted) {
-        this.db.run(`UPDATE outbox SET status = 'REJECTED', reason_code = ? WHERE message_id = ?`, [
-          ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
-          id,
-        ]);
+      this.revokeCurrent(current, reason);
+      return allow(ReasonCode.OK, undefined);
+    });
+  }
+
+  /**
+   * Finishes the one revocation that cannot use the ordinary live-run rule: the provider
+   * has already stopped a suspended project's primary CTO, or the process performing that
+   * stop died and restart reconciliation resolved the session to ERROR.
+   *
+   * ACTIVE work is still unsafe and must first take its legal ACTIVE -> BLOCKED checkpoint.
+   * Every other live state is a durable workflow boundary, not executing CTO work: queued
+   * and revision work can be dispatched under a later owner, review and human-wait work must
+   * stay at that decision boundary, and approved/merge work belongs to the daemon finalizer.
+   * Revoking the assignment fences the stopped owner while preserving those states and their
+   * historical owner tuple. The narrow project/session/generation checks keep this exception
+   * from becoming a general way to orphan runnable work.
+   */
+  revokeUnavailableSuspension(
+    roleKey: string,
+    expected: { sessionId: string; bindingGeneration: number },
+    reason: string,
+  ): Decision<void> {
+    return this.db.tx(() => {
+      const current = this.active(roleKey);
+      if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
+      if (
+        current.sessionId !== expected.sessionId ||
+        current.bindingGeneration !== expected.bindingGeneration
+      ) {
+        return deny(
+          ReasonCode.WRITE_BINDING_GENERATION_STALE,
+          "the primary CTO binding changed before suspend compensation could revoke it",
+          {
+            roleKey,
+            expectedSessionId: expected.sessionId,
+            expectedGeneration: expected.bindingGeneration,
+            currentSessionId: current.sessionId,
+            currentGeneration: current.bindingGeneration,
+          },
+        );
       }
-      this.audit.record({
-        kind: "BINDING_REVOKED",
-        roleKey,
-        sessionId: current.sessionId,
-        evidence: { reason, generation: current.bindingGeneration },
-      });
+
+      const project = current.projectId
+        ? this.db.get<{ suspended: number }>(
+            `SELECT suspended FROM projects WHERE project_id = ?`,
+            [current.projectId],
+          )
+        : null;
+      const session = this.sessions.get(current.sessionId);
+      const unavailable =
+        session?.lifecycle === SessionLifecycle.STOPPED ||
+        session?.lifecycle === SessionLifecycle.ERROR;
+      if (
+        current.role !== Role.PRIMARY_CTO ||
+        !current.projectId ||
+        project?.suspended !== 1 ||
+        !unavailable
+      ) {
+        return deny(
+          ReasonCode.CONFLICT,
+          "suspension recovery revocation requires the suspended project's unavailable primary CTO",
+          {
+            roleKey,
+            role: current.role,
+            projectId: current.projectId,
+            suspended: project?.suspended === 1,
+            sessionId: current.sessionId,
+            lifecycle: session?.lifecycle ?? null,
+          },
+        );
+      }
+
+      const active = this.liveRunsOwnedBy(current).filter((run) => run.state === RunState.ACTIVE);
+      if (active.length > 0) {
+        return deny(
+          ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
+          "the unavailable primary CTO still owns ACTIVE work that was not checkpointed",
+          { roleKey, runs: active.map((run) => run.run_id) },
+        );
+      }
+
+      this.revokeCurrent(current, reason);
       return allow(ReasonCode.OK, undefined);
     });
   }
@@ -971,8 +1031,35 @@ export class BindingRegistry {
     return (row?.maximum ?? 0) + 1;
   }
 
-  private liveRunsOwnedBy(binding: RoleBinding): Array<{ run_id: string; state: string }> {
-    return this.db.all<{ run_id: string; state: string }>(
+  private revokeCurrent(current: RoleBinding, reason: string): void {
+    this.db.run(
+      `UPDATE assignments SET status = 'REVOKED', revoked_at = ?, revoked_reason = ?
+        WHERE assignment_id = ?`,
+      [this.clock.nowIso(), reason, current.assignmentId],
+    );
+    const fence = this.outbox.retargetOrReject(
+      current.roleKey,
+      current.bindingGeneration,
+      current.bindingGeneration,
+      current.sessionId,
+    );
+    // Nothing to retarget onto — everything pending for a revoked role is stale.
+    for (const id of fence.retargeted) {
+      this.db.run(`UPDATE outbox SET status = 'REJECTED', reason_code = ? WHERE message_id = ?`, [
+        ReasonCode.OUTBOX_STALE_GENERATION_REJECTED,
+        id,
+      ]);
+    }
+    this.audit.record({
+      kind: "BINDING_REVOKED",
+      roleKey: current.roleKey,
+      sessionId: current.sessionId,
+      evidence: { reason, generation: current.bindingGeneration },
+    });
+  }
+
+  private liveRunsOwnedBy(binding: RoleBinding): Array<{ run_id: string; state: RunState }> {
+    return this.db.all<{ run_id: string; state: RunState }>(
       `SELECT run_id, state FROM runs
         WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
           AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,

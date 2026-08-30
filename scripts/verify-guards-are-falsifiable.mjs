@@ -1895,15 +1895,50 @@ const GUARDS = [
     ],
   },
   {
-    // The provider stop can finish after a real owner reassignment introduces an ACTIVE
-    // blocker that preflight could not see. The completion transaction must checkpoint
-    // that blocker, retry the real revoke, and preserve recovery evidence.
-    what: "suspendProject retries a revoke blocked during provider stop",
+    // The provider stop can finish after a real owner reassignment introduces a blocker
+    // that preflight could not see. The completion transaction must classify every live
+    // state before it retries the revoke; skipping the branch strands all non-BLOCKED rows.
+    what: "suspendProject compensates every run state introduced during provider stop",
     file: "src/cto/cto-lifecycle.ts",
-    find: "        if (!revoked.allowed && revoked.reasonCode === ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) {\n          const blockers = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });",
-    replace: "        if (false) {\n          const blockers = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });",
+    find: "        if (!revoked.allowed && revoked.reasonCode === ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) {\n          const ownedRuns = this.bindings.revocationBlockers(roleKey);",
+    replace: "        if (false) {\n          const ownedRuns = this.bindings.revocationBlockers(roleKey);",
     killedBy: [
-      "tests/unit/cto-registry-r2.test.ts::#692 suspend retries a revoke blocked during provider stop and records recovery",
+      "tests/unit/cto-registry-r2.test.ts::#692 suspend compensation handles every blocker state",
+    ],
+  },
+  {
+    // ACTIVE is executing CTO work and has one legal checkpoint edge. Preserving it like
+    // a queued or finalizing row would revoke the owner while work still claims to run.
+    what: "suspendProject checkpoints only ACTIVE compensation blockers to BLOCKED",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "                const blocked = this.runs.transition(\n                  owned.run_id,\n                  RunState.BLOCKED,",
+    replace: "                const blocked = this.runs.transition(\n                  owned.run_id,\n                  RunState.READY_FOR_CEO_REVIEW,",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 suspend compensation handles every blocker state",
+    ],
+  },
+  {
+    // The ordinary revoke is intentionally stricter than stop compensation. Reusing it
+    // after an irreversible stop would reject queued, review, human-wait, and finalization
+    // states even though none has a truthful transition to BLOCKED.
+    what: "suspendProject revokes an unavailable suspended CTO without rewriting non-ACTIVE run states",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "          revoked = this.bindings.revokeUnavailableSuspension(\n            roleKey,\n            {\n              sessionId: current.sessionId,\n              bindingGeneration: current.bindingGeneration,\n            },\n            `project suspended after state-aware compensation: ${reason}`,\n          );",
+    replace: "          revoked = this.bindings.revoke(\n            roleKey,\n            `project suspended after state-aware compensation: ${reason}`,\n            { allowBlockedRuns: true },\n          );",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 suspend compensation handles every blocker state",
+    ],
+  },
+  {
+    // A killed suspend resolves its DRAINING fence to ERROR on restart. That is the same
+    // unavailable-owner compensation boundary, so the startup sweep must not fall back to
+    // the ordinary blocker rule and strand a review-state run on the dead binding.
+    what: "startup uses state-aware compensation for a killed suspend's unavailable binding",
+    file: "src/daemon/daemon.ts",
+    find: "      const revoked =\n        binding.lifecycle === SessionLifecycle.STOPPED ||\n        binding.lifecycle === SessionLifecycle.ERROR",
+    replace: "      const revoked =\n        false ||\n        false",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 daemon restart preserves a review blocker admitted during a killed suspend",
     ],
   },
   {

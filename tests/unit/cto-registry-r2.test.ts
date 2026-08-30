@@ -41,9 +41,13 @@ const tool = (server: object, name: string) => (
   }
 )._registeredTools[name]!.handler;
 
-const killSuspendAfterCommit = async (root: string, projectId: string): Promise<void> => {
+const killSuspendAfterCommit = async (
+  root: string,
+  projectId: string,
+  blockerRunId?: string,
+): Promise<void> => {
   const helper = fileURLToPath(new URL("../helpers/run-suspend-crash.ts", import.meta.url));
-  const child = fork(helper, [root, projectId], {
+  const child = fork(helper, [root, projectId, ...(blockerRunId ? [blockerRunId] : [])], {
     cwd: process.cwd(),
     execArgv: ["--import", "tsx"],
     stdio: ["ignore", "ignore", "pipe", "ipc"],
@@ -104,6 +108,57 @@ const CONTRACT: TaskContract = {
   humanGate: [],
   references: [],
 };
+
+const SUSPEND_COMPENSATION_CASES: ReadonlyArray<{
+  state: RunState;
+  path: readonly RunState[];
+  expected: RunState;
+}> = [
+  { state: RunState.QUEUED, path: [], expected: RunState.QUEUED },
+  { state: RunState.ACTIVE, path: [RunState.ACTIVE], expected: RunState.BLOCKED },
+  { state: RunState.BLOCKED, path: [RunState.ACTIVE, RunState.BLOCKED], expected: RunState.BLOCKED },
+  {
+    state: RunState.READY_FOR_CEO_REVIEW,
+    path: [RunState.ACTIVE, RunState.READY_FOR_CEO_REVIEW],
+    expected: RunState.READY_FOR_CEO_REVIEW,
+  },
+  {
+    state: RunState.CEO_APPROVED,
+    path: [RunState.ACTIVE, RunState.READY_FOR_CEO_REVIEW, RunState.CEO_APPROVED],
+    expected: RunState.CEO_APPROVED,
+  },
+  {
+    state: RunState.MERGING,
+    path: [
+      RunState.ACTIVE,
+      RunState.READY_FOR_CEO_REVIEW,
+      RunState.CEO_APPROVED,
+      RunState.MERGING,
+    ],
+    expected: RunState.MERGING,
+  },
+  {
+    state: RunState.POST_MERGE_VERIFYING,
+    path: [
+      RunState.ACTIVE,
+      RunState.READY_FOR_CEO_REVIEW,
+      RunState.CEO_APPROVED,
+      RunState.MERGING,
+      RunState.POST_MERGE_VERIFYING,
+    ],
+    expected: RunState.POST_MERGE_VERIFYING,
+  },
+  {
+    state: RunState.REVISION_REQUIRED,
+    path: [RunState.ACTIVE, RunState.READY_FOR_CEO_REVIEW, RunState.REVISION_REQUIRED],
+    expected: RunState.REVISION_REQUIRED,
+  },
+  {
+    state: RunState.AWAITING_HUMAN,
+    path: [RunState.ACTIVE, RunState.AWAITING_HUMAN],
+    expected: RunState.AWAITING_HUMAN,
+  },
+];
 
 const HANDOFF: HandoffPackage = {
   projectStatus: "ACTIVE/HEALTHY",
@@ -744,6 +799,62 @@ describe("round-2 CTO lifecycle regressions", () => {
     }
   });
 
+  it("#692 daemon restart preserves a review blocker admitted during a killed suspend", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    const binding = await harness.cp.cto.ensurePrimaryCto(projectId, "killed review blocker setup");
+    if (!binding.allowed) throw new Error(binding.message);
+    bindCeo(harness);
+
+    const created = harness.cp.runs.create({
+      projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    for (const next of [RunState.ACTIVE, RunState.READY_FOR_CEO_REVIEW]) {
+      const advanced = harness.cp.runs.transition(
+        created.value.runId,
+        next,
+        `advance killed-suspend fixture to ${next}`,
+      );
+      if (!advanced.allowed) throw new Error(advanced.message);
+    }
+    expect(harness.cp.runs.require(created.value.runId).ownerSessionId).toBeNull();
+
+    const config = harness.cp.config;
+    harness.cp.close();
+    await killSuspendAfterCommit(harness.root, projectId, created.value.runId);
+
+    const restarted = new ControlPlane(config);
+    restarted.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const daemon = restarted.createDaemon({ stateDir: join(harness.root, "review-blocker-restart") });
+    try {
+      const started = await daemon.start();
+      if (!started.allowed) {
+        throw new Error(`cold start refused after killed suspend: ${JSON.stringify(started)}`);
+      }
+
+      expect(started.value.unavailableBindingsRevoked).toEqual([
+        {
+          roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+          sessionId: binding.value.sessionId,
+          lifecycle: SessionLifecycle.ERROR,
+        },
+      ]);
+      expect(started.value.unavailableBindingRevocationsDeferred).toEqual([]);
+      expect(restarted.runs.require(created.value.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+      expect(restarted.bindings.activePrimaryCto(projectId)).toBeNull();
+      const projectDoctor = await restarted.doctor.run("project", projectId);
+      expect(projectDoctor.status).toBe("HEALTHY");
+      expect(deadSessionFinding(projectDoctor)).toBeUndefined();
+    } finally {
+      if (daemon.lock.held()) await daemon.stop();
+      restarted.close();
+    }
+  });
+
   it(
     "#692 round 2 — resumeProject does not reverse a replacement's DRAINING, and its " +
       "DRAIN_REQUEST still governs new dispatch",
@@ -997,6 +1108,59 @@ describe("round-2 CTO lifecycle regressions", () => {
       }),
     ]);
   });
+
+  it.each(SUSPEND_COMPENSATION_CASES)(
+    "#692 suspend compensation handles every blocker state $state",
+    async ({ state, path, expected }) => {
+      const harness = makeHarness();
+      const { projectId, repositoryId } = await registerFixtureProject(harness);
+      const ensured = await harness.cp.cto.ensurePrimaryCto(projectId, "post-stop blocker setup");
+      if (!ensured.allowed) throw new Error(ensured.message);
+
+      const created = harness.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!created.allowed) throw new Error(created.message);
+      for (const next of path) {
+        const advanced = harness.cp.runs.transition(
+          created.value.runId,
+          next,
+          `advance compensation fixture to ${next}`,
+        );
+        if (!advanced.allowed) throw new Error(advanced.message);
+      }
+      expect(harness.cp.runs.require(created.value.runId).state).toBe(state);
+
+      let reassigned: ReturnType<typeof harness.cp.runs.reassignOwner> | null = null;
+      const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+      harness.scripted.stopSession = async (handle) => {
+        await originalStop(handle);
+        reassigned = harness.cp.runs.reassignOwner(
+          created.value.runId,
+          ensured.value,
+          `${state} ownership changed during provider stop`,
+        );
+      };
+
+      const suspended = await harness.cp.cto.suspendProject(
+        projectId,
+        true,
+        "capacity crisis",
+        TEST_OWNER,
+      );
+
+      expect(reassigned).toMatchObject({ allowed: true });
+      expect(suspended).toMatchObject({ allowed: true });
+      expect(harness.cp.sessions.require(ensured.value.sessionId).lifecycle).toBe(
+        SessionLifecycle.STOPPED,
+      );
+      expect(harness.cp.runs.require(created.value.runId).state).toBe(expected);
+      expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+    },
+  );
 
   it("#692 a concurrent revoke after provider stop converges as a successful suspend", async () => {
     const harness = makeHarness();
