@@ -1551,6 +1551,15 @@ const GUARDS = [
       "tests/process/daemon-startup-probe.test.ts::records every startup decision without a fixture authority",
     ],
   },
+  {
+    what: "the startup probe waits out the backoff it triggered before measuring recovery",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    await wait(Math.max(0, Date.parse(retryNotBefore) - waitStartedAt + 25));",
+    replace: "    await wait(0);",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::records every startup decision without a fixture authority",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
