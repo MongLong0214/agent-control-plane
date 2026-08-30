@@ -28,7 +28,7 @@ afterAll(cleanupTempDirs);
  * than silently left for someone to discover only by its absence from `doctor system`'s output.
  */
 describe("#682 round 8's second follow-up: health.json reports Telegram ingress status", () => {
-  it("reports each outcome distinctly, and it is the exact shape DAEMON_STATUS would surface", () => {
+  it("records each Telegram ingress outcome distinctly in health.json", () => {
     const harness = makeHarness();
     const stateDir = tempDir("acp-telegram-ingress-health-");
     const daemon = new Daemon(harness.cp, { stateDir });

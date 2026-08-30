@@ -207,8 +207,7 @@ describe("#682 round 8: the retention floor tracks the transport's own declared 
   );
 
   it(
-    "production wiring succeeds against a custom transport that declares a retention longer " +
-      "than the unset default nonceTtlMs — a known longer window raises the floor, it is not refused",
+    "production wiring accepts a custom transport whose declared retention exceeds the unset nonceTtlMs default",
     async () => {
       const harness = makeHarness();
       const config = {
