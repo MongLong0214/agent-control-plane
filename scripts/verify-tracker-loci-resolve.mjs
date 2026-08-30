@@ -740,9 +740,10 @@
  *   (never comment- or string-scanned), so a `#` inside one — this file's own two heredocs, an
  *   embedded second script — is not mistaken for a comment of the outer file. What cannot be
  *   resolved statically is disclosed rather than silently scored: a YAML block scalar (`|`/`>`) is
- *   walked as ordinary text, not full indentation-tracked; a quoted heredoc word with characters
- *   outside `[A-Za-z0-9_]` is not recognized — neither shape appears in this repository's own
- *   tracked files, confirmed by grep rather than assumed.
+ *   walked as ordinary text, not full indentation-tracked (the current corpus has one, `ci.yml`'s
+ *   embedded shell gate, whose real `result` variable is checked through the production CLI); a
+ *   quoted heredoc word with characters outside `[A-Za-z0-9_]` is not recognized — that latter
+ *   shape does not appear in this repository's tracked shell file, confirmed by grep.
  *
  *   SQL (`stripStrings(stripSqlComments(text))`) had the same latent shape and was not touched in
  *   this round — named, not fixed, and sent back for exactly that reason. See round 17.
@@ -834,6 +835,47 @@
  *   `;`, `|`, `&`, `(`, and `)` as word boundaries — checking only the immediately preceding
  *   character is enough to cover `;;`/`&&`/`||` too, since a repeated operator character still
  *   ends with the same character right before the `#`.
+ *
+ * ## Round 21: regex literals are the seventh delimiter the JS/TS walk did not enumerate
+ *
+ *   A review ran the production CLI with `` `ManagedWriteScope` in
+ *   `src/runtime/cli-adapters.ts` `` and got STALE even though the type is declared at line 1317.
+ *   The preceding line's `/(["\\])/g` regex was the cause: the quote at the start of its character
+ *   class opened a fake string at `stripJsSource`'s quote branch, and the corrupted walk swallowed
+ *   `ManagedWriteScope`, `managedWriteScope`, and `ClaudeCliAdapter` from the symbol view. That
+ *   overturns the primary verdict; the earlier comment describing it as only widening an aside
+ *   was false and has been removed.
+ *
+ *   `stripJsSource` now enumerates every JS-family span opener this corpus uses: a leading Node
+ *   hashbang, `//` and `/* *\/` comments, single/double strings, template literals with recursive
+ *   `${...}` code, and regex literals. A regex scanner treats escapes and `[...]` as atomic before
+ *   accepting an unescaped `/` as the close. `/` is admitted as a regex opener only when the
+ *   previous significant token requires a new expression; identifiers, numbers, literals,
+ *   `)`/`]`, postfix operators, and object closes make it division. Parenthesis/brace context
+ *   distinguishes a closed control condition or function block from a call or object literal.
+ *   JSX text is not parsed or excluded: there is no tracked `.jsx` or `.tsx` file, and a future
+ *   one pays the disclosed cost that JSX prose may count as a symbol until this small lexer gains
+ *   that grammar.
+ *
+ *   The same audit enumerated the other four dispatches rather than assuming prior rounds were
+ *   exhaustive. Python opens `#` comments plus short/triple single/double strings (ordinary
+ *   prefixes lead into the same quote scanner); f-string replacement fields are currently blanked
+ *   with their containing literal, and the one tracked `.py` file has no f-string. Shell opens
+ *   word-boundary `#` comments, plain single/double and ANSI-C `$'...'` strings, and heredocs;
+ *   command/arithmetic substitutions are code rather than literal spans, but a substitution inside
+ *   an ordinary quoted string is currently excluded with that string (heredoc bodies are the
+ *   explicit exception). YAML opens word-boundary `#` comments and single/double quoted scalars;
+ *   indentation-delimited `|`/`>` block bodies stay plain searched text because schema is needed
+ *   to tell embedded programs from prose. SQLite opens `--`/`/* *\/` comments, `'...'` value
+ *   strings, and `"..."`/`` `...` ``/`[...]` quoted identifiers; PostgreSQL dollar quotes remain
+ *   plain text because neither the engine nor either tracked `.sql` file supports them. These
+ *   costs are repeated in `codeSearchScope`, the text the CLI emits with a symbol miss.
+ *
+ *   Verification does not stop at constructed delimiter fixtures. The production CLI checks the
+ *   three real declarations after `cli-adapters.ts:1315`, then checks a TypeScript-parser-derived
+ *   declaration witness in all 253 tracked JS-family files plus explicit real witnesses in the
+ *   one Python file, one shell file, all three YAML files, and both SQL files: 260 tracked files,
+ *   every supported-language file in this tree.
  *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
@@ -950,16 +992,32 @@ const extensionOf = (relPath) => {
 /** A short, human-readable name for what a symbol search excludes in this file's language. */
 const codeSearchScope = (relPath) => {
   const ext = extensionOf(relPath);
-  if (JS_FAMILY_EXTS.has(ext)) return "outside a `//`/`/* */` comment, a quoted string, or template-literal prose";
-  if (PY_EXTS.has(ext)) return "outside a `#` comment or quoted string";
+  if (JS_FAMILY_EXTS.has(ext))
+    return (
+      "outside a `//`/`/* */` comment, a quoted string, or template-literal prose, a regex literal, " +
+      "or a leading hashbang (JSX text is searched as code; this corpus has no JSX/TSX)"
+    );
+  if (PY_EXTS.has(ext))
+    return (
+      "outside a `#` comment or quoted string (f-string replacement fields are excluded with the " +
+      "containing string; this corpus has no f-string)"
+    );
   if (SH_EXTS.has(ext))
     return (
       "outside a `#` comment (at a word boundary — this applies inside a heredoc body too) or a " +
       "quoted string (a heredoc body's own quoted-string content is not excluded; it is searched " +
-      "as the code it contains)"
+      "as the code it contains; command substitutions inside ordinary quoted strings are excluded)"
     );
-  if (YAML_EXTS.has(ext)) return "outside a `#` comment (at a word boundary) or a quoted scalar";
-  if (SQL_EXTS.has(ext)) return "outside a `--`/`/* */` comment or a quoted string (a quoted identifier is code)";
+  if (YAML_EXTS.has(ext))
+    return (
+      "outside a `#` comment (at a word boundary) or a quoted scalar (a `|`/`>` block scalar body " +
+      "is searched as plain text because its content language is unknown)"
+    );
+  if (SQL_EXTS.has(ext))
+    return (
+      "outside a `--`/`/* */` comment or a quoted string (a quoted identifier is code; PostgreSQL " +
+      "dollar quotes are searched as plain text because this is a SQLite corpus)"
+    );
   return `as plain text (no comment or string exclusion applies to .${ext} files)`;
 };
 

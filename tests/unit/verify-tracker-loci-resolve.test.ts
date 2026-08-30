@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 interface IssueFixture {
@@ -2021,6 +2022,106 @@ describe("verify-tracker-loci-resolve", () => {
         expect(result.stdout).toContain("not classified as absent");
         expect(result.stdout).not.toContain("does not exist");
         expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  describe("round 21 JavaScript regex literals are atomic spans", () => {
+    it("ManagedWriteScope remains visible after a regex literal", () => {
+      const { path, cleanup } = withIssues([
+        {
+          number: 68950,
+          title: "round 21 real regex literal counterexample",
+          body: [
+            "`ManagedWriteScope` in `src/runtime/cli-adapters.ts`",
+            "`managedWriteScope` in `src/runtime/cli-adapters.ts`",
+            "`ClaudeCliAdapter` in `src/runtime/cli-adapters.ts`",
+          ].join("\n"),
+        },
+      ]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("every tracked supported language file keeps a real code witness visible through the production CLI", () => {
+      const listed = spawnSync(
+        "git",
+        ["ls-files", "*.ts", "*.tsx", "*.js", "*.mjs", "*.cjs", "*.mts"],
+        { cwd: repoRoot, encoding: "utf8" },
+      );
+      expect(listed.status).toBe(0);
+      const jsFiles = listed.stdout.split("\n").filter(Boolean);
+      const jsIssues = jsFiles.map((relPath, index) => {
+        const source = ts.createSourceFile(
+          relPath,
+          readFileSync(join(repoRoot, relPath), "utf8"),
+          ts.ScriptTarget.Latest,
+          true,
+        );
+        const candidates: Array<{ name: string; start: number }> = [];
+        const visit = (node: ts.Node): void => {
+          if (ts.isIdentifier(node) && /^[A-Za-z_$][\w$]*$/.test(node.text)) {
+            const parent = node.parent;
+            const isDeclarationName =
+              ((ts.isVariableDeclaration(parent) ||
+                ts.isFunctionDeclaration(parent) ||
+                ts.isClassDeclaration(parent) ||
+                ts.isInterfaceDeclaration(parent) ||
+                ts.isTypeAliasDeclaration(parent) ||
+                ts.isEnumDeclaration(parent) ||
+                ts.isImportClause(parent) ||
+                ts.isImportSpecifier(parent) ||
+                ts.isNamespaceImport(parent)) &&
+                parent.name === node) ||
+              (ts.isBindingElement(parent) && parent.name === node);
+            if (isDeclarationName) candidates.push({ name: node.text, start: node.getStart(source) });
+          }
+          ts.forEachChild(node, visit);
+        };
+        visit(source);
+        const witness = candidates.sort((a, b) => a.start - b.start).at(-1);
+        expect(witness, `no parsed declaration witness in ${relPath}`).toBeDefined();
+        return {
+          number: 96000 + index,
+          title: `tracked JS-family corpus witness ${relPath}`,
+          body: `\`${witness!.name}\` in \`${relPath}\``,
+        };
+      });
+
+      const otherWitnesses: Record<string, string> = {
+        ".github/workflows/ci.yml": "result",
+        ".github/workflows/tracker-loci.yml": "GH_TOKEN",
+        "deploy/egress/allowlist-proxy.py": "ALLOWLIST_DIGEST",
+        "deploy/install-launchd.sh": "required_keychain_value",
+        "pnpm-lock.yaml": "zod",
+        "src/db/schema.sql": "sessions_incarnation_immutable",
+        "tests/fixtures/schema-v11.sql": "sessions_incarnation_immutable",
+      };
+      const otherListed = spawnSync("git", ["ls-files", "*.py", "*.sh", "*.yaml", "*.yml", "*.sql"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+      });
+      expect(otherListed.status).toBe(0);
+      expect(otherListed.stdout.split("\n").filter(Boolean).sort()).toEqual(Object.keys(otherWitnesses).sort());
+      const otherIssues: IssueFixture[] = Object.entries(otherWitnesses).map(([relPath, witness], index) => ({
+        number: 96500 + index,
+        title: `tracked non-JS corpus witness ${relPath}`,
+        body: `\`${witness}\` in \`${relPath}\``,
+      }));
+
+      expect(jsIssues).toHaveLength(253);
+      const { path, cleanup } = withIssues([...jsIssues, ...otherIssues]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout || result.stderr).toBe(0);
+        expect(result.stdout).toBe("");
       } finally {
         cleanup();
       }

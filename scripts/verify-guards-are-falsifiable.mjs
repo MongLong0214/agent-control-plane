@@ -2359,6 +2359,26 @@ const GUARDS = [
     ],
   },
   {
+    // Without the regex branch, the quote inside cli-adapters.ts's /(["\\])/g character class
+    // opens a fake string and erases all three real declarations the production CLI checks.
+    what: "a JavaScript regex literal is one atomic span before quotes and comments are dispatched",
+    file: "scripts/lib/tracker-loci-strip.mjs",
+    find: '      if (ch === "/" && canStartRegex) {',
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::ManagedWriteScope remains visible after a regex literal",
+    ],
+  },
+  {
+    // Treating every slash as a regex opener consumes the rest of a division line when no closing
+    // slash exists, recreating the opposite half of the lexical ambiguity this fix must resolve.
+    what: "a slash after an expression ending token remains division rather than opening a regex literal",
+    file: "scripts/lib/tracker-loci-strip.mjs",
+    find: '      if (ch === "/" && canStartRegex) {',
+    replace: '      if (ch === "/") {',
+    killedBy: ["tests/unit/tracker-loci-strip-invariants.test.ts::division does not open a regex literal"],
+  },
+  {
     // #693 — the no-replace trigger refuses a colliding or moved source row, never a fresh one: a
     // new (channel, nonce) at a new batch_ordinal, inserted onto a turn that already exists,
     // passed every WHEN clause above it. This is the write-time backstop: every source `claim()`

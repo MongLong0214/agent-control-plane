@@ -98,6 +98,10 @@ const ADVERSARIAL_INPUTS: Array<{ label: string; text: string }> = [
     text: 'const a = "https://example.com/path";\nconst b = 2;',
   },
   {
+    label: "a regex literal containing quotes, comment markers, and a character-class slash",
+    text: ['const pattern = /["\'/*]/u;', "const afterRegex = 1;"].join("\n"),
+  },
+  {
     label: "a Python triple-quoted docstring containing a # character (#700)",
     text: ['"""Built and proved for #419.', "Not a comment — inside the docstring.", '"""', "x = 1"].join("\n"),
   },
@@ -332,6 +336,50 @@ describe("tracker-loci strip invariants", () => {
       expect(out.split("\n")[1]).toBe("const z = 13;"); // the real end was reached, not miscounted
     });
 
+    it("a regex literal shields quotes comment markers and character class slashes", () => {
+      const input = 'const pattern = /["\'/*]\\/\\//giu;\nconst afterRegex = 14;';
+      const symbolView = stripJsSource(input, true);
+      expect(symbolView.split("\n")[0]).toBe("const pattern = /          /   ;");
+      expect(symbolView.split("\n")[1]).toBe("const afterRegex = 14;");
+      expect(stripJsSource(input, false)).toBe(input);
+    });
+
+    it("division does not open a regex literal", () => {
+      const input = 'const ratio = numerator / denominator; const afterDivision = "still code";';
+      const out = stripJsSource(input, true);
+      expect(out).toContain("numerator / denominator");
+      expect(out).toContain("afterDivision");
+      expect(out).not.toContain("still code");
+    });
+
+    it("regex literals start after expression prefixes and a closed control condition", () => {
+      const input = [
+        "const assigned = /a/;",
+        "const returned = () => /b/;",
+        "if (assigned) /c/.test(returned);",
+        "const divided = assigned / 2;",
+      ].join("\n");
+      const out = stripJsSource(input, true);
+      expect(out).toContain("const assigned = / /;");
+      expect(out).toContain("const returned = () => / /;");
+      expect(out).toContain("if (assigned) / /.test(returned);");
+      expect(out).toContain("const divided = assigned / 2;");
+    });
+
+    it("a regex literal inside a template expression cannot close the expression with its pattern", () => {
+      const input = '`before ${/[}"\']/u.test(value)} after`;\nconst afterTemplateRegex = 15;';
+      const out = stripJsSource(input, true);
+      expect(out).toContain("${/     / .test(value)}");
+      expect(out.split("\n")[1]).toBe("const afterTemplateRegex = 15;");
+    });
+
+    it("a Node hashbang is a comment rather than a symbol occurrence", () => {
+      const input = "#!/usr/bin/env node --commentOnlyInterpreterSymbol\nconst liveHashbangFollower = 16;";
+      const out = stripJsSource(input, true);
+      expect(out).not.toContain("commentOnlyInterpreterSymbol");
+      expect(out.split("\n")[1]).toBe("const liveHashbangFollower = 16;");
+    });
+
     it("the real tests/integration/pipeline.test.ts:184 shape: module.exports inside a string with an embedded // is blanked, not left visible", () => {
       const fs = require("node:fs");
       const path = require("node:path");
@@ -343,6 +391,16 @@ describe("tracker-loci strip invariants", () => {
       expect(symbolView).not.toContain("module.exports");
       const contentView = stripJsSource(text, false);
       expect(contentView).toContain('module.exports = () => 2; // addressed review');
+    });
+
+    it("the real cli adapters regex leaves all later declarations visible", () => {
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const text = fs.readFileSync(path.join(__dirname, "..", "..", "src", "runtime", "cli-adapters.ts"), "utf8");
+      const symbolView = stripJsSource(text, true);
+      expect(symbolView).toContain("ManagedWriteScope");
+      expect(symbolView).toContain("managedWriteScope");
+      expect(symbolView).toContain("ClaudeCliAdapter");
     });
   });
 
