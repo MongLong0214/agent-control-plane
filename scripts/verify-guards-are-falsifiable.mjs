@@ -1241,6 +1241,23 @@ const GUARDS = [
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
   {
+    // #676: a writer census that stops reporting a writer it found is a census that stopped
+    // meaning anything, silently.
+    what: "the turn-fence writer census reports a writer outside its table's owner list",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "    if (!allowed.has(file)) residual.push({ table, file });",
+    replace: "    if (false) residual.push({ table, file });",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // The other direction of the same defect: an owner entry nothing consults reads as coverage.
+    what: "the turn-fence writer census reports an owner that no longer writes its table",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "    if (!seenFiles.includes(owner)) staleOwners.push({ table, owner });",
+    replace: "    if (false) staleOwners.push({ table, owner });",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
     // Contract 1's whole point, landing here: a turn claimed under one CEO generation is a
     // different CEO's work from a receipt minted under the next. Without this a reconciler
     // completes a turn on a receipt that was never about this claim.
