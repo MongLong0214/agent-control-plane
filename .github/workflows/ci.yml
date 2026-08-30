@@ -76,6 +76,9 @@ jobs:
       # into a room nobody was in. Dependency-free by the same PRD §17.4 contract as
       # `terminology` and `release:version` above and below it.
       - run: pnpm reason-codes
+      # #448: discover staleness Decision construction from TypeScript symbols and require both
+      # compared generations at every new site; legacy shapes are a stale-checked ratchet.
+      - run: pnpm generation-comparisons
       # Reports, never fails: stale evidence is a fact to see, and a check that fails on a
       # true statement gets switched off. --strict exists for when a release wants a gate.
       - run: pnpm evidence:freshness
