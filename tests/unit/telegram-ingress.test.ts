@@ -1,13 +1,19 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { answerAsCeo, startDaemonTelegramListener } from "../../src/daemon/agentcpd.ts";
-import { TelegramInterruption } from "../../src/ingress/telegram-router.ts";
+import {
+  TelegramInterruption,
+  type TelegramHermesRouter,
+  type TelegramRouteOutcome,
+} from "../../src/ingress/telegram-router.ts";
 import {
   configuredTelegramLongPollConfig,
+  TelegramBotApi,
   TelegramDeliveryError,
   type TelegramBotTransport,
   type TelegramLongPollService,
@@ -19,7 +25,7 @@ import { digestOf } from "../../src/core/digest.ts";
 import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { CeoConversationPort } from "../../src/mcp/ceo-conversation.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { Daemon } from "../../src/daemon/daemon.ts";
+import { Daemon, OPERATOR_METHOD } from "../../src/daemon/daemon.ts";
 import {
   bindCeo,
   driveToReviewedCandidate,
@@ -48,10 +54,15 @@ const update = (text: string, over: Record<string, unknown> = {}, updateId = 100
 });
 
 class FakeTelegramTransport implements TelegramBotTransport {
-  // Used through `startDaemonTelegramListener` / `startTelegramLongPollListener`, which now
-  // derives IngressGuard's retention floor from this value (#682, round 8) — declared as the
-  // real measured figure since this fake is standing in for ordinary Telegram behavior.
+  // Used through `startDaemonTelegramListener` / `startTelegramLongPollListener`, which derives
+  // IngressGuard's retention floor from the transport that actually runs.
   readonly redeliveryRetentionMs = 24 * 60 * 60 * 1000;
+  readonly sendAttempts: Array<{
+    chatId: string;
+    text: string;
+    replyToMessageId?: number;
+    correlationId: string;
+  }> = [];
   readonly sent: Array<{
     chatId: string;
     text: string;
@@ -60,7 +71,10 @@ class FakeTelegramTransport implements TelegramBotTransport {
   }> = [];
   readonly offsets: Array<number | undefined> = [];
   updates: TelegramUpdate[] = [];
-  failSends = 0;
+  /** Simulates a known-not-sent server rejection that is safe to retry after backoff. */
+  rejectSends = 0;
+  /** Simulates an unknown outcome such as a network error or timeout. */
+  failSendsAmbiguous = 0;
   /** Fails only owner-gate prompt sends, leaving the reply path working. */
   failOwnerGateSends = false;
 
@@ -75,12 +89,35 @@ class FakeTelegramTransport implements TelegramBotTransport {
     replyToMessageId?: number;
     correlationId: string;
   }): Promise<{ messageId: number }> {
+    this.sendAttempts.push(input);
     if (this.failOwnerGateSends && input.correlationId.startsWith("telegram:owner-gate:")) {
-      throw new TelegramDeliveryError("simulated owner-gate prompt delivery failure", false);
+      throw new TelegramDeliveryError("simulated owner-gate prompt delivery failure", {
+        kind: "PERMANENT_REJECTION",
+        statusCode: 400,
+        description: "Bad Request: owner-gate prompt is unacceptable",
+        migrateToChatId: null,
+        retryAfterSeconds: null,
+      });
     }
-    if (this.failSends > 0) {
-      this.failSends -= 1;
-      throw new TelegramDeliveryError("simulated Telegram send crash", false);
+    if (this.failSendsAmbiguous > 0) {
+      this.failSendsAmbiguous -= 1;
+      throw new TelegramDeliveryError("simulated Telegram outage (no response)", {
+        kind: "UNKNOWN",
+        statusCode: null,
+        description: null,
+        migrateToChatId: null,
+        retryAfterSeconds: null,
+      });
+    }
+    if (this.rejectSends > 0) {
+      this.rejectSends -= 1;
+      throw new TelegramDeliveryError("simulated Telegram service rejection", {
+        kind: "RETRYABLE",
+        statusCode: 503,
+        description: "Service Unavailable",
+        migrateToChatId: null,
+        retryAfterSeconds: null,
+      });
     }
     this.sent.push(input);
     return { messageId: nextFakeTelegramMessageId++ };
@@ -97,6 +134,170 @@ const telegramConfig = {
 } as const;
 
 const daemonStub = { finalizeApprovedRun: async (_runId: string): Promise<void> => undefined };
+
+const acknowledgeTelegramReply = async (
+  harness: ReturnType<typeof makeHarness>,
+  nonce: string,
+) => {
+  const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-telegram-reply-operator-") });
+  const acquired = daemon.lock.acquire(harness.clock.nowIso());
+  expect(acquired.allowed).toBe(true);
+  try {
+    return await daemon.handleOperatorRequest({
+      requestId: `acknowledge:${nonce}`,
+      method: OPERATOR_METHOD.TELEGRAM_REPLY_ACKNOWLEDGE,
+      params: {
+        nonce,
+        reasonCode: "operator-reviewed-telegram",
+        evidenceDigest: `sha256:reviewed:${nonce}`,
+      },
+      idempotencyKey: `acknowledge:${nonce}`,
+    }, {
+      channel: "cli",
+      peerId: `cli:${TEST_OWNER.actor}`,
+      actor: TEST_OWNER.actor,
+      incarnation: "telegram-reply-review",
+    });
+  } finally {
+    daemon.lock.release();
+  }
+};
+
+interface TelegramApiCall {
+  method: "getUpdates" | "sendMessage";
+  body: Record<string, unknown>;
+}
+
+const telegramBotApiFixture = (
+  updates: readonly TelegramUpdate[],
+  firstSendResponse: { status: number; body: Record<string, unknown> | string },
+  options: { persistentlyRejectReplyToMessageId?: number } = {},
+): { transport: TelegramBotApi; calls: TelegramApiCall[] } => {
+  const calls: TelegramApiCall[] = [];
+  let sendCount = 0;
+  const fetcher: typeof globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const method = url.endsWith("/getUpdates") ? "getUpdates" : "sendMessage";
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    calls.push({ method, body });
+    if (method === "getUpdates") {
+      const offset = typeof body["offset"] === "number" ? body["offset"] : 0;
+      const result = updates.filter((candidate) => candidate.update_id >= offset).slice(0, 100);
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }
+    sendCount += 1;
+    if (
+      sendCount === 1
+      || body["reply_to_message_id"] === options.persistentlyRejectReplyToMessageId
+    ) {
+      const responseBody = typeof firstSendResponse.body === "string"
+        ? firstSendResponse.body
+        : JSON.stringify(firstSendResponse.body);
+      return new Response(responseBody, { status: firstSendResponse.status });
+    }
+    return new Response(JSON.stringify({ ok: true, result: { message_id: nextFakeTelegramMessageId++ } }), {
+      status: 200,
+    });
+  };
+  return { transport: new TelegramBotApi("fixture-bot-token", { fetcher }), calls };
+};
+
+const liveUnknownTelegramBotApiFixture = () => {
+  const calls: TelegramApiCall[] = [];
+  const updates: TelegramUpdate[] = [update("reply delivery becomes unknown", { message_id: 7_107 }, 710)];
+  let rejectFirstSend = true;
+  const fetcher: typeof globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const method = url.endsWith("/getUpdates") ? "getUpdates" : "sendMessage";
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    calls.push({ method, body });
+    if (method === "getUpdates") {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      const offset = typeof body["offset"] === "number" ? body["offset"] : 0;
+      return new Response(JSON.stringify({
+        ok: true,
+        result: updates.filter((candidate) => candidate.update_id >= offset).slice(0, 100),
+      }), { status: 200 });
+    }
+    if (rejectFirstSend) {
+      rejectFirstSend = false;
+      throw new TypeError("simulated Telegram connection loss after send");
+    }
+    return new Response(JSON.stringify({ ok: true, result: { message_id: nextFakeTelegramMessageId++ } }), {
+      status: 200,
+    });
+  };
+  return {
+    transport: new TelegramBotApi("fixture-bot-token", { fetcher }),
+    calls,
+    enqueue: (next: TelegramUpdate): void => { updates.push(next); },
+  };
+};
+
+const startLiveUnknownDaemonIngress = async () => {
+  const harness = makeHarness({
+    ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+  });
+  const stateDir = tempDir("acp-telegram-live-recovery-");
+  const daemon = new Daemon(harness.cp, { stateDir });
+  const acquired = daemon.lock.acquire(harness.clock.nowIso());
+  expect(acquired.allowed).toBe(true);
+  // Ensure the health file exists before ingress starts. The daemon factory, not this test,
+  // owns every Telegram status transition written after this point.
+  daemon.writeHealth(null);
+  const fixture = liveUnknownTelegramBotApiFixture();
+  const handled: string[] = [];
+  const errors: unknown[] = [];
+  const listener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemon, {
+    transport: fixture.transport,
+    ownerGateSignals: () => [],
+    onDirect: (input) => {
+      handled.push(input.text);
+      return `reply to ${input.text}`;
+    },
+    onError: (error) => { errors.push(error); },
+  });
+  await vi.waitFor(() => {
+    const row = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:710"],
+    );
+    expect(row?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+  });
+  return { harness, stateDir, daemon, fixture, handled, errors, listener };
+};
+
+const acknowledgeLiveTelegramReply = (
+  daemon: Daemon,
+  nonce: string,
+  requestSuffix: string,
+) => daemon.handleOperatorRequest({
+  requestId: `acknowledge-live:${requestSuffix}`,
+  method: OPERATOR_METHOD.TELEGRAM_REPLY_ACKNOWLEDGE,
+  params: {
+    nonce,
+    reasonCode: "operator-reviewed-telegram",
+    evidenceDigest: `sha256:reviewed:${nonce}`,
+  },
+  idempotencyKey: `acknowledge-live:${requestSuffix}`,
+}, {
+  channel: "cli",
+  peerId: `cli:${TEST_OWNER.actor}`,
+  actor: TEST_OWNER.actor,
+  incarnation: "telegram-live-recovery",
+});
+
+const runLiveDoctor = (daemon: Daemon, requestSuffix: string) => daemon.handleOperatorRequest({
+  requestId: `doctor-live:${requestSuffix}`,
+  method: OPERATOR_METHOD.DOCTOR_RUN,
+  params: { scope: "system" },
+  idempotencyKey: `doctor-live:${requestSuffix}`,
+}, {
+  channel: "cli",
+  peerId: `cli:${TEST_OWNER.actor}`,
+  actor: TEST_OWNER.actor,
+  incarnation: "telegram-live-recovery",
+});
 
 /**
  * A CEO turn can outlive `pollOnce` after #630, so its fault belongs to the listener's task
@@ -520,7 +721,13 @@ describe("Telegram production ingress", () => {
         if (attemptTimes.length === 2) {
           pollsAtSecondAttempt = pollTimes.length;
         }
-        throw new TelegramDeliveryError("continuous confirmed route failure", false);
+        throw new TelegramDeliveryError("continuous confirmed route failure", {
+          kind: "RETRYABLE",
+          statusCode: 503,
+          description: "Service Unavailable",
+          migrateToChatId: null,
+          retryAfterSeconds: null,
+        });
       },
     };
     const errors: unknown[] = [];
@@ -1463,7 +1670,7 @@ describe("Telegram production ingress", () => {
     const firstTransport = new FakeTelegramTransport();
     const firstUpdate = update(`/managed ${registered.projectId} inspect the project`, {}, 301);
     firstTransport.updates = [firstUpdate];
-    firstTransport.failSends = 1;
+    firstTransport.rejectSends = 1;
     const firstListener = await startDaemonTelegramListener(
       harness.cp,
       telegramConfig,
@@ -1471,7 +1678,9 @@ describe("Telegram production ingress", () => {
       { transport: firstTransport, start: false },
     );
     try {
-      await expect(observedTurnFault(firstListener.service)).rejects.toThrow("simulated Telegram send crash");
+      await expect(observedTurnFault(firstListener.service)).rejects.toThrow(
+        "simulated Telegram service rejection",
+      );
     } finally {
       await firstListener.close();
     }
@@ -1510,7 +1719,65 @@ describe("Telegram production ingress", () => {
     expect(completed?.result_json).toContain('"sent":true');
   });
 
-  it("does not resend when Telegram accepts a reply before the completion checkpoint", async () => {
+  it("a crash before Telegram send leaves one unresolved reply and never sends it", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const firstTransport = new FakeTelegramTransport();
+    const firstUpdate = update("reply reserved before send", {}, 306);
+    firstTransport.updates = [firstUpdate];
+    let handled = 0;
+    const firstListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: firstTransport,
+        start: false,
+        onDirect: () => {
+          handled += 1;
+          return "reserved reply";
+        },
+        onInterrupt: async (point) => {
+          if (point === "after-reply-reserve") throw new TelegramInterruption(point);
+        },
+      },
+    );
+    try {
+      await expect(observedTurnFault(firstListener.service)).rejects.toMatchObject({
+        point: "after-reply-reserve",
+      });
+    } finally {
+      await firstListener.close();
+    }
+    expect(firstTransport.sendAttempts).toHaveLength(0);
+
+    const secondTransport = new FakeTelegramTransport();
+    secondTransport.updates = [firstUpdate];
+    const secondListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: secondTransport, start: false, onDirect: () => "must not run" },
+    );
+    try {
+      const resumed = (await settledPoll(secondListener.service)).outcomes[0]!;
+      expect(resumed.replayed).toBe(true);
+      expect(resumed.reply).toBeNull();
+    } finally {
+      await secondListener.close();
+    }
+    expect(handled).toBe(1);
+    expect(secondTransport.sendAttempts).toHaveLength(0);
+    const unresolved = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:306"],
+    );
+    expect(unresolved?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+    expect(unresolved?.result_json).not.toContain('"sent"');
+  });
+
+  it("a crash after a successful send leaves one unresolved reply and never sends it again", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1559,11 +1826,820 @@ describe("Telegram production ingress", () => {
     } finally {
       await secondListener.close();
     }
-    expect(secondTransport.sent).toHaveLength(0);
-    expect(firstTransport.sent.length + secondTransport.sent.length).toBe(1);
+    expect(secondTransport.sendAttempts).toHaveLength(0);
+    expect(firstTransport.sendAttempts.length + secondTransport.sendAttempts.length).toBe(1);
+    const completed = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:302"],
+    );
+    expect(completed?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+    expect(completed?.result_json).not.toContain('"sent"');
+
+    const doctor = await harness.cp.doctor.run("system");
+    expect(doctor.findings).toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
+    }));
+
+    const acknowledged = await acknowledgeTelegramReply(harness, "update:302");
+    expect(acknowledged).toMatchObject({
+      allowed: true,
+      value: {
+        deliveryStatus: "UNRESOLVED",
+        operatorResolution: { disposition: "NO_RETRY" },
+      },
+    });
+    const acknowledgedState = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:302"],
+    );
+    expect(acknowledgedState?.result_json).toContain('"disposition":"NO_RETRY"');
+    expect(harness.cp.audit.byKind("TELEGRAM_REPLY_NO_RETRY_ACKNOWLEDGED")).toHaveLength(1);
+    const afterAcknowledgement = await harness.cp.doctor.run("system");
+    expect(afterAcknowledgement.findings).not.toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
+    }));
   });
 
-  it("#682: a claimed turn's PENDING reply survives a redelivery instead of becoming a false no-reply", async () => {
+  it("UNKNOWN stop changes daemon health to stopped", async () => {
+    const live = await startLiveUnknownDaemonIngress();
+    try {
+      const health = JSON.parse(readFileSync(join(live.stateDir, "health.json"), "utf8")) as {
+        telegram: unknown;
+      };
+      expect(health.telegram).toMatchObject({
+        configured: true,
+        running: false,
+        disabledReason: expect.stringContaining("update:710"),
+      });
+      expect(live.errors).toContainEqual(expect.objectContaining({
+        failure: expect.objectContaining({ kind: "UNKNOWN" }),
+      }));
+      expect(live.fixture.calls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
+    } finally {
+      await live.listener.close();
+      live.daemon.lock.release();
+    }
+  });
+
+  it("exact nonce acknowledge restarts the existing listener", async () => {
+    const live = await startLiveUnknownDaemonIngress();
+    try {
+      const wrong = await acknowledgeLiveTelegramReply(live.daemon, "update:711", "wrong-nonce");
+      expect(wrong).toMatchObject({ allowed: false, reasonCode: ReasonCode.NOT_FOUND });
+      expect(live.fixture.calls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
+
+      const acknowledged = await acknowledgeLiveTelegramReply(live.daemon, "update:710", "exact-nonce");
+      expect(acknowledged).toMatchObject({
+        allowed: true,
+        value: { nonce: "update:710", deliveryStatus: "UNRESOLVED" },
+      });
+      live.fixture.enqueue(update("message after operator recovery", { message_id: 7_117 }, 711));
+      await vi.waitFor(() => {
+        expect(live.handled).toContain("message after operator recovery");
+      });
+      expect(live.fixture.calls.filter((call) => call.method === "sendMessage").map((call) =>
+        call.body["reply_to_message_id"]
+      )).toEqual([7_107, 7_117]);
+    } finally {
+      await live.listener.close();
+      live.daemon.lock.release();
+    }
+  });
+
+  it("Doctor stays truthful after acknowledge because ingress is running", async () => {
+    const live = await startLiveUnknownDaemonIngress();
+    try {
+      const before = await runLiveDoctor(live.daemon, "before-acknowledge");
+      expect(before).toMatchObject({
+        allowed: true,
+        value: {
+          findings: expect.arrayContaining([
+            expect.objectContaining({ code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN" }),
+            expect.objectContaining({
+              code: "TELEGRAM_INGRESS_STOPPED",
+              observedEvidence: expect.objectContaining({ recoveryNonce: "update:710" }),
+            }),
+          ]),
+        },
+      });
+
+      const acknowledged = await acknowledgeLiveTelegramReply(live.daemon, "update:710", "doctor");
+      expect(acknowledged.allowed).toBe(true);
+      live.fixture.enqueue(update("Doctor observes recovered ingress", { message_id: 7_117 }, 711));
+      await vi.waitFor(() => {
+        expect(live.handled).toContain("Doctor observes recovered ingress");
+      });
+
+      const after = await runLiveDoctor(live.daemon, "after-acknowledge");
+      expect(after.allowed).toBe(true);
+      const findings = (after as { value: { findings: Array<{ code: string }> } }).value.findings;
+      expect(findings).not.toContainEqual(expect.objectContaining({ code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN" }));
+      expect(findings).not.toContainEqual(expect.objectContaining({ code: "TELEGRAM_INGRESS_STOPPED" }));
+      const health = JSON.parse(readFileSync(join(live.stateDir, "health.json"), "utf8")) as {
+        telegram: unknown;
+      };
+      expect(health.telegram).toMatchObject({ configured: true, running: true, disabledReason: null });
+    } finally {
+      await live.listener.close();
+      live.daemon.lock.release();
+    }
+  });
+
+  it("an unknown send result is terminal without automatic retry and stops the loop", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const handled: string[] = [];
+    const onDirect = (input: { text: string }): string => {
+      handled.push(input.text);
+      return `reply to ${input.text}`;
+    };
+    const firstUpdate = update("inspect the project", {}, 303);
+    const firstTransport = new FakeTelegramTransport();
+    const laterUpdate = update("inspect later", {}, 304);
+    firstTransport.updates = [firstUpdate, laterUpdate];
+    firstTransport.failSendsAmbiguous = 1;
+    const firstListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: firstTransport, start: false, onDirect },
+    );
+    try {
+      await expect(settledPoll(firstListener.service)).rejects.toMatchObject({
+        failure: { kind: "UNKNOWN" },
+      });
+    } finally {
+      await firstListener.close();
+    }
+    expect(firstListener.service.offset).toBeUndefined();
+    expect(firstTransport.sendAttempts.filter((attempt) => attempt.correlationId.includes("303"))).toHaveLength(1);
+    expect(firstTransport.sent).toHaveLength(0);
+    expect(handled).toEqual(["inspect the project"]);
+    const unresolved = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:303"],
+    );
+    expect(unresolved?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+    expect(unresolved?.result_json).toContain('"unknownDeliveryAttempts":1');
+    expect(unresolved?.result_json).not.toContain('"sent"');
+
+    // A restart sees the durable uncertainty and does not turn it into a second Telegram call.
+    const secondTransport = new FakeTelegramTransport();
+    secondTransport.updates = [firstUpdate];
+    const secondListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: secondTransport, start: false, onDirect },
+    );
+    try {
+      const resumed = await settledPoll(secondListener.service);
+      expect(resumed.outcomes[0]?.replayed).toBe(true);
+      expect(resumed.outcomes[0]?.reply).toBeNull();
+    } finally {
+      await secondListener.close();
+    }
+    expect(secondTransport.sendAttempts).toHaveLength(0);
+
+    // A terminal unresolved fact must outlive the ordinary nonce TTL. This later production
+    // admission drives IngressGuard.prune after 25 hours; it must not erase update 303 or its
+    // doctor finding.
+    harness.clock.advance(25 * 60 * 60 * 1_000);
+    const laterTransport = new FakeTelegramTransport();
+    laterTransport.updates = [update("inspect tomorrow", {}, 305)];
+    const laterListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: laterTransport, start: false, onDirect },
+    );
+    try {
+      await laterListener.service.pollOnce();
+    } finally {
+      await laterListener.close();
+    }
+    const preserved = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:303"],
+    );
+    expect(preserved?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+    const doctor = await harness.cp.doctor.run("system");
+    expect(doctor.findings).toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
+      observedEvidence: expect.objectContaining({
+        outstanding: 1,
+        oldest: expect.objectContaining({
+          deliveryStatus: "UNRESOLVED",
+          unknownDeliveryAttempts: 1,
+        }),
+      }),
+    }));
+    expect(doctor.findings).not.toContainEqual(expect.objectContaining({ code: "TURN_OUTCOME_UNKNOWN" }));
+  });
+
+  it("a permanent 400 advances past 101 later updates and its terminal reply has an operator exit", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const stuckMessageId = 70_401;
+    const stuck = update("permanently rejected direct reply", { message_id: stuckMessageId }, 401);
+    const later = Array.from({ length: 101 }, (_, index) => update(
+      `later direct message ${index + 1}`,
+      { message_id: stuckMessageId + index + 1 },
+      402 + index,
+    ));
+    const fixture = telegramBotApiFixture([stuck, ...later], {
+      status: 400,
+      body: {
+        ok: false,
+        error_code: 400,
+        description: "Bad Request: group chat was migrated",
+        parameters: { migrate_to_chat_id: -100_123_456_789 },
+      },
+    }, { persistentlyRejectReplyToMessageId: stuckMessageId });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        onDirect: (input) => `reply to ${input.text}`,
+        ownerGateSignals: () => [],
+      },
+    );
+    try {
+      const firstBatch = await settledPoll(listener.service);
+      expect(firstBatch.outcomes).toHaveLength(100);
+      expect(firstBatch.nextOffset).toBe(501);
+      const secondBatch = await settledPoll(listener.service);
+      expect(secondBatch.outcomes).toHaveLength(2);
+      expect(secondBatch.nextOffset).toBe(503);
+    } finally {
+      await listener.close();
+    }
+
+    const stuckRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:401"],
+    );
+    expect(stuckRow?.result_json).toContain('"deliveryStatus":"UNANSWERABLE"');
+    expect(stuckRow?.result_json).toContain('"statusCode":400');
+    expect(stuckRow?.result_json).toContain('"migrateToChatId":"-100123456789"');
+    const settledTurn = harness.cp.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:401"],
+    );
+    expect(settledTurn?.turn_claim_json).toContain('"settlement":"UNANSWERABLE"');
+    expect(settledTurn?.turn_claim_json).not.toContain('"repliedAt"');
+    const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:502"],
+    );
+    expect(laterRow?.result_json).toContain('"sent":true');
+    expect(fixture.calls.filter((call) =>
+      call.method === "sendMessage" && call.body["reply_to_message_id"] === stuckMessageId
+    )).toHaveLength(1);
+
+    const doctor = await harness.cp.doctor.run("system");
+    expect(doctor.findings).toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_UNANSWERABLE",
+      observedEvidence: expect.objectContaining({
+        outstanding: 1,
+        oldest: expect.objectContaining({
+          deliveryStatus: "UNANSWERABLE",
+          statusCode: 400,
+          migrateToChatId: "-100123456789",
+        }),
+      }),
+    }));
+    expect(doctor.findings).not.toContainEqual(expect.objectContaining({ code: "TURN_OUTCOME_UNKNOWN" }));
+
+    const acknowledged = await acknowledgeTelegramReply(harness, "update:401");
+    expect(acknowledged).toMatchObject({
+      allowed: true,
+      value: {
+        deliveryStatus: "UNANSWERABLE",
+        operatorResolution: { disposition: "NO_RETRY" },
+      },
+    });
+    const afterAcknowledgement = await harness.cp.doctor.run("system");
+    expect(afterAcknowledgement.findings).not.toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_UNANSWERABLE",
+    }));
+  });
+
+  it("a delayed terminal send failure stops its batch before the next update is routed", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const firstMessageId = 80_450;
+    const laterMessageId = 80_451;
+    const updates = [
+      update("slow terminal reply", { message_id: firstMessageId }, 450),
+      update("must remain unconsumed", { message_id: laterMessageId }, 451),
+    ];
+    const calls: TelegramApiCall[] = [];
+    const fetcher: typeof globalThis.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = url.endsWith("/getUpdates") ? "getUpdates" : "sendMessage";
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      calls.push({ method, body });
+      if (method === "getUpdates") {
+        const offset = typeof body["offset"] === "number" ? body["offset"] : 0;
+        return new Response(JSON.stringify({
+          ok: true,
+          result: updates.filter((candidate) => candidate.update_id >= offset),
+        }), { status: 200 });
+      }
+      if (body["reply_to_message_id"] === firstMessageId) {
+        // A fetch timeout or slow network error rejects well after one event-loop yield.
+        for (let turn = 0; turn < 3; turn += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+        throw new TypeError("simulated delayed Telegram fetch timeout");
+      }
+      return new Response(JSON.stringify({ ok: true, result: { message_id: nextFakeTelegramMessageId++ } }), {
+        status: 200,
+      });
+    };
+    const errors: unknown[] = [];
+    const listener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: new TelegramBotApi("fixture-bot-token", { fetcher }),
+      onDirect: (input) => `reply to ${input.text}`,
+      onError: (error) => errors.push(error),
+      ownerGateSignals: () => [],
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(errors).toContainEqual(expect.objectContaining({
+          failure: expect.objectContaining({ kind: "UNKNOWN" }),
+        }));
+      });
+      expect(calls.filter((call) => call.method === "sendMessage").map((call) =>
+        call.body["reply_to_message_id"]
+      )).toEqual([firstMessageId]);
+      expect(harness.cp.db.get(
+        `SELECT nonce FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+        ["update:451"],
+      )).toBeUndefined();
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("a later permanent 400 cannot advance the offset past an earlier pending CEO turn", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const first = update("slow first turn", { message_id: 80_470 }, 470);
+    const laterMessageId = 80_471;
+    const later = update("later turn", { message_id: laterMessageId }, 471);
+    const fixture = telegramBotApiFixture([first, later], {
+      status: 400,
+      body: { ok: false, error_code: 400, description: "Bad Request: reply message not found" },
+    }, { persistentlyRejectReplyToMessageId: laterMessageId });
+    let releaseFirst!: () => void;
+    const firstTurn = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: async (input) => {
+          if (input.text === "slow first turn") await firstTurn;
+          return `reply to ${input.text}`;
+        },
+      },
+    );
+
+    try {
+      const cycle = await listener.service.pollOnce();
+      expect(cycle.nextOffsetAtReturn).toBeUndefined();
+      expect(listener.service.offset).toBeUndefined();
+      const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+        `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+        ["update:471"],
+      );
+      expect(laterRow?.result_json).toContain('"deliveryStatus":"UNANSWERABLE"');
+
+      releaseFirst();
+      const settled = await cycle.settled();
+      await listener.service.pendingTurnsSettled();
+      expect(settled.outcomes).toHaveLength(2);
+      expect(settled.nextOffset).toBe(472);
+      expect(listener.service.offset).toBe(472);
+    } finally {
+      releaseFirst();
+      await listener.close();
+    }
+  });
+
+  it("a structured Telegram 403 is terminal and advances the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const rejected = update("blocked chat", {}, 483);
+    const later = update("later direct message", {}, 484);
+    const fixture = telegramBotApiFixture([rejected, later], {
+      status: 403,
+      body: { ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: (input) => `reply to ${input.text}`,
+      },
+    );
+
+    try {
+      const cycle = await listener.service.pollOnce();
+      const observers = await Promise.allSettled([
+        listener.service.pendingTurnsSettled(),
+        cycle.settled(),
+      ]);
+      expect({
+        observerStatuses: observers.map((result) => result.status),
+        offset: listener.service.offset,
+      }).toEqual({
+        observerStatuses: ["fulfilled", "fulfilled"],
+        offset: 485,
+      });
+    } finally {
+      await listener.close();
+    }
+
+    const rejectedRow = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:483"],
+    );
+    expect(rejectedRow?.result_json).toContain('"deliveryStatus":"UNANSWERABLE"');
+    expect(rejectedRow?.result_json).toContain('"statusCode":403');
+    expect(rejectedRow?.turn_claim_json).toContain('"settlement":"UNANSWERABLE"');
+    const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:484"],
+    );
+    expect(laterRow?.result_json).toContain('"sent":true');
+  });
+
+  it("an HTML 403 is a global retryable transport fault and holds the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const rejected = update("proxy-rejected reply", {}, 485);
+    const later = update("later direct message", {}, 486);
+    const fixture = telegramBotApiFixture([rejected, later], {
+      status: 403,
+      body: "<html><body>request blocked by proxy</body></html>",
+    });
+    const reportedErrors: unknown[] = [];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: (input) => `reply to ${input.text}`,
+        onError: (error) => { reportedErrors.push(error); },
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    const rejectedRow = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:485"],
+    );
+    const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:486"],
+    );
+    expect({
+      failure: deliveryError instanceof TelegramDeliveryError ? deliveryError.failure : deliveryError,
+      operatorErrors: reportedErrors.map((error) => error instanceof Error ? error.message : String(error)),
+      offset: listener.service.offset,
+      rejectedResult: rejectedRow?.result_json,
+      rejectedTurn: rejectedRow?.turn_claim_json,
+      laterResult: laterRow?.result_json,
+    }).toMatchObject({
+      failure: { kind: "GLOBAL_REJECTION", statusCode: 403, description: null },
+      operatorErrors: ["Telegram Bot API sendMessage received a non-Telegram HTTP 403 response"],
+      offset: undefined,
+      rejectedResult: expect.stringContaining('"deliveryStatus":"RETRYABLE"'),
+      rejectedTurn: expect.not.stringContaining("settledAt"),
+      laterResult: expect.stringContaining('"sent":true'),
+    });
+  });
+
+  it("a JSON 403 without an error code is a global retryable transport fault and holds the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const rejected = update("gateway-rejected reply", {}, 487);
+    const later = update("later direct message", {}, 488);
+    const fixture = telegramBotApiFixture([rejected, later], {
+      status: 403,
+      body: { ok: false, description: "request blocked by gateway" },
+    });
+    const reportedErrors: unknown[] = [];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: (input) => `reply to ${input.text}`,
+        onError: (error) => { reportedErrors.push(error); },
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    const rejectedRow = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:487"],
+    );
+    const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:488"],
+    );
+    expect({
+      failure: deliveryError instanceof TelegramDeliveryError ? deliveryError.failure : deliveryError,
+      operatorErrors: reportedErrors.map((error) => error instanceof Error ? error.message : String(error)),
+      offset: listener.service.offset,
+      rejectedResult: rejectedRow?.result_json,
+      rejectedTurn: rejectedRow?.turn_claim_json,
+      laterResult: laterRow?.result_json,
+    }).toMatchObject({
+      failure: { kind: "GLOBAL_REJECTION", statusCode: 403, description: null },
+      operatorErrors: ["Telegram Bot API sendMessage received a non-Telegram HTTP 403 response"],
+      offset: undefined,
+      rejectedResult: expect.stringContaining('"deliveryStatus":"RETRYABLE"'),
+      rejectedTurn: expect.not.stringContaining("settledAt"),
+      laterResult: expect.stringContaining('"sent":true'),
+    });
+  });
+
+  it("a 401 remains a global retryable failure and does not terminalize the reply", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const fixture = telegramBotApiFixture([update("token rejected", {}, 481)], {
+      status: 401,
+      body: { ok: false, error_code: 401, description: "Unauthorized" },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: () => "reply that must remain retryable",
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    expect(deliveryError).toMatchObject({
+      failure: { kind: "GLOBAL_REJECTION", statusCode: 401 },
+    });
+    expect(listener.service.offset).toBeUndefined();
+    const row = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:481"],
+    );
+    expect(row?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
+    expect(row?.result_json).not.toContain('"deliveryStatus":"UNANSWERABLE"');
+    expect(row?.turn_claim_json).not.toContain("settledAt");
+  });
+
+  it("a structured 421 token-range rejection is global and holds the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const fixture = telegramBotApiFixture([update("token outside server range", {}, 489)], {
+      status: 421,
+      body: {
+        ok: false,
+        error_code: 421,
+        description: "Misdirected Request: forbidden token specified",
+      },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: () => "reply that must survive server reconfiguration",
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    expect(deliveryError).toMatchObject({
+      failure: {
+        kind: "GLOBAL_REJECTION",
+        statusCode: 421,
+        description: "Misdirected Request: forbidden token specified",
+      },
+    });
+    expect(listener.service.offset).toBeUndefined();
+    const row = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:489"],
+    );
+    expect(row?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
+    expect(row?.result_json).not.toContain('"deliveryStatus":"UNANSWERABLE"');
+    expect(row?.turn_claim_json).not.toContain("settledAt");
+  });
+
+  it("a 429 rate limit leaves its update retryable and holds the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const first = update("first direct message", {}, 451);
+    const fixture = telegramBotApiFixture([first], {
+      status: 429,
+      body: {
+        ok: false,
+        error_code: 429,
+        description: "Too Many Requests: retry later",
+        parameters: { retry_after: 17 },
+      },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        onDirect: (input) => `reply to ${input.text}`,
+        ownerGateSignals: () => [],
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    expect(deliveryError).toMatchObject({
+      failure: {
+        kind: "RETRYABLE",
+        statusCode: 429,
+        retryAfterSeconds: 17,
+      },
+    });
+    expect(listener.service.offset).toBeUndefined();
+    expect(fixture.calls.map((call) => call.method)).toEqual(["getUpdates", "sendMessage"]);
+    const firstRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:451"],
+    );
+    expect(firstRow?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
+  });
+
+  it("a 5xx outage leaves its update retryable and holds the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const first = update("first direct message", {}, 461);
+    const fixture = telegramBotApiFixture([first], {
+      status: 502,
+      body: { ok: false, error_code: 502, description: "Bad Gateway" },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        onDirect: (input) => `reply to ${input.text}`,
+        ownerGateSignals: () => [],
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    expect(deliveryError).toMatchObject({
+      failure: {
+        kind: "RETRYABLE",
+        statusCode: 502,
+        retryAfterSeconds: null,
+      },
+    });
+    expect(listener.service.offset).toBeUndefined();
+    expect(fixture.calls.map((call) => call.method)).toEqual(["getUpdates", "sendMessage"]);
+    const firstRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:461"],
+    );
+    expect(firstRow?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
+  });
+
+  it("an unrecognisable status is global and holds its ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const fixture = telegramBotApiFixture([update("unexpected rejection", {}, 462)], {
+      status: 302,
+      body: { ok: false, error_code: 302, description: "Unexpected redirect" },
+    });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: () => "reply that must remain retryable",
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    expect(deliveryError).toMatchObject({
+      failure: { kind: "GLOBAL_REJECTION", statusCode: 302 },
+    });
+    expect(listener.service.offset).toBeUndefined();
+    const row = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:462"],
+    );
+    expect(row?.result_json).toContain('"deliveryStatus":"RETRYABLE"');
+    expect(row?.turn_claim_json).not.toContain("settledAt");
+  });
+
+  it("a claimed turn's PENDING reply becomes delivery-unknown on redelivery instead of false no-reply", async () => {
     // The claimed twin of the test above. That one uses `/managed`, which never calls
     // `claimTurn` — so its crash-and-restart sequence never reaches `completeNoReplyAndResolveTurn`
     // at all, and cannot prove anything about it. An ordinary DIRECT message does claim a turn,
@@ -1606,6 +2682,30 @@ describe("Telegram production ingress", () => {
       transport: secondTransport,
       start: false,
     });
+
+    // Measure the replay predicate independently from the neighbouring admitted predicate. The
+    // production send above created this PENDING row; the direct call enters the same public
+    // no-reply boundary the polling service uses, with the one shape that makes `replayed` the
+    // deciding fact. Removing only that predicate must try the no-reply transition and fail.
+    const replayGuardRouter = Reflect.get(secondListener.service, "router") as TelegramHermesRouter;
+    const replayGuardOutcome: TelegramRouteOutcome = {
+      updateId: firstUpdate.update_id,
+      nonce: "update:402",
+      correlationId: "telegram-replay-no-reply-guard",
+      admitted: true,
+      replayed: true,
+      classification: null,
+      input: null,
+      reply: null,
+      reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
+    };
+    replayGuardRouter.resolveNoReplyOutcome(replayGuardOutcome);
+    const afterReplayGuard = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:402"],
+    );
+    expect(afterReplayGuard).toEqual(beforeRestart);
+
     try {
       const resumed = (await settledPoll(secondListener.service)).outcomes[0]!;
       // The same observable shape the MANAGED test asserts — this is production reproducing
@@ -1617,18 +2717,17 @@ describe("Telegram production ingress", () => {
     }
     expect(secondTransport.sent).toHaveLength(0);
 
-    // The durable evidence that Telegram may already have accepted the reply must survive
-    // untouched: still PENDING, still holding what the first attempt reserved, and the claim
-    // still unresolved. An ambiguous send outcome stays ambiguous — it must not become a
-    // confident "nothing was sent", because that is what tells the owner to resend a message
-    // Telegram may have already delivered.
+    // The durable evidence that Telegram may already have accepted the reply becomes an explicit
+    // terminal unknown. It is not resent and it does not become a false no-reply.
     const afterRestart = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
       `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
       ["update:402"],
     );
-    expect(afterRestart?.result_json).toBe(beforeRestart?.result_json);
-    expect(afterRestart?.turn_claim_json).toBe(beforeRestart?.turn_claim_json);
+    expect(afterRestart?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+    expect(afterRestart?.result_json).not.toContain('"sent"');
+    expect(afterRestart?.turn_claim_json).toContain('"settlement":"UNRESOLVED"');
     expect(afterRestart?.turn_claim_json).not.toContain("repliedAt");
+    expect(afterRestart?.turn_claim_json).not.toContain("noReplyAt");
   });
 
   it("clears a human gate only through the real owner receipt path", async () => {

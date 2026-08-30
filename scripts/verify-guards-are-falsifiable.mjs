@@ -228,14 +228,8 @@ const GUARDS = [
     // exactly why it needs its own row rather than resting on that being true forever.
     what: "a no-reply resolution never moves a claim that already has a terminal fact",
     file: "src/ingress/ingress-guard.ts",
-    find:
-      "      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };\n" +
-      "      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {\n" +
-      "        // Already resolved, one way or the other. Idempotent-safe, and the guard that keeps a\n" +
-      "        // real `repliedAt` from ever being overwritten by this path.\n" +
-      "        return allow(ReasonCode.OK, undefined);\n" +
-      "      }\n",
-    replace: "",
+    find: "      if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {",
+    replace: "      if (false) {",
     killedBy: [
       "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: never writes noReplyAt over a turn whose reply already resolved",
     ],
@@ -280,18 +274,8 @@ const GUARDS = [
     // that also protects the reservation taken on its own.
     what: "a reply reservation is refused for a turn already resolved as no-reply",
     file: "src/ingress/ingress-guard.ts",
-    find:
-      "      if (current.turn_claim_json) {\n" +
-      "        const claim = JSON.parse(current.turn_claim_json) as { noReplyAt?: unknown };\n" +
-      "        if (claim.noReplyAt !== undefined) {\n" +
-      "          return deny(\n" +
-      "            ReasonCode.RESOURCE_COLLISION,\n" +
-      "            \"cannot transition an ingress result for a turn already resolved as no-reply\",\n" +
-      "            { channel, nonce },\n" +
-      "          );\n" +
-      "        }\n" +
-      "      }\n",
-    replace: "",
+    find: "        if (claim.noReplyAt !== undefined || claim.settledAt !== undefined) {",
+    replace: "        if (false) {",
     killedBy: [
       "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682: reserveResponse refuses a reply for a turn already resolved as no-reply",
     ],
@@ -314,20 +298,15 @@ const GUARDS = [
   },
   {
     // Found by Sol's review of #672's own PR (#682): `route()` reports `reply: null` for two
-    // different facts, and this guard is what keeps them apart. A replayed admission of a
-    // claimed turn whose reply reservation is still PENDING after a crash also comes back with
-    // `reply: null` — `storedResponseOutcome` omits it on purpose, so the poller does not resend
-    // into Telegram — and without `outcome.replayed` in this condition, that ambiguous "we do not
-    // know if this was sent" state was overwritten with a confident "nothing was sent", losing
-    // the durable evidence that Telegram may have already delivered it. Removing the clause
-    // restores exactly that: a replayed, still-PENDING reply reaches `completeNoReplyAndResolveTurn`
-    // and is destroyed.
+    // different facts, and this guard is what keeps them apart. Recovery turns a surviving
+    // PENDING reservation into an explicit UNRESOLVED result and returns `reply: null`; without
+    // `outcome.replayed`, the no-reply path tries to overwrite that delivery-unknown fact.
     what: "a replayed outcome is never read as a fresh no-reply, even when both carry reply: null",
     file: "src/ingress/telegram-router.ts",
     find: "    if (outcome.reply || !outcome.admitted || outcome.replayed) return;",
     replace: "    if (outcome.reply || !outcome.admitted) return;",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::#682: a claimed turn's PENDING reply survives a redelivery instead of becoming a false no-reply",
+      "tests/unit/telegram-ingress.test.ts::a claimed turn's PENDING reply becomes delivery-unknown on redelivery instead of false no-reply",
     ],
   },
   {
@@ -1134,7 +1113,7 @@ const GUARDS = [
     // update immediately retryable reopens the hot loop while its Telegram offset is held.
     what: "a detached Telegram route waits for retryDelayMs before it is attempted again",
     file: "src/ingress/telegram-polling.ts",
-    find: "        retryAt: Date.now() + (this.options.retryDelayMs ?? 5_000),",
+    find: "        retryAt: Date.now() + deliveryRetryDelayMs(error, this.options.retryDelayMs ?? 5_000),",
     replace: "        retryAt: Date.now(),",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::waits for retryDelayMs before a detached route is attempted again",
@@ -2120,8 +2099,8 @@ const GUARDS = [
     // discarded, which is exactly that regression.
     what: "bind reuses the actor that already owns a verified target instead of minting a second one",
     file: "src/session/binding-registry.ts",
-    find: "      const actorId = reused.value ?? this.mintActor(input.role, input.sessionId, session.incarnation);",
-    replace: "      const actorId = this.mintActor(input.role, input.sessionId, session.incarnation);",
+    find: "      const actorId = reused.value ?? this.mintActor(\n        input.role,\n        input.sessionId,\n        session.incarnation,\n        freshCandidate,\n      );",
+    replace: "      const actorId = this.mintActor(\n        input.role,\n        input.sessionId,\n        session.incarnation,\n        freshCandidate,\n      );",
     killedBy: [
       "tests/unit/reconstitution-needs-a-verified-target.test.ts::reuses the actor rather than minting a second owner",
     ],
@@ -2526,6 +2505,299 @@ const GUARDS = [
     killedBy: ["tests/unit/tracker-loci-strip-invariants.test.ts::division does not open a regex literal"],
   },
   {
+    // Without the envelope boundary, an HTML/plain-text proxy rejection falls through to the
+    // status classifier and a 403 is consumed as if Telegram had rejected this one message.
+    what: "an HTML 403 is a global retryable transport fault and holds the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      if (!response.ok) {\n        if (!isTelegramApiError(parsed)) {",
+    replace: "      if (!response.ok) {\n        if (false) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::an HTML 403 is a global retryable transport fault and holds the ordered offset",
+    ],
+  },
+  {
+    // A proxy can return Telegram-shaped JSON without Telegram's integer error_code. Removing
+    // that discriminator consumes the request as a permanent Telegram rejection and drops it.
+    what: "a JSON 403 without an error code is a global retryable transport fault and holds the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find:
+      "  && telegramDescription(payload) !== null\n" +
+      "  && Number.isSafeInteger(payload[\"error_code\"])\n" +
+      "  && Number(payload[\"error_code\"]) > 0;",
+    replace: "  && telegramDescription(payload) !== null;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a JSON 403 without an error code is a global retryable transport fault and holds the ordered offset",
+    ],
+  },
+  {
+    // migrate_to_chat_id identifies this request's destination as obsolete. Removing that
+    // structured signal leaves a message-specific 400 retryable and wedges 101 later updates.
+    what: "a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    file: "src/ingress/telegram-polling.ts",
+    find: "  return telegramMigrateToChatId(payload) !== null",
+    replace: "  return false",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // Telegram names the request's reply target as missing. Removing that semantic signal leaves
+    // a message-specific 400 retryable and prevents the earlier pending turn from draining.
+    what: "a later permanent 400 cannot advance the offset past an earlier pending CEO turn",
+    file: "src/ingress/telegram-polling.ts",
+    find: "    || description === \"Bad Request: reply message not found\"",
+    replace: "    || false",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a later permanent 400 cannot advance the offset past an earlier pending CEO turn",
+    ],
+  },
+  {
+    // This description confines the refusal to the destination user. Removing it makes one
+    // blocked chat hold unrelated updates even though the shared Bot API remains usable.
+    what: "a structured Telegram 403 is terminal and advances the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "    || description === \"Forbidden: bot was blocked by the user\";",
+    replace: "    || false;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a structured Telegram 403 is terminal and advances the ordered offset",
+    ],
+  },
+  {
+    // Telegram has no structured scope field. Dropping the request-local predicate recreates the
+    // 421 loss by consuming a self-hosted server's token-range configuration rejection.
+    what: "a structured 421 token-range rejection is global and holds the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "  if (statusCode >= 400 && statusCode < 500 && isTelegramRequestLocalRejection(payload)) {",
+    replace: "  if (statusCode >= 400 && statusCode < 500) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a structured 421 token-range rejection is global and holds the ordered offset",
+    ],
+  },
+  {
+    // Narrowing the server-error default to the familiar 503 makes an unlisted 502 look global
+    // rather than retryable and lets an enumeration stand in for the status class.
+    what: "a 5xx outage leaves its update retryable and holds the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "  if (statusCode >= 500 && statusCode < 600) {",
+    replace: "  if (statusCode === 503) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a 5xx outage leaves its update retryable and holds the ordered offset",
+    ],
+  },
+  {
+    // An unrecognised response provides no evidence that this one request is permanently bad;
+    // consuming it instead of holding the batch would silently discard the unexplained request.
+    what: "an unrecognisable status is global and holds its ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find:
+      "  // No scope evidence means the failure may affect every request. Holding the ordered offset is\n" +
+      "  // recoverable; terminalizing an unrecognised shared fault would silently lose the reply.\n" +
+      "  return {\n" +
+      "    kind: \"GLOBAL_REJECTION\",",
+    replace:
+      "  // No scope evidence means the failure may affect every request. Holding the ordered offset is\n" +
+      "  // recoverable; terminalizing an unrecognised shared fault would silently lose the reply.\n" +
+      "  return {\n" +
+      "    kind: \"PERMANENT_REJECTION\",",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::an unrecognisable status is global and holds its ordered offset",
+    ],
+  },
+  {
+    // Removing the new boundary makes v32 current again, so opening it takes no pre-migration
+    // backup before this binary can begin writing the forward-only settledAt state.
+    what: "opening a v32 database takes an automatic rollback snapshot before Telegram settlement state",
+    file: "src/db/migrations.ts",
+    find: "export const SCHEMA_VERSION = 33;",
+    replace: "export const SCHEMA_VERSION = 32;",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::opening a v32 database takes an automatic rollback snapshot before Telegram settlement state",
+    ],
+  },
+  {
+    // Telegram's response body is the only source of retry_after. Reading only the HTTP status
+    // stops the current storm but schedules the next attempt earlier than Telegram requested.
+    what: "a Telegram 429 preserves its retry after instruction",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      retryAfterSeconds: telegramRetryAfterSeconds(payload),",
+    replace: "      retryAfterSeconds: null,",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a 429 rate limit leaves its update retryable and holds the ordered offset",
+    ],
+  },
+  {
+    // A known-not-sent service failure is safe to retry. It must release the reserved reply and
+    // reject its route so retryUpdate holds this update's place in the ordered offset queue.
+    what: "a retryable Telegram service failure holds its ordered update",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      if (policy.reply === \"RELEASE\") {",
+    replace:
+      "      if (false) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a 5xx outage leaves its update retryable and holds the ordered offset",
+    ],
+  },
+  {
+    // Advancing is safe only after the permanent rejection is durably terminal. Releasing it to
+    // RETRYABLE while advancing recreates the silent orphan behind the round-four wedge.
+    what: "a permanent Telegram rejection is durably recorded as terminal",
+    file: "src/ingress/telegram-polling.ts",
+    find: "        this.router.abandonResponse(outcome, error.failure);",
+    replace: "        this.router.releaseResponse(outcome);",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // An unknown outcome may already be an accepted send. Retrying it can duplicate an external
+    // message, so its reply state must be terminal before the listener stops.
+    what: "an unknown send result is durably terminal without automatic retry",
+    file: "src/ingress/telegram-polling.ts",
+    find: "        this.router.recordUnknownResponse(outcome, error.failure);",
+    replace: "        throw error;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::an unknown send result is terminal without automatic retry and stops the loop",
+    ],
+  },
+  {
+    // The terminal reply state prevents a duplicate of this send; the batch action independently
+    // prevents a later message from following an outcome whose scope is unknown.
+    what: "an unknown send result stops the loop before a later message",
+    file: "src/ingress/telegram-polling.ts",
+    find: "  UNKNOWN: { reply: \"SETTLE\", batch: \"STOP\" },",
+    replace: "  UNKNOWN: { reply: \"SETTLE\", batch: \"ADVANCE\" },",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::an unknown send result is terminal without automatic retry and stops the loop",
+    ],
+  },
+  {
+    // Runtime status reaches health through this value. Pinning it to running recreates the
+    // invisible stop even though the listener still emits its exact UNKNOWN state.
+    what: "UNKNOWN stop changes daemon health to stopped",
+    file: "src/daemon/agentcpd.ts",
+    find: "          running: status.running,",
+    replace: "          running: true,",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::UNKNOWN stop changes daemon health to stopped",
+    ],
+  },
+  {
+    // The durable acknowledgement is not recovery by itself. Removing this live-listener action
+    // recreates the issue: Doctor's database warning closes while the existing poller stays down.
+    what: "the exact UNKNOWN reply acknowledgement resumes the existing Telegram listener",
+    file: "src/daemon/daemon.ts",
+    find: "            await this.#telegramIngressController?.resumeAfterAcknowledgement(nonce.value);",
+    replace: "            await Promise.resolve(false);",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::exact nonce acknowledge restarts the existing listener",
+    ],
+  },
+  {
+    // Restarting the poller is not enough for Doctor to become truthful again. The recovered
+    // listener must publish that it is running so daemon health leaves the stopped state.
+    what: "Doctor stays truthful after acknowledge because ingress is running",
+    file: "src/ingress/telegram-polling.ts",
+    find: "    this.options.onRuntimeStatus?.({ running: true, stopReason: null, recoveryNonce: null });",
+    replace: "",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::Doctor stays truthful after acknowledge because ingress is running",
+    ],
+  },
+  {
+    // Terminal delivery states are useful only if the inbound acknowledgement moves past them.
+    // Removing this update leaves the unanswerable row visible but restores the 100-update wedge.
+    what: "a terminal Telegram reply advances the inbound offset",
+    file: "src/ingress/telegram-polling.ts",
+    find:
+      "          (outcome) => {\n" +
+      "            this.completeUpdate(update.update_id);\n" +
+      "            return outcome;\n" +
+      "          },",
+    replace:
+      "          (outcome) => {\n" +
+      "            return outcome;\n" +
+      "          },",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // A recovered PENDING may be the record lagging a successful send. Returning its stored reply
+    // asks the polling loop to cross the irreversible Telegram boundary a second time.
+    what: "a crash after a successful send leaves one unresolved reply and never sends it again",
+    file: "src/ingress/telegram-router.ts",
+    find: "      return completedRoute(this.storedResponseOutcome(update, recovered, false));",
+    replace: "      return completedRoute(this.storedResponseOutcome(update, recovered, true));",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a crash after a successful send leaves one unresolved reply and never sends it again",
+    ],
+  },
+  {
+    // A later route may settle while an earlier CEO turn is still running. Telegram's offset
+    // confirms every lower update id, so the drain must stop at the first non-settled entry.
+    what: "a later terminal reply cannot advance the offset past an earlier pending CEO turn",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      if (this.#updateStates.get(next)?.status !== \"SETTLED\") break;",
+    replace: "      if (false) break;",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a later permanent 400 cannot advance the offset past an earlier pending CEO turn",
+    ],
+  },
+  {
+    // A terminal row without an authenticated operator surface is still silence. Doctor reads
+    // the reply lifecycle directly because managed acknowledgements have no CEO turn claim.
+    what: "doctor reports permanently unanswerable Telegram replies",
+    file: "src/doctor/doctor.ts",
+    find: "          AND json_extract(result_json, '$.deliveryStatus') IN ('UNANSWERABLE', 'UNRESOLVED')",
+    replace: "          AND json_extract(result_json, '$.deliveryStatus') = 'UNRESOLVED'",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // Acknowledgement is the operator exit: the delivery fact stays terminal, while Doctor stops
+    // presenting a reviewed NO_RETRY disposition as work nobody has addressed.
+    what: "a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    file: "src/doctor/doctor.ts",
+    find: "          AND json_type(result_json, '$.operatorResolution') IS NULL",
+    replace: "          AND json_type(result_json, '$.operatorResolution') IS NOT NULL",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // The stored disposition is deliberately NO_RETRY: an operator clears the alert without
+    // asserting that Telegram delivered the reply or granting a later automatic resend.
+    what: "a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "  const operatorResolution: TelegramReplyOperatorResolution = {\n" +
+      "    disposition: \"NO_RETRY\",",
+    replace:
+      "  const operatorResolution: TelegramReplyOperatorResolution = {\n" +
+      "    disposition: \"RETRY\",",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // The terminal state must outlive ordinary nonce pruning or its Doctor finding disappears and
+    // a retained update can look new again after the exact state meant to stop automatic resend.
+    what: "terminal Telegram reply failures survive ordinary ingress pruning",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "                'PENDING',\n" +
+      "                'UNKNOWN_RETRYABLE',\n" +
+      "                'UNANSWERABLE',\n" +
+      "                'UNRESOLVED'",
+    replace:
+      "                'PENDING',\n" +
+      "                'UNKNOWN_RETRYABLE'",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::an unknown send result is terminal without automatic retry and stops the loop",
+    ],
+  },
+  {
     // #693 — the no-replace trigger refuses a colliding or moved source row, never a fresh one: a
     // new (channel, nonce) at a new batch_ordinal, inserted onto a turn that already exists,
     // passed every WHEN clause above it. This is the write-time backstop: every source `claim()`
@@ -2623,6 +2895,115 @@ const GUARDS = [
     replace: "    raw.pragma(`user_version = ${SCHEMA_VERSION - 1}`);",
     killedBy: [
       "tests/unit/database-migration-restore.test.ts::migrates pinned v11 and restores it after the injected post-v12 failure",
+    ],
+  },
+  {
+    what: "the plausible script-site census includes every regular direct child regardless of extension",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "const scriptFiles = readdirSync(scriptsDir)\n" +
+      "  .filter((name) => statSync(join(scriptsDir, name)).isFile())\n" +
+      "  .sort();",
+    replace:
+      "const scriptFiles = readdirSync(scriptsDir)\n" +
+      "  .filter((name) => statSync(join(scriptsDir, name)).isFile())\n" +
+      "  .filter((name) => /\\.(mjs|ts|js|cjs)$/.test(name))\n" +
+      "  .sort();",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::finds shell Python and extensionless scripts with no plausible site",
+    ],
+  },
+  {
+    what: "an interpreter argument outside its plausible entrypoint position is not counted as a site",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find: "  return entrypoint !== null && isScriptOperand(entrypoint, needle);",
+    replace: "  return words.includes(needle);",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::rejects interpreter arguments that are not plausible entrypoint positions",
+    ],
+  },
+  {
+    what: "every recognized test-spawn site is labeled execution unproven",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "  for (const test of testSources) {\n" +
+      "    if (testFileHasPlausibleSpawn(test.text, name)) {\n" +
+      "      sites.push({ type: \"test\", file: test.source, plausibleCiRoute: true, execution: \"unproven\" });\n" +
+      "    }\n" +
+      "  }",
+    replace:
+      "  for (const test of testSources) {\n" +
+      "    if (testFileHasPlausibleSpawn(test.text, name)) {\n" +
+      "      sites.push({ type: \"test\", file: test.source, plausibleCiRoute: true, execution: \"observed\" });\n" +
+      "    }\n" +
+      "  }",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::reports a skipped spawn as execution unproven",
+    ],
+  },
+  {
+    what: "a real suite spawn is included as a plausible test site",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "  for (const test of testSources) {\n" +
+      "    if (testFileHasPlausibleSpawn(test.text, name)) {\n" +
+      "      sites.push({ type: \"test\", file: test.source, plausibleCiRoute: true, execution: \"unproven\" });\n" +
+      "    }\n" +
+      "  }",
+    replace: "  for (const test of []) void test;",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::counts a real spawn as plausible and leaves execution unproven",
+    ],
+  },
+  {
+    what: "a plausible package CI route flows from a reached site to the alias it invokes",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "const queue = [...plausiblyCiRoutedPackageScripts];\n" +
+      "while (queue.length > 0) {\n" +
+      "  const caller = queue.shift();\n" +
+      "  for (const called of packageCallsIn(packageScripts[caller], packageScriptNames)) {\n" +
+      "    if (plausiblyCiRoutedPackageScripts.has(called)) continue;\n" +
+      "    plausiblyCiRoutedPackageScripts.add(called);\n" +
+      "    queue.push(called);\n" +
+      "  }\n" +
+      "}",
+    replace:
+      "const queue = [];\n" +
+      "let grew = true;\n" +
+      "while (grew) {\n" +
+      "  grew = false;\n" +
+      "  for (const [caller, command] of packageScriptEntries) {\n" +
+      "    if (plausiblyCiRoutedPackageScripts.has(caller)) continue;\n" +
+      "    const callsReachedAlias = [...packageCallsIn(command, packageScriptNames)].some((called) =>\n" +
+      "      plausiblyCiRoutedPackageScripts.has(called),\n" +
+      "    );\n" +
+      "    if (!callsReachedAlias) continue;\n" +
+      "    plausiblyCiRoutedPackageScripts.add(caller);\n" +
+      "    grew = true;\n" +
+      "  }\n" +
+      "}",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::does not propagate a plausible CI route from callee back to an unused package site",
+    ],
+  },
+  {
+    what: "any plausibly CI routed package alias marks a multiply aliased script route plausible",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "    withPlausibleSites.push({\n" +
+      "      name,\n" +
+      "      plausibleSites,\n" +
+      "      plausibleCiRoute: plausibleSites.some((site) => site.plausibleCiRoute),\n" +
+      "    });",
+    replace:
+      "    withPlausibleSites.push({\n" +
+      "      name,\n" +
+      "      plausibleSites,\n" +
+      "      plausibleCiRoute: plausibleSites[0].plausibleCiRoute,\n" +
+      "    });",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::uses any plausibly CI routed package alias for a multiply aliased script",
     ],
   },
 ];

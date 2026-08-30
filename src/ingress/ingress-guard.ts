@@ -115,6 +115,7 @@ export const buzzActorBindingSigningRequest = (
 });
 
 const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
+type TelegramReplyTransitionExpectation = "AVAILABLE" | "PENDING" | "UNKNOWN_RETRYABLE";
 
 /**
  * How long each transport itself may still redeliver an update whose receipt was never
@@ -625,7 +626,7 @@ export class IngressGuard {
     channel: string,
     nonce: string,
     result: unknown,
-    expected: "AVAILABLE" | "PENDING",
+    expected: TelegramReplyTransitionExpectation,
   ): Decision<void> {
     {
       const current = this.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
@@ -636,19 +637,22 @@ export class IngressGuard {
         return deny(ReasonCode.NOT_FOUND, "cannot transition a missing ingress result", { channel, nonce });
       }
       if (current.turn_claim_json) {
-        const claim = JSON.parse(current.turn_claim_json) as { noReplyAt?: unknown };
-        if (claim.noReplyAt !== undefined) {
+        const claim = JSON.parse(current.turn_claim_json) as {
+          noReplyAt?: unknown;
+          settledAt?: unknown;
+        };
+        if (claim.noReplyAt !== undefined || claim.settledAt !== undefined) {
           return deny(
             ReasonCode.RESOURCE_COLLISION,
-            "cannot transition an ingress result for a turn already resolved as no-reply",
+            "cannot transition an ingress result for a turn already resolved as no-reply or settled by a delivery failure",
             { channel, nonce },
           );
         }
       }
       const deliveryStatus = resultDeliveryStatus(current.result_json);
-      const allowed = expected === "PENDING"
-        ? deliveryStatus === "PENDING"
-        : deliveryStatus !== "PENDING" && deliveryStatus !== "APPLIED";
+      const allowed = expected === "AVAILABLE"
+        ? deliveryStatus === null || deliveryStatus === "RETRYABLE"
+        : deliveryStatus === expected;
       if (!allowed) {
         return deny(
           ReasonCode.RESOURCE_COLLISION,
@@ -706,6 +710,7 @@ export class IngressGuard {
         WHERE channel = ?
           AND turn_claim_json IS NOT NULL
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
+          AND json_extract(turn_claim_json, '$.settledAt') IS NULL
           AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
           AND json_extract(turn_claim_json, '$.sessionDigest') IS ?
         ORDER BY received_at ASC`,
@@ -759,6 +764,25 @@ export class IngressGuard {
       const completed = this.#recordResultHere(channel, nonce, result, "PENDING");
       if (!completed.allowed) return completed;
       return this.#resolveTurnHere(channel, nonce);
+    });
+  }
+
+  /**
+   * Atomically terminalize a failed reply and settle the handler turn that produced it.
+   * `settledAt` is separate from `repliedAt`: Telegram did not accept this reply, so the row must
+   * not claim that it did, but the stored handler result is no longer an unknown turn outcome.
+   */
+  settleReplyAndTurn(
+    channel: string,
+    nonce: string,
+    result: unknown,
+    settlement: "UNANSWERABLE" | "UNRESOLVED",
+    expected: "PENDING" | "UNKNOWN_RETRYABLE" = "PENDING",
+  ): Decision<void> {
+    return this.db.txDecision(() => {
+      const completed = this.#recordResultHere(channel, nonce, result, expected);
+      if (!completed.allowed) return completed;
+      return this.#settleTurnHere(channel, nonce, settlement);
     });
   }
 
@@ -831,11 +855,22 @@ export class IngressGuard {
         // No claim, nothing to resolve — the ordinary non-CEO path, same as `resolveTurn`.
         return allow(ReasonCode.OK, undefined);
       }
-      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };
+      const claim = JSON.parse(current.turn_claim_json) as {
+        repliedAt?: unknown;
+        noReplyAt?: unknown;
+        settledAt?: unknown;
+      };
       if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined) {
         // Already resolved, one way or the other. Idempotent-safe, and the guard that keeps a
         // real `repliedAt` from ever being overwritten by this path.
         return allow(ReasonCode.OK, undefined);
+      }
+      if (claim.settledAt !== undefined) {
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "cannot record no-reply for a turn already settled by a delivery failure",
+          { channel, nonce },
+        );
       }
       // No `kind: "TELEGRAM_WORKFLOW"`, deliberately: that shape's `sent` and `phase` describe
       // the reply lifecycle, and there is no reply to describe. `isRecoverableIngressResult`'s
@@ -891,7 +926,11 @@ export class IngressGuard {
       // now refuses the reservation that would let a caller reach this state through the reply
       // lifecycle, but `resolveTurn` is also called directly, bypassing that gate entirely — so
       // this function has to refuse the conflict on its own rather than rely on an earlier guard.
-      const claim = JSON.parse(current.turn_claim_json) as { repliedAt?: unknown; noReplyAt?: unknown };
+      const claim = JSON.parse(current.turn_claim_json) as {
+        repliedAt?: unknown;
+        noReplyAt?: unknown;
+        settledAt?: unknown;
+      };
       if (claim.repliedAt !== undefined) {
         // Already resolved by an earlier reply. Idempotent, not a conflict: an ordinary redelivery
         // of a completed turn reaches this on the reply path, and refusing it here would make
@@ -908,10 +947,20 @@ export class IngressGuard {
           { channel, nonce },
         );
       }
+      if (claim.settledAt !== undefined) {
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "cannot record an accepted reply for a turn already settled by a delivery failure",
+          { channel, nonce },
+        );
+      }
       const updated = this.db.run(
         `UPDATE inbound_messages
             SET turn_claim_json = json_set(turn_claim_json, '$.repliedAt', ?)
-          WHERE channel = ? AND nonce = ? AND json_extract(turn_claim_json, '$.repliedAt') IS NULL`,
+          WHERE channel = ? AND nonce = ?
+            AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
+            AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
+            AND json_extract(turn_claim_json, '$.settledAt') IS NULL`,
         [this.clock.nowIso(), channel, nonce],
       );
       // The row count is checked (#682, third review) rather than returning `allow(OK)`
@@ -929,8 +978,57 @@ export class IngressGuard {
     }
   }
 
+  #settleTurnHere(
+    channel: string,
+    nonce: string,
+    settlement: "UNANSWERABLE" | "UNRESOLVED",
+  ): Decision<void> {
+    const current = this.db.get<{ turn_claim_json: string | null }>(
+      `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
+      [channel, nonce],
+    );
+    if (!current?.turn_claim_json) return allow(ReasonCode.OK, undefined);
+    const claim = JSON.parse(current.turn_claim_json) as {
+      repliedAt?: unknown;
+      noReplyAt?: unknown;
+      settledAt?: unknown;
+      settlement?: unknown;
+    };
+    if (claim.settledAt !== undefined && claim.settlement === settlement) {
+      return allow(ReasonCode.OK, undefined);
+    }
+    if (claim.repliedAt !== undefined || claim.noReplyAt !== undefined || claim.settledAt !== undefined) {
+      return deny(
+        ReasonCode.RESOURCE_COLLISION,
+        "cannot settle a turn that already has a different terminal outcome",
+        { channel, nonce, settlement },
+      );
+    }
+    const updated = this.db.run(
+      `UPDATE inbound_messages
+          SET turn_claim_json = json_set(
+            turn_claim_json,
+            '$.settledAt', ?,
+            '$.settlement', ?
+          )
+        WHERE channel = ? AND nonce = ?
+          AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
+          AND json_extract(turn_claim_json, '$.noReplyAt') IS NULL
+          AND json_extract(turn_claim_json, '$.settledAt') IS NULL`,
+      [this.clock.nowIso(), settlement, channel, nonce],
+    );
+    return updated.changes === 1
+      ? allow(ReasonCode.OK, undefined)
+      : deny(ReasonCode.RESOURCE_COLLISION, "turn settlement raced another writer", {
+          channel,
+          nonce,
+          settlement,
+        });
+  }
+
   private prune(channel: string, ttlMs: number): void {
-    // A claimed turn whose outcome was never recorded is exempt.
+    // A claimed turn whose outcome was never recorded and a Telegram reply whose delivery is
+    // ambiguous or terminally failed are exempt.
     //
     // The nonce window exists so a replay of old traffic is refused cheaply, and for an ordinary
     // row expiry is right: after the TTL, the message is not coming back. A claimed row is not
@@ -945,25 +1043,161 @@ export class IngressGuard {
     // the moment a reply was reserved — so the row a timeout produced was pruned like any other,
     // and the nonce it held was freed (#646).
     //
-    // These rows need a person, not a timer. `INGRESS_TURN_OUTCOME_UNKNOWN` is written to the
-    // audit log, and `agentctl doctor system` reports the same outstanding claim as a
-    // `TURN_OUTCOME_UNKNOWN` finding (`Doctor.checkUnresolvedTurns`) — so the runbook's first
-    // command surfaces it too, not only someone tailing `audit_events`.
+    // The reply lifecycle is independently durable even when its handler claimed no turn (for
+    // example, a managed-command acknowledgement). Deleting an UNANSWERABLE or UNRESOLVED row
+    // would silence its doctor finding; deleting an ambiguous reservation would also discard the
+    // only evidence that an accepted send must not be attempted again.
     //
-    // `noReplyAt`, not only `repliedAt`: a turn a handler genuinely decided not to reply to is
-    // exactly as finished as one whose reply the transport accepted, and is just as prunable —
-    // but it is a *different* fact (#682), so it gets its own check rather than being folded
-    // into `repliedAt`'s.
+    // Terminal reply failures need a person, not a timer. `agentctl doctor system` reads these
+    // exact rows and reports the unanswerable or unknown delivery state.
     this.db.run(
       `DELETE FROM inbound_messages
         WHERE channel = ? AND received_at < ?
-          AND (turn_claim_json IS NULL
+          AND (
+            turn_claim_json IS NULL
             OR json_extract(turn_claim_json, '$.repliedAt') IS NOT NULL
-            OR json_extract(turn_claim_json, '$.noReplyAt') IS NOT NULL)`,
+            OR json_extract(turn_claim_json, '$.noReplyAt') IS NOT NULL
+            OR json_extract(turn_claim_json, '$.settledAt') IS NOT NULL
+          )
+          AND NOT COALESCE((
+            json_valid(result_json) = 1
+            AND json_type(result_json, '$.reply') = 'object'
+            AND (
+              json_extract(result_json, '$.deliveryStatus') IN (
+                'PENDING',
+                'UNKNOWN_RETRYABLE',
+                'UNANSWERABLE',
+                'UNRESOLVED'
+              )
+              OR (
+                json_type(result_json, '$.deliveryStatus') IS NULL
+                AND json_extract(result_json, '$.sent') IS NOT 1
+              )
+            )
+          ), 0)`,
       [channel, new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString()],
     );
   }
 }
+
+export interface TelegramReplyOperatorResolution {
+  disposition: "NO_RETRY";
+  resolvedAt: string;
+  resolvedBy: string;
+  reasonCode: string;
+  evidenceDigest: string;
+  auditEventId: number;
+}
+
+export interface TelegramReplyAcknowledgement {
+  nonce: string;
+  deliveryStatus: "UNANSWERABLE" | "UNRESOLVED";
+  operatorResolution: TelegramReplyOperatorResolution;
+}
+
+/**
+ * Records that an authenticated operator reviewed a terminal Telegram reply and chose no retry.
+ *
+ * The terminal status is retained: acknowledgement does not prove whether Telegram accepted an
+ * unknown send, and it does not pretend a rejected reply was delivered. The audit row and the
+ * result update share one transaction, so a crash produces either both facts or neither.
+ */
+export const acknowledgeTerminalTelegramReply = (
+  db: Db,
+  clock: Clock,
+  audit: AuditLog,
+  input: {
+    nonce: string;
+    resolvedBy: string;
+    reasonCode: string;
+    evidenceDigest: string;
+  },
+): Decision<TelegramReplyAcknowledgement> => db.txDecision(() => {
+  const row = db.get<{ result_json: string | null }>(
+    `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+    [input.nonce],
+  );
+  if (!row?.result_json) {
+    return deny(ReasonCode.NOT_FOUND, "no Telegram reply exists for this nonce", { nonce: input.nonce });
+  }
+
+  let state: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(row.result_json) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return deny(ReasonCode.CONFLICT, "the Telegram reply state is not an object", { nonce: input.nonce });
+    }
+    state = parsed as Record<string, unknown>;
+  } catch {
+    return deny(ReasonCode.CONFLICT, "the Telegram reply state is not valid JSON", { nonce: input.nonce });
+  }
+
+  const deliveryStatus = state["deliveryStatus"];
+  if (deliveryStatus !== "UNANSWERABLE" && deliveryStatus !== "UNRESOLVED") {
+    return deny(
+      ReasonCode.CONFLICT,
+      "only an unanswerable or unresolved Telegram reply can be acknowledged",
+      { nonce: input.nonce, status: typeof deliveryStatus === "string" ? deliveryStatus : null },
+    );
+  }
+
+  const existing = state["operatorResolution"];
+  if (typeof existing === "object" && existing !== null && !Array.isArray(existing)) {
+    const resolution = existing as Partial<TelegramReplyOperatorResolution>;
+    if (
+      resolution.disposition === "NO_RETRY"
+      && typeof resolution.resolvedAt === "string"
+      && typeof resolution.resolvedBy === "string"
+      && typeof resolution.reasonCode === "string"
+      && typeof resolution.evidenceDigest === "string"
+      && typeof resolution.auditEventId === "number"
+    ) {
+      return allow(ReasonCode.INGRESS_REPLAY_IGNORED, {
+        nonce: input.nonce,
+        deliveryStatus,
+        operatorResolution: resolution as TelegramReplyOperatorResolution,
+      });
+    }
+    return deny(ReasonCode.CONFLICT, "the Telegram reply has an invalid operator resolution", {
+      nonce: input.nonce,
+    });
+  }
+
+  const resolvedAt = clock.nowIso();
+  const audited = audit.record({
+    kind: "TELEGRAM_REPLY_NO_RETRY_ACKNOWLEDGED",
+    actor: input.resolvedBy,
+    reasonCode: ReasonCode.OK,
+    evidence: {
+      channel: "telegram",
+      nonce: input.nonce,
+      status: deliveryStatus,
+      resolution: "NO_RETRY",
+      reasonCode: input.reasonCode,
+      evidenceDigest: input.evidenceDigest,
+    },
+  });
+  if (!audited.allowed) return deny(audited.reasonCode, audited.message, audited.evidence);
+
+  const operatorResolution: TelegramReplyOperatorResolution = {
+    disposition: "NO_RETRY",
+    resolvedAt,
+    resolvedBy: input.resolvedBy,
+    reasonCode: input.reasonCode,
+    evidenceDigest: input.evidenceDigest,
+    auditEventId: audited.value,
+  };
+  const updated = db.run(
+    `UPDATE inbound_messages SET result_json = ?
+      WHERE channel = 'telegram' AND nonce = ? AND result_json = ?`,
+    [JSON.stringify({ ...state, operatorResolution }), input.nonce, row.result_json],
+  );
+  return updated.changes === 1
+    ? allow(ReasonCode.OK, { nonce: input.nonce, deliveryStatus, operatorResolution })
+    : deny(ReasonCode.RESOURCE_COLLISION, "the Telegram reply changed during acknowledgement", {
+        nonce: input.nonce,
+      });
+});
 
 /**
  * A Telegram row with no terminal response is an unfinished workflow, not a completed replay.
@@ -1042,6 +1276,10 @@ export interface TurnIdentity {
 
 export interface TurnClaim extends TurnIdentity {
   deliveryStatus: typeof TURN_CLAIMED;
+  repliedAt?: string;
+  noReplyAt?: string;
+  settledAt?: string;
+  settlement?: "UNANSWERABLE" | "UNRESOLVED";
 }
 
 /**
@@ -1120,6 +1358,7 @@ const isRecoverableIngressResult = (resultJson: string | null): boolean => {
     // branch because a claim carries no `kind`, and falling through would reach the
     // `value.sent === false` default and re-admit it.
     if (value.deliveryStatus === TURN_CLAIMED) return false;
+    if (value.deliveryStatus === "UNANSWERABLE" || value.deliveryStatus === "UNRESOLVED") return false;
     if (value.kind === "TELEGRAM_WORKFLOW") {
       return value.phase === "ADMITTED" || value.phase === "CREATED" || value.phase === "DISPATCHED" || value.sent === false;
     }
@@ -1133,16 +1372,21 @@ const isRecoverableIngressResult = (resultJson: string | null): boolean => {
  * Whether a stored claim is still waiting on an outcome.
  *
  * A claim with `repliedAt` produced a reply the transport accepted; a claim with `noReplyAt` had a
- * handler that decided not to reply (#682) — different facts, but either is the closest thing to
- * an outcome this layer can observe, and either one closes the claim. Without the distinction the
- * claim would survive forever and every replay of a finished turn would report an unknown outcome
- * — the hold #651 warned that fixing #646 would create.
+ * handler that decided not to reply; a claim with `settledAt` produced a stored handler result
+ * whose reply was terminally unanswerable or externally unresolved. These are three different
+ * facts, and each closes the ingress claim without overstating the others.
  */
 const unresolvedClaim = (turnClaimJson: string | null): boolean => {
   if (!turnClaimJson) return false;
   try {
-    const claim = JSON.parse(turnClaimJson) as { repliedAt?: unknown; noReplyAt?: unknown };
-    return claim.repliedAt === undefined && claim.noReplyAt === undefined;
+    const claim = JSON.parse(turnClaimJson) as {
+      repliedAt?: unknown;
+      noReplyAt?: unknown;
+      settledAt?: unknown;
+    };
+    return claim.repliedAt === undefined
+      && claim.noReplyAt === undefined
+      && claim.settledAt === undefined;
   } catch {
     // Unparseable is treated as outstanding. A claim nobody can read is not a claim that resolved.
     return true;

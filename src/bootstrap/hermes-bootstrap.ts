@@ -14,6 +14,7 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { runHermesTargetBind } from "../runtime/hermes-target-bind.ts";
 import {
   assertPrivatePath,
   ensurePrivateDirectory,
@@ -29,6 +30,12 @@ const NONCE_MIN_LENGTH = 16;
 export interface HermesBootstrapRequest {
   command: readonly string[];
   model: string;
+  hermesExecutable: string;
+  hermesProfile: string;
+  hermesHome: string;
+  requestedSessionId: string;
+  expectedLineageRootDigest: string;
+  executorRuntimeIdentity: string;
 }
 
 export interface HermesBootstrapResult {
@@ -256,9 +263,31 @@ const parseBootstrapRequest = (input: unknown): Decision<HermesBootstrapRequest>
   if (rawModel !== undefined && (typeof rawModel !== "string" || rawModel.trim().length === 0)) {
     return deny(ReasonCode.INVALID_ARGUMENT, "Hermes bootstrap model must be a non-empty string", {});
   }
+  const hermesExecutable = nonEmptyBootstrapString(input["hermesExecutable"]);
+  const hermesProfile = nonEmptyBootstrapString(input["hermesProfile"]);
+  const hermesHome = nonEmptyBootstrapString(input["hermesHome"]);
+  const requestedSessionId = nonEmptyBootstrapString(input["requestedSessionId"]);
+  const expectedLineageRootDigest = nonEmptyBootstrapString(input["expectedLineageRootDigest"]);
+  const executorRuntimeIdentity = nonEmptyBootstrapString(input["executorRuntimeIdentity"]);
+  if (
+    hermesExecutable === null ||
+    hermesProfile === null ||
+    hermesHome === null ||
+    requestedSessionId === null ||
+    expectedLineageRootDigest === null ||
+    executorRuntimeIdentity === null
+  ) {
+    return deny(ReasonCode.INVALID_ARGUMENT, "Hermes bootstrap attestation parameters must be non-empty strings", {});
+  }
   return allow(ReasonCode.OK, {
     command: rawCommand,
     model: (rawModel as string | undefined)?.trim() || "hermes-runtime",
+    hermesExecutable,
+    hermesProfile,
+    hermesHome,
+    requestedSessionId,
+    expectedLineageRootDigest,
+    executorRuntimeIdentity,
   });
 };
 
@@ -338,7 +367,57 @@ const constituteHermesAuthority = async (
     );
   }
 
-  const bound = cp.bindings.bind({ role: Role.CEO, roleKey, sessionId: created.sessionId });
+  const claimedTarget = {
+    executorKind: "hermes",
+    targetLocator: request.requestedSessionId,
+    targetLocatorDigest: request.expectedLineageRootDigest,
+  };
+  let attestationDigest = "";
+  const bound = cp.bindings.bind({
+    role: Role.CEO,
+    roleKey,
+    sessionId: created.sessionId,
+    authenticatedTarget: {
+      claimed: claimedTarget,
+      protocolVersion: "hermes.target-bind/v1",
+      get attestationDigest(): string {
+        return attestationDigest;
+      },
+      verify: (tuple) => {
+        try {
+          const attested = runHermesTargetBind({
+            hermesExecutable: request.hermesExecutable,
+            hermesProfile: request.hermesProfile,
+            hermesHome: request.hermesHome,
+            sessionId: request.requestedSessionId,
+            expectedLineageRootDigest: request.expectedLineageRootDigest,
+            actorId: tuple.actorId,
+            bindingGeneration: tuple.generation,
+            executorRuntimeIdentity: request.executorRuntimeIdentity,
+            timeoutMs: 5_000,
+            maxOutputBytes: 65_536,
+          });
+          if (!attested.allowed) return null;
+          const receipt = attested.value;
+          if (
+            receipt.domain !== "hermes.target-bind" ||
+            receipt.version !== 1 ||
+            receipt.actor_id !== tuple.actorId ||
+            receipt.binding_generation !== tuple.generation ||
+            receipt.executor_runtime_identity !== request.executorRuntimeIdentity ||
+            receipt.requested_session_id !== request.requestedSessionId ||
+            receipt.lineage_root_digest !== request.expectedLineageRootDigest ||
+            typeof receipt.receipt_digest !== "string" ||
+            receipt.receipt_digest.length === 0
+          ) return null;
+          attestationDigest = receipt.receipt_digest;
+          return claimedTarget;
+        } catch {
+          return null;
+        }
+      },
+    },
+  });
   if (!bound.allowed) {
     return failSession(cp, created.sessionId, bound.reasonCode, bound.message);
   }
@@ -743,6 +822,11 @@ const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 };
+
+const nonEmptyBootstrapString = (value: unknown): string | null =>
+  typeof value === "string" && !value.includes("\u0000") && value.trim().length > 0
+    ? value.trim()
+    : null;
 
 const safeError = (error: unknown): string =>
   (error instanceof Error ? error.message : String(error)).replace(/[\r\n\t]/g, " ").slice(0, 300);

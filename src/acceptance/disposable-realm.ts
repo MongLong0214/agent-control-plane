@@ -170,8 +170,8 @@ export type ProbeSignal =
  * What a run may do next.
  *
  * `INCONCLUSIVE` is terminal on purpose and has no retry beside it. Every signal that produces it
- * is a state where "did the side effect happen" is unanswerable, and the one thing that must not
- * follow an unanswerable question is another message.
+ * is a state where "did the side effect happen" is unanswerable.
+ * An ambiguous send is terminal for that reply and stops the loop before another message.
  */
 export type ProbeDisposition = "CONTINUE" | "INCONCLUSIVE";
 

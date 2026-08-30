@@ -71,11 +71,19 @@ jobs:
       - run: pnpm native:peercred:build
       - run: pnpm lint
       - run: pnpm terminology
+      # #705 — this check is correct and was reachable from neither package.json nor here, so
+      # a real defect it found (a `_STALE` code absent from STALENESS_REASON_CODES) reported
+      # into a room nobody was in. Dependency-free by the same PRD §17.4 contract as
+      # `terminology` and `release:version` above and below it.
+      - run: pnpm reason-codes
       # Reports, never fails: stale evidence is a fact to see, and a check that fails on a
       # true statement gets switched off. --strict exists for when a release wants a gate.
       - run: pnpm evidence:freshness
       - run: pnpm invariants
       - run: pnpm typecheck
+      # #705's static half: every direct script has a plausible invocation site. The command
+      # prints that this cannot establish execution and that dynamic measurement remains #705.
+      - run: pnpm scripts:plausible-callers
       # Seconds, and it answers the question that actually goes stale: does every mutation row
       # still name a line that exists. Editing a guarded line renames its anchor and the row
       # silently stops checking anything — three times on one branch, each found only when the

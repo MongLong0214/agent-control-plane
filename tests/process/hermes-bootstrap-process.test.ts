@@ -55,6 +55,11 @@ const logFilesUnder = (root: string): string[] => {
   return files;
 };
 
+const writeExecutable = (path: string, source: string): void => {
+  writeFileSync(path, source, { mode: 0o700 });
+  chmodSync(path, 0o700);
+};
+
 const launchDaemon = (env: NodeJS.ProcessEnv): ManagedDaemon => {
   const child = spawn(process.execPath, [TSX_ENTRY, DAEMON_ENTRY], {
     cwd: process.cwd(),
@@ -177,6 +182,40 @@ describe("fresh-install Hermes bootstrap process acceptance", () => {
     const fakeBin = join(root, "bin");
     mkdirSync(home, { recursive: true, mode: 0o700 });
     mkdirSync(fakeBin, { recursive: true, mode: 0o700 });
+    const targetBindPath = join(fakeBin, "target-bind");
+    writeExecutable(targetBindPath, `#!${process.execPath}
+const { createHash } = require("node:crypto");
+const expected = ["target", "bind", "--json"];
+if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(expected)) {
+  throw new Error("expected target bind --json");
+}
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  const request = JSON.parse(input);
+  const response = {
+    domain: "hermes.target-bind",
+    version: 1,
+    actor_id: request.actor_id,
+    binding_generation: request.binding_generation,
+    executor_runtime_identity: request.executor_runtime_identity,
+    requested_session_id: request.session_id,
+    lineage_root_digest: request.expected_lineage_root_digest,
+  };
+  const canonical = JSON.stringify(Object.fromEntries(Object.entries(response).sort(([left], [right]) => left.localeCompare(right))));
+  const receipt_digest = "sha256:" + createHash("sha256").update(canonical).digest("hex");
+  process.stdout.write(JSON.stringify({ ...response, receipt_digest }) + "\\n");
+});
+`);
+    const targetSelectors = [
+      "--target-bind-executable", targetBindPath,
+      "--hermes-profile", "process-hermes",
+      "--hermes-home", home,
+      "--requested-session-id", "process-session",
+      "--expected-lineage-root-digest", "sha256:" + "a".repeat(64),
+      "--executor-runtime-identity", "process-runtime",
+    ] as const;
     const providerOutput: Record<string, string> = {
       claude: "5-hour limit: 80% remaining\\n",
       codex: "press enter to confirm\\n5-hour limit: 80% remaining\\n",
@@ -261,6 +300,7 @@ describe("fresh-install Hermes bootstrap process acceptance", () => {
       const bootstrap = await runAgentctl(env, [
         "bootstrap",
         "hermes",
+        ...targetSelectors,
         "--",
         process.execPath,
         HERMES_RUNTIME,
@@ -298,6 +338,7 @@ describe("fresh-install Hermes bootstrap process acceptance", () => {
       const rerun = await runAgentctl(env, [
         "bootstrap",
         "hermes",
+        ...targetSelectors,
         "--",
         process.execPath,
         "-e",

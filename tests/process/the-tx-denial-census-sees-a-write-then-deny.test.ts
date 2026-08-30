@@ -111,6 +111,12 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     anchor: "did not happen and must not leave a row behind.\n    return this.db.txDecision(() => {",
   },
   {
+    label: "BindingRegistry.bind",
+    file: "session/binding-registry.ts",
+    anchor:
+      "bind(input: BindInput): Decision<RoleBinding> {\n    return this.db.txDecision(() => {",
+  },
+  {
     label: "BindingRegistry.switchTo",
     file: "session/binding-registry.ts",
     anchor: 'down already promised and `tx()` alone could not keep.\n    return this.db.txDecision(() => {',
@@ -124,6 +130,11 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     label: "IngressGuard.completeNoReplyAndResolveTurn",
     file: "ingress/ingress-guard.ts",
     anchor: "reasoning #664 exists to stop trusting by hand.\n    return this.db.txDecision(() => {",
+  },
+  {
+    label: "acknowledgeTerminalTelegramReply",
+    file: "ingress/ingress-guard.ts",
+    anchor: "): Decision<TelegramReplyAcknowledgement> => db.txDecision(() => {",
   },
 ];
 
@@ -175,12 +186,6 @@ const NAMED_ENTRIES: Array<{ label: string; file: string; marker: string; expect
     label: "TaskGraph.startExecution's recordInvocationStarted guard (EXEMPT)",
     file: "run/task-graph.ts",
     marker: "const invocationBaseline = this.#baseline.recordInvocationStarted(",
-    expectStdout: "stale exemption",
-  },
-  {
-    label: "BindingRegistry.bind's recordTargetBinding guard (EXEMPT)",
-    file: "session/binding-registry.ts",
-    marker: "const recorded = this.recordTargetBinding(actorId, input.verifiedTarget)",
     expectStdout: "stale exemption",
   },
   {

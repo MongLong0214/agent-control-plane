@@ -15,9 +15,9 @@ import {
   type TelegramOwnerPromptRequest,
   type TelegramInterruptPoint,
   type TelegramRouteOutcome,
-  type TelegramRouteProgress,
   type TelegramStoredState,
   type TelegramStoredResponse,
+  type TelegramStoredDeliveryFailure,
   type TelegramDeliveryStatus,
 } from "./telegram-router.ts";
 import { TelegramIngress, type TelegramUpdate } from "./telegram.ts";
@@ -81,25 +81,188 @@ export interface TelegramBotTransport {
   readonly redeliveryRetentionMs: number | null;
 }
 
+export type TelegramDeliveryFailure =
+  | {
+    kind: "PERMANENT_REJECTION";
+    statusCode: number;
+    description: string | null;
+    migrateToChatId: string | null;
+    retryAfterSeconds: null;
+  }
+  | {
+    kind: "RETRYABLE";
+    statusCode: number;
+    description: string | null;
+    migrateToChatId: null;
+    retryAfterSeconds: number | null;
+  }
+  | {
+    kind: "GLOBAL_REJECTION";
+    statusCode: number;
+    description: string | null;
+    migrateToChatId: null;
+    retryAfterSeconds: null;
+  }
+  | {
+    kind: "UNKNOWN";
+    statusCode: null;
+    description: null;
+    migrateToChatId: null;
+    retryAfterSeconds: null;
+  };
+
+type TelegramDeliveryPolicy = {
+  readonly reply: "RELEASE" | "SETTLE";
+  readonly batch: "ADVANCE" | "HOLD_OFFSET" | "STOP";
+};
+
 /**
- * A send failure must distinguish a confirmed rejection from an ambiguous external result.
- * Only `accepted === false` may release a durable reservation; null means Telegram may have
- * accepted the request and the reservation must remain PENDING across a restart.
+ * The failure classification and its ordered-batch consequence are one policy. Keeping them in
+ * one table prevents a durable reply state from claiming one outcome while the poll loop does
+ * another. An ambiguous send is terminal for that reply and stops the loop before another message.
  */
+const TELEGRAM_DELIVERY_POLICY = {
+  PERMANENT_REJECTION: { reply: "SETTLE", batch: "ADVANCE" },
+  RETRYABLE: { reply: "RELEASE", batch: "HOLD_OFFSET" },
+  GLOBAL_REJECTION: { reply: "RELEASE", batch: "HOLD_OFFSET" },
+  UNKNOWN: { reply: "SETTLE", batch: "STOP" },
+} as const satisfies Record<TelegramDeliveryFailure["kind"], TelegramDeliveryPolicy>;
+
+/** Carries the delivery and batch-scope facts the Bot API adapter actually observed. */
 export class TelegramDeliveryError extends Error {
   constructor(
     message: string,
-    readonly accepted: boolean | null,
+    readonly failure: TelegramDeliveryFailure,
   ) {
     super(message);
     this.name = "TelegramDeliveryError";
   }
 }
 
+const unknownDeliveryFailure = (): TelegramDeliveryFailure => ({
+  kind: "UNKNOWN",
+  statusCode: null,
+  description: null,
+  migrateToChatId: null,
+  retryAfterSeconds: null,
+});
+
+const nonTelegramHttpFailure = (statusCode: number): TelegramDeliveryFailure => ({
+  kind: "GLOBAL_REJECTION",
+  statusCode,
+  description: null,
+  migrateToChatId: null,
+  retryAfterSeconds: null,
+});
+
+const telegramStatusCode = (httpStatus: number, payload: unknown): number => {
+  const telegramCode = isRecord(payload) ? payload["error_code"] : undefined;
+  return Number.isSafeInteger(telegramCode) && Number(telegramCode) > 0
+    ? Number(telegramCode)
+    : httpStatus;
+};
+
+const telegramRetryAfterSeconds = (payload: unknown): number | null => {
+  if (!isRecord(payload) || !isRecord(payload["parameters"])) return null;
+  const retryAfter = payload["parameters"]["retry_after"];
+  return Number.isSafeInteger(retryAfter) && Number(retryAfter) > 0
+    ? Number(retryAfter)
+    : null;
+};
+
+const telegramDescription = (payload: unknown): string | null => {
+  if (!isRecord(payload)) return null;
+  const description = payload["description"];
+  return typeof description === "string" && description.trim().length > 0 ? description : null;
+};
+
+/** Only this envelope proves Telegram, rather than a proxy or WAF, rejected the request. */
+const isTelegramApiError = (payload: unknown): payload is Record<string, unknown> =>
+  isRecord(payload)
+  && payload["ok"] === false
+  && telegramDescription(payload) !== null
+  && Number.isSafeInteger(payload["error_code"])
+  && Number(payload["error_code"]) > 0;
+
+const telegramMigrateToChatId = (payload: unknown): string | null => {
+  if (!isRecord(payload) || !isRecord(payload["parameters"])) return null;
+  const migrateToChatId = payload["parameters"]["migrate_to_chat_id"];
+  return Number.isSafeInteger(migrateToChatId) ? String(migrateToChatId) : null;
+};
+
+/**
+ * Telegram exposes no structured error-scope field. Treat a 4xx as request-local only when its
+ * description affirmatively identifies the unchanged request or destination as the problem.
+ * Unrecognised descriptions deliberately return false so a shared fault cannot consume a reply.
+ */
+const isTelegramRequestLocalRejection = (payload: unknown): boolean => {
+  const description = telegramDescription(payload);
+  return telegramMigrateToChatId(payload) !== null
+    || description === "Bad Request: reply message not found"
+    || description === "Forbidden: bot was blocked by the user";
+};
+
+const rejectedDeliveryFailure = (
+  statusCode: number,
+  payload: unknown,
+): TelegramDeliveryFailure => {
+  // A retry instruction is shared service state, not evidence that this request is unusable.
+  if (statusCode === 429) {
+    return {
+      kind: "RETRYABLE",
+      statusCode,
+      description: telegramDescription(payload),
+      migrateToChatId: null,
+      retryAfterSeconds: telegramRetryAfterSeconds(payload),
+    };
+  }
+
+  // Status alone cannot establish scope: the self-hosted Bot API uses 421 for a token-range
+  // configuration fault. Terminalize only descriptions that identify this request or destination.
+  if (statusCode >= 400 && statusCode < 500 && isTelegramRequestLocalRejection(payload)) {
+    return {
+      kind: "PERMANENT_REJECTION",
+      statusCode,
+      description: telegramDescription(payload),
+      migrateToChatId: telegramMigrateToChatId(payload),
+      retryAfterSeconds: null,
+    };
+  }
+
+  // An otherwise unlisted 5xx is server-side and may recover without changing this message.
+  if (statusCode >= 500 && statusCode < 600) {
+    return {
+      kind: "RETRYABLE",
+      statusCode,
+      description: telegramDescription(payload),
+      migrateToChatId: null,
+      retryAfterSeconds: null,
+    };
+  }
+
+  // No scope evidence means the failure may affect every request. Holding the ordered offset is
+  // recoverable; terminalizing an unrecognised shared fault would silently lose the reply.
+  return {
+    kind: "GLOBAL_REJECTION",
+    statusCode,
+    description: telegramDescription(payload),
+    migrateToChatId: null,
+    retryAfterSeconds: null,
+  };
+};
+
 export interface TelegramLongPollListener {
   service: TelegramLongPollService;
   close(): Promise<void>;
 }
+
+export type TelegramLongPollRuntimeStatus =
+  | { running: true; stopReason: null; recoveryNonce: null }
+  | {
+    running: false;
+    stopReason: "NOT_STARTED" | "UNKNOWN_DELIVERY" | "CLOSED";
+    recoveryNonce: string | null;
+  };
 
 export interface TelegramLongPollStartOptions {
   transport?: TelegramBotTransport;
@@ -112,6 +275,8 @@ export interface TelegramLongPollStartOptions {
   onInterrupt?: (point: TelegramInterruptPoint, update: TelegramUpdate, runId?: string) => void | Promise<void>;
   /** Durable owner-gate notifications to consume before polling for inbound updates. */
   ownerGateSignals?: () => readonly TelegramOwnerGateSignal[];
+  /** Reports the live poll-loop state; durable reply state alone cannot say whether this process stopped. */
+  onRuntimeStatus?: (status: TelegramLongPollRuntimeStatus) => void;
 }
 
 export type TelegramOwnerPromptDeliveryStatus = "PENDING" | "APPLIED" | "RETRYABLE";
@@ -140,6 +305,14 @@ interface TelegramTrackedTurn {
   settled: Promise<void>;
   result: TelegramTrackedTurnResult | null;
 }
+
+type TelegramLongPollRouteProgress =
+  | { status: "COMPLETED"; outcome: TelegramRouteOutcome }
+  | {
+    status: "CEO_TURN_PENDING";
+    outcome: Promise<TelegramRouteOutcome>;
+    deliveryStarted: Promise<void>;
+  };
 
 type TelegramUpdateState =
   | { status: "RUNNING" }
@@ -331,7 +504,7 @@ export class TelegramBotApi implements TelegramBotTransport {
       allow_sending_without_reply: true,
     });
     if (!result || typeof result !== "object" || !Number.isSafeInteger((result as { message_id?: unknown }).message_id)) {
-      throw new TelegramDeliveryError("Telegram Bot API sendMessage returned no message id", null);
+      throw new TelegramDeliveryError("Telegram Bot API sendMessage returned no message id", unknownDeliveryFailure());
     }
     return { messageId: (result as { message_id: number }).message_id };
   }
@@ -355,25 +528,45 @@ export class TelegramBotApi implements TelegramBotTransport {
         body: JSON.stringify(body),
         signal: controller.signal,
       });
+      let parsed: unknown = null;
+      try {
+        parsed = await response.json() as unknown;
+      } catch (error) {
+        if (response.ok) throw error;
+      }
       if (!response.ok) {
+        if (!isTelegramApiError(parsed)) {
+          throw new TelegramDeliveryError(
+            `Telegram Bot API ${method} received a non-Telegram HTTP ${response.status} response`,
+            nonTelegramHttpFailure(response.status),
+          );
+        }
         throw new TelegramDeliveryError(
           `Telegram Bot API ${method} returned HTTP ${response.status}`,
-          false,
+          rejectedDeliveryFailure(telegramStatusCode(response.status, parsed), parsed),
         );
       }
-      const parsed = await response.json() as unknown;
       if (!parsed || typeof parsed !== "object" || (parsed as { ok?: unknown }).ok !== true) {
-        throw new TelegramDeliveryError(`Telegram Bot API ${method} refused the request`, false);
+        if (!isTelegramApiError(parsed)) {
+          throw new TelegramDeliveryError(
+            `Telegram Bot API ${method} returned an invalid success response`,
+            unknownDeliveryFailure(),
+          );
+        }
+        throw new TelegramDeliveryError(
+          `Telegram Bot API ${method} refused the request`,
+          rejectedDeliveryFailure(telegramStatusCode(response.status, parsed), parsed),
+        );
       }
       return (parsed as { result?: unknown }).result;
     } catch (error) {
       if (error instanceof TelegramDeliveryError) throw error;
       if (controller.signal.aborted && !signal?.aborted) {
-        throw new TelegramDeliveryError(`Telegram Bot API ${method} timed out`, null);
+        throw new TelegramDeliveryError(`Telegram Bot API ${method} timed out`, unknownDeliveryFailure());
       }
       throw new TelegramDeliveryError(
         error instanceof Error ? error.message : `Telegram Bot API ${method} failed`,
-        null,
+        unknownDeliveryFailure(),
       );
     } finally {
       clearTimeout(timeout);
@@ -384,8 +577,11 @@ export class TelegramBotApi implements TelegramBotTransport {
 
 export class TelegramLongPollService {
   #running = false;
+  #closed = false;
   #loopPromise: Promise<void> | null = null;
   #controller: AbortController | null = null;
+  #terminalDeliveryError: TelegramDeliveryError | null = null;
+  #terminalDeliveryNonce: string | null = null;
   #offset: number | undefined;
   readonly #pendingTurns = new Set<TelegramTrackedTurn>();
   readonly #turnFailures: unknown[] = [];
@@ -405,6 +601,7 @@ export class TelegramLongPollService {
       onInterrupt?: (point: TelegramInterruptPoint, update: TelegramUpdate, runId?: string) => void | Promise<void>;
       ownerGateSignals?: () => readonly TelegramOwnerGateSignal[];
       ownerPromptStore?: TelegramOwnerPromptStore;
+      onRuntimeStatus?: (status: TelegramLongPollRuntimeStatus) => void;
     } = {},
   ) {
     if (webhookSecret.trim().length === 0) {
@@ -517,7 +714,7 @@ export class TelegramLongPollService {
         correlationId: prepared.value.correlationId,
       });
     } catch (error) {
-      if (error instanceof TelegramDeliveryError && error.accepted === false) {
+      if (error instanceof TelegramDeliveryError && error.failure.kind !== "UNKNOWN") {
         const released = this.options.ownerPromptStore?.release(reservation);
         if (released && !released.allowed) throw new Error(`${released.reasonCode}: ${released.message}`);
       }
@@ -553,6 +750,8 @@ export class TelegramLongPollService {
   }
 
   async pollOnce(): Promise<TelegramPollCycle> {
+    if (this.#terminalDeliveryError) throw this.#terminalDeliveryError;
+
     // Receive first. Owner-gate prompts are outbound and incidental to this loop; the inbound
     // batch is the owner's only way to reach the daemon. Delivering prompts first meant one
     // undeliverable prompt — a denied `sendOwnerPromptIfNeeded`, a Telegram 5xx — threw past
@@ -589,23 +788,32 @@ export class TelegramLongPollService {
             return outcome;
           },
           (error: unknown) => {
-            this.retryUpdate(update.update_id);
+            this.retryUpdate(update.update_id, error);
             throw error;
           },
         );
         routes.push({ status: "CEO_TURN_PENDING", outcome: route });
-        this.trackTurn(route);
+        const turn = this.trackTurn(route);
+        // A CEO call that is still pending may detach, but once it reaches Telegram the ordered
+        // batch waits for that external result. A slow terminal rejection must stop the batch
+        // before the next update can be parked and consumed by the unresolved-turn policy.
+        const deliveryStarted = await Promise.race([
+          progress.deliveryStarted.then(() => true),
+          delay(0).then(() => false),
+        ]);
+        if (deliveryStarted) await turn.settled;
+        if (this.#terminalDeliveryError) break;
       } catch (error) {
         // Non-CEO routes remain inside pollOnce, so their rejection still reaches loop()'s
         // reporter and retry delay exactly as it did before the CEO turn was detached.
-        this.retryUpdate(update.update_id);
+        this.retryUpdate(update.update_id, error);
         throw error;
       }
     }
 
     // A pending CEO turn has been accepted into a tracked task before incidental outbound prompts
     // run. Managed routes and owner decisions still finish here; only the CEO call leaves the poll.
-    await this.deliverOwnerGatePrompts();
+    if (!this.#terminalDeliveryError) await this.deliverOwnerGatePrompts();
     if (routes.length === 0 && updates.length > 0) {
       if (retryInMs !== undefined) {
         // A detached CEO failure no longer reaches loop()'s catch. Its update-local deadline is the
@@ -634,17 +842,36 @@ export class TelegramLongPollService {
 
   start(): void {
     if (this.#running) return;
+    if (this.#closed) throw new Error("Telegram long-poll listener is closed");
+    if (this.#terminalDeliveryError) throw this.#terminalDeliveryError;
     this.#running = true;
+    this.options.onRuntimeStatus?.({ running: true, stopReason: null, recoveryNonce: null });
     this.#loopPromise = this.loop();
   }
 
+  /** Resumes only the stop whose durable UNKNOWN reply the operator actually acknowledged. */
+  async resumeAfterAcknowledgement(nonce: string): Promise<boolean> {
+    if (this.#closed || this.#terminalDeliveryNonce !== nonce) return false;
+    // Keep the terminal marker set until the old loop has observed it and exited. Clearing it
+    // earlier can let that loop continue while start() creates a second poller over the same
+    // offset and controller.
+    await this.#loopPromise;
+    if (this.#closed || this.#terminalDeliveryNonce !== nonce) return false;
+    this.#terminalDeliveryError = null;
+    this.#terminalDeliveryNonce = null;
+    this.start();
+    return true;
+  }
+
   async close(): Promise<void> {
+    this.#closed = true;
     this.#running = false;
     this.#controller?.abort();
     await this.#loopPromise;
     await this.pendingTurnsSettled();
     this.#loopPromise = null;
     this.#controller = null;
+    this.options.onRuntimeStatus?.({ running: false, stopReason: "CLOSED", recoveryNonce: null });
   }
 
   private async loop(): Promise<void> {
@@ -653,9 +880,12 @@ export class TelegramLongPollService {
       try {
         await this.pollOnce();
       } catch (error) {
-        if (!this.#running && this.#controller.signal.aborted) break;
+        if (!this.#running) {
+          if (!this.#controller.signal.aborted) this.options.onError?.(error);
+          break;
+        }
         this.options.onError?.(error);
-        await delay(this.options.retryDelayMs ?? 5_000);
+        await delay(deliveryRetryDelayMs(error, this.options.retryDelayMs ?? 5_000));
       } finally {
         this.#controller = null;
       }
@@ -690,14 +920,20 @@ export class TelegramLongPollService {
     return turn;
   }
 
-  private async routeUpdate(update: TelegramUpdate): Promise<TelegramRouteProgress> {
+  private async routeUpdate(update: TelegramUpdate): Promise<TelegramLongPollRouteProgress> {
     const progress = await this.router.routeUntilCeoTurn(update, this.webhookSecret);
     if (progress.status === "COMPLETED") {
       return { status: "COMPLETED", outcome: await this.deliverRouteOutcome(update, progress.outcome) };
     }
+    let markDeliveryStarted!: () => void;
+    const deliveryStarted = new Promise<void>((resolve) => { markDeliveryStarted = resolve; });
     return {
       status: "CEO_TURN_PENDING",
-      outcome: progress.outcome.then((outcome) => this.deliverRouteOutcome(update, outcome)),
+      deliveryStarted,
+      outcome: progress.outcome.then((outcome) => {
+        markDeliveryStarted();
+        return this.deliverRouteOutcome(update, outcome);
+      }),
     };
   }
 
@@ -714,17 +950,38 @@ export class TelegramLongPollService {
     }
 
     // Reserve before the external call. A reservation left PENDING after an ambiguous return is
-    // never replayed; only a confirmed pre-send rejection is released.
+    // never replayed. A verified request-local rejection is terminal; intermediary responses,
+    // shared/global rejections and 429/5xx release the reservation and keep the update retryable.
     this.router.reserveResponse(outcome);
+    await this.options.onInterrupt?.("after-reply-reserve", update, outcome.runId);
     try {
       await this.transport.sendMessage(outcome.reply);
       await this.options.onInterrupt?.("after-reply-send", update, outcome.runId);
       this.router.completeResponse(outcome);
     } catch (error) {
-      if (error instanceof TelegramDeliveryError && error.accepted === false) {
+      if (!(error instanceof TelegramDeliveryError)) throw error;
+      const policy = TELEGRAM_DELIVERY_POLICY[error.failure.kind];
+      if (policy.reply === "RELEASE") {
         this.router.releaseResponse(outcome);
+        throw error;
       }
-      throw error;
+      if (error.failure.kind === "PERMANENT_REJECTION") {
+        this.router.abandonResponse(outcome, error.failure);
+      } else {
+        if (error.failure.kind !== "UNKNOWN") throw error;
+        this.router.recordUnknownResponse(outcome, error.failure);
+        if (policy.batch === "STOP") {
+          this.#terminalDeliveryError = error;
+          this.#terminalDeliveryNonce = outcome.nonce;
+          this.#running = false;
+          this.options.onRuntimeStatus?.({
+            running: false,
+            stopReason: "UNKNOWN_DELIVERY",
+            recoveryNonce: outcome.nonce,
+          });
+          throw error;
+        }
+      }
     }
     return outcome;
   }
@@ -749,11 +1006,11 @@ export class TelegramLongPollService {
     return { reserved: true };
   }
 
-  private retryUpdate(updateId: number): void {
+  private retryUpdate(updateId: number, error?: unknown): void {
     if (Number.isSafeInteger(updateId)) {
       this.#updateStates.set(updateId, {
         status: "RETRYABLE",
-        retryAt: Date.now() + (this.options.retryDelayMs ?? 5_000),
+        retryAt: Date.now() + deliveryRetryDelayMs(error, this.options.retryDelayMs ?? 5_000),
       });
     }
   }
@@ -876,6 +1133,7 @@ export const startTelegramLongPollListener = async (
     onError: options.onError,
     ownerGateSignals: options.ownerGateSignals ?? (() => ownerGateSignalsFromOutbox(cp)),
     ownerPromptStore: createOwnerPromptStore(cp),
+    onRuntimeStatus: options.onRuntimeStatus,
     ...(options.onInterrupt ? { onInterrupt: options.onInterrupt } : {}),
   });
   if (options.start !== false) service.start();
@@ -1259,6 +1517,8 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
       reply?: unknown;
       sent?: unknown;
       deliveryStatus?: unknown;
+      unknownDeliveryAttempts?: unknown;
+      deliveryFailure?: unknown;
     };
     if (
       candidate.kind !== "TELEGRAM_WORKFLOW" ||
@@ -1268,7 +1528,18 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
     if (candidate.sent !== undefined && typeof candidate.sent !== "boolean") return null;
     if (
       candidate.deliveryStatus !== undefined &&
-      !["PENDING", "RETRYABLE", "APPLIED"].includes(String(candidate.deliveryStatus))
+      ![
+        "PENDING",
+        "RETRYABLE",
+        "UNKNOWN_RETRYABLE",
+        "APPLIED",
+        "UNANSWERABLE",
+        "UNRESOLVED",
+      ].includes(String(candidate.deliveryStatus))
+    ) return null;
+    if (
+      candidate.unknownDeliveryAttempts !== undefined
+      && (!Number.isSafeInteger(candidate.unknownDeliveryAttempts) || Number(candidate.unknownDeliveryAttempts) < 0)
     ) return null;
     if (candidate.reply === undefined) {
       return {
@@ -1277,7 +1548,11 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
         ...(candidate.runId ? { runId: candidate.runId } : {}),
       };
     }
-    if (typeof candidate.reply !== "object" || candidate.reply === null || typeof candidate.sent !== "boolean") return null;
+    if (
+      typeof candidate.reply !== "object"
+      || candidate.reply === null
+      || (candidate.sent === undefined && candidate.deliveryStatus === undefined)
+    ) return null;
     const reply = candidate.reply as Partial<TelegramReply>;
     if (
       typeof reply.chatId !== "string" ||
@@ -1285,13 +1560,34 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
       typeof reply.replyToMessageId !== "number" ||
       typeof reply.correlationId !== "string"
     ) return null;
+    let deliveryFailure: TelegramStoredDeliveryFailure | undefined;
+    if (candidate.deliveryFailure !== undefined) {
+      if (!isRecord(candidate.deliveryFailure)) return null;
+      const failure = candidate.deliveryFailure;
+      if (
+        (failure["kind"] !== "PERMANENT_REJECTION" && failure["kind"] !== "UNKNOWN")
+        || (failure["statusCode"] !== null && !Number.isSafeInteger(failure["statusCode"]))
+        || (failure["description"] !== null && typeof failure["description"] !== "string")
+        || (failure["migrateToChatId"] !== null && typeof failure["migrateToChatId"] !== "string")
+      ) return null;
+      deliveryFailure = {
+        kind: failure["kind"],
+        statusCode: failure["statusCode"] as number | null,
+        description: failure["description"] as string | null,
+        migrateToChatId: failure["migrateToChatId"] as string | null,
+      };
+    }
     return {
       kind: "TELEGRAM_WORKFLOW",
       phase: candidate.phase as TelegramStoredState["phase"],
       ...(candidate.runId ? { runId: candidate.runId } : {}),
       reply: reply as TelegramReply,
-      sent: candidate.sent,
+      ...(candidate.sent === undefined ? {} : { sent: candidate.sent }),
       deliveryStatus: (candidate.deliveryStatus ?? (candidate.sent ? "APPLIED" : "PENDING")) as TelegramDeliveryStatus,
+      ...(candidate.unknownDeliveryAttempts === undefined
+        ? {}
+        : { unknownDeliveryAttempts: Number(candidate.unknownDeliveryAttempts) }),
+      ...(deliveryFailure ? { deliveryFailure } : {}),
     };
   } catch {
     return null;
@@ -1391,4 +1687,18 @@ const parseOptionalBoundedInteger = (
 
 const delay = async (milliseconds: number): Promise<void> => {
   await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+};
+
+const deliveryRetryDelayMs = (error: unknown, fallbackMs: number): number => {
+  if (
+    error instanceof TelegramDeliveryError
+    && error.failure.kind === "RETRYABLE"
+    && error.failure.retryAfterSeconds !== null
+  ) {
+    return Math.max(
+      fallbackMs,
+      Math.min(error.failure.retryAfterSeconds * 1_000, 2_147_483_647),
+    );
+  }
+  return fallbackMs;
 };
