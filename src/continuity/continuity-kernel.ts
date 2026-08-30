@@ -14,7 +14,7 @@ import {
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -377,12 +377,10 @@ export class ContinuityKernel {
       taskId: scope.taskId ?? null,
       mode: assignment.reason === "preferred" ? "PREFERRED" : "FALLBACK",
       reason: `continuity failover: ${reason}`,
-      // A conversation survives only when its active actor, binding generation, target binding,
-      // and attestation still name one exact current runtime tuple. Provider identity neither
-      // substitutes for that proof nor defeats it.
-      conversation: this.hasExactCurrentTargetAttestation(current) ? "SURVIVED" : "REPLACED",
-      // The synchronous check above gives a useful early refusal, while this fence makes
-      // the final revoke-and-rebind atomic with the generation that plan observed.
+      // The registry revalidates the active actor, target binding, and attestation tuple at its
+      // write boundary. Provider identity neither substitutes for that proof nor defeats it.
+      conversation: "SURVIVED",
+      requireCurrentTargetAttestation: true,
       expectedCurrentGeneration: expected?.bindingGeneration,
       // A failover of a role that still owns live work is a takeover: the runs move to the
       // new generation in the same transaction rather than being orphaned.
@@ -463,9 +461,10 @@ export class ContinuityKernel {
         taskId: current.taskId,
         mode: "PREFERRED",
         reason: "continuity restoration",
-        // Restoration uses the same exact outgoing actor proof as failover; a provider is not
+        // Restoration asks for the same write-boundary proof as failover; a provider is not
         // evidence of continuity in either direction.
-        conversation: this.hasExactCurrentTargetAttestation(current) ? "SURVIVED" : "REPLACED",
+        conversation: "SURVIVED",
+        requireCurrentTargetAttestation: true,
         expectedCurrentGeneration: current.bindingGeneration,
       });
       if (!switched.allowed) {
@@ -513,37 +512,6 @@ export class ContinuityKernel {
     return allow(ReasonCode.OK, undefined);
   }
 
-  private hasExactCurrentTargetAttestation(binding: RoleBinding | null): boolean {
-    if (!binding) return false;
-    const proof = this.db.get<{ matched: number }>(
-      `SELECT EXISTS (
-         SELECT 1
-           FROM assignments AS assignment
-           JOIN conversational_actors AS actor
-             ON actor.actor_id = assignment.actor_id
-           JOIN actor_target_bindings AS target
-             ON target.target_actor_id = actor.actor_id
-           JOIN actor_target_attestations AS attestation
-             ON attestation.target_binding_id = target.target_binding_id
-          WHERE assignment.assignment_id = ?
-            AND assignment.status = 'ACTIVE'
-            AND assignment.binding_generation = ?
-            AND actor.current_session_id = ?
-            AND actor.current_session_incarnation = ?
-            AND attestation.assignment_id = assignment.assignment_id
-            AND attestation.binding_generation = assignment.binding_generation
-            AND attestation.executor_session_id = actor.current_session_id
-            AND attestation.executor_session_incarnation = actor.current_session_incarnation
-       ) AS matched`,
-      [
-        binding.assignmentId,
-        binding.bindingGeneration,
-        binding.sessionId,
-        binding.sessionIncarnation,
-      ],
-    );
-    return proof?.matched === 1;
-  }
 
   private requiredRoles(): RequiredRole[] {
     const roles: RequiredRole[] = [

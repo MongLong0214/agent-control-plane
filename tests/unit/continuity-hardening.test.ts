@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -371,6 +371,7 @@ describe("failover produces a routable session (§15.7)", () => {
       roleKey: roleKeyFor(Role.CEO),
       role: Role.CEO,
       sessionId: session.sessionId,
+      authenticatedTarget: authenticatedTarget(),
     });
     if (!bound.allowed) throw new Error(bound.message);
     return session.sessionId;
@@ -540,6 +541,72 @@ describe("attested continuity survival (#649 S2)", () => {
       const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, `same-provider ${name}`);
       expect(decision.allowed).toBe(true);
       expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration).toBe(before.bindingGeneration + 1);
+    }
+  });
+
+  it("replaces a failover when the target binding belongs to a different actor", async () => {
+    const plane = makePlane();
+    const before = bindCeoSessionWithTarget(plane);
+    // The production facade permits DML only. A second test-only connection models a target
+    // ownership row that no longer names the active assignment's actor.
+    const foreign = new Database(join(plane.root, "state.sqlite"));
+    try {
+      foreign.exec(`
+        DROP TRIGGER IF EXISTS actor_target_bindings_immutable;
+        PRAGMA foreign_keys = OFF;
+      `);
+      foreign.prepare(`
+        UPDATE actor_target_bindings
+           SET target_actor_id = ?
+         WHERE target_binding_id = (
+           SELECT target_binding_id
+             FROM actor_target_attestations
+            WHERE assignment_id = ?
+         )
+      `).run("actor:wrong-target-owner", before.assignmentId);
+    } finally {
+      foreign.close();
+    }
+    plane.gpt.setCapacity(reading("gpt", plane.clock, [{ id: "rolling", remainingPercent: 90, resetAt: null, capabilities: FULL }]));
+    plane.claude.setCapacity(reading("claude", plane.clock, [{ id: "rolling", remainingPercent: 0, resetAt: null, capabilities: FULL }]));
+    attach(plane);
+
+    const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "wrong target owner");
+    expect(decision.allowed).toBe(true);
+    expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration).toBe(before.bindingGeneration + 1);
+  });
+
+  it("replaces when the actor runtime moves after planning but before the switch transaction", async () => {
+    const plane = makePlane();
+    const before = bindCeoSessionWithTarget(plane);
+    const racedRuntime = plane.cp.sessions.create({ provider: "gpt", model: "race" });
+    plane.cp.sessions.transition(racedRuntime.sessionId, SessionLifecycle.READY, "test race runtime");
+    plane.gpt.setCapacity(reading("gpt", plane.clock, [{ id: "rolling", remainingPercent: 90, resetAt: null, capabilities: FULL }]));
+    plane.claude.setCapacity(reading("claude", plane.clock, [{ id: "rolling", remainingPercent: 0, resetAt: null, capabilities: FULL }]));
+    attach(plane);
+
+    const originalSwitchTo = plane.cp.bindings.switchTo.bind(plane.cp.bindings);
+    const switchTo = vi.spyOn(plane.cp.bindings, "switchTo").mockImplementation((input) => {
+      // ContinuityKernel has already planned SURVIVED by the time its call reaches this wrapper.
+      // The same-generation runtime move invalidates the old attestation immediately before the
+      // registry's original transaction starts.
+      plane.cp.db.run(
+        `UPDATE conversational_actors
+            SET current_session_id = ?, current_session_incarnation = ?
+          WHERE actor_id = (SELECT actor_id FROM assignments WHERE assignment_id = ?)`,
+        [racedRuntime.sessionId, racedRuntime.incarnation, before.assignmentId],
+      );
+      return originalSwitchTo(input);
+    });
+    try {
+      const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "pre-switch runtime race");
+      expect(decision.allowed).toBe(true);
+      expect(switchTo).toHaveBeenCalledOnce();
+      const after = plane.cp.bindings.active(roleKeyFor(Role.CEO))!;
+      expect(after.bindingGeneration).toBe(before.bindingGeneration + 1);
+      expect(after.assignmentId).not.toBe(before.assignmentId);
+    } finally {
+      switchTo.mockRestore();
     }
   });
 
