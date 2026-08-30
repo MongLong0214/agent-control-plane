@@ -316,6 +316,16 @@ export class CtoLifecycle {
     const current = this.bindings.active(roleKey);
     if (!current) return deny(ReasonCode.NOT_FOUND, "project has no primary CTO", { projectId });
 
+    // #692 review round 4 — handoff_submit is the deployed replacement path. Refuse before
+    // spawning an incoming runtime when an internal suspend has already marked the project.
+    if (this.projects.get(projectId)?.suspended === true) {
+      return deny(
+        ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,
+        "the project is suspended; resume it before submitting a CTO handoff",
+        { projectId },
+      );
+    }
+
     const activeRuns = this.runs.activeRunsOwnedBy(current.sessionId);
     if (activeRuns.length > 0) {
       return deny(
@@ -354,6 +364,16 @@ export class CtoLifecycle {
           ReasonCode.WRITE_BINDING_GENERATION_STALE,
           "the primary CTO binding changed while the replacement was being prepared",
           { projectId, expectedGeneration: current.bindingGeneration, current: fresh?.bindingGeneration ?? null },
+        );
+      }
+      // spawn() awaits provider work. A suspend can begin after the early refusal above but
+      // before this transaction, so suspension is re-read at the point the handoff becomes
+      // durable. A denial here reaches stopUnusedSession() below for the unused runtime.
+      if (this.projects.get(projectId)?.suspended === true) {
+        return deny<{ handoffId: string; incomingSessionId: string }>(
+          ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,
+          "the project became suspended while the CTO handoff was being prepared",
+          { projectId },
         );
       }
       const stillActive = this.runs.activeRunsOwnedBy(current.sessionId);
@@ -654,7 +674,14 @@ export class CtoLifecycle {
     return takeover;
   }
 
-  /** §10.4 — capacity-driven suspend. Owner approval is mandatory. */
+  /**
+   * §10.4 — capacity-driven suspend. Owner approval is mandatory.
+   *
+   * No deployed ingress calls this method today: Hermes cto_suspend terminates with
+   * OWNER_AUTHORITY_NOT_DELEGABLE. Making it reachable is owned by authenticated owner
+   * ingress routing, which must carry admitted owner authority rather than a CTO/Hermes claim.
+   * Direct callers and tests therefore exercise internal lifecycle hardening only.
+   */
   async suspendProject(
     projectId: string,
     ownerApproved: boolean,
@@ -687,6 +714,19 @@ export class CtoLifecycle {
     // afterward, which txDecision does not change — it only closes the gap where a
     // denial *inside* this body left partial writes behind it.
     const prepared = this.db.txDecision(() => {
+      // A prepared handoff and its incoming provider runtime depend on the outgoing binding
+      // remaining active through delivery and ACK. Suspending a replacement-caused drain
+      // would stop and revoke that binding while leaving both artifacts permanently pending.
+      if (
+        session?.lifecycle === SessionLifecycle.DRAINING &&
+        session.drainingCause !== DrainingCause.SUSPEND
+      ) {
+        return deny(
+          ReasonCode.SUSPEND_BLOCKED_NON_SUSPEND_DRAINING,
+          "the primary CTO is already draining for a replacement or switchover",
+          { projectId, sessionId: session.sessionId, drainingCause: session.drainingCause },
+        );
+      }
       const suspended = this.projects.setSuspended(projectId, true, ownerApproved);
       if (!suspended.allowed) return suspended;
       if (!current || !session) return allow(ReasonCode.OK, undefined);
@@ -869,15 +909,11 @@ export class CtoLifecycle {
   /**
    * §10.4 — undoes `setSuspended`'s ordinary suspend prep, not just the flag it wrote.
    *
-   * A successful suspend leaves the primary CTO's session in DRAINING (the FSM
-   * (session-registry.ts LEGAL_LIFECYCLE) declares `DRAINING -> READY` legal precisely
-   * so this has somewhere to go back to). Clearing only `projects.suspended` and leaving
-   * the session in DRAINING would make that a lie: dispatch refuses a DRAINING CTO with
-   * RUN_DISPATCH_BLOCKED_CTO_DRAINING (spawn(), run-engine.ts) regardless of the project
-   * flag, so the project would stay wedged with nothing left to retry against. This does
-   * not touch a session already STOPPED — the provider was actually told to stop and
-   * that is not reversible; resuming a suspend that went all the way through means a
-   * fresh CTO spawns on the next dispatch, exactly like any other dead binding.
+   * A current suspend stamps its in-flight stop process on the DRAINING transition. Resume
+   * refuses while that process is live and resolves a missing or dead fence to ERROR because
+   * whether the provider stop happened is unknown. It does not manufacture a READY runtime
+   * from an unfenced DRAINING row. A suspend that reached STOPPED already has no active
+   * binding; the next dispatch creates a fresh CTO.
    *
    * #692 (review round 2) — DRAINING is not unique to a stuck suspend. An ordinary
    * replacement (requestReplacement) or a CTO-initiated switchover (prepareSwitchover)
@@ -892,7 +928,7 @@ export class CtoLifecycle {
    * stays QUEUED during a replacement, run-engine.ts, tests/scenarios/registry-cto.test.ts
    * CP-S08/CP-S09) said they could not. `session.drainingCause` (set atomically with the
    * DRAINING transition itself, by whichever of the three callers caused it) is the
-   * property that distinguishes them; only a SUSPEND-caused drain is reversed here. A
+   * property that distinguishes them; only a SUSPEND-caused drain is handled here. A
    * non-SUSPEND cause — including the fail-closed null a pre-#692 row would carry — refuses
    * the whole call, rolling back the `projects.suspended` flag flip above with it: there is
    * nothing here for this call to have legitimately resumed.
@@ -931,33 +967,24 @@ export class CtoLifecycle {
         // this cause and *then* awaits `stopSession()`, so this call can land in that exact
         // window. `drainingStopPid` is the fence for it — the pid of the daemon process
         // currently inside that await, stamped atomically with the DRAINING transition.
-        if (session.drainingStopPid != null) {
-          if (isAlive(session.drainingStopPid)) {
-            return deny(
-              ReasonCode.RESUME_BLOCKED_SUSPEND_IN_FLIGHT,
-              "a suspend is still stopping this session's runtime; resuming now would race " +
-                "its own compensation",
-              { projectId, sessionId: current.sessionId, drainingStopPid: session.drainingStopPid },
-            );
-          }
-          // The daemon process that stamped this fence is gone: a crash mid-suspend, not a
-          // suspend still running. Whether stopSession's own call reached the external
-          // runtime before that crash is unknown, so this self-heals to ERROR exactly the
-          // way daemon.ts's own startup `reconcile()` resolves the identical shape (see its
-          // `os_pid` dead-session sweep) rather than resuming as if the suspend had cleanly
-          // never happened. Doing it here, inline, means an orphaned fence does not wedge
-          // the project until the next daemon restart.
-          const errored = this.sessions.transition(
-            current.sessionId,
-            SessionLifecycle.ERROR,
-            "suspend stop process gone",
+        if (session.drainingStopPid != null && isAlive(session.drainingStopPid)) {
+          return deny(
+            ReasonCode.RESUME_BLOCKED_SUSPEND_IN_FLIGHT,
+            "a suspend is still stopping this session's runtime; resuming now would race " +
+              "its own compensation",
+            { projectId, sessionId: current.sessionId, drainingStopPid: session.drainingStopPid },
           );
-          if (!errored.allowed) return errored as Decision<void>;
-          return allow(ReasonCode.OK, undefined);
         }
-
-        const restored = this.sessions.transition(current.sessionId, SessionLifecycle.READY, "project resumed");
-        if (!restored.allowed) return restored as Decision<void>;
+        // The daemon process that stamped this fence is gone, or the row has no fence and
+        // therefore no attributable in-flight operation. Whether stopSession reached the
+        // provider is unknown, so fail closed to ERROR rather than inventing READY. Doing
+        // it inline also means an orphaned fence does not wait for daemon startup reconcile.
+        const errored = this.sessions.transition(
+          current.sessionId,
+          SessionLifecycle.ERROR,
+          session.drainingStopPid == null ? "suspend stop fence missing" : "suspend stop process gone",
+        );
+        if (!errored.allowed) return errored as Decision<void>;
       }
       return allow(ReasonCode.OK, undefined);
     });

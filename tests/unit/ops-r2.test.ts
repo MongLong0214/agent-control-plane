@@ -385,6 +385,24 @@ describe("round-2 ops regressions", () => {
     expect(rawPair.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
   });
 
+  it("#692 deployed cto_suspend terminates without calling internal suspendProject", async () => {
+    const harness = makeHarness();
+    const internalSuspend = vi.spyOn(harness.cp.cto, "suspendProject");
+    const server = createHermesServer(
+      createHermesMcpPort(harness.cp),
+      () => allow(ReasonCode.OK, { actor: "hermes-daemon" }),
+    );
+
+    const result = await tool(server, "cto_suspend")({
+      idempotencyKey: "deployed-suspend-refusal",
+      projectId: "project-with-no-owner-ingress",
+      reason: "capacity",
+    });
+
+    expect(result.structuredContent?.["reasonCode"]).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+    expect(internalSuspend).not.toHaveBeenCalled();
+  });
+
   it("#103/#218: a caller cannot act as an active CTO by claiming its session tuple", async () => {
     const harness = makeHarness();
     const prepared = await prepareBootstrap(harness, "peer-project");

@@ -8,6 +8,8 @@ import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { DrainingCause, ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { DoctorReport } from "../../src/doctor/doctor.ts";
+import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
+import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
@@ -25,6 +27,15 @@ import type { SessionHandle } from "../../src/runtime/provider.ts";
 
 const deadSessionFinding = (report: DoctorReport) =>
   report.findings.find((f) => f.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION");
+
+const tool = (server: object, name: string) => (
+  server as unknown as {
+    _registeredTools: Record<
+      string,
+      { handler: (args: Record<string, unknown>) => Promise<{ structuredContent?: Record<string, unknown> }> }
+    >;
+  }
+)._registeredTools[name]!.handler;
 
 afterAll(cleanupTempDirs);
 
@@ -201,6 +212,173 @@ describe("round-2 CTO lifecycle regressions", () => {
     expect(await harness.scripted.probeSession(unusedHandle)).toBe("UNAVAILABLE");
   });
 
+  it("#692 handoff_submit refuses an in flight internal suspend before starting an incoming runtime", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
+    if (!bound.allowed) throw new Error(bound.message);
+    const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+    const server = createCtoServer(createCtoMcpPort(harness.cp), () => allow(ReasonCode.OK, {
+      actor: "primary-cto",
+      sessionId: binding.sessionId,
+      sessionIncarnation: binding.sessionIncarnation,
+    }));
+    const sessionsBefore = harness.cp.db.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM sessions`,
+    )!.count;
+
+    let stopEntered!: () => void;
+    let releaseStop!: () => void;
+    const entered = new Promise<void>((resolve) => { stopEntered = resolve; });
+    const held = new Promise<void>((resolve) => { releaseStop = resolve; });
+    const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+    harness.scripted.stopSession = async (handle) => {
+      stopEntered();
+      await held;
+      return originalStop(handle);
+    };
+
+    const suspend = harness.cp.cto.suspendProject(projectId, true, "capacity", TEST_OWNER);
+    await entered;
+    try {
+      const refused = await tool(server, "handoff_submit")({
+        idempotencyKey: "handoff-during-suspend-before-spawn",
+        projectId,
+        handoff: HANDOFF,
+      });
+
+      expect(refused.structuredContent?.["reasonCode"]).toBe(ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED);
+      expect(harness.cp.db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM sessions`)!.count)
+        .toBe(sessionsBefore);
+      expect(harness.cp.db.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM handoffs WHERE project_id = ? AND kind = 'HANDOFF'`,
+        [projectId],
+      )!.count).toBe(0);
+    } finally {
+      releaseStop();
+      expect((await suspend).allowed).toBe(true);
+    }
+  });
+
+  it("#692 handoff_submit rechecks suspension after incoming runtime startup", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
+    if (!bound.allowed) throw new Error(bound.message);
+    const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+    const outgoing = harness.cp.sessions.require(binding.sessionId);
+    const outgoingProviderSessionId = outgoing.incarnation.split("#", 1)[0]!;
+    const server = createCtoServer(createCtoMcpPort(harness.cp), () => allow(ReasonCode.OK, {
+      actor: "primary-cto",
+      sessionId: binding.sessionId,
+      sessionIncarnation: binding.sessionIncarnation,
+    }));
+
+    let incomingStarted!: () => void;
+    let releaseIncomingStart!: () => void;
+    const incomingStartedPromise = new Promise<void>((resolve) => { incomingStarted = resolve; });
+    const incomingStartHeld = new Promise<void>((resolve) => { releaseIncomingStart = resolve; });
+    let incomingHandle: SessionHandle | undefined;
+    const originalStart = harness.scripted.startSession.bind(harness.scripted);
+    harness.scripted.startSession = async (spec) => {
+      incomingHandle = await originalStart(spec);
+      incomingStarted();
+      await incomingStartHeld;
+      return incomingHandle;
+    };
+
+    let suspendStopEntered!: () => void;
+    let releaseSuspendStop!: () => void;
+    const suspendStopEnteredPromise = new Promise<void>((resolve) => { suspendStopEntered = resolve; });
+    const suspendStopHeld = new Promise<void>((resolve) => { releaseSuspendStop = resolve; });
+    const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+    harness.scripted.stopSession = async (handle) => {
+      if (handle.externalSessionId === outgoingProviderSessionId) {
+        suspendStopEntered();
+        await suspendStopHeld;
+      }
+      return originalStop(handle);
+    };
+
+    const handoff = tool(server, "handoff_submit")({
+      idempotencyKey: "handoff-suspend-after-spawn",
+      projectId,
+      handoff: HANDOFF,
+    });
+    await incomingStartedPromise;
+    const suspend = harness.cp.cto.suspendProject(projectId, true, "capacity", TEST_OWNER);
+    await suspendStopEnteredPromise;
+
+    try {
+      releaseIncomingStart();
+      const refused = await handoff;
+      expect(refused.structuredContent?.["reasonCode"]).toBe(ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED);
+      if (!incomingHandle) throw new Error("incoming provider runtime did not start");
+      expect(await harness.scripted.probeSession(incomingHandle)).toBe("UNAVAILABLE");
+      expect(harness.cp.db.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM handoffs WHERE project_id = ? AND kind = 'HANDOFF'`,
+        [projectId],
+      )!.count).toBe(0);
+      expect(harness.cp.sessions.require(binding.sessionId)).toMatchObject({
+        lifecycle: SessionLifecycle.DRAINING,
+        drainingCause: DrainingCause.SUSPEND,
+      });
+    } finally {
+      releaseIncomingStart();
+      releaseSuspendStop();
+      expect((await suspend).allowed).toBe(true);
+    }
+  });
+
+  it("#692 internal suspendProject refuses a pending CTO handoff", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
+    if (!bound.allowed) throw new Error(bound.message);
+    const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+    const server = createCtoServer(createCtoMcpPort(harness.cp), () => allow(ReasonCode.OK, {
+      actor: "primary-cto",
+      sessionId: binding.sessionId,
+      sessionIncarnation: binding.sessionIncarnation,
+    }));
+    const prepared = await tool(server, "handoff_submit")({
+      idempotencyKey: "handoff-before-internal-suspend",
+      projectId,
+      handoff: HANDOFF,
+    });
+    expect(prepared.structuredContent?.["ok"]).toBe(true);
+    const value = prepared.structuredContent?.["value"] as {
+      handoffId: string;
+      incomingSessionId: string;
+    };
+    const incoming = harness.cp.sessions.require(value.incomingSessionId);
+    const incomingHandle: SessionHandle = {
+      externalSessionId: incoming.incarnation.split("#", 1)[0]!,
+      provider: incoming.provider,
+      model: incoming.model,
+      effort: incoming.effort,
+      pid: incoming.osPid,
+      workdir: incoming.workdir ?? undefined,
+    };
+    const stopSession = vi.spyOn(harness.scripted, "stopSession");
+
+    const refused = await harness.cp.cto.suspendProject(projectId, true, "capacity", TEST_OWNER);
+
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.SUSPEND_BLOCKED_NON_SUSPEND_DRAINING);
+    expect(stopSession).not.toHaveBeenCalled();
+    expect(harness.cp.projects.require(projectId).suspended).toBe(false);
+    expect(harness.cp.sessions.require(binding.sessionId)).toMatchObject({
+      lifecycle: SessionLifecycle.DRAINING,
+      drainingCause: DrainingCause.REPLACEMENT,
+    });
+    expect(await harness.scripted.probeSession(incomingHandle)).toBe("HEALTHY");
+    expect(harness.cp.db.get<{ status: string }>(
+      `SELECT status FROM handoffs WHERE handoff_id = ?`,
+      [value.handoffId],
+    )?.status).toBe("PENDING");
+  });
+
   it("#148 refuses a handoff ACK that knows only the incoming session id", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
@@ -360,64 +538,11 @@ describe("round-2 CTO lifecycle regressions", () => {
   );
 
   it(
-    "#692 resumeProject clears a session stuck in DRAINING, not just the suspended flag",
-    async () => {
-      // `DRAINING -> READY` is legal in the FSM (session-registry.ts LEGAL_LIFECYCLE)
-      // precisely so a suspend that committed DRAINING but never reached STOPPED (a
-      // crash between the two transactions, or any other reason the runtime stop never
-      // finished) has somewhere to go back to. This drives the session there directly,
-      // the same way a crash mid-suspend would leave it, rather than depending on timing
-      // a real stopSession() await — the FSM transition is the actual mechanism under
-      // test, not the race that can produce it.
-      const harness = makeHarness();
-      const { projectId, repositoryId } = await registerFixtureProject(harness);
-      await createActiveRun(harness, projectId, repositoryId);
-      const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
-      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
-
-      // #692 round 2 — resumeProject now keys on *why* the session is draining, not just that
-      // it is (domain/types.ts DrainingCause). The real suspendProject records SUSPEND
-      // atomically with this same transition; the simulation has to carry it too, or it stops
-      // simulating what a crashed suspend actually leaves behind and starts simulating an
-      // unrelated (and now correctly refused) DRAINING-for-unknown-reason state instead.
-      const drained = harness.cp.sessions.transition(
-        binding.sessionId,
-        SessionLifecycle.DRAINING,
-        "test: simulate a suspend that committed DRAINING but never reached STOPPED",
-        DrainingCause.SUSPEND,
-      );
-      expect(drained.allowed).toBe(true);
-
-      const resumed = harness.cp.cto.resumeProject(projectId);
-      expect(resumed.allowed).toBe(true);
-      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
-
-      // Dispatch must actually succeed now, not just report a lifecycle value: before
-      // this fix, resumeProject cleared only `projects.suspended` and ensurePrimaryCto
-      // kept refusing with RUN_DISPATCH_BLOCKED_CTO_DRAINING regardless, wedging the
-      // project's dispatch permanently.
-      const run = harness.cp.runs.create({
-        projectId,
-        executionMode: ExecutionMode.STANDARD,
-        contract: CONTRACT,
-        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
-      });
-      if (!run.allowed) throw new Error(run.message);
-      const dispatched = await harness.cp.runs.dispatch(run.value.runId);
-      expect(dispatched.allowed).toBe(true);
-      expect(harness.cp.bindings.activePrimaryCto(projectId)?.sessionId).toBe(binding.sessionId);
-    },
-  );
-
-  it(
     "#692 round 3 — resumeProject must not reverse a suspend whose stopSession() is " +
       "still in flight, and a run must not dispatch in that window",
     async () => {
-      // Unlike the test above, this drives the interleaving through the *real*
-      // suspendProject/resumeProject methods rather than assembling the DRAINING state by
-      // hand — round 3's review found that hand-assembly cannot distinguish "a suspend
-      // whose stopSession() await is still pending" from "a crash that left DRAINING
-      // behind", which is exactly the gap this test closes.
+      // The internal suspend method creates the real in-flight state; resume enters through
+      // the deployed Hermes cto_resume tool rather than calling the lifecycle method directly.
       const harness = makeHarness();
       const { projectId, repositoryId } = await registerFixtureProject(harness);
       await createActiveRun(harness, projectId, repositoryId);
@@ -434,22 +559,30 @@ describe("round-2 CTO lifecycle regressions", () => {
       });
       if (!queuedRun.allowed) throw new Error(queuedRun.message);
 
-      let resumeDuringWindow: ReturnType<typeof harness.cp.cto.resumeProject> | undefined;
+      let resumeDuringWindow: { structuredContent?: Record<string, unknown> } | undefined;
       let dispatchDuringWindow: Awaited<ReturnType<typeof harness.cp.runs.dispatch>> | undefined;
+      const hermes = createHermesServer(
+        createHermesMcpPort(harness.cp),
+        () => allow(ReasonCode.OK, { actor: "hermes-daemon" }),
+      );
       const originalStop = harness.scripted.stopSession.bind(harness.scripted);
       harness.scripted.stopSession = async (handle) => {
         // suspendProject has already committed suspended=true and DRAINING/SUSPEND by the
         // time this runs (it only awaits the provider stop after that commit) — the exact
         // window sol's review named.
-        resumeDuringWindow = harness.cp.cto.resumeProject(projectId);
+        resumeDuringWindow = await tool(hermes, "cto_resume")({
+          idempotencyKey: "resume-during-internal-suspend",
+          projectId,
+        });
         dispatchDuringWindow = await harness.cp.runs.dispatch(queuedRun.value.runId);
         return originalStop(handle);
       };
 
       const suspended = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
 
-      expect(resumeDuringWindow?.allowed).toBe(false);
-      expect(resumeDuringWindow?.reasonCode).toBe(ReasonCode.RESUME_BLOCKED_SUSPEND_IN_FLIGHT);
+      expect(resumeDuringWindow?.structuredContent?.["ok"]).toBe(false);
+      expect(resumeDuringWindow?.structuredContent?.["reasonCode"])
+        .toBe(ReasonCode.RESUME_BLOCKED_SUSPEND_IN_FLIGHT);
       expect(dispatchDuringWindow?.allowed).toBe(false);
       // The suspend itself is unaffected by the window closing around it and completes normally.
       expect(suspended.allowed).toBe(true);
@@ -487,9 +620,16 @@ describe("round-2 CTO lifecycle regressions", () => {
       expect(drained.allowed).toBe(true);
       expect(harness.cp.sessions.require(binding.sessionId).drainingStopPid).toBe(deadPid);
 
-      const resumed = harness.cp.cto.resumeProject(projectId);
+      const hermes = createHermesServer(
+        createHermesMcpPort(harness.cp),
+        () => allow(ReasonCode.OK, { actor: "hermes-daemon" }),
+      );
+      const resumed = await tool(hermes, "cto_resume")({
+        idempotencyKey: "resume-after-dead-suspend-process",
+        projectId,
+      });
 
-      expect(resumed.allowed).toBe(true);
+      expect(resumed.structuredContent?.["ok"]).toBe(true);
       // Self-heals to ERROR, not READY: whether the crashed process's stopSession() call
       // ever reached the provider is unknown, so this does not resume as if it hadn't.
       expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
@@ -532,9 +672,16 @@ describe("round-2 CTO lifecycle regressions", () => {
       expect(drainRequest).not.toBeNull();
       expect(["PENDING", "IN_FLIGHT", "SENT"]).toContain(drainRequest!.status);
 
-      const resumed = harness.cp.cto.resumeProject(projectId);
-      expect(resumed.allowed).toBe(false);
-      expect(resumed.reasonCode).toBe(ReasonCode.RESUME_BLOCKED_NON_SUSPEND_DRAINING);
+      const hermes = createHermesServer(
+        createHermesMcpPort(harness.cp),
+        () => allow(ReasonCode.OK, { actor: "hermes-daemon" }),
+      );
+      const resumed = await tool(hermes, "cto_resume")({
+        idempotencyKey: "resume-during-replacement",
+        projectId,
+      });
+      expect(resumed.structuredContent?.["ok"]).toBe(false);
+      expect(resumed.structuredContent?.["reasonCode"]).toBe(ReasonCode.RESUME_BLOCKED_NON_SUSPEND_DRAINING);
 
       // The session must still be DRAINING, not READY — the actual defect: the previous
       // resumeProject reported success here and flipped it back.

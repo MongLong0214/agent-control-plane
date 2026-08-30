@@ -1459,23 +1459,6 @@ const GUARDS = [
     ],
   },
   {
-    // #692 (Sol review, round 3) — DRAINING is legal to reverse back to READY in the FSM
-    // (session-registry.ts LEGAL_LIFECYCLE) precisely so a session that committed
-    // DRAINING but never reached STOPPED has somewhere to go back to. Before this row's
-    // guard existed, resumeProject only cleared `projects.suspended`; a session stuck in
-    // DRAINING stayed there forever and dispatch kept refusing with
-    // RUN_DISPATCH_BLOCKED_CTO_DRAINING regardless of the flag. Without this branch,
-    // resumeProject's claim to reverse a suspend is false for exactly the sessions that
-    // most need it reversed.
-    what: "resumeProject restores a session stuck in DRAINING back to READY",
-    file: "src/cto/cto-lifecycle.ts",
-    find: "      const session = this.sessions.get(current.sessionId);\n      if (session?.lifecycle === SessionLifecycle.DRAINING) {",
-    replace: "      const session = this.sessions.get(current.sessionId);\n      if (false) {",
-    killedBy: [
-      "tests/unit/cto-registry-r2.test.ts::#692 resumeProject clears a session stuck in DRAINING, not just the suspended flag",
-    ],
-  },
-  {
     // #692 round 2 (second blind review) — the counter-example: requestReplacement drains
     // the same way a suspend does, and resumeProject reversed *any* DRAINING session keyed
     // only on the bare lifecycle state. Without this branch, requestReplacement then
@@ -1498,10 +1481,43 @@ const GUARDS = [
     // project an owner suspended and has not resumed.
     what: "requestReplacement refuses to drain a project the owner suspended",
     file: "src/cto/cto-lifecycle.ts",
-    find: "    if (this.projects.get(projectId)?.suspended === true) {",
-    replace: "    if (false) {",
+    find: "    if (this.projects.get(projectId)?.suspended === true) {\n      return deny(\n        ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,\n        \"the project is suspended; resume it before requesting a CTO replacement\",",
+    replace: "    if (false) {\n      return deny(\n        ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,\n        \"the project is suspended; resume it before requesting a CTO replacement\",",
     killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 round 2 — requestReplacement refuses to drain a project the owner suspended",
+    ],
+  },
+  {
+    // #692 round 4 — handoff_submit is the deployed replacement entry. Once an internal
+    // suspend has marked the project, it must refuse before constituting provider state.
+    what: "handoff_submit refuses a suspended project before starting an incoming runtime",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "    if (this.projects.get(projectId)?.suspended === true) {\n      return deny(\n        ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,\n        \"the project is suspended; resume it before submitting a CTO handoff\",",
+    replace: "    if (false) {\n      return deny(\n        ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,\n        \"the project is suspended; resume it before submitting a CTO handoff\",",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 handoff_submit refuses an in flight internal suspend before starting an incoming runtime",
+    ],
+  },
+  {
+    // spawn() awaits the provider. A suspend can begin after the early check and before the
+    // handoff transaction, so the project state must be read again before anything is durable.
+    what: "handoff_submit rechecks suspension after incoming runtime startup",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "      if (this.projects.get(projectId)?.suspended === true) {\n        return deny<{ handoffId: string; incomingSessionId: string }>(\n          ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,\n          \"the project became suspended while the CTO handoff was being prepared\",",
+    replace: "      if (false) {\n        return deny<{ handoffId: string; incomingSessionId: string }>(\n          ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,\n          \"the project became suspended while the CTO handoff was being prepared\",",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 handoff_submit rechecks suspension after incoming runtime startup",
+    ],
+  },
+  {
+    // Once a normal handoff is pending, suspendProject cannot stop and revoke its outgoing
+    // binding without stranding both the incoming provider runtime and the handoff row.
+    what: "internal suspendProject refuses a replacement caused drain",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "      if (\n        session?.lifecycle === SessionLifecycle.DRAINING &&\n        session.drainingCause !== DrainingCause.SUSPEND\n      ) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 internal suspendProject refuses a pending CTO handoff",
     ],
   },
   {
@@ -1654,8 +1670,8 @@ const GUARDS = [
     // which `vitest -t` would read as a regex group rather than the runtime call it names.
     what: "resumeProject refuses to reverse a suspend whose stopSession() is still in flight",
     file: "src/cto/cto-lifecycle.ts",
-    find: "          if (isAlive(session.drainingStopPid)) {",
-    replace: "          if (false) {",
+    find: "        if (session.drainingStopPid != null && isAlive(session.drainingStopPid)) {",
+    replace: "        if (false) {",
     killedBy: ["tests/unit/cto-registry-r2.test.ts"],
   },
   {

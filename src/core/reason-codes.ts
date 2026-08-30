@@ -124,8 +124,10 @@ export const ReasonCode = {
    * operation has not yet finished.
    */
   RESUME_BLOCKED_SUSPEND_IN_FLIGHT: "RESUME_BLOCKED_SUSPEND_IN_FLIGHT",
-  /** #692 — requestReplacement refuses to drain a session out from under an owner suspend. */
+  /** #692 — replacement paths refuse to drain a session out from under an owner suspend. */
   REPLACEMENT_BLOCKED_PROJECT_SUSPENDED: "REPLACEMENT_BLOCKED_PROJECT_SUSPENDED",
+  /** #692 — internal suspend refuses a session already draining for replacement or switchover. */
+  SUSPEND_BLOCKED_NON_SUSPEND_DRAINING: "SUSPEND_BLOCKED_NON_SUSPEND_DRAINING",
   PRODUCER_HISTORY_UNAVAILABLE: "PRODUCER_HISTORY_UNAVAILABLE",
   SESSION_SECRET_STORAGE_UNAVAILABLE: "SESSION_SECRET_STORAGE_UNAVAILABLE",
   SESSION_SECRET_INVALID: "SESSION_SECRET_INVALID",
