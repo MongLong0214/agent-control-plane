@@ -154,7 +154,7 @@ const NAMED_ENTRIES: Array<{ label: string; file: string; marker: string; expect
     expectStdout: "stale exemption",
   },
   {
-    label: "suspendProject's completed tx, compensated on denial (EXEMPT, #692)",
+    label: "suspendProject's STOPPED fact survives a post-stop denial (EXEMPT, #692)",
     file: "cto/cto-lifecycle.ts",
     marker: "the CTO binding changed while runtime shutdown was in progress",
     expectStdout: "stale exemption",

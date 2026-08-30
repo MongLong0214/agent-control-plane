@@ -239,21 +239,17 @@ const EXEMPT = [
     marker: "the CTO binding changed while runtime shutdown was in progress",
     reason:
       "suspendProject's STOPPED transition writes and commits, and bindings.revoke() can " +
-      "still deny (e.g. a concurrent resolveEscalation flips a BLOCKED run back to ACTIVE " +
-      "during the stopSession() await, the only gap left once a preflight check runs " +
-      "immediately before that call). The provider stop above is not reversible, so " +
+      "still deny after the provider stop. The provider stop above is not reversible, so " +
       "rolling STOPPED back would leave the session record disagreeing with reality — the " +
-      "write is deliberately left to survive the denial. That denial is not silently " +
-      "accepted, though: the call site checks for exactly REVOCATION_BLOCKED_ACTIVE_RUNS, " +
-      "records a PROJECT_SUSPEND_BINDING_REVOKE_FAILED audit event, and returns " +
-      "SESSION_STOPPED_BINDING_REVOKE_FAILED instead of the bare denial. It deliberately " +
-      "does not also mark the project UNAVAILABLE (confirmed by reading the branch: only " +
-      "the sibling stopSession()-throws catch above does that) — doctor.ts's " +
-      "CTO_BINDING_POINTS_AT_DEAD_SESSION check (CRITICAL) already reads the exact join an " +
-      "active binding pointing at a STOPPED session forms, so there is nothing left for a " +
-      "separate flag to make visible, and nothing to remember to clear once a later retry's " +
-      "revoke succeeds and the join stops matching — see #692's docstring on this branch " +
-      "for the full reasoning.",
+      "write is deliberately left to survive any later denial. The first " +
+      "REVOCATION_BLOCKED_ACTIVE_RUNS is not returned: suspendProject passes every reported " +
+      "blocker through RunEngine's ACTIVE-to-BLOCKED transition and retries revoke in this " +
+      "same transaction. RunEngine separately refuses reactivation once the project's " +
+      "suspended flag is durable, closing the crash window before this transaction begins. " +
+      "Only a failed checkpoint or a second revoke denial can leave this exempt site as a " +
+      "denial after STOPPED, and the latter is recorded as " +
+      "PROJECT_SUSPEND_BINDING_REVOKE_FAILED with afterCheckpointRetry evidence before it is " +
+      "reported as SESSION_STOPPED_BINDING_REVOKE_FAILED.",
   },
   {
     file: "outbox/outbox.ts",

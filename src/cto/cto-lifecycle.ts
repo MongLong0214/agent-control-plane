@@ -862,28 +862,23 @@ export class CtoLifecycle {
         }
       }
 
-      // #692 — `stopped` below writes and commits, and `bindings.revoke()` can still
-      // deny (e.g. a concurrent `resolveEscalation` flips a BLOCKED run back to ACTIVE
-      // during the `stopSession()` await above — the one gap the preflight check cannot
-      // see, because nothing runs between it and the provider call). This stays a plain
-      // `tx()`, not `txDecision()`: by this point the external provider has already been
-      // told to stop (on this attempt, or — if `session` was already STOPPED above — on
-      // an earlier one) and that is not reversible, so rolling the STOPPED write back
-      // would leave the session record disagreeing with reality.
+      // #692 — `stopped` below writes and commits, and `bindings.revoke()` remains a
+      // decision that can deny if its ownership invariant is violated. Before the
+      // RunEngine fence below, a concurrent `resolveEscalation` could create exactly that
+      // violation by flipping a BLOCKED run back to ACTIVE during the `stopSession()`
+      // await. This stays a plain `tx()`, not `txDecision()`: by this point the external
+      // provider has already been told to stop (on this attempt, or — if `session` was
+      // already STOPPED above — on an earlier one) and that is not reversible, so rolling
+      // the STOPPED write back would leave the session record disagreeing with reality.
       //
-      // A denial here is compensated below, in the *same* transaction as the STOPPED
-      // write — not a project-level flag written afterward. A separate write needs its
-      // own restore path (what un-marks it on a later successful retry?) and its own
-      // atomicity (a crash between the two transactions leaves the fact without its
-      // explanation). Neither problem exists for a fact the rows already carry: an
-      // active binding whose session is STOPPED *is* "revoke denied after an
-      // irreversible stop" — doctor.ts's CTO_BINDING_POINTS_AT_DEAD_SESSION check
-      // (CRITICAL) already reads exactly this join, so there is nothing further to mark
-      // for an operator to see it, and nothing to remember to clear: the moment a later
-      // retry's revoke succeeds, the binding is no longer active and the fact is gone
-      // on its own. The audit record stays, but moves inside this transaction so it
-      // commits atomically with the STOPPED write it explains, with no window where one
-      // exists without the other.
+      // RunEngine.transition now refuses to reactivate work after the suspended flag
+      // commits, at the transaction that would make it ACTIVE. That is the primary
+      // fence: it also closes a process-death window before this completion transaction
+      // begins. The retry below is the compensation backstop. If an ACTIVE blocker was
+      // nevertheless admitted, checkpoint it again and retry the revoke before this
+      // transaction commits; never use an active binding to a STOPPED session as the
+      // durable recovery marker. Doctor is right to classify that join as CRITICAL, and
+      // Daemon.start is right to refuse it.
       const completed = this.db.tx(() => {
         // Provider stop is already irreversible at this boundary. Record that fact before
         // inspecting any binding that another lifecycle path could have moved or revoked
@@ -910,21 +905,44 @@ export class CtoLifecycle {
         // Suspension is the one deliberate exception to a normal revocation: every
         // owned run was checkpointed to BLOCKED above and cannot regain authority from
         // this revoked binding. Any runnable state still refuses the revocation.
-        const revoked = this.bindings.revoke(roleKey, `project suspended: ${reason}`, {
+        let revoked = this.bindings.revoke(roleKey, `project suspended: ${reason}`, {
           allowBlockedRuns: true,
         });
         if (!revoked.allowed && revoked.reasonCode === ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) {
-          // `stopped` above only reaches this line once it has itself already succeeded
-          // and committed within this same transaction, so this denial means the
-          // session really is stopped and the binding really did just outlive it —
-          // recorded here, atomically with that write, not after it.
+          const blockers = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });
+          for (const blocker of blockers) {
+            const blocked = this.runs.transition(
+              blocker.run_id,
+              RunState.BLOCKED,
+              "project capacity suspended after runtime stop",
+              { compensation: "binding revoke retry", sessionId: current.sessionId },
+            );
+            if (!blocked.allowed) return blocked as Decision<void>;
+          }
+          revoked = this.bindings.revoke(roleKey, `project suspended after checkpoint retry: ${reason}`, {
+            allowBlockedRuns: true,
+          });
+          if (revoked.allowed) {
+            this.audit.record({
+              kind: "PROJECT_SUSPEND_BINDING_REVOKE_RECOVERED",
+              projectId,
+              sessionId: current.sessionId,
+              roleKey,
+              evidence: { reason, checkpointedRuns: blockers.map((blocker) => blocker.run_id) },
+            });
+          }
+        }
+        if (!revoked.allowed && revoked.reasonCode === ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) {
+          // This is no longer the compensation state. It is an invariant failure after
+          // every blocker reported by revoke was checkpointed synchronously in this same
+          // transaction, kept distinct from the first denial for forensic accuracy.
           this.audit.record({
             kind: "PROJECT_SUSPEND_BINDING_REVOKE_FAILED",
             reasonCode: ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
             projectId,
             sessionId: current.sessionId,
             roleKey,
-            evidence: { reason, deniedEvidence: revoked.evidence },
+            evidence: { reason, deniedEvidence: revoked.evidence, afterCheckpointRetry: true },
           });
         }
         return revoked;

@@ -96,6 +96,8 @@ export const ReasonCode = {
   RUN_OWNER_REVOKED: "RUN_OWNER_REVOKED",
   RUN_DISPATCH_BLOCKED_CTO_DRAINING: "RUN_DISPATCH_BLOCKED_CTO_DRAINING",
   RUN_QUEUED_AWAITING_CTO: "RUN_QUEUED_AWAITING_CTO",
+  /** #692 — a suspended project cannot restore runnable work before it is resumed. */
+  RUN_ACTIVATION_BLOCKED_PROJECT_SUSPENDED: "RUN_ACTIVATION_BLOCKED_PROJECT_SUSPENDED",
   RUN_CANCELLED: "RUN_CANCELLED",
 
   // --- task ----------------------------------------------------------------

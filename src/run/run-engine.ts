@@ -619,6 +619,25 @@ export class RunEngine {
     }
     return this.db.tx(() => {
       const run = this.require(runId);
+      // #692 — project suspension and run activation are one commit-time invariant.
+      // suspendProject checkpoints ACTIVE work before awaiting the provider stop, but a
+      // CEO escalation resolution, owner decision, or candidate invalidation can try to
+      // reactivate that BLOCKED run while the await is in flight. Reading `suspended`
+      // here, in the same transaction that would make the run ACTIVE, prevents both the
+      // stopped-session revoke race and the earlier crash window between that attempted
+      // reactivation and suspendProject's completion transaction. resumeProject clears
+      // the flag first, so the ordinary recovery transitions remain available afterward.
+      if (
+        to === RunState.ACTIVE &&
+        run.projectId &&
+        this.projects.get(run.projectId)?.suspended === true
+      ) {
+        return deny(
+          ReasonCode.RUN_ACTIVATION_BLOCKED_PROJECT_SUSPENDED,
+          "a suspended project cannot reactivate a run",
+          { runId, projectId: run.projectId, from: run.state },
+        );
+      }
       if (to === RunState.COMPLETED) {
         const expectedSource = run.kind === RunKind.PROJECT_BOOTSTRAP
           ? "bootstrap-activation"

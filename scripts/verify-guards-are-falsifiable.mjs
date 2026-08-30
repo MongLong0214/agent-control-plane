@@ -1488,33 +1488,17 @@ const GUARDS = [
     ],
   },
   {
-    // #692 — before this fix, the whole stop+revoke sequence was skipped once the
-    // session was already STOPPED, on the assumption that STOPPED implied the binding
-    // had been revoked too. A denied revoke can now leave STOPPED committed without a
-    // revoke (see the compensation below), so a caller retrying suspendProject after
-    // that compensation must still be able to finish the revoke — not have it skipped
-    // again because the session looks done.
-    what: "suspendProject retries the revoke instead of skipping it once the session is already stopped",
-    file: "src/cto/cto-lifecycle.ts",
-    find: "    if (current && session) {\n      if (session.lifecycle !== SessionLifecycle.STOPPED) {",
-    replace: "    if (current && session && session.lifecycle !== SessionLifecycle.STOPPED) {\n      {",
+    // #692 round 6 — suspension checkpoints ACTIVE work before awaiting the provider.
+    // Every path that can make that work ACTIVE again converges on RunEngine.transition,
+    // so the suspended flag must be re-read at that commit point. Without the fence the
+    // test's real escalation resolution persists ACTIVE, suspend leaves a dead binding,
+    // and the fresh Daemon.start is refused by doctor.
+    what: "a suspended project cannot reactivate a run",
+    file: "src/run/run-engine.ts",
+    find: "        to === RunState.ACTIVE &&\n        run.projectId &&\n        this.projects.get(run.projectId)?.suspended === true",
+    replace: "        false &&\n        run.projectId &&\n        this.projects.get(run.projectId)?.suspended === true",
     killedBy: [
-      "tests/unit/cto-registry-r2.test.ts::#692 a retry after the compensation actually completes the revoke, and doctor clears on its own",
-    ],
-  },
-  {
-    // #692 — the STOPPED write above only reaches bindings.revoke() once it has itself
-    // already committed, so a denial here means the session really is stopped and the
-    // binding really did just outlive it. Without this branch, that denial would return
-    // as the bare REVOCATION_BLOCKED_ACTIVE_RUNS a fresh revoke attempt reports on its
-    // own, with no audit record explaining that the STOPPED write it depended on had
-    // already gone through.
-    what: "suspendProject records why (audit, same transaction) when a stopped session's binding revoke is denied",
-    file: "src/cto/cto-lifecycle.ts",
-    find: "        if (completed.reasonCode !== ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) return completed;",
-    replace: "        return completed;",
-    killedBy: [
-      "tests/unit/cto-registry-r2.test.ts::#692 compensates instead of losing a binding revoke denied after the runtime stop already happened",
+      "tests/unit/cto-registry-r2.test.ts::#692 a suspend crossing run reactivation leaves a cold start recoverable",
     ],
   },
   {
