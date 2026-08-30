@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 32;
+export const SCHEMA_VERSION = 33;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2141,6 +2141,24 @@ const v32: SchemaMigration = {
   checksum: () => migrationChecksum("v32-a-source-can-only-cite-its-turns-own-claim-event"),
 };
 
+/**
+ * Creates the rollback boundary for Telegram's forward-only `settledAt` turn state.
+ *
+ * The state lives inside `inbound_messages.turn_claim_json`, so there is no DDL to apply. It still
+ * needs a version boundary: `Db` snapshots a database before entering any migration chain, and the
+ * constructor completes that chain before the daemon can route an update. A v32 deployment is
+ * therefore captured before this binary can write a claim the v32 reader would misclassify as
+ * unresolved. Rolling the binary back still requires restoring that snapshot (or first deploying
+ * a compatibility reader); opening the post-v33 live database with a v32 binary is not safe.
+ */
+const v33: SchemaMigration = {
+  id: "v33-back-up-before-telegram-settlement-state",
+  fromVersion: 32,
+  toVersion: 33,
+  apply: () => undefined,
+  checksum: () => migrationChecksum("v33-back-up-before-telegram-settlement-state"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2163,6 +2181,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v30,
   v31,
   v32,
+  v33,
 ]);
 
 interface RequiredTrigger {

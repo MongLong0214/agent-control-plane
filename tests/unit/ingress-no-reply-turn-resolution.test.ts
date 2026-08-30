@@ -320,6 +320,8 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
     const refused = guard.resolveTurn("telegram", nonce);
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+    if (refused.allowed) throw new Error("expected resolveTurn to refuse the conflicting terminal fact");
+    expect(refused.message).toBe("cannot record a reply for a turn already resolved as no-reply");
 
     const afterResolveTurnCall = storedClaim(harness, nonce);
     expect(afterResolveTurnCall["noReplyAt"]).toBe(resolved["noReplyAt"]);
