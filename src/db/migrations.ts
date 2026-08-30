@@ -2114,18 +2114,31 @@ const v31: SchemaMigration = {
  * no-replace trigger only refused a colliding or moved row, never a fresh one. This adds the
  * write-time backstop for the invariant `canonical_turn_sources.admission_audit_event_id` already
  * documented: every source `claim()` writes shares its turn's own `claim_audit_event_id`, because
- * the whole batch is inserted in the same transaction as the turn. A source citing any other
- * audit event — including one attached after the claim transaction has closed — is refused.
+ * the whole batch is inserted in the same transaction as the turn. A source citing a *fresh*,
+ * honestly-produced audit event — including one attached after the claim transaction has closed —
+ * is refused. It is an equality check, not a provenance proof: a raw writer that reads
+ * `claim_audit_event_id` back out and copies it into the new row's `admission_audit_event_id`
+ * passes, the same residual every trigger in this schema carries against a privileged raw-SQL
+ * writer (one can always `DROP TRIGGER` too) — see `canonical_turn_sources_admission_matches_claim`
+ * in schema.sql for the fuller account, and the "does NOT refuse a source that copies …" tests for
+ * where it is pinned.
+ *
+ * Install-only: this migration adds the trigger for future writes and does not scan existing rows
+ * for ones that already violate it. Harmless today because the canonical-turn ledger this trigger
+ * guards has no production writer (`claim()` — #638/#639). If a production writer ever lands, it
+ * ships onto a ledger this migration never audited for pre-existing violations; whoever adds that
+ * writer should add a one-time backfill check (or confirm the ledger is still empty) rather than
+ * assume this migration already did it.
  */
 const v32: SchemaMigration = {
-  id: "v32-a-source-cannot-be-attached-after-the-claim-that-admitted-it",
+  id: "v32-a-source-can-only-cite-its-turns-own-claim-event",
   fromVersion: 31,
   toVersion: 32,
   apply: (raw) => {
     raw.exec(`DROP TRIGGER IF EXISTS canonical_turn_sources_admission_matches_claim`);
     raw.exec(sourceAdmissionMatchesClaimTriggerDdl());
   },
-  checksum: () => migrationChecksum("v32-a-source-cannot-be-attached-after-the-claim-that-admitted-it"),
+  checksum: () => migrationChecksum("v32-a-source-can-only-cite-its-turns-own-claim-event"),
 };
 
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([

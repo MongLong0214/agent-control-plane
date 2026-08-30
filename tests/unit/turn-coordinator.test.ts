@@ -1232,14 +1232,16 @@ describe("one unresolved turn per conversation", () => {
     ]);
   });
 
-  it("refuses a direct INSERT that attaches a later message to an already-claimed turn", () => {
-    // The docstring above states the invariant as absolute: "canonical_turn_sources is written
-    // once, in the same transaction as the turn, and everything downstream leans on that being
-    // final." The test above only shows that a *second `claim()` call* cannot coalesce — it never
-    // attempts the counter-example a review raised: the schema forbids REPLACE and UPDATE/DELETE
-    // of a source row, but nothing forbade a plain INSERT of a new batch_ordinal onto a turn that
-    // already exists, and `ControlPlane.db` + `Db.run()` are public enough to do it. This is that
-    // INSERT, executed directly rather than through the coordinator.
+  it("refuses a direct INSERT whose source cites a fresh audit event, not its turn's own claim", () => {
+    // The schema forbids REPLACE and UPDATE/DELETE of a source row, but nothing forbade a plain
+    // INSERT of a new batch_ordinal onto a turn that already exists, and `ControlPlane.db` +
+    // `Db.run()` are public enough to do it. This is that INSERT, executed directly rather than
+    // through the coordinator — with an honestly-produced, *fresh* audit event, the shape any real
+    // second admission or coalescing write would actually have. `canonical_turn_sources_admission_
+    // matches_claim` requires a source's admission event to equal its turn's own claim event, and a
+    // fresh event never does, so this is refused. It is a narrower property than "no later source
+    // can ever attach" — see the test right below, which shows the one case this equality check
+    // cannot catch.
     const h = makeHarness();
     const actorId = target(h, "coalesce-insert");
     const first = claimOf(h, actorId, [source(h, "m1")]);
@@ -1263,6 +1265,35 @@ describe("one unresolved turn per conversation", () => {
       [first.turnRequestId],
     );
     expect(sources.map((r) => r.source_nonce)).toEqual(["m1"]);
+  });
+
+  it("does NOT refuse a direct INSERT whose source copies its turn's own claim event — the guard's known limit", () => {
+    // The trigger enforces an equality, not a provenance proof: it cannot tell an honest
+    // claim-time write from a raw writer that reads `canonical_turns.claim_audit_event_id` back
+    // out and copies it into a new source row, because the two columns then genuinely agree. A
+    // blind review reproduced exactly this — claim m1, then INSERT m2-late copying the turn's own
+    // claim event — and both rows persisted. That is not a bug in the trigger; it is the residual
+    // every trigger in this schema carries against a sufficiently privileged raw-SQL writer (one
+    // can always `DROP TRIGGER`, too). Pinned here so it is not silently assumed away and is not
+    // re-discovered as a surprise: this INSERT is expected to succeed.
+    const h = makeHarness();
+    const actorId = target(h, "coalesce-copied-id");
+    const first = claimOf(h, actorId, [source(h, "m1")]);
+    const claimEvent = h.cp.db.get<{ claim_audit_event_id: number }>(
+      `SELECT claim_audit_event_id FROM canonical_turns WHERE turn_request_id = ?`,
+      [first.turnRequestId],
+    )!.claim_audit_event_id;
+    const second = source(h, "m2-late");
+
+    expect(() =>
+      h.cp.db.run(
+        `INSERT INTO canonical_turn_sources
+           (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,
+            source_digest, predecessor_turn_request_id, admission_audit_event_id)
+         VALUES (?, ?, ?, ?, 1, 'd:m2-late', NULL, ?)`,
+        [first.turnRequestId, second.channel, second.nonce, second.attempt, claimEvent],
+      ),
+    ).not.toThrow();
   });
 
   it("holds one conversation without blocking another", () => {

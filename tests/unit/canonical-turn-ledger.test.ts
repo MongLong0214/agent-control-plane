@@ -422,12 +422,14 @@ describe("which messages a turn consumed", () => {
     expect(() => source(h, "turn:np", "update:y", 2, 0, null, claimEvent)).toThrow();
   });
 
-  it("refuses a source whose admission event is not the turn's own claim event", () => {
-    // #693's write-time backstop: a source attached to an already-claimed turn under a *different*
-    // audit event — the shape a raw INSERT or a future coalescing write would produce, since the
-    // turn's own claim event was consumed and closed when the turn was born. This is the direct
-    // schema-level counter-example the coordinator-level test in turn-coordinator.test.ts also
-    // covers through `claim()`; this one exercises the trigger with no coordinator in between.
+  it("refuses a source citing a fresh audit event instead of the turn's own claim event", () => {
+    // #693's write-time backstop: a source attached to an already-claimed turn under a *fresh,
+    // honestly-produced* audit event — the shape a real second admission or a future coalescing
+    // write would produce, since the turn's own claim event was consumed and closed when the turn
+    // was born. This is the direct schema-level counter-example the coordinator-level test in
+    // turn-coordinator.test.ts also covers through `claim()`; this one exercises the trigger with
+    // no coordinator in between. It is a narrower property than "no later source can ever attach"
+    // — see the test right below for the one case a fresh-event check cannot catch.
     const h = makeHarness();
     const t = target(h, "laterclaim");
     inDoubtTurn(h, "turn:laterclaim", t.actorId, t.bindingId, t.attestationId);
@@ -435,6 +437,24 @@ describe("which messages a turn consumed", () => {
     expect(() =>
       source(h, "turn:laterclaim", "update:late", 1, 0, null, auditEvent(h)),
     ).toThrow();
+  });
+
+  it("does NOT refuse a source that copies the turn's own claim event — the guard's known limit", () => {
+    // The trigger checks equality (`admission_audit_event_id = canonical_turns.claim_audit_
+    // event_id`), not who wrote the row or when: a writer that reads the turn's own claim event
+    // back out and copies it into a later source's `admission_audit_event_id` satisfies that
+    // equality honestly, because the two columns then genuinely agree. A blind review reproduced
+    // exactly this against the coordinator (claim m1, INSERT m2-late copying the claim event, both
+    // rows persisted); this pins the same shape at the schema level. It is the same residual every
+    // trigger in this schema carries against a sufficiently privileged raw-SQL writer — one can
+    // always `DROP TRIGGER`, too — named here so it is not silently assumed away.
+    const h = makeHarness();
+    const t = target(h, "copiedclaim");
+    const claimEvent = inDoubtTurn(h, "turn:copiedclaim", t.actorId, t.bindingId, t.attestationId);
+
+    expect(() =>
+      source(h, "turn:copiedclaim", "update:late", 1, 0, null, claimEvent),
+    ).not.toThrow();
   });
 });
 
