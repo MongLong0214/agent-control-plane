@@ -17,6 +17,7 @@ import {
   type TelegramRouteOutcome,
   type TelegramStoredState,
   type TelegramStoredResponse,
+  type TelegramStoredDeliveryFailure,
   type TelegramDeliveryStatus,
 } from "./telegram-router.ts";
 import { TelegramIngress, type TelegramUpdate } from "./telegram.ts";
@@ -56,21 +57,24 @@ export interface TelegramBotTransport {
 
 export type TelegramDeliveryFailure =
   | {
-    delivery: "NOT_SENT";
-    scope: "MESSAGE";
-    statusCode: 400;
+    kind: "PERMANENT_REJECTION";
+    statusCode: number;
+    description: string | null;
+    migrateToChatId: string | null;
     retryAfterSeconds: null;
   }
   | {
-    delivery: "NOT_SENT";
-    scope: "BATCH";
+    kind: "RETRYABLE";
     statusCode: number;
+    description: string | null;
+    migrateToChatId: null;
     retryAfterSeconds: number | null;
   }
   | {
-    delivery: "UNKNOWN";
-    scope: "BATCH";
+    kind: "UNKNOWN";
     statusCode: null;
+    description: null;
+    migrateToChatId: null;
     retryAfterSeconds: null;
   };
 
@@ -86,9 +90,10 @@ export class TelegramDeliveryError extends Error {
 }
 
 const unknownDeliveryFailure = (): TelegramDeliveryFailure => ({
-  delivery: "UNKNOWN",
-  scope: "BATCH",
+  kind: "UNKNOWN",
   statusCode: null,
+  description: null,
+  migrateToChatId: null,
   retryAfterSeconds: null,
 });
 
@@ -107,23 +112,37 @@ const telegramRetryAfterSeconds = (payload: unknown): number | null => {
     : null;
 };
 
+const telegramDescription = (payload: unknown): string | null => {
+  if (!isRecord(payload)) return null;
+  const description = payload["description"];
+  return typeof description === "string" && description.trim().length > 0 ? description : null;
+};
+
+const telegramMigrateToChatId = (payload: unknown): string | null => {
+  if (!isRecord(payload) || !isRecord(payload["parameters"])) return null;
+  const migrateToChatId = payload["parameters"]["migrate_to_chat_id"];
+  return Number.isSafeInteger(migrateToChatId) ? String(migrateToChatId) : null;
+};
+
 const rejectedDeliveryFailure = (
   statusCode: number,
   payload: unknown,
 ): TelegramDeliveryFailure => {
-  if (statusCode === 400) {
+  if (statusCode === 429 || statusCode >= 500) {
     return {
-      delivery: "NOT_SENT",
-      scope: "MESSAGE",
+      kind: "RETRYABLE",
       statusCode,
-      retryAfterSeconds: null,
+      description: telegramDescription(payload),
+      migrateToChatId: null,
+      retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,
     };
   }
   return {
-    delivery: "NOT_SENT",
-    scope: "BATCH",
+    kind: "PERMANENT_REJECTION",
     statusCode,
-    retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,
+    description: telegramDescription(payload),
+    migrateToChatId: telegramMigrateToChatId(payload),
+    retryAfterSeconds: null,
   };
 };
 
@@ -471,7 +490,7 @@ export class TelegramLongPollService {
         correlationId: prepared.value.correlationId,
       });
     } catch (error) {
-      if (error instanceof TelegramDeliveryError && error.failure.delivery === "NOT_SENT") {
+      if (error instanceof TelegramDeliveryError && error.failure.kind !== "UNKNOWN") {
         const released = this.options.ownerPromptStore?.release(reservation);
         if (released && !released.allowed) throw new Error(`${released.reasonCode}: ${released.message}`);
       }
@@ -518,14 +537,12 @@ export class TelegramLongPollService {
       signal: this.#controller?.signal,
     });
     const outcomes: TelegramRouteOutcome[] = [];
-    // Policy: a message-specific rejection continues the batch, while a batch-scoped rejection
-    // or unknown outcome stops it; only a reply known not to have been sent becomes RETRYABLE.
-    // HTTP or Telegram error code 400 is message-scoped. Rate limits, server failures, and every
-    // other definite rejection are batch-scoped, so they release this reply for a later retry and
-    // throw before another update or owner-gate send. An unknown outcome keeps the reservation
-    // PENDING and throws without replay. Once a message-scoped rejection is deferred, the offset
-    // still cannot advance past it even if later updates succeed in this same poll.
-    let firstDeliveryError: unknown;
+    // One classification, made by the Bot API adapter, owns the batch decision:
+    // - 429/5xx releases the known-not-sent reply, stops this batch, and holds the offset;
+    // - a permanent rejection records UNANSWERABLE, continues, and advances;
+    // - an unknown result stops and holds until one retry is used, then records UNRESOLVED,
+    //   continues, and advances;
+    // - acceptance completes the reply and advances normally.
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
       const outcome = await this.router.route(update, this.webhookSecret);
@@ -539,22 +556,25 @@ export class TelegramLongPollService {
           await this.options.onInterrupt?.("after-reply-send", update, outcome.runId);
           this.router.completeResponse(outcome);
         } catch (error) {
-          if (!(error instanceof TelegramDeliveryError) || error.failure.delivery !== "NOT_SENT") throw error;
-          this.router.releaseResponse(outcome);
-          if (error.failure.scope === "BATCH") throw error;
-          if (firstDeliveryError === undefined) firstDeliveryError = error;
-          continue;
+          if (!(error instanceof TelegramDeliveryError)) throw error;
+          if (error.failure.kind === "RETRYABLE") {
+            this.router.releaseResponse(outcome);
+            throw error;
+          }
+          if (error.failure.kind === "PERMANENT_REJECTION") {
+            this.router.abandonResponse(outcome, error.failure);
+          } else if (!this.router.recordUnknownResponse(outcome, error.failure)) {
+            throw error;
+          }
         }
       }
-      if (firstDeliveryError === undefined && Number.isSafeInteger(update.update_id)) {
+      if (Number.isSafeInteger(update.update_id)) {
         this.#offset = Math.max(this.#offset ?? 0, update.update_id + 1);
       }
     }
 
-    // After the inbound batch, and never fatally — even when a delivery above is deferred,
-    // an owner-gate approval must still reach the owner this poll.
+    // After the inbound batch, and never fatally.
     await this.deliverOwnerGatePrompts();
-    if (firstDeliveryError !== undefined) throw firstDeliveryError;
     return { outcomes, ...(this.#offset === undefined ? {} : { nextOffset: this.#offset }) };
   }
 
@@ -580,7 +600,8 @@ export class TelegramLongPollService {
       } catch (error) {
         if (!this.#running && this.#controller.signal.aborted) break;
         this.options.onError?.(error);
-        const retryAfterMs = error instanceof TelegramDeliveryError && error.failure.retryAfterSeconds !== null
+        const retryAfterMs = error instanceof TelegramDeliveryError && error.failure.kind === "RETRYABLE"
+          && error.failure.retryAfterSeconds !== null
           ? Math.min(error.failure.retryAfterSeconds * 1_000, 2_147_483_647)
           : 0;
         await delay(Math.max(this.options.retryDelayMs ?? 5_000, retryAfterMs));
@@ -1067,6 +1088,8 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
       reply?: unknown;
       sent?: unknown;
       deliveryStatus?: unknown;
+      unknownDeliveryAttempts?: unknown;
+      deliveryFailure?: unknown;
     };
     if (
       candidate.kind !== "TELEGRAM_WORKFLOW" ||
@@ -1076,7 +1099,18 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
     if (candidate.sent !== undefined && typeof candidate.sent !== "boolean") return null;
     if (
       candidate.deliveryStatus !== undefined &&
-      !["PENDING", "RETRYABLE", "APPLIED"].includes(String(candidate.deliveryStatus))
+      ![
+        "PENDING",
+        "RETRYABLE",
+        "UNKNOWN_RETRYABLE",
+        "APPLIED",
+        "UNANSWERABLE",
+        "UNRESOLVED",
+      ].includes(String(candidate.deliveryStatus))
+    ) return null;
+    if (
+      candidate.unknownDeliveryAttempts !== undefined
+      && (!Number.isSafeInteger(candidate.unknownDeliveryAttempts) || Number(candidate.unknownDeliveryAttempts) < 0)
     ) return null;
     if (candidate.reply === undefined) {
       return {
@@ -1093,6 +1127,23 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
       typeof reply.replyToMessageId !== "number" ||
       typeof reply.correlationId !== "string"
     ) return null;
+    let deliveryFailure: TelegramStoredDeliveryFailure | undefined;
+    if (candidate.deliveryFailure !== undefined) {
+      if (!isRecord(candidate.deliveryFailure)) return null;
+      const failure = candidate.deliveryFailure;
+      if (
+        (failure["kind"] !== "PERMANENT_REJECTION" && failure["kind"] !== "UNKNOWN")
+        || (failure["statusCode"] !== null && !Number.isSafeInteger(failure["statusCode"]))
+        || (failure["description"] !== null && typeof failure["description"] !== "string")
+        || (failure["migrateToChatId"] !== null && typeof failure["migrateToChatId"] !== "string")
+      ) return null;
+      deliveryFailure = {
+        kind: failure["kind"],
+        statusCode: failure["statusCode"] as number | null,
+        description: failure["description"] as string | null,
+        migrateToChatId: failure["migrateToChatId"] as string | null,
+      };
+    }
     return {
       kind: "TELEGRAM_WORKFLOW",
       phase: candidate.phase as TelegramStoredState["phase"],
@@ -1100,6 +1151,10 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
       reply: reply as TelegramReply,
       sent: candidate.sent,
       deliveryStatus: (candidate.deliveryStatus ?? (candidate.sent ? "APPLIED" : "PENDING")) as TelegramDeliveryStatus,
+      ...(candidate.unknownDeliveryAttempts === undefined
+        ? {}
+        : { unknownDeliveryAttempts: Number(candidate.unknownDeliveryAttempts) }),
+      ...(deliveryFailure ? { deliveryFailure } : {}),
     };
   } catch {
     return null;

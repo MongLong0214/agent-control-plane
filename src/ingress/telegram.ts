@@ -306,6 +306,15 @@ export class TelegramIngress {
     return this.guard.completeReplyAndResolveTurn("telegram", nonce, result);
   }
 
+  /** Atomically records a terminal failed reply and settles the handler's turn, if it claimed one. */
+  settleReplyAndTurn(
+    nonce: string,
+    result: unknown,
+    settlement: "UNANSWERABLE" | "UNRESOLVED",
+  ): Decision<void> {
+    return this.guard.settleReplyAndTurn("telegram", nonce, result, settlement);
+  }
+
   /**
    * Every unresolved turn on this conversation. See `IngressGuard.unresolvedTurns`.
    *

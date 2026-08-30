@@ -137,7 +137,7 @@ export class Doctor {
       findings.push(...(await this.checkHostResources()));
       findings.push(...this.checkClaims());
       findings.push(...this.checkOutbox());
-      findings.push(...this.checkPendingTelegramReplies());
+      findings.push(...this.checkTerminalTelegramReplies());
       findings.push(...this.checkUnresolvedTurns());
       findings.push(...this.checkCanonicalTurns());
       findings.push(...(await this.checkRepositories()));
@@ -647,63 +647,77 @@ export class Doctor {
     }));
   }
 
-  /**
-   * Telegram replies whose external outcome cannot be established.
-   *
-   * This reads the reply-delivery lifecycle directly rather than inferring it from a turn claim:
-   * managed commands and routing failures also produce owner-facing replies, but never claim a
-   * CEO turn. PENDING is deliberately terminal under the at-most-once ambiguity policy, so a
-   * durable doctor finding is the operator-facing half of choosing not to resend it.
-   */
-  private checkPendingTelegramReplies(): Finding[] {
+  /** Telegram replies whose terminal delivery failure requires operator visibility. */
+  private checkTerminalTelegramReplies(): Finding[] {
     const rows = this.db.all<{
       nonce: string;
       received_at: string;
       correlation_id: string | null;
       reply_to_message_id: number | null;
+      delivery_status: "UNANSWERABLE" | "UNRESOLVED";
+      unknown_delivery_attempts: number | null;
+      status_code: number | null;
+      description: string | null;
+      migrate_to_chat_id: string | null;
     }>(
       `SELECT nonce,
               received_at,
               json_extract(result_json, '$.reply.correlationId') AS correlation_id,
-              json_extract(result_json, '$.reply.replyToMessageId') AS reply_to_message_id
+              json_extract(result_json, '$.reply.replyToMessageId') AS reply_to_message_id,
+              json_extract(result_json, '$.deliveryStatus') AS delivery_status,
+              json_extract(result_json, '$.unknownDeliveryAttempts') AS unknown_delivery_attempts,
+              json_extract(result_json, '$.deliveryFailure.statusCode') AS status_code,
+              json_extract(result_json, '$.deliveryFailure.description') AS description,
+              json_extract(result_json, '$.deliveryFailure.migrateToChatId') AS migrate_to_chat_id
          FROM inbound_messages
         WHERE channel = 'telegram'
           AND json_valid(result_json) = 1
           AND json_type(result_json, '$.reply') = 'object'
-          AND (
-            json_extract(result_json, '$.deliveryStatus') = 'PENDING'
-            OR (
-              json_type(result_json, '$.deliveryStatus') IS NULL
-              AND json_extract(result_json, '$.sent') IS NOT 1
-            )
-          )
+          AND json_extract(result_json, '$.deliveryStatus') IN ('UNANSWERABLE', 'UNRESOLVED')
         ORDER BY received_at ASC`,
     );
     if (rows.length === 0) return [];
 
-    const oldest = rows[0]!;
-    const ageMs = Date.parse(this.clock.nowIso()) - Date.parse(oldest.received_at);
-    const ageMinutes = Math.max(0, Math.round(ageMs / 60_000));
-    return [{
-      code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
-      severity: ageMinutes >= UNRESOLVED_TURN_ESCALATION_MINUTES ? "ERROR" : "WARN",
-      scope: "telegram",
-      blocking: false,
-      confidence: "HIGH",
-      observedEvidence: {
-        outstanding: rows.length,
-        oldestAgeMinutes: ageMinutes,
-        oldest: {
-          nonce: oldest.nonce,
-          receivedAt: oldest.received_at,
-          correlationId: oldest.correlation_id,
-          replyToMessageId: oldest.reply_to_message_id,
-          deliveryStatus: "PENDING",
+    const findings: Finding[] = [];
+    for (const deliveryStatus of ["UNANSWERABLE", "UNRESOLVED"] as const) {
+      const matching = rows.filter((row) => row.delivery_status === deliveryStatus);
+      if (matching.length === 0) continue;
+      const oldest = matching[0]!;
+      const ageMs = Date.parse(this.clock.nowIso()) - Date.parse(oldest.received_at);
+      const ageMinutes = Math.max(0, Math.round(ageMs / 60_000));
+      findings.push({
+        code: deliveryStatus === "UNANSWERABLE"
+          ? "TELEGRAM_REPLY_UNANSWERABLE"
+          : "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
+        severity: ageMinutes >= UNRESOLVED_TURN_ESCALATION_MINUTES ? "ERROR" : "WARN",
+        scope: "telegram",
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          outstanding: matching.length,
+          oldestAgeMinutes: ageMinutes,
+          oldest: {
+            nonce: oldest.nonce,
+            receivedAt: oldest.received_at,
+            correlationId: oldest.correlation_id,
+            replyToMessageId: oldest.reply_to_message_id,
+            deliveryStatus,
+            ...(oldest.unknown_delivery_attempts === null
+              ? {}
+              : { unknownDeliveryAttempts: oldest.unknown_delivery_attempts }),
+            ...(oldest.status_code === null ? {} : { statusCode: oldest.status_code }),
+            ...(oldest.description === null ? {} : { description: oldest.description }),
+            ...(oldest.migrate_to_chat_id === null
+              ? {}
+              : { migrateToChatId: oldest.migrate_to_chat_id }),
+          },
         },
-      },
-      recommendedAction:
-        "inspect whether Telegram received the reply; ACP preserves the unknown outcome and will not resend it",
-    }];
+        recommendedAction: deliveryStatus === "UNANSWERABLE"
+          ? "inspect the Telegram rejection and correct the reply content or migrated chat configuration"
+          : "inspect whether Telegram received either bounded attempt; ACP stopped automatic resend",
+      });
+    }
+    return findings;
   }
 
   /**
@@ -737,6 +751,7 @@ export class Doctor {
       `SELECT channel, nonce, received_at FROM inbound_messages
         WHERE turn_claim_json IS NOT NULL
           AND json_extract(turn_claim_json, '$.repliedAt') IS NULL
+          AND json_extract(turn_claim_json, '$.settledAt') IS NULL
         ORDER BY received_at ASC`,
     );
     if (rows.length === 0) return [];

@@ -1472,29 +1472,14 @@ const GUARDS = [
     ],
   },
   {
-    // #699: a rejected sendMessage used to rethrow unconditionally, so this line was never
-    // reached for the update that failed — but that also stopped every later update in the
-    // same poll from being tried at all. Once the loop keeps going after a delivery error, the
-    // offset must stop advancing for the rest of this poll too, or a later update's success
-    // would carry the offset past the still-unresolved one and Telegram would never redeliver
-    // it — the opposite failure from wedging forever, and a silent one.
-    what: "the offset never advances past an update whose delivery this poll could not confirm",
+    // The adapter owns the distinction: a 400 is terminal for this reply, while 429 and 5xx are
+    // service conditions that stop the batch. Folding 400 into the latter restores the wedge.
+    what: "a Telegram 400 is a permanent rejection rather than a retryable service condition",
     file: "src/ingress/telegram-polling.ts",
-    find: "      if (firstDeliveryError === undefined && Number.isSafeInteger(update.update_id)) {",
-    replace: "      if (Number.isSafeInteger(update.update_id)) {",
+    find: "  if (statusCode === 429 || statusCode >= 500) {",
+    replace: "  if (statusCode >= 400) {",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a 400 content rejection continues later replies and owner gate prompts while only its reply retries",
-    ],
-  },
-  {
-    // Only a Telegram code 400 says this request's content was unacceptable. Treating it as a
-    // batch failure restores the original wedge by stopping before later independent updates.
-    what: "a Telegram 400 rejection is message scoped",
-    file: "src/ingress/telegram-polling.ts",
-    find: "  if (statusCode === 400) {",
-    replace: "  if (false) {",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a 400 content rejection continues later replies and owner gate prompts while only its reply retries",
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 records an unanswerable reply and advances past 101 later updates",
     ],
   },
   {
@@ -1502,67 +1487,107 @@ const GUARDS = [
     // stops the current storm but schedules the next attempt earlier than Telegram requested.
     what: "a Telegram 429 preserves its retry after instruction",
     file: "src/ingress/telegram-polling.ts",
-    find: "    retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,",
-    replace: "    retryAfterSeconds: null,",
+    find: "      retryAfterSeconds: statusCode === 429 ? telegramRetryAfterSeconds(payload) : null,",
+    replace: "      retryAfterSeconds: null,",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::a 429 rate limit stops the batch before later replies and owner gate prompts",
     ],
   },
   {
-    // A known-not-sent result is not enough to continue: 429 and 5xx describe the batch's
-    // current ability to send, so later replies and owner prompts must wait for another poll.
-    what: "a batch scoped Telegram rejection stops later sends in the poll",
+    // A known-not-sent service failure is safe to retry, but later sends in this batch must wait
+    // for the requested or default backoff rather than joining the same outage.
+    what: "a retryable Telegram service failure stops the current batch",
     file: "src/ingress/telegram-polling.ts",
-    find: "          if (error.failure.scope === \"BATCH\") throw error;",
-    replace: "          if (false) throw error;",
+    find:
+      "          if (error.failure.kind === \"RETRYABLE\") {\n" +
+      "            this.router.releaseResponse(outcome);\n" +
+      "            throw error;\n" +
+      "          }",
+    replace:
+      "          if (false) {\n" +
+      "            this.router.releaseResponse(outcome);\n" +
+      "            throw error;\n" +
+      "          }",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::a 5xx outage stops the batch before later replies and owner gate prompts",
     ],
   },
   {
-    // An unknown outcome may already have delivered the reply. Removing the distinction below
-    // releases the reservation as RETRYABLE and makes a later poll send it again.
-    what: "an unknown Telegram delivery outcome stays pending and stops the poll",
+    // Advancing is safe only after the permanent rejection is durably terminal. Releasing it to
+    // RETRYABLE while advancing recreates the silent orphan behind the round-four wedge.
+    what: "a permanent Telegram rejection is durably recorded as terminal",
     file: "src/ingress/telegram-polling.ts",
-    find: "          if (!(error instanceof TelegramDeliveryError) || error.failure.delivery !== \"NOT_SENT\") throw error;",
-    replace: "          if (!(error instanceof TelegramDeliveryError)) throw error;",
+    find: "            this.router.abandonResponse(outcome, error.failure);",
+    replace: "            this.router.releaseResponse(outcome);",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::an unknown send outcome stops later work and remains pending without resend",
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 records an unanswerable reply and advances past 101 later updates",
     ],
   },
   {
-    // Telegram does not receive correlationId and offers no server-side de-duplication key for
-    // this sendMessage call. A PENDING replay must therefore stop in the router instead of
-    // re-entering the response-reservation path.
-    what: "a pending Telegram reply is replay-ignored before response reservation",
+    // The first unknown result owns the batch until its one retry. Continuing immediately would
+    // let later work pass an outcome that still has automatic recovery remaining.
+    what: "the first unknown Telegram result holds the batch and offset for its bounded retry",
+    file: "src/ingress/telegram-polling.ts",
+    find:
+      "          } else if (!this.router.recordUnknownResponse(outcome, error.failure)) {\n" +
+      "            throw error;\n" +
+      "          }",
+    replace:
+      "          } else {\n" +
+      "            this.router.recordUnknownResponse(outcome, error.failure);\n" +
+      "          }",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a lost response retries once then records unresolved and advances the offset",
+    ],
+  },
+  {
+    // Terminal delivery states are useful only if the inbound acknowledgement moves past them.
+    // Removing this update leaves the unanswerable row visible but restores the 100-update wedge.
+    what: "a terminal Telegram reply advances the inbound offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      if (Number.isSafeInteger(update.update_id)) {",
+    replace: "      if (false && Number.isSafeInteger(update.update_id)) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 records an unanswerable reply and advances past 101 later updates",
+    ],
+  },
+  {
+    // Two means the initial ambiguous result plus one ambiguous retry. Raising it silently grows
+    // the duplicate bound and delays the terminal state that lets later ingress proceed.
+    what: "an unknown Telegram reply gets one retry before becoming unresolved",
     file: "src/ingress/telegram-router.ts",
-    find: "      return this.storedResponseOutcome(update, stored, false);",
-    replace: "      return this.storedResponseOutcome(update, stored, true);",
+    find: "const UNKNOWN_DELIVERY_ATTEMPT_LIMIT = 2;",
+    replace: "const UNKNOWN_DELIVERY_ATTEMPT_LIMIT = 3;",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::persistent response loss does not resend the same pending reply",
+      "tests/unit/telegram-ingress.test.ts::a lost response retries once then records unresolved and advances the offset",
     ],
   },
   {
-    // A no-resend policy that only lives in SQLite is silence to an operator. Doctor is the
-    // authenticated read path every runbook starts with, and it must inspect reply PENDING
-    // directly because managed replies do not carry a CEO turn claim.
-    what: "doctor reports every ambiguous Telegram reply",
+    // A terminal row without an authenticated operator surface is still silence. Doctor reads
+    // the reply lifecycle directly because managed acknowledgements have no CEO turn claim.
+    what: "doctor reports permanently unanswerable Telegram replies",
     file: "src/doctor/doctor.ts",
-    find: "            json_extract(result_json, '$.deliveryStatus') = 'PENDING'",
-    replace: "            json_extract(result_json, '$.deliveryStatus') = 'APPLIED'",
+    find: "          AND json_extract(result_json, '$.deliveryStatus') IN ('UNANSWERABLE', 'UNRESOLVED')",
+    replace: "          AND json_extract(result_json, '$.deliveryStatus') = 'UNRESOLVED'",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::An ambiguous Telegram reply is not resent and remains visible as PENDING",
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 records an unanswerable reply and advances past 101 later updates",
     ],
   },
   {
-    // Expiring a PENDING row after the ordinary nonce TTL removes the operator fact and permits a
-    // retained update to execute again. A durable ambiguity policy cannot have a timer back door.
-    what: "an ambiguous Telegram reply survives ordinary ingress pruning",
+    // The terminal state must outlive ordinary nonce pruning or its Doctor finding disappears and
+    // a retained update can look new again after the exact state meant to stop automatic resend.
+    what: "terminal Telegram reply failures survive ordinary ingress pruning",
     file: "src/ingress/ingress-guard.ts",
-    find: "              json_extract(result_json, '$.deliveryStatus') = 'PENDING'",
-    replace: "              false",
+    find:
+      "                'PENDING',\n" +
+      "                'UNKNOWN_RETRYABLE',\n" +
+      "                'UNANSWERABLE',\n" +
+      "                'UNRESOLVED'",
+    replace:
+      "                'PENDING',\n" +
+      "                'UNKNOWN_RETRYABLE'",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::persistent response loss does not resend the same pending reply",
+      "tests/unit/telegram-ingress.test.ts::a lost response retries once then records unresolved and advances the offset",
     ],
   },
 ];
