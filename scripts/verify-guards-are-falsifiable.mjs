@@ -2337,14 +2337,74 @@ const GUARDS = [
     ],
   },
   {
-    // GitHub Markdown permits tilde fences and variable-length markers. Returning no fence
-    // reopens the false green where a vanished quoted line becomes only an advisory citation.
-    what: "every GitHub Markdown fence form makes vanished fenced code stale",
+    // The top-level table covers both markers and variable-length runs without claiming every
+    // container spelling. Removing tilde from the executable grammar reopens the false green.
+    what: "supported top level fence marker length indentation and info string forms make vanished code stale",
     file: "scripts/verify-tracker-loci-resolve.mjs",
-    find: "  return { marker: match[1][0], length: match[1].length };",
-    replace: "  return null;",
+    find: '    markers: Object.freeze(["`", "~"]),',
+    replace: '    markers: Object.freeze(["`"]),',
     killedBy: [
-      "tests/unit/verify-tracker-loci-resolve.test.ts::all GitHub Markdown fence spellings make vanished code stale",
+      "tests/unit/verify-tracker-loci-resolve.test.ts::supported top level fence marker length indentation and info string forms make vanished code stale",
+    ],
+  },
+  {
+    what: "blockquote prefixes are removed before fence indentation is judged",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  const blockquote = blockquoteLineForOpening(rawLine);",
+    replace: "  const blockquote = { logical: rawLine, depth: 0 };",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::blockquote and list container relative fences make vanished code stale",
+    ],
+  },
+  {
+    what: "list markers and continuation indentation are removed before fence indentation is judged",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  const directList = listItemLine(blockquote.logical);",
+    replace: "  const directList = null;",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::blockquote and list container relative fences make vanished code stale",
+    ],
+  },
+  {
+    what: "an inline backtick span closes only on a run equal to its opener",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "      if (runEnd - cursor === openerLength) {",
+    replace: "      if (runEnd - cursor > 0) {",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a backtick run closes only at an equal length run",
+    ],
+  },
+  {
+    what: "a backtick wrapped citation consumes its whole equal length closing run",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find:
+      "    if (closingRun?.length === backtickOpener.length) {\n" +
+      "      return { matched: true, tail: after.slice(closingRun.length), unsupportedReason: null };\n" +
+      "    }",
+    replace:
+      "    if (closingRun !== null) {\n" +
+      "      return { matched: true, tail: after.slice(1), unsupportedReason: null };\n" +
+      "    }",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a backtick run closes only at an equal length run",
+    ],
+  },
+  {
+    what: "signed line numbers reach stale classification instead of disappearing at extraction",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '    integerSource: "-?\\\\d+",',
+    replace: '    integerSource: "\\\\d+",',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::negative line numbers in every supported coordinate form are stale instead of invisible",
+    ],
+  },
+  {
+    what: "explicit citation shapes outside the grammar fail instead of reporting success",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  unsupported.length > 0 ||\n  nonDurableFindings.length > 0 ||",
+    replace: "  false ||\n  nonDurableFindings.length > 0 ||",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::explicit citation shapes outside the grammar fail as unsupported instead of disappearing",
     ],
   },
   {
@@ -2353,8 +2413,8 @@ const GUARDS = [
     // genuinely vanished line from STALE to ADVISORY.
     what: "a Markdown link closing delimiter is removed before its quoted content is read",
     file: "scripts/verify-tracker-loci-resolve.mjs",
-    find: "  t = t.replace(/^[)`'\"]/, \"\"); // a citation close is adjacent; whitespace means the quote opens content",
-    replace: "  t = t.replace(/^[`'\"]/, \"\"); // a citation close is adjacent; whitespace means the quote opens content",
+    find: "    return { matched: true, tail: after.slice(close.length), unsupportedReason: null };",
+    replace: "    return { matched: true, tail: after, unsupportedReason: null };",
     killedBy: [
       "tests/unit/verify-tracker-loci-resolve.test.ts::bare and Markdown linked loci give vanished quoted content the same STALE verdict",
     ],
@@ -2364,8 +2424,8 @@ const GUARDS = [
     // the quoted content and turns a real stale-content finding back into a line-number advisory.
     what: "a separator cannot consume the opening backtick of quoted citation content",
     file: "scripts/verify-tracker-loci-resolve.mjs",
-    find: "  t = t.replace(/^[)`'\"]/, \"\"); // a citation close is adjacent; whitespace means the quote opens content",
-    replace: "  t = t.replace(/^\\s*[)`'\"]/, \"\"); // a citation close is adjacent; whitespace means the quote opens content",
+    find: '  t = t.replace(/^[\\s:—–-]+/, ""); // the separator between a citation and what follows',
+    replace: '  t = t.replace(/^[\\s`—–:-]+/, ""); // the separator between a citation and what follows',
     killedBy: [
       "tests/unit/verify-tracker-loci-resolve.test.ts::a separator cannot consume the opening backtick of quoted citation content",
     ],

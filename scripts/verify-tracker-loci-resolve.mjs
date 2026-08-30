@@ -9,18 +9,29 @@
  * check to the supported citation forms in every open issue body rather than claiming to
  * understand every filename-shaped phrase in prose.
  *
- * ## Supported explicit citation formats
+ * ## Citation grammar table
  *
- *   - a same-repository GitHub blob URL, with or without a `#L…` line fragment
- *   - a path with a filename extension and a directory separator; a line number is optional
- *   - a filename with an extension and an explicit `:line[-end]` or `#Lline[-Lend]`
- *   - a directory-qualified extensionless path with an explicit line number
- *   - a root extensionless dotfile with an explicit line number
- *   - a root filename, without a line number, only when backtick- or quote-delimited and its
- *     extension occurs in the tracked tree
- *   - a `/private/tmp` or `/tmp` path, reported separately as non-durable
- *   - a backtick-delimited symbol paired with a backtick-delimited path, either as
- *     `` `path` — `symbol` `` or `` `symbol` in `path` ``
+ * | Context | Status | Grammar and result |
+ * | --- | --- | --- |
+ * | Inline code span after a line citation | SUPPORTED | A run of one or more backticks opens the span; only a run of exactly the same length closes it. Single- and double-quote pairs remain supported as one-line compatibility forms. An opener with no same-line close is reported UNSUPPORTED instead of being treated as absent content. |
+ * | Fenced code block | SUPPORTED | A run of at least three backticks or tildes opens it; the closer uses the same marker and at least the opening length. Up to three spaces are measured after the supported container prefix: top level, blockquote markers, or one bullet/ordered-list item and its continuation indentation. |
+ * | Markdown inline link | SUPPORTED | `[text](target)` and `[text](<target>)` may target a supported path or blob URL. The destination's closing `)` is consumed as link syntax before trailing quoted content is read. A link title in the destination is UNSUPPORTED and reported. |
+ * | Bare path plus line | SUPPORTED | `path:line[-end]` and `path#Lline[-Lend]`, under the path disambiguation rules below. |
+ * | Same-repository blob URL | SUPPORTED | `https://github.com/<owner>/<repo>/blob/<ref>/<path>` with an optional supported line fragment. A non-line hash is UNSUPPORTED and reported. |
+ * | Line number | SUPPORTED | A signed base-10 integer. `line <= 0`, an end before its start, and a coordinate beyond the file are STALE. A coordinate-shaped suffix outside this grammar is UNSUPPORTED and reported. |
+ * | Undelimited root filename with no line | OUT OF GRAMMAR | Intentionally ignored as ambiguous prose; unlike an explicit but unsupported form, it is not claimed as a citation the parser read. |
+ *
+ * The executable form of this table is `CITATION_GRAMMAR_RULES`; delimiter widths, fence
+ * markers, containers, link forms, and signed line-number syntax are read from that table rather
+ * than re-declared at each parser branch.
+ *
+ * The supported path shapes are: a path with a filename extension and a directory separator
+ * (line optional); a filename with an extension and an explicit line; a directory-qualified
+ * extensionless path or root extensionless dotfile with an explicit line; and a root filename
+ * without a line only when backtick- or quote-delimited and its extension occurs in the tracked
+ * tree. `/private/tmp` and `/tmp` are reported separately as non-durable. Backtick-delimited
+ * symbols paired with backtick-delimited paths are supported as either `` `path` — `symbol` `` or
+ * `` `symbol` in `path` ``.
  *
  * Only issue bodies are read. An inline line citation's trailing content is checked only when it
  * is explicitly backtick- or quote-delimited; fenced content is checked only when it reads as
@@ -96,7 +107,7 @@
  * because "still resolves today" is not "will resolve next week". A blob URL with no line
  * fragment is also surfaced: otherwise exit 0 cannot be distinguished from the URL parser never
  * looking at it. ADVISORY does not fail the build by default (`--strict` promotes it); STALE,
- * UNRESOLVED, and NON_DURABLE do.
+ * UNRESOLVED, UNSUPPORTED, and NON_DURABLE do.
  *
  * ## Why there is no allow-list for "this citation is legitimately historical"
  *
@@ -1246,6 +1257,85 @@ const resolvePath = (cited) => {
 };
 
 // --- extraction --------------------------------------------------------------------------------
+/**
+ * Executable citation grammar. Each parser below reads its delimiter, container, link, or line
+ * rule from this table; the header renders the same contexts for operators. `unsupported` means
+ * an explicit citation-shaped construct is reported and fails instead of disappearing. `out-of-
+ * grammar` is reserved for ambiguous prose that this scanner does not claim is a citation.
+ */
+const CITATION_GRAMMAR_RULES = Object.freeze([
+  Object.freeze({
+    context: "inline-code-span",
+    support: "supported",
+    marker: "`",
+    minimumRun: 1,
+    closingRun: "equal",
+    multiline: false,
+  }),
+  Object.freeze({
+    context: "fenced-code-block",
+    support: "supported",
+    markers: Object.freeze(["`", "~"]),
+    minimumRun: 3,
+    relativeIndentMaximum: 3,
+    containers: Object.freeze(["top-level", "blockquote", "list-item"]),
+  }),
+  Object.freeze({
+    context: "markdown-inline-link",
+    support: "supported",
+    destinationForms: Object.freeze(["bare", "angle"]),
+    titles: false,
+  }),
+  Object.freeze({
+    context: "bare-path-line",
+    support: "supported",
+    coordinatePrefixes: Object.freeze([":", "#L"]),
+  }),
+  Object.freeze({
+    context: "github-blob-url",
+    support: "supported",
+    protocol: "https:",
+    hostname: "github.com",
+  }),
+  Object.freeze({
+    context: "line-number",
+    support: "supported",
+    integerSource: "-?\\d+",
+    firstValidLine: 1,
+  }),
+  Object.freeze({
+    context: "undelimited-root-filename-without-line",
+    support: "out-of-grammar",
+  }),
+]);
+
+const citationGrammar = (context) => {
+  const rule = CITATION_GRAMMAR_RULES.find((candidate) => candidate.context === context);
+  if (!rule) throw new Error(`missing citation grammar rule: ${context}`);
+  return rule;
+};
+
+const INLINE_CODE_GRAMMAR = citationGrammar("inline-code-span");
+const FENCE_GRAMMAR = citationGrammar("fenced-code-block");
+const MARKDOWN_LINK_GRAMMAR = citationGrammar("markdown-inline-link");
+const LINE_GRAMMAR = citationGrammar("line-number");
+const BLOB_GRAMMAR = citationGrammar("github-blob-url");
+
+const DIRECTORY_PATH_SOURCE = "\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)+";
+const ROOT_DOTFILE_SOURCE = "\\.[A-Za-z_][\\w-]*";
+const EXTENDED_PATH_SOURCE = "\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*";
+const PATH_TOKEN_SOURCE = `(?:${DIRECTORY_PATH_SOURCE}|${ROOT_DOTFILE_SOURCE}|${EXTENDED_PATH_SOURCE})`;
+const SIGNED_LINE_SOURCE = LINE_GRAMMAR.integerSource;
+const COLON_COORDINATE_SOURCE = `:(?<cs>${SIGNED_LINE_SOURCE})(?:-(?<ce>${SIGNED_LINE_SOURCE}))?`;
+const ANCHOR_COORDINATE_SOURCE = `#L(?<as>${SIGNED_LINE_SOURCE})(?:-L?(?<ae>${SIGNED_LINE_SOURCE}))?`;
+const SUPPORTED_COORDINATE_RE = new RegExp(
+  `^(?::${SIGNED_LINE_SOURCE}(?:-${SIGNED_LINE_SOURCE})?|#L${SIGNED_LINE_SOURCE}(?:-L?${SIGNED_LINE_SOURCE})?)$`,
+);
+const COORDINATE_SHAPED_RE = new RegExp(
+  `(?<![\\w.])(${PATH_TOKEN_SOURCE})\\b(?<coordinate>:[^\\s\`'"\\)\\]}>*_]+|#L?[^\\s\`'"\\)\\]}>*_]+)`,
+  "g",
+);
+
 // Round 6: this used to be a hand-maintained list of specific extensions (`tsx|ts|mts|mjs|cjs|
 // json|js|plist|py|sh|sql|md|yaml|yml`) — evidence-first (each one added because a real issue
 // cited it), but still a list, and a fourth counterexample found the shape again: a real tracked
@@ -1326,15 +1416,15 @@ const resolvePath = (cited) => {
 // actual target, kept) — never a bare word on the strength of a line number alone. `localhost` and
 // `HTTP` have neither and are excluded; `.gitignore` and `.definitely-missing` both have the dot.
 const PATH_RE = new RegExp(
-  `(?<![\\w.])(\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)+(?=:\\d|#L\\d)|\\.[A-Za-z_][\\w-]*(?=:\\d|#L\\d)|\\.?[A-Za-z_][\\w-]*(?:/[\\w.-]+)*\\.[A-Za-z][\\w]*)\\b` +
-    `(?::(?<cs>\\d+)(?:-(?<ce>\\d+))?|#L(?<as>\\d+)(?:-L?(?<ae>\\d+))?)?`,
+  `(?<![\\w.])(${DIRECTORY_PATH_SOURCE}(?=:-?\\d|#L-?\\d)|${ROOT_DOTFILE_SOURCE}(?=:-?\\d|#L-?\\d)|${EXTENDED_PATH_SOURCE})\\b` +
+    `(?:${COLON_COORDINATE_SOURCE}|${ANCHOR_COORDINATE_SOURCE})?`,
   "g",
 );
 // This regex only finds the lexical URL span and masks it from PATH_RE. `parseGitHubBlobUrl`
 // below gives the span to the platform URL parser; path, query, and fragment boundaries are URL
 // structure, not delimiters this script should try to reproduce in another regular expression.
 // Backticks and a Markdown link's closing parenthesis are prose delimiters, not URL content.
-const URL_RE = /https?:\/\/[^\s`)]+/g;
+const URL_RE = /https?:\/\/[^\s`)>]+/g;
 
 /**
  * Parses one URL token as a GitHub blob URL. `URL.pathname` is deliberately the only source for
@@ -1350,7 +1440,9 @@ const parseGitHubBlobUrl = (raw) => {
   } catch {
     return null;
   }
-  if (parsed.protocol !== "https:" || parsed.hostname.toLowerCase() !== "github.com") return null;
+  if (parsed.protocol !== BLOB_GRAMMAR.protocol || parsed.hostname.toLowerCase() !== BLOB_GRAMMAR.hostname) {
+    return null;
+  }
 
   let segments;
   try {
@@ -1361,13 +1453,19 @@ const parseGitHubBlobUrl = (raw) => {
   const [, owner, repo, route, ...refAndPathSegments] = segments;
   if (!owner || !repo || route !== "blob" || refAndPathSegments.length < 2) return null;
 
-  const lineMatch = parsed.hash.match(/^#L(\d+)(?:-L?(\d+))?$/);
+  const lineMatch = parsed.hash.match(
+    new RegExp(`^#L(${SIGNED_LINE_SOURCE})(?:-L?(${SIGNED_LINE_SOURCE}))?$`),
+  );
   return {
     raw: citation,
     slug: `${owner}/${repo}`.toLowerCase(),
     refAndPathSegments,
     startLine: lineMatch ? Number(lineMatch[1]) : null,
     endLine: lineMatch?.[2] ? Number(lineMatch[2]) : null,
+    lineSyntaxError:
+      parsed.hash.length > 0 && !lineMatch
+        ? `blob URL fragment ${parsed.hash} is unsupported; use #L<signed-decimal> or #L<signed-decimal>-L<signed-decimal>`
+        : null,
   };
 };
 
@@ -1503,17 +1601,70 @@ const containsSnippetFragments = (haystack, fragments) => {
 };
 
 /**
- * Strips the citation's own closing delimiter and the markdown separator between a citation and
- * whatever follows it — whitespace, a dash, a colon. Shared by both the fenced and inline paths:
- * a fenced line still has the citation's own trailing backtick to remove if it was written
- * `` `path:line` `` inside the fence, and both need the separator dropped before looking at what
- * comes next.
+ * After a Markdown link or explicit citation delimiter has been consumed structurally, strips a
+ * remaining parenthetical close and the prose separator between the citation and what follows.
+ * Whitespace is a separator, never permission to reach across it for a quote mark.
  */
 const stripCitationSeparator = (text) => {
   let t = text.replace(/←.*$/, "").trimEnd();
-  t = t.replace(/^[)`'"]/, ""); // a citation close is adjacent; whitespace means the quote opens content
+  t = t.replace(/^\)/, ""); // a parenthetical citation close is adjacent; Markdown links were consumed structurally
   t = t.replace(/^[\s:—–-]+/, ""); // the separator between a citation and what follows
   return t;
+};
+
+/**
+ * Removes an inline Markdown link destination's own close before the citation's trailing content
+ * is parsed. The path/URL match starts immediately after `(` or `<` in the two supported forms.
+ * A title is deliberately not guessed through: it is explicit Markdown syntax outside this
+ * grammar and therefore produces an UNSUPPORTED finding rather than hiding the following quote.
+ */
+const markdownLinkTail = (line, matchStart, matchEnd) => {
+  const before = line.slice(0, matchStart);
+  const after = line.slice(matchEnd);
+  const angle = MARKDOWN_LINK_GRAMMAR.destinationForms.includes("angle") && /\[[^\]\n]*\]\(\s*<$/.test(before);
+  const bare = MARKDOWN_LINK_GRAMMAR.destinationForms.includes("bare") && /\[[^\]\n]*\]\(\s*$/.test(before);
+  if (!angle && !bare) return { matched: false, tail: after, unsupportedReason: null };
+
+  const close = angle ? ">)" : ")";
+  if (after.startsWith(close)) {
+    return { matched: true, tail: after.slice(close.length), unsupportedReason: null };
+  }
+  return {
+    matched: true,
+    tail: "",
+    unsupportedReason:
+      `Markdown link destination syntax after ${line.slice(matchStart, matchEnd)} is unsupported; ` +
+      `use [text](target) or [text](<target>) without a destination title`,
+  };
+};
+
+/** Removes the exact delimiter run that wraps the citation itself, if one is adjacent. */
+const citationOwnDelimiterTail = (line, matchStart, matchEnd) => {
+  const link = markdownLinkTail(line, matchStart, matchEnd);
+  if (link.matched) return link;
+
+  const before = line.slice(0, matchStart);
+  const after = line.slice(matchEnd);
+  const backtickOpener = before.match(/(`+)$/)?.[1] ?? null;
+  if (backtickOpener !== null) {
+    const closingRun = after.match(/^`+/)?.[0] ?? null;
+    if (closingRun?.length === backtickOpener.length) {
+      return { matched: true, tail: after.slice(closingRun.length), unsupportedReason: null };
+    }
+    return {
+      matched: true,
+      tail: "",
+      unsupportedReason:
+        `citation code span opens with ${backtickOpener.length} backticks but its adjacent close ` +
+        "does not use the same run length",
+    };
+  }
+
+  const quote = before.at(-1);
+  if ((quote === '"' || quote === "'") && after.startsWith(quote)) {
+    return { matched: true, tail: after.slice(1), unsupportedReason: null };
+  }
+  return { matched: false, tail: after, unsupportedReason: null };
 };
 
 /**
@@ -1535,8 +1686,10 @@ const isExplicitlyDelimited = (line, matchStart, matchEnd) => {
 
 /**
  * Reads an *explicitly* quoted span from the start of already-separator-stripped text — a
- * backtick or quote mark, up to its matching close — or returns `null` if there is none. Used
- * only for an inline citation's trailing text, which is otherwise an ordinary sentence: without
+ * backtick run closed by an equal-length run, or a quote mark up to its matching close. Returns
+ * `null` when no delimiter opens and a visible unsupported reason when one opens without the
+ * supported same-line close. Used only for an inline citation's trailing text, which is otherwise
+ * an ordinary sentence: without
  * an explicit delimiter there is no fact to check here, only a guess about whether the citer
  * meant to quote something, and guessing is exactly what let ordinary prose ("This describes the
  * banner text and its return value has changed") be read as a stale quote of code that was never
@@ -1544,11 +1697,52 @@ const isExplicitlyDelimited = (line, matchStart, matchEnd) => {
  * not checked at all.
  */
 const readDelimitedSpan = (text) => {
-  for (const quote of ["`", '"', "'"]) {
-    if (text.startsWith(quote)) {
-      const closing = text.indexOf(quote, 1);
-      return (closing === -1 ? text.slice(1) : text.slice(1, closing)).trim();
+  if (text.startsWith(INLINE_CODE_GRAMMAR.marker)) {
+    let openerLength = INLINE_CODE_GRAMMAR.minimumRun;
+    while (text[openerLength] === INLINE_CODE_GRAMMAR.marker) openerLength++;
+
+    let cursor = openerLength;
+    while (cursor < text.length) {
+      if (text[cursor] !== INLINE_CODE_GRAMMAR.marker) {
+        cursor++;
+        continue;
+      }
+      let runEnd = cursor + 1;
+      while (text[runEnd] === INLINE_CODE_GRAMMAR.marker) runEnd++;
+      if (runEnd - cursor === openerLength) {
+        let content = text.slice(openerLength, cursor);
+        if (content.startsWith(" ") && content.endsWith(" ") && /[^ ]/.test(content)) {
+          content = content.slice(1, -1);
+        }
+        return { content, unsupportedReason: null };
+      }
+      cursor = runEnd;
     }
+    return {
+      content: null,
+      unsupportedReason:
+        `inline code span opens with ${openerLength} backticks but has no same-line closing run of ` +
+        `${openerLength} backticks`,
+    };
+  }
+
+  for (const quote of ['"', "'"]) {
+    if (!text.startsWith(quote)) continue;
+    let cursor = 1;
+    while (cursor < text.length) {
+      if (text[cursor] === "\\" && cursor + 1 < text.length) {
+        cursor += 2;
+        continue;
+      }
+      if (text[cursor] === quote) {
+        return { content: text.slice(1, cursor).trim(), unsupportedReason: null };
+      }
+      cursor++;
+    }
+    return {
+      content: null,
+      unsupportedReason: `inline ${quote} quote has no same-line matching close`,
+    };
   }
   return null;
 };
@@ -1641,39 +1835,138 @@ const looksLikeCode = (text) => {
   return false;
 };
 
-/**
- * GitHub Markdown accepts fences of either marker, three or more characters long, with up to
- * three leading spaces. The closer must use the opening marker and be at least as long, with
- * only trailing whitespace. An opening fence may have any info string; backtick fences are the
- * one exception where a backtick in that string is invalid Markdown.
- */
-const openingFence = (line) => {
-  const match = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
-  if (!match || (match[1][0] === "`" && match[2].includes("`"))) return null;
-  return { marker: match[1][0], length: match[1].length };
+/** Removes every leading blockquote marker so an opener is judged in container-relative space. */
+const blockquoteLineForOpening = (line) => {
+  let logical = line;
+  let depth = 0;
+  while (true) {
+    const marker = logical.match(/^ {0,3}>[\t ]?/);
+    if (!marker) return { logical, depth };
+    logical = logical.slice(marker[0].length);
+    depth++;
+  }
 };
 
-const closesFence = (line, fence) =>
-  new RegExp(`^ {0,3}${fence.marker}{${fence.length},}[\\t ]*$`).test(line);
+/** Removes exactly the blockquote depth that owns an already-open fence. */
+const blockquoteLineAtDepth = (line, depth) => {
+  let logical = line;
+  for (let i = 0; i < depth; i++) {
+    const marker = logical.match(/^ {0,3}>[\t ]?/);
+    if (!marker) return null;
+    logical = logical.slice(marker[0].length);
+  }
+  return logical;
+};
+
+/** Reads one list marker and the indentation of its content column. */
+const listItemLine = (line) => {
+  const match = line.match(/^( {0,3})(?:([-+*])|(\d{1,9}[.)]))( {1,4})(.*)$/);
+  if (!match) return null;
+  const marker = match[2] ?? match[3];
+  return {
+    logical: match[5],
+    indent: match[1].length + marker.length + match[4].length,
+  };
+};
+
+/**
+ * Strips supported Markdown containers before applying a fence's own relative indentation. A
+ * list fence may open on its marker line or on a following line at the item's content column.
+ */
+const fenceLineForOpening = (rawLine, activeList) => {
+  const blockquote = blockquoteLineForOpening(rawLine);
+  const directList = listItemLine(blockquote.logical);
+  if (directList) {
+    const list = { quoteDepth: blockquote.depth, indent: directList.indent };
+    return { logical: directList.logical, quoteDepth: blockquote.depth, list, nextActiveList: list };
+  }
+
+  if (activeList?.quoteDepth === blockquote.depth) {
+    const indentation = blockquote.logical.match(/^ */)[0].length;
+    if (indentation >= activeList.indent) {
+      return {
+        logical: blockquote.logical.slice(activeList.indent),
+        quoteDepth: blockquote.depth,
+        list: activeList,
+        nextActiveList: activeList,
+      };
+    }
+    if (blockquote.logical.trim().length === 0) {
+      return { logical: "", quoteDepth: blockquote.depth, list: activeList, nextActiveList: activeList };
+    }
+  }
+
+  return { logical: blockquote.logical, quoteDepth: blockquote.depth, list: null, nextActiveList: null };
+};
+
+const fenceLineInside = (rawLine, fence) => {
+  const afterQuote = blockquoteLineAtDepth(rawLine, fence.quoteDepth);
+  if (afterQuote === null) return null;
+  if (fence.list === null) return afterQuote;
+  const indentation = afterQuote.match(/^ */)[0].length;
+  return indentation >= fence.list.indent ? afterQuote.slice(fence.list.indent) : null;
+};
+
+/**
+ * Fences read their marker, run length, and relative indentation from the grammar table. The
+ * closer uses the same marker and at least the opening length. A backtick in a backtick fence's
+ * info string is the CommonMark exception and does not open a fence.
+ */
+const openingFence = (containerLine) => {
+  const markerRuns = FENCE_GRAMMAR.markers
+    .map((marker) => `${escapeRegex(marker)}{${FENCE_GRAMMAR.minimumRun},}`)
+    .join("|");
+  const match = containerLine.logical.match(
+    new RegExp(`^ {0,${FENCE_GRAMMAR.relativeIndentMaximum}}(${markerRuns})(.*)$`),
+  );
+  if (!match || (match[1][0] === "`" && match[2].includes("`"))) return null;
+  return {
+    marker: match[1][0],
+    length: match[1].length,
+    quoteDepth: containerLine.quoteDepth,
+    list: containerLine.list,
+  };
+};
+
+const closesFence = (logicalLine, fence) =>
+  new RegExp(
+    `^ {0,${FENCE_GRAMMAR.relativeIndentMaximum}}${escapeRegex(fence.marker)}{${fence.length},}[\\t ]*$`,
+  ).test(logicalLine);
 
 const extractFromBody = (body) => {
   const lines = body.split("\n");
   let fence = null;
+  let activeList = null;
   const seenPath = new Set();
   const seenSymbolRow = new Set();
   const seenNonDurable = new Set();
+  const seenUnsupported = new Set();
   const pathCitations = [];
   const symbolCitations = [];
   const nonDurable = [];
+  const unsupportedCitations = [];
+
+  const noteUnsupported = (citation, reason) => {
+    const key = `${citation}:${reason}`;
+    if (seenUnsupported.has(key)) return;
+    seenUnsupported.add(key);
+    unsupportedCitations.push({ citation, reason });
+  };
 
   for (const rawLine of lines) {
     if (fence) {
-      if (closesFence(rawLine, fence)) {
+      const logical = fenceLineInside(rawLine, fence);
+      if (logical === null) {
+        fence = null;
+      } else if (closesFence(logical, fence)) {
         fence = null;
         continue;
       }
-    } else {
-      const opened = openingFence(rawLine);
+    }
+    if (!fence) {
+      const containerLine = fenceLineForOpening(rawLine, activeList);
+      activeList = containerLine.nextActiveList;
+      const opened = openingFence(containerLine);
       if (opened) {
         fence = opened;
         continue;
@@ -1698,6 +1991,21 @@ const extractFromBody = (body) => {
     // which is true but redundant and points a reader at "re-derive the claim from the code" for
     // something re-deriving cannot fix.
     const insideNonDurable = (idx) => nonDurableSpans.some(([s, e]) => idx >= s && idx < e);
+    const unsupportedCoordinateSpans = [];
+    for (const coordinateMatch of rawLine.matchAll(COORDINATE_SHAPED_RE)) {
+      if (insideUrl(coordinateMatch.index) || insideNonDurable(coordinateMatch.index)) continue;
+      const coordinate = coordinateMatch.groups.coordinate.replace(/[.,;:]+$/, "");
+      if (SUPPORTED_COORDINATE_RE.test(coordinate)) continue;
+      const raw = `${coordinateMatch[1]}${coordinate}`;
+      unsupportedCoordinateSpans.push([coordinateMatch.index, coordinateMatch.index + raw.length]);
+      noteUnsupported(
+        raw,
+        "line coordinate syntax is unsupported; use :<signed-decimal>[-<signed-decimal>] " +
+          "or #L<signed-decimal>[-L<signed-decimal>]",
+      );
+    }
+    const insideUnsupportedCoordinate = (idx) =>
+      unsupportedCoordinateSpans.some(([start, end]) => idx >= start && idx < end);
 
     // Round 4 opened content-checking to inline citations (not just fenced ones) — the #649
     // shape itself, written the ordinary way people actually write one, was never checked at
@@ -1738,14 +2046,23 @@ const extractFromBody = (body) => {
     //     description was never going to appear verbatim. `looksLikeCode` stays on this branch
     //     because dropping it here reintroduces exactly that false STALE — checked directly against
     //     this fixture before deciding, not assumed.
-    const contentAfter = (matchEnd, startLine) => {
+    const contentAfter = (matchStart, matchEnd, startLine) => {
+      const citationTail = citationOwnDelimiterTail(rawLine, matchStart, matchEnd);
+      if (citationTail.unsupportedReason !== null) {
+        noteUnsupported(rawLine.trim(), citationTail.unsupportedReason);
+        return null;
+      }
       if (startLine === null) return null;
-      const afterCitation = stripCitationSeparator(rawLine.slice(matchEnd));
+      const afterCitation = stripCitationSeparator(citationTail.tail);
       if (fence) {
         return afterCitation.length > 0 && looksLikeCode(afterCitation) ? afterCitation : null;
       }
       const delimited = readDelimitedSpan(afterCitation);
-      return delimited && delimited.length > 0 ? delimited : null;
+      if (delimited?.unsupportedReason) {
+        noteUnsupported(rawLine.trim(), delimited.unsupportedReason);
+        return null;
+      }
+      return delimited?.content && delimited.content.length > 0 ? delimited.content : null;
     };
 
     // A GitHub blob permalink to *this* repository is a precise, structured citation and is
@@ -1756,8 +2073,12 @@ const extractFromBody = (body) => {
       for (const m of rawLine.matchAll(URL_RE)) {
         const blob = parseGitHubBlobUrl(m[0]);
         if (blob === null || blob.slug !== repoSlug) continue;
+        if (blob.lineSyntaxError !== null) {
+          noteUnsupported(blob.raw, blob.lineSyntaxError);
+          continue;
+        }
         const resolution = resolveBlobRefAndPath(blob.refAndPathSegments);
-        const content = contentAfter(m.index + blob.raw.length, blob.startLine);
+        const content = contentAfter(m.index, m.index + blob.raw.length, blob.startLine);
         const key =
           `${resolution.path ?? ""}:${resolution.unresolvedReason ?? ""}:` +
           `${blob.startLine ?? ""}:${blob.endLine ?? ""}:${content ?? ""}`;
@@ -1777,6 +2098,7 @@ const extractFromBody = (body) => {
 
     for (const m of rawLine.matchAll(PATH_RE)) {
       if (insideNonDurable(m.index)) continue;
+      if (insideUnsupportedCoordinate(m.index)) continue;
       // Any URL, not only a GitHub blob link: a fragment of a hyperlink's text is not a citation
       // in its own right, whether or not it superficially carries a line-number-shaped suffix —
       // that leniency is exactly what let a URL fragment through as a fabricated path before. A
@@ -1811,7 +2133,7 @@ const extractFromBody = (body) => {
       if (startLine === null && !path.includes("/") && !bareDelimited) {
         continue;
       }
-      const content = contentAfter(m.index + m[0].length, startLine);
+      const content = contentAfter(m.index, m.index + m[0].length, startLine);
       // The quoted content is part of the identity, not decoration on top of it. Two citations of
       // the same `path:line` are two different claims when one of them also quotes code — a bare
       // `README.md:1` and a fenced `README.md:1  const definitelyGone = true` are not the same
@@ -1845,17 +2167,22 @@ const extractFromBody = (body) => {
     symbolCitations.push({ raw: m[0], path, symbols: [symbol] });
   }
 
-  return { pathCitations, symbolCitations, nonDurable };
+  return { pathCitations, symbolCitations, nonDurable, unsupportedCitations };
 };
 
 // --- classification ------------------------------------------------------------------------
 const stale = [];
 const unresolved = [];
+const unsupported = [];
 const advisory = [];
 const nonDurableFindings = [];
 
 for (const issue of issues) {
-  const { pathCitations, symbolCitations, nonDurable } = extractFromBody(issue.body ?? "");
+  const { pathCitations, symbolCitations, nonDurable, unsupportedCitations } = extractFromBody(issue.body ?? "");
+
+  for (const finding of unsupportedCitations) {
+    unsupported.push({ issue, citation: finding.citation, reason: finding.reason });
+  }
 
   for (const nd of nonDurable) {
     nonDurableFindings.push({ issue, path: nd.path });
@@ -1918,11 +2245,13 @@ for (const issue of issues) {
     // sees it because 0 is never past the end of anything. `README.md:20-10` is not out of range
     // either — it is backwards, and "beyond the file" is not what is wrong with it. Both are
     // checked before the file is even asked how long it is, because neither needs an answer.
-    if (citation.startLine < 1) {
+    if (citation.startLine < LINE_GRAMMAR.firstValidLine) {
       stale.push({
         issue,
         citation: citation.raw,
-        reason: `line ${citation.startLine} does not exist — a citation's first line is 1, not ${citation.startLine}`,
+        reason:
+          `line ${citation.startLine} does not exist — a citation's first line is ` +
+          `${LINE_GRAMMAR.firstValidLine}, not ${citation.startLine}`,
       });
       continue;
     }
@@ -2128,10 +2457,14 @@ for (const issue of issues) {
 
 // --- report ---------------------------------------------------------------------------------
 const nothingToReport =
-  stale.length === 0 && unresolved.length === 0 && nonDurableFindings.length === 0 && advisory.length === 0;
+  stale.length === 0 &&
+  unresolved.length === 0 &&
+  unsupported.length === 0 &&
+  nonDurableFindings.length === 0 &&
+  advisory.length === 0;
 
 if (asJson) {
-  console.log(JSON.stringify({ stale, unresolved, advisory, nonDurable: nonDurableFindings }, null, 2));
+  console.log(JSON.stringify({ stale, unresolved, unsupported, advisory, nonDurable: nonDurableFindings }, null, 2));
 } else if (!nothingToReport) {
   if (stale.length > 0) {
     console.log(`STALE (${stale.length}):`);
@@ -2144,6 +2477,14 @@ if (asJson) {
   if (unresolved.length > 0) {
     console.log(`\nUNRESOLVED (${unresolved.length}):`);
     for (const item of unresolved) {
+      console.log(`  #${item.issue.number} ${item.issue.title}`);
+      console.log(`    ${item.citation}`);
+      console.log(`    ${item.reason}`);
+    }
+  }
+  if (unsupported.length > 0) {
+    console.log(`\nUNSUPPORTED (${unsupported.length}):`);
+    for (const item of unsupported) {
       console.log(`  #${item.issue.number} ${item.issue.title}`);
       console.log(`    ${item.citation}`);
       console.log(`    ${item.reason}`);
@@ -2165,19 +2506,27 @@ if (asJson) {
     }
   }
   console.log(
-    `\n${stale.length} stale, ${unresolved.length} unresolved, ${nonDurableFindings.length} non-durable path citation(s), ` +
+    `\n${stale.length} stale, ${unresolved.length} unresolved, ${unsupported.length} unsupported, ` +
+      `${nonDurableFindings.length} non-durable path citation(s), ` +
       `${advisory.length} advisory ` +
       `(citations that resolve but should name a durable locus) across ${issues.length} open issue(s).`,
   );
-  if (stale.length > 0 || unresolved.length > 0 || nonDurableFindings.length > 0) {
+  if (stale.length > 0 || unresolved.length > 0 || unsupported.length > 0 || nonDurableFindings.length > 0) {
     console.log(
       "\nSTALE means the citation no longer describes the tree; re-derive the claim from the code, not the issue text.\n" +
         "UNRESOLVED means the check could not prove a multi-segment blob ref's path boundary; it did not call the file absent.\n" +
+        "UNSUPPORTED means an explicit citation-shaped form was seen but is outside the grammar above; rewrite it in a supported form.\n" +
         "NON_DURABLE means the citation names something the filesystem does not guarantee to keep;\n" +
         "commit it or accept it is gone. A contradictory issue edit does not repair any of these findings.",
     );
   }
-  if (advisory.length > 0 && (stale.length === 0 && nonDurableFindings.length === 0)) {
+  if (
+    advisory.length > 0 &&
+    stale.length === 0 &&
+    unresolved.length === 0 &&
+    unsupported.length === 0 &&
+    nonDurableFindings.length === 0
+  ) {
     console.log("\nADVISORY does not fail the build; pass --strict to promote it to a failure.");
   }
 }
@@ -2185,5 +2534,9 @@ if (asJson) {
 // always prints stops being read.
 
 const failing =
-  stale.length > 0 || unresolved.length > 0 || nonDurableFindings.length > 0 || (strict && advisory.length > 0);
+  stale.length > 0 ||
+  unresolved.length > 0 ||
+  unsupported.length > 0 ||
+  nonDurableFindings.length > 0 ||
+  (strict && advisory.length > 0);
 process.exit(failing ? 1 : 0);

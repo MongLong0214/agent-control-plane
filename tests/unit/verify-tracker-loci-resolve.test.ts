@@ -844,9 +844,14 @@ describe("verify-tracker-loci-resolve", () => {
     const forms = [
       ["bare path", "src/session/binding-registry.ts:163"],
       ["Markdown path", "[source](src/session/binding-registry.ts:163)"],
+      ["Markdown angle path", "[source](<src/session/binding-registry.ts:163>)"],
       [
         "Markdown blob URL",
         "[source](https://github.com/MongLong0214/agent-control-plane/blob/main/src/session/binding-registry.ts#L163)",
+      ],
+      [
+        "Markdown angle blob URL",
+        "[source](<https://github.com/MongLong0214/agent-control-plane/blob/main/src/session/binding-registry.ts#L163>)",
       ],
     ] as const;
 
@@ -1976,7 +1981,9 @@ describe("verify-tracker-loci-resolve", () => {
   });
 
   describe("round 19 GitHub Markdown fences and complete issue pagination", () => {
-    it("all GitHub Markdown fence spellings make vanished code stale", () => {
+    it("supported top level fence marker length indentation and info string forms make vanished code stale", () => {
+      // This table is intentionally top-level only: blockquote prefixes, same-line list markers,
+      // and list continuation indentation are a separate production-path table in round 23.
       const fences = [
         { label: "triple backticks", opening: "```ts", closing: "```" },
         { label: "triple tildes", opening: "~~~ts", closing: "~~~" },
@@ -2291,6 +2298,119 @@ describe("verify-tracker-loci-resolve", () => {
         expect(result.stdout).toContain("STALE");
         expect(result.stdout).toContain("no longer appears");
         expect(elapsedMs).toBeLessThan(2_000);
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  describe("round 23 citation grammar", () => {
+    it("a backtick run closes only at an equal length run", () => {
+      const forms = [
+        ["bare citation", "README.md:1 — ``const gone = `x`;``"],
+        ["two backtick citation", "``README.md:1`` — ``const gone = `x`;``"],
+      ] as const;
+
+      for (const [index, [label, body]] of forms.entries()) {
+        const { path, cleanup } = withIssues([
+          { number: 68963 + index, title: `${label} with two backtick content`, body },
+        ]);
+        try {
+          const result = run(path);
+          expect(result.status, result.stdout || result.stderr).toBe(1);
+          expect(result.stdout).toContain("STALE");
+          expect(result.stdout).toContain("const gone = `x`;");
+          expect(result.stdout).toContain("no longer appears");
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it("blockquote and list container relative fences make vanished code stale", () => {
+      const forms = [
+        {
+          label: "blockquote",
+          body: ["> ```ts", "> README.md:1  const definitelyGoneXYZ = true", "> ```"].join("\n"),
+        },
+        {
+          label: "bullet list",
+          body: ["- ```ts", "  README.md:1  const definitelyGoneXYZ = true", "  ```"].join("\n"),
+        },
+        {
+          label: "ordered list",
+          body: ["1. ```ts", "   README.md:1  const definitelyGoneXYZ = true", "   ```"].join("\n"),
+        },
+        {
+          label: "list continuation",
+          body: ["- item", "  ```ts", "  README.md:1  const definitelyGoneXYZ = true", "  ```"].join("\n"),
+        },
+        {
+          label: "nested blockquote",
+          body: ["> > ```ts", "> > README.md:1  const definitelyGoneXYZ = true", "> > ```"].join("\n"),
+        },
+        {
+          label: "blockquote list",
+          body: ["> - ```ts", ">   README.md:1  const definitelyGoneXYZ = true", ">   ```"].join("\n"),
+        },
+      ] as const;
+
+      for (const [index, form] of forms.entries()) {
+        const { path, cleanup } = withIssues([
+          { number: 68964 + index, title: `${form.label} fenced quote`, body: form.body },
+        ]);
+        try {
+          const result = run(path);
+          expect(result.status, `${form.label}: ${result.stdout || result.stderr}`).toBe(1);
+          expect(result.stdout).toContain("STALE");
+          expect(result.stdout).toContain("definitelyGoneXYZ");
+          expect(result.stdout).toContain("no longer appears");
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it("negative line numbers in every supported coordinate form are stale instead of invisible", () => {
+      const forms = [
+        ["bare colon", "README.md:-1"],
+        ["bare anchor", "README.md#L-1"],
+        [
+          "blob anchor",
+          "https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#L-1",
+        ],
+      ] as const;
+
+      for (const [index, [label, body]] of forms.entries()) {
+        const { path, cleanup } = withIssues([{ number: 68967 + index, title: `${label} negative line`, body }]);
+        try {
+          const result = run(path);
+          expect(result.status, result.stdout || result.stderr).toBe(1);
+          expect(result.stdout).toContain("STALE");
+          expect(result.stdout).toContain(body);
+          expect(result.stdout).toContain("line -1 does not exist");
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it("explicit citation shapes outside the grammar fail as unsupported instead of disappearing", () => {
+      const body = [
+        "README.md:+1",
+        "README.md:1 — ``unterminated",
+        '[source](README.md:1 "title")',
+        "https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#heading",
+      ].join("\n");
+      const { path, cleanup } = withIssues([{ number: 68968, title: "unsupported citation grammar", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout || result.stderr).toBe(1);
+        expect(result.stdout).toContain("UNSUPPORTED (4)");
+        expect(result.stdout).toContain("README.md:+1");
+        expect(result.stdout).toContain("no same-line closing run");
+        expect(result.stdout).toContain("without a destination title");
+        expect(result.stdout).toContain("#heading is unsupported");
       } finally {
         cleanup();
       }
