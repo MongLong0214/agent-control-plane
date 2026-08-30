@@ -762,13 +762,7 @@ export class CtoLifecycle {
         // await is invisible to any check that runs before it, and still reaches the
         // compensation path after it (see the `completed` tx below).
         try {
-          await this.providers.require(session.provider).stopSession({
-            externalSessionId: current.sessionId,
-            provider: session.provider,
-            model: session.model,
-            effort: session.effort,
-            pid: session.osPid,
-          });
+          await this.providers.require(session.provider).stopSession(handleFor(session));
         } catch (error) {
           this.db.tx(() => {
             const latest = this.sessions.require(current.sessionId);
@@ -1146,13 +1140,7 @@ export class CtoLifecycle {
     const session = this.sessions.get(sessionId);
     if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
     try {
-      await this.providers.require(session.provider).stopSession({
-        externalSessionId: sessionId,
-        provider: session.provider,
-        model: session.model,
-        effort: session.effort,
-        pid: session.osPid,
-      });
+      await this.providers.require(session.provider).stopSession(handleFor(session));
       this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
     } catch (error) {
       this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);

@@ -99,8 +99,13 @@ export class ScriptedAdapter implements ProviderAdapter {
     };
   }
 
-  async stopSession(handle?: SessionHandle): Promise<void> {
-    if (!handle || handle.provider !== this.provider) return;
+  async stopSession(handle: SessionHandle): Promise<void> {
+    if (handle.provider !== this.provider) {
+      throw new Error(`scripted adapter ${this.provider} cannot stop a ${handle.provider} session`);
+    }
+    if (!this.#knownSessions.has(handle.externalSessionId)) {
+      throw new Error(`scripted adapter ${this.provider} does not know session ${handle.externalSessionId}`);
+    }
     this.#knownSessions.delete(handle.externalSessionId);
     this.#sessionHealth.delete(handle.externalSessionId);
   }

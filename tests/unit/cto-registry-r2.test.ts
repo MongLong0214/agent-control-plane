@@ -21,6 +21,7 @@ import {
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+import type { SessionHandle } from "../../src/runtime/provider.ts";
 
 const deadSessionFinding = (report: DoctorReport) =>
   report.findings.find((f) => f.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION");
@@ -170,6 +171,36 @@ describe("round-2 CTO lifecycle regressions", () => {
     expect(harness.cp.sessions.require(bound.value.sessionId).lifecycle).toBe(SessionLifecycle.READY);
   });
 
+  it("#692 refused switchover stops its unused provider session", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
+    if (!bound.allowed) throw new Error(bound.message);
+
+    const originalStart = harness.scripted.startSession.bind(harness.scripted);
+    let unusedHandle: SessionHandle | undefined;
+    harness.scripted.startSession = async (spec) => {
+      unusedHandle = await originalStart(spec);
+      const run = harness.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!run.allowed) throw new Error(run.message);
+      const dispatched = await harness.cp.runs.dispatch(run.value.runId);
+      if (!dispatched.allowed) throw new Error(dispatched.message);
+      return unusedHandle;
+    };
+
+    const refused = await harness.cp.cto.prepareSwitchover(projectId, HANDOFF);
+
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.SWITCHOVER_BLOCKED_ACTIVE_RUNS);
+    if (!unusedHandle) throw new Error("replacement provider session was not constituted");
+    expect(await harness.scripted.probeSession(unusedHandle)).toBe("UNAVAILABLE");
+  });
+
   it("#148 refuses a handoff ACK that knows only the incoming session id", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
@@ -206,6 +237,40 @@ describe("round-2 CTO lifecycle regressions", () => {
     expect(harness.cp.runs.require(run.runId).state).toBe(RunState.BLOCKED);
     expect(harness.cp.cto.latestHandoff(projectId)?.status).toBe("PENDING");
     expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+  });
+
+  it("#692 suspend stops the constituted provider session", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    await createActiveRun(harness, projectId, repositoryId);
+    const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+    const session = harness.cp.sessions.require(binding.sessionId);
+    const providerHandle = {
+      externalSessionId: session.incarnation.split("#", 1)[0]!,
+      provider: session.provider,
+      model: session.model,
+      effort: session.effort,
+      pid: session.osPid,
+      workdir: session.workdir ?? undefined,
+    };
+    expect(await harness.scripted.probeSession(providerHandle)).toBe("HEALTHY");
+
+    const suspended = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
+
+    expect(suspended.allowed).toBe(true);
+    expect(await harness.scripted.probeSession(providerHandle)).toBe("UNAVAILABLE");
+  });
+
+  it("#692 scripted adapter refuses an unknown provider session", async () => {
+    const harness = makeHarness();
+
+    await expect(harness.scripted.stopSession({
+      externalSessionId: "provider-session-not-constituted",
+      provider: harness.scripted.provider,
+      model: "scripted-cto",
+      effort: null,
+      pid: null,
+    })).rejects.toThrow("does not know session provider-session-not-constituted");
   });
 
   it("#151 reports provider stop failure and keeps the binding instead of claiming a clean suspension", async () => {

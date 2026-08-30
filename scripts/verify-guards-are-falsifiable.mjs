@@ -1374,6 +1374,43 @@ const GUARDS = [
     ],
   },
   {
+    // Sol's fourth-round finding: the control plane persists a `ses_cto_...` alias beside
+    // the provider-issued id in `incarnation`. Only the latter addresses the runtime;
+    // passing the alias let the scripted adapter report success while leaving the
+    // constituted provider session healthy.
+    what: "suspendProject stops the constituted provider session rather than its control-plane alias",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        try {\n          await this.providers.require(session.provider).stopSession(handleFor(session));",
+    replace: "        try {\n          await this.providers.require(session.provider).stopSession({ ...handleFor(session), externalSessionId: current.sessionId });",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 suspend stops the constituted provider session",
+    ],
+  },
+  {
+    // The wider identifier audit found the same alias reconstruction in the cleanup for
+    // a replacement that was constituted but never became authoritative. That session is
+    // provider state too, so the same durable handle reconstruction applies.
+    what: "a refused switchover stops its unused provider session rather than its control-plane alias",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "    try {\n      await this.providers.require(session.provider).stopSession(handleFor(session));",
+    replace: "    try {\n      await this.providers.require(session.provider).stopSession({ ...handleFor(session), externalSessionId: sessionId });",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 refused switchover stops its unused provider session",
+    ],
+  },
+  {
+    // A deterministic adapter that accepts an id it never constituted hides exactly the
+    // wrong-identifier defect above. Unknown provider handles are failures, not idempotent
+    // successes; callers that want idempotence already avoid stopping a STOPPED session.
+    what: "the scripted adapter refuses to stop a provider session it never constituted",
+    file: "src/runtime/scripted-adapter.ts",
+    find: "    if (!this.#knownSessions.has(handle.externalSessionId)) {\n      throw new Error(`scripted adapter ${this.provider} does not know session ${handle.externalSessionId}`);\n    }",
+    replace: "    if (false) {\n      throw new Error(`scripted adapter ${this.provider} does not know session ${handle.externalSessionId}`);\n    }",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 scripted adapter refuses an unknown provider session",
+    ],
+  },
+  {
     // #692 — before this fix, the whole stop+revoke sequence was skipped once the
     // session was already STOPPED, on the assumption that STOPPED implied the binding
     // had been revoked too. A denied revoke can now leave STOPPED committed without a
