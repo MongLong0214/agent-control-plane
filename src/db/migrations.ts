@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 33;
+export const SCHEMA_VERSION = 34;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2159,6 +2159,45 @@ const v33: SchemaMigration = {
   checksum: () => migrationChecksum("v33-back-up-before-telegram-settlement-state"),
 };
 
+/**
+ * Persists the raw Hermes target-bind receipt and bootstrap executor expectation beside the
+ * attestation that cites its digest.
+ *
+ * Both columns are deliberately nullable and receive no backfill. A v33 attestation has neither
+ * raw executor response nor the independent bootstrap expectation, and fabricating either from
+ * ACP configuration would turn missing proof into false authority. Current-receipt readers
+ * therefore treat either NULL legacy value as unverifiable.
+ */
+const v34: SchemaMigration = {
+  id: "v34-persist-hermes-target-bind-receipt-evidence",
+  fromVersion: 33,
+  toVersion: 34,
+  apply: (raw) => {
+    const columns = (
+      raw.prepare(`SELECT name FROM pragma_table_info('actor_target_attestations')`).all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+    if (!columns.includes("target_bind_receipt_json")) {
+      raw.exec(`
+        ALTER TABLE actor_target_attestations
+        ADD COLUMN target_bind_receipt_json TEXT CHECK (
+          target_bind_receipt_json IS NULL OR json_valid(target_bind_receipt_json)
+        )
+      `);
+    }
+    if (!columns.includes("target_bind_executor_runtime_identity")) {
+      raw.exec(`
+        ALTER TABLE actor_target_attestations
+        ADD COLUMN target_bind_executor_runtime_identity TEXT CHECK (
+          target_bind_executor_runtime_identity IS NULL OR length(target_bind_executor_runtime_identity) > 0
+        )
+      `);
+    }
+  },
+  checksum: () => migrationChecksum("v34-persist-hermes-target-bind-receipt-evidence"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2182,6 +2221,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v31,
   v32,
   v33,
+  v34,
 ]);
 
 interface RequiredTrigger {
