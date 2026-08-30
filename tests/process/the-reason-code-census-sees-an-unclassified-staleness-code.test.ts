@@ -17,12 +17,11 @@ afterAll(cleanupTempDirs);
  * tests/process/the-replace-census-sees-every-guard-form.test.ts and
  * tests/process/the-tx-denial-census-sees-a-write-then-deny.test.ts.
  *
- * `#704` (open at the time this test was written) fixes the real, pre-existing
- * `CEO_CONVERSATION_STALE` defect this issue's measurement found. This test does not assume
- * that fix has landed: it measures the working tree's own baseline exit code first, then
- * proves that adding one synthetic `_STALE` code with no `STALENESS_REASON_CODES` entry is
- * exactly what turns a run red, and that removing that one addition returns to the measured
- * baseline — so the assertion holds whether #704 has merged yet or not.
+ * `#704` fixed the real `CEO_CONVERSATION_STALE` defect this issue's measurement found. The
+ * production entrypoint must therefore be green before this check is wired into CI. This test
+ * runs that entrypoint in the actual worktree and requires exit 0, then proves in a scratch
+ * copy that adding one synthetic `_STALE` code with no `STALENESS_REASON_CODES` entry turns
+ * the same census red and removing the addition turns it green again.
  */
 const ROOT = process.cwd();
 const SCRIPT = "scripts/verify-reason-codes.mjs";
@@ -45,6 +44,11 @@ const censusOn = (catalogueSource: string): { status: number | null; stdout: str
   return { status: done.status, stdout: done.stdout, stderr: done.stderr };
 };
 
+const runRealEntrypoint = (): { status: number | null; stdout: string; stderr: string } => {
+  const done = spawnSync("node", [SCRIPT], { cwd: ROOT, encoding: "utf8" });
+  return { status: done.status, stdout: done.stdout, stderr: done.stderr };
+};
+
 const CURRENT = () => readFileSync(join(ROOT, CATALOGUE), "utf8");
 
 /** Inserts one new code, ending in `_STALE`, immediately before the catalogue's closing brace —
@@ -58,12 +62,11 @@ const withUnclassifiedStalenessCode = (source: string): string => {
 };
 
 describe("the reason-code census reports a staleness verdict absent from STALENESS_REASON_CODES", () => {
-  it("measures the working tree's own baseline first, so later assertions don't assume #704 has merged", () => {
-    const baseline = censusOn(CURRENT());
-    // Either possible baseline is a valid starting point for the rest of this file: 0 if #704
-    // has merged, 1 (naming CEO_CONVERSATION_STALE) if it has not. Anything else means the
-    // fixture stopped matching the file it reads.
-    expect([0, 1]).toContain(baseline.status);
+  it("the real entrypoint exits 0 on the working tree", () => {
+    const done = runRealEntrypoint();
+
+    expect(done.status).toBe(0);
+    expect(done.stdout).toContain("none missing");
   });
 
   it("fails on a synthetic _STALE code with no STALENESS_REASON_CODES entry", () => {
@@ -74,13 +77,12 @@ describe("the reason-code census reports a staleness verdict absent from STALENE
     expect(done.stderr).toContain("absent from STALENESS_REASON_CODES");
   });
 
-  it("returns to the measured baseline once the synthetic code is removed", () => {
-    const baseline = censusOn(CURRENT());
+  it("exits 0 again once the synthetic code is removed", () => {
     const injected = censusOn(withUnclassifiedStalenessCode(CURRENT()));
     const restored = censusOn(CURRENT());
 
     expect(injected.status).toBe(1);
-    expect(restored.status).toBe(baseline.status);
+    expect(restored.status).toBe(0);
     expect(restored.stderr).not.toContain("CENSUS_PROBE_SYNTHETIC_STALE");
   });
 });
