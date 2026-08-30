@@ -12,6 +12,7 @@ import {
   stripStrings,
   stripTemplateLiteralProse,
   stripYamlSource,
+  STRING_BOUNDARY_RULES,
 } from "../../scripts/lib/tracker-loci-strip.mjs";
 
 /**
@@ -201,7 +202,139 @@ describe("tracker-loci strip invariants", () => {
     expect(out.split("\n").length).toBe(input.split("\n").length);
   });
 
+  const languageStringRules = [
+    {
+      language: "Python",
+      form: "triple double quote",
+      opener: '"""',
+      closer: '"""',
+      escapeRule: "backslash escapes the next character",
+      backslashEscapes: "any",
+      rawNewlineEndsSpan: false,
+      source: ['"""has " quote', 'still string"""', 'PYTHON_SYMBOL = "x"'].join("\n"),
+      hidden: "still string",
+      visible: "PYTHON_SYMBOL",
+      strip: (source: string) => stripPythonSource(source, true),
+    },
+    {
+      language: "Python",
+      form: "triple single quote",
+      opener: "'''",
+      closer: "'''",
+      escapeRule: "backslash escapes the next character",
+      backslashEscapes: "any",
+      rawNewlineEndsSpan: false,
+      source: ["'''has ' apostrophe", "still string'''", 'PYTHON_SYMBOL = "x"'].join("\n"),
+      hidden: "still string",
+      visible: "PYTHON_SYMBOL",
+      strip: (source: string) => stripPythonSource(source, true),
+    },
+    {
+      language: "Python",
+      form: "short double quote",
+      opener: '"',
+      closer: '"',
+      escapeRule: "backslash escapes the next character",
+      backslashEscapes: "any",
+      rawNewlineEndsSpan: true,
+      source: ['"unterminated short string', "PYTHON_SYMBOL = 1"].join("\n"),
+      hidden: "unterminated short string",
+      visible: "PYTHON_SYMBOL",
+      strip: (source: string) => stripPythonSource(source, true),
+    },
+    {
+      language: "Python",
+      form: "short single quote",
+      opener: "'",
+      closer: "'",
+      escapeRule: "backslash escapes the next character",
+      backslashEscapes: "any",
+      rawNewlineEndsSpan: true,
+      source: ["'unterminated short string", "PYTHON_SYMBOL = 1"].join("\n"),
+      hidden: "unterminated short string",
+      visible: "PYTHON_SYMBOL",
+      strip: (source: string) => stripPythonSource(source, true),
+    },
+    {
+      language: "Bash",
+      form: "ANSI C quote",
+      opener: "$'",
+      closer: "'",
+      escapeRule: "backslash escapes the next character",
+      backslashEscapes: "any",
+      rawNewlineEndsSpan: false,
+      source: ["echo $'has \\' quote", "expect'", "SHELL_SYMBOL=1"].join("\n"),
+      hidden: "expect",
+      visible: "SHELL_SYMBOL",
+      strip: (source: string) => stripShellSource(source, true),
+    },
+    {
+      language: "Bash",
+      form: "single quote",
+      opener: "'",
+      closer: "'",
+      escapeRule: "nothing escapes the delimiter",
+      backslashEscapes: [],
+      rawNewlineEndsSpan: false,
+      source: ["echo 'first line", "expect'", "SHELL_SYMBOL=1"].join("\n"),
+      hidden: "expect",
+      visible: "SHELL_SYMBOL",
+      strip: (source: string) => stripShellSource(source, true),
+    },
+    {
+      language: "Bash",
+      form: "double quote",
+      opener: '"',
+      closer: '"',
+      escapeRule: "backslash escapes dollar backtick double quote backslash and newline",
+      backslashEscapes: ["$", "`", '"', "\\", "\n"],
+      rawNewlineEndsSpan: false,
+      source: ['echo "has \\" quote', 'expect"', "SHELL_SYMBOL=1"].join("\n"),
+      hidden: "expect",
+      visible: "SHELL_SYMBOL",
+      strip: (source: string) => stripShellSource(source, true),
+    },
+  ] as const;
+
+  it.each(languageStringRules)(
+    "$language $form opens with $opener closes with $closer uses $escapeRule and raw newline ends span is $rawNewlineEndsSpan",
+    ({ language, form, opener, closer, backslashEscapes, rawNewlineEndsSpan, source, strip, hidden, visible }) => {
+      const rules = language === "Python" ? STRING_BOUNDARY_RULES.python : STRING_BOUNDARY_RULES.shell;
+      expect(rules).toContainEqual({
+        form,
+        open: opener,
+        close: closer,
+        backslashEscapes,
+        rawNewlineEndsSpan,
+      });
+      const out = strip(source);
+      expect(out).not.toContain(hidden);
+      expect(out).toContain(visible);
+      expect(out.split("\n")).toHaveLength(source.split("\n").length);
+    },
+  );
+
   describe("stripPythonSource (#700)", () => {
+    it.each([
+      ["triple double quote plain", '"""plain"""'],
+      ["triple double quote with apostrophe", '"""has \' apos"""'],
+      ["triple double quote with double quote", '"""has " quote"""'],
+      ["triple single quote plain", "'''plain'''"],
+      ["f-string", 'f"value {1 + 1}"'],
+      ["raw string", 'r"has \\" quote"'],
+      ["raw f-string with triple quotes", 'rf"""has " quote"""'],
+      ["escaped quote", '"has \\" quote"'],
+      ["escaped newline", '"line one \\\nline two"'],
+    ])("keeps the Python %s delimiter aligned through the following symbol", (_label, literal) => {
+      const input = ["def f():", `    ${literal}`, '    SYM = "x"'].join("\n");
+      const genericOut = stripStrings(input);
+      const productionOut = stripPythonSource(input, true);
+      expect(genericOut).toContain("SYM");
+      expect(productionOut).toContain("SYM");
+      expect(genericOut.split("\n")).toHaveLength(input.split("\n").length);
+      expect(productionOut.split("\n")).toHaveLength(input.split("\n").length);
+    });
+
     it("pairs a triple-quoted docstring as one delimiter, not three single quotes, and does not desync what follows", () => {
       // The exact shape of the reported bug: a triple-quoted string ahead of real code. The old
       // stripStrings(stripHashComments(text)) pipeline read the opening `"""` as an empty string
@@ -582,11 +715,12 @@ describe("tracker-loci strip invariants", () => {
       expect(stripShellSource(input, true)).toBe('echo "    "\nx=11');
     });
 
-    it("an unterminated single-quoted string is blanked to where it actually ends", () => {
-      const input = "echo 'never closes\nx=12";
+    it("a raw newline does not end a Bash single-quoted string", () => {
+      const input = "echo 'first line\nexpect'\nx=12";
       const out = stripShellSource(input, true);
-      expect(out.split("\n")[0]).toBe("echo '            ");
-      expect(out.split("\n")[1]).toBe("x=12");
+      expect(out.split("\n")[0]).toBe("echo '          ");
+      expect(out.split("\n")[1]).toBe("      '");
+      expect(out.split("\n")[2]).toBe("x=12");
     });
 
     it("#689 round 18: a heredoc body's own # comment (at a word boundary) IS stripped now — the false green the real corpus reproduced", () => {
@@ -601,15 +735,24 @@ describe("tracker-loci strip invariants", () => {
       expect(stripShellSource(input, false)).toBe(expected); // comments are unconditional, not gated on blankStrings
     });
 
-    it("#689 round 18: a quoted string inside a heredoc body is never blanked, in either view — a # inside it is not a comment", () => {
-      // Narrower than treating the whole body as code of its content language: quoted-string
-      // *content* inside a heredoc is left exactly as it was (unlike an ordinary quoted string
-      // outside a heredoc, which the symbol view blanks) so a real occurrence reached through a
-      // command substitution inside a double-quoted string — `required_keychain_value`'s own call
-      // site in this same file's heredoc — is not erased along with genuine string prose.
+    it("a quoted string inside a heredoc body follows the selected symbol or content view", () => {
       const input = 'cat <<\'EOF\'\necho "value #notacomment"\nEOF\nx=13b';
-      expect(stripShellSource(input, true)).toBe(input);
+      const symbolView = stripShellSource(input, true);
+      expect(symbolView).not.toContain("value");
+      expect(symbolView).not.toContain("#notacomment");
       expect(stripShellSource(input, false)).toBe(input);
+    });
+
+    it("balanced command substitution inside a double-quoted string remains searchable code", () => {
+      const input = 'token="$(required_keychain_value TOKEN)"';
+      const symbolView = stripShellSource(input, true);
+      expect(symbolView).toContain("required_keychain_value");
+      expect(symbolView).toContain("TOKEN");
+    });
+
+    it("escaped command substitution text inside a double quote stays string prose", () => {
+      const input = 'token="\\$(not_shell_code)"';
+      expect(stripShellSource(input, true)).not.toContain("not_shell_code");
     });
 
     it("#689 round 18: the real deploy/install-launchd.sh — CODEX_HOME (only mentioned inside a heredoc's own # comment) is excluded from both views", () => {
@@ -632,9 +775,13 @@ describe("tracker-loci strip invariants", () => {
       expect(stripShellSource(input, true)).toBe('cat <<< "    "\nx=15');
     });
 
-    it("an unterminated heredoc passes the rest of the file through verbatim", () => {
-      const input = "cat <<'EOF'\nnever\nterminates";
-      expect(stripShellSource(input, true)).toBe(input);
+    it("an unterminated heredoc applies the selected view through end of file", () => {
+      const input = "cat <<'EOF'\necho 'hidden'\nvisible_command";
+      const symbolView = stripShellSource(input, true);
+      expect(symbolView).not.toContain("hidden");
+      expect(symbolView).toContain("visible_command");
+      expect(stripShellSource(input, false)).toBe(input);
+      expect(symbolView.split("\n")).toHaveLength(input.split("\n").length);
     });
 
     it("the real deploy/install-launchd.sh: required_keychain_value survives all three real occurrences", () => {
@@ -760,7 +907,7 @@ describe("tracker-loci strip invariants", () => {
     });
 
     it("an unterminated string is blanked to end of file — a raw newline does not end a SQL string", () => {
-      // Unlike JS/shell, a real SQL string literal can legitimately contain a raw newline
+      // Like Bash but unlike JS, a real SQL string literal can legitimately contain a raw newline
       // (confirmed against better-sqlite3 directly), so an unterminated one is not cut off at the
       // first line break — it consumes to true end of input, the same disclosed answer
       // `stripJsSource`/`stripShellSource` give an unterminated template literal/heredoc.
@@ -798,23 +945,18 @@ describe("tracker-loci strip invariants", () => {
       }
     });
 
-    it("a constructed instance of the cascading defect: a symbol only inside a string with an embedded -- reads STALE only after the fix", () => {
-      // The real corpus has no live instance of this (see the test above), so this constructs the
-      // same shape round 16 found for real in deploy/install-launchd.sh: a -- embedded in a
-      // '...' string destroys that string's closing quote under the old pipeline, and
-      // stripStrings' whole-file regex pairs the orphaned quote with the next ' in the file,
-      // desynchronizing everything after it.
+    it("a symbol inside a SQL string with an embedded comment marker is excluded without hiding later code", () => {
+      // The real corpus has no live instance of this (see the test above), so this drives the SQL
+      // production scanner through the same delimiter-ordering shape round 16 found in shell.
       const text = [
         "SELECT 'note: value--marker still a string' AS explanation;",
         "SELECT 'first' AS a;",
         "SELECT 'onlyInsideThisSqlString' AS b;",
         "CREATE TABLE real_table_marker (id INTEGER);",
       ].join("\n");
-      const oldSym = stripStrings(stripSqlComments(text));
       const newSym = stripSqlSource(text, true);
-      expect(oldSym).toContain("onlyInsideThisSqlString"); // the old bug, reproduced
-      expect(newSym).not.toContain("onlyInsideThisSqlString"); // fixed: correctly blanked
-      expect(newSym).toContain("real_table_marker"); // real code still resolves
+      expect(newSym).not.toContain("onlyInsideThisSqlString");
+      expect(newSym).toContain("real_table_marker");
     });
   });
 });

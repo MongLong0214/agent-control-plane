@@ -33,6 +33,194 @@ import ts from "typescript";
 export const blankKeepingNewlines = (match) => match.replace(/[^\n]/g, " ");
 
 /**
+ * Quote boundaries for the two dispatches whose review counterexamples depend on delimiter width
+ * and raw-newline behavior. Longest openers come first so Python's triple quotes and Bash's `$'`
+ * are each one token, never a sequence of shorter quote tokens.
+ *
+ * `backslashEscapes` names exactly which following characters cannot act as syntax: `"any"` for
+ * Python and Bash ANSI-C quotes, an empty list for Bash single quotes, and Bash's five special
+ * double-quote characters for Bash double quotes. `rawNewlineEndsSpan` says whether an unescaped
+ * newline ends an unterminated quoted span: Python's short strings do; Python triple strings and
+ * all three Bash quote forms do not. Python's `f`/`r` prefixes sit before these delimiters and do
+ * not change their boundary rules; f-string replacement fields remain part of the blanked span.
+ */
+export const STRING_BOUNDARY_RULES = Object.freeze({
+  python: Object.freeze([
+    {
+      form: "triple double quote",
+      open: '"""',
+      close: '"""',
+      backslashEscapes: "any",
+      rawNewlineEndsSpan: false,
+    },
+    {
+      form: "triple single quote",
+      open: "'''",
+      close: "'''",
+      backslashEscapes: "any",
+      rawNewlineEndsSpan: false,
+    },
+    { form: "short double quote", open: '"', close: '"', backslashEscapes: "any", rawNewlineEndsSpan: true },
+    { form: "short single quote", open: "'", close: "'", backslashEscapes: "any", rawNewlineEndsSpan: true },
+  ]),
+  shell: Object.freeze([
+    { form: "ANSI C quote", open: "$'", close: "'", backslashEscapes: "any", rawNewlineEndsSpan: false },
+    { form: "single quote", open: "'", close: "'", backslashEscapes: Object.freeze([]), rawNewlineEndsSpan: false },
+    {
+      form: "double quote",
+      open: '"',
+      close: '"',
+      backslashEscapes: Object.freeze(["$", "`", '"', "\\", "\n"]),
+      rawNewlineEndsSpan: false,
+    },
+  ]),
+});
+
+const backslashEscapesNext = (text, index, rule) =>
+  text[index] === "\\" &&
+  index + 1 < text.length &&
+  (rule.backslashEscapes === "any" || rule.backslashEscapes.includes(text[index + 1]));
+
+/** Returns the matching quote rule and its exact span, or null when no rule opens at `start`. */
+const readQuotedSpan = (text, start, rules) => {
+  const rule = rules.find(({ open }) => text.startsWith(open, start));
+  if (!rule) return null;
+
+  let end = start + rule.open.length;
+  while (end < text.length) {
+    if (backslashEscapesNext(text, end, rule)) {
+      end += 2;
+      continue;
+    }
+    if (text.startsWith(rule.close, end)) {
+      return { rule, end: end + rule.close.length, closed: true };
+    }
+    if (rule.rawNewlineEndsSpan && (text[end] === "\n" || text[end] === "\r")) {
+      return { rule, end, closed: false };
+    }
+    end++;
+  }
+  return { rule, end, closed: false };
+};
+
+/** Blanks one already-recognized quoted span while preserving its delimiters and every newline. */
+const renderQuotedSpan = (span, rule, closed, blankStrings) => {
+  if (!blankStrings) return span;
+  const closeLength = closed ? rule.close.length : 0;
+  const interior = span.slice(rule.open.length, span.length - closeLength);
+  return (
+    span.slice(0, rule.open.length) +
+    blankKeepingNewlines(interior) +
+    (closeLength ? span.slice(-closeLength) : "")
+  );
+};
+
+const isShellWordBoundaryBefore = (text, index) =>
+  index === 0 || [" ", "\t", "\n", ";", "|", "&", "(", ")"].includes(text[index - 1]);
+
+/** Finds the `)` paired with a Bash `$(`, ignoring parentheses inside nested quoted spans. */
+const readShellCommandSubstitution = (text, start) => {
+  let depth = 1;
+  let end = start + 2;
+  while (end < text.length) {
+    if (text[end] === "\\" && end + 1 < text.length) {
+      end += 2;
+      continue;
+    }
+    const quoted = readShellQuotedSpan(text, end);
+    if (quoted) {
+      end = quoted.end;
+      continue;
+    }
+    if (text[end] === "#" && isShellWordBoundaryBefore(text, end)) {
+      while (end < text.length && text[end] !== "\n") end++;
+      continue;
+    }
+    if (text.startsWith("$(", end)) {
+      depth++;
+      end += 2;
+      continue;
+    }
+    if (text[end] === "(") {
+      depth++;
+      end++;
+      continue;
+    }
+    if (text[end] === ")") {
+      depth--;
+      end++;
+      if (depth === 0) return { end, closed: true };
+      continue;
+    }
+    end++;
+  }
+  return { end, closed: false };
+};
+
+/**
+ * Applies the shell rule table while letting a balanced `$()` body carry its own nested quotes.
+ * Without this, an inner `"` would be mistaken for the close of the surrounding double quote.
+ */
+const readShellQuotedSpan = (text, start) => {
+  const rule = STRING_BOUNDARY_RULES.shell.find(({ open }) => text.startsWith(open, start));
+  if (!rule) return null;
+
+  let end = start + rule.open.length;
+  while (end < text.length) {
+    if (backslashEscapesNext(text, end, rule)) {
+      end += 2;
+      continue;
+    }
+    if (rule.form === "double quote" && text.startsWith("$(", end)) {
+      const command = readShellCommandSubstitution(text, end);
+      end = command.end;
+      if (!command.closed) return { rule, end, closed: false };
+      continue;
+    }
+    if (text.startsWith(rule.close, end)) {
+      return { rule, end: end + rule.close.length, closed: true };
+    }
+    if (rule.rawNewlineEndsSpan && (text[end] === "\n" || text[end] === "\r")) {
+      return { rule, end, closed: false };
+    }
+    end++;
+  }
+  return { rule, end, closed: false };
+};
+
+/** Blanks shell string prose but recursively retains code inside balanced `$()` substitutions. */
+const renderShellQuotedSpan = (span, rule, closed, blankStrings) => {
+  if (!blankStrings || rule.form !== "double quote") {
+    return renderQuotedSpan(span, rule, closed, blankStrings);
+  }
+
+  const closeLength = closed ? rule.close.length : 0;
+  const interiorEnd = span.length - closeLength;
+  let out = span.slice(0, rule.open.length);
+  let cursor = rule.open.length;
+  let proseStart = cursor;
+  while (cursor < interiorEnd) {
+    if (backslashEscapesNext(span, cursor, rule)) {
+      cursor += 2;
+      continue;
+    }
+    if (!span.startsWith("$(", cursor)) {
+      cursor++;
+      continue;
+    }
+    const command = readShellCommandSubstitution(span, cursor);
+    if (!command.closed || command.end > interiorEnd) break;
+    out += blankKeepingNewlines(span.slice(proseStart, cursor));
+    out += "$(" + stripShellSource(span.slice(cursor + 2, command.end - 1), true) + ")";
+    cursor = command.end;
+    proseStart = cursor;
+  }
+  out += blankKeepingNewlines(span.slice(proseStart, interiorEnd));
+  if (closeLength) out += span.slice(-closeLength);
+  return out;
+};
+
+/**
  * Removes `//` line comments and `/* ... *\/` block comments before a symbol search, so a symbol
  * mentioned only in prose about the code — a comment explaining what a mechanism used to do, or
  * warning about a related concept — does not count toward it. A comment mentioning a word is a
@@ -64,31 +252,41 @@ export const stripSqlComments = (text) =>
     .join("\n");
 
 /**
- * Removes the contents of single- and double-quoted string literals (the opening and closing
- * quote characters are kept, so this does not fuse the tokens on either side together). `"utf8"`
- * as an encoding argument is not a citation's enforcing symbol resolving — it is a string that
- * happens to spell the same word, and without this a row pairing any file with any common string
- * constant used in it would pass. Applies across every language this check handles: Python, shell,
- * YAML, and SQL all use the same two quote characters for a string, and JS/TS's own `"`/`'`
- * strings are the same shape.
+ * Removes quoted content using an explicit delimiter table, keeping the opening and closing
+ * delimiters so tokens on either side cannot fuse. The default table is Python's: it includes
+ * single-character quote forms plus both triple-quote forms, with the longer openers
+ * considered first. Callers that need another language pass that language's own table instead of
+ * pretending the same two regular expressions describe every language.
  *
- * This generic helper is deliberately not the JavaScript dispatcher. JS/TS must distinguish a
- * quote inside a regex literal from a string opener and `/` from division, which requires lexical
- * token state; `stripJsSource` owns that ordered walk. The language-specific Python, shell, YAML,
- * and SQL dispatches likewise own delimiters whose escape rules this generic regex cannot express.
+ * This helper only resolves quote boundaries; it does not resolve comments. Production dispatches
+ * still own the ordered comment/string walk so a comment marker inside a string, or a quote inside
+ * a comment, cannot be interpreted out of order.
  */
-export const stripStrings = (text) =>
-  text
-    .replace(/"(?:[^"\\]|\\.)*"/g, (m) => `"${blankKeepingNewlines(m.slice(1, -1))}"`)
-    .replace(/'(?:[^'\\]|\\.)*'/g, (m) => `'${blankKeepingNewlines(m.slice(1, -1))}'`);
+export const stripStrings = (text, rules = STRING_BOUNDARY_RULES.python) => {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const quoted = readQuotedSpan(text, i, rules);
+    if (!quoted) {
+      out += text[i];
+      i++;
+      continue;
+    }
+    const span = text.slice(i, quoted.end);
+    out += renderQuotedSpan(span, quoted.rule, quoted.closed, true);
+    i = quoted.end;
+  }
+  return out;
+};
 
 /**
- * #700: `stripStrings` treats every `"` and `'` as an independent single-character delimiter,
- * which is wrong for Python — a triple-quoted string (`"""..."""` or `'''...'''`) is one
- * multi-character delimiter, not three single-quote pairs. Feeding a module docstring through
- * `stripStrings` reads its opening `"""` as an empty string (`""`) immediately followed by a
- * fresh opening `"`, and every quote after that is paired one position out of phase for the rest
- * of the file — confirmed directly against the one `.py` file this repository tracks
+ * #700: the old regex implementation of `stripStrings` treated every `"` and `'` as an independent
+ * single-character delimiter, which is wrong for Python — a triple-quoted string (`"""..."""` or
+ * `'''...'''`) is one multi-character delimiter, not three single-quote pairs. Feeding a module
+ * docstring through that implementation read its opening `"""` as an empty string (`""`)
+ * followed by a fresh opening `"`, and every quote after that was paired one position out of
+ * phase for the rest of the file — confirmed directly against the one `.py` file this repository
+ * tracks
  * (`deploy/egress/allowlist-proxy.py`): `ALLOWLIST_DIGEST`'s own declaration at line 77, well
  * after the module docstring, is blanked away in the corrupted view.
  *
@@ -124,32 +322,11 @@ export const stripPythonSource = (text, blankStrings) => {
       i = j;
       continue;
     }
-    if (ch === '"' || ch === "'") {
-      const isTriple = text.slice(i, i + 3) === ch.repeat(3);
-      const delim = isTriple ? ch.repeat(3) : ch;
-      let j = i + delim.length;
-      let closed = false;
-      while (j < n) {
-        if (text[j] === "\\" && j + 1 < n) {
-          j += 2;
-          continue;
-        }
-        if (text.slice(j, j + delim.length) === delim) {
-          j += delim.length;
-          closed = true;
-          break;
-        }
-        j++;
-      }
-      const span = text.slice(i, j);
-      if (blankStrings) {
-        const closeLen = closed ? delim.length : 0;
-        const interior = span.slice(delim.length, span.length - closeLen);
-        out += span.slice(0, delim.length) + blankKeepingNewlines(interior) + (closeLen ? span.slice(-closeLen) : "");
-      } else {
-        out += span;
-      }
-      i = j;
+    const quoted = readQuotedSpan(text, i, STRING_BOUNDARY_RULES.python);
+    if (quoted) {
+      const span = text.slice(i, quoted.end);
+      out += renderQuotedSpan(span, quoted.rule, quoted.closed, blankStrings);
+      i = quoted.end;
       continue;
     }
     out += ch;
@@ -491,14 +668,14 @@ export const stripTemplateLiteralProse = (text) => {
  * writes `printf '#!/bin/bash\nset -euo pipefail\n'` — a single-quoted string whose content
  * starts with `#!/bin/bash`. The old `stripHashComments` ran first, blind to the string boundary;
  * the `#` right after the opening `'` (preceded by `'`, not `:`) started a "comment" that consumed
- * the rest of the line, including the string's own closing `'`. `stripStrings`'s single-quote
- * regex (`/'(?:[^'\\]|\\.)*'/g`, which spans newlines) then paired that surviving lone `'` with
+ * the rest of the line, including the string's own closing `'`. The old `stripStrings`
+ * single-quote regex (`/'(?:[^'\\]|\\.)*'/g`, which spans newlines) then paired that surviving lone `'` with
  * the *next* `'` character anywhere later in the file — the opening quote of the following line's
  * own `printf '...'` — and every quote pairing after that was one quote out of phase for the rest
  * of the file. Confirmed directly: `required_keychain_value` (declared at line 191, called at 249
  * and 250 — three real, current occurrences) does not survive a single one of them in the old
- * stripped view; `stripStrings(stripHashComments(readFileSync("deploy/install-launchd.sh")))`
- * contains zero matches for a symbol this file genuinely, currently declares and calls.
+ * stripped view; the old `stripStrings(stripHashComments(...))` pipeline contained zero matches
+ * for a symbol this file genuinely, currently declares and calls.
  *
  * `stripShellSource` replaces that two-function pipeline with one ordered character walk, the
  * same shape `stripPythonSource`/`stripJsSource` already use:
@@ -513,17 +690,15 @@ export const stripTemplateLiteralProse = (text) => {
  *     "preceded by `:`" as the actual rule.
  *   - a plain single-quoted string (`'...'`) has *no* escape character at all — a backslash
  *     inside one is a literal backslash, not an escape, and the closing delimiter is the very next
- *     `'`, unconditionally. This is a real difference from `stripStrings`'s generic single-quote
- *     regex (which treats every single-quoted string as backslash-escaped — only true for
- *     `$'...'`, below) and from YAML's single-quoted scalar (a doubled `''` is a literal quote —
+ *     `'`, unconditionally. This differs from the default Python short-string rule (backslash
+ *     escaped — only true for `$'...'` in shell) and from YAML's single-quoted scalar (a doubled
+ *     `''` is a literal quote —
  *     see `stripYamlSource`).
  *   - `$'...'` (ANSI-C quoting) *does* recognize backslash escapes (`\n`, `\t`, `\'`, …), so it
  *     gets its own branch rather than falling into the plain single-quote one.
- *   - a double-quoted string (`"..."`) recognizes backslash escapes — the same generic "any `\X`
- *     pair does not end the string" treatment `stripStrings`/`stripPythonSource`/`stripJsSource`
- *     already use. Real shell only makes `\"`, `\\`, `` \` ``, `\$`, and an escaped newline special
- *     inside double quotes; treating every `\X` pair as non-terminating is a safe superset for the
- *     one thing this function needs to get right — where the string actually ends.
+ *   - a double-quoted string (`"..."`) gives backslash special meaning only before `"`, `\\`,
+ *     `` ` ``, `$`, and a newline. The rule table names those five cases explicitly instead of
+ *     treating every `\X` pair like an escape.
  *   - a heredoc (`<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`) is recognized the moment it opens; a
  *     bare-word delimiter must start with a letter or underscore, which excludes an arithmetic
  *     left-shift (`$((1 << 2))`) from being misread as one — disclosed, not silently guessed,
@@ -532,14 +707,11 @@ export const stripTemplateLiteralProse = (text) => {
  *     multi-line body) is excluded explicitly so it falls through to ordinary quote handling
  *     instead. The body — from the line after the opener to the line that is exactly the
  *     delimiter word (leading tabs stripped first when the operator was `<<-`) — is literal data
- *     (or, as in this file's own two heredocs, an embedded second script) that is genuinely part
- *     of what the file contains, so it is not string-scanned or blanked the way an ordinary quoted
- *     string is; but round 18 found its `#`-comments are not exempt from the same word-boundary
- *     rule the rest of this file's `#` handling uses — see `consumeHeredocBody`'s own comment for
- *     the real false green this caused and why only comments, not quoted content, are stripped
- *     inside it. An unterminated
- *     heredoc (no matching delimiter line before end of file) passes the remainder of the file
- *     through the same comment-stripped-only rule, rather than guessing where it would have ended.
+ *     or, as in this file's own two heredocs, an embedded second script. The body is therefore
+ *     walked recursively in the caller's selected view: comments and ordinary string prose are
+ *     excluded from a symbol search, while balanced `$()` bodies inside double quotes remain code.
+ *     An unterminated heredoc passes the remainder through the same rule rather than guessing where
+ *     it would have ended.
  *     Content on the heredoc-opening
  *     line *after* the operator (a trailing `# comment`, more of the command) is not treated as
  *     part of the body — it is walked normally, through this same dispatch, before the body
@@ -567,25 +739,6 @@ export const stripShellSource = (text, blankStrings) => {
   // just above). `;`, `|`, and `&` cover `;;`/`||`/`&&` too, since checking only the immediately
   // preceding character is enough regardless of how many of that character precede it; `(`/`)`
   // cover a subshell or function body opening/closing right before a `#`.
-  const isWordBoundaryBefore = (idx) =>
-    idx === 0 || [" ", "\t", "\n", ";", "|", "&", "(", ")"].includes(text[idx - 1]);
-
-  /**
-   * Renders a quoted span, honoring `blankStrings` the same way every other stripper here does.
-   * `openLen`/`closeLen` are given independently — `$'...'` opens with 2 characters (`$'`) and
-   * closes with 1 (`'`), which a single shared width would get wrong for one side or the other.
-   * `closed` says whether `span`'s last `closeLen` characters really are the closing delimiter
-   * (false for an unterminated string, where the whole remainder after the opener is interior).
-   */
-  const renderQuoted = (span, openLen, closeLen, closed) => {
-    if (!blankStrings) return span;
-    const actualCloseLen = closed ? closeLen : 0;
-    const interior = span.slice(openLen, span.length - actualCloseLen);
-    return (
-      span.slice(0, openLen) + blankKeepingNewlines(interior) + (actualCloseLen ? span.slice(-actualCloseLen) : "")
-    );
-  };
-
   /**
    * #689 round 18: a heredoc body is genuinely part of what the file contains, and this
    * repository's own two heredocs are embedded shell scripts (`deploy/install-launchd.sh:187-287`
@@ -598,21 +751,12 @@ export const stripShellSource = (text, blankStrings) => {
    * `deploy/install-launchd.sh` `` returned exit 0 with empty findings, when the file's only
    * mention of the symbol is prose about a bug, not a use of it.
    *
-   * The fix is narrower than stripping the whole body the way `stripJsSource`/`stripPythonSource`
-   * strip a whole file: it recurses with `blankStrings` forced to `false`, which — because a
-   * comment is stripped *unconditionally* in this same function's dispatch above, regardless of
-   * `blankStrings` — strips only the body's own `#`-comments (quote-aware, so a `#` inside a
-   * quoted string in the body is not misread as a comment the same way it isn't at the top level)
-   * and leaves every quoted string's content exactly as it was, in both the symbol- and
-   * content-search views. That second half is deliberate, not an oversight: this file's other real
-   * heredoc-body occurrence, `required_keychain_value` (declared and called inside the same
-   * heredoc, the call reached through `"$(required_keychain_value …)"` — a command substitution
-   * inside a double-quoted string), is real code, not string prose, and forcing `blankStrings: true`
-   * into the recursive call would blank that command substitution's content the way an ordinary
-   * string's content is blanked for the symbol view, erasing a legitimate call rather than
-   * excluding a comment. So: "search the heredoc verbatim" and "a comment inside a heredoc is not
-   * code" are both true at once — the body's comments are excluded, its code (including code
-   * reached through a quoted command substitution) is not.
+   * The body recurses with the caller's `blankStrings` choice. In symbol view that excludes its
+   * comments and ordinary quoted prose, including the multiline `node -e '...'` program whose JS
+   * comment contains `expect`; in content view it preserves strings. Balanced `$()` content inside
+   * a double quote is recursively searched as code in symbol view, so the real
+   * `"$(required_keychain_value …)"` call remains visible without treating all surrounding string
+   * prose as code.
    */
   const consumeHeredocBody = ({ delim, stripTabs }) => {
     // `i` is already past the newline that starts the body.
@@ -623,12 +767,12 @@ export const stripShellSource = (text, blankStrings) => {
       const line = text.slice(cursor, lineEnd);
       const compare = stripTabs ? line.replace(/^\t+/, "") : line;
       if (compare === delim) {
-        out += stripShellSource(text.slice(i, lineEnd), false); // body + delimiter line, comments stripped, strings verbatim
+        out += stripShellSource(text.slice(i, lineEnd), blankStrings); // body + delimiter line, same symbol/content view
         i = lineEnd;
         return;
       }
       if (nextNl === -1) {
-        out += stripShellSource(text.slice(i, n), false); // unterminated: rest of file is body, same rule
+        out += stripShellSource(text.slice(i, n), blankStrings); // unterminated: rest of file, same symbol/content view
         i = n;
         return;
       }
@@ -647,63 +791,16 @@ export const stripShellSource = (text, blankStrings) => {
       continue;
     }
 
-    if (ch === "#" && isWordBoundaryBefore(i)) {
+    if (ch === "#" && isShellWordBoundaryBefore(text, i)) {
       while (i < n && text[i] !== "\n") i++;
       continue; // deleted outright, matching stripHashComments' existing behavior
     }
 
-    if (ch === "$" && text[i + 1] === "'") {
-      const start = i;
-      let j = i + 2;
-      let closed = false;
-      while (j < n) {
-        if (text[j] === "\\" && j + 1 < n) {
-          j += 2;
-          continue;
-        }
-        if (text[j] === "'") {
-          j++;
-          closed = true;
-          break;
-        }
-        if (text[j] === "\n") break;
-        j++;
-      }
-      out += renderQuoted(text.slice(start, j), 2, 1, closed); // opens "$'" (2), closes "'" (1)
-      i = j;
-      continue;
-    }
-
-    if (ch === "'") {
-      const start = i;
-      let j = i + 1;
-      while (j < n && text[j] !== "'" && text[j] !== "\n") j++;
-      const closed = j < n && text[j] === "'";
-      if (closed) j++;
-      out += renderQuoted(text.slice(start, j), 1, 1, closed);
-      i = j;
-      continue;
-    }
-
-    if (ch === '"') {
-      const start = i;
-      let j = i + 1;
-      let closed = false;
-      while (j < n) {
-        if (text[j] === "\\" && j + 1 < n) {
-          j += 2;
-          continue;
-        }
-        if (text[j] === '"') {
-          j++;
-          closed = true;
-          break;
-        }
-        if (text[j] === "\n") break;
-        j++;
-      }
-      out += renderQuoted(text.slice(start, j), 1, 1, closed);
-      i = j;
+    const quoted = readShellQuotedSpan(text, i);
+    if (quoted) {
+      const span = text.slice(i, quoted.end);
+      out += renderShellQuotedSpan(span, quoted.rule, quoted.closed, blankStrings);
+      i = quoted.end;
       continue;
     }
 
@@ -737,14 +834,13 @@ export const stripShellSource = (text, blankStrings) => {
  *
  *   - a single-quoted scalar (`'...'`) escapes a literal quote by *doubling* it (`''`), not with a
  *     backslash — a backslash inside one is a literal backslash. Different from shell's plain
- *     single-quote (no escape of any kind) and from `stripStrings`'s generic regex (backslash-
- *     escaped, which is right for neither).
+ *     single-quote (no escape of any kind) and from the default Python short-string rule
+ *     (backslash-escaped, which is right for neither shell nor YAML).
  *   - a double-quoted scalar (`"..."`) recognizes backslash escapes, the same generic "any `\X`
  *     pair does not end the string" treatment used throughout this file.
- *   - unlike shell/JS (where a raw string literally cannot span an unescaped newline — that is a
- *     syntax error in both, so stopping the scan at `\n` is the *correct*, not merely convenient,
- *     answer), a YAML quoted scalar legitimately folds across multiple lines. This walk does not
- *     cut a quoted scalar off at a raw newline the way `stripShellSource`/`stripJsSource` do;
+ *   - like Bash but unlike JS (where a raw string cannot span an unescaped newline), a YAML quoted
+ *     scalar legitimately folds across multiple lines. This walk does not cut a quoted scalar off
+ *     at a raw newline; Bash's own explicit table makes the same newline choice for its quotes.
  *     confirmed safe against this repository's own tracked YAML rather than assumed: neither
  *     tracked workflow file has a multi-line quoted scalar today, so this does not change any
  *     current verdict, but a scalar that never closes is well-defined here (blanked to end of
@@ -838,9 +934,9 @@ export const stripYamlSource = (text, blankStrings) => {
 /**
  * #689 round 17: the fifth instance of the same defect, disclosed and left unfixed at the end of
  * round 16 and sent back for exactly that reason. SQL's dispatch
- * (`stripStrings(stripSqlComments(text))` for the symbol view, `stripSqlComments(text)` alone for
- * the content view) has the identical two-pass, comment-blind-to-strings shape round 15 fixed for
- * JS/TS and round 16 fixed for shell/YAML.
+ * (formerly `stripStrings(stripSqlComments(text))` for the symbol view and
+ * `stripSqlComments(text)` alone for the content view) had the identical two-pass,
+ * comment-blind-to-strings shape round 15 fixed for JS/TS and round 16 fixed for shell/YAML.
  *
  * Measured against this repository's own tracked SQL, not assumed: neither `src/db/schema.sql`
  * nor `tests/fixtures/schema-v11.sql` contains a `--` or `/* *\/` literally inside a `'...'`
@@ -862,7 +958,7 @@ export const stripYamlSource = (text, blankStrings) => {
  *     the existing (non-ordered) `stripSqlComments` already assumed.
  *   - a `'...'` value string literal escapes its own delimiter by *doubling* it (`''`), not with a
  *     backslash — standard SQL and SQLite both treat `\` as a literal character inside a string.
- *     This is a real correction from `stripStrings`'s generic single-quote regex (which assumes
+ *     This was a real correction from the old generic single-quote regex (which assumed
  *     backslash-escaping), not just a reordering; this repository's own corpus has no
  *     backslash-adjacent-to-quote case to have exposed the difference, confirmed by grep.
  *   - `"..."`, `` `...` ``, and `[...]` are *identifier* quoting, not value quoting — a quoted
