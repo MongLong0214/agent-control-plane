@@ -27,6 +27,7 @@ interface IssueFixture {
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const scriptPath = join(repoRoot, "scripts", "verify-tracker-loci-resolve.mjs");
 const issue649Fixture = join(repoRoot, "tests", "fixtures", "tracker-loci-issue-649.json");
+const symbolFixturePath = "tests/fixtures/tracker-loci-symbols.ts";
 
 /** Writes a throwaway `--issues-file` fixture and returns its path plus a cleanup function. */
 const withIssues = (issues: IssueFixture[]) => {
@@ -2219,7 +2220,7 @@ describe("verify-tracker-loci-resolve", () => {
         );
         const candidates: Array<{ name: string; start: number }> = [];
         const visit = (node: ts.Node): void => {
-          if (ts.isIdentifier(node) && /^[A-Za-z_$][\w$]*$/.test(node.text)) {
+          if (ts.isIdentifier(node)) {
             const parent = node.parent;
             const isDeclarationName =
               ((ts.isVariableDeclaration(parent) ||
@@ -2268,7 +2269,7 @@ describe("verify-tracker-loci-resolve", () => {
         body: `\`${witness}\` in \`${relPath}\``,
       }));
 
-      expect(jsIssues).toHaveLength(253);
+      expect(jsIssues).toHaveLength(254);
       const { path, cleanup } = withIssues([...jsIssues, ...otherIssues]);
       try {
         const result = run(path);
@@ -2411,6 +2412,109 @@ describe("verify-tracker-loci-resolve", () => {
         expect(result.stdout).toContain("no same-line closing run");
         expect(result.stdout).toContain("without a destination title");
         expect(result.stdout).toContain("#heading is unsupported");
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
+  describe("round 24 JavaScript and TypeScript symbol grammar", () => {
+    it("dollar prefixed identifiers resolve when present and are stale when absent", () => {
+      const forms = [
+        ["$element", 0, ""],
+        ["element", 1, "STALE"],
+        ["$definitelyMissingElement", 1, "STALE"],
+      ] as const;
+
+      for (const [index, [symbol, status, output]] of forms.entries()) {
+        const body = `\`${symbol}\` in \`${symbolFixturePath}\``;
+        const { path, cleanup } = withIssues([
+          { number: 68970 + index, title: `dollar identifier ${symbol}`, body },
+        ]);
+        try {
+          const result = run(path);
+          expect(result.status, result.stdout || result.stderr).toBe(status);
+          if (status === 0) {
+            expect(result.stdout).toBe(output);
+          } else {
+            expect(result.stdout).toContain(output);
+            expect(result.stdout).toContain(symbol);
+          }
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it("Unicode identifiers resolve when present and are stale when absent", () => {
+      const forms = [
+        ["절대존재심볼", 0, ""],
+        ["존재심볼", 1, "STALE"],
+        ["절대없는심볼", 1, "STALE"],
+      ] as const;
+
+      for (const [index, [symbol, status, output]] of forms.entries()) {
+        const body = `\`${symbolFixturePath}\` — \`${symbol}\``;
+        const { path, cleanup } = withIssues([
+          { number: 68972 + index, title: `Unicode identifier ${index}`, body },
+        ]);
+        try {
+          const result = run(path);
+          expect(result.status, result.stdout || result.stderr).toBe(status);
+          if (status === 0) {
+            expect(result.stdout).toBe(output);
+          } else {
+            expect(result.stdout).toContain(output);
+            expect(result.stdout).toContain(symbol);
+          }
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it("join control continuation characters use the same identifier grammar", () => {
+      const symbol = "joiner\u200cName";
+      const body = `\`${symbol}\` in \`${symbolFixturePath}\``;
+      const { path, cleanup } = withIssues([{ number: 68976, title: "join control identifier", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout || result.stderr).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("quoted non identifiers are unsupported instead of disappearing", () => {
+      const forms = [
+        `\`not-a-symbol\` in \`${symbolFixturePath}\``,
+        `\`${symbolFixturePath}\` — \`not a symbol\``,
+      ];
+
+      for (const [index, body] of forms.entries()) {
+        const { path, cleanup } = withIssues([
+          { number: 68977 + index, title: `unsupported symbol ${index}`, body },
+        ]);
+        try {
+          const result = run(path);
+          expect(result.status, result.stdout || result.stderr).toBe(1);
+          expect(result.stdout).toContain("UNSUPPORTED (1)");
+          expect(result.stdout).toContain(index === 0 ? "not-a-symbol" : "not a symbol");
+          expect(result.stdout).not.toContain("STALE (");
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it("ASCII identifiers keep resolving", () => {
+      const body = `\`calculateReadabilityScore\` in \`${symbolFixturePath}\``;
+      const { path, cleanup } = withIssues([{ number: 68979, title: "ASCII control", body }]);
+      try {
+        const result = run(path);
+        expect(result.status, result.stdout || result.stderr).toBe(0);
+        expect(result.stdout).toBe("");
       } finally {
         cleanup();
       }

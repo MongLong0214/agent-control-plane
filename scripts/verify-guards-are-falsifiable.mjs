@@ -2399,6 +2399,48 @@ const GUARDS = [
     ],
   },
   {
+    what: "symbol extraction accepts Unicode identifier starts from the shared grammar",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '  identifierStartSource: "[\\\\p{ID_Start}$_]",',
+    replace: '  identifierStartSource: "[A-Za-z$_]",',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::Unicode identifiers resolve when present and are stale when absent",
+    ],
+  },
+  {
+    what: "symbol search boundaries use identifier continuation instead of ASCII word boundaries",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find:
+      "  return new RegExp(\n" +
+      "    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})` +\n" +
+      "      `${escaped}` +\n" +
+      "      `(?!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})`,\n" +
+      '    "u",\n' +
+      "  );",
+    replace: '  return new RegExp(`\\\\b${escaped}\\\\b`, "u");',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::dollar prefixed identifiers resolve when present and are stale when absent",
+    ],
+  },
+  {
+    what: "quoted non identifiers in a symbol citation report unsupported instead of disappearing",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find:
+      "    if (symbol === null) {\n" +
+      "      noteUnsupported(\n" +
+      "        m[0],\n" +
+      "        `quoted symbol \\`${m[1]}\\` is ${SYMBOL_GRAMMAR_RULES.invalidQuotedToken}; ` +\n" +
+      "          `use ${SYMBOL_GRAMMAR_RULES.support} ` +\n" +
+      '          "JavaScript/TypeScript identifier or dotted member-reference syntax, or rewrite the citation",\n' +
+      "      );\n" +
+      "      continue;\n" +
+      "    }",
+    replace: "    if (symbol === null) continue;",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::quoted non identifiers are unsupported instead of disappearing",
+    ],
+  },
+  {
     what: "explicit citation shapes outside the grammar fail instead of reporting success",
     file: "scripts/verify-tracker-loci-resolve.mjs",
     find: "  unsupported.length > 0 ||\n  nonDurableFindings.length > 0 ||",

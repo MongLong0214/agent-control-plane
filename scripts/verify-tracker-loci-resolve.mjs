@@ -25,6 +25,19 @@
  * markers, containers, link forms, and signed line-number syntax are read from that table rather
  * than re-declared at each parser branch.
  *
+ * ## Symbol grammar table
+ *
+ * | Form | Status | Grammar and result |
+ * | --- | --- | --- |
+ * | JavaScript/TypeScript identifier | SUPPORTED | The first character is Unicode `ID_Start`, `$`, or `_`; every remaining character is Unicode `ID_Continue`, `$`, `_`, ZWNJ, or ZWJ. |
+ * | Private identifier or member reference | SUPPORTED | `#` may prefix a supported identifier; a reference may join supported identifier segments with `.`. Sigils and separators remain part of the searched symbol. |
+ * | Callable shorthand | SUPPORTED | A supported identifier or member reference may be cited with a trailing `()`; the shorthand is removed before searching. |
+ * | Other quoted token in a symbol-citation form | UNSUPPORTED | A token that is neither an identifier nor a member reference is reported and fails instead of disappearing or being guessed into one. |
+ *
+ * `SYMBOL_GRAMMAR_RULES` is the executable form of this table. Symbol extraction, validation,
+ * and the search boundary all read the same start and continuation sources from it; neither
+ * JavaScript's ASCII-only `\w` nor its ASCII word boundary `\b` defines an identifier here.
+ *
  * The supported path shapes are: a path with a filename extension and a directory separator
  * (line optional); a filename with an extension and an explicit line; a directory-qualified
  * extensionless path or root extensionless dotfile with an explicit line; and a root filename
@@ -1507,14 +1520,47 @@ const resolveBlobRefAndPath = (segments) => {
       "no known local branch or tag matches it, and no tracked file tail identifies the boundary; not classified as absent",
   };
 };
-// A symbol may be cited as `name` or `name()` — the parens are the citer marking it a function or
-// method, not literal text to search for (a call site rarely has empty arguments); the extraction
-// below captures the identifier alone and drops them, the same way `snippetFragments`' elision
-// treats an empty `()` as "a call, arguments omitted" rather than a literal empty parameter list.
-// A leading `#` (round 7) is JavaScript's own private-field/method sigil, not decoration to strip —
-// `#observe` and `observe` name two different things, and this codebase declares private members
-// heavily (`turn-coordinator.ts`'s `#observe` among them), so the symbol pattern allows it directly.
-const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`#?[\w.$]+(?:\(\))?`,?\s*)+)/g;
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// One executable answer to "what is a symbol". JavaScript's `\w` and `\b` are ASCII definitions,
+// so they cannot model either Unicode identifiers or a `$` boundary. `ID_Continue` does not include
+// the two join controls that JavaScript permits after the first character, hence their explicit
+// inclusion. Extraction and `symbolPattern` both derive from these exact sources.
+const SYMBOL_GRAMMAR_RULES = Object.freeze({
+  support: "supported",
+  identifierStartSource: "[\\p{ID_Start}$_]",
+  identifierContinueSource: "[\\p{ID_Continue}$_\\u200C\\u200D]",
+  privatePrefix: "#",
+  memberSeparator: ".",
+  callSuffix: "()",
+  invalidQuotedToken: "unsupported",
+});
+
+const SYMBOL_IDENTIFIER_SOURCE =
+  `${SYMBOL_GRAMMAR_RULES.identifierStartSource}` +
+  `${SYMBOL_GRAMMAR_RULES.identifierContinueSource}*`;
+const SYMBOL_PRIVATE_IDENTIFIER_SOURCE =
+  `${escapeRegex(SYMBOL_GRAMMAR_RULES.privatePrefix)}?${SYMBOL_IDENTIFIER_SOURCE}`;
+const SYMBOL_REFERENCE_SOURCE =
+  `(?:${SYMBOL_PRIVATE_IDENTIFIER_SOURCE}|` +
+  `${SYMBOL_IDENTIFIER_SOURCE}` +
+  `(?:${escapeRegex(SYMBOL_GRAMMAR_RULES.memberSeparator)}${SYMBOL_PRIVATE_IDENTIFIER_SOURCE})+)`;
+const SYMBOL_REFERENCE_RE = new RegExp(
+  `^(?<symbol>${SYMBOL_REFERENCE_SOURCE})` +
+    `(?:${escapeRegex(SYMBOL_GRAMMAR_RULES.callSuffix)})?$`,
+  "u",
+);
+const QUOTED_SYMBOL_TOKEN_SOURCE = "`([^`\\r\\n]*)`";
+const QUOTED_SYMBOL_TOKEN_RE = new RegExp(QUOTED_SYMBOL_TOKEN_SOURCE, "gu");
+
+// The outer citation forms are intentionally wider than the identifier grammar: an explicitly
+// quoted token in one of these positions must reach validation so an unsupported token is loud.
+// Restricting these matchers to valid identifiers would recreate the silent false green.
+const SYMBOL_ROW_RE = new RegExp(
+  "`([\\w./-]+\\.\\w+)`\\s*(?:—|--?)\\s*" +
+    `((?:${QUOTED_SYMBOL_TOKEN_SOURCE},?[ \\t]*)+)`,
+  "gu",
+);
 // A symbol may also be cited the ordinary way people write English about code rather than the
 // repo's own table convention — reversed order, `` `symbol` in `path` `` instead of `` `path` —
 // `symbol` ``. This is not the keyword scan of unquoted prose round 5 ruled out: both spans here
@@ -1525,25 +1571,23 @@ const SYMBOL_ROW_RE = /`([\w./-]+\.\w+)`\s*(?:—|--?)\s*((?:`#?[\w.$]+(?:\(\))?
 // `src/ceo/production-gate.ts`, `completeReplyAndResolveTurn` in `src/ingress/ingress-guard.ts`),
 // both genuine, zero incidental matches on anything else in the corpus at the time of that
 // snapshot — see the round 9 commit for the full diff.
-const SYMBOL_PROSE_RE = /`(#?[\w.$]+)(?:\(\))?`\s+in\s+`([\w./-]+\.\w+)`/g;
+const SYMBOL_PROSE_RE = new RegExp(
+  `${QUOTED_SYMBOL_TOKEN_SOURCE}\\s+in\\s+\`([\\w./-]+\\.\\w+)\``,
+  "gu",
+);
 const NON_DURABLE_RE = /(\/private\/tmp\/[^\s`)]+|(?<![\w/])\/tmp\/[^\s`)]+)/g;
 
-const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const parseSymbolReference = (raw) => SYMBOL_REFERENCE_RE.exec(raw)?.groups?.symbol ?? null;
 
-/**
- * A word-boundary search pattern for a cited symbol — except `\b` does not work in front of `#`.
- * `\b` is a transition between a word character and a non-word one, and `#` is non-word on both
- * sides in the shape this actually appears (`this.#observe(`, or `#observe(...) {` at the start of
- * a declaration): the character before it is `.`, `{`, or whitespace, all non-word, so `\b#observe`
- * never matches anywhere a private field is genuinely declared or called. A negative lookbehind
- * for a word character or another `#` does the same job `\b` does for an ordinary identifier —
- * refuses a match in the middle of a longer name — without requiring a boundary `#` cannot have.
- */
+/** A symbol starts and ends where the shared grammar says an identifier cannot continue. */
 const symbolPattern = (symbol) => {
   const escaped = escapeRegex(symbol);
-  return symbol.startsWith("#")
-    ? new RegExp(`(?<![\\w#])${escaped}\\b`)
-    : new RegExp(`\\b${escaped}\\b`);
+  return new RegExp(
+    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})` +
+      `${escaped}` +
+      `(?!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})`,
+    "u",
+  );
 };
 
 /** How far from the cited line a quoted snippet may still be found and count as "present". */
@@ -2148,7 +2192,21 @@ const extractFromBody = (body) => {
 
   for (const m of body.matchAll(SYMBOL_ROW_RE)) {
     const path = m[1];
-    const symbols = [...m[2].matchAll(/`(#?[\w.$]+)(?:\(\))?`/g)].map((s) => s[1]);
+    const symbols = [];
+    for (const token of m[2].matchAll(QUOTED_SYMBOL_TOKEN_RE)) {
+      const symbol = parseSymbolReference(token[1]);
+      if (symbol === null) {
+        noteUnsupported(
+          m[0],
+            `quoted symbol \`${token[1]}\` is ${SYMBOL_GRAMMAR_RULES.invalidQuotedToken}; ` +
+            `use ${SYMBOL_GRAMMAR_RULES.support} ` +
+            "JavaScript/TypeScript identifier or dotted member-reference syntax, or rewrite the citation",
+        );
+        continue;
+      }
+      symbols.push(symbol);
+    }
+    if (symbols.length === 0) continue;
     const key = `${path}:${symbols.join(",")}`;
     if (seenSymbolRow.has(key)) continue;
     seenSymbolRow.add(key);
@@ -2159,8 +2217,17 @@ const extractFromBody = (body) => {
   // disclosed as a limitation. Same dedup key shape as the table form above (`path:symbol`), so a
   // symbol cited both ways collapses to one row instead of being reported twice.
   for (const m of body.matchAll(SYMBOL_PROSE_RE)) {
-    const symbol = m[1];
+    const symbol = parseSymbolReference(m[1]);
     const path = m[2];
+    if (symbol === null) {
+      noteUnsupported(
+        m[0],
+        `quoted symbol \`${m[1]}\` is ${SYMBOL_GRAMMAR_RULES.invalidQuotedToken}; ` +
+          `use ${SYMBOL_GRAMMAR_RULES.support} ` +
+          "JavaScript/TypeScript identifier or dotted member-reference syntax, or rewrite the citation",
+      );
+      continue;
+    }
     const key = `${path}:${symbol}`;
     if (seenSymbolRow.has(key)) continue;
     seenSymbolRow.add(key);
