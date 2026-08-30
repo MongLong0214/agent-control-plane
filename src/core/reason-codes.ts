@@ -509,6 +509,14 @@ export const ReasonCode = {
    * database that was never read.
    */
   ACCEPTANCE_CENSUS_UNOBSERVABLE: "ACCEPTANCE_CENSUS_UNOBSERVABLE",
+  /** The synthetic probe did not produce exactly two matched, durable DIRECT round trips. */
+  ACCEPTANCE_PROBE_INCOMPLETE: "ACCEPTANCE_PROBE_INCOMPLETE",
+  /** A probe side effect may have happened, so another message must not be attempted. */
+  ACCEPTANCE_PROBE_INCONCLUSIVE: "ACCEPTANCE_PROBE_INCONCLUSIVE",
+  /** The requested evidence sentence claims more than this isolated observation proves. */
+  ACCEPTANCE_EVIDENCE_OVERCLAIMED: "ACCEPTANCE_EVIDENCE_OVERCLAIMED",
+  /** Cleanup was asked to signal a process whose pid and start time were not both owned. */
+  ACCEPTANCE_PROCESS_NOT_OWNED: "ACCEPTANCE_PROCESS_NOT_OWNED",
 
   // --- outbox --------------------------------------------------------------
   OUTBOX_STALE_GENERATION_REJECTED: "OUTBOX_STALE_GENERATION_REJECTED",
