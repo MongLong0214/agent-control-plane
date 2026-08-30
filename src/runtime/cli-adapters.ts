@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { Clock } from "../core/clock.ts";
+import { disposableWorkspaceLocation } from "../core/disposable-workspace-root.ts";
 import { acpScratchDir } from "../core/scratch-root.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
@@ -1233,11 +1234,13 @@ const reviewerProfile = (
   additionalExecutables: readonly string[] = [],
   egressPort?: number,
 ): string => {
+  const disposableWorkspaceRoot = disposableWorkspaceLocation().workspaceRoot;
   const lines = ["(version 1)", "(allow default)"];
   const sensitive = [
     ...hostCredentialPaths(credentialPaths[0]),
     ...reviewerTranscriptRoots(),
     ...denyReadPaths,
+    disposableWorkspaceRoot,
   ];
   for (const path of [...new Set(sensitive)]) {
     const resolved = resolvePath(path);
@@ -1294,6 +1297,10 @@ const reviewerProfile = (
   // `/private/var`, so an allowance written from `TMPDIR` silently fails to match.
   const perUserTemp = resolvePath(tmpdir());
   if (perUserTemp) lines.push(`(allow file-write* (subpath ${quote(perUserTemp)}))`);
+  // The fixed disposable allocator can be below the allowed temp root on hosts whose OS default is
+  // `/tmp`. Carve it back out after that allowance: ACP evidence may not become reviewer-writable
+  // merely because the two system roots coincide on one platform.
+  lines.push(`(deny file-write* (subpath ${quote(resolvePath(disposableWorkspaceRoot))}))`);
   return lines.join("\n");
 };
 
