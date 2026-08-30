@@ -373,6 +373,12 @@ export class BindingRegistry {
     input: BindInput & {
       reason: string;
       conversation: "SURVIVED" | "REPLACED";
+      /**
+       * An intended surviving continuity switch must prove its outgoing actor's target tuple
+       * inside this transaction. Existing non-continuity callers retain their explicit
+       * `conversation` semantics unless they opt into this proof requirement.
+       */
+      requireCurrentTargetAttestation?: boolean;
       takeover?: boolean;
       expectedCurrentGeneration?: number;
     },
@@ -402,6 +408,44 @@ export class BindingRegistry {
         );
       }
 
+      // The kernel may have planned this switch while the actor still named an attested runtime.
+      // That plan is not a write-boundary proof: a same-generation runtime move can happen before
+      // this transaction reads `current`. Revalidate the whole active assignment/actor/target/
+      // attestation tuple here, then fail closed to a replacement if it no longer matches.
+      let effectiveConversation = input.conversation;
+      if (effectiveConversation === "SURVIVED" && input.requireCurrentTargetAttestation) {
+        const proof = current
+          ? this.db.get<{ matched: number }>(
+              `SELECT EXISTS (
+                 SELECT 1
+                   FROM assignments AS assignment
+                   JOIN conversational_actors AS actor
+                     ON actor.actor_id = assignment.actor_id
+                   JOIN actor_target_bindings AS target
+                     ON target.target_actor_id = actor.actor_id
+                   JOIN actor_target_attestations AS attestation
+                     ON attestation.target_binding_id = target.target_binding_id
+                  WHERE assignment.assignment_id = ?
+                    AND assignment.status = 'ACTIVE'
+                    AND assignment.binding_generation = ?
+                    AND actor.current_session_id = ?
+                    AND actor.current_session_incarnation = ?
+                    AND attestation.assignment_id = assignment.assignment_id
+                    AND attestation.binding_generation = assignment.binding_generation
+                    AND attestation.executor_session_id = actor.current_session_id
+                    AND attestation.executor_session_incarnation = actor.current_session_incarnation
+               ) AS matched`,
+              [
+                current.assignmentId,
+                current.bindingGeneration,
+                current.sessionId,
+                current.sessionIncarnation,
+              ],
+            )
+          : null;
+        if (proof?.matched !== 1) effectiveConversation = "REPLACED";
+      }
+
       // A plain switch must not orphan work. If the outgoing binding still owns live runs,
       // those runs would be pinned to a revoked generation: the old session is refused
       // because its generation is gone, and the new one because the run still names the
@@ -409,7 +453,7 @@ export class BindingRegistry {
       // A surviving conversation strands nothing: the binding is not replaced, so live runs stay
       // pinned to the same tuple and the same generation. The guard below exists because a *new*
       // generation would leave them owned by a revoked one — a condition this path cannot create.
-      if (current && input.conversation === "REPLACED") {
+      if (current && effectiveConversation === "REPLACED") {
         const orphaned = this.liveRunsOwnedBy(current);
         if (orphaned.length > 0 && !input.takeover) {
           return deny(
@@ -437,7 +481,7 @@ export class BindingRegistry {
       // to carry a generation. Holding a generation across a rewrite would have meant weakening
       // `assignments_generation_monotonic`, and weakening a fencing guard to implement failover
       // is the wrong direction.
-      if (input.conversation === "SURVIVED") {
+      if (effectiveConversation === "SURVIVED") {
         if (!current) {
           return deny(
             ReasonCode.NOT_FOUND,
@@ -1281,7 +1325,7 @@ export class BindingRegistry {
       `SELECT run_id, state FROM runs
         WHERE owner_session_id = ? AND owner_binding_generation = ? AND owner_role_key = ?
           AND state IN (${LIVE_RUN_STATES.map(() => "?").join(",")})`,
-      [binding.sessionId, binding.bindingGeneration, binding.roleKey, ...LIVE_RUN_STATES],
+      [binding.boundSessionId, binding.bindingGeneration, binding.roleKey, ...LIVE_RUN_STATES],
     );
   }
 }
