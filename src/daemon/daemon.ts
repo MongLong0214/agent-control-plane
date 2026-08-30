@@ -361,8 +361,6 @@ export interface IngressChannelStatus {
   disabledReason: string | null;
 }
 
-export type TelegramIngressRecovery = (nonce: string) => Promise<boolean>;
-
 /**
  * PRD §33.1 and §34.5.
  *
@@ -388,7 +386,6 @@ export class Daemon {
   // Unset until `main`'s composition root reports Telegram's outcome — `null` renders in
   // `health.json` as "this daemon has no opinion yet", distinct from `configured: false`.
   #telegramIngress: IngressChannelStatus | null = null;
-  #telegramIngressRecovery: TelegramIngressRecovery | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
@@ -691,20 +688,12 @@ export class Daemon {
           if (!reasonCode.allowed) return reasonCode;
           const evidenceDigest = requiredOperatorString(request.params, "evidenceDigest");
           if (!evidenceDigest.allowed) return evidenceDigest;
-          const acknowledged = acknowledgeTerminalTelegramReply(this.cp.db, this.cp.clock, this.cp.audit, {
+          return acknowledgeTerminalTelegramReply(this.cp.db, this.cp.clock, this.cp.audit, {
             nonce: nonce.value,
             resolvedBy: peer.actor,
             reasonCode: reasonCode.value,
             evidenceDigest: evidenceDigest.value,
           });
-          if (!acknowledged.allowed) return acknowledged;
-          // UNKNOWN is the only terminal reply outcome that stops the live poller. The
-          // acknowledgement is committed before recovery, so a crash in between is safe: the next
-          // daemon's listener sees the durable terminal row and consumes it as a no-send replay.
-          if (acknowledged.value.deliveryStatus === "UNRESOLVED") {
-            await this.#telegramIngressRecovery?.(acknowledged.value.nonce);
-          }
-          return acknowledged;
         }
 
         case OPERATOR_METHOD.CONVERSATION_ADJUDICATE: {
@@ -1508,15 +1497,15 @@ export class Daemon {
     }
   }
 
-  /** Records every Telegram lifecycle transition immediately for the health surface. */
+  /**
+   * Recorded once, right after `main`'s composition root decides Telegram's outcome (started,
+   * refused, or never configured), and written into `health.json` immediately rather than
+   * waiting for the next periodic `writeHealth` — a daemon that comes up and sits idle for a
+   * while must not report a stale "no opinion yet" the whole time.
+   */
   setTelegramIngressStatus(status: IngressChannelStatus): void {
     this.#telegramIngress = status;
     this.writeHealth(null);
-  }
-
-  /** Installs the live listener's acknowledgement-gated recovery path. */
-  attachTelegramIngressRecovery(recovery: TelegramIngressRecovery): void {
-    this.#telegramIngressRecovery = recovery;
   }
 
   /**

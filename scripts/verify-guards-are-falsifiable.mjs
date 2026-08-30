@@ -2445,7 +2445,7 @@ const GUARDS = [
     find: "        this.router.recordUnknownResponse(outcome, error.failure);",
     replace: "        throw error;",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
+      "tests/unit/telegram-ingress.test.ts::an unknown send result is terminal without automatic retry and stops the loop",
     ],
   },
   {
@@ -2456,111 +2456,7 @@ const GUARDS = [
     find: "  UNKNOWN: { reply: \"SETTLE\", batch: \"STOP\" },",
     replace: "  UNKNOWN: { reply: \"SETTLE\", batch: \"ADVANCE\" },",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
-    ],
-  },
-  {
-    // The CEO may answer quickly while the Bot API rejects slowly. Removing this wait restores the
-    // one-turn race that lets the unresolved-turn reply consume the next update first.
-    what: "a delayed terminal send failure stops its batch before the next update is routed",
-    file: "src/ingress/telegram-polling.ts",
-    find: "        if (deliveryStarted) await turn.settled;",
-    replace: "        if (deliveryStarted) await Promise.resolve();",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a delayed terminal send failure stops its batch before the next update is routed",
-    ],
-  },
-  {
-    // Stopping the loop is not observable until the same transition updates daemon health. Removing
-    // the notification recreates the live process whose health still claims Telegram is running.
-    what: "an unknown Telegram send reports the stopped listener to daemon health",
-    file: "src/ingress/telegram-polling.ts",
-    find:
-      "          this.options.onStateChange?.({\n" +
-      "            running: false,\n" +
-      "            stoppedReason:\n" +
-      "              `reply delivery outcome is unknown for ${outcome.nonce}; acknowledge NO_RETRY to resume`,\n" +
-      "            stoppedNonce: outcome.nonce,\n" +
-      "          });",
-    replace: "          void 0;",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
-    ],
-  },
-  {
-    // Acknowledgement without this call only hides Doctor's finding. The daemon must invoke the
-    // live listener control attached by the production composition root.
-    what: "the Telegram acknowledgement command invokes live listener recovery",
-    file: "src/daemon/daemon.ts",
-    find: "            await this.#telegramIngressRecovery?.(acknowledged.value.nonce);",
-    replace: "            await Promise.resolve(false);",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
-    ],
-  },
-  {
-    // The production factory owns both objects. If it never attaches the listener control, the
-    // daemon's acknowledgement call above is a successful optional no-op.
-    what: "the production Telegram factory attaches same-listener recovery before polling",
-    file: "src/daemon/agentcpd.ts",
-    find:
-      "  daemon.attachTelegramIngressRecovery((nonce) => listener.service.resumeAfterAcknowledgement(nonce));",
-    replace: "  void listener;",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
-    ],
-  },
-  {
-    // The service knows its state, but only the production factory can publish that state through
-    // the daemon health file. Removing the bridge makes both stop and resume invisible.
-    what: "the production Telegram factory mirrors listener transitions into daemon health",
-    file: "src/daemon/agentcpd.ts",
-    find:
-      "      daemon.setTelegramIngressStatus({\n" +
-      "        configured: true,\n" +
-      "        running: state.running,\n" +
-      "        disabledReason: state.stoppedReason,\n" +
-      "      });",
-    replace: "      void state;",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
-    ],
-  },
-  {
-    // Two unresolved rows can coexist. Removing both nonce checks lets acknowledgement of an older
-    // row clear the current stop, which is not the failure the operator reviewed.
-    what: "listener recovery is bound to the exact acknowledged stopped nonce",
-    file: "src/ingress/telegram-polling.ts",
-    find:
-      "    if (!terminalError || this.#terminalDeliveryNonce !== nonce || updateId === null) return false;\n" +
-      "\n" +
-      "    await this.#loopPromise;\n" +
-      "    if (\n" +
-      "      this.#terminalDeliveryError !== terminalError\n" +
-      "      || this.#terminalDeliveryNonce !== nonce\n" +
-      "      || this.#terminalDeliveryUpdateId !== updateId\n" +
-      "    ) return false;",
-    replace:
-      "    if (!terminalError || updateId === null) return false;\n" +
-      "\n" +
-      "    await this.#loopPromise;\n" +
-      "    if (\n" +
-      "      this.#terminalDeliveryError !== terminalError\n" +
-      "      || this.#terminalDeliveryUpdateId !== updateId\n" +
-      "    ) return false;",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
-    ],
-  },
-  {
-    // Clearing terminal state without starting the same service turns the command into another
-    // silent acknowledgement: the held update and every later one remain unprocessed.
-    what: "acknowledgement restarts the same stopped Telegram listener",
-    file: "src/ingress/telegram-polling.ts",
-    find: "    this.start();\n    return true;",
-    replace: "    return true;",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
+      "tests/unit/telegram-ingress.test.ts::an unknown send result is terminal without automatic retry and stops the loop",
     ],
   },
   {
@@ -2641,25 +2537,20 @@ const GUARDS = [
     ],
   },
   {
-    // Until an operator chooses NO_RETRY, the terminal state and its Doctor finding must outlive
-    // ordinary nonce pruning. Removing the resolution predicate drops that evidence at the TTL.
-    what: "unacknowledged terminal Telegram reply failures survive ordinary ingress pruning",
+    // The terminal state must outlive ordinary nonce pruning or its Doctor finding disappears and
+    // a retained update can look new again after the exact state meant to stop automatic resend.
+    what: "terminal Telegram reply failures survive ordinary ingress pruning",
     file: "src/ingress/ingress-guard.ts",
-    find: "                AND json_type(result_json, '$.operatorResolution') IS NULL",
-    replace: "                AND 1 = 0",
+    find:
+      "                'PENDING',\n" +
+      "                'UNKNOWN_RETRYABLE',\n" +
+      "                'UNANSWERABLE',\n" +
+      "                'UNRESOLVED'",
+    replace:
+      "                'PENDING',\n" +
+      "                'UNKNOWN_RETRYABLE'",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::an unacknowledged terminal reply remains visible after transport retention",
-    ],
-  },
-  {
-    // After NO_RETRY and the transport-retention floor, keeping the row forever hides unbounded
-    // accumulation behind Doctor's acknowledgement filter. Removing the predicate reproduces it.
-    what: "acknowledged terminal Telegram replies expire after transport retention",
-    file: "src/ingress/ingress-guard.ts",
-    find: "                AND json_type(result_json, '$.operatorResolution') IS NULL",
-    replace: "                AND 1 = 1",
-    killedBy: [
-      "tests/unit/telegram-ingress.test.ts::acknowledgement resumes the stopped production listener and health reports each transition",
+      "tests/unit/telegram-ingress.test.ts::an unknown send result is terminal without automatic retry and stops the loop",
     ],
   },
   {

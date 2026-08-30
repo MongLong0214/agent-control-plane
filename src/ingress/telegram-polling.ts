@@ -259,8 +259,6 @@ export interface TelegramLongPollListener {
 export interface TelegramLongPollStartOptions {
   transport?: TelegramBotTransport;
   onError?: (error: unknown) => void;
-  /** Reports the live listener transition that `health.json` must mirror. */
-  onStateChange?: (state: TelegramLongPollState) => void;
   onDirect?: (input: TelegramDirectInput) => string | Promise<string>;
   onCeoApproved?: (runId: string) => void | Promise<unknown>;
   /** Production starts polling immediately; tests can drive one poll cycle deterministically. */
@@ -270,10 +268,6 @@ export interface TelegramLongPollStartOptions {
   /** Durable owner-gate notifications to consume before polling for inbound updates. */
   ownerGateSignals?: () => readonly TelegramOwnerGateSignal[];
 }
-
-export type TelegramLongPollState =
-  | { running: true; stoppedReason: null; stoppedNonce: null }
-  | { running: false; stoppedReason: string; stoppedNonce: string };
 
 export type TelegramOwnerPromptDeliveryStatus = "PENDING" | "APPLIED" | "RETRYABLE";
 
@@ -576,8 +570,6 @@ export class TelegramLongPollService {
   #loopPromise: Promise<void> | null = null;
   #controller: AbortController | null = null;
   #terminalDeliveryError: TelegramDeliveryError | null = null;
-  #terminalDeliveryNonce: string | null = null;
-  #terminalDeliveryUpdateId: number | null = null;
   #offset: number | undefined;
   readonly #pendingTurns = new Set<TelegramTrackedTurn>();
   readonly #turnFailures: unknown[] = [];
@@ -594,7 +586,6 @@ export class TelegramLongPollService {
       allowedChatIds?: readonly string[];
       nowIso?: () => string;
       onError?: (error: unknown) => void;
-      onStateChange?: (state: TelegramLongPollState) => void;
       onInterrupt?: (point: TelegramInterruptPoint, update: TelegramUpdate, runId?: string) => void | Promise<void>;
       ownerGateSignals?: () => readonly TelegramOwnerGateSignal[];
       ownerPromptStore?: TelegramOwnerPromptStore;
@@ -840,39 +831,7 @@ export class TelegramLongPollService {
     if (this.#running) return;
     if (this.#terminalDeliveryError) throw this.#terminalDeliveryError;
     this.#running = true;
-    this.options.onStateChange?.({ running: true, stoppedReason: null, stoppedNonce: null });
     this.#loopPromise = this.loop();
-  }
-
-  /**
-   * Resumes only the live stop whose terminal reply the operator just acknowledged.
-   *
-   * The durable UNRESOLVED row makes the held update a no-send replay, and making that exact
-   * nonce the key prevents acknowledgement of some older reply from clearing the current stop.
-   * Waiting for the old loop to finish also prevents two poll loops sharing an offset queue.
-   */
-  async resumeAfterAcknowledgement(nonce: string): Promise<boolean> {
-    const terminalError = this.#terminalDeliveryError;
-    const updateId = this.#terminalDeliveryUpdateId;
-    if (!terminalError || this.#terminalDeliveryNonce !== nonce || updateId === null) return false;
-
-    await this.#loopPromise;
-    if (
-      this.#terminalDeliveryError !== terminalError
-      || this.#terminalDeliveryNonce !== nonce
-      || this.#terminalDeliveryUpdateId !== updateId
-    ) return false;
-
-    // The rejected route marked this update RETRYABLE on its way out. Admit it immediately after
-    // acknowledgement so the durable terminal state drains before a later update can move ahead.
-    if (this.#updateStates.get(updateId)?.status !== "SETTLED") {
-      this.#updateStates.set(updateId, { status: "RETRYABLE", retryAt: 0 });
-    }
-    this.#terminalDeliveryError = null;
-    this.#terminalDeliveryNonce = null;
-    this.#terminalDeliveryUpdateId = null;
-    this.start();
-    return true;
   }
 
   async close(): Promise<void> {
@@ -979,15 +938,7 @@ export class TelegramLongPollService {
         this.router.recordUnknownResponse(outcome, error.failure);
         if (policy.batch === "STOP") {
           this.#terminalDeliveryError = error;
-          this.#terminalDeliveryNonce = outcome.nonce;
-          this.#terminalDeliveryUpdateId = update.update_id;
           this.#running = false;
-          this.options.onStateChange?.({
-            running: false,
-            stoppedReason:
-              `reply delivery outcome is unknown for ${outcome.nonce}; acknowledge NO_RETRY to resume`,
-            stoppedNonce: outcome.nonce,
-          });
           throw error;
         }
       }
@@ -1140,7 +1091,6 @@ export const startTelegramLongPollListener = async (
     allowedChatIds: config.allowedChatIds,
     nowIso: () => cp.clock.nowIso(),
     onError: options.onError,
-    onStateChange: options.onStateChange,
     ownerGateSignals: options.ownerGateSignals ?? (() => ownerGateSignalsFromOutbox(cp)),
     ownerPromptStore: createOwnerPromptStore(cp),
     ...(options.onInterrupt ? { onInterrupt: options.onInterrupt } : {}),
