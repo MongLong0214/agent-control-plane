@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   blankKeepingNewlines,
   stripHashComments,
+  stripJsSource,
   stripPythonSource,
   stripSlashComments,
   stripSqlComments,
@@ -127,6 +128,10 @@ const strippers: Array<{ name: string; fn: (text: string) => string }> = [
   // (line-count preservation) is asserted for both, not just the one a caller happened to reach.
   { name: "stripPythonSource(blankStrings=true)", fn: (text) => stripPythonSource(text, true) },
   { name: "stripPythonSource(blankStrings=false)", fn: (text) => stripPythonSource(text, false) },
+  // #689/round 15: `stripJsSource` replaces the three-function JS/TS pipeline with one ordered
+  // walk — same reason `stripPythonSource` gets its own two rows above, not just one call site.
+  { name: "stripJsSource(blankStrings=true)", fn: (text) => stripJsSource(text, true) },
+  { name: "stripJsSource(blankStrings=false)", fn: (text) => stripJsSource(text, false) },
 ];
 
 describe("tracker-loci strip invariants", () => {
@@ -224,6 +229,83 @@ describe("tracker-loci strip invariants", () => {
       expect(contentView.split("\n")[76]).toBe(
         '    ALLOWLIST_DIGEST = "sha256:" + hashlib.sha256(_f.read()).hexdigest()',
       );
+    });
+  });
+
+  describe("stripJsSource (#689, round 15)", () => {
+    // Every delimiter-ordering shape this class of bug can take, each its own row rather than one
+    // broad assertion — the same discipline round 11's property test above uses, and the one a
+    // prior round of this exact script was blocked for skipping.
+
+    it("// inside a string is not read as a comment marker", () => {
+      // The real shape #689 found: no `://` before the `//`, the one case the old
+      // `stripSlashComments` lookbehind protected — everything else fell through.
+      const input = 'const a = "a//b";\nconst c = 1;';
+      expect(stripJsSource(input, true)).toBe('const a = "    ";\nconst c = 1;');
+      expect(stripJsSource(input, false)).toBe(input); // content view: string left untouched
+    });
+
+    it("a quote inside a genuine // comment does not open a string", () => {
+      const input = "// this isn't \"real\" code\nconst a = 1;";
+      const symbolView = stripJsSource(input, true);
+      const contentView = stripJsSource(input, false);
+      expect(symbolView).toBe("\nconst a = 1;");
+      expect(contentView).toBe("\nconst a = 1;");
+    });
+
+    it("a quote inside a /* */ comment does not open a string", () => {
+      const input = '/* say "hi" and \'bye\' */\nconst a = 1;';
+      const out = stripJsSource(input, true);
+      expect(out).not.toContain('"');
+      expect(out).not.toContain("'");
+      expect(out.split("\n")[1]).toBe("const a = 1;");
+    });
+
+    it("a /* */ span inside a string is string content, not a comment", () => {
+      const input = 'const a = "a/*b*/c";\nconst d = 2;';
+      expect(stripJsSource(input, true)).toBe('const a = "       ";\nconst d = 2;');
+      expect(stripJsSource(input, false)).toBe(input);
+    });
+
+    it("a template literal's ${...} expression containing a quote resolves the nested string", () => {
+      const input = '`text ${"a"} more`;\nconst z = 3;';
+      expect(stripJsSource(input, true)).toBe('`     ${" "}     `;\nconst z = 3;');
+      expect(stripJsSource(input, false)).toBe(input);
+    });
+
+    it("an escaped quote inside a string does not end it early", () => {
+      const input = 'const a = "a\\"b";\nconst c = 4;';
+      // The escaped `\"` does not close the string one character early; the real closing `"` is
+      // the one right before `;`. If it ended early, the un-blanked remainder (`b";`) would
+      // survive as unstripped code instead of being folded into the blanked interior.
+      expect(stripJsSource(input, true)).toBe('const a = "    ";\nconst c = 4;');
+    });
+
+    it("an unterminated string is blanked to where it actually ends, not left unrecognized", () => {
+      const input = 'const a = "never closes\nconst b = 6;';
+      const out = stripJsSource(input, true);
+      expect(out.split("\n")[0]).toBe('const a = "            ');
+      expect(out.split("\n")[1]).toBe("const b = 6;"); // unaffected — the newline still ended it
+    });
+
+    it("a } that closes a string inside ${...} does not end the expression early", () => {
+      const input = '`x ${ x || "}" } y`;\nconst z = 13;';
+      const out = stripJsSource(input, true);
+      expect(out).toContain('${ x ||');
+      expect(out.split("\n")[1]).toBe("const z = 13;"); // the real end was reached, not miscounted
+    });
+
+    it("the real tests/integration/pipeline.test.ts:184 shape: module.exports inside a string with an embedded // is blanked, not left visible", () => {
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const text = fs.readFileSync(
+        path.join(__dirname, "..", "integration", "pipeline.test.ts"),
+        "utf8",
+      );
+      const symbolView = stripJsSource(text, true);
+      expect(symbolView).not.toContain("module.exports");
+      const contentView = stripJsSource(text, false);
+      expect(contentView).toContain('module.exports = () => 2; // addressed review');
     });
   });
 });

@@ -160,6 +160,177 @@ export const stripPythonSource = (text, blankStrings) => {
 };
 
 /**
+ * #689 (round 15): the JS/TS pipeline — `stripStrings(stripTemplateLiteralProse(
+ * stripSlashComments(text)))` for the symbol-search view, `stripSlashComments(text)` alone for the
+ * content view — ran `stripSlashComments` *first*, blind to string and template-literal
+ * boundaries. That is the exact defect #700 fixed for Python's `#` (see `stripPythonSource`'s own
+ * comment), applied here to `//`: a `//` inside a string literal that contains no `://` (the one
+ * shape `stripSlashComments`'s lookbehind protects) reads as a real comment and truncates the
+ * line, destroying the string's closing quote before `stripStrings` ever runs.
+ *
+ * Confirmed against the real corpus, not a constructed case: `tests/integration/pipeline.test.ts`
+ * writes `"module.exports = () => 2; // addressed review\n"` as a string; `module.exports`
+ * appears *only* inside that string, and this script's own contract says a symbol found only
+ * inside a string is STALE. Feeding it `` `module.exports` in
+ * `tests/integration/pipeline.test.ts` `` returned `stale: []` instead — the corrupted
+ * comment-strip deleted from the embedded `//` to end of line (there is no `:` right before it),
+ * taking the string's closing quote with it. `stripStrings` then found no matching close on that
+ * line and left `module.exports = () => 2; ` completely unrecognized as a string, so its content
+ * was never blanked and the bare word read as if it were real code.
+ *
+ * `stripJsSource` replaces that three-function pipeline with one ordered character walk, the way
+ * `stripPythonSource` already resolves `#` and quotes for Python: `//`, `/* ... *\/`, `"`, `'`,
+ * and `` ` `` (template literals, including their `${…}` expressions — walked recursively, so a
+ * nested string, comment, or template inside an expression is resolved the same way, and a `}`
+ * that closes a string inside the expression does not end the expression early) are each
+ * recognized in the order a real tokenizer would see them. A string or template literal is
+ * entered — and everything inside it treated as literal content, never markup — the instant its
+ * opening delimiter is seen, before any `//` or `/*` inside it gets a chance to be misread as a
+ * comment. The mirror case holds symmetrically: once a `//` or `/* *\/` comment has started, a
+ * `"`, `'`, or `` ` `` inside it is just comment text and never opens a string. With ordering
+ * fixed at the source, the `://` lookbehind `stripSlashComments` needed is no longer necessary
+ * here — a URL inside a string is protected because the string is recognized as one delimiter
+ * before its interior `//` is ever inspected, not because of a special case for `:`.
+ *
+ * `blankStrings` answers the same question `stripPythonSource`'s does: `true` for the
+ * symbol-search view (string and template-literal *content* blanked, delimiters kept — a symbol
+ * only spelled inside a string does not count as the file declaring it); `false` for the
+ * content-search view (comments blanked, string/template content left untouched, so a citation
+ * quoting a string's exact text still compares against the real one).
+ *
+ * An unterminated string or template literal (no closing delimiter before end of line/file, the
+ * same adversarial shape the property test below exercises) is blanked up to wherever it actually
+ * ends, rather than left completely unrecognized the way the old regex-based `stripStrings`
+ * silently did — a defined, testable answer instead of an accidental one.
+ */
+export const stripJsSource = (text, blankStrings) => {
+  const n = text.length;
+
+  /** Consumes a `"`/`'`-quoted string starting at `i`; returns the rendered span and next index. */
+  const scanQuotedString = (i, quote) => {
+    const start = i;
+    let j = i + 1;
+    while (j < n) {
+      if (text[j] === "\\" && j + 1 < n) {
+        j += 2;
+        continue;
+      }
+      if (text[j] === quote) {
+        j++;
+        break;
+      }
+      if (text[j] === "\n") break; // a JS string does not span a raw newline
+      j++;
+    }
+    const span = text.slice(start, j);
+    if (!blankStrings) return { rendered: span, next: j };
+    const closed = span.length > 1 && span[span.length - 1] === quote;
+    const closeLen = closed ? 1 : 0;
+    const interior = span.slice(1, span.length - closeLen);
+    const rendered = span.slice(0, 1) + blankKeepingNewlines(interior) + (closeLen ? span.slice(-1) : "");
+    return { rendered, next: j };
+  };
+
+  /**
+   * Consumes a template literal starting at `i` (`text[i] === "`"`). Prose is blanked (in
+   * `blankStrings` mode) the same way `stripTemplateLiteralProse` blanks it; a `${…}` expression
+   * is handed to `walk` in expression mode so its own strings/comments/nested templates resolve
+   * through the same ordered logic, and a brace inside one of those does not miscount toward the
+   * expression's own close.
+   */
+  const scanTemplateLiteral = (i) => {
+    let out = "`";
+    i++;
+    let proseStart = i;
+    const flushProse = (end) => {
+      const prose = text.slice(proseStart, end);
+      out += blankStrings ? blankKeepingNewlines(prose) : prose;
+    };
+    while (i < n) {
+      if (text[i] === "\\" && i + 1 < n) {
+        i += 2;
+        continue;
+      }
+      if (text[i] === "`") {
+        flushProse(i);
+        out += "`";
+        return { rendered: out, next: i + 1 };
+      }
+      if (text[i] === "$" && text[i + 1] === "{") {
+        flushProse(i);
+        out += "${";
+        const { rendered, next } = walk(i + 2, 1);
+        out += rendered;
+        i = next;
+        proseStart = i;
+        continue;
+      }
+      i++;
+    }
+    flushProse(i); // unterminated template literal: flush whatever prose remains to end of text
+    return { rendered: out, next: i };
+  };
+
+  /**
+   * The shared ordered walk. `exprDepth === null` means top-level (runs to end of text);
+   * otherwise it is inside a template literal's `${…}` and returns the moment a `}` brings the
+   * (already-1-deep, for the `${` that opened it) depth back to 0 — a literal `{`/`}` reached
+   * as ordinary code (not inside a string/comment/nested template, which are each consumed whole
+   * by their own branch below and never seen by this counter) adjusts that depth first.
+   */
+  const walk = (start, exprDepth) => {
+    let out = "";
+    let depth = exprDepth ?? null;
+    let i = start;
+    while (i < n) {
+      const ch = text[i];
+      if (ch === "/" && text[i + 1] === "/") {
+        while (i < n && text[i] !== "\n") i++;
+        continue; // line comments are deleted outright, matching stripSlashComments
+      }
+      if (ch === "/" && text[i + 1] === "*") {
+        const blockStart = i;
+        i += 2;
+        while (i < n && !(text[i] === "*" && text[i + 1] === "/")) i++;
+        if (i < n) i += 2;
+        out += blankKeepingNewlines(text.slice(blockStart, i));
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        const { rendered, next } = scanQuotedString(i, ch);
+        out += rendered;
+        i = next;
+        continue;
+      }
+      if (ch === "`") {
+        const { rendered, next } = scanTemplateLiteral(i);
+        out += rendered;
+        i = next;
+        continue;
+      }
+      if (depth !== null && ch === "{") {
+        depth++;
+        out += ch;
+        i++;
+        continue;
+      }
+      if (depth !== null && ch === "}") {
+        depth--;
+        out += ch;
+        i++;
+        if (depth === 0) return { rendered: out, next: i };
+        continue;
+      }
+      out += ch;
+      i++;
+    }
+    return { rendered: out, next: i };
+  };
+
+  return walk(0, null).rendered;
+};
+
+/**
  * Template literals (`` `...` ``) hold two different things at once: literal text the author
  * wrote, and `${…}` expressions that are ordinary code. Stripping the whole literal (the earlier
  * approach) throws the code away with the prose; leaving it alone (the approach before that) reads

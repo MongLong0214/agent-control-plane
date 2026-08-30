@@ -675,6 +675,38 @@
  *   are still stripped from both sides here) are both unaffected — only string-content sensitivity
  *   changed, and only in the content-search path.
  *
+ * ## Round 15: the third instance of the same bug — the JS/TS stripper was never string-aware to
+ * begin with
+ *
+ *   Round 14 fixed Python's `#`-vs-string ordering (#700, `stripPythonSource`) and split the
+ *   content-search view from the symbol-search view. Both call sites for JS/TS still ran
+ *   `stripSlashComments` — a regex, line-by-line, comment stripper — *first*, before either view
+ *   knew where a string started. A `//` inside a string literal that contains no `://` (the one
+ *   shape the old lookbehind protected) read as a real comment and truncated the line, destroying
+ *   the string's closing quote before `stripStrings` ever ran.
+ *
+ *   Confirmed against the real corpus: `tests/integration/pipeline.test.ts` writes
+ *   `"module.exports = () => 2; // addressed review\n"` as a string, and `module.exports` appears
+ *   *only* inside it. `` `module.exports` in `tests/integration/pipeline.test.ts` `` returned
+ *   `stale: []` — the opposite of this script's own rule that a symbol found only inside a string
+ *   is STALE — because the corrupted comment-strip left `module.exports = () => 2; ` looking like
+ *   an unterminated, unrecognized string that `stripStrings` never paired off and therefore never
+ *   blanked.
+ *
+ *   `stripJsSource` (`scripts/lib/tracker-loci-strip.mjs`) replaces the three-function pipeline
+ *   (`stripStrings(stripTemplateLiteralProse(stripSlashComments(text)))` for the symbol view,
+ *   `stripSlashComments(text)` alone for the content view) with one ordered character walk, the
+ *   same shape as `stripPythonSource`: `//`, `/* ... *\/`, `"`, `'`, and `` ` `` (template
+ *   literals, `${…}` expressions walked recursively) are each recognized in the order a real
+ *   tokenizer sees them, so a string or template literal is entered before a `//`/`/*` inside it
+ *   can be misread, and — the mirror case — a quote inside an already-started comment is just
+ *   comment text and never opens a string. The `://` lookbehind is gone; it is no longer needed
+ *   once ordering itself is correct. Verified against every delimiter-ordering shape this class of
+ *   bug can take (`tests/unit/tracker-loci-strip-invariants.test.ts`): `//` in a string, a quote in
+ *   a `//` comment, a quote in a `/* *\/` comment, a `/* *\/` inside a string, a template literal
+ *   whose `${…}` contains a quote, an escaped quote, and an unterminated string — each has its own
+ *   row, not folded into one broad assertion, the same discipline round 11's property test used.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -683,11 +715,10 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stripHashComments,
+  stripJsSource,
   stripPythonSource,
-  stripSlashComments,
   stripSqlComments,
   stripStrings,
-  stripTemplateLiteralProse,
 } from "./lib/tracker-loci-strip.mjs";
 
 const defaultRepoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -795,7 +826,7 @@ const codeSearchScope = (relPath) => {
  * different answers about string content, and #700 for the Python-specific fix here.
  */
 const stripToCodeView = (text, ext) => {
-  if (JS_FAMILY_EXTS.has(ext)) return stripStrings(stripTemplateLiteralProse(stripSlashComments(text)));
+  if (JS_FAMILY_EXTS.has(ext)) return stripJsSource(text, true);
   if (PY_EXTS.has(ext)) return stripPythonSource(text, true);
   if (HASH_COMMENT_EXTS.has(ext)) return stripStrings(stripHashComments(text));
   if (SQL_EXTS.has(ext)) return stripStrings(stripSqlComments(text));
@@ -845,7 +876,7 @@ const readCode = (relPath) => {
  * content differs between the two views.
  */
 const stripCommentsForContentView = (text, ext) => {
-  if (JS_FAMILY_EXTS.has(ext)) return stripSlashComments(text);
+  if (JS_FAMILY_EXTS.has(ext)) return stripJsSource(text, false);
   if (PY_EXTS.has(ext)) return stripPythonSource(text, false);
   if (HASH_COMMENT_EXTS.has(ext)) return stripHashComments(text);
   if (SQL_EXTS.has(ext)) return stripSqlComments(text);

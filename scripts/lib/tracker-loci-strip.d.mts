@@ -13,3 +13,4 @@ export declare const stripSqlComments: (text: string) => string;
 export declare const stripStrings: (text: string) => string;
 export declare const stripTemplateLiteralProse: (text: string) => string;
 export declare const stripPythonSource: (text: string, blankStrings: boolean) => string;
+export declare const stripJsSource: (text: string, blankStrings: boolean) => string;

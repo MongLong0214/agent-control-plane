@@ -1610,6 +1610,46 @@ describe("verify-tracker-loci-resolve", () => {
     });
   });
 
+  describe("[round 15] #689: the JS/TS comment stripper was never string-aware — the third instance of this script's own most-repeated defect", () => {
+    it("module.exports in tests/integration/pipeline.test.ts:184 occurs only inside a string containing an embedded //, and reads STALE — the real repo citation, not a constructed fixture", () => {
+      // The real shape found in this repository, not hand-built: `tests/integration/
+      // pipeline.test.ts:184` writes `"module.exports = () => 2; // addressed review\n"` as a
+      // string. `module.exports` appears nowhere else in the file as real code — both of its
+      // occurrences (line 184 and line 372) are inside string literals that each contain their own
+      // embedded `//`. Before this fix, `stripSlashComments` ran first, blind to the string
+      // boundary; the embedded `//` (no `:` right before it, the one shape its lookbehind
+      // protected) truncated the line and destroyed the string's own closing quote before
+      // `stripStrings` ever ran, leaving `module.exports = () => 2; ` looking like ordinary code
+      // that `stripJsSource`'s predecessor pipeline never recognized as string content at all —
+      // `stale: []`, exit 0, the opposite of this script's own contract that a symbol found only
+      // inside a string is STALE.
+      const body = "`module.exports` in `tests/integration/pipeline.test.ts`";
+      const { path, cleanup } = withIssues([{ number: 68901, title: "round 15: // inside a string bypasses the symbol search", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("module.exports");
+        expect(result.stdout).toContain("does not appear");
+        expect(result.stdout).toContain("tests/integration/pipeline.test.ts");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a real, current TypeScript identifier used as code (not only inside a string) still resolves silently — positive control", () => {
+      const body = "`withIssues` in `tests/unit/verify-tracker-loci-resolve.test.ts`";
+      const { path, cleanup } = withIssues([{ number: 68902, title: "round 15: real code identifier still resolves", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);
