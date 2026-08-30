@@ -16,9 +16,10 @@ import { ReasonCode } from "../core/reason-codes.ts";
  *
  * What is allowed instead is a realm that shares nothing with production: its own state
  * directory, database, sockets, lock and runtime root, its own disposable actor, and a probe
- * target that is not the canonical root. The evidence it can produce is bounded to match — an
- * isolated instance answered and remembered, which is not a statement about canonical safety,
- * actor reconstitution, duplicate freedom, or activation.
+ * target that is not the canonical root. The synthetic evidence is bounded to match what runs:
+ * production ingress admits and classifies, a driver-owned callback answers, and ingress records
+ * an APPLIED reply. Actor handling, a target-authored transcript and CEO durability stay unproven,
+ * along with canonical safety, actor reconstitution, duplicate freedom and activation.
  *
  * **Every safety condition here is a refusal, not a note.** The failure this module is written
  * against is a procedure that lists its own preconditions in prose and then runs anyway, so each
@@ -623,9 +624,13 @@ export const mayTerminate = (owned: readonly OwnedProcess[], candidate: OwnedPro
  * was observed and what gets claimed is where an acceptance run stops being evidence.
  */
 export const REALM_EVIDENCE_CLAIM =
-  "an isolated disposable ACP instance admitted, routed, answered and remembered a two-message " +
-  "probe. This says nothing about canonical safety, actor reconstitution, duplicate freedom, " +
-  "the target fence and receipt, or activation.";
+  "A disposable ACP instance in a UUID OS-temp workspace admitted and DIRECT-classified two " +
+  "synthetic Telegram updates through the production poll-and-router entry, invoked a " +
+  "driver-owned direct callback, sent both callback replies through an injected transport, and " +
+  "persisted matching APPLIED ingress reply records. The bound actor, production CEO path, " +
+  "target-authored transcript, CEO-side durable commit, live Telegram, canonical safety, actor " +
+  "reconstitution, duplicate freedom, the target fence and receipt, and activation were not " +
+  "exercised.";
 
 /** Whether the production database can be read without being opened for writing. */
 export const productionIsReadable = (home = homedir()): boolean => {

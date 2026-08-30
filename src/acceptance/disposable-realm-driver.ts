@@ -1,12 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +12,7 @@ import { Role, SessionLifecycle } from "../domain/types.ts";
 import {
   TelegramDeliveryError,
   type TelegramBotTransport,
+  type TelegramLongPollStartOptions,
   type TelegramSentMessage,
   startTelegramLongPollListener,
 } from "../ingress/telegram-polling.ts";
@@ -54,6 +49,7 @@ export type SyntheticProbeFault =
   | "REALM_POINTS_AT_FAKE_PRODUCTION"
   | "SECOND_ACTOR"
   | "SYNTHETIC_BASELINE_CHANGES"
+  | "SYNTHETIC_TRANSPORT_NOT_INJECTED"
   | "LEAVE_REALM_RESIDUE";
 
 export interface SyntheticDisposableRealmOptions {
@@ -76,41 +72,226 @@ export interface SyntheticSentReply {
   readonly text: string;
 }
 
-export interface SyntheticTargetTurn {
+export interface SyntheticDriverTurn {
   readonly prompt: string;
   readonly reply: string;
+}
+
+export interface SyntheticIngressAppliedReply extends SyntheticSentReply {
+  readonly nonce: string;
+  readonly chatId: string;
+  readonly correlationId: string;
 }
 
 export interface SyntheticProbeTrace {
   readonly outcomes: SyntheticProbeOutcome[];
   readonly sentReplies: SyntheticSentReply[];
-  readonly targetTurns: SyntheticTargetTurn[];
-  readonly durableNonces: string[];
+  readonly driverTurns: SyntheticDriverTurn[];
+  readonly ingressAppliedReplies: SyntheticIngressAppliedReply[];
   readonly actorIds: string[];
   readonly targetActorIds: string[];
 }
+
+export type SyntheticEvidenceStepStatus = "CHECKED_BY_RUN" | "UNPROVEN";
+
+export interface SyntheticEvidenceStep {
+  readonly id: string;
+  readonly status: SyntheticEvidenceStepStatus;
+  readonly statement: string;
+}
+
+const SYNTHETIC_EVIDENCE_STEPS: readonly SyntheticEvidenceStep[] = [
+  {
+    id: "REALM_PATHS_ISOLATED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "The generated realm paths passed isolation planning before and after creation inside the janitor-owned OS-temp workspace.",
+  },
+  {
+    id: "NONCANONICAL_PROBE_TARGET",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "The generated probe target passed the noncanonical-target check before and after realm creation.",
+  },
+  {
+    id: "SYNTHETIC_TRANSPORT_USED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "The listener received and used the driver-owned synthetic Telegram transport instead of its live fallback.",
+  },
+  {
+    id: "PRODUCTION_POLL_AND_ROUTER_USED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "Production polling and routing admitted and DIRECT-classified both synthetic Telegram updates.",
+  },
+  {
+    id: "DRIVER_DIRECT_CALLBACK_ANSWERED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "A driver-owned onDirect callback handled both prompts and supplied both reply bodies.",
+  },
+  {
+    id: "INGRESS_APPLIED_REPLIES_READ",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "The driver reread two matching APPLIED ingress reply records from the realm database.",
+  },
+  {
+    id: "SYNTHETIC_BASELINE_UNCHANGED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "The generated synthetic baseline had the same observed facts before and after the probe.",
+  },
+  {
+    id: "REALM_AND_WORKSPACE_REMOVED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "The normal run observed no realm residue and the janitor confirmed the outer workspace absent before this artifact was built.",
+  },
+  {
+    id: "BOUND_ACTOR_HANDLED_PROBE",
+    status: "UNPROVEN",
+    statement:
+      "The bound actor did not handle either probe message; the run used a driver-owned onDirect callback.",
+  },
+  {
+    id: "PRODUCTION_CEO_PATH_ANSWERED",
+    status: "UNPROVEN",
+    statement:
+      "The production CeoConversationPort and authenticated MCP peer were not connected or exercised.",
+  },
+  {
+    id: "TARGET_AUTHORED_TRANSCRIPT",
+    status: "UNPROVEN",
+    statement:
+      "No target process authored or persisted a transcript; the run did not observe target-owned state.",
+  },
+  {
+    id: "CEO_DURABLE_COMMIT",
+    status: "UNPROVEN",
+    statement:
+      "APPLIED is ingress reply-delivery state; the run did not prove a CEO-side durable commit.",
+  },
+  {
+    id: "LIVE_CANONICAL_ACTIVATION",
+    status: "UNPROVEN",
+    statement:
+      "Live Telegram, canonical state, actor reconstitution, duplicate freedom, the target fence and receipt, and activation were not exercised.",
+  },
+];
+
+export type SyntheticSafetyConditionStatus = "CHECKED_BY_RUN" | "ASSERTED_ONLY";
+
+export interface SyntheticSafetyCondition {
+  readonly condition: string;
+  readonly status: SyntheticSafetyConditionStatus;
+  readonly detail: string;
+}
+
+const SYNTHETIC_SAFETY_CONDITIONS: readonly SyntheticSafetyCondition[] = [
+  {
+    condition: "A realm that shares a path with production is not a realm",
+    status: "CHECKED_BY_RUN",
+    detail:
+      "The generated paths passed planning before and after creation against the synthetic production root; no live production path was supplied.",
+  },
+  {
+    condition: "The probe may not address the canonical conversation",
+    status: "CHECKED_BY_RUN",
+    detail:
+      "The generated probe root passed the canonical-root containment refusal before and after creation.",
+  },
+  {
+    condition: "Production has to be the same set of facts afterwards",
+    status: "CHECKED_BY_RUN",
+    detail:
+      "Before and after censuses matched for the generated synthetic baseline; live production was deliberately not read and is not covered.",
+  },
+  {
+    condition: "A failure to look is not an observation of absence",
+    status: "CHECKED_BY_RUN",
+    detail: "Both synthetic census reads returned observations; either unreadable census denies the run.",
+  },
+  {
+    condition: "Disposable means observed to be gone",
+    status: "CHECKED_BY_RUN",
+    detail:
+      "Normal realm cleanup reported no residue and janitor release confirmed the outer workspace absent; parent-death cleanup was not exercised by this artifact.",
+  },
+  {
+    condition: "An unanswerable question is never followed by another message",
+    status: "ASSERTED_ONLY",
+    detail:
+      "This successful run observed no ambiguous signal, so terminal no-retry behavior was not exercised by this artifact.",
+  },
+  {
+    condition: "Cleanup terminates only what this run started",
+    status: "ASSERTED_ONLY",
+    detail:
+      "Synthetic mode started no target or Gateway process and supplied zero cleanup candidates, so PID and start-time ownership refusal was not exercised by this artifact.",
+  },
+  {
+    condition: "The evidence claim is bounded in the code, not in the write-up",
+    status: "CHECKED_BY_RUN",
+    detail:
+      "The requested claim matched the only permitted sentence and every CHECKED_BY_RUN step was matched to an execution marker before this artifact was returned.",
+  },
+];
 
 export interface SyntheticDisposableRealmEvidence {
   readonly mode: "SYNTHETIC";
   readonly claim: typeof REALM_EVIDENCE_CLAIM;
   readonly updateIds: readonly number[];
   readonly replyCount: number;
-  readonly targetTurnCount: number;
-  readonly durableNonceCount: number;
-  readonly disposableActorCount: number;
-  readonly targetBindingCount: number;
+  readonly driverHandledTurnCount: number;
+  readonly ingressAppliedReplyCount: number;
+  readonly createdActorCount: number;
+  readonly createdTargetBindingCount: number;
+  readonly syntheticBaselineUnchanged: true;
+  readonly workspaceRemoved: true;
+  readonly residue: readonly string[];
+  readonly layout: readonly string[];
+  readonly steps: readonly SyntheticEvidenceStep[];
+  readonly safetyConditions: readonly SyntheticSafetyCondition[];
+}
+
+interface SyntheticDisposableRealmObservation {
+  readonly updateIds: readonly number[];
+  readonly replyCount: number;
+  readonly driverHandledTurnCount: number;
+  readonly ingressAppliedReplyCount: number;
+  readonly createdActorCount: number;
+  readonly createdTargetBindingCount: number;
   readonly syntheticBaselineUnchanged: true;
   readonly residue: readonly string[];
   readonly layout: readonly string[];
 }
 
+export const assertEvidenceStepsExecuted = (
+  steps: readonly SyntheticEvidenceStep[],
+  executed: ReadonlySet<string>,
+): Decision<void> => {
+  const unsupportedSteps = steps
+    .filter((step) => step.status === "CHECKED_BY_RUN" && !executed.has(step.id))
+    .map((step) => step.id);
+  if (unsupportedSteps.length > 0) {
+    return deny(
+      ReasonCode.ACCEPTANCE_EVIDENCE_OVERCLAIMED,
+      "the evidence artifact marked a step checked that this run did not execute",
+      { unsupportedSteps },
+    );
+  }
+  return allow(ReasonCode.OK, undefined);
+};
+
 /**
  * The two-message claim is structural, not a count attached after the fact.
  *
  * Every observation must agree on the same two updates: Telegram admission, the reply accepted
- * by the transport, the synthetic target's own transcript and the durable APPLIED row. The realm
- * must also contain one actor with one lifetime binding to the synthetic target. A two in one
- * column and a zero in another is an incomplete probe, not a partially successful one.
+ * by the injected transport, the driver-owned callback turn and the full APPLIED ingress reply
+ * reread from the database. The realm must also contain one created actor and target binding,
+ * which is only a creation count — handling by that actor is explicitly unproven in the artifact.
  */
 export const assertSyntheticProbeComplete = (
   trace: SyntheticProbeTrace,
@@ -119,22 +300,22 @@ export const assertSyntheticProbeComplete = (
   const counts = {
     outcomes: trace.outcomes.length,
     sentReplies: trace.sentReplies.length,
-    targetTurns: trace.targetTurns.length,
-    durableNonces: trace.durableNonces.length,
+    driverTurns: trace.driverTurns.length,
+    ingressAppliedReplies: trace.ingressAppliedReplies.length,
     actorIds: trace.actorIds.length,
     targetActorIds: trace.targetActorIds.length,
   };
   if (
     counts.outcomes !== 2 ||
     counts.sentReplies !== 2 ||
-    counts.targetTurns !== 2 ||
-    counts.durableNonces !== 2 ||
+    counts.driverTurns !== 2 ||
+    counts.ingressAppliedReplies !== 2 ||
     counts.actorIds !== 1 ||
     counts.targetActorIds !== 1
   ) {
     return deny(
       ReasonCode.ACCEPTANCE_PROBE_INCOMPLETE,
-      "the disposable probe did not produce two complete round trips owned by one actor",
+      "the disposable probe did not produce two matching driver-handled ingress exchanges and one created actor binding",
       counts,
     );
   }
@@ -142,10 +323,12 @@ export const assertSyntheticProbeComplete = (
   for (let index = 0; index < UPDATE_IDS.length; index += 1) {
     const outcome = trace.outcomes[index]!;
     const sent = trace.sentReplies[index]!;
-    const target = trace.targetTurns[index]!;
+    const driverTurn = trace.driverTurns[index]!;
+    const ingress = trace.ingressAppliedReplies[index]!;
+    const expectedCorrelationId = `telegram:${UPDATE_IDS[index]}:${MESSAGE_IDS[index]}`;
     const expectedReply =
-      `DIRECT received; no run created\n${target.reply}\n` +
-      `correlation: telegram:${UPDATE_IDS[index]}:${MESSAGE_IDS[index]}`;
+      `DIRECT received; no run created\n${driverTurn.reply}\n` +
+      `correlation: ${expectedCorrelationId}`;
     if (
       outcome.updateId !== UPDATE_IDS[index] ||
       outcome.admitted !== true ||
@@ -154,13 +337,17 @@ export const assertSyntheticProbeComplete = (
       outcome.reply !== expectedReply ||
       sent.replyToMessageId !== MESSAGE_IDS[index] ||
       sent.text !== expectedReply ||
-      target.prompt !== PROMPTS[index] ||
-      trace.durableNonces[index] !== expectedNonces[index]
+      driverTurn.prompt !== PROMPTS[index] ||
+      ingress.nonce !== expectedNonces[index] ||
+      ingress.chatId !== CHAT_ID ||
+      ingress.replyToMessageId !== MESSAGE_IDS[index] ||
+      ingress.text !== expectedReply ||
+      ingress.correlationId !== expectedCorrelationId
     ) {
       return deny(
         ReasonCode.ACCEPTANCE_PROBE_INCOMPLETE,
-        "the synthetic transport, target transcript and durable reply do not describe the same turn",
-        { index, outcome, sent, target, durableNonce: trace.durableNonces[index] ?? null },
+        "the production router, driver callback, injected transport and APPLIED ingress record do not describe the same exchange",
+        { index, outcome, sent, driverTurn, ingress },
       );
     }
   }
@@ -190,6 +377,21 @@ const assertEvidenceClaim = (claim: string): Decision<typeof REALM_EVIDENCE_CLAI
         ReasonCode.ACCEPTANCE_EVIDENCE_OVERCLAIMED,
         "the requested evidence sentence claims more than the disposable realm observed",
         { permittedClaim: REALM_EVIDENCE_CLAIM },
+      );
+
+const assertSyntheticTransportInjected = (
+  options: TelegramLongPollStartOptions,
+  transport: TelegramBotTransport,
+): Decision<void> =>
+  options.transport === transport
+    ? allow(ReasonCode.OK, undefined)
+    : deny(
+        ReasonCode.ACCEPTANCE_PROBE_INCOMPLETE,
+        "the synthetic listener refused to start without its injected transport because omission selects the live Bot API fallback",
+        {
+          configuredTransport: "DEFAULT_LIVE_FALLBACK",
+          requiredTransport: "SYNTHETIC_INJECTED",
+        },
       );
 
 const controlPlaneConfig = (
@@ -358,8 +560,9 @@ export const createJanitorOwnedRealmWorkspace = async (): Promise<JanitorOwnedRe
 };
 
 /**
- * Runs the only driver #655 currently permits: deterministic transport and target, never live
- * Telegram, never the live Gateway, and never a caller-supplied state root.
+ * Runs the only driver #655 currently permits: deterministic transport and a driver-owned direct
+ * handler, never live Telegram, never a target or Gateway process, and never a caller-supplied
+ * state root.
  */
 export const runSyntheticDisposableRealmProbe = async (
   options: SyntheticDisposableRealmOptions = {},
@@ -384,8 +587,9 @@ export const runSyntheticDisposableRealmProbe = async (
   let realm: ControlPlane | null = null;
   let listener: Awaited<ReturnType<typeof startTelegramLongPollListener>> | null = null;
   let residueWasPresent = false;
+  const executedEvidenceSteps = new Set<string>();
 
-  const execute = async (): Promise<Decision<SyntheticDisposableRealmEvidence>> => {
+  const execute = async (): Promise<Decision<SyntheticDisposableRealmObservation>> => {
     try {
     const fakeHome = join(workspace, "home");
     const fakeProductionRoot = productionRoot(fakeHome);
@@ -414,7 +618,7 @@ export const runSyntheticDisposableRealmProbe = async (
       canonicalTargetRoot,
     });
     if (!planned.allowed) {
-      return planned as Decision<SyntheticDisposableRealmEvidence>;
+      return planned as Decision<SyntheticDisposableRealmObservation>;
     }
 
     const before = options.fault === "BEFORE_CENSUS_UNOBSERVABLE"
@@ -424,7 +628,7 @@ export const runSyntheticDisposableRealmProbe = async (
         )
       : takeProductionCensus(production, fakeProductionRoot);
     if (!before.allowed) {
-      return before as Decision<SyntheticDisposableRealmEvidence>;
+      return before as Decision<SyntheticDisposableRealmObservation>;
     }
 
     mkdirSync(paths.stateDir, { recursive: true, mode: 0o700 });
@@ -437,8 +641,10 @@ export const runSyntheticDisposableRealmProbe = async (
       canonicalTargetRoot,
     });
     if (!createdPlan.allowed) {
-      return createdPlan as Decision<SyntheticDisposableRealmEvidence>;
+      return createdPlan as Decision<SyntheticDisposableRealmObservation>;
     }
+    executedEvidenceSteps.add("REALM_PATHS_ISOLATED");
+    executedEvidenceSteps.add("NONCANONICAL_PROBE_TARGET");
 
     realm = new ControlPlane(controlPlaneConfig(paths.stateDir, [{ channel: "telegram", actor: OWNER_ID }]));
     const session = realm.sessions.create({
@@ -452,7 +658,7 @@ export const runSyntheticDisposableRealmProbe = async (
       "synthetic disposable target ready",
     );
     if (!ready.allowed) {
-      return ready as Decision<SyntheticDisposableRealmEvidence>;
+      return ready as Decision<SyntheticDisposableRealmObservation>;
     }
     const targetLocatorDigest = digestOf({ executorKind: "hermes", targetLocator: probeTargetRoot });
     const bound = realm.bindings.bind({
@@ -465,7 +671,7 @@ export const runSyntheticDisposableRealmProbe = async (
       },
     });
     if (!bound.allowed) {
-      return bound as Decision<SyntheticDisposableRealmEvidence>;
+      return bound as Decision<SyntheticDisposableRealmObservation>;
     }
     if (options.fault === "SECOND_ACTOR") {
       const secondTargetRoot = join(paths.stateDir, "second-probe-target");
@@ -480,7 +686,7 @@ export const runSyntheticDisposableRealmProbe = async (
         "synthetic second target ready",
       );
       if (!secondReady.allowed) {
-        return secondReady as Decision<SyntheticDisposableRealmEvidence>;
+        return secondReady as Decision<SyntheticDisposableRealmObservation>;
       }
       const switched = realm.bindings.switchTo({
         role: Role.CEO,
@@ -498,12 +704,26 @@ export const runSyntheticDisposableRealmProbe = async (
         expectedCurrentGeneration: bound.value.bindingGeneration,
       });
       if (!switched.allowed) {
-        return switched as Decision<SyntheticDisposableRealmEvidence>;
+        return switched as Decision<SyntheticDisposableRealmObservation>;
       }
     }
 
-    const targetTurns: SyntheticTargetTurn[] = [];
+    const driverTurns: SyntheticDriverTurn[] = [];
     const transport = new SyntheticTelegramTransport(options.fault);
+    const listenerOptions: TelegramLongPollStartOptions = {
+      ...(options.fault === "SYNTHETIC_TRANSPORT_NOT_INJECTED" ? {} : { transport }),
+      start: false,
+      onDirect: (input) => {
+        const reply = `synthetic reply ${driverTurns.length + 1}`;
+        driverTurns.push({ prompt: input.text, reply });
+        return reply;
+      },
+    };
+    const injected = assertSyntheticTransportInjected(listenerOptions, transport);
+    if (!injected.allowed) {
+      return injected as Decision<SyntheticDisposableRealmObservation>;
+    }
+    executedEvidenceSteps.add("SYNTHETIC_TRANSPORT_USED");
     listener = await startTelegramLongPollListener(
       realm,
       {
@@ -514,21 +734,7 @@ export const runSyntheticDisposableRealmProbe = async (
         pollTimeoutSeconds: 1,
         retryDelayMs: 100,
       },
-      {
-        transport,
-        start: false,
-        onDirect: (input) => {
-          const reply = `synthetic reply ${targetTurns.length + 1}`;
-          const turn = { prompt: input.text, reply };
-          mkdirSync(probeTargetRoot, { recursive: true, mode: 0o700 });
-          appendFileSync(join(probeTargetRoot, "transcript.jsonl"), `${JSON.stringify(turn)}\n`, {
-            encoding: "utf8",
-            mode: 0o600,
-          });
-          targetTurns.push(turn);
-          return reply;
-        },
-      },
+      listenerOptions,
     );
 
     const outcomes: TelegramRouteOutcome[] = [];
@@ -544,27 +750,54 @@ export const runSyntheticDisposableRealmProbe = async (
           return deny(
             ReasonCode.ACCEPTANCE_PROBE_INCONCLUSIVE,
             "the synthetic probe stopped after an outcome that cannot be retried safely",
-            { signal, polls: transport.polls, sends: transport.sends, targetTurns: targetTurns.length },
+            {
+              signal,
+              polls: transport.polls,
+              sends: transport.sends,
+              driverHandledTurns: driverTurns.length,
+            },
           );
         }
         throw error;
       }
     }
 
-    const durableNonces = realm.db
+    const ingressAppliedReplies = realm.db
       .all<{ nonce: string; result_json: string | null }>(
         "SELECT nonce, result_json FROM inbound_messages WHERE channel = 'telegram' ORDER BY nonce",
       )
-      .filter((row) => {
-        if (!row.result_json) return false;
+      .flatMap((row): SyntheticIngressAppliedReply[] => {
+        if (!row.result_json) return [];
         try {
-          const value = JSON.parse(row.result_json) as { deliveryStatus?: unknown };
-          return value.deliveryStatus === "APPLIED";
+          const value = JSON.parse(row.result_json) as {
+            deliveryStatus?: unknown;
+            reply?: {
+              chatId?: unknown;
+              text?: unknown;
+              replyToMessageId?: unknown;
+              correlationId?: unknown;
+            };
+          };
+          const reply = value.reply;
+          if (
+            value.deliveryStatus !== "APPLIED" ||
+            !reply ||
+            typeof reply.chatId !== "string" ||
+            typeof reply.text !== "string" ||
+            typeof reply.replyToMessageId !== "number" ||
+            typeof reply.correlationId !== "string"
+          ) return [];
+          return [{
+            nonce: row.nonce,
+            chatId: reply.chatId,
+            text: reply.text,
+            replyToMessageId: reply.replyToMessageId,
+            correlationId: reply.correlationId,
+          }];
         } catch {
-          return false;
+          return [];
         }
-      })
-      .map((row) => row.nonce);
+      });
     const actorIds = realm.db
       .all<{ actor_id: string }>("SELECT actor_id FROM conversational_actors ORDER BY actor_id")
       .map((row) => row.actor_id);
@@ -584,22 +817,25 @@ export const runSyntheticDisposableRealmProbe = async (
         reply: outcome.reply?.text ?? null,
       })),
       sentReplies: transport.sentReplies,
-      targetTurns,
-      durableNonces,
+      driverTurns,
+      ingressAppliedReplies,
       actorIds,
       targetActorIds,
     };
     const complete = assertSyntheticProbeComplete(trace);
     if (!complete.allowed) {
-      return complete as Decision<SyntheticDisposableRealmEvidence>;
+      return complete as Decision<SyntheticDisposableRealmObservation>;
     }
+    executedEvidenceSteps.add("PRODUCTION_POLL_AND_ROUTER_USED");
+    executedEvidenceSteps.add("DRIVER_DIRECT_CALLBACK_ANSWERED");
+    executedEvidenceSteps.add("INGRESS_APPLIED_REPLIES_READ");
 
     // Synthetic mode starts no target or Gateway process. The empty set is still passed through
     // the same ownership decision a future child would have to satisfy; the negative case is a
     // public helper and is exercised with a reused pid in the affected test.
     const cleanupOwnership = assertCleanupCandidatesOwned([], []);
     if (!cleanupOwnership.allowed) {
-      return cleanupOwnership as Decision<SyntheticDisposableRealmEvidence>;
+      return cleanupOwnership as Decision<SyntheticDisposableRealmObservation>;
     }
 
     const layout = realmLayout(paths);
@@ -617,28 +853,27 @@ export const runSyntheticDisposableRealmProbe = async (
 
     const after = takeProductionCensus(production, fakeProductionRoot);
     if (!after.allowed) {
-      return after as Decision<SyntheticDisposableRealmEvidence>;
+      return after as Decision<SyntheticDisposableRealmObservation>;
     }
     const unchanged = assertProductionUnchanged(before.value, after.value);
     if (!unchanged.allowed) {
-      return unchanged as Decision<SyntheticDisposableRealmEvidence>;
+      return unchanged as Decision<SyntheticDisposableRealmObservation>;
     }
+    executedEvidenceSteps.add("SYNTHETIC_BASELINE_UNCHANGED");
 
     const residue = verifyRealmResidue(paths);
     if (!residue.allowed) {
       residueWasPresent = true;
-      return residue as Decision<SyntheticDisposableRealmEvidence>;
+      return residue as Decision<SyntheticDisposableRealmObservation>;
     }
 
     return allow(ReasonCode.OK, {
-      mode: "SYNTHETIC",
-      claim: claim.value,
       updateIds: outcomes.map((outcome) => outcome.updateId),
       replyCount: transport.sentReplies.length,
-      targetTurnCount: targetTurns.length,
-      durableNonceCount: durableNonces.length,
-      disposableActorCount: actorIds.length,
-      targetBindingCount: targetActorIds.length,
+      driverHandledTurnCount: driverTurns.length,
+      ingressAppliedReplyCount: ingressAppliedReplies.length,
+      createdActorCount: actorIds.length,
+      createdTargetBindingCount: targetActorIds.length,
       syntheticBaselineUnchanged: true,
       residue: [],
       layout,
@@ -662,5 +897,19 @@ export const runSyntheticDisposableRealmProbe = async (
   if (residueWasPresent && !result.allowed) {
     result.evidence["janitorRemovedResidue"] = !existsSync(workspace);
   }
-  return result;
+  if (!result.allowed) return result as Decision<SyntheticDisposableRealmEvidence>;
+
+  executedEvidenceSteps.add("REALM_AND_WORKSPACE_REMOVED");
+  const steps = SYNTHETIC_EVIDENCE_STEPS.map((step) => ({ ...step }));
+  const supported = assertEvidenceStepsExecuted(steps, executedEvidenceSteps);
+  if (!supported.allowed) return supported as Decision<SyntheticDisposableRealmEvidence>;
+
+  return allow(ReasonCode.OK, {
+    mode: "SYNTHETIC",
+    claim: claim.value,
+    ...result.value,
+    workspaceRemoved: true,
+    steps,
+    safetyConditions: SYNTHETIC_SAFETY_CONDITIONS.map((condition) => ({ ...condition })),
+  });
 };

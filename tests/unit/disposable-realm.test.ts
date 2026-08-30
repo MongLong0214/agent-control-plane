@@ -558,7 +558,10 @@ describe("cleanup terminates only what this run started", () => {
 
 describe("the evidence claim is bounded in the code, not in the write-up", () => {
   it("says what was observed and what was not", () => {
-    expect(REALM_EVIDENCE_CLAIM).toContain("isolated disposable ACP instance");
+    expect(REALM_EVIDENCE_CLAIM).toContain("driver-owned direct callback");
+    expect(REALM_EVIDENCE_CLAIM).toContain("APPLIED ingress reply records");
+    expect(REALM_EVIDENCE_CLAIM).toContain("bound actor");
+    expect(REALM_EVIDENCE_CLAIM).toContain("not exercised");
     for (const excluded of [
       "canonical safety",
       "actor reconstitution",

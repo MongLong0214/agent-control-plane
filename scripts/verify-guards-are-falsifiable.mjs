@@ -323,8 +323,8 @@ const GUARDS = [
   {
     what: "an unobservable before census stops the disposable driver",
     file: "src/acceptance/disposable-realm-driver.ts",
-    find: "    if (!before.allowed) {\n      return before as Decision<SyntheticDisposableRealmEvidence>;\n    }",
-    replace: "    if (false) {\n      return before as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    find: "    if (!before.allowed) {\n      return before as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    replace: "    if (false) {\n      return before as Decision<SyntheticDisposableRealmObservation>;\n    }",
     killedBy: [
       "tests/unit/disposable-realm-driver.test.ts::refuses when the before census cannot be observed",
     ],
@@ -339,37 +339,37 @@ const GUARDS = [
     ],
   },
   {
-    what: "the disposable driver requires two complete routed and durable turns",
+    what: "the disposable driver requires two matching driver-handled ingress exchanges",
     file: "src/acceptance/disposable-realm-driver.ts",
-    find: "    if (!complete.allowed) {\n      return complete as Decision<SyntheticDisposableRealmEvidence>;\n    }",
-    replace: "    if (false) {\n      return complete as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    find: "    if (!complete.allowed) {\n      return complete as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    replace: "    if (false) {\n      return complete as Decision<SyntheticDisposableRealmObservation>;\n    }",
     killedBy: [
       "tests/unit/disposable-realm-driver.test.ts::refuses when the real polling entry returns only one message",
     ],
   },
   {
-    what: "the disposable trace contains exactly two messages and one target actor",
+    what: "the disposable trace contains exactly two driver-handled exchanges and one created target binding",
     file: "src/acceptance/disposable-realm-driver.ts",
-    find: "    counts.outcomes !== 2 ||\n    counts.sentReplies !== 2 ||\n    counts.targetTurns !== 2 ||\n    counts.durableNonces !== 2 ||\n    counts.actorIds !== 1 ||\n    counts.targetActorIds !== 1",
+    find: "    counts.outcomes !== 2 ||\n    counts.sentReplies !== 2 ||\n    counts.driverTurns !== 2 ||\n    counts.ingressAppliedReplies !== 2 ||\n    counts.actorIds !== 1 ||\n    counts.targetActorIds !== 1",
     replace: "    false",
     killedBy: [
       "tests/unit/disposable-realm-driver.test.ts::refuses two actors created through the binding lifecycle",
     ],
   },
   {
-    what: "each sent reply is the reply the synthetic target authored for that admitted update",
+    what: "each transport record is the reply the driver-owned callback supplied for that admitted update",
     file: "src/acceptance/disposable-realm-driver.ts",
     find: "      sent.text !== expectedReply ||",
     replace: "      false ||",
     killedBy: [
-      "tests/unit/disposable-realm-driver.test.ts::refuses a reply that the synthetic target did not author",
+      "tests/unit/disposable-realm-driver.test.ts::refuses a transport record that differs from the driver-owned callback reply",
     ],
   },
   {
     what: "the disposable driver refuses any synthetic baseline census difference",
     file: "src/acceptance/disposable-realm-driver.ts",
-    find: "    if (!unchanged.allowed) {\n      return unchanged as Decision<SyntheticDisposableRealmEvidence>;\n    }",
-    replace: "    if (false) {\n      return unchanged as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    find: "    if (!unchanged.allowed) {\n      return unchanged as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    replace: "    if (false) {\n      return unchanged as Decision<SyntheticDisposableRealmObservation>;\n    }",
     killedBy: [
       "tests/unit/disposable-realm-driver.test.ts::refuses when the synthetic baseline changes during the probe",
     ],
@@ -390,6 +390,24 @@ const GUARDS = [
     replace: "  const unowned = candidates.filter(() => false);",
     killedBy: [
       "tests/unit/disposable-realm-driver.test.ts::refuses to terminate a reused pid whose start time does not match",
+    ],
+  },
+  {
+    what: "the evidence artifact refuses a checked step that this run did not execute",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "  if (unsupportedSteps.length > 0) {",
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses an artifact that marks an unexecuted step as checked by the run",
+    ],
+  },
+  {
+    what: "the synthetic driver refuses before the live transport fallback when injection is absent",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: '      ...(options.fault === "SYNTHETIC_TRANSPORT_NOT_INJECTED" ? {} : { transport }),',
+    replace: "      ...{},",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::runs two synthetic messages through the production Telegram entry and removes the realm",
     ],
   },
   {
