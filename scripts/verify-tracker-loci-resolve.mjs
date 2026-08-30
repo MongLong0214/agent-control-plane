@@ -849,13 +849,15 @@
  *   `stripJsSource` now enumerates every JS-family span opener this corpus uses: a leading Node
  *   hashbang, `//` and `/* *\/` comments, single/double strings, template literals with recursive
  *   `${...}` code, and regex literals. A regex scanner treats escapes and `[...]` as atomic before
- *   accepting an unescaped `/` as the close. `/` is admitted as a regex opener only when the
- *   previous significant token requires a new expression; identifiers, numbers, literals,
- *   `)`/`]`, postfix operators, and object closes make it division. Parenthesis/brace context
- *   distinguishes a closed control condition or function block from a call or object literal.
- *   JSX text is not parsed or excluded: there is no tracked `.jsx` or `.tsx` file, and a future
- *   one pays the disclosed cost that JSX prose may count as a symbol until this small lexer gains
- *   that grammar.
+ *   accepting an unescaped `/` as the close. The existing TypeScript parser applies JavaScript's
+ *   lexical-goal rule — preceding significant token plus grammar context — and supplies the regex
+ *   starts, so function/class expressions and contextual identifiers remain division while a
+ *   closed declaration/control statement can admit a regex. JSX text is not parsed or excluded:
+ *   there is no tracked `.jsx` or `.tsx` file, and a future one pays the disclosed cost that JSX
+ *   prose may count as a symbol until the dispatcher can select a filename-aware parser mode.
+ *   Malformed or proposal-only syntax follows TypeScript's recovery and can therefore classify a
+ *   slash differently from the author's intent; the diagnostic says that can cause either a false
+ *   stale finding or a false resolution instead of silently promising full-parser certainty.
  *
  *   The same audit enumerated the other four dispatches rather than assuming prior rounds were
  *   exhaustive. Python opens `#` comments plus short/triple single/double strings (ordinary
@@ -995,7 +997,9 @@ const codeSearchScope = (relPath) => {
   if (JS_FAMILY_EXTS.has(ext))
     return (
       "outside a `//`/`/* */` comment, a quoted string, or template-literal prose, a regex literal, " +
-      "or a leading hashbang (JSX text is searched as code; this corpus has no JSX/TSX)"
+      "or a leading hashbang (regex/division follows TypeScript parser recovery; malformed or " +
+      "proposal-only syntax can cause a false stale finding or false resolution; JSX text is " +
+      "searched as code, and this corpus has no JSX/TSX)"
     );
   if (PY_EXTS.has(ext))
     return (

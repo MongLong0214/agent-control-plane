@@ -27,6 +27,8 @@
  * nine rounds unnoticed.
  */
 
+import ts from "typescript";
+
 /** Blanks every non-newline character in a matched span, for use as a `String.replace` callback. */
 export const blankKeepingNewlines = (match) => match.replace(/[^\n]/g, " ");
 
@@ -196,22 +198,22 @@ export const stripPythonSource = (text, blankStrings) => {
  * content-search view (comments blanked, string/template content left untouched, so a citation
  * quoting a string's exact text still compares against the real one).
  *
- * Round 21 adds the missing regex token. `/` is a regex opener only when the previous significant
- * token cannot end an expression; after an identifier, number, literal, `)`, `]`, postfix
- * `++`/`--`, or an object close it is division. Expression-prefix keywords and punctuators (`return`,
- * `throw`, `case`, `=`, `:`, `,`, `=>`, and their peers) admit a regex. Parenthesis and brace stacks
- * retain the two contexts a character-only look-behind loses: `if (condition) /re/` starts a new
- * statement, while `call() / divisor` divides; a function/control block close admits a statement,
- * while an object-literal close is a value. Regex escapes and character classes are consumed before
- * a `/` can close the literal, so quotes and comment markers inside the pattern are ordinary bytes.
- * The flags are part of the literal too and are blanked from the symbol view.
+ * Round 21 adds the missing regex token. JavaScript's lexical goal for `/` depends on the preceding
+ * significant token and its grammar context: the same block close can finish a declaration (a
+ * regex may start the next statement) or an expression (the slash divides that value). A local
+ * keyword/brace heuristic reproduced the review's case but failed valid function expressions,
+ * class expressions, and contextual identifiers such as `of`. The existing TypeScript parser now
+ * supplies the exact starts of regex-literal nodes; every other slash is division or an operator.
+ * The ordered walk still owns rendering the regex as one span: escapes and character classes are
+ * consumed before an unescaped `/` can close it, so quotes and comment markers inside the pattern
+ * are ordinary bytes, and flags are blanked with the literal in the symbol view.
  *
- * This is still a deliberately small lexer, not a JS parser. It does not parse JSX text (the
- * tracked corpus has no `.jsx` or `.tsx` file) and a grammar-invalid or proposal-only construct can
- * make block-versus-object context unknowable without a parser. The CLI's per-language scope names
- * that cost instead of claiming JSX/proposal syntax is excluded. Every valid slash context present
- * in the tracked JS-family corpus is walked by a production-CLI corpus test that checks a real,
- * parser-derived declaration witness in every tracked JS-family file.
+ * JSX parsing is not selected because `stripJsSource` has no filename and this tracked corpus has
+ * no `.jsx` or `.tsx` file. Grammar-invalid or proposal-only syntax follows TypeScript's recovery,
+ * which can classify a slash differently from the author's intent; the CLI's per-language scope
+ * names that cost. The production-CLI corpus test checks a real parser-derived declaration witness
+ * in every tracked JS-family file, while the invariant test independently checks every parsed regex
+ * literal and division token present in those files.
  *
  * An unterminated string, regex, or template literal (no closing delimiter before end of line/file,
  * the same adversarial shape the property test below exercises) is blanked up to wherever it
@@ -220,27 +222,13 @@ export const stripPythonSource = (text, blankStrings) => {
  */
 export const stripJsSource = (text, blankStrings) => {
   const n = text.length;
-  const REGEX_PREFIX_KEYWORDS = new Set([
-    "await",
-    "case",
-    "default",
-    "delete",
-    "do",
-    "else",
-    "extends",
-    "in",
-    "instanceof",
-    "new",
-    "of",
-    "return",
-    "throw",
-    "typeof",
-    "void",
-    "yield",
-  ]);
-  const CONTROL_PAREN_KEYWORDS = new Set(["catch", "for", "if", "switch", "while", "with"]);
-  const BLOCK_BODY_KEYWORDS = new Set(["class", "enum", "interface", "module", "namespace"]);
-  const isIdentifierStart = (ch) => ch !== undefined && /[$_\p{ID_Start}]/u.test(ch);
+  const parsed = ts.createSourceFile("tracker-loci.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const regexStarts = new Set();
+  const collectRegexStarts = (node) => {
+    if (node.kind === ts.SyntaxKind.RegularExpressionLiteral) regexStarts.add(node.getStart(parsed));
+    ts.forEachChild(node, collectRegexStarts);
+  };
+  collectRegexStarts(parsed);
   const isIdentifierPart = (ch) => ch !== undefined && /[$\u200c\u200d\p{ID_Continue}]/u.test(ch);
 
   /** Consumes a `"`/`'`-quoted string starting at `i`; returns the rendered span and next index. */
@@ -372,21 +360,6 @@ export const stripJsSource = (text, blankStrings) => {
     let out = "";
     let depth = exprDepth ?? null;
     let i = start;
-    let canStartRegex = true;
-    let lastToken = { kind: "start", text: "" };
-    let pendingFunctionBody = false;
-    let pendingNamedBlockBody = false;
-    const parenStack = [];
-    const braceStack = [];
-
-    const noteValue = (kind, tokenText) => {
-      canStartRegex = false;
-      lastToken = { kind, text: tokenText };
-    };
-    const notePrefix = (kind, tokenText) => {
-      canStartRegex = true;
-      lastToken = { kind, text: tokenText };
-    };
 
     while (i < n) {
       const ch = text[i];
@@ -406,181 +379,39 @@ export const stripJsSource = (text, blankStrings) => {
         out += blankKeepingNewlines(text.slice(blockStart, i));
         continue;
       }
-      if (ch === "/" && canStartRegex) {
+      if (ch === "/" && regexStarts.has(i)) {
         const { rendered, next } = scanRegexLiteral(i);
         out += rendered;
         i = next;
-        noteValue("regex", "/");
-        continue;
-      }
-      if (ch === "/") {
-        out += ch;
-        i++;
-        notePrefix("operator", "/");
         continue;
       }
       if (ch === '"' || ch === "'") {
         const { rendered, next } = scanQuotedString(i, ch);
         out += rendered;
         i = next;
-        noteValue("literal", ch);
         continue;
       }
       if (ch === "`") {
         const { rendered, next } = scanTemplateLiteral(i);
         out += rendered;
         i = next;
-        noteValue("literal", "`");
         continue;
       }
       if (depth !== null && ch === "{") {
         depth++;
-        braceStack.push("object");
         out += ch;
         i++;
-        notePrefix("openBrace", "{");
         continue;
       }
       if (depth !== null && ch === "}") {
         depth--;
-        const braceKind = braceStack.pop() ?? "object";
         out += ch;
         i++;
         if (depth === 0) return { rendered: out, next: i };
-        if (braceKind === "block") notePrefix("closeBlock", "}");
-        else noteValue("closeObject", "}");
-        continue;
-      }
-      if (/\s/u.test(ch)) {
-        out += ch;
-        i++;
-        continue;
-      }
-      if (isIdentifierStart(ch)) {
-        let j = i + 1;
-        while (j < n && isIdentifierPart(text[j])) j++;
-        const word = text.slice(i, j);
-        out += word;
-        i = j;
-        if (word === "function") {
-          pendingFunctionBody = true;
-          notePrefix("functionKeyword", word);
-        } else if (BLOCK_BODY_KEYWORDS.has(word)) {
-          pendingNamedBlockBody = true;
-          notePrefix("blockKeyword", word);
-        } else if (CONTROL_PAREN_KEYWORDS.has(word)) {
-          notePrefix("controlKeyword", word);
-        } else if (REGEX_PREFIX_KEYWORDS.has(word)) {
-          notePrefix("prefixKeyword", word);
-        } else {
-          noteValue("identifier", word);
-        }
-        continue;
-      }
-      if (/\d/u.test(ch) || (ch === "." && /\d/u.test(text[i + 1] ?? ""))) {
-        out += ch;
-        i++;
-        noteValue("number", ch);
-        continue;
-      }
-      if (ch === "(") {
-        const kind = pendingFunctionBody
-          ? "function"
-          : lastToken.kind === "controlKeyword"
-            ? "control"
-            : "group";
-        parenStack.push(kind);
-        pendingFunctionBody = false;
-        out += ch;
-        i++;
-        notePrefix("openParen", ch);
-        continue;
-      }
-      if (ch === ")") {
-        const kind = parenStack.pop() ?? "group";
-        out += ch;
-        i++;
-        if (kind === "control") notePrefix("closeControl", ch);
-        else noteValue(kind === "function" ? "closeFunction" : "closeParen", ch);
-        continue;
-      }
-      if (ch === "[") {
-        out += ch;
-        i++;
-        notePrefix("openBracket", ch);
-        continue;
-      }
-      if (ch === "]") {
-        out += ch;
-        i++;
-        noteValue("closeBracket", ch);
-        continue;
-      }
-      if (ch === "{") {
-        const block =
-          pendingNamedBlockBody ||
-          lastToken.kind === "closeControl" ||
-          lastToken.kind === "closeFunction" ||
-          lastToken.kind === "arrow" ||
-          lastToken.kind === "closeBlock" ||
-          lastToken.kind === "start" ||
-          lastToken.text === ";" ||
-          ["do", "else", "finally", "try"].includes(lastToken.text) ||
-          (lastToken.kind === "closeParen" && braceStack.at(-1) === "block");
-        braceStack.push(block ? "block" : "object");
-        pendingNamedBlockBody = false;
-        out += ch;
-        i++;
-        notePrefix("openBrace", ch);
-        continue;
-      }
-      if (ch === "}") {
-        const kind = braceStack.pop() ?? "block";
-        out += ch;
-        i++;
-        if (kind === "block") notePrefix("closeBlock", ch);
-        else noteValue("closeObject", ch);
-        continue;
-      }
-      if ((ch === "+" || ch === "-") && text[i + 1] === ch) {
-        out += ch + ch;
-        i += 2;
-        noteValue("postfix", ch + ch);
-        continue;
-      }
-      if (ch === "=" && text[i + 1] === ">") {
-        out += "=>";
-        i += 2;
-        notePrefix("arrow", "=>");
-        continue;
-      }
-      if (text.slice(i, i + 3) === "...") {
-        out += "...";
-        i += 3;
-        notePrefix("spread", "...");
-        continue;
-      }
-      if (ch === "?" && text[i + 1] === ".") {
-        out += "?.";
-        i += 2;
-        noteValue("member", "?.");
-        continue;
-      }
-      if (ch === ".") {
-        out += ch;
-        i++;
-        noteValue("member", ch);
-        continue;
-      }
-      if (";,?:=+-*%&|^!~<>".includes(ch)) {
-        out += ch;
-        i++;
-        notePrefix("operator", ch);
         continue;
       }
       out += ch;
       i++;
-      noteValue("other", ch);
     }
     return { rendered: out, next: i };
   };

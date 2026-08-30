@@ -2363,7 +2363,7 @@ const GUARDS = [
     // opens a fake string and erases all three real declarations the production CLI checks.
     what: "a JavaScript regex literal is one atomic span before quotes and comments are dispatched",
     file: "scripts/lib/tracker-loci-strip.mjs",
-    find: '      if (ch === "/" && canStartRegex) {',
+    find: '      if (ch === "/" && regexStarts.has(i)) {',
     replace: "      if (false) {",
     killedBy: [
       "tests/unit/verify-tracker-loci-resolve.test.ts::ManagedWriteScope remains visible after a regex literal",
@@ -2374,7 +2374,7 @@ const GUARDS = [
     // slash exists, recreating the opposite half of the lexical ambiguity this fix must resolve.
     what: "a slash after an expression ending token remains division rather than opening a regex literal",
     file: "scripts/lib/tracker-loci-strip.mjs",
-    find: '      if (ch === "/" && canStartRegex) {',
+    find: '      if (ch === "/" && regexStarts.has(i)) {',
     replace: '      if (ch === "/") {',
     killedBy: ["tests/unit/tracker-loci-strip-invariants.test.ts::division does not open a regex literal"],
   },

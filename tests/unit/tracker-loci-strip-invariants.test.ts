@@ -1,3 +1,4 @@
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import {
   blankKeepingNewlines,
@@ -366,6 +367,27 @@ describe("tracker-loci strip invariants", () => {
       expect(out).toContain("const divided = assigned / 2;");
     });
 
+    it("a function block close admits a regex while an object close admits division", () => {
+      const input = [
+        "function done(): void {}",
+        "/afterBlock/.test(done);",
+        "const dividedObject = ({ value: 6 } / 2);",
+      ].join("\n");
+      const out = stripJsSource(input, true);
+      expect(out.split("\n")[1]).toBe("/          /.test(done);");
+      expect(out.split("\n")[2]).toContain("{ value: 6 } / 2");
+    });
+
+    it("function and class expressions plus contextual identifiers keep division semantics", () => {
+      const input = [
+        "const functionRatio = function named(): void {} / 2;",
+        "const classRatio = class Named {} / 2;",
+        "const of = 8; const contextualRatio = of / 2;",
+        "const memberRatio = holder.return / 2;",
+      ].join("\n");
+      expect(stripJsSource(input, true)).toBe(input);
+    });
+
     it("a regex literal inside a template expression cannot close the expression with its pattern", () => {
       const input = '`before ${/[}"\']/u.test(value)} after`;\nconst afterTemplateRegex = 15;';
       const out = stripJsSource(input, true);
@@ -401,6 +423,79 @@ describe("tracker-loci strip invariants", () => {
       expect(symbolView).toContain("ManagedWriteScope");
       expect(symbolView).toContain("managedWriteScope");
       expect(symbolView).toContain("ClaudeCliAdapter");
+    });
+
+    it("every parsed regex and division token in the tracked JS family keeps its lexical role", () => {
+      const { spawnSync } = require("node:child_process");
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const repoRoot = path.join(__dirname, "..", "..");
+      const listed = spawnSync("git", ["ls-files", "*.ts", "*.tsx", "*.js", "*.mjs", "*.cjs", "*.mts"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+      });
+      expect(listed.status).toBe(0);
+      let regexCount = 0;
+      let divisionCount = 0;
+
+      for (const relPath of listed.stdout.split("\n").filter(Boolean)) {
+        const text = fs.readFileSync(path.join(repoRoot, relPath), "utf8");
+        const parsed = ts.createSourceFile(relPath, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+        const outputLines = stripJsSource(text, true).split("\n");
+        const terminals: ts.Node[] = [];
+        const flatten = (node: ts.Node): void => {
+          const children = node.getChildren(parsed);
+          if (children.length === 0) {
+            if (node.getWidth(parsed) > 0) terminals.push(node);
+            return;
+          }
+          for (const child of children) flatten(child);
+        };
+        flatten(parsed);
+        terminals.sort((a, b) => a.getStart(parsed) - b.getStart(parsed));
+
+        for (let index = 0; index < terminals.length; index++) {
+          const token = terminals[index]!;
+          const start = token.getStart(parsed);
+          const position = parsed.getLineAndCharacterOfPosition(start);
+          const raw = text.slice(start, token.getEnd());
+          if (token.kind === ts.SyntaxKind.RegularExpressionLiteral) {
+            regexCount++;
+            const rendered = outputLines[position.line]!.slice(position.character, position.character + raw.length);
+            expect(rendered, `${relPath}:${position.line + 1} ${raw}`).toHaveLength(raw.length);
+            expect(rendered, `${relPath}:${position.line + 1} ${raw}`).not.toMatch(/[^/\s]/u);
+            continue;
+          }
+          if (token.kind !== ts.SyntaxKind.SlashToken && token.kind !== ts.SyntaxKind.SlashEqualsToken) continue;
+          divisionCount++;
+          const nextVisible = terminals.slice(index + 1).find((candidate) => {
+            const candidatePosition = parsed.getLineAndCharacterOfPosition(candidate.getStart(parsed));
+            return (
+              candidatePosition.line === position.line &&
+              ![
+                ts.SyntaxKind.StringLiteral,
+                ts.SyntaxKind.NoSubstitutionTemplateLiteral,
+                ts.SyntaxKind.RegularExpressionLiteral,
+                ts.SyntaxKind.TemplateHead,
+                ts.SyntaxKind.TemplateMiddle,
+                ts.SyntaxKind.TemplateTail,
+              ].includes(candidate.kind)
+            );
+          });
+          if (nextVisible === undefined) continue;
+          const nextStart = nextVisible.getStart(parsed);
+          const nextPosition = parsed.getLineAndCharacterOfPosition(nextStart);
+          const nextRaw = text.slice(nextStart, nextVisible.getEnd());
+          const nextRendered = outputLines[nextPosition.line]!.slice(
+            nextPosition.character,
+            nextPosition.character + nextRaw.length,
+          );
+          expect(nextRendered, `${relPath}:${nextPosition.line + 1} after ${raw}`).toBe(nextRaw);
+        }
+      }
+
+      expect(regexCount).toBeGreaterThan(0);
+      expect(divisionCount).toBeGreaterThan(0);
     });
   });
 
