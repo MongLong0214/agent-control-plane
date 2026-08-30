@@ -94,7 +94,9 @@ any actor binding exists (see C1, C3).
   `reserveResponse` records the handler's reply; (2) a known retryable or batch/global rejection.
   `deliverRouteOutcome` releases those reservations to `RETRYABLE`, and the route wrapper calls
   `retryUpdate` so ordered offset advancement remains held. An unlisted 4xx records `UNANSWERABLE`
-  (with 401 and 429 as explicit global/retryable exceptions); an unknown send result records
+  only when a JSON body with `ok: false` and a description proves Telegram rejected the request
+  (with 401 and 429 as explicit global/retryable exceptions). A non-Telegram HTTP response is a
+  global retryable transport fault and holds the offset; an unknown send result records
   `UNRESOLVED`; and a replay of a surviving `PENDING` reservation records `UNRESOLVED` without
   another send. Each terminal transition settles the claim in the same database transaction as
   the reply state.

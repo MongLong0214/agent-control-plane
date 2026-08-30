@@ -131,6 +131,14 @@ const unknownDeliveryFailure = (): TelegramDeliveryFailure => ({
   retryAfterSeconds: null,
 });
 
+const nonTelegramHttpFailure = (statusCode: number): TelegramDeliveryFailure => ({
+  kind: "GLOBAL_REJECTION",
+  statusCode,
+  description: null,
+  migrateToChatId: null,
+  retryAfterSeconds: null,
+});
+
 const telegramStatusCode = (httpStatus: number, payload: unknown): number => {
   const telegramCode = isRecord(payload) ? payload["error_code"] : undefined;
   return Number.isSafeInteger(telegramCode) && Number(telegramCode) > 0
@@ -152,6 +160,12 @@ const telegramDescription = (payload: unknown): string | null => {
   return typeof description === "string" && description.trim().length > 0 ? description : null;
 };
 
+/** Only this envelope proves Telegram, rather than a proxy or WAF, rejected the request. */
+const isTelegramApiError = (payload: unknown): payload is Record<string, unknown> =>
+  isRecord(payload)
+  && payload["ok"] === false
+  && telegramDescription(payload) !== null;
+
 const telegramMigrateToChatId = (payload: unknown): string | null => {
   if (!isRecord(payload) || !isRecord(payload["parameters"])) return null;
   const migrateToChatId = payload["parameters"]["migrate_to_chat_id"];
@@ -162,7 +176,7 @@ const rejectedDeliveryFailure = (
   statusCode: number,
   payload: unknown,
 ): TelegramDeliveryFailure => {
-  // These are the two 4xx exceptions whose scope is broader than one sendMessage request.
+  // These are the two verified Telegram 4xx exceptions whose scope is broader than one request.
   if (statusCode === 401) {
     return {
       kind: "GLOBAL_REJECTION",
@@ -182,8 +196,8 @@ const rejectedDeliveryFailure = (
     };
   }
 
-  // An otherwise unlisted 4xx rejects this request, so terminalizing this message prevents one
-  // bad chat or reply from holding every later update. Exceptions belong above this class default.
+  // An otherwise unlisted 4xx in a verified Telegram error envelope rejects this request, so
+  // terminalizing this message prevents one bad chat or reply from holding every later update.
   if (statusCode >= 400 && statusCode < 500) {
     return {
       kind: "PERMANENT_REJECTION",
@@ -482,12 +496,24 @@ export class TelegramBotApi implements TelegramBotTransport {
         if (response.ok) throw error;
       }
       if (!response.ok) {
+        if (!isTelegramApiError(parsed)) {
+          throw new TelegramDeliveryError(
+            `Telegram Bot API ${method} received a non-Telegram HTTP ${response.status} response`,
+            nonTelegramHttpFailure(response.status),
+          );
+        }
         throw new TelegramDeliveryError(
           `Telegram Bot API ${method} returned HTTP ${response.status}`,
           rejectedDeliveryFailure(telegramStatusCode(response.status, parsed), parsed),
         );
       }
       if (!parsed || typeof parsed !== "object" || (parsed as { ok?: unknown }).ok !== true) {
+        if (!isTelegramApiError(parsed)) {
+          throw new TelegramDeliveryError(
+            `Telegram Bot API ${method} returned an invalid success response`,
+            unknownDeliveryFailure(),
+          );
+        }
         throw new TelegramDeliveryError(
           `Telegram Bot API ${method} refused the request`,
           rejectedDeliveryFailure(telegramStatusCode(response.status, parsed), parsed),
@@ -842,8 +868,8 @@ export class TelegramLongPollService {
     }
 
     // Reserve before the external call. A reservation left PENDING after an ambiguous return is
-    // never replayed. A per-message 4xx is terminal; batch/global rejections and 429/5xx release
-    // the reservation and keep the update retryable.
+    // never replayed. A verified per-message Telegram 4xx is terminal; intermediary responses,
+    // batch/global rejections and 429/5xx release the reservation and keep the update retryable.
     this.router.reserveResponse(outcome);
     await this.options.onInterrupt?.("after-reply-reserve", update, outcome.runId);
     try {

@@ -1896,14 +1896,25 @@ const GUARDS = [
     ],
   },
   {
-    // Narrowing the class default back to one enumerated code recreates the 403 wedge: the
-    // rejected row stays retryable and the ordered offset cannot drain past it.
-    what: "an unlisted Telegram 4xx is terminal and advances the ordered offset",
+    // Without the envelope boundary, an HTML/plain-text proxy rejection falls through to the
+    // status classifier and a 403 is consumed as if Telegram had rejected this one message.
+    what: "an HTML 403 is a global retryable transport fault and holds the ordered offset",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      if (!response.ok) {\n        if (!isTelegramApiError(parsed)) {",
+    replace: "      if (!response.ok) {\n        if (false) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::an HTML 403 is a global retryable transport fault and holds the ordered offset",
+    ],
+  },
+  {
+    // Narrowing the verified Telegram class default back to one enumerated code recreates the 403
+    // wedge: the rejected row stays retryable and the ordered offset cannot drain past it.
+    what: "a structured Telegram 403 is terminal and advances the ordered offset",
     file: "src/ingress/telegram-polling.ts",
     find: "  if (statusCode >= 400 && statusCode < 500) {",
     replace: "  if (statusCode === 400) {",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::an unlisted Telegram 4xx is terminal and advances the ordered offset",
+      "tests/unit/telegram-ingress.test.ts::a structured Telegram 403 is terminal and advances the ordered offset",
     ],
   },
   {

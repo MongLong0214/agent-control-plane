@@ -165,7 +165,7 @@ interface TelegramApiCall {
 
 const telegramBotApiFixture = (
   updates: readonly TelegramUpdate[],
-  firstSendResponse: { status: number; body: Record<string, unknown> },
+  firstSendResponse: { status: number; body: Record<string, unknown> | string },
   options: { persistentlyRejectReplyToMessageId?: number } = {},
 ): { transport: TelegramBotApi; calls: TelegramApiCall[] } => {
   const calls: TelegramApiCall[] = [];
@@ -185,7 +185,10 @@ const telegramBotApiFixture = (
       sendCount === 1
       || body["reply_to_message_id"] === options.persistentlyRejectReplyToMessageId
     ) {
-      return new Response(JSON.stringify(firstSendResponse.body), { status: firstSendResponse.status });
+      const responseBody = typeof firstSendResponse.body === "string"
+        ? firstSendResponse.body
+        : JSON.stringify(firstSendResponse.body);
+      return new Response(responseBody, { status: firstSendResponse.status });
     }
     return new Response(JSON.stringify({ ok: true, result: { message_id: nextFakeTelegramMessageId++ } }), {
       status: 200,
@@ -1990,7 +1993,7 @@ describe("Telegram production ingress", () => {
     }
   });
 
-  it("an unlisted Telegram 4xx is terminal and advances the ordered offset", async () => {
+  it("a structured Telegram 403 is terminal and advances the ordered offset", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -2043,6 +2046,64 @@ describe("Telegram production ingress", () => {
     expect(laterRow?.result_json).toContain('"sent":true');
   });
 
+  it("an HTML 403 is a global retryable transport fault and holds the ordered offset", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const rejected = update("proxy-rejected reply", {}, 485);
+    const later = update("later direct message", {}, 486);
+    const fixture = telegramBotApiFixture([rejected, later], {
+      status: 403,
+      body: "<html><body>request blocked by proxy</body></html>",
+    });
+    const reportedErrors: unknown[] = [];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: fixture.transport,
+        start: false,
+        ownerGateSignals: () => [],
+        onDirect: (input) => `reply to ${input.text}`,
+        onError: (error) => { reportedErrors.push(error); },
+      },
+    );
+
+    let deliveryError: unknown;
+    try {
+      await observedTurnFault(listener.service);
+    } catch (error) {
+      deliveryError = error;
+    } finally {
+      await listener.close();
+    }
+
+    const rejectedRow = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:485"],
+    );
+    const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:486"],
+    );
+    expect({
+      failure: deliveryError instanceof TelegramDeliveryError ? deliveryError.failure : deliveryError,
+      operatorErrors: reportedErrors.map((error) => error instanceof Error ? error.message : String(error)),
+      offset: listener.service.offset,
+      rejectedResult: rejectedRow?.result_json,
+      rejectedTurn: rejectedRow?.turn_claim_json,
+      laterResult: laterRow?.result_json,
+    }).toMatchObject({
+      failure: { kind: "GLOBAL_REJECTION", statusCode: 403, description: null },
+      operatorErrors: ["Telegram Bot API sendMessage received a non-Telegram HTTP 403 response"],
+      offset: undefined,
+      rejectedResult: expect.stringContaining('"deliveryStatus":"RETRYABLE"'),
+      rejectedTurn: expect.not.stringContaining("settledAt"),
+      laterResult: expect.stringContaining('"sent":true'),
+    });
+  });
+
   it("a 401 remains a global retryable failure and does not terminalize the reply", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
@@ -2092,7 +2153,12 @@ describe("Telegram production ingress", () => {
     const first = update("first direct message", {}, 451);
     const fixture = telegramBotApiFixture([first], {
       status: 429,
-      body: { ok: false, parameters: { retry_after: 17 } },
+      body: {
+        ok: false,
+        error_code: 429,
+        description: "Too Many Requests: retry later",
+        parameters: { retry_after: 17 },
+      },
     });
     const listener = await startDaemonTelegramListener(
       harness.cp,
@@ -2138,7 +2204,7 @@ describe("Telegram production ingress", () => {
     const first = update("first direct message", {}, 461);
     const fixture = telegramBotApiFixture([first], {
       status: 502,
-      body: { ok: false },
+      body: { ok: false, error_code: 502, description: "Bad Gateway" },
     });
     const listener = await startDaemonTelegramListener(
       harness.cp,
