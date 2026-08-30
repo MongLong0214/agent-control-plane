@@ -85,6 +85,46 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // This is the one static outflow for the code. Its catalogue classification remains,
+    // proving that membership metadata and prose cannot satisfy the outflow census.
+    what: "every declared reason code has a verified static outflow",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,\n",
+    replace:
+      '          ("CONVERSATION_TARGET_ATTESTATION_STALE is retained for a future consumer",\n' +
+      "            ReasonCode.CONVERSATION_TARGET_UNATTESTED),\n",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a verified static outflow",
+    ],
+  },
+  {
+    what: "a SQLite trigger reason code reaches the typed translator",
+    file: "src/db/database.ts",
+    find: "  SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,\n",
+    replace: "  SESSION_INCARNATION_IMMUTABLE: ReasonCode.CONFLICT,\n",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a verified static outflow",
+    ],
+  },
+  {
+    what: "catalogue metadata references are declared",
+    file: "src/core/reason-codes.ts",
+    find: '  CONVERSATION_TARGET_ATTESTATION_STALE: "CONVERSATION_TARGET_ATTESTATION_STALE",\n',
+    replace: "",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::catalogue metadata references are declared",
+    ],
+  },
+  {
+    what: "production trigger denials and mappings agree",
+    file: "scripts/verify-reason-code-usage.mjs",
+    find: '  ["src/db/migrations.ts", read("src/db/migrations.ts")],\n',
+    replace: "",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::production trigger denials and mappings agree",
+    ],
+  },
+  {
     // Two lifecycles in one field: the reply reservation writes `result_json` whole, and an
     // ordinary timeout produces a reply, so the claim and the turn identity went with it.
     what: "the turn claim is stored apart from the reply it will produce",
