@@ -26,7 +26,7 @@
     "terminology": "node scripts/verify-terminology.mjs",
     "reason-codes": "node scripts/verify-reason-codes.mjs",
     "reason-codes:usage": "node scripts/verify-reason-code-usage.mjs",
-    "scripts:callers": "node scripts/verify-every-script-has-a-caller.mjs",
+    "scripts:plausible-callers": "node scripts/verify-every-script-has-a-plausible-caller.mjs",
     "evidence:freshness": "node scripts/verify-evidence-freshness.mjs",
     "invariants": "node scripts/verify-invariant-coverage.mjs",
     "buzz:contract": "tsx scripts/verify-buzz-cli-contract.ts",

@@ -1,33 +1,30 @@
 #!/usr/bin/env node
 /**
  * #705 — a correct verification script was never invoked, so the defect it found reported
- * into an empty room. A direct child of `scripts/` has a caller when this dependency-free
- * census can prove at least one of these execution paths:
+ * into an empty room. This dependency-free census makes one deliberately static claim:
  *
- *   - a workflow `run:` command executes the file directly;
- *   - a package.json command executes the file (and CI reachability is reported by following
- *     package-script calls forward from workflow `run:` commands); or
- *   - a test selected by CI's full `pnpm test` run statically spawns the file.
+ * Every regular direct child of scripts/ has at least one statically plausible invocation site,
+ * or a named exemption.
  *
- * The third path matters because a test that spawns a script executes its real entrypoint; it
- * is not a weaker kind of caller merely because the workflow spells `pnpm test` instead of the
- * script's filename. The static scan is deliberately conservative. It recognizes literal paths,
- * literal `join`/`resolve` paths, and constants made from those forms in `spawn`, `spawnSync`,
- * `execFile`, or `execFileSync`. A path assembled dynamically, an imported helper that spawns a
- * script, dynamic Vitest selection, dynamic shell, or an unrecognized interpreter option is not
- * credited. Every human-readable run prints that limit instead of turning "not detected" into
- * "does not exist".
+ * Plausible sites are command-shaped workflow `run:` text, package.json commands, and recognized
+ * child-process-shaped calls in tests selected by a statically recognized full Vitest command.
+ * This does not prove that any site executes. In particular, the scan does not determine import
+ * origin, `it.skip`, disabled suites such as `describe.runIf(false)`, unreachable branches,
+ * dynamic test selection, dynamic shell, runtime-built paths, or unrecognized interpreter
+ * options. Every detected test-spawn site is therefore labeled execution-unproven, and every run
+ * prints this limit. Measuring which scripts CI actually enters remains dynamic work owned by
+ * issue #705; this static census is not its substitute and cannot close that issue by itself.
  *
  * Every regular file directly under `scripts/` is a candidate, including `.sh`, `.py`, and
  * extensionless files. `scripts/lib/` remains out of scope because its files are not direct
- * children. Command matching is about the entrypoint operand, not a filename appearing somewhere
+ * children. Command matching is about a plausible entrypoint operand, not a filename appearing somewhere
  * after an interpreter: `node --eval 0 scripts/x`, `sh -c true scripts/x`, and
- * `npx echo scripts/x` do not execute `scripts/x` and therefore do not count.
+ * `npx echo scripts/x` are not plausible invocation sites.
  *
  * sol-simplify: this exists for #705's silent, user-visible verification gap; remove it when
  * `scripts/` stops being an entrypoint inventory or another caller graph supplies this evidence.
  *
- * Usage: node scripts/verify-every-script-has-a-caller.mjs [--json]
+ * Usage: node scripts/verify-every-script-has-a-plausible-caller.mjs [--json]
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, relative } from "node:path";
@@ -248,17 +245,17 @@ const workflowRuns = readdirSync(workflowsDir)
     extractRunCommands(readFileSync(join(workflowsDir, name), "utf8"), `.github/workflows/${name}`),
   );
 
-/** Follow the real direction: CI-called package script -> package scripts that command calls. */
-const ciReachablePackageScripts = new Set();
+/** Follow the plausible graph direction: workflow-named package script -> aliases its command names. */
+const plausiblyCiRoutedPackageScripts = new Set();
 for (const { command } of workflowRuns) {
-  for (const called of packageCallsIn(command, packageScriptNames)) ciReachablePackageScripts.add(called);
+  for (const called of packageCallsIn(command, packageScriptNames)) plausiblyCiRoutedPackageScripts.add(called);
 }
-const queue = [...ciReachablePackageScripts];
+const queue = [...plausiblyCiRoutedPackageScripts];
 while (queue.length > 0) {
   const caller = queue.shift();
   for (const called of packageCallsIn(packageScripts[caller], packageScriptNames)) {
-    if (ciReachablePackageScripts.has(called)) continue;
-    ciReachablePackageScripts.add(called);
+    if (plausiblyCiRoutedPackageScripts.has(called)) continue;
+    plausiblyCiRoutedPackageScripts.add(called);
     queue.push(called);
   }
 }
@@ -273,10 +270,10 @@ const commandRunsFullVitestSuite = (command) =>
       (words.length === 2 || (words.length === 3 && words[2] === "run"));
   });
 
-const ciFullTestScripts = [...ciReachablePackageScripts].filter((name) =>
+const plausibleCiFullTestScripts = [...plausiblyCiRoutedPackageScripts].filter((name) =>
   commandRunsFullVitestSuite(packageScripts[name]),
 );
-const workflowRunsFullTests = workflowRuns.some(({ command }) => commandRunsFullVitestSuite(command));
+const workflowPlausiblyRunsFullTests = workflowRuns.some(({ command }) => commandRunsFullVitestSuite(command));
 
 /** Replaces strings and comments with spaces, preserving offsets for a small static call scan. */
 const maskNonCode = (source) => {
@@ -443,7 +440,7 @@ const staticArgvEntrypoint = (executable, argv, name, constants) => {
   return Boolean(elements[entryAt]) && expressionResolvesToScript(elements[entryAt], name, constants);
 };
 
-const testFileSpawns = (source, scriptName) => {
+const testFileHasPlausibleSpawn = (source, scriptName) => {
   const masked = maskNonCode(source);
   const constants = constantsIn(source, masked);
   const call = /\b(?:spawn|spawnSync|execFile|execFileSync)\s*\(/g;
@@ -470,8 +467,8 @@ const filesBelow = (dir) => {
 const vitestConfigPath = join(repoRoot, "vitest.config.ts");
 const vitestConfig = readFileSync(vitestConfigPath, "utf8");
 const staticTestSelectionKnown = /include\s*:\s*\[\s*["']tests\/\*\*\/\*\.test\.ts["']\s*\]/.test(vitestConfig);
-const fullTestsAreCiReachable = workflowRunsFullTests || ciFullTestScripts.length > 0;
-const testFiles = staticTestSelectionKnown && fullTestsAreCiReachable
+const fullTestsHavePlausibleCiRoute = workflowPlausiblyRunsFullTests || plausibleCiFullTestScripts.length > 0;
+const testFiles = staticTestSelectionKnown && fullTestsHavePlausibleCiRoute
   ? filesBelow(join(repoRoot, "tests")).filter((path) => /\.test\.ts$/.test(path))
   : [];
 const testSources = testFiles.map((path) => ({
@@ -479,39 +476,42 @@ const testSources = testFiles.map((path) => ({
   text: readFileSync(path, "utf8"),
 }));
 
-const callersFor = (name) => {
+const plausibleSitesFor = (name) => {
   const needle = `scripts/${name}`;
-  const callers = [];
+  const sites = [];
   for (const { source, command } of workflowRuns) {
-    if (commandInvokes(command, needle)) callers.push({ type: "workflow", file: source, ciReachable: true });
+    if (commandInvokes(command, needle)) {
+      sites.push({ type: "workflow", file: source, plausibleCiRoute: true, execution: "unproven" });
+    }
   }
   for (const [scriptName, command] of packageScriptEntries) {
     if (commandInvokes(command, needle)) {
-      callers.push({
+      sites.push({
         type: "package.json",
         script: scriptName,
-        ciReachable: ciReachablePackageScripts.has(scriptName),
+        plausibleCiRoute: plausiblyCiRoutedPackageScripts.has(scriptName),
+        execution: "unproven",
       });
     }
   }
   for (const test of testSources) {
-    if (testFileSpawns(test.text, name)) {
-      callers.push({ type: "test", file: test.source, ciReachable: true });
+    if (testFileHasPlausibleSpawn(test.text, name)) {
+      sites.push({ type: "test", file: test.source, plausibleCiRoute: true, execution: "unproven" });
     }
   }
-  return callers;
+  return sites;
 };
 
 const failures = [];
-const wired = [];
+const withPlausibleSites = [];
 const exempted = [];
 for (const name of scriptFiles) {
-  const callers = callersFor(name);
-  if (callers.length > 0) {
-    wired.push({
+  const plausibleSites = plausibleSitesFor(name);
+  if (plausibleSites.length > 0) {
+    withPlausibleSites.push({
       name,
-      callers,
-      ciConfirmed: callers.some((caller) => caller.ciReachable),
+      plausibleSites,
+      plausibleCiRoute: plausibleSites.some((site) => site.plausibleCiRoute),
     });
   } else if (Object.prototype.hasOwnProperty.call(EXEMPT, name)) {
     exempted.push({ name, reason: EXEMPT[name] });
@@ -526,27 +526,35 @@ const emptyReasonExemptions = Object.entries(EXEMPT)
   .filter(([, reason]) => typeof reason !== "string" || reason.trim().length === 0)
   .map(([name]) => name);
 const hasFailures = failures.length > 0 || staleExemptions.length > 0 || emptyReasonExemptions.length > 0;
+const claim =
+  "Every regular direct child of scripts/ has at least one statically plausible invocation site, " +
+  "or a named exemption.";
 const staticLimit =
-  "test-spawn detection is static: only CI-selected tests/**/*.test.ts calls to spawn, spawnSync, " +
-  "execFile, or execFileSync with a literal or statically joined script path are counted; dynamic " +
-  "paths assembled at runtime, imported spawning helpers, dynamic test selection, dynamic shell, and unrecognized " +
-  "interpreter options are not detected";
+  "Static analysis does not prove execution: it cannot determine import origin, it.skip, disabled " +
+  "suites such as describe.runIf(false), unreachable branches, dynamic test selection, dynamic shell, " +
+  "runtime-built paths, or unrecognized interpreter options; every detected test-spawn site is " +
+  "execution-unproven.";
+const remainingWork =
+  "Dynamic measurement of which scripts CI actually enters remains owned by issue #705; this static " +
+  "census cannot close #705 by itself.";
 
 if (asJson) {
   console.log(
     JSON.stringify(
       {
+        claim,
         inspected: scriptFiles.length,
-        wired,
+        withPlausibleSites,
         exempted,
-        withoutDetectedCaller: failures,
+        withoutPlausibleSite: failures,
         staleExemptions,
         emptyReasonExemptions,
         limitations: [staticLimit],
+        remainingWork,
         testScan: {
           staticTestSelectionKnown,
-          fullTestsAreCiReachable,
-          ciFullTestScripts,
+          fullTestsHavePlausibleCiRoute,
+          plausibleCiFullTestScripts,
           filesScanned: testFiles.length,
           limitation: staticLimit,
         },
@@ -558,58 +566,62 @@ if (asJson) {
 } else {
   if (failures.length > 0) {
     console.error(
-      `verify-every-script-has-a-caller: ${failures.length} script(s) with no statically detected caller`,
+      `verify-every-script-has-a-plausible-caller: ${failures.length} script(s) with no statically plausible invocation site`,
     );
     for (const name of failures) {
       console.error(
-        `  scripts/${name} — no statically detected caller from a workflow, package.json command, or CI-run test`,
+        `  scripts/${name} — no plausible site in workflow command text, package.json, or a CI-selected test`,
       );
     }
-    console.error("\nAdd a real caller, or name the deliberately manual file in EXEMPT with a reason.");
+    console.error("\nAdd a caller in a statically recognizable form, or name the deliberately manual file in EXEMPT with a reason.");
   }
   if (staleExemptions.length > 0) {
-    console.error(`verify-every-script-has-a-caller: ${staleExemptions.length} stale EXEMPT entr(y/ies)`);
+    console.error(`verify-every-script-has-a-plausible-caller: ${staleExemptions.length} stale EXEMPT entr(y/ies)`);
     for (const name of staleExemptions) {
       console.error(`  EXEMPT["${name}"] names no direct child of scripts/ — remove the entry`);
     }
   }
   if (emptyReasonExemptions.length > 0) {
     console.error(
-      `verify-every-script-has-a-caller: ${emptyReasonExemptions.length} EXEMPT entr(y/ies) with no reason`,
+      `verify-every-script-has-a-plausible-caller: ${emptyReasonExemptions.length} EXEMPT entr(y/ies) with no reason`,
     );
     for (const name of emptyReasonExemptions) {
       console.error(`  EXEMPT["${name}"] has an empty reason — state why it is deliberately unreached`);
     }
   }
   if (!hasFailures) {
-    const ciConfirmedCount = wired.filter((entry) => entry.ciConfirmed).length;
-    const notCiConfirmedCount = wired.length - ciConfirmedCount;
-    const directWorkflowCount = wired.filter((entry) =>
-      entry.callers.some((caller) => caller.type === "workflow"),
+    const plausibleCiRouteCount = withPlausibleSites.filter((entry) => entry.plausibleCiRoute).length;
+    const packageOnlyCount = withPlausibleSites.length - plausibleCiRouteCount;
+    const directWorkflowCount = withPlausibleSites.filter((entry) =>
+      entry.plausibleSites.some((site) => site.type === "workflow"),
     ).length;
-    const ciPackageCount = wired.filter((entry) =>
-      entry.callers.some((caller) => caller.type === "package.json" && caller.ciReachable),
+    const plausibleCiPackageCount = withPlausibleSites.filter((entry) =>
+      entry.plausibleSites.some((site) => site.type === "package.json" && site.plausibleCiRoute),
     ).length;
-    const testSpawnedCount = wired.filter((entry) => entry.callers.some((caller) => caller.type === "test")).length;
+    const plausibleTestSpawnCount = withPlausibleSites.filter((entry) =>
+      entry.plausibleSites.some((site) => site.type === "test"),
+    ).length;
     console.log(
-      `verify-every-script-has-a-caller: ${wired.length} script(s) with detected caller(s) ` +
-        `(${ciConfirmedCount} CI-confirmed, ${notCiConfirmedCount} package entry only with CI reachability ` +
-        `not confirmed), ${exempted.length} named exemption(s), 0 without a statically detected caller`,
+      `verify-every-script-has-a-plausible-caller: ${withPlausibleSites.length} script(s) with plausible ` +
+        `invocation site(s) (${plausibleCiRouteCount} with plausible CI routes, ${packageOnlyCount} package ` +
+        `entry only), ${exempted.length} named exemption(s), 0 without a statically plausible site`,
     );
     console.log(
-      `  detected CI routes: ${directWorkflowCount} direct workflow, ${ciPackageCount} CI-reached package.json, ` +
-        `${testSpawnedCount} test-spawn`,
+      `  plausible CI routes: ${directWorkflowCount} workflow command, ${plausibleCiPackageCount} package.json, ` +
+        `${plausibleTestSpawnCount} execution-unproven test-spawn`,
     );
-    for (const entry of wired.filter((candidate) => !candidate.ciConfirmed)) {
-      const aliases = entry.callers
-        .filter((caller) => caller.type === "package.json")
-        .map((caller) => caller.script)
+    for (const entry of withPlausibleSites.filter((candidate) => !candidate.plausibleCiRoute)) {
+      const aliases = entry.plausibleSites
+        .filter((site) => site.type === "package.json")
+        .map((site) => site.script)
         .join(", ");
-      console.log(`  package entry only, not confirmed CI-reachable: scripts/${entry.name} (via ${aliases})`);
+      console.log(`  package entry only, no plausible CI route detected: scripts/${entry.name} (via ${aliases})`);
     }
     for (const { name, reason } of exempted) console.log(`  exempt: scripts/${name} — ${reason}`);
   }
-  console.log(`  static limit: ${staticLimit}`);
+  console.log(`  claim: ${claim}`);
+  console.log(`  limit: ${staticLimit}`);
+  console.log(`  remaining work: ${remainingWork}`);
 }
 
 process.exit(hasFailures ? 1 : 0);

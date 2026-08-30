@@ -81,10 +81,9 @@ jobs:
       - run: pnpm evidence:freshness
       - run: pnpm invariants
       - run: pnpm typecheck
-      # #705's own self-check: a script under scripts/ with no pnpm entry and no workflow
-      # step or suite caller is the exact shape this whole issue was about. Failing this is
-      # how the next script with no detected caller is a red CI run instead of a silent gap.
-      - run: pnpm scripts:callers
+      # #705's static half: every direct script has a plausible invocation site. The command
+      # prints that this cannot establish execution and that dynamic measurement remains #705.
+      - run: pnpm scripts:plausible-callers
       # Seconds, and it answers the question that actually goes stale: does every mutation row
       # still name a line that exists. Editing a guarded line renames its anchor and the row
       # silently stops checking anything — three times on one branch, each found only when the
