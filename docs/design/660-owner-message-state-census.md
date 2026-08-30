@@ -10,11 +10,22 @@ hard SHA goes stale the moment the code around it moves, and a stale locus fails
 marks it wrong until a reader notices the search comes up empty (#597). Every claim below names a
 function, a type, or a quoted comment fragment `grep`-able against whatever `origin/main` is when
 this is read, and every producing transition names the commit that closed or introduced it as a
-historical fact — those commits do not change. What is *not* a fact that survives rereading is a
-pinned "current source" SHA: this was last re-derived 2026-08-29 against `origin/main` merged into
-this branch. Re-derive by rerunning the searches and rereading the functions each row names against
-whatever `origin/main` is when you read this; where this document and the code disagree, the code
-is right and this document is what has gone stale.
+historical fact — those commits do not change. Re-derive by rerunning the searches and rereading
+the functions each row names against whatever `origin/main` is when you read this; where this
+document and the code disagree, the code is right and this document is what has gone stale.
+
+**This document was last re-derived 2026-08-30 against `origin/main` at commit**
+**`2a9f979656f7480402a381cec29c68043eb69224` (#691, "the seam a receipt would arrive through, and**
+**a sweep that asks for one"), merged into this branch.** This pinned SHA is not the same kind of
+fact as a file:line locus above — it names *when this document's prose was checked*, not *where a
+claim lives in the code*, and it is the one piece of "current source" bookkeeping this document
+keeps, precisely because the alternative already failed once: an earlier version of this document
+was re-derived against a commit before #691 merged, and its `S4`/`C1` rows described `main` as it
+was then without any way for a reader to tell that a further commit had shipped since — a blind
+review caught the gap, not this document. Re-derive by rerunning the searches above against
+whatever `origin/main` now is; when you do, update this SHA to the one you checked against, so the
+next reader inherits the same one-command staleness check instead of having to re-derive every row
+to discover it.
 
 Each row is `state / producing transition / current terminal or gap / critical-path disposition`.
 The disposition is this document's own judgment about whether a state belongs on the DIRECT wiring
@@ -135,18 +146,48 @@ any actor binding exists (see C1, C3).
   never persisted: *"The key is per instance and not persisted, so a permit does not survive the
   process that issued it... reconciling a turn after a restart is the reconciler's job, from a
   receipt, not a resurrected permit."*
-- **Terminal:** the mechanism gap is closed. `resolveInDoubt` on `ConversationTurnCoordinator`
-  (added by #669), wired to the operator surface as `OPERATOR_METHOD.CONVERSATION_RESOLVE`
-  (`src/daemon/daemon.ts`), does not need the dead permit — it authenticates the operator's own
-  review (`OPERATOR_AFTER_REVIEW` authority, `ABORTED`-only, with a `fenceAsserted` flag checked
-  against `actor_target_attestations` where the fence can be verified) and, via `materialize()`
-  (`OPERATOR_AFTER_REVIEW` is in `MATERIALIZING_AUTHORITIES`), clears the partial unique index
-  (`canonical_turns_one_unresolved`) that was blocking a fresh claim.
-- **Disposition:** the mechanism no longer needs absorbing into a wiring ticket — it shipped
+- **Terminal:** two independent exit mechanisms exist, neither needing the dead permit, and both
+  reachable only through the daemon (see C1).
+  1. `resolveInDoubt` on `ConversationTurnCoordinator` (added by #669), wired to the operator
+     surface as `OPERATOR_METHOD.CONVERSATION_RESOLVE` (`src/daemon/daemon.ts`) — it authenticates
+     the operator's own review (`OPERATOR_AFTER_REVIEW` authority, `ABORTED`-only, with a
+     `fenceAsserted` flag checked against `actor_target_attestations` where the fence can be
+     verified) and, via `materialize()` (`OPERATOR_AFTER_REVIEW` is in `MATERIALIZING_AUTHORITIES`),
+     clears the partial unique index (`canonical_turns_one_unresolved`) that was blocking a fresh
+     claim. A person acts; nothing asks a target.
+  2. `reconcileUnresolved` on `ConversationTurnCoordinator` (added by #691) — asks
+     `this.#receiptPort` (the `ReceiptPort` interface, #638's seam) about every `IN_DOUBT` row and,
+     for a matched receipt, settles it through `#settleFromReceipt` with no `TurnPermit` at all: a
+     restart's dead permit is exactly the gap this path exists to route around. It can materialize
+     `ABORTED` (authority `HERMES_TARGET`) once eight identity fields — turn, actor, prompt,
+     binding generation, target binding, target attestation, executor session and incarnation —
+     all match the row it settles (`ReceiptLookupResult`'s docstring: the wider field set closes a
+     gap `bindingGeneration` alone leaves, where a `SURVIVED` failover moves an actor's runtime to a
+     new session without advancing the generation). **It refuses every `COMPLETED` receipt
+     unconditionally**, not only while today's other gaps hold: `#settleFromReceipt` denies with
+     `CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE` before any identity check runs,
+     because a matched receipt is supposed to move `TURN_COMPLETED` and insert one reply-outbox
+     item atomically, and nothing wired to `canonical_turns` can perform that second half yet
+     (`src/outbox/outbox.ts`'s message kinds are role-to-role task dispatch, not a reply to the
+     owner). `daemon.ts` calls this once at startup, fire-and-forget (`void
+     this.runPeriodic("turn_reconcile", ...)`, right after `resumeQueuedRuns`/`resumeApprovedRuns`)
+     and again on a periodic timer (default `turnReconcileIntervalMs` 60s, budgeted by
+     `RECONCILE_SWEEP_BUDGET_MS`/`turnReconcileBudgetMs`, asserted to fit inside the interval).
+  **Both mechanisms are, today, reachable code with nothing for them to act on — the
+  mechanism-exists-but-unreachable state this row is required to record rather than collapse into
+  either "present" or "absent."** Two independent facts hold at once, per `reconcileUnresolved`'s
+  own docstring: `ConversationTurnCoordinator.claim()` — the only writer into `canonical_turns` —
+  still has no caller in `src/` (C1), so every sweep runs over an empty set regardless of the port;
+  and separately, `control-plane.ts` wires the coordinator's `#receiptPort` to
+  `NEVER_FOUND_RECEIPT_PORT` explicitly, not left to the default, so even a populated table would
+  answer `found: false` on every lookup. Both facts would have to change — a `claim()` caller and a
+  real `ReceiptPort` implementation (#638) — before `reconcileUnresolved` could settle anything real,
+  and even then `COMPLETED` stays refused until a reply-outbox mechanism is wired to this ledger.
+- **Disposition:** neither mechanism needs absorbing into a wiring ticket — both shipped
   independently. Whether the *state* can occur in production at all is a separate question (see
   C3): `claim()` refuses every call with `CONVERSATION_TARGET_UNVERIFIED` until an
   `actor_target_bindings` row exists, so this state cannot occur in production today regardless of
-  the exit mechanism now existing.
+  either exit mechanism now existing.
 
 ### S5 — `replacement_turn_request_id` set while still `IN_DOUBT`
 
@@ -206,15 +247,24 @@ because flattening them into a list of names would lose *why* each is load-beari
 
 `canonical_turns` (the coordinator's ledger) and `inbound_messages.turn_claim_json` (the ingress
 ledger) are separate tables with separate writers. `ConversationTurnCoordinator` is instantiated
-once (`src/app/control-plane.ts`), and its read/operator methods (`contradictions`,
-`unresolvedAcrossActors`, `resolveInDoubt`, `adjudicate`) are called from `src/daemon/daemon.ts` —
-but `.claim()`, the only method that inserts into `canonical_turns`, has no caller anywhere in
-`src/` (confirmed by searching every `.conversation.*` call site in `src/`). `src/ingress/
-ingress-guard.ts` says so itself, in a comment on `UnresolvedTurn.receivedAt`: *"when
-`canonical_turns` gains a writer it will have `claimed_at`."* Present tense: it still does not.
-S1/S2/S6's ingress fixes and S4's mechanism fix are independent repairs to independent ledgers,
-not one fix reaching both — which is why S4, S5 and S7 remain unreachable in production regardless
-of what ships on the ingress side (C3).
+once (`src/app/control-plane.ts`), and its read/operator/reconciliation methods (`contradictions`,
+`unresolvedAcrossActors`, `resolveInDoubt`, `adjudicate`, and — added by #691 —
+`reconcileUnresolved`) are called from `src/daemon/daemon.ts` — but `.claim()`, the only method
+that inserts into `canonical_turns`, still has no caller anywhere in `src/` (confirmed by searching
+every `.conversation.*` call site in `src/`). `src/ingress/ingress-guard.ts` says so itself, in a
+comment on `UnresolvedTurn.receivedAt`: *"when `canonical_turns` gains a writer it will have
+`claimed_at`."* Present tense: it still does not. `reconcileUnresolved` is a real, running
+daemon-connected path — called at startup and on a periodic timer (S4) — not a hypothetical one,
+and it is not the `.claim()` writer either: it only settles rows that already exist, and
+`unresolvedIdentities()` (its read half) selects from `canonical_turns` the same way every other
+operator method does. So the count of independent repairs to independent ledgers is now three —
+S1/S2/S6's ingress fixes, `resolveInDoubt`, and `reconcileUnresolved` — not one fix reaching both
+ledgers, and not two mechanisms collapsing to one: `resolveInDoubt` needs a person and settles
+`ABORTED` under `OPERATOR_AFTER_REVIEW`; `reconcileUnresolved` needs a receipt and settles
+`ABORTED` under `HERMES_TARGET`, refusing `COMPLETED` outright. Which is why S4, S5 and S7 remain
+unreachable in production regardless of what ships on the ingress side or how many exit mechanisms
+`canonical_turns` accumulates (C3) — a writer for `.claim()` is the one prerequisite none of this
+touches.
 
 **A second divergence, in the ingress ledger alone: it can mark a turn "resolved" and "answered"
 while the CEO's own execution may still be running.** `answerAsCeo` (`src/daemon/agentcpd.ts`)
@@ -292,7 +342,10 @@ in its row, verifiable by rereading the code rather than trusting this summary.
 **On the critical path, real design work:** S2 (the second-unresolved-row disclosure gap), S7 (a
 later message against a coalesced batch, unreachable until the embargo lifts but real design work
 regardless).
-**Independent, embargoed:** S4 (mechanism closed, state unreachable), S5 (no writer, unreachable).
+**Independent, embargoed:** S4 (two exit mechanisms shipped — operator `resolveInDoubt` and
+receipt-driven `reconcileUnresolved` — both currently inert: no `.claim()` writer, and
+`reconcileUnresolved` additionally wired to a `ReceiptPort` that always answers `found: false`),
+S5 (no writer, unreachable).
 **Context, not scheduled:** C1 (two ledgers; ingress-resolves-early divergence), C2 (sentences
 keep changing), C3 (embargo mechanism).
 
