@@ -1,12 +1,13 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { execFileSync, spawnSync } from "node:child_process";
-import { appendFileSync, cpSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { cp, mkdir, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+import { cleanupTempDirsAsync, tempDir } from "../helpers/fixtures.ts";
 
-afterAll(cleanupTempDirs);
+afterAll(cleanupTempDirsAsync);
 
 /**
  * #676: a writer census that tries to evaluate JavaScript has no stable edge. Six review rounds
@@ -25,27 +26,56 @@ const CLAIM =
  * that typecheck and execute get the complete installed dependency tree. Neither form leaves pnpm
  * looking at a modules directory whose resolved target is outside the scratch repository.
  */
-const scratchRepo = (dependencies: "typescript" | "all" = "typescript"): string => {
-  const dir = join(tempDir("acp-writer-census-"), "repo");
-  execFileSync("git", ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir]);
-  execFileSync("cp", [join(ROOT, SCRIPT), join(dir, SCRIPT)]);
-  rmSync(join(dir, "src"), { recursive: true, force: true });
-  execFileSync("cp", ["-R", join(ROOT, "src"), join(dir, "src")]);
-  if (dependencies === "all") {
-    cpSync(join(ROOT, "node_modules"), join(dir, "node_modules"), { recursive: true });
-  } else {
-    mkdirSync(join(dir, "node_modules"), { recursive: true });
-    cpSync(realpathSync(join(ROOT, "node_modules/typescript")), join(dir, "node_modules/typescript"), {
-      recursive: true,
+interface ChildResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+const runChild = (command: string, args: string[], cwd: string): Promise<ChildResult> =>
+  new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout += chunk;
     });
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (status) => resolve({ status, stdout, stderr }));
+  });
+
+const scratchRepo = async (
+  dependencies: "typescript" | "all" = "typescript",
+): Promise<string> => {
+  const dir = join(tempDir("acp-writer-census-"), "repo");
+  const cloned = await runChild(
+    "git",
+    ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir],
+    ROOT,
+  );
+  if (cloned.status !== 0) throw new Error(`scratch clone failed: ${cloned.stderr}`);
+  await cp(join(ROOT, SCRIPT), join(dir, SCRIPT));
+  await rm(join(dir, "src"), { recursive: true, force: true });
+  await cp(join(ROOT, "src"), join(dir, "src"), { recursive: true });
+  if (dependencies === "all") {
+    await cp(join(ROOT, "node_modules"), join(dir, "node_modules"), { recursive: true });
+  } else {
+    await mkdir(join(dir, "node_modules"), { recursive: true });
+    await cp(
+      realpathSync(join(ROOT, "node_modules/typescript")),
+      join(dir, "node_modules/typescript"),
+      { recursive: true },
+    );
   }
   return dir;
 };
 
-const censusOn = (dir: string): { status: number | null; stdout: string } => {
-  const done = spawnSync("node", [SCRIPT], { cwd: dir, encoding: "utf8" });
-  return { status: done.status, stdout: done.stdout };
-};
+const censusOn = (dir: string): Promise<ChildResult> => runChild("node", [SCRIPT], dir);
 
 const esbuildBin = (repo: string): string =>
   createRequire(realpathSync(join(repo, "node_modules/tsx/package.json"))).resolve(
@@ -68,16 +98,20 @@ const writeProbe = (repo: string, name: string, body: string, imports: string[] 
   );
 };
 
+const replaceInFile = (path: string, search: string, replacement: string): void => {
+  writeFileSync(path, readFileSync(path, "utf8").replace(search, replacement));
+};
+
 describe(CLAIM, () => {
-  it("fails when an inline SQL exact Db run call names a governed table outside its owner", () => {
-    const repo = scratchRepo();
+  it("fails when an inline SQL exact Db run call names a governed table outside its owner", async () => {
+    const repo = await scratchRepo();
     writeProbe(
       repo,
       "rogue-writer-676.ts",
       "db.run(`UPDATE canonical_turns SET lifecycle_state = 'SETTLED' WHERE turn_request_id = ?`, [turnRequestId]);",
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("src/probe/rogue-writer-676.ts");
     expect(done.stdout).toContain("canonical_turns");
@@ -85,8 +119,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("counts string and no substitution template literal calls", () => {
-    const repo = scratchRepo();
+  it("counts string and no substitution template literal calls", async () => {
+    const repo = await scratchRepo();
     writeProbe(
       repo,
       "rogue-string-literal.ts",
@@ -98,7 +132,7 @@ describe(CLAIM, () => {
       "db.run(`DELETE FROM canonical_turns WHERE 1 = 0`);",
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("src/probe/rogue-string-literal.ts");
     expect(done.stdout).toContain("src/probe/rogue-template-literal.ts");
@@ -106,8 +140,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("measures inline SQL syntax and semantic run key boundary forms", () => {
-    const repo = scratchRepo("all");
+  it("measures inline SQL syntax and semantic run key boundary forms", async () => {
+    const repo = await scratchRepo("all");
     const inline = [
       {
         name: "parenthesized-inline-sql.ts",
@@ -219,11 +253,12 @@ describe(CLAIM, () => {
       ].join("\n  "),
     );
 
-    const typed = spawnSync("node", ["node_modules/typescript/bin/tsc", "--noEmit"], {
-      cwd: repo,
-      encoding: "utf8",
-    });
-    const done = censusOn(repo);
+    const typed = await runChild(
+      "node",
+      ["node_modules/typescript/bin/tsc", "--noEmit"],
+      repo,
+    );
+    const done = await censusOn(repo);
 
     expect(typed.status, typed.stdout + typed.stderr).toBe(0);
     for (const probe of inline) expect(done.stdout).toContain(`src/probe/${probe.name}`);
@@ -240,8 +275,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("reports Array join SQL outside the inline SQL boundary", () => {
-    const repo = scratchRepo("all");
+  it("reports Array join SQL outside the inline SQL boundary", async () => {
+    const repo = await scratchRepo("all");
     writeProbe(
       repo,
       "rogue-array-join-676.ts",
@@ -301,11 +336,8 @@ describe(CLAIM, () => {
 
     // The counterexample typechecks and actually inserts through the real Db.run implementation.
     // The old shadow probe called a nonexistent Db.exec and could pass without either property.
-    const typed = spawnSync(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], {
-      cwd: repo,
-      encoding: "utf8",
-    });
-    const built = spawnSync(
+    const typed = await runChild(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], repo);
+    const built = await runChild(
       esbuildBin(repo),
       [
         "tests/execute-array-join-probe.ts",
@@ -315,13 +347,10 @@ describe(CLAIM, () => {
         "--packages=external",
         "--outfile=src/db/execute-array-join-probe.mjs",
       ],
-      { cwd: repo, encoding: "utf8" },
+      repo,
     );
-    const executed = spawnSync("node", ["src/db/execute-array-join-probe.mjs"], {
-      cwd: repo,
-      encoding: "utf8",
-    });
-    const done = censusOn(repo);
+    const executed = await runChild("node", ["src/db/execute-array-join-probe.mjs"], repo);
+    const done = await censusOn(repo);
 
     expect(typed.status, typed.stdout + typed.stderr).toBe(0);
     expect(built.status, built.stdout + built.stderr).toBe(0);
@@ -334,8 +363,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(0);
   });
 
-  it("documents that a RunPort alias is outside the exact symbol boundary", () => {
-    const repo = scratchRepo("all");
+  it("documents that a RunPort alias is outside the exact symbol boundary", async () => {
+    const repo = await scratchRepo("all");
     writeProbe(
       repo,
       "rogue-run-port-676.ts",
@@ -359,11 +388,8 @@ describe(CLAIM, () => {
       ].join("\n"),
     );
 
-    const typed = spawnSync(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], {
-      cwd: repo,
-      encoding: "utf8",
-    });
-    const built = spawnSync(
+    const typed = await runChild(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], repo);
+    const built = await runChild(
       esbuildBin(repo),
       [
         "tests/execute-run-port-probe.ts",
@@ -373,13 +399,10 @@ describe(CLAIM, () => {
         "--packages=external",
         "--outfile=src/db/execute-run-port-probe.mjs",
       ],
-      { cwd: repo, encoding: "utf8" },
+      repo,
     );
-    const executed = spawnSync("node", ["src/db/execute-run-port-probe.mjs"], {
-      cwd: repo,
-      encoding: "utf8",
-    });
-    const done = censusOn(repo);
+    const executed = await runChild("node", ["src/db/execute-run-port-probe.mjs"], repo);
+    const done = await censusOn(repo);
 
     expect(typed.status, typed.stdout + typed.stderr).toBe(0);
     expect(built.status, built.stdout + built.stderr).toBe(0);
@@ -408,11 +431,11 @@ describe(CLAIM, () => {
   ];
 
   for (const { label, body } of nonInlineForms) {
-    it(`reports a ${label} outside the inline SQL boundary`, () => {
-      const repo = scratchRepo();
+    it(`reports a ${label} outside the inline SQL boundary`, async () => {
+      const repo = await scratchRepo();
       writeProbe(repo, `rogue-${label.replaceAll(" ", "-")}.ts`, body);
 
-      const done = censusOn(repo);
+      const done = await censusOn(repo);
 
       expect(done.stdout).toContain("OUTSIDE INLINE-SQL BOUNDARY:");
       expect(done.stdout).toContain("governed-table ownership unmeasured");
@@ -421,8 +444,8 @@ describe(CLAIM, () => {
     });
   }
 
-  it("reports imported SQL outside the inline SQL boundary", () => {
-    const repo = scratchRepo();
+  it("reports imported SQL outside the inline SQL boundary", async () => {
+    const repo = await scratchRepo();
     mkdirSync(join(repo, "src/probe"), { recursive: true });
     writeFileSync(
       join(repo, "src/probe/imported-sql.ts"),
@@ -435,37 +458,37 @@ describe(CLAIM, () => {
       ['import { sql } from "./imported-sql.ts";'],
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("src/probe/rogue-imported-sql.ts");
     expect(done.stdout).toContain("governed-table ownership unmeasured");
     expect(done.status).toBe(0);
   });
 
-  it("fails when exact Db run is captured instead of called directly", () => {
-    const repo = scratchRepo();
+  it("fails when exact Db run is captured instead of called directly", async () => {
+    const repo = await scratchRepo();
     writeProbe(
       repo,
       "rogue-run-alias.ts",
       "const run = db.run.bind(db); run(`UPDATE canonical_turns SET lifecycle_state = 'SETTLED'`);",
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("escapes its direct call surface");
     expect(done.stdout).toContain("RESULT: FAIL");
     expect(done.status).toBe(1);
   });
 
-  it("refuses Db run captured through literal bracket access", () => {
-    const repo = scratchRepo();
+  it("refuses Db run captured through literal bracket access", async () => {
+    const repo = await scratchRepo();
     writeProbe(
       repo,
       "rogue-run-bracket.ts",
       'const captured = db["run"]; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("src/probe/rogue-run-bracket.ts");
     expect(done.stdout).toContain("escapes its direct call surface");
@@ -473,8 +496,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("refuses Db run captured by object binding destructuring", () => {
-    const repo = scratchRepo("all");
+  it("refuses Db run captured by object binding destructuring", async () => {
+    const repo = await scratchRepo("all");
     writeProbe(
       repo,
       "rogue-run-destructure.ts",
@@ -497,11 +520,8 @@ describe(CLAIM, () => {
       ].join("\n"),
     );
 
-    const typed = spawnSync(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], {
-      cwd: repo,
-      encoding: "utf8",
-    });
-    const built = spawnSync(
+    const typed = await runChild(join(repo, "node_modules/.bin/tsc"), ["--noEmit"], repo);
+    const built = await runChild(
       esbuildBin(repo),
       [
         "tests/execute-run-destructure-probe.ts",
@@ -511,13 +531,10 @@ describe(CLAIM, () => {
         "--packages=external",
         "--outfile=src/db/execute-run-destructure-probe.mjs",
       ],
-      { cwd: repo, encoding: "utf8" },
+      repo,
     );
-    const executed = spawnSync("node", ["src/db/execute-run-destructure-probe.mjs"], {
-      cwd: repo,
-      encoding: "utf8",
-    });
-    const done = censusOn(repo);
+    const executed = await runChild("node", ["src/db/execute-run-destructure-probe.mjs"], repo);
+    const done = await censusOn(repo);
 
     expect(typed.status, typed.stdout + typed.stderr).toBe(0);
     expect(built.status, built.stdout + built.stderr).toBe(0);
@@ -528,8 +545,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("refuses Db run captured by object assignment destructuring", () => {
-    const repo = scratchRepo();
+  it("refuses Db run captured by object assignment destructuring", async () => {
+    const repo = await scratchRepo();
     writeProbe(
       repo,
       "rogue-run-assignment.ts",
@@ -540,7 +557,7 @@ describe(CLAIM, () => {
       ].join("\n  "),
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("src/probe/rogue-run-assignment.ts");
     expect(done.stdout).toContain("escapes its direct call surface");
@@ -548,8 +565,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("leaves the stated excluded reference forms outside coverage", () => {
-    const repo = scratchRepo();
+  it("leaves the stated excluded reference forms outside coverage", async () => {
+    const repo = await scratchRepo();
     writeProbe(
       repo,
       "excluded-reference-forms.ts",
@@ -574,7 +591,7 @@ describe(CLAIM, () => {
       ].join("\n"),
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).not.toContain("excluded-reference-forms.ts");
     expect(done.stdout).not.toContain("generated-writer.js");
@@ -583,23 +600,23 @@ describe(CLAIM, () => {
     expect(done.status).toBe(0);
   });
 
-  it("fails when an inline exact Db run call names a table with no application owner", () => {
-    const repo = scratchRepo();
+  it("fails when an inline exact Db run call names a table with no application owner", async () => {
+    const repo = await scratchRepo();
     writeProbe(
       repo,
       "rogue-attester-676.ts",
       'db.run(`INSERT INTO actor_target_attestations (target_attestation_id) VALUES (?)`, ["x"]);',
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("actor_target_attestations");
     expect(done.stdout).toContain("outside its declared application owner list (none)");
     expect(done.status).toBe(1);
   });
 
-  it("passes on the source tree as it stands", () => {
-    const done = censusOn(scratchRepo());
+  it("passes on the source tree as it stands", async () => {
+    const done = await censusOn(await scratchRepo());
 
     expect(done.stdout).toContain(`CHECK: ${CLAIM}`);
     expect(done.stdout).toContain("RESULT: PASS");
@@ -607,29 +624,23 @@ describe(CLAIM, () => {
     expect(done.status).toBe(0);
   });
 
-  it("fails when a declared application owner no longer names its table", () => {
-    const repo = scratchRepo();
-    execFileSync(
-      "node",
-      [
-        "-e",
-        `const fs=require('fs');const p='${SCRIPT}';let s=fs.readFileSync(p,'utf8');` +
-          `s=s.replace('actor_target_bindings: ["src/session/binding-registry.ts"],', ` +
-          `'actor_target_bindings: ["src/session/a-file-that-does-not-write-this-anymore.ts"],');` +
-          `fs.writeFileSync(p,s);`,
-      ],
-      { cwd: repo },
+  it("fails when a declared application owner no longer names its table", async () => {
+    const repo = await scratchRepo();
+    replaceInFile(
+      join(repo, SCRIPT),
+      'actor_target_bindings: ["src/session/binding-registry.ts"],',
+      'actor_target_bindings: ["src/session/a-file-that-does-not-write-this-anymore.ts"],',
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("actor_target_bindings");
     expect(done.stdout).toContain("application-owner entry");
     expect(done.status).toBe(1);
   });
 
-  it("fails when a schema trigger body writes a governed table directly", () => {
-    const repo = scratchRepo();
+  it("fails when a schema trigger body writes a governed table directly", async () => {
+    const repo = await scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
       [
@@ -643,7 +654,7 @@ describe(CLAIM, () => {
       ].join("\n"),
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("src/db/schema.sql");
     expect(done.stdout).toContain("canonical_turn_sources");
@@ -651,8 +662,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("scans source and destination table names in schema renames", () => {
-    const repo = scratchRepo();
+  it("scans source and destination table names in schema renames", async () => {
+    const repo = await scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
       [
@@ -667,7 +678,7 @@ describe(CLAIM, () => {
       ].join("\n"),
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     for (const table of [
       "canonical_turn_sources",
@@ -685,104 +696,90 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("does not fabricate a schema write from an SQL comment", () => {
-    const repo = scratchRepo();
+  it("does not fabricate a schema write from an SQL comment", async () => {
+    const repo = await scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
       "\n-- `UPDATE canonical_turns SET outcome_kind='ABORTED'` is only documentation.\n",
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("RESULT: PASS");
     expect(done.status).toBe(0);
   });
 
-  it("discovers a governed table declared with an SQL comment between CREATE and TABLE", () => {
-    const repo = scratchRepo();
+  it("discovers a governed table declared with an SQL comment between CREATE and TABLE", async () => {
+    const repo = await scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
       "\nCREATE/**/TABLE IF NOT EXISTS canonical_turn_probe_676a (turn_request_id TEXT PRIMARY KEY);\n",
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("canonical_turn_probe_676a");
     expect(done.stdout).toContain("no application-owner entry");
     expect(done.status).toBe(1);
   });
 
-  it("discovers a governed table declared with a schema-qualified name", () => {
-    const repo = scratchRepo();
+  it("discovers a governed table declared with a schema-qualified name", async () => {
+    const repo = await scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
       "\nCREATE TABLE main.canonical_turn_probe_676b (turn_request_id TEXT PRIMARY KEY);\n",
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("canonical_turn_probe_676b");
     expect(done.stdout).toContain("no application-owner entry");
     expect(done.status).toBe(1);
   });
 
-  it("fails when declared ownership names a table the schema no longer declares", () => {
-    const repo = scratchRepo();
-    execFileSync(
-      "node",
-      [
-        "-e",
-        `const fs=require('fs');const p='src/db/schema.sql';let s=fs.readFileSync(p,'utf8');` +
-          `s=s.replace('CREATE TABLE IF NOT EXISTS actor_target_attestations (', ` +
-          `'CREATE TABLE IF NOT EXISTS zzz_676_removed_attestations (');` +
-          `fs.writeFileSync(p,s);`,
-      ],
-      { cwd: repo },
+  it("fails when declared ownership names a table the schema no longer declares", async () => {
+    const repo = await scratchRepo();
+    replaceInFile(
+      join(repo, "src/db/schema.sql"),
+      "CREATE TABLE IF NOT EXISTS actor_target_attestations (",
+      "CREATE TABLE IF NOT EXISTS zzz_676_removed_attestations (",
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("actor_target_attestations");
     expect(done.stdout).toContain("schema no longer declares");
     expect(done.status).toBe(1);
   });
 
-  it("fails when a named migration rebuild surface goes stale", () => {
-    const repo = scratchRepo();
-    execFileSync(
-      "node",
-      [
-        "-e",
-        `const fs=require('fs');const p='src/db/migrations.ts';let s=fs.readFileSync(p,'utf8');` +
-          `s=s.replace('export const rebuildCanonicalTurnsIfStale =', ` +
-          `'export const oldRebuildCanonicalTurnsIfStale =');fs.writeFileSync(p,s);`,
-      ],
-      { cwd: repo },
+  it("fails when a named migration rebuild surface goes stale", async () => {
+    const repo = await scratchRepo();
+    replaceInFile(
+      join(repo, "src/db/migrations.ts"),
+      "export const rebuildCanonicalTurnsIfStale =",
+      "export const oldRebuildCanonicalTurnsIfStale =",
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain("rebuildCanonicalTurnsIfStale is missing");
     expect(done.stdout).toContain("declared migration rebuild surface");
     expect(done.status).toBe(1);
   });
 
-  it("reports named migration rebuild functions without evaluating their SQL", () => {
-    const repo = scratchRepo();
-    execFileSync(
-      "node",
+  it("reports named migration rebuild functions without evaluating their SQL", async () => {
+    const repo = await scratchRepo();
+    replaceInFile(
+      join(repo, "src/db/migrations.ts"),
+      "export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {",
       [
-        "-e",
-        `const fs=require('fs');const p='src/db/migrations.ts';let s=fs.readFileSync(p,'utf8');` +
-          `s=s.replace('export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {', ` +
-          `'export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {\\n` +
-          `  const unevaluatedProbeSql = "UPDATE canonical_turns SET lifecycle_state = ?";\\n` +
-          `  void unevaluatedProbeSql;');fs.writeFileSync(p,s);`,
-      ],
-      { cwd: repo },
+        "export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {",
+        '  const unevaluatedProbeSql = "UPDATE canonical_turns SET lifecycle_state = ?";',
+        "  void unevaluatedProbeSql;",
+      ].join("\n"),
     );
 
-    const done = censusOn(repo);
+    const done = await censusOn(repo);
 
     expect(done.stdout).toContain(
       "canonical_turns: src/db/migrations.ts#rebuildCanonicalTurnsIfStale",
@@ -791,8 +788,8 @@ describe(CLAIM, () => {
     expect(done.status).toBe(0);
   });
 
-  it("prints the exact boundary on every run", () => {
-    const done = censusOn(scratchRepo());
+  it("prints the exact boundary on every run", async () => {
+    const done = await censusOn(await scratchRepo());
 
     expect(done.stdout).toContain("BOUNDARY:");
     expect(done.stdout).toContain("property symbol resolves exactly to Db.run");
