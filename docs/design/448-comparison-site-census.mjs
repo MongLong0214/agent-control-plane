@@ -5,37 +5,108 @@
  * This is a census, not a check: it has no baseline, never fails on a finding, and is not
  * called by package.json or CI. Run it with:
  *
- *   node docs/design/448-comparison-site-census.mjs [--json]
+ *   node docs/design/448-comparison-site-census.mjs --ref <sha> [--json]
  */
-import { readdirSync, statSync } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const SOURCE_ROOT = resolve(ROOT, "src");
+const CONFIG_SOURCE = resolve(ROOT, "tsconfig.json");
 const ERRORS_SOURCE = resolve(SOURCE_ROOT, "core", "errors.ts");
 const REASON_CODES_SOURCE = resolve(SOURCE_ROOT, "core", "reason-codes.ts");
-const asJson = process.argv.includes("--json");
+const usage = "node docs/design/448-comparison-site-census.mjs --ref <sha> [--json]";
 
-const sourcesBelow = (directory) => {
-  const found = [];
-  for (const entry of readdirSync(directory).sort()) {
-    const path = resolve(directory, entry);
-    const stats = statSync(path);
-    if (stats.isDirectory()) found.push(...sourcesBelow(path));
-    else if (entry.endsWith(".ts") && !entry.endsWith(".d.ts")) found.push(path);
+let asJson = false;
+let requestedRef = null;
+const args = process.argv.slice(2);
+for (let index = 0; index < args.length; index += 1) {
+  const argument = args[index];
+  if (argument === "--json") {
+    asJson = true;
+  } else if (argument === "--ref") {
+    const value = args[index + 1];
+    if (!value || value.startsWith("--")) throw new Error(`--ref requires a value; usage: ${usage}`);
+    if (requestedRef !== null) throw new Error(`--ref may only be specified once; usage: ${usage}`);
+    requestedRef = value;
+    index += 1;
+  } else {
+    throw new Error(`unknown argument ${argument}; usage: ${usage}`);
   }
-  return found;
+}
+if (requestedRef === null) throw new Error(`--ref is required; usage: ${usage}`);
+
+const gitText = (...gitArgs) =>
+  execFileSync("git", gitArgs, { cwd: ROOT, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+const measuredCommit = gitText("rev-parse", "--verify", `${requestedRef}^{commit}`).trim();
+const trackedPaths = gitText("ls-tree", "-r", "--name-only", measuredCommit)
+  .split("\n")
+  .filter(Boolean);
+const trackedPathSet = new Set(trackedPaths);
+const trackedDirectories = new Set([""]);
+for (const path of trackedPaths) {
+  let slash = path.lastIndexOf("/");
+  while (slash >= 0) {
+    trackedDirectories.add(path.slice(0, slash));
+    slash = path.lastIndexOf("/", slash - 1);
+  }
+}
+const sourceNames = trackedPaths
+  .filter((path) => path.startsWith("src/") && path.endsWith(".ts") && !path.endsWith(".d.ts"))
+  .map((path) => resolve(ROOT, path));
+const snapshotTexts = new Map();
+
+const repositoryPath = (path) => {
+  const fromRoot = relative(ROOT, resolve(path));
+  if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`)) return null;
+  return fromRoot.split(sep).join("/");
 };
 
-const configPath = ts.findConfigFile(ROOT, ts.sys.fileExists, "tsconfig.json");
-if (!configPath) throw new Error("tsconfig.json is missing");
-const config = ts.readConfigFile(configPath, ts.sys.readFile);
-if (config.error) throw new Error("tsconfig.json could not be read");
-const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, dirname(configPath));
-const sourceNames = sourcesBelow(SOURCE_ROOT);
-const program = ts.createProgram({ rootNames: sourceNames, options: parsed.options });
+const snapshotText = (path) => {
+  const repoPath = repositoryPath(path);
+  if (repoPath === null || !trackedPathSet.has(repoPath)) return undefined;
+  if (!snapshotTexts.has(repoPath)) {
+    snapshotTexts.set(repoPath, gitText("show", `${measuredCommit}:${repoPath}`));
+  }
+  return snapshotTexts.get(repoPath);
+};
+
+const baseHost = ts.createCompilerHost({});
+const fromDependency = (path) => repositoryPath(path)?.startsWith("node_modules/") ?? true;
+const fileExists = (path) => {
+  if (fromDependency(path)) return baseHost.fileExists(path);
+  const repoPath = repositoryPath(path);
+  return repoPath !== null && trackedPathSet.has(repoPath);
+};
+const readFile = (path) => fromDependency(path) ? baseHost.readFile(path) : snapshotText(path);
+const directoryExists = (path) => {
+  if (fromDependency(path)) return baseHost.directoryExists(path);
+  const repoPath = repositoryPath(path);
+  return repoPath !== null && trackedDirectories.has(repoPath);
+};
+
+const configText = snapshotText(CONFIG_SOURCE);
+if (configText === undefined) throw new Error(`tsconfig.json is missing at ${measuredCommit}`);
+const config = ts.parseConfigFileTextToJson(CONFIG_SOURCE, configText);
+if (config.error) throw new Error(`tsconfig.json could not be read at ${measuredCommit}`);
+const parsed = ts.convertCompilerOptionsFromJson(config.config.compilerOptions ?? {}, ROOT, CONFIG_SOURCE);
+if (parsed.errors.length > 0) throw new Error(`tsconfig.json compiler options are invalid at ${measuredCommit}`);
+
+const host = ts.createCompilerHost(parsed.options);
+host.fileExists = fileExists;
+host.readFile = readFile;
+host.directoryExists = directoryExists;
+host.getSourceFile = (fileName, languageVersion, onError) => {
+  const text = readFile(fileName);
+  if (text === undefined) {
+    onError?.(`file is missing at ${measuredCommit}: ${fileName}`);
+    return undefined;
+  }
+  return ts.createSourceFile(fileName, text, languageVersion, true, ts.getScriptKindFromFileName(fileName));
+};
+const program = ts.createProgram({ rootNames: sourceNames, options: parsed.options, host });
 const checker = program.getTypeChecker();
 
 const resolvedSymbol = (node) => {
@@ -423,7 +494,7 @@ const recordCandidateF = (node, source, left, right, kind) => {
   const leftClass = rootClass(leftRoots);
   const rightClass = rootClass(rightRoots);
   const classes = [leftClass, rightClass];
-  if (!classes.includes("parameter")) return;
+  if (!classes.some((root) => root === "parameter" || root === "mixed")) return;
   if (classes.includes("literal")) return;
   candidateFPredicates.push({
     ...siteOf(node, source),
@@ -542,7 +613,7 @@ const fSummary = {
 };
 
 const result = {
-  measuredCommit: "working-tree",
+  measuredCommit,
   productionTypeScriptFiles: sourceNames.length,
   candidateE: { summary: eSummary, sites: candidateESites },
   candidateF: {

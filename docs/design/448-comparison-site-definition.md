@@ -3,8 +3,13 @@
 Measured against `8622195` (`origin/main` at the start of this work). The census covered the 88
 tracked production TypeScript files under `src/`; tests, documents, scripts, and untracked files
 were not treated as production callables. Run C2 is reproducible with
-`node docs/design/448-comparison-site-census.mjs --json`. That script only reports candidates E and
-F: it has no baseline or failure result and is not a package or CI entry point.
+`node docs/design/448-comparison-site-census.mjs --ref 8622195 --json`. The script resolves that ref
+to a commit and reads its tracked blobs, rather than reading `src/` from the working tree. The
+original census put a generation on the prose while its command measured a potentially different
+working-tree generation: the document about binding both comparison operands to one generation did
+not bind its own two sides, stated SHA and measured input. That was the same class of error this
+document describes. The script only reports candidates E and F: it has no baseline or failure
+result and is not a package or CI entry point.
 
 ## 1. Definition
 
@@ -32,7 +37,7 @@ conditional expression contains a binary comparison and its selected branch cont
 | C | callable that calls both and has a comparison controlling a decision branch | C1 count withdrawn | Still admits pure validation and misses delegated comparisons. |
 | D | C-like decision callable with a raw comparison spelling `generation`, `digest`, `sha`, or `head` | C1 count withdrawn | Names are proxies: they admit type/null checks and miss neutral names such as `incarnation`, `changes`, and object entries. |
 | E | direct `deny()`/`fail()` call using a member of `STALENESS_REASON_CODES` | 70 sites | An output classification, not a comparison definition: 66 return denials and 4 throw; 67 have a direct controlling condition, and at least 43 expose both compared operands in evidence. |
-| F | non-literal binary or `has`/`includes` predicate with a parameter-reachable operand; classify the other operand by origin | 844 predicates | 283 parameter/parameter pairs are compliant, 530 parameter/ambient-reachable asymmetries are flagged, and 31 cannot be resolved. The inspected false-positive rate is 5/5. |
+| F | non-literal binary or `has`/`includes` predicate with a parameter-reachable operand, including a mixed operand; classify the other operand by origin | 1,075 predicates | 283 parameter/parameter pairs are compliant, 530 parameter/ambient-reachable asymmetries are flagged, and 262 (24.4%) cannot be resolved. All 5 inspected flagged asymmetries were false positives; this is not a population-wide rate. |
 
 ### Candidate A samples
 
@@ -120,6 +125,7 @@ from 42 to 43.
 For C2, an operand is parameter-reachable when it is a parameter or a local derived from one.
 `this`/`super`, module-level declarations, imports, globals, and locals derived from them are
 ambient-reachable. An operand reachable from both is still ambient-reachable for the asymmetry.
+Such a mixed operand is admitted to the population even when neither operand is parameter-only.
 Literals are excluded; unresolved origins are reported separately. The predicates are ordinary
 binary relations plus one-argument `has()` and `includes()` membership checks.
 
@@ -141,8 +147,9 @@ Five flagged asymmetries were inspected:
 
 All five are true parameter-versus-ambient syntax and false comparison-site positives: the
 ambient side is immutable policy, not an independently mutable observation. The observed sample
-false-positive rate is therefore **5/5 (100%)**. This is a measured sample rate, not a claim that
-all 530 findings were manually classified.
+result is therefore **5/5 false positives**. These five were inspected from the 530 resolved
+asymmetry findings; they demonstrate a false-positive class, but they do not estimate the rate for
+the other 525 findings or for the unresolved population.
 
 Five misses were also inspected: repository `inspect` compares the live and accepted heads
 (`src/registry/repository-registry.ts:251`), repository `observed` repeats that comparison in its
@@ -152,7 +159,15 @@ remain unresolved after the `Promise.all` destructure (`src/verify/worktree.ts:9
 (`src/outbox/outbox.ts:265`). F therefore misses ambient/ambient state, data flow it cannot resolve,
 and comparisons below TypeScript. Distinguishing immutable ambient policy from mutable ambient
 state would require the semantic classification F was meant to discover, so adding another name
-or type proxy would only recreate D. Candidate F does not survive and is not installed.
+or type proxy would only recreate D.
+
+Admitting mixed operands raises the unresolved bucket from 31 to 262, **24.4% of the 1,075-site
+population**. That changes what may be inferred from the 5/5 inspection: it says only that five
+resolved flags were false positives, not that F has a measured population-wide false-positive
+rate, and says nothing about the unresolved quarter. It does not change the disposition. F already
+flags immutable policy as though it were mutable state, while the much larger unresolved bucket
+adds another material area where it produces no classification. Candidate F does not survive and
+is not installed.
 
 ## 3. Current count
 
