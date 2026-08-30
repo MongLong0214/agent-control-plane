@@ -690,45 +690,75 @@ export class CtoLifecycle {
     });
     if (!prepared.allowed) return prepared;
 
-    if (current && session && session.lifecycle !== SessionLifecycle.STOPPED) {
-      try {
-        await this.providers.require(session.provider).stopSession({
-          externalSessionId: current.sessionId,
-          provider: session.provider,
-          model: session.model,
-          effort: session.effort,
-          pid: session.osPid,
-        });
-      } catch (error) {
-        this.db.tx(() => {
-          const latest = this.sessions.require(current.sessionId);
-          if (latest.lifecycle === SessionLifecycle.READY || latest.lifecycle === SessionLifecycle.DRAINING) {
-            this.sessions.transition(current.sessionId, SessionLifecycle.ERROR, "provider stop failed");
-          }
-          this.projects.setAvailability(projectId, "UNAVAILABLE", "provider stop failed during suspension");
-          this.audit.record({
-            kind: "PROJECT_SUSPEND_RUNTIME_STOP_FAILED",
-            reasonCode: ReasonCode.SESSION_STOP_FAILED,
+    if (current && session) {
+      if (session.lifecycle !== SessionLifecycle.STOPPED) {
+        // #692 — before telling the provider to stop (not reversible once it answers),
+        // confirm nothing already owned by this binding would refuse the revoke that is
+        // meant to follow it. This matters for more than the race below: LIVE_RUN_STATES
+        // (binding-registry.ts) also counts QUEUED, READY_FOR_CEO_REVIEW, CEO_APPROVED,
+        // MERGING, POST_MERGE_VERIFYING, REVISION_REQUIRED and AWAITING_HUMAN as live, and
+        // the checkpoint tx above only moves ACTIVE runs to BLOCKED — a run parked in any
+        // of the others would refuse the later revoke every single time, not as a race but
+        // as an ordinary outcome, and without this check that refusal would only surface
+        // after the provider had already been told to stop. This preflight cannot close
+        // the genuine race, though: nothing else in this function yields before the
+        // `stopSession()` await below, so a run that reactivates *during* that await is
+        // invisible here and still reaches the compensation path after it.
+        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });
+        if (preflight.length > 0) {
+          return deny(
+            ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
+            "the active binding owns live runs and cannot be revoked without a takeover",
+            { projectId, roleKey, runs: preflight.map((run) => run.run_id) },
+          );
+        }
+        try {
+          await this.providers.require(session.provider).stopSession({
+            externalSessionId: current.sessionId,
+            provider: session.provider,
+            model: session.model,
+            effort: session.effort,
+            pid: session.osPid,
+          });
+        } catch (error) {
+          this.db.tx(() => {
+            const latest = this.sessions.require(current.sessionId);
+            if (latest.lifecycle === SessionLifecycle.READY || latest.lifecycle === SessionLifecycle.DRAINING) {
+              this.sessions.transition(current.sessionId, SessionLifecycle.ERROR, "provider stop failed");
+            }
+            this.projects.setAvailability(projectId, "UNAVAILABLE", "provider stop failed during suspension");
+            this.audit.record({
+              kind: "PROJECT_SUSPEND_RUNTIME_STOP_FAILED",
+              reasonCode: ReasonCode.SESSION_STOP_FAILED,
+              projectId,
+              sessionId: current.sessionId,
+              evidence: { reason, error: error instanceof Error ? error.message : String(error) },
+            });
+          });
+          return deny(ReasonCode.SESSION_STOP_FAILED, "CTO runtime stop failed; cleanup remains pending", {
             projectId,
             sessionId: current.sessionId,
-            evidence: { reason, error: error instanceof Error ? error.message : String(error) },
           });
-        });
-        return deny(ReasonCode.SESSION_STOP_FAILED, "CTO runtime stop failed; cleanup remains pending", {
-          projectId,
-          sessionId: current.sessionId,
-        });
+        }
       }
 
-      // #692 (deferred out of #664/#679) — `stopped` below writes and commits, and
-      // `bindings.revoke()` can then deny (e.g. a concurrent `resolveEscalation` flips a
-      // BLOCKED run back to ACTIVE between the two calls). This is deliberately left as
-      // plain `tx()`, not converted to `txDecision()`: by this point the external
-      // provider has already been told to stop and that is not reversible, so rolling
-      // the STOPPED write back would leave the session record disagreeing with reality.
-      // The real fix needs an explicit compensation policy and an interleaving test; see
-      // #692. `scripts/verify-tx-denial-sites.mjs` records this as a deferred, not an
-      // exempt, site — it is a known open defect, not a decision that the write is safe.
+      // #692 — `stopped` below writes and commits, and `bindings.revoke()` can still
+      // deny (e.g. a concurrent `resolveEscalation` flips a BLOCKED run back to ACTIVE
+      // during the `stopSession()` await above — the one gap the preflight check cannot
+      // see, because nothing runs between it and the provider call). This stays a plain
+      // `tx()`, not `txDecision()`: by this point the external provider has already been
+      // told to stop (on this attempt, or — if `session` was already STOPPED above — on
+      // an earlier one) and that is not reversible, so rolling the STOPPED write back
+      // would leave the session record disagreeing with reality. A denial here is
+      // compensated below instead of rolled back: STOPPED stands, the mismatch is
+      // recorded, and the caller gets a reason code that says so rather than the bare
+      // `REVOCATION_BLOCKED_ACTIVE_RUNS` a fresh revoke attempt would report on its own.
+      // This is why the STOPPED transition is not skipped just because `session` was
+      // already STOPPED: that used to be a safe proxy for "revoke already succeeded
+      // too", until this exact race broke it, and a caller retrying suspendProject after
+      // the compensation below needs this to actually retry the revoke, not silently
+      // report success over a binding that was never revoked. `sessions.transition` is
+      // a no-op when already at the target state, so retrying costs nothing here.
       const completed = this.db.tx(() => {
         const fresh = this.bindings.active(roleKey);
         if (
@@ -755,7 +785,33 @@ export class CtoLifecycle {
           allowBlockedRuns: true,
         });
       });
-      if (!completed.allowed) return completed;
+      if (!completed.allowed) {
+        if (completed.reasonCode !== ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) return completed;
+        // The STOPPED transition above only reaches `bindings.revoke()` once it has
+        // itself already succeeded and committed, so this denial means the session
+        // really is stopped and the binding really did just outlive it — not that
+        // nothing happened. Compensate rather than pretend the stop can be undone.
+        this.db.tx(() => {
+          this.projects.setAvailability(
+            projectId,
+            "UNAVAILABLE",
+            "binding revoke denied after an irreversible runtime stop",
+          );
+          this.audit.record({
+            kind: "PROJECT_SUSPEND_BINDING_REVOKE_FAILED",
+            reasonCode: ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
+            projectId,
+            sessionId: current.sessionId,
+            roleKey,
+            evidence: { reason, deniedEvidence: completed.evidence },
+          });
+        });
+        return deny(
+          ReasonCode.SESSION_STOPPED_BINDING_REVOKE_FAILED,
+          "the runtime stop completed but the binding could not be revoked; the binding now outlives its stopped session",
+          { projectId, sessionId: current.sessionId, roleKey },
+        );
+      }
     }
 
     this.audit.record({

@@ -476,6 +476,23 @@ export class BindingRegistry {
     });
   }
 
+  /**
+   * The runs that would refuse a `revoke(roleKey, ..., options)` call right now — a
+   * read-only preview, not a decision, so a caller can check this *before* an
+   * irreversible action (e.g. telling a provider to stop a session) rather than only
+   * discovering the same denial after that action cannot be undone (#692). `revoke()`
+   * itself calls this so the two can never drift.
+   */
+  revocationBlockers(
+    roleKey: string,
+    options: { allowBlockedRuns?: boolean } = {},
+  ): Array<{ run_id: string; state: string }> {
+    const current = this.active(roleKey);
+    if (!current) return [];
+    const ownedRuns = this.liveRunsOwnedBy(current);
+    return options.allowBlockedRuns ? ownedRuns.filter((run) => run.state !== "BLOCKED") : ownedRuns;
+  }
+
   revoke(
     roleKey: string,
     reason: string,
@@ -484,10 +501,7 @@ export class BindingRegistry {
     return this.db.tx(() => {
       const current = this.active(roleKey);
       if (!current) return deny(ReasonCode.NOT_FOUND, "no active binding", { roleKey });
-      const ownedRuns = this.liveRunsOwnedBy(current);
-      const orphaned = options.allowBlockedRuns
-        ? ownedRuns.filter((run) => run.state !== "BLOCKED")
-        : ownedRuns;
+      const orphaned = this.revocationBlockers(roleKey, options);
       if (orphaned.length > 0) {
         return deny(
           ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,

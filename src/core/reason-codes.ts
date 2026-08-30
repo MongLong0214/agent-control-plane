@@ -126,6 +126,11 @@ export const ReasonCode = {
   RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER:
     "RECOVERY_TAKEOVER_REQUIRES_UNREACHABLE_OWNER",
   SESSION_STOP_FAILED: "SESSION_STOP_FAILED",
+  // A run reactivated (e.g. via a concurrent escalation resolution) between the
+  // provider stop and the binding revoke that was meant to follow it (#692). The
+  // provider stop is not reversible, so the STOPPED write stands and the binding
+  // outlives its own session instead of the two rolling back together.
+  SESSION_STOPPED_BINDING_REVOKE_FAILED: "SESSION_STOPPED_BINDING_REVOKE_FAILED",
 
   // --- registries ----------------------------------------------------------
   MANIFEST_ACTIVATION_EVIDENCE_MISSING: "MANIFEST_ACTIVATION_EVIDENCE_MISSING",

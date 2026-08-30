@@ -1276,6 +1276,35 @@ const GUARDS = [
       "tests/unit/binding-hardening.test.ts::switchTo denies a takeover that would strand a live, unabandonable execution, and rolls back its own writes",
     ],
   },
+  {
+    // #692 — before this fix, the whole stop+revoke sequence was skipped once the
+    // session was already STOPPED, on the assumption that STOPPED implied the binding
+    // had been revoked too. A denied revoke can now leave STOPPED committed without a
+    // revoke (see the compensation below), so a caller retrying suspendProject after
+    // that compensation must still be able to finish the revoke — not have it skipped
+    // again because the session looks done.
+    what: "suspendProject retries the revoke instead of skipping it once the session is already stopped",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "    if (current && session) {\n      if (session.lifecycle !== SessionLifecycle.STOPPED) {",
+    replace: "    if (current && session && session.lifecycle !== SessionLifecycle.STOPPED) {\n      {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 a retry after the compensation actually completes the revoke",
+    ],
+  },
+  {
+    // #692 — the STOPPED write above only reaches bindings.revoke() once it has itself
+    // already committed, so a denial here means the session really is stopped and the
+    // binding really did just outlive it. Without this branch, that denial would return
+    // as the bare REVOCATION_BLOCKED_ACTIVE_RUNS a fresh revoke attempt reports on its
+    // own, with no record that the write it depended on had already gone through.
+    what: "suspendProject compensates (marks the project, records why) when a stopped session's binding revoke is denied",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        if (completed.reasonCode !== ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) return completed;",
+    replace: "        return completed;",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 compensates instead of losing a binding revoke denied after the runtime stop already happened",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

@@ -10,6 +10,7 @@ import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fix
 import {
   TEST_OWNER,
   type Harness,
+  bindCeo,
   finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
@@ -216,6 +217,68 @@ describe("round-2 CTO lifecycle regressions", () => {
     expect(harness.cp.sessions.require(harness.cp.bindings.activePrimaryCto(projectId)!.sessionId).lifecycle).toBe(
       SessionLifecycle.ERROR,
     );
+  });
+
+  it(
+    "#692 compensates instead of losing a binding revoke denied after the runtime stop " +
+      "already happened",
+    async () => {
+      const harness = makeHarness();
+      const { projectId, repositoryId } = await registerFixtureProject(harness);
+      const run = await createActiveRun(harness, projectId, repositoryId);
+      const ceoSessionId = bindCeo(harness);
+      const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+
+      // suspendProject's own checkpoint tx (before stopSession is ever called) already
+      // moved this run to BLOCKED, and the preflight check right before stopSession would
+      // see exactly that and let the call proceed. The only gap left is this await
+      // itself: a concurrent CEO decision resolving the escalation while the provider
+      // stop is in flight flips the run back to ACTIVE before bindings.revoke() runs.
+      harness.scripted.stopSession = async () => {
+        const resolved = harness.cp.ceo.resolveEscalation(run.runId, "resolved mid-suspend", ceoSessionId);
+        if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
+      };
+
+      const suspended = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
+
+      expect(suspended.allowed).toBe(false);
+      expect(suspended.reasonCode).toBe(ReasonCode.SESSION_STOPPED_BINDING_REVOKE_FAILED);
+      // The provider was already told to stop and that cannot be undone — the STOPPED
+      // write must stand rather than roll back into a lie about the runtime's state.
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+      // The binding was NOT silently revoked, and it was NOT silently left as if nothing
+      // happened either: the mismatch is durable and visible.
+      expect(harness.cp.bindings.activePrimaryCto(projectId)?.sessionId).toBe(binding.sessionId);
+      expect(harness.cp.projects.get(projectId)?.availability).toBe("UNAVAILABLE");
+      const events = harness.cp.audit.byKind("PROJECT_SUSPEND_BINDING_REVOKE_FAILED");
+      expect(events.length).toBe(1);
+      expect(events[0]?.sessionId).toBe(binding.sessionId);
+    },
+  );
+
+  it("#692 a retry after the compensation actually completes the revoke", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    const run = await createActiveRun(harness, projectId, repositoryId);
+    const ceoSessionId = bindCeo(harness);
+
+    harness.scripted.stopSession = async () => {
+      const resolved = harness.cp.ceo.resolveEscalation(run.runId, "resolved mid-suspend", ceoSessionId);
+      if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
+    };
+    const first = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
+    expect(first.allowed).toBe(false);
+    expect(first.reasonCode).toBe(ReasonCode.SESSION_STOPPED_BINDING_REVOKE_FAILED);
+
+    // The session is already STOPPED now, so a retry must not call the provider again —
+    // but it must still be able to finish the revoke the first attempt could not, rather
+    // than treating an already-stopped session as proof the binding was cleaned up too.
+    harness.scripted.stopSession = async () => {
+      throw new Error("stopSession must not be called again for an already-stopped session");
+    };
+    const retried = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis retry", TEST_OWNER);
+    expect(retried.allowed).toBe(true);
+    expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
   });
 
   it("#226 leaves a durable blocked run instead of an ACTIVE run owned by a revoked CTO", async () => {

@@ -235,6 +235,21 @@ const EXEMPT = [
       "method, after decide() returns, against an in-process Map, not a SQLite transaction.",
   },
   {
+    file: "cto/cto-lifecycle.ts",
+    marker: "the CTO binding changed while runtime shutdown was in progress",
+    reason:
+      "suspendProject's STOPPED transition writes and commits, and bindings.revoke() can " +
+      "still deny (e.g. a concurrent resolveEscalation flips a BLOCKED run back to ACTIVE " +
+      "during the stopSession() await, the only gap left once a preflight check runs " +
+      "immediately before that call). The provider stop above is not reversible, so " +
+      "rolling STOPPED back would leave the session record disagreeing with reality — the " +
+      "write is deliberately left to survive the denial. That denial is not silently " +
+      "accepted, though: the call site checks for exactly REVOCATION_BLOCKED_ACTIVE_RUNS, " +
+      "marks the project UNAVAILABLE, records a PROJECT_SUSPEND_BINDING_REVOKE_FAILED " +
+      "audit event, and returns SESSION_STOPPED_BINDING_REVOKE_FAILED instead of the bare " +
+      "denial — see #692.",
+  },
+  {
     file: "outbox/outbox.ts",
     marker: "kind: \"OUTBOX_ACK_REJECTED\",",
     reason:
@@ -254,20 +269,7 @@ const EXEMPT = [
  * issue, not a claim of safety, and is reported as such rather than folded into
  * "documented exemption(s)" where a reader could mistake it for one.
  */
-const DEFERRED = [
-  {
-    file: "cto/cto-lifecycle.ts",
-    marker: "the CTO binding changed while runtime shutdown was in progress",
-    reason:
-      "suspendProject's STOPPED transition commits, then bindings.revoke() can deny " +
-      "(e.g. a concurrent resolveEscalation flips a BLOCKED run back to ACTIVE between " +
-      "the two calls) — and by then the external provider has already been told to " +
-      "stop, which is not reversible, so this is not a mechanical tx()->txDecision() " +
-      "substitution. Needs an explicit compensation policy and an interleaving test. " +
-      "Tracked in #692; see the comment at the call site.",
-    issue: "#692",
-  },
-];
+const DEFERRED = [];
 
 /** Recursively list `.ts` files under `dir`, skipping test files. */
 const listTsFiles = (dir) => {
