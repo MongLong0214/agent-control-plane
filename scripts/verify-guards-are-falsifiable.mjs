@@ -2460,6 +2460,17 @@ const GUARDS = [
     ],
   },
   {
+    // The durable acknowledgement is not recovery by itself. Removing this live-listener action
+    // recreates the issue: Doctor's database warning closes while the existing poller stays down.
+    what: "the exact UNKNOWN reply acknowledgement resumes the existing Telegram listener",
+    file: "src/daemon/daemon.ts",
+    find: "            await this.#telegramIngressController?.resumeAfterAcknowledgement(nonce.value);",
+    replace: "            await Promise.resolve(false);",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::exact nonce acknowledge restarts the existing listener",
+    ],
+  },
+  {
     // Terminal delivery states are useful only if the inbound acknowledgement moves past them.
     // Removing this update leaves the unanswerable row visible but restores the 100-update wedge.
     what: "a terminal Telegram reply advances the inbound offset",

@@ -256,6 +256,14 @@ export interface TelegramLongPollListener {
   close(): Promise<void>;
 }
 
+export type TelegramLongPollRuntimeStatus =
+  | { running: true; stopReason: null; recoveryNonce: null }
+  | {
+    running: false;
+    stopReason: "NOT_STARTED" | "UNKNOWN_DELIVERY" | "CLOSED";
+    recoveryNonce: string | null;
+  };
+
 export interface TelegramLongPollStartOptions {
   transport?: TelegramBotTransport;
   onError?: (error: unknown) => void;
@@ -267,6 +275,8 @@ export interface TelegramLongPollStartOptions {
   onInterrupt?: (point: TelegramInterruptPoint, update: TelegramUpdate, runId?: string) => void | Promise<void>;
   /** Durable owner-gate notifications to consume before polling for inbound updates. */
   ownerGateSignals?: () => readonly TelegramOwnerGateSignal[];
+  /** Reports the live poll-loop state; durable reply state alone cannot say whether this process stopped. */
+  onRuntimeStatus?: (status: TelegramLongPollRuntimeStatus) => void;
 }
 
 export type TelegramOwnerPromptDeliveryStatus = "PENDING" | "APPLIED" | "RETRYABLE";
@@ -567,9 +577,11 @@ export class TelegramBotApi implements TelegramBotTransport {
 
 export class TelegramLongPollService {
   #running = false;
+  #closed = false;
   #loopPromise: Promise<void> | null = null;
   #controller: AbortController | null = null;
   #terminalDeliveryError: TelegramDeliveryError | null = null;
+  #terminalDeliveryNonce: string | null = null;
   #offset: number | undefined;
   readonly #pendingTurns = new Set<TelegramTrackedTurn>();
   readonly #turnFailures: unknown[] = [];
@@ -589,6 +601,7 @@ export class TelegramLongPollService {
       onInterrupt?: (point: TelegramInterruptPoint, update: TelegramUpdate, runId?: string) => void | Promise<void>;
       ownerGateSignals?: () => readonly TelegramOwnerGateSignal[];
       ownerPromptStore?: TelegramOwnerPromptStore;
+      onRuntimeStatus?: (status: TelegramLongPollRuntimeStatus) => void;
     } = {},
   ) {
     if (webhookSecret.trim().length === 0) {
@@ -829,18 +842,36 @@ export class TelegramLongPollService {
 
   start(): void {
     if (this.#running) return;
+    if (this.#closed) throw new Error("Telegram long-poll listener is closed");
     if (this.#terminalDeliveryError) throw this.#terminalDeliveryError;
     this.#running = true;
+    this.options.onRuntimeStatus?.({ running: true, stopReason: null, recoveryNonce: null });
     this.#loopPromise = this.loop();
   }
 
+  /** Resumes only the stop whose durable UNKNOWN reply the operator actually acknowledged. */
+  async resumeAfterAcknowledgement(nonce: string): Promise<boolean> {
+    if (this.#closed || this.#terminalDeliveryNonce !== nonce) return false;
+    // Keep the terminal marker set until the old loop has observed it and exited. Clearing it
+    // earlier can let that loop continue while start() creates a second poller over the same
+    // offset and controller.
+    await this.#loopPromise;
+    if (this.#closed || this.#terminalDeliveryNonce !== nonce) return false;
+    this.#terminalDeliveryError = null;
+    this.#terminalDeliveryNonce = null;
+    this.start();
+    return true;
+  }
+
   async close(): Promise<void> {
+    this.#closed = true;
     this.#running = false;
     this.#controller?.abort();
     await this.#loopPromise;
     await this.pendingTurnsSettled();
     this.#loopPromise = null;
     this.#controller = null;
+    this.options.onRuntimeStatus?.({ running: false, stopReason: "CLOSED", recoveryNonce: null });
   }
 
   private async loop(): Promise<void> {
@@ -849,7 +880,10 @@ export class TelegramLongPollService {
       try {
         await this.pollOnce();
       } catch (error) {
-        if (!this.#running && this.#controller.signal.aborted) break;
+        if (!this.#running) {
+          if (!this.#controller.signal.aborted) this.options.onError?.(error);
+          break;
+        }
         this.options.onError?.(error);
         await delay(deliveryRetryDelayMs(error, this.options.retryDelayMs ?? 5_000));
       } finally {
@@ -938,7 +972,13 @@ export class TelegramLongPollService {
         this.router.recordUnknownResponse(outcome, error.failure);
         if (policy.batch === "STOP") {
           this.#terminalDeliveryError = error;
+          this.#terminalDeliveryNonce = outcome.nonce;
           this.#running = false;
+          this.options.onRuntimeStatus?.({
+            running: false,
+            stopReason: "UNKNOWN_DELIVERY",
+            recoveryNonce: outcome.nonce,
+          });
           throw error;
         }
       }
@@ -1093,6 +1133,7 @@ export const startTelegramLongPollListener = async (
     onError: options.onError,
     ownerGateSignals: options.ownerGateSignals ?? (() => ownerGateSignalsFromOutbox(cp)),
     ownerPromptStore: createOwnerPromptStore(cp),
+    onRuntimeStatus: options.onRuntimeStatus,
     ...(options.onInterrupt ? { onInterrupt: options.onInterrupt } : {}),
   });
   if (options.start !== false) service.start();
