@@ -1059,7 +1059,7 @@ export class IngressGuard {
             OR json_extract(turn_claim_json, '$.noReplyAt') IS NOT NULL
             OR json_extract(turn_claim_json, '$.settledAt') IS NOT NULL
           )
-          AND NOT (
+          AND NOT COALESCE((
             json_valid(result_json) = 1
             AND json_type(result_json, '$.reply') = 'object'
             AND (
@@ -1074,7 +1074,7 @@ export class IngressGuard {
                 AND json_extract(result_json, '$.sent') IS NOT 1
               )
             )
-          )`,
+          ), 0)`,
       [channel, new Date(new Date(this.clock.nowIso()).getTime() - ttlMs).toISOString()],
     );
   }
