@@ -837,7 +837,8 @@ describe("baseline boundary contracts", () => {
       "v29-a-dispatch-is-a-fact",
       "v30-a-turn-and-a-reply-are-two-lifecycles",
       "v31-a-generation-means-nothing-without-its-role-key",
-      "v32-a-silent-poller-and-no-new-mentions-look-the-same",
+      "v32-a-source-can-only-cite-its-turns-own-claim-event",
+      "v33-a-silent-poller-and-no-new-mentions-look-the-same",
     ]);
   });
 

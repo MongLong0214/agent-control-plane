@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 32;
+export const SCHEMA_VERSION = 33;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -139,6 +139,7 @@ export const LEDGER_TRIGGER_NAMES: readonly string[] = [
     "canonical_turn_sources_immutable",
     "canonical_turn_sources_no_delete",
     "canonical_turn_sources_no_replace",
+    "canonical_turn_sources_admission_matches_claim",
     "actor_target_attestations_append_only",
     "actor_target_attestations_no_delete",
     "actor_target_attestations_no_replace",
@@ -1729,9 +1730,24 @@ export const rebuildCanonicalTurnsIfStale = (raw: Database.Database): void => {
   );
   const columns = sharedColumns(raw, "canonical_turns", "canonical_turns_rebuilt").join(", ");
   raw.exec(`INSERT INTO canonical_turns_rebuilt (${columns}) SELECT ${columns} FROM canonical_turns`);
+  // `canonical_turn_sources_admission_matches_claim` lives on a *different* table
+  // (`canonical_turn_sources`) and reads `canonical_turns` in a subquery — so dropping
+  // `canonical_turns` does not drop it the way v26/v27's comment describes for `canonical_turns`'
+  // own triggers. Left in place, the very next schema-changing statement (the rename below) makes
+  // SQLite eagerly recompile every trigger's SQL and find `canonical_turns` momentarily gone:
+  // "no such table: main.canonical_turns", thrown from a rename that has nothing to do with
+  // sources. Dropped here and recreated once the rename has restored the table's real name, so no
+  // schema-changing statement ever runs while this trigger's referenced table does not exist.
+  // Guarded on `canonical_turn_sources` existing at all — a rebuild exercised on a bare
+  // `canonical_turns` fixture (no sibling table) has nothing to drop or recreate.
+  const hasSources = raw
+    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'canonical_turn_sources'")
+    .get();
+  if (hasSources) raw.exec(`DROP TRIGGER IF EXISTS canonical_turn_sources_admission_matches_claim`);
   raw.exec("DROP TABLE canonical_turns");
   raw.exec("ALTER TABLE canonical_turns_rebuilt RENAME TO canonical_turns");
   raw.exec(canonicalTurnsIndexDdl());
+  if (hasSources) raw.exec(sourceAdmissionMatchesClaimTriggerDdl());
 };
 
 const dispatchesDdl = (): string =>
@@ -1757,6 +1773,12 @@ const actorIncarnationTriggersDdl = (): string =>
       "the actor incarnation update trigger",
     ),
   ].join("\n\n");
+
+const sourceAdmissionMatchesClaimTriggerDdl = (): string =>
+  schemaObject(
+    /CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_admission_matches_claim\n[\s\S]*?\nEND;/,
+    "the source admission-matches-claim trigger",
+  );
 
 const observationsIndexDdl = (): string =>
   schemaObject(
@@ -2088,39 +2110,56 @@ const v31: SchemaMigration = {
 };
 
 /**
- * #674 — a session's ad hoc, session-local poll for Buzz mentions can die silently, and a
+ * #693 — a source could be attached to an already-claimed turn by a plain `INSERT`, because the
+ * no-replace trigger only refused a colliding or moved row, never a fresh one. This adds the
+ * write-time backstop for the invariant `canonical_turn_sources.admission_audit_event_id` already
+ * documented: every source `claim()` writes shares its turn's own `claim_audit_event_id`, because
+ * the whole batch is inserted in the same transaction as the turn. A source citing a *fresh*,
+ * honestly-produced audit event — including one attached after the claim transaction has closed —
+ * is refused. It is an equality check, not a provenance proof: a raw writer that reads
+ * `claim_audit_event_id` back out and copies it into the new row's `admission_audit_event_id`
+ * passes, the same residual every trigger in this schema carries against a privileged raw-SQL
+ * writer (one can always `DROP TRIGGER` too) — see `canonical_turn_sources_admission_matches_claim`
+ * in schema.sql for the fuller account, and the "does NOT refuse a source that copies …" tests for
+ * where it is pinned.
+ *
+ * Install-only: this migration adds the trigger for future writes and does not scan existing rows
+ * for ones that already violate it. Harmless today because the canonical-turn ledger this trigger
+ * guards has no production writer (`claim()` — #638/#639). If a production writer ever lands, it
+ * ships onto a ledger this migration never audited for pre-existing violations; whoever adds that
+ * writer should add a one-time backfill check (or confirm the ledger is still empty) rather than
+ * assume this migration already did it.
+ */
+const v32: SchemaMigration = {
+  id: "v32-a-source-can-only-cite-its-turns-own-claim-event",
+  fromVersion: 31,
+  toVersion: 32,
+  apply: (raw) => {
+    raw.exec(`DROP TRIGGER IF EXISTS canonical_turn_sources_admission_matches_claim`);
+    raw.exec(sourceAdmissionMatchesClaimTriggerDdl());
+  },
+  checksum: () => migrationChecksum("v32-a-source-can-only-cite-its-turns-own-claim-event"),
+};
+
+/**
+ * #674 — a session's ad hoc, session-local poll for Buzz channel traffic can die silently, and a
  * silent poller and "nothing new arrived" produce the exact same observable fact: nothing.
  * Measured three times in one incident, each a different bug in the same poller, each
  * indistinguishable from health until read after the fact.
  *
- * This table is the durable half of the fix (Option C from the issue's review): a per-session
- * cursor plus bookkeeping for whether the last attempt to read it even succeeded, so
- * `Doctor.checkBuzzMentions` can tell "N behind since T" apart from "never checked" apart from
- * "could not reach the relay" — see `src/buzz/mention-watch.ts` for the full lifecycle this
- * feeds, and `doctor.ts` for the three-way distinction it makes possible.
+ * This table is the durable half of the fix: a per-session cursor plus bookkeeping for whether
+ * the last attempt to read it even succeeded, so `Doctor.checkBuzzMentions` can tell "N behind
+ * since T" apart from "never checked" apart from "could not reach the relay". It deliberately
+ * counts channel traffic, not mention classification; see `src/buzz/mention-watch.ts`.
  *
- * Keyed on `session_id` rather than `channel_id` (#710, still within this same unmerged round):
- * a blind review found sessions can share one `ACP_BUZZ_CHANNEL`, and a channel-keyed row let
- * one session's reconnect silently reset another session's baseline. `channel_id` is kept as a
- * plain column — it is still what the CLI read runs against — but the row's identity is the
- * session the state belongs to.
- *
- * Numbered v32, the true next contiguous step from `origin/main`'s v31 — not v34, despite that
- * being the number this change was briefed to use. v32 and v33 are claimed by other open,
- * unmerged PRs against this same head, but `tests/unit/database-migration-restore.test.ts:440`
- * enforces `fromVersion === toVersion - 1` for every migration in this array, so a
- * `fromVersion: 31, toVersion: 34` jump fails that invariant outright, and a v31 database (what
- * `origin/main` actually ships) could never reach it because nothing here defines the v32/v33
- * steps in between. Reserving a number ahead of the gap does not avoid the eventual collision;
- * a strictly-linear, single-step schema chain means whichever of these three PRs merges last
- * renumbers regardless of what it started as. That renumbering is the single-canonical-lane WIP
- * discipline #674 itself names as the actual blocker, not a technical dependency this migration
- * can design around.
+ * Keyed on `session_id` rather than `channel_id` (#710): production sessions can share one
+ * `ACP_BUZZ_CHANNEL`, and a channel-keyed row let one session's reconnect silently reset another
+ * session's baseline. `channel_id` remains the address the CLI reads.
  */
-const v32: SchemaMigration = {
-  id: "v32-a-silent-poller-and-no-new-mentions-look-the-same",
-  fromVersion: 31,
-  toVersion: 32,
+const v33: SchemaMigration = {
+  id: "v33-a-silent-poller-and-no-new-mentions-look-the-same",
+  fromVersion: 32,
+  toVersion: 33,
   apply: (raw) => {
     raw.exec(`
       CREATE TABLE IF NOT EXISTS buzz_mention_watch (
@@ -2141,7 +2180,7 @@ const v32: SchemaMigration = {
       CREATE INDEX IF NOT EXISTS buzz_mention_watch_channel ON buzz_mention_watch(channel_id);
     `);
   },
-  checksum: () => migrationChecksum("v32-a-silent-poller-and-no-new-mentions-look-the-same"),
+  checksum: () => migrationChecksum("v33-a-silent-poller-and-no-new-mentions-look-the-same"),
 };
 
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
@@ -2166,6 +2205,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v30,
   v31,
   v32,
+  v33,
 ]);
 
 interface RequiredTrigger {
@@ -2272,6 +2312,7 @@ const REQUIRED_SCHEMA_TRIGGERS: ReadonlyArray<RequiredTrigger> = [
   { name: "attestation_generation_matches_assignment", sentinel: "ATTESTATION_GENERATION_MISMATCH", introducedIn: 31 },
   { name: "conversational_actors_incarnation_matches_session_on_insert", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
   { name: "conversational_actors_incarnation_matches_session_on_update", sentinel: "ACTOR_SESSION_INCARNATION_MISMATCH", introducedIn: 31 },
+  { name: "canonical_turn_sources_admission_matches_claim", sentinel: "CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME", introducedIn: 32 },
 ];
 
 const REQUIRED_LEDGER_TRIGGERS: ReadonlyArray<RequiredTrigger> = [

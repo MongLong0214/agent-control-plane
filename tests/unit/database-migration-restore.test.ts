@@ -507,7 +507,8 @@ describe("versioned SQLite migration", () => {
         [29, "v29-a-dispatch-is-a-fact"],
         [30, "v30-a-turn-and-a-reply-are-two-lifecycles"],
         [31, "v31-a-generation-means-nothing-without-its-role-key"],
-        [SCHEMA_VERSION, "v32-a-silent-poller-and-no-new-mentions-look-the-same"],
+        [32, "v32-a-source-can-only-cite-its-turns-own-claim-event"],
+        [33, "v33-a-silent-poller-and-no-new-mentions-look-the-same"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a
