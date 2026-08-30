@@ -97,22 +97,29 @@ export type VitestRpcClassification =
   | "no-slow-segment"
   | "incomplete";
 
+export interface VitestRpcSegmentMeasurement {
+  durationMs: number | null;
+  workerBusyMs: number | null;
+  workerEventLoopDelayMaxMs: number | null;
+}
+
 export interface VitestRpcMeasurement extends TraceBase {
   type: "measurement";
   workerPid: number;
   sequence: number;
   classification: VitestRpcClassification;
   missing: string[];
+  unmeasured: string[];
   roundTripMs: number | null;
-  requestToMainMs: number | null;
-  mainOnTaskUpdateMs: number | null;
-  outsideMainMs: number | null;
-  responseToWorkerMs: number | null;
-  workerActiveMs: number | null;
   workerActivityObserved: boolean;
-  workerActiveAfterMainMs: number | null;
-  workerEventLoopDelayMaxMs: number | null;
-  ipcOrProcessSchedulingMs: number | null;
+  responseArrivalObserved: boolean;
+  requestToMain: VitestRpcSegmentMeasurement;
+  mainOnTaskUpdate: VitestRpcSegmentMeasurement;
+  mainReturnToResponseArrival: VitestRpcSegmentMeasurement;
+  responseArrivalToWorkerPickup: VitestRpcSegmentMeasurement;
+  unpartitionedMainReturnToWorkerPickup: VitestRpcSegmentMeasurement;
+  wholeRpcWorkerActiveMs: number | null;
+  workerHistogramDelayMaxMs: number | null;
 }
 
 export interface VitestRpcSummaryRecord extends TraceBase {
@@ -149,6 +156,9 @@ interface InternalVitest {
 const nowEpochMs = (): number => performance.timeOrigin + performance.now();
 
 const rounded = (value: number): number => Math.round(value * 1_000) / 1_000;
+
+const durationText = (value: number | null): string =>
+  value === null ? "unmeasured" : `${value}ms`;
 
 const correlationKey = (workerPid: number, sequence: number): string =>
   `${workerPid}:${sequence}`;
@@ -266,44 +276,29 @@ const missingParts = (entry: Correlation): string[] => {
 
 const classifyMeasurement = (
   missing: readonly string[],
+  requestToMainMs: number,
   mainOnTaskUpdateMs: number,
-  outsideMainMs: number | null,
-  responseToWorkerMs: number,
-  workerActiveAfterMainMs: number | null,
-  workerEventLoopDelayMaxMs: number | null,
-  ipcOrProcessSchedulingMs: number | null,
+  unpartitionedMainReturnToWorkerPickupMs: number,
 ): VitestRpcClassification => {
   if (missing.length > 0) return "incomplete";
   const candidates: VitestRpcClassification[] = [];
+  if (requestToMainMs >= VITEST_RPC_SLOW_SEGMENT_MS) {
+    candidates.push("b-ipc-or-process-scheduling");
+  }
   if (mainOnTaskUpdateMs >= VITEST_RPC_SLOW_SEGMENT_MS) {
     candidates.push("a-main-onTaskUpdate");
   }
-  if (
-    responseToWorkerMs >= VITEST_RPC_SLOW_SEGMENT_MS &&
-    workerActiveAfterMainMs !== null &&
-    workerActiveAfterMainMs >= VITEST_RPC_SLOW_SEGMENT_MS &&
-    workerEventLoopDelayMaxMs !== null &&
-    workerEventLoopDelayMaxMs >= VITEST_RPC_SLOW_SEGMENT_MS
-  ) {
-    candidates.push("c-worker-event-loop");
-  }
-  if (
-    ipcOrProcessSchedulingMs !== null &&
-    ipcOrProcessSchedulingMs >= VITEST_RPC_SLOW_SEGMENT_MS
-  ) {
-    candidates.push("b-ipc-or-process-scheduling");
-  }
-  const outsideMainIsSlow =
-    outsideMainMs !== null && outsideMainMs >= VITEST_RPC_SLOW_SEGMENT_MS;
+  const unpartitionedResponseIsSlow =
+    unpartitionedMainReturnToWorkerPickupMs >= VITEST_RPC_SLOW_SEGMENT_MS;
   if (
     candidates.length === 1 &&
-    !(candidates[0] === "a-main-onTaskUpdate" && outsideMainIsSlow)
+    !unpartitionedResponseIsSlow
   ) {
     return candidates[0]!;
   }
   if (
     candidates.length > 1 ||
-    outsideMainIsSlow
+    unpartitionedResponseIsSlow
   ) {
     return "insufficient";
   }
@@ -341,6 +336,30 @@ const activeTimeWithin = (
   }
   if (current) activeMs += current.end - current.start;
   return activeMs;
+};
+
+const unmeasuredSegment = (): VitestRpcSegmentMeasurement => ({
+  durationMs: null,
+  workerBusyMs: null,
+  workerEventLoopDelayMaxMs: null,
+});
+
+const measuredSegment = (
+  activity: readonly WorkerActiveRecord[],
+  startAtMs: number | undefined,
+  endAtMs: number | undefined,
+  workerActivityObserved: boolean,
+): VitestRpcSegmentMeasurement => {
+  if (startAtMs === undefined || endAtMs === undefined) return unmeasuredSegment();
+  return {
+    durationMs: rounded(Math.max(0, endAtMs - startAtMs)),
+    workerBusyMs: workerActivityObserved
+      ? rounded(activeTimeWithin(activity, startAtMs, endAtMs))
+      : null,
+    // monitorEventLoopDelay exposes one histogram for the whole pending RPC. It does not retain
+    // timestamps that could assign its maximum to one of these cross-process segments.
+    workerEventLoopDelayMaxMs: null,
+  };
 };
 
 export const summarizeVitestRpcTrace = (
@@ -403,34 +422,26 @@ export const summarizeVitestRpcTrace = (
       entry.settle?.sequence ??
       -1;
     const roundTripMs = entry.settle?.roundTripMs ?? null;
-    const requestToMainMs =
-      entry.send && entry.mainStart
-        ? Math.max(0, entry.mainStart.atMs - entry.send.atMs)
-        : null;
-    const mainOnTaskUpdateMs = entry.mainEnd?.mainOnTaskUpdateMs ?? null;
-    const responseToWorkerMs =
-      entry.mainEnd && entry.settle
-        ? Math.max(0, entry.settle.atMs - entry.mainEnd.atMs)
-        : null;
-    const workerActiveMs = entry.settle?.workerActiveMs ?? null;
     const workerActivityObserved = entry.settle?.workerActivityObserved === true;
-    const workerEventLoopDelayMaxMs = entry.settle?.workerEventLoopDelayMaxMs ?? null;
-    const outsideMainMs =
-      requestToMainMs === null || responseToWorkerMs === null
-        ? null
-        : requestToMainMs + responseToWorkerMs;
-    const workerActiveAfterMainMs =
-      entry.mainEnd && entry.settle && workerActivityObserved
-        ? activeTimeWithin(
-            workerActivity.get(workerPid) ?? [],
-            entry.mainEnd.atMs,
-            entry.settle.atMs,
-          )
-        : null;
-    const ipcOrProcessSchedulingMs =
-      outsideMainMs === null || workerActiveAfterMainMs === null
-        ? null
-        : Math.max(0, outsideMainMs - workerActiveAfterMainMs);
+    const activity = workerActivity.get(workerPid) ?? [];
+    const requestToMain = measuredSegment(
+      activity,
+      entry.send?.atMs,
+      entry.mainStart?.atMs,
+      workerActivityObserved,
+    );
+    const mainOnTaskUpdate = measuredSegment(
+      activity,
+      entry.mainStart?.atMs,
+      entry.mainEnd?.atMs,
+      workerActivityObserved,
+    );
+    const unpartitionedMainReturnToWorkerPickup = measuredSegment(
+      activity,
+      entry.mainEnd?.atMs,
+      entry.settle?.atMs,
+      workerActivityObserved,
+    );
 
     return {
       ...recordBase(runId),
@@ -439,29 +450,30 @@ export const summarizeVitestRpcTrace = (
       sequence,
       classification: classifyMeasurement(
         missing,
-        mainOnTaskUpdateMs ?? 0,
-        outsideMainMs,
-        responseToWorkerMs ?? 0,
-        workerActiveAfterMainMs,
-        workerEventLoopDelayMaxMs,
-        ipcOrProcessSchedulingMs,
+        requestToMain.durationMs ?? 0,
+        mainOnTaskUpdate.durationMs ?? 0,
+        unpartitionedMainReturnToWorkerPickup.durationMs ?? 0,
       ),
       missing,
+      unmeasured: [
+        "main-return-to-response-arrival",
+        "response-arrival-to-worker-pickup",
+        "worker-event-loop-delay-by-segment",
+      ],
       roundTripMs: roundTripMs === null ? null : rounded(roundTripMs),
-      requestToMainMs: requestToMainMs === null ? null : rounded(requestToMainMs),
-      mainOnTaskUpdateMs:
-        mainOnTaskUpdateMs === null ? null : rounded(mainOnTaskUpdateMs),
-      outsideMainMs: outsideMainMs === null ? null : rounded(outsideMainMs),
-      responseToWorkerMs:
-        responseToWorkerMs === null ? null : rounded(responseToWorkerMs),
-      workerActiveMs: workerActiveMs === null ? null : rounded(workerActiveMs),
       workerActivityObserved,
-      workerActiveAfterMainMs:
-        workerActiveAfterMainMs === null ? null : rounded(workerActiveAfterMainMs),
-      workerEventLoopDelayMaxMs:
-        workerEventLoopDelayMaxMs === null ? null : rounded(workerEventLoopDelayMaxMs),
-      ipcOrProcessSchedulingMs:
-        ipcOrProcessSchedulingMs === null ? null : rounded(ipcOrProcessSchedulingMs),
+      responseArrivalObserved: false,
+      requestToMain,
+      mainOnTaskUpdate,
+      mainReturnToResponseArrival: unmeasuredSegment(),
+      responseArrivalToWorkerPickup: unmeasuredSegment(),
+      unpartitionedMainReturnToWorkerPickup,
+      wholeRpcWorkerActiveMs:
+        entry.settle === undefined ? null : rounded(entry.settle.workerActiveMs),
+      workerHistogramDelayMaxMs:
+        entry.settle?.workerEventLoopDelayMaxMs === null || entry.settle === undefined
+          ? null
+          : rounded(entry.settle.workerEventLoopDelayMaxMs),
     };
   });
 
@@ -607,13 +619,16 @@ export class VitestRpcTraceReporter implements Reporter {
     const slowest = summary.slowest;
     const slowestText = slowest
       ? `slowest=${slowest.classification} ` +
-        `rtt=${slowest.roundTripMs}ms ` +
-        `main=${slowest.mainOnTaskUpdateMs}ms ` +
-        `outside-main=${slowest.outsideMainMs}ms ` +
-        `response=${slowest.responseToWorkerMs}ms ` +
-        `worker-active-after-main=${slowest.workerActiveAfterMainMs}ms ` +
-        `worker-delay-max=${slowest.workerEventLoopDelayMaxMs}ms ` +
-        `ipc-or-scheduling=${slowest.ipcOrProcessSchedulingMs}ms; `
+        `rtt=${durationText(slowest.roundTripMs)} ` +
+        `request-to-main=${durationText(slowest.requestToMain.durationMs)} ` +
+        `main=${durationText(slowest.mainOnTaskUpdate.durationMs)} ` +
+        `main-to-response-arrival=unmeasured ` +
+        `response-arrival-to-worker-pickup=unmeasured ` +
+        `unpartitioned-main-to-worker=${durationText(slowest.unpartitionedMainReturnToWorkerPickup.durationMs)} ` +
+        `worker-busy-request=${durationText(slowest.requestToMain.workerBusyMs)} ` +
+        `worker-busy-main=${durationText(slowest.mainOnTaskUpdate.workerBusyMs)} ` +
+        `worker-busy-unpartitioned-response=${durationText(slowest.unpartitionedMainReturnToWorkerPickup.workerBusyMs)} ` +
+        `worker-delay-by-segment=unmeasured; `
       : "slowest=unmeasured; ";
     process.stderr.write(
       `[ACP Vitest RPC trace] ` +

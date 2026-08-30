@@ -30,43 +30,47 @@ main reporter wraps Vitest's real `_testRun.updated` method, which includes stat
 reporting, and every reporter's `onTaskUpdate`. The worker records when that same RPC promise
 settles.
 
-Each `measurement` line gives these clocks and boundaries:
+Each `measurement` line reports intervals instead of subtracting one interval from another:
 
 | Field | Observation |
 | --- | --- |
-| `requestToMainMs` | worker send to entry into main `_testRun.updated` |
-| `mainOnTaskUpdateMs` | time spent in main `_testRun.updated` |
-| `outsideMainMs` | request-to-main plus response-to-worker time |
-| `responseToWorkerMs` | main exit to the worker running the response callback |
-| `workerActiveMs` | worker event-loop active time during the whole RPC, retained as raw context but not used to classify `(c)` |
-| `workerActivityObserved` | whether the opt-in callback observer ran, so zero is distinct from no observation |
-| `workerActiveAfterMainMs` | merged worker JavaScript callback activity overlapping main exit to worker settle |
-| `workerEventLoopDelayMaxMs` | maximum worker delay observed by `monitorEventLoopDelay`; `null` means unmeasured |
-| `ipcOrProcessSchedulingMs` | time outside main after subtracting only observed post-main worker activity |
+| `requestToMain` | worker send to entry into main `_testRun.updated` |
+| `mainOnTaskUpdate` | entry into main `_testRun.updated` to its return |
+| `mainReturnToResponseArrival` | main return to response arrival in the worker; currently `null` because the JavaScript hooks do not observe transport arrival before the worker event loop runs |
+| `responseArrivalToWorkerPickup` | response arrival to the worker promise callback; currently `null` for the same reason |
+| `unpartitionedMainReturnToWorkerPickup` | the directly observed main-return-to-worker-pickup interval, retained without assigning its time to transport or the worker |
+
+Every interval is a `{ durationMs, workerBusyMs, workerEventLoopDelayMaxMs }` object. Worker busy
+time is the merged JavaScript callback activity that overlaps that exact interval. The existing
+event-loop histogram covers the whole pending RPC and has no timestamps, so the per-interval
+event-loop-delay value is `null`; `workerHistogramDelayMaxMs` retains the raw histogram maximum
+without assigning it to a segment. `workerActivityObserved` and
+`responseArrivalObserved` distinguish an observed zero from an unmeasured value. The `unmeasured`
+array names the three unavailable observations explicitly.
 
 The 100 ms classification threshold matches Vitest 3.2.7's task-update batching interval; it is
 not a latency target. It does not discard data—all durations are written even below it—and only
 gives a slow update a readable label:
 
-- `(a) a-main-onTaskUpdate`: the main handler took at least 100 ms and time outside it stayed below
-  100 ms.
-- `(c) c-worker-event-loop`: the response gap, observed post-main worker callback activity, and
-  worker event-loop delay histogram maximum were each at least 100 ms.
-- `(b) b-ipc-or-process-scheduling`: at least 100 ms remains outside both measured handlers. The
-  timestamps cannot honestly separate kernel IPC queueing from OS process scheduling, so the
-  label names both rather than claiming kernel IPC alone.
-- `insufficient`: more than one slow cause has evidence, or at least 100 ms lies outside the main
-  handler without enough evidence to choose `(b)` or `(c)`. A 60-second update with 101 ms in main
-  is reported as `main=101ms`, `outside-main=59899ms`, `insufficient`, not `(a)`.
+- `(a) a-main-onTaskUpdate`: the directly observed main handler took at least 100 ms and the
+  unpartitioned response interval stayed below 100 ms.
+- `(b) b-ipc-or-process-scheduling`: the directly observed request-to-main interval took at least
+  100 ms, while the main and unpartitioned response intervals stayed below 100 ms.
+- `(c) c-worker-event-loop`: reserved for a future observation that measures response arrival and
+  at least 100 ms of worker busy time inside the arrival-to-pickup window. The current hooks cannot
+  measure that window and therefore never emit this classification.
+- `insufficient`: more than one directly observed segment is slow, or the main-return-to-worker
+  interval is at least 100 ms but response arrival was not observed. That interval may contain
+  transport delay, process scheduling, or worker pickup delay; overlapping worker activity does
+  not split it.
 - `incomplete`: at least one of worker send, main entry, main exit, or worker settle was not
   observed. `unattributedMainUpdates` separately counts main updates that arrived without a worker
   stamp. Neither absence is reported as zero.
 
-Thus a timeout with only a long `mainOnTaskUpdateMs` is `(a)`; a short main interval and long
-`ipcOrProcessSchedulingMs` is `(b)`; and a long response-to-worker gap accompanied by measured
-post-main worker activity and histogram delay is `(c)`. When those observations do not identify
-one cause, the result stays `insufficient`. Raw lines remain useful if the run dies before the
-final summary.
+Thus a timeout with only a long `mainOnTaskUpdate.durationMs` is `(a)`, and a timeout with only a
+long `requestToMain.durationMs` is `(b)`. A long unpartitioned response interval remains
+`insufficient`, even when worker activity overlaps most of it. Raw lines remain useful if the run
+dies before the final summary.
 
 ## Sampling and cost
 
@@ -94,10 +98,11 @@ so this remains a diagnosis switch rather than a default CI mode.
 `tests/process/vitest-rpc-trace.test.ts` starts nested Vitest runs through this repository's real
 configuration and fork pool. One nested run blocks a main reporter for 180 ms and asserts an `(a)`
 measurement. A test-only setup delays worker RPC response delivery at the process-message boundary
-and asserts `(b)` for a real `onTaskUpdate` while main and worker-active time stay short. The third
-run lets the worker send a real suite update, holds that worker's JavaScript loop for 260 ms, and
-asserts the response gap, post-main callback activity, histogram delay, and `(c)` measurement.
-Three synthetic correlations preserve the review counterexamples: activity entirely before main
-exit and a zero-delay histogram cannot produce `(c)`, while 101 ms in main plus 59,899 ms outside
-main cannot produce `(a)`. These delays exist only in the fixture; the tracing code has no delay
-injection.
+and asserts that the real `onTaskUpdate` remains `insufficient` without response-arrival timing.
+The third run lets the worker send a real suite update, holds that worker's JavaScript loop for 260
+ms, and asserts that the unsplit response interval, worker activity, and worker histogram also
+remain `insufficient`. Four synthetic correlations preserve the review counterexamples: activity
+before an unobserved arrival and a zero-delay histogram cannot produce `(c)`; 101 ms in main plus
+59,899 ms after main cannot produce `(a)`; and 59,950 ms of worker activity overlapping a 60-second
+response gap is not subtracted into a 50 ms transport claim. These delays exist only in the
+fixture; the tracing code has no delay injection.

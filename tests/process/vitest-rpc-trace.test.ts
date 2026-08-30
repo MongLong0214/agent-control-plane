@@ -132,7 +132,7 @@ const runTraceFixture = (
 };
 
 describe("Vitest onTaskUpdate tracing", () => {
-  it("does not call pre-main worker activity a worker event-loop cause", () => {
+  it("does not call worker activity before an unobserved response arrival a worker cause", () => {
     const measurement = measureRecords([
       {
         version: 1,
@@ -194,11 +194,23 @@ describe("Vitest onTaskUpdate tracing", () => {
       },
     ]);
 
-    expect(measurement.requestToMainMs).toBe(90);
-    expect(measurement.mainOnTaskUpdateMs).toBe(99);
-    expect(measurement.responseToWorkerMs).toBe(110);
-    expect(measurement.workerActiveMs).toBe(110);
-    expect(measurement.workerActiveAfterMainMs).toBe(0);
+    expect(measurement.requestToMain).toEqual({
+      durationMs: 90,
+      workerBusyMs: 90,
+      workerEventLoopDelayMaxMs: null,
+    });
+    expect(measurement.mainOnTaskUpdate).toEqual({
+      durationMs: 99,
+      workerBusyMs: 20,
+      workerEventLoopDelayMaxMs: null,
+    });
+    expect(measurement.unpartitionedMainReturnToWorkerPickup).toEqual({
+      durationMs: 110,
+      workerBusyMs: 0,
+      workerEventLoopDelayMaxMs: null,
+    });
+    expect(measurement.responseArrivalObserved).toBe(false);
+    expect(measurement.classification).toBe("insufficient");
     expect(measurement.classification).not.toBe("c-worker-event-loop");
   });
 
@@ -264,8 +276,10 @@ describe("Vitest onTaskUpdate tracing", () => {
       },
     ]);
 
-    expect(measurement.workerActiveAfterMainMs).toBe(110);
-    expect(measurement.workerEventLoopDelayMaxMs).toBe(0);
+    expect(measurement.unpartitionedMainReturnToWorkerPickup.workerBusyMs).toBe(110);
+    expect(measurement.workerHistogramDelayMaxMs).toBe(0);
+    expect(measurement.mainReturnToResponseArrival.durationMs).toBeNull();
+    expect(measurement.responseArrivalToWorkerPickup.durationMs).toBeNull();
     expect(measurement.classification).toBe("insufficient");
   });
 
@@ -321,10 +335,90 @@ describe("Vitest onTaskUpdate tracing", () => {
       },
     ]);
 
-    expect(measurement.mainOnTaskUpdateMs).toBe(101);
-    expect(measurement.outsideMainMs).toBe(59_899);
+    expect(measurement.mainOnTaskUpdate.durationMs).toBe(101);
+    expect(measurement.unpartitionedMainReturnToWorkerPickup.durationMs).toBe(59_899);
     expect(measurement.classification).toBe("insufficient");
     expect(measurement.classification).not.toBe("a-main-onTaskUpdate");
+  });
+
+  it("does not subtract overlapping worker work from a sixty second response gap", () => {
+    const measurement = measureRecords([
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 1_000,
+        type: "worker-send",
+        workerPid: 41,
+        sequence: 1,
+        taskIds: ["task"],
+        taskEvents: [],
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 40,
+        atMs: 1_000,
+        type: "main-update-start",
+        workerPid: 41,
+        sequence: 1,
+        workerSentAtMs: 1_000,
+        taskCount: 1,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 40,
+        atMs: 1_001,
+        type: "main-update-end",
+        workerPid: 41,
+        sequence: 1,
+        mainOnTaskUpdateMs: 1,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 60_951,
+        type: "worker-active",
+        workerPid: 41,
+        startedAtMs: 1_001,
+        endedAtMs: 60_951,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 61_001,
+        type: "worker-settle",
+        workerPid: 41,
+        sequence: 1,
+        status: "resolved",
+        roundTripMs: 60_001,
+        workerActiveMs: 59_950,
+        workerIdleMs: 51,
+        workerUtilization: 59_950 / 60_001,
+        workerActivityObserved: true,
+        workerEventLoopDelayMaxMs: 59_950,
+      },
+    ]);
+
+    expect(measurement.mainOnTaskUpdate.durationMs).toBe(1);
+    expect(measurement.unpartitionedMainReturnToWorkerPickup).toEqual({
+      durationMs: 60_000,
+      workerBusyMs: 59_950,
+      workerEventLoopDelayMaxMs: null,
+    });
+    expect(measurement.mainReturnToResponseArrival.durationMs).toBeNull();
+    expect(measurement.responseArrivalToWorkerPickup.durationMs).toBeNull();
+    expect(measurement.unmeasured).toEqual([
+      "main-return-to-response-arrival",
+      "response-arrival-to-worker-pickup",
+      "worker-event-loop-delay-by-segment",
+    ]);
+    expect(measurement).not.toHaveProperty("ipcOrProcessSchedulingMs");
+    expect(measurement.classification).toBe("insufficient");
+    expect(measurement.classification).not.toBe("c-worker-event-loop");
   });
 
   it("reports an artificial main handler stall as the main onTaskUpdate segment", () => {
@@ -341,10 +435,10 @@ it("passes through the real runner", () => expect(1).toBe(1));
       (measurement) => measurement.classification === "a-main-onTaskUpdate",
     );
     expect(mainStall?.missing).toEqual([]);
-    expect(mainStall?.mainOnTaskUpdateMs).toBeGreaterThanOrEqual(150);
+    expect(mainStall?.mainOnTaskUpdate.durationMs).toBeGreaterThanOrEqual(150);
   });
 
-  it("reports an artificial response transport delay between the measured processes", () => {
+  it("leaves an artificial response transport delay insufficient without arrival timing", () => {
     const run = runTraceFixture(
       `
 import { expect, it } from "vitest";
@@ -355,15 +449,18 @@ it("passes through the delayed response transport", () => expect(1).toBe(1));
 
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     const transportDelay = run.measurements.find(
-      (measurement) => measurement.classification === "b-ipc-or-process-scheduling",
+      (measurement) =>
+        (measurement.unpartitionedMainReturnToWorkerPickup.durationMs ?? 0) >= 150,
     );
     expect(transportDelay, JSON.stringify(run.measurements, null, 2)).toBeDefined();
     expect(transportDelay?.missing).toEqual([]);
-    expect(transportDelay?.mainOnTaskUpdateMs).toBeLessThan(100);
-    expect(transportDelay?.ipcOrProcessSchedulingMs).toBeGreaterThanOrEqual(150);
+    expect(transportDelay?.mainOnTaskUpdate.durationMs).toBeLessThan(100);
+    expect(transportDelay?.mainReturnToResponseArrival.durationMs).toBeNull();
+    expect(transportDelay?.responseArrivalToWorkerPickup.durationMs).toBeNull();
+    expect(transportDelay?.classification).toBe("insufficient");
   });
 
-  it("reports an artificial worker stall as delayed worker event-loop pickup", () => {
+  it("leaves an artificial worker stall insufficient without response arrival timing", () => {
     const run = runTraceFixture(`
 import { expect, it } from "vitest";
 
@@ -380,12 +477,20 @@ it("occupies the worker event loop after a real task update", () => {
 
     expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
     const workerStall = run.measurements.find(
-      (measurement) => measurement.classification === "c-worker-event-loop",
+      (measurement) =>
+        (measurement.unpartitionedMainReturnToWorkerPickup.workerBusyMs ?? 0) >= 180,
     );
     expect(workerStall?.missing).toEqual([]);
-    expect(workerStall?.responseToWorkerMs).toBeGreaterThanOrEqual(180);
-    expect(workerStall?.workerActiveMs).toBeGreaterThanOrEqual(180);
-    expect(workerStall?.workerActiveAfterMainMs).toBeGreaterThanOrEqual(180);
-    expect(workerStall?.workerEventLoopDelayMaxMs).toBeGreaterThanOrEqual(100);
+    expect(workerStall?.unpartitionedMainReturnToWorkerPickup.durationMs).toBeGreaterThanOrEqual(
+      180,
+    );
+    expect(workerStall?.wholeRpcWorkerActiveMs).toBeGreaterThanOrEqual(180);
+    expect(workerStall?.unpartitionedMainReturnToWorkerPickup.workerBusyMs).toBeGreaterThanOrEqual(
+      180,
+    );
+    expect(workerStall?.workerHistogramDelayMaxMs).toBeGreaterThanOrEqual(100);
+    expect(workerStall?.mainReturnToResponseArrival.durationMs).toBeNull();
+    expect(workerStall?.responseArrivalToWorkerPickup.durationMs).toBeNull();
+    expect(workerStall?.classification).toBe("insufficient");
   });
 });
