@@ -2414,6 +2414,115 @@ const GUARDS = [
       "tests/unit/database-migration-restore.test.ts::migrates pinned v11 and restores it after the injected post-v12 failure",
     ],
   },
+  {
+    what: "the plausible script-site census includes every regular direct child regardless of extension",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "const scriptFiles = readdirSync(scriptsDir)\n" +
+      "  .filter((name) => statSync(join(scriptsDir, name)).isFile())\n" +
+      "  .sort();",
+    replace:
+      "const scriptFiles = readdirSync(scriptsDir)\n" +
+      "  .filter((name) => statSync(join(scriptsDir, name)).isFile())\n" +
+      "  .filter((name) => /\\.(mjs|ts|js|cjs)$/.test(name))\n" +
+      "  .sort();",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::finds shell Python and extensionless scripts with no plausible site",
+    ],
+  },
+  {
+    what: "an interpreter argument outside its plausible entrypoint position is not counted as a site",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find: "  return entrypoint !== null && isScriptOperand(entrypoint, needle);",
+    replace: "  return words.includes(needle);",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::rejects interpreter arguments that are not plausible entrypoint positions",
+    ],
+  },
+  {
+    what: "every recognized test-spawn site is labeled execution unproven",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "  for (const test of testSources) {\n" +
+      "    if (testFileHasPlausibleSpawn(test.text, name)) {\n" +
+      "      sites.push({ type: \"test\", file: test.source, plausibleCiRoute: true, execution: \"unproven\" });\n" +
+      "    }\n" +
+      "  }",
+    replace:
+      "  for (const test of testSources) {\n" +
+      "    if (testFileHasPlausibleSpawn(test.text, name)) {\n" +
+      "      sites.push({ type: \"test\", file: test.source, plausibleCiRoute: true, execution: \"observed\" });\n" +
+      "    }\n" +
+      "  }",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::reports a skipped spawn as execution unproven",
+    ],
+  },
+  {
+    what: "a real suite spawn is included as a plausible test site",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "  for (const test of testSources) {\n" +
+      "    if (testFileHasPlausibleSpawn(test.text, name)) {\n" +
+      "      sites.push({ type: \"test\", file: test.source, plausibleCiRoute: true, execution: \"unproven\" });\n" +
+      "    }\n" +
+      "  }",
+    replace: "  for (const test of []) void test;",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::counts a real spawn as plausible and leaves execution unproven",
+    ],
+  },
+  {
+    what: "a plausible package CI route flows from a reached site to the alias it invokes",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "const queue = [...plausiblyCiRoutedPackageScripts];\n" +
+      "while (queue.length > 0) {\n" +
+      "  const caller = queue.shift();\n" +
+      "  for (const called of packageCallsIn(packageScripts[caller], packageScriptNames)) {\n" +
+      "    if (plausiblyCiRoutedPackageScripts.has(called)) continue;\n" +
+      "    plausiblyCiRoutedPackageScripts.add(called);\n" +
+      "    queue.push(called);\n" +
+      "  }\n" +
+      "}",
+    replace:
+      "const queue = [];\n" +
+      "let grew = true;\n" +
+      "while (grew) {\n" +
+      "  grew = false;\n" +
+      "  for (const [caller, command] of packageScriptEntries) {\n" +
+      "    if (plausiblyCiRoutedPackageScripts.has(caller)) continue;\n" +
+      "    const callsReachedAlias = [...packageCallsIn(command, packageScriptNames)].some((called) =>\n" +
+      "      plausiblyCiRoutedPackageScripts.has(called),\n" +
+      "    );\n" +
+      "    if (!callsReachedAlias) continue;\n" +
+      "    plausiblyCiRoutedPackageScripts.add(caller);\n" +
+      "    grew = true;\n" +
+      "  }\n" +
+      "}",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::does not propagate a plausible CI route from callee back to an unused package site",
+    ],
+  },
+  {
+    what: "any plausibly CI routed package alias marks a multiply aliased script route plausible",
+    file: "scripts/verify-every-script-has-a-plausible-caller.mjs",
+    find:
+      "    withPlausibleSites.push({\n" +
+      "      name,\n" +
+      "      plausibleSites,\n" +
+      "      plausibleCiRoute: plausibleSites.some((site) => site.plausibleCiRoute),\n" +
+      "    });",
+    replace:
+      "    withPlausibleSites.push({\n" +
+      "      name,\n" +
+      "      plausibleSites,\n" +
+      "      plausibleCiRoute: plausibleSites[0].plausibleCiRoute,\n" +
+      "    });",
+    killedBy: [
+      "tests/process/every-script-has-a-plausible-caller.test.ts::uses any plausibly CI routed package alias for a multiply aliased script",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
