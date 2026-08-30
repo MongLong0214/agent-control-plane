@@ -355,22 +355,54 @@ const asV14Fixture = (path: string): void => {
 };
 
 /** Builds the immediately previous release boundary without copying current migration internals. */
-const asV32Fixture = (path: string): void => {
+const asV33Fixture = (path: string): void => {
   const current = new Db(path);
   current.close();
 
   const raw = new Database(path);
   try {
+    const hasReceiptColumn = raw
+      .prepare("SELECT 1 AS present FROM pragma_table_info('actor_target_attestations') WHERE name = 'target_bind_receipt_json'")
+      .get();
+    if (hasReceiptColumn) raw.exec("ALTER TABLE actor_target_attestations DROP COLUMN target_bind_receipt_json");
     raw.function("acp_schema_migration_authorized", () => 1);
     raw.exec("DROP TRIGGER schema_migrations_immutable; DROP TRIGGER schema_migrations_no_delete;");
     raw.exec("DELETE FROM schema_migrations");
-    const v32 = MIGRATIONS.find((migration) => migration.toVersion === 32);
-    if (!v32) throw new Error("v32 migration is absent from the ordered registry");
+    const v33 = MIGRATIONS.find((migration) => migration.toVersion === 33);
+    if (!v33) throw new Error("v33 migration is absent from the ordered registry");
     raw.prepare(
       "INSERT INTO schema_migrations (version, migration_id, checksum, applied_at) VALUES (?, ?, ?, ?)",
-    ).run(32, v32.id, v32.checksum(), NOW);
+    ).run(33, v33.id, v33.checksum(), NOW);
     installMigrationLedger(raw);
-    raw.pragma("user_version = 32");
+    raw.prepare(
+      `INSERT INTO sessions (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)
+       VALUES ('v33-legacy-session', 'v33-legacy-incarnation', 'fixture', 'fixture', 'READY', ?, ?)`,
+    ).run(NOW, NOW);
+    raw.prepare(
+      `INSERT INTO conversational_actors
+         (actor_id, kind, current_session_id, current_session_incarnation, created_at)
+       VALUES ('v33-legacy-actor', 'CEO', 'v33-legacy-session', 'v33-legacy-incarnation', ?)`,
+    ).run(NOW);
+    raw.prepare(
+      `INSERT INTO actor_target_bindings
+         (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)
+       VALUES ('v33-legacy-target', 'v33-legacy-actor', 'hermes', 'target:v33', 'sha256:${"a".repeat(64)}', ?)`,
+    ).run(NOW);
+    raw.prepare(
+      `INSERT INTO assignments
+         (assignment_id, role_key, role, actor_id, session_id, session_incarnation,
+          binding_generation, mode, status, created_at)
+       VALUES ('v33-legacy-assignment', 'CEO', 'CEO', 'v33-legacy-actor', 'v33-legacy-session',
+               'v33-legacy-incarnation', 1, 'PREFERRED', 'ACTIVE', ?)`,
+    ).run(NOW);
+    raw.prepare(
+      `INSERT INTO actor_target_attestations
+         (target_attestation_id, target_binding_id, protocol_version, attestation_digest,
+          executor_session_id, executor_session_incarnation, binding_generation, assignment_id, attested_at)
+       VALUES ('v33-legacy-attestation', 'v33-legacy-target', 'hermes.target-bind/v1', 'sha256:${"b".repeat(64)}',
+               'v33-legacy-session', 'v33-legacy-incarnation', 1, 'v33-legacy-assignment', ?)`,
+    ).run(NOW);
+    raw.pragma("user_version = 33");
   } finally {
     raw.close();
     asPrivateStateFile(path);
@@ -432,42 +464,45 @@ const assertEmptyActorRegistry = (db: Db): void => {
 };
 
 describe("versioned SQLite migration", () => {
-  it("opening a v32 database takes an automatic rollback snapshot before Telegram settlement state", () => {
-    const path = join(tempDir("acp-v32-telegram-settlement-boundary-"), "state.sqlite");
-    asV32Fixture(path);
+  it("upgrades v33 attestations without backfilling receipt evidence and snapshots before v34", () => {
+    const path = join(tempDir("acp-v33-hermes-receipt-boundary-"), "state.sqlite");
+    asV33Fixture(path);
 
     const migrated = new Db(path);
     let backupPath: string;
     try {
-      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(33);
+      expect(Number(migrated.raw.pragma("user_version", { simple: true }))).toBe(34);
       const receipt = migrated.get<{
         migration_id: string;
         backup_file: string | null;
         backup_checksum: string | null;
       }>(
         `SELECT migration_id, backup_file, backup_checksum
-           FROM schema_migrations WHERE version = 33`,
+           FROM schema_migrations WHERE version = 34`,
       );
       expect(receipt).toMatchObject({
-        migration_id: "v33-back-up-before-telegram-settlement-state",
-        backup_file: expect.stringContaining("-pre-migration-v32-"),
+        migration_id: "v34-persist-hermes-target-bind-receipt-evidence",
+        backup_file: expect.stringContaining("-pre-migration-v33-"),
         backup_checksum: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       });
-      if (!receipt?.backup_file) throw new Error("v33 receipt did not name its automatic backup");
+      if (!receipt?.backup_file) throw new Error("v34 receipt did not name its automatic backup");
       backupPath = receipt.backup_file;
       expect(existsSync(backupPath)).toBe(true);
+      expect(migrated.get<{ target_bind_receipt_json: string | null }>(
+        "SELECT target_bind_receipt_json FROM actor_target_attestations WHERE target_attestation_id = 'v33-legacy-attestation'",
+      )).toEqual({ target_bind_receipt_json: null });
     } finally {
       migrated.close();
     }
 
     const rollbackSnapshot = new Database(backupPath, { readonly: true, fileMustExist: true });
     try {
-      expect(Number(rollbackSnapshot.pragma("user_version", { simple: true }))).toBe(32);
+      expect(Number(rollbackSnapshot.pragma("user_version", { simple: true }))).toBe(33);
       expect(rollbackSnapshot.prepare(
         "SELECT version, migration_id FROM schema_migrations ORDER BY version DESC LIMIT 1",
       ).get()).toEqual({
-        version: 32,
-        migration_id: "v32-a-source-can-only-cite-its-turns-own-claim-event",
+        version: 33,
+        migration_id: "v33-back-up-before-telegram-settlement-state",
       });
     } finally {
       rollbackSnapshot.close();
@@ -579,7 +614,8 @@ describe("versioned SQLite migration", () => {
         [30, "v30-a-turn-and-a-reply-are-two-lifecycles"],
         [31, "v31-a-generation-means-nothing-without-its-role-key"],
         [32, "v32-a-source-can-only-cite-its-turns-own-claim-event"],
-        [SCHEMA_VERSION, "v33-back-up-before-telegram-settlement-state"],
+        [33, "v33-back-up-before-telegram-settlement-state"],
+        [SCHEMA_VERSION, "v34-persist-hermes-target-bind-receipt-evidence"],
       ]);
       // Stated as properties rather than one `objectContaining` per version. The list above
       // already pins the exact order and ids; this block only ever said "every receipt carries a

@@ -1565,6 +1565,11 @@ CREATE TABLE IF NOT EXISTS actor_target_attestations (
   -- production yet, so none exists to lose) — `claim()` cannot match a NULL to any assignment,
   -- so an unfilled row is correctly read as unverifiable rather than current.
   assignment_id                 TEXT REFERENCES assignments(assignment_id),
+  -- A Hermes target-bind response is raw executor evidence. It stays nullable because a v33
+  -- attestation has no receipt that this migration can honestly manufacture; readers reject NULL.
+  target_bind_receipt_json      TEXT CHECK (
+    target_bind_receipt_json IS NULL OR json_valid(target_bind_receipt_json)
+  ),
   attested_at                   TEXT NOT NULL,
   UNIQUE (target_binding_id, attestation_digest),
   UNIQUE (target_attestation_id, target_binding_id)

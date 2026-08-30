@@ -2397,7 +2397,7 @@ const GUARDS = [
     // backup before this binary can begin writing the forward-only settledAt state.
     what: "opening a v32 database takes an automatic rollback snapshot before Telegram settlement state",
     file: "src/db/migrations.ts",
-    find: "export const SCHEMA_VERSION = 33;",
+    find: "export const SCHEMA_VERSION = 34;",
     replace: "export const SCHEMA_VERSION = 32;",
     killedBy: [
       "tests/unit/database-migration-restore.test.ts::opening a v32 database takes an automatic rollback snapshot before Telegram settlement state",

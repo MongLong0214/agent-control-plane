@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 33;
+export const SCHEMA_VERSION = 34;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2159,6 +2159,35 @@ const v33: SchemaMigration = {
   checksum: () => migrationChecksum("v33-back-up-before-telegram-settlement-state"),
 };
 
+/**
+ * Persists the raw Hermes target-bind receipt beside the attestation that cites its digest.
+ *
+ * The column is deliberately nullable and receives no backfill. A v33 attestation does not carry
+ * an executor response, and fabricating one from ACP's configuration would turn a missing proof
+ * into a false one. Current-receipt readers therefore treat a NULL legacy value as unverifiable.
+ */
+const v34: SchemaMigration = {
+  id: "v34-persist-hermes-target-bind-receipt-evidence",
+  fromVersion: 33,
+  toVersion: 34,
+  apply: (raw) => {
+    const columns = (
+      raw.prepare(`SELECT name FROM pragma_table_info('actor_target_attestations')`).all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+    if (!columns.includes("target_bind_receipt_json")) {
+      raw.exec(`
+        ALTER TABLE actor_target_attestations
+        ADD COLUMN target_bind_receipt_json TEXT CHECK (
+          target_bind_receipt_json IS NULL OR json_valid(target_bind_receipt_json)
+        )
+      `);
+    }
+  },
+  checksum: () => migrationChecksum("v34-persist-hermes-target-bind-receipt-evidence"),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2182,6 +2211,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v31,
   v32,
   v33,
+  v34,
 ]);
 
 interface RequiredTrigger {
