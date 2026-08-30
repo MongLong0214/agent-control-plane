@@ -1964,6 +1964,44 @@ const GUARDS = [
     ],
   },
   {
+    what: "the startup probe enters each standalone scenario through the production daemon factory",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    const daemon = cp.createDaemon({ stateDir });\n    const observed = await observeStartup(daemon);",
+    replace:
+      "    const daemon = cp.daemonFinalizationAuthorities();\n    const observed = await observeStartup(daemon);",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
+    ],
+  },
+  {
+    what: "the startup probe rebuilds the production daemon after provisioning a refused deployment",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    const retryDaemon = cp.createDaemon({ stateDir });\n    const immediate = await observeStartup(retryDaemon);",
+    replace:
+      "    const retryDaemon = cp.daemonFinalizationAuthorities();\n    const immediate = await observeStartup(retryDaemon);",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
+    ],
+  },
+  {
+    what: "the startup probe injects isolated usage collectors before constructing production adapters",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "  if (collectorMode === \"isolated\") config.adapterOptions = isolatedAdapterOptions();",
+    replace: "  if (false) config.adapterOptions = isolatedAdapterOptions();",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
+    ],
+  },
+  {
+    what: "the startup probe waits out the backoff it triggered before measuring recovery",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    await wait(Math.max(0, Date.parse(retryNotBefore) - waitStartedAt + 25));",
+    replace: "    await wait(0);",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
+    ],
+  },
+  {
     // The rollback image can carry the very missing guard that made an upgrade fail. Operator
     // restore still requires that guard; this process-owned, exact-checksum snapshot must not.
     what: "automatic migration rollback validates the captured image without requiring the invariant that migration was repairing",
