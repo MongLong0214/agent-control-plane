@@ -85,6 +85,46 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    // This is the one static outflow for the code. Its catalogue classification remains,
+    // proving that membership metadata and prose cannot satisfy the outflow census.
+    what: "every declared reason code has a verified static outflow",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "          ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,\n",
+    replace:
+      '          ("CONVERSATION_TARGET_ATTESTATION_STALE is retained for a future consumer",\n' +
+      "            ReasonCode.CONVERSATION_TARGET_UNATTESTED),\n",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a verified static outflow",
+    ],
+  },
+  {
+    what: "a SQLite trigger reason code reaches the typed translator",
+    file: "src/db/database.ts",
+    find: "  SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,\n",
+    replace: "  SESSION_INCARNATION_IMMUTABLE: ReasonCode.CONFLICT,\n",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a verified static outflow",
+    ],
+  },
+  {
+    what: "catalogue metadata references are declared",
+    file: "src/core/reason-codes.ts",
+    find: '  CONVERSATION_TARGET_ATTESTATION_STALE: "CONVERSATION_TARGET_ATTESTATION_STALE",\n',
+    replace: "",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::catalogue metadata references are declared",
+    ],
+  },
+  {
+    what: "production trigger denials and mappings agree",
+    file: "scripts/verify-reason-code-usage.mjs",
+    find: '  ["src/db/migrations.ts", read("src/db/migrations.ts")],\n',
+    replace: "",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::production trigger denials and mappings agree",
+    ],
+  },
+  {
     // Two lifecycles in one field: the reply reservation writes `result_json` whole, and an
     // ordinary timeout produces a reply, so the claim and the turn identity went with it.
     what: "the turn claim is stored apart from the reply it will produce",
@@ -2078,6 +2118,44 @@ const GUARDS = [
     replace: "WHEN 0\nBEGIN",
     killedBy: [
       "tests/unit/canonical-turn-ledger.test.ts::refuses a source citing a fresh audit event instead of the turn's own claim event",
+    ],
+  },
+  {
+    what: "the startup probe enters each standalone scenario through the production daemon factory",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    const daemon = cp.createDaemon({ stateDir });\n    const observed = await observeStartup(daemon);",
+    replace:
+      "    const daemon = cp.daemonFinalizationAuthorities();\n    const observed = await observeStartup(daemon);",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
+    ],
+  },
+  {
+    what: "the startup probe rebuilds the production daemon after provisioning a refused deployment",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    const retryDaemon = cp.createDaemon({ stateDir });\n    const immediate = await observeStartup(retryDaemon);",
+    replace:
+      "    const retryDaemon = cp.daemonFinalizationAuthorities();\n    const immediate = await observeStartup(retryDaemon);",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
+    ],
+  },
+  {
+    what: "the startup probe injects isolated usage collectors before constructing production adapters",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "  if (collectorMode === \"isolated\") config.adapterOptions = isolatedAdapterOptions();",
+    replace: "  if (false) config.adapterOptions = isolatedAdapterOptions();",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
+    ],
+  },
+  {
+    what: "the startup probe waits out the backoff it triggered before measuring recovery",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    await wait(Math.max(0, Date.parse(retryNotBefore) - waitStartedAt + 25));",
+    replace: "    await wait(0);",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::keeps startup outcomes independent of provider login files",
     ],
   },
   {
