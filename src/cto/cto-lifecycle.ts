@@ -11,7 +11,14 @@ import type { OwnerAuthorityPort } from "../ceo/owner-authority.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import {
+  DrainingCause,
+  Role,
+  type RoleBinding,
+  RunState,
+  SessionLifecycle,
+  roleKeyFor,
+} from "../domain/types.ts";
 import { MessageKind } from "../outbox/envelope.ts";
 import type { Outbox } from "../outbox/outbox.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
@@ -222,7 +229,28 @@ export class CtoLifecycle {
     const current = this.bindings.active(roleKey);
     if (!current) return deny(ReasonCode.NOT_FOUND, "project has no primary CTO", { projectId });
 
-    const drain = this.sessions.transition(current.sessionId, SessionLifecycle.DRAINING, reason);
+    // #692 (review round 2) — the mirror of resumeProject's own fix. Without this, a
+    // replacement requested against a session a suspend already parked in DRAINING is a
+    // silent no-op transition (SessionRegistry.transition short-circuits on "already
+    // DRAINING") that nonetheless reports success, enqueues a DRAIN_REQUEST, and records
+    // CTO_REPLACEMENT_REQUESTED as if a real replacement were now underway — over a project
+    // an owner suspended and has not resumed. Refusing here, rather than only guarding
+    // resumeProject's side, keeps a replacement from ever believing it started on a project
+    // that is not actually live.
+    if (this.projects.get(projectId)?.suspended === true) {
+      return deny(
+        ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED,
+        "the project is suspended; resume it before requesting a CTO replacement",
+        { projectId },
+      );
+    }
+
+    const drain = this.sessions.transition(
+      current.sessionId,
+      SessionLifecycle.DRAINING,
+      reason,
+      DrainingCause.REPLACEMENT,
+    );
     if (!drain.allowed) return drain as Decision<{ draining: boolean; activeRuns: number }>;
 
     this.outbox.enqueue({
@@ -343,6 +371,7 @@ export class CtoLifecycle {
         current.sessionId,
         SessionLifecycle.DRAINING,
         "switchover prepared",
+        DrainingCause.REPLACEMENT,
       );
       if (!draining.allowed) {
         return draining as Decision<{ handoffId: string; incomingSessionId: string }>;
@@ -705,7 +734,12 @@ export class CtoLifecycle {
       }
 
       if (session.lifecycle === SessionLifecycle.READY) {
-        const draining = this.sessions.transition(current.sessionId, SessionLifecycle.DRAINING, "project suspended");
+        const draining = this.sessions.transition(
+          current.sessionId,
+          SessionLifecycle.DRAINING,
+          "project suspended",
+          DrainingCause.SUSPEND,
+        );
         if (!draining.allowed) return draining as Decision<void>;
       }
       return allow(ReasonCode.OK, undefined);
@@ -844,6 +878,24 @@ export class CtoLifecycle {
    * not touch a session already STOPPED — the provider was actually told to stop and
    * that is not reversible; resuming a suspend that went all the way through means a
    * fresh CTO spawns on the next dispatch, exactly like any other dead binding.
+   *
+   * #692 (review round 2) — DRAINING is not unique to a stuck suspend. An ordinary
+   * replacement (requestReplacement) or a CTO-initiated switchover (prepareSwitchover)
+   * drains this binding's session by the identical mechanism, and each leaves its own
+   * outstanding artifact behind it (a DRAIN_REQUEST, or a PENDING handoff) that expects the
+   * session to actually leave — not come back as the still-active primary CTO. Flipping
+   * *any* DRAINING session
+   * back to READY, keyed only on the bare lifecycle state, reverses whichever of the three
+   * happened regardless of which one this call is meant to undo: `requestReplacement` then
+   * `resumeProject` returned the outgoing CTO to READY with its DRAIN_REQUEST still
+   * outstanding, and new runs could dispatch against it while the standing invariant (work
+   * stays QUEUED during a replacement, run-engine.ts, tests/scenarios/registry-cto.test.ts
+   * CP-S08/CP-S09) said they could not. `session.drainingCause` (set atomically with the
+   * DRAINING transition itself, by whichever of the three callers caused it) is the
+   * property that distinguishes them; only a SUSPEND-caused drain is reversed here. A
+   * non-SUSPEND cause — including the fail-closed null a pre-#692 row would carry — refuses
+   * the whole call, rolling back the `projects.suspended` flag flip above with it: there is
+   * nothing here for this call to have legitimately resumed.
    */
   resumeProject(projectId: string): Decision<void> {
     return this.db.txDecision(() => {
@@ -855,6 +907,14 @@ export class CtoLifecycle {
       if (!current) return allow(ReasonCode.OK, undefined);
       const session = this.sessions.get(current.sessionId);
       if (session?.lifecycle === SessionLifecycle.DRAINING) {
+        if (session.drainingCause !== DrainingCause.SUSPEND) {
+          return deny(
+            ReasonCode.RESUME_BLOCKED_NON_SUSPEND_DRAINING,
+            "the primary CTO is draining for a replacement or switchover, not a suspend; " +
+              "resuming would return it to READY out from under that in-flight drain",
+            { projectId, sessionId: current.sessionId, drainingCause: session.drainingCause },
+          );
+        }
         const restored = this.sessions.transition(current.sessionId, SessionLifecycle.READY, "project resumed");
         if (!restored.allowed) return restored as Decision<void>;
       }

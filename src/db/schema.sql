@@ -100,6 +100,11 @@ CREATE TABLE IF NOT EXISTS sessions (
   effort         TEXT,
   lifecycle      TEXT NOT NULL
                    CHECK (lifecycle IN ('STARTING','READY','DRAINING','STOPPED','ERROR')),
+  -- #692 — which caller put this session into DRAINING (suspendProject vs. requestReplacement /
+  -- prepareSwitchover). Meaningful only while lifecycle = 'DRAINING'; SessionRegistry.transition
+  -- clears it to NULL on every other destination and never overwrites it on a no-op transition
+  -- (lifecycle already DRAINING). See domain/types.ts DrainingCause for why this exists.
+  draining_cause TEXT CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT')),
   buzz_address   TEXT,
   -- §27.2 — the Buzz *actor* identity this session speaks as, which is not the same fact
   -- as `buzz_address`: an address is a shared routing destination anybody can name, so it

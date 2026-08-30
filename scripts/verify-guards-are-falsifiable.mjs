@@ -1439,6 +1439,35 @@ const GUARDS = [
     ],
   },
   {
+    // #692 round 2 (second blind review) — the counter-example: requestReplacement drains
+    // the same way a suspend does, and resumeProject reversed *any* DRAINING session keyed
+    // only on the bare lifecycle state. Without this branch, requestReplacement then
+    // resumeProject returns the outgoing CTO to READY with its DRAIN_REQUEST still
+    // outstanding, and new runs dispatch against it while the standing invariant (work
+    // stays QUEUED during a replacement) says they cannot.
+    what: "resumeProject refuses to reverse a DRAINING session whose cause was not suspendProject",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        if (session.drainingCause !== DrainingCause.SUSPEND) {",
+    replace: "        if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 round 2 — resumeProject does not reverse a replacement's DRAINING, and its DRAIN_REQUEST still governs new dispatch",
+    ],
+  },
+  {
+    // #692 round 2 — the mirror direction the same review asked to be checked: without
+    // this, requestReplacement against a session a suspend already parked in DRAINING is a
+    // silent no-op transition that still reports success, enqueues a DRAIN_REQUEST and
+    // records CTO_REPLACEMENT_REQUESTED as though a real replacement had started, over a
+    // project an owner suspended and has not resumed.
+    what: "requestReplacement refuses to drain a project the owner suspended",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "    if (this.projects.get(projectId)?.suspended === true) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 round 2 — requestReplacement refuses to drain a project the owner suspended",
+    ],
+  },
+  {
     // Sol's fifth review of #691: `bindingGeneration` alone does not fence a `SURVIVED` failover,
     // which moves an actor's live runtime to a new session while deliberately keeping the same
     // generation. Removing this check reopens exactly that: a receipt naming the wrong target

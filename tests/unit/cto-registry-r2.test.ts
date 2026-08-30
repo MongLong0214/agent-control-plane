@@ -5,7 +5,7 @@ import { type HandoffAcknowledgement, type HandoffPackage } from "../../src/cto/
 import { digestOf } from "../../src/core/digest.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import { DrainingCause, ExecutionMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import type { DoctorReport } from "../../src/doctor/doctor.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import {
@@ -309,10 +309,16 @@ describe("round-2 CTO lifecycle regressions", () => {
       const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
       expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
 
+      // #692 round 2 — resumeProject now keys on *why* the session is draining, not just that
+      // it is (domain/types.ts DrainingCause). The real suspendProject records SUSPEND
+      // atomically with this same transition; the simulation has to carry it too, or it stops
+      // simulating what a crashed suspend actually leaves behind and starts simulating an
+      // unrelated (and now correctly refused) DRAINING-for-unknown-reason state instead.
       const drained = harness.cp.sessions.transition(
         binding.sessionId,
         SessionLifecycle.DRAINING,
         "test: simulate a suspend that committed DRAINING but never reached STOPPED",
+        DrainingCause.SUSPEND,
       );
       expect(drained.allowed).toBe(true);
 
@@ -334,6 +340,104 @@ describe("round-2 CTO lifecycle regressions", () => {
       const dispatched = await harness.cp.runs.dispatch(run.value.runId);
       expect(dispatched.allowed).toBe(true);
       expect(harness.cp.bindings.activePrimaryCto(projectId)?.sessionId).toBe(binding.sessionId);
+    },
+  );
+
+  it(
+    "#692 round 2 — resumeProject does not reverse a replacement's DRAINING, and its " +
+      "DRAIN_REQUEST still governs new dispatch",
+    async () => {
+      // The exact counter-example the second blind review found: requestReplacement (an
+      // ordinary replacement, not a suspend) puts the session into DRAINING and leaves a
+      // DRAIN_REQUEST outstanding (cto-lifecycle.ts requestReplacement). The previous fix
+      // to resumeProject reversed *any* DRAINING session, so calling it here returned the
+      // outgoing CTO to READY with that DRAIN_REQUEST still sitting in the outbox — nothing
+      // about the replacement had actually happened, but new work could dispatch again,
+      // breaking CP-S09's invariant that work stays QUEUED during a replacement.
+      const harness = makeHarness();
+      const { projectId, repositoryId } = await registerFixtureProject(harness);
+      const first = await createActiveRun(harness, projectId, repositoryId);
+      const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+
+      const replacement = harness.cp.cto.requestReplacement(projectId, "operator request");
+      expect(replacement.allowed).toBe(true);
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.DRAINING);
+      const drainRequest = harness.cp.outbox.byIdempotencyKey(`drain:${projectId}:${binding.bindingGeneration}`);
+      expect(drainRequest).not.toBeNull();
+      expect(["PENDING", "IN_FLIGHT", "SENT"]).toContain(drainRequest!.status);
+
+      const resumed = harness.cp.cto.resumeProject(projectId);
+      expect(resumed.allowed).toBe(false);
+      expect(resumed.reasonCode).toBe(ReasonCode.RESUME_BLOCKED_NON_SUSPEND_DRAINING);
+
+      // The session must still be DRAINING, not READY — the actual defect: the previous
+      // resumeProject reported success here and flipped it back.
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.DRAINING);
+      // The DRAIN_REQUEST this replacement enqueued is still exactly where it was — not
+      // acknowledged, not rejected, not expired — because nothing about the replacement was
+      // undone by the refused resume.
+      const stillDraining = harness.cp.outbox.byIdempotencyKey(`drain:${projectId}:${binding.bindingGeneration}`);
+      expect(stillDraining!.status).toBe(drainRequest!.status);
+
+      // The standing invariant CP-S09 names: new work stays QUEUED while the CTO drains,
+      // not merely "the lifecycle string says DRAINING" — dispatch has to actually refuse.
+      const second = harness.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!second.allowed) throw new Error(second.message);
+      const blocked = await harness.cp.runs.dispatch(second.value.runId);
+      expect(blocked.allowed).toBe(false);
+      expect(blocked.reasonCode).toBe(ReasonCode.RUN_DISPATCH_BLOCKED_CTO_DRAINING);
+      expect(harness.cp.runs.require(second.value.runId).state).toBe(RunState.QUEUED);
+
+      // The other direction, named by the same review: requestReplacement must not be able
+      // to paper over an owner suspend either. A project the owner actually suspended
+      // refuses a replacement request outright, rather than silently no-op-ing the DRAINING
+      // transition and reporting success as though a replacement had started.
+      const stillActiveRun = harness.cp.runs.require(first.runId);
+      expect([RunState.ACTIVE, RunState.BLOCKED]).toContain(stillActiveRun.state);
+    },
+  );
+
+  it(
+    "#692 round 2 — requestReplacement refuses to drain a project the owner suspended",
+    async () => {
+      // A *completed* suspend already revokes the binding entirely (STOPPED, no active
+      // binding left) — requestReplacement refuses that with NOT_FOUND on its own, before
+      // this fix ever mattered. The case this guards is the one the sibling test above
+      // simulates the other side of: a suspend that committed `projects.suspended` and the
+      // DRAINING transition but crashed before reaching STOPPED, leaving the binding still
+      // active. Simulated the same way as that test — driving the real FSM transition
+      // directly rather than timing a real stopSession() crash.
+      const harness = makeHarness();
+      const { projectId } = await registerFixtureProject(harness);
+      const bound = await harness.cp.cto.ensurePrimaryCto(projectId, "setup");
+      if (!bound.allowed) throw new Error(bound.message);
+
+      const suspendedFlag = harness.cp.projects.setSuspended(projectId, true, true);
+      expect(suspendedFlag.allowed).toBe(true);
+      const drained = harness.cp.sessions.transition(
+        bound.value.sessionId,
+        SessionLifecycle.DRAINING,
+        "test: simulate a suspend that committed DRAINING but never reached STOPPED",
+        DrainingCause.SUSPEND,
+      );
+      expect(drained.allowed).toBe(true);
+      expect(harness.cp.projects.require(projectId).suspended).toBe(true);
+      expect(harness.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))).not.toBeNull();
+
+      const replacement = harness.cp.cto.requestReplacement(projectId, "operator request");
+      expect(replacement.allowed).toBe(false);
+      expect(replacement.reasonCode).toBe(ReasonCode.REPLACEMENT_BLOCKED_PROJECT_SUSPENDED);
+
+      // Refused cleanly — the session is still exactly where the simulated crash left it,
+      // draining for the suspend, not layered with a second, unrelated drain cause.
+      expect(harness.cp.sessions.require(bound.value.sessionId).lifecycle).toBe(SessionLifecycle.DRAINING);
+      expect(harness.cp.sessions.require(bound.value.sessionId).drainingCause).toBe(DrainingCause.SUSPEND);
     },
   );
 

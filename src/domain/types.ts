@@ -30,6 +30,27 @@ export const SessionLifecycle = {
 } as const;
 export type SessionLifecycle = (typeof SessionLifecycle)[keyof typeof SessionLifecycle];
 
+/**
+ * #692 (review round 2) — why a session is DRAINING, not just that it is.
+ *
+ * `DRAINING -> READY` is legal in the FSM precisely so a suspend that committed DRAINING but
+ * crashed before reaching STOPPED has somewhere to go back to (cto-lifecycle.ts resumeProject).
+ * But an ordinary replacement or a CTO-initiated switchover also drains the session — and their
+ * DRAIN_REQUEST / HANDOFF_PACKAGE expect it to leave, not come back. Reversing DRAINING on the
+ * bare state, with no memory of which of the three callers put it there, undoes whichever one
+ * happened to run last. This is the property that distinguishes them: set once, atomically with
+ * the DRAINING transition itself (SessionRegistry.transition), by whichever of suspendProject,
+ * requestReplacement or prepareSwitchover actually caused it; cleared back to null the moment the
+ * session leaves DRAINING for any destination. A transition that finds the session already
+ * DRAINING is a no-op (SessionRegistry.transition short-circuits before any write), so a
+ * replacement request layered on top of an existing suspend-drain can never overwrite it.
+ */
+export const DrainingCause = {
+  SUSPEND: "SUSPEND",
+  REPLACEMENT: "REPLACEMENT",
+} as const;
+export type DrainingCause = (typeof DrainingCause)[keyof typeof DrainingCause];
+
 export const ContinuityMode = {
   NORMAL: "NORMAL",
   DEGRADED: "DEGRADED",

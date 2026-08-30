@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 32;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2087,6 +2087,41 @@ const v31: SchemaMigration = {
   checksum: () => migrationChecksum("v31-a-generation-means-nothing-without-its-role-key"),
 };
 
+/**
+ * v32 records why a session is DRAINING, not just that it is (#692 round 2).
+ *
+ * `resumeProject` reversed *any* DRAINING session back to READY, keyed on the bare lifecycle
+ * state. A replacement drains the same way a suspend does (requestReplacement, DRAIN_REQUEST) —
+ * so `requestReplacement` then `resumeProject` returned the outgoing CTO to READY out from under
+ * its own still-outstanding DRAIN_REQUEST, letting new runs dispatch against it while the
+ * standing assumption (work stays QUEUED during a replacement) said they could not.
+ *
+ * Additive and nullable, like v19's `os_process_started_at`: existing rows carry NULL, and
+ * `resumeProject` treats NULL the same as a non-suspend cause — fail closed, not "assume it was a
+ * suspend". Nothing production writes today reaches a DRAINING session with this column unset
+ * except through the exact crash this migration is too late to have recorded, which is why the
+ * fail-closed reading is the only one available for pre-migration rows.
+ */
+const V32_DDL = `
+  ALTER TABLE sessions ADD COLUMN draining_cause TEXT
+    CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT'));
+`;
+
+const v32: SchemaMigration = {
+  id: "v32-draining-remembers-its-cause",
+  fromVersion: 31,
+  toVersion: 32,
+  apply: (raw) => {
+    // The v12/v19 replay trap: a database reconstructed through the migration chain may already
+    // carry this column from a replayed CREATE TABLE, and a bare ALTER then fails with
+    // `duplicate column name`. Adding it only when absent keeps both routes working.
+    const present = (raw.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>)
+      .some((column) => column.name === "draining_cause");
+    if (!present) raw.exec(V32_DDL);
+  },
+  checksum: () => sha256(`v32-draining-remembers-its-cause\n${V32_DDL}`),
+};
+
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v12,
   v13,
@@ -2108,6 +2143,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v29,
   v30,
   v31,
+  v32,
 ]);
 
 interface RequiredTrigger {
