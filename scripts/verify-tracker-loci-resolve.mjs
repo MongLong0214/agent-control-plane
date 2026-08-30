@@ -974,7 +974,10 @@ const listIssues = () => {
     if (stderr) console.error(stderr);
     // Exit 2, not 1 — see the header. "Nobody could look" must not read as "the citations
     // disagree with the tree"; the former sends a reader hunting a mismatch that may not exist.
-    process.exit(2);
+    // Return an empty work set and preserve exit 2 through the final assignment so stderr can
+    // flush naturally even when this CLI's output is piped.
+    process.exitCode = 2;
+    return [];
   }
 };
 
@@ -2606,4 +2609,7 @@ const failing =
   unsupported.length > 0 ||
   nonDurableFindings.length > 0 ||
   (strict && advisory.length > 0);
-process.exit(failing ? 1 : 0);
+// Do not force termination after writing the report: stdout is asynchronous when piped, and a
+// large JSON report can otherwise be truncated before Node flushes it. Preserve an earlier exit 2
+// from listIssues(); natural process termination flushes both report streams.
+process.exitCode ??= failing ? 1 : 0;

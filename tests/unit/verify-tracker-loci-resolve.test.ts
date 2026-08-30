@@ -1857,6 +1857,46 @@ describe("verify-tracker-loci-resolve", () => {
         cleanup();
       }
     });
+
+    it("YAML plain and block scalar apostrophes do not hide later symbols through the production CLI", () => {
+      const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-yaml-scalars-"));
+      try {
+        writeFileSync(join(dir, "plain.yml"), "description: it's plain\nAFTER_PLAIN_SCALAR: true\n");
+        writeFileSync(join(dir, "block.yml"), "run: |\n  echo it's block text\nAFTER_BLOCK_SCALAR: true\n");
+        spawnSync("git", ["init", "-q", "."], { cwd: dir });
+        spawnSync("git", ["add", "-A"], { cwd: dir });
+        spawnSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fixture"], {
+          cwd: dir,
+        });
+
+        const issuesPath = join(dir, "issues.json");
+        writeFileSync(
+          issuesPath,
+          JSON.stringify(
+            [
+              {
+                number: 68980,
+                title: "YAML plain scalar apostrophe",
+                body: "`AFTER_PLAIN_SCALAR` in `plain.yml`",
+              },
+              {
+                number: 68981,
+                title: "YAML block scalar apostrophe",
+                body: "`AFTER_BLOCK_SCALAR` in `block.yml`",
+              },
+            ],
+            null,
+            2,
+          ),
+        );
+
+        const result = run(issuesPath, [`--repo-root=${dir}`]);
+        expect(result.status, result.stdout || result.stderr).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("[round 17] #689: SQL — the fifth and last dispatch, disclosed at the end of round 16 and fixed here", () => {
@@ -2048,6 +2088,34 @@ describe("verify-tracker-loci-resolve", () => {
         expect(result.status).toBe(1);
         expect(result.stdout).toContain("#94500 page issue 501");
         expect(result.stdout).toContain("across 501 open issue(s).");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("a large GitHub listing failure flushes through its final diagnostic and exits 2", () => {
+      const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-gh-error-"));
+      const bin = join(dir, "bin");
+      const fakeGh = join(bin, "gh");
+      mkdirSync(bin);
+      writeFileSync(
+        fakeGh,
+        [
+          "#!/usr/bin/env node",
+          'process.stderr.write("x".repeat(70 * 1024));',
+          'process.stderr.write("FINAL_GH_DIAGNOSTIC\\n");',
+          "process.exitCode = 1;",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(fakeGh, 0o755);
+
+      try {
+        const result = runLive({ PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` });
+        expect(result.status).toBe(2);
+        expect(Buffer.byteLength(result.stderr, "utf8")).toBeGreaterThan(64 * 1024);
+        expect(result.stderr).toContain("FINAL_GH_DIAGNOSTIC");
+        expect(result.stdout).toBe("");
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -2549,13 +2617,30 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
-  it("--json emits parseable structured output", () => {
-    const body = "`src/does/not/exist.ts:1` is the culprit.";
-    const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);
+  it("--json flushes structured output larger than 64 KiB through the final field", () => {
+    const issueCount = 503;
+    const issues = Array.from({ length: issueCount }, (_, index) => ({
+      number: 90_000 + index,
+      title: index === issueCount - 1 ? "json mode final issue" : `json mode issue ${index + 1}`,
+      body: "`src/does/not/exist.ts:1` is the culprit.",
+    }));
+    const { path, cleanup } = withIssues(issues);
     try {
       const result = run(path, ["--json"]);
-      const parsed = JSON.parse(result.stdout);
-      expect(parsed.stale.length).toBeGreaterThan(0);
+      expect(result.status, result.stderr).toBe(1);
+      expect(Buffer.byteLength(result.stdout, "utf8")).toBeGreaterThan(64 * 1024);
+
+      const parsed = JSON.parse(result.stdout) as {
+        stale: Array<{ issue: IssueFixture }>;
+        nonDurable: unknown[];
+      };
+      expect(parsed.stale).toHaveLength(issueCount);
+      expect(parsed.stale.at(-1)?.issue).toMatchObject({
+        number: 90_000 + issueCount - 1,
+        title: "json mode final issue",
+      });
+      expect(Object.keys(parsed).at(-1)).toBe("nonDurable");
+      expect(parsed.nonDurable).toEqual([]);
     } finally {
       cleanup();
     }

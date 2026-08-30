@@ -210,6 +210,7 @@ describe("tracker-loci strip invariants", () => {
       closer: '"""',
       escapeRule: "backslash escapes the next character",
       backslashEscapes: "any",
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
       source: ['"""has " quote', 'still string"""', 'PYTHON_SYMBOL = "x"'].join("\n"),
       hidden: "still string",
@@ -223,6 +224,7 @@ describe("tracker-loci strip invariants", () => {
       closer: "'''",
       escapeRule: "backslash escapes the next character",
       backslashEscapes: "any",
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
       source: ["'''has ' apostrophe", "still string'''", 'PYTHON_SYMBOL = "x"'].join("\n"),
       hidden: "still string",
@@ -236,6 +238,7 @@ describe("tracker-loci strip invariants", () => {
       closer: '"',
       escapeRule: "backslash escapes the next character",
       backslashEscapes: "any",
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: true,
       source: ['"unterminated short string', "PYTHON_SYMBOL = 1"].join("\n"),
       hidden: "unterminated short string",
@@ -249,6 +252,7 @@ describe("tracker-loci strip invariants", () => {
       closer: "'",
       escapeRule: "backslash escapes the next character",
       backslashEscapes: "any",
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: true,
       source: ["'unterminated short string", "PYTHON_SYMBOL = 1"].join("\n"),
       hidden: "unterminated short string",
@@ -262,6 +266,7 @@ describe("tracker-loci strip invariants", () => {
       closer: "'",
       escapeRule: "backslash escapes the next character",
       backslashEscapes: "any",
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
       source: ["echo $'has \\' quote", "expect'", "SHELL_SYMBOL=1"].join("\n"),
       hidden: "expect",
@@ -275,6 +280,7 @@ describe("tracker-loci strip invariants", () => {
       closer: "'",
       escapeRule: "nothing escapes the delimiter",
       backslashEscapes: [],
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
       source: ["echo 'first line", "expect'", "SHELL_SYMBOL=1"].join("\n"),
       hidden: "expect",
@@ -288,23 +294,70 @@ describe("tracker-loci strip invariants", () => {
       closer: '"',
       escapeRule: "backslash escapes dollar backtick double quote backslash and newline",
       backslashEscapes: ["$", "`", '"', "\\", "\n"],
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
       source: ['echo "has \\" quote', 'expect"', "SHELL_SYMBOL=1"].join("\n"),
       hidden: "expect",
       visible: "SHELL_SYMBOL",
       strip: (source: string) => stripShellSource(source, true),
     },
+    {
+      language: "YAML",
+      form: "single-quoted scalar",
+      opener: "'",
+      closer: "'",
+      escapeRule: "a doubled close delimiter is a literal quote",
+      backslashEscapes: [],
+      doubledCloseEscapes: true,
+      rawNewlineEndsSpan: false,
+      source: ["key: 'it''s", "still one scalar'", "YAML_SYMBOL: true"].join("\n"),
+      hidden: "still one scalar",
+      visible: "YAML_SYMBOL",
+      strip: (source: string) => stripYamlSource(source, true),
+    },
+    {
+      language: "YAML",
+      form: "double-quoted scalar",
+      opener: '"',
+      closer: '"',
+      escapeRule: "backslash escapes the next character",
+      backslashEscapes: "any",
+      doubledCloseEscapes: false,
+      rawNewlineEndsSpan: false,
+      source: ['key: "has \\" quote', 'still one scalar"', "YAML_SYMBOL: true"].join("\n"),
+      hidden: "still one scalar",
+      visible: "YAML_SYMBOL",
+      strip: (source: string) => stripYamlSource(source, true),
+    },
   ] as const;
 
   it.each(languageStringRules)(
     "$language $form opens with $opener closes with $closer uses $escapeRule and raw newline ends span is $rawNewlineEndsSpan",
-    ({ language, form, opener, closer, backslashEscapes, rawNewlineEndsSpan, source, strip, hidden, visible }) => {
-      const rules = language === "Python" ? STRING_BOUNDARY_RULES.python : STRING_BOUNDARY_RULES.shell;
+    ({
+      language,
+      form,
+      opener,
+      closer,
+      backslashEscapes,
+      doubledCloseEscapes,
+      rawNewlineEndsSpan,
+      source,
+      strip,
+      hidden,
+      visible,
+    }) => {
+      const rules =
+        language === "Python"
+          ? STRING_BOUNDARY_RULES.python
+          : language === "Bash"
+            ? STRING_BOUNDARY_RULES.shell
+            : STRING_BOUNDARY_RULES.yaml;
       expect(rules).toContainEqual({
         form,
         open: opener,
         close: closer,
         backslashEscapes,
+        doubledCloseEscapes,
         rawNewlineEndsSpan,
       });
       const out = strip(source);
@@ -818,6 +871,12 @@ describe("tracker-loci strip invariants", () => {
       expect(stripYamlSource(input, true)).toBe("\nkey: value");
     });
 
+    it("apostrophes and quotes inside a plain scalar are content rather than delimiters", () => {
+      const input = `description: it's "plain"\nAFTER_PLAIN_SCALAR: true`;
+      expect(stripYamlSource(input, true)).toBe(input);
+      expect(stripYamlSource(input, false)).toBe(input);
+    });
+
     it("a doubled '' inside a single-quoted scalar is a literal quote, not a terminator", () => {
       const input = "key: 'it''s here'\nkey2: value2";
       expect(stripYamlSource(input, true)).toBe("key: '          '\nkey2: value2");
@@ -834,6 +893,19 @@ describe("tracker-loci strip invariants", () => {
       const input = "key: 'a''";
       const out = stripYamlSource(input, true);
       expect(out).toBe("key: '   "); // no closing quote appended — genuinely unterminated
+    });
+
+    it("literal and folded block scalar bodies end by indentation and ignore quote and comment markers", () => {
+      const input = [
+        "run: |",
+        "  echo it's # literal block content",
+        "AFTER_LITERAL_BLOCK: true",
+        "summary: >-",
+        '  say "an unmatched quote is content',
+        "AFTER_FOLDED_BLOCK: true",
+      ].join("\n");
+      expect(stripYamlSource(input, true)).toBe(input);
+      expect(stripYamlSource(input, false)).toBe(input);
     });
   });
 

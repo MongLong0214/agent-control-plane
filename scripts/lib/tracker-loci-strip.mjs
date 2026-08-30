@@ -48,22 +48,29 @@ export const blankKeepingNewlines = (match) => match.replace(/[^\n]/g, " ");
  * @property {string} open
  * @property {string} close
  * @property {"any" | readonly string[]} backslashEscapes
+ * @property {boolean} [doubledCloseEscapes]
  * @property {boolean} rawNewlineEndsSpan
  */
 
 /**
- * Quote boundaries for the two dispatches whose review counterexamples depend on delimiter width
- * and raw-newline behavior. Longest openers come first so Python's triple quotes and Bash's `$'`
- * are each one token, never a sequence of shorter quote tokens.
+ * Quote boundaries for the three dispatches whose review counterexamples depend on delimiter
+ * width, escape syntax, and raw-newline behavior. Longest openers come first so Python's triple
+ * quotes and Bash's `$'` are each one token, never a sequence of shorter quote tokens.
  *
  * `backslashEscapes` names exactly which following characters cannot act as syntax: `"any"` for
  * Python and Bash ANSI-C quotes, an empty list for Bash single quotes, and Bash's five special
- * double-quote characters for Bash double quotes. `rawNewlineEndsSpan` says whether an unescaped
- * newline ends an unterminated quoted span: Python's short strings do; Python triple strings and
- * all three Bash quote forms do not. Python's `f`/`r` prefixes sit before these delimiters and do
- * not change their boundary rules; f-string replacement fields remain part of the blanked span.
+ * double-quote characters for Bash double quotes. `doubledCloseEscapes` records YAML's `''`
+ * escape, which is neither a backslash escape nor two boundaries. `rawNewlineEndsSpan` says
+ * whether an unescaped newline ends an unterminated quoted span: Python's short strings do;
+ * Python triple strings, all three Bash quote forms, and both YAML quoted scalar forms do not.
+ * Python's `f`/`r` prefixes sit before these delimiters and do not change their boundary rules;
+ * f-string replacement fields remain part of the blanked span.
  *
- * @type {Readonly<{python: readonly StringBoundaryRule[], shell: readonly StringBoundaryRule[]}>}
+ * YAML plain scalars do not have a quote delimiter at all, so `stripYamlSource` selects the two
+ * rules in `yaml` only at a YAML value start. Its indentation-delimited block scalars are handled
+ * by the same walk before quote matching.
+ *
+ * @type {Readonly<{python: readonly StringBoundaryRule[], shell: readonly StringBoundaryRule[], yaml: readonly StringBoundaryRule[]}>}
  */
 export const STRING_BOUNDARY_RULES = Object.freeze({
   python: Object.freeze([
@@ -72,6 +79,7 @@ export const STRING_BOUNDARY_RULES = Object.freeze({
       open: '"""',
       close: '"""',
       backslashEscapes: /** @type {const} */ ("any"),
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
     },
     {
@@ -79,6 +87,7 @@ export const STRING_BOUNDARY_RULES = Object.freeze({
       open: "'''",
       close: "'''",
       backslashEscapes: /** @type {const} */ ("any"),
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
     },
     {
@@ -86,6 +95,7 @@ export const STRING_BOUNDARY_RULES = Object.freeze({
       open: '"',
       close: '"',
       backslashEscapes: /** @type {const} */ ("any"),
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: true,
     },
     {
@@ -93,6 +103,7 @@ export const STRING_BOUNDARY_RULES = Object.freeze({
       open: "'",
       close: "'",
       backslashEscapes: /** @type {const} */ ("any"),
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: true,
     },
   ]),
@@ -102,14 +113,41 @@ export const STRING_BOUNDARY_RULES = Object.freeze({
       open: "$'",
       close: "'",
       backslashEscapes: /** @type {const} */ ("any"),
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
     },
-    { form: "single quote", open: "'", close: "'", backslashEscapes: Object.freeze([]), rawNewlineEndsSpan: false },
+    {
+      form: "single quote",
+      open: "'",
+      close: "'",
+      backslashEscapes: Object.freeze([]),
+      doubledCloseEscapes: false,
+      rawNewlineEndsSpan: false,
+    },
     {
       form: "double quote",
       open: '"',
       close: '"',
       backslashEscapes: Object.freeze(["$", "`", '"', "\\", "\n"]),
+      doubledCloseEscapes: false,
+      rawNewlineEndsSpan: false,
+    },
+  ]),
+  yaml: Object.freeze([
+    {
+      form: "single-quoted scalar",
+      open: "'",
+      close: "'",
+      backslashEscapes: Object.freeze([]),
+      doubledCloseEscapes: true,
+      rawNewlineEndsSpan: false,
+    },
+    {
+      form: "double-quoted scalar",
+      open: '"',
+      close: '"',
+      backslashEscapes: /** @type {const} */ ("any"),
+      doubledCloseEscapes: false,
       rawNewlineEndsSpan: false,
     },
   ]),
@@ -129,6 +167,10 @@ const readQuotedSpan = (text, start, rules) => {
   while (end < text.length) {
     if (backslashEscapesNext(text, end, rule)) {
       end += 2;
+      continue;
+    }
+    if (rule.doubledCloseEscapes && text.startsWith(rule.close + rule.close, end)) {
+      end += rule.close.length * 2;
       continue;
     }
     if (text.startsWith(rule.close, end)) {
@@ -895,33 +937,18 @@ export const stripShellSource = (text, blankStrings) => {
 };
 
 /**
- * #689 round 16: YAML's own comment/quote rules, in the same one-ordered-walk shape. YAML shares
- * shell's `#`-word-boundary rule (a `#` only starts a comment preceded by whitespace or at the
- * start of a line — confirmed against this repository's own tracked `.github/workflows/*.yml`:
- * every apostrophe inside an English contraction in a comment, `` job's ``/`` it's ``/`` PR's ``,
- * sits *after* a `#` that already opened the comment at a word boundary, so it is never reached as
- * a potential quote-opener — the same mirror case round 15 named for JS's `//`), but its quoting
- * rules differ from both shell and JS:
+ * #689: YAML's comment and scalar boundaries in one ordered walk.
  *
- *   - a single-quoted scalar (`'...'`) escapes a literal quote by *doubling* it (`''`), not with a
- *     backslash — a backslash inside one is a literal backslash. Different from shell's plain
- *     single-quote (no escape of any kind) and from the default Python short-string rule
- *     (backslash-escaped, which is right for neither shell nor YAML).
- *   - a double-quoted scalar (`"..."`) recognizes backslash escapes, the same generic "any `\X`
- *     pair does not end the string" treatment used throughout this file.
- *   - like Bash but unlike JS (where a raw string cannot span an unescaped newline), a YAML quoted
- *     scalar legitimately folds across multiple lines. This walk does not cut a quoted scalar off
- *     at a raw newline; Bash's own explicit table makes the same newline choice for its quotes.
- *     confirmed safe against this repository's own tracked YAML rather than assumed: neither
- *     tracked workflow file has a multi-line quoted scalar today, so this does not change any
- *     current verdict, but a scalar that never closes is well-defined here (blanked to end of
- *     file, the delimiter kept) rather than silently reinterpreted.
+ * A quote is a delimiter only when it is the first non-whitespace character at a value start.
+ * Otherwise the value is a plain scalar and both `'` and `"` are ordinary content, so
+ * `description: it's plain` cannot open a scalar that consumes the rest of the file. The quoted
+ * forms use `STRING_BOUNDARY_RULES.yaml`: doubled `''` escapes a single quote, backslash escapes
+ * inside a double-quoted scalar, and either form may span a raw newline.
  *
- * Disclosed, not silently scored: a YAML block scalar (`|`/`>`, e.g. `run: |` in this repository's
- * own `ci.yml`) is walked as ordinary text, not as an indentation-delimited literal block — a `#`
- * inside one is still only a comment at a word boundary, which happens to be the right answer for
- * the one block scalar this repository currently tracks (an embedded shell step with no `#` in
- * it), but is not full block-scalar indentation tracking and does not claim to be.
+ * Literal (`|`) and folded (`>`) block scalar bodies end at their indentation boundary. Their
+ * contents remain searchable as plain text because this checker does not know the embedded
+ * language, but quote and `#` characters inside the body are data and cannot change the YAML
+ * walk's state. Header comments are still stripped before the body is copied.
  *
  * @param {string} text
  * @param {boolean} blankStrings
@@ -935,6 +962,49 @@ export const stripYamlSource = (text, blankStrings) => {
   const isWordBoundaryBefore = (idx) =>
     idx === 0 || text[idx - 1] === " " || text[idx - 1] === "\t" || text[idx - 1] === "\n";
 
+  const isValueStart = (idx) => {
+    const lineStart = text.lastIndexOf("\n", idx - 1) + 1;
+    let previous = idx - 1;
+    while (previous >= lineStart && (text[previous] === " " || text[previous] === "\t")) previous--;
+    if (previous < lineStart) return false;
+    if (text[previous] === ":" || text[previous] === "[" || text[previous] === "{" || text[previous] === ",") {
+      return true;
+    }
+    return text[previous] === "-" && /^[ \t]*$/.test(text.slice(lineStart, previous));
+  };
+
+  const readBlockScalar = (start) => {
+    const lineStart = text.lastIndexOf("\n", start - 1) + 1;
+    const lineEndAt = text.indexOf("\n", start);
+    const lineEnd = lineEndAt === -1 ? n : lineEndAt;
+    const header = text.slice(start, lineEnd);
+    const indicator = /^(?:[|>])(?:([1-9])([+-])?|([+-])([1-9])?)?/.exec(header);
+    if (!indicator || !/^[ \t]*(?:#.*)?$/.test(header.slice(indicator[0].length))) return null;
+
+    const baseIndent = (/^[ \t]*/.exec(text.slice(lineStart, start))?.[0].length ?? 0);
+    const explicitIndent = indicator[1] ?? indicator[4];
+    let contentIndent = explicitIndent ? baseIndent + Number(explicitIndent) : null;
+    const bodyStart = lineEndAt === -1 ? n : lineEnd + 1;
+    let cursor = bodyStart;
+
+    while (cursor < n) {
+      const nextLineEndAt = text.indexOf("\n", cursor);
+      const nextLineEnd = nextLineEndAt === -1 ? n : nextLineEndAt;
+      const line = text.slice(cursor, nextLineEnd).replace(/\r$/, "");
+      if (!/^[ \t]*$/.test(line)) {
+        const indent = /^[ \t]*/.exec(line)?.[0].length ?? 0;
+        if (contentIndent === null) {
+          if (indent <= baseIndent) break;
+          contentIndent = indent;
+        }
+        if (indent < contentIndent) break;
+      }
+      cursor = nextLineEndAt === -1 ? n : nextLineEnd + 1;
+    }
+
+    return { header, lineEndAt, bodyStart, end: cursor };
+  };
+
   while (i < n) {
     const ch = text[i];
 
@@ -943,60 +1013,25 @@ export const stripYamlSource = (text, blankStrings) => {
       continue;
     }
 
-    if (ch === "'") {
-      const start = i;
-      let j = i + 1;
-      let closed = false;
-      while (j < n) {
-        if (text[j] === "'" && text[j + 1] === "'") {
-          j += 2;
-          continue;
-        }
-        if (text[j] === "'") {
-          j++;
-          closed = true;
-          break;
-        }
-        j++;
+    if ((ch === "|" || ch === ">") && isValueStart(i)) {
+      const block = readBlockScalar(i);
+      if (block) {
+        const comment = block.header.indexOf("#");
+        out += comment === -1 ? block.header : block.header.slice(0, comment);
+        if (block.lineEndAt !== -1) out += "\n" + text.slice(block.bodyStart, block.end);
+        i = block.end;
+        continue;
       }
-      const span = text.slice(start, j);
-      if (blankStrings) {
-        const closeLen = closed ? 1 : 0;
-        const interior = span.slice(1, span.length - closeLen);
-        out += span.slice(0, 1) + blankKeepingNewlines(interior) + (closeLen ? "'" : "");
-      } else {
-        out += span;
-      }
-      i = j;
-      continue;
     }
 
-    if (ch === '"') {
-      const start = i;
-      let j = i + 1;
-      let closed = false;
-      while (j < n) {
-        if (text[j] === "\\" && j + 1 < n) {
-          j += 2;
-          continue;
-        }
-        if (text[j] === '"') {
-          j++;
-          closed = true;
-          break;
-        }
-        j++;
+    if ((ch === "'" || ch === '"') && isValueStart(i)) {
+      const quoted = readQuotedSpan(text, i, STRING_BOUNDARY_RULES.yaml);
+      if (quoted) {
+        const span = text.slice(i, quoted.end);
+        out += renderQuotedSpan(span, quoted.rule, quoted.closed, blankStrings);
+        i = quoted.end;
+        continue;
       }
-      const span = text.slice(start, j);
-      if (blankStrings) {
-        const closeLen = closed ? 1 : 0;
-        const interior = span.slice(1, span.length - closeLen);
-        out += span.slice(0, 1) + blankKeepingNewlines(interior) + (closeLen ? '"' : "");
-      } else {
-        out += span;
-      }
-      i = j;
-      continue;
     }
 
     out += ch;
