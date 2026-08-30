@@ -56,8 +56,16 @@ export interface WorkerSettleRecord extends TraceBase {
   workerActiveMs: number;
   workerIdleMs: number;
   workerUtilization: number;
+  workerActivityObserved: boolean;
   workerEventLoopDelayMaxMs: number | null;
   error?: string;
+}
+
+export interface WorkerActiveRecord extends TraceBase {
+  type: "worker-active";
+  workerPid: number;
+  startedAtMs: number;
+  endedAtMs: number;
 }
 
 export interface MainUpdateStartRecord extends TraceBase {
@@ -85,6 +93,7 @@ export type VitestRpcClassification =
   | "a-main-onTaskUpdate"
   | "b-ipc-or-process-scheduling"
   | "c-worker-event-loop"
+  | "insufficient"
   | "no-slow-segment"
   | "incomplete";
 
@@ -97,8 +106,11 @@ export interface VitestRpcMeasurement extends TraceBase {
   roundTripMs: number | null;
   requestToMainMs: number | null;
   mainOnTaskUpdateMs: number | null;
+  outsideMainMs: number | null;
   responseToWorkerMs: number | null;
   workerActiveMs: number | null;
+  workerActivityObserved: boolean;
+  workerActiveAfterMainMs: number | null;
   workerEventLoopDelayMaxMs: number | null;
   ipcOrProcessSchedulingMs: number | null;
 }
@@ -115,6 +127,7 @@ export interface VitestRpcSummaryRecord extends TraceBase {
 export type VitestRpcTraceRecord =
   | WorkerSendRecord
   | WorkerSettleRecord
+  | WorkerActiveRecord
   | MainUpdateStartRecord
   | MainUpdateEndRecord
   | MainUpdateUnattributedRecord
@@ -254,22 +267,80 @@ const missingParts = (entry: Correlation): string[] => {
 const classifyMeasurement = (
   missing: readonly string[],
   mainOnTaskUpdateMs: number,
+  outsideMainMs: number | null,
   responseToWorkerMs: number,
-  workerActiveMs: number,
-  ipcOrProcessSchedulingMs: number,
+  workerActiveAfterMainMs: number | null,
+  workerEventLoopDelayMaxMs: number | null,
+  ipcOrProcessSchedulingMs: number | null,
 ): VitestRpcClassification => {
   if (missing.length > 0) return "incomplete";
-  if (mainOnTaskUpdateMs >= VITEST_RPC_SLOW_SEGMENT_MS) return "a-main-onTaskUpdate";
+  const candidates: VitestRpcClassification[] = [];
+  if (mainOnTaskUpdateMs >= VITEST_RPC_SLOW_SEGMENT_MS) {
+    candidates.push("a-main-onTaskUpdate");
+  }
   if (
     responseToWorkerMs >= VITEST_RPC_SLOW_SEGMENT_MS &&
-    workerActiveMs >= VITEST_RPC_SLOW_SEGMENT_MS
+    workerActiveAfterMainMs !== null &&
+    workerActiveAfterMainMs >= VITEST_RPC_SLOW_SEGMENT_MS &&
+    workerEventLoopDelayMaxMs !== null &&
+    workerEventLoopDelayMaxMs >= VITEST_RPC_SLOW_SEGMENT_MS
   ) {
-    return "c-worker-event-loop";
+    candidates.push("c-worker-event-loop");
   }
-  if (ipcOrProcessSchedulingMs >= VITEST_RPC_SLOW_SEGMENT_MS) {
-    return "b-ipc-or-process-scheduling";
+  if (
+    ipcOrProcessSchedulingMs !== null &&
+    ipcOrProcessSchedulingMs >= VITEST_RPC_SLOW_SEGMENT_MS
+  ) {
+    candidates.push("b-ipc-or-process-scheduling");
+  }
+  const outsideMainIsSlow =
+    outsideMainMs !== null && outsideMainMs >= VITEST_RPC_SLOW_SEGMENT_MS;
+  if (
+    candidates.length === 1 &&
+    !(candidates[0] === "a-main-onTaskUpdate" && outsideMainIsSlow)
+  ) {
+    return candidates[0]!;
+  }
+  if (
+    candidates.length > 1 ||
+    outsideMainIsSlow
+  ) {
+    return "insufficient";
   }
   return "no-slow-segment";
+};
+
+interface ActivitySpan {
+  start: number;
+  end: number;
+}
+
+const activeTimeWithin = (
+  records: readonly WorkerActiveRecord[],
+  startAtMs: number,
+  endAtMs: number,
+): number => {
+  const spans = records
+    .map((record): ActivitySpan => ({
+      start: Math.max(startAtMs, record.startedAtMs),
+      end: Math.min(endAtMs, record.endedAtMs),
+    }))
+    .filter((span) => span.end > span.start)
+    .sort((left, right) => left.start - right.start);
+  let activeMs = 0;
+  let current: ActivitySpan | undefined;
+  for (const span of spans) {
+    if (!current) {
+      current = { ...span };
+    } else if (span.start <= current.end) {
+      current.end = Math.max(current.end, span.end);
+    } else {
+      activeMs += current.end - current.start;
+      current = { ...span };
+    }
+  }
+  if (current) activeMs += current.end - current.start;
+  return activeMs;
 };
 
 export const summarizeVitestRpcTrace = (
@@ -277,6 +348,7 @@ export const summarizeVitestRpcTrace = (
   runId: string,
 ): { measurements: VitestRpcMeasurement[]; summary: VitestRpcSummaryRecord } => {
   const correlations = new Map<string, Correlation>();
+  const workerActivity = new Map<number, WorkerActiveRecord[]>();
   let unattributedMainUpdates = 0;
 
   const entryFor = (workerPid: number, sequence: number): Correlation => {
@@ -301,6 +373,12 @@ export const summarizeVitestRpcTrace = (
       case "worker-settle":
         entryFor(record.workerPid, record.sequence).settle = record;
         break;
+      case "worker-active": {
+        const recordsForWorker = workerActivity.get(record.workerPid) ?? [];
+        recordsForWorker.push(record);
+        workerActivity.set(record.workerPid, recordsForWorker);
+        break;
+      }
       case "main-update-unattributed":
         unattributedMainUpdates += 1;
         break;
@@ -335,19 +413,24 @@ export const summarizeVitestRpcTrace = (
         ? Math.max(0, entry.settle.atMs - entry.mainEnd.atMs)
         : null;
     const workerActiveMs = entry.settle?.workerActiveMs ?? null;
+    const workerActivityObserved = entry.settle?.workerActivityObserved === true;
     const workerEventLoopDelayMaxMs = entry.settle?.workerEventLoopDelayMaxMs ?? null;
     const outsideMainMs =
       requestToMainMs === null || responseToWorkerMs === null
         ? null
         : requestToMainMs + responseToWorkerMs;
-    const workerPickupMs =
-      responseToWorkerMs === null || workerActiveMs === null
-        ? null
-        : Math.min(responseToWorkerMs, workerActiveMs);
+    const workerActiveAfterMainMs =
+      entry.mainEnd && entry.settle && workerActivityObserved
+        ? activeTimeWithin(
+            workerActivity.get(workerPid) ?? [],
+            entry.mainEnd.atMs,
+            entry.settle.atMs,
+          )
+        : null;
     const ipcOrProcessSchedulingMs =
-      outsideMainMs === null || workerPickupMs === null
+      outsideMainMs === null || workerActiveAfterMainMs === null
         ? null
-        : Math.max(0, outsideMainMs - workerPickupMs);
+        : Math.max(0, outsideMainMs - workerActiveAfterMainMs);
 
     return {
       ...recordBase(runId),
@@ -357,18 +440,24 @@ export const summarizeVitestRpcTrace = (
       classification: classifyMeasurement(
         missing,
         mainOnTaskUpdateMs ?? 0,
+        outsideMainMs,
         responseToWorkerMs ?? 0,
-        workerActiveMs ?? 0,
-        ipcOrProcessSchedulingMs ?? 0,
+        workerActiveAfterMainMs,
+        workerEventLoopDelayMaxMs,
+        ipcOrProcessSchedulingMs,
       ),
       missing,
       roundTripMs: roundTripMs === null ? null : rounded(roundTripMs),
       requestToMainMs: requestToMainMs === null ? null : rounded(requestToMainMs),
       mainOnTaskUpdateMs:
         mainOnTaskUpdateMs === null ? null : rounded(mainOnTaskUpdateMs),
+      outsideMainMs: outsideMainMs === null ? null : rounded(outsideMainMs),
       responseToWorkerMs:
         responseToWorkerMs === null ? null : rounded(responseToWorkerMs),
       workerActiveMs: workerActiveMs === null ? null : rounded(workerActiveMs),
+      workerActivityObserved,
+      workerActiveAfterMainMs:
+        workerActiveAfterMainMs === null ? null : rounded(workerActiveAfterMainMs),
       workerEventLoopDelayMaxMs:
         workerEventLoopDelayMaxMs === null ? null : rounded(workerEventLoopDelayMaxMs),
       ipcOrProcessSchedulingMs:
@@ -380,6 +469,7 @@ export const summarizeVitestRpcTrace = (
     "a-main-onTaskUpdate",
     "b-ipc-or-process-scheduling",
     "c-worker-event-loop",
+    "insufficient",
     "no-slow-segment",
     "incomplete",
   ];
@@ -519,8 +609,10 @@ export class VitestRpcTraceReporter implements Reporter {
       ? `slowest=${slowest.classification} ` +
         `rtt=${slowest.roundTripMs}ms ` +
         `main=${slowest.mainOnTaskUpdateMs}ms ` +
+        `outside-main=${slowest.outsideMainMs}ms ` +
         `response=${slowest.responseToWorkerMs}ms ` +
-        `worker-active=${slowest.workerActiveMs}ms ` +
+        `worker-active-after-main=${slowest.workerActiveAfterMainMs}ms ` +
+        `worker-delay-max=${slowest.workerEventLoopDelayMaxMs}ms ` +
         `ipc-or-scheduling=${slowest.ipcOrProcessSchedulingMs}ms; `
       : "slowest=unmeasured; ";
     process.stderr.write(
@@ -528,6 +620,7 @@ export class VitestRpcTraceReporter implements Reporter {
         `a-main=${counts["a-main-onTaskUpdate"]} ` +
         `b-ipc-or-scheduling=${counts["b-ipc-or-process-scheduling"]} ` +
         `c-worker-loop=${counts["c-worker-event-loop"]} ` +
+        `insufficient=${counts.insufficient} ` +
         `incomplete=${counts.incomplete + summary.unattributedMainUpdates}; ` +
         slowestText +
         `${this.file}\n`,

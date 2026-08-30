@@ -1,4 +1,5 @@
 import { afterAll } from "vitest";
+import { createHook, executionAsyncId } from "node:async_hooks";
 import type {
   RunnerTaskEventPack as TaskEventPack,
   RunnerTaskResultPack as TaskResultPack,
@@ -51,7 +52,55 @@ const install = (): InstalledWorkerTrace | undefined => {
   const originalRpc = state.rpc;
   const originalOnTaskUpdate = originalRpc.onTaskUpdate;
   const pending = new Map<number, PendingUpdate>();
+  const activeStarts = new Map<number, number>();
+  const ignoredAsyncIds = new Set<number>();
+  let suppressActivity = false;
   let sequence = 0;
+
+  const record: VitestRpcTraceWriter["record"] = (traceRecord) => {
+    suppressActivity = true;
+    try {
+      writer.record(traceRecord);
+    } finally {
+      suppressActivity = false;
+    }
+  };
+
+  const activityHook = createHook({
+    init(asyncId, _type, triggerAsyncId) {
+      if (suppressActivity || ignoredAsyncIds.has(triggerAsyncId)) {
+        ignoredAsyncIds.add(asyncId);
+      }
+    },
+    before(asyncId) {
+      if (!ignoredAsyncIds.has(asyncId)) {
+        activeStarts.set(asyncId, performance.timeOrigin + performance.now());
+      }
+    },
+    after(asyncId) {
+      const startedAtMs = activeStarts.get(asyncId);
+      activeStarts.delete(asyncId);
+      if (startedAtMs === undefined || ignoredAsyncIds.has(asyncId) || pending.size === 0) {
+        return;
+      }
+      const endedAtMs = performance.timeOrigin + performance.now();
+      record({
+        version: 1,
+        runId: trace.runId,
+        pid: process.pid,
+        atMs: endedAtMs,
+        type: "worker-active",
+        workerPid: process.pid,
+        startedAtMs,
+        endedAtMs,
+      });
+    },
+    destroy(asyncId) {
+      activeStarts.delete(asyncId);
+      ignoredAsyncIds.delete(asyncId);
+    },
+  });
+  activityHook.enable();
 
   const tracedOnTaskUpdate = (
     packs: TaskResultPack[],
@@ -64,11 +113,15 @@ const install = (): InstalledWorkerTrace | undefined => {
       sentAtMs: performance.timeOrigin + performance.now(),
     };
     attachVitestRpcTraceStamp(packs, stamp);
+    const asyncId = executionAsyncId();
+    if (!ignoredAsyncIds.has(asyncId) && !activeStarts.has(asyncId)) {
+      activeStarts.set(asyncId, stamp.sentAtMs);
+    }
     pending.set(stamp.sequence, {
       stamp,
       utilization: performance.eventLoopUtilization(),
     });
-    writer.record({
+    record({
       version: 1,
       runId: trace.runId,
       pid: process.pid,
@@ -99,7 +152,7 @@ const install = (): InstalledWorkerTrace | undefined => {
     const atMs = performance.timeOrigin + performance.now();
     const utilization = performance.eventLoopUtilization(entry.utilization);
     const eventLoopDelayMaxMs = histogram.max / 1_000_000;
-    writer.record({
+    record({
       version: 1,
       runId: trace.runId,
       pid: process.pid,
@@ -112,6 +165,7 @@ const install = (): InstalledWorkerTrace | undefined => {
       workerActiveMs: utilization.active,
       workerIdleMs: utilization.idle,
       workerUtilization: utilization.utilization,
+      workerActivityObserved: true,
       workerEventLoopDelayMaxMs: Number.isFinite(eventLoopDelayMaxMs)
         ? eventLoopDelayMaxMs
         : null,
@@ -136,6 +190,7 @@ const install = (): InstalledWorkerTrace | undefined => {
   };
   workerGlobal.__acp_vitest_rpc_trace__ = installed;
   state.onCleanup(async () => {
+    activityHook.disable();
     histogram.disable();
     await writer.flush();
   });

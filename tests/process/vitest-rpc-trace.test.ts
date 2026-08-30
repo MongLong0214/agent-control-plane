@@ -7,14 +7,22 @@ import { afterAll, describe, expect, it } from "vitest";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import {
   readVitestRpcTrace,
+  summarizeVitestRpcTrace,
   VITEST_RPC_TRACE_ENV,
   type VitestRpcMeasurement,
+  type VitestRpcTraceRecord,
 } from "../helpers/vitest-rpc-trace.ts";
 
 afterAll(cleanupTempDirs);
 
 const ROOT = process.cwd();
 const VITEST = join(ROOT, "node_modules", "vitest", "vitest.mjs");
+
+const measureRecords = (records: VitestRpcTraceRecord[]): VitestRpcMeasurement => {
+  const { measurements } = summarizeVitestRpcTrace(records, "counterexample");
+  expect(measurements).toHaveLength(1);
+  return measurements[0]!;
+};
 
 interface TraceFixtureRun {
   status: number | null;
@@ -124,6 +132,201 @@ const runTraceFixture = (
 };
 
 describe("Vitest onTaskUpdate tracing", () => {
+  it("does not call pre-main worker activity a worker event-loop cause", () => {
+    const measurement = measureRecords([
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 1_000,
+        type: "worker-send",
+        workerPid: 41,
+        sequence: 1,
+        taskIds: ["task"],
+        taskEvents: [],
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 1_110,
+        type: "worker-active",
+        workerPid: 41,
+        startedAtMs: 1_000,
+        endedAtMs: 1_110,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 40,
+        atMs: 1_090,
+        type: "main-update-start",
+        workerPid: 41,
+        sequence: 1,
+        workerSentAtMs: 1_000,
+        taskCount: 1,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 40,
+        atMs: 1_189,
+        type: "main-update-end",
+        workerPid: 41,
+        sequence: 1,
+        mainOnTaskUpdateMs: 99,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 1_299,
+        type: "worker-settle",
+        workerPid: 41,
+        sequence: 1,
+        status: "resolved",
+        roundTripMs: 299,
+        workerActiveMs: 110,
+        workerIdleMs: 189,
+        workerUtilization: 110 / 299,
+        workerActivityObserved: true,
+        workerEventLoopDelayMaxMs: 1,
+      },
+    ]);
+
+    expect(measurement.requestToMainMs).toBe(90);
+    expect(measurement.mainOnTaskUpdateMs).toBe(99);
+    expect(measurement.responseToWorkerMs).toBe(110);
+    expect(measurement.workerActiveMs).toBe(110);
+    expect(measurement.workerActiveAfterMainMs).toBe(0);
+    expect(measurement.classification).not.toBe("c-worker-event-loop");
+  });
+
+  it("does not call a zero-delay histogram a worker event-loop cause", () => {
+    const measurement = measureRecords([
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 1_000,
+        type: "worker-send",
+        workerPid: 41,
+        sequence: 1,
+        taskIds: ["task"],
+        taskEvents: [],
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 40,
+        atMs: 1_090,
+        type: "main-update-start",
+        workerPid: 41,
+        sequence: 1,
+        workerSentAtMs: 1_000,
+        taskCount: 1,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 40,
+        atMs: 1_189,
+        type: "main-update-end",
+        workerPid: 41,
+        sequence: 1,
+        mainOnTaskUpdateMs: 99,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 1_299,
+        type: "worker-active",
+        workerPid: 41,
+        startedAtMs: 1_189,
+        endedAtMs: 1_299,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 1_299,
+        type: "worker-settle",
+        workerPid: 41,
+        sequence: 1,
+        status: "resolved",
+        roundTripMs: 299,
+        workerActiveMs: 110,
+        workerIdleMs: 189,
+        workerUtilization: 110 / 299,
+        workerActivityObserved: true,
+        workerEventLoopDelayMaxMs: 0,
+      },
+    ]);
+
+    expect(measurement.workerActiveAfterMainMs).toBe(110);
+    expect(measurement.workerEventLoopDelayMaxMs).toBe(0);
+    expect(measurement.classification).toBe("insufficient");
+  });
+
+  it("does not let a short main stall claim a mostly outside-main timeout", () => {
+    const measurement = measureRecords([
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 1_000,
+        type: "worker-send",
+        workerPid: 41,
+        sequence: 1,
+        taskIds: ["task"],
+        taskEvents: [],
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 40,
+        atMs: 1_000,
+        type: "main-update-start",
+        workerPid: 41,
+        sequence: 1,
+        workerSentAtMs: 1_000,
+        taskCount: 1,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 40,
+        atMs: 1_101,
+        type: "main-update-end",
+        workerPid: 41,
+        sequence: 1,
+        mainOnTaskUpdateMs: 101,
+      },
+      {
+        version: 1,
+        runId: "counterexample",
+        pid: 41,
+        atMs: 61_000,
+        type: "worker-settle",
+        workerPid: 41,
+        sequence: 1,
+        status: "resolved",
+        roundTripMs: 60_000,
+        workerActiveMs: 0,
+        workerIdleMs: 60_000,
+        workerUtilization: 0,
+        workerActivityObserved: true,
+        workerEventLoopDelayMaxMs: 0,
+      },
+    ]);
+
+    expect(measurement.mainOnTaskUpdateMs).toBe(101);
+    expect(measurement.outsideMainMs).toBe(59_899);
+    expect(measurement.classification).toBe("insufficient");
+    expect(measurement.classification).not.toBe("a-main-onTaskUpdate");
+  });
+
   it("reports an artificial main handler stall as the main onTaskUpdate segment", () => {
     const run = runTraceFixture(
       `
@@ -182,6 +385,7 @@ it("occupies the worker event loop after a real task update", () => {
     expect(workerStall?.missing).toEqual([]);
     expect(workerStall?.responseToWorkerMs).toBeGreaterThanOrEqual(180);
     expect(workerStall?.workerActiveMs).toBeGreaterThanOrEqual(180);
+    expect(workerStall?.workerActiveAfterMainMs).toBeGreaterThanOrEqual(180);
     expect(workerStall?.workerEventLoopDelayMaxMs).toBeGreaterThanOrEqual(100);
   });
 });
