@@ -128,7 +128,7 @@ const APPLICATION_OWNERS = {
   canonical_turn_adjudications: ["src/conversation/turn-coordinator.ts"],
   canonical_turn_adjudication_citations: ["src/conversation/turn-coordinator.ts"],
   actor_target_bindings: ["src/session/binding-registry.ts"],
-  actor_target_attestations: [],
+  actor_target_attestations: ["src/session/binding-registry.ts"],
 };
 
 /** Migrations are an infrastructure owner through these named rebuild functions, not `Db.run`. */
