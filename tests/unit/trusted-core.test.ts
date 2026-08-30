@@ -651,24 +651,7 @@ describe("candidate snapshot (PRD §16)", () => {
 });
 
 describe("verification sandbox (PRD §17.4)", () => {
-  it("RF-S23: sandbox environment excludes daemon authority secrets", () => {
-    const command = parseVerificationCommand({
-      id: "environment",
-      argv: ["node", "verify.js"],
-      envAllowlist: ["CI", "ACP_TRUSTED_GITHUB_TOKEN", "BUZZ_PRIVATE_KEY"],
-    });
-    const environment = buildSandboxEnvironment(command, tempDir("acp-env-"), {
-      CI: "1",
-      ACP_TRUSTED_GITHUB_TOKEN: "ghp_should_not_leak",
-      BUZZ_PRIVATE_KEY: "nsec1shouldnotleak",
-    });
-
-    expect(environment.CI).toBe("true");
-    expect(environment.ACP_TRUSTED_GITHUB_TOKEN).toBeUndefined();
-    expect(environment.BUZZ_PRIVATE_KEY).toBeUndefined();
-  });
-
-  it("CP-S27 and RF-S23: candidate verification receives no authority secrets", async () => {
+  it("CP-S27: a candidate command cannot read authority secrets from the environment", async () => {
     const repo = makeRepo();
     writeFileSync(
       join(repo, "probe.js"),

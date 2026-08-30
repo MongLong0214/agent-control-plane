@@ -897,7 +897,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
     ...over,
   });
 
-  it("CP-S52 and RF-S17: a factory result cannot claim ACP activation facts", () => {
+  it("CP-S52: a factory result that claims activation facts is rejected", () => {
     const harness = makeHarness();
     const overclaiming = factoryResult(harness, "bootstrap-project", {
       primaryCto: { sessionId: "ses_x" },
@@ -944,7 +944,7 @@ describe("Repo Factory boundary (CP-S52)", () => {
     expect(drifted.reasonCode).toBe(ReasonCode.BOOTSTRAP_CONTRACT_DRIFT);
   });
 
-  it("CP-S52 and RF-S17: only ACP activation supplies CTO Buzz and doctor facts", async () => {
+  it("CP-S52: only the ACP activation result supplies CTO, Buzz and doctor facts", async () => {
     const harness = makeHarness();
     const created = harness.cp.runs.create({
       kind: RunKind.PROJECT_BOOTSTRAP,
