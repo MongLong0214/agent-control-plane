@@ -23,6 +23,13 @@ afterAll(cleanupTempDirs);
  * consults is the same defect wearing different clothes." An EXEMPT entry naming a file that
  * does not exist in scripts/ has to fail loudly too, or the census could carry a stale entry
  * forever without anyone noticing it stopped referring to anything.
+ *
+ * #709's review found the first cut of this check too wide: it matched a script's filename
+ * as a plain substring anywhere in `package.json` or a workflow, so a YAML comment or a
+ * dead `echo scripts/x.mjs` counted as a caller exactly like a real invocation. The four
+ * cases below prove the narrowed check both ways — a mention that never executes must not
+ * satisfy it, and a genuine invocation must — plus that an EXEMPT entry with no reason fails
+ * the same way a stale one does.
  */
 const ROOT = process.cwd();
 const SCRIPT = "scripts/verify-every-script-has-a-caller.mjs";
@@ -74,6 +81,29 @@ const addExemption = (dir: string, scriptFilename: string, reason: string): void
   );
 };
 
+/** Appends a line to the copied ci.yml that mentions a script's filename without executing
+ * it: either a YAML comment, or a `run:` step whose command only echoes the name rather than
+ * invoking it. Both are the exact shape #709's review found the substring-based check
+ * treating as a caller. */
+const injectDeadMention = (dir: string, scriptFilename: string, style: "comment" | "echo"): void => {
+  const workflowPath = join(dir, ".github", "workflows", "ci.yml");
+  const source = readFileSync(workflowPath, "utf8");
+  const line =
+    style === "comment"
+      ? `      # a stray mention, never executed: scripts/${scriptFilename}`
+      : `      - run: echo scripts/${scriptFilename} is deprecated`;
+  writeFileSync(workflowPath, `${source}\n${line}\n`);
+};
+
+/** Appends a real `run:` step to the copied ci.yml that directly invokes a script — the
+ * genuine-invocation counterpart to `injectDeadMention`, proving the check still recognizes
+ * a caller that actually runs the thing. */
+const injectRealInvocation = (dir: string, scriptFilename: string): void => {
+  const workflowPath = join(dir, ".github", "workflows", "ci.yml");
+  const source = readFileSync(workflowPath, "utf8");
+  writeFileSync(workflowPath, `${source}\n      - run: node scripts/${scriptFilename}\n`);
+};
+
 // A script this fixture is free to pick on: it must currently be reached through
 // package.json alone (no workflow reference), so dropping its one caller leaves it with
 // none. `verify-tx-denial-sites.mjs` — wired in this same PR — fits: `guards:tx-denials`
@@ -119,6 +149,65 @@ describe("the every-script-has-a-caller census", () => {
 
     expect(done.stderr).toContain("census-probe-does-not-exist.mjs");
     expect(done.stderr).toContain("stale");
+    expect(done.status).toBe(1);
+  });
+
+  it("is not satisfied by a comment mentioning the script's filename", () => {
+    const dir = scratchRepo();
+    dropPackageJsonCaller(dir, TARGET_SCRIPT);
+    injectDeadMention(dir, TARGET_SCRIPT, "comment");
+
+    const done = run(dir);
+
+    // A stray comment must not be counted as a caller — the census still reports the
+    // script as orphaned, not wired via .github/workflows.
+    expect(done.stderr).toContain(`scripts/${TARGET_SCRIPT}`);
+    expect(done.stderr).toContain("no caller");
+    expect(done.status).toBe(1);
+  });
+
+  it("is not satisfied by a dead `echo` of the script's filename", () => {
+    const dir = scratchRepo();
+    dropPackageJsonCaller(dir, TARGET_SCRIPT);
+    injectDeadMention(dir, TARGET_SCRIPT, "echo");
+
+    const done = run(dir);
+
+    // `echo scripts/x.mjs` mentions the name but never runs it — same requirement as the
+    // comment case, proven separately since the two are different code paths in the fix.
+    expect(done.stderr).toContain(`scripts/${TARGET_SCRIPT}`);
+    expect(done.stderr).toContain("no caller");
+    expect(done.status).toBe(1);
+  });
+
+  it("is satisfied by a genuine direct invocation once the package.json caller is gone", () => {
+    const dir = scratchRepo();
+    dropPackageJsonCaller(dir, TARGET_SCRIPT);
+    injectRealInvocation(dir, TARGET_SCRIPT);
+
+    const done = run(dir);
+
+    // The counterpart to the two cases above: an actual `run: node scripts/x.mjs` step
+    // does count, so the negative results above are about position, not about the census
+    // being unable to see workflow-based callers at all. A confirmed caller prints nothing
+    // by name (only the unconfirmed ones are listed), so the proof is a clean pass with no
+    // "no caller" failure line anywhere in the output.
+    expect(done.stderr).not.toContain("no caller");
+    expect(done.stdout).toContain("orphaned");
+    expect(done.status).toBe(0);
+  });
+
+  it("fails on an EXEMPT entry with an empty reason", () => {
+    const dir = scratchRepo();
+    dropPackageJsonCaller(dir, TARGET_SCRIPT);
+    addExemption(dir, TARGET_SCRIPT, "");
+
+    const done = run(dir);
+
+    // An exemption that records no reason is the same trap as a stale one: it looks like
+    // coverage and lets nobody check it later.
+    expect(done.stderr).toContain(`${TARGET_SCRIPT}`);
+    expect(done.stderr.toLowerCase()).toContain("empty");
     expect(done.status).toBe(1);
   });
 });
