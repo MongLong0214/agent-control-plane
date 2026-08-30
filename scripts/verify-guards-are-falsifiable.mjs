@@ -1385,6 +1385,19 @@ const GUARDS = [
     ],
   },
   {
+    // A crash after suspendProject's checkpoint leaves the binding ACTIVE while startup
+    // resolves its dead stop fence to ERROR. The terminal-binding sweep must inspect that
+    // durable join before the doctor runs, including when a prior process already wrote the
+    // terminal lifecycle and died before it could revoke.
+    what: "startup revokes an active binding whose live session is unavailable",
+    file: "src/daemon/daemon.ts",
+    find: "      if (!unavailable) continue;",
+    replace: "      if (true) continue;",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 daemon restart revokes a binding stranded by a killed suspend",
+    ],
+  },
+  {
     // #692 round 5 — continuity can finish its plan before suspend, then await provider
     // admission and session readiness. The switch itself must re-read suspend.
     what: "switchTo refuses a primary CTO switch whose project suspended during failover",

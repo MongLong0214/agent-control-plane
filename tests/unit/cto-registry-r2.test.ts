@@ -1,5 +1,7 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { spawnSync } from "node:child_process";
+import { fork, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
 import { ControlPlane } from "../../src/app/control-plane.ts";
@@ -37,6 +39,57 @@ const tool = (server: object, name: string) => (
     >;
   }
 )._registeredTools[name]!.handler;
+
+const killSuspendAfterCommit = async (root: string, projectId: string): Promise<void> => {
+  const helper = fileURLToPath(new URL("../helpers/run-suspend-crash.ts", import.meta.url));
+  const child = fork(helper, [root, projectId], {
+    cwd: process.cwd(),
+    execArgv: ["--import", "tsx"],
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString("utf8");
+  });
+
+  try {
+    const committed = await new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`suspend child did not reach its committed stop boundary: ${stderr}`));
+      }, 10_000);
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        child.off("message", onMessage);
+        child.off("error", onError);
+        child.off("exit", onExit);
+      };
+      const onMessage = (message: unknown): void => {
+        cleanup();
+        resolve(message);
+      };
+      const onError = (error: Error): void => {
+        cleanup();
+        reject(error);
+      };
+      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+        cleanup();
+        reject(new Error(`suspend child exited before its commit marker: code=${code} signal=${signal} ${stderr}`));
+      };
+      child.once("message", onMessage);
+      child.once("error", onError);
+      child.once("exit", onExit);
+    });
+    expect(committed).toEqual({ type: "SUSPEND_COMMITTED" });
+    expect(child.kill("SIGKILL")).toBe(true);
+    await once(child, "exit");
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+  }
+};
 
 afterAll(cleanupTempDirs);
 
@@ -648,6 +701,47 @@ describe("round-2 CTO lifecycle regressions", () => {
       expect(dispatched.allowed).toBe(true);
     },
   );
+
+  it("#692 daemon restart revokes a binding stranded by a killed suspend", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    const run = await createActiveRun(harness, projectId, repositoryId);
+    bindCeo(harness);
+    const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+    const config = harness.cp.config;
+    harness.cp.close();
+
+    await killSuspendAfterCommit(harness.root, projectId);
+
+    const restarted = new ControlPlane(config);
+    restarted.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const daemon = restarted.createDaemon({ stateDir: join(harness.root, "crash-restart") });
+    try {
+      const started = await daemon.start();
+
+      if (!started.allowed) {
+        throw new Error(`cold start refused after killed suspend: ${JSON.stringify(started)}`);
+      }
+      expect(started.value.unavailableBindingsRevoked).toEqual([
+        {
+          roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+          sessionId: binding.sessionId,
+          lifecycle: SessionLifecycle.ERROR,
+        },
+      ]);
+      expect(started.value.unavailableBindingRevocationsDeferred).toEqual([]);
+      expect(restarted.projects.require(projectId).suspended).toBe(true);
+      expect(restarted.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.ERROR);
+      expect(restarted.runs.require(run.runId).state).toBe(RunState.BLOCKED);
+      expect(restarted.bindings.activePrimaryCto(projectId)).toBeNull();
+      const projectDoctor = await restarted.doctor.run("project", projectId);
+      expect(projectDoctor.status).toBe("HEALTHY");
+      expect(deadSessionFinding(projectDoctor)).toBeUndefined();
+    } finally {
+      if (daemon.lock.held()) await daemon.stop();
+      restarted.close();
+    }
+  });
 
   it(
     "#692 round 2 — resumeProject does not reverse a replacement's DRAINING, and its " +

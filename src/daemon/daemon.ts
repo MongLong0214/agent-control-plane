@@ -150,6 +150,17 @@ export interface BlockingFinding {
 
 export interface ReconcileReport {
   activeBindings: number;
+  unavailableBindingsRevoked: Array<{
+    roleKey: string;
+    sessionId: string;
+    lifecycle: string;
+  }>;
+  unavailableBindingRevocationsDeferred: Array<{
+    roleKey: string;
+    sessionId: string;
+    lifecycle: string;
+    reasonCode: string;
+  }>;
   resumedRuns: string[];
   expiredClaims: number;
   expiredMessages: number;
@@ -250,6 +261,14 @@ const mergeReconciled = (earlier: ReconcileReport, later: ReconcileReport): Reco
   ...later,
   expiredClaims: earlier.expiredClaims + later.expiredClaims,
   expiredMessages: earlier.expiredMessages + later.expiredMessages,
+  unavailableBindingsRevoked: [
+    ...earlier.unavailableBindingsRevoked,
+    ...later.unavailableBindingsRevoked,
+  ],
+  unavailableBindingRevocationsDeferred: [
+    ...earlier.unavailableBindingRevocationsDeferred,
+    ...later.unavailableBindingRevocationsDeferred,
+  ],
   orphanedExecutions: [...earlier.orphanedExecutions, ...later.orphanedExecutions],
   sessionsMarkedError: [...earlier.sessionsMarkedError, ...later.sessionsMarkedError],
   reclaimedFinalizationAttempts: [
@@ -1032,6 +1051,68 @@ export class Daemon {
       }
     }
 
+    // Terminalizing a session is only half of restart reconciliation. An ACTIVE binding
+    // still routes through its conversational actor's live session, so leaving that pointer
+    // on STOPPED, ERROR, or a missing row manufactures the exact CRITICAL join the doctor is
+    // meant to reject. Sweep the state, not the producer: this catches a suspend killed after
+    // its checkpoint, a provider-stop failure, an earlier STOPPED/revoke gap, and a crash
+    // between this method's own lifecycle transition above and this cleanup. The ordinary
+    // revocation guard remains in force. A suspended run was checkpointed to BLOCKED before
+    // its stop fence committed, so allowBlockedRuns removes that dead authority without
+    // orphaning runnable work; any other live owner is left visible for takeover rather than
+    // silently detached from its generation.
+    const unavailableBindingsRevoked: ReconcileReport["unavailableBindingsRevoked"] = [];
+    const unavailableBindingRevocationsDeferred:
+      ReconcileReport["unavailableBindingRevocationsDeferred"] = [];
+    const activeBindings = this.cp.db.all<{
+      role_key: string;
+      session_id: string;
+      lifecycle: string | null;
+    }>(
+      `SELECT a.role_key,
+              COALESCE(c.current_session_id, a.session_id) AS session_id,
+              s.lifecycle
+         FROM assignments a
+         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
+         LEFT JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
+        WHERE a.status = 'ACTIVE'
+        ORDER BY a.role_key`,
+    );
+    for (const binding of activeBindings) {
+      const lifecycle = binding.lifecycle ?? "missing";
+      const unavailable =
+        binding.lifecycle === null ||
+        binding.lifecycle === SessionLifecycle.STOPPED ||
+        binding.lifecycle === SessionLifecycle.ERROR;
+      if (!unavailable) continue;
+
+      const revoked = this.cp.bindings.revoke(
+        binding.role_key,
+        `startup reconciled unavailable session ${binding.session_id} (${lifecycle})`,
+        { allowBlockedRuns: true },
+      );
+      const evidence = {
+        roleKey: binding.role_key,
+        sessionId: binding.session_id,
+        lifecycle,
+      };
+      if (revoked.allowed) {
+        unavailableBindingsRevoked.push(evidence);
+      } else {
+        unavailableBindingRevocationsDeferred.push({
+          ...evidence,
+          reasonCode: revoked.reasonCode,
+        });
+        this.cp.audit.record({
+          kind: "DAEMON_RECONCILE_BINDING_REVOKE_DEFERRED",
+          reasonCode: revoked.reasonCode,
+          roleKey: binding.role_key,
+          sessionId: binding.session_id,
+          evidence: { lifecycle, deniedEvidence: revoked.evidence },
+        });
+      }
+    }
+
     // A receipt that says RUNNING across a restart has no live worker behind it.
     const orphanedExecutions: string[] = [];
     for (const row of this.cp.db.all<{ execution_id: string; worker_process_id: number | null }>(
@@ -1046,14 +1127,16 @@ export class Daemon {
       }
     }
 
-    const activeBindings = this.cp.db.get<{ n: number }>(
+    const remainingActiveBindings = this.cp.db.get<{ n: number }>(
       `SELECT COUNT(*) AS n FROM assignments WHERE status = 'ACTIVE'`,
     );
 
     const report = await this.cp.doctor.run("system");
 
     return {
-      activeBindings: activeBindings?.n ?? 0,
+      activeBindings: remainingActiveBindings?.n ?? 0,
+      unavailableBindingsRevoked,
+      unavailableBindingRevocationsDeferred,
       resumedRuns: [],
       expiredClaims,
       expiredMessages,
