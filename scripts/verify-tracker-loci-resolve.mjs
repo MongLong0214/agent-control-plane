@@ -581,6 +581,62 @@
  *   the corpus, is what proves this fix and the one before it, the same distinction this round
  *   exists to make concrete rather than merely assert.
  *
+ * ## Round 13: the mirror of round 11's own fix, in the other direction
+ *
+ *   The content-search needle was still built from `citation.content` verbatim — the citation's
+ *   *raw* quoted text — while round 11 moved the haystack to `readCode`, which also strips
+ *   string-literal content (blanked to same-length spaces, quotes kept). An exact, currently-
+ *   correct citation that happens to quote a line containing a string literal read STALE: `` `if
+ *   (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });` `` — the real,
+ *   unchanged line at `session-registry.ts:148` — failed a literal match against the stripped
+ *   haystack on the one span (`"unknown session"`) that was never supposed to compare literally in
+ *   the first place, because that span was blanked on one side of the comparison and not the
+ *   other. The identical line with the string literal replaced by a bare identifier (no quote at
+ *   all) already worked; only the presence of a string in the *quoted citation* broke it, which is
+ *   exactly why the round-11 fix and this one are the same shape pointed in opposite directions.
+ *
+ *   Three options, considered in order of how much they change: strip the needle the same way as
+ *   the haystack (symmetric, simplest); search raw text for the needle but require the match to
+ *   fall outside a stripped span (keeps the needle raw, but needs the strippers to report span
+ *   positions, not just blanked text — a bigger interface change for every stripper); or keep two
+ *   haystacks and pick the "appropriate" one per citation (does not actually resolve anything: a
+ *   needle that legitimately mixes real code and a string literal has no single "appropriate"
+ *   haystack to check whole against). Took the first: `stripToCodeView` — the same per-extension
+ *   dispatch `readCode` already used, pulled out so it can run on a string that is not a file's
+ *   contents — strips the needle through the identical path before `snippetPattern` builds a regex
+ *   from it, so both sides of the comparison agree about what counts as content rather than one
+ *   side searching in raw space and the other in stripped space.
+ *
+ *   Checked before adopting it, not assumed safe: does stripping the needle reopen round 11's
+ *   comment case? No — a needle that is *itself* ordinary code (no `//`/`/* *\/`/quote syntax in
+ *   the quoted text, `server.close()` among them) strips to itself unchanged, so a citation whose
+ *   old code now survives only inside the file's comment still fails to match the comment-stripped
+ *   haystack exactly as round 11 intended; verified directly, not inferred. The one case that does
+ *   change: a needle that quotes a comment *including its own marker* (`` `// old code:
+ *   doSomething()` ``) strips to nothing. `snippetPattern("")` was already `null` elsewhere in this
+ *   script for an empty snippet; falling through to ADVISORY — the same treatment a citation with
+ *   no quoted content at all already gets — is the defined answer Sol's report asked for, not a
+ *   crash and not a silently wrong verdict: an unverifiable quote is not asserted as a fact this
+ *   check cannot check.
+ *
+ *   On the property question: round 11's own invariant (`strip(text)` preserves `text`'s line
+ *   count) is a property of *one stripper in isolation* and says nothing about whether *two
+ *   applications of stripping, to two different strings, agree with each other* — which is
+ *   exactly the class this bug is in. The property that covers this class is different and higher
+ *   up: **citing a real, current line verbatim must never read STALE.** `tests/unit/verify-
+ *   tracker-loci-resolve.test.ts` now asserts it across three of the four stripped language
+ *   families (TypeScript, SQL, shell) against real tracked files, not fenced/inline shapes typed by
+ *   hand — the fourth, Python, is deliberately excluded: verifying this property against the one
+ *   `.py` file this repository tracks (`deploy/egress/allowlist-proxy.py`) surfaced a *separate*,
+ *   real defect — its triple-quoted module docstring desynchronizes `stripStrings`' single-
+ *   character quote pairing for everything after it (confirmed directly: `ALLOWLIST_DIGEST`'s own
+ *   declaration at line 77 is blanked away in the stripped view, and the existing round-4 positive-
+ *   control test for that exact symbol only passes because a second, coincidental occurrence at
+ *   line 84 survives the corruption). That is a string-*boundary* defect (triple quotes are not a
+ *   single character), not a needle/haystack asymmetry, and reported rather than folded into this
+ *   fix — see the round 13 commit message for the fuller account of what was found and why it is
+ *   left for its own round.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -683,22 +739,22 @@ const codeSearchScope = (relPath) => {
   return `as plain text (no comment or string exclusion applies to .${ext} files)`;
 };
 
+/**
+ * The per-extension comment/string-stripping dispatch itself, pulled out of `readCode` so the
+ * same transform can run on a string that is not a file's contents — see round 13's fix to the
+ * content-search needle, below, for why that is needed at all.
+ */
+const stripToCodeView = (text, ext) => {
+  if (JS_FAMILY_EXTS.has(ext)) return stripStrings(stripTemplateLiteralProse(stripSlashComments(text)));
+  if (HASH_COMMENT_EXTS.has(ext)) return stripStrings(stripHashComments(text));
+  if (SQL_EXTS.has(ext)) return stripStrings(stripSqlComments(text));
+  return text; // no supported comment syntax for this extension — see codeSearchScope
+};
+
 const codeTextCache = new Map();
 const readCode = (relPath) => {
   if (!codeTextCache.has(relPath)) {
-    const raw = readText(relPath);
-    const ext = extensionOf(relPath);
-    let code;
-    if (JS_FAMILY_EXTS.has(ext)) {
-      code = stripStrings(stripTemplateLiteralProse(stripSlashComments(raw)));
-    } else if (HASH_COMMENT_EXTS.has(ext)) {
-      code = stripStrings(stripHashComments(raw));
-    } else if (SQL_EXTS.has(ext)) {
-      code = stripStrings(stripSqlComments(raw));
-    } else {
-      code = raw; // no supported comment syntax for this extension — see codeSearchScope
-    }
-    codeTextCache.set(relPath, code);
+    codeTextCache.set(relPath, stripToCodeView(readText(relPath), extensionOf(relPath)));
   }
   return codeTextCache.get(relPath);
 };
@@ -1437,7 +1493,27 @@ for (const issue of issues) {
     }
 
     if (citation.content) {
-      const pattern = snippetPattern(citation.content);
+      // Round 13: the needle used to be built from `citation.content` verbatim — the citation's
+      // *raw* quoted text — while round 11 moved the haystack to `readCode`, which also strips
+      // string-literal content (blanked to same-length spaces, quotes kept — see `stripStrings`).
+      // An exact, currently-correct citation that happens to quote a line containing a string
+      // literal (`` `session-registry.ts:148` — `if (!row) return deny(ReasonCode.NOT_FOUND,
+      // "unknown session", { sessionId });` ``, the real, current line) read STALE: the raw needle
+      // still had `"unknown session"` intact, and the stripped haystack had that same span blanked
+      // to spaces, so a literal match against real, unchanged code failed on the one part of it
+      // that was never supposed to compare literally in the first place. Fixed by stripping the
+      // needle through the same per-extension view (`stripToCodeView`) the haystack already gets,
+      // so both sides agree about what counts as "content" rather than one side searching in raw
+      // space and the other in stripped space. This does not reopen round 11's comment case: a
+      // needle that is *itself* ordinary code (no `//`/`/* */`/quote syntax in the quoted text)
+      // strips to itself unchanged, so a citation whose old code now survives only inside the
+      // file's comment still fails to match the (comment-stripped) haystack exactly as before. A
+      // needle that quotes a comment *including its own marker* strips to nothing and yields no
+      // pattern (`snippetPattern("")` is already `null`) — an unverifiable quote is treated the
+      // same as no quoted content at all, falling through to ADVISORY rather than asserting a
+      // fact this check cannot check.
+      const needle = stripToCodeView(citation.content, extensionOf(resolved.path));
+      const pattern = snippetPattern(needle);
       // Searched near the cited line, not across the whole file. A file this size legitimately
       // repeats a shape — `binding-registry.ts` has a second, deliberate unconditional
       // `this.mintActor(...)` in an unrelated method 225 lines from the one #649 cited — and

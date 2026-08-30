@@ -1434,6 +1434,128 @@ describe("verify-tracker-loci-resolve", () => {
     }
   });
 
+  // --- Round 13: an independent review found the mirror of round 11's own fix — the content-
+  // search needle was built from the citation's *raw* quoted text while round 11 moved the
+  // haystack to `readCode`, which also strips string-literal content. An exact, currently-correct
+  // citation that happens to quote a line containing a string literal read STALE.
+
+  it("[round 13] an exact, current citation whose quoted code contains a string literal is ADVISORY, not STALE", () => {
+    // The real, current line at `session-registry.ts:148`, quoted verbatim including its string
+    // literal argument. Before this fix: the raw needle still had `"unknown session"` intact, the
+    // `readCode`-stripped haystack had that same span blanked to spaces, and a literal match
+    // against real, unchanged code failed on the one part of it that was never supposed to compare
+    // literally in the first place.
+    const body =
+      "The check is at `src/session/session-registry.ts:148` — " +
+      '`if (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });` for the guard.';
+    const { path, cleanup } = withIssues([{ number: 93001, title: "string literal in needle counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 13] the same real line's shape without a string literal was already ADVISORY — the paired control", () => {
+    // The line immediately after the one above, real and current, with no string literal in it.
+    // This already worked before the fix; pinned here so the two tests read as the pair Sol's
+    // report described rather than one fix looking isolated.
+    const body = "The check is at `src/session/session-registry.ts:150` — `const expected = hashSessionSecret(sessionSecret);` for the guard.";
+    const { path, cleanup } = withIssues([{ number: 93002, title: "no string literal in needle control", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 13] a needle that is entirely a comment strips to nothing and is treated as unverifiable, not a crash", () => {
+    // Stripping the needle the same way the haystack is stripped means a quote that names its own
+    // comment marker (`// old code: doSomething()`, backtick-quoted including the `//`) reduces to
+    // nothing. `snippetPattern("")` is already `null` elsewhere in this script; falling through to
+    // ADVISORY (the same treatment a citation with no quoted content at all gets) is the defined
+    // answer, not an unverifiable claim asserted as fact.
+    const body = "See `src/session/session-registry.ts:1` — `// old code: doSomething()` for context.";
+    const { path, cleanup } = withIssues([{ number: 93003, title: "comment-only needle counterexample", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).not.toContain("STALE (");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("[round 13] the round 11 comment-survival fix is unaffected: stripping the needle does not reopen it", () => {
+    // The needle here (`server.close()`) has no comment/string syntax in the quoted text itself,
+    // so stripping it changes nothing — it still fails to match the (comment-stripped) haystack
+    // exactly as round 11 intended. This is the regression guard that would have failed if the
+    // fix here had been "stop stripping the haystack" instead of "also strip the needle".
+    const body = "The fix is at `src/daemon/agentcpd.ts:1420` — `server.close()` for the shutdown guard.";
+    const { path, cleanup } = withIssues([{ number: 93004, title: "comment-survival regression guard", body }]);
+    try {
+      const result = run(path);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("STALE");
+      expect(result.stdout).toContain("server.close()");
+      expect(result.stdout).toContain("no longer appears");
+    } finally {
+      cleanup();
+    }
+  });
+
+  // The property this round's fix actually needs, generalized past the one shape Sol reported:
+  // citing a real, current line verbatim — across every language this check strips comments and
+  // strings for, not just TypeScript — must never read STALE just because the line happens to
+  // contain a string literal. `.py` is deliberately excluded here: verifying this property against
+  // `deploy/egress/allowlist-proxy.py` surfaced a separate, real defect (a triple-quoted docstring
+  // desynchronizes `stripStrings`' quote pairing for the rest of the file) that is not this round's
+  // needle/haystack asymmetry and is reported rather than folded in here — see the round 13 commit.
+  const REAL_STRING_LITERAL_CITATIONS: Array<{ label: string; path: string; line: number; content: string }> = [
+    {
+      label: "TypeScript, a double-quoted string argument",
+      path: "src/session/session-registry.ts",
+      line: 148,
+      content: 'if (!row) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId });',
+    },
+    {
+      label: "SQL, a single-quoted string argument",
+      path: "src/db/schema.sql",
+      line: 32,
+      content: "SELECT RAISE(ABORT, 'MANIFEST_IMMUTABLE');",
+    },
+    {
+      label: "shell, a double-quoted assignment",
+      path: "deploy/install-launchd.sh",
+      line: 5,
+      content: 'readonly LABEL="com.agentcontrolplane.agentcpd"',
+    },
+  ];
+
+  describe("[round 13] property: a real, current line containing a string literal is never STALE", () => {
+    for (const { label, path: filePath, line, content } of REAL_STRING_LITERAL_CITATIONS) {
+      it(label, () => {
+        const body = `See \`${filePath}:${line}\` — \`${content}\` for the detail.`;
+        const { path, cleanup } = withIssues([{ number: 93010 + line, title: `string-literal property: ${label}`, body }]);
+        try {
+          const result = run(path);
+          expect(result.status).toBe(0);
+          expect(result.stdout).toContain("ADVISORY");
+          expect(result.stdout).not.toContain("STALE (");
+        } finally {
+          cleanup();
+        }
+      });
+    }
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);
