@@ -18,6 +18,16 @@
  * next to it: derive the governed table set from the schema, derive the writer set from the
  * source, and require every writer to be one this file already names — printing the census either
  * way, not just on failure.
+ *
+ * v2 (post-review): the first version's SQL detector matched exactly one spelling of each
+ * statement — uppercase `INSERT INTO`/`UPDATE`/`DELETE FROM` followed by a bare identifier. A
+ * blind adversarial review fed it `INSERT OR ABORT INTO`, `INSERT OR IGNORE INTO`, a
+ * double-quoted table name, a schema-qualified one, and lowercase SQL, and every one of them read
+ * as MISSED — a writer only had to spell its statement slightly differently to become invisible,
+ * which is the exact defect this file exists to catch, one level up. It also missed `REPLACE
+ * INTO` outright, though `assertDataMutation` in `src/db/database.ts` names `REPLACE` beside
+ * `INSERT` as an ordinary mutation this schema's own connection issues. See `WRITE` below for the
+ * replacement, and `unresolvable` below for the one form no static regex can ever close.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -39,19 +49,92 @@ const walk = (dir) => {
 };
 
 /**
+ * Strip `//` and block comments from TypeScript source while leaving string and template-literal
+ * bodies untouched — the SQL this census has to see lives inside those strings, not the comments.
+ *
+ * Necessary because this file's own commit history is full of doc comments that quote *old*,
+ * defective SQL as an example ("a plain `UPDATE canonical_turns SET outcome_kind='ABORTED'`…" in
+ * `src/db/migrations.ts`). A regex over raw source text cannot tell a quoted illustration of a bug
+ * from the bug; only a comment reads it, and only a comment should be discounted. This does not
+ * parse JavaScript — it tracks quote/comment state character by character, which is enough to
+ * keep `//` and a block comment inside a string from being mistaken for a comment, and enough to keep a
+ * comment's own quotes from being mistaken for a real string.
+ */
+const stripComments = (source) => {
+  let out = "";
+  let i = 0;
+  const n = source.length;
+  while (i < n) {
+    const c = source[i];
+    const next = source[i + 1];
+    if (c === "/" && next === "/") {
+      while (i < n && source[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      i += 2;
+      while (i < n && !(source[i] === "*" && source[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      const quote = c;
+      out += c;
+      i++;
+      while (i < n) {
+        if (source[i] === "\\") {
+          out += source[i] + (source[i + 1] ?? "");
+          i += 2;
+          continue;
+        }
+        out += source[i];
+        if (source[i] === quote) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+};
+
+/** A SQL identifier: bare, double-quoted, backtick-quoted, or bracket-quoted. Case is not folded here. */
+const IDENT = String.raw`(?:[A-Za-z_]\w*|"(?:[^"]|"")*"|\`[^\`]*\`|\[[^\]]*\])`;
+
+/** Strip whatever quoting an identifier carries, so it compares equal to the schema's bare name. */
+const unquoteIdent = (raw) => {
+  if (raw.startsWith('"') && raw.endsWith('"')) return raw.slice(1, -1).replace(/""/g, '"');
+  if (raw.startsWith("`") && raw.endsWith("`")) return raw.slice(1, -1);
+  if (raw.startsWith("[") && raw.endsWith("]")) return raw.slice(1, -1);
+  return raw;
+};
+
+/**
  * The governed tables, derived from the schema rather than typed out here a second time.
  *
  * `canonical_turn*` and `actor_target_*` is the whole ledger: the turn and its five satellites,
  * plus the binding and the attestation the ledger's authority triggers reference. Deriving this
  * from `CREATE TABLE` statements means a ninth table in either family enters the census the day
- * it is declared, with no second edit here to remember.
+ * it is declared, with no second edit here to remember — case, quoting, and whitespace around the
+ * declaration do not exempt it, because the review that found the writer-side regex too narrow
+ * asked this side the same question and a hand check of the real schema.sql found none of these
+ * forms currently in use, which is exactly the situation a check that only recognises them by luck
+ * is supposed to outlive.
  */
 const schema = readFileSync(join(ROOT, "src/db/schema.sql"), "utf8");
+const CREATE_TABLE = new RegExp(
+  String.raw`CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(${IDENT})\s*\(`,
+  "gi",
+);
 const governedTables = [
   ...new Set(
-    [...schema.matchAll(/^CREATE TABLE IF NOT EXISTS (canonical_turn\w*|actor_target_\w+) \(/gm)].map(
-      (m) => m[1],
-    ),
+    [...schema.matchAll(CREATE_TABLE)]
+      .map((m) => unquoteIdent(m[1]))
+      .filter((name) => /^(?:canonical_turn\w*|actor_target_\w+)$/i.test(name)),
   ),
 ].sort();
 
@@ -59,6 +142,8 @@ if (governedTables.length === 0) {
   process.stdout.write("RESULT: FAIL — found zero canonical_turn*/actor_target_* tables in the schema.\n");
   process.exit(1);
 }
+/** Case-insensitive lookup back to the schema's own casing, since SQLite folds identifier case. */
+const governedByLower = new Map(governedTables.map((t) => [t.toLowerCase(), t]));
 
 /**
  * The reviewed writer for each table, or `[]` when this repository has never written it at all.
@@ -93,26 +178,78 @@ if (unowned.length > 0) {
 }
 
 /**
- * `src/db/migrations.ts` is schema history, not application code: it carries every past version of
- * this DDL as text (so a line like "a plain `UPDATE canonical_turns SET ...`" describing an old
- * defect, in a comment, would read as a write to this regex) and its one genuine data-moving
- * statement is the ALTER-emulation copy into a `<table>_rebuilt` shadow table when SQLite cannot
- * alter a column in place — a different table name, covered by `migrations:check`, not by this
- * one. Scored separately already: `pnpm schema:registry` and `pnpm schema:denials` cover that
- * file's own correctness. Excluding it here is a scope line, not a blind spot.
+ * `src/db/migrations.ts` used to be excluded here on the claim that `pnpm schema:registry` and
+ * `pnpm schema:denials` already score its one genuine data-moving statement. That claim was never
+ * checked: `schema:registry` (`verify-every-trigger-is-required.mjs`) confirms every declared
+ * trigger is named by a required-trigger registry, and `schema:denials`
+ * (`verify-trigger-denials-are-typed.mjs`) confirms every trigger sentinel maps to a typed
+ * `ReasonCode`. Both are about the schema's *triggers* — neither reads a single line of
+ * `migrations.ts` and neither would notice a migration that inserted a row into a governed table
+ * directly. An exclusion defended by a citation nobody had opened is the same exemption-nothing-
+ * consults shape this file was written to catch, one file up.
+ *
+ * So `migrations.ts` is walked like every other file now. Its comments are not: this is the file
+ * that documents this ledger's past defects by quoting the broken SQL verbatim ("a plain `UPDATE
+ * canonical_turns SET outcome_kind='ABORTED'`…"), and without `stripComments` that quotation reads
+ * as a live write. Its one real data-moving statement — the ALTER-emulation copy into a
+ * `<table>_rebuilt` shadow table SQLite needs to change a column it cannot alter in place — targets
+ * a *different* table name (`canonical_turns_rebuilt`, not `canonical_turns`), so it does not need
+ * an OWNERS entry: a hand check of the current file found no INSERT/UPDATE/DELETE/REPLACE against
+ * an exact governed table name outside a comment. If that ever changes, this census now says so.
  */
-const files = walk(SRC)
-  .map((f) => relative(ROOT, f))
-  .filter((f) => f !== "src/db/migrations.ts");
+const files = walk(SRC).map((f) => relative(ROOT, f));
 
-const WRITE = /\b(?:INSERT INTO|UPDATE|DELETE FROM)\s+(\w+)/g;
+/** `INSERT`/`UPDATE` accept an explicit conflict-resolution clause; `DELETE` does not. */
+const CONFLICT = String.raw`(?:OR\s+(?:ABORT|FAIL|IGNORE|REPLACE|ROLLBACK)\s+)?`;
+/** An optional schema qualifier (`main.foo`, `temp."Foo"`, …) followed by the table name itself. */
+const TABLE_REF = String.raw`(?:${IDENT}\s*\.\s*)?(${IDENT})`;
+/**
+ * Every write-statement opener this schema's own connection accepts (`assertDataMutation` in
+ * `src/db/database.ts` names `INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `WITH` as data statements),
+ * case-folded, with the table reference made optional so a write whose target this regex cannot
+ * resolve — a template-interpolated or concatenated table name — still matches the verb and is
+ * reported as unresolved rather than silently not matching at all.
+ */
+// Each branch owns its own optional table reference rather than sharing one trailing `(?:\s+TABLE_REF)?`
+// after the alternation: `CONFLICT` already swallows the whitespace before `INTO`/the table name when
+// it matches, and the branches differ in whether a keyword (`INTO`/`FROM`) sits between the conflict
+// clause and the table — collapsing them into one shared tail required a second `\s+` that plain
+// `UPDATE table SET …` (no conflict clause) does not have, which silently turned the fix into a
+// regression: every ordinary UPDATE in this repository read as an unresolved dynamic table name.
+const WRITE = new RegExp(
+  String.raw`\b(?:` +
+    String.raw`INSERT\s+${CONFLICT}INTO(?:\s+${TABLE_REF})?` +
+    String.raw`|UPDATE\s+${CONFLICT}(?:${TABLE_REF})?` +
+    String.raw`|REPLACE\s+INTO(?:\s+${TABLE_REF})?` +
+    String.raw`|DELETE\s+FROM(?:\s+${TABLE_REF})?` +
+    String.raw`)`,
+  "gi",
+);
 
 const writesByTable = new Map(governedTables.map((t) => [t, []]));
+/**
+ * A write verb this scan cannot resolve to a static table name at all — a dynamically built
+ * identifier. No regex can name what was never written down; the honest response is to say so out
+ * loud, the same way `verify-append-only-tables-are-closed.mjs` fails rather than passes silently
+ * when it meets a trigger form it cannot read. Silence here would read as "checked, found nothing",
+ * indistinguishable from a real zero.
+ */
+const unresolvable = [];
 for (const file of files) {
-  const content = readFileSync(join(ROOT, file), "utf8");
+  const raw = readFileSync(join(ROOT, file), "utf8");
+  const content = stripComments(raw);
   for (const match of content.matchAll(WRITE)) {
-    const table = match[1];
-    if (writesByTable.has(table)) writesByTable.get(table).push(file);
+    // `TABLE_REF` is spliced into the pattern once per branch above, so each occurrence claims its
+    // own group number (1-4) rather than sharing one — only the branch that actually matched has a
+    // defined group, so the table name is whichever of the four is not `undefined`.
+    const capturedTable = match[1] ?? match[2] ?? match[3] ?? match[4];
+    if (capturedTable === undefined) {
+      const after = content.slice(match.index + match[0].length, match.index + match[0].length + 40).replace(/\s+/g, " ").trim();
+      unresolvable.push({ file, verb: match[0].trim(), after });
+      continue;
+    }
+    const table = governedByLower.get(unquoteIdent(capturedTable).toLowerCase());
+    if (table !== undefined) writesByTable.get(table).push(file);
   }
 }
 
@@ -137,6 +274,25 @@ const report = governedTables
     return `  ${table}: ${seenFiles.length} writer file(s)${seenFiles.length > 0 ? ` (${seenFiles.join(", ")})` : ""}`;
   })
   .join("\n");
+
+if (unresolvable.length > 0) {
+  process.stdout.write(
+    `${report}\n\n` +
+      unresolvable
+        .map(
+          ({ file, verb, after }) =>
+            `  ${file}: \`${verb}\` is followed by \`${after}…\`, not a static table name this ` +
+            "census can read. It may or may not target a governed table — a dynamically built " +
+            "identifier cannot be resolved by any static scan.\n",
+        )
+        .join("") +
+      "\nName the table statically, or move the construction somewhere this census's authors have " +
+      "reviewed by hand and can vouch for out of band.\n" +
+      `RESULT: FAIL — ${unresolvable.length} write(s) with a table name this census could not resolve. ` +
+      "Unresolved is not the same as clean.\n",
+  );
+  process.exit(1);
+}
 
 if (staleOwners.length > 0) {
   process.stdout.write(
@@ -178,5 +334,5 @@ const totalWriters = governedTables.reduce((n, t) => n + new Set(writesByTable.g
 process.stdout.write(
   `${report}\n\n` +
     `RESULT: PASS — ${governedTables.length} governed table(s), ${totalWriters} writer file ` +
-    "reference(s), every one inside its table's owner list. residual: 0.\n",
+    "reference(s), every one inside its table's owner list, 0 unresolved write(s). residual: 0.\n",
 );

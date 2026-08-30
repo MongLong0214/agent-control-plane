@@ -1258,6 +1258,57 @@ const GUARDS = [
     killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
   },
   {
+    // Round 2 of #676: a blind review fed the old regex `INSERT OR ABORT INTO` and it read as
+    // MISSED — a writer only had to spell its INSERT slightly differently to become invisible.
+    // Dropping the conflict-resolution clause from the pattern reproduces exactly that.
+    what: "the turn-fence writer census recognises INSERT/UPDATE's OR conflict-clause forms",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: 'const CONFLICT = String.raw`(?:OR\\s+(?:ABORT|FAIL|IGNORE|REPLACE|ROLLBACK)\\s+)?`;',
+    replace: 'const CONFLICT = "";',
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // `Db` itself permits `REPLACE` as an ordinary mutation (`assertDataMutation` in
+    // `src/db/database.ts`), so `REPLACE INTO` unqualified by `INSERT OR` is a legitimate write
+    // this census must name too, not only the `INSERT OR REPLACE` spelling of the same thing.
+    what: "the turn-fence writer census recognises a bare REPLACE INTO write",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "String.raw`|REPLACE\\s+INTO(?:\\s+${TABLE_REF})?` +",
+    replace: "",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // A write whose target is a template-interpolated or concatenated table name cannot be
+    // resolved by any static scan. Scoring it silently as zero writers is indistinguishable from a
+    // real all-clear; this census has to say the write exists and could not be verified.
+    what: "the turn-fence writer census reports a write it could not resolve to a static table name",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "    if (capturedTable === undefined) {",
+    replace: "    if (false) {",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // `migrations.ts` used to be excluded on an unverified claim that other checks already cover
+    // its writes. Neither `schema:registry` nor `schema:denials` reads a line of it; re-excluding
+    // it here is the same exemption-nothing-consults shape one file up.
+    what: "the turn-fence writer census scans src/db/migrations.ts like every other file",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: 'const files = walk(SRC).map((f) => relative(ROOT, f));',
+    replace: 'const files = walk(SRC).map((f) => relative(ROOT, f)).filter((f) => f !== "src/db/migrations.ts");',
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // Without comment-stripping, migrations.ts's own doc comments — which quote past defective SQL
+    // verbatim as an example, e.g. a plain `UPDATE canonical_turns SET outcome_kind='ABORTED'` — read
+    // as a live write, and a census that cannot tell a quoted illustration of a bug from the bug
+    // itself would fail the file for prose, not code.
+    what: "the turn-fence writer census strips comments before scanning for writes",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "  const content = stripComments(raw);",
+    replace: "  const content = raw;",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
     // Contract 1's whole point, landing here: a turn claimed under one CEO generation is a
     // different CEO's work from a receipt minted under the next. Without this a reconciler
     // completes a turn on a receipt that was never about this claim.
