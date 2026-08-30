@@ -100,6 +100,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   effort         TEXT,
   lifecycle      TEXT NOT NULL
                    CHECK (lifecycle IN ('STARTING','READY','DRAINING','STOPPED','ERROR')),
+  -- #692 — which caller put this session into DRAINING (suspendProject vs. requestReplacement /
+  -- prepareSwitchover). Meaningful only while lifecycle = 'DRAINING'; SessionRegistry.transition
+  -- clears it to NULL on every other destination and never overwrites it on a no-op transition
+  -- (lifecycle already DRAINING). See domain/types.ts DrainingCause for why this exists.
+  draining_cause TEXT CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT')),
+  -- #692 round 3 — the in-flight fence: the OS pid of the daemon process currently awaiting
+  -- suspendProject's stopSession() for this session. Meaningful only while lifecycle = 'DRAINING'
+  -- and draining_cause = 'SUSPEND'; resumeProject refuses to reverse the drain while this pid is
+  -- set and alive, and SessionRegistry.transition clears it to NULL on every destination other
+  -- than DRAINING, the same way draining_cause is cleared.
+  draining_stop_pid INTEGER,
   buzz_address   TEXT,
   -- §27.2 — the Buzz *actor* identity this session speaks as, which is not the same fact
   -- as `buzz_address`: an address is a shared routing destination anybody can name, so it
@@ -1167,7 +1178,7 @@ CREATE INDEX IF NOT EXISTS outbox_role ON outbox(role_key, binding_generation, s
 CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE status = 'PENDING';
 
 -- ---------------------------------------------------------------------------
--- buzz_mention_watch (v33, #674; re-keyed by #710)
+-- buzz_mention_watch (v34, #674; re-keyed by #710)
 --   A per-SESSION cursor plus tick health, so a session's ad hoc poll dying silently and
 --   "nothing new arrived" no longer read as the same fact. See src/buzz/mention-watch.ts
 --   for the full lifecycle: the reset generation/time/event-id cursor moves only via an explicit

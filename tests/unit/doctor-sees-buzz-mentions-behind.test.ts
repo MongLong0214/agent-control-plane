@@ -20,8 +20,9 @@ afterAll(cleanupTempDirs);
 /**
  * #674 — a session's ad hoc, session-local poll for Buzz mentions can die silently, and three
  * separate times in one incident a dead poller and "nothing new arrived" were indistinguishable.
- * This is the read side of the fix: a durable cursor plus tick health, so Doctor can say
- * "N channel messages behind since T" without depending on that poller's own liveness.
+ * This is the delivery-silence-only read side: a durable cursor plus tick health, so Doctor can
+ * report channel traffic without depending on that poller's own liveness. It does not inspect
+ * `mentions` versus `needs_action`; an arrived-but-unclassified message remains out of scope.
  *
  * Re-keyed by #710: a blind review found the original `channel_id`-keyed state let one
  * session's reconnect corrupt another session's baseline whenever they shared a channel, plus a
@@ -176,11 +177,12 @@ die("unsupported argv: " + argv.join(" "));
   }
 }
 
-const behindFinding = (report: DoctorReport) => report.findings.find((f) => f.code === "BUZZ_CHANNEL_TRAFFIC_BEHIND");
+const behindFinding = (report: DoctorReport) =>
+  report.findings.find((f) => f.code === "BUZZ_DELIVERY_SILENCE_TRAFFIC_FOUND");
 const neverCheckedFinding = (report: DoctorReport) =>
-  report.findings.find((f) => f.code === "BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED");
+  report.findings.find((f) => f.code === "BUZZ_DELIVERY_SILENCE_NEVER_CHECKED");
 const unavailableFinding = (report: DoctorReport) =>
-  report.findings.find((f) => f.code === "BUZZ_CHANNEL_TRAFFIC_WATCH_UNAVAILABLE");
+  report.findings.find((f) => f.code === "BUZZ_DELIVERY_SILENCE_WATCH_UNAVAILABLE");
 
 /** `BuzzMentionWatch.tick()` now takes one target per live session, not one per channel (#710). */
 const target = (sessionId: string, channelId: string): WatchTarget => ({ sessionId, channelId });
@@ -220,7 +222,7 @@ describe("what doctor says about a silent buzz channel-traffic watch (#674)", ()
     expect(unavailableFinding(report)).toBeUndefined();
   });
 
-  it("reports N channel messages behind since the baseline, and does not double-count on a repeat tick", async () => {
+  it("reports delivery-silence-only traffic and names arrived but unclassified as out of scope", async () => {
     const harness = makeHarness();
     const source = new ScriptedMentionSource();
     const mentionWatch = new BuzzMentionWatch(harness.cp.db, harness.cp.clock, harness.cp.audit, source);
@@ -249,6 +251,8 @@ describe("what doctor says about a silent buzz channel-traffic watch (#674)", ()
     expect(finding?.observedEvidence).toMatchObject({
       sessionId,
       channel,
+      measurementScope: "DELIVERY_SILENCE_ONLY",
+      classificationCoverage: "ARRIVED_BUT_UNCLASSIFIED_OUT_OF_SCOPE_674",
       channelMessagesSinceBaseline: 4,
       atLeast: false,
       sinceIso: new Date(baselineEpoch * 1000).toISOString(),
@@ -585,7 +589,7 @@ describe("#710 — shared-channel and concurrency findings from the blind review
 
     const report = await harness.cp.doctor.run("system");
     const findingForA = report.findings.find(
-      (f) => f.code === "BUZZ_CHANNEL_TRAFFIC_BEHIND" && f.observedEvidence["sessionId"] === sessionA.sessionId,
+      (f) => f.code === "BUZZ_DELIVERY_SILENCE_TRAFFIC_FOUND" && f.observedEvidence["sessionId"] === sessionA.sessionId,
     );
     // Session A's 4-message backlog must still be reported: session B connecting to the same
     // channel re-arms only session B's own (until now nonexistent) baseline.
@@ -595,7 +599,7 @@ describe("#710 — shared-channel and concurrency findings from the blind review
     // Session B, having just connected, has its own clean slate — never-checked, not "0 behind"
     // and not session A's 4.
     const findingForB = report.findings.find((f) => f.observedEvidence["sessionId"] === sessionB.sessionId);
-    expect(findingForB?.code).toBe("BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED");
+    expect(findingForB?.code).toBe("BUZZ_DELIVERY_SILENCE_NEVER_CHECKED");
   });
 
   it("finding 3: a tick that hits the per-check read cap reports a floor, not an exact count", async () => {

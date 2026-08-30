@@ -16,7 +16,7 @@ import type { BuzzCliMessage } from "./buzz-adapter.ts";
  * silence a dead poller leaves in its place.
  *
  * Deliberately not mention resolution, and the finding this feeds is named accordingly
- * (`BUZZ_CHANNEL_TRAFFIC_*`, not `BUZZ_MENTIONS_*` — renamed in #710). Counting is
+ * (`BUZZ_DELIVERY_SILENCE_*`, not `BUZZ_MENTIONS_*`). Counting is
  * an overlapping `messages get --since` read against the channel a session is bound to — every
  * message the channel received, not messages confirmed to `#p`-tag this session. A blind review of
  * #710 confirmed this isn't a gap that can be closed with what's here: the only pubkey this
@@ -44,7 +44,7 @@ export interface BuzzMentionWatchRow {
   sessionId: string;
   channelId: string;
   cursorGeneration: string;
-  /** The "since T" a BUZZ_CHANNEL_TRAFFIC_BEHIND finding measures against. Null only before
+  /** The "since T" a BUZZ_DELIVERY_SILENCE_TRAFFIC_FOUND finding measures against. Null only before
    * this session has ever been ticked once. Stored in epoch milliseconds. */
   baselineAt: number | null;
   baselineEventIds: readonly string[];
@@ -151,7 +151,7 @@ const safeErrorMessage = (err: unknown): string => {
  * `last_success_at` from before the reset would let Doctor read an unverified new baseline as a
  * "checked and found nothing" zero — a success that never actually happened against this
  * baseline. Clearing it means a session that reconnected but has not yet been ticked reads as
- * `BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED`, the same as a session ticked for the very first time.
+ * `BUZZ_DELIVERY_SILENCE_NEVER_CHECKED`, the same as a session ticked for the very first time.
  */
 export class BuzzMentionWatch {
   constructor(
@@ -193,7 +193,7 @@ export class BuzzMentionWatch {
 
     // The read genuinely happens on the very first tick too rather than being skipped — that is
     // what lets a channel this watch can never
-    // reach report BUZZ_CHANNEL_TRAFFIC_WATCH_UNAVAILABLE from tick one, instead of a false
+    // reach report BUZZ_DELIVERY_SILENCE_WATCH_UNAVAILABLE from tick one, instead of a false
     // healthy baseline nobody ever verified.
     try {
       const messages = await this.source.messagesSince(channelId, inclusiveSince(baselineAt), OVERFETCH_LIMIT);

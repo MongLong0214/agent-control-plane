@@ -1441,6 +1441,100 @@ const GUARDS = [
     ],
   },
   {
+    // #692 — before this fix, the whole stop+revoke sequence was skipped once the
+    // session was already STOPPED, on the assumption that STOPPED implied the binding
+    // had been revoked too. A denied revoke can now leave STOPPED committed without a
+    // revoke (see the compensation below), so a caller retrying suspendProject after
+    // that compensation must still be able to finish the revoke — not have it skipped
+    // again because the session looks done.
+    what: "suspendProject retries the revoke instead of skipping it once the session is already stopped",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "    if (current && session) {\n      if (session.lifecycle !== SessionLifecycle.STOPPED) {",
+    replace: "    if (current && session && session.lifecycle !== SessionLifecycle.STOPPED) {\n      {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 a retry after the compensation actually completes the revoke, and doctor clears on its own",
+    ],
+  },
+  {
+    // #692 — the STOPPED write above only reaches bindings.revoke() once it has itself
+    // already committed, so a denial here means the session really is stopped and the
+    // binding really did just outlive it. Without this branch, that denial would return
+    // as the bare REVOCATION_BLOCKED_ACTIVE_RUNS a fresh revoke attempt reports on its
+    // own, with no audit record explaining that the STOPPED write it depended on had
+    // already gone through.
+    what: "suspendProject records why (audit, same transaction) when a stopped session's binding revoke is denied",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        if (completed.reasonCode !== ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) return completed;",
+    replace: "        return completed;",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 compensates instead of losing a binding revoke denied after the runtime stop already happened",
+    ],
+  },
+  {
+    // #692 (Sol review, round 2) — an adversarial review found that the two rows above
+    // both reach the same race regardless of whether this preflight exists at all: both
+    // tests reactivate the run *inside* the mocked stopSession, which only runs after
+    // the preflight has already passed. Without a row that removes the preflight itself,
+    // nothing here proved it does anything — it could be deleted and every existing test
+    // would still pass. The new standalone test drives a run to READY_FOR_CEO_REVIEW (a
+    // live state the checkpoint loop never touches) and calls suspendProject with no
+    // race at all: only the preflight stands between that and an irreversible provider
+    // stop it should never reach.
+    what: "suspendProject's preflight refuses an ordinary blocker before the irreversible provider stop",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "      const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n      if (preflight.length > 0) {",
+    replace: "      const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n      if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 the preflight refuses an ordinary non-race blocker before the irreversible provider stop, never calling it at all",
+    ],
+  },
+  {
+    // #692 (Sol review, round 3) — DRAINING is legal to reverse back to READY in the FSM
+    // (session-registry.ts LEGAL_LIFECYCLE) precisely so a session that committed
+    // DRAINING but never reached STOPPED has somewhere to go back to. Before this row's
+    // guard existed, resumeProject only cleared `projects.suspended`; a session stuck in
+    // DRAINING stayed there forever and dispatch kept refusing with
+    // RUN_DISPATCH_BLOCKED_CTO_DRAINING regardless of the flag. Without this branch,
+    // resumeProject's claim to reverse a suspend is false for exactly the sessions that
+    // most need it reversed.
+    what: "resumeProject restores a session stuck in DRAINING back to READY",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "      const session = this.sessions.get(current.sessionId);\n      if (session?.lifecycle === SessionLifecycle.DRAINING) {",
+    replace: "      const session = this.sessions.get(current.sessionId);\n      if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 resumeProject clears a session stuck in DRAINING, not just the suspended flag",
+    ],
+  },
+  {
+    // #692 round 2 (second blind review) — the counter-example: requestReplacement drains
+    // the same way a suspend does, and resumeProject reversed *any* DRAINING session keyed
+    // only on the bare lifecycle state. Without this branch, requestReplacement then
+    // resumeProject returns the outgoing CTO to READY with its DRAIN_REQUEST still
+    // outstanding, and new runs dispatch against it while the standing invariant (work
+    // stays QUEUED during a replacement) says they cannot.
+    what: "resumeProject refuses to reverse a DRAINING session whose cause was not suspendProject",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        if (session.drainingCause !== DrainingCause.SUSPEND) {",
+    replace: "        if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 round 2 — resumeProject does not reverse a replacement's DRAINING, and its DRAIN_REQUEST still governs new dispatch",
+    ],
+  },
+  {
+    // #692 round 2 — the mirror direction the same review asked to be checked: without
+    // this, requestReplacement against a session a suspend already parked in DRAINING is a
+    // silent no-op transition that still reports success, enqueues a DRAIN_REQUEST and
+    // records CTO_REPLACEMENT_REQUESTED as though a real replacement had started, over a
+    // project an owner suspended and has not resumed.
+    what: "requestReplacement refuses to drain a project the owner suspended",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "    if (this.projects.get(projectId)?.suspended === true) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 round 2 — requestReplacement refuses to drain a project the owner suspended",
+    ],
+  },
+  {
     // #695: both places the DIRECT branch read `unresolvedTurns()` used only its first (oldest)
     // element. A second unresolved turn accumulates whenever an overriding claim itself goes
     // unresolved (A crashes, `/again` claims B, B also crashes) — and the override record must
@@ -1579,6 +1673,20 @@ const GUARDS = [
     killedBy: [
       "tests/unit/doctor-daemon-r2.test.ts::#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger",
     ],
+  },
+  {
+    // #692 round 3 — a cause is not a lock. Without this, resumeProject reverses a
+    // SUSPEND-caused DRAINING the moment it sees the cause, regardless of whether
+    // suspendProject's own stopSession() await for it is still running — reopening both
+    // of dispatch's blocking conditions (project.suspended, CTO draining) while the
+    // original suspend has not finished. The bare file is named rather than one test by
+    // name: the round-3 test's title contains literal parentheses ("stopSession()"),
+    // which `vitest -t` would read as a regex group rather than the runtime call it names.
+    what: "resumeProject refuses to reverse a suspend whose stopSession() is still in flight",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "          if (isAlive(session.drainingStopPid)) {",
+    replace: "          if (false) {",
+    killedBy: ["tests/unit/cto-registry-r2.test.ts"],
   },
   {
     // #693 — the no-replace trigger refuses a colliding or moved source row, never a fresh one: a

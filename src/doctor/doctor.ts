@@ -447,8 +447,8 @@ export class Doctor {
   }
 
   /**
-   * #674 — the gap this closes is not delivery, it is that a dead session-local poller and "no
-   * new messages" were the same observable fact. `buzz_mention_watch` (written only by
+   * #674 — the gap this closes is delivery silence only: a dead session-local poller and "no
+   * new channel traffic" were the same observable fact. `buzz_mention_watch` (written only by
    * `BuzzMentionWatch`, `src/buzz/mention-watch.ts`) is read here, never written — this stays a
    * pure `SELECT`, consistent with Doctor's read-only construction. Looked up by `session_id`
    * (#710) — the row is scoped to the session asking, not shared by every session on the same
@@ -456,18 +456,17 @@ export class Doctor {
    *
    * Three outcomes, deliberately not collapsed into one:
    *
-   *   `BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED`      the watch has never ticked this session at all
-   *   `BUZZ_CHANNEL_TRAFFIC_WATCH_UNAVAILABLE`  the most recent attempt failed; the count on
-   *                                             record cannot be trusted as current
-   *   `BUZZ_CHANNEL_TRAFFIC_BEHIND`             a successful check found channel traffic since
-   *                                             baseline
+   *   `BUZZ_DELIVERY_SILENCE_NEVER_CHECKED`      the watch has never ticked this session at all
+   *   `BUZZ_DELIVERY_SILENCE_WATCH_UNAVAILABLE`  the most recent attempt failed; the count on
+   *                                              record cannot be trusted as current
+   *   `BUZZ_DELIVERY_SILENCE_TRAFFIC_FOUND`      a successful check found channel traffic since
+   *                                              baseline
    *
-   * Named `BUZZ_CHANNEL_TRAFFIC_*`, not `BUZZ_MENTIONS_*` (renamed in #710, this same round): a
-   * blind review found no `p`-tag filtering exists, and none can be added with what this
-   * codebase has today — sessions have no relay identity of their own for a `p` tag to name (see
-   * `mention-watch.ts`'s docstring). The count this reports is every message the channel
-   * received since baseline, not a verified mention, so the finding's own name says that rather
-   * than borrowing the stronger word.
+   * Named `BUZZ_DELIVERY_SILENCE_*`, not `BUZZ_MENTIONS_*`: this probe reads raw channel traffic.
+   * It does not compare the `mentions` feed with `needs_action`, and it does not observe delivery
+   * into the canonical CEO turn. A message that arrived but was misclassified is therefore out of
+   * scope and remains #674 work. The same boundary is printed in every finding's evidence so an
+   * operator cannot read this probe's silence as classification coverage.
    *
    * The middle one exists for the same reason #636 split `CAPACITY_SENSOR_FAILED` from
    * `CAPACITY_LOW`: reporting a stale `pending_count` as though it were a fresh "N behind" would
@@ -504,12 +503,17 @@ export class Doctor {
 
       if (!row || row.last_attempt_at === null) {
         findings.push({
-          code: "BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED",
+          code: "BUZZ_DELIVERY_SILENCE_NEVER_CHECKED",
           severity: "WARN",
           scope: `session:${session.sessionId}`,
           blocking: false,
           confidence: "HIGH",
-          observedEvidence: { sessionId: session.sessionId, channel },
+          observedEvidence: {
+            sessionId: session.sessionId,
+            channel,
+            measurementScope: "DELIVERY_SILENCE_ONLY",
+            classificationCoverage: "ARRIVED_BUT_UNCLASSIFIED_OUT_OF_SCOPE_674",
+          },
           recommendedAction:
             "the periodic buzz channel-traffic watch has not observed this session yet; confirm the watch tick is running",
         });
@@ -523,7 +527,7 @@ export class Doctor {
         (row.last_success_at === null || Date.parse(row.last_error_at) >= Date.parse(row.last_success_at));
       if (lastAttemptFailed) {
         findings.push({
-          code: "BUZZ_CHANNEL_TRAFFIC_WATCH_UNAVAILABLE",
+          code: "BUZZ_DELIVERY_SILENCE_WATCH_UNAVAILABLE",
           severity: "ERROR",
           scope: `session:${session.sessionId}`,
           blocking: false,
@@ -531,6 +535,8 @@ export class Doctor {
           observedEvidence: {
             sessionId: session.sessionId,
             channel,
+            measurementScope: "DELIVERY_SILENCE_ONLY",
+            classificationCoverage: "ARRIVED_BUT_UNCLASSIFIED_OUT_OF_SCOPE_674",
             error: row.last_error,
             lastErrorAt: row.last_error_at,
             lastKnownGoodAt: row.last_success_at,
@@ -543,7 +549,7 @@ export class Doctor {
 
       if (row.pending_count > 0) {
         findings.push({
-          code: "BUZZ_CHANNEL_TRAFFIC_BEHIND",
+          code: "BUZZ_DELIVERY_SILENCE_TRAFFIC_FOUND",
           severity: "WARN",
           scope: `session:${session.sessionId}`,
           blocking: false,
@@ -551,6 +557,8 @@ export class Doctor {
           observedEvidence: {
             sessionId: session.sessionId,
             channel,
+            measurementScope: "DELIVERY_SILENCE_ONLY",
+            classificationCoverage: "ARRIVED_BUT_UNCLASSIFIED_OUT_OF_SCOPE_674",
             // Unit and object, named plainly: every message the channel received since the
             // baseline, per `messages get --since` — not a verified @-mention of this session.
             // No `#p`-tag matching is wired anywhere in this codebase (#674's own audit), so
@@ -563,9 +571,10 @@ export class Doctor {
             checkedAt: row.last_success_at,
           },
           recommendedAction:
-            row.pending_saturated === 1
+            (row.pending_saturated === 1
               ? "read the buzz channel since the reported time; the count is capped at the per-tick read limit and the true backlog may be larger"
-              : "read the buzz channel since the reported time; this session's channel-traffic watch has not accounted for these messages",
+              : "read the buzz channel since the reported time; this session's channel-traffic watch has not accounted for these messages") +
+            "; this delivery-silence probe does not inspect mentions-to-needs_action classification, which remains #674",
         });
       }
     }

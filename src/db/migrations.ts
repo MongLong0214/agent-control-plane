@@ -8,7 +8,7 @@ import { acpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 
 /** The ordered registry is the only authority for changing a deployed schema. */
-export const SCHEMA_VERSION = 33;
+export const SCHEMA_VERSION = 34;
 
 const schemaPath = fileURLToPath(new URL("./schema.sql", import.meta.url));
 
@@ -2110,6 +2110,69 @@ const v31: SchemaMigration = {
 };
 
 /**
+ * v33 records why a session is DRAINING, not just that it is (#692 round 2), and — round 3 —
+ * whether the operation that caused it is still running.
+ *
+ * `resumeProject` reversed *any* DRAINING session back to READY, keyed on the bare lifecycle
+ * state. A replacement drains the same way a suspend does (requestReplacement, DRAIN_REQUEST) —
+ * so `requestReplacement` then `resumeProject` returned the outgoing CTO to READY out from under
+ * its own still-outstanding DRAIN_REQUEST, letting new runs dispatch against it while the
+ * standing assumption (work stays QUEUED during a replacement) said they could not.
+ *
+ * Additive and nullable, like v19's `os_process_started_at`: existing rows carry NULL, and
+ * `resumeProject` treats NULL the same as a non-suspend cause — fail closed, not "assume it was a
+ * suspend". Nothing production writes today reaches a DRAINING session with this column unset
+ * except through the exact crash this migration is too late to have recorded, which is why the
+ * fail-closed reading is the only one available for pre-migration rows.
+ *
+ * `draining_stop_pid` is round 3's addition: a cause is not a lock. `suspendProject` commits
+ * `draining_cause = SUSPEND` and *then* awaits `stopSession()` — a `resumeProject` landing in
+ * that window read only the cause, saw SUSPEND, and reversed a suspend that was still running.
+ * The pid (the daemon process currently awaiting that stop) is the fence: `resumeProject`
+ * refuses whenever it is set and that process is still alive, exactly the way
+ * `daemon.ts reconcile()`'s existing dead-session sweep already treats `sessions.os_pid` — the
+ * same tolerance for pid reuse (a plain liveness check, not the stricter `(pid, startedAt)`
+ * tuple `assertReviewerIndependence` needs for a security-sensitive lookup) is enough here too.
+ * A crash that kills the daemon mid-await leaves this pid stamped but dead; `reconcile()` sweeps
+ * exactly that shape to ERROR on the next startup (mirroring its `os_pid` loop immediately
+ * above it), and `resumeProject` performs the identical check inline so it self-heals even
+ * before the next restart, rather than depending on reconcile() having already run.
+ *
+ */
+const V33_DDL = `
+  ALTER TABLE sessions ADD COLUMN draining_cause TEXT
+    CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT'));
+  ALTER TABLE sessions ADD COLUMN draining_stop_pid INTEGER;
+`;
+
+const v33: SchemaMigration = {
+  id: "v33-draining-remembers-its-cause",
+  fromVersion: 32,
+  toVersion: 33,
+  apply: (raw) => {
+    // The v12/v19 replay trap: a database reconstructed through the migration chain may already
+    // carry this column from a replayed CREATE TABLE, and a bare ALTER then fails with
+    // `duplicate column name`. Adding it only when absent keeps both routes working. The two
+    // columns are checked (and, if necessary, added) independently: a database that already
+    // replayed a CREATE TABLE carrying `draining_cause` but not yet `draining_stop_pid` (or vice
+    // versa, mid-migration-history) must not skip the one it is actually missing.
+    const columns = (raw.prepare(`PRAGMA table_info(sessions)`).all() as Array<{ name: string }>).map(
+      (column) => column.name,
+    );
+    if (!columns.includes("draining_cause")) {
+      raw.exec(
+        `ALTER TABLE sessions ADD COLUMN draining_cause TEXT
+           CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT'));`,
+      );
+    }
+    if (!columns.includes("draining_stop_pid")) {
+      raw.exec(`ALTER TABLE sessions ADD COLUMN draining_stop_pid INTEGER;`);
+    }
+  },
+  checksum: () => sha256(`v33-draining-remembers-its-cause\n${V33_DDL}`),
+};
+
+/**
  * #693 — a source could be attached to an already-claimed turn by a plain `INSERT`, because the
  * no-replace trigger only refused a colliding or moved row, never a fresh one. This adds the
  * write-time backstop for the invariant `canonical_turn_sources.admission_audit_event_id` already
@@ -2147,19 +2210,19 @@ const v32: SchemaMigration = {
  * Measured three times in one incident, each a different bug in the same poller, each
  * indistinguishable from health until read after the fact.
  *
- * This table is the durable half of the fix: a per-session cursor plus bookkeeping for whether
- * the last attempt to read it even succeeded, so `Doctor.checkBuzzMentions` can tell "N behind
- * since T" apart from "never checked" apart from "could not reach the relay". It deliberately
- * counts channel traffic, not mention classification; see `src/buzz/mention-watch.ts`.
+ * This table is the delivery-silence-only half of the fix: a per-session cursor plus bookkeeping
+ * for whether the last attempt to read it even succeeded. It deliberately counts raw channel
+ * traffic, not `mentions`-to-`needs_action` classification; an arrived-but-unclassified message
+ * remains out of scope under #674. See `src/buzz/mention-watch.ts`.
  *
  * Keyed on `session_id` rather than `channel_id` (#710): production sessions can share one
  * `ACP_BUZZ_CHANNEL`, and a channel-keyed row let one session's reconnect silently reset another
  * session's baseline. `channel_id` remains the address the CLI reads.
  */
-const v33: SchemaMigration = {
-  id: "v33-a-silent-poller-and-no-new-mentions-look-the-same",
-  fromVersion: 32,
-  toVersion: 33,
+const v34: SchemaMigration = {
+  id: "v34-a-silent-poller-and-no-new-mentions-look-the-same",
+  fromVersion: 33,
+  toVersion: 34,
   apply: (raw) => {
     raw.exec(`
       CREATE TABLE IF NOT EXISTS buzz_mention_watch (
@@ -2180,7 +2243,7 @@ const v33: SchemaMigration = {
       CREATE INDEX IF NOT EXISTS buzz_mention_watch_channel ON buzz_mention_watch(channel_id);
     `);
   },
-  checksum: () => migrationChecksum("v33-a-silent-poller-and-no-new-mentions-look-the-same"),
+  checksum: () => migrationChecksum("v34-a-silent-poller-and-no-new-mentions-look-the-same"),
 };
 
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
@@ -2206,6 +2269,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v31,
   v32,
   v33,
+  v34,
 ]);
 
 interface RequiredTrigger {
