@@ -2088,7 +2088,7 @@ const v31: SchemaMigration = {
 };
 
 /**
- * v32 records why a session is DRAINING, not just that it is (#692 round 2).
+ * v33 records why a session is DRAINING, not just that it is (#692 round 2).
  *
  * `resumeProject` reversed *any* DRAINING session back to READY, keyed on the bare lifecycle
  * state. A replacement drains the same way a suspend does (requestReplacement, DRAIN_REQUEST) —
@@ -2101,14 +2101,28 @@ const v31: SchemaMigration = {
  * suspend". Nothing production writes today reaches a DRAINING session with this column unset
  * except through the exact crash this migration is too late to have recorded, which is why the
  * fail-closed reading is the only one available for pre-migration rows.
+ *
+ * The id is `v33`, not `v32`, while `fromVersion`/`toVersion` below still read 31/32: #701
+ * (id `v32-a-source-can-only-cite-its-turns-own-claim-event`) is ahead of this PR in the merge
+ * queue and will land on `main` as the real v31->32 step first. The id string is the part
+ * `verify-migrations-are-immutable.mjs` freezes once a database has actually run it — nothing
+ * has, yet, so renaming it now is free, and it is the last moment that is true. The numeric
+ * fields cannot be bumped to 32/33 in the same commit: nothing in this branch bridges 31->32
+ * (that bridge is #701's migration, which does not exist here until #701 merges and this branch
+ * merges `main` again on top of it), and `migrationChainFrom` throws "no ordered migration is
+ * defined" for exactly that gap — confirmed by trying it: 6 of 13
+ * `database-migration-restore.test.ts` cases fail with that message the moment `fromVersion`
+ * here reads 32 instead of 31. Whoever resolves the merge conflict this creates once #701 lands
+ * must bump `fromVersion` to 32 and `toVersion` to 33 (and `SCHEMA_VERSION` to 33) then, not
+ * before — that is a distinct, later step, not a rename.
  */
 const V32_DDL = `
   ALTER TABLE sessions ADD COLUMN draining_cause TEXT
     CHECK (draining_cause IS NULL OR draining_cause IN ('SUSPEND','REPLACEMENT'));
 `;
 
-const v32: SchemaMigration = {
-  id: "v32-draining-remembers-its-cause",
+const v33: SchemaMigration = {
+  id: "v33-draining-remembers-its-cause",
   fromVersion: 31,
   toVersion: 32,
   apply: (raw) => {
@@ -2119,7 +2133,7 @@ const v32: SchemaMigration = {
       .some((column) => column.name === "draining_cause");
     if (!present) raw.exec(V32_DDL);
   },
-  checksum: () => sha256(`v32-draining-remembers-its-cause\n${V32_DDL}`),
+  checksum: () => sha256(`v33-draining-remembers-its-cause\n${V32_DDL}`),
 };
 
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
@@ -2143,7 +2157,7 @@ export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([
   v29,
   v30,
   v31,
-  v32,
+  v33,
 ]);
 
 interface RequiredTrigger {
