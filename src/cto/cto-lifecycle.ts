@@ -862,45 +862,41 @@ export class CtoLifecycle {
         }
       }
 
-      // #692 — `stopped` below writes and commits, and `bindings.revoke()` remains a
-      // decision that can deny if its ownership invariant is violated. Before the
-      // RunEngine fence below, a concurrent `resolveEscalation` could create exactly that
-      // violation by flipping a BLOCKED run back to ACTIVE during the `stopSession()`
-      // await. This stays a plain `tx()`, not `txDecision()`: by this point the external
-      // provider has already been told to stop (on this attempt, or — if `session` was
-      // already STOPPED above — on an earlier one) and that is not reversible, so rolling
-      // the STOPPED write back would leave the session record disagreeing with reality.
-      //
-      // RunEngine.transition now refuses to reactivate work after the suspended flag
-      // commits, at the transaction that would make it ACTIVE. That is the primary
-      // fence: it also closes a process-death window before this completion transaction
-      // begins. The retry below is the compensation backstop. If an ACTIVE blocker was
-      // nevertheless admitted, checkpoint it again and retry the revoke before this
-      // transaction commits; never use an active binding to a STOPPED session as the
-      // durable recovery marker. Doctor is right to classify that join as CRITICAL, and
-      // Daemon.start is right to refuse it.
-      const completed = this.db.tx(() => {
-        // Provider stop is already irreversible at this boundary. Record that fact before
-        // inspecting any binding that another lifecycle path could have moved or revoked
-        // during the await above; a stale binding decision must not roll reality back to
-        // DRAINING.
-        const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, "project suspended");
-        if (!stopped.allowed) return stopped as Decision<void>;
+      // Provider stop is already irreversible at this boundary. Commit that fact before
+      // any remaining decision: rollback may undo only the later checkpoint/revoke writes,
+      // never paint the provider-stopped runtime back to DRAINING.
+      const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, "project suspended");
+      if (!stopped.allowed) return stopped as Decision<void>;
+
+      let movedBinding: RoleBinding | null = null;
+      const completed = this.db.txDecision(() => {
         const fresh = this.bindings.active(roleKey);
+        if (!fresh) {
+          // A concurrent revoke reached the same end state while stopSession was in
+          // flight. It is convergence, not a stale rejection after an irreversible stop.
+          return allow(ReasonCode.OK, undefined);
+        }
         if (
-          !fresh ||
           fresh.sessionId !== current.sessionId ||
           fresh.bindingGeneration !== current.bindingGeneration
         ) {
-          return deny<void>(
-            ReasonCode.WRITE_BINDING_GENERATION_STALE,
-            "the CTO binding changed while runtime shutdown was in progress",
-            {
-              projectId,
+          // Ordinary bind/switch paths cannot reach this after the durable suspension
+          // fence. If another trusted writer did move it, finish this stopped generation
+          // and suspend the generation that won instead of rejecting after the stop.
+          movedBinding = fresh;
+          this.audit.record({
+            kind: "PROJECT_SUSPEND_BINDING_MOVED_AFTER_STOP",
+            projectId,
+            sessionId: current.sessionId,
+            roleKey,
+            evidence: {
+              reason,
               expectedGeneration: current.bindingGeneration,
-              currentGeneration: fresh?.bindingGeneration ?? null,
+              currentGeneration: fresh.bindingGeneration,
+              currentSessionId: fresh.sessionId,
             },
-          );
+          });
+          return allow(ReasonCode.OK, undefined);
         }
         // Suspension is the one deliberate exception to a normal revocation: every
         // owned run was checkpointed to BLOCKED above and cannot regain authority from
@@ -954,6 +950,9 @@ export class CtoLifecycle {
           "the runtime stop completed but the binding could not be revoked; the binding now outlives its stopped session",
           { projectId, sessionId: current.sessionId, roleKey },
         );
+      }
+      if (movedBinding) {
+        return this.suspendProject(projectId, ownerApproved, reason, owner);
       }
     }
 

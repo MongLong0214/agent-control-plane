@@ -14,6 +14,7 @@ import type { DoctorReport } from "../../src/doctor/doctor.ts";
 import { createCtoMcpPort, createCtoServer } from "../../src/mcp/cto-server.ts";
 import { createHermesMcpPort, createHermesServer } from "../../src/mcp/hermes-server.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
+import { TestProductionAdapter } from "../helpers/production-adapter.ts";
 import {
   TEST_OWNER,
   type Harness,
@@ -910,7 +911,94 @@ describe("round-2 CTO lifecycle regressions", () => {
     },
   );
 
-  it("#692 round 5 suspend records stopped before rejecting a binding moved during provider stop", async () => {
+  it("#692 a suspended checkpoint cannot advance to another live run state during provider stop", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    const run = await createActiveRun(harness, projectId, repositoryId);
+    let advanced: ReturnType<typeof harness.cp.runs.transition> | null = null;
+
+    const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+    harness.scripted.stopSession = async (handle) => {
+      await originalStop(handle);
+      advanced = harness.cp.runs.transition(
+        run.runId,
+        RunState.AWAITING_HUMAN,
+        "human gate requested while provider stop was in flight",
+      );
+    };
+
+    const suspended = await harness.cp.cto.suspendProject(
+      projectId,
+      true,
+      "capacity crisis",
+      TEST_OWNER,
+    );
+
+    expect(suspended.allowed).toBe(true);
+    expect(advanced).toMatchObject({
+      allowed: false,
+      reasonCode: ReasonCode.RUN_ACTIVATION_BLOCKED_PROJECT_SUSPENDED,
+    });
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.BLOCKED);
+    expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+  });
+
+  it("#692 suspend retries a revoke blocked during provider stop and records recovery", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    const ensured = await harness.cp.cto.ensurePrimaryCto(projectId, "post-stop retry setup");
+    if (!ensured.allowed) throw new Error(ensured.message);
+
+    // Keep an ACTIVE run outside the incumbent's ownership during suspend preflight. The
+    // real emergency-owner path then attaches it while stopSession is in flight, so the
+    // first real BindingRegistry.revoke observes a blocker that did not exist pre-stop.
+    const created = harness.cp.runs.create({
+      projectId,
+      executionMode: ExecutionMode.STANDARD,
+      contract: CONTRACT,
+      repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+    });
+    if (!created.allowed) throw new Error(created.message);
+    const active = harness.cp.runs.transition(
+      created.value.runId,
+      RunState.ACTIVE,
+      "work became active before emergency ownership",
+    );
+    if (!active.allowed) throw new Error(active.message);
+    expect(active.value.ownerSessionId).toBeNull();
+
+    let reassigned: ReturnType<typeof harness.cp.runs.reassignOwner> | null = null;
+    const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+    harness.scripted.stopSession = async (handle) => {
+      await originalStop(handle);
+      reassigned = harness.cp.runs.reassignOwner(
+        created.value.runId,
+        ensured.value,
+        "emergency ownership changed during provider stop",
+      );
+    };
+
+    const suspended = await harness.cp.cto.suspendProject(
+      projectId,
+      true,
+      "capacity crisis",
+      TEST_OWNER,
+    );
+
+    expect(reassigned).toMatchObject({ allowed: true });
+    expect(suspended.allowed).toBe(true);
+    expect(harness.cp.runs.require(created.value.runId).state).toBe(RunState.BLOCKED);
+    expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+    expect(harness.cp.audit.byKind("PROJECT_SUSPEND_BINDING_REVOKE_RECOVERED")).toEqual([
+      expect.objectContaining({
+        projectId,
+        sessionId: ensured.value.sessionId,
+        evidence: expect.objectContaining({ checkpointedRuns: [created.value.runId] }),
+      }),
+    ]);
+  });
+
+  it("#692 a concurrent revoke after provider stop converges as a successful suspend", async () => {
     const harness = makeHarness();
     const { projectId } = await registerFixtureProject(harness);
     const binding = await harness.cp.cto.ensurePrimaryCto(projectId, "concurrent revoke setup");
@@ -933,11 +1021,151 @@ describe("round-2 CTO lifecycle regressions", () => {
       "provider stop races binding revoke",
       TEST_OWNER,
     );
-    expect(suspended.allowed).toBe(false);
-    expect(suspended.reasonCode).toBe(ReasonCode.WRITE_BINDING_GENERATION_STALE);
+    expect(suspended.allowed).toBe(true);
     expect(harness.cp.projects.require(projectId).suspended).toBe(true);
     expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
     expect(harness.cp.sessions.require(binding.value.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+  });
+
+  it("#692 suspend follows a replacement runtime that wins during provider stop", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const incumbent = await harness.cp.cto.ensurePrimaryCto(projectId, "replacement race setup");
+    if (!incumbent.allowed) throw new Error(incumbent.message);
+
+    const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+    let replacementHandle: SessionHandle | null = null;
+    let replacementSessionId: string | null = null;
+    let moved = false;
+    harness.scripted.stopSession = async (handle) => {
+      await originalStop(handle);
+      if (moved) return;
+      moved = true;
+
+      replacementHandle = await harness.scripted.startSession({
+        model: "replacement-cto",
+        purpose: "trusted replacement racing suspend",
+        workdir: harness.root,
+      });
+      const replacement = harness.cp.sessions.create({
+        provider: replacementHandle.provider,
+        model: replacementHandle.model,
+        sessionId: "ses_replacement_racing_suspend",
+        incarnation: `${replacementHandle.externalSessionId}#${harness.clock.nowIso()}`,
+      });
+      replacementSessionId = replacement.sessionId;
+      const ready = harness.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement ready");
+      if (!ready.allowed) throw new Error(`${ready.reasonCode}: ${ready.message}`);
+
+      // BindingRegistry normally refuses this switch because suspend already committed its
+      // project fence. Temporarily clear only that flag to model a trusted concurrent writer
+      // that won anyway, entering the post-stop generation-change branch under test.
+      const resumed = harness.cp.projects.setSuspended(projectId, false, true);
+      if (!resumed.allowed) throw new Error(resumed.message);
+      const switched = harness.cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO,
+        projectId,
+        sessionId: replacement.sessionId,
+        mode: "FALLBACK",
+        reason: "trusted replacement won during provider stop",
+        conversation: "SURVIVED",
+      });
+      if (!switched.allowed) throw new Error(`${switched.reasonCode}: ${switched.message}`);
+      const resuspended = harness.cp.projects.setSuspended(projectId, true, true);
+      if (!resuspended.allowed) throw new Error(resuspended.message);
+    };
+
+    const suspended = await harness.cp.cto.suspendProject(
+      projectId,
+      true,
+      "provider stop races a replacement generation",
+      TEST_OWNER,
+    );
+
+    expect(suspended.allowed).toBe(true);
+    expect(replacementHandle).not.toBeNull();
+    expect(replacementSessionId).not.toBeNull();
+    expect(await harness.scripted.probeSession(replacementHandle!)).toBe("UNAVAILABLE");
+    expect(harness.cp.sessions.require(replacementSessionId!).lifecycle).toBe(SessionLifecycle.STOPPED);
+    expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+    expect(harness.cp.audit.byKind("PROJECT_SUSPEND_BINDING_MOVED_AFTER_STOP")).toHaveLength(1);
+  });
+
+  it("#692 suspend follows a replacement generation that wins during provider stop", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const incumbent = await harness.cp.cto.ensurePrimaryCto(projectId, "generation race setup");
+    if (!incumbent.allowed) throw new Error(incumbent.message);
+
+    const replacementAdapter = new TestProductionAdapter(harness.clock, "replacement-provider");
+    harness.cp.providers.register(replacementAdapter);
+    const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+    let replacementHandle: SessionHandle | null = null;
+    let replacementSessionId: string | null = null;
+    let replacementGeneration: number | null = null;
+    let moved = false;
+    harness.scripted.stopSession = async (handle) => {
+      await originalStop(handle);
+      if (moved) return;
+      moved = true;
+
+      replacementHandle = await replacementAdapter.startSession({
+        model: "replacement-cto",
+        purpose: "different-provider replacement racing suspend",
+        workdir: harness.root,
+      });
+      const replacement = harness.cp.sessions.create({
+        provider: replacementHandle.provider,
+        model: replacementHandle.model,
+        sessionId: "ses_replacement_generation_racing_suspend",
+        incarnation: `${replacementHandle.externalSessionId}#${harness.clock.nowIso()}`,
+      });
+      replacementSessionId = replacement.sessionId;
+      const ready = harness.cp.sessions.transition(replacement.sessionId, SessionLifecycle.READY, "replacement ready");
+      if (!ready.allowed) throw new Error(`${ready.reasonCode}: ${ready.message}`);
+
+      // A different provider means continuity replaces the counterpart and mints a new
+      // generation. Clear only the ordinary suspension fence to enter the defensive
+      // post-stop branch even if a trusted concurrent writer has bypassed that fence.
+      const resumed = harness.cp.projects.setSuspended(projectId, false, true);
+      if (!resumed.allowed) throw new Error(resumed.message);
+      const switched = harness.cp.bindings.switchTo({
+        role: Role.PRIMARY_CTO,
+        projectId,
+        sessionId: replacement.sessionId,
+        mode: "FALLBACK",
+        reason: "different-provider replacement won during provider stop",
+        conversation: "REPLACED",
+        takeover: true,
+      });
+      if (!switched.allowed) throw new Error(`${switched.reasonCode}: ${switched.message}`);
+      replacementGeneration = switched.value.bindingGeneration;
+      const resuspended = harness.cp.projects.setSuspended(projectId, true, true);
+      if (!resuspended.allowed) throw new Error(resuspended.message);
+    };
+
+    const suspended = await harness.cp.cto.suspendProject(
+      projectId,
+      true,
+      "provider stop races a replacement generation",
+      TEST_OWNER,
+    );
+
+    expect(suspended.allowed).toBe(true);
+    expect(replacementGeneration).toBeGreaterThan(incumbent.value.bindingGeneration);
+    expect(replacementHandle).not.toBeNull();
+    expect(replacementSessionId).not.toBeNull();
+    expect(await replacementAdapter.probeSession(replacementHandle!)).toBe("UNAVAILABLE");
+    expect(harness.cp.sessions.require(replacementSessionId!).lifecycle).toBe(SessionLifecycle.STOPPED);
+    expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+    expect(harness.cp.audit.byKind("PROJECT_SUSPEND_BINDING_MOVED_AFTER_STOP")).toEqual([
+      expect.objectContaining({
+        evidence: expect.objectContaining({
+          expectedGeneration: incumbent.value.bindingGeneration,
+          currentGeneration: replacementGeneration,
+        }),
+      }),
+    ]);
   });
 
   it("#226 leaves a durable blocked run instead of an ACTIVE run owned by a revoked CTO", async () => {

@@ -466,6 +466,38 @@ describe("round-2 ops regressions", () => {
     expect(harness.cp.projects.get("wrong-run")).toBeNull();
   });
 
+  it("#692 suspended bootstrap activation refuses before changing its project or repository binding", async () => {
+    const harness = makeHarness();
+    const projectId = "suspended-bootstrap-activation";
+    const prepared = await prepareBootstrap(harness, projectId);
+    const approvedManifest = fixtureManifest(projectId);
+    const registered = harness.cp.projects.register({
+      projectId,
+      name: "suspended bootstrap activation",
+      manifest: approvedManifest,
+      authorization: harness.cp.manifestAuthorizationForTests(approvedManifest),
+    });
+    if (!registered.allowed) throw new Error(registered.message);
+    const suspended = harness.cp.projects.setSuspended(projectId, true, true);
+    if (!suspended.allowed) throw new Error(suspended.message);
+
+    const refused = await harness.cp.bootstrap.activate(
+      activationInput(harness, prepared.runId, projectId, prepared.plan),
+    );
+
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED);
+    expect({
+      activeManifestDigest: harness.cp.projects.require(projectId).activeManifestDigest,
+      repositoryBinding: harness.cp.repositories.byIdentity("github:acme/fixture"),
+      primaryCtoBinding: harness.cp.bindings.activePrimaryCto(projectId),
+    }).toEqual({
+      activeManifestDigest: registered.value.activeManifestDigest,
+      repositoryBinding: null,
+      primaryCtoBinding: null,
+    });
+  });
+
   it("#106/#203: absent, failed, or skipped bootstrap verification is not parseable evidence", () => {
     const harness = makeHarness();
     const plan = { bootstrapOperationId: "op-bootstrap", requestDigest: digestOf({ request: "bootstrap" }), projectManifestDigest: digestOf(fixtureManifest("evidence")) };

@@ -922,6 +922,16 @@ export class BootstrapActivation {
         incomplete: ["localBindings"],
       });
     }
+    // BindingRegistry still rechecks this invariant in the transaction that would make a
+    // primary CTO authoritative. Activation needs the same refusal here as well: it persists
+    // the project manifest and local repository bindings before it reaches that commit fence.
+    if (this.projects.get(projectId)?.suspended === true) {
+      return deny(
+        ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED,
+        "a suspended project cannot be activated with a primary CTO binding",
+        { projectId },
+      );
+    }
     const missing = missingHandoffFields(input.handoff);
     if (missing.length > 0) {
       return deny(ReasonCode.HANDOFF_PACKAGE_INCOMPLETE, "activation handoff is incomplete", {
@@ -948,7 +958,6 @@ export class BootstrapActivation {
       );
     }
 
-    void projectId;
     return allow(ReasonCode.OK, undefined);
   }
 

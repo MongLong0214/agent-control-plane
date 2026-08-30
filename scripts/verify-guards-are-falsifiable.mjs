@@ -1752,6 +1752,18 @@ const GUARDS = [
     ],
   },
   {
+    // Bootstrap activation writes its project manifest and repository binding before it
+    // reaches BindingRegistry's commit fence. A project already suspended at entry must be
+    // refused by the caller's own preflight so that refusal leaves neither write behind.
+    what: "bootstrap activation refuses a suspended project before changing its project or repository binding",
+    file: "src/bootstrap/activation.ts",
+    find: "    if (this.projects.get(projectId)?.suspended === true) {\n      return deny(\n        ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED,\n        \"a suspended project cannot be activated with a primary CTO binding\",",
+    replace: "    if (false) {\n      return deny(\n        ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED,\n        \"a suspended project cannot be activated with a primary CTO binding\",",
+    killedBy: [
+      "tests/unit/ops-r2.test.ts::#692 suspended bootstrap activation refuses before changing its project or repository binding",
+    ],
+  },
+  {
     // A crash after suspendProject's checkpoint leaves the binding ACTIVE while startup
     // resolves its dead stop fence to ERROR. The terminal-binding sweep must inspect that
     // durable join before the doctor runs, including when a prior process already wrote the
@@ -1762,6 +1774,17 @@ const GUARDS = [
     replace: "      if (true) continue;",
     killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 daemon restart revokes a binding stranded by a killed suspend",
+    ],
+  },
+  {
+    // The startup sweep repairs a killed suspend, not every terminal binding. Broadening it
+    // erases a dead once-bootstrapped CEO before continuity can observe and replace that role.
+    what: "startup terminal binding reconciliation is limited to primary CTOs of suspended projects",
+    file: "src/daemon/daemon.ts",
+    find: "         FROM assignments a\n         JOIN projects p ON p.project_id = a.project_id\n         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id\n         LEFT JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)\n        WHERE a.status = 'ACTIVE' AND a.role = 'PRIMARY_CTO' AND p.suspended = 1",
+    replace: "         FROM assignments a\n         LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id\n         LEFT JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)\n        WHERE a.status = 'ACTIVE'",
+    killedBy: [
+      "tests/unit/continuity-r2.test.ts::#596: a CEO on an unmanaged provider still fails over once its session stops being ready",
     ],
   },
   {
@@ -1798,14 +1821,14 @@ const GUARDS = [
     ],
   },
   {
-    // The provider stop precedes the binding freshness check because the stop is already a
-    // fact even when a concurrent revoke makes that later check deny.
-    what: "suspendProject records STOPPED before rejecting a binding changed during provider stop",
+    // The provider stop is already a fact when a concurrent revoke reaches the same end
+    // state. That convergence must return success while recording STOPPED locally.
+    what: "suspendProject records STOPPED and accepts a concurrent revoke as convergence",
     file: "src/cto/cto-lifecycle.ts",
-    find: "        const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, \"project suspended\");\n        if (!stopped.allowed) return stopped as Decision<void>;",
-    replace: "        const stopped = allow(ReasonCode.OK, this.sessions.require(current.sessionId));\n        if (!stopped.allowed) return stopped as Decision<void>;",
+    find: "      const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, \"project suspended\");\n      if (!stopped.allowed) return stopped as Decision<void>;",
+    replace: "      const stopped = allow(ReasonCode.OK, this.sessions.require(current.sessionId));\n      if (!stopped.allowed) return stopped as Decision<void>;",
     killedBy: [
-      "tests/unit/cto-registry-r2.test.ts::#692 round 5 suspend records stopped before rejecting a binding moved during provider stop",
+      "tests/unit/cto-registry-r2.test.ts::#692 a concurrent revoke after provider stop converges as a successful suspend",
     ],
   },
   {
@@ -1817,6 +1840,31 @@ const GUARDS = [
     replace: "      void handleFor(session);",
     killedBy: [
       "tests/unit/continuity-r2.test.ts::#692 round 5 failover started before suspend cannot bind after suspend commits",
+    ],
+  },
+  {
+    // A binding that moved despite the ordinary suspension fence owns a different
+    // provider session, either on the surviving generation or a newly minted one. Finishing
+    // only the old stop would leak it; compensation follows the winner through suspend.
+    what: "suspendProject follows and stops a replacement runtime or generation that won during provider stop",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "      if (movedBinding) {\n        return this.suspendProject(projectId, ownerApproved, reason, owner);\n      }",
+    replace: "      if (false) {\n        return this.suspendProject(projectId, ownerApproved, reason, owner);\n      }",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 suspend follows a replacement runtime that wins during provider stop",
+      "tests/unit/cto-registry-r2.test.ts::#692 suspend follows a replacement generation that wins during provider stop",
+    ],
+  },
+  {
+    // The provider stop can finish after a real owner reassignment introduces an ACTIVE
+    // blocker that preflight could not see. The completion transaction must checkpoint
+    // that blocker, retry the real revoke, and preserve recovery evidence.
+    what: "suspendProject retries a revoke blocked during provider stop",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        if (!revoked.allowed && revoked.reasonCode === ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) {\n          const blockers = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });",
+    replace: "        if (false) {\n          const blockers = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 suspend retries a revoke blocked during provider stop and records recovery",
     ],
   },
   {
@@ -1868,17 +1916,15 @@ const GUARDS = [
     ],
   },
   {
-    // #692 round 6 — suspension checkpoints ACTIVE work before awaiting the provider.
-    // Every path that can make that work ACTIVE again converges on RunEngine.transition,
-    // so the suspended flag must be re-read at that commit point. Without the fence the
-    // test's real escalation resolution persists ACTIVE, suspend leaves a dead binding,
-    // and the fresh Daemon.start is refused by doctor.
-    what: "a suspended project cannot reactivate a run",
+    // #692 round 6+ — ACTIVE was the first reproduced post-checkpoint move;
+    // AWAITING_HUMAN is its sibling and is equally a live revocation blocker.
+    what: "a suspended project cannot move a checkpointed run into another live state",
     file: "src/run/run-engine.ts",
-    find: "        to === RunState.ACTIVE &&\n        run.projectId &&\n        this.projects.get(run.projectId)?.suspended === true",
+    find: "        (to === RunState.ACTIVE || to === RunState.AWAITING_HUMAN) &&\n        run.projectId &&\n        this.projects.get(run.projectId)?.suspended === true",
     replace: "        false &&\n        run.projectId &&\n        this.projects.get(run.projectId)?.suspended === true",
     killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 a suspend crossing run reactivation leaves a cold start recoverable",
+      "tests/unit/cto-registry-r2.test.ts::#692 a suspended checkpoint cannot advance to another live run state during provider stop",
     ],
   },
   {

@@ -235,23 +235,6 @@ const EXEMPT = [
       "method, after decide() returns, against an in-process Map, not a SQLite transaction.",
   },
   {
-    file: "cto/cto-lifecycle.ts",
-    marker: "the CTO binding changed while runtime shutdown was in progress",
-    reason:
-      "suspendProject's STOPPED transition writes and commits, and bindings.revoke() can " +
-      "still deny after the provider stop. The provider stop above is not reversible, so " +
-      "rolling STOPPED back would leave the session record disagreeing with reality — the " +
-      "write is deliberately left to survive any later denial. The first " +
-      "REVOCATION_BLOCKED_ACTIVE_RUNS is not returned: suspendProject passes every reported " +
-      "blocker through RunEngine's ACTIVE-to-BLOCKED transition and retries revoke in this " +
-      "same transaction. RunEngine separately refuses reactivation once the project's " +
-      "suspended flag is durable, closing the crash window before this transaction begins. " +
-      "Only a failed checkpoint or a second revoke denial can leave this exempt site as a " +
-      "denial after STOPPED, and the latter is recorded as " +
-      "PROJECT_SUSPEND_BINDING_REVOKE_FAILED with afterCheckpointRetry evidence before it is " +
-      "reported as SESSION_STOPPED_BINDING_REVOKE_FAILED.",
-  },
-  {
     file: "outbox/outbox.ts",
     marker: "kind: \"OUTBOX_ACK_REJECTED\",",
     reason:

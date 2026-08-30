@@ -1073,20 +1073,16 @@ export class Daemon {
       }
     }
 
-    // Terminalizing a session is only half of restart reconciliation. An ACTIVE binding
-    // still routes through its conversational actor's live session, so leaving that pointer
-    // on STOPPED, ERROR, or a missing row manufactures the exact CRITICAL join the doctor is
-    // meant to reject. Sweep the state, not the producer: this catches a suspend killed after
-    // its checkpoint, a provider-stop failure, an earlier STOPPED/revoke gap, and a crash
-    // between this method's own lifecycle transition above and this cleanup. The ordinary
-    // revocation guard remains in force. A suspended run was checkpointed to BLOCKED before
-    // its stop fence committed, so allowBlockedRuns removes that dead authority without
-    // orphaning runnable work; any other live owner is left visible for takeover rather than
-    // silently detached from its generation.
+    // A killed suspend can leave a suspended project's PRIMARY_CTO binding ACTIVE after its
+    // session becomes STOPPED or ERROR. That dead authority must be removed before the doctor,
+    // because suspend already checkpointed its work to BLOCKED. Keep this sweep specific to
+    // that durable suspend shape: continuity needs every other unavailable active binding
+    // (notably the once-bootstrapped CEO) to remain visible so it can replace the role rather
+    // than losing the requirement when startup deletes it first.
     const unavailableBindingsRevoked: ReconcileReport["unavailableBindingsRevoked"] = [];
     const unavailableBindingRevocationsDeferred:
       ReconcileReport["unavailableBindingRevocationsDeferred"] = [];
-    const activeBindings = this.cp.db.all<{
+    const strandedSuspendBindings = this.cp.db.all<{
       role_key: string;
       session_id: string;
       lifecycle: string | null;
@@ -1095,12 +1091,13 @@ export class Daemon {
               COALESCE(c.current_session_id, a.session_id) AS session_id,
               s.lifecycle
          FROM assignments a
+         JOIN projects p ON p.project_id = a.project_id
          LEFT JOIN conversational_actors c ON c.actor_id = a.actor_id
          LEFT JOIN sessions s ON s.session_id = COALESCE(c.current_session_id, a.session_id)
-        WHERE a.status = 'ACTIVE'
+        WHERE a.status = 'ACTIVE' AND a.role = 'PRIMARY_CTO' AND p.suspended = 1
         ORDER BY a.role_key`,
     );
-    for (const binding of activeBindings) {
+    for (const binding of strandedSuspendBindings) {
       const lifecycle = binding.lifecycle ?? "missing";
       const unavailable =
         binding.lifecycle === null ||

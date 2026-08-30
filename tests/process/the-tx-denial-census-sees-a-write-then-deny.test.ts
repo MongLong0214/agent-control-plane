@@ -96,6 +96,11 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     anchor: "denial *inside* this body left partial writes behind it.\n    const prepared = this.db.txDecision(() => {",
   },
   {
+    label: "CtoLifecycle.suspendProject (post-stop cleanup)",
+    file: "cto/cto-lifecycle.ts",
+    anchor: "      let movedBinding: RoleBinding | null = null;\n      const completed = this.db.txDecision(() => {",
+  },
+  {
     label: "DaemonFinalizer lease acquisition",
     file: "daemon/finalizer.ts",
     anchor: "did not happen and must not leave a row behind.\n    return this.cp.db.txDecision(() => {",
@@ -156,12 +161,6 @@ const NAMED_ENTRIES: Array<{ label: string; file: string; marker: string; expect
     label: "production-gate CEO decision transition guard (EXEMPT)",
     file: "ceo/production-gate.ts",
     marker: "CEO ${input.decision}",
-    expectStdout: "stale exemption",
-  },
-  {
-    label: "suspendProject's STOPPED fact survives a post-stop denial (EXEMPT, #692)",
-    file: "cto/cto-lifecycle.ts",
-    marker: "the CTO binding changed while runtime shutdown was in progress",
     expectStdout: "stale exemption",
   },
   {
