@@ -1524,7 +1524,7 @@ const containsSnippetFragments = (haystack, fragments) => {
  */
 const stripCitationSeparator = (text) => {
   let t = text.replace(/←.*$/, "").trimEnd();
-  t = t.replace(/^\s*[`'"]/, ""); // the citation's own closing delimiter, if it had one
+  t = t.replace(/^\s*[)`'"]/, ""); // the citation's own closing delimiter, if it had one
   t = t.replace(/^[\s:—–-]+/, ""); // the separator between a citation and what follows
   return t;
 };
