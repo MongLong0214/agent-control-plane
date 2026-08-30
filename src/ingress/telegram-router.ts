@@ -101,11 +101,24 @@ export interface TelegramReply {
 export interface TelegramStoredResponse {
   reply: TelegramReply;
   sent: boolean;
-  /** Durable delivery protocol: PENDING is a reserved, possibly accepted send. */
+  /** Durable delivery protocol; terminal failures remain operator-visible. */
   deliveryStatus: TelegramDeliveryStatus;
 }
 
-export type TelegramDeliveryStatus = "PENDING" | "RETRYABLE" | "APPLIED";
+export type TelegramDeliveryStatus =
+  | "PENDING"
+  | "RETRYABLE"
+  | "UNKNOWN_RETRYABLE"
+  | "APPLIED"
+  | "UNANSWERABLE"
+  | "UNRESOLVED";
+
+export interface TelegramStoredDeliveryFailure {
+  kind: "PERMANENT_REJECTION" | "UNKNOWN";
+  statusCode: number | null;
+  description: string | null;
+  migrateToChatId: string | null;
+}
 
 export type TelegramWorkflowPhase = "ADMITTED" | "CREATED" | "DISPATCHED" | "REPLIED";
 
@@ -116,12 +129,15 @@ export interface TelegramStoredState {
   reply?: TelegramReply;
   sent?: boolean;
   deliveryStatus?: TelegramDeliveryStatus;
+  unknownDeliveryAttempts?: number;
+  deliveryFailure?: TelegramStoredDeliveryFailure;
 }
 
 export type TelegramInterruptPoint =
   | "after-admission"
   | "after-hermes-create"
   | "after-dispatch"
+  | "after-reply-reserve"
   | "after-reply-send";
 
 /** Test and recovery probes use a typed interruption so normal routing errors remain replies. */
@@ -441,15 +457,25 @@ export class TelegramHermesRouter {
     presentedSecret: string | null,
   ): Promise<TelegramRouteProgress> {
     const stored = this.getStoredState(this.ingress.nonceFor(update));
-    if (stored?.reply && this.deliveryStatus(stored) === "PENDING") {
-      // A PENDING reservation means an earlier process may already have reached Telegram.
-      // It is deliberately not retried: an ambiguous external result is safer as a single
-      // possibly-lost response than as a duplicate owner-facing message.
-      return completedRoute(this.storedResponseOutcome(update, stored, false));
+    if (stored?.reply && (
+      this.deliveryStatus(stored) === "PENDING"
+      || this.deliveryStatus(stored) === "UNKNOWN_RETRYABLE"
+    )) {
+      // A reservation that survived its sender is indistinguishable from one Telegram accepted.
+      // Old UNKNOWN_RETRYABLE rows have the same ambiguity. Neither may cross the external
+      // boundary again without an idempotency key Telegram honours, so recovery records the
+      // uncertainty and returns no reply to the polling loop.
+      const recovered = this.recoverPendingResponse(update, stored);
+      return completedRoute(this.storedResponseOutcome(update, recovered, false));
     }
     if (stored?.reply && this.deliveryStatus(stored) === "RETRYABLE") {
       return completedRoute(this.storedResponseOutcome(update, stored, true));
     }
+    if (stored?.reply && (
+      this.deliveryStatus(stored) === "APPLIED"
+      || this.deliveryStatus(stored) === "UNANSWERABLE"
+      || this.deliveryStatus(stored) === "UNRESOLVED"
+    )) return completedRoute(this.storedResponseOutcome(update, stored, false));
 
     const parsedOwner = update.message && !this.ingress.isForwarded(update)
       ? parseTelegramOwnerDecision(update.message.text ?? "")
@@ -722,6 +748,10 @@ export class TelegramHermesRouter {
       reply: outcome.reply,
       sent: false,
       deliveryStatus: "PENDING",
+      ...(prior?.unknownDeliveryAttempts === undefined
+        ? {}
+        : { unknownDeliveryAttempts: prior.unknownDeliveryAttempts }),
+      ...(prior?.deliveryFailure ? { deliveryFailure: prior.deliveryFailure } : {}),
     } satisfies TelegramStoredState, "AVAILABLE");
     if (!reserved.allowed) throw new Error(`${reserved.reasonCode}: ${reserved.message}`);
   }
@@ -746,6 +776,9 @@ export class TelegramHermesRouter {
       reply: outcome.reply,
       sent: true,
       deliveryStatus: "APPLIED",
+      ...(prior?.unknownDeliveryAttempts === undefined
+        ? {}
+        : { unknownDeliveryAttempts: prior.unknownDeliveryAttempts }),
     } satisfies TelegramStoredState);
     if (!completed.allowed) throw new Error(`${completed.reasonCode}: ${completed.message}`);
   }
@@ -763,8 +796,59 @@ export class TelegramHermesRouter {
       reply: outcome.reply,
       sent: false,
       deliveryStatus: "RETRYABLE",
+      ...(prior?.unknownDeliveryAttempts === undefined
+        ? {}
+        : { unknownDeliveryAttempts: prior.unknownDeliveryAttempts }),
+      ...(prior?.deliveryFailure ? { deliveryFailure: prior.deliveryFailure } : {}),
     } satisfies TelegramStoredState, "PENDING");
     if (!released.allowed) throw new Error(`${released.reasonCode}: ${released.message}`);
+  }
+
+  /** Terminally record a reply Telegram definitively refused, then let ingress advance. */
+  abandonResponse(
+    outcome: TelegramRouteOutcome,
+    failure: TelegramStoredDeliveryFailure,
+  ): void {
+    if (!outcome.reply || !outcome.admitted) return;
+    const prior = this.getStoredState(outcome.nonce);
+    if (this.deliveryStatus(prior) !== "PENDING") return;
+    const unknownDeliveryAttempts = prior?.unknownDeliveryAttempts ?? 0;
+    const deliveryStatus: TelegramDeliveryStatus = unknownDeliveryAttempts > 0
+      ? "UNRESOLVED"
+      : "UNANSWERABLE";
+    const settled = this.ingress.settleReplyAndTurn(outcome.nonce, {
+      kind: "TELEGRAM_WORKFLOW",
+      phase: "REPLIED",
+      ...(outcome.runId ?? prior?.runId ? { runId: outcome.runId ?? prior?.runId } : {}),
+      reply: outcome.reply,
+      sent: false,
+      deliveryStatus,
+      ...(unknownDeliveryAttempts > 0 ? { unknownDeliveryAttempts } : {}),
+      deliveryFailure: failure,
+    } satisfies TelegramStoredState, deliveryStatus);
+    if (!settled.allowed) throw new Error(`${settled.reasonCode}: ${settled.message}`);
+  }
+
+  /** Record an unknown transport result as terminal; retrying could duplicate an accepted send. */
+  recordUnknownResponse(
+    outcome: TelegramRouteOutcome,
+    failure: TelegramStoredDeliveryFailure,
+  ): void {
+    if (!outcome.reply || !outcome.admitted) return;
+    const prior = this.getStoredState(outcome.nonce);
+    if (this.deliveryStatus(prior) !== "PENDING") return;
+    const unknownDeliveryAttempts = (prior?.unknownDeliveryAttempts ?? 0) + 1;
+    const state = {
+      kind: "TELEGRAM_WORKFLOW",
+      phase: "REPLIED",
+      ...(outcome.runId ?? prior?.runId ? { runId: outcome.runId ?? prior?.runId } : {}),
+      reply: outcome.reply,
+      deliveryStatus: "UNRESOLVED",
+      unknownDeliveryAttempts,
+      deliveryFailure: failure,
+    } satisfies TelegramStoredState;
+    const recorded = this.ingress.settleReplyAndTurn(outcome.nonce, state, "UNRESOLVED");
+    if (!recorded.allowed) throw new Error(`${recorded.reasonCode}: ${recorded.message}`);
   }
 
   /** Compatibility wrapper for callers that used the old boolean response API. */
@@ -919,7 +1003,7 @@ export class TelegramHermesRouter {
       updateId: update.update_id,
       nonce: this.ingress.nonceFor(update),
       correlationId: correlationIdFor(update),
-      admitted: true,
+      admitted: includeReply,
       replayed: true,
       classification: null,
       input: null,
@@ -927,6 +1011,37 @@ export class TelegramHermesRouter {
       reasonCode: ReasonCode.INGRESS_REPLAY_IGNORED,
       ...(stored.runId ? { runId: stored.runId } : {}),
     };
+  }
+
+  /** Convert a reservation left by a dead process into a terminal, operator-visible unknown. */
+  private recoverPendingResponse(update: TelegramUpdate, stored: TelegramStoredState): TelegramStoredState {
+    const priorStatus = this.deliveryStatus(stored);
+    const state = {
+      ...stored,
+      // `undefined` deliberately removes the legacy boolean during JSON serialization. The
+      // process cannot know whether Telegram accepted this send, so `sent: false` would turn an
+      // unknown outcome into a confident claim.
+      sent: undefined,
+      deliveryStatus: "UNRESOLVED",
+      deliveryFailure: {
+        kind: "UNKNOWN",
+        statusCode: null,
+        description: "process ended with a reserved reply; Telegram acceptance is unknown",
+        migrateToChatId: null,
+      },
+    } satisfies TelegramStoredState;
+    const nonce = this.ingress.nonceFor(update);
+    const recorded = this.ingress.settleReplyAndTurn(
+      nonce,
+      state,
+      "UNRESOLVED",
+      priorStatus === "UNKNOWN_RETRYABLE" ? "UNKNOWN_RETRYABLE" : "PENDING",
+    );
+    if (recorded.allowed) return state;
+
+    // Another poller may have claimed the retry between the read and transition. Read its state
+    // and never send merely because this recovery attempt lost that race.
+    return this.getStoredState(nonce) ?? stored;
   }
 
   private deliveryStatus(stored: TelegramStoredState | null): TelegramDeliveryStatus | null {

@@ -838,6 +838,7 @@ describe("baseline boundary contracts", () => {
       "v30-a-turn-and-a-reply-are-two-lifecycles",
       "v31-a-generation-means-nothing-without-its-role-key",
       "v32-a-source-can-only-cite-its-turns-own-claim-event",
+      "v33-back-up-before-telegram-settlement-state",
     ]);
   });
 
