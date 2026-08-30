@@ -13,10 +13,10 @@ import type { McpPeerAuthenticator } from "./shared.ts";
 /**
  * How long the daemon will hold a Telegram turn open waiting for the CEO to answer.
  *
- * The long-poll loop is single-threaded per update, so this is the ceiling on how long one
- * ordinary message can stall the next one. A CEO that is genuinely thinking for longer than
- * this is not a state the chat should hide: the owner gets a timeout they can retry, rather
- * than silence.
+ * The Telegram route task is detached from the long-poll loop, so this no longer stalls the next
+ * poll. It remains the ceiling on how long one ordinary message waits for its reply. A CEO that
+ * is genuinely thinking for longer than this is not a state the chat should hide: the owner gets
+ * a timeout rather than silence.
  *
  * It is no longer written down here. This deadline contains the runtime's own reply timeout,
  * and as two independent constants they were ordered backwards — 60s out, 120s in — so the
@@ -107,9 +107,9 @@ export class CeoConversationPort {
    * interleave in a transcript the CEO then carries forward as context. That cannot be unwound
    * and the CEO cannot tell it happened.
    *
-   * Today the property holds anyway, because `TelegramLongPoller.pollOnce` awaits each update in
-   * turn — the stack frame is the mutex. #630 removes that await, so the invariant is made
-   * explicit here first, while it is still true, rather than after it stops being true.
+   * `TelegramLongPollService.pollOnce` now detaches route tasks, so call ordering no longer
+   * serializes this boundary. This flag is the enforcement: a later turn is refused before it
+   * reaches the canonical session.
    */
   #inFlight = false;
   /**
