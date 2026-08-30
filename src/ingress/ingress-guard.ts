@@ -793,9 +793,36 @@ export class IngressGuard {
    *
    * Refuses to move a claim that already carries either terminal fact — most importantly, this
    * must never write `noReplyAt` over a claim that already has a real `repliedAt`.
+   *
+   * Also refuses — found by a fourth review of #682 — unless `result_json` is still exactly the
+   * fresh `ADMITTED` marker `admit` wrote, the same shape `isClaimable` calls "nothing has
+   * happened yet". The `turn_claim_json` checks above are not enough on their own: they see
+   * whether *this* turn resolved, not whether a reply was reserved or sent for it. `outcome.
+   * replayed` at the call site (`telegram-router.ts`) is a snapshot taken when `route()` returned,
+   * and cannot see a reservation another poller commits after that snapshot and before this
+   * transaction starts — `reserveResponse` writes `result_json` but never touches
+   * `turn_claim_json`, so the checks above would still see a claim with neither terminal fact and
+   * proceed to destroy that reservation.
+   *
+   * Enforced by the write's own WHERE clause below, not by a separate read-then-branch. A first
+   * draft also carried a standalone `if (!isClaimable(current.result_json)) return deny(...)`
+   * ahead of the write — the same predicate, expressed twice: once as a JS branch and once as the
+   * WHERE clause's `json_extract` conditions. Removing the JS branch and keeping only the WHERE
+   * clause changed no observable behaviour (the mutation test for the JS branch still passed,
+   * because the WHERE clause's own row-count check below already denies the identical case) — a
+   * measured instance of a redundant check reporting coverage it did not independently have. One
+   * enforcement site, the one that actually participates in the write, is what stays.
    */
   completeNoReplyAndResolveTurn(channel: string, nonce: string): Decision<void> {
-    return this.db.tx(() => {
+    // `txDecision`, not plain `tx` (#664 tx-denial discipline, caught by
+    // `scripts/verify-tx-denial-sites.mjs`'s own census): the `updated.changes !== 1` guard below
+    // writes `result_json` and can then deny in the same body, and a plain `tx()` treats that
+    // `Decision` as an ordinary return value rather than something to roll back on. The write
+    // itself is a no-op whenever that branch denies (`changes !== 1` means the WHERE clause
+    // matched zero rows), but nothing about that is visible to the census's static check, and
+    // relying on "this particular write happens to be harmless when denied" is exactly the
+    // reasoning #664 exists to stop trusting by hand.
+    return this.db.txDecision(() => {
       const current = this.db.get<{ turn_claim_json: string | null }>(
         `SELECT turn_claim_json FROM inbound_messages WHERE channel = ? AND nonce = ?`,
         [channel, nonce],
@@ -814,11 +841,27 @@ export class IngressGuard {
       // the reply lifecycle, and there is no reply to describe. `isRecoverableIngressResult`'s
       // fallback for any other kind is `sent === false`, which a marker with no `sent` field
       // satisfies as `false` — recoverable only when a workflow explicitly says it has not sent.
-      this.db.run(`UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`, [
-        JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }),
-        channel,
-        nonce,
-      ]);
+      const updated = this.db.run(
+        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (
+           result_json IS NULL OR (
+             json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND
+             json_extract(result_json, '$.phase') = 'ADMITTED'
+           )
+         )`,
+        [JSON.stringify({ kind: "TELEGRAM_NO_REPLY" }), channel, nonce],
+      );
+      if (updated.changes !== 1) {
+        // The read above passed but the write's own WHERE clause did not match — belt-and-braces
+        // against the same class of collapse `#recordResultHere`'s row-count check guards (#682,
+        // third review): a mismatch here means `result_json` changed between the read and this
+        // write, and reporting success regardless would be exactly the wrong-answer-with-
+        // confidence this method exists to refuse.
+        return deny(
+          ReasonCode.RESOURCE_COLLISION,
+          "ingress result changed underneath the no-reply resolution",
+          { channel, nonce },
+        );
+      }
       this.db.run(
         `UPDATE inbound_messages
             SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)

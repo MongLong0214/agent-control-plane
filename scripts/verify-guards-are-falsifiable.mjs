@@ -152,11 +152,27 @@ const GUARDS = [
     what: "a turn with no reply is marked non-recoverable, not only resolved",
     file: "src/ingress/ingress-guard.ts",
     find:
-      "      this.db.run(`UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`, [\n" +
-      "        JSON.stringify({ kind: \"TELEGRAM_NO_REPLY\" }),\n" +
-      "        channel,\n" +
-      "        nonce,\n" +
-      "      ]);\n" +
+      "      const updated = this.db.run(\n" +
+      "        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (\n" +
+      "           result_json IS NULL OR (\n" +
+      "             json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND\n" +
+      "             json_extract(result_json, '$.phase') = 'ADMITTED'\n" +
+      "           )\n" +
+      "         )`,\n" +
+      "        [JSON.stringify({ kind: \"TELEGRAM_NO_REPLY\" }), channel, nonce],\n" +
+      "      );\n" +
+      "      if (updated.changes !== 1) {\n" +
+      "        // The read above passed but the write's own WHERE clause did not match — belt-and-braces\n" +
+      "        // against the same class of collapse `#recordResultHere`'s row-count check guards (#682,\n" +
+      "        // third review): a mismatch here means `result_json` changed between the read and this\n" +
+      "        // write, and reporting success regardless would be exactly the wrong-answer-with-\n" +
+      "        // confidence this method exists to refuse.\n" +
+      "        return deny(\n" +
+      "          ReasonCode.RESOURCE_COLLISION,\n" +
+      "          \"ingress result changed underneath the no-reply resolution\",\n" +
+      "          { channel, nonce },\n" +
+      "        );\n" +
+      "      }\n" +
       "      this.db.run(\n" +
       "        `UPDATE inbound_messages\n" +
       "            SET turn_claim_json = json_set(turn_claim_json, '$.noReplyAt', ?)\n" +
@@ -1629,6 +1645,31 @@ const GUARDS = [
     replace: "        if (false) {",
     killedBy: [
       "tests/unit/binding-hardening.test.ts::switchTo denies a takeover that would strand a live, unabandonable execution, and rolls back its own writes",
+    ],
+  },
+  {
+    // #682 (fourth review): `completeNoReplyAndResolveTurn` used to overwrite `result_json`
+    // unconditionally, gated only by `turn_claim_json` checks that cannot see a reply reservation
+    // — `outcome.replayed` at the call site is a snapshot taken when `route()` returned, and
+    // cannot see a reservation another poller commits after that snapshot and before this
+    // transaction starts: `reserveResponse` writes `result_json` but never touches
+    // `turn_claim_json`, so the checks above would still see a claim with neither terminal fact
+    // and proceed to destroy a PENDING reservation — durable evidence that Telegram may already
+    // have accepted a reply. Widening the WHERE clause back to an unconditional match (the
+    // original bug) restores exactly that: a reservation lands, the no-reply path runs on the same
+    // nonce, and the reservation is gone.
+    what: "a no-reply resolution's write is bound to the row still being fresh ADMITTED, not any row for this nonce",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ? AND (\n" +
+      "           result_json IS NULL OR (\n" +
+      "             json_extract(result_json, '$.kind') = 'TELEGRAM_WORKFLOW' AND\n" +
+      "             json_extract(result_json, '$.phase') = 'ADMITTED'\n" +
+      "           )\n" +
+      "         )`,",
+    replace: "        `UPDATE inbound_messages SET result_json = ? WHERE channel = ? AND nonce = ?`,",
+    killedBy: [
+      "tests/unit/ingress-no-reply-turn-resolution.test.ts::#682, fourth review: a reservation that lands after the router's snapshot survives the no-reply path",
     ],
   },
 ];

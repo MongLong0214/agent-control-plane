@@ -30,12 +30,21 @@ const SECRET = "no-reply-webhook-secret";
  * exempts the row on purpose (that exemption is correct — see ingress-turn-claim.test.ts — the
  * defect is that nothing ever clears it for a turn that is, in fact, done).
  *
- * The first test below stubs `route()` because no handler the current classifier can reach
- * produces `admitted: true, replayed: false, reply: null` — DIRECT always replies, even to say
- * a run was refused. That is an honest limit of this fixture, not a hidden one: the mechanism it
- * exercises (`resolveNoReplyOutcome` / `completeNoReplyAndResolveTurn`) is real and load-bearing
- * the moment such a handler exists, but this file cannot prove the branch is *reachable* today,
- * only that it behaves correctly if it is reached.
+ * The first test below stubs `route()` because no path through it can produce `admitted: true,
+ * replayed: false, reply: null` today — traced exhaustively, not just for DIRECT: `directHandler`
+ * is typed `(input) => string | Promise<string>` (`telegram-router.ts`), so DIRECT always replies,
+ * even to say a run was refused or parked; OWNER_DECISION always builds a reply via `replyFor`,
+ * whether the decision is recorded, refused, or unresolvable; MANAGED (`routeManaged`) always
+ * builds a reply for every one of its returns, including the create/dispatch-refused branches; and
+ * the top-level catch-all also replies. The only two producers of a literal `reply: null` are
+ * `deniedOrReplay` (forces `admitted: false`) and `storedResponseOutcome` (forces `replayed:
+ * true`) — neither can carry `admitted: true, replayed: false`. So the state this fixture stubs is
+ * not merely unobserved, it is unreachable through every current caller of `route()`, and that is
+ * a fact about today's handler set, not about this test: the mechanism it exercises
+ * (`resolveNoReplyOutcome` / `completeNoReplyAndResolveTurn`) is real and load-bearing the moment a
+ * handler that can decline to reply exists, but this file cannot prove the branch is *reachable*
+ * today, only that it behaves correctly if it is reached. Reviewed and confirmed unreachable again
+ * at #682 (fourth review) rather than papered over by adjusting the stub.
  *
  * A blind review (#682) found the shape this fixture could not see: `route()` already produces
  * `reply: null` for a *replayed* admission — a claimed turn's PENDING reply reservation,
@@ -375,5 +384,65 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
     const claim = storedClaim(harness, nonce);
     expect(claim["noReplyAt"]).toBeTruthy();
     expect(claim["repliedAt"]).toBeUndefined();
+  });
+
+  it("#682, fourth review: a reservation that lands after the router's snapshot survives the no-reply path", async () => {
+    // A blind review of the fix above found the window it left open: `outcome.replayed` is a
+    // snapshot `route()` took when it returned, and `completeNoReplyAndResolveTurn` only ever
+    // read `turn_claim_json` — never `result_json` — before overwriting the latter outright. So a
+    // second poller's `reserveResponse` (real production entry point, called before any Telegram
+    // send) can land *between* that snapshot and this call reaching the database, and nothing
+    // stopped the no-reply write from clobbering it.
+    //
+    // Reproduced as the interleaving itself, not as a description of it: the reservation is taken
+    // first (`recordResultIf`, exactly what `reserveResponse` calls), and only then does the
+    // no-reply path run on the very same nonce — the same order a stale `outcome.replayed`
+    // snapshot would produce in production. Before the CAS fix, this call returned `allowed: true`
+    // and overwrote the PENDING reservation with `TELEGRAM_NO_REPLY`, destroying the only durable
+    // evidence that Telegram may already have accepted a reply.
+    const harness = makeHarness();
+    const { guard, ingress } = buildRouter(harness);
+    const nonce = "update:6";
+
+    expect(
+      guard.admit({ channel: "telegram", actor: "owner", conversation: "chat", nonce, payload: { text: "hi" } })
+        .allowed,
+    ).toBe(true);
+    expect(guard.claimTurn("telegram", nonce, identity()).allowed).toBe(true);
+
+    // The other poller's reservation, committed first.
+    const reply = {
+      chatId: "chat",
+      text: "a reply the transport may already have accepted",
+      replyToMessageId: 1,
+      correlationId: "race-correlation",
+    };
+    expect(
+      ingress.recordResultIf(
+        nonce,
+        { kind: "TELEGRAM_WORKFLOW", phase: "REPLIED", reply, sent: false, deliveryStatus: "PENDING" },
+        "AVAILABLE",
+      ).allowed,
+    ).toBe(true);
+    const beforeResultJson = harness.cp.db.get<{ result_json: string | null }>(
+      "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
+      [nonce],
+    )?.result_json;
+    expect(beforeResultJson).toContain('"deliveryStatus":"PENDING"');
+
+    // The no-reply path, reached afterward on a snapshot that predates the reservation above.
+    const result = guard.completeNoReplyAndResolveTurn("telegram", nonce);
+    expect(result.allowed).toBe(false);
+    expect(result.reasonCode).toBe(ReasonCode.RESOURCE_COLLISION);
+
+    // The reservation must survive untouched, and the claim must not carry `noReplyAt` — a reply
+    // may yet complete for this turn.
+    const afterResultJson = harness.cp.db.get<{ result_json: string | null }>(
+      "SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?",
+      [nonce],
+    )?.result_json;
+    expect(afterResultJson).toBe(beforeResultJson);
+    const claim = storedClaim(harness, nonce);
+    expect(claim["noReplyAt"]).toBeUndefined();
   });
 });
