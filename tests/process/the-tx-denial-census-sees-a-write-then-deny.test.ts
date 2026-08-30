@@ -131,6 +131,11 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     file: "ingress/ingress-guard.ts",
     anchor: "reasoning #664 exists to stop trusting by hand.\n    return this.db.txDecision(() => {",
   },
+  {
+    label: "acknowledgeTerminalTelegramReply",
+    file: "ingress/ingress-guard.ts",
+    anchor: "): Decision<TelegramReplyAcknowledgement> => db.txDecision(() => {",
+  },
 ];
 
 /** Every EXEMPT and DEFERRED entry, so a marker drifting out of its body is caught for all of them, not just one. */

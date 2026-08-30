@@ -39,6 +39,8 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl actor register <id> <generation> <expected-set-generation>
   agentctl actor list                     list registered conversational actors
   agentctl actor unregister <id> <generation> <expected-set-generation> <reason>
+  agentctl telegram reply acknowledge <nonce> <reason-code> <evidence-digest>
+                                           record that a terminal reply was reviewed and will not retry
   agentctl conversation contradictions     turns whose records disagree, with the ids to cite
   agentctl conversation adjudicate <actor> <turn> <reason-code> <evidence-digest> <id>...
   agentctl conversation unresolved         turns waiting on a person, with what each already holds
@@ -76,6 +78,7 @@ const OPERATOR_MUTATION_METHOD_NAMES = new Set([
   "actor.unregister",
   "conversation.adjudicate",
   "conversation.resolve",
+  "telegram.reply.acknowledge",
 ]);
 
 /** Creates a daemon-only operator client. It never opens SQLite or constructs a service. */
@@ -348,6 +351,18 @@ export const dispatch = async (
       });
     }
     return fail(`unknown actor subcommand: ${sub ?? ""}`);
+  }
+
+  if (command === "telegram") {
+    const [subject, sub, nonce, reasonCode, evidenceDigest] = args;
+    if (subject !== "reply" || sub !== "acknowledge") {
+      return fail(`unknown telegram subcommand: ${[subject, sub].filter(Boolean).join(" ")}`);
+    }
+    return call("telegram.reply.acknowledge", {
+      nonce: required(nonce, "nonce"),
+      reasonCode: required(reasonCode, "reasonCode"),
+      evidenceDigest: required(evidenceDigest, "evidenceDigest"),
+    });
   }
 
   if (command === "conversation") {
