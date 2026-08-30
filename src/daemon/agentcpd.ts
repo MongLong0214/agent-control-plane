@@ -21,6 +21,7 @@ import { ReasonCode } from "../core/reason-codes.ts";
 import {
   BuzzActorIngress,
   IngressGuard,
+  isTransportRetentionUnknown,
   type IngressPolicy,
 } from "../ingress/ingress-guard.ts";
 import {
@@ -1248,6 +1249,49 @@ export const startDaemonTelegramListener = (
   });
 
 /**
+ * `startDaemonTelegramListener`, but a transport whose redelivery retention `IngressGuard`
+ * cannot bound (#682, round 8) is refused as `null` rather than thrown.
+ *
+ * A supported, deliberately-configured transport — most commonly a self-hosted Bot API server
+ * behind `ACP_TELEGRAM_API_BASE_URL` — can have a retention nobody here has measured, and the
+ * guard now refuses to build a nonce floor it cannot bound. That refusal must not take the rest
+ * of the daemon down with it: this operator configured Telegram on purpose, and MCP listeners,
+ * Buzz and the operator door still have to come up. Any other failure is still a real bug and is
+ * rethrown unchanged, so `main`'s own startup teardown still runs for it exactly as before.
+ *
+ * A separate top-level function rather than a nested `try`/`catch` inline in `main`: a nested
+ * `try` that reassigns an outer `let` and conditionally rethrows is a real TypeScript control-flow
+ * analysis gap (confirmed with a minimal reproduction against this repo's compiler) — the outer
+ * variable narrows to `never` at the enclosing `catch` even though the value is reachable there.
+ * One `await` of a plain function does not exhibit it.
+ */
+const startDaemonTelegramListenerOrRefuse = async (
+  cp: ControlPlane,
+  config: Parameters<typeof startTelegramLongPollListener>[1],
+  daemon: { finalizeApprovedRun(runId: string): void | Promise<unknown> },
+  options: DaemonTelegramStartOptions,
+): Promise<{ listener: TelegramLongPollListener | null; disabledReason: string | null }> => {
+  try {
+    const listener = await startDaemonTelegramListener(cp, config, daemon, options);
+    process.stdout.write("Telegram ingress started\n");
+    return { listener, disabledReason: null };
+  } catch (error) {
+    if (!isTransportRetentionUnknown(error)) throw error;
+    // The reason travels with the outcome rather than being re-derived at the call site, so
+    // `health.json` (via `Daemon.setTelegramIngressStatus`, #682 round 8's second follow-up)
+    // says the same thing this stderr line does — a daemon that comes up healthy while a
+    // configured feature silently never started is exactly the gap that review found.
+    const disabledReason =
+      `transport's redelivery retention is not known for channel '${error.channel}'`;
+    process.stderr.write(
+      `Telegram ingress refused: its ${disabledReason}, so a safe nonce floor cannot be ` +
+        "established; continuing without Telegram ingress\n",
+    );
+    return { listener: null, disabledReason };
+  }
+};
+
+/**
  * `directHandler` returns a string, so a refusal has to be readable rather than thrown: the
  * owner is a person waiting in a chat, and an exception here would surface as a dropped
  * message. The reason code travels with the sentence so a refusal in the transcript can still
@@ -1507,7 +1551,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     if (telegramConfig) {
       const telegramStartOptions = options.telegramStartOptions ?? {};
       const ceoConversation = listeners.ceoConversation;
-      telegram = await startDaemonTelegramListener(cp, telegramConfig, daemon, {
+      const outcome = await startDaemonTelegramListenerOrRefuse(cp, telegramConfig, daemon, {
         // §6.1 — ordinary conversation goes to the CEO. A test that supplies its own handler
         // keeps it; production has none, which is how this route stayed unreachable.
         onDirect: (input) => answerAsCeo(ceoConversation, input.text),
@@ -1517,9 +1561,15 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
           telegramStartOptions.onError?.(error);
         },
       });
-      process.stdout.write("Telegram ingress started\n");
+      telegram = outcome.listener;
+      daemon.setTelegramIngressStatus({
+        configured: true,
+        running: outcome.listener !== null,
+        disabledReason: outcome.disabledReason,
+      });
     } else {
       process.stderr.write("Telegram ingress not configured; continuing without Telegram ingress\n");
+      daemon.setTelegramIngressStatus({ configured: false, running: false, disabledReason: null });
     }
   } catch (err) {
     await telegram?.close();

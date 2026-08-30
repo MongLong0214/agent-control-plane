@@ -48,6 +48,10 @@ const update = (text: string, over: Record<string, unknown> = {}, updateId = 100
 });
 
 class FakeTelegramTransport implements TelegramBotTransport {
+  // Used through `startDaemonTelegramListener` / `startTelegramLongPollListener`, which now
+  // derives IngressGuard's retention floor from this value (#682, round 8) — declared as the
+  // real measured figure since this fake is standing in for ordinary Telegram behavior.
+  readonly redeliveryRetentionMs = 24 * 60 * 60 * 1000;
   readonly sent: Array<{
     chatId: string;
     text: string;
@@ -171,7 +175,13 @@ describe("Telegram production ingress", () => {
       "utf8",
     );
     // This is a composition-root assertion only; the behavior below still runs the factory.
-    expect(agentcpdSource).toContain("telegram = await startDaemonTelegramListener(cp, telegramConfig, daemon");
+    // `main()` calls `startDaemonTelegramListenerOrRefuse` now, not `startDaemonTelegramListener`
+    // directly — the wrapper that catches only an unmeasured-transport-retention refusal so it
+    // does not take the rest of the daemon down (#682, round 8 follow-up). Both assertions matter:
+    // the first proves the composition root did not drift onto some other path, the second proves
+    // the wrapper itself still runs the real daemon-owned factory rather than a substitute.
+    expect(agentcpdSource).toContain("const outcome = await startDaemonTelegramListenerOrRefuse(cp, telegramConfig, daemon");
+    expect(agentcpdSource).toContain("const listener = await startDaemonTelegramListener(cp, config, daemon, options);");
 
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
@@ -499,6 +509,7 @@ describe("Telegram production ingress", () => {
     let markSecondFailure!: () => void;
     const secondFailure = new Promise<void>((resolve) => { markSecondFailure = resolve; });
     const transport: TelegramBotTransport = {
+      redeliveryRetentionMs: 24 * 60 * 60 * 1000,
       async getUpdates(options) {
         pollTimes.push(Date.now());
         offsets.push(options.offset);
@@ -1550,6 +1561,74 @@ describe("Telegram production ingress", () => {
     }
     expect(secondTransport.sent).toHaveLength(0);
     expect(firstTransport.sent.length + secondTransport.sent.length).toBe(1);
+  });
+
+  it("#682: a claimed turn's PENDING reply survives a redelivery instead of becoming a false no-reply", async () => {
+    // The claimed twin of the test above. That one uses `/managed`, which never calls
+    // `claimTurn` — so its crash-and-restart sequence never reaches `completeNoReplyAndResolveTurn`
+    // at all, and cannot prove anything about it. An ordinary DIRECT message does claim a turn,
+    // and `route()`'s restart branch reports the exact same shape as `/managed`'s for the exact
+    // same reason — a PENDING reservation is deliberately not retried, so `includeReply` is
+    // false and `reply` comes back null — but this time #672's no-reply branch after routing is
+    // reachable, and a real redelivery must not read that ambiguous, already-claimed outcome as a
+    // fresh handler deciding not to reply.
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const firstTransport = new FakeTelegramTransport();
+    const firstUpdate = update("what is the status", {}, 402);
+    firstTransport.updates = [firstUpdate];
+    const firstListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: firstTransport,
+      start: false,
+      onInterrupt: async (point) => {
+        if (point === "after-reply-send") throw new TelegramInterruption(point);
+      },
+    });
+
+    try {
+      await expect(observedTurnFault(firstListener.service)).rejects.toMatchObject({ point: "after-reply-send" });
+    } finally {
+      await firstListener.close();
+    }
+    expect(firstTransport.sent).toHaveLength(1);
+
+    const beforeRestart = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:402"],
+    );
+    expect(beforeRestart?.result_json).toContain('"deliveryStatus":"PENDING"');
+    expect(beforeRestart?.turn_claim_json).not.toContain("repliedAt");
+
+    const secondTransport = new FakeTelegramTransport();
+    secondTransport.updates = [firstUpdate];
+    const secondListener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport: secondTransport,
+      start: false,
+    });
+    try {
+      const resumed = (await settledPoll(secondListener.service)).outcomes[0]!;
+      // The same observable shape the MANAGED test asserts — this is production reproducing
+      // Sol's sequence, not a fixture standing in for it.
+      expect(resumed.replayed).toBe(true);
+      expect(resumed.reply).toBeNull();
+    } finally {
+      await secondListener.close();
+    }
+    expect(secondTransport.sent).toHaveLength(0);
+
+    // The durable evidence that Telegram may already have accepted the reply must survive
+    // untouched: still PENDING, still holding what the first attempt reserved, and the claim
+    // still unresolved. An ambiguous send outcome stays ambiguous — it must not become a
+    // confident "nothing was sent", because that is what tells the owner to resend a message
+    // Telegram may have already delivered.
+    const afterRestart = harness.cp.db.get<{ result_json: string | null; turn_claim_json: string | null }>(
+      `SELECT result_json, turn_claim_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:402"],
+    );
+    expect(afterRestart?.result_json).toBe(beforeRestart?.result_json);
+    expect(afterRestart?.turn_claim_json).toBe(beforeRestart?.turn_claim_json);
+    expect(afterRestart?.turn_claim_json).not.toContain("repliedAt");
   });
 
   it("clears a human gate only through the real owner receipt path", async () => {

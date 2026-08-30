@@ -97,19 +97,16 @@ any actor binding exists (see C1, C3).
 - **Terminal or gap:** the single-unresolved-turn case is closed —
   `TelegramHermesRouter`'s DIRECT branch calls `unresolvedTurns(identity.sessionDigest)` before
   `claimTurn` for every DIRECT message (not only a suspected resend), parks with an explicit reply,
-  and records a deliberate override (`overriddenUnresolvedNonce`) when the owner replies `/again`.
-  **A second unresolved row is neither disclosed nor recorded.** Both the park reply and the
-  override write read only `unresolved[0]` — the oldest row. Reproducible with two ordinary
-  crashes, no concurrency required: `A` crashes (unresolved); owner sends `/again`, claiming `B`
-  and recording the override against `A`; `B` also crashes (now `A` and `B` are both unresolved); a
-  third message `C` arrives and its park reply names only `A` — `B` is never mentioned, and a
-  further `/again` from the owner would again record only `A`. No test reaches this: the
-  production `/again` test resolves its override turn instead of crashing it, so only one
-  unresolved row is ever constructed; the guard-level test that does construct two unresolved
-  claims bypasses the router and only checks ordering.
-- **Disposition:** on the critical path. The single-turn mechanism is closed; the disclosure gap
-  for a second unresolved row is real, live on the ingress ledger today (not embargoed by #638),
-  and tracked in #695.
+  and records a deliberate override when the owner replies `/again`. The plural
+  `overriddenUnresolvedNonces` records every unresolved nonce, including a second row created when
+  an earlier `/again` turn also fails. The park reply names at most
+  `MAX_NAMED_UNRESOLVED_TURNS` rows, reports the total, and summarizes the rest so disclosure stays
+  within Telegram's message limit without narrowing the durable override record. The production
+  path tests construct both the two-row sequence and a sequence beyond the reply cap.
+- **Disposition:** closed for both one and multiple unresolved rows. The rows themselves remain
+  unresolved until a reply is accepted, a fresh no-reply outcome completes, or a later authority
+  reconciles them; the owner-visible park reply is bounded, while `/again` records the full set it
+  overrides.
 
 ### S3 — `ADMITTED` and not claimed
 
