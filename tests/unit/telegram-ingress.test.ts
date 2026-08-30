@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -200,6 +201,103 @@ const telegramBotApiFixture = (
   };
   return { transport: new TelegramBotApi("fixture-bot-token", { fetcher }), calls };
 };
+
+const liveUnknownTelegramBotApiFixture = () => {
+  const calls: TelegramApiCall[] = [];
+  const updates: TelegramUpdate[] = [update("reply delivery becomes unknown", { message_id: 7_107 }, 710)];
+  let rejectFirstSend = true;
+  const fetcher: typeof globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const method = url.endsWith("/getUpdates") ? "getUpdates" : "sendMessage";
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    calls.push({ method, body });
+    if (method === "getUpdates") {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      const offset = typeof body["offset"] === "number" ? body["offset"] : 0;
+      return new Response(JSON.stringify({
+        ok: true,
+        result: updates.filter((candidate) => candidate.update_id >= offset).slice(0, 100),
+      }), { status: 200 });
+    }
+    if (rejectFirstSend) {
+      rejectFirstSend = false;
+      throw new TypeError("simulated Telegram connection loss after send");
+    }
+    return new Response(JSON.stringify({ ok: true, result: { message_id: nextFakeTelegramMessageId++ } }), {
+      status: 200,
+    });
+  };
+  return {
+    transport: new TelegramBotApi("fixture-bot-token", { fetcher }),
+    calls,
+    enqueue: (next: TelegramUpdate): void => { updates.push(next); },
+  };
+};
+
+const startLiveUnknownDaemonIngress = async () => {
+  const harness = makeHarness({
+    ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+  });
+  const stateDir = tempDir("acp-telegram-live-recovery-");
+  const daemon = new Daemon(harness.cp, { stateDir });
+  const acquired = daemon.lock.acquire(harness.clock.nowIso());
+  expect(acquired.allowed).toBe(true);
+  // Ensure the health file exists before ingress starts. The daemon factory, not this test,
+  // owns every Telegram status transition written after this point.
+  daemon.writeHealth(null);
+  const fixture = liveUnknownTelegramBotApiFixture();
+  const handled: string[] = [];
+  const errors: unknown[] = [];
+  const listener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemon, {
+    transport: fixture.transport,
+    ownerGateSignals: () => [],
+    onDirect: (input) => {
+      handled.push(input.text);
+      return `reply to ${input.text}`;
+    },
+    onError: (error) => { errors.push(error); },
+  });
+  await vi.waitFor(() => {
+    const row = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:710"],
+    );
+    expect(row?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+  });
+  return { harness, stateDir, daemon, fixture, handled, errors, listener };
+};
+
+const acknowledgeLiveTelegramReply = (
+  daemon: Daemon,
+  nonce: string,
+  requestSuffix: string,
+) => daemon.handleOperatorRequest({
+  requestId: `acknowledge-live:${requestSuffix}`,
+  method: OPERATOR_METHOD.TELEGRAM_REPLY_ACKNOWLEDGE,
+  params: {
+    nonce,
+    reasonCode: "operator-reviewed-telegram",
+    evidenceDigest: `sha256:reviewed:${nonce}`,
+  },
+  idempotencyKey: `acknowledge-live:${requestSuffix}`,
+}, {
+  channel: "cli",
+  peerId: `cli:${TEST_OWNER.actor}`,
+  actor: TEST_OWNER.actor,
+  incarnation: "telegram-live-recovery",
+});
+
+const runLiveDoctor = (daemon: Daemon, requestSuffix: string) => daemon.handleOperatorRequest({
+  requestId: `doctor-live:${requestSuffix}`,
+  method: OPERATOR_METHOD.DOCTOR_RUN,
+  params: { scope: "system" },
+  idempotencyKey: `doctor-live:${requestSuffix}`,
+}, {
+  channel: "cli",
+  peerId: `cli:${TEST_OWNER.actor}`,
+  actor: TEST_OWNER.actor,
+  incarnation: "telegram-live-recovery",
+});
 
 /**
  * A CEO turn can outlive `pollOnce` after #630, so its fault belongs to the listener's task
@@ -1760,6 +1858,91 @@ describe("Telegram production ingress", () => {
     expect(afterAcknowledgement.findings).not.toContainEqual(expect.objectContaining({
       code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
     }));
+  });
+
+  it("UNKNOWN stop changes daemon health to stopped", async () => {
+    const live = await startLiveUnknownDaemonIngress();
+    try {
+      const health = JSON.parse(readFileSync(join(live.stateDir, "health.json"), "utf8")) as {
+        telegram: unknown;
+      };
+      expect(health.telegram).toMatchObject({
+        configured: true,
+        running: false,
+        disabledReason: expect.stringContaining("update:710"),
+      });
+      expect(live.errors).toContainEqual(expect.objectContaining({
+        failure: expect.objectContaining({ kind: "UNKNOWN" }),
+      }));
+      expect(live.fixture.calls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
+    } finally {
+      await live.listener.close();
+      live.daemon.lock.release();
+    }
+  });
+
+  it("exact nonce acknowledge restarts the existing listener", async () => {
+    const live = await startLiveUnknownDaemonIngress();
+    try {
+      const wrong = await acknowledgeLiveTelegramReply(live.daemon, "update:711", "wrong-nonce");
+      expect(wrong).toMatchObject({ allowed: false, reasonCode: ReasonCode.NOT_FOUND });
+      expect(live.fixture.calls.filter((call) => call.method === "sendMessage")).toHaveLength(1);
+
+      const acknowledged = await acknowledgeLiveTelegramReply(live.daemon, "update:710", "exact-nonce");
+      expect(acknowledged).toMatchObject({
+        allowed: true,
+        value: { nonce: "update:710", deliveryStatus: "UNRESOLVED" },
+      });
+      live.fixture.enqueue(update("message after operator recovery", { message_id: 7_117 }, 711));
+      await vi.waitFor(() => {
+        expect(live.handled).toContain("message after operator recovery");
+      });
+      expect(live.fixture.calls.filter((call) => call.method === "sendMessage").map((call) =>
+        call.body["reply_to_message_id"]
+      )).toEqual([7_107, 7_117]);
+    } finally {
+      await live.listener.close();
+      live.daemon.lock.release();
+    }
+  });
+
+  it("Doctor stays truthful after acknowledge because ingress is running", async () => {
+    const live = await startLiveUnknownDaemonIngress();
+    try {
+      const before = await runLiveDoctor(live.daemon, "before-acknowledge");
+      expect(before).toMatchObject({
+        allowed: true,
+        value: {
+          findings: expect.arrayContaining([
+            expect.objectContaining({ code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN" }),
+            expect.objectContaining({
+              code: "TELEGRAM_INGRESS_STOPPED",
+              observedEvidence: expect.objectContaining({ recoveryNonce: "update:710" }),
+            }),
+          ]),
+        },
+      });
+
+      const acknowledged = await acknowledgeLiveTelegramReply(live.daemon, "update:710", "doctor");
+      expect(acknowledged.allowed).toBe(true);
+      live.fixture.enqueue(update("Doctor observes recovered ingress", { message_id: 7_117 }, 711));
+      await vi.waitFor(() => {
+        expect(live.handled).toContain("Doctor observes recovered ingress");
+      });
+
+      const after = await runLiveDoctor(live.daemon, "after-acknowledge");
+      expect(after.allowed).toBe(true);
+      const findings = (after as { value: { findings: Array<{ code: string }> } }).value.findings;
+      expect(findings).not.toContainEqual(expect.objectContaining({ code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN" }));
+      expect(findings).not.toContainEqual(expect.objectContaining({ code: "TELEGRAM_INGRESS_STOPPED" }));
+      const health = JSON.parse(readFileSync(join(live.stateDir, "health.json"), "utf8")) as {
+        telegram: unknown;
+      };
+      expect(health.telegram).toMatchObject({ configured: true, running: true, disabledReason: null });
+    } finally {
+      await live.listener.close();
+      live.daemon.lock.release();
+    }
   });
 
   it("an unknown send result is terminal without automatic retry and stops the loop", async () => {

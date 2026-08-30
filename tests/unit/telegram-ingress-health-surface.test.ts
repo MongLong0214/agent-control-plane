@@ -13,19 +13,14 @@ afterAll(cleanupTempDirs);
  * #682, round 8's second follow-up (Sol's second BLOCK) — a daemon that comes up healthy while
  * Telegram silently never started looked identical, on every existing health surface, to one
  * that never had Telegram configured at all: `health.json`'s `mode` and `lockHeld` say nothing
- * about ingress, and `agentctl doctor system`'s checks are all derived from durable DB state,
- * which a live-process refusal decision never touches.
+ * about ingress, and the original Doctor checks were all derived from durable DB state, which a
+ * live-process refusal decision never touches.
  *
- * `Daemon.setTelegramIngressStatus` closes the gap `health.json` can close: `main`'s composition
- * root calls it once, right after Telegram's outcome is known, and it is written into
+ * `Daemon.setTelegramIngressStatus` writes each startup and runtime transition into
  * `health.json` immediately (`OPERATOR_METHOD.DAEMON_STATUS`, which backs `agentctl daemon
- * status`, reads that file verbatim — see `handleOperatorRequest`'s `DAEMON_STATUS` case).
- *
- * `agentctl doctor system` has no equivalent: `Doctor`'s checks all read `cp.db`/host state, and
- * a live ingress decision is not durable state Doctor's checks (or a separate CLI invocation)
- * could observe. Extending Doctor to cover this would mean persisting the outcome into the
- * database, which is a larger, separate change — flagged in the PR body as a known gap rather
- * than silently left for someone to discover only by its absence from `doctor system`'s output.
+ * status`, reads that file verbatim). `OPERATOR_METHOD.DOCTOR_RUN` supplements the durable
+ * Doctor checks from the same live daemon field, so both operator surfaces describe the listener
+ * actually owned by the process rather than only its startup outcome.
  */
 describe("#682 round 8's second follow-up: health.json reports Telegram ingress status", () => {
   it("records each Telegram ingress outcome distinctly in health.json", () => {
