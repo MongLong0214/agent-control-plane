@@ -1882,6 +1882,24 @@ const GUARDS = [
       "tests/unit/doctor-daemon-r2.test.ts::#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger",
     ],
   },
+  {
+    // #693 — the no-replace trigger refuses a colliding or moved source row, never a fresh one: a
+    // new (channel, nonce) at a new batch_ordinal, inserted onto a turn that already exists,
+    // passed every WHEN clause above it. This is the write-time backstop: every source `claim()`
+    // writes shares its turn's own `claim_audit_event_id`, so a source citing a *fresh*,
+    // honestly-produced audit event — including one attached after the claim transaction has
+    // closed — is refused. It is an equality check, not a provenance proof: a raw writer that
+    // copies the turn's own `claim_audit_event_id` into the new row passes it (pinned by
+    // "does NOT refuse a source that copies the turn's own claim event" in the same file), the same
+    // residual every trigger here carries against a privileged raw-SQL writer.
+    what: "a source citing a fresh audit event instead of its turn's own claim event is refused",
+    file: "src/db/schema.sql",
+    find: "WHEN NEW.admission_audit_event_id <> (\n  SELECT claim_audit_event_id FROM canonical_turns WHERE turn_request_id = NEW.turn_request_id\n)\nBEGIN",
+    replace: "WHEN 0\nBEGIN",
+    killedBy: [
+      "tests/unit/canonical-turn-ledger.test.ts::refuses a source citing a fresh audit event instead of the turn's own claim event",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

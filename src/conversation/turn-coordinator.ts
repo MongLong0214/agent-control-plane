@@ -563,6 +563,48 @@ export class ConversationTurnCoordinator {
    * this one — wiring a production caller here is #683/#639's other half, deliberately not done in
    * this change. See `reconcileUnresolved`'s docstring, fact 1 of 2, for what that means for the
    * sweep — and fact 2, which is independent of this one and does not resolve when this does.
+   *
+   * A later message that arrives once this method has already produced an `IN_DOUBT` turn is
+   * refused twice over, and both refusals are the intended answer, not a gap (#693). It is not a
+   * legal extra source of the turn already claimed: `canonical_turn_sources_admission_matches_claim`
+   * (`schema.sql`) requires a source's `admission_audit_event_id` to equal its turn's own
+   * `claim_audit_event_id` — the one audit event every source in a claim-time batch actually
+   * shares, because the whole batch is written in the same transaction as the turn, from the same
+   * `audited.value`, below. A later, honestly-produced source cites a *different* audit event —
+   * its own admission is a fact the claim transaction never recorded — so it is refused, and so is
+   * any future coalescing code that tries to attach one the way an ordinary writer would.
+   *
+   * This is an equality check on a value, not a proof of when a row was written: a raw writer that
+   * reads `canonical_turns.claim_audit_event_id` back out and copies it into a new source row
+   * passes the check, because the two columns then genuinely agree. That is the same residual
+   * every trigger in this schema carries against a sufficiently privileged raw-SQL writer — one
+   * can always `DROP TRIGGER` too — and it is why `prompt_digest` is what actually has to hold:
+   * `prompt_digest` is fixed at claim time, `TurnPermit.issuance` signs over it, and
+   * `#settleFromReceipt`'s identity match compares a target's receipt against that same frozen
+   * value. A coalescing write — honest or a copied-id bypass alike — would have to either rewrite
+   * `prompt_digest` after the fact, breaking the receipt match for a turn the target may already be
+   * executing against the value that was there first, or leave it unchanged, which records the
+   * turn as having consumed a message it was never actually asked to answer. Neither is a fix; both
+   * corrupt what `prompt_digest` is for, regardless of whether the source row that produced the
+   * corruption got past the trigger honestly or by copying its way past it.
+   *
+   * And it is not a legal new turn either: refused below by `canonical_turns_one_unresolved` /
+   * `CONVERSATION_TURN_IN_DOUBT`, on purpose, not as an accidental side effect of the
+   * one-unresolved-turn hold — this method has no override for it. Ingress is not this strict:
+   * `/again` deliberately lets the owner start an independent second turn while an earlier one on
+   * the same conversation is still unresolved (`telegram-router.ts`, `overridesUnresolved`), and
+   * `IngressGuard.claimTurn()` admits it. `ConversationTurnCoordinator.claim()` has no matching
+   * override today, so the two paths disagree on this one point — deliberately left unresolved
+   * here rather than guessed at, because `claim()` has no production caller (#638/#639) to be
+   * wrong in front of yet. Whoever wires this method to production has to decide then whether the
+   * one-unresolved-turn hold gains an `/again`-equivalent override or whether the coordinator
+   * stays stricter than ingress on purpose; either is a real decision and neither is this comment's
+   * to make. What is already true regardless of that decision: a later message is never a source of
+   * the turn already claimed — it is refused, once that decision is made, either as a new
+   * independent turn (matching `/again`) or as a hold violation (matching today's code), but never
+   * coalesced into the incumbent. Recourse for the caller belongs where the message is received,
+   * not here: the ingress ledger already parks a resend behind an unresolved claim and tells the
+   * owner to `/again` past it if they mean it now (#680, `telegram-router.ts`).
    */
   claim(input: {
     targetActorId: string;
@@ -808,6 +850,10 @@ export class ConversationTurnCoordinator {
       // refusal rather than an exception. `db.tx` holds a write lock from BEGIN IMMEDIATE, so
       // nothing can slip a turn in between this read and the insert below; the partial unique
       // index stays as the backstop for a bug, and firing it is a fault rather than a state.
+      //
+      // This is also the "not a legal new turn" half of #693's answer: a later message never
+      // joins the incumbent (see this method's docstring) and is refused here rather than queued
+      // or coalesced, deliberately, every time this fires.
       const incumbent = this.db.get<{ turn_request_id: string }>(
         `SELECT turn_request_id FROM canonical_turns
           WHERE target_actor_id = ? AND lifecycle_state = 'IN_DOUBT'`,
