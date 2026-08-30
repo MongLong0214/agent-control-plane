@@ -365,9 +365,8 @@ describe("one turn at a time on the CEO's canonical session", () => {
    * `hermes chat --resume <same id>` and interleave in a transcript the CEO carries forward as
    * context — which cannot be unwound, and which the CEO cannot tell happened.
    *
-   * The property holds today only because `TelegramLongPoller.pollOnce` awaits each update in
-   * turn. That await is what #630 removes, so this is written while the invariant is still true
-   * rather than after it stops being.
+   * `TelegramLongPollService.pollOnce` now detaches CEO turns, so this port — not a poll stack
+   * frame — is what prevents two overlapping turns from reaching the canonical session.
    */
   const heldPeer = (): { peer: FakePeer; server: McpServer; release: (text: string) => void } => {
     let release!: (text: string) => void;

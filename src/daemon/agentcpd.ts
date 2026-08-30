@@ -1297,7 +1297,7 @@ const startDaemonTelegramListenerOrRefuse = async (
  * message. The reason code travels with the sentence so a refusal in the transcript can still
  * be traced to the branch that produced it.
  */
-const answerAsCeo = async (port: CeoConversationPort, text: string): Promise<string> => {
+export const answerAsCeo = async (port: CeoConversationPort, text: string): Promise<string> => {
   const answered = await port.ask(text);
   if (answered.allowed) return answered.value;
   return `${ceoUnavailableSentence(answered.reasonCode)} (${answered.reasonCode})`;
@@ -1356,12 +1356,10 @@ export const ceoUnavailableSentence = (reasonCode: string): string => {
     return "The CEO session received this message and its reply failed. Sending the same message again starts a new turn rather than retrying this one.";
   }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_BUSY) {
-    // Not "send it again". This is the third copy of a sentence this repository has now
-    // corrected twice: #633 removed a claim the seam could not observe, #643 removed an
-    // invitation that was itself the duplicate path. The advice is true today — the turn
-    // genuinely did not start — and becomes wrong the moment BUSY is reachable in production
-    // (#630), because by then a held message is waiting rather than discarded.
-    return "The CEO is still working on the previous message. This one was not started; it will be taken once that turn finishes.";
+    // Not "send it again", and not a queue. The single-flight port refuses before this turn
+    // reaches the canonical session; #631 may add durable ordering later, but #630 must tell the
+    // owner only what exists now.
+    return "The CEO is still working on the previous message. This one was not started.";
   }
   if (reasonCode === ReasonCode.CEO_CONVERSATION_STALE) {
     // This used to fall through to the sentence below, which says the CEO answered. It did not:

@@ -30,7 +30,7 @@ const SECRET = "no-reply-webhook-secret";
  * exempts the row on purpose (that exemption is correct — see ingress-turn-claim.test.ts — the
  * defect is that nothing ever clears it for a turn that is, in fact, done).
  *
- * The first test below stubs `route()` because no path through it can produce `admitted: true,
+ * The first test below stubs `routeUntilCeoTurn()` because no path through it can produce `admitted: true,
  * replayed: false, reply: null` today — traced exhaustively, not just for DIRECT: `directHandler`
  * is typed `(input) => string | Promise<string>` (`telegram-router.ts`), so DIRECT always replies,
  * even to say a run was refused or parked; OWNER_DECISION always builds a reply via `replyFor`,
@@ -128,7 +128,7 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
 
     // Set up exactly the state `route()` would have left behind up to the claim: admitted and
     // claimed. What is under test is what happens *after* a handler decides not to reply, so
-    // `route()` itself is stubbed to return that outcome directly rather than reproducing a real
+    // `routeUntilCeoTurn()` itself is stubbed to return that outcome directly rather than reproducing a real
     // no-reply DIRECT handler — nothing in the current classifier can produce one, which is part
     // of why this bug is latent rather than yet observed in production.
     expect(
@@ -148,13 +148,17 @@ describe("#672 a claimed turn whose handler produces no reply", () => {
       reply: null,
       reasonCode: ReasonCode.OK,
     };
-    vi.spyOn(router, "route").mockResolvedValueOnce(noReplyOutcome);
+    vi.spyOn(router, "routeUntilCeoTurn").mockResolvedValueOnce({
+      status: "COMPLETED",
+      outcome: noReplyOutcome,
+    });
 
     const service = new TelegramLongPollService(new FakeTransport([telegramUpdate(1)]), router, SECRET, {
       allowedChatIds: ["chat"],
     });
 
-    await service.pollOnce();
+    const cycle = await service.pollOnce();
+    await cycle.settled();
 
     // The claim must reach a terminal state — the same *kind* of terminal state `resolveTurn`
     // produces for a reply that was actually sent, but not the *same field* (#682): this handler

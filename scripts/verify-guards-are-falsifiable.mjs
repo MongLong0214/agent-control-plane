@@ -866,6 +866,29 @@ const GUARDS = [
     ],
   },
   {
+    // A detached turn is not complete when pollOnce returns. Omitting it from the route list
+    // restores the old return type's lie in a new form: the work is still running, but the cycle
+    // says nothing was handed off and gives callers no promise to settle.
+    what: "pollOnce names a detached CEO turn as pending instead of returning an empty cycle",
+    file: "src/ingress/telegram-polling.ts",
+    find: '        routes.push({ status: "CEO_TURN_PENDING", outcome: route });',
+    replace: "",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::returns a pending CEO turn while refusing a second and reports the final offset when settled",
+    ],
+  },
+  {
+    // Detachment also removes the loop catch that used to impose retryDelayMs. Making a failed
+    // update immediately retryable reopens the hot loop while its Telegram offset is held.
+    what: "a detached Telegram route waits for retryDelayMs before it is attempted again",
+    file: "src/ingress/telegram-polling.ts",
+    find: "        retryAt: Date.now() + (this.options.retryDelayMs ?? 5_000),",
+    replace: "        retryAt: Date.now(),",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::waits for retryDelayMs before a detached route is attempted again",
+    ],
+  },
+  {
     what: "the grok billing read refuses to carry a bearer through a proxy or an unchecked certificate",
     file: "src/capacity/usage-collectors.ts",
     find: "    const unsafe = unsafeGrokTransport(process.env);",
