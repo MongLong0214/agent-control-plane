@@ -1650,10 +1650,25 @@ const GUARDS = [
   {
     what: "the turn-fence writer check refuses a literal bracket capture of Db run",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: 'node.argumentExpression.text === "run" &&',
-    replace: 'node.argumentExpression.text === "not-run" &&',
+    find: 'semanticStringConstant(node.argumentExpression) === "run" &&',
+    replace: 'semanticStringConstant(node.argumentExpression) === "not-run" &&',
     killedBy: [
       "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::refuses Db run captured through literal bracket access",
+    ],
+  },
+  {
+    what: "the turn-fence writer check resolves semantic constant run keys",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find:
+      "const semanticStringConstant = (expression) => {\n" +
+      "  const type = checker.getTypeAtLocation(expression);\n" +
+      "  return (type.flags & ts.TypeFlags.StringLiteral) !== 0 ? type.value : undefined;\n" +
+      "};",
+    replace:
+      "const semanticStringConstant = (expression) =>\n" +
+      "  ts.isStringLiteralLike(expression) ? expression.text : undefined;",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::measures inline SQL syntax and semantic run key boundary forms",
     ],
   },
   {

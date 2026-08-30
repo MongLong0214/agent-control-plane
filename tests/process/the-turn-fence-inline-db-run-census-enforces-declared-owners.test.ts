@@ -106,6 +106,135 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
+  it("measures inline SQL syntax and semantic run key boundary forms", () => {
+    const repo = scratchRepo("all");
+    const inline = [
+      {
+        name: "parenthesized-inline-sql.ts",
+        body: 'db.run(("DELETE FROM canonical_turns WHERE 1 = 0"));',
+      },
+      {
+        name: "unicode-escaped-inline-sql.ts",
+        body: String.raw`db.run("DELETE FROM canonical_t\u0075rns WHERE 1 = 0");`,
+      },
+    ];
+    const outside = [
+      {
+        name: "as-const-sql.ts",
+        body: 'db.run("DELETE FROM canonical_turns WHERE 1 = 0" as const);',
+      },
+      {
+        name: "satisfies-sql.ts",
+        body: 'db.run("DELETE FROM canonical_turns WHERE 1 = 0" satisfies string);',
+      },
+      {
+        name: "const-identifier-sql.ts",
+        body: 'const sql = "DELETE FROM canonical_turns WHERE 1 = 0"; db.run(sql);',
+      },
+      {
+        name: "substitution-template-sql.ts",
+        body: 'db.run(`DELETE FROM canonical_turns WHERE ${1} = 0`);',
+      },
+    ];
+    const semanticKeys = [
+      {
+        name: "parenthesized-run-key.ts",
+        body: 'db[("run")]("DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "as-const-run-key.ts",
+        body: 'const captured = db["run" as const]; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "satisfies-run-key.ts",
+        body: 'const captured = db["run" satisfies string]; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "template-run-key.ts",
+        body: 'const captured = db[`run`]; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "unicode-escaped-run-key.ts",
+        body: String.raw`const captured = db["r\u0075n"]; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");`,
+      },
+      {
+        name: "unicode-escaped-run-identifier.ts",
+        body: String.raw`const captured = db.r\u0075n; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");`,
+      },
+      {
+        name: "const-identifier-run-key.ts",
+        body: 'const key = "run"; const captured = db[key]; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "parenthesized-binding-key.ts",
+        body: 'const { [("run")]: captured } = db; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "as-const-binding-key.ts",
+        body: 'const { ["run" as const]: captured } = db; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "satisfies-binding-key.ts",
+        body: 'const { ["run" satisfies string]: captured } = db; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "template-binding-key.ts",
+        body: 'const { [`run`]: captured } = db; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "unicode-escaped-binding-key.ts",
+        body: String.raw`const { ["r\u0075n"]: captured } = db; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");`,
+      },
+      {
+        name: "const-identifier-binding-key.ts",
+        body: 'const key = "run"; const { [key]: captured } = db; captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "parenthesized-assignment-key.ts",
+        body: 'let captured: Db["run"] | undefined; ({ [("run")]: captured } = db); captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+      {
+        name: "const-identifier-assignment-key.ts",
+        body: 'const key = "run"; let captured: Db["run"] | undefined; ({ [key]: captured } = db); captured.call(db, "DELETE FROM canonical_turns WHERE 1 = 0");',
+      },
+    ];
+    for (const probe of [...inline, ...outside, ...semanticKeys]) {
+      writeProbe(repo, probe.name, probe.body);
+    }
+    writeProbe(
+      repo,
+      "widened-run-keys.ts",
+      [
+        'const widened = "run" as keyof Db;',
+        'const concatenated = ("r" + "un") as keyof Db;',
+        'const substituted = `r${"un"}` as keyof Db;',
+        'void db[widened];',
+        'void db[concatenated];',
+        'void db[substituted];',
+      ].join("\n  "),
+    );
+
+    const typed = spawnSync("node", ["node_modules/typescript/bin/tsc", "--noEmit"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    const done = censusOn(repo);
+
+    expect(typed.status, typed.stdout + typed.stderr).toBe(0);
+    for (const probe of inline) expect(done.stdout).toContain(`src/probe/${probe.name}`);
+    for (const probe of outside) {
+      expect(done.stdout).toContain(`src/probe/${probe.name}`);
+      expect(done.stdout).toContain("governed-table ownership unmeasured");
+    }
+    for (const probe of semanticKeys) {
+      expect(done.stdout).toContain(`src/probe/${probe.name}`);
+    }
+    expect(done.stdout).not.toContain("src/probe/widened-run-keys.ts");
+    expect(done.stdout).toContain("escapes its direct call surface");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
   it("reports Array join SQL outside the inline SQL boundary", () => {
     const repo = scratchRepo("all");
     writeProbe(
@@ -661,14 +790,18 @@ describe(CLAIM, () => {
     const done = censusOn(scratchRepo());
 
     expect(done.stdout).toContain("BOUNDARY:");
-    expect(done.stdout).toContain("TypeScript property symbol is exactly Db.run");
+    expect(done.stdout).toContain("property symbol resolves exactly to Db.run");
+    expect(done.stdout).toContain("after parentheses are removed");
     expect(done.stdout).toContain("string literal or no-substitution template literal");
-    expect(done.stdout).toContain("literal run-key bracket access");
-    expect(done.stdout).toContain("object binding destructuring");
-    expect(done.stdout).toContain("object assignment destructuring");
+    expect(done.stdout).toContain("element access plus object binding or assignment destructuring");
+    expect(done.stdout).toContain('TypeScript gives the key expression the string-literal type "run"');
+    expect(done.stdout).toContain("as const, satisfies, no-substitution templates, Unicode escapes");
+    expect(done.stdout).toContain('keys TypeScript does not type as literal "run"');
+    expect(done.stdout).toContain("keyof Db widening, concatenation, and substitution templates");
     expect(done.stdout).toContain("interface and other property aliases such as RunPort.run");
     expect(done.stdout).toContain("non-inline SQL expressions");
-    expect(done.stdout).toContain("casts to any, reflection, generated JavaScript, other SQL APIs");
+    expect(done.stdout).toContain("receiver casts to any, reflection, generated JavaScript");
+    expect(done.stdout).toContain("other SQL APIs");
     expect(done.stdout).toContain("object rest or spread");
     expect(done.stdout).toContain("both table names in ALTER TABLE RENAME TO");
     expect(done.stdout).toContain("after SQL comments are blanked");

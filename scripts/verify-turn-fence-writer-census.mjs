@@ -19,12 +19,18 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLAIM =
   "Every inline-SQL direct call whose TypeScript property symbol is exactly Db.run and that names a turn-fence table is in that table's declared application owner.";
 const BOUNDARY =
-  "Under src, this check counts only dot-property calls whose TypeScript property symbol is exactly " +
-  "Db.run and whose first argument is a string literal or no-substitution template literal at the " +
-  "call site; exact Db.run references through dot-property access, literal run-key bracket access, " +
-  "object binding destructuring, and object assignment destructuring are refused; interface and " +
-  "other property aliases such as RunPort.run, non-inline SQL expressions, casts to any, reflection, " +
-  "generated JavaScript, other SQL APIs, object rest or spread, and code outside src are not covered; " +
+  "Under src TypeScript, this check counts only dot-property calls whose property symbol resolves " +
+  "exactly to Db.run and whose first argument, after parentheses are removed, is syntactically a " +
+  "string literal or no-substitution template literal; exact Db.run references through dot-property " +
+  "access are refused unless used as that direct call, and element access plus object binding or " +
+  "assignment destructuring are refused only when the receiver type has exact Db.run and TypeScript " +
+  'gives the key expression the string-literal type "run", as measured for direct literals, parentheses, ' +
+  "as const, satisfies, no-substitution templates, Unicode escapes, and const identifiers; interface " +
+  'and other property aliases such as RunPort.run, keys TypeScript does not type as literal "run" ' +
+  "as measured for keyof Db widening, concatenation, and substitution templates, non-inline SQL " +
+  "expressions including casts and satisfies expressions, " +
+  "receiver casts to any, reflection, generated JavaScript, other SQL APIs, object rest or spread, " +
+  "and code outside src are not covered; " +
   "schema.sql coverage is limited to INSERT, UPDATE, REPLACE, DELETE, and both table names in ALTER " +
   "TABLE RENAME TO after SQL comments are blanked; named migration rebuild functions are reported but " +
   "their SQL is not evaluated.";
@@ -219,12 +225,16 @@ const locationOf = (sourceFile, node) => {
   const point = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
   return { file: relativeSourceFile(sourceFile), line: point.line + 1 };
 };
+const semanticStringConstant = (expression) => {
+  const type = checker.getTypeAtLocation(expression);
+  return (type.flags & ts.TypeFlags.StringLiteral) !== 0 ? type.value : undefined;
+};
 const staticPropertyName = (name) => {
   if (ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)) {
     return name.text;
   }
-  if (ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) {
-    return name.expression.text;
+  if (ts.isComputedPropertyName(name)) {
+    return semanticStringConstant(name.expression);
   }
   return undefined;
 };
@@ -280,8 +290,7 @@ for (const sourceFile of program.getSourceFiles()) {
     }
     if (
       ts.isElementAccessExpression(node) &&
-      ts.isStringLiteralLike(node.argumentExpression) &&
-      node.argumentExpression.text === "run" &&
+      semanticStringConstant(node.argumentExpression) === "run" &&
       typeHasDbRun(node.expression)
     ) {
       recordEscapedRun(sourceFile, node);
