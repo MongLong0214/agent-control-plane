@@ -15,6 +15,7 @@ import {
   type TelegramOwnerPromptRequest,
   type TelegramInterruptPoint,
   type TelegramRouteOutcome,
+  type TelegramRouteProgress,
   type TelegramStoredState,
   type TelegramStoredResponse,
   type TelegramDeliveryStatus,
@@ -122,6 +123,26 @@ type TelegramUpdateState =
 type TelegramUpdateReservation =
   | { reserved: true }
   | { reserved: false; retryInMs?: number };
+
+export type TelegramPollRoute =
+  | { status: "COMPLETED"; outcome: TelegramRouteOutcome }
+  | { status: "CEO_TURN_PENDING"; outcome: Promise<TelegramRouteOutcome> };
+
+export interface TelegramSettledPollCycle {
+  outcomes: TelegramRouteOutcome[];
+  nextOffset?: number;
+}
+
+/**
+ * The honest boundary returned by `pollOnce`: ordinary routes are complete, while a CEO turn is
+ * named as pending. `settled()` observes this cycle's completed outcomes and the cursor after they
+ * finish; `nextOffsetAtReturn` is only the cursor snapshot taken when polling itself returned.
+ */
+export interface TelegramPollCycle {
+  routes: TelegramPollRoute[];
+  nextOffsetAtReturn?: number;
+  settled(): Promise<TelegramSettledPollCycle>;
+}
 
 /** Durable reservation port for owner prompts; production wires this to the CP database. */
 export interface TelegramOwnerPromptStore {
@@ -348,8 +369,8 @@ export class TelegramLongPollService {
   /**
    * Waits for every route already handed to the listener and rejects with any fault it recorded.
    *
-   * Routed tasks leave `pollOnce` in #630, so a caller cannot use that poll promise as evidence
-   * that a task finished. Faults are retained until this method observes them; the rejection is
+   * CEO turns leave `pollOnce` in #630, so a caller cannot use that poll promise as evidence that
+   * a turn finished. Faults are retained until this method observes them; the rejection is
    * not inferred from an empty outcome list, which would make "nothing failed" indistinguishable
    * from "the test never looked".
    */
@@ -481,7 +502,7 @@ export class TelegramLongPollService {
     }, persisted.evidence);
   }
 
-  async pollOnce(): Promise<{ outcomes: TelegramRouteOutcome[]; nextOffset?: number }> {
+  async pollOnce(): Promise<TelegramPollCycle> {
     // Receive first. Owner-gate prompts are outbound and incidental to this loop; the inbound
     // batch is the owner's only way to reach the daemon. Delivering prompts first meant one
     // undeliverable prompt — a denied `sendOwnerPromptIfNeeded`, a Telegram 5xx — threw past
@@ -492,7 +513,7 @@ export class TelegramLongPollService {
       timeoutSeconds: this.options.pollTimeoutSeconds ?? 50,
       signal: this.#controller?.signal,
     });
-    const outcomes: TelegramRouteOutcome[] = [];
+    const routes: TelegramPollRoute[] = [];
     let retryInMs: number | undefined;
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
@@ -504,40 +525,61 @@ export class TelegramLongPollService {
         continue;
       }
 
-      const outcomeIndex = outcomes.length;
-      // Allocate the slot now so completion order cannot reorder the batch a caller observes.
-      outcomes.length += 1;
-      const route = this.routeUpdate(update).then(
-        (outcome) => {
-          outcomes[outcomeIndex] = outcome;
+      try {
+        const progress = await this.routeUpdate(update);
+        if (progress.status === "COMPLETED") {
           this.completeUpdate(update.update_id);
-          return outcome;
-        },
-        (error: unknown) => {
-          this.retryUpdate(update.update_id);
-          throw error;
-        },
-      );
-      this.trackTurn(route);
+          routes.push(progress);
+          continue;
+        }
+
+        const route = progress.outcome.then(
+          (outcome) => {
+            this.completeUpdate(update.update_id);
+            return outcome;
+          },
+          (error: unknown) => {
+            this.retryUpdate(update.update_id);
+            throw error;
+          },
+        );
+        routes.push({ status: "CEO_TURN_PENDING", outcome: route });
+        this.trackTurn(route);
+      } catch (error) {
+        // Non-CEO routes remain inside pollOnce, so their rejection still reaches loop()'s
+        // reporter and retry delay exactly as it did before the CEO turn was detached.
+        this.retryUpdate(update.update_id);
+        throw error;
+      }
     }
 
-    // The inbound batch has been accepted into tracked tasks before incidental outbound prompts
-    // run. A slow routed task no longer holds this poll promise or the next getUpdates call open.
+    // A pending CEO turn has been accepted into a tracked task before incidental outbound prompts
+    // run. Managed routes and owner decisions still finish here; only the CEO call leaves the poll.
     await this.deliverOwnerGatePrompts();
-    if (outcomes.length === 0 && updates.length > 0) {
+    if (routes.length === 0 && updates.length > 0) {
       if (retryInMs !== undefined) {
-        // A detached failure no longer reaches loop()'s catch. Its update-local deadline is the
+        // A detached CEO failure no longer reaches loop()'s catch. Its update-local deadline is the
         // replacement observer: keep the held offset, but do not ask Telegram for this update in
         // a hot loop or schedule its route again before the configured backoff expires.
         await delay(retryInMs);
       } else if (this.#pendingTurns.size > 0) {
         // Holding the offset makes Telegram return the running update immediately. A bounded pause
-        // prevents a hot loop without waiting for the routed task itself; a newly arrived update is
+        // prevents a hot loop without waiting for the CEO turn itself; a newly arrived update is
         // delayed by at most 100ms before the next getUpdates call can schedule it.
         await delay(Math.min(this.options.retryDelayMs ?? 5_000, 100));
       }
     }
-    return { outcomes, ...(this.#offset === undefined ? {} : { nextOffset: this.#offset }) };
+    return {
+      routes,
+      ...(this.#offset === undefined ? {} : { nextOffsetAtReturn: this.#offset }),
+      settled: async () => {
+        const outcomes = await Promise.all(routes.map((route) => route.outcome));
+        return {
+          outcomes,
+          ...(this.#offset === undefined ? {} : { nextOffset: this.#offset }),
+        };
+      },
+    };
   }
 
   start(): void {
@@ -598,8 +640,21 @@ export class TelegramLongPollService {
     return turn;
   }
 
-  private async routeUpdate(update: TelegramUpdate): Promise<TelegramRouteOutcome> {
-    const outcome = await this.router.route(update, this.webhookSecret);
+  private async routeUpdate(update: TelegramUpdate): Promise<TelegramRouteProgress> {
+    const progress = await this.router.routeUntilCeoTurn(update, this.webhookSecret);
+    if (progress.status === "COMPLETED") {
+      return { status: "COMPLETED", outcome: await this.deliverRouteOutcome(update, progress.outcome) };
+    }
+    return {
+      status: "CEO_TURN_PENDING",
+      outcome: progress.outcome.then((outcome) => this.deliverRouteOutcome(update, outcome)),
+    };
+  }
+
+  private async deliverRouteOutcome(
+    update: TelegramUpdate,
+    outcome: TelegramRouteOutcome,
+  ): Promise<TelegramRouteOutcome> {
     if (!outcome.reply) return outcome;
 
     // Reserve before the external call. A reservation left PENDING after an ambiguous return is

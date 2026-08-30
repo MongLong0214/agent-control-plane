@@ -78,22 +78,22 @@ any actor binding exists (see C1, C3).
   `repliedAt`). So a slow-but-answered turn *does* sit unresolved while its handler runs, and
   *becomes* resolved only once that handler returns and the reply is accepted — both are true, at
   different times.
-- **Why an ordinary slow turn does not by itself produce a second unresolved row: the poll loop's
-  seriality, not the first row never existing.** `telegram-polling.ts`'s `pollOnce` routes each
-  update in a batch with `for (const update of updates) { await this.router.route(update, ...);
-  ... }` — sequential, one `await` at a time. A second update in the same batch cannot begin
-  routing (and so cannot reach `claimTurn`) until the first's entire `route()` call, including its
-  `directHandler` await, has returned. This is a claim about this one loop processing one batch
-  at a time; it says nothing about whether two listener processes could run concurrently, which
-  this row does not check. **Produced by two paths that do reach a second, genuinely simultaneous
-  unresolved row:** (1) a process crash before `completeResponse`/`reserveResponse` ever run —
-  what every existing test (`TelegramInterruption`) simulates, ending the process (and the loop's
-  serialization with it) mid-await; (2) a Telegram delivery failure:
-  `telegram-polling.ts`'s `pollOnce` calls `reserveResponse` before every send and
-  `completeResponse` — the only call that sets `repliedAt` — only after `sendMessage` succeeds; if
-  it throws, the claim stays unresolved and the exception is caught by `loop()`, which logs it via
-  `onError` and keeps polling — the process survives, but the row stays unresolved past the
-  handler's own return, no longer bounded by the serialization argument above.
+- **Why an ordinary slow turn does not by itself produce a second unresolved row: the ingress
+  check, not poll-loop seriality.** `telegram-polling.ts` now waits through admission,
+  classification, and `claimTurn`, then detaches only the pending DIRECT handler that calls the
+  CEO. Managed commands and owner decisions remain inside `pollOnce`; a later DIRECT update can
+  reach the router while the first CEO handler is still open. Before it can claim, however, the
+  DIRECT branch reads `unresolvedTurns(identity.sessionDigest)` and parks an ordinary message.
+  `/again` is the explicit exception: it may claim a later turn while the first is unresolved,
+  after recording every overridden nonce. This is a claim about one listener's route policy; it
+  says nothing about whether two listener processes could run concurrently, which this row does
+  not check. **Produced by two paths that can leave unresolved rows:** (1) a process crash before
+  `completeResponse`/`reserveResponse` ever run — what the existing `TelegramInterruption` tests
+  simulate; (2) a Telegram delivery failure. `telegram-polling.ts` calls `reserveResponse` before
+  every send and `completeResponse` — the only call that sets `repliedAt` — only after
+  `sendMessage` succeeds. A detached DIRECT failure is reported by the tracked-turn observer and
+  held behind its update-local retry deadline; a non-DIRECT failure still reaches `loop()`'s catch.
+  In either case the process can survive while the claim stays unresolved past the handler return.
 - **Terminal or gap:** the single-unresolved-turn case is closed —
   `TelegramHermesRouter`'s DIRECT branch calls `unresolvedTurns(identity.sessionDigest)` before
   `claimTurn` for every DIRECT message (not only a suspected resend), parks with an explicit reply,

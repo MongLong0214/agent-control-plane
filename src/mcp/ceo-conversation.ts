@@ -107,7 +107,7 @@ export class CeoConversationPort {
    * interleave in a transcript the CEO then carries forward as context. That cannot be unwound
    * and the CEO cannot tell it happened.
    *
-   * `TelegramLongPollService.pollOnce` now detaches route tasks, so call ordering no longer
+   * `TelegramLongPollService.pollOnce` now detaches CEO turns, so call ordering no longer
    * serializes this boundary. This flag is the enforcement: a later turn is refused before it
    * reaches the canonical session.
    */

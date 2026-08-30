@@ -24,7 +24,7 @@
  * **These values are not yet sized against a real turn, and that is deliberate.** A CEO turn is
  * a full agent loop: one measured on 2026-08-20 took 3m15s and added 92 messages, 65 of them
  * tool calls. Both numbers here are below that. Raising them is not the whole fix, because
- * routed Telegram tasks now leave `TelegramLongPollService.pollOnce`, so this budget is no longer
+ * routed CEO turns now leave `TelegramLongPollService.pollOnce`, so this budget is no longer
  * the ceiling on how long one owner message stalls polling. It is still below the one measured
  * turn, and one measurement is not enough to choose a production deadline. What is fixed here is
  * the relationship between the two deadlines, which is wrong at any size.

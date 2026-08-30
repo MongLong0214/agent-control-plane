@@ -145,6 +145,19 @@ export interface TelegramRouteOutcome {
   runId?: string;
 }
 
+/**
+ * Routing stops at the one boundary that may outlive a Telegram poll: the admitted DIRECT
+ * handler that calls the CEO. Every other route has already completed when it is returned.
+ */
+export type TelegramRouteProgress =
+  | { status: "COMPLETED"; outcome: TelegramRouteOutcome }
+  | { status: "CEO_TURN_PENDING"; outcome: Promise<TelegramRouteOutcome> };
+
+const completedRoute = (outcome: TelegramRouteOutcome): TelegramRouteProgress => ({
+  status: "COMPLETED",
+  outcome,
+});
+
 export interface TelegramRouterOptions {
   ingress: TelegramIngress;
   /** The sealed Hermes surface; the router never receives the ControlPlane. */
@@ -414,15 +427,28 @@ export class TelegramHermesRouter {
   }
 
   async route(update: TelegramUpdate, presentedSecret: string | null): Promise<TelegramRouteOutcome> {
+    const progress = await this.routeUntilCeoTurn(update, presentedSecret);
+    return progress.status === "COMPLETED" ? progress.outcome : await progress.outcome;
+  }
+
+  /**
+   * Completes admission, classification, claims, managed work, and owner decisions inline. Only
+   * an admitted and claimed DIRECT handler is returned as pending, because that is the CEO turn
+   * whose latency must not hold the next Telegram poll open.
+   */
+  async routeUntilCeoTurn(
+    update: TelegramUpdate,
+    presentedSecret: string | null,
+  ): Promise<TelegramRouteProgress> {
     const stored = this.getStoredState(this.ingress.nonceFor(update));
     if (stored?.reply && this.deliveryStatus(stored) === "PENDING") {
       // A PENDING reservation means an earlier process may already have reached Telegram.
       // It is deliberately not retried: an ambiguous external result is safer as a single
       // possibly-lost response than as a duplicate owner-facing message.
-      return this.storedResponseOutcome(update, stored, false);
+      return completedRoute(this.storedResponseOutcome(update, stored, false));
     }
     if (stored?.reply && this.deliveryStatus(stored) === "RETRYABLE") {
-      return this.storedResponseOutcome(update, stored, true);
+      return completedRoute(this.storedResponseOutcome(update, stored, true));
     }
 
     const parsedOwner = update.message && !this.ingress.isForwarded(update)
@@ -431,7 +457,9 @@ export class TelegramHermesRouter {
 
     if (parsedOwner) {
       const prompt = this.promptForReply(update, parsedOwner.runId);
-      if (!prompt) return this.unresolvableOwnerDecision(update, presentedSecret, parsedOwner);
+      if (!prompt) {
+        return completedRoute(await this.unresolvableOwnerDecision(update, presentedSecret, parsedOwner));
+      }
       const idempotencyKey = ownerDecisionIdempotencyKey(update, parsedOwner);
       const approval: TelegramOwnerApproval = {
         runId: parsedOwner.runId,
@@ -447,7 +475,9 @@ export class TelegramHermesRouter {
       };
       const admitted = this.ingress.admitOwnerApproval(update, presentedSecret, approval);
       if (!admitted.allowed) {
-        return this.deniedOrReplay(update, admitted.reasonCode, admitted.message, admitted.evidence);
+        return completedRoute(
+          this.deniedOrReplay(update, admitted.reasonCode, admitted.message, admitted.evidence),
+        );
       }
       await this.interrupt("after-admission", update);
 
@@ -468,7 +498,7 @@ export class TelegramHermesRouter {
           ? `OWNER DECISION recorded: ${parsedOwner.approved ? "APPROVED" : "REJECTED"}\nrun: ${parsedOwner.runId}\nitem: ${parsedOwner.item}`
           : this.failureText("OWNER DECISION refused", decision),
       );
-      return {
+      return completedRoute({
         updateId: update.update_id,
         nonce: this.ingress.nonceFor(update),
         correlationId: correlationIdFor(update),
@@ -478,25 +508,27 @@ export class TelegramHermesRouter {
         input: null,
         reply,
         reasonCode: decision.reasonCode,
-      };
+      });
     }
 
     const admitted = this.ingress.admit(update, presentedSecret);
     if (!admitted.allowed) {
-      return this.deniedOrReplay(update, admitted.reasonCode, admitted.message, admitted.evidence);
+      return completedRoute(
+        this.deniedOrReplay(update, admitted.reasonCode, admitted.message, admitted.evidence),
+      );
     }
     await this.interrupt("after-admission", update);
 
     const classified = classifyTelegramMessage(admitted.value, update, this.defaultProjectId);
     if (!classified.allowed) {
-      return this.outcomeWithReply(
+      return completedRoute(this.outcomeWithReply(
         update,
         true,
         false,
         null,
         this.replyFor(update, this.failureText("Telegram request refused", classified)),
         classified.reasonCode,
-      );
+      ));
     }
 
     try {
@@ -535,7 +567,7 @@ export class TelegramHermesRouter {
           // grow without bound, and naming all of them risks the exact opposite failure — a
           // reply so long it cannot be sent, or one truncated in a way that drops the
           // instructions telling the owner `/again` exists at all.
-          return this.outcomeWithReply(
+          return completedRoute(this.outcomeWithReply(
             update,
             true,
             false,
@@ -549,7 +581,7 @@ export class TelegramHermesRouter {
               ].join("\n"),
             ),
             ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION,
-          );
+          ));
         }
 
         // Reached without an unresolved turn, or with one or more the owner deliberately
@@ -564,41 +596,66 @@ export class TelegramHermesRouter {
           overriddenUnresolvedNonces ? { ...identity, overriddenUnresolvedNonces } : identity,
         );
         if (!claimed.allowed) {
-          return this.outcomeWithReply(
+          return completedRoute(this.outcomeWithReply(
             update,
             true,
             false,
             null,
             this.replyFor(update, this.failureText("Telegram request not run", claimed)),
             claimed.reasonCode,
-          );
+          ));
         }
-        const directText = await this.directHandler(classified.value);
-        return this.outcomeWithReply(
-          update,
-          true,
-          false,
-          classified.value,
-          // Not "acknowledged by Hermes". The default directHandler is a pure function that
-          // formats a string; nothing is dispatched and Hermes never sees the message. Naming
-          // an actor that did not receive it tells the owner a request is in motion when it is
-          // not — the reply was the only thing that looked like progress.
-          //
-          // A deployment may inject a directHandler that does reach somewhere, so the prefix
-          // states only what the router itself knows: the message arrived and created no run.
-          // Anything about who handled it belongs to the handler's own text.
-          this.replyFor(update, `DIRECT received; no run created\n${directText}`),
-          ReasonCode.OK,
-        );
+        return {
+          status: "CEO_TURN_PENDING",
+          outcome: this.completeDirectRoute(update, classified.value),
+        };
       }
-      return await this.routeManaged(update, admitted.value, classified.value);
+      return completedRoute(await this.routeManaged(update, admitted.value, classified.value));
+    } catch (error) {
+      if (error instanceof TelegramInterruption) throw error;
+      return completedRoute(this.outcomeWithReply(
+        update,
+        true,
+        false,
+        classified.value,
+        this.replyFor(update, this.failureText("Telegram routing failed", deny(
+          ReasonCode.INTERNAL_ERROR,
+          error instanceof Error ? error.message : String(error),
+        ))),
+        ReasonCode.INTERNAL_ERROR,
+      ));
+    }
+  }
+
+  private async completeDirectRoute(
+    update: TelegramUpdate,
+    input: TelegramDirectInput,
+  ): Promise<TelegramRouteOutcome> {
+    try {
+      const directText = await this.directHandler(input);
+      return this.outcomeWithReply(
+        update,
+        true,
+        false,
+        input,
+        // Not "acknowledged by Hermes". The default directHandler is a pure function that
+        // formats a string; nothing is dispatched and Hermes never sees the message. Naming
+        // an actor that did not receive it tells the owner a request is in motion when it is
+        // not — the reply was the only thing that looked like progress.
+        //
+        // A deployment may inject a directHandler that does reach somewhere, so the prefix
+        // states only what the router itself knows: the message arrived and created no run.
+        // Anything about who handled it belongs to the handler's own text.
+        this.replyFor(update, `DIRECT received; no run created\n${directText}`),
+        ReasonCode.OK,
+      );
     } catch (error) {
       if (error instanceof TelegramInterruption) throw error;
       return this.outcomeWithReply(
         update,
         true,
         false,
-        classified.value,
+        input,
         this.replyFor(update, this.failureText("Telegram routing failed", deny(
           ReasonCode.INTERNAL_ERROR,
           error instanceof Error ? error.message : String(error),

@@ -95,24 +95,20 @@ const telegramConfig = {
 const daemonStub = { finalizeApprovedRun: async (_runId: string): Promise<void> => undefined };
 
 /**
- * A routed task will outlive `pollOnce` after #630, so its fault belongs to the listener's task
- * observer rather than to the poll promise. Catching the poll rejection keeps this same assertion
- * valid while routing is still synchronous: if the observer stops recording the injected fault,
- * this promise resolves and the named test fails instead of passing because `pollOnce` happened to
- * reject first.
+ * A CEO turn can outlive `pollOnce` after #630, so its fault belongs to the listener's task
+ * observer rather than to the poll promise. Managed and owner-decision faults still reject the
+ * poll itself. Waiting both boundaries makes the named fault mandatory whichever side produced it.
  */
-const observedTurnFault = async (service: {
-  pollOnce(): Promise<unknown>;
-  pendingTurnsSettled(): Promise<void>;
-}): Promise<void> => {
-  await service.pollOnce().catch(() => undefined);
+const observedTurnFault = async (service: TelegramLongPollService): Promise<void> => {
+  const cycle = await service.pollOnce();
   await service.pendingTurnsSettled();
+  await cycle.settled();
 };
 
 const settledPoll = async (service: TelegramLongPollService) => {
   const cycle = await service.pollOnce();
   await service.pendingTurnsSettled();
-  return cycle;
+  return cycle.settled();
 };
 
 describe("Telegram production ingress", () => {
@@ -308,7 +304,7 @@ describe("Telegram production ingress", () => {
     }
   });
 
-  it("returns from polling while one CEO turn runs and refuses a second without advancing past the first", async () => {
+  it("returns a pending CEO turn while refusing a second and reports the final offset when settled", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -343,20 +339,20 @@ describe("Telegram production ingress", () => {
       const firstCycle = await listener.service.pollOnce();
       await firstReached;
       expect(peerCalls).toEqual(["first detached turn"]);
-      expect(firstCycle.outcomes[0]).toBeUndefined();
+      expect(firstCycle.routes).toHaveLength(1);
+      expect(firstCycle.routes[0]?.status).toBe("CEO_TURN_PENDING");
+      expect(firstCycle.nextOffsetAtReturn).toBeUndefined();
       expect(listener.service.offset).toBeUndefined();
 
       // /again deliberately gets past the unresolved-turn ingress hold, so the refusal below is
       // the CEO port's #inFlight guard rather than an earlier router branch.
       transport.updates = [first, update("/again second detached turn", {}, 681)];
       const secondCycle = await listener.service.pollOnce();
-      const deadline = Date.now() + 1_000;
-      while (transport.sent.length === 0 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 1));
-      }
+      const secondSettled = await secondCycle.settled();
 
       expect(transport.sent[0]?.text).toContain(ReasonCode.CEO_CONVERSATION_BUSY);
-      expect(secondCycle.outcomes[0]?.reply?.text).toContain(ReasonCode.CEO_CONVERSATION_BUSY);
+      expect(secondCycle.routes[0]?.status).toBe("CEO_TURN_PENDING");
+      expect(secondSettled.outcomes[0]?.reply?.text).toContain(ReasonCode.CEO_CONVERSATION_BUSY);
       expect(peerCalls, "the busy turn reached the peer or was queued behind the first").toEqual([
         "first detached turn",
       ]);
@@ -364,12 +360,109 @@ describe("Telegram production ingress", () => {
 
       releaseFirst({ model: "fake", role: "assistant", content: { type: "text", text: "first answer" } });
       await listener.service.pendingTurnsSettled();
+      const firstSettled = await firstCycle.settled();
 
       expect(peerCalls, "the refused second turn ran after the first finished").toEqual(["first detached turn"]);
-      expect(firstCycle.outcomes[0]?.reply?.text).toContain("first answer");
+      expect(firstSettled.outcomes[0]?.reply?.text).toContain("first answer");
+      expect(firstSettled.nextOffset).toBe(682);
       expect(listener.service.offset).toBe(682);
     } finally {
       releaseFirst({ model: "fake", role: "assistant", content: { type: "text", text: "cleanup" } });
+      await listener.close();
+    }
+  });
+
+  it("keeps a managed route inside pollOnce until its dispatch checkpoint completes", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const transport = new FakeTelegramTransport();
+    transport.updates = [update(`/managed ${registered.projectId} wait at dispatch`, {}, 679)];
+    let releaseDispatch!: () => void;
+    let markDispatchReached!: () => void;
+    const dispatchReached = new Promise<void>((resolve) => { markDispatchReached = resolve; });
+    const heldDispatch = new Promise<void>((resolve) => { releaseDispatch = resolve; });
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      {
+        transport,
+        start: false,
+        onInterrupt: async (point) => {
+          if (point !== "after-dispatch") return;
+          markDispatchReached();
+          await heldDispatch;
+        },
+      },
+    );
+
+    try {
+      let pollReturned = false;
+      const polling = listener.service.pollOnce().then((cycle) => {
+        pollReturned = true;
+        return cycle;
+      });
+      await dispatchReached;
+      await Promise.resolve();
+      expect(pollReturned, "the managed route was detached with the CEO turn").toBe(false);
+
+      releaseDispatch();
+      const cycle = await polling;
+      expect(cycle.routes).toHaveLength(1);
+      expect(cycle.routes[0]?.status).toBe("COMPLETED");
+      const settled = await cycle.settled();
+      expect(settled.outcomes[0]?.classification).toBe("MANAGED");
+      expect(settled.nextOffset).toBe(680);
+    } finally {
+      releaseDispatch();
+      await listener.close();
+    }
+  });
+
+  it("keeps an admitted owner decision refusal inside pollOnce until routing completes", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const transport = new FakeTelegramTransport();
+    transport.updates = [update("/approve run_missing deploy", {
+      reply_to_message: { message_id: 999_999 },
+    }, 678)];
+    let releaseAdmission!: () => void;
+    let markAdmissionReached!: () => void;
+    const admissionReached = new Promise<void>((resolve) => { markAdmissionReached = resolve; });
+    const heldAdmission = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    const listener = await startDaemonTelegramListener(harness.cp, telegramConfig, daemonStub, {
+      transport,
+      start: false,
+      onInterrupt: async (point) => {
+        if (point !== "after-admission") return;
+        markAdmissionReached();
+        await heldAdmission;
+      },
+    });
+
+    try {
+      let pollReturned = false;
+      const polling = listener.service.pollOnce().then((cycle) => {
+        pollReturned = true;
+        return cycle;
+      });
+      await admissionReached;
+      await Promise.resolve();
+      expect(pollReturned, "the owner decision route was detached with the CEO turn").toBe(false);
+
+      releaseAdmission();
+      const cycle = await polling;
+      expect(cycle.routes).toHaveLength(1);
+      expect(cycle.routes[0]?.status).toBe("COMPLETED");
+      const settled = await cycle.settled();
+      expect(settled.outcomes[0]?.classification).toBe("OWNER_DECISION");
+      expect(settled.outcomes[0]?.reasonCode).toBe(ReasonCode.OWNER_AUTHORITY_NOT_DELEGABLE);
+      expect(settled.nextOffset).toBe(679);
+    } finally {
+      releaseAdmission();
       await listener.close();
     }
   });
@@ -400,17 +493,22 @@ describe("Telegram production ingress", () => {
     const retryDelayMs = 200;
     const failedUpdate = update("reply delivery keeps failing", {}, 683);
     const attemptTimes: number[] = [];
+    const pollTimes: number[] = [];
     const offsets: Array<number | undefined> = [];
-    let markSecondAttempt!: () => void;
-    const secondAttempt = new Promise<void>((resolve) => { markSecondAttempt = resolve; });
+    let pollsAtSecondAttempt: number | undefined;
+    let markSecondFailure!: () => void;
+    const secondFailure = new Promise<void>((resolve) => { markSecondFailure = resolve; });
     const transport: TelegramBotTransport = {
       async getUpdates(options) {
+        pollTimes.push(Date.now());
         offsets.push(options.offset);
         return [failedUpdate];
       },
       async sendMessage() {
         attemptTimes.push(Date.now());
-        if (attemptTimes.length === 2) markSecondAttempt();
+        if (attemptTimes.length === 2) {
+          pollsAtSecondAttempt = pollTimes.length;
+        }
         throw new TelegramDeliveryError("continuous confirmed route failure", false);
       },
     };
@@ -423,14 +521,17 @@ describe("Telegram production ingress", () => {
         transport,
         start: false,
         onDirect: () => "reply that Telegram refuses",
-        onError: (error) => { errors.push(error); },
+        onError: (error) => {
+          errors.push(error);
+          if (errors.length === 2) markSecondFailure();
+        },
       },
     );
 
     listener.service.start();
     try {
       await Promise.race([
-        secondAttempt,
+        secondFailure,
         new Promise<never>((_resolve, reject) => {
           const timeout = setTimeout(() => reject(new Error("second route attempt never started")), 3_000);
           timeout.unref();
@@ -444,6 +545,8 @@ describe("Telegram production ingress", () => {
     expect(attemptTimes.slice(1).every(
       (attemptedAt, index) => attemptedAt - attemptTimes[index]! >= retryDelayMs,
     )).toBe(true);
+    expect(pollsAtSecondAttempt, "the poll loop spun on the retryable update during its backoff")
+      .toBeLessThanOrEqual(4);
     expect(listener.service.offset).toBeUndefined();
     expect(offsets.every((offset) => offset === undefined)).toBe(true);
     expect(errors).toHaveLength(attemptTimes.length);
@@ -482,7 +585,10 @@ describe("Telegram production ingress", () => {
         }),
         update(`/approve ${driven.runId} deploy to production`, { forward_from: { id: 999 } }, 102),
       ];
-      const outcomes = (await settledPoll(listener.service)).outcomes;
+      const cycle = await listener.service.pollOnce();
+      expect(cycle.routes[0]?.status).toBe("COMPLETED");
+      await listener.service.pendingTurnsSettled();
+      const outcomes = (await cycle.settled()).outcomes;
       const outcome = outcomes[0]!;
       expect(outcome.classification).toBe("OWNER_DECISION");
       expect(outcome.admitted).toBe(true);

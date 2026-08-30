@@ -365,7 +365,7 @@ describe("one turn at a time on the CEO's canonical session", () => {
    * `hermes chat --resume <same id>` and interleave in a transcript the CEO carries forward as
    * context — which cannot be unwound, and which the CEO cannot tell happened.
    *
-   * `TelegramLongPollService.pollOnce` now detaches route tasks, so this port — not a poll stack
+   * `TelegramLongPollService.pollOnce` now detaches CEO turns, so this port — not a poll stack
    * frame — is what prevents two overlapping turns from reaching the canonical session.
    */
   const heldPeer = (): { peer: FakePeer; server: McpServer; release: (text: string) => void } => {
