@@ -58,6 +58,8 @@ import type { DaemonFinalizationAuthorities } from "../daemon/finalizer.ts";
 
 export interface ControlPlaneConfig {
   databasePath: string;
+  /** Optional connection policy for callers that may not inherit native temporary-file paths. */
+  databaseTemporaryStorage?: "MEMORY";
   /**
    * Identities that may act as the owner (§21). Empty means this deployment has no owner
    * identity, so no human gate can be satisfied — an explicit absence, never an implicit
@@ -357,7 +359,12 @@ export class ControlPlane {
     });
     const runtimeRoot = config.runtimeRoot ?? join(dirname(config.databasePath), "runtime");
     ensurePrivateDirectory(runtimeRoot);
-    this.db = new Db(config.databasePath);
+    this.db = new Db(
+      config.databasePath,
+      config.databaseTemporaryStorage === undefined
+        ? {}
+        : { temporaryStorage: config.databaseTemporaryStorage },
+    );
     // Everything after the database handle exists, wrapped because the coordinator below claims
     // the materialization capability and this constructor can still throw afterwards — rejecting
     // a non-production adapter, for one. A throw leaves no value for the caller to close, so the

@@ -1,12 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
 import { __testing } from "../../src/runtime/cli-adapters.ts";
+import { disposableWorkspaceLocation } from "../../src/core/disposable-workspace-root.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 
 afterAll(cleanupTempDirs);
@@ -231,5 +232,46 @@ describe("the reviewer may write to the per-user temp directory and nowhere new 
     const cache = join(dirname(realpathSync(tmpdir())), "C");
     const result = writeUnderSandbox(join(cache, `acp-489-${process.pid}.tmp`));
     expect(result.status, "the reviewer wrote into the per-user cache directory").not.toBe(0);
+  });
+
+  it("places disposable allocator denials after the temporary write allowance", () => {
+    const allocator = disposableWorkspaceLocation().workspaceRoot;
+    const profile = buildProfile(home, packetRoot);
+    const temporaryAllowance =
+      `(allow file-write* (subpath ${JSON.stringify(realpathSync(tmpdir()))}))`;
+    const readDenial = `(deny file-read* (subpath ${JSON.stringify(allocator)}))`;
+    const writeDenial = `(deny file-write* (subpath ${JSON.stringify(allocator)}))`;
+
+    expect(profile).toContain(readDenial);
+    expect(profile).toContain(writeDenial);
+    expect(profile.indexOf(writeDenial)).toBeGreaterThan(profile.indexOf(temporaryAllowance));
+  });
+
+  it("keeps the disposable allocator unreadable and unwritable to the reviewer", () => {
+    const allocator = disposableWorkspaceLocation().workspaceRoot;
+    mkdirSync(allocator, { recursive: true, mode: 0o700 });
+    const existing = join(allocator, `acp-655-read-${process.pid}.txt`);
+    const attempted = join(allocator, `acp-655-write-${process.pid}.txt`);
+    writeFileSync(existing, "private disposable evidence", { mode: 0o600 });
+
+    try {
+      const profile = buildProfile(home, packetRoot);
+      const controlFile = join(packetRoot, `acp-655-control-${process.pid}.txt`);
+      writeFileSync(controlFile, "reviewer-readable control", { mode: 0o600 });
+      const control = readUnderSandbox(profile, controlFile, home);
+      expect(
+        control.status,
+        `sandbox-exec did not apply a usable profile: ${control.stderr}`,
+      ).toBe(0);
+
+      const read = readUnderSandbox(profile, existing, home);
+      const write = writeUnderSandbox(attempted);
+      expect(read.status, "the reviewer read disposable-realm evidence").not.toBe(0);
+      expect(write.status, "the reviewer wrote into the disposable allocator").not.toBe(0);
+      expect(existsSync(attempted)).toBe(false);
+    } finally {
+      rmSync(existing, { force: true });
+      rmSync(attempted, { force: true });
+    }
   });
 });

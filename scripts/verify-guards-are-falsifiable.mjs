@@ -615,6 +615,15 @@ const GUARDS = [
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
   {
+    what: "a disposable workspace allocator that shares a path with live ACP state is refused",
+    file: "src/acceptance/disposable-realm.ts",
+    find: "    if (within(production, workspace) || within(workspace, production)) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm.test.ts::refuses a workspace allocator root inside production",
+    ],
+  },
+  {
     // Comparing declared paths passes a scratch directory that is a symlink into production.
     what: "isolation is judged on the resolved path, not the one that was typed",
     file: "src/acceptance/disposable-realm.ts",
@@ -694,6 +703,209 @@ const GUARDS = [
     find: "  owned.some((one) => one.pid === candidate.pid && one.startedAtMs === candidate.startedAtMs);",
     replace: "  owned.some((one) => one.pid === candidate.pid);",
     killedBy: ["tests/unit/disposable-realm.test.ts"],
+  },
+  {
+    what: "the disposable driver refuses an evidence sentence wider than its bounded observation",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "  if (!claim.allowed) return claim;",
+    replace: "  if (false) return claim;",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses a claim wider than the bounded disposable observation",
+    ],
+  },
+  {
+    what: "an unobservable before census stops the disposable driver",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (!before.allowed) {\n      return before as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    replace: "    if (false) {\n      return before as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses when the before census cannot be observed",
+    ],
+  },
+  {
+    what: "an ambiguous send is terminal before the disposable driver polls again",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: '        if (classifyProbeSignal(signal) === "INCONCLUSIVE") {',
+    replace: "        if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::treats an ambiguous send as terminal and never polls a second message",
+    ],
+  },
+  {
+    what: "the disposable driver requires two matching driver-handled ingress exchanges",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (!complete.allowed) {\n      return complete as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    replace: "    if (false) {\n      return complete as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses when the real polling entry returns only one message",
+    ],
+  },
+  {
+    what: "the disposable trace contains exactly two settled driver-handled exchanges and one created target binding",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    counts.outcomes !== 2 ||\n    counts.pollCycles !== 2 ||\n    counts.sentReplies !== 2 ||\n    counts.driverTurns !== 2 ||\n    counts.ingressAppliedReplies !== 2 ||\n    counts.actorIds !== 1 ||\n    counts.targetActorIds !== 1",
+    replace: "    false",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses two actors created through the binding lifecycle",
+    ],
+  },
+  {
+    what: "each transport record is the reply the driver-owned callback supplied for that admitted update",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "      sent.text !== expectedReply ||",
+    replace: "      false ||",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses a transport record that differs from the driver-owned callback reply",
+    ],
+  },
+  {
+    what: "the disposable driver refuses any synthetic baseline census difference",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (!unchanged.allowed) {\n      return unchanged as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    replace: "    if (false) {\n      return unchanged as Decision<SyntheticDisposableRealmObservation>;\n    }",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses when the synthetic baseline changes during the probe",
+    ],
+  },
+  {
+    what: "the disposable driver refuses cleanup residue before the janitor removes it",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (!residue.allowed) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses cleanup that leaves realm residue and then removes it with the janitor",
+    ],
+  },
+  {
+    what: "cleanup refuses a process identity this disposable run did not own",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "  const unowned = candidates.filter((candidate) => !mayTerminate(owned, candidate));",
+    replace: "  const unowned = candidates.filter(() => false);",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses to terminate a reused pid whose start time does not match",
+    ],
+  },
+  {
+    what: "the evidence artifact refuses a checked step that this run did not execute",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "  if (unsupportedSteps.length > 0) {",
+    replace: "  if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses an artifact that marks an unexecuted step as checked by the run",
+    ],
+  },
+  {
+    what: "the synthetic driver refuses before the live transport fallback when injection is absent",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: '      ...(options.fault === "SYNTHETIC_TRANSPORT_NOT_INJECTED" ? {} : { transport }),',
+    replace: "      ...{},",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::runs two synthetic messages through the production Telegram entry and removes the realm",
+    ],
+  },
+  {
+    what: "the janitor creates the synthetic workspace after taking ownership of its cleanup pipe",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: '  workspace = mkdtempSync(join(root, "acp-655-synthetic-"));',
+    replace: '  workspace = join(root, "not-created");',
+    killedBy: [
+      "tests/process/disposable-realm-janitor.test.ts::removes the workspace when the process holding its pipe is killed",
+    ],
+  },
+  {
+    what: "the crash janitor removes the synthetic workspace when its owner pipe closes",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (workspace !== null) rmSync(workspace, { recursive: true, force: true });",
+    replace: "    if (false) rmSync(workspace, { recursive: true, force: true });",
+    killedBy: [
+      "tests/process/disposable-realm-janitor.test.ts::removes the workspace when the process holding its pipe is killed",
+    ],
+  },
+  {
+    what: "the disposable workspace root comes from a fixed OS path and not live ACP state",
+    file: "src/core/disposable-workspace-root.ts",
+    find: "    workspaceRoot: join(\n      systemTemporaryRoot,\n      `.agent-control-plane-disposable-realms-${account.uid}`,\n    ),",
+    replace: '    workspaceRoot: join(account.homedir, ".agent-control-plane"),',
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::establishes workspace placement without inherited HOME TMPDIR NODE_OPTIONS or cwd",
+    ],
+  },
+  {
+    what: "the workspace janitor inherits no caller environment",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "      env: {},",
+    replace: "      env: { ...process.env },",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::establishes workspace placement without inherited HOME TMPDIR NODE_OPTIONS or cwd",
+    ],
+  },
+  {
+    what: "the workspace janitor starts in the established allocator root instead of caller cwd",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "      cwd: workspaceRoot,",
+    replace: "      cwd: undefined,",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::establishes workspace placement without inherited HOME TMPDIR NODE_OPTIONS or cwd",
+    ],
+  },
+  {
+    what: "the reviewer cannot read the disposable realm allocator",
+    file: "src/runtime/cli-adapters.ts",
+    find: "    disposableWorkspaceRoot,",
+    replace: "",
+    killedBy: [
+      "tests/unit/reviewer-transcript-isolation.test.ts::places disposable allocator denials after the temporary write allowance",
+    ],
+  },
+  {
+    what: "the reviewer cannot write the disposable realm allocator through its temporary-directory allowance",
+    file: "src/runtime/cli-adapters.ts",
+    find: "  lines.push(`(deny file-write* (subpath ${quote(resolvePath(disposableWorkspaceRoot))}))`);",
+    replace: "  void disposableWorkspaceRoot;",
+    killedBy: [
+      "tests/unit/reviewer-transcript-isolation.test.ts::places disposable allocator denials after the temporary write allowance",
+    ],
+  },
+  {
+    what: "the disposable realm launcher does not load a TMPDIR-backed TypeScript transform cache",
+    file: "package.json",
+    find:
+      '    "acceptance:disposable-realm": "NODE_DISABLE_COMPILE_CACHE=1 node --experimental-transform-types scripts/run-disposable-realm-probe.ts",',
+    replace:
+      '    "acceptance:disposable-realm": "NODE_DISABLE_COMPILE_CACHE=1 node --import tsx scripts/run-disposable-realm-probe.ts",',
+    killedBy: [
+      "tests/process/disposable-realm-janitor.test.ts::does not write through inherited TMPDIR before the disposable workspace is established",
+    ],
+  },
+  {
+    what: "the disposable realm requests in-memory SQLite temporary storage",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: '  databaseTemporaryStorage: "MEMORY",',
+    replace: "",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::runs two synthetic messages through the production Telegram entry and removes the realm",
+    ],
+  },
+  {
+    what: "the control plane passes its SQLite temporary-storage policy to the database",
+    file: "src/app/control-plane.ts",
+    find:
+      "      config.databaseTemporaryStorage === undefined\n" +
+      "        ? {}\n" +
+      "        : { temporaryStorage: config.databaseTemporaryStorage },",
+    replace: "      {},",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::runs two synthetic messages through the production Telegram entry and removes the realm",
+    ],
+  },
+  {
+    what: "the database applies the requested in-memory SQLite temporary-storage policy",
+    file: "src/db/database.ts",
+    find: '        this.#raw.pragma("temp_store = MEMORY");',
+    replace: "        void this.options.temporaryStorage;",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::runs two synthetic messages through the production Telegram entry and removes the realm",
+    ],
   },
   {
     what: "the periodic capacity sweep gets a budget sized against the sweep, not against startup",
