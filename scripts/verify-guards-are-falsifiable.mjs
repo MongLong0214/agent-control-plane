@@ -741,9 +741,9 @@ const GUARDS = [
     ],
   },
   {
-    what: "the disposable trace contains exactly two driver-handled exchanges and one created target binding",
+    what: "the disposable trace contains exactly two settled driver-handled exchanges and one created target binding",
     file: "src/acceptance/disposable-realm-driver.ts",
-    find: "    counts.outcomes !== 2 ||\n    counts.sentReplies !== 2 ||\n    counts.driverTurns !== 2 ||\n    counts.ingressAppliedReplies !== 2 ||\n    counts.actorIds !== 1 ||\n    counts.targetActorIds !== 1",
+    find: "    counts.outcomes !== 2 ||\n    counts.pollCycles !== 2 ||\n    counts.sentReplies !== 2 ||\n    counts.driverTurns !== 2 ||\n    counts.ingressAppliedReplies !== 2 ||\n    counts.actorIds !== 1 ||\n    counts.targetActorIds !== 1",
     replace: "    false",
     killedBy: [
       "tests/unit/disposable-realm-driver.test.ts::refuses two actors created through the binding lifecycle",

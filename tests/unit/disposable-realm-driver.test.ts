@@ -80,6 +80,12 @@ describe("the disposable realm driver", () => {
       statement:
         "Both synthetic control planes used in-memory SQLite temporary storage instead of native TMPDIR or SQLITE_TMPDIR file placement.",
     });
+    expect(result.value.steps).toContainEqual({
+      id: "PRODUCTION_TELEGRAM_CYCLES_SETTLED",
+      status: "CHECKED_BY_RUN",
+      statement:
+        "The driver observed both DIRECT routes through production task and poll-cycle settlement, after reply delivery advanced each update offset.",
+    });
   });
 
   it("names every actor and durability gap as unproven in the artifact", async () => {

@@ -12,6 +12,7 @@ import { Role, SessionLifecycle } from "../domain/types.ts";
 import {
   TelegramDeliveryError,
   type TelegramBotTransport,
+  type TelegramGetUpdatesOptions,
   type TelegramLongPollStartOptions,
   type TelegramSentMessage,
   startTelegramLongPollListener,
@@ -86,11 +87,17 @@ export interface SyntheticIngressAppliedReply extends SyntheticSentReply {
 
 export interface SyntheticProbeTrace {
   readonly outcomes: SyntheticProbeOutcome[];
+  readonly pollCycles: SyntheticPollCycleObservation[];
   readonly sentReplies: SyntheticSentReply[];
   readonly driverTurns: SyntheticDriverTurn[];
   readonly ingressAppliedReplies: SyntheticIngressAppliedReply[];
   readonly actorIds: string[];
   readonly targetActorIds: string[];
+}
+
+export interface SyntheticPollCycleObservation {
+  readonly routeStatuses: readonly ("COMPLETED" | "CEO_TURN_PENDING")[];
+  readonly settledNextOffset: number | undefined;
 }
 
 export type SyntheticEvidenceStepStatus = "CHECKED_BY_RUN" | "UNPROVEN";
@@ -137,6 +144,12 @@ const SYNTHETIC_EVIDENCE_STEPS: readonly SyntheticEvidenceStep[] = [
     status: "CHECKED_BY_RUN",
     statement:
       "Production polling and routing admitted and DIRECT-classified both synthetic Telegram updates.",
+  },
+  {
+    id: "PRODUCTION_TELEGRAM_CYCLES_SETTLED",
+    status: "CHECKED_BY_RUN",
+    statement:
+      "The driver observed both DIRECT routes through production task and poll-cycle settlement, after reply delivery advanced each update offset.",
   },
   {
     id: "DRIVER_DIRECT_CALLBACK_ANSWERED",
@@ -312,6 +325,7 @@ export const assertSyntheticProbeComplete = (
   const expectedNonces = UPDATE_IDS.map((id) => `update:${id}`);
   const counts = {
     outcomes: trace.outcomes.length,
+    pollCycles: trace.pollCycles.length,
     sentReplies: trace.sentReplies.length,
     driverTurns: trace.driverTurns.length,
     ingressAppliedReplies: trace.ingressAppliedReplies.length,
@@ -320,6 +334,7 @@ export const assertSyntheticProbeComplete = (
   };
   if (
     counts.outcomes !== 2 ||
+    counts.pollCycles !== 2 ||
     counts.sentReplies !== 2 ||
     counts.driverTurns !== 2 ||
     counts.ingressAppliedReplies !== 2 ||
@@ -335,6 +350,7 @@ export const assertSyntheticProbeComplete = (
 
   for (let index = 0; index < UPDATE_IDS.length; index += 1) {
     const outcome = trace.outcomes[index]!;
+    const pollCycle = trace.pollCycles[index]!;
     const sent = trace.sentReplies[index]!;
     const driverTurn = trace.driverTurns[index]!;
     const ingress = trace.ingressAppliedReplies[index]!;
@@ -348,6 +364,9 @@ export const assertSyntheticProbeComplete = (
       outcome.classification !== "DIRECT" ||
       outcome.reasonCode !== ReasonCode.OK ||
       outcome.reply !== expectedReply ||
+      pollCycle.routeStatuses.length !== 1 ||
+      pollCycle.routeStatuses[0] !== "CEO_TURN_PENDING" ||
+      pollCycle.settledNextOffset !== UPDATE_IDS[index]! + 1 ||
       sent.replyToMessageId !== MESSAGE_IDS[index] ||
       sent.text !== expectedReply ||
       driverTurn.prompt !== PROMPTS[index] ||
@@ -360,7 +379,7 @@ export const assertSyntheticProbeComplete = (
       return deny(
         ReasonCode.ACCEPTANCE_PROBE_INCOMPLETE,
         "the production router, driver callback, injected transport and APPLIED ingress record do not describe the same exchange",
-        { index, outcome, sent, driverTurn, ingress },
+        { index, outcome, pollCycle, sent, driverTurn, ingress },
       );
     }
   }
@@ -455,6 +474,11 @@ const update = (index: number): TelegramUpdate => ({
 });
 
 class SyntheticTelegramTransport implements TelegramBotTransport {
+  /**
+   * `getUpdates` consumes each in-memory update before any reply attempt, and never emits that
+   * update again, so this transport's actual redelivery window is zero milliseconds.
+   */
+  readonly redeliveryRetentionMs = 0;
   readonly sentReplies: SyntheticSentReply[] = [];
   polls = 0;
   sends = 0;
@@ -462,8 +486,14 @@ class SyntheticTelegramTransport implements TelegramBotTransport {
 
   constructor(private readonly fault?: SyntheticProbeFault) {}
 
-  async getUpdates(): Promise<readonly TelegramUpdate[]> {
+  async getUpdates(options: TelegramGetUpdatesOptions): Promise<readonly TelegramUpdate[]> {
     this.polls += 1;
+    const expectedOffset = this.#next === 0 ? undefined : UPDATE_IDS[this.#next - 1]! + 1;
+    if (options.offset !== expectedOffset) {
+      throw new Error(
+        `synthetic transport expected offset ${String(expectedOffset)}, received ${String(options.offset)}`,
+      );
+    }
     if (this.fault === "ONE_MESSAGE_ONLY" && this.#next === 1) return [];
     if (this.#next >= UPDATE_IDS.length) return [];
     const next = update(this.#next);
@@ -889,10 +919,17 @@ export const runSyntheticDisposableRealmProbe = async (
     );
 
     const outcomes: TelegramRouteOutcome[] = [];
+    const pollCycles: SyntheticPollCycleObservation[] = [];
     for (let index = 0; index < UPDATE_IDS.length; index += 1) {
       try {
-        const polled = await listener.service.pollOnce();
-        outcomes.push(...polled.outcomes);
+        const cycle = await listener.service.pollOnce();
+        await listener.service.pendingTurnsSettled();
+        const settled = await cycle.settled();
+        outcomes.push(...settled.outcomes);
+        pollCycles.push({
+          routeStatuses: cycle.routes.map((route) => route.status),
+          settledNextOffset: settled.nextOffset,
+        });
       } catch (error) {
         const signal = error instanceof TelegramDeliveryError && error.accepted === null
           ? "TELEGRAM_SEND_AMBIGUOUS"
@@ -967,6 +1004,7 @@ export const runSyntheticDisposableRealmProbe = async (
         reasonCode: outcome.reasonCode,
         reply: outcome.reply?.text ?? null,
       })),
+      pollCycles,
       sentReplies: transport.sentReplies,
       driverTurns,
       ingressAppliedReplies,
@@ -978,6 +1016,7 @@ export const runSyntheticDisposableRealmProbe = async (
       return complete as Decision<SyntheticDisposableRealmObservation>;
     }
     executedEvidenceSteps.add("PRODUCTION_POLL_AND_ROUTER_USED");
+    executedEvidenceSteps.add("PRODUCTION_TELEGRAM_CYCLES_SETTLED");
     executedEvidenceSteps.add("DRIVER_DIRECT_CALLBACK_ANSWERED");
     executedEvidenceSteps.add("INGRESS_APPLIED_REPLIES_READ");
 
