@@ -1147,6 +1147,24 @@ describe("merge execution (CP-S38, CP-S39, CP-S40)", () => {
 });
 
 describe("release and hotfix (CP-S41, CP-S42)", () => {
+  it("CP-S41 and RF-S12: a release tag requires this run verified release to main merge", async () => {
+    const fixture = await setup();
+
+    const refused = await fixture.harness.cp.github.releaseTag(
+      fixture.runId,
+      fixture.identity,
+      "1.2.0",
+      "1".repeat(40),
+      fixture.caller,
+    );
+    expect(refused.allowed).toBe(false);
+    expect(refused.reasonCode).toBe(ReasonCode.RELEASE_TAG_COMMIT_NOT_ACCEPTED);
+    if (refused.allowed) throw new Error("release tag unexpectedly allowed");
+    expect(refused.message).toBe("tag target is not this run's verified release-to-main merge");
+    expect(fixture.github.calls.filter((call) => call.method === "POST" && /\/git\/refs$/.test(call.path)))
+      .toHaveLength(0);
+  });
+
   it("CP-S41: a tag on an unaccepted commit and a conflicting existing tag are both refused", async () => {
     const fixture = await setupLineageFixture({
       workBranch: "release/1.2.0",
@@ -1197,7 +1215,7 @@ describe("release and hotfix (CP-S41, CP-S42)", () => {
     expect(fixture.github.tags.size).toBe(1);
   });
 
-  it("CP-S42: a hotfix missing from an active release reports propagation incomplete", async () => {
+  it("CP-S42 and RF-S13: a hotfix missing from an active release reports propagation incomplete", async () => {
     const fixture = await setup();
     fixture.github.setBranch("release/1.1.0", "r".repeat(40));
     const fixSha = "h".repeat(40);
@@ -2424,7 +2442,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     expect(report.status).not.toBe("PASS");
   });
 
-  it("CP-S29: an unapproved workflow digest or untrusted creator is also refused", async () => {
+  it("RF-S22: a candidate workflow cannot replace the approved workflow digest", async () => {
     const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const repo = snapshot.repositories[0]!;
@@ -2525,7 +2543,7 @@ describe("trusted CI evidence (CP-S29)", () => {
     ).toBe(ReasonCode.EVIDENCE_MISSING);
   });
 
-  it("CP-HI-03: a command list that does not match the pinned manifest is refused", async () => {
+  it("CP-HI-03 and RF-S06: a candidate command list cannot weaken the current run pinned manifest", async () => {
     const fixture = await setup({ finalization: false });
     const snapshot = await frozen(fixture);
     const run = fixture.harness.cp.runs.require(fixture.runId);

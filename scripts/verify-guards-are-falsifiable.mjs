@@ -85,6 +85,76 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
+    what: "an emitted result is paired with the actual ACP parser",
+    file: "src/tools/pair-repo-factory-result.ts",
+    find: "  const decision = parseRepoFactoryResult(result);",
+    replace:
+      '  const decision = { allowed: true as const, reasonCode: "OK", message: "accepted without parsing", evidence: {} };',
+    killedBy: [
+      "tests/process/repo-factory-result-pairing.test.ts::pairs an emitted result with the actual ACP parser",
+    ],
+  },
+  {
+    what: "a factory result cannot claim ACP activation facts",
+    file: "src/bootstrap/repo-factory-result.ts",
+    find: "    if (overclaims.length > 0) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/scenarios/doctor-ingress-bootstrap-daemon.test.ts::CP-S52 and RF-S17: a factory result cannot claim ACP activation facts",
+    ],
+  },
+  {
+    what: "a candidate command list cannot weaken the current run pinned manifest",
+    file: "src/verify/verification-engine.ts",
+    find: "      if (digestOf(expected) !== digestOf([...options.commands])) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/scenarios/github-kernel.test.ts::CP-HI-03 and RF-S06: a candidate command list cannot weaken the current run pinned manifest",
+    ],
+  },
+  {
+    what: "a candidate workflow cannot replace the approved workflow digest",
+    file: "src/verify/verification-engine.ts",
+    find: "    if (!approved.includes(match.workflowDigest)) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/scenarios/github-kernel.test.ts::RF-S22: a candidate workflow cannot replace the approved workflow digest",
+    ],
+  },
+  {
+    what: "a release tag requires this run verified release to main merge",
+    file: "src/github/github-kernel.ts",
+    find:
+      "    if (\n" +
+      "      acceptedMerge?.verified !== 1 ||\n" +
+      "      !merge ||\n" +
+      '      !merge.sourceBranch?.startsWith("release/") ||\n' +
+      '      merge.targetBranch !== "main"\n' +
+      "    ) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/scenarios/github-kernel.test.ts::CP-S41 and RF-S12: a release tag requires this run verified release to main merge",
+    ],
+  },
+  {
+    what: "a hotfix missing from an active release reports propagation incomplete",
+    file: "src/github/github-kernel.ts",
+    find: "    if (missing.length > 0) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/scenarios/github-kernel.test.ts::CP-S42 and RF-S13: a hotfix missing from an active release reports propagation incomplete",
+    ],
+  },
+  {
+    what: "the sandbox environment excludes daemon authority secrets",
+    file: "src/verify/sandbox.ts",
+    find: "  const env: NodeJS.ProcessEnv = {\n",
+    replace: "  const env: NodeJS.ProcessEnv = {\n    ...(extra ?? {}),\n",
+    killedBy: [
+      "tests/unit/trusted-core.test.ts::RF-S23: sandbox environment excludes daemon authority secrets",
+    ],
+  },
+  {
     // Two lifecycles in one field: the reply reservation writes `result_json` whole, and an
     // ordinary timeout produces a reply, so the claim and the turn identity went with it.
     what: "the turn claim is stored apart from the reply it will produce",
