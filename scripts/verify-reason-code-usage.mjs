@@ -1,34 +1,46 @@
 #!/usr/bin/env node
 /**
- * Verifies a census of reason-code producers and trigger mappings.
+ * Verifies a census of reason-code static outflows and trigger mappings.
  *
  * `verify-reason-codes.mjs` already checks the catalogue's internal shape (value equals
  * key, nothing published was removed). This census additionally detects a declaration with
- * no production producer in src and a raised SQLite trigger name with no TRIGGER_CODES mapping.
+ * neither a positively recognized static outflow nor an explicit reviewed no-outflow disposition,
+ * and a raised SQLite trigger name with no TRIGGER_CODES mapping.
  *
  * Checks:
- *   1. every declared code has a production reference that can produce it: a denial/error,
- *      Decision, return, event, persisted reason or another executable value selection
+ *   1. every declared code is transferred by direct return, throw, concise-arrow result,
+ *      always-throwing `fail`, or an audited write/egress call; otherwise it has an explicit
+ *      reviewed no-outflow disposition
  *   2. every `ReasonCode.X` member used in `src/**`/`tests/**` is declared
  *   3. every string literal used as a `reasonCode` in `src/**`/`tests/**` is declared
- *   4. every staleness-classification member is declared
+ *   4. every `ReasonCode.X` metadata reference anywhere in the catalogue module is declared
  *   5. every `RAISE(ABORT, 'X')` name in production schema or migration DDL has a
  *      TRIGGER_CODES mapping in `src/db/database.ts`
  *
- * Nothing here deletes or edits a code: `src/core/reason-codes.ts` is append-only by
- * contract, so an unused code is reported for a human decision, never removed.
+ * This is deliberately not a reachability claim. The dependency-free scanner does not build a
+ * call graph, so it cannot decide whether a function containing a static outflow is ever called.
+ * Nothing here deletes or edits a code: published codes are append-only, so a code without a
+ * static outflow is reported for a human disposition, never removed automatically.
  *
  * Dependency-free on purpose, like the other verify scripts: it must run in a disposable
  * worktree with no installed packages (PRD §17.4).
  *
- * Usage: node scripts/verify-reason-code-usage.mjs [--json]
+ * Usage: node scripts/verify-reason-code-usage.mjs [--json] [--fresh-census] [--root=<repository>]
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+const rootArg = process.argv.find((arg) => arg.startsWith("--root="));
+const repoRoot = rootArg
+  ? resolve(rootArg.slice("--root=".length))
+  : fileURLToPath(new URL("..", import.meta.url));
 const asJson = process.argv.includes("--json");
+const freshCensus = process.argv.includes("--fresh-census");
+
+const limitations = [
+  "reachability: cannot decide — no call graph is built; a static outflow inside an uncalled function may satisfy this census",
+];
 
 const read = (rel) => readFileSync(join(repoRoot, rel), "utf8");
 
@@ -141,19 +153,60 @@ const memberRefs = (files, accepts = () => true) => {
 };
 
 /**
- * A production reference selects a code as a value that can leave the site. Pure consumers do
- * not: an equality check, membership query or switch label only asks about a code produced
- * elsewhere. The whole catalogue module is excluded by `productionFiles`; declarations and
- * classification entries are metadata, so the catalogue cannot vouch for itself.
+ * Calls whose contract transfers the supplied value across a module boundary: by throwing,
+ * resolving an outward result, recording an event, or writing durable state. This is a positive
+ * list of sinks, not a list of comparison/container shapes to ignore.
  */
-const producesReasonCode = (text, index, length) => {
-  const before = text.slice(Math.max(0, index - 120), index);
-  const after = text.slice(index + length, index + length + 120);
-  if (/\bcase\s*$/.test(before)) return false;
-  if (/(?:===|!==|==|!=)\s*\(*\s*$/.test(before)) return false;
-  if (/^\s*\)*\s*(?:===|!==|==|!=)/.test(after)) return false;
-  if (/\b(?:has|includes|indexOf)\s*\(\s*$/.test(before)) return false;
-  return true;
+const OUTFLOW_CALLEES = new Set([
+  "fail",
+  "finish",
+  "settle",
+  "this.audit.record",
+  "this.cp.audit.record",
+  "this.cp.db.run",
+  "this.db.run",
+  "this.insert",
+]);
+
+const enclosingCalls = (text, index) => {
+  const calls = [];
+  let depth = 0;
+  for (let i = index - 1; i >= 0; i -= 1) {
+    if (text[i] === ")") {
+      depth += 1;
+      continue;
+    }
+    if (text[i] !== "(") continue;
+    if (depth > 0) {
+      depth -= 1;
+      continue;
+    }
+    const callee = /([A-Za-z_$][\w$#]*(?:\s*\.\s*[A-Za-z_$][\w$#]*)*)\s*$/.exec(
+      text.slice(Math.max(0, i - 100), i),
+    );
+    if (callee) calls.push(callee[1].replace(/\s+/g, ""));
+  }
+  return calls;
+};
+
+/**
+ * A static outflow is included only by positive syntax: the member is part of a direct return or
+ * throw expression, the expression body of a concise arrow, an always-throwing `fail` call, or an
+ * argument to an audited write/egress call above. Merely constructing, comparing or classifying a
+ * value is not one of those transfers.
+ */
+const isStaticOutflow = (text, index) => {
+  const before = text.slice(0, index);
+  const statement = before.slice(before.lastIndexOf(";") + 1);
+  if (/\b(?:return|throw)\b/.test(statement)) return true;
+
+  const arrow = before.lastIndexOf("=>");
+  if (arrow >= 0) {
+    const arrowBody = before.slice(arrow + 2);
+    if (!/^\s*\{/.test(arrowBody) && !/[;}]/.test(arrowBody)) return true;
+  }
+
+  return enclosingCalls(text, index).some((callee) => OUTFLOW_CALLEES.has(callee));
 };
 
 /**
@@ -182,35 +235,137 @@ const literalRefs = (files, patterns = REASON_LITERAL) => {
   return hits;
 };
 
-const srcMembers = memberRefs(productionFiles);
-const productionMembers = memberRefs(productionFiles, producesReasonCode);
+const srcMembers = memberRefs(srcFiles);
+const staticOutflowMembers = memberRefs(productionFiles, (text, index) =>
+  isStaticOutflow(text, index),
+);
 const testMembers = memberRefs(testFiles);
 const srcLiterals = literalRefs(srcFiles);
-const productionLiterals = literalRefs(productionFiles, [REASON_LITERAL[0]]);
 const testLiterals = literalRefs(testFiles);
 
-/** Extra diagnostic: a plain-text source mention does not satisfy the production-reference check. */
+/** Extra diagnostic: any source-text mention does not itself satisfy the static-outflow check. */
 const srcText = productionFiles.map(read).join("\n");
 
 const problems = [];
 const notes = [];
 
-// 1 — declared but never produced in src.
-const unreferenced = [];
+/**
+ * Human dispositions from the last census. An entry here explicitly says that the code has no
+ * recognized static outflow; it never makes the code count as one. The census fails for any new
+ * no-outflow code until a reviewer records a reasoned disposition.
+ */
+const RETAINED_WITHOUT_SOURCE_REFERENCE =
+  "no src/** or tests/** reference; restored because this branch had no evidence that removing the external-contract spelling was safe";
+const REVIEWED_WITHOUT_STATIC_OUTFLOW = new Map([
+  ["DIRECT_MUTATION_DENIED", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  [
+    "GITHUB_APP_ENV_FILE_MISSING",
+    "passed as missingCode to inspectCredentialFile, which returns deny(missingCode) to readEnvironmentFile",
+  ],
+  [
+    "GITHUB_APP_ENV_FILE_INSECURE",
+    "passed as insecureCode to inspectCredentialFile, which returns deny(insecureCode) to readEnvironmentFile",
+  ],
+  [
+    "GITHUB_APP_PRIVATE_KEY_MISSING",
+    "passed as missingCode to inspectCredentialFile, whose denial is returned by loadConfiguration",
+  ],
+  [
+    "GITHUB_APP_PRIVATE_KEY_INSECURE",
+    "passed as insecureCode to inspectCredentialFile, whose denial is returned by loadConfiguration",
+  ],
+  ["HEAD_MOVED", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  ["RUN_CANCELLED", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  [
+    "SESSION_INCARNATION_IMMUTABLE",
+    "TRIGGER_CODES maps the raised SESSION_INCARNATION_IMMUTABLE sentinel; translate returns acpError(code)",
+  ],
+  [
+    "PRIMARY_CTO_ALREADY_BOUND",
+    "INDEX_CODES maps the assignments.project_id constraint; translate returns acpError(code)",
+  ],
+  [
+    "SESSION_BUZZ_ACTOR_ALREADY_BOUND",
+    "INDEX_CODES maps the sessions.buzz_actor_id constraint; translate returns acpError(code)",
+  ],
+  [
+    "CLAIM_PATH_CONFLICT",
+    "findConflict selects it into code and returns deny(code); INDEX_CODES also maps the declared_path constraint",
+  ],
+  ["CLAIM_EXPIRED", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  [
+    "VERIFICATION_CI_HEAD_MISMATCH",
+    "assigned to record.reasonCode before writeResultRow persists the record and collectCi returns it",
+  ],
+  ["SANDBOX_SECRET_STRIPPED", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  ["REVIEW_INPUT_CONTAMINATED", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  [
+    "GITHUB_RECEIPT_PROTOCOL_VIOLATION",
+    "TRIGGER_CODES maps the raised GITHUB_RECEIPT_PROTOCOL_VIOLATION sentinel; translate returns acpError(code)",
+  ],
+  ["CAPACITY_PROBE_STALE", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  [
+    "CAPACITY_SENSOR_FILE_MISSING",
+    "checkCapacitySensorFiles pushes it into findings and returns that findings array",
+  ],
+  [
+    "CAPACITY_SENSOR_FILE_INVALID",
+    "checkCapacitySensorFiles pushes it into findings and returns that findings array",
+  ],
+  ["CAPACITY_BUCKET_EXHAUSTED", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  [
+    "RESTORE_WOULD_PREEMPT_INFLIGHT_OWNER",
+    "restore pushes it into the deferred result and returns that result to its caller",
+  ],
+  ["INGRESS_NONCE_EXPIRED", RETAINED_WITHOUT_SOURCE_REFERENCE],
+  [
+    "ATTESTATION_GENERATION_MISMATCH",
+    "TRIGGER_CODES maps the raised ATTESTATION_GENERATION_MISMATCH sentinel; translate returns acpError(code)",
+  ],
+  [
+    "ACTOR_SESSION_INCARNATION_MISMATCH",
+    "TRIGGER_CODES maps the raised ACTOR_SESSION_INCARNATION_MISMATCH sentinel; translate returns acpError(code)",
+  ],
+  [
+    "OUTBOX_DELIVERY_REJECTED",
+    "selected into terminalReason, written to outbox.reason_code, and returned through deny(terminalReason)",
+  ],
+  [
+    "OUTBOX_RETRY_POLICY_UNAVAILABLE",
+    "selected into terminalReason, written to outbox.reason_code, and returned through deny(terminalReason)",
+  ],
+  ["BOOTSTRAP_MANIFEST_ABSOLUTE_PATH", RETAINED_WITHOUT_SOURCE_REFERENCE],
+]);
+
+// 1 — declared without a positively recognized static outflow in src.
+const withoutStaticOutflow = [];
+const reviewedWithoutStaticOutflow = [];
 for (const [code, meta] of declared) {
-  if (productionMembers.has(code) || productionLiterals.has(code)) continue;
-  unreferenced.push({
+  if (staticOutflowMembers.has(code)) continue;
+  const entry = {
     code,
     declaredAt: `${catalogueRel}:${meta.line}`,
     alsoUsedInTests: testMembers.has(code) || testLiterals.has(code),
-    mentionedAsTextInSrc: new RegExp(`\\b${code}\\b`).test(srcText),
-  });
+    mentionedAnywhereInSrc: new RegExp(`\\b${code}\\b`).test(srcText),
+  };
+  const disposition = freshCensus ? undefined : REVIEWED_WITHOUT_STATIC_OUTFLOW.get(code);
+  if (disposition) reviewedWithoutStaticOutflow.push({ ...entry, disposition });
+  else withoutStaticOutflow.push(entry);
 }
-for (const entry of unreferenced) {
+for (const entry of withoutStaticOutflow) {
   problems.push(
-    `declared but produced nowhere in src/**: ${entry.code} (${entry.declaredAt})` +
-      (entry.alsoUsedInTests ? " — asserted by tests/** with no producer" : ""),
+    `declared with no reviewed static outflow disposition: ${entry.code} (${entry.declaredAt})` +
+      (entry.alsoUsedInTests ? " — asserted by tests/** with no static outflow" : ""),
   );
+}
+if (!freshCensus) {
+  for (const code of REVIEWED_WITHOUT_STATIC_OUTFLOW.keys()) {
+    if (!declared.has(code)) {
+      problems.push(`reviewed no-outflow disposition names undeclared code: ${code}`);
+    } else if (staticOutflowMembers.has(code)) {
+      problems.push(`reviewed no-outflow disposition is stale because ${code} now has a static outflow`);
+    }
+  }
 }
 
 // 2 — a ReasonCode member used in source or tests must be declared.
@@ -229,23 +384,7 @@ for (const [code, sites] of srcLiterals) {
   problems.push(`src/** uses an undeclared reason-code literal: ${code} (${sites[0]})`);
 }
 
-// 4 — a classification entry must name an existing code.
-const stalenessBody =
-  /export const STALENESS_REASON_CODES: ReadonlySet<ReasonCode> = new Set\(\[([\s\S]*?)\n\]\);/.exec(
-    catalogueSource,
-  );
-if (!stalenessBody) {
-  problems.push(`${catalogueRel}: could not locate STALENESS_REASON_CODES`);
-} else {
-  const bodyOffset = stalenessBody.index + stalenessBody[0].indexOf(stalenessBody[1]);
-  for (const match of stalenessBody[1].matchAll(/ReasonCode\.([A-Z0-9_]+)/g)) {
-    if (declared.has(match[1])) continue;
-    const line = catalogueSource.slice(0, bodyOffset + match.index).split("\n").length;
-    problems.push(
-      `STALENESS_REASON_CODES classifies undeclared code ${match[1]} (${catalogueRel}:${line})`,
-    );
-  }
-}
+// 4 is enforced by the srcMembers loop above: it scans the entire catalogue module too.
 
 // 5 — every trigger abort name must translate into a reason code.
 const triggerSources = [
@@ -290,7 +429,9 @@ if (asJson) {
         declaredCodes: declared.size,
         srcFiles: srcFiles.length,
         testFiles: testFiles.length,
-        unreferenced,
+        withoutStaticOutflow,
+        reviewedWithoutStaticOutflow,
+        limitations,
         triggerAborts: [...raised.keys()],
         problems,
         notes,
@@ -304,19 +445,26 @@ if (asJson) {
   console.log(`src files scanned:     ${srcFiles.length}`);
   console.log(`test files scanned:    ${testFiles.length}`);
   console.log("");
-  console.log(`declared but unproduced in src/** (${unreferenced.length}):`);
-  for (const entry of unreferenced) {
+  console.log(`without a reviewed static outflow disposition (${withoutStaticOutflow.length}):`);
+  for (const entry of withoutStaticOutflow) {
     console.log(
       `  ${entry.code}  ${entry.declaredAt}` +
         (entry.alsoUsedInTests ? "  [asserted in tests/**]" : "") +
-        (entry.mentionedAsTextInSrc ? "  [mentioned in prose only]" : ""),
+        (entry.mentionedAnywhereInSrc ? "  [mentioned somewhere in src/**]" : ""),
     );
   }
+  console.log("");
+  console.log(`reviewed without a static outflow (${reviewedWithoutStaticOutflow.length}):`);
+  for (const entry of reviewedWithoutStaticOutflow) {
+    console.log(`  ${entry.code} — ${entry.disposition}`);
+  }
+  console.log("");
+  for (const limitation of limitations) console.log(`limitation: ${limitation}`);
   console.log("");
   for (const note of notes) console.log(`note: ${note}`);
   console.log("");
   if (problems.length === 0) {
-    console.log("OK — production reason-code references and trigger DDL mappings agree");
+    console.log("OK — static reason-code outflow dispositions and trigger DDL mappings agree");
   } else {
     console.log(`${problems.length} problem(s):`);
     for (const problem of problems) console.log(`  - ${problem}`);

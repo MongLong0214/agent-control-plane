@@ -85,23 +85,23 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
-    // This is the one production reference for the code. Its catalogue classification remains,
-    // proving that membership metadata cannot satisfy the producer census.
-    what: "every declared reason code has a production reference",
+    // This is the one static outflow for the code. Its catalogue classification remains,
+    // proving that membership metadata cannot satisfy the outflow census.
+    what: "every declared reason code has a reviewed static outflow disposition",
     file: "src/conversation/turn-coordinator.ts",
     find: "          ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,\n",
     replace: "          ReasonCode.CONVERSATION_TARGET_UNATTESTED,\n",
     killedBy: [
-      "tests/process/every-reason-code-has-a-production-reference.test.ts::every declared reason code has a production reference",
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a reviewed static outflow disposition",
     ],
   },
   {
-    what: "staleness classifications name declared reason codes",
+    what: "catalogue metadata references are declared",
     file: "src/core/reason-codes.ts",
     find: '  CONVERSATION_TARGET_ATTESTATION_STALE: "CONVERSATION_TARGET_ATTESTATION_STALE",\n',
     replace: "",
     killedBy: [
-      "tests/process/every-reason-code-has-a-production-reference.test.ts::staleness classifications name declared reason codes",
+      "tests/process/reason-code-static-outflow-census.test.ts::catalogue metadata references are declared",
     ],
   },
   {
@@ -110,7 +110,7 @@ const GUARDS = [
     find: '  ["src/db/migrations.ts", read("src/db/migrations.ts")],\n',
     replace: "",
     killedBy: [
-      "tests/process/every-reason-code-has-a-production-reference.test.ts::production trigger denials and mappings agree",
+      "tests/process/reason-code-static-outflow-census.test.ts::production trigger denials and mappings agree",
     ],
   },
   {
