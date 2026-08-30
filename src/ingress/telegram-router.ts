@@ -1003,7 +1003,7 @@ export class TelegramHermesRouter {
       updateId: update.update_id,
       nonce: this.ingress.nonceFor(update),
       correlationId: correlationIdFor(update),
-      admitted: true,
+      admitted: includeReply,
       replayed: true,
       classification: null,
       input: null,
