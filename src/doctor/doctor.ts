@@ -450,14 +450,24 @@ export class Doctor {
    * #674 — the gap this closes is not delivery, it is that a dead session-local poller and "no
    * new messages" were the same observable fact. `buzz_mention_watch` (written only by
    * `BuzzMentionWatch`, `src/buzz/mention-watch.ts`) is read here, never written — this stays a
-   * pure `SELECT`, consistent with Doctor's read-only construction.
+   * pure `SELECT`, consistent with Doctor's read-only construction. Looked up by `session_id`
+   * (#710) — the row is scoped to the session asking, not shared by every session on the same
+   * channel.
    *
    * Three outcomes, deliberately not collapsed into one:
    *
-   *   `BUZZ_MENTIONS_NEVER_CHECKED`   the watch has never ticked this channel at all
-   *   `BUZZ_MENTIONS_WATCH_UNAVAILABLE`  the most recent attempt failed; the count on record
-   *                                      cannot be trusted as current
-   *   `BUZZ_MENTIONS_BEHIND`          a successful check found channel traffic since baseline
+   *   `BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED`      the watch has never ticked this session at all
+   *   `BUZZ_CHANNEL_TRAFFIC_WATCH_UNAVAILABLE`  the most recent attempt failed; the count on
+   *                                             record cannot be trusted as current
+   *   `BUZZ_CHANNEL_TRAFFIC_BEHIND`             a successful check found channel traffic since
+   *                                             baseline
+   *
+   * Named `BUZZ_CHANNEL_TRAFFIC_*`, not `BUZZ_MENTIONS_*` (renamed in #710, this same round): a
+   * blind review found no `p`-tag filtering exists, and none can be added with what this
+   * codebase has today — sessions have no relay identity of their own for a `p` tag to name (see
+   * `mention-watch.ts`'s docstring). The count this reports is every message the channel
+   * received since baseline, not a verified mention, so the finding's own name says that rather
+   * than borrowing the stronger word.
    *
    * The middle one exists for the same reason #636 split `CAPACITY_SENSOR_FAILED` from
    * `CAPACITY_LOW`: reporting a stale `pending_count` as though it were a fresh "N behind" would
@@ -472,30 +482,36 @@ export class Doctor {
 
     for (const session of sessions) {
       if (!session || !session.buzzAddress) continue;
-      const channel = session.buzzAddress;
       const row = this.db.get<{
+        channel_id: string;
         baseline_at: number | null;
         pending_count: number;
+        pending_saturated: number;
         last_attempt_at: string | null;
         last_success_at: string | null;
         last_error: string | null;
         last_error_at: string | null;
       }>(
-        `SELECT baseline_at, pending_count, last_attempt_at, last_success_at, last_error, last_error_at
-           FROM buzz_mention_watch WHERE channel_id = ?`,
-        [channel],
+        `SELECT channel_id, baseline_at, pending_count, pending_saturated,
+                last_attempt_at, last_success_at, last_error, last_error_at
+           FROM buzz_mention_watch WHERE session_id = ?`,
+        [session.sessionId],
       );
+      // `row.channel_id` (what the watch actually ticked) rather than `session.buzzAddress`
+      // (what the session is bound to right now): they agree in the ordinary case, but citing
+      // the row's own column keeps the evidence honest if they ever diverge.
+      const channel = row?.channel_id ?? session.buzzAddress;
 
       if (!row || row.last_attempt_at === null) {
         findings.push({
-          code: "BUZZ_MENTIONS_NEVER_CHECKED",
+          code: "BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED",
           severity: "WARN",
           scope: `session:${session.sessionId}`,
           blocking: false,
           confidence: "HIGH",
           observedEvidence: { sessionId: session.sessionId, channel },
           recommendedAction:
-            "the periodic buzz mention watch has not observed this channel yet; confirm the watch tick is running",
+            "the periodic buzz channel-traffic watch has not observed this session yet; confirm the watch tick is running",
         });
         continue;
       }
@@ -507,7 +523,7 @@ export class Doctor {
         (row.last_success_at === null || Date.parse(row.last_error_at) >= Date.parse(row.last_success_at));
       if (lastAttemptFailed) {
         findings.push({
-          code: "BUZZ_MENTIONS_WATCH_UNAVAILABLE",
+          code: "BUZZ_CHANNEL_TRAFFIC_WATCH_UNAVAILABLE",
           severity: "ERROR",
           scope: `session:${session.sessionId}`,
           blocking: false,
@@ -520,14 +536,14 @@ export class Doctor {
             lastKnownGoodAt: row.last_success_at,
           },
           recommendedAction:
-            "restore buzz CLI/relay reachability; the mention count cannot be verified until a check succeeds",
+            "restore buzz CLI/relay reachability; the channel-traffic count cannot be verified until a check succeeds",
         });
         continue;
       }
 
       if (row.pending_count > 0) {
         findings.push({
-          code: "BUZZ_MENTIONS_BEHIND",
+          code: "BUZZ_CHANNEL_TRAFFIC_BEHIND",
           severity: "WARN",
           scope: `session:${session.sessionId}`,
           blocking: false,
@@ -540,11 +556,16 @@ export class Doctor {
             // No `#p`-tag matching is wired anywhere in this codebase (#674's own audit), so
             // this is a proxy for unacknowledged channel traffic, not a mention count.
             channelMessagesSinceBaseline: row.pending_count,
+            // The CLI's `--limit` is a return cap, not a total (#710 finding 3): when the read
+            // hit that cap, `channelMessagesSinceBaseline` is a floor, not an exact count.
+            atLeast: row.pending_saturated === 1,
             sinceIso: new Date((row.baseline_at ?? 0) * 1000).toISOString(),
             checkedAt: row.last_success_at,
           },
           recommendedAction:
-            "read the buzz channel since the reported time; this session's mention watch has not accounted for these messages",
+            row.pending_saturated === 1
+              ? "read the buzz channel since the reported time; the count is capped at the per-tick read limit and the true backlog may be larger"
+              : "read the buzz channel since the reported time; this session's channel-traffic watch has not accounted for these messages",
         });
       }
     }

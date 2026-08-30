@@ -2093,11 +2093,17 @@ const v31: SchemaMigration = {
  * Measured three times in one incident, each a different bug in the same poller, each
  * indistinguishable from health until read after the fact.
  *
- * This table is the durable half of the fix (Option C from the issue's review): a per-channel
+ * This table is the durable half of the fix (Option C from the issue's review): a per-session
  * cursor plus bookkeeping for whether the last attempt to read it even succeeded, so
  * `Doctor.checkBuzzMentions` can tell "N behind since T" apart from "never checked" apart from
  * "could not reach the relay" — see `src/buzz/mention-watch.ts` for the full lifecycle this
  * feeds, and `doctor.ts` for the three-way distinction it makes possible.
+ *
+ * Keyed on `session_id` rather than `channel_id` (#710, still within this same unmerged round):
+ * a blind review found sessions can share one `ACP_BUZZ_CHANNEL`, and a channel-keyed row let
+ * one session's reconnect silently reset another session's baseline. `channel_id` is kept as a
+ * plain column — it is still what the CLI read runs against — but the row's identity is the
+ * session the state belongs to.
  *
  * Numbered v32, the true next contiguous step from `origin/main`'s v31 — not v34, despite that
  * being the number this change was briefed to use. v32 and v33 are claimed by other open,
@@ -2118,16 +2124,19 @@ const v32: SchemaMigration = {
   apply: (raw) => {
     raw.exec(`
       CREATE TABLE IF NOT EXISTS buzz_mention_watch (
-        channel_id       TEXT PRIMARY KEY,
-        baseline_at      INTEGER,
-        latest_event_id  TEXT,
-        latest_seen_at   INTEGER,
-        pending_count    INTEGER NOT NULL DEFAULT 0,
-        last_attempt_at  TEXT,
-        last_success_at  TEXT,
-        last_error       TEXT,
-        last_error_at    TEXT
-      )
+        session_id        TEXT PRIMARY KEY,
+        channel_id        TEXT NOT NULL,
+        baseline_at       INTEGER,
+        latest_event_id   TEXT,
+        latest_seen_at    INTEGER,
+        pending_count     INTEGER NOT NULL DEFAULT 0,
+        pending_saturated INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at   TEXT,
+        last_success_at   TEXT,
+        last_error        TEXT,
+        last_error_at     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS buzz_mention_watch_channel ON buzz_mention_watch(channel_id);
     `);
   },
   checksum: () => migrationChecksum("v32-a-silent-poller-and-no-new-mentions-look-the-same"),

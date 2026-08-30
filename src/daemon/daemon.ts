@@ -107,9 +107,15 @@ const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, provide
   }
 };
 
-/** What the periodic tick needs from `BuzzMentionWatch` (#674) — see `src/buzz/mention-watch.ts`. */
+/**
+ * What the periodic tick needs from `BuzzMentionWatch` (#674) — see `src/buzz/mention-watch.ts`.
+ *
+ * One entry per live session bound to a channel, not one per distinct channel (#710): the watch
+ * keys its state on `sessionId`, and two sessions sharing a channel need two independent
+ * measurements, not one shared between them.
+ */
 export interface BuzzMentionTicker {
-  tick(channels: readonly string[]): Promise<void>;
+  tick(targets: readonly { sessionId: string; channelId: string }[]): Promise<void>;
 }
 
 export interface DaemonOptions {
@@ -122,7 +128,7 @@ export interface DaemonOptions {
   /**
    * #674 — the periodic measurement half of the buzz mention watch. Optional, like `buzz`
    * itself: without a live relay there is nothing to tick, and `Doctor.checkBuzzMentions` then
-   * reports `BUZZ_MENTIONS_NEVER_CHECKED` rather than a silently-stale count.
+   * reports `BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED` rather than a silently-stale count.
    */
   mentionWatch?: BuzzMentionTicker;
   /** How often the buzz mention watch re-measures every channel a live session is bound to. */
@@ -371,6 +377,13 @@ export class Daemon {
   #bootstrapAbandoned = false;
   #bootstrapWaiter: (() => void) | null = null;
   #timerFailures = new Map<string, TimerFailure>();
+  // #710 — `runPeriodic` had no protection against a slower-than-its-own-interval action still
+  // running when the next `setInterval` fire arrives. Two overlapping firings of the same named
+  // timer can then commit their writes out of order — an older, slower success landing after a
+  // newer, faster failure and silently erasing the failure's error fields is the exact shape a
+  // blind review found for `buzz_mentions_watch`. Named by timer, not global, so one timer
+  // running long never blocks a different timer's own firing.
+  readonly #periodicInFlight = new Set<string>();
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
@@ -1384,19 +1397,24 @@ export class Daemon {
 
     // #674 — measures, never delivers: one `messages get --since` per live session's channel,
     // so a dead session-local poller stops being indistinguishable from "no new messages".
+    //
+    // One target per live session (#710), not per distinct channel: deduping by channel here —
+    // the previous shape — was exactly the bug a blind review found, because it fed the watch a
+    // single shared identity for sessions that share a channel, and the watch's state was keyed
+    // on that same identity. Every live session with a channel gets its own tick now, even when
+    // several resolve to the same `channelId`.
     if (this.options.mentionWatch) {
       const mentionsMs = this.options.buzzMentionsIntervalMs ?? deliveryMs;
       const mentionsWatch = setInterval(() => {
         void this.runPeriodic("buzz_mentions_watch", async () => {
-          const channels = [
-            ...new Set(
-              this.cp.sessions
-                .live()
-                .map((session) => session.buzzAddress)
-                .filter((address): address is string => address !== null),
-            ),
-          ];
-          await this.options.mentionWatch!.tick(channels);
+          const targets = this.cp.sessions
+            .live()
+            .flatMap((session) =>
+              session.buzzAddress !== null
+                ? [{ sessionId: session.sessionId, channelId: session.buzzAddress }]
+                : [],
+            );
+          await this.options.mentionWatch!.tick(targets);
         });
       }, mentionsMs);
       mentionsWatch.unref();
@@ -1550,43 +1568,57 @@ export class Daemon {
    * §33.1 crash-loop backoff. The supervisor restarts the process; the daemon records
    * consecutive failures so the supervisor's throttle has evidence, and so a loop is
    * visible in the audit trail rather than silent.
+   *
+   * §710 in-flight guard: a named timer whose `action` is still running when the next
+   * `setInterval` fire arrives is skipped rather than run again concurrently. Without this, two
+   * overlapping firings write their outcomes in whatever order their own async work happens to
+   * finish — an older, slower call landing after a newer, faster one and overwriting its result
+   * is exactly the race a blind review found downstream of this method (`buzz_mentions_watch`'s
+   * shared mutable row). Skipping keeps every named timer's own writes strictly serial, which
+   * every caller downstream of this method is entitled to assume.
    */
   private async runPeriodic(name: string, action: () => Promise<void>): Promise<void> {
-    const now = this.cp.clock.nowIso();
-    const previous = this.#timerFailures.get(name);
-    if (previous && Date.parse(previous.retryNotBefore) > Date.parse(now)) return;
-
+    if (this.#periodicInFlight.has(name)) return;
+    this.#periodicInFlight.add(name);
     try {
-      await action();
-      if (previous) {
-        this.#timerFailures.delete(name);
-        this.cp.audit.record({
-          kind: "DAEMON_TIMER_RECOVERED",
-          reasonCode: ReasonCode.OK,
-          evidence: { timer: name, recoveredAfterFailures: previous.consecutiveFailures },
-        });
-        this.writeHealth(null);
-      }
-    } catch (err) {
-      const failures = (previous?.consecutiveFailures ?? 0) + 1;
-      const backoffSeconds = Math.min(300, 2 ** failures);
-      const retryNotBefore = new Date(Date.parse(now) + backoffSeconds * 1000).toISOString();
-      const failure = { consecutiveFailures: failures, lastError: safeErrorMessage(err), retryNotBefore };
-      this.#timerFailures.set(name, failure);
-      this.cp.audit.record({
-        kind: "DAEMON_TIMER_FAILED",
-        reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
-        evidence: { timer: name, ...failure, backoffSeconds },
-      });
+      const now = this.cp.clock.nowIso();
+      const previous = this.#timerFailures.get(name);
+      if (previous && Date.parse(previous.retryNotBefore) > Date.parse(now)) return;
+
       try {
-        this.writeHealth(null);
-      } catch (healthError) {
+        await action();
+        if (previous) {
+          this.#timerFailures.delete(name);
+          this.cp.audit.record({
+            kind: "DAEMON_TIMER_RECOVERED",
+            reasonCode: ReasonCode.OK,
+            evidence: { timer: name, recoveredAfterFailures: previous.consecutiveFailures },
+          });
+          this.writeHealth(null);
+        }
+      } catch (err) {
+        const failures = (previous?.consecutiveFailures ?? 0) + 1;
+        const backoffSeconds = Math.min(300, 2 ** failures);
+        const retryNotBefore = new Date(Date.parse(now) + backoffSeconds * 1000).toISOString();
+        const failure = { consecutiveFailures: failures, lastError: safeErrorMessage(err), retryNotBefore };
+        this.#timerFailures.set(name, failure);
         this.cp.audit.record({
           kind: "DAEMON_TIMER_FAILED",
           reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
-          evidence: { timer: "health", error: safeErrorMessage(healthError) },
+          evidence: { timer: name, ...failure, backoffSeconds },
         });
+        try {
+          this.writeHealth(null);
+        } catch (healthError) {
+          this.cp.audit.record({
+            kind: "DAEMON_TIMER_FAILED",
+            reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
+            evidence: { timer: "health", error: safeErrorMessage(healthError) },
+          });
+        }
       }
+    } finally {
+      this.#periodicInFlight.delete(name);
     }
   }
 

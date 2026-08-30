@@ -1167,23 +1167,34 @@ CREATE INDEX IF NOT EXISTS outbox_role ON outbox(role_key, binding_generation, s
 CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE status = 'PENDING';
 
 -- ---------------------------------------------------------------------------
--- buzz_mention_watch (v32, #674)
---   A per-channel cursor plus tick health, so a session's ad hoc poll dying silently and
+-- buzz_mention_watch (v32, #674; re-keyed by #710)
+--   A per-SESSION cursor plus tick health, so a session's ad hoc poll dying silently and
 --   "nothing new arrived" no longer read as the same fact. See src/buzz/mention-watch.ts
 --   for the full lifecycle: `baseline_at` moves only via an explicit reset on reconnect,
 --   never on an ordinary tick, which only recomputes `pending_count` fresh each time.
+--
+--   Keyed on `session_id`, not `channel_id`: #710 found production sessions can share one
+--   `ACP_BUZZ_CHANNEL` (buzz-adapter.ts's `defaultChannel` path), and a channel-keyed row let
+--   one session's reconnect reset another session's baseline out from under it. `channel_id`
+--   stays as a plain column — it is what the CLI read is actually against — but the identity
+--   this state is scoped to is the session asking the question, so that is the key.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS buzz_mention_watch (
-  channel_id       TEXT PRIMARY KEY,
-  baseline_at      INTEGER,
-  latest_event_id  TEXT,
-  latest_seen_at   INTEGER,
-  pending_count    INTEGER NOT NULL DEFAULT 0,
-  last_attempt_at  TEXT,
-  last_success_at  TEXT,
-  last_error       TEXT,
-  last_error_at    TEXT
+  session_id        TEXT PRIMARY KEY,
+  channel_id        TEXT NOT NULL,
+  baseline_at       INTEGER,
+  latest_event_id   TEXT,
+  latest_seen_at    INTEGER,
+  pending_count     INTEGER NOT NULL DEFAULT 0,
+  -- Set when a tick's read hit MAX_MESSAGES_PER_TICK: the CLI's `--limit` is a return cap, not
+  -- a total, so `pending_count` at the cap is a floor, not an exact count (#710 finding 3).
+  pending_saturated INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at   TEXT,
+  last_success_at   TEXT,
+  last_error        TEXT,
+  last_error_at     TEXT
 );
+CREATE INDEX IF NOT EXISTS buzz_mention_watch_channel ON buzz_mention_watch(channel_id);
 
 -- ---------------------------------------------------------------------------
 -- inbound_messages
