@@ -1287,7 +1287,7 @@ const GUARDS = [
     find: "        const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;",
     replace: "        const overriddenUnresolvedNonces = unresolved[0] ? [unresolved[0].nonce] : undefined;",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::#695: names every unresolved turn, not only the oldest, once a second one accumulates",
+      "tests/unit/telegram-ingress.test.ts::#695: names both unresolved turns, not only the oldest, once a second one accumulates",
     ],
   },
   {
@@ -1302,6 +1302,20 @@ const GUARDS = [
     replace: "  const shown = unresolved;",
     killedBy: [
       "tests/unit/telegram-ingress.test.ts::#695: bounds the park reply's enumeration past the cap, and still records every overridden nonce",
+    ],
+  },
+  {
+    // A blind review found this gap after the fix above shipped: #680 (main) wrote the singular
+    // `overriddenUnresolvedNonce`, and `IngressGuard.prune` deliberately never removes an
+    // unresolved claim, so a row in that shape does not age out on its own. Without the
+    // normalization, `unresolvedTurns` would silently report `overriddenUnresolvedNonces:
+    // undefined` for every such row, indistinguishable from a turn that overrode nothing.
+    what: "unresolvedTurns normalizes a pre-#695 singular overriddenUnresolvedNonce into the plural array",
+    file: "src/ingress/ingress-guard.ts",
+    find: "  return { ...rest, overriddenUnresolvedNonces: [overriddenUnresolvedNonce] };",
+    replace: "  return claim;",
+    killedBy: [
+      "tests/unit/ingress-turn-claim.test.ts::normalizes a pre-#695 row's singular overriddenUnresolvedNonce into the plural array",
     ],
   },
 ];

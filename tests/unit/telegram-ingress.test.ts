@@ -862,7 +862,7 @@ describe("Telegram production ingress", () => {
     }
   });
 
-  it("#695: names every unresolved turn, not only the oldest, once a second one accumulates", async () => {
+  it("#695: names both unresolved turns, not only the oldest, once a second one accumulates", async () => {
     // #680 built the park-before-claim mechanism and #695 is the gap a review found in it
     // afterward: both places the router reads `unresolvedTurns()` used only its first element.
     // Reproduction, entirely sequential — no concurrency required. A crashes; /again overrides A

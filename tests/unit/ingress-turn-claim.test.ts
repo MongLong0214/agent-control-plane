@@ -280,4 +280,41 @@ describe("finding an unresolved turn without knowing its nonce", () => {
 
     expect(outstanding.map((turn) => turn.turnRequestId)).toEqual(["older", "newer"]);
   });
+
+  it("normalizes a pre-#695 row's singular overriddenUnresolvedNonce into the plural array", () => {
+    // #695 changed `TurnIdentity.overriddenUnresolvedNonce` (singular) into
+    // `overriddenUnresolvedNonces` (plural), but `prune` deliberately never removes an unresolved
+    // claim — so a row a pre-#695 build wrote does not age out on its own; it sits in the old
+    // shape until whatever it was claimed alongside is finally resolved, which for a row that is
+    // unresolved by definition may be never. This writes exactly the JSON `main`'s `claimTurn`
+    // produces today (`{ deliveryStatus, turnRequestId, sessionDigest, promptDigest,
+    // bindingDigest, overriddenUnresolvedNonce }`) straight into `turn_claim_json` — the real
+    // production column, in the real production shape — and reads it back through the real
+    // `unresolvedTurns()`, not a hand-built `UnresolvedTurn`.
+    const harness = makeHarness();
+    const guard = guardFor(harness);
+    admitOne(guard, "a6");
+    const legacyClaim = {
+      deliveryStatus: TURN_CLAIMED,
+      turnRequestId: "legacy-turn",
+      sessionDigest: "chat-A",
+      promptDigest: "prompt-digest",
+      bindingDigest: "binding-digest",
+      overriddenUnresolvedNonce: "some-earlier-nonce",
+    };
+    harness.cp.db.run("UPDATE inbound_messages SET turn_claim_json = ? WHERE nonce = ?", [
+      JSON.stringify(legacyClaim),
+      "a6",
+    ]);
+
+    const [turn] = guard.unresolvedTurns("telegram", "chat-A");
+
+    expect(turn?.overriddenUnresolvedNonces, "the singular field must be read as the plural array").toEqual([
+      "some-earlier-nonce",
+    ]);
+    expect(
+      (turn as unknown as { overriddenUnresolvedNonce?: string } | undefined)?.overriddenUnresolvedNonce,
+      "the legacy singular field must not leak through onto the normalized claim",
+    ).toBeUndefined();
+  });
 });
