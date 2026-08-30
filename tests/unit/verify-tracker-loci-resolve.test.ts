@@ -933,7 +933,9 @@ describe("verify-tracker-loci-resolve", () => {
     try {
       const result = run(path);
       expect(result.status).toBe(0);
-      expect(result.stdout).toBe("");
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).toContain("README.md still resolves");
+      expect(result.stdout).not.toContain("STALE (");
     } finally {
       cleanup();
     }
@@ -964,7 +966,9 @@ describe("verify-tracker-loci-resolve", () => {
     try {
       const result = run(path);
       expect(result.status).toBe(0);
-      expect(result.stdout).toBe("");
+      expect(result.stdout).toContain("ADVISORY");
+      expect(result.stdout).toContain("README.md still resolves");
+      expect(result.stdout).not.toContain("STALE (");
     } finally {
       cleanup();
     }
@@ -1892,6 +1896,133 @@ describe("verify-tracker-loci-resolve", () => {
         expect(result.stdout).toContain("across 501 open issue(s).");
       } finally {
         rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("round 20 structured GitHub blob URLs", () => {
+    it("GitHub blob URL query strings do not become part of the tracked path", () => {
+      for (const [index, query] of ["plain=1", "raw=1"].entries()) {
+        const body = `See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md?${query}#L1.`;
+        const { path, cleanup } = withIssues([{ number: 68940 + index, title: `${query} blob URL`, body }]);
+        try {
+          const result = run(path);
+          expect(result.status).toBe(0);
+          expect(result.stdout).toContain("ADVISORY (1)");
+          expect(result.stdout).toContain(`README.md?${query}#L1`);
+          expect(result.stdout).not.toContain("does not exist");
+          expect(result.stdout).not.toContain("STALE (");
+        } finally {
+          cleanup();
+        }
+      }
+    });
+
+    it("a GitHub blob URL line range is read from the fragment", () => {
+      const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md#L10-L20.";
+      const { path, cleanup } = withIssues([{ number: 68941, title: "blob URL line range", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("ADVISORY");
+        expect(result.stdout).toContain("README.md#L10-L20");
+        expect(result.stdout).toContain("README.md still resolves at line 10");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a percent encoded GitHub blob path segment resolves after URL decoding", () => {
+      const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/README%2Emd#L1.";
+      const { path, cleanup } = withIssues([{ number: 68942, title: "encoded blob URL path", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("ADVISORY");
+        expect(result.stdout).toContain("README%2Emd#L1");
+        expect(result.stdout).toContain("README.md still resolves at line 1");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a GitHub blob URL with a slash in its ref resolves by its tracked file tail", () => {
+      const body =
+        "See https://github.com/MongLong0214/agent-control-plane/blob/release/1.2/README.md#L1.";
+      const { path, cleanup } = withIssues([{ number: 68943, title: "slash ref blob URL", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("ADVISORY");
+        expect(result.stdout).toContain("release/1.2/README.md#L1");
+        expect(result.stdout).toContain("README.md still resolves at line 1");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a trailing slash remains part of the GitHub blob path and is stale", () => {
+      const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md/#L1.";
+      const { path, cleanup } = withIssues([{ number: 68944, title: "trailing slash blob URL", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("README.md/ does not exist");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a GitHub blob URL can use a commit SHA instead of a branch", () => {
+      const sha = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim();
+      const body = `See https://github.com/MongLong0214/agent-control-plane/blob/${sha}/README.md#L1.`;
+      const { path, cleanup } = withIssues([{ number: 68945, title: "SHA blob URL", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("ADVISORY");
+        expect(result.stdout).toContain(`${sha}/README.md#L1`);
+        expect(result.stdout).toContain("README.md still resolves at line 1");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a GitHub blob URL with no fragment says that the file resolved", () => {
+      const body = "See https://github.com/MongLong0214/agent-control-plane/blob/main/README.md.";
+      const { path, cleanup } = withIssues([{ number: 68946, title: "fragmentless blob URL", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("ADVISORY");
+        expect(result.stdout).toContain("README.md still resolves");
+        expect(result.stdout).toContain("blob URL has no line fragment");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("an unknown multi segment blob ref is reported unresolved instead of absent", () => {
+      const body =
+        "See https://github.com/MongLong0214/agent-control-plane/blob/" +
+        "definitely-unknown-ref-689/with-slash/scripts/does-not-exist.mjs#L1.";
+      const { path, cleanup } = withIssues([{ number: 68947, title: "unknown slash ref blob URL", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("UNRESOLVED (1)");
+        expect(result.stdout).toContain("cannot determine where the ref ends and the path begins");
+        expect(result.stdout).toContain("not classified as absent");
+        expect(result.stdout).not.toContain("does not exist");
+        expect(result.stdout).not.toContain("STALE (");
+      } finally {
+        cleanup();
       }
     });
   });

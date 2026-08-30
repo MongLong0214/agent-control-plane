@@ -2179,6 +2179,29 @@ const GUARDS = [
     ],
   },
   {
+    // URL.search is not part of URL.pathname. Folding it back into the pathname recreates the
+    // exact false STALE from #689 for both query strings GitHub emits on blob links.
+    what: "a GitHub blob URL query string is not part of its tracked path",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "    segments = parsed.pathname.split(\"/\").map((segment) => decodeURIComponent(segment));",
+    replace:
+      "    segments = `${parsed.pathname}${parsed.search}`.split(\"/\").map((segment) => decodeURIComponent(segment));",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::GitHub blob URL query strings do not become part of the tracked path",
+    ],
+  },
+  {
+    // With neither a known ref nor a tracked-file tail, a multi-segment span has more than one
+    // possible boundary. Treating it like the unambiguous two-segment form manufactures a path.
+    what: "an unknown multi segment blob ref is reported unresolved instead of absent",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  if (segments.length === 2) {",
+    replace: "  if (segments.length >= 2) {",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::an unknown multi segment blob ref is reported unresolved instead of absent",
+    ],
+  },
+  {
     // #693 — the no-replace trigger refuses a colliding or moved source row, never a fresh one: a
     // new (channel, nonce) at a new batch_ordinal, inserted onto a turn that already exists,
     // passed every WHEN clause above it. This is the write-time backstop: every source `claim()`

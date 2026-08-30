@@ -56,12 +56,14 @@
  * an actor first. A check that only asked "is the line number still in range" would have missed
  * the one case this script exists to catch.
  *
- * ## Any `file:line` citation is ADVISORY, whether or not it is stale
+ * ## Any `file:line` citation is ADVISORY, as is a blob URL with no line fragment
  *
  * This is #597's actual rule, not a side effect of this script: a line number is a timestamp
  * wearing a citation's clothes, and it is worth saying so on a citation that still resolves,
- * because "still resolves today" is not "will resolve next week". ADVISORY does not fail the
- * build by default (`--strict` promotes it); STALE and NON_DURABLE do.
+ * because "still resolves today" is not "will resolve next week". A blob URL with no line
+ * fragment is also surfaced: otherwise exit 0 cannot be distinguished from the URL parser never
+ * looking at it. ADVISORY does not fail the build by default (`--strict` promotes it); STALE,
+ * UNRESOLVED, and NON_DURABLE do.
  *
  * ## Why there is no allow-list for "this citation is legitimately historical"
  *
@@ -137,7 +139,7 @@
  *   was present, matched a fragment of the URL (`com/<owner>/<repo>/blob/main/README.md`) rather
  *   than the path the link names, and reported that fragment ambiguous against every tracked
  *   README. Fixed: a blob permalink to *this* repository (`repoSlug`, derived from `origin`) is
- *   now parsed structurally by `GITHUB_BLOB_RE` before the generic regex ever sees the line; the
+ *   now parsed structurally by `parseGitHubBlobUrl` before the generic regex ever sees the line; the
  *   generic regex now excludes anything inside any URL, unconditionally.
  *   [P1] Symbol resolution was narrowed to the cited file in round 1, but stayed a plain text
  *   search — `` `binding-registry.ts` — `reconstitution` `` passed because the file's own comments
@@ -254,7 +256,7 @@
  *   exact line #649 quotes (`binding-registry.ts#L163` next to
  *   `` `const actorId = this.mintActor(...)` ``) passed as ADVISORY while the identical content
  *   cited as a plain path was correctly STALE. The URL's shape governs how a citation is *parsed*
- *   (`GITHUB_BLOB_RE` instead of `PATH_RE`); it has nothing to do with whether the text right
+ *   (`parseGitHubBlobUrl` instead of `PATH_RE`); it has nothing to do with whether the text right
  *   after it gets checked, and treating the two together is what let the bypass in. Fixed by
  *   sharing one `contentAfter` helper between both extraction paths.
  *
@@ -1246,29 +1248,46 @@ const PATH_RE = new RegExp(
     `(?::(?<cs>\\d+)(?:-(?<ce>\\d+))?|#L(?<as>\\d+)(?:-L?(?<ae>\\d+))?)?`,
   "g",
 );
-const URL_RE = /https?:\/\/\S+/g;
-// A GitHub blob permalink, parsed structurally rather than through the generic PATH_RE run over
-// its raw text. Letting the generic regex loose inside a URL was the earlier bug: it greedily
-// matched a fragment of the URL itself (`com/<owner>/<repo>/blob/main/README.md`), not the path
-// the link actually names, and reported that fragment ambiguous against every tracked README.
-//
-// Round 8: two more bugs in this same structural parse, both fixed here.
-//
-// The path group excluded whitespace, `#`, and `)` but not a backtick — the ordinary way people
-// actually write a link in an issue body. `` `https://github.com/…/blob/main/README.md` `` (no
-// `#L` anchor to stop the match early at `#`) captured the closing backtick as part of the path,
-// and `README.md\`` does not exist. Fixed by excluding backtick from every capture group here.
-//
-// `/blob/<ref>/<path>` was parsed on the assumption `<ref>` is exactly one segment — true for
-// `main`, false for this repository's own branches, which are the whole reason it matters:
-// `feat/597-tracker-loci-resolve-or-the-check-says-so` has a slash in it. A URL built from that
-// branch name read as `<ref>` = `feat` and `<path>` = `597-tracker-loci-resolve-…/README.md`, a
-// file that has never existed. There is no purely syntactic way to know where a multi-segment ref
-// ends and the path begins — GitHub itself only knows because it holds the branch list — so this
-// group now captures the *whole* ref-and-path span, and `resolveBlobRefAndPath` (below) tries
-// splits against `knownRefs` and `trackedFiles`, the same two authorities this script already
-// defers to elsewhere.
-const GITHUB_BLOB_RE = /https:\/\/github\.com\/([^/\s`]+)\/([^/\s`]+)\/blob\/([^\s#`)]+)(?:#L(\d+)(?:-L?(\d+))?)?/g;
+// This regex only finds the lexical URL span and masks it from PATH_RE. `parseGitHubBlobUrl`
+// below gives the span to the platform URL parser; path, query, and fragment boundaries are URL
+// structure, not delimiters this script should try to reproduce in another regular expression.
+// Backticks and a Markdown link's closing parenthesis are prose delimiters, not URL content.
+const URL_RE = /https?:\/\/[^\s`)]+/g;
+
+/**
+ * Parses one URL token as a GitHub blob URL. `URL.pathname` is deliberately the only source for
+ * owner, repository, ref, and path: `?plain=1` and `?raw=1` belong to `URL.search`, never to the
+ * tracked filename, while `#L10-L20` belongs to `URL.hash`. Each pathname segment is decoded
+ * separately so an ordinary percent-encoded filename resolves against `git ls-files`.
+ */
+const parseGitHubBlobUrl = (raw) => {
+  const citation = raw.replace(/[.,;:]+$/, "");
+  let parsed;
+  try {
+    parsed = new URL(citation);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname.toLowerCase() !== "github.com") return null;
+
+  let segments;
+  try {
+    segments = parsed.pathname.split("/").map((segment) => decodeURIComponent(segment));
+  } catch {
+    return null;
+  }
+  const [, owner, repo, route, ...refAndPathSegments] = segments;
+  if (!owner || !repo || route !== "blob" || refAndPathSegments.length < 2) return null;
+
+  const lineMatch = parsed.hash.match(/^#L(\d+)(?:-L?(\d+))?$/);
+  return {
+    raw: citation,
+    slug: `${owner}/${repo}`.toLowerCase(),
+    refAndPathSegments,
+    startLine: lineMatch ? Number(lineMatch[1]) : null,
+    endLine: lineMatch?.[2] ? Number(lineMatch[2]) : null,
+  };
+};
 
 /**
  * Splits a permalink's `<ref>/<path>` span into the branch/tag it names and the file within it,
@@ -1281,28 +1300,32 @@ const GITHUB_BLOB_RE = /https:\/\/github\.com\/([^/\s`]+)\/([^/\s`]+)\/blob\/([^
  *   2. Failing that (a fork's branch, a deleted branch, or a checkout where `git for-each-ref`
  *      does not show it), the shortest split whose tail is an *exactly* tracked file — `main`,
  *      the common case, needs nothing more than this.
- *   3. Failing that too, the plain one-segment assumption (`main`-shaped), because a permalink to
- *      a genuinely deleted file can never satisfy step 2 by definition — that file will not
- *      exactly-match anything at any split — and refusing to guess at all here would make this
- *      script unable to ever report the one thing it exists to report: a citation of something
- *      that is gone. An earlier version of this function returned `null` when nothing resolved
- *      exactly, on the theory that a wrong guess is worse than silence; measured against its own
- *      test suite, that theory cost exactly the case it was trying to protect — a multi-segment
- *      ref to a deleted file went silent instead of STALE, because "deleted" and "unresolvable
- *      split" are the same observation from `trackedFiles` alone. Step 1 is what makes step 3 safe
- *      to fall back to: a real branch name, verified independently of whether its file still
- *      exists, is what step 3 lacked, and it did not need it if it never had to run.
+ *   3. Failing that too, a two-segment span is unambiguous (`<ref>/<path>`) and can still name a
+ *      genuinely deleted root file. A longer span is not guessed: without a known ref or an exact
+ *      tracked-file tail, `release/1.2/deleted.md` could mean ref `release` plus path
+ *      `1.2/deleted.md`, or ref `release/1.2` plus path `deleted.md`. The caller reports that as
+ *      UNRESOLVED, rather than manufacturing either path into a false STALE or dropping the URL
+ *      in silence.
  */
-const resolveBlobRefAndPath = (refAndPath) => {
-  const segments = refAndPath.replace(/[.,;:)]+$/, "").split("/");
+const resolveBlobRefAndPath = (segments) => {
   for (let i = segments.length - 1; i >= 1; i--) {
-    if (knownRefs.has(segments.slice(0, i).join("/"))) return segments.slice(i).join("/");
+    if (knownRefs.has(segments.slice(0, i).join("/"))) {
+      return { path: segments.slice(i).join("/"), unresolvedReason: null };
+    }
   }
   for (let i = 1; i < segments.length; i++) {
     const candidate = segments.slice(i).join("/");
-    if (trackedFiles.includes(candidate)) return candidate;
+    if (trackedFiles.includes(candidate)) return { path: candidate, unresolvedReason: null };
   }
-  return segments.length > 1 ? segments.slice(1).join("/") : null;
+  if (segments.length === 2) {
+    return { path: segments[1], unresolvedReason: null };
+  }
+  return {
+    path: null,
+    unresolvedReason:
+      `cannot determine where the ref ends and the path begins in ${segments.join("/")} — ` +
+      "no known local branch or tag matches it, and no tracked file tail identifies the boundary; not classified as absent",
+  };
 };
 // A symbol may be cited as `name` or `name()` — the parens are the citer marking it a function or
 // method, not literal text to search for (a call site rarely has empty arguments); the extraction
@@ -1616,22 +1639,29 @@ const extractFromBody = (body) => {
     };
 
     // A GitHub blob permalink to *this* repository is a precise, structured citation and is
-    // parsed as one directly — see `GITHUB_BLOB_RE`'s comment for why the generic path regex
-    // must not also be let loose on this text. A permalink to a different repository names
-    // nothing in this tree and is dropped rather than misread as one of this repo's paths.
+    // parsed as one directly — see `parseGitHubBlobUrl` for why the generic path regex must not
+    // also be let loose on this text. A permalink to a different repository names nothing in
+    // this tree and is dropped rather than misread as one of this repo's paths.
     if (repoSlug) {
-      for (const m of rawLine.matchAll(GITHUB_BLOB_RE)) {
-        const slug = `${m[1]}/${m[2]}`.toLowerCase();
-        if (slug !== repoSlug) continue;
-        const path = resolveBlobRefAndPath(m[3]);
-        if (path === null) continue; // ref/path boundary not verifiable against a real branch
-        const startLine = m[4] ? Number(m[4]) : null;
-        const endLine = m[5] ? Number(m[5]) : null;
-        const content = contentAfter(m.index + m[0].length, startLine);
-        const key = `${path}:${startLine ?? ""}:${endLine ?? ""}:${content ?? ""}`;
+      for (const m of rawLine.matchAll(URL_RE)) {
+        const blob = parseGitHubBlobUrl(m[0]);
+        if (blob === null || blob.slug !== repoSlug) continue;
+        const resolution = resolveBlobRefAndPath(blob.refAndPathSegments);
+        const content = contentAfter(m.index + blob.raw.length, blob.startLine);
+        const key =
+          `${resolution.path ?? ""}:${resolution.unresolvedReason ?? ""}:` +
+          `${blob.startLine ?? ""}:${blob.endLine ?? ""}:${content ?? ""}`;
         if (seenPath.has(key)) continue;
         seenPath.add(key);
-        pathCitations.push({ raw: m[0], path, startLine, endLine, content });
+        pathCitations.push({
+          raw: blob.raw,
+          path: resolution.path,
+          unresolvedReason: resolution.unresolvedReason,
+          startLine: blob.startLine,
+          endLine: blob.endLine,
+          content,
+          kind: "github-blob",
+        });
       }
     }
 
@@ -1680,7 +1710,7 @@ const extractFromBody = (body) => {
       const key = `${path}:${startLine ?? ""}:${endLine ?? ""}:${content ?? ""}`;
       if (seenPath.has(key)) continue;
       seenPath.add(key);
-      pathCitations.push({ raw: m[0], path, startLine, endLine, content });
+      pathCitations.push({ raw: m[0], path, unresolvedReason: null, startLine, endLine, content, kind: "path" });
     }
   }
 
@@ -1710,6 +1740,7 @@ const extractFromBody = (body) => {
 
 // --- classification ------------------------------------------------------------------------
 const stale = [];
+const unresolved = [];
 const advisory = [];
 const nonDurableFindings = [];
 
@@ -1721,6 +1752,10 @@ for (const issue of issues) {
   }
 
   for (const citation of pathCitations) {
+    if (citation.unresolvedReason !== null) {
+      unresolved.push({ issue, citation: citation.raw, reason: citation.unresolvedReason });
+      continue;
+    }
     const resolved = resolvePath(citation.path);
     if (resolved.ambiguous) {
       stale.push({
@@ -1754,8 +1789,14 @@ for (const issue of issues) {
     }
 
     if (citation.startLine === null) {
+      if (citation.kind === "github-blob") {
+        advisoryReasons.push(
+          `${resolved.path} still resolves, but the blob URL has no line fragment — ` +
+            "name the enforcing symbol or line instead (#597)",
+        );
+      }
       if (advisoryReasons.length > 0) advisory.push({ issue, citation: citation.raw, reason: advisoryReasons.join("; ") });
-      continue; // bare path, resolves, nothing more to say
+      continue; // a plain bare path stays silent; a fragmentless blob URL was surfaced above
     }
 
     const text = readText(resolved.path);
@@ -1976,14 +2017,23 @@ for (const issue of issues) {
 }
 
 // --- report ---------------------------------------------------------------------------------
-const nothingToReport = stale.length === 0 && nonDurableFindings.length === 0 && advisory.length === 0;
+const nothingToReport =
+  stale.length === 0 && unresolved.length === 0 && nonDurableFindings.length === 0 && advisory.length === 0;
 
 if (asJson) {
-  console.log(JSON.stringify({ stale, advisory, nonDurable: nonDurableFindings }, null, 2));
+  console.log(JSON.stringify({ stale, unresolved, advisory, nonDurable: nonDurableFindings }, null, 2));
 } else if (!nothingToReport) {
   if (stale.length > 0) {
     console.log(`STALE (${stale.length}):`);
     for (const item of stale) {
+      console.log(`  #${item.issue.number} ${item.issue.title}`);
+      console.log(`    ${item.citation}`);
+      console.log(`    ${item.reason}`);
+    }
+  }
+  if (unresolved.length > 0) {
+    console.log(`\nUNRESOLVED (${unresolved.length}):`);
+    for (const item of unresolved) {
       console.log(`  #${item.issue.number} ${item.issue.title}`);
       console.log(`    ${item.citation}`);
       console.log(`    ${item.reason}`);
@@ -2005,14 +2055,16 @@ if (asJson) {
     }
   }
   console.log(
-    `\n${stale.length} stale, ${nonDurableFindings.length} non-durable path citation(s), ${advisory.length} advisory ` +
-      `(line-number citations that still resolve) across ${issues.length} open issue(s).`,
+    `\n${stale.length} stale, ${unresolved.length} unresolved, ${nonDurableFindings.length} non-durable path citation(s), ` +
+      `${advisory.length} advisory ` +
+      `(citations that resolve but should name a durable locus) across ${issues.length} open issue(s).`,
   );
-  if (stale.length > 0 || nonDurableFindings.length > 0) {
+  if (stale.length > 0 || unresolved.length > 0 || nonDurableFindings.length > 0) {
     console.log(
       "\nSTALE means the citation no longer describes the tree; re-derive the claim from the code, not the issue text.\n" +
+        "UNRESOLVED means the check could not prove a multi-segment blob ref's path boundary; it did not call the file absent.\n" +
         "NON_DURABLE means the citation names something the filesystem does not guarantee to keep;\n" +
-        "commit it or accept it is gone. Neither is fixed by editing the issue to agree.",
+        "commit it or accept it is gone. A contradictory issue edit does not repair any of these findings.",
     );
   }
   if (advisory.length > 0 && (stale.length === 0 && nonDurableFindings.length === 0)) {
@@ -2022,5 +2074,6 @@ if (asJson) {
 // nothingToReport: print nothing at all, deliberately — see the header on why a check that
 // always prints stops being read.
 
-const failing = stale.length > 0 || nonDurableFindings.length > 0 || (strict && advisory.length > 0);
+const failing =
+  stale.length > 0 || unresolved.length > 0 || nonDurableFindings.length > 0 || (strict && advisory.length > 0);
 process.exit(failing ? 1 : 0);
