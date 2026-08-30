@@ -111,7 +111,7 @@ const GUARDS = [
     // admitted while attempt 1 was still in flight.
     what: "a dispatched turn cannot be reported as never started",
     file: "src/conversation/turn-coordinator.ts",
-    find: '      if (phase === "BEFORE" && this.dispatched(permit.turnRequestId)) {',
+    find: '      if (phase === "BEFORE" && this.dispatched(identity.turnRequestId)) {',
     replace: "      if (false) {",
     killedBy: [
       "tests/unit/a-dispatch-is-a-fact.test.ts::refuses the claim that contradicts the ledger's own record",
@@ -682,8 +682,8 @@ const GUARDS = [
     // check any caller can write an object of that shape and settle a turn it never ran.
     what: "only a permit this coordinator issued can settle a turn",
     file: "src/conversation/turn-coordinator.ts",
-    find: "      const issued = this.assertIssuedHere(permit);\n      if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);",
-    replace: "      void this.assertIssuedHere(permit);",
+    find: "    const issued = this.assertIssuedHere(permit);\n    if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);",
+    replace: "    void this.assertIssuedHere(permit);",
     killedBy: ["tests/unit/turn-coordinator.test.ts"],
   },
   {
@@ -1015,7 +1015,7 @@ const GUARDS = [
     // in none.
     what: "a receipt redelivered onto a different turn is refused",
     file: "src/conversation/turn-coordinator.ts",
-    find: "          already.turn_request_id === permit.turnRequestId &&",
+    find: "          already.turn_request_id === identity.turnRequestId &&",
     replace: "          true &&",
     killedBy: ["tests/unit/a-receipt-identity-names-one-claim.test.ts"],
   },
@@ -1241,6 +1241,103 @@ const GUARDS = [
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
   {
+    // Contract 1's whole point, landing here: a turn claimed under one CEO generation is a
+    // different CEO's work from a receipt minted under the next. Without this a reconciler
+    // completes a turn on a receipt that was never about this claim.
+    what: "a receipt naming a different CEO generation cannot complete the turn it names",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (row.binding_generation !== attested.bindingGeneration) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn on a receipt naming a different CEO generation, and keeps sweeping the rest",
+    ],
+  },
+  {
+    // Sol's review of #691, round 1: the query the reconciler sends is built from the row it is
+    // about to check, so an identity check built from that query instead of the port's answer
+    // compares the database against itself and cannot fail. Reverting `result.targetActorId` to
+    // `candidate.targetActorId` here reintroduces exactly that — a receipt attesting to the wrong
+    // actor settles the turn anyway, because nothing but the candidate (self-sourced) was checked.
+    what: "the reconciler checks the actor the receipt attests to, not the actor it already knew",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "targetActorId: result.targetActorId,",
+    replace: "targetActorId: candidate.targetActorId,",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong actor, even though the query it was asked under was correct",
+    ],
+  },
+  {
+    // Same defect, the other content field the tautology swallowed.
+    what: "the reconciler checks the prompt digest the receipt attests to, not the one it already knew",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "promptDigest: result.promptDigest,",
+    replace: "promptDigest: candidate.promptDigest,",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong prompt",
+    ],
+  },
+  {
+    // Sol's review of #691, round 2: `reconcileWithReceipt` used to be public and receipt-shaped,
+    // so anyone holding the coordinator could read a turn's identity from `unresolvedIdentities()`
+    // and hand it back with a fabricated receipt — no `ReceiptPort` ever consulted. Restoring a
+    // public method of that shape (taking a receipt as a plain argument) reopens exactly that; the
+    // forgery test proves no such method exists to call.
+    what: "no public method accepts a receipt from a caller — only this coordinator's own port can produce one",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "  async reconcileUnresolved(",
+    replace: "  reconcileWithReceipt(query, receipt) { return this.#settleFromReceipt(query.turnRequestId, query, receipt); }\n\n  async reconcileUnresolved(",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::attack 1 — reassigning the coordinator's bound receipt port has no effect: the real field is not reachable by that name",
+    ],
+  },
+  // No mutation row for "#receiptPort is a true private field": the only mechanical mutation that
+  // removes it — un-prefixing the declaration while every read site still says `this.#receiptPort`
+  // — does not compile. Measured: esbuild refuses it (`Private name "#receiptPort" must be
+  // declared in an enclosing class`), vitest collects zero tests, and the harness would have
+  // reported that as a "kill" without the named test's own assertion ever running — a collection
+  // error standing in for a RED. The guard is real and is demonstrated by hand instead: reverting
+  // this field and the exported singleton's freeze together (both are needed to keep the file
+  // compiling) reopens attack 1 and attack 2 below, and restoring them closes it again.
+  {
+    // The other half of the same review: even a private field does not help if the *object* it
+    // defaults to is exported, shared and mutable. Un-freezing here reopens overwriting
+    // `NEVER_FOUND_RECEIPT_PORT.lookup` in place — no coordinator field ever touched, every
+    // coordinator using the default affected.
+    what: "the exported default receipt port is frozen, so its lookup method cannot be reassigned in place",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = Object.freeze({",
+    replace: "export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = ({",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::attack 2 — tampering with the exported NEVER_FOUND_RECEIPT_PORT singleton throws, and its answer is unchanged",
+    ],
+  },
+  {
+    // Contract 1's fourth field. Without this, a receipt for one turn can settle a different one
+    // that happens to share the same actor, prompt and generation — precisely the case #691's round
+    // 1 fix left unchecked, because `turnRequestId` was still taken from the query, not the answer.
+    what: "a receipt attesting to a different turn than the one asked about cannot settle it",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "    if (attested.turnRequestId !== turnRequestId) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to a different turn id than the one asked about, even though actor, prompt and generation all agree",
+    ],
+  },
+  {
+    // Sol's third review of #691: contract 6 requires a matched receipt to move `TURN_COMPLETED`
+    // and insert one reply-outbox item atomically, and nothing wired to `canonical_turns` performs
+    // the second half. Removing this refusal reopens the exact gap: a receipt with perfectly
+    // matching identity would record `COMPLETED` with no way to prove any reply was ever
+    // preserved, and that transition cannot be undone through the ordinary API.
+    what: "a receipt reporting completion is refused, because no reply-outbox insert can accompany it yet",
+    file: "src/conversation/turn-coordinator.ts",
+    find: '    if (receipt.outcome === "COMPLETED") {',
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn even when every identity field matches, because the reply obligation cannot yet be discharged",
+    ],
+  },
+  {
     // #649 part A: `bind()` minted a fresh actor unconditionally, so re-bootstrapping against the
     // same Hermes transcript produced a second owner beside the first — two actors that collide on
     // nothing, so the alias was silent. Without this line the reuse path is computed and then
@@ -1322,6 +1419,104 @@ const GUARDS = [
     replace: "        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n        if (false) {",
     killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 the preflight refuses an ordinary non-race blocker before the irreversible provider stop, never calling it at all",
+    ],
+  },
+  {
+    // Sol's fifth review of #691: `bindingGeneration` alone does not fence a `SURVIVED` failover,
+    // which moves an actor's live runtime to a new session while deliberately keeping the same
+    // generation. Removing this check reopens exactly that: a receipt naming the wrong target
+    // binding would still settle the turn as long as turn, actor, prompt and generation agreed.
+    what: "a receipt naming a different target binding than the one this turn was claimed against is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (row.target_binding_id !== attested.targetBindingId) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong target binding",
+    ],
+  },
+  {
+    // Same review, the attestation field: a stale or replaced attestation is not evidence about a
+    // turn claimed under a different one, even when the binding and generation both still agree.
+    what: "a receipt naming a different attestation than the one that verified this turn's target is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (row.target_attestation_id !== attested.targetAttestationId) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to the wrong attestation",
+    ],
+  },
+  {
+    // The field that actually catches a `SURVIVED` failover: `BindingRegistry.switchTo` moves the
+    // actor's runtime to a new session while leaving `binding_generation` untouched, so this is
+    // the one check standing between that failover and a wrongly settled turn.
+    what: "a receipt naming a different executor session or incarnation than the one this turn was claimed under is refused",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        row.executor_session_id !== attested.executorSessionId ||",
+    replace: "        false ||",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not complete a turn when the receipt attests to a different runtime than the one this turn was claimed under, after a SURVIVED failover keeps the generation unchanged",
+    ],
+  },
+  {
+    // Sol's sixth review: `ReceiptPort.lookup` may return a `Promise` that never settles — a
+    // legitimate slow implementation, not a misbehaving one — and the sweep used to await it with
+    // no bound. Reverting to the bare port call here reopens that hang for every candidate after
+    // the stuck one, and for the daemon startup call this sweep runs from.
+    what: "a receipt lookup that never settles is bounded by a timeout, not awaited indefinitely",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        result = await this.#lookupWithTimeout({",
+    replace: "        result = await this.#receiptPort.lookup({",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::treats a lookup that never settles as no evidence after its timeout, and keeps sweeping the rest",
+    ],
+  },
+  {
+    // Sol's seventh review: a per-lookup timeout only abandoned a slow call, leaving its promise
+    // — and any network work behind it — running. Removing the abort here reopens exactly that:
+    // a real implementation with something to cancel is never told to.
+    what: "a timed-out lookup's signal is aborted, not merely abandoned",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        controller.abort(new Error(`receipt lookup for ${query.turnRequestId} timed out`));",
+    replace: "        void 0;",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::aborts the signal it gave a lookup once that lookup's own timeout fires",
+    ],
+  },
+  {
+    // Sol's eighth review: a per-lookup timeout bounds one turn, not the whole pass. Seven
+    // honestly slow lookups in one sweep add up past the periodic interval, and `runPeriodic` has
+    // no in-flight guard — removing this check reopens the overlap the budget exists to prevent.
+    what: "the sweep stops issuing new lookups once the whole pass exceeds its own budget",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "      if (Date.now() - startedAt >= budgetMs) break;",
+    replace: "      if (false) break;",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::stops issuing new lookups once the whole pass exceeds its own budget, leaving the rest for the next sweep",
+    ],
+  },
+  {
+    // Sol's second (of this round) finding: a sweep that silently swallows every lookup failure
+    // and still reports success is indistinguishable, to the daemon, from a port with nothing to
+    // find. Removing the increment here reopens that — `failed` stays 0 no matter how many
+    // lookups actually failed.
+    what: "the sweep counts lookups it could not get an honest answer from",
+    file: "src/conversation/turn-coordinator.ts",
+    find: "        failed += 1;",
+    replace: "        void 0;",
+    killedBy: [
+      "tests/unit/the-sweep-asks-a-receipt-port-about-every-unresolved-turn.test.ts::does not stop the sweep when one lookup throws",
+    ],
+  },
+  {
+    // The daemon-side half of the same finding: `runPeriodic` only backs off and audits on a
+    // thrown `action()`. Without this throw, a sweep reporting `failed > 0` still reads to
+    // `runPeriodic` — and to the health file — as an ordinary success.
+    what: "the daemon throws when a turn-reconciliation sweep reports any failed lookups, so runPeriodic can see it",
+    file: "src/daemon/daemon.ts",
+    find: "    if (result.failed > 0) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/doctor-daemon-r2.test.ts::#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger",
     ],
   },
 ];

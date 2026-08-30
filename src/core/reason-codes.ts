@@ -422,6 +422,66 @@ export const ReasonCode = {
   CONVERSATION_TURN_ALREADY_DISPATCHED: "CONVERSATION_TURN_ALREADY_DISPATCHED",
   /** An adjudication cited only part of the disagreement, or something outside it. */
   CONVERSATION_ADJUDICATION_INCOMPLETE: "CONVERSATION_ADJUDICATION_INCOMPLETE",
+  /**
+   * A reconciler's receipt names the right turn under the wrong CEO generation.
+   *
+   * `bindingGeneration` is why a receipt cannot be matched by id alone (#639): a turn claimed
+   * under generation N and a receipt minted under N+1 describe two different CEOs' work, even
+   * when every other field agrees. Left `IN_DOUBT`, not `CONTRADICTED` — nothing this turn's own
+   * observations say disagrees with anything; the receipt is simply not about this claim.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_GENERATION: "CONVERSATION_TURN_RECEIPT_WRONG_GENERATION",
+  /**
+   * A reconciler's receipt attests to a different turn than the one the sweep asked about.
+   *
+   * `turnRequestId` is the fourth of contract 1's four fields, and a review found it was the one
+   * still taken from the sweep's own query rather than from the receipt's answer: a port that
+   * confused two turns sharing the same actor, prompt and generation could otherwise settle the
+   * wrong one on a receipt that was never about it. Left `IN_DOUBT`, for the same reason a wrong
+   * generation is: the receipt is simply not evidence about this claim, not a contradiction of it.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_TURN: "CONVERSATION_TURN_RECEIPT_WRONG_TURN",
+  /**
+   * A reconciled receipt says `COMPLETED`, and this build has no way to discharge the reply
+   * obligation that transition carries alongside it.
+   *
+   * #639's contract: a matched receipt must move the turn to `TURN_COMPLETED` and insert one
+   * reply-outbox item atomically, in the same transaction — not as two facts that could disagree.
+   * A review found the reconciler only did the first: `canonical_turns` moved, nothing else did,
+   * and `COMPLETED` cannot be walked back through the ordinary API once recorded. There is no
+   * reply-outbox mechanism wired to this ledger to insert into — `src/outbox/outbox.ts` exists,
+   * but its `MessageKind`s are role-to-role task dispatch, not a reply to the owner who asked — so
+   * recording `COMPLETED` today would be exactly the false positive contract 6 exists to prevent.
+   * `ABORTED` carries no such obligation and is unaffected.
+   */
+  CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE:
+    "CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE",
+  /**
+   * A reconciled receipt names a different target binding than the one this turn was claimed
+   * against. Kept apart from the generation/runtime checks because it is a distinct fact: which
+   * Hermes conversation this turn belongs to, not which execution of it.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_BINDING: "CONVERSATION_TURN_RECEIPT_WRONG_BINDING",
+  /**
+   * A reconciled receipt names a different attestation than the one that verified this turn's
+   * target at claim time. A stale or replaced attestation is not evidence about a turn claimed
+   * under a different one, even when the binding and generation both still agree.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_ATTESTATION: "CONVERSATION_TURN_RECEIPT_WRONG_ATTESTATION",
+  /**
+   * A reconciled receipt names a different executor session or incarnation than the one this
+   * turn was claimed under — the gap `bindingGeneration` alone cannot close.
+   *
+   * `BindingRegistry.switchTo`'s `SURVIVED` failover moves an actor's live runtime to a new
+   * session while deliberately keeping the same `bindingGeneration` ("the binding is not
+   * rewritten, which is why `binding_generation` cannot advance here"). So a turn claimed under
+   * one runtime can have its actor's session move to another while the turn is still `IN_DOUBT`,
+   * and a receipt describing the *new* runtime's work would pass turn, actor, prompt and
+   * generation checks alike while being evidence about an execution this turn was never
+   * dispatched under. Left `IN_DOUBT`, for the same reason every other identity mismatch is: the
+   * receipt is not evidence about this claim, not a contradiction of it.
+   */
+  CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME: "CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME",
   // --- disposable acceptance realm ------------------------------------------
   /**
    * A path the acceptance realm would use resolves inside production, or outside its own state
