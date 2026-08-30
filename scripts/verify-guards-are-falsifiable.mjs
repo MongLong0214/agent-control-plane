@@ -2120,8 +2120,8 @@ const GUARDS = [
     // discarded, which is exactly that regression.
     what: "bind reuses the actor that already owns a verified target instead of minting a second one",
     file: "src/session/binding-registry.ts",
-    find: "      const actorId = reused.value ?? this.mintActor(\n        input.role,\n        input.sessionId,\n        session.incarnation,\n        provisionalActorId,\n      );",
-    replace: "      const actorId = this.mintActor(\n        input.role,\n        input.sessionId,\n        session.incarnation,\n        provisionalActorId,\n      );",
+    find: "      const actorId = reused.value ?? this.mintActor(\n        input.role,\n        input.sessionId,\n        session.incarnation,\n        freshCandidate,\n      );",
+    replace: "      const actorId = this.mintActor(\n        input.role,\n        input.sessionId,\n        session.incarnation,\n        freshCandidate,\n      );",
     killedBy: [
       "tests/unit/reconstitution-needs-a-verified-target.test.ts::reuses the actor rather than minting a second owner",
     ],

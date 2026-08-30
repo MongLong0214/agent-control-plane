@@ -213,7 +213,8 @@ export class BindingRegistry {
       const reused = this.actorOwning(claimedTarget);
       if (!reused.allowed) return reused as Decision<RoleBinding>;
       // Plan a new id before verification so target authentication is the last pre-write step.
-      const provisionalActorId = reused.value ?? `actor:${newAssignmentId()}`;
+      const freshCandidate = `actor:${newAssignmentId()}`;
+      const provisionalActorId = reused.value ?? freshCandidate;
       if (input.authenticatedTarget) {
         let authenticated: VerifiedTargetBinding | null;
         try {
@@ -251,7 +252,7 @@ export class BindingRegistry {
         input.role,
         input.sessionId,
         session.incarnation,
-        provisionalActorId,
+        freshCandidate,
       );
       if (reused.value !== null) {
         // The actor survives and the runtime does not, which is the whole content of a reuse.
