@@ -1852,7 +1852,6 @@ const GUARDS = [
     replace: "      if (false) {\n        return this.suspendProject(projectId, ownerApproved, reason, owner);\n      }",
     killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 suspend follows a replacement runtime that wins during provider stop",
-      "tests/unit/cto-registry-r2.test.ts::#692 suspend follows a replacement generation that wins during provider stop",
     ],
   },
   {
@@ -1924,6 +1923,16 @@ const GUARDS = [
     replace: "        false &&\n        run.projectId &&\n        this.projects.get(run.projectId)?.suspended === true",
     killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 a suspend crossing run reactivation leaves a cold start recoverable",
+    ],
+  },
+  {
+    // AWAITING_HUMAN owns live work just as ACTIVE does. It needs its own mutation because
+    // the broader fence row above is already killed by the original ACTIVE race.
+    what: "a suspended checkpoint cannot advance to awaiting human during provider stop",
+    file: "src/run/run-engine.ts",
+    find: "        (to === RunState.ACTIVE || to === RunState.AWAITING_HUMAN) &&\n        run.projectId &&",
+    replace: "        to === RunState.ACTIVE &&\n        run.projectId &&",
+    killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 a suspended checkpoint cannot advance to another live run state during provider stop",
     ],
   },
