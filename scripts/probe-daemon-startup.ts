@@ -27,7 +27,6 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { ControlPlane, defaultConfig, type ControlPlaneConfig } from "../src/app/control-plane.ts";
-import { Daemon } from "../src/daemon/daemon.ts";
 import { startLocalMcpListeners } from "../src/daemon/agentcpd.ts";
 import { SessionLifecycle } from "../src/domain/types.ts";
 
@@ -62,7 +61,7 @@ const scenario = async (
     stage["doctorFindings"] = summarise(doctor.findings);
 
     const stateDir = dirname(config.databasePath);
-    const daemon = new Daemon(cp, { stateDir });
+    const daemon = cp.createDaemon({ stateDir });
     const started = await daemon.start();
     stage["daemonStart"] = started.allowed
       ? { allowed: true, reasonCode: started.reasonCode }
@@ -252,7 +251,7 @@ await scenario("credential + structured capacity files for both providers", (cp,
   const cp = new ControlPlane(config);
   try {
     const stateDir = dirname(config.databasePath);
-    const daemon = new Daemon(cp, { stateDir });
+    const daemon = cp.createDaemon({ stateDir });
     const first = await daemon.start();
     stage["firstStart"] = { allowed: first.allowed, reasonCode: first.reasonCode };
 

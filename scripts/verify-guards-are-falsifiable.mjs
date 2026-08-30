@@ -1531,6 +1531,26 @@ const GUARDS = [
       "tests/unit/canonical-turn-ledger.test.ts::refuses a source citing a fresh audit event instead of the turn's own claim event",
     ],
   },
+  {
+    what: "the startup probe enters daemon startup through the production composition root",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    const daemon = cp.createDaemon({ stateDir });\n    const started = await daemon.start();",
+    replace:
+      "    const daemon = cp.daemonFinalizationAuthorities({ stateDir });\n    const started = await daemon.start();",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::records every startup decision without a fixture authority",
+    ],
+  },
+  {
+    what: "the startup probe uses the production composition root after a refused start",
+    file: "scripts/probe-daemon-startup.ts",
+    find: "    const daemon = cp.createDaemon({ stateDir });\n    const first = await daemon.start();",
+    replace:
+      "    const daemon = cp.daemonFinalizationAuthorities({ stateDir });\n    const first = await daemon.start();",
+    killedBy: [
+      "tests/process/daemon-startup-probe.test.ts::records every startup decision without a fixture authority",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
