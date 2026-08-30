@@ -312,6 +312,105 @@ const GUARDS = [
     killedBy: ["tests/unit/disposable-realm.test.ts"],
   },
   {
+    what: "the disposable driver refuses an evidence sentence wider than its bounded observation",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "  if (!claim.allowed) return claim;",
+    replace: "  if (false) return claim;",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses a claim wider than the bounded disposable observation",
+    ],
+  },
+  {
+    what: "an unobservable before census stops the disposable driver",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (!before.allowed) {\n      return before as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    replace: "    if (false) {\n      return before as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses when the before census cannot be observed",
+    ],
+  },
+  {
+    what: "an ambiguous send is terminal before the disposable driver polls again",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: '        if (classifyProbeSignal(signal) === "INCONCLUSIVE") {',
+    replace: "        if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::treats an ambiguous send as terminal and never polls a second message",
+    ],
+  },
+  {
+    what: "the disposable driver requires two complete routed and durable turns",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (!complete.allowed) {\n      return complete as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    replace: "    if (false) {\n      return complete as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses when the real polling entry returns only one message",
+    ],
+  },
+  {
+    what: "the disposable trace contains exactly two messages and one target actor",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    counts.outcomes !== 2 ||\n    counts.sentReplies !== 2 ||\n    counts.targetTurns !== 2 ||\n    counts.durableNonces !== 2 ||\n    counts.actorIds !== 1 ||\n    counts.targetActorIds !== 1",
+    replace: "    false",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses two actors created through the binding lifecycle",
+    ],
+  },
+  {
+    what: "each sent reply is the reply the synthetic target authored for that admitted update",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "      sent.text !== expectedReply ||",
+    replace: "      false ||",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses a reply that the synthetic target did not author",
+    ],
+  },
+  {
+    what: "the disposable driver refuses any synthetic baseline census difference",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (!unchanged.allowed) {\n      return unchanged as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    replace: "    if (false) {\n      return unchanged as Decision<SyntheticDisposableRealmEvidence>;\n    }",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses when the synthetic baseline changes during the probe",
+    ],
+  },
+  {
+    what: "the disposable driver refuses cleanup residue before the janitor removes it",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    if (!residue.allowed) {",
+    replace: "    if (false) {",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses cleanup that leaves realm residue and then removes it with the janitor",
+    ],
+  },
+  {
+    what: "cleanup refuses a process identity this disposable run did not own",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "  const unowned = candidates.filter((candidate) => !mayTerminate(owned, candidate));",
+    replace: "  const unowned = candidates.filter(() => false);",
+    killedBy: [
+      "tests/unit/disposable-realm-driver.test.ts::refuses to terminate a reused pid whose start time does not match",
+    ],
+  },
+  {
+    what: "the janitor creates the synthetic workspace after taking ownership of its cleanup pipe",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "mkdirSync(target, { recursive: true, mode: 0o700 });",
+    replace: "void target;",
+    killedBy: [
+      "tests/process/disposable-realm-janitor.test.ts::removes the workspace when the process holding its pipe is killed",
+    ],
+  },
+  {
+    what: "the crash janitor removes the synthetic workspace when its owner pipe closes",
+    file: "src/acceptance/disposable-realm-driver.ts",
+    find: "    rmSync(target, { recursive: true, force: true });",
+    replace: "    void target;",
+    killedBy: [
+      "tests/process/disposable-realm-janitor.test.ts::removes the workspace when the process holding its pipe is killed",
+    ],
+  },
+  {
     what: "the periodic capacity sweep gets a budget sized against the sweep, not against startup",
     symbols: ["sweepBudgetMs"],
     file: "src/daemon/daemon.ts",
