@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ControlPlane } from "../app/control-plane.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../capacity/capacity-monitor.ts";
 import { COLLECTOR_TIMEOUT_MS } from "../capacity/usage-collectors.ts";
+import { RECONCILE_SWEEP_BUDGET_MS } from "../conversation/turn-coordinator.ts";
 import type { RequiredRole, RoleCoveragePlan } from "../continuity/continuity-kernel.ts";
 import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
@@ -124,6 +125,16 @@ export interface DaemonOptions {
    * supervisor's restart.
    */
   bootstrapRecheckIntervalMs?: number;
+  /** How often the daemon asks its receipt port about every unresolved turn (#639 contract 6). */
+  turnReconcileIntervalMs?: number;
+  /**
+   * How long one turn-reconciliation pass may run before it stops issuing new lookups. Defaults
+   * to `RECONCILE_SWEEP_BUDGET_MS`; overridable so a caller sizing `turnReconcileIntervalMs` down
+   * (tests, a tighter deployment) can keep the budget-fits-its-interval invariant satisfied
+   * without waiting the production default out — the same pairing `capacityRefreshBudgetMs`
+   * already gives the capacity sweep.
+   */
+  turnReconcileBudgetMs?: number;
 }
 
 /**
@@ -951,6 +962,22 @@ export class Daemon {
 
       report.resumedRuns = await this.resumeQueuedRuns();
       report.resumedFinalizations = await this.resumeApprovedRuns();
+      // #639 contract 6, at the moment it matters most: right after a restart, before the first
+      // periodic sweep would otherwise get to it. This genuinely runs and asks — it is not a
+      // no-op by omission — but two independent facts limit it today, both stated in full in
+      // `reconcileUnresolved`'s docstring: (1) it sweeps `canonical_turns`, which nothing in
+      // production writes to yet, so it always finds nothing to sweep; and (2) even once
+      // something is found, a `COMPLETED` receipt is refused unconditionally, because no
+      // reply-outbox mechanism is wired to this ledger. Resolving (1) does not resolve (2).
+      //
+      // Not awaited. A review found this call had no bound on how long one lookup could run —
+      // `reconcileUnresolved()` now times out each one internally, but a *sequence* of several
+      // slow (not hung) lookups could still add up to real seconds, and startup has no reason to
+      // spend them: the periodic timer below finds exactly the same unresolved rows within
+      // `turnReconcileIntervalMs` regardless of whether this call ever ran. Fire-and-forget
+      // through `runPeriodic` for the same backoff/audit treatment the timer gets, rather than a
+      // bare `void` that would let a repeatedly-failing sweep fail silently forever.
+      void this.runPeriodic("turn_reconcile", () => this.runTurnReconcile());
       this.writeHealth(report);
       this.startTimers();
       this.clearCrashLoop();
@@ -1301,6 +1328,34 @@ export class Daemon {
     capacitySensor.unref();
     this.#timers.push(capacitySensor);
 
+    // #639 contract 6's active half: ask, on a schedule, rather than wait to be told. Before #638
+    // this always asks a port that answers `found: false` — a real sweep that genuinely runs, not
+    // the absence of one. Two independent facts still limit it, both stated in full in
+    // `reconcileUnresolved`'s docstring: (1) `canonical_turns` has no production writer yet
+    // (`ConversationTurnCoordinator.claim()` has none — #683/#639's other half), so
+    // `unresolvedIdentities()` returns empty here regardless of what the port would say; and (2)
+    // even once it does not, a `COMPLETED` receipt is refused unconditionally today, because no
+    // reply-outbox mechanism is wired to this ledger. (1) resolving does not resolve (2).
+    //
+    // The interval also has to fit the sweep's own budget, for the same reason the capacity
+    // sweep's budget is asserted against its interval rather than left to chance — a pass that
+    // can legitimately run right up to its budget must still finish before the next one is due,
+    // or the two overlap regardless of the budget existing at all.
+    const turnReconcileMs = this.options.turnReconcileIntervalMs ?? 60_000;
+    const turnReconcileBudgetMs = this.options.turnReconcileBudgetMs ?? RECONCILE_SWEEP_BUDGET_MS;
+    if (turnReconcileBudgetMs >= turnReconcileMs) {
+      throw acpError(
+        ReasonCode.INVALID_ARGUMENT,
+        "the turn-reconciliation sweep's own budget must fit inside its interval",
+        { turnReconcileIntervalMs: turnReconcileMs, turnReconcileBudgetMs },
+      );
+    }
+    const turnReconcile = setInterval(() => {
+      void this.runPeriodic("turn_reconcile", () => this.runTurnReconcile());
+    }, turnReconcileMs);
+    turnReconcile.unref();
+    this.#timers.push(turnReconcile);
+
     if (this.options.buzz) {
       const delivery = setInterval(() => {
         void this.runPeriodic("buzz_delivery", async () => {
@@ -1432,6 +1487,29 @@ export class Daemon {
     writeFileSync(join(this.options.stateDir, "health.json"), JSON.stringify(health, null, 2), {
       mode: 0o600,
     });
+  }
+
+  /**
+   * `reconcileUnresolved()`, made to throw when the daemon needs to know something went wrong.
+   *
+   * A review found the sweep swallowed every per-turn lookup failure — correctly, so one bad turn
+   * does not stop the rest from being asked about — and then always returned as though it had
+   * succeeded. `runPeriodic` only backs off and audits on a thrown `action()`, so a port that
+   * fails on *every* call looked, to the daemon, identical to one with nothing to find: the exact
+   * ambiguity contract 6 exists to remove, just moved one layer up. This is the one place that
+   * distinction is turned back into the signal `runPeriodic` already knows how to act on, so the
+   * daemon needs no new mechanism for it — the same backoff and `DAEMON_TIMER_FAILED` audit the
+   * watchdog and capacity timers already produce.
+   */
+  private async runTurnReconcile(): Promise<void> {
+    const result = await this.cp.conversation.reconcileUnresolved(
+      this.options.turnReconcileBudgetMs ?? RECONCILE_SWEEP_BUDGET_MS,
+    );
+    if (result.failed > 0) {
+      throw new Error(
+        `${result.failed} of ${result.swept} receipt lookup(s) failed or timed out this sweep`,
+      );
+    }
   }
 
   /**
