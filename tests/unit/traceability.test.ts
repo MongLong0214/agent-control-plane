@@ -20,6 +20,8 @@ const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 // production scenario look covered simply because it tests the traceability mechanism.
 const fixtureScenarioId = ["CP", "S01"].join("-");
 const pipelineScenarioId = ["CP", "S30"].join("-");
+const coveredRepoFactoryScenarioId = ["RF", "S05"].join("-");
+const missingRepoFactoryScenarioId = ["RF", "S06"].join("-");
 const fixtureTestTitle = `${fixtureScenarioId}: refuses the invalid operation`;
 
 const requirement: Requirement = {
@@ -141,5 +143,31 @@ describe("traceability executed-test coverage", () => {
     expect(report.requirements[0]?.status).toBe("DECLARATION_GAP");
     expect(report.summary.scenariosMissing).toEqual([fixtureScenarioId]);
     expect(traceabilityPasses(report)).toBe(false);
+  });
+
+  it("lists Repo Factory scenarios that this execution did not cover", () => {
+    const report = buildTraceabilityReport(
+      [requirement],
+      new Map([[fixtureScenarioId, "fixture scenario"]]),
+      new Map([
+        [coveredRepoFactoryScenarioId, "covered factory scenario"],
+        [missingRepoFactoryScenarioId, "missing factory scenario"],
+      ]),
+      new Map([
+        [fixtureScenarioId, [{ file: declaration.file, title: declaration.title }]],
+        [coveredRepoFactoryScenarioId, [{ file: declaration.file, title: declaration.title }]],
+      ]),
+      vitestResult("passed"),
+    );
+
+    expect(report.repoFactoryScenarios).toEqual([
+      expect.objectContaining({ id: coveredRepoFactoryScenarioId, status: "DECLARATION_COVERED" }),
+      expect.objectContaining({ id: missingRepoFactoryScenarioId, status: "DECLARATION_MISSING", tests: [] }),
+    ]);
+    expect(report.summary).toMatchObject({
+      repoFactoryScenarios: 2,
+      repoFactoryScenariosWithPassedDeclarations: 1,
+      repoFactoryScenariosMissing: [missingRepoFactoryScenarioId],
+    });
   });
 });
