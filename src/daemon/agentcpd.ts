@@ -1342,6 +1342,13 @@ export interface AgentcpdMainOptions {
   config?: ControlPlaneConfig;
   /** Test-only transport/lifecycle seam; production uses the real Bot API and stays alive. */
   telegramStartOptions?: DaemonTelegramStartOptions;
+  /** Lets the focused main-entry composition test avoid waiting for the production interval. */
+  buzzChannelTrafficIntervalMs?: number;
+  /** Lets a main-entry test inspect the started daemon before unrelated listener sockets open. */
+  afterDaemonStart?: (
+    shutdown: (signal: string) => Promise<void>,
+    context: AgentcpdMainContext,
+  ) => Promise<void>;
   /** Allows a composition test to inspect the lock-held composition before shutting down. */
   waitForShutdown?: (
     shutdown: (signal: string) => Promise<void>,
@@ -1352,6 +1359,7 @@ export interface AgentcpdMainOptions {
 export interface AgentcpdMainContext {
   cp: ControlPlane;
   daemon: Daemon;
+  buzz: BuzzAdapter;
   telegram: TelegramLongPollListener | null;
 }
 
@@ -1438,7 +1446,12 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     sessionLaunch,
   });
 
-  const daemon = cp.createDaemon({ stateDir, buzz, channelTrafficWatch });
+  const daemon = cp.createDaemon({
+    stateDir,
+    buzz,
+    channelTrafficWatch,
+    buzzChannelTrafficIntervalMs: options.buzzChannelTrafficIntervalMs,
+  });
 
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;
@@ -1503,6 +1516,9 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   }
 
   startCompleted = true;
+  if (options.afterDaemonStart) {
+    await options.afterDaemonStart(shutdown, { cp, daemon, buzz, telegram });
+  }
   try {
     hermesBootstrap = createHermesBootstrapAuthority(cp, {
       stateDir,
@@ -1559,7 +1575,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
 
   process.stdout.write(`${JSON.stringify({ started: started.value }, null, 2)}\n`);
 
-  const context: AgentcpdMainContext = { cp, daemon, telegram };
+  const context: AgentcpdMainContext = { cp, daemon, buzz, telegram };
 
   // Keep the process alive; work arrives through authenticated local MCP sockets or timers.
   if (options.waitForShutdown) {

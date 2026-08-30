@@ -86,8 +86,8 @@ const safeErrorMessage = (err: unknown): string => {
 };
 
 /**
- * Records raw Buzz channel event ids returned by `--since` that were absent from prior completed
- * reads for the session's current channel route.
+ * Records raw Buzz channel event ids returned by `--since` that were absent from the preceding
+ * completed read for the session's current channel route.
  *
  * Lifecycle:
  *

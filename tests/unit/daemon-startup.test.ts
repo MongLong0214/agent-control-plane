@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it, vi } from "vitest";
@@ -37,11 +37,45 @@ const runMain = async (input: {
   seedState?: boolean;
   expectTelegram?: boolean;
   expectPromptFlow?: boolean;
+  expectBuzzWatch?: boolean;
 }): Promise<MainResult> => {
   // macOS sockaddr_un paths are short; the repository's temp worktree path is long enough
   // to make the operator socket exceed that OS limit and would test the wrong failure.
   const root = mkdtempSync(join("/tmp", "acp-main-startup-"));
   const stateRoot = join(root, ".agent-control-plane");
+  const buzzBinary = join(root, "buzz");
+  const buzzMessages = join(root, "buzz-messages.json");
+  if (input.expectBuzzWatch) {
+    writeFileSync(buzzMessages, "[]", "utf8");
+    writeFileSync(
+      buzzBinary,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+const flag = (name) => {
+  const index = argv.indexOf(name);
+  return index < 0 ? null : argv[index + 1] ?? null;
+};
+if (argv[0] === "channels" && argv[1] === "get") {
+  process.stdout.write(JSON.stringify({ channel_id: flag("--channel") }));
+  process.exit(0);
+}
+if (argv[0] === "messages" && argv[1] === "get") {
+  const since = Number(flag("--since"));
+  const limit = Number(flag("--limit"));
+  const messages = JSON.parse(fs.readFileSync(${JSON.stringify(buzzMessages)}, "utf8"));
+  process.stdout.write(JSON.stringify(
+    messages.filter((entry) => entry.created_at > since).slice(0, limit),
+  ));
+  process.exit(0);
+}
+process.stderr.write(JSON.stringify({ error: "unsupported argv", argv }));
+process.exit(1);
+`,
+      "utf8",
+    );
+    chmodSync(buzzBinary, 0o755);
+  }
   if (input.ownerIdentity) {
     mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
     writeFileSync(join(stateRoot, "owner-identities"), `telegram:${OWNER_ID}\n`, { mode: 0o600 });
@@ -58,6 +92,17 @@ const runMain = async (input: {
     ...(input.seedState ? { ACP_STARTUP_TEST_SEED: "1" } : {}),
     ...(input.expectTelegram ? { ACP_STARTUP_TEST_EXPECT_TELEGRAM: "1" } : {}),
     ...(input.expectPromptFlow ? { ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW: "1" } : {}),
+    ...(input.expectBuzzWatch
+      ? {
+          ACP_STARTUP_TEST_EXPECT_BUZZ_WATCH: "1",
+          ACP_STARTUP_TEST_BUZZ_MESSAGES: buzzMessages,
+          ACP_BUZZ_BINARY: buzzBinary,
+          ACP_BUZZ_CHANNEL: "00000000-0000-0000-0000-000000000674",
+          BUZZ_PRIVATE_KEY: "startup-test-private-key",
+          ACP_BUZZ_INGRESS_SECRET: "startup-test-ingress-secret",
+          ACP_BUZZ_ALLOWED_ACTORS: "startup-test-actor",
+        }
+      : {}),
     ...(input.telegram ?? {}),
   };
   for (const name of TELEGRAM_VARIABLES) {
@@ -97,6 +142,13 @@ describe("agentcpd main Telegram startup composition", () => {
     expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
     expect(result.stderr).toContain("Telegram ingress not configured");
     expect(result.stdout).not.toContain("Telegram ingress started");
+  }, 40_000);
+
+  it("agentcpd main carries the Buzz channel event watch into the daemon", async () => {
+    const result = await runMain({ seedState: true, expectBuzzWatch: true });
+
+    expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain("startup test main composed the Buzz channel event watch");
   }, 40_000);
 
   it("refuses partial Telegram configuration through main and names every missing requirement", async () => {

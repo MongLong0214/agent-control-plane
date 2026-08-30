@@ -1,4 +1,4 @@
-import { main } from "../../src/daemon/agentcpd.ts";
+import { main, type AgentcpdMainContext } from "../../src/daemon/agentcpd.ts";
 import { defaultConfig } from "../../src/app/control-plane.ts";
 import { NotificationKind } from "../../src/ceo/production-gate.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -140,7 +140,78 @@ if (process.env["ACP_STARTUP_TEST_PARK"] === "1") {
 
 const expectTelegram = process.env["ACP_STARTUP_TEST_EXPECT_TELEGRAM"] === "1";
 const expectPromptFlow = process.env["ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW"] === "1";
+const expectBuzzWatch = process.env["ACP_STARTUP_TEST_EXPECT_BUZZ_WATCH"] === "1";
 const startupTransport = new StartupTelegramTransport(expectPromptFlow);
+
+const exerciseBuzzWatch = async (
+  shutdown: (signal: string) => Promise<void>,
+  context: AgentcpdMainContext,
+): Promise<void> => {
+  const messagesPath = process.env["ACP_STARTUP_TEST_BUZZ_MESSAGES"];
+  if (!messagesPath) throw new Error("ACP_STARTUP_TEST_BUZZ_MESSAGES is required");
+  const connect = async (model: string): Promise<string> => {
+    const session = context.cp.sessions.create({ provider: "claude", model });
+    const connected = await context.buzz.connect(session.sessionId, `cto:${model}`);
+    if (!connected.allowed) throw new Error(`${connected.reasonCode}: ${connected.message}`);
+    const ready = context.cp.sessions.transition(
+      session.sessionId,
+      SessionLifecycle.READY,
+      "agentcpd main Buzz watch composition test",
+    );
+    if (!ready.allowed) throw new Error(`${ready.reasonCode}: ${ready.message}`);
+    return session.sessionId;
+  };
+  const sessionIds = await Promise.all([connect("shared-a"), connect("shared-b")]);
+  const waitForRows = async (where: string, description: string): Promise<void> => {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const row = context.cp.db.get<{ measured: number }>(
+        `SELECT COUNT(*) AS measured FROM buzz_channel_traffic_watch WHERE ${where}`,
+      );
+      if (row?.measured === sessionIds.length) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`startup test timed out waiting for ${description}`);
+  };
+
+  await waitForRows("last_read_success_at IS NOT NULL", "two main-composed Buzz baselines");
+  const createdAt = Math.floor(Date.now() / 1000) + 1;
+  writeFileSync(
+    messagesPath,
+    JSON.stringify([{
+      id: "startup-main-shared-event",
+      content: "<redacted>",
+      pubkey: "startup-test-pubkey",
+      created_at: createdAt,
+      kind: 9,
+      tags: [],
+    }]),
+    "utf8",
+  );
+  await waitForRows(
+    "observed_count = 1 AND window_started_at IS NOT NULL",
+    "two main-composed Buzz event windows",
+  );
+
+  const report = await context.cp.doctor.run("system");
+  for (const sessionId of sessionIds) {
+    const measured = report.findings.find(
+      (finding) =>
+        finding.code ===
+          "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRECEDING_COMPLETED_READ" &&
+        finding.observedEvidence["sessionId"] === sessionId,
+    );
+    if (
+      measured?.observedEvidence[
+        "rawChannelEventIdsReturnedBySinceAbsentFromPrecedingCompletedRead"
+      ] !== 1
+    ) {
+      throw new Error(`startup test saw no raw Buzz event-id count for ${sessionId}`);
+    }
+  }
+  process.stdout.write("startup test main composed the Buzz channel event watch\n");
+  await shutdown("STARTUP_BUZZ_WATCH_TEST");
+};
 
 try {
   await main({
@@ -149,6 +220,9 @@ try {
       transport: startupTransport,
       ...(expectPromptFlow ? { start: false } : {}),
     },
+    ...(expectBuzzWatch
+      ? { buzzChannelTrafficIntervalMs: 100, afterDaemonStart: exerciseBuzzWatch }
+      : {}),
     waitForShutdown: async (shutdown, context) => {
       if (expectPromptFlow) {
         if (!context.telegram) throw new Error("Telegram startup test did not compose the listener");

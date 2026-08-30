@@ -448,8 +448,9 @@ export class Doctor {
 
   /**
    * #674 — reports exactly the independent CLI measurement available here: raw Buzz channel event
-   * ids returned by `--since` that were absent from prior completed reads for the session's current
-   * channel route. This method only reads `buzz_channel_traffic_watch`; the watch owns every write.
+   * ids returned by `--since` that were absent from the preceding completed read for the session's
+   * current channel route. This method only reads `buzz_channel_traffic_watch`; the watch owns every
+   * write.
    *
    * A successful complete check always emits INFO, including a measured zero. The evidence says
    * on every outcome that the CLI has no stable relay ordering token and that events excluded by
@@ -463,7 +464,7 @@ export class Doctor {
     const findings: Finding[] = [];
     const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.live();
     const measurementBoundary = {
-      measurementScope: "RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS",
+      measurementScope: "RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRECEDING_COMPLETED_READ",
       eventIdentity: "BUZZ_EVENT_ID",
       cursorResumeCapability: "TIMESTAMP_ONLY_NO_STABLE_RELAY_ORDER_TOKEN",
       cursorBoundary: "LOCAL_QUERY_START_WITH_ONE_SECOND_OVERLAP",
@@ -557,7 +558,7 @@ export class Doctor {
             sessionId: session.sessionId,
             channel,
             ...measurementBoundary,
-            confirmedRawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads:
+            confirmedRawChannelEventIdsReturnedBySinceAbsentFromPrecedingCompletedRead:
               row.observed_count,
             windowStartedAt: row.window_started_at === null
               ? null
@@ -644,7 +645,7 @@ export class Doctor {
       }
 
       findings.push({
-        code: "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS",
+        code: "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRECEDING_COMPLETED_READ",
         severity: "INFO",
         scope: `session:${session.sessionId}`,
         blocking: false,
@@ -653,7 +654,7 @@ export class Doctor {
           sessionId: session.sessionId,
           channel,
           ...measurementBoundary,
-          rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: row.observed_count,
+          rawChannelEventIdsReturnedBySinceAbsentFromPrecedingCompletedRead: row.observed_count,
           windowStartedAt: row.window_started_at === null
             ? null
             : new Date(row.window_started_at).toISOString(),
@@ -664,7 +665,7 @@ export class Doctor {
           ...cursorEvidence,
         },
         recommendedAction:
-          "raw channel event ids returned by --since that were absent from prior completed reads imply no health action; arrived-but-unclassified or undelivered messages require relay-side telemetry under #674",
+          "raw channel event ids returned by --since that were absent from the preceding completed read imply no health action; arrived-but-unclassified or undelivered messages require relay-side telemetry under #674",
       });
     }
     return findings;

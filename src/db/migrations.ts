@@ -2206,9 +2206,9 @@ const v32: SchemaMigration = {
 
 /**
  * #674 — durable, per-session results for raw Buzz channel reads. The CLI surface can verify raw
- * channel event ids returned by `--since` that were absent from prior completed reads, plus read
- * availability; it exposes no stable ordering cursor, mention classification, `needs_action`, or
- * canonical-turn delivery, so the table does not name or model those stronger states.
+ * channel event ids returned by `--since` that were absent from the preceding completed read, plus
+ * read availability; it exposes no stable ordering cursor, mention classification, `needs_action`,
+ * or canonical-turn delivery, so the table does not name or model those stronger states.
  * `seen_event_ids` retains only the latest complete response, bounded to 200 ids, for overlap
  * deduplication. `baseline_at` stores the local query start, not response completion, so query
  * latency remains inside the next overlapping read.

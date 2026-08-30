@@ -1409,8 +1409,9 @@ export class Daemon {
       this.#timers.push(delivery);
     }
 
-    // #674 — measures raw channel event ids returned by `--since` that were absent from prior
-    // completed reads, never classification or delivery: one read per live session's channel.
+    // #674 — measures raw channel event ids returned by `--since` that were absent from the
+    // preceding completed read, never classification or delivery: one read per live session's
+    // channel.
     //
     // One target per live session (#710), not per distinct channel: deduping by channel here —
     // the previous shape — was exactly the bug a blind review found, because it fed the watch a
