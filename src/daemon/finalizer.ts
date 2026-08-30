@@ -612,11 +612,19 @@ export class ApprovedRunFinalizer {
   /** Marks a still-owned attempt complete; used to heal the post-state-transition crash gap. */
   private completeAnyRunningAttempt(runId: string, attemptId?: string): number {
     const now = this.cp.clock.nowIso();
+    if (attemptId !== undefined) {
+      return this.cp.db.run(
+        `UPDATE finalization_attempts
+            SET state = 'COMPLETED', last_step = 'COMPLETED', completed_at = ?, deadline_at = ?
+          WHERE run_id = ? AND state = 'RUNNING' AND attempt_id = ?`,
+        [now, now, runId, attemptId],
+      ).changes;
+    }
     return this.cp.db.run(
       `UPDATE finalization_attempts
           SET state = 'COMPLETED', last_step = 'COMPLETED', completed_at = ?, deadline_at = ?
-        WHERE run_id = ? AND state = 'RUNNING'${attemptId ? " AND attempt_id = ?" : ""}`,
-      attemptId ? [now, now, runId, attemptId] : [now, now, runId],
+        WHERE run_id = ? AND state = 'RUNNING'`,
+      [now, now, runId],
     ).changes;
   }
 

@@ -8,36 +8,20 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 afterAll(cleanupTempDirs);
 
 /**
- * #676: residual zero for the turn-fence ledger was demonstrated once, off-repo, by a script that
- * ran nowhere afterward. Nothing here checked whether a second file had started writing
- * `canonical_turns` or its satellites, and the schema's own triggers do not fill that gap — they
- * refuse a *bad* write regardless of who sends it, but a file that reconstructs the coordinator's
- * own INSERT/UPDATE shape satisfies every one of them while going around the coordinator itself.
- *
- * So the census (`scripts/verify-turn-fence-writer-census.mjs`) is run against a clone carrying a
- * synthetic second writer, and required to fail — then run again with the writer removed, and
- * required to pass. A check that has never failed is not known to work.
- *
- * Earlier blind reviews found that its source-text detector recognised exactly one
- * spelling of each write statement — plain uppercase `INSERT INTO`/`UPDATE`/`DELETE FROM` followed
- * by a bare identifier — and missed `INSERT OR ABORT`, `INSERT OR IGNORE`, a quoted table name, a
- * schema-qualified one, and lowercase SQL outright, plus `REPLACE INTO` by name. A synthetic
- * violation written in only the one form the regex recognised proved the check catches that form,
- * not that it catches the defect. So every write form the review named is probed here, in both
- * directions — MISSED before the fix, caught after — rather than the one shape the first version
- * happened to get right.
+ * #676: a writer census that tries to evaluate JavaScript has no stable edge. Six review rounds
+ * found another spelling each time: SQL regex alternatives, comments, escapes, binary `+`, and
+ * finally `Array.join`. The production entrance is narrower than JavaScript: `Db.run` is the named
+ * mutation surface. This test drives that surface in a throwaway source tree and requires the
+ * census to reject every non-inline argument instead of trying to compute it.
  */
 const ROOT = process.cwd();
 const SCRIPT = "scripts/verify-turn-fence-writer-census.mjs";
 const CLAIM =
-  "The turn-fence writer census resolves statically knowable SQL and fails when a governed table is written or replaced outside its owner list, while reporting runtime-computed SQL it cannot resolve.";
+  "Every direct Db.run call in src has inline SQL, and each one that names a turn-fence table is in that table's declared application owner.";
 
-/** A throwaway clone carrying the working-tree census and source tree, so this measures the script being edited. */
 const scratchRepo = (): string => {
   const dir = join(tempDir("acp-writer-census-"), "repo");
   execFileSync("git", ["clone", "--quiet", "--no-hardlinks", "--depth", "1", ROOT, dir]);
-  // Copy the working-tree script and source over the clone's committed versions, the same way
-  // the sibling census test does, so a not-yet-committed edit to either is what gets measured.
   execFileSync("cp", [join(ROOT, SCRIPT), join(dir, SCRIPT)]);
   rmSync(join(dir, "src"), { recursive: true, force: true });
   execFileSync("cp", ["-R", join(ROOT, "src"), join(dir, "src")]);
@@ -50,13 +34,13 @@ const censusOn = (dir: string): { status: number | null; stdout: string } => {
   return { status: done.status, stdout: done.stdout };
 };
 
-const writeProbe = (repo: string, name: string, body: string): void => {
+const writeProbe = (repo: string, name: string, body: string, imports: string[] = []): void => {
   mkdirSync(join(repo, "src/probe"), { recursive: true });
   writeFileSync(
     join(repo, "src/probe", name),
     [
-      `// Synthetic writer-form probe for issue #676, round 2.`,
       'import type { Db } from "../db/database.ts";',
+      ...imports,
       "",
       "export const rogueWrite = (db: Db, turnRequestId: string): void => {",
       `  ${body}`,
@@ -67,7 +51,7 @@ const writeProbe = (repo: string, name: string, body: string): void => {
 };
 
 describe(CLAIM, () => {
-  it("fails when a new file writes canonical_turns directly", () => {
+  it("fails when a new file names a governed table at Db run", () => {
     const repo = scratchRepo();
     writeProbe(
       repo,
@@ -83,56 +67,163 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("fails on JavaScript escaped newline whitespace after UPDATE", () => {
+  it("fails closed on Array join SQL passed to Db run", () => {
     const repo = scratchRepo();
     writeProbe(
       repo,
-      "rogue-javascript-newline-escape-676.ts",
-      String.raw`db.run("UPDATE\ncanonical_turns SET observation_consistency = 'ADJUDICATED'");`,
+      "rogue-array-join-676.ts",
+      [
+        "const sql = [",
+        '  "INSERT",',
+        '  " INTO canonical_turn_sources",',
+        '  " (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,",',
+        '  " source_digest, predecessor_turn_request_id, admission_audit_event_id)",',
+        '  " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",',
+        '].join("");',
+        "db.run(sql, [turnRequestId, 'telegram', 'probe', 1, 0, 'digest', null, 1]);",
+      ].join("\n  "),
+    );
+    writeFileSync(
+      join(repo, "tests/execute-array-join-probe.ts"),
+      [
+        'import { Db } from "../src/db/database.ts";',
+        'import { rogueWrite } from "../src/probe/rogue-array-join-676.ts";',
+        "",
+        'const db = new Db(":memory:");',
+        "db.run(`INSERT INTO sessions",
+        "  (session_id, incarnation, provider, model, lifecycle, created_at, updated_at)",
+        "  VALUES ('session:probe', 'inc-1', 'claude', 'opus', 'READY', 'now', 'now')`);",
+        "db.run(`INSERT INTO conversational_actors",
+        "  (actor_id, kind, current_session_id, current_session_incarnation, created_at)",
+        "  VALUES ('actor:probe', 'CEO', 'session:probe', 'inc-1', 'now')`);",
+        "db.run(`INSERT INTO actor_target_bindings",
+        "  (target_binding_id, target_actor_id, executor_kind, target_locator, target_locator_digest, bound_at)",
+        "  VALUES ('binding:probe', 'actor:probe', 'hermes', 'target:probe', 'digest:target', 'now')`);",
+        "db.run(`INSERT INTO assignments",
+        "  (assignment_id, role_key, role, actor_id, session_id, session_incarnation,",
+        "   binding_generation, mode, status, created_at)",
+        "  VALUES ('assignment:probe', 'CEO:probe', 'CEO', 'actor:probe', 'session:probe',",
+        "          'inc-1', 1, 'PREFERRED', 'ACTIVE', 'now')`);",
+        "db.run(`INSERT INTO actor_target_attestations",
+        "  (target_attestation_id, target_binding_id, protocol_version, attestation_digest,",
+        "   executor_session_id, executor_session_incarnation, binding_generation, assignment_id, attested_at)",
+        "  VALUES ('attestation:probe', 'binding:probe', 'v1', 'digest:attestation',",
+        "          'session:probe', 'inc-1', 1, 'assignment:probe', 'now')`);",
+        "db.run(`INSERT INTO audit_events (at, kind, evidence_json) VALUES ('now', 'PROBE', '{}')`);",
+        "db.run(`INSERT INTO canonical_turns",
+        "  (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,",
+        "   executor_session_id, executor_session_incarnation, binding_generation, prompt_digest,",
+        "   claimed_at, claim_audit_event_id, lifecycle_state)",
+        "  VALUES ('turn:probe', 'actor:probe', 'binding:probe', 'attestation:probe',",
+        "          'session:probe', 'inc-1', 1, 'digest:prompt', 'now', 1, 'IN_DOUBT')`);",
+        'rogueWrite(db, "turn:probe");',
+        "const landed = db.all<{ n: number }>(",
+        "  `SELECT COUNT(*) AS n FROM canonical_turn_sources WHERE turn_request_id = 'turn:probe'`,",
+        ");",
+        'if (landed[0]?.n !== 1) throw new Error("Array.join writer did not execute");',
+        "db.close();",
+        "",
+      ].join("\n"),
+    );
+
+    // The counterexample typechecks and actually inserts through the real Db.run implementation.
+    // The old shadow probe called a nonexistent Db.exec and could pass without either property.
+    const typed = spawnSync("pnpm", ["typecheck"], { cwd: repo, encoding: "utf8" });
+    const built = spawnSync(
+      "pnpm",
+      [
+        "exec",
+        "esbuild",
+        "tests/execute-array-join-probe.ts",
+        "--bundle",
+        "--platform=node",
+        "--format=esm",
+        "--packages=external",
+        "--outfile=src/db/execute-array-join-probe.mjs",
+      ],
+      { cwd: repo, encoding: "utf8" },
+    );
+    const executed = spawnSync("node", ["src/db/execute-array-join-probe.mjs"], {
+      cwd: repo,
+      encoding: "utf8",
+    });
+    const done = censusOn(repo);
+
+    expect(typed.status, typed.stdout + typed.stderr).toBe(0);
+    expect(built.status, built.stdout + built.stderr).toBe(0);
+    expect(executed.status, executed.stdout + executed.stderr).toBe(0);
+    expect(done.stdout).not.toContain("residual: 0");
+    expect(done.stdout).toContain("src/probe/rogue-array-join-676.ts");
+    expect(done.stdout).toContain("not inline SQL");
+    expect(done.stdout).toContain("residual: unmeasured");
+    expect(done.status).toBe(1);
+  });
+
+  const nonInlineForms = [
+    {
+      label: "concat call",
+      body: 'db.run("UPDATE ".concat("canonical_turns SET lifecycle_state = \'SETTLED\'"));',
+    },
+    {
+      label: "String raw tag",
+      body: "db.run(String.raw`UPDATE canonical_turns SET lifecycle_state = 'SETTLED'`);",
+    },
+    {
+      label: "const identifier",
+      body: "const sql = `UPDATE canonical_turns SET lifecycle_state = 'SETTLED'`; db.run(sql);",
+    },
+  ];
+
+  for (const { label, body } of nonInlineForms) {
+    it(`fails closed on a ${label} passed to Db run`, () => {
+      const repo = scratchRepo();
+      writeProbe(repo, `rogue-${label.replaceAll(" ", "-")}.ts`, body);
+
+      const done = censusOn(repo);
+
+      expect(done.stdout).toContain("not inline SQL");
+      expect(done.stdout).toContain("RESULT: FAIL");
+      expect(done.status).toBe(1);
+    });
+  }
+
+  it("fails closed when imported SQL reaches Db run", () => {
+    const repo = scratchRepo();
+    mkdirSync(join(repo, "src/probe"), { recursive: true });
+    writeFileSync(
+      join(repo, "src/probe/imported-sql.ts"),
+      'export const sql = "INSERT INTO canonical_turn_sources (turn_request_id) VALUES (?)";\n',
+    );
+    writeProbe(
+      repo,
+      "rogue-imported-sql.ts",
+      "db.run(sql, [turnRequestId]);",
+      ['import { sql } from "./imported-sql.ts";'],
     );
 
     const done = censusOn(repo);
 
-    expect(done.stdout).toContain("src/probe/rogue-javascript-newline-escape-676.ts");
-    expect(done.stdout).toContain("canonical_turns");
-    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.stdout).toContain("src/probe/rogue-imported-sql.ts");
+    expect(done.stdout).toContain("not inline SQL");
     expect(done.status).toBe(1);
   });
 
-  it("fails on JavaScript escaped hexadecimal whitespace after UPDATE", () => {
+  it("fails when Db run is captured instead of called directly", () => {
     const repo = scratchRepo();
     writeProbe(
       repo,
-      "rogue-javascript-hex-escape-676.ts",
-      String.raw`db.run("UPDATE\x20canonical_turns SET observation_consistency = 'ADJUDICATED'");`,
+      "rogue-run-alias.ts",
+      "const run = db.run.bind(db); run(`UPDATE canonical_turns SET lifecycle_state = 'SETTLED'`);",
     );
 
     const done = censusOn(repo);
 
-    expect(done.stdout).toContain("src/probe/rogue-javascript-hex-escape-676.ts");
-    expect(done.stdout).toContain("canonical_turns");
+    expect(done.stdout).toContain("escapes its direct call surface");
     expect(done.stdout).toContain("RESULT: FAIL");
     expect(done.status).toBe(1);
   });
 
-  it("fails on adjacent literal concatenation that spells UPDATE", () => {
-    const repo = scratchRepo();
-    writeProbe(
-      repo,
-      "rogue-adjacent-literal-concatenation-676.ts",
-      String.raw`db.run("UP" + "DATE\ncanonical_turns SET observation_consistency = 'ADJUDICATED'");`,
-    );
-
-    const done = censusOn(repo);
-
-    expect(done.stdout).toContain("src/probe/rogue-adjacent-literal-concatenation-676.ts");
-    expect(done.stdout).toContain("canonical_turns");
-    expect(done.stdout).toContain("RESULT: FAIL");
-    expect(done.status).toBe(1);
-  });
-
-  it("fails when a new file writes actor_target_attestations, which nothing has ever written", () => {
-    // The one table with a declared owner list of zero. Any writer at all is new.
+  it("fails when a table with no application owner gains a Db run call", () => {
     const repo = scratchRepo();
     writeProbe(
       repo,
@@ -143,14 +234,12 @@ describe(CLAIM, () => {
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("actor_target_attestations");
-    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.stdout).toContain("outside its declared application owner list (none)");
     expect(done.status).toBe(1);
   });
 
-  it("passes on the source tree as it stands, so the probe failures are about their added writers", () => {
-    const repo = scratchRepo();
-
-    const done = censusOn(repo);
+  it("passes on the source tree as it stands", () => {
+    const done = censusOn(scratchRepo());
 
     expect(done.stdout).toContain(`CHECK: ${CLAIM}`);
     expect(done.stdout).toContain("RESULT: PASS");
@@ -158,174 +247,28 @@ describe(CLAIM, () => {
     expect(done.status).toBe(0);
   });
 
-  it("fails when a declared owner no longer writes its table", () => {
-    // The other direction of the same defect: an exemption nothing consults. Rather than edit the
-    // source tree, this rewrites the census's own OWNERS entry to name a file that writes
-    // nothing, which is what a stale owner looks like after a real writer is deleted or renamed.
+  it("fails when a declared application owner no longer names its table", () => {
     const repo = scratchRepo();
-    execFileSync("node", [
-      "-e",
-      `const fs=require('fs');const p='${SCRIPT}';let s=fs.readFileSync(p,'utf8');` +
-        `s=s.replace('actor_target_bindings: ["src/session/binding-registry.ts"],', ` +
-        `'actor_target_bindings: ["src/session/a-file-that-does-not-write-this-anymore.ts"],');` +
-        `fs.writeFileSync(p,s);`,
-    ], { cwd: repo });
+    execFileSync(
+      "node",
+      [
+        "-e",
+        `const fs=require('fs');const p='${SCRIPT}';let s=fs.readFileSync(p,'utf8');` +
+          `s=s.replace('actor_target_bindings: ["src/session/binding-registry.ts"],', ` +
+          `'actor_target_bindings: ["src/session/a-file-that-does-not-write-this-anymore.ts"],');` +
+          `fs.writeFileSync(p,s);`,
+      ],
+      { cwd: repo },
+    );
 
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("actor_target_bindings");
-    expect(done.stdout).toContain("no longer writes or replaces its table");
+    expect(done.stdout).toContain("application-owner entry");
     expect(done.status).toBe(1);
-  });
-
-  /**
-   * Every write form the blind review fed the old regex and got MISSED back, plus the ones it
-   * named as untested (REPLACE INTO, UPDATE's own OR clause, backtick/bracket quoting, multi-line).
-   * One probe file per form, one governed table (`canonical_turns`) per probe, so a regression in
-   * any single alternative reads as a specific missing FAIL rather than a generic count change.
-   */
-  const forms: Array<{ label: string; body: string }> = [
-    { label: "INSERT OR ABORT", body: "db.run(`INSERT OR ABORT INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "INSERT OR IGNORE", body: "db.run(`INSERT OR IGNORE INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "INSERT OR ROLLBACK", body: "db.run(`INSERT OR ROLLBACK INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "INSERT OR FAIL", body: "db.run(`INSERT OR FAIL INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "INSERT OR REPLACE", body: "db.run(`INSERT OR REPLACE INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "bare REPLACE INTO", body: "db.run(`REPLACE INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "UPDATE OR ABORT", body: "db.run(`UPDATE OR ABORT canonical_turns SET lifecycle_state = 'SETTLED' WHERE turn_request_id = ?`, [turnRequestId]);" },
-    { label: "double-quoted table", body: 'db.run(`UPDATE "canonical_turns" SET lifecycle_state = \'SETTLED\' WHERE turn_request_id = ?`, [turnRequestId]);' },
-    // A double-quoted outer string, not a backtick template literal, so the backtick around the
-    // table name is a bare source character and this actually exercises backtick-quote detection
-    // rather than an escaped-backtick artifact of nesting one template literal inside another.
-    { label: "backtick-quoted table", body: 'db.run("UPDATE `canonical_turns` SET lifecycle_state = \'SETTLED\' WHERE turn_request_id = ?", [turnRequestId]);' },
-    { label: "bracket-quoted table", body: "db.run(`UPDATE [canonical_turns] SET lifecycle_state = 'SETTLED' WHERE turn_request_id = ?`, [turnRequestId]);" },
-    { label: "schema-qualified table", body: "db.run(`DELETE FROM main.canonical_turns WHERE turn_request_id = ?`, [turnRequestId]);" },
-    { label: "lowercase sql", body: "db.run(`update canonical_turns set lifecycle_state = 'SETTLED' where turn_request_id = ?`, [turnRequestId]);" },
-    { label: "mixed case sql", body: "db.run(`Update canonical_turns Set lifecycle_state = 'SETTLED' where turn_request_id = ?`, [turnRequestId]);" },
-    {
-      label: "multi-line statement",
-      body: [
-        "db.run(",
-        "    `UPDATE canonical_turns",
-        "     SET lifecycle_state = 'SETTLED'",
-        "     WHERE turn_request_id = ?`,",
-        "    [turnRequestId],",
-        "  );",
-      ].join("\n  "),
-    },
-    // Round 3 of #676: a blind review ran these three directly against system SQLite and confirmed
-    // they execute as ordinary writes — the old pattern required literal `\s+` at every keyword
-    // boundary, and a `/**/` comment there is whitespace to SQLite but not to that regex, so all
-    // three scored `residual: 0`. Interleaved at every keyword boundary the review didn't name too,
-    // both to close the exact spellings and the shape one level up.
-    { label: "INSERT/**/INTO block comment", body: "db.run(`INSERT/**/INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "INSERT INTO/**/table block comment", body: "db.run(`INSERT INTO/**/canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "UPDATE/**/table block comment", body: "db.run(`UPDATE/**/canonical_turns SET lifecycle_state = 'SETTLED' WHERE turn_request_id = ?`, [turnRequestId]);" },
-    { label: "DELETE/**/FROM block comment", body: "db.run(`DELETE/**/FROM canonical_turns WHERE turn_request_id = ?`, [turnRequestId]);" },
-    { label: "DELETE FROM/**/table block comment", body: "db.run(`DELETE FROM/**/canonical_turns WHERE turn_request_id = ?`, [turnRequestId]);" },
-    { label: "REPLACE/**/INTO block comment", body: "db.run(`REPLACE/**/INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "REPLACE INTO/**/table block comment", body: "db.run(`REPLACE INTO/**/canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "INSERT OR/**/IGNORE block comment", body: "db.run(`INSERT OR/**/IGNORE INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    { label: "INSERT OR IGNORE/**/INTO block comment", body: "db.run(`INSERT OR IGNORE/**/INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
-    {
-      label: "UPDATE--line comment before table",
-      body: "db.run(`UPDATE--x\ncanonical_turns SET lifecycle_state = 'SETTLED' WHERE turn_request_id = ?`, [turnRequestId]);",
-    },
-    {
-      label: "INSERT--line comment before INTO",
-      body: "db.run(`INSERT--x\nINTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);",
-    },
-  ];
-
-  for (const { label, body } of forms) {
-    it(`fails on a ${label} write to canonical_turns`, () => {
-      const repo = scratchRepo();
-      const filename = `rogue-form-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.ts`;
-      writeProbe(repo, filename, body);
-
-      const done = censusOn(repo);
-
-      expect(done.stdout).toContain(`src/probe/${filename}`);
-      expect(done.stdout).toContain("RESULT: FAIL");
-      expect(done.status).toBe(1);
-    });
-  }
-
-  it("reports a dynamically built table name as unresolved rather than silently scoring it zero", () => {
-    // Static analysis cannot name a table built at runtime. The honest response is a loud, distinct
-    // failure — not a PASS that looks identical to a real all-clear.
-    const repo = scratchRepo();
-    writeProbe(
-      repo,
-      "rogue-dynamic-table.ts",
-      'const table = "canonical_turns"; db.run(`INSERT INTO ${table} (turn_request_id) VALUES (?)`, [turnRequestId]);',
-    );
-
-    const done = censusOn(repo);
-
-    expect(done.stdout).toContain("src/probe/rogue-dynamic-table.ts");
-    expect(done.stdout).toContain("not a static table name this census can read");
-    expect(done.stdout).toContain("RESULT: FAIL");
-    expect(done.stdout).toContain("could not resolve");
-    expect(done.status).toBe(1);
-  });
-
-  it("fails on shadow table replacement of canonical turns", () => {
-    // Finding 2 of review round 5: the production migration writes a `_rebuilt` shadow table,
-    // drops the governed table, and renames the shadow over the canonical name. The old direct
-    // INSERT probe exercised a path production does not use and let the real replacement score zero.
-    const repo = scratchRepo();
-    writeProbe(
-      repo,
-      "rogue-shadow-table-replacement-676.ts",
-      [
-        "db.exec(`CREATE TABLE canonical_turns_rebuilt AS SELECT * FROM canonical_turns WHERE 0;",
-        "INSERT INTO canonical_turns_rebuilt SELECT * FROM canonical_turns;",
-        "DROP TABLE canonical_turns;",
-        "ALTER TABLE canonical_turns_rebuilt RENAME TO canonical_turns`);",
-      ].join("\n  "),
-    );
-
-    const done = censusOn(repo);
-
-    expect(done.stdout).toContain("src/probe/rogue-shadow-table-replacement-676.ts");
-    expect(done.stdout).toContain("canonical_turns");
-    expect(done.stdout).toContain("replaces this table");
-    expect(done.stdout).toContain("RESULT: FAIL");
-    expect(done.status).toBe(1);
-  });
-
-  it("does not fabricate a write from TypeScript migration comments", () => {
-    // The reason migrations.ts used to be excluded wholesale: its comments document this ledger's
-    // past defects by quoting the broken SQL verbatim, e.g. a plain `UPDATE canonical_turns SET
-    // outcome_kind='ABORTED'`. Included-but-comment-blind would fail on prose, not code. Confirmed
-    // by the unmodified real source tree passing (the earlier "passes on the source tree as it
-    // stands" test already covers this on real migrations.ts) and, here, an added comment-only
-    // quotation is still silent.
-    const repo = scratchRepo();
-    appendFileSync(
-      join(repo, "src/db/migrations.ts"),
-      [
-        "",
-        "// A synthetic doc comment, same shape as the real one: `UPDATE canonical_turns SET",
-        "// outcome_kind='ABORTED'` describes a defect this schema no longer permits.",
-        "",
-      ].join("\n"),
-    );
-
-    const done = censusOn(repo);
-
-    expect(done.stdout).toContain("RESULT: PASS");
-    expect(done.stdout).toContain("residual: 0");
-    expect(done.status).toBe(0);
   });
 
   it("fails when a schema trigger body writes a governed table directly", () => {
-    // Finding 2, round 3: `migrations.ts`'s `schemaDdl()` reads `src/db/schema.sql` whole and
-    // installs it into the real database, so a trigger body in that file is exactly as live a
-    // write surface as a TypeScript module — and the walk above only ever reads `.ts` files.
-    // `schema.sql` was read for `CREATE TABLE` names only; a second writer sitting in a trigger
-    // body forever would never have been seen. This appends a real cascading write, the same shape
-    // a materializer-adjacent trigger could plausibly carry, and requires the census to see it.
     const repo = scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
@@ -348,82 +291,30 @@ describe(CLAIM, () => {
     expect(done.status).toBe(1);
   });
 
-  it("does not fabricate a write from SQL schema comments", () => {
-    // schema.sql already carries this exact shape for real, above `canonical_turns_settlement_authority`:
-    // "...an ordinary `UPDATE canonical_turns SET lifecycle_state='SETTLED', outcome_kind='ABORTED', …`
-    // on a turn that had never been settled succeeded...". Scanning schema.sql without stripping its
-    // own `--`/`/* */` comments first would fail on that prose the moment schema.sql joined the scan.
-    // Confirmed by the unmodified real source tree passing (the earlier "passes on the source tree as
-    // it stands" test already covers this on the real file) and, here, an added comment-only
-    // quotation appended fresh is still silent.
+  it("does not fabricate a schema write from an SQL comment", () => {
     const repo = scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
-      [
-        "",
-        "-- A synthetic doc comment, same shape as the real one: an ordinary",
-        "-- `UPDATE canonical_turns SET outcome_kind='ABORTED'` describes a defect this schema no",
-        "-- longer permits.",
-        "",
-      ].join("\n"),
+      "\n-- `UPDATE canonical_turns SET outcome_kind='ABORTED'` is only documentation.\n",
     );
 
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("RESULT: PASS");
-    expect(done.stdout).toContain("residual: 0");
     expect(done.status).toBe(0);
   });
 
-  /**
-   * Round 4 of #676: a blind review found the "unresolvable" path itself defeatable. `IDENT`'s bare
-   * alternative (`[A-Za-z_]\w*`) cannot include `$`, so a table name with a *static prefix* followed
-   * by a template placeholder — `canonical_turn_${suffix}` — does not fail to match the way a name
-   * with no static part at all does (`${table}`, already covered above). It matches the prefix alone,
-   * which does not equal any governed table's name, so the write used to vanish as a silently
-   * unresolved-but-not-reported reference. With `suffix === "s"` in production this is a live write to
-   * `canonical_turns`. A truncated prefix must land in the same loud `unresolvable` path as a name
-   * with no static part, not resolve to whatever it happens to share letters with.
-   */
-  it("treats a table name truncated by a template placeholder as unresolved, not a coincidentally similar table", () => {
-    const repo = scratchRepo();
-    writeProbe(
-      repo,
-      "rogue-truncated-template-676.ts",
-      'const suffix = "s"; db.run(`UPDATE canonical_turn_${suffix} SET lifecycle_state = ?`, [turnRequestId]);',
-    );
-
-    const done = censusOn(repo);
-
-    expect(done.stdout).toContain("src/probe/rogue-truncated-template-676.ts");
-    expect(done.stdout).toContain("not a static table name this census can read");
-    expect(done.stdout).toContain("RESULT: FAIL");
-    expect(done.stdout).toContain("could not resolve");
-    expect(done.status).toBe(1);
-  });
-
-  /**
-   * Round 4, finding 2: `CREATE_TABLE`'s old pattern required literal `\s+` at every keyword
-   * boundary and a bare identifier with no schema qualifier — so a table declared as
-   * `CREATE/**\/TABLE foo (` (a comment is whitespace to SQLite at any boundary, confirmed against
-   * system SQLite the same way the writer-side `WS` fix was) or `CREATE TABLE main.foo (`
-   * (schema-qualified, which the writer side already tolerates via `TABLE_REF`) entered nothing:
-   * not `governedTables`, not `OWNERS`, not the writer scan. Both forms are probed here — the new
-   * table must at least be *seen* (and, having no `OWNERS` entry, must fail as unowned) rather than
-   * silently absent from an 8-table PASS.
-   */
   it("discovers a governed table declared with an SQL comment between CREATE and TABLE", () => {
     const repo = scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
-      "\nCREATE/**/TABLE IF NOT EXISTS canonical_turn_probe_676a (\n  turn_request_id TEXT PRIMARY KEY\n);\n",
+      "\nCREATE/**/TABLE IF NOT EXISTS canonical_turn_probe_676a (turn_request_id TEXT PRIMARY KEY);\n",
     );
 
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("canonical_turn_probe_676a");
-    expect(done.stdout).toContain("RESULT: FAIL");
-    expect(done.stdout).toContain("no owner entry");
+    expect(done.stdout).toContain("no application-owner entry");
     expect(done.status).toBe(1);
   });
 
@@ -431,55 +322,63 @@ describe(CLAIM, () => {
     const repo = scratchRepo();
     appendFileSync(
       join(repo, "src/db/schema.sql"),
-      "\nCREATE TABLE main.canonical_turn_probe_676b (\n  turn_request_id TEXT PRIMARY KEY\n);\n",
+      "\nCREATE TABLE main.canonical_turn_probe_676b (turn_request_id TEXT PRIMARY KEY);\n",
     );
 
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("canonical_turn_probe_676b");
-    expect(done.stdout).toContain("RESULT: FAIL");
-    expect(done.stdout).toContain("no owner entry");
+    expect(done.stdout).toContain("no application-owner entry");
     expect(done.status).toBe(1);
   });
 
-  /**
-   * Round 4, finding 3: the `staleOwners` loop only ever visits tables still in `governedTables`, so
-   * it can only notice an owner that stopped writing a table the schema *still declares*. An `OWNERS`
-   * key for a table the schema no longer declares at all was never visited by anything — it would sit
-   * unexamined until someone happened to delete it by hand, and if the same table name were ever
-   * reintroduced, that stale key would stand in as if a fresh review had already covered it. This
-   * removes the `CREATE TABLE` backing the one owner entry that is easiest to isolate
-   * (`actor_target_attestations`, already declared with zero writers) without touching `OWNERS`, so
-   * the only change is that the schema stops declaring the table the entry names.
-   */
-  it("fails when OWNERS names a table the schema no longer declares", () => {
+  it("fails when declared ownership names a table the schema no longer declares", () => {
     const repo = scratchRepo();
-    execFileSync("node", [
-      "-e",
-      `const fs=require('fs');const p='src/db/schema.sql';let s=fs.readFileSync(p,'utf8');` +
-        `s=s.replace('CREATE TABLE IF NOT EXISTS actor_target_attestations (', ` +
-        `'CREATE TABLE IF NOT EXISTS zzz_676_removed_attestations (');` +
-        `fs.writeFileSync(p,s);`,
-    ], { cwd: repo });
+    execFileSync(
+      "node",
+      [
+        "-e",
+        `const fs=require('fs');const p='src/db/schema.sql';let s=fs.readFileSync(p,'utf8');` +
+          `s=s.replace('CREATE TABLE IF NOT EXISTS actor_target_attestations (', ` +
+          `'CREATE TABLE IF NOT EXISTS zzz_676_removed_attestations (');` +
+          `fs.writeFileSync(p,s);`,
+      ],
+      { cwd: repo },
+    );
 
     const done = censusOn(repo);
 
     expect(done.stdout).toContain("actor_target_attestations");
-    expect(done.stdout).toContain("RESULT: FAIL");
-    expect(done.stdout).toContain("no longer declares");
+    expect(done.stdout).toContain("schema no longer declares");
     expect(done.status).toBe(1);
   });
 
-  it("states that SQL computed entirely at runtime is outside the census", () => {
-    // Parsing closes source spellings of a static value, but it cannot prove a string constructed
-    // only from runtime data. The check names that boundary on every run instead of letting its
-    // static count read as a claim about runtime-only construction.
+  it("fails when a named migration rebuild surface goes stale", () => {
     const repo = scratchRepo();
+    execFileSync(
+      "node",
+      [
+        "-e",
+        `const fs=require('fs');const p='src/db/migrations.ts';let s=fs.readFileSync(p,'utf8');` +
+          `s=s.replace('export const rebuildCanonicalTurnsIfStale =', ` +
+          `'export const oldRebuildCanonicalTurnsIfStale =');fs.writeFileSync(p,s);`,
+      ],
+      { cwd: repo },
+    );
 
     const done = censusOn(repo);
 
-    expect(done.stdout).toContain("RESULT: PASS");
-    expect(done.stdout).toContain("LIMIT:");
-    expect(done.stdout).toContain("computed entirely at runtime");
+    expect(done.stdout).toContain("rebuildCanonicalTurnsIfStale is missing");
+    expect(done.stdout).toContain("declared migration rebuild surface");
+    expect(done.status).toBe(1);
+  });
+
+  it("prints the exact boundary on every run", () => {
+    const done = censusOn(scratchRepo());
+
+    expect(done.stdout).toContain("BOUNDARY:");
+    expect(done.stdout).toContain("first argument must be a string literal or no-substitution template literal");
+    expect(done.stdout).toContain("named migration rebuild functions are reported but their SQL is not evaluated");
+    expect(done.stdout).toContain("casts to any, reflection, generated code, other SQL APIs, and code outside src are not covered");
   });
 });
