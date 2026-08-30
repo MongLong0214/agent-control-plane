@@ -384,6 +384,41 @@ describe("round 2 daemon regressions", () => {
     await daemon.stop();
   });
 
+  it("#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger", async () => {
+    // A review found `reconcileUnresolved()` swallowing every per-turn lookup failure and then
+    // returning as though it had succeeded — so a port failing on *every* call looked identical
+    // to one with nothing to find, to `runPeriodic` and to the health file alike. This spies the
+    // sweep straight to a nonzero `failed` count, the same shape a receipt port stuck failing
+    // every lookup would actually produce, without needing a real port to make that happen.
+    const { harness } = await makeDaemonStartHealthy();
+    const stateDir = tempDir("acp-daemon-r2-");
+    vi.spyOn(harness.cp.conversation, "reconcileUnresolved").mockResolvedValueOnce({
+      swept: 3,
+      settled: 0,
+      unresolved: 3,
+      failed: 3,
+    });
+    const daemon = new Daemon(harness.cp, {
+      stateDir,
+      turnReconcileIntervalMs: 2,
+      turnReconcileBudgetMs: 1,
+    });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 25));
+    const health = JSON.parse(readFileSync(join(stateDir, "health.json"), "utf8")) as {
+      timerHealth: { status: string; failures: Record<string, { lastError: string }> };
+    };
+
+    expect(harness.cp.audit.byKind("DAEMON_TIMER_FAILED")[0]?.reasonCode).toBe(ReasonCode.DAEMON_TIMER_FAILED);
+    expect(health.timerHealth).toMatchObject({
+      status: "DEGRADED",
+      failures: { turn_reconcile: { lastError: "3 of 3 receipt lookup(s) failed or timed out this sweep" } },
+    });
+    await daemon.stop();
+  });
+
   it("#118: a stale malformed lock is reclaimed after the bounded writer grace", () => {
     const stateDir = tempDir("acp-lock-r2-");
     const path = join(stateDir, "agentcpd.lock");
