@@ -86,13 +86,24 @@ const vitestArgsFor = (killedBy) => {
 const GUARDS = [
   {
     // This is the one static outflow for the code. Its catalogue classification remains,
-    // proving that membership metadata cannot satisfy the outflow census.
-    what: "every declared reason code has a reviewed static outflow disposition",
+    // proving that membership metadata and prose cannot satisfy the outflow census.
+    what: "every declared reason code has a verified static outflow",
     file: "src/conversation/turn-coordinator.ts",
     find: "          ReasonCode.CONVERSATION_TARGET_ATTESTATION_STALE,\n",
-    replace: "          ReasonCode.CONVERSATION_TARGET_UNATTESTED,\n",
+    replace:
+      '          ("CONVERSATION_TARGET_ATTESTATION_STALE is retained for a future consumer",\n' +
+      "            ReasonCode.CONVERSATION_TARGET_UNATTESTED),\n",
     killedBy: [
-      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a reviewed static outflow disposition",
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a verified static outflow",
+    ],
+  },
+  {
+    what: "a SQLite trigger reason code reaches the typed translator",
+    file: "src/db/database.ts",
+    find: "  SESSION_INCARNATION_IMMUTABLE: ReasonCode.SESSION_INCARNATION_IMMUTABLE,\n",
+    replace: "  SESSION_INCARNATION_IMMUTABLE: ReasonCode.CONFLICT,\n",
+    killedBy: [
+      "tests/process/reason-code-static-outflow-census.test.ts::every declared reason code has a verified static outflow",
     ],
   },
   {

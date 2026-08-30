@@ -14,14 +14,13 @@ interface Census {
   exitCode: number | null;
   limitations: string[];
   problems: string[];
-  reviewedWithoutStaticOutflow: Array<{ code: string; disposition: string }>;
   withoutStaticOutflow: Array<{ code: string }>;
   notes: string[];
 }
 
 const census = (fixtureRoot?: string): Census => {
   const args = [script, "--json"];
-  if (fixtureRoot) args.push("--fresh-census", `--root=${fixtureRoot}`);
+  if (fixtureRoot) args.push(`--root=${fixtureRoot}`);
   const result = spawnSync(process.execPath, args, {
     cwd: root,
     encoding: "utf8",
@@ -60,13 +59,11 @@ const fixtureCensus = (source: string, catalogueMetadata = ""): Census => {
   }
 };
 
-/** Every declaration has either a positive static outflow or an explicit reviewed disposition. */
-it("every declared reason code has a reviewed static outflow disposition", () => {
+/** Every declaration has a direct outflow or a machine-verified indirect outflow. */
+it("every declared reason code has a verified static outflow", () => {
   const result = census();
 
-  expect(result.declaredCodes).toBe(243);
   expect(result.withoutStaticOutflow).toEqual([]);
-  expect(result.reviewedWithoutStaticOutflow).toHaveLength(27);
   expect(result.problems).toEqual([]);
   expect(result.exitCode).toBe(0);
 });
@@ -98,11 +95,20 @@ it("production trigger denials and mappings agree", () => {
 
 it("a false branch is not a static outflow", () => {
   const result = fixtureCensus(
-    'export const decoy = () => { if (false) deny(ReasonCode.X, "never", {}); };\n',
+    "export const decoy = () => { if (false) finish(ReasonCode.X); };\n",
   );
 
   expect(result.withoutStaticOutflow.map((entry) => entry.code)).toEqual(["X"]);
   expect(result.exitCode).toBe(1);
+});
+
+it("a live sink branch is a static outflow", () => {
+  const result = fixtureCensus(
+    "export const produce = () => { if (true) finish(ReasonCode.X); };\n",
+  );
+
+  expect(result.withoutStaticOutflow).toEqual([]);
+  expect(result.exitCode).toBe(0);
 });
 
 it("a Set literal is not a static outflow", () => {
@@ -117,6 +123,61 @@ it("a z literal is not a static outflow", () => {
 
   expect(result.withoutStaticOutflow.map((entry) => entry.code)).toEqual(["X"]);
   expect(result.exitCode).toBe(1);
+});
+
+it("a return comparison is not a static outflow", () => {
+  const result = fixtureCensus(
+    "export const classify = (value: string) => { return value === ReasonCode.X; };\n",
+  );
+
+  expect(result.withoutStaticOutflow.map((entry) => entry.code)).toEqual(["X"]);
+  expect(result.exitCode).toBe(1);
+});
+
+it("a concise arrow comparison is not a static outflow", () => {
+  const result = fixtureCensus(
+    "export const classify = (value: string) => value === ReasonCode.X;\n",
+  );
+
+  expect(result.withoutStaticOutflow.map((entry) => entry.code)).toEqual(["X"]);
+  expect(result.exitCode).toBe(1);
+});
+
+it("a parenthesized comparison is not a static outflow", () => {
+  const result = fixtureCensus(
+    "export const classify = (value: string) => { return value === (ReasonCode.X); };\n",
+  );
+
+  expect(result.withoutStaticOutflow.map((entry) => entry.code)).toEqual(["X"]);
+  expect(result.exitCode).toBe(1);
+});
+
+it("a returned collection membership check is not a static outflow", () => {
+  const result = fixtureCensus(
+    "export const classify = () => { return [ReasonCode.X].includes(value); };\n",
+  );
+
+  expect(result.withoutStaticOutflow.map((entry) => entry.code)).toEqual(["X"]);
+  expect(result.exitCode).toBe(1);
+});
+
+it("a disposition sentence is not a static outflow", () => {
+  const result = fixtureCensus(
+    'export const disposition = "X is retained for a future consumer";\n',
+  );
+
+  expect(result.withoutStaticOutflow.map((entry) => entry.code)).toEqual(["X"]);
+  expect(result.exitCode).toBe(1);
+});
+
+it("direct return values are static outflows", () => {
+  const returned = fixtureCensus("export const produce = () => { return ReasonCode.X; };\n");
+  const concise = fixtureCensus("export const produce = () => ReasonCode.X;\n");
+
+  expect(returned.withoutStaticOutflow).toEqual([]);
+  expect(returned.exitCode).toBe(0);
+  expect(concise.withoutStaticOutflow).toEqual([]);
+  expect(concise.exitCode).toBe(0);
 });
 
 it("an uncalled function reports reachability as undecidable", () => {
