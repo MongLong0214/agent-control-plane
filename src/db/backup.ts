@@ -330,8 +330,8 @@ const validateRestoredTemporary = (path: string, expectedSha256: string): void =
 };
 
 /**
- * Once the writer is stopped, fold committed WAL pages into the main file before detaching its
- * sidecars. A process death after this point can therefore reopen the old main file by itself.
+ * After the physical source files have been copied, fold committed WAL pages into the live main
+ * file before detaching its sidecars. A process death can then reopen the live main file by itself.
  */
 const checkpointExistingWal = (databasePath: string): void => {
   if (!databaseSidecarPaths(databasePath).some((sidecar) => existsSync(sidecar))) return;
@@ -351,9 +351,9 @@ const checkpointExistingWal = (databasePath: string): void => {
 
 /**
  * Restore only accepts a manifest-checked, owner-private snapshot and stages it in the
- * destination directory before replacement. The old database and sidecars are preserved
- * under backups/ for forensic recovery; this is intentionally not a delete-and-copy flow.
- * The caller must first stop the daemon, which the maintenance CLI enforces.
+ * destination directory before replacement. The old physical database and sidecars are copied
+ * under backups/ before the live WAL is checkpointed for forensic recovery. The caller must first
+ * stop the daemon, which the maintenance CLI enforces.
  */
 const restoreValidatedDatabase = (
   databasePath: string,
@@ -387,7 +387,6 @@ const restoreValidatedDatabase = (
     chmodSync(temporary, PRIVATE_FILE_MODE);
     validateRestoredTemporary(temporary, manifest.databaseSha256);
 
-    if (hadDatabase) checkpointExistingWal(databasePath);
     const existingSidecars = databaseSidecarPaths(databasePath).filter((sidecar) => existsSync(sidecar));
     for (const sidecar of existingSidecars) assertPrivatePath(sidecar, "file");
 
@@ -401,36 +400,46 @@ const restoreValidatedDatabase = (
       backupDirectory,
       `${basename(databasePath)}-orphaned-sidecar-pre-restore-${Date.now()}-${randomUUID()}.sqlite`,
     );
-
-    let installed = false;
-    try {
-      if (preservedDatabasePath) {
-        // The old inode remains reachable at databasePath until the single atomic replacement
-        // below. SIGKILL at any earlier point leaves a complete database at the live path.
-        linkSync(databasePath, preservedDatabasePath);
-      }
+    const copiedForensicFiles: string[] = [];
+    const copyForensicFile = (from: string, to: string): void => {
+      copyFileSync(from, to, fsConstants.COPYFILE_EXCL);
+      copiedForensicFiles.push(to);
+      chmodSync(to, PRIVATE_FILE_MODE);
+      assertPrivatePath(to, "file");
+    };
+    const preserveExisting = (): void => {
+      if (preservedDatabasePath) copyForensicFile(databasePath, preservedDatabasePath);
       for (const sidecar of existingSidecars) {
         const suffix = sidecar.slice(databasePath.length);
         const preserved = `${sidecarPreservationBase}${suffix}`;
-        linkSync(sidecar, preserved);
-        unlinkSync(sidecar);
+        copyForensicFile(sidecar, preserved);
         preservedSidecars.push({ from: sidecar, to: preserved });
+      }
+    };
+
+    let preservationComplete = false;
+    try {
+      // Restore copies the original database and sidecars before checkpointing the live database.
+      preserveExisting();
+      preservationComplete = true;
+      if (hadDatabase) checkpointExistingWal(databasePath);
+
+      for (const sidecar of databaseSidecarPaths(databasePath).filter((path) => existsSync(path))) {
+        assertPrivatePath(sidecar, "file");
+        unlinkSync(sidecar);
       }
       options.afterPreservingExisting?.();
       // rename over an existing entry is one atomic directory operation: readers see either the
       // checkpointed pre-restore inode or the already-validated restored inode, never no database.
       renameSync(temporary, databasePath);
-      installed = true;
       assertPrivateDatabaseFiles(databasePath);
     } catch (error) {
-      if (!installed) {
-        for (const sidecar of preservedSidecars.reverse()) {
-          if (!existsSync(sidecar.from) && existsSync(sidecar.to)) {
-            renameSync(sidecar.to, sidecar.from);
-          }
-        }
-        if (preservedDatabasePath && existsSync(preservedDatabasePath)) {
-          unlinkSync(preservedDatabasePath);
+      // Before the whole physical set is copied, the live files are untouched and incomplete
+      // forensic outputs are disposable. Once complete, keep that evidence across every later
+      // checkpoint, sidecar-detach, callback, rename, or validation failure.
+      if (!preservationComplete) {
+        for (const copied of copiedForensicFiles.reverse()) {
+          if (existsSync(copied)) unlinkSync(copied);
         }
       }
       throw error;

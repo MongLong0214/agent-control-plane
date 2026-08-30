@@ -1543,14 +1543,25 @@ const GUARDS = [
     ],
   },
   {
-    // Renaming the old main file away before installing the staged image leaves no database for a
-    // restart to open if the process dies between those operations.
-    what: "restore preserves the old inode by link so the live database path exists until atomic replacement",
+    // Renaming the old main file away while taking its forensic copy leaves no database for a
+    // restart to open if the process dies before the staged image is installed.
+    what: "restore keeps the live database readable until atomic replacement",
     file: "src/db/backup.ts",
-    find: "        linkSync(databasePath, preservedDatabasePath);",
-    replace: "        renameSync(databasePath, preservedDatabasePath);",
+    find: "      if (preservedDatabasePath) copyForensicFile(databasePath, preservedDatabasePath);",
+    replace: "      if (preservedDatabasePath) renameSync(databasePath, preservedDatabasePath);",
     killedBy: [
-      "tests/unit/database-migration-restore.test.ts::keeps the original database at its path when the restore process dies before replacement",
+      "tests/unit/database-migration-restore.test.ts::restore keeps the live database readable until atomic replacement",
+    ],
+  },
+  {
+    // Checkpointing first mutates the main file and can truncate the WAL before their forensic
+    // copies exist. A hard link would share the same mutation, so the source set must be copied.
+    what: "restore copies the original database and sidecars before checkpointing the live database",
+    file: "src/db/backup.ts",
+    find: "      preserveExisting();\n      preservationComplete = true;\n      if (hadDatabase) checkpointExistingWal(databasePath);",
+    replace: "      if (hadDatabase) checkpointExistingWal(databasePath);\n      preserveExisting();\n      preservationComplete = true;",
+    killedBy: [
+      "tests/unit/database-migration-restore.test.ts::restore copies the original database and sidecars before checkpointing the live database",
     ],
   },
   {

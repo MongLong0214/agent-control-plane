@@ -765,7 +765,7 @@ describe("backup and restore drill", () => {
     }
   });
 
-  it("keeps the original database at its path when the restore process dies before replacement", async () => {
+  it("restore keeps the live database readable until atomic replacement", async () => {
     const path = join(tempDir("acp-restore-crash-"), "state.sqlite");
     const source = new Db(path);
     seedHistory(source);
@@ -801,6 +801,91 @@ describe("backup and restore drill", () => {
       expect(survived.pragma("integrity_check", { simple: true })).toBe("ok");
       expect(
         survived.prepare("SELECT COUNT(*) AS n FROM runs WHERE run_id = 'run_after_backup'").get(),
+      ).toEqual({ n: 1 });
+    } finally {
+      survived.close();
+    }
+  });
+
+  it("restore copies the original database and sidecars before checkpointing the live database", async () => {
+    const path = join(tempDir("acp-restore-wal-crash-"), "state.sqlite");
+    const source = new Db(path);
+    seedHistory(source);
+    const backup = await source.backup();
+    source.close();
+
+    const databaseModule = new URL("../../src/db/database.ts", import.meta.url).href;
+    const writer = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `const { Db } = await import(${JSON.stringify(databaseModule)});
+         const source = new Db(${JSON.stringify(path)});
+         source.run(
+           \`INSERT INTO runs (run_id, kind, execution_mode, priority, state, goal, contract_digest, created_at)
+             VALUES ('run_in_wal_before_restore', 'STANDARD_WORK', 'STANDARD', 'NORMAL', 'QUEUED',
+                     'must survive in the forensic WAL', 'sha256:forensic-wal', ?)\`,
+           [${JSON.stringify(NOW)}],
+         );
+         process.kill(process.pid, "SIGKILL");`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(writer.signal).toBe("SIGKILL");
+
+    const originalDatabase = readFileSync(path);
+    const originalSidecars = new Map(
+      ["-wal", "-shm", "-journal"]
+        .filter((suffix) => existsSync(`${path}${suffix}`))
+        .map((suffix) => [suffix, readFileSync(`${path}${suffix}`)]),
+    );
+    expect(originalSidecars.has("-wal")).toBe(true);
+
+    const backupModule = new URL("../../src/db/backup.ts", import.meta.url).href;
+    const restore = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--input-type=module",
+        "--eval",
+        `const { restoreDatabase } = await import(${JSON.stringify(backupModule)});
+         restoreDatabase(${JSON.stringify(path)}, ${JSON.stringify(backup.path)}, {
+           afterPreservingExisting: () => process.kill(process.pid, "SIGKILL"),
+         });`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(restore.signal).toBe("SIGKILL");
+
+    const preservedDatabaseNames = readdirSync(defaultBackupDirectory(path)).filter(
+      (entry) => entry.startsWith(`${basename(path)}-pre-restore-`) && entry.endsWith(".sqlite"),
+    );
+    expect(preservedDatabaseNames).toHaveLength(1);
+    const preservedDatabasePath = join(defaultBackupDirectory(path), preservedDatabaseNames[0]!);
+    expect(readFileSync(preservedDatabasePath)).toEqual(originalDatabase);
+    for (const [suffix, bytes] of originalSidecars) {
+      expect(readFileSync(`${preservedDatabasePath}${suffix}`)).toEqual(bytes);
+    }
+
+    const forensic = new Database(preservedDatabasePath, { readonly: true, fileMustExist: true });
+    try {
+      expect(forensic.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(
+        forensic.prepare("SELECT COUNT(*) AS n FROM runs WHERE run_id = 'run_in_wal_before_restore'").get(),
+      ).toEqual({ n: 1 });
+    } finally {
+      forensic.close();
+    }
+
+    const survived = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(survived.pragma("integrity_check", { simple: true })).toBe("ok");
+      expect(
+        survived.prepare("SELECT COUNT(*) AS n FROM runs WHERE run_id = 'run_in_wal_before_restore'").get(),
       ).toEqual({ n: 1 });
     } finally {
       survived.close();
