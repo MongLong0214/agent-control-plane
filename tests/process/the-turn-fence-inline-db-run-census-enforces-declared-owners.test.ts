@@ -211,6 +211,11 @@ describe(CLAIM, () => {
         'void db[widened];',
         'void db[concatenated];',
         'void db[substituted];',
+        'const { [widened]: widenedBinding } = db;',
+        'let widenedAssignment: Db[keyof Db] | undefined;',
+        '({ [concatenated]: widenedAssignment } = db);',
+        'void widenedBinding;',
+        'void widenedAssignment;',
       ].join("\n  "),
     );
 
