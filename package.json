@@ -22,7 +22,6 @@
     "test:e2e": "vitest run tests/e2e --testTimeout=600000",
     "lint": "eslint .",
     "trace": "tsx src/tools/traceability.ts",
-    "repo-factory:pair": "node --import tsx src/tools/pair-repo-factory-result.ts",
     "terminology": "node scripts/verify-terminology.mjs",
     "evidence:freshness": "node scripts/verify-evidence-freshness.mjs",
     "invariants": "node scripts/verify-invariant-coverage.mjs",

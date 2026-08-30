@@ -85,16 +85,6 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
-    what: "an emitted result is paired with the actual ACP parser",
-    file: "src/tools/pair-repo-factory-result.ts",
-    find: "  const decision = parseRepoFactoryResult(result);",
-    replace:
-      '  const decision = { allowed: true as const, reasonCode: "OK", message: "accepted without parsing", evidence: {} };',
-    killedBy: [
-      "tests/process/repo-factory-result-pairing.test.ts::pairs an emitted result with the actual ACP parser",
-    ],
-  },
-  {
     what: "a factory result cannot claim ACP activation facts",
     file: "src/bootstrap/repo-factory-result.ts",
     find: "    if (overclaims.length > 0) {",
