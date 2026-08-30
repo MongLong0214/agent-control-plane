@@ -20,6 +20,7 @@
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",
     "test:e2e": "vitest run tests/e2e --testTimeout=600000",
+    "acceptance:disposable-realm": "NODE_DISABLE_COMPILE_CACHE=1 node --experimental-transform-types scripts/run-disposable-realm-probe.ts",
     "lint": "eslint .",
     "trace": "tsx src/tools/traceability.ts",
     "terminology": "node scripts/verify-terminology.mjs",
@@ -40,6 +41,7 @@
     "migrations:check": "node scripts/verify-migrations-are-immutable.mjs",
     "migrations:freeze": "node scripts/verify-migrations-are-immutable.mjs --update",
     "schema:census": "node scripts/verify-append-only-tables-are-closed.mjs",
+    "schema:writers": "node scripts/verify-turn-fence-writer-census.mjs",
     "schema:denials": "node scripts/verify-trigger-denials-are-typed.mjs",
     "schema:registry": "node scripts/verify-every-trigger-is-required.mjs",
     "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs"

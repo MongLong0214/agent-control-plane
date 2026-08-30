@@ -112,6 +112,23 @@ export type TelegramDeliveryFailure =
     retryAfterSeconds: null;
   };
 
+type TelegramDeliveryPolicy = {
+  readonly reply: "RELEASE" | "SETTLE";
+  readonly batch: "ADVANCE" | "HOLD_OFFSET" | "STOP";
+};
+
+/**
+ * The failure classification and its ordered-batch consequence are one policy. Keeping them in
+ * one table prevents a durable reply state from claiming one outcome while the poll loop does
+ * another. An ambiguous send is terminal for that reply and stops the loop before another message.
+ */
+const TELEGRAM_DELIVERY_POLICY = {
+  PERMANENT_REJECTION: { reply: "SETTLE", batch: "ADVANCE" },
+  RETRYABLE: { reply: "RELEASE", batch: "HOLD_OFFSET" },
+  GLOBAL_REJECTION: { reply: "RELEASE", batch: "HOLD_OFFSET" },
+  UNKNOWN: { reply: "SETTLE", batch: "STOP" },
+} as const satisfies Record<TelegramDeliveryFailure["kind"], TelegramDeliveryPolicy>;
+
 /** Carries the delivery and batch-scope facts the Bot API adapter actually observed. */
 export class TelegramDeliveryError extends Error {
   constructor(
@@ -545,6 +562,7 @@ export class TelegramLongPollService {
   #running = false;
   #loopPromise: Promise<void> | null = null;
   #controller: AbortController | null = null;
+  #terminalDeliveryError: TelegramDeliveryError | null = null;
   #offset: number | undefined;
   readonly #pendingTurns = new Set<TelegramTrackedTurn>();
   readonly #turnFailures: unknown[] = [];
@@ -712,6 +730,8 @@ export class TelegramLongPollService {
   }
 
   async pollOnce(): Promise<TelegramPollCycle> {
+    if (this.#terminalDeliveryError) throw this.#terminalDeliveryError;
+
     // Receive first. Owner-gate prompts are outbound and incidental to this loop; the inbound
     // batch is the owner's only way to reach the daemon. Delivering prompts first meant one
     // undeliverable prompt — a denied `sendOwnerPromptIfNeeded`, a Telegram 5xx — threw past
@@ -753,7 +773,12 @@ export class TelegramLongPollService {
           },
         );
         routes.push({ status: "CEO_TURN_PENDING", outcome: route });
-        this.trackTurn(route);
+        const turn = this.trackTurn(route);
+        // A fast delivery result is already knowable before the next update enters production.
+        // Give that result one event-loop turn to stop this batch; a genuinely pending CEO call
+        // still detaches and lets the next update reach the unresolved-turn policy from #713.
+        await Promise.race([turn.settled, delay(0)]);
+        if (this.#terminalDeliveryError) break;
       } catch (error) {
         // Non-CEO routes remain inside pollOnce, so their rejection still reaches loop()'s
         // reporter and retry delay exactly as it did before the CEO turn was detached.
@@ -764,7 +789,7 @@ export class TelegramLongPollService {
 
     // A pending CEO turn has been accepted into a tracked task before incidental outbound prompts
     // run. Managed routes and owner decisions still finish here; only the CEO call leaves the poll.
-    await this.deliverOwnerGatePrompts();
+    if (!this.#terminalDeliveryError) await this.deliverOwnerGatePrompts();
     if (routes.length === 0 && updates.length > 0) {
       if (retryInMs !== undefined) {
         // A detached CEO failure no longer reaches loop()'s catch. Its update-local deadline is the
@@ -793,6 +818,7 @@ export class TelegramLongPollService {
 
   start(): void {
     if (this.#running) return;
+    if (this.#terminalDeliveryError) throw this.#terminalDeliveryError;
     this.#running = true;
     this.#loopPromise = this.loop();
   }
@@ -883,14 +909,21 @@ export class TelegramLongPollService {
       this.router.completeResponse(outcome);
     } catch (error) {
       if (!(error instanceof TelegramDeliveryError)) throw error;
-      if (error.failure.kind === "RETRYABLE" || error.failure.kind === "GLOBAL_REJECTION") {
+      const policy = TELEGRAM_DELIVERY_POLICY[error.failure.kind];
+      if (policy.reply === "RELEASE") {
         this.router.releaseResponse(outcome);
         throw error;
       }
       if (error.failure.kind === "PERMANENT_REJECTION") {
         this.router.abandonResponse(outcome, error.failure);
       } else {
+        if (error.failure.kind !== "UNKNOWN") throw error;
         this.router.recordUnknownResponse(outcome, error.failure);
+        if (policy.batch === "STOP") {
+          this.#terminalDeliveryError = error;
+          this.#running = false;
+          throw error;
+        }
       }
     }
     return outcome;

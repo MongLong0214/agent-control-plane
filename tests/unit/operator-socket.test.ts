@@ -300,14 +300,14 @@ describe("authenticated operator socket (#393/#405)", () => {
       const code = await dispatch(
         { request },
         "telegram",
-        ["reply", "acknowledge", "update:302", "OPERATOR_REVIEWED", "sha256:evidence"],
+        ["reply", "acknowledge", "update:302", "operator-reviewed", "sha256:evidence"],
         false,
       );
 
       expect(code).toBe(0);
       expect(request).toHaveBeenCalledWith("telegram.reply.acknowledge", {
         nonce: "update:302",
-        reasonCode: "OPERATOR_REVIEWED",
+        reasonCode: "operator-reviewed",
         evidenceDigest: "sha256:evidence",
       }, undefined);
     } finally {

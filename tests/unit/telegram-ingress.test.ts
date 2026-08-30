@@ -143,7 +143,7 @@ const acknowledgeTelegramReply = async (
       method: OPERATOR_METHOD.TELEGRAM_REPLY_ACKNOWLEDGE,
       params: {
         nonce,
-        reasonCode: "OPERATOR_REVIEWED_TELEGRAM",
+        reasonCode: "operator-reviewed-telegram",
         evidenceDigest: `sha256:reviewed:${nonce}`,
       },
       idempotencyKey: `acknowledge:${nonce}`,
@@ -1758,7 +1758,7 @@ describe("Telegram production ingress", () => {
     }));
   });
 
-  it("an unknown send result is terminal without automatic retry and later updates advance", async () => {
+  it("an unknown send result is terminal without automatic retry and stops the loop", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1779,16 +1779,16 @@ describe("Telegram production ingress", () => {
       { transport: firstTransport, start: false, onDirect },
     );
     try {
-      const result = await settledPoll(firstListener.service);
-      expect(result.outcomes).toHaveLength(2);
-      expect(result.nextOffset).toBe(305);
+      await expect(settledPoll(firstListener.service)).rejects.toMatchObject({
+        failure: { kind: "UNKNOWN" },
+      });
     } finally {
       await firstListener.close();
     }
-    expect(firstListener.service.offset).toBe(305);
+    expect(firstListener.service.offset).toBeUndefined();
     expect(firstTransport.sendAttempts.filter((attempt) => attempt.correlationId.includes("303"))).toHaveLength(1);
-    expect(firstTransport.sent[0]?.correlationId).toContain("304");
-    expect(handled).toEqual(["inspect the project", "inspect later"]);
+    expect(firstTransport.sent).toHaveLength(0);
+    expect(handled).toEqual(["inspect the project"]);
     const unresolved = harness.cp.db.get<{ result_json: string | null }>(
       `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
       ["update:303"],

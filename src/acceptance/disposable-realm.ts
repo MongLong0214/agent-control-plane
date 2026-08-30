@@ -16,9 +16,10 @@ import { ReasonCode } from "../core/reason-codes.ts";
  *
  * What is allowed instead is a realm that shares nothing with production: its own state
  * directory, database, sockets, lock and runtime root, its own disposable actor, and a probe
- * target that is not the canonical root. The evidence it can produce is bounded to match — an
- * isolated instance answered and remembered, which is not a statement about canonical safety,
- * actor reconstitution, duplicate freedom, or activation.
+ * target that is not the canonical root. The synthetic evidence is bounded to match what runs:
+ * production ingress admits and classifies, a driver-owned callback answers, and ingress records
+ * an APPLIED reply. Actor handling, a target-authored transcript and CEO durability stay unproven,
+ * along with canonical safety, actor reconstitution, duplicate freedom and activation.
  *
  * **Every safety condition here is a refusal, not a note.** The failure this module is written
  * against is a procedure that lists its own preconditions in prose and then runs anyway, so each
@@ -169,8 +170,8 @@ export type ProbeSignal =
  * What a run may do next.
  *
  * `INCONCLUSIVE` is terminal on purpose and has no retry beside it. Every signal that produces it
- * is a state where "did the side effect happen" is unanswerable, and the one thing that must not
- * follow an unanswerable question is another message.
+ * is a state where "did the side effect happen" is unanswerable.
+ * An ambiguous send is terminal for that reply and stops the loop before another message.
  */
 export type ProbeDisposition = "CONTINUE" | "INCONCLUSIVE";
 
@@ -371,6 +372,48 @@ export const planDisposableRealm = (request: RealmRequest): Decision<RealmPaths>
     return deny(
       ReasonCode.ACCEPTANCE_REALM_UNRESOLVABLE,
       "a realm path could not be resolved, so where it would write is unknown",
+      { path: error.path, code: error.code },
+    );
+  }
+};
+
+/**
+ * Whether the allocator above a realm is separate from the host's live ACP state.
+ *
+ * The realm planner checks every path the realm will write, but the allocator matters too: it is
+ * the directory a janitor is allowed to create children in and the authority from which a caller
+ * could otherwise substitute a live tree. Check containment in both directions so neither an
+ * allocator inside production nor an allocator broad enough to contain production can be called
+ * disposable. Both paths are settled before comparison; an inherited spelling is not evidence
+ * about where either path actually lands.
+ */
+export const assertDisposableWorkspaceRoot = (
+  home: string,
+  workspaceRoot: string,
+): Decision<void> => {
+  if (!isAbsolute(home) || !isAbsolute(workspaceRoot)) {
+    return deny(
+      ReasonCode.INVALID_ARGUMENT,
+      "the account home and disposable workspace root have to be absolute paths",
+      { home, workspaceRoot },
+    );
+  }
+  try {
+    const production = settled(productionRoot(home));
+    const workspace = settled(workspaceRoot);
+    if (within(production, workspace) || within(workspace, production)) {
+      return deny(
+        ReasonCode.ACCEPTANCE_REALM_NOT_ISOLATED,
+        "the disposable workspace allocator shares a path with live ACP production state",
+        { production, workspace },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
+  } catch (error) {
+    if (!(error instanceof UnresolvablePath)) throw error;
+    return deny(
+      ReasonCode.ACCEPTANCE_REALM_UNRESOLVABLE,
+      "the disposable workspace allocator could not be resolved, so its isolation is unknown",
       { path: error.path, code: error.code },
     );
   }
@@ -623,9 +666,14 @@ export const mayTerminate = (owned: readonly OwnedProcess[], candidate: OwnedPro
  * was observed and what gets claimed is where an acceptance run stops being evidence.
  */
 export const REALM_EVIDENCE_CLAIM =
-  "an isolated disposable ACP instance admitted, routed, answered and remembered a two-message " +
-  "probe. This says nothing about canonical safety, actor reconstitution, duplicate freedom, " +
-  "the target fence and receipt, or activation.";
+  "A disposable ACP instance in an exclusively created, driver-established private workspace " +
+  "outside live ACP production state admitted and DIRECT-classified two " +
+  "synthetic Telegram updates through the production poll-and-router entry, invoked a " +
+  "driver-owned direct callback, sent both callback replies through an injected transport, and " +
+  "persisted matching APPLIED ingress reply records. The bound actor, production CEO path, " +
+  "target-authored transcript, CEO-side durable commit, live Telegram, canonical safety, actor " +
+  "reconstitution, duplicate freedom, the target fence and receipt, and activation were not " +
+  "exercised.";
 
 /** Whether the production database can be read without being opened for writing. */
 export const productionIsReadable = (home = homedir()): boolean => {

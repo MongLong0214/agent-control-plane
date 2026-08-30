@@ -93,13 +93,15 @@ any actor binding exists (see C1, C3).
   not check. **Produced by two paths that can leave unresolved rows:** (1) a process crash before
   `reserveResponse` records the handler's reply; (2) a known retryable or batch/global rejection.
   `deliverRouteOutcome` releases those reservations to `RETRYABLE`, and the route wrapper calls
-  `retryUpdate` so ordered offset advancement remains held. An unlisted 4xx records `UNANSWERABLE`
-  only when a JSON body with `ok: false` and a description proves Telegram rejected the request
-  (with 401 and 429 as explicit global/retryable exceptions). A non-Telegram HTTP response is a
-  global retryable transport fault and holds the offset; an unknown send result records
-  `UNRESOLVED`; and a replay of a surviving `PENDING` reservation records `UNRESOLVED` without
-  another send. Each terminal transition settles the claim in the same database transaction as
-  the reply state.
+  `retryUpdate` so ordered offset advancement remains held. A 4xx records `UNANSWERABLE` only when
+  a verified Telegram error envelope carries `migrate_to_chat_id` or exactly “Bad Request: reply
+  message not found” or “Forbidden: bot was blocked by the user”. Every other unrecognised
+  description is global, while 429 is retryable. A non-Telegram HTTP response is also a global
+  retryable transport fault and holds the offset.
+  An ambiguous send is terminal for that reply and stops the loop before another message. It
+  records `UNRESOLVED`, while a replay of a surviving `PENDING` reservation records `UNRESOLVED`
+  without another send. Each terminal transition settles the claim in the same database
+  transaction as the reply state.
 - **Terminal or gap:** the single-unresolved-turn case is closed —
   `TelegramHermesRouter`'s DIRECT branch calls `unresolvedTurns(identity.sessionDigest)` before
   `claimTurn` for every DIRECT message (not only a suspected resend), parks with an explicit reply,

@@ -97,11 +97,13 @@ export interface TraceabilityReport {
     scenarios: number;
     scenariosWithPassedDeclarations: number;
     scenariosMissing: string[];
-    repoFactoryScenariosTouched: number;
+    repoFactoryScenarios: number;
+    repoFactoryScenariosWithPassedDeclarations: number;
+    repoFactoryScenariosMissing: string[];
   };
   requirements: RequirementRow[];
   scenarios: ScenarioRow[];
-  repoFactoryScenariosTouched: ScenarioRow[];
+  repoFactoryScenarios: ScenarioRow[];
 }
 
 const readPrd = (root: string, name: string): string => readFileSync(join(root, "docs", "prd", name), "utf8");
@@ -334,14 +336,12 @@ export const buildTraceabilityReport = (
     status: (tests.get(id) ?? []).length > 0 ? "DECLARATION_COVERED" : "DECLARATION_MISSING",
   }));
 
-  const rfScenarioRows: ScenarioRow[] = [...repoFactoryScenarios.entries()]
-    .filter(([id]) => (tests.get(id) ?? []).length > 0)
-    .map(([id, description]) => ({
-      id,
-      description,
-      tests: tests.get(id) ?? [],
-      status: "DECLARATION_COVERED",
-    }));
+  const rfScenarioRows: ScenarioRow[] = [...repoFactoryScenarios.entries()].map(([id, description]) => ({
+    id,
+    description,
+    tests: tests.get(id) ?? [],
+    status: (tests.get(id) ?? []).length > 0 ? "DECLARATION_COVERED" : "DECLARATION_MISSING",
+  }));
 
   return {
     generatedFrom: [
@@ -364,11 +364,17 @@ export const buildTraceabilityReport = (
       scenarios: scenarioRows.length,
       scenariosWithPassedDeclarations: scenarioRows.filter((row) => row.status === "DECLARATION_COVERED").length,
       scenariosMissing: scenarioRows.filter((row) => row.status === "DECLARATION_MISSING").map((row) => row.id),
-      repoFactoryScenariosTouched: rfScenarioRows.length,
+      repoFactoryScenarios: rfScenarioRows.length,
+      repoFactoryScenariosWithPassedDeclarations: rfScenarioRows.filter(
+        (row) => row.status === "DECLARATION_COVERED",
+      ).length,
+      repoFactoryScenariosMissing: rfScenarioRows
+        .filter((row) => row.status === "DECLARATION_MISSING")
+        .map((row) => row.id),
     },
     requirements: requirementRows,
     scenarios: scenarioRows,
-    repoFactoryScenariosTouched: rfScenarioRows,
+    repoFactoryScenarios: rfScenarioRows,
   };
 };
 
@@ -492,6 +498,10 @@ const markdownReport = (report: TraceabilityReport): string => [
   report.summary.scenariosMissing.length > 0
     ? `- Missing scenarios: ${report.summary.scenariosMissing.join(", ")}`
     : "- Missing scenarios: none",
+  `- Repo Factory scenarios: ${report.summary.repoFactoryScenarios} (passed declarations ${report.summary.repoFactoryScenariosWithPassedDeclarations})`,
+  report.summary.repoFactoryScenariosMissing.length > 0
+    ? `- Missing Repo Factory scenarios: ${report.summary.repoFactoryScenariosMissing.join(", ")}`
+    : "- Missing Repo Factory scenarios: none",
   "",
   "| Requirement | Blocking | Declared scenarios | Declaration status |",
   "|---|---|---|---|",
@@ -505,6 +515,13 @@ const markdownReport = (report: TraceabilityReport): string => [
   "| Scenario | Declaration status | Passed executable test declarations |",
   "|---|---|---|",
   ...report.scenarios.map(
+    (row) =>
+      `| ${row.id} | ${row.status} | ${row.tests.map((test) => `${test.file} › ${test.title}`).join("<br>") || "—"} |`,
+  ),
+  "",
+  "| Repo Factory scenario | Declaration status | Passed executable test declarations |",
+  "|---|---|---|",
+  ...report.repoFactoryScenarios.map(
     (row) =>
       `| ${row.id} | ${row.status} | ${row.tests.map((test) => `${test.file} › ${test.title}`).join("<br>") || "—"} |`,
   ),
