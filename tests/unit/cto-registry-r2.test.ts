@@ -225,7 +225,7 @@ describe("round-2 CTO lifecycle regressions", () => {
   });
 
   it(
-    "#692 the preflight refuses an ordinary (non-race) blocker before the irreversible " +
+    "#692 the preflight refuses an ordinary non-race blocker before the irreversible " +
       "provider stop, never calling it at all",
     async () => {
       // A run reaching CEO review through the real evidence pipeline is owned by the CTO

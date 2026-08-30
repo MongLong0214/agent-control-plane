@@ -1321,7 +1321,7 @@ const GUARDS = [
     find: "        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n        if (preflight.length > 0) {",
     replace: "        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n        if (false) {",
     killedBy: [
-      "tests/unit/cto-registry-r2.test.ts::#692 the preflight refuses an ordinary (non-race) blocker before the irreversible provider stop, never calling it at all",
+      "tests/unit/cto-registry-r2.test.ts::#692 the preflight refuses an ordinary non-race blocker before the irreversible provider stop, never calling it at all",
     ],
   },
 ];
