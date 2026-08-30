@@ -500,7 +500,7 @@ const GUARDS = [
     find: "  Math.max(0, Math.floor(baselineAt / 1000) - 1);",
     replace: "  Math.max(0, Math.floor(baselineAt / 1000));",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an unseen event stamped before the local baseline is counted when the relay returns it",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an event absent from prior completed reads is counted when --since returns it",
     ],
   },
   {
@@ -527,7 +527,7 @@ const GUARDS = [
     find: "          JSON.stringify(incomplete ? [] : eventIds(messages)),",
     replace: "          JSON.stringify([]),",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::event ids present at baseline are not first observed in the next window",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::event ids in a prior completed read are absent from the next count",
     ],
   },
   {
@@ -592,6 +592,47 @@ const GUARDS = [
     replace: "      if (lastAttemptFailed || row.last_read_success_at === null) {",
     killedBy: [
       "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an unfinished daemon watch attempt is not a verified old window",
+    ],
+  },
+  {
+    what: "the Doctor finding names raw channel event ids returned by since and absent from prior completed reads",
+    file: "src/doctor/doctor.ts",
+    find:
+      "        code: \"BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS\",",
+    replace: "        code: \"BUZZ_CHANNEL_TRAFFIC_BETWEEN_COMPLETED_CHECKS\",",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::raw channel event ids returned by since and absent from prior completed reads are counted",
+    ],
+  },
+  {
+    what: "the Doctor scope names raw channel event ids returned by since and absent from prior completed reads",
+    file: "src/doctor/doctor.ts",
+    find:
+      "      measurementScope: \"RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS\",",
+    replace: "      measurementScope: \"RAW_CHANNEL_TRAFFIC_BETWEEN_COMPLETED_CHECKS\",",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::raw channel event ids returned by since and absent from prior completed reads are counted",
+    ],
+  },
+  {
+    what: "the Doctor count field names raw channel event ids returned by since and absent from prior completed reads",
+    file: "src/doctor/doctor.ts",
+    find:
+      "          rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: row.observed_count,",
+    replace: "          rawChannelEventIds: row.observed_count,",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::raw channel event ids returned by since and absent from prior completed reads are counted",
+    ],
+  },
+  {
+    what: "the capped Doctor count field names confirmed raw channel event ids returned by since and absent from prior completed reads",
+    file: "src/doctor/doctor.ts",
+    find:
+      "            confirmedRawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads:\n" +
+      "              row.observed_count,",
+    replace: "            confirmedRawChannelEventIds: row.observed_count,",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a capped read cannot become healthy silence after identity filtering",
     ],
   },
   {

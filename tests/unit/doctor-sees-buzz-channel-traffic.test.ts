@@ -157,6 +157,7 @@ const stop = async (runtime: RunningWatch): Promise<void> => {
 const watchRow = (runtime: RunningWatch, sessionId: string) =>
   runtime.harness.cp.db.get<{
     baseline_at: number | null;
+    seen_event_ids: string;
     window_started_at: number | null;
     observed_count: number;
     window_incomplete: number;
@@ -164,7 +165,7 @@ const watchRow = (runtime: RunningWatch, sessionId: string) =>
     last_read_success_at: string | null;
     last_error_at: string | null;
   }>(
-    `SELECT baseline_at, window_started_at, observed_count, window_incomplete,
+    `SELECT baseline_at, seen_event_ids, window_started_at, observed_count, window_incomplete,
             attempt_in_progress, last_read_success_at, last_error_at
        FROM buzz_channel_traffic_watch WHERE session_id = ?`,
     [sessionId],
@@ -177,7 +178,7 @@ const waitForBaseline = async (runtime: RunningWatch, sessionId: string): Promis
   );
 };
 
-describe("Doctor reports raw Buzz event ids first observed between completed watch checks", () => {
+describe("Doctor reports raw Buzz channel event ids returned by --since that were absent from prior completed reads", () => {
   it("a connected session is never checked until the daemon watch runs", async () => {
     const runtime = await runningWatch();
     try {
@@ -196,7 +197,7 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
     }
   });
 
-  it("a complete watch check advances the raw event identity window", async () => {
+  it("raw channel event ids returned by since and absent from prior completed reads are counted", async () => {
     const runtime = await runningWatch();
     try {
       const session = await connectSession(runtime, "advancing-window");
@@ -223,11 +224,11 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
       const firstWindowEnd = watchRow(runtime, session.sessionId)?.baseline_at;
       expect(firstWindowEnd).not.toBe(initialBaseline);
       const first = await runtime.harness.cp.doctor.run("system");
-      const measured = finding(first, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId);
+      const measured = finding(first, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", session.sessionId);
       expect(measured?.severity).toBe("INFO");
       expect(aggregate(measured ? [measured] : [])).toBe("HEALTHY");
       expect(measured?.observedEvidence).toMatchObject({
-        measurementScope: "RAW_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_WATCH_CHECKS",
+        measurementScope: "RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS",
         eventIdentity: "BUZZ_EVENT_ID",
         cursorResumeCapability: "TIMESTAMP_ONLY_NO_STABLE_RELAY_ORDER_TOKEN",
         cursorBoundary: "LOCAL_QUERY_START_WITH_ONE_SECOND_OVERLAP",
@@ -236,7 +237,7 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
         sourceBlindSpot: "EVENTS_EXCLUDED_BY_RELAY_SINCE_TIMESTAMP_ARE_UNMEASURED",
         unmeasured: "MENTION_CLASSIFICATION_NEEDS_ACTION_AND_CANONICAL_TURN_DELIVERY",
         remainder: "ISSUE_674_REQUIRES_RELAY_SIDE_TELEMETRY",
-        rawChannelEventIdsFirstObservedBetweenCompletedChecks: 4,
+        rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 4,
       });
 
       runtime.harness.clock.advance(1_000);
@@ -249,9 +250,9 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
       );
       const second = await runtime.harness.cp.doctor.run("system");
       expect(
-        finding(second, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId)
+        finding(second, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", session.sessionId)
           ?.observedEvidence,
-      ).toMatchObject({ rawChannelEventIdsFirstObservedBetweenCompletedChecks: 0 });
+      ).toMatchObject({ rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 0 });
     } finally {
       await stop(runtime);
     }
@@ -275,9 +276,9 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
       expect(reconnected.allowed).toBe(true);
       const report = await runtime.harness.cp.doctor.run("system");
       expect(
-        finding(report, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId)
+        finding(report, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", session.sessionId)
           ?.observedEvidence,
-      ).toMatchObject({ rawChannelEventIdsFirstObservedBetweenCompletedChecks: 2 });
+      ).toMatchObject({ rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 2 });
     } finally {
       await stop(runtime);
     }
@@ -443,12 +444,12 @@ describe("Buzz channel traffic cursor boundaries", () => {
       const firstReport = await runtime.harness.cp.doctor.run("session", session.sessionId);
       const firstFinding = finding(
         firstReport,
-        "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS",
+        "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS",
         session.sessionId,
       );
       expect(firstFinding?.confidence).toBe("HIGH");
       expect(firstFinding?.observedEvidence).toMatchObject({
-        rawChannelEventIdsFirstObservedBetweenCompletedChecks: 0,
+        rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 0,
         cursorBlindGapMs: 0,
         queryLatencyOverlapMs: 10_000,
         confidenceBasis: "NO_LOCAL_CURSOR_GAP_AND_UNCAPPED_READ",
@@ -503,7 +504,7 @@ describe("Buzz channel traffic cursor boundaries", () => {
     }
   });
 
-  it("an unseen event stamped before the local baseline is counted when the relay returns it", async () => {
+  it("an event absent from prior completed reads is counted when --since returns it", async () => {
     const runtime = await runningWatch();
     try {
       runtime.harness.clock.advance(200);
@@ -521,9 +522,9 @@ describe("Buzz channel traffic cursor boundaries", () => {
 
       const report = await runtime.harness.cp.doctor.run("system");
       expect(
-        finding(report, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId)
+        finding(report, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", session.sessionId)
           ?.observedEvidence,
-      ).toMatchObject({ rawChannelEventIdsFirstObservedBetweenCompletedChecks: 1 });
+      ).toMatchObject({ rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 1 });
       expect(runtime.source.calls.at(-1)).toMatchObject({ since: baselineSecond - 1, limit: 201 });
     } finally {
       await stop(runtime);
@@ -551,10 +552,10 @@ describe("Buzz channel traffic cursor boundaries", () => {
       );
       const report = await runtime.harness.cp.doctor.run("system");
       expect(
-        finding(report, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId)
+        finding(report, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", session.sessionId)
           ?.observedEvidence,
       ).toMatchObject({
-        rawChannelEventIdsFirstObservedBetweenCompletedChecks: 0,
+        rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 0,
         sourceBlindSpot: "EVENTS_EXCLUDED_BY_RELAY_SINCE_TIMESTAMP_ARE_UNMEASURED",
       });
     } finally {
@@ -562,7 +563,7 @@ describe("Buzz channel traffic cursor boundaries", () => {
     }
   });
 
-  it("event ids present at baseline are not first observed in the next window", async () => {
+  it("event ids in a prior completed read are absent from the next count", async () => {
     const runtime = await runningWatch();
     try {
       runtime.harness.clock.advance(200);
@@ -584,9 +585,9 @@ describe("Buzz channel traffic cursor boundaries", () => {
       );
       const report = await runtime.harness.cp.doctor.run("system");
       expect(
-        finding(report, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId)
+        finding(report, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", session.sessionId)
           ?.observedEvidence,
-      ).toMatchObject({ rawChannelEventIdsFirstObservedBetweenCompletedChecks: 1 });
+      ).toMatchObject({ rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 1 });
     } finally {
       await stop(runtime);
     }
@@ -610,9 +611,9 @@ describe("Buzz channel traffic cursor boundaries", () => {
       );
       const report = await runtime.harness.cp.doctor.run("system");
       expect(
-        finding(report, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId)
+        finding(report, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", session.sessionId)
           ?.observedEvidence,
-      ).toMatchObject({ rawChannelEventIdsFirstObservedBetweenCompletedChecks: 2 });
+      ).toMatchObject({ rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 2 });
     } finally {
       await stop(runtime);
     }
@@ -718,7 +719,9 @@ describe("Buzz channel traffic cursor boundaries", () => {
       const report = await runtime.harness.cp.doctor.run("system");
       const incomplete = finding(report, "BUZZ_CHANNEL_TRAFFIC_WINDOW_INCOMPLETE", session.sessionId);
       expect(report.status).toBe("DEGRADED");
-      expect(incomplete?.observedEvidence).toMatchObject({ confirmedFirstObservedRawChannelEventIds: 0 });
+      expect(incomplete?.observedEvidence).toMatchObject({
+        confirmedRawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 0,
+      });
     } finally {
       await stop(runtime);
     }
@@ -741,11 +744,41 @@ describe("Buzz channel traffic cursor boundaries", () => {
       );
       const report = await runtime.harness.cp.doctor.run("system");
       expect(
-        finding(report, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId)
+        finding(report, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", session.sessionId)
           ?.observedEvidence,
-      ).toMatchObject({ rawChannelEventIdsFirstObservedBetweenCompletedChecks: 200 });
+      ).toMatchObject({ rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 200 });
       expect(finding(report, "BUZZ_CHANNEL_TRAFFIC_WINDOW_INCOMPLETE", session.sessionId))
         .toBeUndefined();
+    } finally {
+      await stop(runtime);
+    }
+  });
+
+  it("completed reads retain at most one response of event ids", async () => {
+    const runtime = await runningWatch();
+    try {
+      const session = await connectSession(runtime, "bounded-event-identities");
+      const target = [{ sessionId: session.sessionId, channelId: session.channel }];
+      await runtime.watch.tick(target);
+
+      for (let windowIndex = 0; windowIndex < 3; windowIndex += 1) {
+        runtime.harness.clock.advance(201_000);
+        const baselineSecond = Math.floor(runtime.harness.clock.now().getTime() / 1000);
+        const currentIds = Array.from({ length: 200 }, (_, messageIndex) =>
+          `${windowIndex.toString(16)}${messageIndex.toString(16).padStart(63, "0")}`,
+        );
+        runtime.source.respondWith(
+          currentIds.map((id, messageIndex) => message(baselineSecond + messageIndex + 1, id)),
+        );
+
+        await runtime.watch.tick(target);
+
+        const row = watchRow(runtime, session.sessionId);
+        const retainedIds = JSON.parse(row?.seen_event_ids ?? "null") as unknown;
+        expect(row?.observed_count).toBe(200);
+        expect(retainedIds).toEqual([...currentIds].sort());
+        expect(Buffer.byteLength(row?.seen_event_ids ?? "", "utf8")).toBe(13_401);
+      }
     } finally {
       await stop(runtime);
     }
@@ -891,16 +924,16 @@ describe("agentcpd Buzz composition", () => {
         10_000,
       );
       const report = await harness.cp.doctor.run("system");
-      const measuredA = finding(report, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", sessionA);
+      const measuredA = finding(report, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", sessionA);
       expect(aggregate(measuredA ? [measuredA] : [])).toBe("HEALTHY");
       expect(measuredA?.observedEvidence).toMatchObject({
-        rawChannelEventIdsFirstObservedBetweenCompletedChecks: 1,
+        rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 1,
         unmeasured: "MENTION_CLASSIFICATION_NEEDS_ACTION_AND_CANONICAL_TURN_DELIVERY",
       });
       expect(
-        finding(report, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", sessionB)
+        finding(report, "BUZZ_RAW_CHANNEL_EVENT_IDS_RETURNED_BY_SINCE_ABSENT_FROM_PRIOR_COMPLETED_READS", sessionB)
           ?.observedEvidence,
-      ).toMatchObject({ rawChannelEventIdsFirstObservedBetweenCompletedChecks: 1 });
+      ).toMatchObject({ rawChannelEventIdsReturnedBySinceAbsentFromPriorCompletedReads: 1 });
       expect(cli.messageReadCount()).toBeGreaterThanOrEqual(4);
 
       cli.respondRaw([{}]);

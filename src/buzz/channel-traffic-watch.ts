@@ -28,7 +28,7 @@ export interface BuzzChannelTrafficWatchRow {
   cursorGeneration: string;
   /** Latest local instant the completed read can conservatively account through, in epoch ms. */
   baselineAt: number | null;
-  /** Event ids observed by completed reads since this session acquired this channel route. */
+  /** Event ids in the latest completed response, bounded by the complete-read limit. */
   seenEventIds: readonly string[];
   windowStartedAt: number | null;
   windowEndedAt: number | null;
@@ -86,7 +86,8 @@ const safeErrorMessage = (err: unknown): string => {
 };
 
 /**
- * Records raw Buzz event ids first observed between completed watch checks.
+ * Records raw Buzz channel event ids returned by `--since` that were absent from prior completed
+ * reads for the session's current channel route.
  *
  * Lifecycle:
  *
@@ -95,12 +96,12 @@ const safeErrorMessage = (err: unknown): string => {
  *   and mints a generation because that evidence does not describe the new channel.
  * - The first successful, uncapped tick establishes a baseline at the local instant immediately
  *   before the query and seeds its returned event ids but reports no historical traffic.
- * - Every later successful, uncapped tick counts ids absent from every earlier completed read on
- *   this channel route, stores those ids durably, and advances the baseline to the local query
- *   start. A relay snapshot cannot predate the request that asks for it, so the whole response-
- *   latency interval remains inside the next overlapping read instead of becoming a blind gap.
- *   Relay timestamps only select the CLI fetch range; future, tied, or overlapping timestamps
- *   cannot make an already-seen id new again.
+ * - Every later successful, uncapped tick compares with the preceding complete response, retains
+ *   only the current response's ids, and advances the baseline to the local query start. An id old
+ *   enough to fall outside the next cursor cannot return; an overlapping or future-dated id stays
+ *   in the retained response. A complete response contains at most 200 ids, so deduplication state
+ *   cannot grow with daemon lifetime. The response-latency interval remains inside the next
+ *   overlapping read instead of becoming a blind gap.
  * - A failed or capped read does not advance. Doctor reports unavailable or incomplete instead of
  *   treating the preserved boundary as a verified zero.
  * - If the process dies during the CLI read, the attempt timestamp remains without a completed
@@ -238,9 +239,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
       const seenEventIds = new Set(existing.seenEventIds);
       const uniqueMessages = uniqueByEventId(messages);
       const observed = uniqueMessages.filter((message) => !seenEventIds.has(message.id));
-      const completedSeenEventIds = [
-        ...new Set([...seenEventIds, ...uniqueMessages.map((message) => message.id)]),
-      ].sort();
+      const completedSeenEventIds = eventIds(uniqueMessages);
 
       this.db.run(
         `UPDATE buzz_channel_traffic_watch

@@ -2205,11 +2205,13 @@ const v32: SchemaMigration = {
 };
 
 /**
- * #674 — durable, per-session results for raw Buzz channel reads. The CLI surface can verify
- * event ids first observed by completed reads and read availability; it exposes no stable ordering
- * cursor, mention classification, `needs_action`, or canonical-turn delivery, so the table does not
- * name or model those stronger states. `baseline_at` stores the local query start, not response
- * completion, so query latency remains inside the next overlapping read.
+ * #674 — durable, per-session results for raw Buzz channel reads. The CLI surface can verify raw
+ * channel event ids returned by `--since` that were absent from prior completed reads, plus read
+ * availability; it exposes no stable ordering cursor, mention classification, `needs_action`, or
+ * canonical-turn delivery, so the table does not name or model those stronger states.
+ * `seen_event_ids` retains only the latest complete response, bounded to 200 ids, for overlap
+ * deduplication. `baseline_at` stores the local query start, not response completion, so query
+ * latency remains inside the next overlapping read.
  *
  * Rollback is not a code-only operation after this migration opens a database: a v33 binary
  * refuses schema v34. Restoring the automatic pre-migration backup is the downgrade path, and it
