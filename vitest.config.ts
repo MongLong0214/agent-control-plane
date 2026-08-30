@@ -19,7 +19,7 @@ export default defineConfig({
     pool: "forks",
     // The JSON reporter is declared here rather than passed on the command line: `pnpm test --`
     // forwards `--` to vitest, which then has to guess whether the rest are flags or filters.
-    reporters: process.env.CI ? ["default", "junit", "json"] : ["default"],
+    reporters: process.env.CI || process.env.ACP_VITEST_GATE ? ["default", "junit", "json"] : ["default"],
     outputFile: {
       junit: "evidence/junit.xml",
       json: "evidence/local/ci-vitest-results.json",

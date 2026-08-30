@@ -246,3 +246,93 @@ considering. Merely adding `if: always()` in the same workspace assumes a failed
 tree clean; R1 and R2 each left a mutation marker after a timed-out test, so that assumption did
 not hold locally. Independent clean workspaces would assume the extra CI cost is acceptable and
 that `trace` defines what it should report when the test-result artifact is missing or incomplete.
+
+## Implemented resolution
+
+Follow-up work on 2026-08-31 upgraded the pinned version to Vitest 4.1.11 and added an
+exit-code-independent result gate. These are two separate protections: the version removes the
+specific 60-second worker RPC timer, while the gate distinguishes product failures, incomplete
+result sets, and post-test infrastructure failures even if a later version changes that transport
+again.
+
+### Vitest 4 source result
+
+The exact 4.1.11 npm artifact contains the structural change #719 needed:
+
+- `dist/chunks/rpc.MzXet3jl.js` passes `timeout: -1` when it creates the runtime worker RPC;
+- `dist/chunks/cli-api.CnMVyzaz.js` also passes `timeout: -1` for the pool-side RPC;
+- bundled birpc still declares `DEFAULT_TIMEOUT = 6e4`, but creates a timer only when
+  `timeout >= 0`; and
+- `onTaskUpdate` still crosses that RPC and still awaits the main process's test-run update, so
+  this is a timeout removal rather than a claim that the update path disappeared.
+
+There is still no repository configuration key for this timer. Vitest 4.1.11 disables it inside
+the standard transport. Consequently the exact `[vitest-worker]: Timeout calling "onTaskUpdate"`
+failure cannot be produced by waiting 60 seconds on that worker RPC in 4.1.11.
+
+The npm artifact does not bundle a changelog. External release-note review was unavailable in the
+networkless sandbox and is **unmeasured**. The locally available package and source did expose the
+relevant compatibility changes: Vitest now requires Node 20.x, 22.x, or 24 and newer; this repository
+requires Node 22.18.0 and therefore remains inside that range. Vitest 4 removes `test.poolOptions`,
+but this repository uses the still-supported top-level `pool: "forks"` setting and has no
+`poolOptions` entry.
+
+An exact Vitest 4.1.11 runner, assembled from cached npm artifacts and pointed at this repository,
+accepted the existing config and collected all 116 test files. The full run took 480.57 seconds:
+75 files passed, 40 failed, and 1 skipped; 1,426 tests passed, 250 failed, and 6 skipped, with 11
+errors. The run did not emit an `onTaskUpdate` RPC timeout. Its failure output was dominated by
+socket binding and writes beneath the sandbox-blocked user scratch directory; the run is
+**sandbox-suspected, unmeasured outside the sandbox**, not an outside-sandbox compatibility result.
+A focused 4.1.11 run of the new result-gate file passed 6/6 tests, and its CI reporter output
+contained a completed interval for the one collected file and consistent 6/6 counters.
+
+### Result gate
+
+`pnpm test` now enters `scripts/run-vitest-gate.mjs`. Before each attempt it deletes both old
+report files, runs the normal Vitest production entry point, and classifies the new JSON result:
+
+- any failed assertion or failed-test counter is a product failure;
+- a collected file without a finite, ordered start/end interval is incomplete and fails;
+- missing, malformed, empty, inconsistent, or unsuccessful result data fails closed;
+- a complete all-passing result plus exit zero passes; and
+- a complete all-passing result plus a nonzero exit is explicitly infrastructure, not a product
+  failure.
+
+Only that last classification is retried, exactly once. A second infrastructure classification
+fails the gate and prints both that the product tests passed and that infrastructure remained
+nonzero. Product, incomplete, and invalid results are never retried or converted to success.
+
+Four synthetic counterexamples are permanent tests and mutation rows. Each mutation was applied
+individually, its named test was run as a regular-expression-safe selector, the test failed, and
+the source was restored:
+
+| mutation | named test result |
+|---|---|
+| ignore a failed-test count | failed: expected `product-failure`, received `run-failure` |
+| ignore an incomplete collected file | failed: expected `incomplete`, received `run-failure` |
+| treat nonzero after complete pass as zero | failed: expected `infrastructure`, received `pass` |
+| let a second infrastructure result pass | failed: expected exit 1, received exit 0 |
+
+The restored test file passed 6/6 under both the installed 3.2.7 runner and the exact 4.1.11
+runner. The actual gate entry point, exercised against the installed runner, wrote JSON and JUnit
+and printed `PASS` for one completed file and six passing tests. A 4.1.11 JSON result for that same
+file classified as `pass` with exit zero and `infrastructure` with exit one.
+
+### Independent downstream jobs and cost
+
+Guard falsifiability, traceability, and SSOT reconciliation now each run in a separate checkout
+after `verify-matrix`, under a job-level `always()` condition. The required `verify` job allow-lists
+success from all four jobs, so a failed, cancelled, or skipped downstream job cannot satisfy the
+gate. No downstream command runs in a workspace a failed test or mutation may have edited.
+
+Traceability deliberately does not download a matrix artifact: it runs its own suite and creates
+its own JSON result in the clean checkout. This preserves its complete-result dependency when
+both matrix tests fail or produce no artifact.
+
+The source-counted workflow cost changes are exact: full-suite invocations increase from two to
+three, full falsifiability sweeps decrease from two to one, and SSOT invocations decrease from two
+to one. Three independent job setup/install sequences are added. The local 4.1.11 full-suite run
+above measured 480.57 seconds, but GitHub runner duration for the extra traceability suite, the
+falsifiability job, job startup, and install/rebuild is **unmeasured**. All dependency-bearing jobs
+use `actions/setup-node`'s pnpm cache with the same lockfile-derived key; actual cache hits and
+saved runner time are **unmeasured** until this workflow runs on GitHub Actions.

@@ -128,17 +128,66 @@ jobs:
       # front; this is the half that holds for a clone that never installed the hooks.
       - run: pnpm trailers ${{ github.event.pull_request.base.sha && format('{0}..HEAD', github.event.pull_request.base.sha) || 'HEAD~1..HEAD' }}
       - run: pnpm build
-      # One suite run, not two. `trace` needs a JSON reporter pass; it used to obtain that by
-      # running the whole suite a second time, which doubled a suite that spawns real
-      # sandboxed children. The JSON reporter is configured in vitest.config.ts under CI, so
-      # this stays a plain `pnpm test`.
+      # One suite run in each matrix leg. Its JSON belongs to the gate that judged this exact run;
+      # the independent traceability job below makes its own result in its own clean checkout.
       - run: pnpm test
-      # Deletes each named guard on purpose and requires a named test to die. It edits the
-      # working tree in place and restores it, so it never runs alongside `pnpm test`.
+
+  # These checks used to follow `pnpm test` in each matrix workspace. A non-test Vitest exit
+  # skipped all three, while a killed mutation run could also leave that workspace deliberately
+  # broken. Each check now starts from its own checkout and still runs when verify-matrix fails.
+  # The shared setup-node cache key is the lockfile hash, so the dependency store remains reusable
+  # across jobs even though no working tree is shared.
+  guard-falsifiability:
+    name: guard falsifiability
+    needs: verify-matrix
+    if: always()
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 10
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.18.0"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm rebuild better-sqlite3
+      - run: pnpm native:peercred:build
       - run: pnpm guards:falsifiable
+
+  # Traceability needs a complete Vitest JSON result. It intentionally makes that result in this
+  # clean checkout instead of consuming a possibly absent artifact from a failed matrix leg.
+  # `pnpm trace` states this fallback and runs the suite once with its own JSON output path.
+  traceability:
+    name: traceability
+    needs: verify-matrix
+    if: always()
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 10
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22.18.0"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm rebuild better-sqlite3
+      - run: pnpm native:peercred:build
       - run: pnpm trace
-        env:
-          ACP_VITEST_RESULTS: evidence/local/ci-vitest-results.json
+
+  ssot:
+    name: SSOT reconciliation
+    needs: verify-matrix
+    if: always()
+    runs-on: macos-15
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: node scripts/ssot-report.mjs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -152,7 +201,7 @@ jobs:
   # exist again, without touching the required-check string itself.
   #
   # `if: always()` is load-bearing, not decoration. Without it, this job's default condition is
-  # "the jobs it needs all succeeded" — so the moment either matrix leg fails or the run is
+  # "the jobs it needs all succeeded" — so the moment any verification job fails or the run is
   # cancelled, this job would not run at all, and GitHub reports a job that never ran as
   # `skipped`, not `failure`. A `skipped` required check is treated as satisfied on this platform
   # (the same "coverage implied, not observed" shape this whole effort has been about), so a gate
@@ -161,22 +210,28 @@ jobs:
   # pass or fail — never GitHub's default treatment of an unrun job.
   #
   # The check itself must read `== 'success'` (an allow-list), not `!= 'failure'` (a deny-list):
-  # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`, and the matrix's
-  # own `fail-fast: false` means one leg failing does not cancel the other — but a job's overall
-  # result is still `failure` if any matrix combination failed, so this does not need to inspect
-  # individual legs to know that. An allow-list means `cancelled` and `skipped` fail closed too,
-  # with no separate case for either needed.
+  # `needs.<job>.result` can be `success`, `failure`, `cancelled`, or `skipped`. The matrix's own
+  # `fail-fast: false` means one leg failing does not cancel the other, while its aggregate result
+  # is still `failure` if any leg failed. An allow-list makes every other job fail closed on
+  # `cancelled` and `skipped` too, with no separate case needed.
   verify-gate:
     name: verify
-    needs: verify-matrix
+    needs: [verify-matrix, guard-falsifiability, traceability, ssot]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: require every verify-matrix leg to have actually succeeded
+      - name: require every verification job to have actually succeeded
         run: |
-          result="${{ needs.verify-matrix.result }}"
-          if [ "$result" != "success" ]; then
-            echo "verify-matrix result was '$result', not 'success' — failing the required verify check"
+          verify_matrix="${{ needs.verify-matrix.result }}"
+          guard_falsifiability="${{ needs.guard-falsifiability.result }}"
+          traceability="${{ needs.traceability.result }}"
+          ssot="${{ needs.ssot.result }}"
+          if [ "$verify_matrix" != "success" ] || \
+             [ "$guard_falsifiability" != "success" ] || \
+             [ "$traceability" != "success" ] || \
+             [ "$ssot" != "success" ]; then
+            echo "verification jobs: verify-matrix=$verify_matrix guard-falsifiability=$guard_falsifiability traceability=$traceability ssot=$ssot"
+            echo "at least one verification job was not successful — failing the required verify check"
             exit 1
           fi
-          echo "verify-matrix succeeded on every leg"
+          echo "every verification job succeeded"

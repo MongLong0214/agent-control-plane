@@ -2795,6 +2795,50 @@ const GUARDS = [
       "tests/process/every-script-has-a-plausible-caller.test.ts::uses any plausibly CI routed package alias for a multiply aliased script",
     ],
   },
+  {
+    what: "a reported failed test is a product failure",
+    file: "scripts/run-vitest-gate.mjs",
+    find: "  if (failedTests > 0) {",
+    replace: "  if (failedTests < 0) {",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::fails when the result contains a failed test",
+    ],
+  },
+  {
+    what: "a collected file without a completed interval is an incomplete run",
+    file: "scripts/run-vitest-gate.mjs",
+    find: "  if (incompleteFiles.length > 0) {",
+    replace: "  if (incompleteFiles.length < 0) {",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::fails when a collected file is incomplete",
+    ],
+  },
+  {
+    what: "a nonzero exit after complete passing results is infrastructure",
+    file: "scripts/run-vitest-gate.mjs",
+    find: "  if (exitCode !== 0) {",
+    replace: "  if (exitCode === 0) {",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::classifies a nonzero exit after complete passing results as infrastructure",
+    ],
+  },
+  {
+    what: "two consecutive infrastructure classifications fail the gate",
+    file: "scripts/run-vitest-gate.mjs",
+    find:
+      '      out(\n' +
+      '        "VITEST GATE: FAIL — two consecutive infrastructure-classified runs; product tests passed in both runs, but infrastructure stayed nonzero",\n' +
+      "      );\n" +
+      "      return 1;",
+    replace:
+      '      out(\n' +
+      '        "VITEST GATE: PASS — two consecutive infrastructure-classified runs",\n' +
+      "      );\n" +
+      "      return 0;",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::fails after two consecutive infrastructure classifications",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
