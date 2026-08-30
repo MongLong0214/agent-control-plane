@@ -201,7 +201,11 @@ export class VerificationEngine {
       // may repeat it for compatibility, but it cannot select a weaker replacement.
       const pinned = this.manifests?.(run.pinnedManifestDigest) ?? null;
       if (!pinned) {
-        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "pinned manifest is not retrievable", {
+        // #448: the run's pinned digest exists, but the manifest it names cannot be produced
+        // to compare against. That is not a disagreement between two known values — nothing
+        // was compared — so it must not report as MISMATCH, which reads as "compared and
+        // differs" to anyone matching on the code.
+        return deny(ReasonCode.CONTRACT_UNVERIFIED, "pinned manifest is not retrievable", {
           runId,
           pinnedManifestDigest: run.pinnedManifestDigest,
         });

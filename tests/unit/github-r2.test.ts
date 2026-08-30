@@ -535,7 +535,7 @@ describe("round-two GitHub hardening", () => {
     try {
       const refused = await fixture.harness.cp.github.prPrepare(fixture.input);
       expect(refused.allowed).toBe(false);
-      expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_DIGEST_MISMATCH);
+      expect(refused.reasonCode).toBe(ReasonCode.CONTRACT_UNVERIFIED);
     } finally {
       manifest.mockRestore();
     }

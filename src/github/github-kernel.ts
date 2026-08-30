@@ -3468,14 +3468,17 @@ export class GitHubKernel {
 
   private branchProfile(runId: string): Decision<BranchProfile> {
     const run = this.runs.get(runId);
+    // #448: neither branch below has two values to compare — one side is simply absent.
+    // CONTRACT_DIGEST_MISMATCH reads as "two digests were compared and disagree"; reporting
+    // it here told a caller a comparison happened when the manifest was never produced.
     if (!run?.pinnedManifestDigest) {
-      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run has no pinned manifest for a GitHub decision", {
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run has no pinned manifest for a GitHub decision", {
         runId,
       });
     }
     const manifest = this.projects.manifest(run.pinnedManifestDigest);
     if (!manifest?.branchProfile) {
-      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run's pinned manifest is unavailable", {
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run's pinned manifest is unavailable", {
         runId,
         pinnedManifestDigest: run.pinnedManifestDigest,
       });
