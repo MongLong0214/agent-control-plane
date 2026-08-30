@@ -365,6 +365,22 @@ describe("tracker-loci strip invariants", () => {
       expect(stripShellSource(input, true)).toBe(input); // untouched: no comment, no string
     });
 
+    it("#689 round 18: # starts a comment right after ; with no whitespace between them", () => {
+      const input = "x=1;# commentOnlySymbol\ny=2";
+      expect(stripShellSource(input, true)).toBe("x=1;\ny=2");
+    });
+
+    it("#689 round 18: # starts a comment right after | with no whitespace between them", () => {
+      const input = "echo foo|# commentOnlySymbol\ny=2";
+      expect(stripShellSource(input, true)).toBe("echo foo|\ny=2");
+    });
+
+    it("#689 round 18: # starts a comment right after &, (, and ) with no whitespace between them", () => {
+      expect(stripShellSource("cmd &# bg comment\ny=2", true)).toBe("cmd &\ny=2");
+      expect(stripShellSource("(# subshell comment\ny=2", true)).toBe("(\ny=2");
+      expect(stripShellSource("foo)# close comment\ny=2", true)).toBe("foo)\ny=2");
+    });
+
     it("$# (positional parameter count) is not misread as a comment", () => {
       // The real shape in deploy/install-launchd.sh:49.
       const input = "while [[ $# -gt 0 ]]; do\nx=4";
@@ -420,10 +436,37 @@ describe("tracker-loci strip invariants", () => {
       expect(out.split("\n")[1]).toBe("x=12");
     });
 
-    it("a heredoc body is passed through untouched — a # inside it is not a comment", () => {
-      const input = "cat <<'EOF'\n# not a comment, just data\nEOF\nx=13";
+    it("#689 round 18: a heredoc body's own # comment (at a word boundary) IS stripped now — the false green the real corpus reproduced", () => {
+      // Round 16 shipped this exact input as "not a comment, just data": the whole heredoc body
+      // passed through verbatim, so a symbol mentioned only in a comment *inside* a heredoc read
+      // as a real occurrence. `deploy/install-launchd.sh:268` is exactly this shape for real —
+      // `CODEX_HOME` appears nowhere else in that file — and the production CLI returned exit 0
+      // with empty findings for it before this fix (see the real-corpus test below).
+      const input = "cat <<'EOF'\n# a real comment now\nnot_a_comment#still_mid_word\nEOF\nx=13";
+      const expected = "cat <<'EOF'\n\nnot_a_comment#still_mid_word\nEOF\nx=13";
+      expect(stripShellSource(input, true)).toBe(expected);
+      expect(stripShellSource(input, false)).toBe(expected); // comments are unconditional, not gated on blankStrings
+    });
+
+    it("#689 round 18: a quoted string inside a heredoc body is never blanked, in either view — a # inside it is not a comment", () => {
+      // Narrower than treating the whole body as code of its content language: quoted-string
+      // *content* inside a heredoc is left exactly as it was (unlike an ordinary quoted string
+      // outside a heredoc, which the symbol view blanks) so a real occurrence reached through a
+      // command substitution inside a double-quoted string — `required_keychain_value`'s own call
+      // site in this same file's heredoc — is not erased along with genuine string prose.
+      const input = 'cat <<\'EOF\'\necho "value #notacomment"\nEOF\nx=13b';
       expect(stripShellSource(input, true)).toBe(input);
       expect(stripShellSource(input, false)).toBe(input);
+    });
+
+    it("#689 round 18: the real deploy/install-launchd.sh — CODEX_HOME (only mentioned inside a heredoc's own # comment) is excluded from both views", () => {
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const text = fs.readFileSync(path.join(__dirname, "..", "..", "deploy", "install-launchd.sh"), "utf8");
+      const count = (s: string) => (s.match(/CODEX_HOME/g) ?? []).length;
+      expect(count(text)).toBe(1); // the file's only mention, deploy/install-launchd.sh:268
+      expect(count(stripShellSource(text, true))).toBe(0);
+      expect(count(stripShellSource(text, false))).toBe(0);
     });
 
     it("a <<- heredoc strips leading tabs only when matching the terminator line", () => {

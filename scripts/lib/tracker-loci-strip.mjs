@@ -442,12 +442,16 @@ export const stripTemplateLiteralProse = (text) => {
  *     heredoc word to test it against. `<<<` (a here-string, a single word/string argument, not a
  *     multi-line body) is excluded explicitly so it falls through to ordinary quote handling
  *     instead. The body — from the line after the opener to the line that is exactly the
- *     delimiter word (leading tabs stripped first when the operator was `<<-`) — passes through
- *     untouched: not comment-stripped, not string-scanned, not blanked, because it is not a string
- *     literal or a comment, it is literal data (or, as in this file's own two heredocs, an embedded
- *     second script) that is genuinely part of what the file contains. An unterminated heredoc (no
- *     matching delimiter line before end of file) passes the remainder of the file through the
- *     same way, rather than guessing where it would have ended. Content on the heredoc-opening
+ *     delimiter word (leading tabs stripped first when the operator was `<<-`) — is literal data
+ *     (or, as in this file's own two heredocs, an embedded second script) that is genuinely part
+ *     of what the file contains, so it is not string-scanned or blanked the way an ordinary quoted
+ *     string is; but round 18 found its `#`-comments are not exempt from the same word-boundary
+ *     rule the rest of this file's `#` handling uses — see `consumeHeredocBody`'s own comment for
+ *     the real false green this caused and why only comments, not quoted content, are stripped
+ *     inside it. An unterminated
+ *     heredoc (no matching delimiter line before end of file) passes the remainder of the file
+ *     through the same comment-stripped-only rule, rather than guessing where it would have ended.
+ *     Content on the heredoc-opening
  *     line *after* the operator (a trailing `# comment`, more of the command) is not treated as
  *     part of the body — it is walked normally, through this same dispatch, before the body
  *     consumption begins at the next newline — so a heredoc opened mid-pipeline is not mistaken
@@ -465,8 +469,17 @@ export const stripShellSource = (text, blankStrings) => {
   let i = 0;
   const pendingHeredocs = [];
 
+  // #689 round 18: a new shell word does not only start after whitespace — it also starts right
+  // after a control operator that ends the previous word/command, even with no space between them.
+  // `;# comment` and `|# comment` are both real comments (confirmed: neither this repository's own
+  // `.sh` files nor `.github/workflows/*.yml` currently contain this shape, so this closes a latent
+  // gap rather than one the corpus has already exercised — the earlier whitespace-only rule was
+  // still wrong to have, per this same file's own "get the rule right" standard for `$#`/`##`/`8#`
+  // just above). `;`, `|`, and `&` cover `;;`/`||`/`&&` too, since checking only the immediately
+  // preceding character is enough regardless of how many of that character precede it; `(`/`)`
+  // cover a subshell or function body opening/closing right before a `#`.
   const isWordBoundaryBefore = (idx) =>
-    idx === 0 || text[idx - 1] === " " || text[idx - 1] === "\t" || text[idx - 1] === "\n";
+    idx === 0 || [" ", "\t", "\n", ";", "|", "&", "(", ")"].includes(text[idx - 1]);
 
   /**
    * Renders a quoted span, honoring `blankStrings` the same way every other stripper here does.
@@ -484,6 +497,34 @@ export const stripShellSource = (text, blankStrings) => {
     );
   };
 
+  /**
+   * #689 round 18: a heredoc body is genuinely part of what the file contains, and this
+   * repository's own two heredocs are embedded shell scripts (`deploy/install-launchd.sh:187-287`
+   * is a full nested launcher, function definitions and all) — but "genuinely part of the file"
+   * does not mean "not a comment". `deploy/install-launchd.sh:268` is a `#`-prefixed line inside
+   * that heredoc, at a real word boundary (start of line), explaining a design decision; the
+   * symbol `CODEX_HOME` appears *only* there, nowhere else in the file. Passing the body through
+   * fully verbatim (the pre-#689-round-18 behavior) read that comment as code and returned a false
+   * green — reproduced against the real production CLI: `` `CODEX_HOME` in
+   * `deploy/install-launchd.sh` `` returned exit 0 with empty findings, when the file's only
+   * mention of the symbol is prose about a bug, not a use of it.
+   *
+   * The fix is narrower than stripping the whole body the way `stripJsSource`/`stripPythonSource`
+   * strip a whole file: it recurses with `blankStrings` forced to `false`, which — because a
+   * comment is stripped *unconditionally* in this same function's dispatch above, regardless of
+   * `blankStrings` — strips only the body's own `#`-comments (quote-aware, so a `#` inside a
+   * quoted string in the body is not misread as a comment the same way it isn't at the top level)
+   * and leaves every quoted string's content exactly as it was, in both the symbol- and
+   * content-search views. That second half is deliberate, not an oversight: this file's other real
+   * heredoc-body occurrence, `required_keychain_value` (declared and called inside the same
+   * heredoc, the call reached through `"$(required_keychain_value …)"` — a command substitution
+   * inside a double-quoted string), is real code, not string prose, and forcing `blankStrings: true`
+   * into the recursive call would blank that command substitution's content the way an ordinary
+   * string's content is blanked for the symbol view, erasing a legitimate call rather than
+   * excluding a comment. So: "search the heredoc verbatim" and "a comment inside a heredoc is not
+   * code" are both true at once — the body's comments are excluded, its code (including code
+   * reached through a quoted command substitution) is not.
+   */
   const consumeHeredocBody = ({ delim, stripTabs }) => {
     // `i` is already past the newline that starts the body.
     let cursor = i;
@@ -493,12 +534,12 @@ export const stripShellSource = (text, blankStrings) => {
       const line = text.slice(cursor, lineEnd);
       const compare = stripTabs ? line.replace(/^\t+/, "") : line;
       if (compare === delim) {
-        out += text.slice(i, lineEnd); // body + delimiter line, verbatim
+        out += stripShellSource(text.slice(i, lineEnd), false); // body + delimiter line, comments stripped, strings verbatim
         i = lineEnd;
         return;
       }
       if (nextNl === -1) {
-        out += text.slice(i, n); // unterminated: rest of file is body, verbatim
+        out += stripShellSource(text.slice(i, n), false); // unterminated: rest of file is body, same rule
         i = n;
         return;
       }

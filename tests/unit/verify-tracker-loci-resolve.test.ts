@@ -1772,6 +1772,52 @@ describe("verify-tracker-loci-resolve", () => {
     });
   });
 
+  describe("[round 18] #689: a blind review reproduced a false green through the real production CLI — a comment inside a heredoc counted as real code", () => {
+    it("CODEX_HOME in deploy/install-launchd.sh reads STALE — it appears only inside a # comment inside a heredoc body", () => {
+      // The real CLI invocation a blind review ran and got exit 0 / empty findings from, before
+      // this fix: `` `CODEX_HOME` in `deploy/install-launchd.sh` ``. CODEX_HOME appears exactly
+      // once in that file, at line 268 — a # comment (word-boundary, start of line) inside the
+      // heredoc deploy/install-launchd.sh:187-287 writes. Round 16 passed the whole heredoc body
+      // through untouched, on the stated theory that a heredoc's content is "genuinely part of
+      // what the file contains" — true of the code inside it, but a comment inside a heredoc is
+      // still a comment, not code, the same way a comment at the top level of the file is. This is
+      // the RED this round's fix turns GREEN: not a constructed fixture, the real tracked file.
+      const body = "`CODEX_HOME` in `deploy/install-launchd.sh`";
+      const { path, cleanup } = withIssues([
+        { number: 68907, title: "round 18: a comment inside a heredoc is not code", body },
+      ]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("CODEX_HOME");
+        expect(result.stdout).toContain("does not appear");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("required_keychain_value in deploy/install-launchd.sh still resolves silently — a heredoc's own quoted-string content is not blanked by this fix", () => {
+      // The regression guard for the narrower reading of the fix: required_keychain_value's own
+      // call sites (deploy/install-launchd.sh:249-250) are reached through
+      // `"$(required_keychain_value …)"` — a command substitution inside a double-quoted string,
+      // itself inside the same heredoc CODEX_HOME's comment lives in. Blanking heredoc
+      // quoted-string content the way an ordinary string's content is blanked for the symbol view
+      // would have erased this real call along with the fix for the comment above it.
+      const body = "`required_keychain_value` in `deploy/install-launchd.sh`";
+      const { path, cleanup } = withIssues([
+        { number: 68908, title: "round 18: heredoc quoted content still counts as code", body },
+      ]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("");
+      } finally {
+        cleanup();
+      }
+    });
+  });
+
   it("--json emits parseable structured output", () => {
     const body = "`src/does/not/exist.ts:1` is the culprit.";
     const { path, cleanup } = withIssues([{ number: 9007, title: "json mode", body }]);

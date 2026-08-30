@@ -786,6 +786,53 @@
  *
  *   All five dispatches now run one ordered walk each. None remains on the old two-pass shape.
  *
+ * ## Round 18: the sixth instance — this file's own report text claimed an exclusion shell's
+ * stripper does not perform, and shell's `#` word-boundary rule was itself still too narrow
+ *
+ *   A blind review reproduced a false green through the real production CLI, not a constructed
+ *   case: `` `CODEX_HOME` in `deploy/install-launchd.sh` `` returned exit 0 with empty findings.
+ *   `CODEX_HOME` appears exactly once in that file, at line 268 — inside a `#` comment, itself
+ *   inside the heredoc `deploy/install-launchd.sh:187-287` writes as an embedded launcher script.
+ *   Round 16's `stripShellSource` passed a heredoc body through fully verbatim, on purpose (a
+ *   heredoc's content is "genuinely part of what the file contains," per that round's own
+ *   comment) — but round 16's `codeSearchScope` sentence, above, also claimed a heredoc body was
+ *   *excluded* from the symbol search, which was never true even before this round: real code
+ *   inside a heredoc body (`required_keychain_value`, the same round's own corpus example) has
+ *   always counted as found, not excluded. Two different bugs, sharing one root: the report
+ *   sentence and the stripper's actual behavior were never checked against each other as one
+ *   claim.
+ *
+ *   The resolution keeps "search the heredoc verbatim" and "a comment inside a heredoc is not
+ *   code" both true, rather than picking one: `consumeHeredocBody`
+ *   (`scripts/lib/tracker-loci-strip.mjs`) now recurses into the body with `stripShellSource(...,
+ *   false)` — `blankStrings: false` is forced regardless of the outer call's own view, which,
+ *   because a `#` comment is stripped unconditionally in this same function's dispatch (`#` is
+ *   never gated on `blankStrings`), strips only the body's own comments and leaves every quoted
+ *   string's content exactly as it was in both views. Narrower than treating the whole body as
+ *   code of its content language: `required_keychain_value`'s own call site inside the same
+ *   heredoc reaches it through `"$(required_keychain_value …)"`, a command substitution inside a
+ *   double-quoted string — real code, not string prose — and forcing `blankStrings: true` into the
+ *   recursive call would have blanked that call out of the symbol view, trading one false green
+ *   for a false negative on a real, currently-passing corpus assertion
+ *   (`tests/unit/tracker-loci-strip-invariants.test.ts`'s `required_keychain_value` row, which
+ *   still asserts all three real occurrences survive both views). `codeSearchScope`'s SH_EXTS
+ *   sentence, above, is rewritten to say exactly this: a `#` comment excludes at a word boundary
+ *   including inside a heredoc body, a quoted string excludes outside one, and a heredoc body's
+ *   own quoted-string content does not.
+ *
+ *   The same review flagged shell's `#` word-boundary rule (round 16: comment only at
+ *   start-of-line or after whitespace) as narrower than real shell grammar: `;# comment` and
+ *   `|# comment` both open real comments (a new word starts right after a control operator, not
+ *   only after whitespace), and the old rule read the `#` in both as plain text. Neither shape
+ *   appears in this repository's own tracked `.sh` files or `.github/workflows/*.yml` today
+ *   (confirmed by grep, not assumed) — this closes a latent gap rather than a live corpus
+ *   citation, but per this same file's own standard for `$#`/`${x##suffix}`/`8#22` two rounds
+ *   ago, the rule should be right regardless of whether the corpus happens to exercise every
+ *   shape of it yet. `isWordBoundaryBefore` (`scripts/lib/tracker-loci-strip.mjs`) now also treats
+ *   `;`, `|`, `&`, `(`, and `)` as word boundaries — checking only the immediately preceding
+ *   character is enough to cover `;;`/`&&`/`||` too, since a repeated operator character still
+ *   ends with the same character right before the `#`.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -893,7 +940,12 @@ const codeSearchScope = (relPath) => {
   const ext = extensionOf(relPath);
   if (JS_FAMILY_EXTS.has(ext)) return "outside a `//`/`/* */` comment, a quoted string, or template-literal prose";
   if (PY_EXTS.has(ext)) return "outside a `#` comment or quoted string";
-  if (SH_EXTS.has(ext)) return "outside a `#` comment (at a word boundary), a quoted string, or a heredoc body";
+  if (SH_EXTS.has(ext))
+    return (
+      "outside a `#` comment (at a word boundary — this applies inside a heredoc body too) or a " +
+      "quoted string (a heredoc body's own quoted-string content is not excluded; it is searched " +
+      "as the code it contains)"
+    );
   if (YAML_EXTS.has(ext)) return "outside a `#` comment (at a word boundary) or a quoted scalar";
   if (SQL_EXTS.has(ext)) return "outside a `--`/`/* */` comment or a quoted string (a quoted identifier is code)";
   return `as plain text (no comment or string exclusion applies to .${ext} files)`;
