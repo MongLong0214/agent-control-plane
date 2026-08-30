@@ -58,7 +58,8 @@ These are timestamped evidence, not counters to maintain by hand.
 - Stable identity, fencing, ingress, reconciliation, outbox, settlement, and crash behavior remain
   open in #639, #664, #630, #631, #632, #641, #650, #660, #662, #666, and #672–#673.
 - ACP cannot yet prove a disconnected Hermes turn's terminal commit from a durable receipt (#638;
-  upstream #91434), and broad writer closure plus its executable guard remain open in #675–#676.
+  upstream #91434), broad writer closure remains open in #675, and #676 checks only inline-SQL
+  direct calls whose TypeScript property symbol is exactly `Db.run`.
 - Canonical live cutover remains owner-gated in #510 and may not run before the receipt, crash, recovery,
   wrapper-removal, and rollback prerequisites below pass on one integrated candidate.
 - The current evidence manifests are stale, so none authorizes a live cutover.
@@ -159,8 +160,8 @@ Close terminal-turn truth before any canonical activation:
 4. absent, stale-generation, contradictory, or identity-mismatched evidence remains
    `OUTCOME_UNKNOWN`; queue state is separately `BLOCKED`, and retry policy is `NO_AUTO_RETRY`;
 5. admission-correctness writes roll back on deny (#664);
-6. broad writer closure and its executable future-writer guard pass before the denominator is frozen
-   (#675–#676);
+6. broad writer closure passes before the denominator is frozen (#675); #676's exact-symbol,
+   inline-SQL `Db.run` owner census does not establish that closure;
 7. crash-before/after-row/receipt, duplicate-ID, wrong-target, and stale-generation matrices prove the
    row and receipt are visible together or not visible together.
 

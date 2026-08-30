@@ -1860,6 +1860,163 @@ const GUARDS = [
     killedBy: ["tests/process/the-replace-census-sees-every-guard-form.test.ts"],
   },
   {
+    // #676: ownership is attached to the real mutation surface. Losing symbol resolution makes
+    // the synthetic call disappear and leaves only stale-owner noise.
+    what: "the turn-fence writer check resolves the exact Db run symbol",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find:
+      "const symbolIsDbRun = (symbol) =>\n" +
+      "  symbol !== undefined && symbol.declarations?.some((declaration) => sameDeclaration(declaration));",
+    replace: "const symbolIsDbRun = () => false;",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when an inline SQL exact Db run call names a governed table outside its owner",
+    ],
+  },
+  {
+    what: "the turn-fence writer check rejects in-bound exact Db run calls outside the table owner",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "    if (!allowed.has(file)) applicationResidual.push({ table, file });",
+    replace: "    if (false) applicationResidual.push({ table, file });",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when an inline SQL exact Db run call names a governed table outside its owner",
+    ],
+  },
+  {
+    what: "the turn-fence writer check reports non-inline exact Db run calls outside its boundary",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "    nonInlineCalls.push({",
+    replace: "    [].push({",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::reports Array join SQL outside the inline SQL boundary",
+    ],
+  },
+  {
+    what: "the turn-fence writer check rejects a captured exact Db run method",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "if (escapedRunReferences.length > 0) {",
+    replace: "if (false) {",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when exact Db run is captured instead of called directly",
+    ],
+  },
+  {
+    what: "the turn-fence writer check refuses a literal bracket capture of Db run",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: 'semanticStringConstant(node.argumentExpression) === "run" &&',
+    replace: 'semanticStringConstant(node.argumentExpression) === "not-run" &&',
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::refuses Db run captured through literal bracket access",
+    ],
+  },
+  {
+    what: "the turn-fence writer check resolves semantic constant run keys",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find:
+      "const semanticStringConstant = (expression) => {\n" +
+      "  const type = checker.getTypeAtLocation(expression);\n" +
+      "  return (type.flags & ts.TypeFlags.StringLiteral) !== 0 ? type.value : undefined;\n" +
+      "};",
+    replace:
+      "const semanticStringConstant = (expression) =>\n" +
+      "  ts.isStringLiteralLike(expression) ? expression.text : undefined;",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::measures inline SQL syntax and semantic run key boundary forms",
+    ],
+  },
+  {
+    what: "the turn-fence writer check refuses object binding destructuring of Db run",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find:
+      "if (ts.isBindingElement(node) && bindingCapturesRun(node) && typeHasDbRun(node.parent)) {",
+    replace: "if (false) {",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::refuses Db run captured by object binding destructuring",
+    ],
+  },
+  {
+    what: "the turn-fence writer check refuses object assignment destructuring of Db run",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find:
+      "      assignmentCapturesRun(node.left) &&\n" +
+      "      typeHasDbRun(node.right)",
+    replace: "      false",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::refuses Db run captured by object assignment destructuring",
+    ],
+  },
+  {
+    what: "the turn-fence writer check reports a stale application owner",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "    if (!seenFiles.has(owner)) staleOwners.push({ table, owner });",
+    replace: "    if (false) staleOwners.push({ table, owner });",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when a declared application owner no longer names its table",
+    ],
+  },
+  {
+    what: "the turn-fence writer check scans direct trigger SQL in schema sql",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "for (const match of strippedSchema.matchAll(WRITE)) {",
+    replace: "for (const match of []) {",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when a schema trigger body writes a governed table directly",
+    ],
+  },
+  {
+    what: "the turn-fence writer check scans both table names in schema renames",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "  for (const captured of [match[1], match[2]]) {",
+    replace: "  for (const captured of [match[2]]) {",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::scans source and destination table names in schema renames",
+    ],
+  },
+  {
+    what: "the turn-fence writer check reports a stale named migration rebuild surface",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "  if (!hasExec) missingRebuildSurfaces.push({ table, surface });",
+    replace: "  if (false) missingRebuildSurfaces.push({ table, surface });",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when a named migration rebuild surface goes stale",
+    ],
+  },
+  {
+    what: "the turn-fence writer check discovers a CREATE TABLE with a comment at a keyword boundary",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "[...strippedSchema.matchAll(CREATE_TABLE)]",
+    replace: "[...schema.matchAll(CREATE_TABLE)]",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::discovers a governed table declared with an SQL comment between CREATE and TABLE",
+    ],
+  },
+  {
+    what: "the turn-fence writer check discovers a schema-qualified CREATE TABLE declaration",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "(?:${IDENT}\\s*\\.\\s*)?(${IDENT})\\s*\\(`,",
+    replace: "(${IDENT})\\s*\\(`,",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::discovers a governed table declared with a schema-qualified name",
+    ],
+  },
+  {
+    what: "the turn-fence writer check reports ownership for a table the schema no longer declares",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "if (orphanedOwners.length > 0 || orphanedRebuilds.length > 0) {",
+    replace: "if (false) {",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::fails when declared ownership names a table the schema no longer declares",
+    ],
+  },
+  {
+    what: "the turn-fence writer check prints its exact boundary on every run",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "process.stdout.write(`CHECK: ${CLAIM}\\nBOUNDARY: ${BOUNDARY}\\n`);",
+    replace: "process.stdout.write(`CHECK: ${CLAIM}\\n`);",
+    killedBy: [
+      "tests/process/the-turn-fence-inline-db-run-census-enforces-declared-owners.test.ts::prints the exact boundary on every run",
+    ],
+  },
+  {
     // Contract 1's whole point, landing here: a turn claimed under one CEO generation is a
     // different CEO's work from a receipt minted under the next. Without this a reconciler
     // completes a turn on a receipt that was never about this claim.
