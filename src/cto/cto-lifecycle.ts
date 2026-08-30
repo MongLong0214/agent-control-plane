@@ -749,16 +749,21 @@ export class CtoLifecycle {
       // `tx()`, not `txDecision()`: by this point the external provider has already been
       // told to stop (on this attempt, or — if `session` was already STOPPED above — on
       // an earlier one) and that is not reversible, so rolling the STOPPED write back
-      // would leave the session record disagreeing with reality. A denial here is
-      // compensated below instead of rolled back: STOPPED stands, the mismatch is
-      // recorded, and the caller gets a reason code that says so rather than the bare
-      // `REVOCATION_BLOCKED_ACTIVE_RUNS` a fresh revoke attempt would report on its own.
-      // This is why the STOPPED transition is not skipped just because `session` was
-      // already STOPPED: that used to be a safe proxy for "revoke already succeeded
-      // too", until this exact race broke it, and a caller retrying suspendProject after
-      // the compensation below needs this to actually retry the revoke, not silently
-      // report success over a binding that was never revoked. `sessions.transition` is
-      // a no-op when already at the target state, so retrying costs nothing here.
+      // would leave the session record disagreeing with reality.
+      //
+      // A denial here is compensated below, in the *same* transaction as the STOPPED
+      // write — not a project-level flag written afterward. A separate write needs its
+      // own restore path (what un-marks it on a later successful retry?) and its own
+      // atomicity (a crash between the two transactions leaves the fact without its
+      // explanation). Neither problem exists for a fact the rows already carry: an
+      // active binding whose session is STOPPED *is* "revoke denied after an
+      // irreversible stop" — doctor.ts's CTO_BINDING_POINTS_AT_DEAD_SESSION check
+      // (CRITICAL) already reads exactly this join, so there is nothing further to mark
+      // for an operator to see it, and nothing to remember to clear: the moment a later
+      // retry's revoke succeeds, the binding is no longer active and the fact is gone
+      // on its own. The audit record stays, but moves inside this transaction so it
+      // commits atomically with the STOPPED write it explains, with no window where one
+      // exists without the other.
       const completed = this.db.tx(() => {
         const fresh = this.bindings.active(roleKey);
         if (
@@ -781,31 +786,27 @@ export class CtoLifecycle {
         // Suspension is the one deliberate exception to a normal revocation: every
         // owned run was checkpointed to BLOCKED above and cannot regain authority from
         // this revoked binding. Any runnable state still refuses the revocation.
-        return this.bindings.revoke(roleKey, `project suspended: ${reason}`, {
+        const revoked = this.bindings.revoke(roleKey, `project suspended: ${reason}`, {
           allowBlockedRuns: true,
         });
-      });
-      if (!completed.allowed) {
-        if (completed.reasonCode !== ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) return completed;
-        // The STOPPED transition above only reaches `bindings.revoke()` once it has
-        // itself already succeeded and committed, so this denial means the session
-        // really is stopped and the binding really did just outlive it — not that
-        // nothing happened. Compensate rather than pretend the stop can be undone.
-        this.db.tx(() => {
-          this.projects.setAvailability(
-            projectId,
-            "UNAVAILABLE",
-            "binding revoke denied after an irreversible runtime stop",
-          );
+        if (!revoked.allowed && revoked.reasonCode === ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) {
+          // `stopped` above only reaches this line once it has itself already succeeded
+          // and committed within this same transaction, so this denial means the
+          // session really is stopped and the binding really did just outlive it —
+          // recorded here, atomically with that write, not after it.
           this.audit.record({
             kind: "PROJECT_SUSPEND_BINDING_REVOKE_FAILED",
             reasonCode: ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
             projectId,
             sessionId: current.sessionId,
             roleKey,
-            evidence: { reason, deniedEvidence: completed.evidence },
+            evidence: { reason, deniedEvidence: revoked.evidence },
           });
-        });
+        }
+        return revoked;
+      });
+      if (!completed.allowed) {
+        if (completed.reasonCode !== ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) return completed;
         return deny(
           ReasonCode.SESSION_STOPPED_BINDING_REVOKE_FAILED,
           "the runtime stop completed but the binding could not be revoked; the binding now outlives its stopped session",

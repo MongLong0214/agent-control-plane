@@ -1288,7 +1288,7 @@ const GUARDS = [
     find: "    if (current && session) {\n      if (session.lifecycle !== SessionLifecycle.STOPPED) {",
     replace: "    if (current && session && session.lifecycle !== SessionLifecycle.STOPPED) {\n      {",
     killedBy: [
-      "tests/unit/cto-registry-r2.test.ts::#692 a retry after the compensation actually completes the revoke",
+      "tests/unit/cto-registry-r2.test.ts::#692 a retry after the compensation actually completes the revoke, and doctor clears on its own",
     ],
   },
   {
@@ -1296,13 +1296,32 @@ const GUARDS = [
     // already committed, so a denial here means the session really is stopped and the
     // binding really did just outlive it. Without this branch, that denial would return
     // as the bare REVOCATION_BLOCKED_ACTIVE_RUNS a fresh revoke attempt reports on its
-    // own, with no record that the write it depended on had already gone through.
-    what: "suspendProject compensates (marks the project, records why) when a stopped session's binding revoke is denied",
+    // own, with no audit record explaining that the STOPPED write it depended on had
+    // already gone through.
+    what: "suspendProject records why (audit, same transaction) when a stopped session's binding revoke is denied",
     file: "src/cto/cto-lifecycle.ts",
     find: "        if (completed.reasonCode !== ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS) return completed;",
     replace: "        return completed;",
     killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 compensates instead of losing a binding revoke denied after the runtime stop already happened",
+    ],
+  },
+  {
+    // #692 (Sol review, round 2) — an adversarial review found that the two rows above
+    // both reach the same race regardless of whether this preflight exists at all: both
+    // tests reactivate the run *inside* the mocked stopSession, which only runs after
+    // the preflight has already passed. Without a row that removes the preflight itself,
+    // nothing here proved it does anything — it could be deleted and every existing test
+    // would still pass. The new standalone test drives a run to READY_FOR_CEO_REVIEW (a
+    // live state the checkpoint loop never touches) and calls suspendProject with no
+    // race at all: only the preflight stands between that and an irreversible provider
+    // stop it should never reach.
+    what: "suspendProject's preflight refuses an ordinary blocker before the irreversible provider stop",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n        if (preflight.length > 0) {",
+    replace: "        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n        if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 the preflight refuses an ordinary (non-race) blocker before the irreversible provider stop, never calling it at all",
     ],
   },
 ];

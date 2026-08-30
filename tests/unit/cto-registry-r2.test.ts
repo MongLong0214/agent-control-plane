@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 
 import { type HandoffAcknowledgement, type HandoffPackage } from "../../src/cto/cto-lifecycle.ts";
@@ -6,11 +6,13 @@ import { digestOf } from "../../src/core/digest.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { ExecutionMode, RunState, SessionLifecycle } from "../../src/domain/types.ts";
+import type { DoctorReport } from "../../src/doctor/doctor.ts";
 import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fixtures.ts";
 import {
   TEST_OWNER,
   type Harness,
   bindCeo,
+  driveToReviewedCandidate,
   finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
@@ -18,6 +20,9 @@ import {
   registerFixtureProject,
 } from "../helpers/harness.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
+
+const deadSessionFinding = (report: DoctorReport) =>
+  report.findings.find((f) => f.code === "CTO_BINDING_POINTS_AT_DEAD_SESSION");
 
 afterAll(cleanupTempDirs);
 
@@ -220,6 +225,56 @@ describe("round-2 CTO lifecycle regressions", () => {
   });
 
   it(
+    "#692 the preflight refuses an ordinary (non-race) blocker before the irreversible " +
+      "provider stop, never calling it at all",
+    async () => {
+      // A run reaching CEO review through the real evidence pipeline is owned by the CTO
+      // binding and sits in READY_FOR_CEO_REVIEW — a state suspendProject's checkpoint
+      // loop never touches (it only moves ACTIVE runs to BLOCKED). Without the preflight,
+      // this refusal would only surface from bindings.revoke() *after* the provider had
+      // already been told to stop; with it, the irreversible call never happens.
+      const harness = makeHarness();
+      const driven = await driveToReviewedCandidate(harness);
+      await harness.cp.continuity.evaluate("test");
+      const packet = harness.cp.ceo.buildPacket({
+        runId: driven.runId,
+        candidateSnapshotDigest: driven.candidateSnapshotDigest,
+        approval: {
+          runId: driven.runId,
+          candidateSnapshotDigest: driven.candidateSnapshotDigest,
+          resultSummary: "done",
+          recommendation: "merge",
+          residualRisk: [],
+          approvedBySessionId: driven.ownerSessionId,
+          approvedByGeneration: driven.ownerBindingGeneration,
+          approvedAt: harness.clock.nowIso(),
+        },
+      });
+      if (!packet.allowed) throw new Error(`${packet.reasonCode}: ${packet.message}`);
+      expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
+
+      const binding = harness.cp.bindings.activePrimaryCto(driven.projectId)!;
+      const stopSession = vi.spyOn(harness.scripted, "stopSession");
+
+      const suspended = await harness.cp.cto.suspendProject(
+        driven.projectId,
+        true,
+        "capacity crisis",
+        TEST_OWNER,
+      );
+
+      expect(suspended.allowed).toBe(false);
+      expect(suspended.reasonCode).toBe(ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS);
+      expect(stopSession).not.toHaveBeenCalled();
+      // The one truly irreversible step — telling the provider to stop — never happened:
+      // the session may have moved to DRAINING as ordinary suspend prep (reversible, and
+      // unrelated to this check), but it was never told to stop and is not STOPPED.
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).not.toBe(SessionLifecycle.STOPPED);
+      expect(harness.cp.bindings.activePrimaryCto(driven.projectId)?.sessionId).toBe(binding.sessionId);
+    },
+  );
+
+  it(
     "#692 compensates instead of losing a binding revoke denied after the runtime stop " +
       "already happened",
     async () => {
@@ -232,11 +287,16 @@ describe("round-2 CTO lifecycle regressions", () => {
       // suspendProject's own checkpoint tx (before stopSession is ever called) already
       // moved this run to BLOCKED, and the preflight check right before stopSession would
       // see exactly that and let the call proceed. The only gap left is this await
-      // itself: a concurrent CEO decision resolving the escalation while the provider
-      // stop is in flight flips the run back to ACTIVE before bindings.revoke() runs.
-      harness.scripted.stopSession = async () => {
+      // itself: a concurrent CEO decision resolving the escalation while the *real*
+      // scripted provider stop is in flight flips the run back to ACTIVE before
+      // bindings.revoke() runs. Wrapping (not replacing) stopSession means the adapter's
+      // own stop behavior (scripted-adapter.ts) still runs, not a stand-in for it.
+      const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+      harness.scripted.stopSession = async (handle) => {
+        const result = await originalStop(handle);
         const resolved = harness.cp.ceo.resolveEscalation(run.runId, "resolved mid-suspend", ceoSessionId);
         if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
+        return result;
       };
 
       const suspended = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
@@ -247,28 +307,37 @@ describe("round-2 CTO lifecycle regressions", () => {
       // write must stand rather than roll back into a lie about the runtime's state.
       expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
       // The binding was NOT silently revoked, and it was NOT silently left as if nothing
-      // happened either: the mismatch is durable and visible.
+      // happened either: the mismatch is durable (an active binding pointing at a STOPPED
+      // session), it needs no separate flag to be visible, and doctor already reads
+      // exactly this join as a CRITICAL finding rather than something this fix invented.
       expect(harness.cp.bindings.activePrimaryCto(projectId)?.sessionId).toBe(binding.sessionId);
-      expect(harness.cp.projects.get(projectId)?.availability).toBe("UNAVAILABLE");
+      const report = await harness.cp.doctor.run("project", projectId);
+      const finding = deadSessionFinding(report);
+      expect(finding?.severity).toBe("CRITICAL");
+      expect(finding?.observedEvidence).toMatchObject({ sessionId: binding.sessionId });
       const events = harness.cp.audit.byKind("PROJECT_SUSPEND_BINDING_REVOKE_FAILED");
       expect(events.length).toBe(1);
       expect(events[0]?.sessionId).toBe(binding.sessionId);
     },
   );
 
-  it("#692 a retry after the compensation actually completes the revoke", async () => {
+  it("#692 a retry after the compensation actually completes the revoke, and doctor clears on its own", async () => {
     const harness = makeHarness();
     const { projectId, repositoryId } = await registerFixtureProject(harness);
     const run = await createActiveRun(harness, projectId, repositoryId);
     const ceoSessionId = bindCeo(harness);
 
-    harness.scripted.stopSession = async () => {
+    const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+    harness.scripted.stopSession = async (handle) => {
+      const result = await originalStop(handle);
       const resolved = harness.cp.ceo.resolveEscalation(run.runId, "resolved mid-suspend", ceoSessionId);
       if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
+      return result;
     };
     const first = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
     expect(first.allowed).toBe(false);
     expect(first.reasonCode).toBe(ReasonCode.SESSION_STOPPED_BINDING_REVOKE_FAILED);
+    expect(deadSessionFinding(await harness.cp.doctor.run("project", projectId))?.severity).toBe("CRITICAL");
 
     // The session is already STOPPED now, so a retry must not call the provider again —
     // but it must still be able to finish the revoke the first attempt could not, rather
@@ -279,6 +348,10 @@ describe("round-2 CTO lifecycle regressions", () => {
     const retried = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis retry", TEST_OWNER);
     expect(retried.allowed).toBe(true);
     expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+    // Nothing had to be restored: with no active binding left, the join doctor reads no
+    // longer matches anything — the finding is gone because the fact it read is gone,
+    // not because something remembered to un-mark it.
+    expect(deadSessionFinding(await harness.cp.doctor.run("project", projectId))).toBeUndefined();
   });
 
   it("#226 leaves a durable blocked run instead of an ACTIVE run owned by a revoked CTO", async () => {
