@@ -24,6 +24,9 @@
     "lint": "eslint .",
     "trace": "tsx src/tools/traceability.ts",
     "terminology": "node scripts/verify-terminology.mjs",
+    "reason-codes": "node scripts/verify-reason-codes.mjs",
+    "reason-codes:usage": "node scripts/verify-reason-code-usage.mjs",
+    "scripts:plausible-callers": "node scripts/verify-every-script-has-a-plausible-caller.mjs",
     "evidence:freshness": "node scripts/verify-evidence-freshness.mjs",
     "invariants": "node scripts/verify-invariant-coverage.mjs",
     "buzz:contract": "tsx scripts/verify-buzz-cli-contract.ts",
@@ -44,7 +47,17 @@
     "schema:writers": "node scripts/verify-turn-fence-writer-census.mjs",
     "schema:denials": "node scripts/verify-trigger-denials-are-typed.mjs",
     "schema:registry": "node scripts/verify-every-trigger-is-required.mjs",
-    "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs"
+    "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs",
+    "verify:fresh-database": "tsx scripts/verify-fresh-database.ts",
+    "probe:daemon-startup": "tsx scripts/probe-daemon-startup.ts",
+    "ssot:report": "node scripts/ssot-report.mjs",
+    "review:grok": "node scripts/grok-review.mjs",
+    "review:production": "node scripts/production-review.mjs",
+    "review:file-majors": "node scripts/file-review-majors.mjs",
+    "file:open-work": "node scripts/file-open-work.mjs",
+    "close:evidence": "node scripts/close-with-evidence.mjs",
+    "sync:issues": "node scripts/sync-issues.mjs",
+    "buzz:capture-live": "npx tsx scripts/capture-buzz-live.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
