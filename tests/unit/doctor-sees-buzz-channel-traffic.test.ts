@@ -201,6 +201,10 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
       const session = await connectSession(runtime, "advancing-window");
       await start(runtime);
       await waitForBaseline(runtime, session.sessionId);
+      const initialBaseline = watchRow(runtime, session.sessionId)?.baseline_at;
+      if (initialBaseline === null || initialBaseline === undefined) {
+        throw new Error("fixture baseline was not established");
+      }
       const baselineSecond = Math.floor(runtime.harness.clock.now().getTime() / 1000);
       const traffic = [
         message(baselineSecond + 1),
@@ -215,6 +219,8 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
         () => watchRow(runtime, session.sessionId)?.observed_count === 4,
         "four-message completed window",
       );
+      const firstWindowEnd = watchRow(runtime, session.sessionId)?.baseline_at;
+      expect(firstWindowEnd).not.toBe(initialBaseline);
       const first = await runtime.harness.cp.doctor.run("system");
       const measured = finding(first, "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS", session.sessionId);
       expect(measured?.severity).toBe("INFO");
@@ -232,7 +238,7 @@ describe("Doctor reports raw Buzz event ids first observed between completed wat
       await waitFor(
         () => {
           const row = watchRow(runtime, session.sessionId);
-          return row?.window_started_at !== null && row?.observed_count === 0;
+          return row?.window_started_at === firstWindowEnd && row?.observed_count === 0;
         },
         "next completed zero window",
       );
