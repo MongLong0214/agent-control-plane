@@ -114,7 +114,14 @@ interface TelegramTrackedTurn {
   result: TelegramTrackedTurnResult | null;
 }
 
-type TelegramUpdateState = "RUNNING" | "RETRYABLE" | "SETTLED";
+type TelegramUpdateState =
+  | { status: "RUNNING" }
+  | { status: "RETRYABLE"; retryAt: number }
+  | { status: "SETTLED" };
+
+type TelegramUpdateReservation =
+  | { reserved: true }
+  | { reserved: false; retryInMs?: number };
 
 /** Durable reservation port for owner prompts; production wires this to the CP database. */
 export interface TelegramOwnerPromptStore {
@@ -341,8 +348,8 @@ export class TelegramLongPollService {
   /**
    * Waits for every route already handed to the listener and rejects with any fault it recorded.
    *
-   * Routing will leave `pollOnce` in #630, so a caller cannot use that poll promise as evidence
-   * that a turn finished. Faults are retained until this method observes them; the rejection is
+   * Routed tasks leave `pollOnce` in #630, so a caller cannot use that poll promise as evidence
+   * that a task finished. Faults are retained until this method observes them; the rejection is
    * not inferred from an empty outcome list, which would make "nothing failed" indistinguishable
    * from "the test never looked".
    */
@@ -486,9 +493,16 @@ export class TelegramLongPollService {
       signal: this.#controller?.signal,
     });
     const outcomes: TelegramRouteOutcome[] = [];
+    let retryInMs: number | undefined;
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
-      if (!this.reserveUpdate(update.update_id)) continue;
+      const reservation = this.reserveUpdate(update.update_id);
+      if (!reservation.reserved) {
+        if (reservation.retryInMs !== undefined) {
+          retryInMs = Math.min(retryInMs ?? reservation.retryInMs, reservation.retryInMs);
+        }
+        continue;
+      }
 
       const outcomeIndex = outcomes.length;
       // Allocate the slot now so completion order cannot reorder the batch a caller observes.
@@ -508,13 +522,20 @@ export class TelegramLongPollService {
     }
 
     // The inbound batch has been accepted into tracked tasks before incidental outbound prompts
-    // run. A slow CEO turn no longer holds this poll promise or the next getUpdates call open.
+    // run. A slow routed task no longer holds this poll promise or the next getUpdates call open.
     await this.deliverOwnerGatePrompts();
-    if (outcomes.length === 0 && updates.length > 0 && this.#pendingTurns.size > 0) {
-      // Holding the offset makes Telegram return the running update immediately. A bounded pause
-      // prevents a hot loop without waiting for the CEO turn itself; a newly arrived update is
-      // delayed by at most 100ms before the next getUpdates call can schedule it.
-      await delay(Math.min(this.options.retryDelayMs ?? 5_000, 100));
+    if (outcomes.length === 0 && updates.length > 0) {
+      if (retryInMs !== undefined) {
+        // A detached failure no longer reaches loop()'s catch. Its update-local deadline is the
+        // replacement observer: keep the held offset, but do not ask Telegram for this update in
+        // a hot loop or schedule its route again before the configured backoff expires.
+        await delay(retryInMs);
+      } else if (this.#pendingTurns.size > 0) {
+        // Holding the offset makes Telegram return the running update immediately. A bounded pause
+        // prevents a hot loop without waiting for the routed task itself; a newly arrived update is
+        // delayed by at most 100ms before the next getUpdates call can schedule it.
+        await delay(Math.min(this.options.retryDelayMs ?? 5_000, 100));
+      }
     }
     return { outcomes, ...(this.#offset === undefined ? {} : { nextOffset: this.#offset }) };
   }
@@ -601,32 +622,41 @@ export class TelegramLongPollService {
    * One update id has one live task. A repeated getUpdates response while its offset is held
    * cannot fork the route; a failed task becomes retryable and is the only state admitted again.
    */
-  private reserveUpdate(updateId: number): boolean {
-    if (!Number.isSafeInteger(updateId)) return true;
+  private reserveUpdate(updateId: number): TelegramUpdateReservation {
+    if (!Number.isSafeInteger(updateId)) return { reserved: true };
     const state = this.#updateStates.get(updateId);
-    if (state === "RUNNING" || state === "SETTLED") return false;
-    this.#updateStates.set(updateId, "RUNNING");
+    if (state?.status === "RUNNING" || state?.status === "SETTLED") return { reserved: false };
+    if (state?.status === "RETRYABLE") {
+      const retryInMs = state.retryAt - Date.now();
+      if (retryInMs > 0) return { reserved: false, retryInMs };
+    }
+    this.#updateStates.set(updateId, { status: "RUNNING" });
     if (state === undefined) {
       this.#updateOrder.push(updateId);
       this.#updateOrder.sort((left, right) => left - right);
     }
-    return true;
+    return { reserved: true };
   }
 
   private retryUpdate(updateId: number): void {
-    if (Number.isSafeInteger(updateId)) this.#updateStates.set(updateId, "RETRYABLE");
+    if (Number.isSafeInteger(updateId)) {
+      this.#updateStates.set(updateId, {
+        status: "RETRYABLE",
+        retryAt: Date.now() + (this.options.retryDelayMs ?? 5_000),
+      });
+    }
   }
 
   private completeUpdate(updateId: number): void {
     if (!Number.isSafeInteger(updateId)) return;
-    this.#updateStates.set(updateId, "SETTLED");
+    this.#updateStates.set(updateId, { status: "SETTLED" });
 
     // Telegram confirms every id below offset. A later task may finish first, but it cannot move
     // the offset past an earlier turn that is still running or failed. #631 can make this queue
     // durable; #630 does not open the process-death loss window while that work is pending.
     while (this.#updateOrder.length > 0) {
       const next = this.#updateOrder[0]!;
-      if (this.#updateStates.get(next) !== "SETTLED") break;
+      if (this.#updateStates.get(next)?.status !== "SETTLED") break;
       this.#updateOrder.shift();
       this.#updateStates.delete(next);
       this.#offset = Math.max(this.#offset ?? 0, next + 1);

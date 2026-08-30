@@ -95,7 +95,7 @@ const telegramConfig = {
 const daemonStub = { finalizeApprovedRun: async (_runId: string): Promise<void> => undefined };
 
 /**
- * A routed turn will outlive `pollOnce` after #630, so its fault belongs to the listener's turn
+ * A routed task will outlive `pollOnce` after #630, so its fault belongs to the listener's task
  * observer rather than to the poll promise. Catching the poll rejection keeps this same assertion
  * valid while routing is still synchronous: if the observer stops recording the injected fault,
  * this promise resolves and the named test fails instead of passing because `pollOnce` happened to
@@ -391,6 +391,66 @@ describe("Telegram production ingress", () => {
     // The first close drained the fault before rejecting; a second call completes lifecycle
     // cleanup rather than reporting the same observed failure forever.
     await listener.close();
+  });
+
+  it("waits for retryDelayMs before a detached route is attempted again", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const retryDelayMs = 200;
+    const failedUpdate = update("reply delivery keeps failing", {}, 683);
+    const attemptTimes: number[] = [];
+    const offsets: Array<number | undefined> = [];
+    let markSecondAttempt!: () => void;
+    const secondAttempt = new Promise<void>((resolve) => { markSecondAttempt = resolve; });
+    const transport: TelegramBotTransport = {
+      async getUpdates(options) {
+        offsets.push(options.offset);
+        return [failedUpdate];
+      },
+      async sendMessage() {
+        attemptTimes.push(Date.now());
+        if (attemptTimes.length === 2) markSecondAttempt();
+        throw new TelegramDeliveryError("continuous confirmed route failure", false);
+      },
+    };
+    const errors: unknown[] = [];
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, retryDelayMs },
+      daemonStub,
+      {
+        transport,
+        start: false,
+        onDirect: () => "reply that Telegram refuses",
+        onError: (error) => { errors.push(error); },
+      },
+    );
+
+    listener.service.start();
+    try {
+      await Promise.race([
+        secondAttempt,
+        new Promise<never>((_resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error("second route attempt never started")), 3_000);
+          timeout.unref();
+        }),
+      ]);
+    } finally {
+      await listener.close();
+    }
+
+    expect(attemptTimes.length).toBeGreaterThanOrEqual(2);
+    expect(attemptTimes.slice(1).every(
+      (attemptedAt, index) => attemptedAt - attemptTimes[index]! >= retryDelayMs,
+    )).toBe(true);
+    expect(listener.service.offset).toBeUndefined();
+    expect(offsets.every((offset) => offset === undefined)).toBe(true);
+    expect(errors).toHaveLength(attemptTimes.length);
+    expect(errors).toSatisfy((reported: unknown[]) => reported.every(
+      (error) => error instanceof TelegramDeliveryError && error.message === "continuous confirmed route failure",
+    ));
+    expect(harness.cp.audit.byKind("INGRESS_ADMITTED")).toHaveLength(1);
   });
 
   it("mints an owner decision only through an admitted Telegram receipt", async () => {
