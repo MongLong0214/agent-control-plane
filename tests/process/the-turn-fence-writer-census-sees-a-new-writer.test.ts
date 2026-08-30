@@ -160,6 +160,28 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
         "  );",
       ].join("\n  "),
     },
+    // Round 3 of #676: a blind review ran these three directly against system SQLite and confirmed
+    // they execute as ordinary writes — the old pattern required literal `\s+` at every keyword
+    // boundary, and a `/**/` comment there is whitespace to SQLite but not to that regex, so all
+    // three scored `residual: 0`. Interleaved at every keyword boundary the review didn't name too,
+    // both to close the exact spellings and the shape one level up.
+    { label: "INSERT/**/INTO block comment", body: "db.run(`INSERT/**/INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
+    { label: "INSERT INTO/**/table block comment", body: "db.run(`INSERT INTO/**/canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
+    { label: "UPDATE/**/table block comment", body: "db.run(`UPDATE/**/canonical_turns SET lifecycle_state = 'SETTLED' WHERE turn_request_id = ?`, [turnRequestId]);" },
+    { label: "DELETE/**/FROM block comment", body: "db.run(`DELETE/**/FROM canonical_turns WHERE turn_request_id = ?`, [turnRequestId]);" },
+    { label: "DELETE FROM/**/table block comment", body: "db.run(`DELETE FROM/**/canonical_turns WHERE turn_request_id = ?`, [turnRequestId]);" },
+    { label: "REPLACE/**/INTO block comment", body: "db.run(`REPLACE/**/INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
+    { label: "REPLACE INTO/**/table block comment", body: "db.run(`REPLACE INTO/**/canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
+    { label: "INSERT OR/**/IGNORE block comment", body: "db.run(`INSERT OR/**/IGNORE INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
+    { label: "INSERT OR IGNORE/**/INTO block comment", body: "db.run(`INSERT OR IGNORE/**/INTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);" },
+    {
+      label: "UPDATE--line comment before table",
+      body: "db.run(`UPDATE--x\ncanonical_turns SET lifecycle_state = 'SETTLED' WHERE turn_request_id = ?`, [turnRequestId]);",
+    },
+    {
+      label: "INSERT--line comment before INTO",
+      body: "db.run(`INSERT--x\nINTO canonical_turns (turn_request_id) VALUES (?)`, [turnRequestId]);",
+    },
   ];
 
   for (const { label, body } of forms) {
@@ -237,6 +259,62 @@ describe("the turn-fence writer census sees a writer outside the coordinator", (
         "",
         "// A synthetic doc comment, same shape as the real one: `UPDATE canonical_turns SET",
         "// outcome_kind='ABORTED'` describes a defect this schema no longer permits.",
+        "",
+      ].join("\n"),
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("RESULT: PASS");
+    expect(done.stdout).toContain("residual: 0");
+    expect(done.status).toBe(0);
+  });
+
+  it("fails when a schema.sql trigger body writes a governed table directly, not just src/**.ts", () => {
+    // Finding 2, round 3: `migrations.ts`'s `schemaDdl()` reads `src/db/schema.sql` whole and
+    // installs it into the real database, so a trigger body in that file is exactly as live a
+    // write surface as a TypeScript module — and the walk above only ever reads `.ts` files.
+    // `schema.sql` was read for `CREATE TABLE` names only; a second writer sitting in a trigger
+    // body forever would never have been seen. This appends a real cascading write, the same shape
+    // a materializer-adjacent trigger could plausibly carry, and requires the census to see it.
+    const repo = scratchRepo();
+    appendFileSync(
+      join(repo, "src/db/schema.sql"),
+      [
+        "",
+        "CREATE TRIGGER IF NOT EXISTS probe_676_rogue_cascade",
+        "AFTER INSERT ON canonical_turn_dispatches",
+        "BEGIN",
+        "  INSERT INTO canonical_turn_sources (turn_request_id) VALUES (NEW.turn_request_id);",
+        "END;",
+        "",
+      ].join("\n"),
+    );
+
+    const done = censusOn(repo);
+
+    expect(done.stdout).toContain("src/db/schema.sql");
+    expect(done.stdout).toContain("canonical_turn_sources");
+    expect(done.stdout).toContain("RESULT: FAIL");
+    expect(done.status).toBe(1);
+  });
+
+  it("does not fabricate a write from schema.sql's own trigger doc comments quoting old, defective SQL", () => {
+    // schema.sql already carries this exact shape for real, above `canonical_turns_settlement_authority`:
+    // "...an ordinary `UPDATE canonical_turns SET lifecycle_state='SETTLED', outcome_kind='ABORTED', …`
+    // on a turn that had never been settled succeeded...". Scanning schema.sql without stripping its
+    // own `--`/`/* */` comments first would fail on that prose the moment schema.sql joined the scan.
+    // Confirmed by the unmodified real source tree passing (the earlier "passes on the source tree as
+    // it stands" test already covers this on the real file) and, here, an added comment-only
+    // quotation appended fresh is still silent.
+    const repo = scratchRepo();
+    appendFileSync(
+      join(repo, "src/db/schema.sql"),
+      [
+        "",
+        "-- A synthetic doc comment, same shape as the real one: an ordinary",
+        "-- `UPDATE canonical_turns SET outcome_kind='ABORTED'` describes a defect this schema no",
+        "-- longer permits.",
         "",
       ].join("\n"),
     );

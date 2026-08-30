@@ -28,6 +28,33 @@
  * INTO` outright, though `assertDataMutation` in `src/db/database.ts` names `REPLACE` beside
  * `INSERT` as an ordinary mutation this schema's own connection issues. See `WRITE` below for the
  * replacement, and `unresolvable` below for the one form no static regex can ever close.
+ *
+ * v3 (post-review, round 3): two more findings, both against a regex that required a keyword
+ * boundary to be literal whitespace.
+ *
+ * Finding 1 — SQLite treats an SQL comment exactly like whitespace between two tokens, so
+ * `INSERT/**\/INTO`, `UPDATE/**\/canonical_turns` and `DELETE/**\/FROM canonical_turns` all run as
+ * ordinary writes (confirmed against system SQLite) while the old `\s+` at every keyword boundary
+ * scored all three zero. `WS` below is what "whitespace" means to SQLite at a statement boundary —
+ * real whitespace or a comment, one or more of either — so a comment inserted at any boundary the
+ * old pattern required no longer hides the write.
+ *
+ * Finding 2 — `src/db/migrations.ts`'s `schemaDdl()` reads `src/db/schema.sql` whole and installs
+ * it into the real database, so a trigger body in that file is a production write surface exactly
+ * like a `.ts` module — and this census never read `schema.sql` for anything but `CREATE TABLE`
+ * names. A second writer could sit in a trigger body forever and this file would never see it.
+ * `schema.sql` is now scanned by the same `WRITE` regex as every other file, through
+ * `stripSqlComments` first: this file's own trigger doc comments quote past defective SQL verbatim
+ * (see `canonical_turns_settlement_authority`'s comment above it), the same shape
+ * `stripComments`/`.ts` files already had to be protected from.
+ *
+ * `stripSqlComments` mirrors `stripSqlSource` in `scripts/lib/tracker-loci-strip.mjs` (`--` line
+ * comments, non-nesting `/* *\/` block comments, `'...'` value strings escaping their own quote by
+ * doubling it, `"`/`` ` ``/`[` identifier quoting left untouched) rather than importing it: that
+ * file lives on branch `feat/597-tracker-loci-resolve` (PR #689), which is not merged to `main` and
+ * so is not reachable from this branch without pulling in an unrelated, unmerged branch's full
+ * history — out of scope for this fix. This is a local equivalent, not a sixth stripper solving a
+ * new problem; if #689 lands first, importing it and deleting this copy is a one-line follow-up.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -94,6 +121,90 @@ const stripComments = (source) => {
         }
         i++;
       }
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+};
+
+/**
+ * SQL's own comment forms, stripped from a *pure SQL* source (`schema.sql`) before the `WRITE`
+ * regex ever sees it — see the "Finding 2" note in the file header for why this exists and why it
+ * is a local copy of `stripSqlSource` rather than an import.
+ *
+ * Blanks rather than deletes so a diagnostic slice of the file (line count, column offsets)
+ * downstream stays meaningful; SQL's `'...'` value strings (doubling their own quote to escape,
+ * not backslash) and `"`/`` ` ``/`[` identifier quoting are tracked so a `--`/`/* *\/` sequence
+ * inside a real string value is never mistaken for a comment start — `schema.sql` has no such case
+ * today (checked directly), but this does not assume that stays true.
+ */
+const stripSqlComments = (source) => {
+  let out = "";
+  let i = 0;
+  const n = source.length;
+  while (i < n) {
+    const c = source[i];
+    const next = source[i + 1];
+    if (c === "-" && next === "-") {
+      out += "  ";
+      i += 2;
+      while (i < n && source[i] !== "\n") {
+        out += " ";
+        i++;
+      }
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      let j = i + 2;
+      while (j < n && !(source[j] === "*" && source[j + 1] === "/")) j++;
+      if (j < n) j += 2;
+      out += source.slice(i, j).replace(/[^\n]/g, " ");
+      i = j;
+      continue;
+    }
+    if (c === "'") {
+      let j = i + 1;
+      while (j < n) {
+        if (source[j] === "'" && source[j + 1] === "'") {
+          j += 2;
+          continue;
+        }
+        if (source[j] === "'") {
+          j++;
+          break;
+        }
+        j++;
+      }
+      out += source.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '"' || c === "`") {
+      const quote = c;
+      let j = i + 1;
+      while (j < n) {
+        if (source[j] === quote && source[j + 1] === quote) {
+          j += 2;
+          continue;
+        }
+        if (source[j] === quote) {
+          j++;
+          break;
+        }
+        j++;
+      }
+      out += source.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (c === "[") {
+      let j = i + 1;
+      while (j < n && source[j] !== "]") j++;
+      if (j < n) j++;
+      out += source.slice(i, j);
+      i = j;
       continue;
     }
     out += c;
@@ -199,10 +310,19 @@ if (unowned.length > 0) {
  */
 const files = walk(SRC).map((f) => relative(ROOT, f));
 
+/**
+ * What "whitespace" means to SQLite at a statement's keyword boundaries: real whitespace, or a
+ * comment (`/* *\/`, non-nesting; `--` to end of line), one or more of either in any mix. A regex
+ * that required literal `\s+` here scored `INSERT/**\/INTO` — a real write, confirmed against
+ * system SQLite — as no write at all, because the scan never got past recognising the keyword
+ * pair in the first place. See the "Finding 1" note in the file header.
+ */
+const SQL_COMMENT = String.raw`(?:/\*[\s\S]*?\*/|--[^\n]*)`;
+const WS = String.raw`(?:\s|${SQL_COMMENT})+`;
 /** `INSERT`/`UPDATE` accept an explicit conflict-resolution clause; `DELETE` does not. */
-const CONFLICT = String.raw`(?:OR\s+(?:ABORT|FAIL|IGNORE|REPLACE|ROLLBACK)\s+)?`;
+const CONFLICT = String.raw`(?:OR${WS}(?:ABORT|FAIL|IGNORE|REPLACE|ROLLBACK)${WS})?`;
 /** An optional schema qualifier (`main.foo`, `temp."Foo"`, …) followed by the table name itself. */
-const TABLE_REF = String.raw`(?:${IDENT}\s*\.\s*)?(${IDENT})`;
+const TABLE_REF = String.raw`(?:${IDENT}(?:${WS})?\.(?:${WS})?)?(${IDENT})`;
 /**
  * Every write-statement opener this schema's own connection accepts (`assertDataMutation` in
  * `src/db/database.ts` names `INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `WITH` as data statements),
@@ -210,18 +330,18 @@ const TABLE_REF = String.raw`(?:${IDENT}\s*\.\s*)?(${IDENT})`;
  * resolve — a template-interpolated or concatenated table name — still matches the verb and is
  * reported as unresolved rather than silently not matching at all.
  */
-// Each branch owns its own optional table reference rather than sharing one trailing `(?:\s+TABLE_REF)?`
-// after the alternation: `CONFLICT` already swallows the whitespace before `INTO`/the table name when
+// Each branch owns its own optional table reference rather than sharing one trailing `(?:WS TABLE_REF)?`
+// after the alternation: `CONFLICT` already swallows the separator before `INTO`/the table name when
 // it matches, and the branches differ in whether a keyword (`INTO`/`FROM`) sits between the conflict
-// clause and the table — collapsing them into one shared tail required a second `\s+` that plain
+// clause and the table — collapsing them into one shared tail required a second separator that plain
 // `UPDATE table SET …` (no conflict clause) does not have, which silently turned the fix into a
 // regression: every ordinary UPDATE in this repository read as an unresolved dynamic table name.
 const WRITE = new RegExp(
   String.raw`\b(?:` +
-    String.raw`INSERT\s+${CONFLICT}INTO(?:\s+${TABLE_REF})?` +
-    String.raw`|UPDATE\s+${CONFLICT}(?:${TABLE_REF})?` +
-    String.raw`|REPLACE\s+INTO(?:\s+${TABLE_REF})?` +
-    String.raw`|DELETE\s+FROM(?:\s+${TABLE_REF})?` +
+    String.raw`INSERT${WS}${CONFLICT}INTO(?:${WS}${TABLE_REF})?` +
+    String.raw`|UPDATE${WS}${CONFLICT}(?:${TABLE_REF})?` +
+    String.raw`|REPLACE${WS}INTO(?:${WS}${TABLE_REF})?` +
+    String.raw`|DELETE${WS}FROM(?:${WS}${TABLE_REF})?` +
     String.raw`)`,
   "gi",
 );
@@ -235,9 +355,12 @@ const writesByTable = new Map(governedTables.map((t) => [t, []]));
  * indistinguishable from a real zero.
  */
 const unresolvable = [];
-for (const file of files) {
-  const raw = readFileSync(join(ROOT, file), "utf8");
-  const content = stripComments(raw);
+/**
+ * Scans one file's already-comment-stripped content for `WRITE` matches and records them, shared
+ * between the `.ts` walk below and `schema.sql` (Finding 2) so both go through one path rather
+ * than two copies of the same match-handling logic drifting apart.
+ */
+const scanForWrites = (file, content) => {
   for (const match of content.matchAll(WRITE)) {
     // `TABLE_REF` is spliced into the pattern once per branch above, so each occurrence claims its
     // own group number (1-4) rather than sharing one — only the branch that actually matched has a
@@ -251,7 +374,22 @@ for (const file of files) {
     const table = governedByLower.get(unquoteIdent(capturedTable).toLowerCase());
     if (table !== undefined) writesByTable.get(table).push(file);
   }
+};
+
+for (const file of files) {
+  const raw = readFileSync(join(ROOT, file), "utf8");
+  scanForWrites(file, stripComments(raw));
 }
+
+/**
+ * Finding 2: `schema.sql` is not a `.ts` file, so the walk above never reads it — but
+ * `schemaDdl()` in `migrations.ts` installs it whole into the real database, and a trigger body
+ * writing a governed table would be exactly as live a writer as any TypeScript module. Scanned
+ * here through `stripSqlComments` (SQL's own comment grammar, not JS's) rather than `stripComments`
+ * so this file's own trigger doc comments — which quote past defective SQL verbatim — do not read
+ * as a live write.
+ */
+scanForWrites("src/db/schema.sql", stripSqlComments(schema));
 
 const residual = [];
 const staleOwners = [];

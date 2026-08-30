@@ -1263,7 +1263,7 @@ const GUARDS = [
     // Dropping the conflict-resolution clause from the pattern reproduces exactly that.
     what: "the turn-fence writer census recognises INSERT/UPDATE's OR conflict-clause forms",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: 'const CONFLICT = String.raw`(?:OR\\s+(?:ABORT|FAIL|IGNORE|REPLACE|ROLLBACK)\\s+)?`;',
+    find: "const CONFLICT = String.raw`(?:OR${WS}(?:ABORT|FAIL|IGNORE|REPLACE|ROLLBACK)${WS})?`;",
     replace: 'const CONFLICT = "";',
     killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
   },
@@ -1273,7 +1273,7 @@ const GUARDS = [
     // this census must name too, not only the `INSERT OR REPLACE` spelling of the same thing.
     what: "the turn-fence writer census recognises a bare REPLACE INTO write",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: "String.raw`|REPLACE\\s+INTO(?:\\s+${TABLE_REF})?` +",
+    find: "String.raw`|REPLACE${WS}INTO(?:${WS}${TABLE_REF})?` +",
     replace: "",
     killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
   },
@@ -1304,8 +1304,41 @@ const GUARDS = [
     // itself would fail the file for prose, not code.
     what: "the turn-fence writer census strips comments before scanning for writes",
     file: "scripts/verify-turn-fence-writer-census.mjs",
-    find: "  const content = stripComments(raw);",
-    replace: "  const content = raw;",
+    find: "  scanForWrites(file, stripComments(raw));",
+    replace: "  scanForWrites(file, raw);",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // Round 3, finding 1: SQLite treats a comment exactly like whitespace between two tokens
+    // (`INSERT/**/INTO` runs as an ordinary INSERT, confirmed against system SQLite), and the old
+    // `\s+` at every keyword boundary scored it zero. Reverting `WS` to bare whitespace reopens
+    // exactly that — a write is invisible again the moment a comment sits where the pattern
+    // required literal whitespace.
+    what: "the turn-fence writer census treats an SQL comment as whitespace at a keyword boundary",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: "const WS = String.raw`(?:\\s|${SQL_COMMENT})+`;",
+    replace: "const WS = String.raw`\\s+`;",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // Round 3, finding 2: `migrations.ts`'s `schemaDdl()` installs `schema.sql` whole into the real
+    // database, so a trigger body writing a governed table is exactly as live a writer as a `.ts`
+    // module — and the walk above only ever reads `.ts` files. Removing the schema.sql scan reopens
+    // a writer this census can never see no matter how long it sits in a trigger body.
+    what: "the turn-fence writer census also scans schema.sql, not just src/**.ts",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: 'scanForWrites("src/db/schema.sql", stripSqlComments(schema));',
+    replace: "",
+    killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
+  },
+  {
+    // schema.sql documents this ledger's past defects by quoting broken SQL verbatim in a trigger
+    // doc comment (`canonical_turns_settlement_authority`'s own comment above it). Scanning
+    // schema.sql without stripping its own comments first reads that prose as a live write.
+    what: "the turn-fence writer census strips schema.sql's own comments before scanning it",
+    file: "scripts/verify-turn-fence-writer-census.mjs",
+    find: 'scanForWrites("src/db/schema.sql", stripSqlComments(schema));',
+    replace: 'scanForWrites("src/db/schema.sql", schema);',
     killedBy: ["tests/process/the-turn-fence-writer-census-sees-a-new-writer.test.ts"],
   },
   {
