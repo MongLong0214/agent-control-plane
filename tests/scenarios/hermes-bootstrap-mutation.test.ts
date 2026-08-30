@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
   existsSync,
@@ -12,6 +12,8 @@ import {
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 
+import { digestOf } from "../../src/core/digest.ts";
+import { runHermesTargetBind } from "../../src/runtime/hermes-target-bind.ts";
 import { createHermesBootstrapAuthority } from "../../src/bootstrap/hermes-bootstrap.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { Role, roleKeyFor } from "../../src/domain/types.ts";
@@ -20,11 +22,32 @@ import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { bindCeo, makeHarness, type Harness } from "../helpers/harness.ts";
 
 vi.mock("node:fs", { spy: true });
+vi.mock("../../src/runtime/hermes-target-bind.ts", async (original) => ({
+  ...(await original<typeof import("../../src/runtime/hermes-target-bind.ts")>()),
+  runHermesTargetBind: vi.fn(),
+}));
 
 afterAll(cleanupTempDirs);
 
 const CEO_ROLE_KEY = roleKeyFor(Role.CEO);
 const BOOTSTRAP_SOCKET_NAME = "hermes.bootstrap.sock";
+const TARGET = {
+  hermesExecutable: "/opt/owner/hermes", hermesProfile: "owner-profile", hermesHome: "/opt/owner/home",
+  requestedSessionId: "hermes-owner-session", expectedLineageRootDigest: digestOf({ root: "owner" }),
+  executorRuntimeIdentity: "acp-runtime:owner",
+};
+const withTarget = (input: { command: readonly string[]; model?: string }) => ({ ...input, ...TARGET });
+
+beforeEach(() => {
+  vi.mocked(runHermesTargetBind).mockImplementation((input) => {
+    const receipt = {
+      domain: "hermes.target-bind" as const, version: 1 as const, actor_id: input.actorId,
+      binding_generation: input.bindingGeneration, executor_runtime_identity: input.executorRuntimeIdentity,
+      requested_session_id: input.sessionId, lineage_root_digest: input.expectedLineageRootDigest,
+    };
+    return { allowed: true, value: { ...receipt, receipt_digest: digestOf(receipt) } };
+  });
+});
 
 const VALID_RUNTIME = String.raw`
 const crypto = require("node:crypto");
@@ -149,6 +172,21 @@ const listenAt = (server: Server, path: string): Promise<void> =>
   });
 
 describe("Hermes bootstrap mutation-sensitive coverage", () => {
+  it("atomically records an exact target-bind v1 attestation for the new CEO assignment", async () => {
+    const harness = makeHarness();
+    const authority = createHermesBootstrapAuthority(harness.cp, bootstrapOptions(tempDir("hb-attest-")));
+    try {
+      const result = await authority.bootstrap(withTarget({ command: commandFor(VALID_RUNTIME) }));
+      expect(result.allowed).toBe(true);
+      const binding = harness.cp.db.get<{ actor_id: string; assignment_id: string; binding_generation: number }>(
+        "SELECT actor_id, assignment_id, binding_generation FROM assignments WHERE role_key = ?", [CEO_ROLE_KEY],
+      );
+      expect(harness.cp.db.get("SELECT target_binding_id FROM actor_target_bindings")).toBeDefined();
+      expect(harness.cp.db.get<{ protocol_version: string; assignment_id: string; binding_generation: number }>(
+        "SELECT protocol_version, assignment_id, binding_generation FROM actor_target_attestations",
+      )).toMatchObject({ protocol_version: "hermes.target-bind/v1", assignment_id: binding?.assignment_id, binding_generation: binding?.binding_generation });
+    } finally { await closeHarness(authority, harness); }
+  });
   it("racing real bootstrap attempts bind exactly one generation-1 CEO and explicitly refuse the loser", async () => {
     const harness = makeHarness();
     const stateDir = tempDir("acp-hermes-mutation-race-");
@@ -160,8 +198,8 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     try {
       const command = commandFor(VALID_RUNTIME);
       const decisions = await Promise.all([
-        authority.bootstrap({ command, model: "race-first" }),
-        authority.bootstrap({ command, model: "race-second" }),
+        authority.bootstrap(withTarget({ command, model: "race-first" })),
+        authority.bootstrap(withTarget({ command, model: "race-second" })),
       ]);
       const allowed = decisions.filter((decision) => decision.allowed);
       const refused = decisions.filter((decision) => !decision.allowed);
@@ -186,9 +224,9 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const bootstrap = authority.bootstrap({
+      const bootstrap = authority.bootstrap(withTarget({
         command: commandFor(GATED_RUNTIME, gatePath),
-      });
+      }));
       await waitForPath(join(stateDir, BOOTSTRAP_SOCKET_NAME), "bootstrap door after initial authority check");
 
       const competingSessionId = bindCeo(harness);
@@ -258,9 +296,9 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const resultPromise = authority.bootstrap({
+      const resultPromise = authority.bootstrap(withTarget({
         command: commandFor(MARKED_RUNTIME, launchedPath),
-      });
+      }));
       if (expectLaunched) await waitForPath(launchedPath, "Hermes runtime launch before lock loss");
       const result = await resultPromise;
 
@@ -328,9 +366,9 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const result = await authority.bootstrap({
+      const result = await authority.bootstrap(withTarget({
         command: commandFor(REPLAY_RUNTIME, replayPath),
-      });
+      }));
       await waitForPath(replayPath, "preconnected proof replay response");
       const replay = JSON.parse(readFileSync(replayPath, "utf8")) as {
         first: { ok: boolean };
@@ -367,7 +405,7 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const result = await authority.bootstrap({ command: commandFor(VALID_RUNTIME) });
+      const result = await authority.bootstrap(withTarget({ command: commandFor(VALID_RUNTIME) }));
 
       expect(result.allowed).toBe(false);
       expect(result.reasonCode).toBe(ReasonCode.SESSION_NOT_READY);
@@ -401,7 +439,7 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const result = await authority.bootstrap({ command: commandFor(VALID_RUNTIME) });
+      const result = await authority.bootstrap(withTarget({ command: commandFor(VALID_RUNTIME) }));
       const history = harness.cp.bindings.history(CEO_ROLE_KEY);
 
       expect(bind).toHaveBeenCalledTimes(1);
@@ -445,7 +483,7 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const result = await authority.bootstrap({ command: commandFor(VALID_RUNTIME) });
+      const result = await authority.bootstrap(withTarget({ command: commandFor(VALID_RUNTIME) }));
 
       expect(result.allowed).toBe(false);
       expect(result.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED);
@@ -476,7 +514,7 @@ describe("Hermes bootstrap mutation-sensitive coverage", () => {
     );
 
     try {
-      const result = await authority.bootstrap({ command: commandFor(VALID_RUNTIME) });
+      const result = await authority.bootstrap(withTarget({ command: commandFor(VALID_RUNTIME) }));
 
       expect(result.allowed).toBe(false);
       expect(result.reasonCode).toBe(ReasonCode.HERMES_BOOTSTRAP_RUNTIME_FAILED);
