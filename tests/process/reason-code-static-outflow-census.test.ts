@@ -73,11 +73,14 @@ it("every declared reason code has a reviewed static outflow disposition", () =>
 
 /** Catalogue metadata is scanned for undeclared members but cannot satisfy an outflow. */
 it("catalogue metadata references are declared", () => {
+  const production = census();
   const result = fixtureCensus(
     "export const produce = () => ReasonCode.X;\n",
     "export const metadata = new Set([ReasonCode.NOT_DECLARED]);\n",
   );
 
+  expect(production.problems).toEqual([]);
+  expect(production.exitCode).toBe(0);
   expect(result.problems).toContain(
     "src/** references an undeclared ReasonCode member: NOT_DECLARED (src/core/reason-codes.ts:4)",
   );
