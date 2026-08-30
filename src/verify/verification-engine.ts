@@ -451,7 +451,10 @@ export class VerificationEngine {
         pinned.pinned_run_scoped_commands_digest === null ||
         pinned.pinned_run_scoped_commands_json === null
       ) {
-        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run-scoped verification contract was not durably pinned", {
+        // #448: this guarded write just ran (or found a pin already there) and the row still
+        // shows nothing durable. There is no persisted contract here to compare the candidate
+        // against — absent, not disagreeing.
+        return deny(ReasonCode.CONTRACT_UNVERIFIED, "run-scoped verification contract was not durably pinned", {
           runId,
         });
       }
@@ -461,20 +464,25 @@ export class VerificationEngine {
         const decoded: unknown = JSON.parse(pinned.pinned_run_scoped_commands_json);
         const parsedPersisted = verificationCommandSchema.array().safeParse(decoded);
         if (!parsedPersisted.success) {
-          return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "stored run-scoped verification contract is malformed", {
+          // #448: malformed, same as an absent pin — nothing valid was produced to compare.
+          return deny(ReasonCode.CONTRACT_UNVERIFIED, "stored run-scoped verification contract is malformed", {
             runId,
           });
         }
         persisted = parsedPersisted.data;
       } catch {
-        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "stored run-scoped verification contract is malformed", {
+        return deny(ReasonCode.CONTRACT_UNVERIFIED, "stored run-scoped verification contract is malformed", {
           runId,
         });
       }
 
       const persistedDigest = digestOf(persisted);
       if (persistedDigest !== pinned.pinned_run_scoped_commands_digest) {
-        return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "stored run-scoped verification contract digest is invalid", {
+        // #448: this is the persisted record failing its own self-check — its content does not
+        // hash to the digest it was stored under — not the candidate's commands disagreeing
+        // with anything. The candidate-vs-pin comparison is the one below, once a trustworthy
+        // pin is actually in hand.
+        return deny(ReasonCode.CONTRACT_UNVERIFIED, "stored run-scoped verification contract digest is invalid", {
           runId,
           stored: pinned.pinned_run_scoped_commands_digest,
           calculated: persistedDigest,

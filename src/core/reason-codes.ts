@@ -47,9 +47,13 @@ export const ReasonCode = {
   CONTRACT_DIGEST_MISMATCH: "CONTRACT_DIGEST_MISMATCH",
   /**
    * The pinned contract could not be produced to compare at all — the manifest is not
-   * retrievable, or the run-scoped pin is absent/malformed. #448: an unreadable record is
-   * not a verdict that it disagrees; folding "unknown" into "mismatch" told a caller a
-   * comparison happened and disagreed, when no comparison ever took place.
+   * retrievable, the run-scoped pin is absent/malformed, a stored record's own digest does
+   * not match its content, or a lookup meant to resolve to exactly one contract could not.
+   * #448: an unreadable record is not a verdict that it disagrees; folding "unknown" into
+   * "mismatch" told a caller a comparison happened and disagreed, when no comparison ever
+   * took place. This holds at every entry point that reaches this state — preparing a PR,
+   * post-CEO-approval finalization, and the CI-trust path alike — not only the first one
+   * that was fixed.
    */
   CONTRACT_UNVERIFIED: "CONTRACT_UNVERIFIED",
   CANDIDATE_CANNOT_WEAKEN_CONTRACT: "CANDIDATE_CANNOT_WEAKEN_CONTRACT",
