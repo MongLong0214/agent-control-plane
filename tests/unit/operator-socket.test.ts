@@ -250,6 +250,59 @@ describe("authenticated operator socket (#393/#405)", () => {
     }
   });
 
+  it("requires all owner-authenticated Hermes target selectors before the runtime command", async () => {
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const request = vi.fn(async () => ({
+      allowed: true as const,
+      reasonCode: ReasonCode.OK,
+      evidence: {},
+      value: {},
+    }));
+    const client = { request };
+    const digest = "a".repeat(64);
+    const selectors = [
+      "--target-bind-executable", "/opt/owner/hermes",
+      "--hermes-profile", "owner-profile",
+      "--hermes-home", "/opt/owner/home",
+      "--requested-session-id", "hermes-owner-session",
+      "--expected-lineage-root-digest", digest,
+      "--executor-runtime-identity", "acp-runtime:owner",
+    ];
+    try {
+      expect(await dispatch(client, "bootstrap", ["hermes", ...selectors, "--", "node", "runtime.js"], true)).toBe(0);
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(request.mock.calls[0]?.slice(0, 2)).toEqual([
+        "bootstrap.hermes",
+        {
+          command: ["node", "runtime.js"],
+          hermesExecutable: "/opt/owner/hermes",
+          hermesProfile: "owner-profile",
+          hermesHome: "/opt/owner/home",
+          requestedSessionId: "hermes-owner-session",
+          expectedLineageRootDigest: digest,
+          executorRuntimeIdentity: "acp-runtime:owner",
+        },
+      ]);
+
+      for (const args of [
+        ["hermes", ...selectors.slice(0, -2), "--", "node", "runtime.js"],
+        ["hermes", ...selectors, "--hermes-profile", "duplicate", "--", "node", "runtime.js"],
+        ["hermes", ...selectors, "--unknown-selector", "unknown", "--", "node", "runtime.js"],
+        ["hermes", "--target-bind-executable", "/opt/owner/hermes", "--hermes-profile", "owner-profile", "--hermes-home", "", "--requested-session-id", "hermes-owner-session", "--expected-lineage-root-digest", digest, "--executor-runtime-identity", "acp-runtime:owner", "--", "node", "runtime.js"],
+        ["hermes", ...selectors, "node", "runtime.js"],
+        ["hermes", ...selectors, "--"],
+      ]) {
+        request.mockClear();
+        expect(await dispatch(client, "bootstrap", args, true)).toBe(2);
+        expect(request).not.toHaveBeenCalled();
+      }
+    } finally {
+      stdout.mockRestore();
+      stderr.mockRestore();
+    }
+  });
+
   it("maps actor register, list, and unregister commands onto the daemon operator methods", async () => {
     const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const request = vi.fn(async () => ({
