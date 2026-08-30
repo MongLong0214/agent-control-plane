@@ -113,7 +113,8 @@ const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, provide
  *
  * One entry per live session bound to a channel, not one per distinct channel (#710): the watch
  * keys its state on `sessionId`, and two sessions sharing a channel need two independent
- * measurements, not one shared between them.
+ * measurements, not one shared between them. The daemon submits one freshly resolved entry at a
+ * time so a slow earlier read cannot leave a later session carrying a stale channel snapshot.
  */
 export interface BuzzChannelTrafficTicker {
   tick(targets: readonly { sessionId: string; channelId: string }[]): Promise<void>;
@@ -1415,8 +1416,8 @@ export class Daemon {
       this.#timers.push(delivery);
     }
 
-    // #674 — measures raw channel traffic, never classification or delivery: one
-    // `messages get --since` per live session's channel.
+    // #674 — measures first-observed raw channel event ids, never classification or delivery:
+    // one `messages get --since` per live session's channel.
     //
     // One target per live session (#710), not per distinct channel: deduping by channel here —
     // the previous shape — was exactly the bug a blind review found, because it fed the watch a
@@ -1430,11 +1431,20 @@ export class Daemon {
           const targets = this.cp.sessions
             .live()
             .flatMap((session) =>
-              session.buzzAddress !== null
-                ? [{ sessionId: session.sessionId, channelId: session.buzzAddress }]
-                : [],
+              session.buzzAddress === null
+                ? []
+                : [{ sessionId: session.sessionId, channelId: session.buzzAddress }],
             );
-          await this.options.channelTrafficWatch!.tick(targets);
+          for (const target of targets) {
+            // Resolve both liveness and channel immediately before this session's read. Taking all
+            // channels in one snapshot let a slow first CLI call carry a later session's old
+            // address past a completed reconnect and bind the watch back to that stale target.
+            const current = this.cp.sessions.live().find((session) => session.sessionId === target.sessionId);
+            if (!current?.buzzAddress) continue;
+            await this.options.channelTrafficWatch!.tick([
+              { sessionId: target.sessionId, channelId: current.buzzAddress },
+            ]);
+          }
         });
       }, channelTrafficMs);
       channelTrafficWatch.unref();

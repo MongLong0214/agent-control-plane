@@ -1180,8 +1180,9 @@ CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE s
 -- ---------------------------------------------------------------------------
 -- buzz_channel_traffic_watch (v34, #674; per-session after #710)
 --   The latest raw-channel window read by the independent daemon watch. A complete tick advances
---   the baseline; reconnect and session-poller processing do not. The Buzz CLI surface exposes no
---   mention classification, needs_action, or canonical-turn delivery state.
+--   the baseline and durably remembers every event id seen on this channel route; reconnect and
+--   session-poller processing do not. The Buzz CLI surface exposes no mention classification,
+--   needs_action, or canonical-turn delivery state.
 --
 --   Keyed on `session_id`, not `channel_id`: #710 found production sessions can share one
 --   `ACP_BUZZ_CHANNEL`. `channel_id` remains the address each independent measurement reads.
@@ -1191,13 +1192,14 @@ CREATE TABLE IF NOT EXISTS buzz_channel_traffic_watch (
   channel_id        TEXT NOT NULL,
   -- An opaque CAS token prevents an old-channel read overwriting a newer binding.
   cursor_generation TEXT NOT NULL,
-  -- End of the last complete check. Reads overlap its whole second and ids disambiguate it.
+  -- End of the last complete check. The local clock selects the next overlapping CLI fetch.
   baseline_at       INTEGER,
-  baseline_event_ids TEXT NOT NULL DEFAULT '[]',
+  -- Deduplication identity across completed reads; cleared atomically with a real channel-route change.
+  seen_event_ids     TEXT NOT NULL DEFAULT '[]',
   window_started_at INTEGER,
   window_ended_at   INTEGER,
   observed_count    INTEGER NOT NULL DEFAULT 0,
-  -- A capped source result is incomplete even when boundary filtering confirms zero new ids.
+  -- A capped source result is incomplete even when identity filtering confirms zero new ids.
   window_incomplete INTEGER NOT NULL DEFAULT 0,
   last_attempt_at   TEXT,
   -- Set before the async CLI read and cleared by either terminal outcome; survives a process death.

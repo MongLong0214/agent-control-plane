@@ -28,8 +28,8 @@ export interface BuzzChannelTrafficWatchRow {
   cursorGeneration: string;
   /** End of the last complete watch check and start of the next window, in epoch milliseconds. */
   baselineAt: number | null;
-  /** Event ids already observed in `baselineAt`'s whole-second relay timestamp. */
-  baselineEventIds: readonly string[];
+  /** Event ids observed by completed reads since this session acquired this channel route. */
+  seenEventIds: readonly string[];
   windowStartedAt: number | null;
   windowEndedAt: number | null;
   observedCount: number;
@@ -49,29 +49,23 @@ const MAX_MESSAGES_PER_CHECK = 200;
 const OVERFETCH_LIMIT = MAX_MESSAGES_PER_CHECK + 1;
 
 /**
- * Buzz accepts an exclusive whole-second cursor. Overlap one second and remove boundary events by
- * id so an event later in the same epoch second is not lost.
+ * Buzz accepts an exclusive whole-second cursor. Overlap one second so a newly returned event with
+ * a sender timestamp tied to the local baseline remains visible; durable ids remove replays.
  */
 const inclusiveSince = (baselineAt: number): number =>
   Math.max(0, Math.floor(baselineAt / 1000) - 1);
 
-/** Relay order is not a cursor and a repeated event is still one event. */
+/** Relay order and relay timestamps are not identity; a repeated event id is still one event. */
 const uniqueByEventId = (messages: readonly BuzzCliMessage[]): BuzzCliMessage[] => {
   const unique = new Map<string, BuzzCliMessage>();
   for (const message of messages) {
-    const present = unique.get(message.id);
-    if (!present || message.created_at > present.created_at) unique.set(message.id, message);
+    if (!unique.has(message.id)) unique.set(message.id, message);
   }
   return [...unique.values()];
 };
 
-const boundaryEventIds = (messages: readonly BuzzCliMessage[], boundaryAt: number): string[] => {
-  const boundarySecond = Math.floor(boundaryAt / 1000);
-  return uniqueByEventId(messages)
-    .filter((message) => message.created_at === boundarySecond)
-    .map((message) => message.id)
-    .sort();
-};
+const eventIds = (messages: readonly BuzzCliMessage[]): string[] =>
+  uniqueByEventId(messages).map((message) => message.id).sort();
 
 const safeErrorMessage = (err: unknown): string => {
   const message = err instanceof Error ? err.message : String(err);
@@ -79,17 +73,19 @@ const safeErrorMessage = (err: unknown): string => {
 };
 
 /**
- * Records raw Buzz channel traffic between completed watch checks.
+ * Records raw Buzz event ids first observed between completed watch checks.
  *
  * Lifecycle:
  *
  * - `bindChannel` establishes scope. Repeating an identical binding is a no-op, so reconnect
  *   cannot erase evidence. A real channel change clears the old channel's measurement
  *   and mints a generation because that evidence does not describe the new channel.
- * - The first successful, uncapped tick establishes a baseline but reports no historical traffic.
- * - Every later successful, uncapped tick records one completed window and advances the baseline
- *   to the read's completion time. This independent watch tick is the only ordinary advance;
- *   session poller processing is not exposed to this class and cannot be inferred here.
+ * - The first successful, uncapped tick establishes a baseline and seeds its returned event ids but
+ *   reports no historical traffic.
+ * - Every later successful, uncapped tick counts ids absent from every earlier completed read on
+ *   this channel route, stores those ids durably, and advances the baseline to the read's local
+ *   completion time. Relay timestamps only select the CLI fetch range; future, tied, or overlapping
+ *   timestamps cannot make an already-seen id new again.
  * - A failed or capped read does not advance. Doctor reports unavailable or incomplete instead of
  *   treating the preserved boundary as a verified zero.
  * - If the process dies during the CLI read, the attempt timestamp remains without a completed
@@ -118,7 +114,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
        ON CONFLICT(session_id) DO UPDATE SET
          channel_id = excluded.channel_id,
          cursor_generation = excluded.cursor_generation,
-         baseline_at = NULL, baseline_event_ids = '[]',
+         baseline_at = NULL, seen_event_ids = '[]',
          window_started_at = NULL, window_ended_at = NULL,
          observed_count = 0, window_incomplete = 0,
          last_attempt_at = NULL, attempt_in_progress = 0, last_read_success_at = NULL,
@@ -174,7 +170,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
       const incomplete = messages.length >= OVERFETCH_LIMIT;
       this.db.run(
         `UPDATE buzz_channel_traffic_watch
-            SET baseline_at = ?, baseline_event_ids = ?,
+            SET baseline_at = ?, seen_event_ids = ?,
                 window_started_at = NULL, window_ended_at = ?,
                 observed_count = 0, window_incomplete = ?,
                 attempt_in_progress = 0, last_read_success_at = ?,
@@ -182,7 +178,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
           WHERE session_id = ? AND cursor_generation = ?`,
         [
           incomplete ? null : completedAt,
-          JSON.stringify(incomplete ? [] : boundaryEventIds(messages, completedAt)),
+          JSON.stringify(incomplete ? [] : eventIds(messages)),
           completedAt,
           incomplete ? 1 : 0,
           readSucceededAt,
@@ -215,18 +211,16 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
       const completedAt = this.clock.now().getTime();
       const readSucceededAt = this.clock.nowIso();
       const incomplete = messages.length >= OVERFETCH_LIMIT;
-      const presentAtBoundary = new Set(existing.baselineEventIds);
-      const baselineSecond = Math.floor(baselineAt / 1000);
+      const seenEventIds = new Set(existing.seenEventIds);
       const uniqueMessages = uniqueByEventId(messages);
-      const observed = uniqueMessages.filter(
-        (message) =>
-          message.created_at > baselineSecond ||
-          (message.created_at === baselineSecond && !presentAtBoundary.has(message.id)),
-      );
+      const observed = uniqueMessages.filter((message) => !seenEventIds.has(message.id));
+      const completedSeenEventIds = [
+        ...new Set([...seenEventIds, ...uniqueMessages.map((message) => message.id)]),
+      ].sort();
 
       this.db.run(
         `UPDATE buzz_channel_traffic_watch
-            SET baseline_at = ?, baseline_event_ids = ?,
+            SET baseline_at = ?, seen_event_ids = ?,
                 window_started_at = ?, window_ended_at = ?,
                 observed_count = ?, window_incomplete = ?,
                 attempt_in_progress = 0, last_read_success_at = ?,
@@ -234,7 +228,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
           WHERE session_id = ? AND cursor_generation = ?`,
         [
           incomplete ? baselineAt : completedAt,
-          JSON.stringify(incomplete ? existing.baselineEventIds : boundaryEventIds(uniqueMessages, completedAt)),
+          JSON.stringify(incomplete ? existing.seenEventIds : completedSeenEventIds),
           baselineAt,
           completedAt,
           observed.length,
@@ -269,7 +263,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
       channel_id: string;
       cursor_generation: string;
       baseline_at: number | null;
-      baseline_event_ids: string;
+      seen_event_ids: string;
       window_started_at: number | null;
       window_ended_at: number | null;
       observed_count: number;
@@ -286,7 +280,7 @@ export class BuzzChannelTrafficWatch implements ChannelTrafficBindingObserver {
       channelId: row.channel_id,
       cursorGeneration: row.cursor_generation,
       baselineAt: row.baseline_at,
-      baselineEventIds: JSON.parse(row.baseline_event_ids) as string[],
+      seenEventIds: JSON.parse(row.seen_event_ids) as string[],
       windowStartedAt: row.window_started_at,
       windowEndedAt: row.window_ended_at,
       observedCount: row.observed_count,

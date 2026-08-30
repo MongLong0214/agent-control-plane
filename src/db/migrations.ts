@@ -2206,8 +2206,9 @@ const v32: SchemaMigration = {
 
 /**
  * #674 — durable, per-session results for raw Buzz channel reads. The CLI surface can verify
- * channel traffic and read availability; it cannot expose mention classification, `needs_action`,
- * or canonical-turn delivery, so the table does not name or model those stronger states.
+ * event ids first observed by completed reads and read availability; it cannot expose mention
+ * classification, `needs_action`, or canonical-turn delivery, so the table does not name or model
+ * those stronger states.
  *
  * Keyed on `session_id` rather than `channel_id` (#710): production sessions can share one
  * `ACP_BUZZ_CHANNEL`, while each daemon target still owns an independent measurement window.
@@ -2223,7 +2224,7 @@ const v34: SchemaMigration = {
         channel_id        TEXT NOT NULL,
         cursor_generation TEXT NOT NULL,
         baseline_at       INTEGER,
-        baseline_event_ids TEXT NOT NULL DEFAULT '[]',
+        seen_event_ids     TEXT NOT NULL DEFAULT '[]',
         window_started_at INTEGER,
         window_ended_at   INTEGER,
         observed_count    INTEGER NOT NULL DEFAULT 0,

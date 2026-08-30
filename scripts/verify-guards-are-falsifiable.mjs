@@ -500,7 +500,7 @@ const GUARDS = [
     find: "  Math.max(0, Math.floor(baselineAt / 1000) - 1);",
     replace: "  Math.max(0, Math.floor(baselineAt / 1000));",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an event after the baseline in the same epoch second reaches Doctor through the daemon watch",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an unseen event stamped before the local baseline is counted when the relay returns it",
     ],
   },
   {
@@ -509,16 +509,25 @@ const GUARDS = [
     find: "      const uniqueMessages = uniqueByEventId(messages);",
     replace: "      const uniqueMessages = messages;",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::event ids make repeated and out of order relay rows one count each",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::event ids count tied and repeated relay rows once each",
     ],
   },
   {
-    what: "the buzz baseline second excludes event ids already present when the window started",
+    what: "the buzz baseline seeds event ids already present when the window starts",
     file: "src/buzz/channel-traffic-watch.ts",
-    find: "      const presentAtBoundary = new Set(existing.baselineEventIds);",
-    replace: "      const presentAtBoundary = new Set<string>();",
+    find: "          JSON.stringify(incomplete ? [] : eventIds(messages)),",
+    replace: "          JSON.stringify([]),",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::the baseline second excludes event ids already present when the window started",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::event ids present at baseline are not first observed in the next window",
+    ],
+  },
+  {
+    what: "a buzz event id seen in one completed window is not counted in the next window",
+    file: "src/buzz/channel-traffic-watch.ts",
+    find: "      const observed = uniqueMessages.filter((message) => !seenEventIds.has(message.id));",
+    replace: "      const observed = uniqueMessages;",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a future dated event is counted once across two consecutive windows",
     ],
   },
   {
@@ -573,20 +582,20 @@ const GUARDS = [
     find: "          incomplete ? baselineAt : completedAt,",
     replace: "          baselineAt,",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a complete watch check advances the raw traffic window",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a complete watch check advances the raw event identity window",
     ],
   },
   {
-    what: "a capped buzz channel read stays incomplete even when boundary filtering confirms zero rows",
+    what: "a capped buzz channel read stays incomplete even when identity filtering confirms zero rows",
     file: "src/buzz/channel-traffic-watch.ts",
     find:
       "      const incomplete = messages.length >= OVERFETCH_LIMIT;\n" +
-      "      const presentAtBoundary = new Set(existing.baselineEventIds);",
+      "      const seenEventIds = new Set(existing.seenEventIds);",
     replace:
       "      const incomplete = false;\n" +
-      "      const presentAtBoundary = new Set(existing.baselineEventIds);",
+      "      const seenEventIds = new Set(existing.seenEventIds);",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a capped read cannot become healthy silence after boundary filtering",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a capped read cannot become healthy silence after identity filtering",
     ],
   },
   {
@@ -596,6 +605,15 @@ const GUARDS = [
     replace: "    if (false) return;",
     killedBy: [
       "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::reconnecting to the same channel preserves the completed measurement",
+    ],
+  },
+  {
+    what: "a daemon channel-traffic target is refreshed after an earlier session read completes",
+    file: "src/daemon/daemon.ts",
+    find: "              { sessionId: target.sessionId, channelId: current.buzzAddress },",
+    replace: "              { sessionId: target.sessionId, channelId: target.channelId },",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a stale target snapshot cannot restore an earlier channel",
     ],
   },
   {

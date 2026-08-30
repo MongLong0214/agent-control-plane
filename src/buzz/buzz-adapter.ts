@@ -89,8 +89,10 @@ const asChannelList = (value: unknown, what: string): BuzzCliChannel[] => {
 
 /**
  * A watch result is only a measurement when every row carries the event identity and relay
- * timestamp the cursor compares. A cast here used to turn `[{}]` into a successful empty window:
- * `undefined` fell out during the boundary filter and Doctor recorded a verified zero.
+ * timestamp needed by the CLI fetch contract. `created_at` is sender-controlled and only scopes
+ * the next overlapping read; the watch never uses it to decide whether a returned id is new. A
+ * cast here used to turn `[{}]` into a successful empty window: `undefined` fell out during the
+ * boundary filter and Doctor recorded a verified zero.
  */
 const asMessageList = (value: unknown, what: string): BuzzCliMessage[] => {
   if (!Array.isArray(value)) throw new Error(`buzz ${what} did not return a list of messages`);

@@ -447,20 +447,23 @@ export class Doctor {
   }
 
   /**
-   * #674 — reports exactly the independent CLI measurement available here: raw Buzz channel
-   * traffic between completed watch checks. This method only reads
+   * #674 — reports exactly the independent CLI measurement available here: raw Buzz event ids
+   * first observed between completed watch checks. This method only reads
    * `buzz_channel_traffic_watch`; the watch owns every write.
    *
    * A successful complete check always emits INFO, including a measured zero. The evidence says
-   * on every outcome that mention classification, `needs_action`, and canonical-turn delivery are
-   * unmeasured by this CLI surface. A message can therefore be present in the raw feed while the
-   * CEO incident remains invisible; closing that remainder requires relay-side telemetry on #674.
+   * on every outcome that events excluded by the relay's timestamp cursor, mention classification,
+   * `needs_action`, and canonical-turn delivery are unmeasured by this CLI surface. A message can
+   * therefore be present in the raw feed while the CEO incident remains invisible; closing that
+   * remainder requires relay-side telemetry on #674.
    */
   private checkBuzzChannelTraffic(sessionId: string | null): Finding[] {
     const findings: Finding[] = [];
     const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.live();
     const measurementBoundary = {
-      measurementScope: "RAW_CHANNEL_TRAFFIC_BETWEEN_COMPLETED_WATCH_CHECKS",
+      measurementScope: "RAW_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_WATCH_CHECKS",
+      eventIdentity: "BUZZ_EVENT_ID",
+      sourceBlindSpot: "EVENTS_EXCLUDED_BY_RELAY_SINCE_TIMESTAMP_ARE_UNMEASURED",
       unmeasured: "MENTION_CLASSIFICATION_NEEDS_ACTION_AND_CANONICAL_TURN_DELIVERY",
       remainder: "ISSUE_674_REQUIRES_RELAY_SIDE_TELEMETRY",
     } as const;
@@ -550,7 +553,7 @@ export class Doctor {
             sessionId: session.sessionId,
             channel,
             ...measurementBoundary,
-            confirmedRawChannelMessages: row.observed_count,
+            confirmedFirstObservedRawChannelEventIds: row.observed_count,
             windowStartedAt: row.window_started_at === null
               ? null
               : new Date(row.window_started_at).toISOString(),
@@ -588,7 +591,7 @@ export class Doctor {
       }
 
       findings.push({
-        code: "BUZZ_CHANNEL_TRAFFIC_BETWEEN_COMPLETED_CHECKS",
+        code: "BUZZ_CHANNEL_EVENT_IDS_FIRST_OBSERVED_BETWEEN_COMPLETED_CHECKS",
         severity: "INFO",
         scope: `session:${session.sessionId}`,
         blocking: false,
@@ -597,7 +600,7 @@ export class Doctor {
           sessionId: session.sessionId,
           channel,
           ...measurementBoundary,
-          rawChannelMessagesBetweenCompletedChecks: row.observed_count,
+          rawChannelEventIdsFirstObservedBetweenCompletedChecks: row.observed_count,
           windowStartedAt: row.window_started_at === null
             ? null
             : new Date(row.window_started_at).toISOString(),
@@ -607,7 +610,7 @@ export class Doctor {
           lastReadSuccessAt: row.last_read_success_at,
         },
         recommendedAction:
-          "raw channel traffic alone implies no health action; arrived-but-unclassified or undelivered messages require relay-side telemetry under #674",
+          "first-observed raw channel event ids alone imply no health action; arrived-but-unclassified or undelivered messages require relay-side telemetry under #674",
       });
     }
     return findings;
