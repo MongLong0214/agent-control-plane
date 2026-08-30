@@ -14,7 +14,7 @@ import {
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
-import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
+import { ContinuityMode, Role, type RoleBinding, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
 import type { ProviderRegistry } from "../runtime/provider.ts";
 import type { RunEngine } from "../run/run-engine.ts";
@@ -368,15 +368,6 @@ export class ContinuityKernel {
       });
     }
 
-    const outgoingRuntime = current ? this.sessions.get(current.sessionId) : null;
-    const incomingRuntime = this.sessions.get(provisioned.value.sessionId);
-    const sameProviderReplacement =
-      outgoingRuntime !== null &&
-      incomingRuntime !== null &&
-      outgoingRuntime !== undefined &&
-      incomingRuntime !== undefined &&
-      outgoingRuntime.provider === incomingRuntime.provider;
-
     const switched = this.bindings.switchTo({
       roleKey,
       role,
@@ -386,13 +377,10 @@ export class ContinuityKernel {
       taskId: scope.taskId ?? null,
       mode: assignment.reason === "preferred" ? "PREFERRED" : "FALLBACK",
       reason: `continuity failover: ${reason}`,
-      // #493 — a conversation survives its runtime restarting, not its provider changing. What a
-      // conversational actor accumulates cannot be carried to another provider, so a Claude
-      // counterpart replaced by GPT is a different counterpart however similar its role; only a
-      // same-provider replacement is the same actor continuing on a new runtime. The PRD
-      // scenarios say this directly — P0-06 expects a GPT-bound CEO to be replaced by a
-      // *fresh Claude generation*.
-      conversation: sameProviderReplacement ? "SURVIVED" : "REPLACED",
+      // A conversation survives only when its active actor, binding generation, target binding,
+      // and attestation still name one exact current runtime tuple. Provider identity neither
+      // substitutes for that proof nor defeats it.
+      conversation: this.hasExactCurrentTargetAttestation(current) ? "SURVIVED" : "REPLACED",
       // The synchronous check above gives a useful early refusal, while this fence makes
       // the final revoke-and-rebind atomic with the generation that plan observed.
       expectedCurrentGeneration: expected?.bindingGeneration,
@@ -475,13 +463,10 @@ export class ContinuityKernel {
         taskId: current.taskId,
         mode: "PREFERRED",
         reason: "continuity restoration",
-        // #493 — restoration moves a role back to its preferred provider, so by definition the
-        // provider changes and the counterpart is a new one. Same rule as the failover path
-        // above, and here it always resolves the same way.
-        conversation:
-          session && this.sessions.get(provisioned.value.sessionId)?.provider === session.provider
-            ? "SURVIVED"
-            : "REPLACED",
+        // Restoration uses the same exact outgoing actor proof as failover; a provider is not
+        // evidence of continuity in either direction.
+        conversation: this.hasExactCurrentTargetAttestation(current) ? "SURVIVED" : "REPLACED",
+        expectedCurrentGeneration: current.bindingGeneration,
       });
       if (!switched.allowed) {
         this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "restoration rejected");
@@ -526,6 +511,38 @@ export class ContinuityKernel {
       );
     }
     return allow(ReasonCode.OK, undefined);
+  }
+
+  private hasExactCurrentTargetAttestation(binding: RoleBinding | null): boolean {
+    if (!binding) return false;
+    const proof = this.db.get<{ matched: number }>(
+      `SELECT EXISTS (
+         SELECT 1
+           FROM assignments AS assignment
+           JOIN conversational_actors AS actor
+             ON actor.actor_id = assignment.actor_id
+           JOIN actor_target_bindings AS target
+             ON target.target_actor_id = actor.actor_id
+           JOIN actor_target_attestations AS attestation
+             ON attestation.target_binding_id = target.target_binding_id
+          WHERE assignment.assignment_id = ?
+            AND assignment.status = 'ACTIVE'
+            AND assignment.binding_generation = ?
+            AND actor.current_session_id = ?
+            AND actor.current_session_incarnation = ?
+            AND attestation.assignment_id = assignment.assignment_id
+            AND attestation.binding_generation = assignment.binding_generation
+            AND attestation.executor_session_id = actor.current_session_id
+            AND attestation.executor_session_incarnation = actor.current_session_incarnation
+       ) AS matched`,
+      [
+        binding.assignmentId,
+        binding.bindingGeneration,
+        binding.sessionId,
+        binding.sessionIncarnation,
+      ],
+    );
+    return proof?.matched === 1;
   }
 
   private requiredRoles(): RequiredRole[] {

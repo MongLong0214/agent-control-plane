@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import { join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
@@ -9,6 +11,7 @@ import { ControlPlane } from "../../src/app/control-plane.ts";
 import { AGENTCTL_CAPACITY_OBSERVATION_SOURCE, RefreshTrigger } from "../../src/capacity/capacity-monitor.ts";
 import { ContinuityMode, Role, SessionLifecycle, roleKeyFor } from "../../src/domain/types.ts";
 import { ContinuityKernel } from "../../src/continuity/continuity-kernel.ts";
+import type { AuthenticatedTargetTuple } from "../../src/session/binding-registry.ts";
 import type {
   CapacityReading,
   InvocationRequest,
@@ -90,6 +93,47 @@ const reading = (
 });
 
 const FULL = ["ceo", "cto", "blind-review", "worker"];
+
+const authenticatedTarget = () => {
+  const claimed = {
+    executorKind: "hermes",
+    targetLocator: "target:continuity-hardening-ceo",
+    targetLocatorDigest: `sha256:${"c".repeat(64)}`,
+  };
+  let verified: AuthenticatedTargetTuple | undefined;
+  return {
+    claimed,
+    protocolVersion: "hermes.target-bind/v1",
+    get attestationDigest() {
+      if (!verified) throw new Error("attestation digest read before tuple verification");
+      const tuple = [
+        verified.actorId,
+        String(verified.generation),
+        verified.assignmentId,
+        verified.sessionId,
+        verified.incarnation,
+      ].join("\u0000");
+      return `sha256:${createHash("sha256").update(tuple).digest("hex")}`;
+    },
+    verify: (tuple: AuthenticatedTargetTuple) => {
+      verified = tuple;
+      return claimed;
+    },
+  };
+};
+
+const bindCeoSessionWithTarget = (plane: ReturnType<typeof makePlane>, attest = true) => {
+  const session = plane.cp.sessions.create({ provider: "gpt", model: "gpt-5.6-sol" });
+  plane.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
+  const bound = plane.cp.bindings.bind({
+    roleKey: roleKeyFor(Role.CEO),
+    role: Role.CEO,
+    sessionId: session.sessionId,
+    ...(attest ? { authenticatedTarget: authenticatedTarget() } : {}),
+  });
+  if (!bound.allowed) throw new Error(bound.message);
+  return bound.value;
+};
 
 describe("capacity routability (§14.3 — no UNKNOWN routing)", () => {
   it("a bucket with no remaining percentage is not routable and does not staff a role", async () => {
@@ -439,5 +483,94 @@ describe("failover produces a routable session (§15.7)", () => {
       `UPDATE sessions SET workdir = ? WHERE session_id = ?`,
       [join(plane.root, "another-runtime"), provisioned.sessionId],
     )).toThrow("SESSION_WORKDIR_IMMUTABLE");
+  });
+});
+
+
+describe("attested continuity survival (#649 S2)", () => {
+  const attach = (plane: ReturnType<typeof makePlane>) => {
+    plane.cp.continuity.attach({
+      readiness: { checkSession: async () => allow(ReasonCode.OK, undefined) },
+      buzz: { connect: async (sessionId: string) => allow(ReasonCode.OK, `buzz:${sessionId}`) },
+    });
+  };
+
+  it("survives a provider-changing failover only with an exact current attestation", async () => {
+    const plane = makePlane();
+    const before = bindCeoSessionWithTarget(plane);
+    plane.gpt.setCapacity(reading("gpt", plane.clock, [{ id: "rolling", remainingPercent: 0, resetAt: null, capabilities: FULL }]));
+    plane.claude.setCapacity(reading("claude", plane.clock, [{ id: "rolling", remainingPercent: 90, resetAt: null, capabilities: FULL }]));
+    attach(plane);
+
+    const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, "attested provider change");
+    expect(decision.allowed).toBe(true);
+    expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration).toBe(before.bindingGeneration);
+  });
+
+  it("replaces same-provider failover when attestation is absent or any exact tuple denominator is stale", async () => {
+    const corruptions: Array<[string, "executor_session_id" | "executor_session_incarnation" | "binding_generation" | "assignment_id", string | number]> = [
+      ["stale session", "executor_session_id", "stale-session"],
+      ["stale incarnation", "executor_session_incarnation", "stale-incarnation"],
+      ["stale generation", "binding_generation", 2],
+      ["wrong assignment", "assignment_id", "stale-assignment"],
+    ];
+    for (const [name, column, value] of [["absent", null, null] as const, ...corruptions]) {
+      const plane = makePlane();
+      const before = bindCeoSessionWithTarget(plane, column !== null);
+      if (column !== null) {
+        // The production facade permits DML only. A second test-only connection models a stale
+        // persisted row that current write-time guards would otherwise reject.
+        const foreign = new Database(join(plane.root, "state.sqlite"));
+        try {
+          foreign.exec(`
+            DROP TRIGGER IF EXISTS actor_target_attestations_append_only;
+            DROP TRIGGER IF EXISTS attestation_generation_matches_assignment;
+            PRAGMA foreign_keys = OFF;
+          `);
+          foreign.prepare(`UPDATE actor_target_attestations SET ${column} = ? WHERE assignment_id = ?`)
+            .run(value, before.assignmentId);
+        } finally {
+          foreign.close();
+        }
+      }
+      plane.gpt.setCapacity(reading("gpt", plane.clock, [{ id: "rolling", remainingPercent: 90, resetAt: null, capabilities: FULL }]));
+      plane.claude.setCapacity(reading("claude", plane.clock, [{ id: "rolling", remainingPercent: 0, resetAt: null, capabilities: FULL }]));
+      attach(plane);
+
+      const decision = await plane.cp.continuity.failover(roleKeyFor(Role.CEO), Role.CEO, {}, `same-provider ${name}`);
+      expect(decision.allowed).toBe(true);
+      expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))!.bindingGeneration).toBe(before.bindingGeneration + 1);
+    }
+  });
+
+  it("applies the same exact-attestation rule during restoration", async () => {
+    const plane = makePlane();
+    const projectId = "attested-restore";
+    const manifest = fixtureManifest(projectId);
+    const registered = plane.cp.projects.register({
+      projectId,
+      name: projectId,
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
+    });
+    if (!registered.allowed) throw new Error(registered.message);
+    const session = plane.cp.sessions.create({ provider: "gpt", model: "test" });
+    plane.cp.sessions.transition(session.sessionId, SessionLifecycle.READY, "test");
+    const bound = plane.cp.bindings.bind({
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: session.sessionId,
+      mode: "FALLBACK",
+      authenticatedTarget: authenticatedTarget(),
+    });
+    if (!bound.allowed) throw new Error(bound.message);
+    plane.gpt.setCapacity(reading("gpt", plane.clock, [{ id: "rolling", remainingPercent: 90, resetAt: null, capabilities: FULL }]));
+    plane.claude.setCapacity(reading("claude", plane.clock, [{ id: "rolling", remainingPercent: 90, resetAt: null, capabilities: FULL }]));
+    attach(plane);
+
+    await plane.cp.continuity.restore();
+    const active = plane.cp.bindings.active(roleKeyFor(Role.PRIMARY_CTO, { projectId }))!;
+    expect(active.sessionId).not.toBe(session.sessionId);
+    expect(active.bindingGeneration).toBe(bound.value.bindingGeneration);
   });
 });
