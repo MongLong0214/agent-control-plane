@@ -682,6 +682,28 @@ export class CtoLifecycle {
           if (!checkpointed.allowed) return checkpointed as Decision<void>;
         }
       }
+
+      // #692 — this has to run, and deny, from *inside* this transaction, before the
+      // DRAINING transition below — not after it as a separate step once this has
+      // already committed. LIVE_RUN_STATES (binding-registry.ts) counts QUEUED,
+      // READY_FOR_CEO_REVIEW, CEO_APPROVED, MERGING, POST_MERGE_VERIFYING,
+      // REVISION_REQUIRED and AWAITING_HUMAN as live, and the checkpoint loop above only
+      // moves ACTIVE runs to BLOCKED — a run parked in any of the others refuses the
+      // later revoke every single time, not as a race but as an ordinary outcome. A
+      // refusal here has to roll back the suspended flag, the recovery insert and the
+      // checkpoint above with it (this is a txDecision, not a tx, precisely so a `deny`
+      // unwinds all three) — otherwise every one of those writes survives a refused
+      // suspend, including the DRAINING transition that follows, and DRAINING blocks
+      // dispatch (RUN_DISPATCH_BLOCKED_CTO_DRAINING) with no run left to retry against.
+      const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });
+      if (preflight.length > 0) {
+        return deny(
+          ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
+          "the active binding owns live runs and cannot be revoked without a takeover",
+          { projectId, roleKey, runs: preflight.map((run) => run.run_id) },
+        );
+      }
+
       if (session.lifecycle === SessionLifecycle.READY) {
         const draining = this.sessions.transition(current.sessionId, SessionLifecycle.DRAINING, "project suspended");
         if (!draining.allowed) return draining as Decision<void>;
@@ -692,26 +714,13 @@ export class CtoLifecycle {
 
     if (current && session) {
       if (session.lifecycle !== SessionLifecycle.STOPPED) {
-        // #692 — before telling the provider to stop (not reversible once it answers),
-        // confirm nothing already owned by this binding would refuse the revoke that is
-        // meant to follow it. This matters for more than the race below: LIVE_RUN_STATES
-        // (binding-registry.ts) also counts QUEUED, READY_FOR_CEO_REVIEW, CEO_APPROVED,
-        // MERGING, POST_MERGE_VERIFYING, REVISION_REQUIRED and AWAITING_HUMAN as live, and
-        // the checkpoint tx above only moves ACTIVE runs to BLOCKED — a run parked in any
-        // of the others would refuse the later revoke every single time, not as a race but
-        // as an ordinary outcome, and without this check that refusal would only surface
-        // after the provider had already been told to stop. This preflight cannot close
-        // the genuine race, though: nothing else in this function yields before the
-        // `stopSession()` await below, so a run that reactivates *during* that await is
-        // invisible here and still reaches the compensation path after it.
-        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });
-        if (preflight.length > 0) {
-          return deny(
-            ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS,
-            "the active binding owns live runs and cannot be revoked without a takeover",
-            { projectId, roleKey, runs: preflight.map((run) => run.run_id) },
-          );
-        }
+        // The preflight above already refused this call, atomically with every write it
+        // would have needed to undo, whenever a live run blocked it. Nothing yields
+        // between that check committing and the `stopSession()` await below — so there
+        // is no second window to re-check here — until the await itself, which is the
+        // one gap this preflight can never close: a run that reactivates *during* that
+        // await is invisible to any check that runs before it, and still reaches the
+        // compensation path after it (see the `completed` tx below).
         try {
           await this.providers.require(session.provider).stopSession({
             externalSessionId: current.sessionId,
@@ -823,8 +832,34 @@ export class CtoLifecycle {
     return allow(ReasonCode.OK, undefined);
   }
 
+  /**
+   * §10.4 — undoes `setSuspended`'s ordinary suspend prep, not just the flag it wrote.
+   *
+   * A successful suspend leaves the primary CTO's session in DRAINING (the FSM
+   * (session-registry.ts LEGAL_LIFECYCLE) declares `DRAINING -> READY` legal precisely
+   * so this has somewhere to go back to). Clearing only `projects.suspended` and leaving
+   * the session in DRAINING would make that a lie: dispatch refuses a DRAINING CTO with
+   * RUN_DISPATCH_BLOCKED_CTO_DRAINING (spawn(), run-engine.ts) regardless of the project
+   * flag, so the project would stay wedged with nothing left to retry against. This does
+   * not touch a session already STOPPED — the provider was actually told to stop and
+   * that is not reversible; resuming a suspend that went all the way through means a
+   * fresh CTO spawns on the next dispatch, exactly like any other dead binding.
+   */
   resumeProject(projectId: string): Decision<void> {
-    return this.projects.setSuspended(projectId, false, true);
+    return this.db.txDecision(() => {
+      const resumed = this.projects.setSuspended(projectId, false, true);
+      if (!resumed.allowed) return resumed;
+
+      const roleKey = roleKeyFor(Role.PRIMARY_CTO, { projectId });
+      const current = this.bindings.active(roleKey);
+      if (!current) return allow(ReasonCode.OK, undefined);
+      const session = this.sessions.get(current.sessionId);
+      if (session?.lifecycle === SessionLifecycle.DRAINING) {
+        const restored = this.sessions.transition(current.sessionId, SessionLifecycle.READY, "project resumed");
+        if (!restored.allowed) return restored as Decision<void>;
+      }
+      return allow(ReasonCode.OK, undefined);
+    });
   }
 
   latestHandoff(projectId: string): (HandoffPackage & { handoffId: string; status: string }) | null {

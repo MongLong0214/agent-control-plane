@@ -1415,10 +1415,27 @@ const GUARDS = [
     // stop it should never reach.
     what: "suspendProject's preflight refuses an ordinary blocker before the irreversible provider stop",
     file: "src/cto/cto-lifecycle.ts",
-    find: "        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n        if (preflight.length > 0) {",
-    replace: "        const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n        if (false) {",
+    find: "      const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n      if (preflight.length > 0) {",
+    replace: "      const preflight = this.bindings.revocationBlockers(roleKey, { allowBlockedRuns: true });\n      if (false) {",
     killedBy: [
       "tests/unit/cto-registry-r2.test.ts::#692 the preflight refuses an ordinary non-race blocker before the irreversible provider stop, never calling it at all",
+    ],
+  },
+  {
+    // #692 (Sol review, round 3) — DRAINING is legal to reverse back to READY in the FSM
+    // (session-registry.ts LEGAL_LIFECYCLE) precisely so a session that committed
+    // DRAINING but never reached STOPPED has somewhere to go back to. Before this row's
+    // guard existed, resumeProject only cleared `projects.suspended`; a session stuck in
+    // DRAINING stayed there forever and dispatch kept refusing with
+    // RUN_DISPATCH_BLOCKED_CTO_DRAINING regardless of the flag. Without this branch,
+    // resumeProject's claim to reverse a suspend is false for exactly the sessions that
+    // most need it reversed.
+    what: "resumeProject restores a session stuck in DRAINING back to READY",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "      const session = this.sessions.get(current.sessionId);\n      if (session?.lifecycle === SessionLifecycle.DRAINING) {",
+    replace: "      const session = this.sessions.get(current.sessionId);\n      if (false) {",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 resumeProject clears a session stuck in DRAINING, not just the suspended flag",
     ],
   },
   {

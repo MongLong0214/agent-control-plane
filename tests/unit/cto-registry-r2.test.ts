@@ -254,6 +254,7 @@ describe("round-2 CTO lifecycle regressions", () => {
       expect(harness.cp.runs.require(driven.runId).state).toBe(RunState.READY_FOR_CEO_REVIEW);
 
       const binding = harness.cp.bindings.activePrimaryCto(driven.projectId)!;
+      const lifecycleBefore = harness.cp.sessions.require(binding.sessionId).lifecycle;
       const stopSession = vi.spyOn(harness.scripted, "stopSession");
 
       const suspended = await harness.cp.cto.suspendProject(
@@ -266,11 +267,73 @@ describe("round-2 CTO lifecycle regressions", () => {
       expect(suspended.allowed).toBe(false);
       expect(suspended.reasonCode).toBe(ReasonCode.REVOCATION_BLOCKED_ACTIVE_RUNS);
       expect(stopSession).not.toHaveBeenCalled();
-      // The one truly irreversible step — telling the provider to stop — never happened:
-      // the session may have moved to DRAINING as ordinary suspend prep (reversible, and
-      // unrelated to this check), but it was never told to stop and is not STOPPED.
-      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).not.toBe(SessionLifecycle.STOPPED);
+      // The preflight now runs *inside* the same txDecision as the suspended flag, the
+      // recovery insert and the DRAINING transition, so a refusal here rolls all of them
+      // back — the session never moves to DRAINING at all, not "moves there but it's
+      // fine because it's reversible": there is nothing left to reverse. Assert the
+      // lifecycle is byte-for-byte unchanged, not merely "not STOPPED" — that weaker
+      // assertion is exactly what let a real DRAINING-forever regression pass here once.
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(lifecycleBefore);
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).not.toBe(SessionLifecycle.DRAINING);
       expect(harness.cp.bindings.activePrimaryCto(driven.projectId)?.sessionId).toBe(binding.sessionId);
+
+      // The refused suspend left nothing to undo — dispatch must actually work, not
+      // merely report a lifecycle value that looks fine. A second run against the same
+      // project reuses the same untouched binding without needing resumeProject at all.
+      const secondRun = harness.cp.runs.create({
+        projectId: driven.projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId: driven.repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!secondRun.allowed) throw new Error(secondRun.message);
+      const dispatched = await harness.cp.runs.dispatch(secondRun.value.runId);
+      expect(dispatched.allowed).toBe(true);
+      expect(harness.cp.bindings.activePrimaryCto(driven.projectId)?.sessionId).toBe(binding.sessionId);
+    },
+  );
+
+  it(
+    "#692 resumeProject clears a session stuck in DRAINING, not just the suspended flag",
+    async () => {
+      // `DRAINING -> READY` is legal in the FSM (session-registry.ts LEGAL_LIFECYCLE)
+      // precisely so a suspend that committed DRAINING but never reached STOPPED (a
+      // crash between the two transactions, or any other reason the runtime stop never
+      // finished) has somewhere to go back to. This drives the session there directly,
+      // the same way a crash mid-suspend would leave it, rather than depending on timing
+      // a real stopSession() await — the FSM transition is the actual mechanism under
+      // test, not the race that can produce it.
+      const harness = makeHarness();
+      const { projectId, repositoryId } = await registerFixtureProject(harness);
+      await createActiveRun(harness, projectId, repositoryId);
+      const binding = harness.cp.bindings.activePrimaryCto(projectId)!;
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+
+      const drained = harness.cp.sessions.transition(
+        binding.sessionId,
+        SessionLifecycle.DRAINING,
+        "test: simulate a suspend that committed DRAINING but never reached STOPPED",
+      );
+      expect(drained.allowed).toBe(true);
+
+      const resumed = harness.cp.cto.resumeProject(projectId);
+      expect(resumed.allowed).toBe(true);
+      expect(harness.cp.sessions.require(binding.sessionId).lifecycle).toBe(SessionLifecycle.READY);
+
+      // Dispatch must actually succeed now, not just report a lifecycle value: before
+      // this fix, resumeProject cleared only `projects.suspended` and ensurePrimaryCto
+      // kept refusing with RUN_DISPATCH_BLOCKED_CTO_DRAINING regardless, wedging the
+      // project's dispatch permanently.
+      const run = harness.cp.runs.create({
+        projectId,
+        executionMode: ExecutionMode.STANDARD,
+        contract: CONTRACT,
+        repositories: [{ repositoryId, repositoryRole: "primary", baseBranch: "dev" }],
+      });
+      if (!run.allowed) throw new Error(run.message);
+      const dispatched = await harness.cp.runs.dispatch(run.value.runId);
+      expect(dispatched.allowed).toBe(true);
+      expect(harness.cp.bindings.activePrimaryCto(projectId)?.sessionId).toBe(binding.sessionId);
     },
   );
 
