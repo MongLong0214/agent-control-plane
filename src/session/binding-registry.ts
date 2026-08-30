@@ -38,6 +38,23 @@ export interface VerifiedTargetBinding {
   targetLocatorDigest: string;
 }
 
+/** The tuple the executor signs before a target is allowed to become routable. */
+export interface AuthenticatedTargetTuple {
+  actorId: string;
+  generation: number;
+  assignmentId: string;
+  sessionId: string;
+  incarnation: string;
+}
+
+/** A claimed target selects reuse only; the executor authenticates the complete planned tuple. */
+export interface AuthenticatedTargetBinding {
+  claimed: VerifiedTargetBinding;
+  protocolVersion: string;
+  attestationDigest: string;
+  verify(tuple: AuthenticatedTargetTuple): VerifiedTargetBinding | null;
+}
+
 export interface BindInput {
   /**
    * Optional. The key is *derived* from the role and its scope; supplying one that does
@@ -60,6 +77,8 @@ export interface BindInput {
    * has said which conversation it is.
    */
   verifiedTarget?: VerifiedTargetBinding;
+  /** Authenticated successor to `verifiedTarget`; legacy callers remain compatible. */
+  authenticatedTarget?: AuthenticatedTargetBinding;
 }
 
 const LIVE_RUN_STATES = [
@@ -163,7 +182,7 @@ export class BindingRegistry {
   }
 
   bind(input: BindInput): Decision<RoleBinding> {
-    return this.db.tx(() => {
+    return this.db.txDecision(() => {
       const key = this.resolveRoleKey(input);
       if (!key.allowed) return key as Decision<RoleBinding>;
       const roleKey = key.value;
@@ -190,8 +209,33 @@ export class BindingRegistry {
 
       const generation = this.nextGeneration(roleKey);
       const assignmentId = newAssignmentId();
-      const reused = this.actorOwning(input.verifiedTarget);
+      const claimedTarget = input.authenticatedTarget?.claimed ?? input.verifiedTarget;
+      const reused = this.actorOwning(claimedTarget);
       if (!reused.allowed) return reused as Decision<RoleBinding>;
+      // Plan a new id before verification so target authentication is the last pre-write step.
+      const provisionalActorId = reused.value ?? `actor:${newAssignmentId()}`;
+      if (input.authenticatedTarget) {
+        let authenticated: VerifiedTargetBinding | null;
+        try {
+          authenticated = input.authenticatedTarget.verify({
+            actorId: provisionalActorId,
+            generation,
+            assignmentId,
+            sessionId: input.sessionId,
+            incarnation: session.incarnation,
+          });
+        } catch (error) {
+          return deny(ReasonCode.INTERNAL_ERROR, "target verification failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        if (!claimedTarget || !authenticated || !this.sameTarget(authenticated, claimedTarget)) {
+          return deny(ReasonCode.CONFLICT, "authenticated target did not confirm the claimed target", {
+            claimed: claimedTarget,
+            authenticated,
+          });
+        }
+      }
       // Reuse when the target says which actor owns it; mint otherwise.
       //
       // Minting unconditionally is how re-bootstrapping against the same conversation produced a
@@ -203,11 +247,12 @@ export class BindingRegistry {
       // deployment to come up at all. What does not happen is any claim about which conversation
       // it answers: that is established by an authenticated preflight bind (#638), and until one
       // exists this binding is not routable to a transcript.
-      const actorId = reused.value ?? this.mintActor(input.role, input.sessionId, session.incarnation);
-      if (reused.value === null && input.verifiedTarget) {
-        const recorded = this.recordTargetBinding(actorId, input.verifiedTarget);
-        if (!recorded.allowed) return recorded as Decision<RoleBinding>;
-      }
+      const actorId = reused.value ?? this.mintActor(
+        input.role,
+        input.sessionId,
+        session.incarnation,
+        provisionalActorId,
+      );
       if (reused.value !== null) {
         // The actor survives and the runtime does not, which is the whole content of a reuse.
         // `mintActor` sets this pointer for a new actor; without the same move here the recovered
@@ -220,6 +265,10 @@ export class BindingRegistry {
           [input.sessionId, session.incarnation, actorId],
         );
       }
+      const targetBinding = claimedTarget
+        ? this.targetBindingId(actorId, claimedTarget)
+        : allow(ReasonCode.OK, null);
+      if (!targetBinding.allowed) return targetBinding as Decision<RoleBinding>;
       this.db.run(
         `INSERT INTO assignments (assignment_id, role_key, role, project_id, run_id, task_id,
                                   actor_id, session_id, session_incarnation, binding_generation,
@@ -231,6 +280,18 @@ export class BindingRegistry {
           input.mode ?? "PREFERRED", this.clock.nowIso(),
         ],
       );
+      if (input.authenticatedTarget && targetBinding.value) {
+        const attested = this.recordTargetAttestation({
+          targetBindingId: targetBinding.value,
+          generation,
+          assignmentId,
+          sessionId: input.sessionId,
+          incarnation: session.incarnation,
+          protocolVersion: input.authenticatedTarget.protocolVersion,
+          attestationDigest: input.authenticatedTarget.attestationDigest,
+        });
+        if (!attested.allowed) return attested as Decision<RoleBinding>;
+      }
 
       this.audit.record({
         kind: "BINDING_CREATED",
@@ -874,15 +935,34 @@ export class BindingRegistry {
     return allow(ReasonCode.OK, row?.target_actor_id ?? null);
   }
 
-  /**
-   * Records that this actor owns this target, once.
-   *
-   * The uniqueness is the database's, not this method's: an actor with a second target and a
-   * target with a second actor are both refused by constraints, so a race that got past the read
-   * above fails here rather than producing the alias. That is why the insert is not conditional
-   * on the read.
-   */
-  private recordTargetBinding(actorId: string, target: VerifiedTargetBinding): Decision<void> {
+  private sameTarget(
+    left: VerifiedTargetBinding,
+    right: VerifiedTargetBinding,
+  ): boolean {
+    return left.executorKind === right.executorKind &&
+      left.targetLocator === right.targetLocator &&
+      left.targetLocatorDigest === right.targetLocatorDigest;
+  }
+
+  /** Finds the exact existing target-binding id or records a new one for this actor. */
+  private targetBindingId(actorId: string, target: VerifiedTargetBinding): Decision<string> {
+    const existing = this.db.get<{ target_binding_id: string; target_actor_id: string }>(
+      `SELECT target_binding_id, target_actor_id FROM actor_target_bindings
+        WHERE executor_kind = ? AND target_locator_digest = ?`,
+      [target.executorKind, target.targetLocatorDigest],
+    );
+    if (existing) {
+      if (existing.target_actor_id !== actorId) {
+        return deny(ReasonCode.CONFLICT, "target is already bound to another actor", {
+          actorId,
+          targetActorId: existing.target_actor_id,
+          executorKind: target.executorKind,
+        });
+      }
+      return allow(ReasonCode.OK, existing.target_binding_id);
+    }
+
+    const targetBindingId = `tb_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
     try {
       this.db.run(
         `INSERT INTO actor_target_bindings
@@ -890,7 +970,7 @@ export class BindingRegistry {
             target_locator_digest, bound_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
         [
-          `tb_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+          targetBindingId,
           actorId,
           target.executorKind,
           target.targetLocator,
@@ -898,27 +978,62 @@ export class BindingRegistry {
           this.clock.nowIso(),
         ],
       );
-      return allow(ReasonCode.OK, undefined);
+      return allow(ReasonCode.OK, targetBindingId);
     } catch (error) {
-      // The constraint fired. Which one it was matters to the reader: an actor cannot take a
-      // second transcript, and a transcript cannot take a second actor.
       return deny(
-        ReasonCode.CONFLICT,
-        "this actor or this target is already bound to another; the relation is one-to-one for their lifetimes",
+        ReasonCode.INTERNAL_ERROR,
+        "target binding could not be recorded",
         { actorId, executorKind: target.executorKind, error: error instanceof Error ? error.message : String(error) },
       );
     }
   }
 
-  private mintActor(role: string, sessionId: string, incarnation: string): string {
-    const actorId = `actor:${newAssignmentId()}`;
+  private recordTargetAttestation(input: {
+    targetBindingId: string;
+    generation: number;
+    assignmentId: string;
+    sessionId: string;
+    incarnation: string;
+    protocolVersion: string;
+    attestationDigest: string;
+  }): Decision<void> {
+    try {
+      this.db.run(
+        `INSERT INTO actor_target_attestations
+           (target_attestation_id, target_binding_id, binding_generation, assignment_id, executor_session_id,
+            executor_session_incarnation, protocol_version, attestation_digest, attested_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          `ta_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+          input.targetBindingId,
+          input.generation,
+          input.assignmentId,
+          input.sessionId,
+          input.incarnation,
+          input.protocolVersion,
+          input.attestationDigest,
+          this.clock.nowIso(),
+        ],
+      );
+      return allow(ReasonCode.OK, undefined);
+    } catch (error) {
+      return deny(ReasonCode.INTERNAL_ERROR, "target attestation could not be recorded", {
+        targetBindingId: input.targetBindingId,
+        assignmentId: input.assignmentId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private mintActor(role: string, sessionId: string, incarnation: string, actorId?: string): string {
+    const exactActorId = actorId ?? `actor:${newAssignmentId()}`;
     this.db.run(
       `INSERT INTO conversational_actors
          (actor_id, kind, current_session_id, current_session_incarnation, created_at)
        VALUES (?, ?, ?, ?, ?)`,
-      [actorId, role, sessionId, incarnation, this.clock.nowIso()],
+      [exactActorId, role, sessionId, incarnation, this.clock.nowIso()],
     );
-    return actorId;
+    return exactActorId;
   }
 
   private nextGeneration(roleKey: string): number {
