@@ -127,7 +127,7 @@ export class Doctor {
     }
     if (scope === "system" || scope === "session") {
       findings.push(...this.checkSessions(target ?? null));
-      findings.push(...this.checkBuzzMentions(target ?? null));
+      findings.push(...this.checkBuzzChannelTraffic(target ?? null));
     }
     if (scope === "system" || scope === "capacity") {
       findings.push(...this.checkCapacitySensorFiles());
@@ -447,63 +447,53 @@ export class Doctor {
   }
 
   /**
-   * #674 — the gap this closes is delivery silence only: a dead session-local poller and "no
-   * new channel traffic" were the same observable fact. `buzz_mention_watch` (written only by
-   * `BuzzMentionWatch`, `src/buzz/mention-watch.ts`) is read here, never written — this stays a
-   * pure `SELECT`, consistent with Doctor's read-only construction. Looked up by `session_id`
-   * (#710) — the row is scoped to the session asking, not shared by every session on the same
-   * channel.
+   * #674 — reports exactly the independent CLI measurement available here: raw Buzz channel
+   * traffic between completed watch checks. This method only reads
+   * `buzz_channel_traffic_watch`; the watch owns every write.
    *
-   * Three outcomes, deliberately not collapsed into one:
-   *
-   *   `BUZZ_DELIVERY_SILENCE_NEVER_CHECKED`      the watch has never ticked this session at all
-   *   `BUZZ_DELIVERY_SILENCE_WATCH_UNAVAILABLE`  the most recent attempt failed; the count on
-   *                                              record cannot be trusted as current
-   *   `BUZZ_DELIVERY_SILENCE_TRAFFIC_FOUND`      a successful check found channel traffic since
-   *                                              baseline
-   *
-   * Named `BUZZ_DELIVERY_SILENCE_*`, not `BUZZ_MENTIONS_*`: this probe reads raw channel traffic.
-   * It does not compare the `mentions` feed with `needs_action`, and it does not observe delivery
-   * into the canonical CEO turn. A message that arrived but was misclassified is therefore out of
-   * scope and remains #674 work. The same boundary is printed in every finding's evidence so an
-   * operator cannot read this probe's silence as classification coverage.
-   *
-   * The middle one exists for the same reason #636 split `CAPACITY_SENSOR_FAILED` from
-   * `CAPACITY_LOW`: reporting a stale `pending_count` as though it were a fresh "N behind" would
-   * state a false, definite value in place of "could not look" — the exact fold #636 corrected.
-   * A count of zero is never emitted on its own; it is silence, and silence here is backed by a
-   * `last_success_at` that proves a check actually ran, which is what tells it apart from having
-   * never looked.
+   * A successful complete check always emits INFO, including a measured zero. The evidence says
+   * on every outcome that mention classification, `needs_action`, and canonical-turn delivery are
+   * unmeasured by this CLI surface. A message can therefore be present in the raw feed while the
+   * CEO incident remains invisible; closing that remainder requires relay-side telemetry on #674.
    */
-  private checkBuzzMentions(sessionId: string | null): Finding[] {
+  private checkBuzzChannelTraffic(sessionId: string | null): Finding[] {
     const findings: Finding[] = [];
     const sessions = sessionId ? [this.sessions.get(sessionId)].filter(Boolean) : this.sessions.live();
+    const measurementBoundary = {
+      measurementScope: "RAW_CHANNEL_TRAFFIC_BETWEEN_COMPLETED_WATCH_CHECKS",
+      unmeasured: "MENTION_CLASSIFICATION_NEEDS_ACTION_AND_CANONICAL_TURN_DELIVERY",
+      remainder: "ISSUE_674_REQUIRES_RELAY_SIDE_TELEMETRY",
+    } as const;
 
     for (const session of sessions) {
       if (!session || !session.buzzAddress) continue;
-      const row = this.db.get<{
+      const stored = this.db.get<{
         channel_id: string;
         baseline_at: number | null;
-        pending_count: number;
-        pending_saturated: number;
+        window_started_at: number | null;
+        window_ended_at: number | null;
+        observed_count: number;
+        window_incomplete: number;
         last_attempt_at: string | null;
-        last_success_at: string | null;
+        attempt_in_progress: number;
+        last_read_success_at: string | null;
         last_error: string | null;
         last_error_at: string | null;
       }>(
-        `SELECT channel_id, baseline_at, pending_count, pending_saturated,
-                last_attempt_at, last_success_at, last_error, last_error_at
-           FROM buzz_mention_watch WHERE session_id = ?`,
+        `SELECT channel_id, baseline_at, window_started_at, window_ended_at,
+                observed_count, window_incomplete, last_attempt_at,
+                attempt_in_progress, last_read_success_at, last_error, last_error_at
+           FROM buzz_channel_traffic_watch WHERE session_id = ?`,
         [session.sessionId],
       );
-      // `row.channel_id` (what the watch actually ticked) rather than `session.buzzAddress`
-      // (what the session is bound to right now): they agree in the ordinary case, but citing
-      // the row's own column keeps the evidence honest if they ever diverge.
-      const channel = row?.channel_id ?? session.buzzAddress;
+      // Evidence for another channel is not a measurement of the current binding. The next daemon
+      // tick binds it; until then Doctor says the current channel has not been checked.
+      const row = stored?.channel_id === session.buzzAddress ? stored : null;
+      const channel = session.buzzAddress;
 
       if (!row || row.last_attempt_at === null) {
         findings.push({
-          code: "BUZZ_DELIVERY_SILENCE_NEVER_CHECKED",
+          code: "BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED",
           severity: "WARN",
           scope: `session:${session.sessionId}`,
           blocking: false,
@@ -511,23 +501,23 @@ export class Doctor {
           observedEvidence: {
             sessionId: session.sessionId,
             channel,
-            measurementScope: "DELIVERY_SILENCE_ONLY",
-            classificationCoverage: "ARRIVED_BUT_UNCLASSIFIED_OUT_OF_SCOPE_674",
+            ...measurementBoundary,
           },
           recommendedAction:
-            "the periodic buzz channel-traffic watch has not observed this session yet; confirm the watch tick is running",
+            "the raw Buzz channel-traffic watch has not attempted this channel; confirm the daemon watch tick is running",
         });
         continue;
       }
 
-      // The most recent attempt against this channel failed if a failure was recorded no
-      // earlier than the last success — including "failed and never succeeded since".
+      // An error no earlier than the last successful read is the current outcome. A process death
+      // can also leave an attempt with neither success nor error; that is unavailable, not zero.
       const lastAttemptFailed =
         row.last_error_at !== null &&
-        (row.last_success_at === null || Date.parse(row.last_error_at) >= Date.parse(row.last_success_at));
-      if (lastAttemptFailed) {
+        (row.last_read_success_at === null ||
+          Date.parse(row.last_error_at) >= Date.parse(row.last_read_success_at));
+      if (row.attempt_in_progress === 1 || lastAttemptFailed || row.last_read_success_at === null) {
         findings.push({
-          code: "BUZZ_DELIVERY_SILENCE_WATCH_UNAVAILABLE",
+          code: "BUZZ_CHANNEL_TRAFFIC_WATCH_UNAVAILABLE",
           severity: "ERROR",
           scope: `session:${session.sessionId}`,
           blocking: false,
@@ -535,21 +525,23 @@ export class Doctor {
           observedEvidence: {
             sessionId: session.sessionId,
             channel,
-            measurementScope: "DELIVERY_SILENCE_ONLY",
-            classificationCoverage: "ARRIVED_BUT_UNCLASSIFIED_OUT_OF_SCOPE_674",
-            error: row.last_error,
+            ...measurementBoundary,
+            error: row.attempt_in_progress === 1
+              ? "watch attempt did not complete"
+              : row.last_error ?? "watch has no completed read",
+            lastAttemptAt: row.last_attempt_at,
             lastErrorAt: row.last_error_at,
-            lastKnownGoodAt: row.last_success_at,
+            lastReadSuccessAt: row.last_read_success_at,
           },
           recommendedAction:
-            "restore buzz CLI/relay reachability; the channel-traffic count cannot be verified until a check succeeds",
+            "restore Buzz CLI/relay reachability and complete a raw channel-traffic watch check",
         });
         continue;
       }
 
-      if (row.pending_count > 0) {
+      if (row.window_incomplete === 1) {
         findings.push({
-          code: "BUZZ_DELIVERY_SILENCE_TRAFFIC_FOUND",
+          code: "BUZZ_CHANNEL_TRAFFIC_WINDOW_INCOMPLETE",
           severity: "WARN",
           scope: `session:${session.sessionId}`,
           blocking: false,
@@ -557,26 +549,66 @@ export class Doctor {
           observedEvidence: {
             sessionId: session.sessionId,
             channel,
-            measurementScope: "DELIVERY_SILENCE_ONLY",
-            classificationCoverage: "ARRIVED_BUT_UNCLASSIFIED_OUT_OF_SCOPE_674",
-            // Unit and object, named plainly: every message the channel received since the
-            // baseline, per `messages get --since` — not a verified @-mention of this session.
-            // No `#p`-tag matching is wired anywhere in this codebase (#674's own audit), so
-            // this is a proxy for unacknowledged channel traffic, not a mention count.
-            channelMessagesSinceBaseline: row.pending_count,
-            // The CLI's `--limit` is a return cap, not a total (#710 finding 3): when the read
-            // hit that cap, `channelMessagesSinceBaseline` is a floor, not an exact count.
-            atLeast: row.pending_saturated === 1,
-            sinceIso: new Date(row.baseline_at ?? 0).toISOString(),
-            checkedAt: row.last_success_at,
+            ...measurementBoundary,
+            confirmedRawChannelMessages: row.observed_count,
+            windowStartedAt: row.window_started_at === null
+              ? null
+              : new Date(row.window_started_at).toISOString(),
+            readEndedAt: row.window_ended_at === null
+              ? null
+              : new Date(row.window_ended_at).toISOString(),
+            lastReadSuccessAt: row.last_read_success_at,
           },
           recommendedAction:
-            (row.pending_saturated === 1
-              ? "read the buzz channel since the reported time; the count is capped at the per-tick read limit and the true backlog may be larger"
-              : "read the buzz channel since the reported time; this session's channel-traffic watch has not accounted for these messages") +
-            "; this delivery-silence probe does not inspect mentions-to-needs_action classification, which remains #674",
+            "the Buzz CLI result hit the watch limit, so the window did not advance; inspect or paginate the raw feed without treating it as classification coverage",
         });
+        continue;
       }
+
+      if (row.window_started_at === null) {
+        findings.push({
+          code: "BUZZ_CHANNEL_TRAFFIC_BASELINE_ESTABLISHED",
+          severity: "INFO",
+          scope: `session:${session.sessionId}`,
+          blocking: false,
+          confidence: "HIGH",
+          observedEvidence: {
+            sessionId: session.sessionId,
+            channel,
+            ...measurementBoundary,
+            baselineEstablishedAt: row.baseline_at === null
+              ? null
+              : new Date(row.baseline_at).toISOString(),
+            lastReadSuccessAt: row.last_read_success_at,
+          },
+          recommendedAction:
+            "no action; the raw channel baseline is established and the next complete watch check will report a window",
+        });
+        continue;
+      }
+
+      findings.push({
+        code: "BUZZ_CHANNEL_TRAFFIC_BETWEEN_COMPLETED_CHECKS",
+        severity: "INFO",
+        scope: `session:${session.sessionId}`,
+        blocking: false,
+        confidence: "HIGH",
+        observedEvidence: {
+          sessionId: session.sessionId,
+          channel,
+          ...measurementBoundary,
+          rawChannelMessagesBetweenCompletedChecks: row.observed_count,
+          windowStartedAt: row.window_started_at === null
+            ? null
+            : new Date(row.window_started_at).toISOString(),
+          windowCompletedAt: row.window_ended_at === null
+            ? null
+            : new Date(row.window_ended_at).toISOString(),
+          lastReadSuccessAt: row.last_read_success_at,
+        },
+        recommendedAction:
+          "raw channel traffic alone implies no health action; arrived-but-unclassified or undelivered messages require relay-side telemetry under #674",
+      });
     }
     return findings;
   }

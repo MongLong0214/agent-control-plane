@@ -2205,45 +2205,40 @@ const v32: SchemaMigration = {
 };
 
 /**
- * #674 — a session's ad hoc, session-local poll for Buzz channel traffic can die silently, and a
- * silent poller and "nothing new arrived" produce the exact same observable fact: nothing.
- * Measured three times in one incident, each a different bug in the same poller, each
- * indistinguishable from health until read after the fact.
- *
- * This table is the delivery-silence-only half of the fix: a per-session cursor plus bookkeeping
- * for whether the last attempt to read it even succeeded. It deliberately counts raw channel
- * traffic, not `mentions`-to-`needs_action` classification; an arrived-but-unclassified message
- * remains out of scope under #674. See `src/buzz/mention-watch.ts`.
+ * #674 — durable, per-session results for raw Buzz channel reads. The CLI surface can verify
+ * channel traffic and read availability; it cannot expose mention classification, `needs_action`,
+ * or canonical-turn delivery, so the table does not name or model those stronger states.
  *
  * Keyed on `session_id` rather than `channel_id` (#710): production sessions can share one
- * `ACP_BUZZ_CHANNEL`, and a channel-keyed row let one session's reconnect silently reset another
- * session's baseline. `channel_id` remains the address the CLI reads.
+ * `ACP_BUZZ_CHANNEL`, while each daemon target still owns an independent measurement window.
  */
 const v34: SchemaMigration = {
-  id: "v34-a-silent-poller-and-no-new-mentions-look-the-same",
+  id: "v34-buzz-channel-traffic-between-watch-checks",
   fromVersion: 33,
   toVersion: 34,
   apply: (raw) => {
     raw.exec(`
-      CREATE TABLE IF NOT EXISTS buzz_mention_watch (
+      CREATE TABLE IF NOT EXISTS buzz_channel_traffic_watch (
         session_id        TEXT PRIMARY KEY,
         channel_id        TEXT NOT NULL,
         cursor_generation TEXT NOT NULL,
         baseline_at       INTEGER,
         baseline_event_ids TEXT NOT NULL DEFAULT '[]',
-        latest_event_id   TEXT,
-        latest_seen_at    INTEGER,
-        pending_count     INTEGER NOT NULL DEFAULT 0,
-        pending_saturated INTEGER NOT NULL DEFAULT 0,
+        window_started_at INTEGER,
+        window_ended_at   INTEGER,
+        observed_count    INTEGER NOT NULL DEFAULT 0,
+        window_incomplete INTEGER NOT NULL DEFAULT 0,
         last_attempt_at   TEXT,
-        last_success_at   TEXT,
+        attempt_in_progress INTEGER NOT NULL DEFAULT 0,
+        last_read_success_at TEXT,
         last_error        TEXT,
         last_error_at     TEXT
       );
-      CREATE INDEX IF NOT EXISTS buzz_mention_watch_channel ON buzz_mention_watch(channel_id);
+      CREATE INDEX IF NOT EXISTS buzz_channel_traffic_watch_channel
+        ON buzz_channel_traffic_watch(channel_id);
     `);
   },
-  checksum: () => migrationChecksum("v34-a-silent-poller-and-no-new-mentions-look-the-same"),
+  checksum: () => migrationChecksum("v34-buzz-channel-traffic-between-watch-checks"),
 };
 
 export const MIGRATIONS: readonly SchemaMigration[] = Object.freeze([

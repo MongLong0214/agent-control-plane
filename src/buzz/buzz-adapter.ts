@@ -88,6 +88,30 @@ const asChannelList = (value: unknown, what: string): BuzzCliChannel[] => {
 };
 
 /**
+ * A watch result is only a measurement when every row carries the event identity and relay
+ * timestamp the cursor compares. A cast here used to turn `[{}]` into a successful empty window:
+ * `undefined` fell out during the boundary filter and Doctor recorded a verified zero.
+ */
+const asMessageList = (value: unknown, what: string): BuzzCliMessage[] => {
+  if (!Array.isArray(value)) throw new Error(`buzz ${what} did not return a list of messages`);
+  return value.map((entry, index) => {
+    const id = typeof entry === "object" && entry !== null
+      ? (entry as { id?: unknown }).id
+      : undefined;
+    const createdAt = typeof entry === "object" && entry !== null
+      ? (entry as { created_at?: unknown }).created_at
+      : undefined;
+    if (
+      typeof id !== "string" || id.length === 0 ||
+      typeof createdAt !== "number" || !Number.isInteger(createdAt) || createdAt < 0
+    ) {
+      throw new Error(`buzz ${what} returned an invalid message at index ${index}; id and created_at are required`);
+    }
+    return entry as BuzzCliMessage;
+  });
+};
+
+/**
  * The subject of a purpose: the last `:` segment. A purpose is `role:subject` — the callers
  * build `primary-cto:${projectId}` (`cto-lifecycle.ts:852`), `continuity:${role}`, and so
  * on — so the subject is the part that could name a room, and the role prefix never is.
@@ -194,15 +218,12 @@ export class BuzzCliTransport implements BuzzTransport {
       BUZZ_CLI_INVOCATIONS.messagesGet(channel, limit),
       { encoding: "utf8", timeout: 30_000 },
     );
-    const messages = parseJson(stdout, "messages get");
-    if (!Array.isArray(messages)) throw new Error("buzz messages get did not return a list");
-    return messages as BuzzCliMessage[];
+    return asMessageList(parseJson(stdout, "messages get"), "messages get");
   }
 
   /**
-   * `messages get --since` — feeds `BuzzMentionWatch` (#674). A count, not a feed: the CLI's
-   * `--since` is what makes a durable "N behind" cheap to ask for repeatedly, rather than
-   * re-reading a channel's whole history on every tick.
+   * `messages get --since` — feeds `BuzzChannelTrafficWatch` (#674). This is a raw channel read:
+   * the CLI output has no field that proves mention classification or canonical-turn delivery.
    */
   async messagesSince(channel: string, sinceEpochSeconds: number, limit: number): Promise<BuzzCliMessage[]> {
     const { stdout } = await exec(
@@ -210,9 +231,7 @@ export class BuzzCliTransport implements BuzzTransport {
       BUZZ_CLI_INVOCATIONS.messagesGetSince(channel, sinceEpochSeconds, limit),
       { encoding: "utf8", timeout: 30_000 },
     );
-    const messages = parseJson(stdout, "messages get --since");
-    if (!Array.isArray(messages)) throw new Error("buzz messages get --since did not return a list");
-    return messages as BuzzCliMessage[];
+    return asMessageList(parseJson(stdout, "messages get --since"), "messages get --since");
   }
 
   async #listChannels(): Promise<BuzzCliChannel[]> {
@@ -339,15 +358,13 @@ export const BUZZ_CLI_INVOCATIONS = {
 } as const;
 
 /**
- * What `BuzzAdapter.connect()` needs from `BuzzMentionWatch` (#674) — spelled out narrowly
- * here, rather than imported, so this module does not import from `mention-watch.ts` while
- * that module imports `BuzzCliMessage` from this one.
+ * What `BuzzAdapter.connect()` tells the channel-traffic watch (#674). A same-channel reconnect
+ * is deliberately a no-op: relay reachability is not evidence that a session processed traffic.
+ * A real channel change invalidates the old channel's window and mints a new generation so an
+ * in-flight read of the old channel cannot overwrite it.
  */
-export interface MentionCursorReset {
-  /** Keyed on `sessionId`, not just `channelId` (#710) — production sessions can share one
-   * `ACP_BUZZ_CHANNEL`, and a channel-only key let one session's reconnect reset a baseline
-   * another live session on that same channel had never touched. */
-  resetCursor(sessionId: string, channelId: string): Promise<void>;
+export interface ChannelTrafficBindingObserver {
+  bindChannel(sessionId: string, channelId: string): void;
 }
 
 export class BuzzAdapter {
@@ -359,8 +376,8 @@ export class BuzzAdapter {
     private readonly bindings: BindingRegistry,
     private readonly outbox: Outbox,
     private readonly transport: BuzzTransport,
-    /** Optional so every existing caller keeps compiling; wired in production (#674). */
-    private readonly mentionWatch?: MentionCursorReset,
+    /** Optional so existing non-daemon compositions keep compiling; wired in production (#674). */
+    private readonly channelTrafficWatch?: ChannelTrafficBindingObserver,
   ) {}
 
   async connect(sessionId: string, purpose: string): Promise<Decision<string>> {
@@ -369,13 +386,8 @@ export class BuzzAdapter {
     }
     try {
       const address = await this.transport.openChannel(purpose);
-      await this.mentionWatch?.resetCursor(sessionId, address);
+      this.channelTrafficWatch?.bindChannel(sessionId, address);
       this.sessions.setBuzzAddress(sessionId, address);
-      // The mention-watch cursor's one way back (#674): a session is (re)confirmed alive and
-      // watching this channel right here, so its baseline re-arms at "now". A harness restart
-      // that reconnects clears an accumulated backlog nobody would otherwise ever look at again.
-      // Keyed on this session's own id (#710): other sessions bound to the same channel keep
-      // their own baseline untouched.
       this.audit.record({
         kind: "BUZZ_CONNECTED",
         sessionId,

@@ -16,7 +16,7 @@ import {
   type HermesBootstrapAuthority,
 } from "../bootstrap/hermes-bootstrap.ts";
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
-import { BuzzMentionWatch } from "../buzz/mention-watch.ts";
+import { BuzzChannelTrafficWatch } from "../buzz/channel-traffic-watch.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import {
@@ -1356,6 +1356,31 @@ export interface AgentcpdMainContext {
 }
 
 /**
+ * The Buzz composition shared by production `main` and its focused composition test. Keeping the
+ * adapter, independent watch, and common CLI transport in one factory makes the tested wiring the
+ * wiring `agentcpd` actually starts.
+ */
+export const createBuzzRuntime = (cp: ControlPlane, buzzTransport: BuzzCliTransport) => {
+  const channelTrafficWatch = new BuzzChannelTrafficWatch(
+    cp.db,
+    cp.clock,
+    cp.audit,
+    buzzTransport,
+  );
+  const buzz = new BuzzAdapter(
+    cp.db,
+    cp.clock,
+    cp.audit,
+    cp.sessions,
+    cp.bindings,
+    cp.outbox,
+    buzzTransport,
+    channelTrafficWatch,
+  );
+  return { buzz, channelTrafficWatch };
+};
+
+/**
  * `agentcpd` — the single local runtime authority (PRD §33.1).
  *
  * Intended to run under a process supervisor (`launchd` on macOS). The daemon owns the
@@ -1402,20 +1427,8 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     process.env["ACP_BUZZ_BINARY"] ?? "buzz",
     process.env["ACP_BUZZ_CHANNEL"] ?? null,
   );
-  // #674 — the measurement half of the mention watch. Shares the same CLI transport `buzz`
-  // sends through; `messagesSince` resolves the channel argument it is given directly and does
-  // not consult `defaultChannel`, so there is no cross-talk between delivery and this.
-  const mentionWatch = new BuzzMentionWatch(cp.db, cp.clock, cp.audit, buzzTransport);
-  const buzz = new BuzzAdapter(
-    cp.db,
-    cp.clock,
-    cp.audit,
-    cp.sessions,
-    cp.bindings,
-    cp.outbox,
-    buzzTransport,
-    mentionWatch,
-  );
+  // #674 — the independent raw-channel watch shares the transport `buzz` sends through.
+  const { buzz, channelTrafficWatch } = createBuzzRuntime(cp, buzzTransport);
   cp.cto.attach({
     buzz: {
       connect: (sessionId, purpose) => buzz.connect(sessionId, purpose),
@@ -1425,7 +1438,7 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
     sessionLaunch,
   });
 
-  const daemon = cp.createDaemon({ stateDir, buzz, mentionWatch });
+  const daemon = cp.createDaemon({ stateDir, buzz, channelTrafficWatch });
 
   let listeners: LocalMcpListeners | null = null;
   let buzzActorIngress: LocalBuzzActorIngress | null = null;

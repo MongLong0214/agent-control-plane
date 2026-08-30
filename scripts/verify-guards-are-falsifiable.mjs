@@ -495,70 +495,116 @@ const GUARDS = [
     killedBy: ["tests/unit/buzz-cli-surface.test.ts"],
   },
   {
-    what: "the buzz cursor overlaps the exclusive CLI second so an event beside reset is visible",
-    file: "src/buzz/mention-watch.ts",
+    what: "the buzz cursor overlaps the exclusive CLI second so an event beside the baseline is visible",
+    file: "src/buzz/channel-traffic-watch.ts",
     find: "  Math.max(0, Math.floor(baselineAt / 1000) - 1);",
     replace: "  Math.max(0, Math.floor(baselineAt / 1000));",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::an event after reset in the same epoch second reaches Doctor through the exclusive-since CLI",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an event after the baseline in the same epoch second reaches Doctor through the daemon watch",
     ],
   },
   {
     what: "the buzz cursor counts event ids rather than repeated relay rows",
-    file: "src/buzz/mention-watch.ts",
-    find: "      const afterReset = uniqueByEventId(messages).filter(",
-    replace: "      const afterReset = messages.filter(",
+    file: "src/buzz/channel-traffic-watch.ts",
+    find: "      const uniqueMessages = uniqueByEventId(messages);",
+    replace: "      const uniqueMessages = messages;",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::event ids make repeated and out-of-order relay rows one count each",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::event ids make repeated and out of order relay rows one count each",
     ],
   },
   {
-    what: "the buzz reset second excludes event ids already present when reset completed",
-    file: "src/buzz/mention-watch.ts",
-    find: "      const presentAtReset = new Set(existing.baselineEventIds);",
-    replace: "      const presentAtReset = new Set<string>();",
+    what: "the buzz baseline second excludes event ids already present when the window started",
+    file: "src/buzz/channel-traffic-watch.ts",
+    find: "      const presentAtBoundary = new Set(existing.baselineEventIds);",
+    replace: "      const presentAtBoundary = new Set<string>();",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::the reset second uses event identity to exclude traffic already present at reset",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::the baseline second excludes event ids already present when the window started",
     ],
   },
   {
-    what: "a buzz reconnect generation rejects a stale tick even without clock movement",
-    file: "src/buzz/mention-watch.ts",
+    what: "a buzz channel generation rejects a stale tick after the binding changes",
+    file: "src/buzz/channel-traffic-watch.ts",
     find:
-      "                last_success_at = ?, last_error = NULL, last_error_at = NULL\n" +
+      "                observed_count = ?, window_incomplete = ?,\n" +
+      "                attempt_in_progress = 0, last_read_success_at = ?,\n" +
+      "                last_error = NULL, last_error_at = NULL\n" +
       "          WHERE session_id = ? AND cursor_generation = ?",
     replace:
-      "                last_success_at = ?, last_error = NULL, last_error_at = NULL\n" +
+      "                observed_count = ?, window_incomplete = ?,\n" +
+      "                attempt_in_progress = 0, last_read_success_at = ?,\n" +
+      "                last_error = NULL, last_error_at = NULL\n" +
       "          WHERE session_id = ? AND ? IS NOT NULL",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::a reconnect generation rejects a stale tick even when the wall clock does not advance",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a channel generation rejects a stale tick after a real channel change",
     ],
   },
   {
-    // #674 — the row-exists-but-never-attempted state (a session just connected and reset the
-    // cursor, but the periodic tick has not run yet) must read the same as no row at all, not as
-    // a verified zero. Dropping this disjunct is exactly the fold #636 corrected for capacity:
-    // an absence of observation reported as a healthy measurement.
-    what: "a buzz mention watch row with no attempt yet is never-checked, not a verified zero",
+    what: "a buzz channel watch row with no attempt yet is never checked rather than a verified zero",
     file: "src/doctor/doctor.ts",
     find: "      if (!row || row.last_attempt_at === null) {",
     replace: "      if (!row) {",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::a session that just connected but was never ticked is never-checked, not a verified zero",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a connected session is never checked until the daemon watch runs",
     ],
   },
   {
-    // #674 — the middle case between "never checked" and "behind": the most recent tick failed,
-    // so `pending_count` on record cannot be trusted as current. Folding this into "behind" or
-    // into silence would state a stale count as though it were fresh — the same shape #636 fixed
-    // for CAPACITY_LOW firing on a reading nobody could take.
-    what: "a buzz mention watch tick that just failed is reported unavailable, not folded into a stale count",
+    what: "a buzz channel watch tick that just failed is unavailable rather than a stale count",
     file: "src/doctor/doctor.ts",
     find:
-      "      const lastAttemptFailed =\n        row.last_error_at !== null &&\n        (row.last_success_at === null || Date.parse(row.last_error_at) >= Date.parse(row.last_success_at));",
+      "      const lastAttemptFailed =\n        row.last_error_at !== null &&\n        (row.last_read_success_at === null ||\n          Date.parse(row.last_error_at) >= Date.parse(row.last_read_success_at));",
     replace: "      const lastAttemptFailed = false;",
     killedBy: [
-      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::a failed check reports unavailable, never a false zero standing in for it",
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a failed check reports unavailable instead of a stale count",
+    ],
+  },
+  {
+    what: "a buzz channel watch attempt interrupted by process death is not an old verified window",
+    file: "src/doctor/doctor.ts",
+    find:
+      "      if (row.attempt_in_progress === 1 || lastAttemptFailed || row.last_read_success_at === null) {",
+    replace: "      if (lastAttemptFailed || row.last_read_success_at === null) {",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::an unfinished daemon watch attempt is not a verified old window",
+    ],
+  },
+  {
+    what: "a complete buzz channel watch check advances the next measurement window",
+    file: "src/buzz/channel-traffic-watch.ts",
+    find: "          incomplete ? baselineAt : completedAt,",
+    replace: "          baselineAt,",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a complete watch check advances the raw traffic window",
+    ],
+  },
+  {
+    what: "a capped buzz channel read stays incomplete even when boundary filtering confirms zero rows",
+    file: "src/buzz/channel-traffic-watch.ts",
+    find:
+      "      const incomplete = messages.length >= OVERFETCH_LIMIT;\n" +
+      "      const presentAtBoundary = new Set(existing.baselineEventIds);",
+    replace:
+      "      const incomplete = false;\n" +
+      "      const presentAtBoundary = new Set(existing.baselineEventIds);",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::a capped read cannot become healthy silence after boundary filtering",
+    ],
+  },
+  {
+    what: "a same-channel reconnect does not clear the last completed channel-traffic measurement",
+    file: "src/buzz/channel-traffic-watch.ts",
+    find: "    if (existing?.channelId === channelId) return;",
+    replace: "    if (false) return;",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-channel-traffic.test.ts::reconnecting to the same channel preserves the completed measurement",
+    ],
+  },
+  {
+    what: "the Buzz CLI rejects message rows without the identity and timestamp the watch measures",
+    file: "src/buzz/buzz-adapter.ts",
+    find: "    return asMessageList(parseJson(stdout, \"messages get --since\"), \"messages get --since\");",
+    replace: "    return parseJson(stdout, \"messages get --since\") as BuzzCliMessage[];",
+    killedBy: [
+      "tests/unit/buzz-cli-surface.test.ts::refuses a message row without the identity and timestamp the watch measures",
     ],
   },
   {

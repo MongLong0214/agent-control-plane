@@ -108,13 +108,14 @@ const assertSweepFitsItsInterval = (refreshMs: number, budgetMs: number, provide
 };
 
 /**
- * What the periodic tick needs from `BuzzMentionWatch` (#674) — see `src/buzz/mention-watch.ts`.
+ * What the periodic tick needs from `BuzzChannelTrafficWatch` (#674) — see
+ * `src/buzz/channel-traffic-watch.ts`.
  *
  * One entry per live session bound to a channel, not one per distinct channel (#710): the watch
  * keys its state on `sessionId`, and two sessions sharing a channel need two independent
  * measurements, not one shared between them.
  */
-export interface BuzzMentionTicker {
+export interface BuzzChannelTrafficTicker {
   tick(targets: readonly { sessionId: string; channelId: string }[]): Promise<void>;
 }
 
@@ -126,13 +127,12 @@ export interface DaemonOptions {
   capacityRefreshIntervalMs?: number;
   buzz?: BuzzAdapter;
   /**
-   * #674 — the periodic measurement half of the buzz mention watch. Optional, like `buzz`
-   * itself: without a live relay there is nothing to tick, and `Doctor.checkBuzzMentions` then
-   * reports `BUZZ_DELIVERY_SILENCE_NEVER_CHECKED` rather than a silently-stale count.
+   * #674 — the independent raw-channel measurement. Optional, like `buzz` itself: without a
+   * source there is no traffic window to complete, and Doctor reports that it was never checked.
    */
-  mentionWatch?: BuzzMentionTicker;
-  /** How often the buzz mention watch re-measures every channel a live session is bound to. */
-  buzzMentionsIntervalMs?: number;
+  channelTrafficWatch?: BuzzChannelTrafficTicker;
+  /** How often the watch completes a raw-channel measurement window for every live session. */
+  buzzChannelTrafficIntervalMs?: number;
   /** Consecutive start failures before the supervisor should back off harder. */
   crashLoopThreshold?: number;
   /** How long the whole capacity refresh may hold startup before it is abandoned. */
@@ -381,7 +381,7 @@ export class Daemon {
   // running when the next `setInterval` fire arrives. Two overlapping firings of the same named
   // timer can then commit their writes out of order — an older, slower success landing after a
   // newer, faster failure and silently erasing the failure's error fields is the exact shape a
-  // blind review found for `buzz_mentions_watch`. Named by timer, not global, so one timer
+  // blind review found for `buzz_channel_traffic_watch`. Named by timer, not global, so one timer
   // running long never blocks a different timer's own firing.
   readonly #periodicInFlight = new Set<string>();
   #continuityCoordinatorInstalled = false;
@@ -1415,18 +1415,18 @@ export class Daemon {
       this.#timers.push(delivery);
     }
 
-    // #674 — measures, never delivers: one `messages get --since` per live session's channel,
-    // so a dead session-local poller stops being indistinguishable from "no new messages".
+    // #674 — measures raw channel traffic, never classification or delivery: one
+    // `messages get --since` per live session's channel.
     //
     // One target per live session (#710), not per distinct channel: deduping by channel here —
     // the previous shape — was exactly the bug a blind review found, because it fed the watch a
     // single shared identity for sessions that share a channel, and the watch's state was keyed
     // on that same identity. Every live session with a channel gets its own tick now, even when
     // several resolve to the same `channelId`.
-    if (this.options.mentionWatch) {
-      const mentionsMs = this.options.buzzMentionsIntervalMs ?? deliveryMs;
-      const mentionsWatch = setInterval(() => {
-        void this.runPeriodic("buzz_mentions_watch", async () => {
+    if (this.options.channelTrafficWatch) {
+      const channelTrafficMs = this.options.buzzChannelTrafficIntervalMs ?? deliveryMs;
+      const channelTrafficWatch = setInterval(() => {
+        void this.runPeriodic("buzz_channel_traffic_watch", async () => {
           const targets = this.cp.sessions
             .live()
             .flatMap((session) =>
@@ -1434,11 +1434,11 @@ export class Daemon {
                 ? [{ sessionId: session.sessionId, channelId: session.buzzAddress }]
                 : [],
             );
-          await this.options.mentionWatch!.tick(targets);
+          await this.options.channelTrafficWatch!.tick(targets);
         });
-      }, mentionsMs);
-      mentionsWatch.unref();
-      this.#timers.push(mentionsWatch);
+      }, channelTrafficMs);
+      channelTrafficWatch.unref();
+      this.#timers.push(channelTrafficWatch);
     }
   }
 
@@ -1593,7 +1593,7 @@ export class Daemon {
    * `setInterval` fire arrives is skipped rather than run again concurrently. Without this, two
    * overlapping firings write their outcomes in whatever order their own async work happens to
    * finish — an older, slower call landing after a newer, faster one and overwriting its result
-   * is exactly the race a blind review found downstream of this method (`buzz_mentions_watch`'s
+   * is exactly the race a blind review found downstream of this method (`buzz_channel_traffic_watch`'s
    * shared mutable row). Skipping keeps every named timer's own writes strictly serial, which
    * every caller downstream of this method is entitled to assume.
    */

@@ -1178,38 +1178,36 @@ CREATE INDEX IF NOT EXISTS outbox_role ON outbox(role_key, binding_generation, s
 CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE status = 'PENDING';
 
 -- ---------------------------------------------------------------------------
--- buzz_mention_watch (v34, #674; re-keyed by #710)
---   A per-SESSION cursor plus tick health, so a session's ad hoc poll dying silently and
---   "nothing new arrived" no longer read as the same fact. See src/buzz/mention-watch.ts
---   for the full lifecycle: the reset generation/time/event-id cursor moves only via an explicit
---   reset on reconnect, never on an ordinary tick, which recomputes `pending_count` fresh.
+-- buzz_channel_traffic_watch (v34, #674; per-session after #710)
+--   The latest raw-channel window read by the independent daemon watch. A complete tick advances
+--   the baseline; reconnect and session-poller processing do not. The Buzz CLI surface exposes no
+--   mention classification, needs_action, or canonical-turn delivery state.
 --
 --   Keyed on `session_id`, not `channel_id`: #710 found production sessions can share one
---   `ACP_BUZZ_CHANNEL` (buzz-adapter.ts's `defaultChannel` path), and a channel-keyed row let
---   one session's reconnect reset another session's baseline out from under it. `channel_id`
---   stays as a plain column — it is what the CLI read is actually against — but the identity
---   this state is scoped to is the session asking the question, so that is the key.
+--   `ACP_BUZZ_CHANNEL`. `channel_id` remains the address each independent measurement reads.
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS buzz_mention_watch (
+CREATE TABLE IF NOT EXISTS buzz_channel_traffic_watch (
   session_id        TEXT PRIMARY KEY,
   channel_id        TEXT NOT NULL,
-  -- An opaque CAS token. Wall time cannot distinguish two reconnects in one clock tick.
+  -- An opaque CAS token prevents an old-channel read overwriting a newer binding.
   cursor_generation TEXT NOT NULL,
-  -- Millisecond evidence time; CLI reads overlap its whole second and event ids disambiguate it.
+  -- End of the last complete check. Reads overlap its whole second and ids disambiguate it.
   baseline_at       INTEGER,
   baseline_event_ids TEXT NOT NULL DEFAULT '[]',
-  latest_event_id   TEXT,
-  latest_seen_at    INTEGER,
-  pending_count     INTEGER NOT NULL DEFAULT 0,
-  -- Set when a tick's read hit MAX_MESSAGES_PER_TICK: the CLI's `--limit` is a return cap, not
-  -- a total, so `pending_count` at the cap is a floor, not an exact count (#710 finding 3).
-  pending_saturated INTEGER NOT NULL DEFAULT 0,
+  window_started_at INTEGER,
+  window_ended_at   INTEGER,
+  observed_count    INTEGER NOT NULL DEFAULT 0,
+  -- A capped source result is incomplete even when boundary filtering confirms zero new ids.
+  window_incomplete INTEGER NOT NULL DEFAULT 0,
   last_attempt_at   TEXT,
-  last_success_at   TEXT,
+  -- Set before the async CLI read and cleared by either terminal outcome; survives a process death.
+  attempt_in_progress INTEGER NOT NULL DEFAULT 0,
+  last_read_success_at TEXT,
   last_error        TEXT,
   last_error_at     TEXT
 );
-CREATE INDEX IF NOT EXISTS buzz_mention_watch_channel ON buzz_mention_watch(channel_id);
+CREATE INDEX IF NOT EXISTS buzz_channel_traffic_watch_channel
+  ON buzz_channel_traffic_watch(channel_id);
 
 -- ---------------------------------------------------------------------------
 -- inbound_messages

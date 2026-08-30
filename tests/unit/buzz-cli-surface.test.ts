@@ -94,6 +94,10 @@ if (argv[0] === "channels" && argv[1] === "get") {
 }
 if (argv[0] === "messages" && argv[1] === "get") {
   if (!flag("--channel")) die("error: the following required arguments were not provided:\\n  --channel <CHANNEL>");
+  if (process.env.ACP_STUB_MESSAGES_JSON) {
+    process.stdout.write(process.env.ACP_STUB_MESSAGES_JSON);
+    process.exit(0);
+  }
   process.stdout.write(${JSON.stringify(messagesGet)});
   process.exit(0);
 }
@@ -309,7 +313,7 @@ describe("#423 BuzzCliTransport against the installed CLI surface", () => {
     expect(messages[0]).toHaveProperty("pubkey");
   });
 
-  /** #674 — the buzz mention watch's read side; same subcommand, one more declared option. */
+  /** #674 — the raw channel-traffic watch's read side; same command, one more option. */
   it("reads messages since a point in time with `messages get --since`", async () => {
     const messages = await new BuzzCliTransport(stub.binary).messagesSince(ceo.channel_id, 1786255000, 200);
 
@@ -325,6 +329,17 @@ describe("#423 BuzzCliTransport against the installed CLI surface", () => {
     ]);
     expect(messages[0]).toHaveProperty("id");
     expect(messages[0]).toHaveProperty("created_at");
+  });
+
+  it("refuses a message row without the identity and timestamp the watch measures", async () => {
+    process.env["ACP_STUB_MESSAGES_JSON"] = "[{}]";
+    try {
+      await expect(
+        new BuzzCliTransport(stub.binary).messagesSince(ceo.channel_id, 1786255000, 200),
+      ).rejects.toThrow(/message.*id|created_at/);
+    } finally {
+      delete process.env["ACP_STUB_MESSAGES_JSON"];
+    }
   });
 
   it("sends with the argv the CLI accepts and refuses unparseable output", async () => {

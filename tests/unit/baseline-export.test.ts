@@ -839,7 +839,7 @@ describe("baseline boundary contracts", () => {
       "v31-a-generation-means-nothing-without-its-role-key",
       "v32-a-source-can-only-cite-its-turns-own-claim-event",
       "v33-draining-remembers-its-cause",
-      "v34-a-silent-poller-and-no-new-mentions-look-the-same",
+      "v34-buzz-channel-traffic-between-watch-checks",
     ]);
   });
 
