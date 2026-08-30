@@ -1,21 +1,20 @@
 #!/usr/bin/env node
 /**
- * Verifies that the reason-code catalogue is *coherent with the code that uses it*.
+ * Verifies a static census of reason-code references and trigger mappings.
  *
  * `verify-reason-codes.mjs` already checks the catalogue's internal shape (value equals
- * key, nothing published was removed). That is not enough after a multi-wave merge: waves
- * that each added their own denial vocabulary can leave the catalogue holding codes no
- * caller ever emits, and can leave a raised SQLite trigger name with no code to translate
- * it into. PRD §40 calls these strings the stable denial vocabulary — a code nobody emits
- * is a promise the runtime cannot keep, and a trigger nobody maps surfaces to the caller
- * as an opaque SQLITE_CONSTRAINT instead of a reason.
+ * key, nothing published was removed). This census additionally detects a declaration with
+ * no static reference in src and a raised SQLite trigger name with no TRIGGER_CODES mapping.
+ * It does not establish that a reference is reachable at runtime: comments and dead code are
+ * source text too.
  *
  * Checks:
- *   1. every declared code is referenced somewhere in `src/**` outside its declaration
+ *   1. every declared code has a static `ReasonCode.X` or `reasonCode`-literal reference in
+ *      `src/**` outside its declaration
  *   2. every code referenced in `tests/**` is declared
  *   3. every string literal used as a `reasonCode` in `src/**`/`tests/**` is declared
- *   4. every `RAISE(ABORT, 'X')` name in production schema or migration DDL is mapped by
- *      TRIGGER_CODES in `src/db/database.ts`, so a trigger abort becomes a reason code
+ *   4. every `RAISE(ABORT, 'X')` name in production schema or migration DDL has a
+ *      TRIGGER_CODES mapping in `src/db/database.ts`
  *
  * Nothing here deletes or edits a code: `src/core/reason-codes.ts` is append-only by
  * contract, so an unused code is reported for a human decision, never removed.
@@ -75,7 +74,7 @@ const referenceSource = (file) =>
       )}`
     : read(file);
 
-/** `ReasonCode.FOO` — the normal, type-checked way to reference a code. */
+/** Textual `ReasonCode.FOO` matches, including comments and unreachable code. */
 const memberRefs = (files) => {
   const hits = new Map();
   for (const file of files) {
@@ -90,10 +89,9 @@ const memberRefs = (files) => {
 };
 
 /**
- * A reason code written as a bare string rather than through the catalogue. Only literals
- * that are *bound to a reason code* count: an UPPER_SNAKE string elsewhere on the same
- * line is usually an audit kind, a run state or a doctor status, and matching those would
- * drown the real finding in noise.
+ * Textual reason-code-literal matches. An UPPER_SNAKE string elsewhere on the same line is
+ * usually an audit kind, a run state or a doctor status, and matching those would drown the
+ * real finding in noise.
  */
 const REASON_LITERAL = [
   /reason[_C]ode:\s*"([A-Z][A-Z0-9_]{2,})"/g,
@@ -121,7 +119,7 @@ const testMembers = memberRefs(testFiles);
 const srcLiterals = literalRefs(srcFiles);
 const testLiterals = literalRefs(testFiles);
 
-/** Plain-text mention anywhere in src, which is how a code reaches a doc comment or SQL. */
+/** Extra diagnostic: a plain-text source mention does not satisfy the static-reference check. */
 const srcText = srcFiles.map(referenceSource).join("\n");
 
 const problems = [];
@@ -182,8 +180,7 @@ if (!triggerCodesBody) {
   for (const [name, at] of raised) {
     if (!mapped.has(name)) {
       problems.push(
-        `schema raises '${name}' but src/db/database.ts TRIGGER_CODES does not map it; ` +
-          `callers see a raw SQLITE_CONSTRAINT (${at})`,
+        `schema raises '${name}' but src/db/database.ts TRIGGER_CODES does not map it (${at})`,
       );
     }
   }
@@ -227,7 +224,7 @@ if (asJson) {
   for (const note of notes) console.log(`note: ${note}`);
   console.log("");
   if (problems.length === 0) {
-    console.log("OK — catalogue is coherent with src/**, tests/** and production trigger DDL");
+    console.log("OK — static reason-code references and production trigger DDL mappings agree");
   } else {
     console.log(`${problems.length} problem(s):`);
     for (const problem of problems) console.log(`  - ${problem}`);

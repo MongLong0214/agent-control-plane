@@ -8,6 +8,8 @@ const root = fileURLToPath(new URL("../..", import.meta.url));
 const script = join(root, "scripts", "verify-reason-code-usage.mjs");
 
 interface Census {
+  exitCode: number | null;
+  problems: string[];
   unreferenced: unknown[];
   notes: string[];
 }
@@ -19,18 +21,29 @@ const census = (): Census => {
   });
   if (result.error) throw result.error;
   try {
-    return JSON.parse(result.stdout) as Census;
+    return {
+      exitCode: result.status,
+      ...(JSON.parse(result.stdout) as Omit<Census, "exitCode">),
+    };
   } catch {
     throw new Error(`reason-code census did not return JSON:\n${result.stdout}${result.stderr}`);
   }
 };
 
-/** Every declared reason code has a production reference. */
-it("every declared reason code has a production reference", () => {
-  expect(census().unreferenced).toEqual([]);
+/** Every declared reason code has a static reference in src. */
+it("every declared reason code has a static reference in src", () => {
+  const result = census();
+
+  expect(result.exitCode).toBe(0);
+  expect(result.problems).toEqual([]);
+  expect(result.unreferenced).toEqual([]);
 });
 
-/** Every mapped trigger denial is raised by production DDL. */
-it("every mapped trigger denial is raised by production DDL", () => {
-  expect(census().notes).toEqual([]);
+/** Production trigger denials and mappings agree. */
+it("production trigger denials and mappings agree", () => {
+  const result = census();
+
+  expect(result.exitCode).toBe(0);
+  expect(result.problems).toEqual([]);
+  expect(result.notes).toEqual([]);
 });

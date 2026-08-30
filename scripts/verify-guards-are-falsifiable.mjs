@@ -85,21 +85,21 @@ const vitestArgsFor = (killedBy) => {
 
 const GUARDS = [
   {
-    what: "every declared reason code has a production reference",
+    what: "every declared reason code has a static reference in src",
     file: "src/core/reason-codes.ts",
     find: "  ReasonCode.CAPACITY_PROBE_STALE,\n",
     replace: "",
     killedBy: [
-      "tests/process/every-reason-code-has-a-production-reference.test.ts::every declared reason code has a production reference",
+      "tests/process/every-reason-code-has-a-production-reference.test.ts::every declared reason code has a static reference in src",
     ],
   },
   {
-    what: "every mapped trigger denial is raised by production DDL",
+    what: "production trigger denials and mappings agree",
     file: "scripts/verify-reason-code-usage.mjs",
     find: '  ["src/db/migrations.ts", read("src/db/migrations.ts")],\n',
     replace: "",
     killedBy: [
-      "tests/process/every-reason-code-has-a-production-reference.test.ts::every mapped trigger denial is raised by production DDL",
+      "tests/process/every-reason-code-has-a-production-reference.test.ts::production trigger denials and mappings agree",
     ],
   },
   {
