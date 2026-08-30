@@ -6,8 +6,8 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { answerAsCeo, startDaemonTelegramListener } from "../../src/daemon/agentcpd.ts";
 import {
-  TelegramHermesRouter,
   TelegramInterruption,
+  type TelegramHermesRouter,
   type TelegramRouteOutcome,
 } from "../../src/ingress/telegram-router.ts";
 import {
