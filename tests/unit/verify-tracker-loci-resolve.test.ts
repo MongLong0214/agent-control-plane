@@ -1513,11 +1513,12 @@ describe("verify-tracker-loci-resolve", () => {
 
   // The property this round's fix actually needs, generalized past the one shape Sol reported:
   // citing a real, current line verbatim — across every language this check strips comments and
-  // strings for, not just TypeScript — must never read STALE just because the line happens to
-  // contain a string literal. `.py` is deliberately excluded here: verifying this property against
+  // strings for — must never read STALE just because the line happens to contain a string
+  // literal. Round 13 deliberately excluded `.py` here: verifying this property against
   // `deploy/egress/allowlist-proxy.py` surfaced a separate, real defect (a triple-quoted docstring
-  // desynchronizes `stripStrings`' quote pairing for the rest of the file) that is not this round's
-  // needle/haystack asymmetry and is reported rather than folded in here — see the round 13 commit.
+  // desynchronizes `stripStrings`' quote pairing for the rest of the file, #700) that was not that
+  // round's needle/haystack asymmetry. Round 14 closes #700 (`stripPythonSource`) and Python is
+  // included below — the exclusion no longer applies.
   const REAL_STRING_LITERAL_CITATIONS: Array<{ label: string; path: string; line: number; content: string }> = [
     {
       label: "TypeScript, a double-quoted string argument",
@@ -1537,6 +1538,15 @@ describe("verify-tracker-loci-resolve", () => {
       line: 5,
       content: 'readonly LABEL="com.agentcontrolplane.agentcpd"',
     },
+    {
+      // #700's own concrete counterexample: this is the occurrence the corrupted triple-quote
+      // pairing was eating (line 77), not the coincidental one 7 lines later (line 84) that let
+      // the pre-existing round-4 symbol-search test pass for the wrong reason the whole time.
+      label: "Python, a double-quoted string literal, after a triple-quoted module docstring (#700)",
+      path: "deploy/egress/allowlist-proxy.py",
+      line: 77,
+      content: 'ALLOWLIST_DIGEST = "sha256:" + hashlib.sha256(_f.read()).hexdigest()',
+    },
   ];
 
   describe("[round 13] property: a real, current line containing a string literal is never STALE", () => {
@@ -1554,6 +1564,50 @@ describe("verify-tracker-loci-resolve", () => {
         }
       });
     }
+  });
+
+  describe("[round 14] #700 finding 2: string content is compared literally, not skipped", () => {
+    it("a citation whose quoted string literal no longer matches the real one reads STALE", () => {
+      // The real, current line at session-registry.ts:148 says "unknown session"; this citation
+      // quotes the same line with the string literal's content swapped for something else
+      // entirely. Round 13's own fix (stripToCodeView on both sides) blanked string content out of
+      // the comparison, which made this pass as ADVISORY — the check reporting coverage over
+      // string content it was not actually comparing. Round 14's `stripCommentsForContentView`
+      // leaves string content in place, so a changed string is a changed citation.
+      const body =
+        'See `src/session/session-registry.ts:148` — ' +
+        '`if (!row) return deny(ReasonCode.NOT_FOUND, "totally different text", { sessionId });` for the detail.';
+      const { path, cleanup } = withIssues([{ number: 70002, title: "finding 2: swapped string content", body }]);
+      try {
+        const result = run(path);
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("STALE");
+        expect(result.stdout).toContain("totally different text");
+        expect(result.stdout).toContain("no longer appears");
+      } finally {
+        cleanup();
+      }
+    });
+
+    it("a citation whose quoted content differs only inside a comment (not a string) still reads ADVISORY", () => {
+      // The companion case: comments are still excluded from the content-search comparison (round
+      // 11's own fix, unaffected by round 14) — only string-content sensitivity changed. A needle
+      // that is ordinary code with no comment syntax in it strips to itself unchanged on both
+      // sides, so this is really the same regression guard as the round-13 property tests above,
+      // named explicitly here as the "comments still don't count" half of the round 14 decision.
+      const body = "The fix is at `src/daemon/agentcpd.ts:1420` — `server.close()` for the shutdown guard.";
+      const { path, cleanup } = withIssues([{ number: 70003, title: "finding 2: comment still excluded", body }]);
+      try {
+        const result = run(path);
+        // This is the exact round-11 regression guard fixture: the real call moved away from this
+        // line and now only survives in a nearby comment, so it correctly stays STALE — comments
+        // are not part of "content" either before or after round 14.
+        expect(result.status).toBe(1);
+        expect(result.stdout).toContain("STALE");
+      } finally {
+        cleanup();
+      }
+    });
   });
 
   it("--json emits parseable structured output", () => {

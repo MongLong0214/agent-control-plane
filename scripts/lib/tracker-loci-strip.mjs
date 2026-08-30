@@ -84,6 +84,82 @@ export const stripStrings = (text) =>
     .replace(/'(?:[^'\\]|\\.)*'/g, (m) => `'${blankKeepingNewlines(m.slice(1, -1))}'`);
 
 /**
+ * #700: `stripStrings` treats every `"` and `'` as an independent single-character delimiter,
+ * which is wrong for Python — a triple-quoted string (`"""..."""` or `'''...'''`) is one
+ * multi-character delimiter, not three single-quote pairs. Feeding a module docstring through
+ * `stripStrings` reads its opening `"""` as an empty string (`""`) immediately followed by a
+ * fresh opening `"`, and every quote after that is paired one position out of phase for the rest
+ * of the file — confirmed directly against the one `.py` file this repository tracks
+ * (`deploy/egress/allowlist-proxy.py`): `ALLOWLIST_DIGEST`'s own declaration at line 77, well
+ * after the module docstring, is blanked away in the corrupted view.
+ *
+ * This walks Python source once, character by character, so a `#` and a quote are each resolved
+ * in the order a real tokenizer would see them — in particular, a `#` *inside* a string (of
+ * either width) is never mistaken for a comment marker, which the previous two-pass pipeline
+ * (`stripStrings(stripHashComments(text))`) got wrong too: `stripHashComments` ran first and
+ * blind to string boundaries, so a `#` inside a docstring (this repository's own module docstring
+ * has one — "built and proved for #419") silently truncated that line before the string walk ever
+ * ran.
+ *
+ * `blankStrings` picks which of two different callers this serves, because they need opposite
+ * answers about string *content* (see `verify-tracker-loci-resolve.mjs` round 14 for the full
+ * argument, and #700's finding 2):
+ *
+ *   - `true` — the symbol-search view (`readCode`): string content is blanked (delimiters kept),
+ *     same as `stripStrings`, so a symbol name that only happens to be spelled inside a string
+ *     literal does not count as the file declaring it.
+ *   - `false` — the content/snippet-comparison view: comments are stripped but string content is
+ *     left untouched, so a citation quoting a line whose string literal no longer matches the
+ *     real one still reads STALE, rather than every string being an unconditional wildcard.
+ */
+export const stripPythonSource = (text, blankStrings) => {
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "#") {
+      let j = i;
+      while (j < n && text[j] !== "\n") j++;
+      out += blankKeepingNewlines(text.slice(i, j));
+      i = j;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const isTriple = text.slice(i, i + 3) === ch.repeat(3);
+      const delim = isTriple ? ch.repeat(3) : ch;
+      let j = i + delim.length;
+      let closed = false;
+      while (j < n) {
+        if (text[j] === "\\" && j + 1 < n) {
+          j += 2;
+          continue;
+        }
+        if (text.slice(j, j + delim.length) === delim) {
+          j += delim.length;
+          closed = true;
+          break;
+        }
+        j++;
+      }
+      const span = text.slice(i, j);
+      if (blankStrings) {
+        const closeLen = closed ? delim.length : 0;
+        const interior = span.slice(delim.length, span.length - closeLen);
+        out += span.slice(0, delim.length) + blankKeepingNewlines(interior) + (closeLen ? span.slice(-closeLen) : "");
+      } else {
+        out += span;
+      }
+      i = j;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+};
+
+/**
  * Template literals (`` `...` ``) hold two different things at once: literal text the author
  * wrote, and `${…}` expressions that are ordinary code. Stripping the whole literal (the earlier
  * approach) throws the code away with the prose; leaving it alone (the approach before that) reads

@@ -637,6 +637,44 @@
  *   fix — see the round 13 commit message for the fuller account of what was found and why it is
  *   left for its own round.
  *
+ * ## Round 14: the two findings a blind review filed against round 13, both instances of this
+ * script's own most-repeated defect — a check does not cover what it says it covers
+ *
+ *   Finding 1 (#700, closed by this round): `stripStrings` pairs a Python triple-quoted string
+ *   (`"""..."""`/`'''...'''`) as three independent single-quote delimiters, not one multi-
+ *   character one — round 13 named this and deliberately left it for its own round rather than
+ *   folding it in. `stripPythonSource` (in `scripts/lib/tracker-loci-strip.mjs`) replaces the
+ *   `stripStrings(stripHashComments(text))` pipeline for `.py` specifically with a single
+ *   character walk that resolves a `#` and a quote (of either width) in the order a real
+ *   tokenizer would — which also fixes a second, smaller desync the two-pass pipeline had: a `#`
+ *   *inside* a docstring (this repository's own module docstring names `#419`) was being read as
+ *   a comment marker regardless of string context, because `stripHashComments` ran blind to it.
+ *   Verified against the real counterexample #700 reported, not a constructed stand-in: quoting
+ *   `deploy/egress/allowlist-proxy.py`'s real line 77 (`ALLOWLIST_DIGEST`'s own declaration, the
+ *   occurrence the corrupted pairing was eating, not the coincidental one 7 lines later that let
+ *   the existing round-4 test pass for the wrong reason) now reads ADVISORY, not STALE. `.sh` and
+ *   `.yaml`/`.yml` share `stripHashComments` but not this fix — neither has a triple-quote string
+ *   convention to get wrong the same way, confirmed rather than assumed by grepping this
+ *   repository's own tracked `.sh` files for one.
+ *
+ *   Finding 2 (also #700): `stripToCodeView` blanked string content out of *both* the content-
+ *   search needle and haystack (round 13's own fix for a different bug — see above), which made
+ *   string content entirely incomparable: an elision-tolerant pattern built from a blanked string
+ *   collapses to `\s+`, matching any string content of any length at that position. A citation
+ *   quoting a line whose string literal had since changed to something else entirely still read
+ *   ADVISORY — the check reporting a coverage over string content it was not actually comparing.
+ *   Decided deliberately, not left as an implicit tolerance: string content is not the same kind
+ *   of thing a comment is (a comment is a sentence *about* code; a string literal *is* content,
+ *   the same way an identifier is), so it should compare literally. `stripCommentsForContentView`
+ *   is a second per-extension view, used only for the content-search needle and haystack, that
+ *   strips comments the same way `stripToCodeView` does but leaves string (and template-literal)
+ *   content untouched; `stripToCodeView`/`readCode` are unchanged and still used for symbol
+ *   search, which still wants string content blanked (round 3's `utf8` counterexample). Verified
+ *   this does not reopen either prior bug it sits beside: round 13's needle/haystack symmetry
+ *   (both sides still go through the same function) and round 11's comment-survival fix (comments
+ *   are still stripped from both sides here) are both unaffected — only string-content sensitivity
+ *   changed, and only in the content-search path.
+ *
  * Usage: node scripts/verify-tracker-loci-resolve.mjs [--json] [--strict] [--issues-file=<path>] [--repo-root=<path>]
  */
 import { execFileSync } from "node:child_process";
@@ -645,6 +683,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   stripHashComments,
+  stripPythonSource,
   stripSlashComments,
   stripSqlComments,
   stripStrings,
@@ -724,6 +763,11 @@ const countLines = (text) => {
 const JS_FAMILY_EXTS = new Set(["ts", "tsx", "js", "mjs", "cjs", "mts"]);
 const HASH_COMMENT_EXTS = new Set(["py", "sh", "yaml", "yml"]);
 const SQL_EXTS = new Set(["sql"]);
+// Python gets its own dedicated stripper (`stripPythonSource`), not the generic
+// `stripStrings(stripHashComments(text))` pipeline the other HASH_COMMENT_EXTS still use — see
+// #700 and round 14 below. `.sh`/`.yaml`/`.yml` have no triple-quote convention to get wrong the
+// same way, so they stay on the simpler pipeline.
+const PY_EXTS = new Set(["py"]);
 
 const extensionOf = (relPath) => {
   const dot = relPath.lastIndexOf(".");
@@ -743,9 +787,16 @@ const codeSearchScope = (relPath) => {
  * The per-extension comment/string-stripping dispatch itself, pulled out of `readCode` so the
  * same transform can run on a string that is not a file's contents — see round 13's fix to the
  * content-search needle, below, for why that is needed at all.
+ *
+ * This is the *symbol-search* view: both comments and string content are excluded, so a symbol
+ * name that only happens to be spelled inside a string literal does not count as the file
+ * declaring it (round 3's `utf8` counterexample). Round 14 splits this from the *content-search*
+ * view (`stripCommentsForContentView`, below) — see that function's comment for why the two need
+ * different answers about string content, and #700 for the Python-specific fix here.
  */
 const stripToCodeView = (text, ext) => {
   if (JS_FAMILY_EXTS.has(ext)) return stripStrings(stripTemplateLiteralProse(stripSlashComments(text)));
+  if (PY_EXTS.has(ext)) return stripPythonSource(text, true);
   if (HASH_COMMENT_EXTS.has(ext)) return stripStrings(stripHashComments(text));
   if (SQL_EXTS.has(ext)) return stripStrings(stripSqlComments(text));
   return text; // no supported comment syntax for this extension — see codeSearchScope
@@ -757,6 +808,56 @@ const readCode = (relPath) => {
     codeTextCache.set(relPath, stripToCodeView(readText(relPath), extensionOf(relPath)));
   }
   return codeTextCache.get(relPath);
+};
+
+/**
+ * ## Round 14: #700's finding 2 — string-insensitive comparison is a hole, not a tolerance
+ *
+ * Round 13 made the content-search needle and haystack agree by stripping *both* through
+ * `stripToCodeView` — the symbol-search view, which blanks string content on both sides. That
+ * fixed the needle/haystack asymmetry it was written for, but it went further than the fix
+ * needed: blanking a string's content to same-length spaces and then building an elision-tolerant
+ * regex from it (`snippetPattern` collapses any run of blanked spaces to `\s+`) makes the regex
+ * match *any* string content of *any* length at that position, not just the one the citation
+ * actually quoted. A citation of `` `session-registry.ts:148` — `deny(ReasonCode.NOT_FOUND,
+ * "unknown session", { sessionId })` `` would keep reading ADVISORY even if the real string were
+ * rewritten to `"completely different text"` — the check reporting coverage over string content
+ * it is not actually comparing, silently.
+ *
+ * Comments and string content are not the same kind of thing here. A comment mentioning deleted
+ * code is a sentence *about* code, not code (round 11's whole argument for stripping comments from
+ * the content-search haystack); a string literal is not a description of the line, it *is* the
+ * line's content, the same way a bare identifier is. Blanking comments out of the comparison is
+ * correct; blanking strings out of it erases exactly the content a citation quoting a string is
+ * making a claim about.
+ *
+ * Decision: the content-search view strips comments only, on both the needle and the haystack, and
+ * leaves string (and template-literal) content untouched. This is a *separate* view from
+ * `stripToCodeView` — the symbol search still wants strings blanked, for the reason above — so
+ * this is not a change to `stripToCodeView` itself, but a second per-extension dispatch used only
+ * by the content-search needle/haystack comparison.
+ *
+ * Checked before adopting it: does this reopen round 13's own bug (needle raw, haystack stripped,
+ * asymmetric)? No — both sides go through this same function now, so they still agree with each
+ * other; what changed is which things count as "content" (strings do, comments still do not), not
+ * whether the two sides are compared symmetrically. Does it reopen round 11's comment-survival
+ * fix? No — comments are still stripped here exactly as `stripToCodeView` strips them; only string
+ * content differs between the two views.
+ */
+const stripCommentsForContentView = (text, ext) => {
+  if (JS_FAMILY_EXTS.has(ext)) return stripSlashComments(text);
+  if (PY_EXTS.has(ext)) return stripPythonSource(text, false);
+  if (HASH_COMMENT_EXTS.has(ext)) return stripHashComments(text);
+  if (SQL_EXTS.has(ext)) return stripSqlComments(text);
+  return text;
+};
+
+const contentViewCache = new Map();
+const readContentView = (relPath) => {
+  if (!contentViewCache.has(relPath)) {
+    contentViewCache.set(relPath, stripCommentsForContentView(readText(relPath), extensionOf(relPath)));
+  }
+  return contentViewCache.get(relPath);
 };
 
 /**
@@ -1494,25 +1595,31 @@ for (const issue of issues) {
 
     if (citation.content) {
       // Round 13: the needle used to be built from `citation.content` verbatim — the citation's
-      // *raw* quoted text — while round 11 moved the haystack to `readCode`, which also strips
-      // string-literal content (blanked to same-length spaces, quotes kept — see `stripStrings`).
-      // An exact, currently-correct citation that happens to quote a line containing a string
-      // literal (`` `session-registry.ts:148` — `if (!row) return deny(ReasonCode.NOT_FOUND,
-      // "unknown session", { sessionId });` ``, the real, current line) read STALE: the raw needle
-      // still had `"unknown session"` intact, and the stripped haystack had that same span blanked
-      // to spaces, so a literal match against real, unchanged code failed on the one part of it
-      // that was never supposed to compare literally in the first place. Fixed by stripping the
-      // needle through the same per-extension view (`stripToCodeView`) the haystack already gets,
-      // so both sides agree about what counts as "content" rather than one side searching in raw
-      // space and the other in stripped space. This does not reopen round 11's comment case: a
-      // needle that is *itself* ordinary code (no `//`/`/* */`/quote syntax in the quoted text)
+      // *raw* quoted text — while round 11 moved the haystack to a stripped view, so an exact,
+      // currently-correct citation that happens to quote a line containing a string literal read
+      // STALE: the raw needle still had the string intact, and the stripped haystack had that same
+      // span blanked, so a literal match against real, unchanged code failed on the one part of it
+      // that was never supposed to compare asymmetrically in the first place. Fixed by stripping
+      // the needle through the same per-extension view the haystack gets, so both sides agree
+      // about what counts as "content" rather than one side searching in raw space and the other
+      // in stripped space.
+      //
+      // Round 14 (#700 finding 2): that view used to be `stripToCodeView` — the *symbol-search*
+      // view, which blanks string content on both sides too. That over-corrected: an elision-
+      // tolerant regex built from a blanked string collapses to `\s+`, which matches *any* string
+      // content of *any* length, so a citation quoting a string literal kept reading ADVISORY even
+      // after the real string's content changed — the check reporting a coverage it did not have.
+      // `stripCommentsForContentView` (see its own comment, above) strips comments only, on both
+      // sides, and leaves string content untouched, so a changed string literal now reads STALE
+      // and an unchanged one still reads ADVISORY. This does not reopen round 11's comment case: a
+      // needle that is *itself* ordinary code (no `//`/`/* */`/`#` syntax in the quoted text)
       // strips to itself unchanged, so a citation whose old code now survives only inside the
       // file's comment still fails to match the (comment-stripped) haystack exactly as before. A
       // needle that quotes a comment *including its own marker* strips to nothing and yields no
       // pattern (`snippetPattern("")` is already `null`) — an unverifiable quote is treated the
       // same as no quoted content at all, falling through to ADVISORY rather than asserting a
       // fact this check cannot check.
-      const needle = stripToCodeView(citation.content, extensionOf(resolved.path));
+      const needle = stripCommentsForContentView(citation.content, extensionOf(resolved.path));
       const pattern = snippetPattern(needle);
       // Searched near the cited line, not across the whole file. A file this size legitimately
       // repeats a shape — `binding-registry.ts` has a second, deliberate unconditional
@@ -1530,17 +1637,17 @@ for (const issue of issues) {
       // `README.md:121` cited as `README.md:61`, +60, the boundary the contract names — read as
       // vanished, because the slice stopped one line before it.
       //
-      // Round 11: this searched `text` — the raw file, comments and strings included — not
-      // `readCode(resolved.path)`, the same comment/string-stripped view the symbol search has
-      // used since round 2. That is this check's own original defect, reappearing in the
+      // Round 11: this searched `text` — the raw file, comments and strings included — not a
+      // comment-stripped view. That is this check's own original defect, reappearing in the
       // direction it started in rather than the one it was fixed for: a citation whose code was
       // deleted but whose *old text survives inside a comment nearby* — the exact #649 shape,
       // just for a quoted snippet instead of a bare symbol — passed as ADVISORY, because the raw
-      // text still contained it. `readCode` preserves every line exactly (each stripper blanks a
-      // comment or string in place, never removing a line), so swapping it in here costs nothing
-      // for the bounds already established above and closes the gap the same way it already did
-      // for symbols: a comment mentioning old code is a sentence about it, not code that holds it.
-      const windowLines = readCode(resolved.path).split("\n");
+      // text still contained it. Round 14 moved this from `readCode` (the symbol-search view) to
+      // `readContentView` (comments stripped, strings preserved — see that function's comment):
+      // both preserve every line exactly (each stripper blanks in place, never removing a line),
+      // so the bounds established above are unaffected by the swap, and a comment mentioning old
+      // code is still a sentence about it, not code that holds it.
+      const windowLines = readContentView(resolved.path).split("\n");
       const from = Math.max(0, citation.startLine - 1 - CONTENT_SEARCH_WINDOW);
       const to = Math.min(windowLines.length, citedEnd + CONTENT_SEARCH_WINDOW);
       const nearby = windowLines.slice(from, to).join("\n");
