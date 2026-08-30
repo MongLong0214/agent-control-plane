@@ -126,6 +126,9 @@ export const ReasonCode = {
   RESUME_BLOCKED_SUSPEND_IN_FLIGHT: "RESUME_BLOCKED_SUSPEND_IN_FLIGHT",
   /** #692 — replacement paths refuse to drain a session out from under an owner suspend. */
   REPLACEMENT_BLOCKED_PROJECT_SUSPENDED: "REPLACEMENT_BLOCKED_PROJECT_SUSPENDED",
+  /** #692 round 5 — a suspended project cannot acquire or switch its primary CTO binding. */
+  PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED:
+    "PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED",
   /** #692 — internal suspend refuses a session already draining for replacement or switchover. */
   SUSPEND_BLOCKED_NON_SUSPEND_DRAINING: "SUSPEND_BLOCKED_NON_SUSPEND_DRAINING",
   PRODUCER_HISTORY_UNAVAILABLE: "PRODUCER_HISTORY_UNAVAILABLE",

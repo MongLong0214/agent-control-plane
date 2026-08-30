@@ -162,11 +162,37 @@ export class BindingRegistry {
     return allow(ReasonCode.OK, derived);
   }
 
+  /**
+   * A project suspension and its primary CTO binding are one commit-time invariant. Callers
+   * may have awaited provider admission, session startup, routing, or readiness since they
+   * last observed the project; only this registry can re-read the flag in the same transaction
+   * that would make the binding authoritative.
+   */
+  private primaryCtoSuspensionFence(input: BindInput): Decision<void> {
+    if (input.role !== Role.PRIMARY_CTO || !input.projectId) {
+      return allow(ReasonCode.OK, undefined);
+    }
+    const project = this.db.get<{ suspended: number }>(
+      `SELECT suspended FROM projects WHERE project_id = ?`,
+      [input.projectId],
+    );
+    if (project?.suspended === 1) {
+      return deny(
+        ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED,
+        "a suspended project cannot acquire or switch its primary CTO binding",
+        { projectId: input.projectId },
+      );
+    }
+    return allow(ReasonCode.OK, undefined);
+  }
+
   bind(input: BindInput): Decision<RoleBinding> {
     return this.db.tx(() => {
       const key = this.resolveRoleKey(input);
       if (!key.allowed) return key as Decision<RoleBinding>;
       const roleKey = key.value;
+      const bindSuspensionFence = this.primaryCtoSuspensionFence(input);
+      if (!bindSuspensionFence.allowed) return bindSuspensionFence as Decision<RoleBinding>;
       const session = this.sessions.get(input.sessionId);
       if (!session) return deny(ReasonCode.NOT_FOUND, "unknown session", { sessionId: input.sessionId });
       if (session.lifecycle !== SessionLifecycle.READY) {
@@ -272,6 +298,8 @@ export class BindingRegistry {
       const key = this.resolveRoleKey(input);
       if (!key.allowed) return key as Decision<RoleBinding>;
       const roleKey = key.value;
+      const switchSuspensionFence = this.primaryCtoSuspensionFence(input);
+      if (!switchSuspensionFence.allowed) return switchSuspensionFence as Decision<RoleBinding>;
       const current = this.active(roleKey);
 
       if (

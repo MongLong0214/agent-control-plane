@@ -833,6 +833,36 @@ describe("round-2 CTO lifecycle regressions", () => {
     expect(deadSessionFinding(await harness.cp.doctor.run("project", projectId))).toBeUndefined();
   });
 
+  it("#692 round 5 suspend records stopped before rejecting a binding moved during provider stop", async () => {
+    const harness = makeHarness();
+    const { projectId } = await registerFixtureProject(harness);
+    const binding = await harness.cp.cto.ensurePrimaryCto(projectId, "concurrent revoke setup");
+    if (!binding.allowed) throw new Error(binding.message);
+
+    const originalStop = harness.scripted.stopSession.bind(harness.scripted);
+    harness.scripted.stopSession = async (handle) => {
+      await originalStop(handle);
+      const revoked = harness.cp.bindings.revoke(
+        roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+        "concurrent continuity revoke",
+        { allowBlockedRuns: true },
+      );
+      if (!revoked.allowed) throw new Error(`${revoked.reasonCode}: ${revoked.message}`);
+    };
+
+    const suspended = await harness.cp.cto.suspendProject(
+      projectId,
+      true,
+      "provider stop races binding revoke",
+      TEST_OWNER,
+    );
+    expect(suspended.allowed).toBe(false);
+    expect(suspended.reasonCode).toBe(ReasonCode.WRITE_BINDING_GENERATION_STALE);
+    expect(harness.cp.projects.require(projectId).suspended).toBe(true);
+    expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+    expect(harness.cp.sessions.require(binding.value.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+  });
+
   it("#226 leaves a durable blocked run instead of an ACTIVE run owned by a revoked CTO", async () => {
     const harness = makeHarness();
     const { projectId, repositoryId } = await registerFixtureProject(harness);

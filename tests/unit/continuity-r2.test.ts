@@ -29,7 +29,7 @@ import type { TaskContract } from "../../src/run/run-engine.ts";
 import { candidateSnapshotDigest } from "../../src/snapshot/candidate-snapshot.ts";
 import type { VerificationReport } from "../../src/verify/verification-engine.ts";
 import { cleanupTempDirs, commitAll, makeRepo, tempDir } from "../helpers/fixtures.ts";
-import { bindWorkerForTask, fixtureManifest, reviewerPass } from "../helpers/harness.ts";
+import { TEST_OWNER, bindWorkerForTask, fixtureManifest, reviewerPass } from "../helpers/harness.ts";
 import { testReviewerEgressEvidence } from "../helpers/production-adapter.ts";
 
 afterAll(cleanupTempDirs);
@@ -104,6 +104,7 @@ const makePlane = () => {
     clock,
     adapters: [gpt, claude],
     allowTestEvidenceWriters: true,
+    ownerIdentities: [TEST_OWNER],
   });
   return { cp, clock, gpt, claude, root };
 };
@@ -1793,6 +1794,223 @@ describe("round-2 continuity and persistence regressions", () => {
     expect(refused.allowed).toBe(false);
     expect(refused.reasonCode).toBe(ReasonCode.BINDING_GENERATION_STALE);
     expect(plane.cp.bindings.active(roleKeyFor(Role.CEO))!.sessionId).toBe(concurrent.sessionId);
+  });
+
+  it("#692 round 5 failover started before suspend cannot bind after suspend commits", async () => {
+    const plane = makePlane();
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    attachRoutablePorts(plane.cp);
+
+    const projectId = "suspend-racing-continuity-failover";
+    const manifest = fixtureManifest(projectId);
+    const project = plane.cp.projects.register({
+      projectId,
+      name: "suspend racing continuity failover",
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    const incumbent = await plane.cp.cto.ensurePrimaryCto(projectId, "failover suspend race setup");
+    if (!incumbent.allowed) throw new Error(incumbent.message);
+
+    const originalStart = plane.claude.startSession.bind(plane.claude);
+    let replacementHandle: SessionHandle | null = null;
+    vi.spyOn(plane.claude, "startSession").mockImplementationOnce(async (spec) => {
+      replacementHandle = await originalStart(spec);
+      return replacementHandle;
+    });
+
+    const originalAdmission = plane.cp.capacity.refreshForProviderSwitch.bind(plane.cp.capacity);
+    let admissionStarted!: () => void;
+    let releaseAdmission!: () => void;
+    const enteredAdmission = new Promise<void>((resolve) => { admissionStarted = resolve; });
+    const admissionGate = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    vi.spyOn(plane.cp.capacity, "refreshForProviderSwitch").mockImplementationOnce(async (target) => {
+      admissionStarted();
+      await admissionGate;
+      return originalAdmission(target);
+    });
+
+    const pendingFailover = plane.cp.continuity.failover(
+      roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+      Role.PRIMARY_CTO,
+      { projectId },
+      "provider failed before suspend",
+    );
+    await enteredAdmission;
+    const suspended = await plane.cp.cto.suspendProject(projectId, true, "owner suspended", TEST_OWNER);
+    expect(suspended.allowed).toBe(true);
+    expect(plane.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+    releaseAdmission();
+
+    const failover = await pendingFailover;
+    const active = plane.cp.bindings.activePrimaryCto(projectId);
+    expect({
+      projectSuspended: plane.cp.projects.require(projectId).suspended,
+      failoverAllowed: failover.allowed,
+      activeSessionId: active?.sessionId ?? null,
+      activeGeneration: active?.bindingGeneration ?? null,
+    }).toEqual({
+      projectSuspended: true,
+      failoverAllowed: false,
+      activeSessionId: null,
+      activeGeneration: null,
+    });
+    expect(failover.reasonCode).toBe(ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED);
+    expect(replacementHandle).not.toBeNull();
+    expect(await plane.claude.probeSession(replacementHandle!)).toBe("UNAVAILABLE");
+  });
+
+  it("#692 round 5 primary CTO startup cannot bind after suspend commits", async () => {
+    const plane = makePlane();
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    attachRoutablePorts(plane.cp);
+
+    const projectId = "suspend-racing-primary-cto-startup";
+    const manifest = fixtureManifest(projectId);
+    const project = plane.cp.projects.register({
+      projectId,
+      name: "suspend racing primary CTO startup",
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
+    });
+    if (!project.allowed) throw new Error(project.message);
+
+    const originalStart = plane.claude.startSession.bind(plane.claude);
+    let providerStarted!: () => void;
+    let releaseStartup!: () => void;
+    let startedHandle: SessionHandle | null = null;
+    const enteredStartup = new Promise<void>((resolve) => { providerStarted = resolve; });
+    const startupGate = new Promise<void>((resolve) => { releaseStartup = resolve; });
+    vi.spyOn(plane.claude, "startSession").mockImplementationOnce(async (spec) => {
+      startedHandle = await originalStart(spec);
+      providerStarted();
+      await startupGate;
+      return startedHandle;
+    });
+
+    const pendingStartup = plane.cp.cto.ensurePrimaryCto(projectId, "startup suspend race");
+    await enteredStartup;
+    const suspended = await plane.cp.cto.suspendProject(projectId, true, "owner suspended", TEST_OWNER);
+    expect(suspended.allowed).toBe(true);
+    releaseStartup();
+
+    const startup = await pendingStartup;
+    expect(startup.allowed).toBe(false);
+    expect(startup.reasonCode).toBe(ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED);
+    expect(plane.cp.projects.require(projectId).suspended).toBe(true);
+    expect(plane.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+    expect(startedHandle).not.toBeNull();
+    expect(await plane.claude.probeSession(startedHandle!)).toBe("UNAVAILABLE");
+  });
+
+  it("#692 round 5 primary CTO reuse rechecks suspend after its provider probe", async () => {
+    const plane = makePlane();
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    attachRoutablePorts(plane.cp);
+
+    const projectId = "suspend-racing-primary-cto-probe";
+    const manifest = fixtureManifest(projectId);
+    const project = plane.cp.projects.register({
+      projectId,
+      name: "suspend racing primary CTO probe",
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    const incumbent = await plane.cp.cto.ensurePrimaryCto(projectId, "probe suspend race setup");
+    if (!incumbent.allowed) throw new Error(incumbent.message);
+
+    const originalProbe = plane.claude.probeSession.bind(plane.claude);
+    let probeStarted!: () => void;
+    let releaseProbe!: () => void;
+    const enteredProbe = new Promise<void>((resolve) => { probeStarted = resolve; });
+    const probeGate = new Promise<void>((resolve) => { releaseProbe = resolve; });
+    vi.spyOn(plane.claude, "probeSession").mockImplementationOnce(async (handle) => {
+      const observed = await originalProbe(handle);
+      probeStarted();
+      await probeGate;
+      return observed;
+    });
+
+    const pendingReuse = plane.cp.cto.ensurePrimaryCto(projectId, "probe racing suspend");
+    await enteredProbe;
+    const suspended = await plane.cp.cto.suspendProject(projectId, true, "owner suspended", TEST_OWNER);
+    expect(suspended.allowed).toBe(true);
+    releaseProbe();
+
+    const reused = await pendingReuse;
+    expect(reused.allowed).toBe(false);
+    expect(reused.reasonCode).toBe(ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED);
+    expect(plane.cp.projects.require(projectId).suspended).toBe(true);
+    expect(plane.cp.bindings.activePrimaryCto(projectId)).toBeNull();
+  });
+
+  it("#692 round 5 restoration cannot replace a binding that moved during session startup", async () => {
+    const plane = makePlane();
+    plane.gpt.setCapacity(healthy("gpt", plane.clock));
+    plane.claude.setCapacity(healthy("claude", plane.clock));
+    attachRoutablePorts(plane.cp);
+
+    const projectId = "restoration-binding-generation-race";
+    const manifest = fixtureManifest(projectId);
+    const project = plane.cp.projects.register({
+      projectId,
+      name: "restoration binding generation race",
+      manifest,
+      authorization: plane.cp.manifestAuthorizationForTests(manifest),
+    });
+    if (!project.allowed) throw new Error(project.message);
+    const actingSession = plane.cp.sessions.create({ provider: "gpt", model: "acting CTO" });
+    plane.cp.sessions.transition(actingSession.sessionId, SessionLifecycle.READY, "acting CTO ready");
+    const acting = plane.cp.bindings.bind({
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: actingSession.sessionId,
+      mode: "FALLBACK",
+    });
+    if (!acting.allowed) throw new Error(acting.message);
+
+    const originalStart = plane.claude.startSession.bind(plane.claude);
+    let providerStarted!: () => void;
+    let releaseStartup!: () => void;
+    let provisionedHandle: SessionHandle | null = null;
+    const enteredStartup = new Promise<void>((resolve) => { providerStarted = resolve; });
+    const startupGate = new Promise<void>((resolve) => { releaseStartup = resolve; });
+    vi.spyOn(plane.claude, "startSession").mockImplementationOnce(async (spec) => {
+      provisionedHandle = await originalStart(spec);
+      providerStarted();
+      await startupGate;
+      return provisionedHandle;
+    });
+
+    const pendingRestore = plane.cp.continuity.restore();
+    await enteredStartup;
+    const newerSession = plane.cp.sessions.create({ provider: "gpt", model: "newer acting CTO" });
+    plane.cp.sessions.transition(newerSession.sessionId, SessionLifecycle.READY, "newer acting CTO ready");
+    const newer = plane.cp.bindings.switchTo({
+      role: Role.PRIMARY_CTO,
+      projectId,
+      sessionId: newerSession.sessionId,
+      mode: "FALLBACK",
+      reason: "newer recovery won the race",
+      conversation: "REPLACED",
+    });
+    expect(newer.allowed).toBe(true);
+    releaseStartup();
+
+    const restored = await pendingRestore;
+    expect(restored.restored).not.toContain(roleKeyFor(Role.PRIMARY_CTO, { projectId }));
+    expect(restored.deferred).toContainEqual({
+      roleKey: roleKeyFor(Role.PRIMARY_CTO, { projectId }),
+      reasonCode: ReasonCode.BINDING_GENERATION_STALE,
+    });
+    expect(plane.cp.bindings.activePrimaryCto(projectId)?.sessionId).toBe(newerSession.sessionId);
+    expect(provisionedHandle).not.toBeNull();
+    expect(await plane.claude.probeSession(provisionedHandle!)).toBe("UNAVAILABLE");
   });
 
   it("#183 fences a superseding binding that arrives between the freshness check and switch", async () => {

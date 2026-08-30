@@ -16,10 +16,10 @@ import type { Db } from "../db/database.ts";
 import { ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { ContinuityMode, Role, RunState, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import type { ProjectRegistry } from "../registry/project-registry.ts";
-import type { ProviderRegistry } from "../runtime/provider.ts";
+import type { ProviderRegistry, SessionHandle } from "../runtime/provider.ts";
 import type { RunEngine } from "../run/run-engine.ts";
 import type { BindingRegistry } from "../session/binding-registry.ts";
-import type { SessionRegistry } from "../session/session-registry.ts";
+import type { SessionRecord, SessionRegistry } from "../session/session-registry.ts";
 import type { Telemetry } from "../telemetry/telemetry.ts";
 
 export type CoverageOutcome = "FULL_COVERAGE" | "PARTIAL_COVERAGE" | "NO_VALID_COVERAGE";
@@ -360,7 +360,7 @@ export class ContinuityKernel {
       current?.assignmentId !== expected?.assignmentId ||
       current?.bindingGeneration !== expected?.bindingGeneration
     ) {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "coverage plan superseded");
+      await this.stopUnusedSession(provisioned.value.sessionId, "coverage plan superseded");
       return deny(ReasonCode.BINDING_GENERATION_STALE, "coverage plan was superseded by a newer binding", {
         roleKey,
         expectedGeneration: expected?.bindingGeneration ?? null,
@@ -401,7 +401,7 @@ export class ContinuityKernel {
       takeover: true,
     });
     if (!switched.allowed) {
-      this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "failover rejected");
+      await this.stopUnusedSession(provisioned.value.sessionId, "failover rejected");
       return switched as Decision<{ provider: string; generation: number }>;
     }
 
@@ -482,9 +482,12 @@ export class ContinuityKernel {
           session && this.sessions.get(provisioned.value.sessionId)?.provider === session.provider
             ? "SURVIVED"
             : "REPLACED",
+        // Session constitution awaited provider work. Fence the exact incumbent observed
+        // before that await so restoration cannot displace a newer owner.
+        expectedCurrentGeneration: current.bindingGeneration,
       });
       if (!switched.allowed) {
-        this.sessions.transition(provisioned.value.sessionId, SessionLifecycle.STOPPED, "restoration rejected");
+        await this.stopUnusedSession(provisioned.value.sessionId, "restoration rejected");
         deferred.push({ roleKey: assignment.roleKey, reasonCode: switched.reasonCode });
         continue;
       }
@@ -692,6 +695,26 @@ export class ContinuityKernel {
     return allow(ReasonCode.OK, { sessionId: session.sessionId });
   }
 
+  /** A continuity session that lost its commit race must not remain live at the provider. */
+  private async stopUnusedSession(sessionId: string, reason: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.lifecycle === SessionLifecycle.STOPPED) return;
+    try {
+      await this.providers.require(session.provider).stopSession(handleFor(session));
+      this.sessions.transition(sessionId, SessionLifecycle.STOPPED, reason);
+    } catch (error) {
+      if (session.lifecycle !== SessionLifecycle.ERROR) {
+        this.sessions.transition(sessionId, SessionLifecycle.ERROR, `${reason}: provider stop failed`);
+      }
+      this.audit.record({
+        kind: "CONTINUITY_UNUSED_SESSION_STOP_FAILED",
+        reasonCode: ReasonCode.SESSION_STOP_FAILED,
+        sessionId,
+        evidence: { reason, error: error instanceof Error ? error.message : String(error) },
+      });
+    }
+  }
+
   private partialAction(byProvider: Map<string, ProviderCapacity>): CoverageAction {
     const resets = [...byProvider.values()]
       .flatMap((c) => c.buckets.map((b) => b.resetAt))
@@ -704,3 +727,12 @@ export class ContinuityKernel {
     return "PAUSE_NEW_WORK";
   }
 }
+
+const handleFor = (session: SessionRecord): SessionHandle => ({
+  externalSessionId: session.incarnation.split("#")[0] ?? session.sessionId,
+  provider: session.provider,
+  model: session.model,
+  effort: session.effort,
+  pid: session.osPid,
+  ...(session.workdir ? { workdir: session.workdir } : {}),
+});

@@ -1374,6 +1374,83 @@ const GUARDS = [
     ],
   },
   {
+    // #692 round 5 — initial CTO creation may spend seconds outside SQLite constituting
+    // provider state. The binding registry is the commit point that must re-read suspend.
+    what: "bind refuses a primary CTO binding whose project suspended during session startup",
+    file: "src/session/binding-registry.ts",
+    find: "      const bindSuspensionFence = this.primaryCtoSuspensionFence(input);\n      if (!bindSuspensionFence.allowed) return bindSuspensionFence as Decision<RoleBinding>;",
+    replace: "      const bindSuspensionFence = this.primaryCtoSuspensionFence(input);\n      if (false) return bindSuspensionFence as Decision<RoleBinding>;",
+    killedBy: [
+      "tests/unit/continuity-r2.test.ts::#692 round 5 primary CTO startup cannot bind after suspend commits",
+    ],
+  },
+  {
+    // #692 round 5 — continuity can finish its plan before suspend, then await provider
+    // admission and session readiness. The switch itself must re-read suspend.
+    what: "switchTo refuses a primary CTO switch whose project suspended during failover",
+    file: "src/session/binding-registry.ts",
+    find: "      const switchSuspensionFence = this.primaryCtoSuspensionFence(input);\n      if (!switchSuspensionFence.allowed) return switchSuspensionFence as Decision<RoleBinding>;",
+    replace: "      const switchSuspensionFence = this.primaryCtoSuspensionFence(input);\n      if (false) return switchSuspensionFence as Decision<RoleBinding>;",
+    killedBy: [
+      "tests/unit/continuity-r2.test.ts::#692 round 5 failover started before suspend cannot bind after suspend commits",
+    ],
+  },
+  {
+    // A provider probe is an observation made before an await completes. Returning its old
+    // binding after suspend commits would hand dispatch authority to a revoked session.
+    what: "ensurePrimaryCto rechecks project suspension after probing an existing provider session",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        if (live.allowed) {\n          // The provider probe awaited an external boundary. Re-read both facts whose old\n          // values would otherwise authorize dispatch: a suspend may have committed and a\n          // continuity move may have replaced this runtime while the probe was in flight.\n          if (this.projects.get(projectId)?.suspended === true) {",
+    replace: "        if (live.allowed) {\n          // The provider probe awaited an external boundary. Re-read both facts whose old\n          // values would otherwise authorize dispatch: a suspend may have committed and a\n          // continuity move may have replaced this runtime while the probe was in flight.\n          if (false) {",
+    killedBy: [
+      "tests/unit/continuity-r2.test.ts::#692 round 5 primary CTO reuse rechecks suspend after its provider probe",
+    ],
+  },
+  {
+    // The central bind fence can reject only after a provider session exists. Cleanup must
+    // stop that provider handle, not merely paint the control-plane row STOPPED.
+    what: "ensurePrimaryCto stops a provider session rejected by the binding commit fence",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "      await this.stopUnusedSession(created.value, \"binding refused\");",
+    replace: "      this.sessions.transition(created.value, SessionLifecycle.STOPPED, \"binding refused\");",
+    killedBy: [
+      "tests/unit/continuity-r2.test.ts::#692 round 5 primary CTO startup cannot bind after suspend commits",
+    ],
+  },
+  {
+    // The provider stop precedes the binding freshness check because the stop is already a
+    // fact even when a concurrent revoke makes that later check deny.
+    what: "suspendProject records STOPPED before rejecting a binding changed during provider stop",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "        const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, \"project suspended\");\n        if (!stopped.allowed) return stopped as Decision<void>;",
+    replace: "        const stopped = allow(ReasonCode.OK, this.sessions.require(current.sessionId));\n        if (!stopped.allowed) return stopped as Decision<void>;",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::#692 round 5 suspend records stopped before rejecting a binding moved during provider stop",
+    ],
+  },
+  {
+    // A failed continuity commit has already constituted provider state. Its cleanup must
+    // cross the provider boundary before marking the local row stopped.
+    what: "continuity stops a provider session whose binding switch loses its commit race",
+    file: "src/continuity/continuity-kernel.ts",
+    find: "      await this.providers.require(session.provider).stopSession(handleFor(session));",
+    replace: "      void handleFor(session);",
+    killedBy: [
+      "tests/unit/continuity-r2.test.ts::#692 round 5 failover started before suspend cannot bind after suspend commits",
+    ],
+  },
+  {
+    // Restoration reads its incumbent before awaiting provider startup. Without passing
+    // that generation into switchTo, it can displace a newer recovery that won meanwhile.
+    what: "continuity restoration fences the incumbent generation observed before session startup",
+    file: "src/continuity/continuity-kernel.ts",
+    find: "        expectedCurrentGeneration: current.bindingGeneration,",
+    replace: "        expectedCurrentGeneration: undefined,",
+    killedBy: [
+      "tests/unit/continuity-r2.test.ts::#692 round 5 restoration cannot replace a binding that moved during session startup",
+    ],
+  },
+  {
     // Sol's fourth-round finding: the control plane persists a `ses_cto_...` alias beside
     // the provider-issued id in `incarnation`. Only the latter addresses the runtime;
     // passing the alias let the scripted adapter report success while leaving the

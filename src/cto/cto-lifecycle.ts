@@ -171,7 +171,44 @@ export class CtoLifecycle {
         // provider still has one. Reusing a session on that alone is the false-ready path
         // §14.3 exists to close, so the provider has to answer for the exact session first.
         const live = await this.probeBoundSession(session);
-        if (live.allowed) return allow(ReasonCode.OK, existing);
+        if (live.allowed) {
+          // The provider probe awaited an external boundary. Re-read both facts whose old
+          // values would otherwise authorize dispatch: a suspend may have committed and a
+          // continuity move may have replaced this runtime while the probe was in flight.
+          if (this.projects.get(projectId)?.suspended === true) {
+            return deny(
+              ReasonCode.PRIMARY_CTO_BINDING_BLOCKED_PROJECT_SUSPENDED,
+              "a suspended project cannot reuse its primary CTO binding",
+              { projectId },
+            );
+          }
+          const fresh = this.bindings.active(roleKey);
+          if (
+            !fresh ||
+            fresh.assignmentId !== existing.assignmentId ||
+            fresh.bindingGeneration !== existing.bindingGeneration ||
+            fresh.sessionId !== existing.sessionId ||
+            fresh.sessionIncarnation !== existing.sessionIncarnation
+          ) {
+            return deny(
+              ReasonCode.BINDING_GENERATION_STALE,
+              "the primary CTO binding changed while its provider session was being probed",
+              {
+                projectId,
+                expectedGeneration: existing.bindingGeneration,
+                currentGeneration: fresh?.bindingGeneration ?? null,
+              },
+            );
+          }
+          if (this.sessions.get(fresh.sessionId)?.lifecycle !== SessionLifecycle.READY) {
+            return deny(
+              ReasonCode.SESSION_NOT_READY,
+              "the primary CTO session stopped being ready while its provider session was being probed",
+              { projectId, sessionId: fresh.sessionId },
+            );
+          }
+          return allow(ReasonCode.OK, fresh);
+        }
         this.audit.record({
           kind: "CTO_SESSION_PROBE_FAILED",
           reasonCode: live.reasonCode,
@@ -208,7 +245,7 @@ export class CtoLifecycle {
       mode: "PREFERRED",
     });
     if (!bound.allowed) {
-      this.sessions.transition(created.value, SessionLifecycle.STOPPED, "binding refused");
+      await this.stopUnusedSession(created.value, "binding refused");
       return bound;
     }
 
@@ -848,6 +885,12 @@ export class CtoLifecycle {
       // commits atomically with the STOPPED write it explains, with no window where one
       // exists without the other.
       const completed = this.db.tx(() => {
+        // Provider stop is already irreversible at this boundary. Record that fact before
+        // inspecting any binding that another lifecycle path could have moved or revoked
+        // during the await above; a stale binding decision must not roll reality back to
+        // DRAINING.
+        const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, "project suspended");
+        if (!stopped.allowed) return stopped as Decision<void>;
         const fresh = this.bindings.active(roleKey);
         if (
           !fresh ||
@@ -864,8 +907,6 @@ export class CtoLifecycle {
             },
           );
         }
-        const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, "project suspended");
-        if (!stopped.allowed) return stopped as Decision<void>;
         // Suspension is the one deliberate exception to a normal revocation: every
         // owned run was checkpointed to BLOCKED above and cannot regain authority from
         // this revoked binding. Any runnable state still refuses the revocation.
