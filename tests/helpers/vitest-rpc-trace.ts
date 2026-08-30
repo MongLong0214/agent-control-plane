@@ -7,7 +7,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, extname, isAbsolute, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import type { Reporter } from "vitest/reporters";
@@ -119,6 +119,10 @@ export interface VitestRpcMeasurement extends TraceBase {
   responseArrivalToWorkerPickup: VitestRpcSegmentMeasurement;
   unpartitionedMainReturnToWorkerPickup: VitestRpcSegmentMeasurement;
   wholeRpcWorkerActiveMs: number | null;
+  /**
+   * A shared worker histogram maximum since installation or the latest all-pending-settled reset.
+   * It can include delay before this RPC and delay from overlapping RPCs.
+   */
   workerHistogramDelayMaxMs: number | null;
 }
 
@@ -530,18 +534,32 @@ export interface PreparedVitestRpcTrace {
   reporter: Reporter;
 }
 
+const nestedTraceFile = (file: string, runId: string): string => {
+  const extension = extname(file);
+  const stem = extension ? file.slice(0, -extension.length) : file;
+  return `${stem}.${runId}${extension}`;
+};
+
 export const prepareVitestRpcTrace = (
   setting: string | undefined,
   root: string,
 ): PreparedVitestRpcTrace | undefined => {
   if (!setting || setting === "0") return undefined;
   const runId = `${process.pid}-${Date.now()}`;
-  const file =
+  const requestedFile =
     setting === "1"
       ? resolve(root, "evidence", "local", `vitest-rpc-trace-${runId}.ndjson`)
       : isAbsolute(setting)
         ? setting
         : resolve(root, setting);
+  const inheritedTrace =
+    process.env[INTERNAL_TRACE_FILE_ENV] && process.env[INTERNAL_TRACE_RUN_ENV];
+  // Keep the caller's exact path for the top-level run. A nested Vitest inherits both the public
+  // setting and these internal markers, so give it a sibling file without disabling its tracing.
+  const file =
+    inheritedTrace && setting !== "1"
+      ? nestedTraceFile(requestedFile, runId)
+      : requestedFile;
   mkdirSync(dirname(file), { recursive: true });
   try {
     writeFileSync(file, "", { flag: "wx" });

@@ -1,6 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
 
@@ -36,6 +43,7 @@ interface TraceFixtureOptions {
   blockMainMs?: number;
   delayRpcResponseMs?: number;
   existingTraceContent?: string;
+  nestedTestSource?: string;
 }
 
 const fixtureConfig = (blockMainMs?: number, delaySetup?: string): string => {
@@ -113,19 +121,27 @@ const runTraceFixture = (
     ),
   );
   writeFileSync(join(testsDir, "probe.test.ts"), testSource);
+  if (options.nestedTestSource !== undefined) {
+    writeFileSync(join(testsDir, "nested.test.ts"), options.nestedTestSource);
+  }
   if (options.existingTraceContent !== undefined) {
     writeFileSync(traceFile, options.existingTraceContent);
   }
 
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    CI: "",
+    [VITEST_RPC_TRACE_ENV]: traceFile,
+  };
+  // These fixtures intentionally start a new top-level trace. A test that exercises inheritance
+  // starts another Vitest from inside probe.test.ts, after this run has installed its own markers.
+  delete env.ACP_VITEST_RPC_TRACE_FILE;
+  delete env.ACP_VITEST_RPC_TRACE_RUN;
   const done = spawnSync(process.execPath, [VITEST, "run", "tests/probe.test.ts"], {
     cwd: dir,
     encoding: "utf8",
     timeout: 20_000,
-    env: {
-      ...process.env,
-      CI: "",
-      [VITEST_RPC_TRACE_ENV]: traceFile,
-    },
+    env,
   });
   const records = existsSync(traceFile) ? readVitestRpcTrace(traceFile) : [];
   return {
@@ -515,5 +531,52 @@ it("would run if trace setup succeeded", () => expect(true).toBe(true));
     expect(run.status).not.toBe(0);
     expect(run.stderr).toContain("Refusing to overwrite existing Vitest RPC trace");
     expect(readFileSync(run.traceFile, "utf8")).toBe(existingTraceContent);
+  });
+
+  it("gives a nested Vitest run its own inherited custom trace file", () => {
+    const run = runTraceFixture(
+      `
+import { spawnSync } from "node:child_process";
+import { expect, it } from "vitest";
+
+it("passes the parent trace environment through unchanged", () => {
+  expect(process.env.${VITEST_RPC_TRACE_ENV}).toBe(process.env.ACP_VITEST_RPC_TRACE_FILE);
+  const nested = spawnSync(
+    process.execPath,
+    [${JSON.stringify(VITEST)}, "run", "tests/nested.test.ts"],
+    { cwd: process.cwd(), encoding: "utf8" },
+  );
+  expect(nested.status, \`\${nested.stdout}\\n\${nested.stderr}\`).toBe(0);
+});
+`,
+      {
+        nestedTestSource: `
+import { existsSync } from "node:fs";
+import { expect, it } from "vitest";
+
+it("writes the nested trace separately", () => {
+  expect(process.env.ACP_VITEST_RPC_TRACE_FILE).not.toBe(
+    process.env.${VITEST_RPC_TRACE_ENV},
+  );
+  expect(existsSync(process.env.ACP_VITEST_RPC_TRACE_FILE!)).toBe(true);
+});
+`,
+      },
+    );
+
+    expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
+    const traceFiles = readdirSync(dirname(run.traceFile)).filter(
+      (file) => file.startsWith("rpc-trace") && file.endsWith(".ndjson"),
+    );
+    expect(traceFiles).toContain(basename(run.traceFile));
+    expect(traceFiles).toHaveLength(2);
+    expect(readVitestRpcTrace(run.traceFile)).toContainEqual(
+      expect.objectContaining({ type: "summary" }),
+    );
+    const nestedTrace = traceFiles.find((file) => file !== basename(run.traceFile));
+    expect(nestedTrace).toMatch(/^rpc-trace\.\d+-\d+\.ndjson$/);
+    expect(readVitestRpcTrace(join(dirname(run.traceFile), nestedTrace!))).toContainEqual(
+      expect.objectContaining({ type: "summary" }),
+    );
   });
 });

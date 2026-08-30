@@ -20,6 +20,12 @@ the file elsewhere:
 ACP_VITEST_RPC_TRACE=/tmp/acp-vitest-rpc.ndjson CI=1 pnpm test
 ```
 
+The top-level run creates that exact path exclusively and refuses to replace a file that already
+exists. If a test starts another Vitest process with the trace environment inherited, the nested
+run remains instrumented but owns a sibling file named
+`/tmp/acp-vitest-rpc.<run-id>.ndjson`. This keeps the nested observations instead of suppressing
+them, while preventing either run from appending to or replacing the other's trace.
+
 No workflow enables it. Deciding which CI run should retain the artifact is separate from this
 instrumentation.
 
@@ -44,7 +50,10 @@ Every interval is a `{ durationMs, workerBusyMs, workerEventLoopDelayMaxMs }` ob
 time is the merged JavaScript callback activity that overlaps that exact interval. The existing
 event-loop histogram covers the whole pending RPC and has no timestamps, so the per-interval
 event-loop-delay value is `null`; `workerHistogramDelayMaxMs` retains the raw histogram maximum
-without assigning it to a segment. `workerActivityObserved` and
+without assigning it to a segment. That histogram starts when tracing is installed and resets only
+after all pending task-update RPCs settle. Its maximum is therefore not per-RPC: it can include
+delay before the measured RPC began and, when RPCs overlap, delay from the other RPCs. The value is
+diagnostic context only and is not used for classification. `workerActivityObserved` and
 `responseArrivalObserved` distinguish an observed zero from an unmeasured value. The `unmeasured`
 array names the three unavailable observations explicitly.
 
@@ -79,7 +88,7 @@ Tracing is installed only when the environment variable is set. While enabled:
 - each real task-update RPC adds one small correlation object to task metadata;
 - the worker reads event-loop utilization at send and settle;
 - one native `monitorEventLoopDelay` histogram runs per active worker at 20 ms resolution and is
-  reset whenever that worker has no pending task-update RPC;
+  reset after the worker's pending task-update RPC count returns to zero;
 - an async-hooks observer timestamps JavaScript callback-active intervals only while an update RPC
   is pending; overlapping intervals are merged before calculating post-main activity;
 - each RPC emits four boundary records—worker send/settle and main entry/exit—plus callback-active
@@ -106,3 +115,7 @@ before an unobserved arrival and a zero-delay histogram cannot produce `(c)`; 10
 59,899 ms after main cannot produce `(a)`; and 59,950 ms of worker activity overlapping a 60-second
 response gap is not subtracted into a 50 ms transport claim. These delays exist only in the
 fixture; the tracing code has no delay injection.
+
+The same test file also starts a Vitest process whose test starts another Vitest without changing
+the inherited trace environment. It asserts that the parent keeps the requested custom path, the
+nested run succeeds with a run-id sibling path, and both files contain their own summary.
