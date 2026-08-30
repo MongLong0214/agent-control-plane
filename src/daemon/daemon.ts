@@ -15,7 +15,11 @@ import type { DoctorScope, Finding } from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
-import { IngressGuard, ownerApprovalPayload } from "../ingress/ingress-guard.ts";
+import {
+  acknowledgeTerminalTelegramReply,
+  IngressGuard,
+  ownerApprovalPayload,
+} from "../ingress/ingress-guard.ts";
 import type { OwnerApprovalReceipt } from "../ceo/owner-authority.ts";
 import type { BuzzAdapter } from "../buzz/buzz-adapter.ts";
 import {
@@ -188,6 +192,7 @@ export const OPERATOR_METHOD = {
   CONVERSATION_ADJUDICATE: "conversation.adjudicate",
   CONVERSATION_UNRESOLVED: "conversation.unresolved",
   CONVERSATION_RESOLVE: "conversation.resolve",
+  TELEGRAM_REPLY_ACKNOWLEDGE: "telegram.reply.acknowledge",
   DAEMON_STATUS: "daemon.status",
 } as const;
 
@@ -206,6 +211,7 @@ export const OPERATOR_MUTATION_METHODS: ReadonlySet<OperatorMethod> = new Set([
   OPERATOR_METHOD.ACTOR_UNREGISTER,
   OPERATOR_METHOD.CONVERSATION_ADJUDICATE,
   OPERATOR_METHOD.CONVERSATION_RESOLVE,
+  OPERATOR_METHOD.TELEGRAM_REPLY_ACKNOWLEDGE,
 ]);
 
 /**
@@ -651,6 +657,21 @@ export class Daemon {
           // interval. A denied resolution must not consume the wake-up — nothing changed to see.
           if (resolved.allowed && this.#mode === "BOOTSTRAP") this.wakeBootstrap("OBSERVED");
           return resolved;
+        }
+
+        case OPERATOR_METHOD.TELEGRAM_REPLY_ACKNOWLEDGE: {
+          const nonce = requiredOperatorString(request.params, "nonce");
+          if (!nonce.allowed) return nonce;
+          const reasonCode = requiredOperatorString(request.params, "reasonCode");
+          if (!reasonCode.allowed) return reasonCode;
+          const evidenceDigest = requiredOperatorString(request.params, "evidenceDigest");
+          if (!evidenceDigest.allowed) return evidenceDigest;
+          return acknowledgeTerminalTelegramReply(this.cp.db, this.cp.clock, this.cp.audit, {
+            nonce: nonce.value,
+            resolvedBy: peer.actor,
+            reasonCode: reasonCode.value,
+            evidenceDigest: evidenceDigest.value,
+          });
         }
 
         case OPERATOR_METHOD.CONVERSATION_ADJUDICATE: {

@@ -674,6 +674,7 @@ export class Doctor {
           AND json_valid(result_json) = 1
           AND json_type(result_json, '$.reply') = 'object'
           AND json_extract(result_json, '$.deliveryStatus') IN ('UNANSWERABLE', 'UNRESOLVED')
+          AND json_type(result_json, '$.operatorResolution') IS NULL
         ORDER BY received_at ASC`,
     );
     if (rows.length === 0) return [];
@@ -713,8 +714,8 @@ export class Doctor {
           },
         },
         recommendedAction: deliveryStatus === "UNANSWERABLE"
-          ? "inspect the Telegram rejection and correct the reply content or migrated chat configuration"
-          : "inspect whether Telegram received either bounded attempt; ACP stopped automatic resend",
+          ? `inspect the Telegram rejection and correct the reply content or migrated chat configuration; then run agentctl telegram reply acknowledge ${oldest.nonce} <reason-code> <evidence-digest>`
+          : `inspect whether Telegram received the attempt; ACP stopped automatic resend; then run agentctl telegram reply acknowledge ${oldest.nonce} <reason-code> <evidence-digest>`,
       });
     }
     return findings;

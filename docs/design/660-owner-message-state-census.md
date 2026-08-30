@@ -15,9 +15,9 @@ the functions each row names against whatever `origin/main` is when you read thi
 document and the code disagree, the code is right and this document is what has gone stale.
 
 **This document was last re-derived 2026-08-30 against `origin/main` at commit**
-**`2a9f979656f7480402a381cec29c68043eb69224` (#691, "the seam a receipt would arrive through, and**
-**a sweep that asks for one"), merged into this branch.** This pinned SHA is not the same kind of
-fact as a file:line locus above — it names *when this document's prose was checked*, not *where a
+**`ab0600222cccac18de42bc6c3d3f190e73bb0893` (#701, "a source can only cite the audit event its**
+**own turn claimed with"), plus this branch's Telegram reply-delivery changes.** This pinned SHA
+is not the same kind of fact as a file:line locus above — it names *when this document's prose was checked*, not *where a
 claim lives in the code*, and it is the one piece of "current source" bookkeeping this document
 keeps, precisely because the alternative already failed once: an earlier version of this document
 was re-derived against a commit before #691 merged, and its `S4`/`C1` rows described `main` as it
@@ -73,11 +73,14 @@ any actor binding exists (see C1, C3).
   handler returns: `CEO_CONVERSATION_TIMEOUT` is a deny (`src/mcp/ceo-conversation.ts`, on
   `McpError`'s `RequestTimeout` — "a refusal, not a hang; the peer may still be running
   server-side"), and `agentcpd.ts`'s `answerAsCeo` turns either an allow or that deny into the
-  same `Promise<string>` shape; `telegram-router.ts` reports `ReasonCode.OK` regardless, and once
-  the reply is sent, `completeResponse` resolves the row (`completeReplyAndResolveTurn`, setting
-  `repliedAt`). So a slow-but-answered turn *does* sit unresolved while its handler runs, and
-  *becomes* resolved only once that handler returns and the reply is accepted — both are true, at
-  different times.
+  same `Promise<string>` shape; `telegram-router.ts` reports `ReasonCode.OK` regardless. The reply
+  then has its own durable lifecycle: `reserveResponse` writes `PENDING` before Telegram is called;
+  acceptance runs `completeReplyAndResolveTurn` and sets the claim's `repliedAt`; a permanent
+  rejection or an unknown send outcome records `UNANSWERABLE` or `UNRESOLVED` and sets the claim's
+  separate `settledAt`. So a slow-but-answered turn *does* sit unresolved while its handler runs,
+  and stops being an outstanding claim only once the reply reaches one of those durable terminal
+  states — both are true, at different times. A settled claim does not assert that Telegram
+  accepted the reply.
 - **Why an ordinary slow turn does not by itself produce a second unresolved row: the poll loop's
   seriality, not the first row never existing.** `telegram-polling.ts`'s `pollOnce` routes each
   update in a batch with `for (const update of updates) { await this.router.route(update, ...);
@@ -85,31 +88,23 @@ any actor binding exists (see C1, C3).
   routing (and so cannot reach `claimTurn`) until the first's entire `route()` call, including its
   `directHandler` await, has returned. This is a claim about this one loop processing one batch
   at a time; it says nothing about whether two listener processes could run concurrently, which
-  this row does not check. **Produced by two paths that do reach a second, genuinely simultaneous
-  unresolved row:** (1) a process crash before `completeResponse`/`reserveResponse` ever run —
-  what every existing test (`TelegramInterruption`) simulates, ending the process (and the loop's
-  serialization with it) mid-await; (2) a Telegram delivery failure:
-  `telegram-polling.ts`'s `pollOnce` calls `reserveResponse` before every send and
-  `completeResponse` — the only call that sets `repliedAt` — only after `sendMessage` succeeds; if
-  it throws, the claim stays unresolved and the exception is caught by `loop()`, which logs it via
-  `onError` and keeps polling — the process survives, but the row stays unresolved past the
-  handler's own return, no longer bounded by the serialization argument above.
-- **Terminal or gap:** the single-unresolved-turn case is closed —
-  `TelegramHermesRouter`'s DIRECT branch calls `unresolvedTurns(identity.sessionDigest)` before
-  `claimTurn` for every DIRECT message (not only a suspected resend), parks with an explicit reply,
-  and records a deliberate override (`overriddenUnresolvedNonce`) when the owner replies `/again`.
-  **A second unresolved row is neither disclosed nor recorded.** Both the park reply and the
-  override write read only `unresolved[0]` — the oldest row. Reproducible with two ordinary
-  crashes, no concurrency required: `A` crashes (unresolved); owner sends `/again`, claiming `B`
-  and recording the override against `A`; `B` also crashes (now `A` and `B` are both unresolved); a
-  third message `C` arrives and its park reply names only `A` — `B` is never mentioned, and a
-  further `/again` from the owner would again record only `A`. No test reaches this: the
-  production `/again` test resolves its override turn instead of crashing it, so only one
-  unresolved row is ever constructed; the guard-level test that does construct two unresolved
-  claims bypasses the router and only checks ordering.
-- **Disposition:** on the critical path. The single-turn mechanism is closed; the disclosure gap
-  for a second unresolved row is real, live on the ingress ledger today (not embargoed by #638),
-  and tracked in #695.
+  this row does not check. **Produced by a process crash before `reserveResponse` records the
+  handler's reply** — what the existing `TelegramInterruption` tests simulate, ending the process
+  (and the loop's serialization with it) after the claim but before a terminal reply record.
+  Delivery failure is no longer another producer: a confirmed-not-sent service failure leaves a
+  retryable reply and stops the batch, while a permanent rejection or unknown outcome atomically
+  settles the claim with its terminal reply state. A recovered `PENDING` is treated as
+  `UNRESOLVED` and is not resent, because it may be the durable record lagging a successful send.
+- **Terminal:** closed. `TelegramHermesRouter`'s DIRECT branch calls
+  `unresolvedTurns(identity.sessionDigest)` before `claimTurn` for every DIRECT message (not only a
+  suspected resend) and parks with an explicit reply. The park reply names up to 10 outstanding
+  turns and reports the full count; `/again` records every outstanding nonce in
+  `overriddenUnresolvedNonces`, not only the displayed subset. Closed by #697. Reply-delivery
+  `UNANSWERABLE`/`UNRESOLVED` rows remain operator-visible through Doctor, but their turn claims
+  carry `settledAt` and therefore do not inflate this state. An authenticated operator can record
+  a `NO_RETRY` acknowledgement without changing or overstating the delivery fact.
+- **Disposition:** off the critical path — no disclosure or duplicate-turn gap remains in this
+  state.
 
 ### S3 — `ADMITTED` and not claimed
 
@@ -216,9 +211,10 @@ any actor binding exists (see C1, C3).
   the *next*, separately-routed message given that precondition. It does not depend on *how* the
   earlier turn became unresolved: an ordinary in-flight turn is technically unresolved too (S2),
   but the poll loop's seriality means no second message is routed while the first's handler is
-  still awaited, so in practice this row is reached via S2's crash or delivery-failure paths,
-  which are what let an unresolved row persist long enough for a genuinely separate message to
-  arrive and be routed against it.
+  still awaited, so in practice this row is reached via S2's crash-before-reply-record path,
+  which is what lets an unresolved claim persist long enough for a genuinely separate message to
+  arrive and be routed against it. Terminal delivery failures settle the claim and do not produce
+  this state.
 - **Disposition:** off the critical path.
 
 ### S7 — a later message against a coalesced batch
@@ -337,11 +333,10 @@ not confirmation of a guarantee.
 
 ## Disposition summary
 
-**Off the critical path, nothing to absorb:** S1, S3, S6 — each closed by a specific commit named
+**Off the critical path, nothing to absorb:** S1, S2, S3, S6 — each closed by a specific commit named
 in its row, verifiable by rereading the code rather than trusting this summary.
-**On the critical path, real design work:** S2 (the second-unresolved-row disclosure gap), S7 (a
-later message against a coalesced batch, unreachable until the embargo lifts but real design work
-regardless).
+**On the critical path, real design work:** S7 (a later message against a coalesced batch,
+unreachable until the embargo lifts but real design work regardless).
 **Independent, embargoed:** S4 (two exit mechanisms shipped — operator `resolveInDoubt` and
 receipt-driven `reconcileUnresolved` — both currently inert: no `.claim()` writer, and
 `reconcileUnresolved` additionally wired to a `ReceiptPort` that always answers `found: false`),

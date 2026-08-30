@@ -16,7 +16,7 @@ import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { digestOf } from "../../src/core/digest.ts";
 import { ExecutionMode, Role, RunState, roleKeyFor } from "../../src/domain/types.ts";
 import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
-import { Daemon } from "../../src/daemon/daemon.ts";
+import { Daemon, OPERATOR_METHOD } from "../../src/daemon/daemon.ts";
 import {
   bindCeo,
   driveToReviewedCandidate,
@@ -122,6 +122,34 @@ const telegramConfig = {
 } as const;
 
 const daemonStub = { finalizeApprovedRun: async (_runId: string): Promise<void> => undefined };
+
+const acknowledgeTelegramReply = async (
+  harness: ReturnType<typeof makeHarness>,
+  nonce: string,
+) => {
+  const daemon = new Daemon(harness.cp, { stateDir: tempDir("acp-telegram-reply-operator-") });
+  const acquired = daemon.lock.acquire(harness.clock.nowIso());
+  expect(acquired.allowed).toBe(true);
+  try {
+    return await daemon.handleOperatorRequest({
+      requestId: `acknowledge:${nonce}`,
+      method: OPERATOR_METHOD.TELEGRAM_REPLY_ACKNOWLEDGE,
+      params: {
+        nonce,
+        reasonCode: "OPERATOR_REVIEWED_TELEGRAM",
+        evidenceDigest: `sha256:reviewed:${nonce}`,
+      },
+      idempotencyKey: `acknowledge:${nonce}`,
+    }, {
+      channel: "cli",
+      peerId: `cli:${TEST_OWNER.actor}`,
+      actor: TEST_OWNER.actor,
+      incarnation: "telegram-reply-review",
+    });
+  } finally {
+    daemon.lock.release();
+  }
+};
 
 interface TelegramApiCall {
   method: "getUpdates" | "sendMessage";
@@ -1325,7 +1353,63 @@ describe("Telegram production ingress", () => {
     expect(completed?.result_json).toContain('"sent":true');
   });
 
-  it("a crash after send consumes the same bounded unknown retry policy", async () => {
+  it("a crash before Telegram send leaves one unresolved reply and never sends it", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const firstTransport = new FakeTelegramTransport();
+    const firstUpdate = update("reply reserved before send", {}, 306);
+    firstTransport.updates = [firstUpdate];
+    let handled = 0;
+    const firstListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      {
+        transport: firstTransport,
+        start: false,
+        onDirect: () => {
+          handled += 1;
+          return "reserved reply";
+        },
+        onInterrupt: async (point) => {
+          if (point === "after-reply-reserve") throw new TelegramInterruption(point);
+        },
+      },
+    );
+    try {
+      await expect(firstListener.service.pollOnce()).rejects.toMatchObject({ point: "after-reply-reserve" });
+    } finally {
+      await firstListener.close();
+    }
+    expect(firstTransport.sendAttempts).toHaveLength(0);
+
+    const secondTransport = new FakeTelegramTransport();
+    secondTransport.updates = [firstUpdate];
+    const secondListener = await startDaemonTelegramListener(
+      harness.cp,
+      telegramConfig,
+      daemonStub,
+      { transport: secondTransport, start: false, onDirect: () => "must not run" },
+    );
+    try {
+      const resumed = (await secondListener.service.pollOnce()).outcomes[0]!;
+      expect(resumed.replayed).toBe(true);
+      expect(resumed.reply).toBeNull();
+    } finally {
+      await secondListener.close();
+    }
+    expect(handled).toBe(1);
+    expect(secondTransport.sendAttempts).toHaveLength(0);
+    const unresolved = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:306"],
+    );
+    expect(unresolved?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+    expect(unresolved?.result_json).not.toContain('"sent"');
+  });
+
+  it("a crash after a successful send leaves one unresolved reply and never sends it again", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1370,25 +1454,45 @@ describe("Telegram production ingress", () => {
     try {
       const resumed = (await secondListener.service.pollOnce()).outcomes[0]!;
       expect(resumed.replayed).toBe(true);
-      expect(resumed.reply).toBeTruthy();
+      expect(resumed.reply).toBeNull();
     } finally {
       await secondListener.close();
     }
-    expect(secondTransport.sendAttempts).toHaveLength(1);
-    expect(firstTransport.sendAttempts.length + secondTransport.sendAttempts.length).toBe(2);
+    expect(secondTransport.sendAttempts).toHaveLength(0);
+    expect(firstTransport.sendAttempts.length + secondTransport.sendAttempts.length).toBe(1);
     const completed = harness.cp.db.get<{ result_json: string | null }>(
       `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
       ["update:302"],
     );
-    expect(completed?.result_json).toContain('"deliveryStatus":"APPLIED"');
+    expect(completed?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+    expect(completed?.result_json).not.toContain('"sent"');
 
     const doctor = await harness.cp.doctor.run("system");
-    expect(doctor.findings).not.toContainEqual(expect.objectContaining({
+    expect(doctor.findings).toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
+    }));
+
+    const acknowledged = await acknowledgeTelegramReply(harness, "update:302");
+    expect(acknowledged).toMatchObject({
+      allowed: true,
+      value: {
+        deliveryStatus: "UNRESOLVED",
+        operatorResolution: { disposition: "NO_RETRY" },
+      },
+    });
+    const acknowledgedState = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:302"],
+    );
+    expect(acknowledgedState?.result_json).toContain('"disposition":"NO_RETRY"');
+    expect(harness.cp.audit.byKind("TELEGRAM_REPLY_NO_RETRY_ACKNOWLEDGED")).toHaveLength(1);
+    const afterAcknowledgement = await harness.cp.doctor.run("system");
+    expect(afterAcknowledgement.findings).not.toContainEqual(expect.objectContaining({
       code: "TELEGRAM_REPLY_DELIVERY_UNKNOWN",
     }));
   });
 
-  it("a lost response retries once then records unresolved and advances the offset", async () => {
+  it("an unknown send result is terminal without automatic retry and later updates advance", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1409,26 +1513,27 @@ describe("Telegram production ingress", () => {
       { transport: firstTransport, start: false, onDirect },
     );
     try {
-      await expect(firstListener.service.pollOnce()).rejects.toThrow("simulated Telegram outage (no response)");
+      const result = await firstListener.service.pollOnce();
+      expect(result.outcomes).toHaveLength(2);
+      expect(result.nextOffset).toBe(305);
     } finally {
       await firstListener.close();
     }
-    expect(firstListener.service.offset).toBeUndefined();
-    expect(firstTransport.sendAttempts).toHaveLength(1);
-    expect(harness.cp.db.get(
-      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
-      ["update:304"],
-    )).toBeUndefined();
-    const retryableUnknown = harness.cp.db.get<{ result_json: string | null }>(
+    expect(firstListener.service.offset).toBe(305);
+    expect(firstTransport.sendAttempts.filter((attempt) => attempt.correlationId.includes("303"))).toHaveLength(1);
+    expect(firstTransport.sent[0]?.correlationId).toContain("304");
+    expect(handled).toEqual(["inspect the project", "inspect later"]);
+    const unresolved = harness.cp.db.get<{ result_json: string | null }>(
       `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
       ["update:303"],
     );
-    expect(retryableUnknown?.result_json).toContain('"deliveryStatus":"UNKNOWN_RETRYABLE"');
-    expect(retryableUnknown?.result_json).toContain('"unknownDeliveryAttempts":1');
+    expect(unresolved?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
+    expect(unresolved?.result_json).toContain('"unknownDeliveryAttempts":1');
+    expect(unresolved?.result_json).not.toContain('"sent"');
 
+    // A restart sees the durable uncertainty and does not turn it into a second Telegram call.
     const secondTransport = new FakeTelegramTransport();
-    secondTransport.updates = [firstUpdate, laterUpdate];
-    secondTransport.failSendsAmbiguous = 1;
+    secondTransport.updates = [firstUpdate];
     const secondListener = await startDaemonTelegramListener(
       harness.cp,
       telegramConfig,
@@ -1438,21 +1543,11 @@ describe("Telegram production ingress", () => {
     try {
       const resumed = await secondListener.service.pollOnce();
       expect(resumed.outcomes[0]?.replayed).toBe(true);
-      expect(resumed.outcomes[1]?.replayed).toBe(false);
-      expect(resumed.nextOffset).toBe(305);
-      expect(secondListener.service.offset).toBe(305);
+      expect(resumed.outcomes[0]?.reply).toBeNull();
     } finally {
       await secondListener.close();
     }
-    expect(secondTransport.sendAttempts.filter((attempt) => attempt.correlationId.includes("303"))).toHaveLength(1);
-    expect(secondTransport.sent[0]?.correlationId).toContain("304");
-    expect(handled).toEqual(["inspect the project", "inspect later"]);
-    const unresolved = harness.cp.db.get<{ result_json: string | null }>(
-      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
-      ["update:303"],
-    );
-    expect(unresolved?.result_json).toContain('"deliveryStatus":"UNRESOLVED"');
-    expect(unresolved?.result_json).toContain('"unknownDeliveryAttempts":2');
+    expect(secondTransport.sendAttempts).toHaveLength(0);
 
     // A terminal unresolved fact must outlive the ordinary nonce TTL. This later production
     // admission drives IngressGuard.prune after 25 hours; it must not erase update 303 or its
@@ -1483,14 +1578,14 @@ describe("Telegram production ingress", () => {
         outstanding: 1,
         oldest: expect.objectContaining({
           deliveryStatus: "UNRESOLVED",
-          unknownDeliveryAttempts: 2,
+          unknownDeliveryAttempts: 1,
         }),
       }),
     }));
     expect(doctor.findings).not.toContainEqual(expect.objectContaining({ code: "TURN_OUTCOME_UNKNOWN" }));
   });
 
-  it("a permanent 400 records an unanswerable reply and advances past 101 later updates", async () => {
+  it("a permanent 400 advances past 101 later updates and its terminal reply has an operator exit", async () => {
     const harness = makeHarness({
       ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
     });
@@ -1567,6 +1662,19 @@ describe("Telegram production ingress", () => {
       }),
     }));
     expect(doctor.findings).not.toContainEqual(expect.objectContaining({ code: "TURN_OUTCOME_UNKNOWN" }));
+
+    const acknowledged = await acknowledgeTelegramReply(harness, "update:401");
+    expect(acknowledged).toMatchObject({
+      allowed: true,
+      value: {
+        deliveryStatus: "UNANSWERABLE",
+        operatorResolution: { disposition: "NO_RETRY" },
+      },
+    });
+    const afterAcknowledgement = await harness.cp.doctor.run("system");
+    expect(afterAcknowledgement.findings).not.toContainEqual(expect.objectContaining({
+      code: "TELEGRAM_REPLY_UNANSWERABLE",
+    }));
   });
 
   it("a 429 rate limit stops the batch before later replies and owner gate prompts", async () => {

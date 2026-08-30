@@ -288,6 +288,33 @@ describe("authenticated operator socket (#393/#405)", () => {
     }
   });
 
+  it("maps Telegram reply acknowledgement onto the daemon operator method", async () => {
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const request = vi.fn(async () => ({
+      allowed: true as const,
+      reasonCode: ReasonCode.OK,
+      evidence: {},
+      value: {},
+    }));
+    try {
+      const code = await dispatch(
+        { request },
+        "telegram",
+        ["reply", "acknowledge", "update:302", "OPERATOR_REVIEWED", "sha256:evidence"],
+        false,
+      );
+
+      expect(code).toBe(0);
+      expect(request).toHaveBeenCalledWith("telegram.reply.acknowledge", {
+        nonce: "update:302",
+        reasonCode: "OPERATOR_REVIEWED",
+        evidenceDigest: "sha256:evidence",
+      }, undefined);
+    } finally {
+      stdout.mockRestore();
+    }
+  });
+
   it("routes a CLI-shaped mutation through the lock-held daemon and opens a 0600 socket", async () => {
     const running = await makeStartedOperator();
     try {

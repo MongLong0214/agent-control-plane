@@ -540,8 +540,7 @@ export class TelegramLongPollService {
     // One classification, made by the Bot API adapter, owns the batch decision:
     // - 429/5xx releases the known-not-sent reply, stops this batch, and holds the offset;
     // - a permanent rejection records UNANSWERABLE, continues, and advances;
-    // - an unknown result stops and holds until one retry is used, then records UNRESOLVED,
-    //   continues, and advances;
+    // - an unknown result records UNRESOLVED without retry, continues, and advances;
     // - acceptance completes the reply and advances normally.
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
@@ -551,6 +550,7 @@ export class TelegramLongPollService {
         // Reserve before the external call. A confirmed rejection releases the reservation to
         // RETRYABLE; an ambiguous result leaves it PENDING and operator-visible without replay.
         this.router.reserveResponse(outcome);
+        await this.options.onInterrupt?.("after-reply-reserve", update, outcome.runId);
         try {
           await this.transport.sendMessage(outcome.reply);
           await this.options.onInterrupt?.("after-reply-send", update, outcome.runId);
@@ -563,8 +563,8 @@ export class TelegramLongPollService {
           }
           if (error.failure.kind === "PERMANENT_REJECTION") {
             this.router.abandonResponse(outcome, error.failure);
-          } else if (!this.router.recordUnknownResponse(outcome, error.failure)) {
-            throw error;
+          } else {
+            this.router.recordUnknownResponse(outcome, error.failure);
           }
         }
       }
@@ -1119,7 +1119,11 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
         ...(candidate.runId ? { runId: candidate.runId } : {}),
       };
     }
-    if (typeof candidate.reply !== "object" || candidate.reply === null || typeof candidate.sent !== "boolean") return null;
+    if (
+      typeof candidate.reply !== "object"
+      || candidate.reply === null
+      || (candidate.sent === undefined && candidate.deliveryStatus === undefined)
+    ) return null;
     const reply = candidate.reply as Partial<TelegramReply>;
     if (
       typeof reply.chatId !== "string" ||
@@ -1149,7 +1153,7 @@ const storedState = (cp: ControlPlane, nonce: string): TelegramStoredState | nul
       phase: candidate.phase as TelegramStoredState["phase"],
       ...(candidate.runId ? { runId: candidate.runId } : {}),
       reply: reply as TelegramReply,
-      sent: candidate.sent,
+      ...(candidate.sent === undefined ? {} : { sent: candidate.sent }),
       deliveryStatus: (candidate.deliveryStatus ?? (candidate.sent ? "APPLIED" : "PENDING")) as TelegramDeliveryStatus,
       ...(candidate.unknownDeliveryAttempts === undefined
         ? {}

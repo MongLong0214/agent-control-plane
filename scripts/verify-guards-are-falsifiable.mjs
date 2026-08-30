@@ -1521,7 +1521,7 @@ const GUARDS = [
     find: "  if (statusCode === 429 || statusCode >= 500) {",
     replace: "  if (statusCode >= 400) {",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a permanent 400 records an unanswerable reply and advances past 101 later updates",
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
     ],
   },
   {
@@ -1562,24 +1562,24 @@ const GUARDS = [
     find: "            this.router.abandonResponse(outcome, error.failure);",
     replace: "            this.router.releaseResponse(outcome);",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a permanent 400 records an unanswerable reply and advances past 101 later updates",
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
     ],
   },
   {
-    // The first unknown result owns the batch until its one retry. Continuing immediately would
-    // let later work pass an outcome that still has automatic recovery remaining.
-    what: "the first unknown Telegram result holds the batch and offset for its bounded retry",
+    // An unknown outcome may already be an accepted send. Retrying it can duplicate an external
+    // message, so it terminalizes and lets later updates advance without a second attempt.
+    what: "an unknown send result is terminal without automatic retry and later updates advance",
     file: "src/ingress/telegram-polling.ts",
     find:
-      "          } else if (!this.router.recordUnknownResponse(outcome, error.failure)) {\n" +
-      "            throw error;\n" +
-      "          }",
-    replace:
       "          } else {\n" +
       "            this.router.recordUnknownResponse(outcome, error.failure);\n" +
       "          }",
+    replace:
+      "          } else {\n" +
+      "            throw error;\n" +
+      "          }",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a lost response retries once then records unresolved and advances the offset",
+      "tests/unit/telegram-ingress.test.ts::an unknown send result is terminal without automatic retry and later updates advance",
     ],
   },
   {
@@ -1590,18 +1590,18 @@ const GUARDS = [
     find: "      if (Number.isSafeInteger(update.update_id)) {",
     replace: "      if (false && Number.isSafeInteger(update.update_id)) {",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a permanent 400 records an unanswerable reply and advances past 101 later updates",
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
     ],
   },
   {
-    // Two means the initial ambiguous result plus one ambiguous retry. Raising it silently grows
-    // the duplicate bound and delays the terminal state that lets later ingress proceed.
-    what: "an unknown Telegram reply gets one retry before becoming unresolved",
+    // A recovered PENDING may be the record lagging a successful send. Returning its stored reply
+    // asks the polling loop to cross the irreversible Telegram boundary a second time.
+    what: "a crash after a successful send leaves one unresolved reply and never sends it again",
     file: "src/ingress/telegram-router.ts",
-    find: "const UNKNOWN_DELIVERY_ATTEMPT_LIMIT = 2;",
-    replace: "const UNKNOWN_DELIVERY_ATTEMPT_LIMIT = 3;",
+    find: "      return this.storedResponseOutcome(update, recovered, false);",
+    replace: "      return this.storedResponseOutcome(update, recovered, true);",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a lost response retries once then records unresolved and advances the offset",
+      "tests/unit/telegram-ingress.test.ts::a crash after a successful send leaves one unresolved reply and never sends it again",
     ],
   },
   {
@@ -1612,7 +1612,33 @@ const GUARDS = [
     find: "          AND json_extract(result_json, '$.deliveryStatus') IN ('UNANSWERABLE', 'UNRESOLVED')",
     replace: "          AND json_extract(result_json, '$.deliveryStatus') = 'UNRESOLVED'",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a permanent 400 records an unanswerable reply and advances past 101 later updates",
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // Acknowledgement is the operator exit: the delivery fact stays terminal, while Doctor stops
+    // presenting a reviewed NO_RETRY disposition as work nobody has addressed.
+    what: "a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    file: "src/doctor/doctor.ts",
+    find: "          AND json_type(result_json, '$.operatorResolution') IS NULL",
+    replace: "          AND json_type(result_json, '$.operatorResolution') IS NOT NULL",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    ],
+  },
+  {
+    // The stored disposition is deliberately NO_RETRY: an operator clears the alert without
+    // asserting that Telegram delivered the reply or granting a later automatic resend.
+    what: "a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
+    file: "src/ingress/ingress-guard.ts",
+    find:
+      "  const operatorResolution: TelegramReplyOperatorResolution = {\n" +
+      "    disposition: \"NO_RETRY\",",
+    replace:
+      "  const operatorResolution: TelegramReplyOperatorResolution = {\n" +
+      "    disposition: \"RETRY\",",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::a permanent 400 advances past 101 later updates and its terminal reply has an operator exit",
     ],
   },
   {
@@ -1629,7 +1655,7 @@ const GUARDS = [
       "                'PENDING',\n" +
       "                'UNKNOWN_RETRYABLE'",
     killedBy: [
-      "tests/unit/telegram-ingress.test.ts::a lost response retries once then records unresolved and advances the offset",
+      "tests/unit/telegram-ingress.test.ts::an unknown send result is terminal without automatic retry and later updates advance",
     ],
   },
   {

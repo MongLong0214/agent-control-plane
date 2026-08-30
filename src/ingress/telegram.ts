@@ -311,8 +311,9 @@ export class TelegramIngress {
     nonce: string,
     result: unknown,
     settlement: "UNANSWERABLE" | "UNRESOLVED",
+    expected: "PENDING" | "UNKNOWN_RETRYABLE" = "PENDING",
   ): Decision<void> {
-    return this.guard.settleReplyAndTurn("telegram", nonce, result, settlement);
+    return this.guard.settleReplyAndTurn("telegram", nonce, result, settlement, expected);
   }
 
   /**

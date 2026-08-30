@@ -90,6 +90,7 @@ export const buzzActorBindingSigningRequest = (
 });
 
 const DEFAULT_NONCE_TTL_MS = 24 * 60 * 60 * 1000;
+type TelegramReplyTransitionExpectation = "AVAILABLE" | "PENDING" | "UNKNOWN_RETRYABLE";
 
 /**
  * PRD §27.
@@ -439,7 +440,7 @@ export class IngressGuard {
     channel: string,
     nonce: string,
     result: unknown,
-    expected: "AVAILABLE" | "PENDING",
+    expected: TelegramReplyTransitionExpectation,
   ): Decision<void> {
     {
       const current = this.db.get<{ result_json: string | null }>(
@@ -450,9 +451,9 @@ export class IngressGuard {
         return deny(ReasonCode.NOT_FOUND, "cannot transition a missing ingress result", { channel, nonce });
       }
       const deliveryStatus = resultDeliveryStatus(current.result_json);
-      const allowed = expected === "PENDING"
-        ? deliveryStatus === "PENDING"
-        : deliveryStatus !== "PENDING" && deliveryStatus !== "APPLIED";
+      const allowed = expected === "AVAILABLE"
+        ? deliveryStatus !== "PENDING" && deliveryStatus !== "APPLIED"
+        : deliveryStatus === expected;
       if (!allowed) {
         return deny(
           ReasonCode.RESOURCE_COLLISION,
@@ -576,9 +577,10 @@ export class IngressGuard {
     nonce: string,
     result: unknown,
     settlement: "UNANSWERABLE" | "UNRESOLVED",
+    expected: "PENDING" | "UNKNOWN_RETRYABLE" = "PENDING",
   ): Decision<void> {
     return this.db.tx(() => {
-      const completed = this.#recordResultHere(channel, nonce, result, "PENDING");
+      const completed = this.#recordResultHere(channel, nonce, result, expected);
       if (!completed.allowed) return completed;
       return this.#settleTurnHere(channel, nonce, settlement);
     });
@@ -684,6 +686,125 @@ export class IngressGuard {
     );
   }
 }
+
+export interface TelegramReplyOperatorResolution {
+  disposition: "NO_RETRY";
+  resolvedAt: string;
+  resolvedBy: string;
+  reasonCode: string;
+  evidenceDigest: string;
+  auditEventId: number;
+}
+
+export interface TelegramReplyAcknowledgement {
+  nonce: string;
+  deliveryStatus: "UNANSWERABLE" | "UNRESOLVED";
+  operatorResolution: TelegramReplyOperatorResolution;
+}
+
+/**
+ * Records that an authenticated operator reviewed a terminal Telegram reply and chose no retry.
+ *
+ * The terminal status is retained: acknowledgement does not prove whether Telegram accepted an
+ * unknown send, and it does not pretend a rejected reply was delivered. The audit row and the
+ * result update share one transaction, so a crash produces either both facts or neither.
+ */
+export const acknowledgeTerminalTelegramReply = (
+  db: Db,
+  clock: Clock,
+  audit: AuditLog,
+  input: {
+    nonce: string;
+    resolvedBy: string;
+    reasonCode: string;
+    evidenceDigest: string;
+  },
+): Decision<TelegramReplyAcknowledgement> => db.txDecision(() => {
+  const row = db.get<{ result_json: string | null }>(
+    `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+    [input.nonce],
+  );
+  if (!row?.result_json) {
+    return deny(ReasonCode.NOT_FOUND, "no Telegram reply exists for this nonce", { nonce: input.nonce });
+  }
+
+  let state: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(row.result_json) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return deny(ReasonCode.CONFLICT, "the Telegram reply state is not an object", { nonce: input.nonce });
+    }
+    state = parsed as Record<string, unknown>;
+  } catch {
+    return deny(ReasonCode.CONFLICT, "the Telegram reply state is not valid JSON", { nonce: input.nonce });
+  }
+
+  const deliveryStatus = state["deliveryStatus"];
+  if (deliveryStatus !== "UNANSWERABLE" && deliveryStatus !== "UNRESOLVED") {
+    return deny(
+      ReasonCode.CONFLICT,
+      "only an unanswerable or unresolved Telegram reply can be acknowledged",
+      { nonce: input.nonce, status: typeof deliveryStatus === "string" ? deliveryStatus : null },
+    );
+  }
+
+  const existing = state["operatorResolution"];
+  if (typeof existing === "object" && existing !== null && !Array.isArray(existing)) {
+    const resolution = existing as Partial<TelegramReplyOperatorResolution>;
+    if (
+      resolution.disposition === "NO_RETRY"
+      && typeof resolution.resolvedAt === "string"
+      && typeof resolution.resolvedBy === "string"
+      && typeof resolution.reasonCode === "string"
+      && typeof resolution.evidenceDigest === "string"
+      && typeof resolution.auditEventId === "number"
+    ) {
+      return allow(ReasonCode.INGRESS_REPLAY_IGNORED, {
+        nonce: input.nonce,
+        deliveryStatus,
+        operatorResolution: resolution as TelegramReplyOperatorResolution,
+      });
+    }
+    return deny(ReasonCode.CONFLICT, "the Telegram reply has an invalid operator resolution", {
+      nonce: input.nonce,
+    });
+  }
+
+  const resolvedAt = clock.nowIso();
+  const audited = audit.record({
+    kind: "TELEGRAM_REPLY_NO_RETRY_ACKNOWLEDGED",
+    actor: input.resolvedBy,
+    reasonCode: ReasonCode.OK,
+    evidence: {
+      channel: "telegram",
+      nonce: input.nonce,
+      status: deliveryStatus,
+      resolution: "NO_RETRY",
+      reasonCode: input.reasonCode,
+      evidenceDigest: input.evidenceDigest,
+    },
+  });
+  if (!audited.allowed) return deny(audited.reasonCode, audited.message, audited.evidence);
+
+  const operatorResolution: TelegramReplyOperatorResolution = {
+    disposition: "NO_RETRY",
+    resolvedAt,
+    resolvedBy: input.resolvedBy,
+    reasonCode: input.reasonCode,
+    evidenceDigest: input.evidenceDigest,
+    auditEventId: audited.value,
+  };
+  const updated = db.run(
+    `UPDATE inbound_messages SET result_json = ?
+      WHERE channel = 'telegram' AND nonce = ? AND result_json = ?`,
+    [JSON.stringify({ ...state, operatorResolution }), input.nonce, row.result_json],
+  );
+  return updated.changes === 1
+    ? allow(ReasonCode.OK, { nonce: input.nonce, deliveryStatus, operatorResolution })
+    : deny(ReasonCode.RESOURCE_COLLISION, "the Telegram reply changed during acknowledgement", {
+        nonce: input.nonce,
+      });
+});
 
 /**
  * A Telegram row with no terminal response is an unfinished workflow, not a completed replay.
