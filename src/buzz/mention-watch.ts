@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type { Clock } from "../core/clock.ts";
 import type { AuditLog } from "../db/audit.ts";
 import type { Db } from "../db/database.ts";
@@ -15,8 +17,8 @@ import type { BuzzCliMessage } from "./buzz-adapter.ts";
  *
  * Deliberately not mention resolution, and the finding this feeds is named accordingly
  * (`BUZZ_CHANNEL_TRAFFIC_*`, not `BUZZ_MENTIONS_*` — renamed in #710). Counting is
- * `messages get --since <baseline>` against the channel a session is bound to — every message
- * the channel received, not messages confirmed to `#p`-tag this session. A blind review of
+ * an overlapping `messages get --since` read against the channel a session is bound to — every
+ * message the channel received, not messages confirmed to `#p`-tag this session. A blind review of
  * #710 confirmed this isn't a gap that can be closed with what's here: the only pubkey this
  * codebase ever binds to a session (`SessionRegistry.bindBuzzActor`, `buzz_actor_id`) is an
  * *inbound* actor's identity — proof that a human controls a session — not a pubkey the relay
@@ -28,7 +30,7 @@ import type { BuzzCliMessage } from "./buzz-adapter.ts";
  * actually measured.
  */
 export interface BuzzMentionSource {
-  /** Messages in `channel` newer than `sinceEpochSeconds`, oldest first, up to `limit`. */
+  /** Messages in `channel` strictly newer than `sinceEpochSeconds`, up to `limit`. */
   messagesSince(channel: string, sinceEpochSeconds: number, limit: number): Promise<BuzzCliMessage[]>;
 }
 
@@ -41,9 +43,11 @@ export interface WatchTarget {
 export interface BuzzMentionWatchRow {
   sessionId: string;
   channelId: string;
+  cursorGeneration: string;
   /** The "since T" a BUZZ_CHANNEL_TRAFFIC_BEHIND finding measures against. Null only before
-   * this session has ever been ticked once. */
+   * this session has ever been ticked once. Stored in epoch milliseconds. */
   baselineAt: number | null;
+  baselineEventIds: readonly string[];
   latestEventId: string | null;
   latestSeenAt: number | null;
   pendingCount: number;
@@ -71,6 +75,28 @@ const MAX_MESSAGES_PER_TICK = 200;
  */
 const OVERFETCH_LIMIT = MAX_MESSAGES_PER_TICK + 1;
 
+/** The CLI's `--since` is exclusive and accepts whole seconds. Read one second earlier so the
+ * reset second is present, then use event identity below to remove what the reset observed. */
+const inclusiveSince = (baselineAt: number): number =>
+  Math.max(0, Math.floor(baselineAt / 1000) - 1);
+
+/** Relay order is not a cursor and a repeated event is still one event. */
+const uniqueByEventId = (messages: readonly BuzzCliMessage[]): BuzzCliMessage[] => {
+  const unique = new Map<string, BuzzCliMessage>();
+  for (const message of messages) {
+    const present = unique.get(message.id);
+    if (!present || message.created_at > present.created_at) unique.set(message.id, message);
+  }
+  return [...unique.values()];
+};
+
+const newestMessage = (messages: readonly BuzzCliMessage[]): BuzzCliMessage | null =>
+  messages.reduce<BuzzCliMessage | null>((latest, message) => {
+    if (latest === null || message.created_at > latest.created_at) return message;
+    if (message.created_at === latest.created_at && message.id > latest.id) return message;
+    return latest;
+  }, null);
+
 const safeErrorMessage = (err: unknown): string => {
   const message = err instanceof Error ? err.message : String(err);
   return message.replace(/[\r\n\t]/g, " ").slice(0, 500);
@@ -86,8 +112,8 @@ const safeErrorMessage = (err: unknown): string => {
  * (the acknowledgment). Nothing else touches `buzz_mention_watch`.
  *
  * **Who advances the baseline.** Never `tick`. A tick recomputes `pending_count` fresh from the
- * *same* `baseline_at` every time — it counts, it never consumes. Only `resetCursor` moves the
- * baseline, and it is called from exactly one production site: `BuzzAdapter.connect()`, the
+ * same cursor every time — it counts, it never consumes. Only `resetCursor` moves the cursor,
+ * and it is called from exactly one production site: `BuzzAdapter.connect()`, the
  * moment a session is (re)confirmed alive and bound to a channel. That is deliberate: the
  * question this answers is "has anything arrived since this session was last known to be
  * watching", and reconnecting after a harness restart — precisely #674's incident — is the
@@ -95,9 +121,9 @@ const safeErrorMessage = (err: unknown): string => {
  *
  * **What a crash between reading and persisting loses.** Nothing, and nothing is double
  * counted either. `pending_count` is never incremented — it is overwritten each successful tick
- * with a fresh count derived from `--since baseline_at`. If the process dies after the CLI
+ * with a fresh count derived from the durable reset cursor. If the process dies after the CLI
  * answers but before the `UPDATE` commits, the row simply keeps its previous (still correct)
- * value, and the next tick re-asks the same question against the same durable baseline and
+ * value, and the next tick re-asks the same question against the same durable cursor and
  * writes the same answer it would have written anyway. A flag that could move without a way
  * back, or that trusted an in-flight count instead of a durable baseline, is the shape that has
  * broken this repository twice before; this has neither.
@@ -108,9 +134,10 @@ const safeErrorMessage = (err: unknown): string => {
  * still what every CLI read runs against — it is carried on the row as a plain column — but the
  * identity a tick's answer is scoped to, and that `resetCursor` re-arms, is the session.
  *
- * **A stale in-flight tick cannot un-reset a reconnect.** `#tickOne` captures the `baseline_at`
- * it read at the top of the call, and its closing `UPDATE` is conditioned on that same value
- * still being current (`WHERE session_id = ? AND baseline_at = ?`). A tick whose CLI round trip
+ * **A stale in-flight tick cannot un-reset a reconnect.** Every reset mints an opaque
+ * `cursor_generation`; both the attempt write and the closing result write are conditioned on
+ * that generation still being current. Unlike a wall-clock token it changes even when reconnects
+ * happen in the same millisecond. A tick whose CLI round trip
  * outlives a concurrent `resetCursor` — the daemon's mention-watch interval can be shorter than
  * the CLI's own timeout, so this is not exotic — finds its `UPDATE` matches zero rows and simply
  * does not write; the fresh reset stands. The daemon additionally serializes ticks against
@@ -146,51 +173,50 @@ export class BuzzMentionWatch {
 
   async #tickOne(sessionId: string, channelId: string): Promise<void> {
     const now = this.clock.nowIso();
-    const nowEpoch = Math.floor(this.clock.now().getTime() / 1000);
-    const existing = this.#row(sessionId);
-    // Established once, from "now" — not from the channel's full history, or a channel with
-    // years of traffic would report its entire backlog as BUZZ_CHANNEL_TRAFFIC_BEHIND the
-    // instant this watch first observes it.
-    const baselineAt = existing?.baselineAt ?? nowEpoch;
-
-    if (!existing) {
-      this.db.run(
-        `INSERT INTO buzz_mention_watch (session_id, channel_id, baseline_at, pending_count, last_attempt_at)
-         VALUES (?, ?, ?, 0, ?)`,
-        [sessionId, channelId, baselineAt, now],
-      );
-    } else {
-      this.db.run(
-        `UPDATE buzz_mention_watch SET channel_id = ?, last_attempt_at = ? WHERE session_id = ?`,
-        [channelId, now, sessionId],
-      );
+    let existing = this.#row(sessionId);
+    // Production reaches reset through connect. This path covers an already-bound session after
+    // an upgrade, and a channel changed outside the adapter, without reading full history.
+    if (!existing || existing.channelId !== channelId) {
+      await this.resetCursor(sessionId, channelId);
+      existing = this.#row(sessionId);
     }
+    if (!existing || existing.baselineAt === null) return;
 
-    // The read genuinely happens on the very first tick too (against `since = now`, expecting
-    // nothing) rather than being skipped — that is what lets a channel this watch can never
+    const baselineAt = existing.baselineAt;
+    const generation = existing.cursorGeneration;
+    const attempt = this.db.run(
+      `UPDATE buzz_mention_watch SET last_attempt_at = ?
+        WHERE session_id = ? AND cursor_generation = ?`,
+      [now, sessionId, generation],
+    );
+    if (attempt.changes !== 1) return;
+
+    // The read genuinely happens on the very first tick too rather than being skipped — that is
+    // what lets a channel this watch can never
     // reach report BUZZ_CHANNEL_TRAFFIC_WATCH_UNAVAILABLE from tick one, instead of a false
     // healthy baseline nobody ever verified.
     try {
-      const messages = await this.source.messagesSince(channelId, baselineAt, OVERFETCH_LIMIT);
+      const messages = await this.source.messagesSince(channelId, inclusiveSince(baselineAt), OVERFETCH_LIMIT);
       const saturated = messages.length > MAX_MESSAGES_PER_TICK;
-      // Oldest first, up to the (over-fetched) limit — so once saturated, the batch this tick
-      // actually holds is the OLDEST slice of an unknown-sized backlog, not the newest. Claiming
-      // a "latest event" out of it would misrepresent a stale message as current, so on
+      const baselineSecond = Math.floor(baselineAt / 1000);
+      const presentAtReset = new Set(existing.baselineEventIds);
+      const afterReset = uniqueByEventId(messages).filter(
+        (message) =>
+          message.created_at > baselineSecond ||
+          (message.created_at === baselineSecond && !presentAtReset.has(message.id)),
+      );
+      // Once the source cap is hit, its order cannot tell which slice the tick actually holds.
+      // Claiming a "latest event" out of it would misrepresent an arbitrary row as current, so on
       // saturation `latest_event_id`/`latest_seen_at` are left exactly as they were, the same
       // "state what you don't know" treatment the catch branch below gives a failed read.
-      const counted = saturated ? messages.slice(0, MAX_MESSAGES_PER_TICK) : messages;
-      const newest = saturated
-        ? null
-        : counted.reduce<BuzzCliMessage | null>(
-            (max, m) => (max === null || m.created_at > max.created_at ? m : max),
-            null,
-          );
+      const counted = saturated ? afterReset.slice(0, MAX_MESSAGES_PER_TICK) : afterReset;
+      const newest = saturated ? null : newestMessage(counted);
       this.db.run(
         `UPDATE buzz_mention_watch
             SET pending_count = ?, pending_saturated = ?,
                 latest_event_id = ?, latest_seen_at = ?,
                 last_success_at = ?, last_error = NULL, last_error_at = NULL
-          WHERE session_id = ? AND baseline_at = ?`,
+          WHERE session_id = ? AND cursor_generation = ?`,
         [
           counted.length,
           saturated ? 1 : 0,
@@ -198,7 +224,7 @@ export class BuzzMentionWatch {
           newest?.created_at ?? existing?.latestSeenAt ?? null,
           now,
           sessionId,
-          baselineAt,
+          generation,
         ],
       );
     } catch (err) {
@@ -207,8 +233,9 @@ export class BuzzMentionWatch {
       // that and "this failed" from `last_error_at` alone, not from a count that would otherwise
       // silently go stale while still being reported as current.
       this.db.run(
-        `UPDATE buzz_mention_watch SET last_error = ?, last_error_at = ? WHERE session_id = ? AND baseline_at = ?`,
-        [safeErrorMessage(err), now, sessionId, baselineAt],
+        `UPDATE buzz_mention_watch SET last_error = ?, last_error_at = ?
+          WHERE session_id = ? AND cursor_generation = ?`,
+        [safeErrorMessage(err), now, sessionId, generation],
       );
     }
   }
@@ -218,17 +245,48 @@ export class BuzzMentionWatch {
    * connect, not only the first: reconnecting while already caught up simply re-arms the same
    * "watching from now" baseline.
    */
-  resetCursor(sessionId: string, channelId: string): void {
-    const nowEpoch = Math.floor(this.clock.now().getTime() / 1000);
+  async resetCursor(sessionId: string, channelId: string): Promise<void> {
+    const snapshotStartedAt = this.clock.now().getTime();
+    let snapshot: BuzzCliMessage[] = [];
+    try {
+      snapshot = await this.source.messagesSince(channelId, inclusiveSince(snapshotStartedAt), OVERFETCH_LIMIT);
+    } catch {
+      // An empty identity set is conservative: boundary-second traffic that may predate the
+      // reset can be over-counted, but an event after the reset can never become verified silence.
+    }
+
+    const baselineAt = this.clock.now().getTime();
+    const baselineSecond = Math.floor(baselineAt / 1000);
+    const snapshotSaturated = snapshot.length > MAX_MESSAGES_PER_TICK;
+    const baselineEventIds = snapshotSaturated
+      ? []
+      : uniqueByEventId(snapshot)
+          .filter((message) => message.created_at === baselineSecond)
+          .map((message) => message.id)
+          .sort();
+    const latestAtReset = snapshotSaturated ? null : newestMessage(uniqueByEventId(snapshot));
+    const generation = randomUUID();
     this.db.run(
-      `INSERT INTO buzz_mention_watch (session_id, channel_id, baseline_at, pending_count)
-       VALUES (?, ?, ?, 0)
+      `INSERT INTO buzz_mention_watch
+         (session_id, channel_id, cursor_generation, baseline_at, baseline_event_ids,
+          latest_event_id, latest_seen_at, pending_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0)
        ON CONFLICT(session_id) DO UPDATE SET
          channel_id = excluded.channel_id,
-         baseline_at = excluded.baseline_at, pending_count = 0, pending_saturated = 0,
-         latest_event_id = NULL, latest_seen_at = NULL,
+         cursor_generation = excluded.cursor_generation,
+         baseline_at = excluded.baseline_at, baseline_event_ids = excluded.baseline_event_ids,
+         pending_count = 0, pending_saturated = 0,
+         latest_event_id = excluded.latest_event_id, latest_seen_at = excluded.latest_seen_at,
          last_attempt_at = NULL, last_success_at = NULL, last_error = NULL, last_error_at = NULL`,
-      [sessionId, channelId, nowEpoch],
+      [
+        sessionId,
+        channelId,
+        generation,
+        baselineAt,
+        JSON.stringify(baselineEventIds),
+        latestAtReset?.id ?? null,
+        latestAtReset?.created_at ?? null,
+      ],
     );
     this.audit.record({
       kind: "BUZZ_MENTION_WATCH_RESET",
@@ -240,7 +298,9 @@ export class BuzzMentionWatch {
     const row = this.db.get<{
       session_id: string;
       channel_id: string;
+      cursor_generation: string;
       baseline_at: number | null;
+      baseline_event_ids: string;
       latest_event_id: string | null;
       latest_seen_at: number | null;
       pending_count: number;
@@ -254,7 +314,9 @@ export class BuzzMentionWatch {
     return {
       sessionId: row.session_id,
       channelId: row.channel_id,
+      cursorGeneration: row.cursor_generation,
       baselineAt: row.baseline_at,
+      baselineEventIds: JSON.parse(row.baseline_event_ids) as string[],
       latestEventId: row.latest_event_id,
       latestSeenAt: row.latest_seen_at,
       pendingCount: row.pending_count,

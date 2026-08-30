@@ -1,8 +1,16 @@
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { afterAll, describe, expect, it } from "vitest";
 
-import { cleanupTempDirs } from "../helpers/fixtures.ts";
+import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
 import { makeHarness } from "../helpers/harness.ts";
-import { BuzzAdapter, InMemoryBuzzTransport, type BuzzCliMessage } from "../../src/buzz/buzz-adapter.ts";
+import {
+  BuzzAdapter,
+  BuzzCliTransport,
+  InMemoryBuzzTransport,
+  type BuzzCliMessage,
+} from "../../src/buzz/buzz-adapter.ts";
 import { BuzzMentionWatch, type BuzzMentionSource, type WatchTarget } from "../../src/buzz/mention-watch.ts";
 import { SessionLifecycle } from "../../src/domain/types.ts";
 import type { DoctorReport } from "../../src/doctor/doctor.ts";
@@ -45,10 +53,9 @@ const message = (createdAt: number): BuzzCliMessage => {
  * enqueued is "what's actually there right now" and is returned again on a repeat ask, until a
  * throw is enqueued to simulate the relay or CLI becoming unreachable.
  *
- * Respects `limit` (#710 finding 3): the previous double ignored it and returned the full
- * enqueued array regardless of what was asked for, which is exactly why a review of the real
- * CLI's `--limit` truncation — a return cap, not a total — reached production with nothing here
- * able to reproduce it.
+ * Respects the CLI's exclusive `since` and its `limit` (#710): the previous double ignored both
+ * and returned the full enqueued array regardless of what was asked for, which is exactly why a
+ * review of the real CLI reached production with nothing here able to reproduce it.
  */
 class ScriptedMentionSource implements BuzzMentionSource {
   readonly calls: Array<{ channel: string; since: number; limit: number }> = [];
@@ -71,42 +78,101 @@ class ScriptedMentionSource implements BuzzMentionSource {
       this.#throwing = null;
       throw err;
     }
-    return this.#current.slice(0, limit);
+    return this.#current.filter((message) => message.created_at > since).slice(0, limit);
   }
 }
 
 /**
- * A source whose reads never resolve until the test releases them, in whatever order the test
- * chooses — lets a test land a `resetCursor` (a reconnect) and even a second, fresher tick in
- * the middle of an earlier tick's still-hanging CLI round trip, the way a real slow
- * `buzz messages get --since` call would (#710 finding 2). Calls are addressed by index so a
- * later call can be released before an earlier, still-pending one.
+ * An executable boundary double for the installed CLI, not a `BuzzMentionSource` model. It
+ * applies the installed command's real rule (`created_at > --since`), honors `--limit`, and
+ * preserves whatever order and repeats the relay returned. The production `BuzzCliTransport`
+ * has to cross this process boundary and parse its JSON before the watch sees a message.
  */
-class DeferredMentionSource implements BuzzMentionSource {
-  #pending: Array<(messages: BuzzCliMessage[]) => void> = [];
-  #notify: (() => void) | null = null;
+class ExclusiveSinceBuzzCli {
+  readonly binary: string;
+  readonly channel = "00000000-0000-0000-0000-000000000674";
+  readonly #messages: string;
+  readonly #calls: string;
+  readonly #blockNext: string;
+  readonly #blocked: string;
+  readonly #release: string;
 
-  async messagesSince(_channel: string, _since: number, _limit: number): Promise<BuzzCliMessage[]> {
-    return new Promise<BuzzCliMessage[]>((resolve) => {
-      this.#pending.push(resolve);
-      this.#notify?.();
-    });
+  constructor() {
+    const root = tempDir("acp-buzz-exclusive-since-");
+    this.binary = join(root, "buzz");
+    this.#messages = join(root, "messages.json");
+    this.#calls = join(root, "calls.jsonl");
+    this.#blockNext = join(root, "block-next");
+    this.#blocked = join(root, "blocked");
+    this.#release = join(root, "release");
+    writeFileSync(this.#messages, "[]", "utf8");
+    writeFileSync(this.#calls, "", "utf8");
+    writeFileSync(
+      this.binary,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(this.#calls)}, JSON.stringify(argv) + "\\n");
+const flag = (name) => {
+  const index = argv.indexOf(name);
+  return index < 0 ? null : argv[index + 1] ?? null;
+};
+const die = (message) => {
+  process.stderr.write(JSON.stringify({ error: "user_error", message, retryable: false }));
+  process.exit(1);
+};
+if (argv[0] === "channels" && argv[1] === "get") {
+  const channel = flag("--channel");
+  if (!channel) die("--channel is required");
+  process.stdout.write(JSON.stringify({ channel_id: channel }));
+  process.exit(0);
+}
+if (argv[0] === "messages" && argv[1] === "get") {
+  if (!flag("--channel")) die("--channel is required");
+  const since = Number(flag("--since"));
+  const limit = Number(flag("--limit"));
+  const response = JSON.parse(fs.readFileSync(${JSON.stringify(this.#messages)}, "utf8"))
+    .filter((message) => message.created_at > since)
+    .slice(0, limit);
+  if (fs.existsSync(${JSON.stringify(this.#blockNext)})) {
+    fs.renameSync(${JSON.stringify(this.#blockNext)}, ${JSON.stringify(this.#blocked)});
+    while (!fs.existsSync(${JSON.stringify(this.#release)})) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  process.stdout.write(JSON.stringify(response));
+  process.exit(0);
+}
+die("unsupported argv: " + argv.join(" "));
+`,
+      "utf8",
+    );
+    chmodSync(this.binary, 0o755);
   }
 
-  /** Resolves once at least `count` calls are pending and unreleased. */
-  async waitUntilPendingCount(count: number): Promise<void> {
-    while (this.#pending.length < count) {
-      await new Promise<void>((resolve) => {
-        this.#notify = resolve;
-      });
+  respondWith(messages: readonly BuzzCliMessage[]): void {
+    writeFileSync(this.#messages, JSON.stringify(messages), "utf8");
+  }
+
+  blockNextMessagesRead(): void {
+    writeFileSync(this.#blockNext, "block", "utf8");
+  }
+
+  async waitUntilBlocked(): Promise<void> {
+    while (!existsSync(this.#blocked)) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
   }
 
-  release(index: number, messages: BuzzCliMessage[]): void {
-    const resolve = this.#pending[index];
-    if (!resolve) throw new Error(`test bug: no pending messagesSince call at index ${index}`);
-    this.#pending.splice(index, 1);
-    resolve(messages);
+  releaseBlockedRead(): void {
+    writeFileSync(this.#release, "release", "utf8");
+  }
+
+  calls(): string[][] {
+    return readFileSync(this.#calls, "utf8")
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as string[]);
   }
 }
 
@@ -336,6 +402,151 @@ describe("what doctor says about a silent buzz channel-traffic watch (#674)", ()
 });
 
 describe("#710 — shared-channel and concurrency findings from the blind review", () => {
+  it("an event after reset in the same epoch second reaches Doctor through the exclusive-since CLI", async () => {
+    const harness = makeHarness();
+    harness.clock.advance(200);
+    const relay = new ExclusiveSinceBuzzCli();
+    const transport = new BuzzCliTransport(relay.binary, relay.channel);
+    const mentionWatch = new BuzzMentionWatch(harness.cp.db, harness.cp.clock, harness.cp.audit, transport);
+    const adapter = new BuzzAdapter(
+      harness.cp.db, harness.cp.clock, harness.cp.audit,
+      harness.cp.sessions, harness.cp.bindings, harness.cp.outbox,
+      transport, mentionWatch,
+    );
+    const priorKey = process.env["BUZZ_PRIVATE_KEY"];
+    process.env["BUZZ_PRIVATE_KEY"] = "test-key";
+    try {
+      const { sessionId, channel } = await connectedSession(harness, adapter, "same-second-session");
+      const resetSecond = Math.floor(harness.clock.now().getTime() / 1000);
+
+      // Reset happened at .200. This event arrives at .900 but, like the real relay payload,
+      // carries only epoch-second precision. An exclusive `--since resetSecond` drops it.
+      relay.respondWith([{ ...message(resetSecond), id: "same-second-after-reset" }]);
+      harness.clock.advance(800);
+      await mentionWatch.tick([target(sessionId, channel)]);
+
+      expect(behindFinding(await harness.cp.doctor.run("system"))?.observedEvidence).toMatchObject({
+        sessionId,
+        channelMessagesSinceBaseline: 1,
+      });
+      expect(relay.calls()).toContainEqual([
+        "messages", "get", "--channel", channel,
+        "--since", String(resetSecond - 1), "--limit", "201",
+      ]);
+    } finally {
+      if (priorKey === undefined) delete process.env["BUZZ_PRIVATE_KEY"];
+      else process.env["BUZZ_PRIVATE_KEY"] = priorKey;
+    }
+  });
+
+  it("the reset second uses event identity to exclude traffic already present at reset", async () => {
+    const harness = makeHarness();
+    harness.clock.advance(200);
+    const relay = new ExclusiveSinceBuzzCli();
+    const transport = new BuzzCliTransport(relay.binary, relay.channel);
+    const mentionWatch = new BuzzMentionWatch(harness.cp.db, harness.cp.clock, harness.cp.audit, transport);
+    const adapter = new BuzzAdapter(
+      harness.cp.db, harness.cp.clock, harness.cp.audit,
+      harness.cp.sessions, harness.cp.bindings, harness.cp.outbox,
+      transport, mentionWatch,
+    );
+    const priorKey = process.env["BUZZ_PRIVATE_KEY"];
+    process.env["BUZZ_PRIVATE_KEY"] = "test-key";
+    try {
+      const resetSecond = Math.floor(harness.clock.now().getTime() / 1000);
+      const beforeReset = { ...message(resetSecond), id: "same-second-before-reset" };
+      relay.respondWith([beforeReset]);
+      const { sessionId, channel } = await connectedSession(harness, adapter, "identity-boundary-session");
+
+      relay.respondWith([
+        { ...message(resetSecond), id: "same-second-after-reset" },
+        beforeReset,
+      ]);
+      harness.clock.advance(800);
+      await mentionWatch.tick([target(sessionId, channel)]);
+
+      expect(behindFinding(await harness.cp.doctor.run("system"))?.observedEvidence).toMatchObject({
+        channelMessagesSinceBaseline: 1,
+      });
+    } finally {
+      if (priorKey === undefined) delete process.env["BUZZ_PRIVATE_KEY"];
+      else process.env["BUZZ_PRIVATE_KEY"] = priorKey;
+    }
+  });
+
+  it("event ids make repeated and out-of-order relay rows one count each", async () => {
+    const harness = makeHarness();
+    harness.clock.advance(200);
+    const relay = new ExclusiveSinceBuzzCli();
+    const transport = new BuzzCliTransport(relay.binary, relay.channel);
+    const mentionWatch = new BuzzMentionWatch(harness.cp.db, harness.cp.clock, harness.cp.audit, transport);
+    const adapter = new BuzzAdapter(
+      harness.cp.db, harness.cp.clock, harness.cp.audit,
+      harness.cp.sessions, harness.cp.bindings, harness.cp.outbox,
+      transport, mentionWatch,
+    );
+    const priorKey = process.env["BUZZ_PRIVATE_KEY"];
+    process.env["BUZZ_PRIVATE_KEY"] = "test-key";
+    try {
+      const { sessionId, channel } = await connectedSession(harness, adapter, "replay-session");
+      const resetSecond = Math.floor(harness.clock.now().getTime() / 1000);
+      const first = { ...message(resetSecond + 1), id: "event-first" };
+      const second = { ...message(resetSecond + 2), id: "event-second" };
+      relay.respondWith([second, first, second]);
+      harness.clock.advance(3_000);
+
+      await mentionWatch.tick([target(sessionId, channel)]);
+      expect(behindFinding(await harness.cp.doctor.run("system"))?.observedEvidence).toMatchObject({
+        channelMessagesSinceBaseline: 2,
+      });
+    } finally {
+      if (priorKey === undefined) delete process.env["BUZZ_PRIVATE_KEY"];
+      else process.env["BUZZ_PRIVATE_KEY"] = priorKey;
+    }
+  });
+
+  it("a reconnect generation rejects a stale tick even when the wall clock does not advance", async () => {
+    const harness = makeHarness();
+    harness.clock.advance(200);
+    const relay = new ExclusiveSinceBuzzCli();
+    const transport = new BuzzCliTransport(relay.binary, relay.channel);
+    const mentionWatch = new BuzzMentionWatch(harness.cp.db, harness.cp.clock, harness.cp.audit, transport);
+    const adapter = new BuzzAdapter(
+      harness.cp.db, harness.cp.clock, harness.cp.audit,
+      harness.cp.sessions, harness.cp.bindings, harness.cp.outbox,
+      transport, mentionWatch,
+    );
+    const priorKey = process.env["BUZZ_PRIVATE_KEY"];
+    process.env["BUZZ_PRIVATE_KEY"] = "test-key";
+    try {
+      const purpose = "cto:same-second-race";
+      const { sessionId, channel } = await connectedSession(harness, adapter, "same-second-race", purpose);
+      const resetSecond = Math.floor(harness.clock.now().getTime() / 1000);
+
+      relay.respondWith([{ ...message(resetSecond + 10), id: "stale-event" }]);
+      relay.blockNextMessagesRead();
+      const staleTick = mentionWatch.tick([target(sessionId, channel)]);
+      await relay.waitUntilBlocked();
+
+      // No clock advance: the old timestamp CAS token is identical on both resets.
+      relay.respondWith([]);
+      const reconnected = await adapter.connect(sessionId, purpose);
+      expect(reconnected.allowed).toBe(true);
+      await mentionWatch.tick([target(sessionId, channel)]);
+
+      relay.releaseBlockedRead();
+      await staleTick;
+
+      const report = await harness.cp.doctor.run("system");
+      expect(behindFinding(report)).toBeUndefined();
+      expect(neverCheckedFinding(report)).toBeUndefined();
+      expect(unavailableFinding(report)).toBeUndefined();
+    } finally {
+      if (priorKey === undefined) delete process.env["BUZZ_PRIVATE_KEY"];
+      else process.env["BUZZ_PRIVATE_KEY"] = priorKey;
+    }
+  });
+
   it("finding 1: a second session connecting to the same channel does not erase the first session's backlog", async () => {
     const harness = makeHarness();
     const source = new ScriptedMentionSource();
@@ -385,56 +596,6 @@ describe("#710 — shared-channel and concurrency findings from the blind review
     // and not session A's 4.
     const findingForB = report.findings.find((f) => f.observedEvidence["sessionId"] === sessionB.sessionId);
     expect(findingForB?.code).toBe("BUZZ_CHANNEL_TRAFFIC_NEVER_CHECKED");
-  });
-
-  it("finding 2: a stale in-flight tick cannot undo a concurrent reconnect's reset", async () => {
-    const harness = makeHarness();
-    const source = new DeferredMentionSource();
-    const mentionWatch = new BuzzMentionWatch(harness.cp.db, harness.cp.clock, harness.cp.audit, source);
-    const adapter = new BuzzAdapter(
-      harness.cp.db, harness.cp.clock, harness.cp.audit,
-      harness.cp.sessions, harness.cp.bindings, harness.cp.outbox,
-      new InMemoryBuzzTransport(), mentionWatch,
-    );
-    const purpose = "cto:race-session";
-    const { sessionId, channel } = await connectedSession(harness, adapter, "race-session", purpose);
-    const oldBaselineEpoch = Math.floor(harness.clock.now().getTime() / 1000);
-
-    // A tick starts against the OLD baseline; its CLI round trip hangs (a slow relay, or the
-    // periodic interval firing again before the previous call returned — #710 finding 2).
-    const staleTick = mentionWatch.tick([target(sessionId, channel)]);
-    await source.waitUntilPendingCount(1);
-
-    // While that tick is still in flight, the session reconnects: resetCursor fires with a
-    // fresh baseline. Production reaches this through `BuzzAdapter.connect()`.
-    harness.clock.advance(120_000);
-    const reconnected = await adapter.connect(sessionId, purpose);
-    expect(reconnected.allowed).toBe(true);
-
-    // A second, fresh tick runs against the NEW baseline and completes cleanly — establishing a
-    // genuine `last_attempt_at`/`last_success_at` for the new baseline, so what this test proves
-    // next is specifically about the stale tick's *count*, not merely re-triggering the
-    // separate never-checked gate a reset alone already defends (that is covered by the
-    // "reset session reads as never-checked" test above).
-    const freshTick = mentionWatch.tick([target(sessionId, channel)]);
-    await source.waitUntilPendingCount(2);
-    source.release(1, []);
-    await freshTick;
-
-    const afterFreshTick = await harness.cp.doctor.run("system");
-    expect(behindFinding(afterFreshTick)).toBeUndefined();
-
-    // The stale tick now finally resolves, answering against the OLD baseline — with messages
-    // that arrived before the reconnect and are no longer relevant to the new baseline.
-    source.release(0, [message(oldBaselineEpoch + 10), message(oldBaselineEpoch + 20)]);
-    await staleTick;
-
-    // The stale write must not have landed: the fresh tick's clean result stands, and nothing is
-    // reported behind. Without the `WHERE ... AND baseline_at = ?` guard, this stale tick's
-    // 2-message count — computed against a baseline the session no longer uses — would have
-    // overwritten the fresh tick's correct zero.
-    const report = await harness.cp.doctor.run("system");
-    expect(behindFinding(report)).toBeUndefined();
   });
 
   it("finding 3: a tick that hits the per-check read cap reports a floor, not an exact count", async () => {

@@ -495,6 +495,46 @@ const GUARDS = [
     killedBy: ["tests/unit/buzz-cli-surface.test.ts"],
   },
   {
+    what: "the buzz cursor overlaps the exclusive CLI second so an event beside reset is visible",
+    file: "src/buzz/mention-watch.ts",
+    find: "  Math.max(0, Math.floor(baselineAt / 1000) - 1);",
+    replace: "  Math.max(0, Math.floor(baselineAt / 1000));",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::an event after reset in the same epoch second reaches Doctor through the exclusive-since CLI",
+    ],
+  },
+  {
+    what: "the buzz cursor counts event ids rather than repeated relay rows",
+    file: "src/buzz/mention-watch.ts",
+    find: "      const afterReset = uniqueByEventId(messages).filter(",
+    replace: "      const afterReset = messages.filter(",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::event ids make repeated and out-of-order relay rows one count each",
+    ],
+  },
+  {
+    what: "the buzz reset second excludes event ids already present when reset completed",
+    file: "src/buzz/mention-watch.ts",
+    find: "      const presentAtReset = new Set(existing.baselineEventIds);",
+    replace: "      const presentAtReset = new Set<string>();",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::the reset second uses event identity to exclude traffic already present at reset",
+    ],
+  },
+  {
+    what: "a buzz reconnect generation rejects a stale tick even without clock movement",
+    file: "src/buzz/mention-watch.ts",
+    find:
+      "                last_success_at = ?, last_error = NULL, last_error_at = NULL\n" +
+      "          WHERE session_id = ? AND cursor_generation = ?",
+    replace:
+      "                last_success_at = ?, last_error = NULL, last_error_at = NULL\n" +
+      "          WHERE session_id = ? AND ? IS NOT NULL",
+    killedBy: [
+      "tests/unit/doctor-sees-buzz-mentions-behind.test.ts::a reconnect generation rejects a stale tick even when the wall clock does not advance",
+    ],
+  },
+  {
     // #674 — the row-exists-but-never-attempted state (a session just connected and reset the
     // cursor, but the periodic tick has not run yet) must read the same as no row at all, not as
     // a verified zero. Dropping this disjunct is exactly the fold #636 corrected for capacity:

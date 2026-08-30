@@ -559,7 +559,7 @@ export class Doctor {
             // The CLI's `--limit` is a return cap, not a total (#710 finding 3): when the read
             // hit that cap, `channelMessagesSinceBaseline` is a floor, not an exact count.
             atLeast: row.pending_saturated === 1,
-            sinceIso: new Date((row.baseline_at ?? 0) * 1000).toISOString(),
+            sinceIso: new Date(row.baseline_at ?? 0).toISOString(),
             checkedAt: row.last_success_at,
           },
           recommendedAction:

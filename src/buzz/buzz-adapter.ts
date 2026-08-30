@@ -347,7 +347,7 @@ export interface MentionCursorReset {
   /** Keyed on `sessionId`, not just `channelId` (#710) — production sessions can share one
    * `ACP_BUZZ_CHANNEL`, and a channel-only key let one session's reconnect reset a baseline
    * another live session on that same channel had never touched. */
-  resetCursor(sessionId: string, channelId: string): void;
+  resetCursor(sessionId: string, channelId: string): Promise<void>;
 }
 
 export class BuzzAdapter {
@@ -369,13 +369,13 @@ export class BuzzAdapter {
     }
     try {
       const address = await this.transport.openChannel(purpose);
+      await this.mentionWatch?.resetCursor(sessionId, address);
       this.sessions.setBuzzAddress(sessionId, address);
       // The mention-watch cursor's one way back (#674): a session is (re)confirmed alive and
       // watching this channel right here, so its baseline re-arms at "now". A harness restart
       // that reconnects clears an accumulated backlog nobody would otherwise ever look at again.
       // Keyed on this session's own id (#710): other sessions bound to the same channel keep
       // their own baseline untouched.
-      this.mentionWatch?.resetCursor(sessionId, address);
       this.audit.record({
         kind: "BUZZ_CONNECTED",
         sessionId,

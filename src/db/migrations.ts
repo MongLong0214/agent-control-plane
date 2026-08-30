@@ -2126,7 +2126,9 @@ const v32: SchemaMigration = {
       CREATE TABLE IF NOT EXISTS buzz_mention_watch (
         session_id        TEXT PRIMARY KEY,
         channel_id        TEXT NOT NULL,
+        cursor_generation TEXT NOT NULL,
         baseline_at       INTEGER,
+        baseline_event_ids TEXT NOT NULL DEFAULT '[]',
         latest_event_id   TEXT,
         latest_seen_at    INTEGER,
         pending_count     INTEGER NOT NULL DEFAULT 0,

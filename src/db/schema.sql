@@ -1170,8 +1170,8 @@ CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE s
 -- buzz_mention_watch (v32, #674; re-keyed by #710)
 --   A per-SESSION cursor plus tick health, so a session's ad hoc poll dying silently and
 --   "nothing new arrived" no longer read as the same fact. See src/buzz/mention-watch.ts
---   for the full lifecycle: `baseline_at` moves only via an explicit reset on reconnect,
---   never on an ordinary tick, which only recomputes `pending_count` fresh each time.
+--   for the full lifecycle: the reset generation/time/event-id cursor moves only via an explicit
+--   reset on reconnect, never on an ordinary tick, which recomputes `pending_count` fresh.
 --
 --   Keyed on `session_id`, not `channel_id`: #710 found production sessions can share one
 --   `ACP_BUZZ_CHANNEL` (buzz-adapter.ts's `defaultChannel` path), and a channel-keyed row let
@@ -1182,7 +1182,11 @@ CREATE INDEX IF NOT EXISTS outbox_retry_ready ON outbox(next_attempt_at) WHERE s
 CREATE TABLE IF NOT EXISTS buzz_mention_watch (
   session_id        TEXT PRIMARY KEY,
   channel_id        TEXT NOT NULL,
+  -- An opaque CAS token. Wall time cannot distinguish two reconnects in one clock tick.
+  cursor_generation TEXT NOT NULL,
+  -- Millisecond evidence time; CLI reads overlap its whole second and event ids disambiguate it.
   baseline_at       INTEGER,
+  baseline_event_ids TEXT NOT NULL DEFAULT '[]',
   latest_event_id   TEXT,
   latest_seen_at    INTEGER,
   pending_count     INTEGER NOT NULL DEFAULT 0,
