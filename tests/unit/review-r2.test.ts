@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { chmodSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -318,6 +318,31 @@ describe("round-2 blind-review regressions", () => {
     expect(result.reasonCode).toBe(ReasonCode.CONTRACT_DIGEST_MISMATCH);
   });
 
+  // #448: `#126` above proves the real comparison — a stored contract is in hand and the
+  // caller's submission disagrees with it — still reports CONTRACT_DIGEST_MISMATCH. This proves
+  // the other half: when the artifact store cannot produce a trustworthy stored contract at all,
+  // nothing was compared, so it must report CONTRACT_UNVERIFIED instead. Both used to be the
+  // same `deny()` call, folded behind one `||`.
+  it("#448 reports CONTRACT_UNVERIFIED when the run's pinned task contract cannot be retrieved from the artifact store", async () => {
+    const setup = await prepareReviewedInputs();
+    const list = vi.spyOn(setup.harness.cp.artifacts, "list").mockReturnValue([]);
+    try {
+      const result = await setup.harness.cp.review.controlPlaneInvoker()({
+        runId: setup.run.runId,
+        projectId: setup.projectId,
+        executionMode: setup.run.executionMode,
+        snapshot: setup.snapshot,
+        contract: CONTRACT,
+        contractDigest: setup.run.contractDigest,
+        verification: setup.verification,
+      });
+      expect(result.allowed).toBe(false);
+      expect(result.reasonCode).toBe(ReasonCode.CONTRACT_UNVERIFIED);
+    } finally {
+      list.mockRestore();
+    }
+  });
+
   it("#127 refuses a verdict attested to a producer provider session", async () => {
     const setup = await prepareReviewedInputs();
     const producerProviderSession = setup.harness.cp.sessions.require(setup.run.ownerSessionId!).incarnation.split("#", 1)[0]!;
@@ -483,6 +508,30 @@ describe("round-2 blind-review regressions", () => {
       setup.run.runId,
       candidateSnapshotDigest(setup.snapshot),
     )).toBeNull();
+  });
+
+  // #448: the pipeline's own pinned-contract lookup (distinct from the one inside blind review,
+  // just above) folded the same two facts into one CONTRACT_DIGEST_MISMATCH — "no trustworthy
+  // contract was retrievable" and "the candidate's contract disagrees with the pinned one".
+  // Only the first is exercised here; nothing here compares the two, so nothing should read as
+  // a disagreement.
+  it("#448 reports CONTRACT_UNVERIFIED when submitResult cannot retrieve the run's pinned task contract", async () => {
+    const setup = await prepareReviewedInputs();
+    setup.harness.cp.verification.verify = async () => allow(ReasonCode.OK, setup.verification);
+    const list = vi.spyOn(setup.harness.cp.artifacts, "list").mockReturnValue([]);
+    try {
+      const result = await setup.harness.cp.pipeline.submitResult({
+        runId: setup.run.runId,
+        ownerSessionId: setup.run.ownerSessionId!,
+        ownerBindingGeneration: setup.run.ownerBindingGeneration!,
+        resultSummary: "done",
+        recommendation: "merge",
+      });
+      expect(result.allowed).toBe(false);
+      expect(result.reasonCode).toBe(ReasonCode.CONTRACT_UNVERIFIED);
+    } finally {
+      list.mockRestore();
+    }
   });
 
   it("#130 serializes concurrent candidate submissions across a reconstructed pipeline", async () => {

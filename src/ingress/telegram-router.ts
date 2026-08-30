@@ -608,6 +608,50 @@ export class TelegramHermesRouter {
     }
   }
 
+  /**
+   * A claimed turn whose handler decided not to reply is itself an outcome, and this is the
+   * point that knows it: `route()` has already returned, no reply exists to reserve, send or
+   * complete, and every one of `reserveResponse` / `completeResponse` / `releaseResponse` begins
+   * `if (!outcome.reply) return` for exactly that reason — a null reply carries nothing for the
+   * reply lifecycle to act on.
+   *
+   * Without this, nothing ever calls `resolveTurn` for that claim: `admit` refuses the nonce
+   * forever as `INGRESS_TURN_OUTCOME_UNKNOWN`, and `prune` exempts the row on purpose (correctly —
+   * see ingress-turn-claim.test.ts), so a turn that is, in fact, done stays outstanding for good
+   * (#672). No handler on the current DIRECT path produces this outcome, but nothing about the
+   * mechanism depends on which handler does — `pollOnce` calls this whenever `route()` returns a
+   * null reply, so any future no-reply handler is covered by construction rather than by whoever
+   * remembers to resolve it.
+   *
+   * `completeNoReplyAndResolveTurn`, not `resolveTurn` alone: a no-reply outcome never reserves or
+   * completes a reply, so `result_json` would otherwise stay null — indistinguishable from a
+   * message that never ran — and a later redelivery's recovery check would re-admit and re-run a
+   * turn that already finished. See that method's docstring.
+   *
+   * `outcome.replayed`, not only `outcome.reply`, is the guard (#682, found by review of #672's own
+   * PR). `route()` reports `reply: null` for two different facts and this method must not treat
+   * them alike:
+   *
+   *   a fresh outcome        the handler ran just now and decided not to reply — genuinely done
+   *   a replayed outcome     `admit` saw this nonce before; `reply: null` here means *this call*
+   *                          is not repeating the send, not that no reply exists
+   *
+   * The second is exactly what `route()` returns for a claimed turn whose reply reservation is
+   * still PENDING after a crash — `storedResponseOutcome(update, stored, false)` deliberately
+   * omits the reply so `pollOnce` does not resend into Telegram, per that method's own comment.
+   * Before this guard, that omission read as a genuine no-reply: `completeNoReplyAndResolveTurn`
+   * overwrote the PENDING reservation — durable evidence that Telegram may already have accepted
+   * the reply — with a marker saying nothing was ever sent, and resolved the claim on top of it.
+   * `PENDING` means ACP does not know the outcome; converting that to a confident "no reply" is
+   * not a resolution, it is a wrong answer given with confidence, and it is irreversible — the
+   * text a redelivery destroys is not recoverable from anywhere else.
+   */
+  resolveNoReplyOutcome(outcome: TelegramRouteOutcome): void {
+    if (outcome.reply || !outcome.admitted || outcome.replayed) return;
+    const resolved = this.ingress.completeNoReplyAndResolveTurn(outcome.nonce);
+    if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
+  }
+
   /** Reserve a response before the external Telegram send. */
   reserveResponse(outcome: TelegramRouteOutcome): void {
     if (!outcome.reply || !outcome.admitted) return;

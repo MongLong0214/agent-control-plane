@@ -2891,9 +2891,13 @@ export class GitHubKernel {
         const candidate = this.candidateRepository(runId, repositoryIdentity);
         return candidate.allowed && candidate.value.candidateHead === head;
       });
+    // #448: neither branch here is a digest disagreement — zero matches means no pinned
+    // contract identifies this head at all, and more than one means the head cannot be
+    // resolved to a single contract to compare against. Both are "could not compare",
+    // reported the same way the CI-trust manifest lookup right below reports it.
     return matches.length === 1
       ? allow(ReasonCode.OK, matches[0]!)
-      : deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "CI head does not resolve to exactly one pinned run contract", {
+      : deny(ReasonCode.CONTRACT_UNVERIFIED, "CI head does not resolve to exactly one pinned run contract", {
           repositoryIdentity,
           head,
           matchingRuns: matches,
@@ -2903,12 +2907,14 @@ export class GitHubKernel {
   private pinnedManifest(runId: string): Decision<ProjectManifest> {
     const run = this.runs.get(runId);
     if (!run?.pinnedManifestDigest) {
-      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run has no pinned manifest", { runId });
+      // #448: absent, not disagreeing — the same fact `branchProfile()` reports for the
+      // PR-preparation path.
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run has no pinned manifest", { runId });
     }
     const manifest = this.projects.manifest(run.pinnedManifestDigest);
     return manifest
       ? allow(ReasonCode.OK, manifest)
-      : deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "pinned manifest is not retrievable", {
+      : deny(ReasonCode.CONTRACT_UNVERIFIED, "pinned manifest is not retrievable", {
           runId,
           pinnedManifestDigest: run.pinnedManifestDigest,
         });
@@ -3118,7 +3124,8 @@ export class GitHubKernel {
       return deny(ReasonCode.EVIDENCE_MISSING, "run has no current frozen candidate", { runId });
     }
     if (!run.pinnedManifestDigest) {
-      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run has no pinned manifest", { runId });
+      // #448: absent, not disagreeing.
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run has no pinned manifest", { runId });
     }
     const snapshot = this.artifacts.latestForSnapshot<CandidateSnapshot>(
       runId,
@@ -3468,14 +3475,17 @@ export class GitHubKernel {
 
   private branchProfile(runId: string): Decision<BranchProfile> {
     const run = this.runs.get(runId);
+    // #448: neither branch below has two values to compare — one side is simply absent.
+    // CONTRACT_DIGEST_MISMATCH reads as "two digests were compared and disagree"; reporting
+    // it here told a caller a comparison happened when the manifest was never produced.
     if (!run?.pinnedManifestDigest) {
-      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run has no pinned manifest for a GitHub decision", {
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run has no pinned manifest for a GitHub decision", {
         runId,
       });
     }
     const manifest = this.projects.manifest(run.pinnedManifestDigest);
     if (!manifest?.branchProfile) {
-      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run's pinned manifest is unavailable", {
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run's pinned manifest is unavailable", {
         runId,
         pinnedManifestDigest: run.pinnedManifestDigest,
       });
