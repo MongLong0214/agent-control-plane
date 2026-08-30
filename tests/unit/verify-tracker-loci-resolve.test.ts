@@ -1,7 +1,18 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
@@ -286,6 +297,97 @@ describe("verify-tracker-loci-resolve", () => {
     expect(trackerYaml).toContain("schedule:");
     expect(trackerYaml).not.toMatch(/^\s*pull_request:/m);
     expect(trackerYaml).not.toMatch(/^\s*push:/m);
+  });
+
+  it("scheduled workflow installs dependencies before the tracker command can load TypeScript", () => {
+    const trackerYaml = readFileSync(join(repoRoot, ".github", "workflows", "tracker-loci.yml"), "utf8");
+    const runCommands = [...trackerYaml.matchAll(/^\s*- run: (.+)$/gm)].map((match) => match[1]);
+    const install = runCommands.indexOf("pnpm install --frozen-lockfile --ignore-scripts");
+    const tracker = runCommands.indexOf("node scripts/verify-tracker-loci-resolve.mjs");
+
+    expect(trackerYaml).toContain("pnpm/action-setup@");
+    expect(trackerYaml).toContain("actions/setup-node@");
+    expect(install).toBeGreaterThanOrEqual(0);
+    expect(tracker).toBeGreaterThan(install);
+  });
+
+  it("scheduled entrypoint resolves every import from the dependencies the workflow installs", () => {
+    const trackerYaml = readFileSync(join(repoRoot, ".github", "workflows", "tracker-loci.yml"), "utf8");
+    const entrypoint = [...trackerYaml.matchAll(/^\s*- run: (node scripts\/verify-tracker-loci-resolve\.mjs)$/gm)]
+      .map((match) => match[1])
+      .at(0);
+    expect(entrypoint).toBe("node scripts/verify-tracker-loci-resolve.mjs");
+
+    const dir = mkdtempSync(join(tmpdir(), "acp-tracker-loci-scheduled-"));
+    const checkout = join(dir, "checkout");
+    try {
+      const cloned = spawnSync("git", ["clone", "--quiet", "--no-hardlinks", "--local", repoRoot, checkout], {
+        encoding: "utf8",
+      });
+      expect(cloned.status, cloned.stdout + cloned.stderr).toBe(0);
+
+      // `git clone` supplies the tracked tree without carrying this worktree's node_modules. Copy
+      // the live script sources over the cloned HEAD so falsifiability mutations enter through the
+      // same scheduled command instead of testing the unmutated commit.
+      cpSync(join(repoRoot, "scripts"), join(checkout, "scripts"), { recursive: true, force: true });
+      cpSync(join(repoRoot, "package.json"), join(checkout, "package.json"), { force: true });
+      expect(existsSync(join(checkout, "node_modules"))).toBe(false);
+
+      // The workflow's frozen install makes exactly the packages declared here available. Reuse
+      // this test run's installed package contents so the regression remains measurable in the
+      // network-blocked test sandbox while preserving that package boundary: an undeclared bare
+      // import is not linked and Node rejects it before `gh` is reached.
+      const packageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      const declared = { ...packageJson.dependencies, ...packageJson.devDependencies };
+      for (const name of Object.keys(declared)) {
+        const installed = join(repoRoot, "node_modules", ...name.split("/"));
+        expect(existsSync(installed), `installed dependency missing from test environment: ${name}`).toBe(true);
+        const target = join(checkout, "node_modules", ...name.split("/"));
+        mkdirSync(dirname(target), { recursive: true });
+        symlinkSync(realpathSync(installed), target, "dir");
+      }
+
+      const bin = join(dir, "bin");
+      const fakeGh = join(bin, "gh");
+      const ghMarker = join(dir, "gh-listed");
+      mkdirSync(bin);
+      writeFileSync(
+        fakeGh,
+        [
+          "#!/usr/bin/env node",
+          'const fs = require("node:fs");',
+          "const args = process.argv.slice(2);",
+          'if (args[0] === "api" && args.includes("--paginate") && args.includes("--slurp")) {',
+          '  fs.writeFileSync(process.env.TRACKER_GH_MARKER, "listed\\n");',
+          '  process.stdout.write("[[]]");',
+          "  process.exit(0);",
+          "}",
+          'process.stderr.write("unexpected gh invocation: " + args.join(" "));',
+          "process.exit(99);",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(fakeGh, 0o755);
+
+      const result = spawnSync(entrypoint!, {
+        cwd: checkout,
+        encoding: "utf8",
+        shell: true,
+        env: {
+          ...process.env,
+          GH_TOKEN: "fixture-token",
+          PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+          TRACKER_GH_MARKER: ghMarker,
+        },
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(readFileSync(ghMarker, "utf8")).toBe("listed\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("[P1] a real GitHub blob permalink to this repo resolves by its actual path, not a URL fragment", () => {

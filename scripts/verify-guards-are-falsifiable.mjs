@@ -2315,6 +2315,28 @@ const GUARDS = [
     ],
   },
   {
+    // The scheduled entrypoint imports TypeScript before it can inspect an issue. Removing the
+    // install restores the clean-checkout ERR_MODULE_NOT_FOUND that blocked #689.
+    what: "the scheduled tracker-loci workflow installs dependencies before starting its scanner",
+    file: ".github/workflows/tracker-loci.yml",
+    find: "      - run: pnpm install --frozen-lockfile --ignore-scripts",
+    replace: "      - run: true",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::scheduled workflow installs dependencies before the tracker command can load TypeScript",
+    ],
+  },
+  {
+    // The clean scheduled-checkout probe exposes only packages declared in package.json. Replacing
+    // the parser with a nonexistent bare import must fail before the fake GitHub client is reached.
+    what: "every package imported by the scheduled tracker-loci entrypoint is resolvable after its declared install",
+    file: "scripts/lib/tracker-loci-strip.mjs",
+    find: 'import ts from "typescript";',
+    replace: 'import ts from "tracker-loci-deliberately-missing";',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::scheduled entrypoint resolves every import from the dependencies the workflow installs",
+    ],
+  },
+  {
     // GitHub Markdown permits tilde fences and variable-length markers. Returning no fence
     // reopens the false green where a vanished quoted line becomes only an advisory citation.
     what: "every GitHub Markdown fence form makes vanished fenced code stale",

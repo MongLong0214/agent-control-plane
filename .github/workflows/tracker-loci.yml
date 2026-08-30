@@ -19,10 +19,11 @@ on:
   # all"; the fix is to act on that argument here rather than also blocking PRs on it.
   #
   # Not tied to the full lint/typecheck/test/`guards:falsifiable` job either: that suite is a
-  # deliberate hour-plus mutation sweep, and this script has no dependency beyond Node's own
-  # `fs`/`child_process` and the `gh` CLI already on the runner — so the job below skips
-  # `pnpm install` entirely rather than paying that suite's cost once a day for a check that needs
-  # neither the build nor the test runner.
+  # deliberate hour-plus mutation sweep. The scanner does need the TypeScript compiler for the
+  # JavaScript lexical goal that distinguishes regex literals from division, so this job pays for
+  # Node/pnpm setup and one frozen dependency install each day. Lifecycle scripts stay disabled:
+  # the scanner needs TypeScript, not either native addon build or the rest of the verification
+  # suite.
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch: {}
@@ -34,6 +35,16 @@ jobs:
       issues: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 10
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22.18.0
+          cache: pnpm
+      # sol-simplify: this install is the scheduled entrypoint's runtime dependency boundary;
+      # remove it when that entrypoint has no bare package imports.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: node scripts/verify-tracker-loci-resolve.mjs
         env:
           GH_TOKEN: ${{ github.token }}
