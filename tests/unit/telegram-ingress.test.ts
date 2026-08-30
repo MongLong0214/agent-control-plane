@@ -1064,6 +1064,77 @@ describe("Telegram production ingress", () => {
     expect(firstTransport.sent.length + secondTransport.sent.length).toBe(1);
   });
 
+  // #699: a rejected sendMessage used to rethrow unconditionally from inside the per-update
+  // loop, so the offset-advance line a few statements below it was never reached for *any*
+  // update still in this poll's batch — not only the one that failed. Telegram then redelivers
+  // the whole batch forever and every later inbound message is silently wedged behind the one
+  // that could not be delivered, even though nothing about it depends on the others.
+  it("does not let one update's undeliverable reply block a later update in the same poll (#699)", async () => {
+    const harness = makeHarness({
+      ownerIdentities: [TEST_OWNER, { channel: "telegram", actor: OWNER_ID }],
+    });
+    const registered = await registerFixtureProject(harness);
+    const transport = new FakeTelegramTransport();
+    const stuck = update(`/managed ${registered.projectId} inspect the project`, {}, 401);
+    const later = update(`/managed ${registered.projectId} inspect again`, {}, 402);
+    transport.updates = [stuck, later];
+    // Only the first sendMessage call in this poll fails; the second (for `later`) succeeds.
+    transport.failSends = 1;
+    const listener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      { transport, start: false },
+    );
+    try {
+      await expect(listener.service.pollOnce()).rejects.toThrow("simulated Telegram send crash");
+    } finally {
+      await listener.close();
+    }
+
+    // `later` still reached the owner even though `stuck` (earlier in the same batch) failed.
+    expect(transport.sent).toHaveLength(1);
+
+    const stuckRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:401"],
+    );
+    expect(stuckRow?.result_json).toContain('"sent":false');
+    const laterRow = harness.cp.db.get<{ result_json: string | null }>(
+      `SELECT result_json FROM inbound_messages WHERE channel = 'telegram' AND nonce = ?`,
+      ["update:402"],
+    );
+    expect(laterRow?.result_json).toContain('"sent":true');
+
+    // The offset must not skip past the still-unresolved `stuck` update just because a later
+    // update in the same batch happened to succeed — otherwise Telegram would never redeliver
+    // `stuck` and its reply would be lost for good, the opposite failure from wedging forever.
+    expect(listener.service.offset === undefined || listener.service.offset <= stuck.update_id).toBe(true);
+
+    // A later poll redelivers the whole unresolved range but only retries `stuck`; `later` is
+    // recognised as already answered and is not sent twice.
+    const retryTransport = new FakeTelegramTransport();
+    retryTransport.updates = [stuck, later];
+    const retryListener = await startDaemonTelegramListener(
+      harness.cp,
+      { ...telegramConfig, defaultProjectId: registered.projectId },
+      daemonStub,
+      { transport: retryTransport, start: false },
+    );
+    try {
+      const resumed = await retryListener.service.pollOnce();
+      expect(resumed.outcomes[0]?.replayed).toBe(true);
+      expect(resumed.outcomes[1]?.replayed).toBe(true);
+      expect(retryTransport.sent).toHaveLength(1);
+      expect(retryTransport.sent[0]?.correlationId).toContain("401");
+    } finally {
+      await retryListener.close();
+    }
+
+    const runs = harness.cp.runs.list();
+    expect(runs).toHaveLength(2);
+  });
+
   it("clears a human gate only through the real owner receipt path", async () => {
     const gateItem = "owner confirms the production scope";
     const harness = makeHarness({

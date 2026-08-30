@@ -1471,6 +1471,21 @@ const GUARDS = [
       "tests/unit/doctor-daemon-r2.test.ts::#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger",
     ],
   },
+  {
+    // #699: a rejected sendMessage used to rethrow unconditionally, so this line was never
+    // reached for the update that failed — but that also stopped every later update in the
+    // same poll from being tried at all. Once the loop keeps going after a delivery error, the
+    // offset must stop advancing for the rest of this poll too, or a later update's success
+    // would carry the offset past the still-unresolved one and Telegram would never redeliver
+    // it — the opposite failure from wedging forever, and a silent one.
+    what: "the offset never advances past an update whose delivery this poll could not confirm",
+    file: "src/ingress/telegram-polling.ts",
+    find: "      if (firstDeliveryError === undefined && Number.isSafeInteger(update.update_id)) {",
+    replace: "      if (Number.isSafeInteger(update.update_id)) {",
+    killedBy: [
+      "tests/unit/telegram-ingress.test.ts::does not let one update's undeliverable reply block a later update in the same poll (#699)",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

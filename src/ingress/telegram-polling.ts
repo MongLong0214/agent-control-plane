@@ -452,6 +452,16 @@ export class TelegramLongPollService {
       signal: this.#controller?.signal,
     });
     const outcomes: TelegramRouteOutcome[] = [];
+    // A send failure on one update must not cost every later update in this same batch its
+    // turn (#699): the offset would never advance past it, so Telegram would redeliver the
+    // whole batch forever and every message behind it looked like silence. Only a genuine
+    // `TelegramDeliveryError` is deferred this way — a `TelegramInterruption` (or any other
+    // unexpected error) still throws immediately, because that stands in for the process
+    // dying right there, and a real crash would not go on to answer the next update either.
+    // The offset must still never skip past the update whose delivery is unresolved, or a
+    // redelivery-based recovery could never reach it again — so once one update is deferred,
+    // no later update's offset in this same poll is allowed to advance past it.
+    let firstDeliveryError: unknown;
     for (const update of updates) {
       if (this.#offset !== undefined && update.update_id < this.#offset) continue;
       const outcome = await this.router.route(update, this.webhookSecret);
@@ -465,19 +475,23 @@ export class TelegramLongPollService {
           await this.options.onInterrupt?.("after-reply-send", update, outcome.runId);
           this.router.completeResponse(outcome);
         } catch (error) {
-          if (error instanceof TelegramDeliveryError && error.accepted === false) {
+          if (!(error instanceof TelegramDeliveryError)) throw error;
+          if (error.accepted === false) {
             this.router.releaseResponse(outcome);
           }
-          throw error;
+          if (firstDeliveryError === undefined) firstDeliveryError = error;
+          continue;
         }
       }
-      if (Number.isSafeInteger(update.update_id)) {
+      if (firstDeliveryError === undefined && Number.isSafeInteger(update.update_id)) {
         this.#offset = Math.max(this.#offset ?? 0, update.update_id + 1);
       }
     }
 
-    // After the inbound batch, and never fatally.
+    // After the inbound batch, and never fatally — even when a delivery above is deferred,
+    // an owner-gate approval must still reach the owner this poll.
     await this.deliverOwnerGatePrompts();
+    if (firstDeliveryError !== undefined) throw firstDeliveryError;
     return { outcomes, ...(this.#offset === undefined ? {} : { nextOffset: this.#offset }) };
   }
 
