@@ -62,6 +62,147 @@ export interface TurnReceipt {
   readonly reasonCode: string;
 }
 
+/**
+ * What a reconciler asks a target about one turn it is still holding.
+ *
+ * Every field `canonical_turns` pins for this turn, not only the four contract 1 names first
+ * (`turnRequestId`, `targetActorId`, `promptDigest`, `bindingGeneration`). A review found the
+ * ledger also fixes `targetBindingId`, `targetAttestationId`, `executorSessionId` and
+ * `executorSessionIncarnation` at claim time, and none of the first four catch a receipt that
+ * describes the wrong one of those: `BindingRegistry.switchTo` can move an actor's live runtime
+ * to an entirely new session while a `SURVIVED` failover **keeps the same `bindingGeneration`**
+ * ("the binding is not rewritten, which is why `binding_generation` cannot advance here" —
+ * `binding-registry.ts`, the `conversation === "SURVIVED"` branch). So a turn claimed under
+ * session S1 can have its actor's runtime move to S2 while the turn is still `IN_DOUBT`, and a
+ * receipt attesting to S2's execution would pass every one of the original four checks — turn,
+ * actor, prompt and generation all genuinely unchanged — while describing work a different
+ * runtime did. `bindingGeneration` is the fence against a *later CEO*; it was never the fence
+ * against a *later runtime under the same CEO*, and nothing else was checking that one.
+ */
+export interface ReceiptLookupQuery {
+  readonly turnRequestId: string;
+  readonly targetActorId: string;
+  readonly promptDigest: string;
+  readonly bindingGeneration: number;
+  readonly targetBindingId: string;
+  readonly targetAttestationId: string;
+  readonly executorSessionId: string;
+  readonly executorSessionIncarnation: string;
+}
+
+/**
+ * What a target answers a reconciler. Absence and ambiguity are both "no receipt", never
+ * evidence that one exists — the distinction contract 6 draws between a lookup that failed and
+ * one that found nothing to say.
+ */
+export type ReceiptLookupResult =
+  | { readonly found: false }
+  | {
+      readonly found: true;
+      readonly outcome: "COMPLETED" | "ABORTED";
+      readonly receiptId: string;
+      readonly evidenceDigest: string;
+      readonly reasonCode: string;
+      /**
+       * The identity the receipt itself attests to — every field `ReceiptLookupQuery` names, not
+       * an echo of the query.
+       *
+       * This is the untrusted half of contract 6: all eight fields, and a caller must compare
+       * every one of them against the stored turn rather than assume they matched because they
+       * were asked about. `turnRequestId` was added first — a port that confused two turns
+       * sharing the same actor, prompt and generation could otherwise settle the wrong one.
+       * `targetBindingId`, `targetAttestationId`, `executorSessionId` and
+       * `executorSessionIncarnation` were added next, for the gap `bindingGeneration` alone
+       * cannot close: a `SURVIVED` failover moves an actor's runtime to a new session while
+       * keeping the same generation, so a receipt describing the *new* runtime's work would
+       * satisfy every one of the first four fields while being evidence about an execution this
+       * turn was never dispatched under. `reconcileUnresolved` checks all eight against the row
+       * it settles, so a caller that rebuilds any of them from its own query instead of from this
+       * answer makes that check compare the database against itself for that field.
+       */
+      readonly turnRequestId: string;
+      readonly targetActorId: string;
+      readonly promptDigest: string;
+      readonly bindingGeneration: number;
+      readonly targetBindingId: string;
+      readonly targetAttestationId: string;
+      readonly executorSessionId: string;
+      readonly executorSessionIncarnation: string;
+    };
+
+/**
+ * The seam #638 implements. Until it exists every real deployment wires a port that always
+ * reports `found: false` — the unmatched-receipt state this whole design has run in since #635,
+ * and the state contract 6 requires it keep running in rather than guess.
+ *
+ * `signal` is part of this seam on purpose, not added once a real implementation needed it. A
+ * review found the sweep's own per-lookup timeout only abandoned a slow call — the promise kept
+ * running, so a genuinely slow network request left duplicate, uncancelled work behind on every
+ * timeout, compounding across overlapping sweeps. `#lookupWithTimeout` aborts this signal exactly
+ * when it gives up waiting, so a real implementation backed by `fetch` or an RPC client with its
+ * own abort support can actually stop the call rather than merely being ignored by the caller.
+ * `NEVER_FOUND_RECEIPT_PORT` never needs to look at it, and that is fine — the contract is "you
+ * may honor this," not "you must," because nothing here can force a network client to cooperate.
+ * Adding the parameter after #638 already implemented this interface would have been the more
+ * expensive version of this same change.
+ */
+export interface ReceiptPort {
+  lookup(query: ReceiptLookupQuery, signal: AbortSignal): Promise<ReceiptLookupResult> | ReceiptLookupResult;
+}
+
+/**
+ * The only real deployment shape before #638: every lookup answers `found: false`.
+ *
+ * The coordinator's default, so composing it without a real port yet is the same visible,
+ * intentional choice everywhere — not an omission a reader has to notice by its absence.
+ *
+ * `Object.freeze`d because it is exported, shared, and stateless. A review found that an
+ * un-frozen shared default is itself a forgery path one indirection removed from a swappable
+ * field: even with `#receiptPort` made truly private, code importing this singleton could still
+ * overwrite its `lookup` method in place, and every coordinator that was ever handed this exact
+ * object — which is every one of them, since it is the default — would answer differently from
+ * that point on. Freezing makes that assignment throw (this file, like every ES module, runs in
+ * strict mode) instead of silently taking effect.
+ */
+export const NEVER_FOUND_RECEIPT_PORT: ReceiptPort = Object.freeze({
+  lookup: (_query: ReceiptLookupQuery, _signal: AbortSignal): ReceiptLookupResult => ({ found: false }),
+});
+
+/**
+ * How long `reconcileUnresolved()` waits for one `ReceiptPort.lookup()` before treating it as
+ * `found: false` rather than evidence of anything.
+ *
+ * A review found the sweep awaited each lookup with no bound at all: a port that never settles —
+ * not a misbehaving one, a slow network call is a legitimate implementation of the interface —
+ * would hang the sweep on that one turn forever, and every candidate after it in the same pass
+ * along with it. Ten seconds is comfortably longer than an ordinary receipt-store round trip (the
+ * daemon's own network collectors budget 20–45s for a much heavier call, `usage-collectors.ts`'s
+ * `COLLECTOR_TIMEOUT_MS`/`NON_INTERACTIVE_TIMEOUT_MS`) while staying well inside the periodic
+ * sweep's own interval, so a handful of slow turns in one pass do not by themselves run into the
+ * next. A port that is *routinely* this slow is a `runPeriodic` failure the daemon already
+ * surfaces through its backoff and audit trail, not something a longer timeout should paper over.
+ */
+export const RECEIPT_LOOKUP_TIMEOUT_MS = 10_000;
+
+/**
+ * How long one whole `reconcileUnresolved()` pass may run before it stops issuing new lookups and
+ * returns with whatever it swept.
+ *
+ * A per-lookup timeout bounds one turn; it does not bound the sweep. A review found seven slow
+ * (not hung) turns in one pass — each honestly answering just under `RECEIPT_LOOKUP_TIMEOUT_MS` —
+ * add up past the periodic interval, so the next sweep starts before the first returns. Nothing
+ * in `runPeriodic` guards against that overlap (see `capacity-sweep-budget.test.ts`'s own
+ * docstring: "`runPeriodic` has a failure backoff and no overlap guard"), and this codebase's
+ * answer to that for the capacity sensor sweep is not an in-flight lock — it is a budget the
+ * caller races the work against (`Daemon.refreshCapacitySensors`), sized to fit inside the
+ * interval and asserted so at startup rather than invented per call site. This constant and the
+ * assertion in `daemon.ts`'s `startTimers()` are the same shape applied here: a candidate not
+ * reached before the budget runs out is left exactly where it was, `IN_DOUBT`, for the next sweep
+ * to try — the same "absent is handled, not a special case" argument the capacity sweep already
+ * makes for its own abandoned collectors.
+ */
+export const RECONCILE_SWEEP_BUDGET_MS = 45_000;
+
 export interface TurnObservation {
   readonly outcome: "COMPLETED" | "NEVER_ADMITTED" | "ABORTED";
   readonly authority:
@@ -212,12 +353,29 @@ export class ConversationTurnCoordinator {
    */
   readonly #materialization: TurnMaterializationAuthority;
 
+  /**
+   * Where `reconcileUnresolved()` asks about a receipt. Bound once, in the constructor, and never
+   * exposed again — a review of the first version of this field found that `private readonly`
+   * is compile-time only: TypeScript erases it, and the ES2023 output was an ordinary writable,
+   * enumerable own property. Anything holding this coordinator could overwrite it with a fake port
+   * and call `reconcileUnresolved()` to forge a completion, the same attack the previous round's
+   * fix closed one door earlier for.
+   *
+   * A `#`-private field is a different part of the language, not a stricter annotation of the same
+   * one: there is no string or symbol key for it, so no assignment, `Object.defineProperty`,
+   * `Reflect.set` or enumeration from outside this class body can reach it. `#materialization`
+   * above already uses this for the same reason; this field failed to match it.
+   */
+  readonly #receiptPort: ReceiptPort;
+
   constructor(
     private readonly db: Db,
     private readonly clock: Clock,
     private readonly audit: AuditLog,
+    receiptPort: ReceiptPort = NEVER_FOUND_RECEIPT_PORT,
   ) {
     this.#materialization = db.claimTurnMaterializationAuthority();
+    this.#receiptPort = receiptPort;
   }
 
   /**
@@ -395,6 +553,16 @@ export class ConversationTurnCoordinator {
    * Refuses rather than queues. A queue here would hold the caller for the length of a turn,
    * which is the stall the design exists to remove; ordering belongs where the message is
    * durable, not in a caller's stack frame.
+   *
+   * **Nothing in production calls this method.** The live Telegram path claims its turn through
+   * `IngressGuard.claimTurn()`, which writes `inbound_messages.turn_claim_json` — a different
+   * table this class never reads or writes. `canonical_turns`, the table this method and
+   * `reconcileUnresolved()` both work against, has no production writer today: every row in it
+   * this build will ever see comes from a test calling `claim()` directly. A review (#691) named
+   * this precisely, and it is a correct description of the current system rather than a defect in
+   * this one — wiring a production caller here is #683/#639's other half, deliberately not done in
+   * this change. See `reconcileUnresolved`'s docstring, fact 1 of 2, for what that means for the
+   * sweep — and fact 2, which is independent of this one and does not resolve when this does.
    */
   claim(input: {
     targetActorId: string;
@@ -756,10 +924,30 @@ export class ConversationTurnCoordinator {
      */
     phase: "BEFORE" | "AFTER",
   ): Decision<TurnMaterialization> {
-    return this.db.tx(() => {
-      const issued = this.assertIssuedHere(permit);
-      if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
+    const issued = this.assertIssuedHere(permit);
+    if (!issued.allowed) return deny(issued.reasonCode, issued.message, issued.evidence);
+    return this.#observeVerified(
+      { turnRequestId: permit.turnRequestId, targetActorId: permit.targetActorId, promptDigest: permit.promptDigest },
+      observation,
+      phase,
+    );
+  }
 
+  /**
+   * `#observe`'s body, reached two ways that establish the same three facts by different means.
+   *
+   * A live caller's permit proves "the process that claimed this turn issued this call", checked
+   * by `assertIssuedHere` before this is reached. `reconcileWithReceipt` instead reads the row
+   * directly and compares every field a reconciler's identity carries — it has no permit to check,
+   * by design (see that method's docstring). Once either has established `identity`, the recording
+   * and materialization logic below does not need to know which path it came from.
+   */
+  #observeVerified(
+    identity: { turnRequestId: string; targetActorId: string; promptDigest: string },
+    observation: TurnObservation,
+    phase: "BEFORE" | "AFTER",
+  ): Decision<TurnMaterialization> {
+    return this.db.tx(() => {
       // Asymmetric, and the asymmetry is the whole design.
       //
       // A turn with a dispatch row cannot be reported as never started: that claim contradicts a
@@ -777,11 +965,11 @@ export class ConversationTurnCoordinator {
       // still fabricate a completion. Nothing here can tell that from a late receipt, because both
       // are a caller supplying an evidence digest. Closing it needs a receipt the target signed,
       // which is #638's to produce.
-      if (phase === "BEFORE" && this.dispatched(permit.turnRequestId)) {
+      if (phase === "BEFORE" && this.dispatched(identity.turnRequestId)) {
         return deny(
           ReasonCode.CONVERSATION_TURN_PHASE_MISMATCH,
           "this turn was dispatched, so nothing can report that it never started",
-          { turnRequestId: permit.turnRequestId, authority: observation.authority },
+          { turnRequestId: identity.turnRequestId, authority: observation.authority },
         );
       }
 
@@ -798,27 +986,27 @@ export class ConversationTurnCoordinator {
         return deny(
           ReasonCode.CONVERSATION_TURN_OBSERVATION_UNEVIDENCED,
           `an observation must carry a ${blank.join(", a ")}`,
-          { turnRequestId: permit.turnRequestId, authority: observation.authority, blank },
+          { turnRequestId: identity.turnRequestId, authority: observation.authority, blank },
         );
       }
 
       const row = this.db.get<{ target_actor_id: string; prompt_digest: string }>(
         `SELECT target_actor_id, prompt_digest FROM canonical_turns WHERE turn_request_id = ?`,
-        [permit.turnRequestId],
+        [identity.turnRequestId],
       );
       if (!row) {
         // Unreachable since v24: a turn cannot be deleted, so a genuinely issued permit always
         // names a row. Recorded as unreachable rather than claimed as a guard — no test can kill
         // it, and a falsifiability row for it would report coverage that does not exist.
         return deny(ReasonCode.CONFLICT, "no turn was ever claimed under this id", {
-          turnRequestId: permit.turnRequestId,
+          turnRequestId: identity.turnRequestId,
         });
       }
-      if (row.target_actor_id !== permit.targetActorId || row.prompt_digest !== permit.promptDigest) {
+      if (row.target_actor_id !== identity.targetActorId || row.prompt_digest !== identity.promptDigest) {
         return deny(
           ReasonCode.CONVERSATION_TURN_PERMIT_MISMATCH,
           "this permit does not describe the turn it names",
-          { turnRequestId: permit.turnRequestId },
+          { turnRequestId: identity.turnRequestId },
         );
       }
 
@@ -839,7 +1027,7 @@ export class ConversationTurnCoordinator {
       );
       if (already) {
         const identical =
-          already.turn_request_id === permit.turnRequestId &&
+          already.turn_request_id === identity.turnRequestId &&
           already.observed_outcome === observation.outcome &&
           already.evidence_digest === observation.evidenceDigest &&
           already.reason_code === observation.reasonCode;
@@ -850,11 +1038,11 @@ export class ConversationTurnCoordinator {
           // rather than believing evidence landed that did not.
           return deny(
             ReasonCode.CONVERSATION_TURN_RECEIPT_REUSED,
-            already.turn_request_id === permit.turnRequestId
+            already.turn_request_id === identity.turnRequestId
               ? "this receipt id already carries different evidence on this turn"
               : "this receipt id is already bound to a different turn",
             {
-              turnRequestId: permit.turnRequestId,
+              turnRequestId: identity.turnRequestId,
               authority: observation.authority,
               receiptId: observation.receiptId,
             },
@@ -862,7 +1050,7 @@ export class ConversationTurnCoordinator {
         }
         // The same receipt redelivered is a no-op, not a second opinion. Without this a retrying
         // transport manufactures a disagreement with itself and quarantines the conversation.
-        return allow(ReasonCode.OK, this.materialization(permit.turnRequestId));
+        return allow(ReasonCode.OK, this.materialization(identity.turnRequestId));
       }
 
       // Past this line every failure throws, because `Db.tx` commits a body that returns a
@@ -872,7 +1060,7 @@ export class ConversationTurnCoordinator {
         kind: "CONVERSATION_TURN_OBSERVED",
         actor: row.target_actor_id,
         evidence: {
-          turnRequestId: permit.turnRequestId,
+          turnRequestId: identity.turnRequestId,
           outcome: observation.outcome,
           authority: observation.authority,
           receiptId: observation.receiptId,
@@ -884,14 +1072,14 @@ export class ConversationTurnCoordinator {
       // computed columns still described the set without it — measured on a review head, where a
       // directly inserted completion left the turn reading NEVER_ADMITTED / CONSISTENT, so the
       // doctor stayed green and the quarantine never engaged.
-      return this.db.materializeTurn(this.#materialization, { turnRequestId: permit.turnRequestId }, () => {
+      return this.db.materializeTurn(this.#materialization, { turnRequestId: identity.turnRequestId }, () => {
         this.db.run(
           `INSERT INTO canonical_turn_observations
              (turn_request_id, observed_outcome, observing_authority, receipt_id,
               evidence_digest, reason_code, observed_at, audit_event_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            permit.turnRequestId,
+            identity.turnRequestId,
             observation.outcome,
             observation.authority,
             observation.receiptId,
@@ -901,8 +1089,363 @@ export class ConversationTurnCoordinator {
             audited.value,
           ],
         );
-        return allow(ReasonCode.OK, this.materialize(permit.turnRequestId));
+        return allow(ReasonCode.OK, this.materialize(identity.turnRequestId));
       });
+    });
+  }
+
+  /**
+   * Every turn a reconciler still needs to ask a target about, with the identity a lookup needs.
+   *
+   * The read half of contract 6. `unresolvedAcrossActors` answers a person and omits
+   * `promptDigest`/`bindingGeneration` because a person does not need them to decide;
+   * `reconcileUnresolved`'s whole job is comparing them, so this exposes what that one omits.
+   * Read-only, and harmless on its own: naming which turns are open is not the write half of
+   * contract 6, and nothing here accepts an externally supplied receipt for one of them — see
+   * `reconcileUnresolved`.
+   */
+  unresolvedIdentities(): ReadonlyArray<ReceiptLookupQuery & { claimedAt: string }> {
+    return this.db
+      .all<{
+        turn_request_id: string;
+        target_actor_id: string;
+        prompt_digest: string;
+        binding_generation: number;
+        target_binding_id: string;
+        target_attestation_id: string;
+        executor_session_id: string;
+        executor_session_incarnation: string;
+        claimed_at: string;
+      }>(
+        `SELECT turn_request_id, target_actor_id, prompt_digest, binding_generation,
+                target_binding_id, target_attestation_id, executor_session_id,
+                executor_session_incarnation, claimed_at
+           FROM canonical_turns WHERE lifecycle_state = 'IN_DOUBT' ORDER BY claimed_at ASC`,
+      )
+      .map((row) => ({
+        turnRequestId: row.turn_request_id,
+        targetActorId: row.target_actor_id,
+        promptDigest: row.prompt_digest,
+        bindingGeneration: row.binding_generation,
+        targetBindingId: row.target_binding_id,
+        targetAttestationId: row.target_attestation_id,
+        executorSessionId: row.executor_session_id,
+        executorSessionIncarnation: row.executor_session_incarnation,
+        claimedAt: row.claimed_at,
+      }));
+  }
+
+  /**
+   * Sweeps every `IN_DOUBT` turn once, asking `this.#receiptPort` about each — the write half of
+   * contract 6, and the one settlement path that does not take a `TurnPermit`.
+   *
+   * A permit proves the transaction that claimed the turn also issued this call, a discipline
+   * that only holds inside the process that ran `claim()`. Reconciliation exists precisely
+   * because that process may be gone: `TurnPermit`'s own docstring says settling a turn after a
+   * restart is the reconciler's job, "not a resurrected permit", and `issuance` is signed with a
+   * key that dies with its coordinator instance.
+   *
+   * A review of the first version of this method (#691) found what that gap actually costs: it
+   * took a receipt as a plain argument, `{turnRequestId, targetActorId, promptDigest,
+   * bindingGeneration}` and `{outcome, receiptId, evidenceDigest, reasonCode}`, both ordinary
+   * data. Anyone holding this coordinator could read a turn's identity from
+   * `unresolvedIdentities()`, hand it straight back with a fabricated receipt, and record a
+   * `HERMES_TARGET` completion that no target ever attested — the identity fix from the same
+   * review closed a tautology in *which* fields were compared, but a caller supplying both the
+   * query and the receipt satisfies any comparison between them. And the settlement it forges is
+   * close to irreversible: `COMPLETED` cannot be walked back through the ordinary API, so a forged
+   * one permanently blocks a retry of a turn that may never have run.
+   *
+   * What closes it is that the receipt never arrives as an argument at all. `this.#receiptPort` is
+   * bound once, at construction — by the composition root, the one place `claimTurnMaterializationAuthority`
+   * already makes singular, since a second coordinator on the same database throws before it
+   * could bind a different port. A caller can still read `unresolvedIdentities()`, but the only
+   * receipt this method will ever act on is one *this instance's own port* returned to *this
+   * instance's own lookup call* — there is no public entry point left that accepts one from
+   * outside.
+   *
+   * One call per turn, not one `Promise.all`: a lookup that throws must not stop the sweep from
+   * asking about the rest, so each is awaited and caught independently. A review found that
+   * "awaited" needed a bound: `ReceiptPort.lookup` may return a `Promise`, and one that never
+   * settles — a legitimate implementation of the interface, not a misbehaving one — used to hang
+   * this whole method on that single turn, forever, with every candidate after it never asked.
+   * Every lookup now races against `RECEIPT_LOOKUP_TIMEOUT_MS` and a timeout is treated exactly
+   * like a thrown lookup: never evidence, never stopping the rest of the sweep, and both are
+   * counted in `failed`. A lookup failure or timeout and a `found: false` answer both leave the
+   * turn exactly where it was, `IN_DOUBT` and visible as `OUTCOME_UNKNOWN`, and contract 6 forbids
+   * treating either as evidence for re-execution — but they are no longer the same event to the
+   * caller: `found: false` is a real answer, `failed` is the sweep not getting one at all, and a
+   * second review found that difference used to be invisible, which made a port that fails on
+   * every call indistinguishable from one with nothing to report.
+   *
+   * **What this does and does not do in the deployed system, stated as two separate facts rather
+   * than one, because a third review (#691) found the first draft's disclosure let the second one
+   * read as a footnote of the first. They are independent, and resolving #1 does not resolve #2:**
+   *
+   * 1. **Nothing to sweep.** This method observes `canonical_turns`, which nothing in production
+   *    currently populates — `ConversationTurnCoordinator.claim()` has no caller in `src/` today;
+   *    the live Telegram path claims through `IngressGuard` into a different table,
+   *    `inbound_messages.turn_claim_json` (see `claim()`'s docstring). So today this sweep runs, and
+   *    asks, over an empty set. The design is kept rather than pointed at the ledger production
+   *    does write, because that is a different table with a different shape and its own review;
+   *    silently retargeting this sweep at it would change what this change *is* without saying so.
+   *    Wiring a production writer for `canonical_turns` is #683/#639's other half.
+   * 2. **Even with something to sweep, `COMPLETED` cannot be acted on — unconditionally, not only
+   *    while #1 holds.** Contract 6 requires a matched receipt to move `TURN_COMPLETED` and insert
+   *    one reply-outbox item atomically, in the same transaction. Nothing wired to `canonical_turns`
+   *    can perform the second half (`src/outbox/outbox.ts` exists, but its message kinds are
+   *    role-to-role task dispatch, not a reply to the owner who asked), so `#settleFromReceipt`
+   *    refuses every `COMPLETED` receipt outright, unconditionally — not "when the reply obligation
+   *    happens to be undischargeable", because there is no path today on which it is dischargeable.
+   *    This was a deliberate choice over a conditional refusal: a conditional check would need a
+   *    reply-outbox interface to test against, and no consumer of one exists yet — inventing that
+   *    seam now is how an API nobody can use gets built. What has to exist first is a reply-outbox
+   *    mechanism actually wired to this ledger; until it does, resolving #1 makes `ABORTED`
+   *    settlements real and leaves `COMPLETED` exactly as inert as it is today. `ABORTED` carries no
+   *    reply obligation and is unaffected by this refusal. A refusal here is recoverable; a
+   *    `COMPLETED` recorded with no way to prove the reply went anywhere is not, since
+   *    `canonical_turns`' settlement is one-way through the ordinary API.
+   */
+  async reconcileUnresolved(
+    /**
+     * How long this whole pass may run before it stops issuing new lookups. Defaults to
+     * `RECONCILE_SWEEP_BUDGET_MS`; overridable for the same reason `Daemon.refreshCapacitySensors`
+     * takes one — a caller sizing it against a deliberately short interval (tests, a tighter
+     * deployment) needs the two to agree, and a hardcoded budget could not.
+     */
+    budgetMs: number = RECONCILE_SWEEP_BUDGET_MS,
+  ): Promise<{
+    readonly swept: number;
+    readonly settled: number;
+    readonly unresolved: number;
+    /**
+     * How many lookups this pass could not get an honest answer from — threw, or timed out.
+     *
+     * A review found the sweep swallowed these silently: `reconcileUnresolved()` always returned
+     * as if it had succeeded, so a port that fails on *every* call looked identical to one with
+     * nothing to find, which is the exact ambiguity contract 6 exists to remove. The daemon's
+     * caller throws when this is nonzero, so `runPeriodic`'s existing backoff and audit trail —
+     * built for the watchdog and capacity timers — sees a struggling receipt port the same way it
+     * already sees any other failing periodic job, with no new mechanism needed for it.
+     */
+    readonly failed: number;
+  }> {
+    const candidates = this.unresolvedIdentities();
+    const startedAt = Date.now();
+    let settled = 0;
+    let failed = 0;
+    for (const candidate of candidates) {
+      // The overall bound a per-lookup timeout does not provide. A review measured seven honestly
+      // slow (not hung) lookups in one pass adding up past the periodic interval, so the next
+      // sweep started before this one returned — `runPeriodic` has no in-flight guard, and this
+      // codebase's answer to that for the analogous capacity sweep is a budget the pass is raced
+      // against, not a lock (see `RECONCILE_SWEEP_BUDGET_MS`). A candidate not reached before the
+      // budget runs out is left exactly where it was, `IN_DOUBT`, for the next sweep to try.
+      if (Date.now() - startedAt >= budgetMs) break;
+
+      let result: ReceiptLookupResult;
+      try {
+        result = await this.#lookupWithTimeout({
+          turnRequestId: candidate.turnRequestId,
+          targetActorId: candidate.targetActorId,
+          promptDigest: candidate.promptDigest,
+          bindingGeneration: candidate.bindingGeneration,
+          targetBindingId: candidate.targetBindingId,
+          targetAttestationId: candidate.targetAttestationId,
+          executorSessionId: candidate.executorSessionId,
+          executorSessionIncarnation: candidate.executorSessionIncarnation,
+        });
+      } catch {
+        failed += 1;
+        continue;
+      }
+      if (!result.found) continue;
+
+      // Every identity field checked below comes from `result` — the port's answer — not from
+      // `candidate`. `candidate.turnRequestId` is passed too, but only as *which row this sweep
+      // asked about*; it is `result.turnRequestId` — what the receipt itself attests to — that
+      // `#settleFromReceipt` compares against it. A port that confused this turn with another
+      // sharing the same actor, prompt and generation used to be indistinguishable from a genuine
+      // match, because nothing compared the one field that would have caught it.
+      const decision = this.#settleFromReceipt(candidate.turnRequestId, {
+        turnRequestId: result.turnRequestId,
+        targetActorId: result.targetActorId,
+        promptDigest: result.promptDigest,
+        bindingGeneration: result.bindingGeneration,
+        targetBindingId: result.targetBindingId,
+        targetAttestationId: result.targetAttestationId,
+        executorSessionId: result.executorSessionId,
+        executorSessionIncarnation: result.executorSessionIncarnation,
+      }, { outcome: result.outcome, receiptId: result.receiptId, evidenceDigest: result.evidenceDigest, reasonCode: result.reasonCode });
+      if (decision.allowed) settled += 1;
+      // A denial here — wrong generation, mismatched identity, or an already-settled turn a
+      // concurrent settlement reached first — leaves the turn exactly as it was. It is not
+      // re-thrown: one candidate's refusal must not stop the sweep from asking about the rest.
+    }
+    return { swept: candidates.length, settled, unresolved: candidates.length - settled, failed };
+  }
+
+  /**
+   * `this.#receiptPort.lookup()`, bounded to `RECEIPT_LOOKUP_TIMEOUT_MS`.
+   *
+   * `Promise.race` against a timer that rejects, not one that resolves `found: false` — resolving
+   * would make a timeout indistinguishable from the port's own answer in a stack trace or a log,
+   * and the caller above already treats a thrown lookup as `found: false`'s equivalent, so
+   * rejecting reuses that path instead of adding a second one. The timer is `unref()`d so a lookup
+   * that outlives this call cannot itself keep the process alive.
+   *
+   * A review found the first version of this method only abandoned a timed-out lookup — the
+   * underlying promise kept running, so a genuinely slow port left duplicate, uncancelled work
+   * behind on every timeout, and that work compounded across the overlapping sweeps a slow port
+   * also causes. `signal.abort()` on timeout is what tells a real implementation to actually stop:
+   * whether it does is that implementation's choice, not something this method can force on a
+   * network client, but the seam exists now rather than after #638 already built against a
+   * `lookup` with nothing to abort.
+   */
+  #lookupWithTimeout(query: ReceiptLookupQuery): Promise<ReceiptLookupResult> {
+    const controller = new AbortController();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        controller.abort(new Error(`receipt lookup for ${query.turnRequestId} timed out`));
+        reject(new Error(`receipt lookup for ${query.turnRequestId} timed out`));
+      }, RECEIPT_LOOKUP_TIMEOUT_MS);
+      timer.unref();
+      Promise.resolve(this.#receiptPort.lookup(query, controller.signal)).then(
+        (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  /**
+   * `reconcileUnresolved`'s settlement half, kept private so a receipt can only ever reach it from
+   * this coordinator's own `this.#receiptPort.lookup()` call — never from a caller-supplied
+   * argument. See that method's docstring for why a public version of this was #691's finding.
+   */
+  #settleFromReceipt(
+    turnRequestId: string,
+    attested: {
+      turnRequestId: string;
+      targetActorId: string;
+      promptDigest: string;
+      bindingGeneration: number;
+      targetBindingId: string;
+      targetAttestationId: string;
+      executorSessionId: string;
+      executorSessionIncarnation: string;
+    },
+    receipt: TurnReceipt & { outcome: "COMPLETED" | "ABORTED" },
+  ): Decision<TurnMaterialization> {
+    // Contract 6's atomic pair, and the half this build cannot perform: a matched receipt must
+    // move `TURN_COMPLETED` and insert one reply-outbox item in the same transaction, and nothing
+    // wired to `canonical_turns` can do the second half today (see `reconcileUnresolved`'s
+    // docstring). Checked first and unconditionally — no identity or generation match makes this
+    // safe, because the gap is not about which turn the receipt names, it is about what recording
+    // `COMPLETED` here would fail to guarantee for any turn. `ABORTED` carries no reply obligation
+    // and reaches the checks below unaffected.
+    if (receipt.outcome === "COMPLETED") {
+      return deny(
+        ReasonCode.CONVERSATION_TURN_RECEIPT_REPLY_OBLIGATION_UNDISCHARGEABLE,
+        "this receipt reports completion, but no reply-outbox insert can be performed atomically with it yet",
+        { turnRequestId },
+      );
+    }
+    // Checked next, and against no table: a receipt attesting to a different turn than the one
+    // this sweep asked about is not evidence about this row at all, whatever else it says. A port
+    // that confused two turns sharing the same actor, prompt and generation — an earlier completed
+    // one and a later one, say — is exactly what this catches; every other field here could agree
+    // by coincidence, and this is the one contract 1 fixes so that coincidence is not enough.
+    if (attested.turnRequestId !== turnRequestId) {
+      return deny(
+        ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_TURN,
+        "this receipt attests to a different turn than the one this sweep asked about",
+        { turnRequestId, receiptTurnRequestId: attested.turnRequestId },
+      );
+    }
+    return this.db.tx(() => {
+      const row = this.db.get<{
+        binding_generation: number;
+        target_binding_id: string;
+        target_attestation_id: string;
+        executor_session_id: string;
+        executor_session_incarnation: string;
+      }>(
+        `SELECT binding_generation, target_binding_id, target_attestation_id,
+                executor_session_id, executor_session_incarnation
+           FROM canonical_turns WHERE turn_request_id = ?`,
+        [turnRequestId],
+      );
+      if (!row) {
+        // Unreachable through this method's one caller: `reconcileUnresolved` sources
+        // `turnRequestId` from `unresolvedIdentities()`, which reads this same table, and turns
+        // are never deleted (canonical_turns_identity_immutable). Kept as a refusal rather than an
+        // assumption — a private method with one caller today is still a method a later caller
+        // could reach differently — and recorded as unreachable rather than claimed as a guard: no
+        // test can kill it, and a falsifiability row for it would report coverage that does not
+        // exist.
+        return deny(ReasonCode.NOT_FOUND, "no turn was ever claimed under this id", { turnRequestId });
+      }
+      // Deliberately not also checking `target_actor_id` / `prompt_digest` here: `#observeVerified`
+      // re-reads this same row and checks exactly those two fields against the identity it is
+      // given, below. A second copy of that comparison would be untested by construction — it
+      // could never fail a test on its own, because the downstream check would catch whatever it
+      // missed — and a check nothing can kill reports coverage it does not have.
+      if (row.binding_generation !== attested.bindingGeneration) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_GENERATION,
+          "this receipt names a different CEO generation than the one that claimed this turn",
+          { turnRequestId, claimedGeneration: row.binding_generation, receiptGeneration: attested.bindingGeneration },
+        );
+      }
+      // The fence a matching generation does not provide: `bindingGeneration` distinguishes CEO
+      // generations, and a `SURVIVED` failover deliberately keeps the generation unchanged while
+      // moving the actor's live runtime to a new session (`binding-registry.ts`, the
+      // `conversation === "SURVIVED"` branch — "the binding is not rewritten, which is why
+      // `binding_generation` cannot advance here"). So these three are checked separately, each
+      // against the row this turn was actually claimed against.
+      if (row.target_binding_id !== attested.targetBindingId) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_BINDING,
+          "this receipt names a different target binding than the one this turn was claimed against",
+          { turnRequestId, claimedBindingId: row.target_binding_id, receiptBindingId: attested.targetBindingId },
+        );
+      }
+      if (row.target_attestation_id !== attested.targetAttestationId) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_ATTESTATION,
+          "this receipt names a different attestation than the one that verified this turn's target",
+          {
+            turnRequestId,
+            claimedAttestationId: row.target_attestation_id,
+            receiptAttestationId: attested.targetAttestationId,
+          },
+        );
+      }
+      if (
+        row.executor_session_id !== attested.executorSessionId ||
+        row.executor_session_incarnation !== attested.executorSessionIncarnation
+      ) {
+        return deny(
+          ReasonCode.CONVERSATION_TURN_RECEIPT_WRONG_RUNTIME,
+          "this receipt names a different executor session or incarnation than the one this turn was claimed under",
+          {
+            turnRequestId,
+            claimedSession: { id: row.executor_session_id, incarnation: row.executor_session_incarnation },
+            receiptSession: { id: attested.executorSessionId, incarnation: attested.executorSessionIncarnation },
+          },
+        );
+      }
+      return this.#observeVerified(
+        { turnRequestId, targetActorId: attested.targetActorId, promptDigest: attested.promptDigest },
+        { ...receipt, authority: "HERMES_TARGET" },
+        "AFTER",
+      );
     });
   }
 

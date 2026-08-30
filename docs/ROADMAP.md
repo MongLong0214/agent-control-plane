@@ -175,7 +175,12 @@ completion authority.
 4. a durable reply outbox preserves the exact origin route without replaying the model turn;
 5. owner resend is a deliberate decision path, not a text-equality shortcut (#641);
 6. `OUTCOME_UNKNOWN` is visible in doctor and metrics (#650);
-7. the S2–S7/direct-wiring state census is represented in the acceptance matrix (#660);
+7. the #660 owner-message state census enumerates seven ingress states and three context facts,
+   each with its producing transition and current terminal-or-gap derived from source; S2's
+   second-unresolved-turn disclosure gap and S7's coalesced-batch gap are the two still on this
+   critical path, tracked in #695 and #693. Full derivation, re-derivable against current source:
+   `docs/design/660-owner-message-state-census.md` (see that document, not this line, for current
+   status — this roadmap does not restate it);
 8. settlement authority, contradiction escalation, and source/attestation truth close #662 and #666;
 9. unresolved-turn operator recovery and durable duplicate retention close #672–#673.
 
