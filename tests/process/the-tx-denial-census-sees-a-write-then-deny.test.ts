@@ -120,6 +120,11 @@ const CONVERTED_SITES: Array<{ label: string; file: string; anchor: string }> = 
     file: "run/task-graph.ts",
     anchor: "underneath this second transaction.\n    return this.db.txDecision(() => {\n      const execution = this.execution(executionId)!;",
   },
+  {
+    label: "IngressGuard.completeNoReplyAndResolveTurn",
+    file: "ingress/ingress-guard.ts",
+    anchor: "reasoning #664 exists to stop trusting by hand.\n    return this.db.txDecision(() => {",
+  },
 ];
 
 /** Every EXEMPT and DEFERRED entry, so a marker drifting out of its body is caught for all of them, not just one. */

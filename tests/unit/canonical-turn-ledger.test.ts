@@ -97,21 +97,30 @@ const auditEvent = (h: Harness, kind = "FIXTURE"): number => {
   );
 };
 
+/**
+ * Returns the audit event the turn itself was born under, because #693's write-time trigger
+ * (`canonical_turn_sources_admission_matches_claim`) requires every source attached at claim time
+ * to cite that same event — the schema's own way of saying a source and its turn are written in
+ * one transaction. A fixture that mints its sources a separate event, the way `claim()` never
+ * does, is testing a shape production cannot produce.
+ */
 const inDoubtTurn = (
   h: Harness,
   turnId: string,
   actorId: string,
   bindingId: string,
   attestationId: string,
-): void => {
+): number => {
+  const claimEvent = auditEvent(h);
   h.cp.db.run(
     `INSERT INTO canonical_turns
        (turn_request_id, target_actor_id, target_binding_id, target_attestation_id,
         executor_session_id, executor_session_incarnation, binding_generation,
         prompt_digest, claimed_at, claim_audit_event_id, lifecycle_state)
      VALUES (?, ?, ?, ?, 'ses-1', 'inc-1', 1, 'prompt', ?, ?, 'IN_DOUBT')`,
-    [turnId, actorId, bindingId, attestationId, NOW, auditEvent(h)],
+    [turnId, actorId, bindingId, attestationId, NOW, claimEvent],
   );
+  return claimEvent;
 };
 
 /**
@@ -323,6 +332,12 @@ describe("a settlement carries what settled it", () => {
 });
 
 describe("which messages a turn consumed", () => {
+  /**
+   * `admissionEvent` is the turn's own `claim_audit_event_id` (`inDoubtTurn`'s return value), not
+   * a freshly minted one — #693's write-time trigger requires every source to cite exactly that
+   * event, the same way `claim()` reuses one `audited.value` for its whole batch. A caller here
+   * stands in for that batch, so it passes the one event every source in it actually shares.
+   */
   const source = (
     h: Harness,
     turnId: string,
@@ -330,13 +345,14 @@ describe("which messages a turn consumed", () => {
     attempt: number,
     ordinal: number,
     predecessor: string | null,
+    admissionEvent: number,
   ): void => {
     h.cp.db.run(
       `INSERT INTO canonical_turn_sources
          (turn_request_id, source_channel, source_nonce, source_attempt, batch_ordinal,
           source_digest, predecessor_turn_request_id, admission_audit_event_id)
        VALUES (?, 'telegram', ?, ?, ?, ?, ?, ?)`,
-      [turnId, nonce, attempt, ordinal, `d:${nonce}`, predecessor, auditEvent(h)],
+      [turnId, nonce, attempt, ordinal, `d:${nonce}`, predecessor, admissionEvent],
     );
   };
 
@@ -345,11 +361,11 @@ describe("which messages a turn consumed", () => {
     // kept, because the answer has to be able to say what it consumed.
     const h = makeHarness();
     const t = target(h, "batch");
-    inDoubtTurn(h, "turn:batch", t.actorId, t.bindingId, t.attestationId);
+    const claimEvent = inDoubtTurn(h, "turn:batch", t.actorId, t.bindingId, t.attestationId);
 
-    source(h, "turn:batch", "update:1", 1, 0, null);
-    source(h, "turn:batch", "update:2", 1, 1, null);
-    source(h, "turn:batch", "update:3", 1, 2, null);
+    source(h, "turn:batch", "update:1", 1, 0, null, claimEvent);
+    source(h, "turn:batch", "update:2", 1, 1, null, claimEvent);
+    source(h, "turn:batch", "update:3", 1, 2, null, claimEvent);
 
     const rows = h.cp.db.all<{ source_nonce: string }>(
       `SELECT source_nonce FROM canonical_turn_sources WHERE turn_request_id='turn:batch'
@@ -361,19 +377,19 @@ describe("which messages a turn consumed", () => {
   it("refuses two messages at the same position in a batch", () => {
     const h = makeHarness();
     const t = target(h, "collide");
-    inDoubtTurn(h, "turn:collide", t.actorId, t.bindingId, t.attestationId);
-    source(h, "turn:collide", "update:1", 1, 0, null);
+    const claimEvent = inDoubtTurn(h, "turn:collide", t.actorId, t.bindingId, t.attestationId);
+    source(h, "turn:collide", "update:1", 1, 0, null, claimEvent);
 
-    expect(() => source(h, "turn:collide", "update:2", 1, 0, null)).toThrow();
+    expect(() => source(h, "turn:collide", "update:2", 1, 0, null, claimEvent)).toThrow();
   });
 
   it("refuses the same message twice in one turn", () => {
     const h = makeHarness();
     const t = target(h, "dup");
-    inDoubtTurn(h, "turn:dup", t.actorId, t.bindingId, t.attestationId);
-    source(h, "turn:dup", "update:1", 1, 0, null);
+    const claimEvent = inDoubtTurn(h, "turn:dup", t.actorId, t.bindingId, t.attestationId);
+    source(h, "turn:dup", "update:1", 1, 0, null, claimEvent);
 
-    expect(() => source(h, "turn:dup", "update:1", 1, 1, null)).toThrow();
+    expect(() => source(h, "turn:dup", "update:1", 1, 1, null, claimEvent)).toThrow();
   });
 
   it("allows a second attempt at a message, which the old schema forbade", () => {
@@ -383,17 +399,17 @@ describe("which messages a turn consumed", () => {
     const h = makeHarness();
     const t = target(h, "retry");
     const first = settleThroughCoordinator(h, t.actorId, "update:9", "NEVER_ADMITTED");
-    inDoubtTurn(h, "turn:try2", t.actorId, t.bindingId, t.attestationId);
+    const claimEvent = inDoubtTurn(h, "turn:try2", t.actorId, t.bindingId, t.attestationId);
 
-    expect(() => source(h, "turn:try2", "update:9", 2, 0, first)).not.toThrow();
+    expect(() => source(h, "turn:try2", "update:9", 2, 0, first, claimEvent)).not.toThrow();
   });
 
   it("refuses a first attempt that names a predecessor", () => {
     const h = makeHarness();
     const t = target(h, "firstpred");
-    inDoubtTurn(h, "turn:fp", t.actorId, t.bindingId, t.attestationId);
+    const claimEvent = inDoubtTurn(h, "turn:fp", t.actorId, t.bindingId, t.attestationId);
 
-    expect(() => source(h, "turn:fp", "update:x", 1, 0, "turn:fp")).toThrow();
+    expect(() => source(h, "turn:fp", "update:x", 1, 0, "turn:fp", claimEvent)).toThrow();
   });
 
   it("refuses a later attempt with no predecessor", () => {
@@ -401,9 +417,44 @@ describe("which messages a turn consumed", () => {
     // ended safely — the chain would exist in the column and mean nothing.
     const h = makeHarness();
     const t = target(h, "nopred");
-    inDoubtTurn(h, "turn:np", t.actorId, t.bindingId, t.attestationId);
+    const claimEvent = inDoubtTurn(h, "turn:np", t.actorId, t.bindingId, t.attestationId);
 
-    expect(() => source(h, "turn:np", "update:y", 2, 0, null)).toThrow();
+    expect(() => source(h, "turn:np", "update:y", 2, 0, null, claimEvent)).toThrow();
+  });
+
+  it("refuses a source citing a fresh audit event instead of the turn's own claim event", () => {
+    // #693's write-time backstop: a source attached to an already-claimed turn under a *fresh,
+    // honestly-produced* audit event — the shape a real second admission or a future coalescing
+    // write would produce, since the turn's own claim event was consumed and closed when the turn
+    // was born. This is the direct schema-level counter-example the coordinator-level test in
+    // turn-coordinator.test.ts also covers through `claim()`; this one exercises the trigger with
+    // no coordinator in between. It is a narrower property than "no later source can ever attach"
+    // — see the test right below for the one case a fresh-event check cannot catch.
+    const h = makeHarness();
+    const t = target(h, "laterclaim");
+    inDoubtTurn(h, "turn:laterclaim", t.actorId, t.bindingId, t.attestationId);
+
+    expect(() =>
+      source(h, "turn:laterclaim", "update:late", 1, 0, null, auditEvent(h)),
+    ).toThrow();
+  });
+
+  it("does NOT refuse a source that copies the turn's own claim event — the guard's known limit", () => {
+    // The trigger checks equality (`admission_audit_event_id = canonical_turns.claim_audit_
+    // event_id`), not who wrote the row or when: a writer that reads the turn's own claim event
+    // back out and copies it into a later source's `admission_audit_event_id` satisfies that
+    // equality honestly, because the two columns then genuinely agree. A blind review reproduced
+    // exactly this against the coordinator (claim m1, INSERT m2-late copying the claim event, both
+    // rows persisted); this pins the same shape at the schema level. It is the same residual every
+    // trigger in this schema carries against a sufficiently privileged raw-SQL writer — one can
+    // always `DROP TRIGGER`, too — named here so it is not silently assumed away.
+    const h = makeHarness();
+    const t = target(h, "copiedclaim");
+    const claimEvent = inDoubtTurn(h, "turn:copiedclaim", t.actorId, t.bindingId, t.attestationId);
+
+    expect(() =>
+      source(h, "turn:copiedclaim", "update:late", 1, 0, null, claimEvent),
+    ).not.toThrow();
   });
 });
 

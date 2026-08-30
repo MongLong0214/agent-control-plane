@@ -332,7 +332,10 @@ export class CandidatePipeline {
       .list<TaskContract>(input.runId, ArtifactKind.TASK_CONTRACT)
       .find((artifact) => !artifact.superseded && artifact.digest === run.contractDigest);
     if (!contract || digestOf(contract.content) !== run.contractDigest) {
-      return deny(ReasonCode.CONTRACT_DIGEST_MISMATCH, "run's pinned task contract is not retrievable by digest", {
+      // #448: nothing was compared — the artifact store has no contract that both matches the
+      // run's pinned digest by name and hashes to it. Not a disagreement; a record that could
+      // not be produced to compare at all.
+      return deny(ReasonCode.CONTRACT_UNVERIFIED, "run's pinned task contract is not retrievable by digest", {
         runId: input.runId,
         expected: run.contractDigest,
         found: contract?.digest ?? null,

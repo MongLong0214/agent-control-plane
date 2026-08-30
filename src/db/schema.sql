@@ -2184,6 +2184,30 @@ BEGIN
   SELECT RAISE(ABORT, 'CANONICAL_TURN_SOURCE_NO_REPLACE');
 END;
 
+-- CP-HI-04 / #693 — the no-replace trigger above stops a source moving between turns or colliding with one
+-- already there, but says nothing about a *fresh* row: a new (channel, nonce) at a new
+-- batch_ordinal, inserted onto a turn that already exists, passes every WHEN clause above and
+-- attaches a later message to an already-claimed turn — the counter-example a review built
+-- against this table's own comment ("Filled at INSERT, from the same transaction's audit row").
+-- That comment is the fence: every source `claim()` writes shares the one `audit_events` row its
+-- turn's own `claim_audit_event_id` names, because the whole batch is inserted in the same
+-- transaction as the turn (`turn-coordinator.ts`, `claim()` — one `audited.value`, reused for
+-- every source in the loop). A source attached afterwards — by any path, coalescing code or a raw
+-- INSERT alike — cites a different audit event, because the turn's own claim event was consumed
+-- and closed when the turn was born; the only way to pass this check without a legitimate
+-- claim-time write is to read the turn's own `claim_audit_event_id` back out and copy it, which
+-- this is not a defense against (schema.sql cannot see intent, only which event id a row cites) —
+-- but no honest writer, coalescing or otherwise, has a reason to borrow a different transaction's
+-- audit event for a fact that transaction never recorded.
+CREATE TRIGGER IF NOT EXISTS canonical_turn_sources_admission_matches_claim
+BEFORE INSERT ON canonical_turn_sources
+WHEN NEW.admission_audit_event_id <> (
+  SELECT claim_audit_event_id FROM canonical_turns WHERE turn_request_id = NEW.turn_request_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME');
+END;
+
 -- CP-HI-04 — replacing a binding is the alias arriving by a third spelling, after edit and
 -- delete were both refused.
 CREATE TRIGGER IF NOT EXISTS actor_target_bindings_no_replace

@@ -14,6 +14,7 @@ import type {
   TelegramIngress,
   TelegramUpdate,
 } from "./telegram.ts";
+import type { UnresolvedTurn } from "./ingress-guard.ts";
 
 export interface TelegramDirectInput {
   kind: "DIRECT";
@@ -143,6 +144,19 @@ export interface TelegramRouteOutcome {
   reasonCode: ReasonCodeValue;
   runId?: string;
 }
+
+/**
+ * Routing stops at the one boundary that may outlive a Telegram poll: the admitted DIRECT
+ * handler that calls the CEO. Every other route has already completed when it is returned.
+ */
+export type TelegramRouteProgress =
+  | { status: "COMPLETED"; outcome: TelegramRouteOutcome }
+  | { status: "CEO_TURN_PENDING"; outcome: Promise<TelegramRouteOutcome> };
+
+const completedRoute = (outcome: TelegramRouteOutcome): TelegramRouteProgress => ({
+  status: "COMPLETED",
+  outcome,
+});
 
 export interface TelegramRouterOptions {
   ingress: TelegramIngress;
@@ -413,15 +427,28 @@ export class TelegramHermesRouter {
   }
 
   async route(update: TelegramUpdate, presentedSecret: string | null): Promise<TelegramRouteOutcome> {
+    const progress = await this.routeUntilCeoTurn(update, presentedSecret);
+    return progress.status === "COMPLETED" ? progress.outcome : await progress.outcome;
+  }
+
+  /**
+   * Completes admission, classification, claims, managed work, and owner decisions inline. Only
+   * an admitted and claimed DIRECT handler is returned as pending, because that is the CEO turn
+   * whose latency must not hold the next Telegram poll open.
+   */
+  async routeUntilCeoTurn(
+    update: TelegramUpdate,
+    presentedSecret: string | null,
+  ): Promise<TelegramRouteProgress> {
     const stored = this.getStoredState(this.ingress.nonceFor(update));
     if (stored?.reply && this.deliveryStatus(stored) === "PENDING") {
       // A PENDING reservation means an earlier process may already have reached Telegram.
       // It is deliberately not retried: an ambiguous external result is safer as a single
       // possibly-lost response than as a duplicate owner-facing message.
-      return this.storedResponseOutcome(update, stored, false);
+      return completedRoute(this.storedResponseOutcome(update, stored, false));
     }
     if (stored?.reply && this.deliveryStatus(stored) === "RETRYABLE") {
-      return this.storedResponseOutcome(update, stored, true);
+      return completedRoute(this.storedResponseOutcome(update, stored, true));
     }
 
     const parsedOwner = update.message && !this.ingress.isForwarded(update)
@@ -430,7 +457,9 @@ export class TelegramHermesRouter {
 
     if (parsedOwner) {
       const prompt = this.promptForReply(update, parsedOwner.runId);
-      if (!prompt) return this.unresolvableOwnerDecision(update, presentedSecret, parsedOwner);
+      if (!prompt) {
+        return completedRoute(await this.unresolvableOwnerDecision(update, presentedSecret, parsedOwner));
+      }
       const idempotencyKey = ownerDecisionIdempotencyKey(update, parsedOwner);
       const approval: TelegramOwnerApproval = {
         runId: parsedOwner.runId,
@@ -446,7 +475,9 @@ export class TelegramHermesRouter {
       };
       const admitted = this.ingress.admitOwnerApproval(update, presentedSecret, approval);
       if (!admitted.allowed) {
-        return this.deniedOrReplay(update, admitted.reasonCode, admitted.message, admitted.evidence);
+        return completedRoute(
+          this.deniedOrReplay(update, admitted.reasonCode, admitted.message, admitted.evidence),
+        );
       }
       await this.interrupt("after-admission", update);
 
@@ -467,7 +498,7 @@ export class TelegramHermesRouter {
           ? `OWNER DECISION recorded: ${parsedOwner.approved ? "APPROVED" : "REJECTED"}\nrun: ${parsedOwner.runId}\nitem: ${parsedOwner.item}`
           : this.failureText("OWNER DECISION refused", decision),
       );
-      return {
+      return completedRoute({
         updateId: update.update_id,
         nonce: this.ingress.nonceFor(update),
         correlationId: correlationIdFor(update),
@@ -477,25 +508,27 @@ export class TelegramHermesRouter {
         input: null,
         reply,
         reasonCode: decision.reasonCode,
-      };
+      });
     }
 
     const admitted = this.ingress.admit(update, presentedSecret);
     if (!admitted.allowed) {
-      return this.deniedOrReplay(update, admitted.reasonCode, admitted.message, admitted.evidence);
+      return completedRoute(
+        this.deniedOrReplay(update, admitted.reasonCode, admitted.message, admitted.evidence),
+      );
     }
     await this.interrupt("after-admission", update);
 
     const classified = classifyTelegramMessage(admitted.value, update, this.defaultProjectId);
     if (!classified.allowed) {
-      return this.outcomeWithReply(
+      return completedRoute(this.outcomeWithReply(
         update,
         true,
         false,
         null,
         this.replyFor(update, this.failureText("Telegram request refused", classified)),
         classified.reasonCode,
-      );
+      ));
     }
 
     try {
@@ -525,8 +558,16 @@ export class TelegramHermesRouter {
         // unstuck, unless they already made that choice via `/again`.
         const unresolved = this.ingress.unresolvedTurns(identity.sessionDigest);
         if (unresolved.length > 0 && !classified.value.overridesUnresolved) {
-          const oldest = unresolved[0]!;
-          return this.outcomeWithReply(
+          // #695: every unresolved row is counted, and up to MAX_NAMED_UNRESOLVED_TURNS are
+          // named individually, not only the oldest. A second one accumulates whenever an
+          // overriding claim itself goes unresolved (A crashes, `/again` claims B, B also
+          // crashes) — the owner has to be told what is actually outstanding, not just the one
+          // this router used to bother reading. Bounded rather than exhaustive (see
+          // `unresolvedTurnsParkText`'s docstring): these rows are never pruned, so the list can
+          // grow without bound, and naming all of them risks the exact opposite failure — a
+          // reply so long it cannot be sent, or one truncated in a way that drops the
+          // instructions telling the owner `/again` exists at all.
+          return completedRoute(this.outcomeWithReply(
             update,
             true,
             false,
@@ -534,55 +575,45 @@ export class TelegramHermesRouter {
             this.replyFor(
               update,
               [
-                `DIRECT parked: an earlier message in this conversation is still unresolved (received ${oldest.receivedAt}).`,
-                "ACP does not know whether that one reached the CEO, so this one was not run — nothing was appended twice.",
-                "Reply with /again <your message> to run this one anyway, knowing the earlier turn may still land too.",
+                unresolvedTurnsParkText(unresolved),
+                "ACP does not know whether any of those reached the CEO, so this one was not run — nothing was appended twice.",
+                "Reply with /again <your message> to run this one anyway, knowing the earlier turn(s) may still land too.",
               ].join("\n"),
             ),
             ReasonCode.INGRESS_TURN_UNRESOLVED_CONVERSATION,
-          );
+          ));
         }
 
-        // Reached without an unresolved turn, or with one the owner deliberately overrode via
-        // `/again`. When it's the latter, the choice is recorded on the claim itself — not only
-        // in this reply — so a later reader does not have to trust that it was made honestly.
-        const overriddenUnresolvedNonce = unresolved[0]?.nonce;
+        // Reached without an unresolved turn, or with one or more the owner deliberately
+        // overrode via `/again`. When it's the latter, the choice is recorded on the claim
+        // itself — not only in this reply — so a later reader does not have to trust that it was
+        // made honestly. Every outstanding nonce is captured, not only the oldest (#695): a
+        // `/again` shown N unresolved turns and recording only one would silently override the
+        // rest, the same defect this issue closes in a new place.
+        const overriddenUnresolvedNonces = unresolved.length > 0 ? unresolved.map((turn) => turn.nonce) : undefined;
         const claimed = this.ingress.claimTurn(
           this.ingress.nonceFor(update),
-          overriddenUnresolvedNonce ? { ...identity, overriddenUnresolvedNonce } : identity,
+          overriddenUnresolvedNonces ? { ...identity, overriddenUnresolvedNonces } : identity,
         );
         if (!claimed.allowed) {
-          return this.outcomeWithReply(
+          return completedRoute(this.outcomeWithReply(
             update,
             true,
             false,
             null,
             this.replyFor(update, this.failureText("Telegram request not run", claimed)),
             claimed.reasonCode,
-          );
+          ));
         }
-        const directText = await this.directHandler(classified.value);
-        return this.outcomeWithReply(
-          update,
-          true,
-          false,
-          classified.value,
-          // Not "acknowledged by Hermes". The default directHandler is a pure function that
-          // formats a string; nothing is dispatched and Hermes never sees the message. Naming
-          // an actor that did not receive it tells the owner a request is in motion when it is
-          // not — the reply was the only thing that looked like progress.
-          //
-          // A deployment may inject a directHandler that does reach somewhere, so the prefix
-          // states only what the router itself knows: the message arrived and created no run.
-          // Anything about who handled it belongs to the handler's own text.
-          this.replyFor(update, `DIRECT received; no run created\n${directText}`),
-          ReasonCode.OK,
-        );
+        return {
+          status: "CEO_TURN_PENDING",
+          outcome: this.completeDirectRoute(update, classified.value),
+        };
       }
-      return await this.routeManaged(update, admitted.value, classified.value);
+      return completedRoute(await this.routeManaged(update, admitted.value, classified.value));
     } catch (error) {
       if (error instanceof TelegramInterruption) throw error;
-      return this.outcomeWithReply(
+      return completedRoute(this.outcomeWithReply(
         update,
         true,
         false,
@@ -592,8 +623,91 @@ export class TelegramHermesRouter {
           error instanceof Error ? error.message : String(error),
         ))),
         ReasonCode.INTERNAL_ERROR,
+      ));
+    }
+  }
+
+  private async completeDirectRoute(
+    update: TelegramUpdate,
+    input: TelegramDirectInput,
+  ): Promise<TelegramRouteOutcome> {
+    try {
+      const directText = await this.directHandler(input);
+      return this.outcomeWithReply(
+        update,
+        true,
+        false,
+        input,
+        // Not "acknowledged by Hermes". The default directHandler is a pure function that
+        // formats a string; nothing is dispatched and Hermes never sees the message. Naming
+        // an actor that did not receive it tells the owner a request is in motion when it is
+        // not — the reply was the only thing that looked like progress.
+        //
+        // A deployment may inject a directHandler that does reach somewhere, so the prefix
+        // states only what the router itself knows: the message arrived and created no run.
+        // Anything about who handled it belongs to the handler's own text.
+        this.replyFor(update, `DIRECT received; no run created\n${directText}`),
+        ReasonCode.OK,
+      );
+    } catch (error) {
+      if (error instanceof TelegramInterruption) throw error;
+      return this.outcomeWithReply(
+        update,
+        true,
+        false,
+        input,
+        this.replyFor(update, this.failureText("Telegram routing failed", deny(
+          ReasonCode.INTERNAL_ERROR,
+          error instanceof Error ? error.message : String(error),
+        ))),
+        ReasonCode.INTERNAL_ERROR,
       );
     }
+  }
+
+  /**
+   * A claimed turn whose handler decided not to reply is itself an outcome, and this is the
+   * point that knows it: routing has produced its outcome, no reply exists to reserve, send or
+   * complete, and every one of `reserveResponse` / `completeResponse` / `releaseResponse` begins
+   * `if (!outcome.reply) return` for exactly that reason — a null reply carries nothing for the
+   * reply lifecycle to act on.
+   *
+   * Without this, nothing ever calls `resolveTurn` for that claim: `admit` refuses the nonce
+   * forever as `INGRESS_TURN_OUTCOME_UNKNOWN`, and `prune` exempts the row on purpose (correctly —
+   * see ingress-turn-claim.test.ts), so a turn that is, in fact, done stays outstanding for good
+   * (#672). No handler on the current DIRECT path produces this outcome, but nothing about the
+   * mechanism depends on which handler does — the poller's delivery helper calls this for both
+   * inline-completed routes and pending DIRECT routes when either produces a null reply, so any
+   * future no-reply handler is covered by construction rather than by whoever remembers to
+   * resolve it.
+   *
+   * `completeNoReplyAndResolveTurn`, not `resolveTurn` alone: a no-reply outcome never reserves or
+   * completes a reply, so `result_json` would otherwise stay null — indistinguishable from a
+   * message that never ran — and a later redelivery's recovery check would re-admit and re-run a
+   * turn that already finished. See that method's docstring.
+   *
+   * `outcome.replayed`, not only `outcome.reply`, is the guard (#682, found by review of #672's own
+   * PR). `route()` reports `reply: null` for two different facts and this method must not treat
+   * them alike:
+   *
+   *   a fresh outcome        the handler ran just now and decided not to reply — genuinely done
+   *   a replayed outcome     `admit` saw this nonce before; `reply: null` here means *this call*
+   *                          is not repeating the send, not that no reply exists
+   *
+   * The second is exactly what `routeUntilCeoTurn()` returns for a claimed turn whose reply reservation is
+   * still PENDING after a crash — `storedResponseOutcome(update, stored, false)` deliberately
+   * omits the reply so the poller does not resend into Telegram, per that method's own comment.
+   * Before this guard, that omission read as a genuine no-reply: `completeNoReplyAndResolveTurn`
+   * overwrote the PENDING reservation — durable evidence that Telegram may already have accepted
+   * the reply — with a marker saying nothing was ever sent, and resolved the claim on top of it.
+   * `PENDING` means ACP does not know the outcome; converting that to a confident "no reply" is
+   * not a resolution, it is a wrong answer given with confidence, and it is irreversible — the
+   * text a redelivery destroys is not recoverable from anywhere else.
+   */
+  resolveNoReplyOutcome(outcome: TelegramRouteOutcome): void {
+    if (outcome.reply || !outcome.admitted || outcome.replayed) return;
+    const resolved = this.ingress.completeNoReplyAndResolveTurn(outcome.nonce);
+    if (!resolved.allowed) throw new Error(`${resolved.reasonCode}: ${resolved.message}`);
   }
 
   /** Reserve a response before the external Telegram send. */
@@ -1017,6 +1131,39 @@ const asEvidence = (value: unknown): Record<string, unknown> =>
 
 const truncateTelegramText = (text: string): string =>
   text.length <= 3900 ? text : `${text.slice(0, 3880)}\n[response truncated]`;
+
+/**
+ * How many unresolved turns the park reply names individually before summarizing the rest.
+ *
+ * #695 named every unresolved row so a second one could no longer accumulate silently, but
+ * `unresolvedTurns` rows are deliberately never pruned (a claim needs a person, not a timer —
+ * see `IngressGuard.prune`), so a conversation that keeps crashing and keeps getting `/again`'d
+ * grows this list without bound. Measured directly: 146 unresolved rows already produces a
+ * 4,099-character joined line, past Telegram's 4,096-character `sendMessage` limit on its own,
+ * before `truncateTelegramText` even runs.
+ *
+ * `truncateTelegramText` *does* keep the literal send from failing — it hard-caps every reply
+ * at 3,900 characters — but a blind slice from the front is the wrong tool for this specific
+ * text: it cuts wherever 3,880 characters lands, which is inside the timestamp list itself, and
+ * carries away the two lines after it — the ones telling the owner `/again` exists at all. A
+ * reply that is technically under the wire limit but says nothing actionable is the same defect
+ * (#695's own gap: a fact the owner needs, dropped from what reaches them) with the length check
+ * satisfied. Naming a fixed, small number and summarizing the rest keeps the reply informative
+ * and bounded on its own terms, without depending on where a generic truncator happens to cut.
+ */
+const MAX_NAMED_UNRESOLVED_TURNS = 10;
+
+/** The park reply's summary of what is unresolved — every row is counted, only some are named. */
+const unresolvedTurnsParkText = (unresolved: readonly UnresolvedTurn[]): string => {
+  if (unresolved.length === 1) {
+    return `DIRECT parked: an earlier message in this conversation is still unresolved (received ${unresolved[0]!.receivedAt}).`;
+  }
+  const shown = unresolved.slice(0, MAX_NAMED_UNRESOLVED_TURNS);
+  const remaining = unresolved.length - shown.length;
+  const timestamps = shown.map((turn) => turn.receivedAt).join(", ");
+  const tail = remaining > 0 ? `, and ${remaining} more` : "";
+  return `DIRECT parked: ${unresolved.length} earlier messages in this conversation are still unresolved (received ${timestamps}${tail}).`;
+};
 
 const replyToMessageIdFor = (update: TelegramUpdate): number | null => {
   const message = update.message;

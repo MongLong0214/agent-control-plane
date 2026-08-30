@@ -11,7 +11,7 @@ import {
   backupOpenDatabaseSync,
   nextBackupPath,
   pruneAutomaticBackups,
-  restoreDatabase,
+  restoreMigrationBackup,
   type DatabaseBackup,
 } from "./backup.ts";
 import {
@@ -66,6 +66,8 @@ export const SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 export interface DbOpenOptions {
   /** Number of generated manual/pre-migration backups retained beside the database. */
   backupRetention?: number;
+  /** Keep SQLite's transient query state off environment-selected filesystem paths. */
+  temporaryStorage?: "MEMORY";
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
   afterMigration?: (migration: SchemaMigration) => void;
 }
@@ -228,6 +230,8 @@ export class Db {
   readonly file: string;
   /** What the once-per-database capabilities are keyed by: the file itself, not a name for it. */
   readonly identity: string;
+  /** The connection's observed SQLite temporary-storage policy. */
+  readonly temporaryStorage: "DEFAULT" | "FILE" | "MEMORY";
 
   constructor(filename: string, private readonly options: DbOpenOptions = {}) {
     const persistent = filename !== ":memory:";
@@ -237,6 +241,25 @@ export class Db {
       if (databaseExisted) assertPrivateDatabaseFiles(filename);
     }
     this.#raw = new Database(filename);
+    let temporaryStorage: typeof this.temporaryStorage;
+    try {
+      if (this.options.temporaryStorage === "MEMORY") {
+        this.#raw.pragma("temp_store = MEMORY");
+      }
+      const observed = Number(this.#raw.pragma("temp_store", { simple: true }));
+      temporaryStorage = observed === 2 ? "MEMORY" : observed === 1 ? "FILE" : "DEFAULT";
+      if (this.options.temporaryStorage === "MEMORY" && temporaryStorage !== "MEMORY") {
+        fail(
+          ReasonCode.INTERNAL_ERROR,
+          "SQLite did not establish the requested in-memory temporary storage",
+          { observed, temporaryStorage },
+        );
+      }
+    } catch (error) {
+      this.#raw.close();
+      throw error;
+    }
+    this.temporaryStorage = temporaryStorage;
     if (persistent) finalizeNewPrivateDatabaseFiles(filename, databaseExisted);
     // `resolve()` only removes lexical path segments. It leaves a symlink alias distinct,
     // which would let two connections to one SQLite file receive separate capabilities.
@@ -396,7 +419,7 @@ export class Db {
       const migrationError = error instanceof Error ? error.message : String(error);
       if (this.#raw.open) this.#raw.close();
       try {
-        restoreDatabase(filename, backup.path);
+        restoreMigrationBackup(filename, backup);
       } catch (restoreError) {
         throw acpError(
           ReasonCode.INTERNAL_ERROR,
@@ -928,6 +951,7 @@ const TRIGGER_CODES: Record<string, ReasonCode> = {
   CANONICAL_TURN_OBSERVATION_NO_REPLACE: ReasonCode.CONFLICT,
   CANONICAL_TURN_SOURCE_IMMUTABLE: ReasonCode.CONFLICT,
   CANONICAL_TURN_SOURCE_NO_REPLACE: ReasonCode.CONFLICT,
+  CANONICAL_TURN_SOURCE_NOT_CLAIM_TIME: ReasonCode.CONFLICT,
   CANONICAL_TURN_ADJUDICATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
   CANONICAL_TURN_ADJUDICATION_APPEND_ONLY: ReasonCode.CONFLICT,
   CANONICAL_TURN_ADJUDICATION_CITATION_AUTHORITY_DENIED: ReasonCode.COMPLETION_AUTHORITY_DENIED,
