@@ -2,9 +2,8 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
-
 import { ManualClock } from "../../src/core/clock.ts";
+import { digestOf } from "../../src/core/digest.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { allow, deny } from "../../src/core/errors.ts";
 import { ControlPlane } from "../../src/app/control-plane.ts";
@@ -100,23 +99,39 @@ const authenticatedTarget = () => {
     targetLocator: "target:continuity-hardening-ceo",
     targetLocatorDigest: `sha256:${"c".repeat(64)}`,
   };
-  let verified: AuthenticatedTargetTuple | undefined;
+  const expectedExecutorRuntimeIdentity = "hermes:continuity-hardening-runtime";
+  let receipt: {
+    domain: "hermes.target-bind";
+    version: 1;
+    actor_id: string;
+    binding_generation: number;
+    executor_runtime_identity: string;
+    requested_session_id: string;
+    lineage_root_digest: string;
+    receipt_digest: string;
+  } | undefined;
   return {
     claimed,
     protocolVersion: "hermes.target-bind/v1",
+    expectedExecutorRuntimeIdentity,
+    get targetBindReceipt() {
+      return receipt;
+    },
     get attestationDigest() {
-      if (!verified) throw new Error("attestation digest read before tuple verification");
-      const tuple = [
-        verified.actorId,
-        String(verified.generation),
-        verified.assignmentId,
-        verified.sessionId,
-        verified.incarnation,
-      ].join("\u0000");
-      return `sha256:${createHash("sha256").update(tuple).digest("hex")}`;
+      if (!receipt) throw new Error("attestation digest read before Hermes target receipt verification");
+      return receipt.receipt_digest;
     },
     verify: (tuple: AuthenticatedTargetTuple) => {
-      verified = tuple;
+      const publicFields = {
+        domain: "hermes.target-bind" as const,
+        version: 1 as const,
+        actor_id: tuple.actorId,
+        binding_generation: tuple.generation,
+        executor_runtime_identity: expectedExecutorRuntimeIdentity,
+        requested_session_id: claimed.targetLocator,
+        lineage_root_digest: claimed.targetLocatorDigest,
+      };
+      receipt = { ...publicFields, receipt_digest: digestOf(publicFields) };
       return claimed;
     },
   };

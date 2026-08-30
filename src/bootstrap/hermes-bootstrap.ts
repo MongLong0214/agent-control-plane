@@ -14,7 +14,7 @@ import type { ControlPlane } from "../app/control-plane.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
-import { runHermesTargetBind } from "../runtime/hermes-target-bind.ts";
+import { runHermesTargetBind, type HermesTargetBindResponse } from "../runtime/hermes-target-bind.ts";
 import {
   assertPrivatePath,
   ensurePrivateDirectory,
@@ -372,7 +372,7 @@ const constituteHermesAuthority = async (
     targetLocator: request.requestedSessionId,
     targetLocatorDigest: request.expectedLineageRootDigest,
   };
-  let attestationDigest = "";
+  let targetBindReceipt: HermesTargetBindResponse | null = null;
   const bound = cp.bindings.bind({
     role: Role.CEO,
     roleKey,
@@ -380,8 +380,12 @@ const constituteHermesAuthority = async (
     authenticatedTarget: {
       claimed: claimedTarget,
       protocolVersion: "hermes.target-bind/v1",
+      expectedExecutorRuntimeIdentity: request.executorRuntimeIdentity,
+      get targetBindReceipt(): HermesTargetBindResponse | null {
+        return targetBindReceipt;
+      },
       get attestationDigest(): string {
-        return attestationDigest;
+        return targetBindReceipt?.receipt_digest ?? "";
       },
       verify: (tuple) => {
         try {
@@ -410,7 +414,7 @@ const constituteHermesAuthority = async (
             typeof receipt.receipt_digest !== "string" ||
             receipt.receipt_digest.length === 0
           ) return null;
-          attestationDigest = receipt.receipt_digest;
+          targetBindReceipt = receipt;
           return claimedTarget;
         } catch {
           return null;
