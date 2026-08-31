@@ -1029,4 +1029,96 @@ describe("#649 — bootstrap target attestations are authenticated and atomic", 
       all.mockRestore();
     }
   });
+
+  it("returns only the exact historical Hermes receipt after a same-generation survived failover", () => {
+    const { bindings, db, session } = setup();
+    const executorSessionId = session("ses_historical_receipt_executor");
+    const bound = bindings.bind({
+      role: Role.CEO,
+      sessionId: executorSessionId,
+      authenticatedTarget: hermesAuthenticated(),
+    });
+    expect(bound.allowed).toBe(true);
+    if (!bound.allowed) return;
+
+    const identity = db.get<{
+      actor_id: string;
+      binding_generation: number;
+      target_binding_id: string;
+      target_attestation_id: string;
+      executor_session_id: string;
+      executor_session_incarnation: string;
+      target_bind_receipt_json: string;
+    }>(`SELECT b.target_actor_id AS actor_id, t.binding_generation, b.target_binding_id,
+               t.target_attestation_id, t.executor_session_id, t.executor_session_incarnation,
+               t.target_bind_receipt_json
+          FROM actor_target_bindings b
+          JOIN actor_target_attestations t ON t.target_binding_id = b.target_binding_id
+         WHERE t.assignment_id = ?`, [bound.value.assignmentId])!;
+    const query = {
+      targetActorId: identity.actor_id,
+      bindingGeneration: identity.binding_generation,
+      targetBindingId: identity.target_binding_id,
+      targetAttestationId: identity.target_attestation_id,
+      executorSessionId: identity.executor_session_id,
+      executorSessionIncarnation: identity.executor_session_incarnation,
+    };
+    const expected = JSON.parse(identity.target_bind_receipt_json) as HermesReceipt;
+
+    const replacementSessionId = session("ses_historical_receipt_replacement");
+    expect(bindings.switchTo({
+      role: Role.CEO,
+      sessionId: replacementSessionId,
+      reason: "the runtime moved but the conversation survived",
+      conversation: "SURVIVED",
+    }).allowed).toBe(true);
+
+    expect(bindings.historicalHermesTargetBindReceipt(query)).toEqual(expected);
+    for (const mismatch of [
+      { ...query, targetActorId: "actor:wrong" },
+      { ...query, bindingGeneration: query.bindingGeneration + 1 },
+      { ...query, targetBindingId: "tb_wrong" },
+      { ...query, targetAttestationId: "ta_wrong" },
+      { ...query, executorSessionId: "ses_wrong" },
+      { ...query, executorSessionIncarnation: "inc-wrong" },
+    ]) {
+      expect(bindings.historicalHermesTargetBindReceipt(mismatch)).toBeNull();
+    }
+
+    const persisted = db.get<{
+      target_locator: string;
+      target_locator_digest: string;
+      attestation_digest: string;
+      target_bind_executor_runtime_identity: string;
+    }>(`SELECT b.target_locator, b.target_locator_digest, t.attestation_digest,
+               t.target_bind_executor_runtime_identity
+          FROM actor_target_bindings b
+          JOIN actor_target_attestations t ON t.target_binding_id = b.target_binding_id
+         WHERE t.target_attestation_id = ?`, [query.targetAttestationId])!;
+    const rows = vi.spyOn(db, "all");
+    const corrupt = (overrides: Record<string, unknown>) => {
+      rows.mockReturnValueOnce([{
+        actor_id: query.targetActorId,
+        binding_generation: query.bindingGeneration,
+        target_binding_id: query.targetBindingId,
+        target_attestation_id: query.targetAttestationId,
+        executor_session_id: query.executorSessionId,
+        executor_session_incarnation: query.executorSessionIncarnation,
+        target_locator: persisted.target_locator,
+        target_locator_digest: persisted.target_locator_digest,
+        attestation_digest: persisted.attestation_digest,
+        target_bind_receipt_json: identity.target_bind_receipt_json,
+        target_bind_executor_runtime_identity: persisted.target_bind_executor_runtime_identity,
+        ...overrides,
+      }] as never);
+      expect(bindings.historicalHermesTargetBindReceipt(query)).toBeNull();
+    };
+    try {
+      corrupt({ target_bind_receipt_json: "{" });
+      corrupt({ attestation_digest: digestOf({ forged: true }) });
+      corrupt({ target_bind_executor_runtime_identity: "attacker:runtime" });
+    } finally {
+      rows.mockRestore();
+    }
+  });
 });

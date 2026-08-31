@@ -1039,6 +1039,88 @@ export class BindingRegistry {
   }
 
   /**
+   * Returns the raw canonical target-bind receipt for one persisted attestation identity.
+   *
+   * This is deliberately historical rather than live: a survived failover moves the actor's
+   * runtime pointer but does not alter the execution tuple the attestation recorded. No current
+   * assignment or session state participates in this read, and every supplied identity field is
+   * an SQL predicate so an absent or ambiguous row is never guessed from a target or generation.
+   */
+  historicalHermesTargetBindReceipt(input: {
+    targetActorId: string;
+    bindingGeneration: number;
+    targetBindingId: string;
+    targetAttestationId: string;
+    executorSessionId: string;
+    executorSessionIncarnation: string;
+  }): HermesTargetBindReceipt | null {
+    const rows = this.db.all<{
+      actor_id: string;
+      binding_generation: number;
+      target_binding_id: string;
+      target_attestation_id: string;
+      executor_session_id: string;
+      executor_session_incarnation: string;
+      target_locator: string;
+      target_locator_digest: string;
+      attestation_digest: string;
+      target_bind_receipt_json: string | null;
+      target_bind_executor_runtime_identity: string | null;
+    }>(
+      `SELECT b.target_actor_id AS actor_id, t.binding_generation, b.target_binding_id,
+              t.target_attestation_id, t.executor_session_id, t.executor_session_incarnation,
+              b.target_locator, b.target_locator_digest, t.attestation_digest,
+              t.target_bind_receipt_json, t.target_bind_executor_runtime_identity
+         FROM actor_target_bindings b
+         JOIN actor_target_attestations t ON t.target_binding_id = b.target_binding_id
+        WHERE b.executor_kind = 'hermes'
+          AND b.target_actor_id = ?
+          AND t.binding_generation = ?
+          AND b.target_binding_id = ?
+          AND t.target_attestation_id = ?
+          AND t.executor_session_id = ?
+          AND t.executor_session_incarnation = ?
+          AND t.protocol_version = ?
+          AND t.target_bind_receipt_json IS NOT NULL
+          AND t.target_bind_executor_runtime_identity IS NOT NULL`,
+      [
+        input.targetActorId,
+        input.bindingGeneration,
+        input.targetBindingId,
+        input.targetAttestationId,
+        input.executorSessionId,
+        input.executorSessionIncarnation,
+        HERMES_TARGET_BIND_PROTOCOL,
+      ],
+    );
+    if (rows.length !== 1) return null;
+    const row = rows[0]!;
+    if (
+      row.target_bind_receipt_json === null ||
+      row.target_bind_executor_runtime_identity === null
+    ) return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.target_bind_receipt_json);
+    } catch {
+      return null;
+    }
+    const receipt = this.parseHermesTargetBindReceipt(parsed, {
+      actorId: row.actor_id,
+      generation: row.binding_generation,
+      requestedSessionId: row.target_locator,
+      lineageRootDigest: row.target_locator_digest,
+      executorRuntimeIdentity: row.target_bind_executor_runtime_identity,
+    });
+    if (!receipt || receipt.receipt_digest !== row.attestation_digest) return null;
+    try {
+      return canonicalJson(receipt) === row.target_bind_receipt_json ? receipt : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Authenticates a runtime and fences its authority in one check. The session secret
    * proves the session identity; the active binding tuple proves its current generation.
    */

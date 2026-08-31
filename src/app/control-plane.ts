@@ -41,6 +41,7 @@ import {
   REVIEWER_PROVIDER_ENDPOINTS,
   type ReviewerEgressConfig,
 } from "../runtime/provider.ts";
+import { HermesReceiptPort, type HermesReceiptPortOptions } from "../runtime/hermes-receipt-port.ts";
 import { BindingRegistry } from "../session/binding-registry.ts";
 import { SessionRegistry } from "../session/session-registry.ts";
 import { Telemetry } from "../telemetry/telemetry.ts";
@@ -80,6 +81,11 @@ export interface ControlPlaneConfig {
   githubAppPrivateKeyPath?: string;
   /** Neutral, daemon-managed runtime root for CTO/continuity sessions. */
   runtimeRoot?: string;
+  /**
+   * Explicit status-only Hermes receipt transport. Omitted is deliberately dark: reconciliation
+   * keeps returning `found: false` until a deployment names this bounded endpoint.
+   */
+  hermesReceipt?: HermesReceiptPortOptions;
   ctoPreference?: CtoPreference;
   reviewer?: { preferred: ReviewerPreference; fallbacks: ReviewerPreference[] };
   capacity?: CapacityOptions;
@@ -373,18 +379,24 @@ export class ControlPlane {
     // hands back exactly what this attempt took.
     try {
       this.audit = new AuditLog(this.db, this.clock);
-      // The always-empty port, named explicitly rather than left to the default: this is the
-      // real, running state before #638 supplies a port that can answer `found: true` — a sweep
-      // that runs and asks, and today always hears nothing back. Two further, independent facts
-      // are named in full where the sweep is defined (`reconcileUnresolved`'s docstring), not
-      // hidden here: (1) it sweeps `canonical_turns`, which nothing in production writes to yet,
-      // and (2) even once it does, a `COMPLETED` receipt is refused unconditionally, because no
-      // reply-outbox mechanism is wired to this ledger — resolving (1) does not resolve (2).
+      // A production deployment is dark unless it explicitly supplies its bounded Hermes ACP
+      // endpoint. The resolver is a closure because this coordinator must claim its singular
+      // materialization authority before request-facing registries are assembled; it is not called
+      // until a later reconciliation, after `bindings` has been constructed below.
+      const receiptPort = config.hermesReceipt
+        ? new HermesReceiptPort(
+            {
+              historicalHermesTargetBindReceipt: (input) =>
+                this.bindings.historicalHermesTargetBindReceipt(input),
+            },
+            config.hermesReceipt,
+          )
+        : NEVER_FOUND_RECEIPT_PORT;
       this.conversation = new ConversationTurnCoordinator(
         this.db,
         this.clock,
         this.audit,
-        NEVER_FOUND_RECEIPT_PORT,
+        receiptPort,
       );
       this.artifacts = new ArtifactStore(this.db, this.clock);
       // Claimed immediately: issuance succeeds once per database, so claiming here is what
