@@ -69,19 +69,23 @@ export type HermesAcpFailureReason =
   | "SERVER_REQUEST"
   | "SPAWN_ERROR"
   | "STDERR_LIMIT"
+  | "STDIN_ERROR"
   | "STDOUT_EOF"
   | "STDOUT_LIMIT"
+  | "STREAM_ERROR"
   | "TERMINAL_RECEIPT_MISMATCH"
   | "TIMEOUT"
   | "UNEXPECTED_EXIT";
 
 type JsonRecord = Record<string, unknown>;
 type AcpReadable = EventEmitter;
-type AcpWritable = { write(value: string): boolean; end(): void };
+type AcpWritable = EventEmitter & { write(value: string): boolean; end(): void };
 type AcpChild = EventEmitter & {
   stdin: AcpWritable;
   stdout: AcpReadable;
   stderr: AcpReadable;
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | null;
   kill(signal?: NodeJS.Signals): boolean;
 };
 
@@ -117,6 +121,30 @@ const TARGET_BIND_KEYS = [
   "version",
 ] as const;
 
+const RECEIPT_EVIDENCE_KEYS = [
+  "receiptIdentity",
+  "receiptIdentityDigest",
+  "targetBindReceipt",
+  "targetBindReceiptDigest",
+] as const;
+
+const RECEIPT_PUBLIC_KEYS = [
+  "claimedAt",
+  "completedAt",
+  "createdAt",
+  "responseDigest",
+  "sessionId",
+  "status",
+  "terminalMessageId",
+  "turnRequestId",
+  ...RECEIPT_EVIDENCE_KEYS,
+] as const;
+
+const PREPARED_KEYS = RECEIPT_PUBLIC_KEYS;
+const CLAIMED_KEYS = RECEIPT_PUBLIC_KEYS;
+const COMPLETED_KEYS = [...RECEIPT_PUBLIC_KEYS, "assistantContent"] as const;
+const SHUTDOWN_GRACE_MS = 25;
+
 const isRecord = (value: unknown): value is JsonRecord =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -129,6 +157,9 @@ const isDigest = (value: unknown): value is string =>
 const safeNonnegativeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
+const finiteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
 const nonEmpty = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
 
@@ -138,8 +169,11 @@ const canonicalJson = (value: unknown): string => {
   return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as JsonRecord)[key])}`).join(",")}}`;
 };
 
-const digestOf = (value: unknown): string =>
+const canonicalDigest = (value: unknown): string =>
   `sha256:${createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")}`;
+
+const rawUtf8Digest = (value: string): string =>
+  `sha256:${createHash("sha256").update(Buffer.from(value, "utf8")).digest("hex")}`;
 
 const sameJson = (left: unknown, right: unknown): boolean => canonicalJson(left) === canonicalJson(right);
 
@@ -160,7 +194,7 @@ const asTargetBindWire = (value: unknown): HermesTargetBindWireReceipt | null =>
     requested_session_id: value.requested_session_id,
     lineage_root_digest: value.lineage_root_digest,
   };
-  if (value.receipt_digest !== digestOf(publicFields)) return null;
+  if (value.receipt_digest !== canonicalDigest(publicFields)) return null;
   return value as HermesTargetBindWireReceipt;
 };
 
@@ -188,7 +222,7 @@ const requestIsValid = (input: HermesAcpInput): boolean => {
   const target = asTargetBindWire(input.targetBindReceipt);
   if (!identity || !target || identity.targetActorId !== target.actor_id || identity.bindingGeneration !== target.binding_generation) return false;
   if (input.operation === "status") return input.text === undefined;
-  return typeof input.text === "string" && identity.promptDigest === digestOf(input.text);
+  return typeof input.text === "string" && identity.promptDigest === canonicalDigest(input.text);
 };
 
 const terminalTargetBind = (value: unknown): HermesTargetBindWireReceipt | null => {
@@ -200,14 +234,38 @@ const terminalTargetBind = (value: unknown): HermesTargetBindWireReceipt | null 
   return asTargetBindWire(wire);
 };
 
+const terminalTargetBindHasClosedShape = (value: unknown): boolean => {
+  if (!isRecord(value)) return false;
+  const wire = hasExactKeys(value, TARGET_BIND_KEYS)
+    ? value
+    : value.schema === "hermes.target-bind-receipt" && hasExactKeys(value, ["schema", ...TARGET_BIND_KEYS])
+      ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== "schema"))
+      : null;
+  return wire !== null &&
+    wire.domain === "hermes.target-bind" && wire.version === 1 &&
+    nonEmpty(wire.actor_id) && safeNonnegativeInteger(wire.binding_generation) &&
+    nonEmpty(wire.executor_runtime_identity) && nonEmpty(wire.requested_session_id) &&
+    isDigest(wire.lineage_root_digest) && isDigest(wire.receipt_digest);
+};
+
+const receiptEvidenceIsWellTyped = (terminal: JsonRecord): boolean =>
+  asReceiptIdentity(terminal.receiptIdentity) !== null &&
+  isDigest(terminal.receiptIdentityDigest) &&
+  terminalTargetBindHasClosedShape(terminal.targetBindReceipt) &&
+  isDigest(terminal.targetBindReceiptDigest);
+
 const terminalMatchesRequest = (terminal: JsonRecord, input: HermesAcpInput): boolean => {
   const returnedIdentity = asReceiptIdentity(terminal.receiptIdentity);
   const returnedTarget = terminalTargetBind(terminal.targetBindReceipt);
   return (
     terminal.turnRequestId === input.receiptIdentity.turnRequestId &&
     terminal.sessionId === input.targetBindReceipt.requested_session_id &&
-    returnedIdentity !== null && sameJson(returnedIdentity, input.receiptIdentity) &&
-    returnedTarget !== null && sameJson(returnedTarget, input.targetBindReceipt) &&
+    returnedIdentity !== null &&
+    terminal.receiptIdentityDigest === canonicalDigest(returnedIdentity) &&
+    sameJson(returnedIdentity, input.receiptIdentity) &&
+    returnedTarget !== null &&
+    terminal.targetBindReceiptDigest === returnedTarget.receipt_digest &&
+    sameJson(returnedTarget, input.targetBindReceipt) &&
     terminal.targetBindReceiptDigest === input.targetBindReceipt.receipt_digest
   );
 };
@@ -234,18 +292,33 @@ const terminalResult = (result: unknown, input: HermesAcpInput): HermesAcpResult
       : { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
   }
   if (status === "PREPARED" || status === "CLAIMED") {
+    const expected = status === "PREPARED" ? PREPARED_KEYS : CLAIMED_KEYS;
+    if (
+      !hasExactKeys(terminal, expected) ||
+      !nonEmpty(terminal.turnRequestId) || !nonEmpty(terminal.sessionId) ||
+      terminal.terminalMessageId !== null || terminal.responseDigest !== null ||
+      !finiteNumber(terminal.createdAt) ||
+      (status === "PREPARED" ? terminal.claimedAt !== null : !finiteNumber(terminal.claimedAt)) ||
+      terminal.completedAt !== null || !receiptEvidenceIsWellTyped(terminal)
+    ) return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
     return terminalMatchesRequest(terminal, input)
       ? { status: "NOT_COMPLETED", terminalStatus: status }
       : { status: "FAILED", reason: "TERMINAL_RECEIPT_MISMATCH" };
   }
   if (status !== "COMPLETED") return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
-  if (!terminalMatchesRequest(terminal, input)) return { status: "FAILED", reason: "TERMINAL_RECEIPT_MISMATCH" };
-  if (!isDigest(terminal.receiptIdentityDigest) || !isDigest(terminal.responseDigest) || typeof terminal.assistantContent !== "string") {
-    return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
+  if (
+    !hasExactKeys(terminal, COMPLETED_KEYS) ||
+    !nonEmpty(terminal.turnRequestId) || !nonEmpty(terminal.sessionId) ||
+    !safeNonnegativeInteger(terminal.terminalMessageId) || !isDigest(terminal.responseDigest) ||
+    !finiteNumber(terminal.createdAt) || !finiteNumber(terminal.claimedAt) || !finiteNumber(terminal.completedAt) ||
+    typeof terminal.assistantContent !== "string" || !receiptEvidenceIsWellTyped(terminal)
+  ) return { status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" };
+  if (!terminalMatchesRequest(terminal, input) || terminal.responseDigest !== rawUtf8Digest(terminal.assistantContent)) {
+    return { status: "FAILED", reason: "TERMINAL_RECEIPT_MISMATCH" };
   }
   return {
     status: "COMPLETED",
-    receiptId: terminal.receiptIdentityDigest,
+    receiptId: terminal.receiptIdentityDigest as string,
     evidenceDigest: terminal.responseDigest,
     content: terminal.assistantContent,
   };
@@ -257,6 +330,7 @@ export const runHermesAcp = async (
   input: HermesAcpInput,
   dependencies: HermesAcpDependencies = {},
 ): Promise<HermesAcpResult> => {
+  if (input.signal?.aborted) return { status: "FAILED", reason: "ABORTED" };
   if (!requestIsValid(input)) return { status: "FAILED", reason: "INVALID_INPUT" };
 
   const spawn = dependencies.spawn ?? ((command, args, options) => spawnChild(command, args, options) as unknown as AcpChild);
@@ -264,7 +338,13 @@ export const runHermesAcp = async (
   try {
     child = spawn(input.executable, ["acp"], {
       cwd: input.cwd,
-      env: { HOME: input.home, HERMES_HOME: input.hermesHome, HERMES_PROFILE: input.hermesProfile },
+      env: {
+        HOME: input.home,
+        HERMES_HOME: input.hermesHome,
+        HERMES_PROFILE: input.hermesProfile,
+        HERMES_ACP_SKIP_ENV_LOAD: "1",
+        HERMES_ACP_SKIP_CONFIGURED_MCP: "1",
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
   } catch {
@@ -278,45 +358,100 @@ export const runHermesAcp = async (
     let stdoutRemainder = "";
     let initSeen = false;
     let promptSent = false;
-    let exitSeen = false;
-    let settled = false;
+    let promptQueued = false;
+    let stdinWriteInProgress = false;
+    let stdinBackpressured = false;
+    let stdinEnded = false;
+    let stdoutEnded = false;
+    let closeSeen = false;
+    let closeCode: number | null = null;
+    let closeSignal: NodeJS.Signals | null = null;
+    let terminalCandidate: HermesAcpResult | undefined;
+    let failure: HermesAcpResult | undefined;
     let resolved = false;
-    let finalResult: HermesAcpResult | undefined;
-    let timer: NodeJS.Timeout | undefined;
+    let timeoutTimer: NodeJS.Timeout | undefined;
+    let shutdownTimer: NodeJS.Timeout | undefined;
     const seenResponseIds = new Set<number>();
 
-    const resolveOnce = (): void => {
-      if (resolved || !finalResult || !exitSeen) return;
-      resolved = true;
-      child.off("exit", onExit);
-      child.off("error", onChildError);
-      resolve(finalResult);
+    const clearTimers = (): void => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (shutdownTimer) clearTimeout(shutdownTimer);
+      timeoutTimer = undefined;
+      shutdownTimer = undefined;
     };
 
     const removeListeners = (): void => {
       child.stdout.off("data", onStdoutData);
       child.stdout.off("end", onStdoutEnd);
+      child.stdout.off("error", onStreamError);
       child.stderr.off("data", onStderrData);
+      child.stderr.off("end", onStderrEnd);
+      child.stderr.off("error", onStreamError);
+      child.stdin.off("drain", onDrain);
+      child.stdin.off("error", onStdinError);
+      child.off("exit", onExit);
+      child.off("close", onClose);
+      child.off("error", onChildError);
       if (input.signal) input.signal.removeEventListener("abort", onAbort);
     };
 
-    const finish = (result: HermesAcpResult): void => {
-      if (settled) return;
-      settled = true;
-      finalResult = result;
-      if (timer) clearTimeout(timer);
+    const resolveOnce = (result: HermesAcpResult): void => {
+      if (resolved) return;
+      resolved = true;
+      clearTimers();
       removeListeners();
-      child.stdin.end();
-      child.kill("SIGKILL");
-      resolveOnce();
+      resolve(result);
     };
 
-    const fail = (reason: HermesAcpFailureReason): void => finish({ status: "FAILED", reason });
+    const closeStdin = (): boolean => {
+      if (stdinEnded) return true;
+      stdinEnded = true;
+      try {
+        child.stdin.end();
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const failureResult = (reason: HermesAcpFailureReason): HermesAcpResult => ({ status: "FAILED", reason });
+
+    const beginFailure = (reason: HermesAcpFailureReason): void => {
+      if (resolved || failure) return;
+      failure = failureResult(reason);
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = undefined;
+      }
+      closeStdin();
+      try { child.kill("SIGKILL"); } catch { /* bounded settlement below remains authoritative */ }
+      if (closeSeen) {
+        resolveOnce(failure);
+        return;
+      }
+      shutdownTimer = setTimeout(() => resolveOnce(failure!), Math.min(SHUTDOWN_GRACE_MS, input.timeoutMs));
+    };
+
+    const settleTerminalCandidate = (): void => {
+      if (resolved || failure || !terminalCandidate || !stdoutEnded || !closeSeen) return;
+      if (closeCode !== 0 || closeSignal !== null) {
+        beginFailure(closeCode !== null && closeCode !== 0 ? "NONZERO_EXIT" : "UNEXPECTED_EXIT");
+        return;
+      }
+      resolveOnce(terminalCandidate);
+    };
 
     const sendPrompt = (): void => {
-      if (promptSent) return fail("DUPLICATE_RESPONSE");
+      if (resolved || failure || promptSent) {
+        if (!resolved && !failure) beginFailure("DUPLICATE_RESPONSE");
+        return;
+      }
+      if (stdinWriteInProgress || stdinBackpressured) {
+        promptQueued = true;
+        return;
+      }
       promptSent = true;
-      child.stdin.write(jsonRpcLine({
+      writeFrame({
         jsonrpc: "2.0",
         id: 2,
         method: "session/prompt",
@@ -329,25 +464,61 @@ export const runHermesAcp = async (
             targetBindReceipt: input.targetBindReceipt,
           } } },
         },
-      }));
+      });
     };
 
-    const handleFrame = (raw: string): HermesAcpResult | undefined => {
+    const flushPrompt = (): void => {
+      if (!promptQueued || stdinWriteInProgress || stdinBackpressured || resolved || failure) return;
+      promptQueued = false;
+      sendPrompt();
+    };
+
+    const writeFrame = (value: unknown): void => {
+      if (resolved || failure) return;
+      stdinWriteInProgress = true;
+      let accepted: boolean;
+      try {
+        accepted = child.stdin.write(jsonRpcLine(value));
+      } catch {
+        stdinWriteInProgress = false;
+        beginFailure("STDIN_ERROR");
+        return;
+      }
+      stdinWriteInProgress = false;
+      if (!accepted) stdinBackpressured = true;
+      flushPrompt();
+    };
+
+    const acceptTerminal = (candidate: HermesAcpResult): void => {
+      if (candidate.status === "FAILED") {
+        beginFailure(candidate.reason);
+        return;
+      }
+      if (terminalCandidate) {
+        beginFailure("DUPLICATE_RESPONSE");
+        return;
+      }
+      terminalCandidate = candidate;
+      if (!closeStdin()) {
+        beginFailure("STDIN_ERROR");
+        return;
+      }
+      settleTerminalCandidate();
+    };
+
+    const handleFrame = (raw: string): void => {
       let frame: unknown;
-      try { frame = JSON.parse(raw); } catch { fail("MALFORMED_FRAME"); return undefined; }
+      try { frame = JSON.parse(raw); } catch { beginFailure("MALFORMED_FRAME"); return; }
       if (!isRecord(frame) || frame.jsonrpc !== "2.0") {
-        fail("MALFORMED_FRAME");
-        return undefined;
+        beginFailure("MALFORMED_FRAME");
+        return;
       }
       if (Object.hasOwn(frame, "method")) {
-        if (typeof frame.method !== "string") {
-          fail("MALFORMED_FRAME");
-        } else if (Object.hasOwn(frame, "id")) {
-          fail("SERVER_REQUEST");
-        } else if (!hasExactKeys(frame, Object.hasOwn(frame, "params") ? ["jsonrpc", "method", "params"] : ["jsonrpc", "method"])) {
-          fail("MALFORMED_FRAME");
-        }
-        return undefined;
+        if (typeof frame.method !== "string") beginFailure("MALFORMED_FRAME");
+        else if (Object.hasOwn(frame, "id")) beginFailure("SERVER_REQUEST");
+        else if (terminalCandidate) beginFailure("MALFORMED_FRAME");
+        else if (!hasExactKeys(frame, Object.hasOwn(frame, "params") ? ["jsonrpc", "method", "params"] : ["jsonrpc", "method"])) beginFailure("MALFORMED_FRAME");
+        return;
       }
       const isResult = Object.hasOwn(frame, "result");
       const isError = Object.hasOwn(frame, "error");
@@ -356,111 +527,156 @@ export const runHermesAcp = async (
         !hasExactKeys(frame, isResult ? ["id", "jsonrpc", "result"] : ["error", "id", "jsonrpc"]) ||
         !Number.isSafeInteger(frame.id)
       ) {
-        fail("MALFORMED_FRAME");
-        return undefined;
+        beginFailure("MALFORMED_FRAME");
+        return;
       }
       const id = frame.id as number;
       if (seenResponseIds.has(id)) {
-        fail("DUPLICATE_RESPONSE");
-        return undefined;
+        beginFailure("DUPLICATE_RESPONSE");
+        return;
       }
       seenResponseIds.add(id);
       if (id !== 1 && id !== 2) {
-        fail("MALFORMED_FRAME");
-        return undefined;
+        beginFailure("MALFORMED_FRAME");
+        return;
       }
       if (isError) {
-        fail("JSON_RPC_ERROR");
-        return undefined;
+        beginFailure("JSON_RPC_ERROR");
+        return;
       }
       if (id === 1) {
-        if (initSeen || !isRecord(frame.result) || frame.result.protocolVersion !== 1) {
-          fail("MALFORMED_FRAME");
-          return undefined;
+        if (terminalCandidate || initSeen || !isRecord(frame.result) || frame.result.protocolVersion !== 1) {
+          beginFailure("MALFORMED_FRAME");
+          return;
         }
         initSeen = true;
         sendPrompt();
-        return undefined;
+        return;
       }
-      if (!initSeen || !promptSent) {
-        fail("MALFORMED_FRAME");
-        return undefined;
+      if (terminalCandidate || !initSeen || !promptSent) {
+        beginFailure(terminalCandidate ? "DUPLICATE_RESPONSE" : "MALFORMED_FRAME");
+        return;
       }
-      return terminalResult(frame.result, input);
+      acceptTerminal(terminalResult(frame.result, input));
     };
 
     const consumeStdout = (text: string): void => {
-      if (settled) return;
+      if (resolved || failure) return;
       stdoutRemainder += text;
       const lines = stdoutRemainder.split("\n");
       stdoutRemainder = lines.pop() ?? "";
-      let candidate: HermesAcpResult | undefined;
       for (const raw of lines) {
-        if (settled) return;
+        if (resolved || failure) return;
         if (Buffer.byteLength(raw, "utf8") > input.maxLineBytes) {
-          fail("LINE_LIMIT");
+          beginFailure("LINE_LIMIT");
           return;
         }
-        if (candidate) {
-          fail("MALFORMED_FRAME");
-          return;
-        }
-        const result = handleFrame(raw);
-        if (settled) return;
-        if (result) candidate = result;
+        handleFrame(raw);
       }
-      if (Buffer.byteLength(stdoutRemainder, "utf8") > input.maxLineBytes) fail("LINE_LIMIT");
-      else if (candidate) finish(candidate);
+      if (!failure && Buffer.byteLength(stdoutRemainder, "utf8") > input.maxLineBytes) beginFailure("LINE_LIMIT");
     };
 
     const onStdoutData = (chunk: Buffer | string): void => {
-      if (settled) return;
+      if (resolved || failure) return;
+      if (stdoutEnded) {
+        beginFailure("MALFORMED_FRAME");
+        return;
+      }
       const bytes = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk, "utf8");
       stdoutBytes += bytes;
-      if (stdoutBytes > input.maxStdoutBytes) return fail("STDOUT_LIMIT");
+      if (stdoutBytes > input.maxStdoutBytes) {
+        beginFailure("STDOUT_LIMIT");
+        return;
+      }
       consumeStdout(decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8")));
     };
 
     const onStdoutEnd = (): void => {
-      if (settled) return;
+      if (resolved || failure || stdoutEnded) return;
       consumeStdout(decoder.end());
-      if (settled) return;
-      if (stdoutRemainder.length > 0) fail("PARTIAL_LINE");
-      else fail("STDOUT_EOF");
+      if (failure) return;
+      stdoutEnded = true;
+      if (stdoutRemainder.length > 0) {
+        beginFailure("PARTIAL_LINE");
+        return;
+      }
+      if (!terminalCandidate) {
+        beginFailure("STDOUT_EOF");
+        return;
+      }
+      settleTerminalCandidate();
     };
 
     const onStderrData = (chunk: Buffer | string): void => {
-      if (settled) return;
+      if (resolved || failure) return;
       stderrBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk, "utf8");
-      if (stderrBytes > input.maxStderrBytes) fail("STDERR_LIMIT");
+      if (stderrBytes > input.maxStderrBytes) beginFailure("STDERR_LIMIT");
     };
 
-    const onExit = (code: number | null): void => {
-      exitSeen = true;
-      if (!settled) fail(code === 0 ? "UNEXPECTED_EXIT" : "NONZERO_EXIT");
-      resolveOnce();
+    const onStderrEnd = (): void => { /* retain the listener through process close for stream errors */ };
+
+    const onStreamError = (): void => beginFailure("STREAM_ERROR");
+    const onStdinError = (): void => beginFailure("STDIN_ERROR");
+
+    const onExit = (code: number | null, signal: NodeJS.Signals | null = null, reconciled = false): void => {
+      if (resolved || failure) return;
+      if (code !== 0 || signal !== null) {
+        beginFailure(code !== null && code !== 0 ? "NONZERO_EXIT" : "UNEXPECTED_EXIT");
+        return;
+      }
+      if (reconciled && !terminalCandidate) beginFailure("UNEXPECTED_EXIT");
     };
 
-    const onChildError = (): void => fail("SPAWN_ERROR");
-    const onAbort = (): void => fail("ABORTED");
+    const onClose = (code: number | null, signal: NodeJS.Signals | null = null): void => {
+      if (resolved) return;
+      closeSeen = true;
+      closeCode = code;
+      closeSignal = signal;
+      if (failure) {
+        resolveOnce(failure);
+        return;
+      }
+      if (!terminalCandidate) {
+        beginFailure(code !== null && code !== 0 ? "NONZERO_EXIT" : "UNEXPECTED_EXIT");
+        return;
+      }
+      settleTerminalCandidate();
+    };
+
+    const onChildError = (): void => beginFailure("SPAWN_ERROR");
+    const onAbort = (): void => beginFailure("ABORTED");
+    const onDrain = (): void => {
+      stdinBackpressured = false;
+      flushPrompt();
+    };
 
     child.stdout.on("data", onStdoutData);
     child.stdout.on("end", onStdoutEnd);
+    child.stdout.on("error", onStreamError);
     child.stderr.on("data", onStderrData);
-    child.once("exit", onExit);
-    child.once("error", onChildError);
+    child.stderr.on("end", onStderrEnd);
+    child.stderr.on("error", onStreamError);
+    child.stdin.on("drain", onDrain);
+    child.stdin.on("error", onStdinError);
+    child.on("exit", onExit);
+    child.on("close", onClose);
+    child.on("error", onChildError);
     if (input.signal) input.signal.addEventListener("abort", onAbort, { once: true });
-    timer = setTimeout(() => fail("TIMEOUT"), input.timeoutMs);
 
     if (input.signal?.aborted) {
-      fail("ABORTED");
+      beginFailure("ABORTED");
       return;
     }
-    child.stdin.write(jsonRpcLine({
+    if (child.exitCode !== null && child.exitCode !== undefined || child.signalCode !== null && child.signalCode !== undefined) {
+      onExit(child.exitCode ?? null, child.signalCode ?? null, true);
+      return;
+    }
+    timeoutTimer = setTimeout(() => beginFailure("TIMEOUT"), input.timeoutMs);
+    writeFrame({
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
       params: { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: "agent-control-plane", version: "1" } },
-    }));
+    });
   });
 };

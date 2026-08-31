@@ -15,15 +15,18 @@ class FakeOutput extends EventEmitter {
   }
 }
 
-class FakeInput {
+class FakeInput extends EventEmitter {
   readonly writes: string[] = [];
   endCalls = 0;
+  returnsFalse = false;
+  throwOnWrite = false;
   onWrite: ((value: string) => void) | undefined;
 
   write(value: string): boolean {
+    if (this.throwOnWrite) throw new Error("write failed");
     this.writes.push(value);
     this.onWrite?.(value);
-    return true;
+    return !this.returnsFalse;
   }
 
   end(): void {
@@ -36,21 +39,24 @@ class FakeChild extends EventEmitter {
   readonly stdout = new FakeOutput();
   readonly stderr = new FakeOutput();
   killCalls = 0;
-  exitCalls = 0;
-  exitOnKill = true;
-  private exited = false;
+  closeCalls = 0;
+  autoCloseOnKill = true;
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
 
   kill(): boolean {
     this.killCalls += 1;
-    if (this.exitOnKill && !this.exited) queueMicrotask(() => this.exit(0));
-    return !this.exited;
+    if (this.autoCloseOnKill) queueMicrotask(() => this.close(0));
+    return this.exitCode === null && this.signalCode === null;
   }
 
-  exit(code: number, signal: NodeJS.Signals | null = null): void {
-    if (this.exited) return;
-    this.exited = true;
-    this.exitCalls += 1;
+  close(code: number | null, signal: NodeJS.Signals | null = null): void {
+    if (this.closeCalls > 0) return;
+    this.closeCalls += 1;
+    this.exitCode = code;
+    this.signalCode = signal;
     this.emit("exit", code, signal);
+    this.emit("close", code, signal);
   }
 }
 
@@ -60,8 +66,11 @@ const canonicalJson = (value: unknown): string => {
   return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
 };
 
-const digest = (value: unknown): string =>
+const canonicalDigest = (value: unknown): string =>
   `sha256:${createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")}`;
+
+const rawUtf8Digest = (value: string): string =>
+  `sha256:${createHash("sha256").update(Buffer.from(value, "utf8")).digest("hex")}`;
 
 const targetBindPublic = {
   domain: "hermes.target-bind",
@@ -75,7 +84,7 @@ const targetBindPublic = {
 
 const targetBindReceipt = {
   ...targetBindPublic,
-  receipt_digest: digest(targetBindPublic),
+  receipt_digest: canonicalDigest(targetBindPublic),
 } as const;
 
 const receiptIdentity = {
@@ -83,7 +92,7 @@ const receiptIdentity = {
   version: 1,
   turnRequestId: "turn-1",
   targetActorId: "actor:ceo",
-  promptDigest: digest("exact prompt bytes"),
+  promptDigest: canonicalDigest("exact prompt bytes"),
   bindingGeneration: 7,
   targetBindingId: "binding-1",
   targetAttestationId: "attestation-1",
@@ -91,28 +100,30 @@ const receiptIdentity = {
   executorSessionIncarnation: "incarnation-1",
 } as const;
 
-const frame = (id: number, result: unknown): string => `${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`;
-const rpcError = (id: number): string => `${JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "refused" } })}\n`;
-const initialized = (): string => frame(1, { protocolVersion: 1, agentInfo: { name: "hermes-agent", version: "test" }, agentCapabilities: {}, authMethods: [] });
+const receiptEvidence = {
+  receiptIdentity,
+  receiptIdentityDigest: canonicalDigest(receiptIdentity),
+  targetBindReceipt: { schema: "hermes.target-bind-receipt", ...targetBindReceipt },
+  targetBindReceiptDigest: targetBindReceipt.receipt_digest,
+} as const;
 
-const terminalResult = (receipt: Record<string, unknown>, extraMeta: Record<string, unknown> = {}): Record<string, unknown> => ({
+const frame = (id: number, result: unknown): string => `${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`;
+const initialized = (): string => frame(1, { protocolVersion: 1, agentInfo: { name: "hermes-agent", version: "test" }, agentCapabilities: {}, authMethods: [] });
+const terminalResult = (receipt: Record<string, unknown>): Record<string, unknown> => ({
   stopReason: receipt.status === "REFUSED" ? "refusal" : "end_turn",
-  _meta: { hermes: { acpTerminalReceipt: receipt }, ...extraMeta },
+  _meta: { hermes: { acpTerminalReceipt: receipt } },
 });
 
 const completed = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
   status: "COMPLETED",
   turnRequestId: receiptIdentity.turnRequestId,
   sessionId: targetBindReceipt.requested_session_id,
-  terminalMessageId: "message-1",
-  responseDigest: digest("exact Hermes bytes"),
+  terminalMessageId: 42,
+  responseDigest: rawUtf8Digest("exact Hermes bytes"),
   createdAt: 1,
   claimedAt: 2,
   completedAt: 3,
-  receiptIdentity,
-  receiptIdentityDigest: digest(receiptIdentity),
-  targetBindReceipt: { schema: "hermes.target-bind-receipt", ...targetBindReceipt },
-  targetBindReceiptDigest: targetBindReceipt.receipt_digest,
+  ...receiptEvidence,
   assistantContent: "exact Hermes bytes",
   ...overrides,
 });
@@ -126,10 +137,7 @@ const inFlight = (status: "PREPARED" | "CLAIMED"): Record<string, unknown> => ({
   createdAt: 1,
   claimedAt: status === "CLAIMED" ? 2 : null,
   completedAt: null,
-  receiptIdentity,
-  receiptIdentityDigest: digest(receiptIdentity),
-  targetBindReceipt: { schema: "hermes.target-bind-receipt", ...targetBindReceipt },
-  targetBindReceiptDigest: targetBindReceipt.receipt_digest,
+  ...receiptEvidence,
 });
 
 const request = (overrides: Record<string, unknown> = {}) => ({
@@ -149,6 +157,12 @@ const request = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
+const cleanClose = (child: FakeChild, code = 0, signal: NodeJS.Signals | null = null): void => {
+  child.stdout.finish();
+  child.stderr.finish();
+  child.close(code, signal);
+};
+
 const connect = (child: FakeChild, onPrompt: () => void): void => {
   child.stdin.onWrite = (written) => {
     const message = JSON.parse(written) as { id: number };
@@ -157,142 +171,239 @@ const connect = (child: FakeChild, onPrompt: () => void): void => {
   };
 };
 
-const expectTornDownOnce = (child: FakeChild): void => {
-  expect(child.stdin.endCalls).toBe(1);
-  expect(child.killCalls).toBe(1);
-  expect(child.exitCalls).toBe(1);
+const expectNoResidue = (child: FakeChild): void => {
   expect(child.stdout.listenerCount("data")).toBe(0);
   expect(child.stdout.listenerCount("end")).toBe(0);
+  expect(child.stdout.listenerCount("error")).toBe(0);
   expect(child.stderr.listenerCount("data")).toBe(0);
+  expect(child.stderr.listenerCount("end")).toBe(0);
+  expect(child.stderr.listenerCount("error")).toBe(0);
+  expect(child.stdin.listenerCount("drain")).toBe(0);
+  expect(child.stdin.listenerCount("error")).toBe(0);
+  expect(child.listenerCount("exit")).toBe(0);
+  expect(child.listenerCount("close")).toBe(0);
   expect(child.listenerCount("error")).toBe(0);
 };
 
+const expectFailureShutdown = (child: FakeChild): void => {
+  expect(child.stdin.endCalls).toBe(1);
+  expect(child.killCalls).toBe(1);
+  expectNoResidue(child);
+};
+
 describe("bounded Hermes ACP client", () => {
-  it("executes against the exact existing Hermes target and maps only its completed receipt", async () => {
+  it("launches only with the explicit dark ACP environment", async () => {
     const child = new FakeChild();
     let spawnOptions: unknown;
-    connect(child, () => child.stdout.emitText(frame(2, terminalResult(completed()))));
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(completed())));
+      cleanClose(child);
+    });
 
-    const result = await runHermesAcp(request(), {
-      spawn: (
-        _executable: string,
-        _args: readonly string[],
-        options: { cwd: string; env: NodeJS.ProcessEnv; stdio: ["pipe", "pipe", "pipe"] },
-      ) => {
+    await expect(runHermesAcp(request(), {
+      spawn: (_command, _args, options) => {
         spawnOptions = options;
         return child;
       },
-    });
-
-    const frames = child.stdin.writes.map((written) => JSON.parse(written) as Record<string, unknown>);
-    expect(frames).toEqual([
-      {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: "agent-control-plane", version: "1" } },
-      },
-      {
-        jsonrpc: "2.0",
-        id: 2,
-        method: "session/prompt",
-        params: {
-          sessionId: targetBindReceipt.requested_session_id,
-          prompt: [{ type: "text", text: "exact prompt bytes" }],
-          _meta: { hermes: { acpTerminalReceipt: {
-            operation: "execute",
-            receiptIdentity,
-            targetBindReceipt,
-          } } },
-        },
-      },
-    ]);
-    expect(frames.map((entry) => entry.method)).not.toContain("session/new");
-    expect(frames.map((entry) => entry.method)).not.toContain("session/load");
-    expect(frames.map((entry) => entry.method)).not.toContain("session/resume");
-    expect(spawnOptions).toEqual({
-      cwd: "/trusted/cwd",
-      env: { HOME: "/trusted/home", HERMES_HOME: "/trusted/hermes-home", HERMES_PROFILE: "owner" },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    expect(result).toEqual({
+    })).resolves.toEqual({
       status: "COMPLETED",
-      receiptId: digest(receiptIdentity),
-      evidenceDigest: digest("exact Hermes bytes"),
+      receiptId: canonicalDigest(receiptIdentity),
+      evidenceDigest: rawUtf8Digest("exact Hermes bytes"),
       content: "exact Hermes bytes",
     });
-    expectTornDownOnce(child);
+    expect(spawnOptions).toEqual({
+      cwd: "/trusted/cwd",
+      env: {
+        HOME: "/trusted/home",
+        HERMES_HOME: "/trusted/hermes-home",
+        HERMES_PROFILE: "owner",
+        HERMES_ACP_SKIP_ENV_LOAD: "1",
+        HERMES_ACP_SKIP_CONFIGURED_MCP: "1",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    expect(child.stdin.endCalls).toBe(1);
+    expect(child.killCalls).toBe(0);
+    expectNoResidue(child);
   });
 
-  it("looks up status with an empty prompt and preserves NEVER_FOUND as non-completion", async () => {
+  it("does not spawn when its signal was already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const spawn = vi.fn(() => new FakeChild());
+
+    await expect(runHermesAcp(request({ signal: controller.signal }), { spawn })).resolves.toEqual({ status: "FAILED", reason: "ABORTED" });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an exit that happened synchronously during spawn", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChild();
+      child.exitCode = 7;
+      child.autoCloseOnKill = false;
+      const pending = runHermesAcp(request(), { spawn: () => child });
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(pending).resolves.toEqual({ status: "FAILED", reason: "NONZERO_EXIT" });
+      expect(child.stdin.writes).toEqual([]);
+      expectFailureShutdown(child);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits to commit a terminal candidate until stdout EOF and a clean close", async () => {
     const child = new FakeChild();
-    connect(child, () => child.stdout.emitText(frame(2, terminalResult({
-      status: "NEVER_FOUND",
-      turnRequestId: receiptIdentity.turnRequestId,
-    }))));
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(completed())));
+      child.stdout.finish();
+    });
+    let settled = false;
+    const pending = runHermesAcp(request(), { spawn: () => child }).then((result) => {
+      settled = true;
+      return result;
+    });
 
-    const result = await runHermesAcp(request({ operation: "status", text: undefined }), { spawn: () => child });
-
-    expect((JSON.parse(child.stdin.writes[1]!) as { params: { prompt: unknown } }).params.prompt).toEqual([]);
-    expect(result).toEqual({ status: "NEVER_FOUND" });
-    expectTornDownOnce(child);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(child.stdin.endCalls).toBe(1);
+    expect(child.killCalls).toBe(0);
+    child.close(0);
+    await expect(pending).resolves.toMatchObject({ status: "COMPLETED" });
+    expectNoResidue(child);
   });
 
   it.each([
-    ["identity", completed({ receiptIdentity: { ...receiptIdentity, targetActorId: "actor:wrong" } })],
-    ["target", completed({ targetBindReceipt: { schema: "hermes.target-bind-receipt", ...targetBindReceipt, actor_id: "actor:wrong" } })],
-  ])("fails closed when a completed receipt has a mismatched %s", async (_name, receipt) => {
+    ["nonzero", 7, null, "NONZERO_EXIT"],
+    ["signal", 0, "SIGTERM", "UNEXPECTED_EXIT"],
+  ] as const)("rejects a terminal candidate followed by a %s close", async (_name, code, signal, reason) => {
     const child = new FakeChild();
-    connect(child, () => child.stdout.emitText(frame(2, terminalResult(receipt))));
-
-    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({
-      status: "FAILED",
-      reason: "TERMINAL_RECEIPT_MISMATCH",
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(completed())));
+      child.stdout.finish();
+      child.close(code, signal);
     });
-    expectTornDownOnce(child);
+
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason });
+    expectFailureShutdown(child);
   });
 
   it.each([
-    ["extra terminal metadata", () => frame(2, terminalResult(completed(), { unexpected: true })), "MALFORMED_TERMINAL_RECEIPT"],
-    ["malformed JSON", () => "not-json\n", "MALFORMED_FRAME"],
-    ["extra response frame", () => frame(2, terminalResult(completed())) + frame(77, {}), "MALFORMED_FRAME"],
-  ])("fails closed on %s", async (_name, makeOutput, reason) => {
+    ["a duplicate response", (child: FakeChild) => child.stdout.emitText(frame(2, terminalResult(completed())) + frame(2, terminalResult(completed()))), "DUPLICATE_RESPONSE"],
+    ["a server request", (child: FakeChild) => child.stdout.emitText(frame(2, terminalResult(completed())) + JSON.stringify({ jsonrpc: "2.0", id: 9, method: "client/request", params: {} }) + "\n"), "SERVER_REQUEST"],
+    ["a malformed frame", (child: FakeChild) => child.stdout.emitText(frame(2, terminalResult(completed())) + "not-json\n"), "MALFORMED_FRAME"],
+    ["a partial line", (child: FakeChild) => { child.stdout.emitText(frame(2, terminalResult(completed())) + "partial"); child.stdout.finish(); }, "PARTIAL_LINE"],
+  ] as const)("rejects post-terminal %s", async (_name, emit, reason) => {
     const child = new FakeChild();
-    connect(child, () => child.stdout.emitText(makeOutput()));
-
-    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({
-      status: "FAILED",
-      reason,
+    connect(child, () => {
+      emit(child);
+      cleanClose(child);
     });
-    expectTornDownOnce(child);
+
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason });
+    expectFailureShutdown(child);
   });
 
-  it("rejects duplicate JSON-RPC response ids and unknown server requests while ignoring bounded notifications", async () => {
-    const duplicate = new FakeChild();
-    duplicate.stdin.onWrite = (written) => {
-      if ((JSON.parse(written) as { id: number }).id === 1) duplicate.stdout.emitText(initialized() + initialized());
-    };
-    await expect(runHermesAcp(request(), { spawn: () => duplicate })).resolves.toEqual({ status: "FAILED", reason: "DUPLICATE_RESPONSE" });
-    expectTornDownOnce(duplicate);
+  it("settles a failed shutdown even if kill emits no close", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChild();
+      child.autoCloseOnKill = false;
+      connect(child, () => child.stdout.emitText("not-json\n"));
+      const pending = runHermesAcp(request(), { spawn: () => child });
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(pending).resolves.toEqual({ status: "FAILED", reason: "MALFORMED_FRAME" });
+      expectFailureShutdown(child);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
-    const serverRequest = new FakeChild();
-    serverRequest.stdin.onWrite = (written) => {
-      if ((JSON.parse(written) as { id: number }).id === 1) {
-        serverRequest.stdout.emitText(initialized() + JSON.stringify({ jsonrpc: "2.0", id: 9, method: "client/request", params: {} }) + "\n");
-      }
-    };
-    await expect(runHermesAcp(request(), { spawn: () => serverRequest })).resolves.toEqual({ status: "FAILED", reason: "SERVER_REQUEST" });
-    expectTornDownOnce(serverRequest);
+  it.each([
+    ["throws from stdin.write", (child: FakeChild) => { child.stdin.throwOnWrite = true; }, "STDIN_ERROR"],
+    ["emits a stdout stream error", (child: FakeChild) => { child.stdout.emit("error", new Error("stdout failed")); }, "STREAM_ERROR"],
+    ["emits a stderr stream error", (child: FakeChild) => { child.stderr.emit("error", new Error("stderr failed")); }, "STREAM_ERROR"],
+  ] as const)("fails closed when it %s", async (_name, trigger, reason) => {
+    const child = new FakeChild();
+    if (reason === "STDIN_ERROR") trigger(child);
+    else connect(child, () => trigger(child));
 
-    const notification = new FakeChild();
-    notification.stdin.onWrite = (written) => {
-      if ((JSON.parse(written) as { id: number }).id === 1) {
-        notification.stdout.emitText(JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: {} }) + "\n" + initialized());
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason });
+    expectFailureShutdown(child);
+  });
+
+  it("waits for drain before writing after stdin backpressure", async () => {
+    const child = new FakeChild();
+    child.stdin.returnsFalse = true;
+    connect(child, () => {
+      if (child.stdin.writes.length === 2) {
+        child.stdout.emitText(frame(2, terminalResult(completed())));
+        cleanClose(child);
       }
-      if ((JSON.parse(written) as { id: number }).id === 2) notification.stdout.emitText(frame(2, terminalResult(completed())));
-    };
-    await expect(runHermesAcp(request(), { spawn: () => notification })).resolves.toMatchObject({ status: "COMPLETED" });
-    expectTornDownOnce(notification);
+    });
+    const pending = runHermesAcp(request(), { spawn: () => child });
+
+    expect(child.stdin.writes).toHaveLength(1);
+    child.stdin.returnsFalse = false;
+    child.stdin.emit("drain");
+    await expect(pending).resolves.toMatchObject({ status: "COMPLETED" });
+    expect(child.stdin.writes).toHaveLength(2);
+    expectNoResidue(child);
+  });
+
+  it.each([
+    ["receipt identity digest", completed({ receiptIdentityDigest: rawUtf8Digest("wrong identity") })],
+    ["target bind digest", completed({ targetBindReceiptDigest: rawUtf8Digest("wrong target") })],
+    ["target bind receipt", completed({ targetBindReceipt: { schema: "hermes.target-bind-receipt", ...targetBindReceipt, receipt_digest: rawUtf8Digest("wrong target") } })],
+    ["raw assistant content digest", completed({ responseDigest: canonicalDigest("exact Hermes bytes") })],
+  ])("rejects a mutated completed %s", async (_name, receipt) => {
+    const child = new FakeChild();
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(receipt)));
+      cleanClose(child);
+    });
+
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason: "TERMINAL_RECEIPT_MISMATCH" });
+    expectFailureShutdown(child);
+  });
+
+  it.each([
+    ["NEVER_FOUND", { status: "NEVER_FOUND", turnRequestId: receiptIdentity.turnRequestId }, "turnRequestId", 7],
+    ["REFUSED", { status: "REFUSED" }, "status", 7],
+    ["PREPARED", inFlight("PREPARED"), "createdAt", "1"],
+    ["CLAIMED", inFlight("CLAIMED"), "claimedAt", null],
+    ["COMPLETED", completed(), "terminalMessageId", "42"],
+  ] as const)("closes the exact %s schema for extra, missing, and wrong-type fields", async (_status, receipt, wrongKey, wrongValue) => {
+    const missing = { ...receipt };
+    delete missing[wrongKey];
+    const variants = [
+      { ...receipt, unexpected: true },
+      missing,
+      { ...receipt, [wrongKey]: wrongValue },
+    ];
+
+    for (const variant of variants) {
+      const child = new FakeChild();
+      connect(child, () => {
+        child.stdout.emitText(frame(2, terminalResult(variant)));
+        cleanClose(child);
+      });
+      await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" });
+      expectFailureShutdown(child);
+    }
+  });
+
+  it("documents that ABORTED has no proven Hermes producer schema and stays fail closed", async () => {
+    const child = new FakeChild();
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult({ status: "ABORTED" })));
+      cleanClose(child);
+    });
+
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason: "MALFORMED_TERMINAL_RECEIPT" });
+    expectFailureShutdown(child);
   });
 
   it.each([
@@ -300,65 +411,18 @@ describe("bounded Hermes ACP client", () => {
     ["CLAIMED", inFlight("CLAIMED")],
     ["REFUSED", { status: "REFUSED" }],
     ["NEVER_FOUND", { status: "NEVER_FOUND", turnRequestId: receiptIdentity.turnRequestId }],
-  ])("never maps execute terminal %s to completed", async (terminalStatus, receipt) => {
+  ] as const)("does not map valid %s outcomes to completed", async (terminalStatus, receipt) => {
     const child = new FakeChild();
-    connect(child, () => child.stdout.emitText(frame(2, terminalResult(receipt))));
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult(receipt)));
+      cleanClose(child);
+    });
 
-    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "NOT_COMPLETED", terminalStatus });
-    expectTornDownOnce(child);
-  });
-
-  it("maps a JSON-RPC error to a fail-closed outcome", async () => {
-    const child = new FakeChild();
-    connect(child, () => child.stdout.emitText(rpcError(2)));
-
-    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason: "JSON_RPC_ERROR" });
-    expectTornDownOnce(child);
-  });
-
-  it("fails closed on timeout and abort without residual timer or listener state", async () => {
-    vi.useFakeTimers();
-    try {
-      const timeout = new FakeChild();
-      connect(timeout, () => {});
-      const timingOut = runHermesAcp(request({ timeoutMs: 50 }), { spawn: () => timeout });
-      await vi.advanceTimersByTimeAsync(50);
-      await expect(timingOut).resolves.toEqual({ status: "FAILED", reason: "TIMEOUT" });
-      expectTornDownOnce(timeout);
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
-
-    const controller = new AbortController();
-    const aborted = new FakeChild();
-    connect(aborted, () => {});
-    const pending = runHermesAcp(request({ signal: controller.signal }), { spawn: () => aborted });
-    controller.abort();
-    await expect(pending).resolves.toEqual({ status: "FAILED", reason: "ABORTED" });
-    expectTornDownOnce(aborted);
-  });
-
-  it.each([
-    ["stdout cap", (child: FakeChild) => child.stdout.emitText("12345"), { maxStdoutBytes: 4 }, "STDOUT_LIMIT"],
-    ["stderr cap", (child: FakeChild) => child.stderr.emitText("12345"), { maxStderrBytes: 4 }, "STDERR_LIMIT"],
-    ["line cap", (child: FakeChild) => child.stdout.emitText("12345\n"), { maxLineBytes: 4 }, "LINE_LIMIT"],
-    ["partial stdout line", (child: FakeChild) => { child.stdout.emitText("partial"); child.stdout.finish(); }, {}, "PARTIAL_LINE"],
-  ])("fails closed on %s", async (_name, emit, caps, reason) => {
-    const child = new FakeChild();
-    connect(child, () => emit(child));
-
-    await expect(runHermesAcp(request(caps), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason });
-    expectTornDownOnce(child);
-  });
-
-  it("fails closed when the child exits nonzero", async () => {
-    const child = new FakeChild();
-    child.stdin.onWrite = (written) => {
-      if ((JSON.parse(written) as { id: number }).id === 1) child.exit(7);
-    };
-
-    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual({ status: "FAILED", reason: "NONZERO_EXIT" });
-    expectTornDownOnce(child);
+    const expected = terminalStatus === "NEVER_FOUND"
+      ? { status: "NOT_COMPLETED", terminalStatus }
+      : { status: "NOT_COMPLETED", terminalStatus };
+    await expect(runHermesAcp(request(), { spawn: () => child })).resolves.toEqual(expected);
+    expect(child.killCalls).toBe(0);
+    expectNoResidue(child);
   });
 });
