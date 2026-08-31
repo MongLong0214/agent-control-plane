@@ -24,6 +24,7 @@ import {
   type RunEvidenceExport,
 } from "../../src/export/run-evidence.ts";
 import { Db } from "../../src/db/database.ts";
+import { approveMigration } from "../../src/db/migration-approval.ts";
 import { migrationChainFrom, SCHEMA_VERSION } from "../../src/db/migrations.ts";
 import {
   bindWorker,
@@ -873,6 +874,9 @@ describe("baseline boundary contracts", () => {
     } finally {
       raw.close();
     }
+    // #738 — a database at an older version no longer migrates itself. This fixture is a
+    // deployment that stopped at v13, so it takes the approval its owner would have taken.
+    approveMigration(databasePath, "baseline-export fixture");
 
     const reopened = new Database(databasePath);
     try {
@@ -998,6 +1002,9 @@ describe("baseline boundary contracts", () => {
     } finally {
       raw.close();
     }
+    // #738 — a database at an older version no longer migrates itself. This fixture is a
+    // deployment that stopped at v13, so it takes the approval its owner would have taken.
+    approveMigration(databasePath, "baseline-export fixture");
 
     expect(() => new Db(databasePath, {
       afterMigration: (migration) => {

@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { defaultConfig, ControlPlane } from "../../src/app/control-plane.ts";
 import { defaultBackupDirectory, restoreDatabase } from "../../src/db/backup.ts";
 import { Db, SCHEMA_VERSION } from "../../src/db/database.ts";
+import { approveMigration } from "../../src/db/migration-approval.ts";
 import {
   installMigrationLedger,
   MIGRATIONS,
@@ -316,6 +317,10 @@ const asV11Fixture = (path: string, seed = false): ReturnType<typeof history> | 
     const result = seed ? history(raw) : undefined;
     raw.close();
     asPrivateStateFile(path);
+    // #738 — a database at an older version does not migrate itself any more. A fixture that
+    // means "this is what an older deployed build left behind" now has to say so the way the
+    // owner does, so these tests exercise the approved path rather than a bypass of it.
+    approveMigration(path, "database-migration-restore fixture");
     return result;
   } finally {
     try { raw.close(); } catch { /* already closed on the success path */ }
@@ -352,6 +357,7 @@ const asV14Fixture = (path: string): void => {
     // umask and 0644 under CI's 022, and production is right to refuse the second one.
     asPrivateStateFile(path);
   }
+  approveMigration(path, "database-migration-restore fixture");
 };
 
 /** Builds the immediately previous release boundary without copying current migration internals. */
@@ -409,6 +415,7 @@ const asV33Fixture = (path: string): void => {
     raw.close();
     asPrivateStateFile(path);
   }
+  approveMigration(path, "database-migration-restore fixture");
 };
 
 const fileSha256 = (path: string): string =>

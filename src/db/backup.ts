@@ -185,6 +185,64 @@ export const backupOpenDatabaseSync = (
   }
 };
 
+/**
+ * The recovery point an approved migration is allowed to rest on (#738).
+ *
+ * `migrate()` makes its own `pre-migration-v<from>` snapshot, but that one is made *by the
+ * process that is about to rewrite the file*, at a path it chooses, after it has already
+ * decided to proceed — so if anything upstream is wrong the snapshot inherits it and nobody
+ * has looked. This one is taken while nothing is migrating and validated before the chain's
+ * `DROP TABLE`s run, so the approval can say which file the owner gets back.
+ *
+ * Synchronous, and it opens the source writable: `VACUUM INTO` is the same snapshot
+ * `backupOpenDatabaseSync` takes for the constructor, and the callers here (the approval
+ * command, fixtures) already hold the database exclusively.
+ */
+export const captureRollbackPointSync = (
+  databasePath: string,
+  destination = nextBackupPath(databasePath, "approved-migration"),
+): DatabaseBackup => {
+  const raw = new Database(databasePath, { fileMustExist: true });
+  try {
+    raw.pragma("busy_timeout = 10000");
+    assertIntegrity(raw, databasePath);
+    return backupOpenDatabaseSync(raw, databasePath, destination);
+  } finally {
+    raw.close();
+  }
+};
+
+/**
+ * Proves a named path is a usable recovery point for a database at `expectedVersion`.
+ *
+ * Private mode, manifest shape, checksum, integrity — the properties that make an image a
+ * usable way back — plus the one an operator restore does not need to ask: that it is at the
+ * version this migration starts from. A snapshot of the *migrated* database is not a way back.
+ *
+ * Load-bearing invariants are deliberately not asserted, for the same reason
+ * `validateMigrationRollbackBackup` skips them: a rollback point is allowed to contain whatever
+ * is wrong with the database it was taken from. Holding it to the current build's invariants
+ * would refuse an approval for precisely the databases that most need one — measured on a v24
+ * image whose ledger the current build reads as malformed, which is a fact about the old
+ * database, not a reason to leave it with no recovery point.
+ */
+export const assertRollbackPointAt = (backupPath: string, expectedVersion: number): DatabaseBackup => {
+  const manifest = validateBackup(backupPath, { assertSchemaInvariants: false });
+  if (manifest.schemaVersion !== expectedVersion) {
+    throw acpError(ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED, "the approved rollback point is not at the version this migration starts from", {
+      backupPath,
+      expected: expectedVersion,
+      found: manifest.schemaVersion,
+    });
+  }
+  return {
+    path: backupPath,
+    manifestPath: backupManifestPath(backupPath),
+    sha256: manifest.databaseSha256,
+    schemaVersion: manifest.schemaVersion,
+  };
+};
+
 /** A human-triggered online snapshot. The backup API keeps a running daemon's WAL coherent. */
 export const backupDatabase = async (
   databasePath: string,

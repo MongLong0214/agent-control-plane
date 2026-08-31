@@ -60,6 +60,20 @@ agentcpd-state backup
 agentcpd-state restore /absolute/backup.sqlite --confirm-restore
 ```
 
+A start that would migrate the database refuses instead (#738), because this app root is also a
+git checkout and a `pnpm build` run in it for any reason changes which `SCHEMA_VERSION` the next
+restart declares. The refusal exits 0, so `KeepAlive { SuccessfulExit = false }` leaves the job
+stopped rather than retrying every `ThrottleInterval`; it leaves `migration-refusal.json` in the
+state directory and `agentctl daemon status` reports it with no daemon running. `migration-plan`
+reads the database read-only and prints what a start would do; `approve-migration` refuses a live
+lock, takes a validated recovery point, and writes an approval naming that exact chain, which is
+spent when the chain runs.
+
+```bash
+agentcpd-state migration-plan
+agentcpd-state approve-migration --approved-by "$USER" --confirm-migration
+```
+
 To roll back a binary, use the pre-migration backup produced by the upgrade and restore it in
 the same operation. The script refuses a binary-only rollback because an older binary must not
 guess at a newer schema.

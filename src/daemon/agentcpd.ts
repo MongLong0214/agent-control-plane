@@ -18,6 +18,7 @@ import {
 import { BuzzAdapter, BuzzCliTransport } from "../buzz/buzz-adapter.ts";
 import { type Decision, allow, deny, isAcpError } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { recordMigrationRefusal } from "../db/migration-approval.ts";
 import {
   BuzzActorIngress,
   IngressGuard,
@@ -1490,6 +1491,16 @@ export const main = async (options: AgentcpdMainOptions = {}): Promise<void> => 
   const telegramConfig = configuredTelegramLongPollConfig(config.ownerIdentities ?? []);
   const cp = new ControlPlane(config);
 
+  // A migration that ran did so because someone approved it, and the approval names them.
+  // `schema_migrations` records what changed; this records who decided it should (#738).
+  if (cp.db.appliedMigrationApproval !== null) {
+    cp.audit.record({
+      kind: "SCHEMA_MIGRATION_APPROVAL_SPENT",
+      reasonCode: ReasonCode.OK,
+      evidence: { ...cp.db.appliedMigrationApproval },
+    });
+  }
+
   let sessionLaunch: LocalSessionLaunchChannel;
   try {
     sessionLaunch = await startSessionLaunchChannel(stateDir);
@@ -1666,12 +1677,69 @@ const waitForBackoff = async (seconds: number): Promise<void> => {
   }
 };
 
+/** What a failed start hands to the supervisor, and what it leaves behind for the owner. */
+export interface StartupDisposition {
+  exitCode: number;
+  body: Record<string, unknown>;
+  /** The refusal report's path when one was written, so the stderr line can name it. */
+  reportPath: string | null;
+}
+
+/**
+ * Decides the exit code a failed start gives launchd (#738).
+ *
+ * `KeepAlive { SuccessfulExit = false }` is a conditional: launchd restarts this job when it
+ * exits *un*successfully and leaves it alone when it exits 0. Every failure path here has
+ * always exited 1, which is right for a crash — but a refusal is not a crash. A daemon that
+ * refuses to migrate and exits 1 is restarted 30 seconds later (`ThrottleInterval`), refuses
+ * again, and burns a restart every 30 seconds until someone notices. That is the crash loop
+ * with a nicer message, and `DAEMON_CRASH_LOOP`'s 137 records are what it looks like.
+ *
+ * Exiting 0 is what makes the refusal durable: launchd stops, and the state is exactly one
+ * refusal per boot rather than one every half minute. The cost is that a stopped job is quiet,
+ * so the refusal report and the stderr line below are not decoration — during a refusal there
+ * is no operator socket and no doctor, because both need the `ControlPlane` that could not open
+ * the database. `agentctl daemon status` reads the report offline, which is the one observation
+ * path that survives.
+ *
+ * Nothing else changes: a crash, a doctor block, a bad token still exit 1 and are still
+ * retried.
+ */
+export const dispositionForStartupError = (err: unknown, databasePath: string): StartupDisposition => {
+  const body = isAcpError(err)
+    ? { reasonCode: err.reasonCode, message: err.message, evidence: err.evidence }
+    : { message: (err as Error).message, stack: (err as Error).stack };
+  if (!isAcpError(err) || err.reasonCode !== ReasonCode.SCHEMA_MIGRATION_NOT_APPROVED) {
+    return { exitCode: 1, body, reportPath: null };
+  }
+  const report = { refusedAt: new Date().toISOString(), pid: process.pid, ...body };
+  let reportPath: string | null = null;
+  try {
+    reportPath = recordMigrationRefusal(databasePath, report);
+  } catch (writeError) {
+    // A state directory this process cannot write is a different fault, and it must not turn a
+    // decided refusal back into a restart loop. The stderr line still carries the whole plan.
+    process.stderr.write(
+      `${JSON.stringify({ migrationRefusalReportUnwritable: String(writeError) }, null, 2)}\n`,
+    );
+  }
+  return { exitCode: 0, body: report, reportPath };
+};
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   void main().catch((err: unknown) => {
-    const body = isAcpError(err)
-      ? { reasonCode: err.reasonCode, message: err.message, evidence: err.evidence }
-      : { message: (err as Error).message, stack: (err as Error).stack };
-    process.stderr.write(`${JSON.stringify(body, null, 2)}\n`);
-    process.exit(1);
+    const disposition = dispositionForStartupError(err, defaultConfig().databasePath);
+    process.stderr.write(`${JSON.stringify(disposition.body, null, 2)}\n`);
+    if (disposition.exitCode === 0) {
+      process.stderr.write(
+        "agentcpd refused to start: this build would migrate the live database and no approval " +
+          "names that migration. The daemon is stopped and will not be restarted by launchd " +
+          "until it is started again.\n" +
+          (disposition.reportPath === null ? "" : `Refusal report: ${disposition.reportPath}\n`) +
+          "Approve with: agentcpd-state approve-migration --approved-by <who> --confirm-migration\n" +
+          "Inspect without approving: agentcpd-state migration-plan\n",
+      );
+    }
+    process.exit(disposition.exitCode);
   });
 }

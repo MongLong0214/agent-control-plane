@@ -298,10 +298,13 @@ live file.**
 `RunAtLoad` is `true` and `KeepAlive` is `{ SuccessfulExit = false }` with a 30 s
 `ThrottleInterval` (`deploy/com.agentcontrolplane.agentcpd.plist.template`). Rebuilding `dist/` in
 place while the job is still loaded means the *next* crash or reboot — not the next command —
-migrates the live database to whatever the rebuild declares, with no approval gate anywhere in
-that path (`Db`'s constructor calls `migrate()` unconditionally, `src/db/database.ts:362`).
-Stopping first removes the job from launchd's supervision entirely until it is explicitly
-started again, which is the only thing in this repository that closes that window:
+arrives at a build declaring a different `SCHEMA_VERSION` than the live database carries. Since
+#738 that start **refuses** rather than migrating: `Db`'s constructor requires an approval on
+file naming the exact from-version, to-version and ordered migration ids
+(`assertMigrationApproved`, `src/db/database.ts`), and the process exits 0 so
+`KeepAlive { SuccessfulExit = false }` stops rather than retrying every 30 s. Stopping the job
+first is still the right order — it removes the job from supervision entirely until it is
+explicitly started again, so the rebuild is not racing a supervised process for the same bytes:
 
     set -e
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh stop
@@ -333,6 +336,12 @@ backup:
 
     DRY_DIR="$(mktemp -d)"; DRY="$DRY_DIR/dry-run.sqlite"
     cp "$BACKUP_PATH" "$DRY"
+    chmod 700 "$DRY_DIR"; chmod 600 "$DRY"
+    # #738 — a migration is now a decided act, and the dry run has to decide it too. This
+    # approves the throwaway copy only: the approval file lands in $DRY_DIR beside it, names
+    # that copy's own from/to versions, and cannot authorise anything for the live database.
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js approve-migration \
+      --database "$DRY" --approved-by "$USER" --confirm-migration
     node --input-type=module -e '
       import { openDb, SCHEMA_VERSION } from "/Users/isaac/projects/agent-control-plane/dist/db/database.js";
       const db = openDb(process.argv[1]);
@@ -368,14 +377,35 @@ nine steps, not a missing link this packet failed to notice.
 If the dry run throws either message: stop. Do not proceed to item 4. File which migration step
 failed and treat it as a blocker on this packet, not something to retry past.
 
-**4. Start the job — this is the real migration, under supervision, not a dry run.**
+**4. Approve the migration, then start the job — this is the real migration, under supervision,
+not a dry run.**
 
+Since #738 the start refuses unless an approval on file names this exact chain. Read the plan
+first — `migration-plan` opens the database read-only and changes nothing — and approve only
+after the printed `fromVersion`, `toVersion` and `migrations` are the ones item 3's dry run just
+proved out:
+
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js migration-plan \
+      --database "$HOME/.agent-control-plane/state.sqlite"
+    node /Users/isaac/projects/agent-control-plane/dist/db/state-admin.js approve-migration \
+      --database "$HOME/.agent-control-plane/state.sqlite" --approved-by "$USER" --confirm-migration
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
 
-The first `Db` the new process opens finds `state.sqlite` at 25 and a build declaring 34, and
-`applySchema` runs the real chain, protected by its own internal backup exactly as validated in
-item 3. Watch it for the first 60–90 s (`ThrottleInterval` is 30 s): if it is not stable by then,
-treat it as crash-looping and go straight to item 6 rather than waiting longer.
+`approve-migration` refuses while the lock is held, takes its own validated recovery point at
+the current version, and writes `~/.agent-control-plane/migration-approval.json` naming that
+backup and the ordered chain. It approves **one** migration between two named versions: after
+the chain runs, the file is renamed to `migration-approval.applied-v25-v34-<epoch>.json` and
+authorises nothing further.
+
+The first `Db` the new process opens finds `state.sqlite` at 25, a build declaring 34, and an
+approval naming exactly 25→34, and `applySchema` runs the real chain — protected by its own
+internal backup exactly as validated in item 3. Watch it for the first 60–90 s
+(`ThrottleInterval` is 30 s): if it is not stable by then, treat it as crash-looping and go
+straight to item 6 rather than waiting longer.
+
+If the start refuses instead, `~/.agent-control-plane/migration-refusal.json` carries the plan
+it declined and `agentctl daemon status` reports it offline — the socket and the doctor are both
+unavailable during a refusal, so that file and `agentcpd.err.log` are the observation surface.
 
 **5. Post-restart readback.**
 
@@ -468,9 +498,11 @@ replaces the bytes of a live process, and the database restore is then refused b
 moment later, leaving a **partial rollback** — old bytes, new schema — the one combination
 `applySchema` refuses outright and `KeepAlive` then retries forever.
 
-Restoring only the database and leaving 34-declaring bytes in place is nearly harmless — a build
-opening a database *older* than itself just migrates forward again, reproducing the state being
-rolled back from. Restoring only the bytes and leaving the database at 34 is not: `applySchema`
+Restoring only the database and leaving 34-declaring bytes in place no longer silently undoes
+itself — since #738 a build opening a database *older* than itself refuses unless an approval
+names that migration, so the restored file stays restored and the daemon stays stopped rather
+than migrating forward again. It is still a half-finished rollback and still has to be completed.
+Restoring only the bytes and leaving the database at 34 is worse: `applySchema`
 refuses a database newer than the running build outright — `"database schema is newer than this
 build"` (`src/db/database.ts:335-341`) — and with `KeepAlive.SuccessfulExit = false` and a 30 s
 `ThrottleInterval`, launchd retries that failure forever. Both restores must complete, in either

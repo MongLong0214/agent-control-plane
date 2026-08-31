@@ -25,6 +25,12 @@ import {
   type SchemaMigration,
 } from "./migrations.ts";
 import {
+  assertMigrationApproved,
+  consumeMigrationApproval,
+  migrationPlanFrom,
+  type MigrationApproval,
+} from "./migration-approval.ts";
+import {
   assertPrivateDatabaseFiles,
   ensurePrivateDirectory,
   finalizeNewPrivateDatabaseFiles,
@@ -70,6 +76,13 @@ export interface DbOpenOptions {
   temporaryStorage?: "MEMORY";
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
   afterMigration?: (migration: SchemaMigration) => void;
+  /**
+   * An approval delivered in-process rather than through the state directory's approval file
+   * (#738). Held to the identical checks, so this is a second way to hand over an approval and
+   * not a way past one. Omitting it does not permit a migration: it means the only approval
+   * this open will consider is the one on disk.
+   */
+  migrationApproval?: MigrationApproval;
 }
 const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
 const TURN_MATERIALIZATION_MINT: unique symbol = Symbol("turn-materialization-mint");
@@ -232,6 +245,12 @@ export class Db {
   readonly identity: string;
   /** The connection's observed SQLite temporary-storage policy. */
   readonly temporaryStorage: "DEFAULT" | "FILE" | "MEMORY";
+  /**
+   * The approval this open spent, or null when it did not migrate. Read by the composition
+   * root so a migration that happened lands in the audit trail with the name of whoever
+   * approved it, rather than only in the schema ledger (#738).
+   */
+  appliedMigrationApproval: MigrationApproval | null = null;
 
   constructor(filename: string, private readonly options: DbOpenOptions = {}) {
     const persistent = filename !== ":memory:";
@@ -359,7 +378,23 @@ export class Db {
       assertMigrationLedgerAt(this.#raw, version);
       return;
     }
+    // #738 — the enforcement site, and the reason it is *here* rather than in the daemon's
+    // startup sequence: `ControlPlane`'s constructor opens the database, so by the time
+    // `Daemon.start()` runs the migration has already happened. A gate in the startup sequence
+    // would name the hazard at a point the mutation never traverses. This line is the last
+    // point that can still refuse, and it is upstream of every caller — daemon, CLI, script —
+    // because they all arrive through this constructor.
+    //
+    // A fresh database (version 0) and a database already at this build's version both
+    // returned above, so nothing that does not migrate reaches this.
+    const approval = assertMigrationApproved(
+      this.file,
+      migrationPlanFrom(version),
+      this.options.migrationApproval ?? null,
+    );
     this.migrate(filename, version);
+    consumeMigrationApproval(this.file, approval);
+    this.appliedMigrationApproval = approval;
   }
 
   private bootstrapFreshSchema(): void {

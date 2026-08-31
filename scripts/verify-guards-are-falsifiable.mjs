@@ -3405,6 +3405,75 @@ const GUARDS = [
       "tests/unit/github-app-credential-store.test.ts::names every approved shape in the refusal message rather than only saying the match failed",
     ],
   },
+  {
+    // #738 — the defect itself. Delete the approval check and the constructor migrates the
+    // database it just opened, which is what a restart under `KeepAlive`/`RunAtLoad` performs
+    // the moment a `pnpm build` in the deployment checkout changes the declared SCHEMA_VERSION.
+    // The mutant is the *previous* behaviour, verbatim.
+    what: "opening a database at an older version refuses instead of migrating it unapproved",
+    file: "src/db/database.ts",
+    find:
+      "    const approval = assertMigrationApproved(\n" +
+      "      this.file,\n" +
+      "      migrationPlanFrom(version),\n" +
+      "      this.options.migrationApproval ?? null,\n" +
+      "    );\n" +
+      "    this.migrate(filename, version);",
+    replace:
+      "    const approval = this.options.migrationApproval ?? null;\n" +
+      "    this.migrate(filename, version);",
+    killedBy: [
+      "tests/unit/a-restart-that-would-migrate.test.ts::refuses, leaves the database at its own version, and exits so the supervisor stops retrying",
+    ],
+  },
+  {
+    // A refusal that exits unsuccessfully is restarted by `KeepAlive { SuccessfulExit = false }`
+    // every `ThrottleInterval`, forever. The message improves and the loop does not.
+    what: "a refused migration exits successfully so launchd stops restarting the daemon",
+    file: "src/daemon/agentcpd.ts",
+    find: "  return { exitCode: 0, body: report, reportPath };",
+    replace: "  return { exitCode: 1, body: report, reportPath };",
+    killedBy: [
+      "tests/unit/a-restart-that-would-migrate.test.ts::refuses, leaves the database at its own version, and exits so the supervisor stops retrying",
+    ],
+  },
+  {
+    // An approval that does not have to name the chain is an approval of migrations in general.
+    what: "an approval must name the same ordered migrations the start would run",
+    file: "src/db/migration-approval.ts",
+    find: "    !sameOrderedIds(approval.migrations, plan.migrations)",
+    replace: "    false",
+    killedBy: [
+      "tests/unit/a-migration-approval.test.ts::is refused when it approves a shorter chain than the one that would run",
+    ],
+  },
+  {
+    // The single automatic pre-migration snapshot is the only recovery point for the whole
+    // chain, and v26..v28 include DROP TABLE. Dropping this check leaves the approval resting
+    // on a path nobody validated.
+    what: "an approval must name a validated recovery point at the version the chain starts from",
+    file: "src/db/migration-approval.ts",
+    find: "  assertRollbackPointAt(approval.backupPath, plan.fromVersion);",
+    replace: "",
+    killedBy: [
+      "tests/unit/a-migration-approval.test.ts::is refused when its recovery point is not an image of the version this migration starts from",
+    ],
+  },
+  {
+    // During a refusal there is no operator socket and no doctor, because both need the
+    // ControlPlane that could not open the database. This reading is the whole observation
+    // surface, and dropping it leaves the owner with an unreachable socket and no reason.
+    what: "the offline daemon status reports a migration refusal when nothing else can",
+    file: "src/cli/agentctl.ts",
+    find:
+      "      migrationRefusal: existsSync(refusalPath)\n" +
+      "        ? (JSON.parse(readFileSync(refusalPath, \"utf8\")) as unknown)\n" +
+      "        : null,",
+    replace: "      migrationRefusal: null,",
+    killedBy: [
+      "tests/unit/a-restart-that-would-migrate.test.ts::still answers an offline observation with the refusal, because no socket and no doctor survive it",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

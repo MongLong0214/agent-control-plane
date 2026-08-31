@@ -561,6 +561,12 @@ export const ReasonCode = {
   DAEMON_STARTUP_FAILED: "DAEMON_STARTUP_FAILED",
   DAEMON_BOOTSTRAP_MODE: "DAEMON_BOOTSTRAP_MODE",
   DAEMON_TIMER_FAILED: "DAEMON_TIMER_FAILED",
+  /**
+   * Opening this database would migrate its schema, and no approval on file names that exact
+   * migration. Distinct from INTERNAL_ERROR — which every other schema refusal uses — because
+   * the process entry point has to recognise this one to decide its exit code (#738).
+   */
+  SCHEMA_MIGRATION_NOT_APPROVED: "SCHEMA_MIGRATION_NOT_APPROVED",
   FINALIZATION_ATTEMPT_STALE: "FINALIZATION_ATTEMPT_STALE",
   FINALIZATION_COMPENSATION_REQUIRED: "FINALIZATION_COMPENSATION_REQUIRED",
 } as const;
