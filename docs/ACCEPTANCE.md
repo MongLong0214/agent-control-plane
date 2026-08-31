@@ -89,8 +89,8 @@ these 12 failures arrived with them.
 | 4 | One multi-repository run with an explicit merge order | **Met in part** | Multi-repository freezing and staleness are proven with two real repositories (CP-S25), `run_repositories.merge_order` and per-repository merge state are implemented, and merge order is enforced with a regression test. A real two-repository run merging in declared order, with the first repository's post-merge verification gating the second, has not been executed — #240. |
 | 5 | Zero role/session independence violations under GPT-down and Claude-down continuity | **Met** | CP-S19–CP-S22, CP-S24, CP-S34, all in `tests/scenarios/graph-capacity-continuity.test.ts`, all passing. Distinct sessions are asserted, and a failover the coverage plan cannot staff is refused rather than downgraded. |
 | 6 | Repo Factory bootstrap → primary CTO activation → doctor | **Met on the control-plane side** | Activation runs from a fixture `repo-factory.result.v2` through registration, binding, handoff ACK and doctor (CP-S52, passing). The producing side is a separate deliverable and does not exist yet — #246. |
-| 7 | Scenario suite + ≥3 dogfood projects + ≥30 observed run/bootstrap lifecycles with zero false completions, duplicate dispatches, accepted stale-generation results, forged gates or unauthorised merges | **Not met — requires an observation period** | The mechanisms each have a negative test proving the zero is enforced rather than hoped for. The *count* needs real operating time across three projects. Three lifecycles exist so far, the three runs of item 3. Tracked as #241. |
-| 8 | Recorded observation window and duration for the zero counts | **Not met** | Follows item 7. #241. |
+| 7 | Zero false completions, duplicate dispatches, accepted stale-generation results, forged gates or unauthorised merges | **Superseded by tooling — run `agentctl acceptance report`** | The CEO ruling on #241 discarded the `30 lifecycles × 3 projects` quota and the hand-transcribed ceremony this row used to describe. `agentctl acceptance report` reads `runs`, `audit_events` and `telemetry_metrics` directly; **its output is the evidence**, not a number copied into this file. It reports two different things for these five categories, not one — see "Items 7–8" below for why they cannot be collapsed into a single count. Zero lifecycles renders every accepted-anomaly count `N/A`, never a passing zero — see `src/export/acceptance-report.ts`. |
+| 8 | Recorded observation window and duration for the zero counts | **Superseded by tooling — run `agentctl acceptance report`** | The same command derives the window from the data's own first and last recorded activity and prints it alongside the counts. Follows item 7. |
 | 9 | Zero owner interrupts for routine technical revision during dogfood | **Not met** | Follows item 7. #241. CP-S33 and CP-S53 prove routine revision and churn do not notify upward, and both pass. |
 | 10 | Every P0 requirement linked to a scenario and evidence | **Met** | The generated report links P0 requirements to scenario declarations from the PRD tables. This is declaration traceability, not behavioural proof that a requirement is met. |
 
@@ -413,11 +413,86 @@ path works against a real project in all three execution modes — but an advers
 with full source access still finds authority and evidence gaps faster than the fix waves
 close them, and the current suite is red.
 
-## What would close items 7–9
+## Items 7–8: `agentctl acceptance report`
 
-Run three real projects through the control plane for as long as it takes to accumulate 30
-run or bootstrap lifecycles, then record the window, the duration and the five counts. The
-telemetry needed for that is already collected (`telemetry_metrics`, scoped run / task /
-quality / capacity / graph / continuity), and `agentctl` can read it back. The three runs in
-item 3 are the first three lifecycles and each one wrote its own telemetry rows, visible in
-the `telemetry` block of each evidence file.
+There is no quota here and nothing in this section is transcribed by hand — a number typed
+into a document with no reconciliation is exactly the defect `#448` item 4 removed elsewhere,
+and copying `agentctl`'s output into prose would reintroduce it for this file alone. Run:
+
+```
+agentctl acceptance report
+```
+
+against the deployment's own database. It reads `runs`, `audit_events` and `telemetry_metrics`
+and prints, as its own output:
+
+- **the observation window** — the first and last recorded activity the data actually spans,
+  and the duration between them (never a configured or constant window);
+- **lifecycle outcomes** — `completed` / `failed` / `cancelled` counts, drawn from `runs.state`.
+  `cancelled` counts `runs.state = 'CANCELLED'`, the terminal state `agentctl run cancel`
+  produces — an explicit, requested cancellation. It is **not** the same claim as an abandoned
+  lifecycle (one left to time out or orphaned with no terminal disposition at all); the schema
+  has no `ABANDONED` run state and no separate event for that, so this report does not claim one;
+- **`preventedAttempts`** — for each category, the count of `audit_events` rows written by the
+  one real production writer that records this category's guard refusing an attempt. A reason
+  code alone is not enough to find that writer: `COMPLETION_AUTHORITY_DENIED` is also the reason
+  code for an evidence-write authority refusal, a schema-migration authority refusal, and five
+  distinct canonical-turn authority refusals (`src/db/database.ts` `TRIGGER_CODES`), none of
+  which is a false completion, and `MERGE_AUTHORITY_DENIED` is also written when the daemon's own
+  finalizer lacks authority mid-finalization — a misconfiguration, not a blocked unauthorised
+  merge. `PREVENTED_ATTEMPT_WRITERS` in `src/export/acceptance-report.ts` names the exact
+  `(kind, reason_code)` pair each category actually reads, found by reading every `.record(` call
+  site in `src/` rather than assumed from the reason code, plus — for the two pairs that still
+  collapse two meanings after fixing `kind` — an `isGenuine` check against a field inside
+  `evidence_json` that narrows the rest of the way.
+  **A non-zero value here is the guard working, not a defect** — a genuine
+  `unauthorizedMerges` row is the record of an unauthorised merge being *stopped*, and reporting
+  that as an anomaly would invert what happened.
+  **Not every category has a writer.** `duplicateDispatches` (`OUTBOX_DUPLICATE_SUPPRESSED`) has
+  none: `Outbox.enqueue()` returns that code as an *allowed*, idempotent-replay `Decision` and
+  never calls `.record(` for it, on either the application-level or the trigger-sourced path. So
+  `preventedAttempts.duplicateDispatches` reads `"UNKNOWN"`, not `0` — a `0` a reader could
+  mistake for "measured and clean" is exactly the defect this correction exists to remove, one
+  field over from `acceptedAnomalies`. `preventedAttempts` is still never `"N/A"`: whether a
+  writer exists, and what it has recorded, does not depend on any lifecycle having happened;
+- **`acceptedAnomalies`** — whether the bad thing actually *landed despite* the guard: a false
+  completion that stuck, a message actually sent twice, a stale-generation result actually used,
+  a forged gate that actually got a merge through, a merge that actually landed without
+  authority. This is the count PRD item 7 means by "zero anomalies", and it is **not** the same
+  number as `preventedAttempts`. As of this writing there is no production mechanism that proves
+  any of the five after the fact — every candidate was searched and rejected (see
+  `ACCEPTED_ANOMALY_SOURCES` in `src/export/acceptance-report.ts` for the search, category by
+  category, including why the closest candidate for false completions was rejected as unreliable
+  rather than merely absent). So every category currently reads `UNKNOWN` once at least one
+  lifecycle exists, never a bare `0` — a `0` here would claim a source proved the anomaly did not
+  happen, and none does yet;
+- **daemon health**, reused from `agentctl daemon status` rather than reimplemented.
+
+**The load-bearing properties, proved by `tests/unit/acceptance-report.test.ts`:**
+
+1. Zero lifecycles renders every `acceptedAnomalies` count `N/A` and the overall verdict `N/A` —
+   never a passing zero. A database can hold tens of thousands of `audit_events` /
+   `telemetry_metrics` rows from the daemon monitoring itself (capacity probes, continuity
+   reconciliation) while `runs` stays empty; the verdict gates on lifecycles reaching a terminal
+   state, not on that self-monitoring activity, so that case still reads `N/A` rather than a
+   clean pass.
+2. `N/A` and `UNKNOWN` are different claims and the output never conflates them: `N/A` means
+   "there were no lifecycles to observe"; `UNKNOWN` means "at least one lifecycle happened but
+   nothing in this database can prove or disprove this category either way."
+3. `ANOMALIES_PRESENT` is decided from `acceptedAnomalies` alone — a `preventedAttempts` count
+   being non-zero never produces it. The realistic case today — lifecycles exist, guards have
+   fired, and every `acceptedAnomalies` source is `UNKNOWN` — is its own verdict, `UNVERIFIED`,
+   precisely so it cannot be mistaken for a clean bill of health. The full verdict vocabulary is
+   `N/A` (no lifecycles), `OBSERVED_NO_ANOMALIES` (lifecycles exist and every accepted-anomaly
+   category is a verified zero — not reachable today, since no category has a source, but the
+   logic supports it once one exists), `UNVERIFIED` (lifecycles exist, nothing positive, at
+   least one category unproven), and `ANOMALIES_PRESENT` (an actual accepted anomaly, named).
+4. A `preventedAttempts` count is keyed on the real writer's `(kind, reason_code)`, never on
+   `reason_code` alone, and a row from a *different* writer that happens to share the reason
+   code must not count: seeding a `MERGE_AUTHORITY_DENIED` row under
+   `kind: "FINALIZATION_ATTEMPT_FAILED"` (the daemon's own finalizer lacking authority) leaves
+   `unauthorizedMerges` at `0`, while the same reason code under
+   `kind: "MANAGED_WRITE_GUARD"` (the guard actually refusing an unauthorised write) counts.
+   Symmetrically, a `COMPLETION_AUTHORITY_DENIED` row stamped with one of the seven unrelated
+   SQLite trigger sentinels in its `evidence.sqlite` field does not count toward
+   `falseCompletions`.
