@@ -31,6 +31,37 @@ const appPermissions = {
   statuses: "write",
 };
 
+/** The narrowed target shape from #575: drops merge_queues/statuses, adds actions: read. */
+const narrowedAppPermissions = {
+  checks: "write",
+  contents: "write",
+  issues: "write",
+  metadata: "read",
+  pull_requests: "write",
+  actions: "read",
+};
+
+const storeWithPermissions = (
+  files: ReturnType<typeof makeAppFiles>,
+  permissions: Record<string, string>,
+): TrustedCredentialStore => {
+  const fetch: typeof globalThis.fetch = async (input) => {
+    const url = requestUrl(input);
+    if (url.endsWith("/app")) {
+      return new Response(JSON.stringify({ slug: "acp-production-gate", permissions }), { status: 200 });
+    }
+    if (url.includes("/access_tokens")) {
+      return new Response(JSON.stringify({
+        token: "installation-token-permission-shape",
+        expires_at: new Date(Date.now() + 60 * 60 * 1_000).toISOString(),
+      }), { status: 201 });
+    }
+    if (url.endsWith("/user")) return new Response(JSON.stringify({ login: "app[bot]" }), { status: 200 });
+    throw new Error(`unexpected request: ${url}`);
+  };
+  return new TrustedCredentialStore(join(files.root, "secrets"), { appEnvFile: files.envFile, fetch });
+};
+
 const makeAppFiles = (options: { appId?: string; installationId?: string } = {}) => {
   const root = credentialTempDir("acp-github-app-");
   const credentials = join(root, "credentials");
@@ -318,5 +349,66 @@ describe("GitHub App credential store", () => {
     const result = await store.githubApi({ method: "GET", path: "/user" });
     expect(result.allowed).toBe(false);
     expect(result.reasonCode).toBe(ReasonCode.GITHUB_APP_PERMISSION_DENIED);
+  });
+
+  it("accepts the currently deployed 7-permission grant shape", async () => {
+    const files = makeAppFiles();
+    const store = storeWithPermissions(files, appPermissions);
+
+    const result = await store.githubApi({ method: "GET", path: "/user" });
+    expect(result.allowed).toBe(true);
+  });
+
+  it("accepts the narrowed post-575 target grant shape with merge_queues and statuses dropped and actions read added", async () => {
+    const files = makeAppFiles();
+    const store = storeWithPermissions(files, narrowedAppPermissions);
+
+    const result = await store.githubApi({ method: "GET", path: "/user" });
+    expect(result.allowed).toBe(true);
+  });
+
+  it("refuses the narrowed grant shape plus one extra permission — a superset is never accepted", async () => {
+    const files = makeAppFiles();
+    const store = storeWithPermissions(files, { ...narrowedAppPermissions, discussions: "write" });
+
+    const result = await store.githubApi({ method: "GET", path: "/user" });
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.GITHUB_APP_PERMISSION_DENIED);
+  });
+
+  it("refuses a grant shape with the right keys but one level downgraded", async () => {
+    const files = makeAppFiles();
+    const store = storeWithPermissions(files, { ...narrowedAppPermissions, contents: "read" });
+
+    const result = await store.githubApi({ method: "GET", path: "/user" });
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.GITHUB_APP_PERMISSION_DENIED);
+  });
+
+  it("refuses a grant shape missing one key", async () => {
+    const files = makeAppFiles();
+    const { actions: _dropped, ...withoutActions } = narrowedAppPermissions;
+    const store = storeWithPermissions(files, withoutActions);
+
+    const result = await store.githubApi({ method: "GET", path: "/user" });
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    expect(result.reasonCode).toBe(ReasonCode.GITHUB_APP_PERMISSION_DENIED);
+  });
+
+  it("names every approved shape in the refusal message rather than only saying the match failed", async () => {
+    const files = makeAppFiles();
+    const store = storeWithPermissions(files, { ...narrowedAppPermissions, discussions: "write" });
+
+    const result = await store.githubApi({ method: "GET", path: "/user" });
+    expect(result.allowed).toBe(false);
+    if (result.allowed) return;
+    // Both approved shapes must be nameable from the message: the deployed 7-permission
+    // grant (via a permission only it carries) and the narrowed target (via `actions:read`,
+    // which only the narrowed shape carries).
+    expect(result.message).toContain("merge_queues:write");
+    expect(result.message).toContain("actions:read");
   });
 });

@@ -156,19 +156,56 @@ const DEFAULT_REFRESH_BEFORE_EXPIRY_MS = 5 * 60 * 1_000;
 const REQUEST_TIMEOUT_MS = 120_000;
 
 /**
- * The owner-approved production grant. Keep this exact rather than accepting a superset:
- * adding a new capability to the App must be a deliberate deployment review, never a
- * silent broadening of the daemon's merge authority.
+ * The owner-approved App permission grants. Authentication succeeds only when the
+ * observed permission set is an *exact* match for one of these — never a superset, and
+ * never a partial or downgraded subset. A widened App still fails to authenticate unless
+ * someone deliberately appends that exact widened shape here, which is a code change and
+ * a review, never a silent broadening of the daemon's merge authority.
+ *
+ * This is a list, not a single shape, so the *ordering* dependency described in #575 goes
+ * away: the GitHub App grant (an owner action in GitHub settings) and this constant (a
+ * code change that ships through CI and a merge) no longer have to change in the same
+ * instant for authentication to keep working. Whichever changes first, the *other* shape
+ * in this list still matches until the second side catches up.
+ *
+ * Every entry must carry a comment naming why it exists — an unexplained entry is exactly
+ * how a list like this rots into a superset by accretion, one addition at a time.
  */
-const REQUIRED_APP_PERMISSIONS: Readonly<Record<string, "read" | "write">> = {
-  checks: "write",
-  contents: "write",
-  issues: "write",
-  merge_queues: "write",
-  metadata: "read",
-  pull_requests: "write",
-  statuses: "write",
-};
+const APPROVED_APP_PERMISSION_SHAPES: ReadonlyArray<Readonly<Record<string, "read" | "write">>> = [
+  {
+    // The grant deployed before #575, retained so the owner can narrow the App's grant in
+    // GitHub settings at any moment with no coordinated deploy. Remove this entry once the
+    // owner confirms in GitHub settings that the App's grant no longer includes
+    // merge_queues or statuses — after that, only the narrowed shape below can ever match,
+    // and this entry existing would itself be the silent-superset risk the list guards
+    // against.
+    checks: "write",
+    contents: "write",
+    issues: "write",
+    merge_queues: "write",
+    metadata: "read",
+    pull_requests: "write",
+    statuses: "write",
+  },
+  {
+    // The #575 target: merge_queues and statuses are dropped (no `/merge-queue` endpoint is
+    // ever called, and the Gate publishes a check-run, not a commit status), and actions:
+    // read is added. actions: read is not required against a public repository — GitHub
+    // permits an installation token to read a public repository's Actions run data
+    // (`GET /repos/:o/:r/actions/runs/:id`, called from
+    // `assertTrustedWorkflowCheck` in github-kernel.ts) with only metadata: read — but it
+    // is required the moment the App is installed on a private repository, where that same
+    // call needs the permission explicitly. #240's two-repository run makes a private
+    // installation reachable, so the permission has to be in the approved shape before
+    // that lands, not after it fails in production.
+    checks: "write",
+    contents: "write",
+    issues: "write",
+    metadata: "read",
+    pull_requests: "write",
+    actions: "read",
+  },
+];
 
 const asObject = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -185,14 +222,27 @@ const parseJson = (body: string): Record<string, unknown> | null => {
 
 const base64url = (value: string | Buffer): string => Buffer.from(value).toString("base64url");
 
-const hasExactPermissions = (permissions: Record<string, unknown> | null): boolean => {
-  if (!permissions) return false;
-  const expected = Object.entries(REQUIRED_APP_PERMISSIONS);
+/** A single approved shape's own exact-match test: same key count, same level per key. */
+const matchesShape = (
+  permissions: Record<string, unknown>,
+  shape: Readonly<Record<string, "read" | "write">>,
+): boolean => {
+  const expected = Object.entries(shape);
   return (
     Object.keys(permissions).length === expected.length &&
     expected.every(([name, level]) => permissions[name] === level)
   );
 };
+
+const describePermissionShape = (shape: Readonly<Record<string, "read" | "write">>): string =>
+  `{${Object.entries(shape).map(([name, level]) => `${name}:${level}`).join(", ")}}`;
+
+/** Named in the refusal message so an operator does not have to read this source to learn it. */
+const describeApprovedPermissionShapes = (): string =>
+  APPROVED_APP_PERMISSION_SHAPES.map(describePermissionShape).join(" OR ");
+
+const hasApprovedPermissionShape = (permissions: Record<string, unknown> | null): boolean =>
+  permissions !== null && APPROVED_APP_PERMISSION_SHAPES.some((shape) => matchesShape(permissions, shape));
 
 /** Parse only assignments; executing a deployment env file would make it a code-input surface. */
 const parseEnvironmentFile = (contents: string): Map<string, string> => {
@@ -486,10 +536,11 @@ export class TrustedCredentialStore {
         {},
       );
     }
-    if (!hasExactPermissions(permissions)) {
+    if (!hasApprovedPermissionShape(permissions)) {
       return deny(
         ReasonCode.GITHUB_APP_PERMISSION_DENIED,
-        "GitHub App permissions do not match the owner-approved production merge grant",
+        "GitHub App permissions do not match any owner-approved grant shape " +
+          `(expected one of: ${describeApprovedPermissionShapes()})`,
         {},
       );
     }
