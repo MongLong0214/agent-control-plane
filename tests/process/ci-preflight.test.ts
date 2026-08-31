@@ -58,6 +58,7 @@ describe("ci preflight", () => {
     const result = run(REPO_ROOT);
 
     expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toMatch(/ci-preflight: [1-9]\d* workflow file/);
     expect(result.stdout).toContain("every package script exists");
     expect(result.stdout).toContain("every run command parses under Bash");
 
