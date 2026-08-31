@@ -544,6 +544,13 @@ describe("role continuity (CP-S19 – CP-S24)", () => {
     harness.claude.setCapacity(reading("claude", harness.clock));
     harness.grok.setCapacity(reading("grok", harness.clock, { runtimeHealth: "UNAVAILABLE", buckets: [] }));
 
+    // #735 — grok is retired from the *unattended* probe `continuity.evaluate()` runs by
+    // default, so its reading has to be seeded through an explicit ask first (the same path
+    // a real deployment uses to probe it on demand). This still exercises the property this
+    // test is about: even with a real, current UNAVAILABLE reading on file, grok's absence
+    // never degrades continuity.
+    await harness.cp.capacity.refresh(RefreshTrigger.PROVIDER_SWITCH_OR_FAILURE, ["grok"]);
+
     const plan = await harness.cp.continuity.evaluate("grok gone");
     expect(plan.outcome).toBe("FULL_COVERAGE");
     expect(plan.mode).toBe(ContinuityMode.NORMAL);

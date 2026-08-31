@@ -1188,6 +1188,36 @@ const GUARDS = [
     killedBy: ["tests/unit/grok-billing-probe.test.ts"],
   },
   {
+    what: "grok is excluded from the unattended capacity probe by default (#735)",
+    symbols: ["isAutoProbeEnabled"],
+    file: "src/capacity/capacity-monitor.ts",
+    find: 'export const UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT: ReadonlySet<string> = new Set(["grok"]);',
+    replace: "export const UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT: ReadonlySet<string> = new Set();",
+    killedBy: [
+      "tests/unit/grok-probe-retirement.test.ts::a default configuration does not probe grok during an unattended refresh",
+    ],
+  },
+  {
+    what: "naming grok in unattendedProbeOptIns actually restores it to the unattended probe",
+    symbols: ["isAutoProbeEnabled"],
+    file: "src/capacity/capacity-monitor.ts",
+    find: "    return (this.#options.unattendedProbeOptIns ?? []).includes(provider);",
+    replace: "    return false;",
+    killedBy: [
+      "tests/unit/grok-probe-retirement.test.ts::an explicit opt in probes grok during an unattended refresh",
+    ],
+  },
+  {
+    what: "a provider retired from the unattended probe is not also faulted for a sensor file the sweep will never refresh again",
+    symbols: ["isAutoProbeEnabled"],
+    file: "src/doctor/doctor.ts",
+    find: "      if (!this.capacity.isAutoProbeEnabled(provider)) continue;\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/grok-probe-retirement.test.ts::a stale grok sensor file does not resurface as a doctor finding after retirement",
+    ],
+  },
+  {
     what: "the handshake deadline stops governing once the peer has authenticated",
     file: "src/daemon/agentcpd.ts",
     find: "    beginRequest(method ?? \"<none>\");\n",

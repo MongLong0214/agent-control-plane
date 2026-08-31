@@ -520,6 +520,11 @@ export class Doctor {
 
     for (const adapter of this.providers.production()) {
       const provider = adapter.provider;
+      // A provider excluded from the unattended probe (#735) never gets this file refreshed
+      // again by that sweep. Checking its age would resurrect exactly the always-on warning
+      // retirement removes — a registered-but-unprobed provider is expected to have no
+      // fresh file, not a stale one, and a missing file is not evidence of anything here.
+      if (!this.capacity.isAutoProbeEnabled(provider)) continue;
       const file = capacitySensorFile(this.capacitySensorFiles.directory, provider);
       if (!existsSync(file)) {
         findings.push({
