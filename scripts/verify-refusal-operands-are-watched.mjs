@@ -19,9 +19,11 @@
  *
  * Usage: verify-refusal-operands-are-watched.mjs [--json]
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { CASES_DIR } from "./lib/falsifiability-cases.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -61,10 +63,30 @@ if (table === null) {
   process.stdout.write("  could not read the GUARDS table\n\nRESULT: FAIL — nothing was compared.\n");
   process.exit(2);
 }
-/** Every `find:` anchor, so an operand appearing inside one counts as named. */
-const anchors = [...table[1].matchAll(/find:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/g)].map(
-  (m) => (m[1] ?? m[2] ?? "").replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\"),
-);
+/** Every `find:` anchor in a source, so an operand appearing inside one counts as named. */
+const anchorsIn = (source) =>
+  [...source.matchAll(/find:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')/g)].map((m) =>
+    (m[1] ?? m[2] ?? "").replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\"),
+  );
+
+/**
+ * #741 moved rows out of the array and into one module per case. Reading only the array would
+ * make every migrated row invisible here, and this check reports an operand no row names — so a
+ * row it cannot see becomes an operand it declares unwatched. That is the failure mode this whole
+ * family of checks exists to catch, arriving in the checker rather than in the checked.
+ *
+ * Read as text with the same regex rather than imported: this script is synchronous and
+ * dependency-free by the same PRD §17.4 contract as the harness, and its subject is what a row
+ * *names*, not what it does.
+ */
+const casesDir = join(ROOT, CASES_DIR);
+const caseSources = existsSync(casesDir)
+  ? readdirSync(casesDir)
+      .filter((name) => name.endsWith(".mjs"))
+      .sort()
+      .map((name) => readFileSync(join(casesDir, name), "utf8"))
+  : [];
+const anchors = [table[1], ...caseSources].flatMap(anchorsIn);
 
 const unnamed = [];
 let operands = 0;

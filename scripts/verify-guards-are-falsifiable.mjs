@@ -37,6 +37,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { CASES_DIR, loadFalsifiabilityCases } from "./lib/falsifiability-cases.mjs";
+
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const VITEST = join(ROOT, "node_modules", ".bin", "vitest");
 /**
@@ -3363,35 +3365,10 @@ const GUARDS = [
       "tests/unit/acceptance-report.test.ts::is ANOMALIES_PRESENT only when an accepted anomaly is an actual positive count, never from prevented attempts alone",
     ],
   },
-  {
-    // #575: the App permission check moved from a single exact shape to an append-only list
-    // of exact shapes, precisely so the App's grant and this code no longer have to narrow in
-    // the same instant. Removing the key-count check turns every shape's match into "contains
-    // at least these keys at these levels" — a superset would then match, which is exactly the
-    // silent broadening the list exists to prevent.
-    what: "an App permission grant with an extra key beyond an approved shape is refused, not accepted as a superset",
-    file: "src/github/credential-store.ts",
-    find: "    Object.keys(permissions).length === expected.length &&\n",
-    replace: "",
-    killedBy: [
-      "tests/unit/github-app-credential-store.test.ts::refuses the narrowed grant shape plus one extra permission — a superset is never accepted",
-    ],
-  },
-  {
-    // The transitional shape (the grant deployed before #575) has to keep matching until the
-    // owner narrows the App in GitHub settings, and the narrowed target shape has to already
-    // match so that narrowing needs no coordinated deploy. Downgrading the narrowed shape's
-    // `actions` entry to `write` makes it require a permission level the actual narrowed grant
-    // (`actions: read`) does not have, so only the transitional shape would still match —
-    // reproducing exactly the ordering deadlock #575 exists to remove.
-    what: "the narrowed post-575 target shape is present in the approved list, not only the transitional one",
-    file: "src/github/credential-store.ts",
-    find: "    actions: \"read\",\n",
-    replace: "    actions: \"write\",\n",
-    killedBy: [
-      "tests/unit/github-app-credential-store.test.ts::accepts the narrowed post-575 target grant shape with merge_queues and statuses dropped and actions read added",
-    ],
-  },
+  // #741 moved two rows out of this array and into `scripts/falsifiability-cases/`:
+  // `app-permission-superset-is-refused` and `narrowed-post-575-shape-is-approved`. They ran
+  // unchanged; what changed is that a branch adding a row no longer has to write at this one
+  // point in this one file.
   {
     // Requirement 4: a refusal must name which shapes were expected, not just that the match
     // failed — otherwise the operator has to read this source to learn what to grant. Removing
@@ -3406,6 +3383,33 @@ const GUARDS = [
     ],
   },
 ];
+
+/**
+ * The rows that live one-per-file under `scripts/falsifiability-cases/` (#741).
+ *
+ * This is the **first** thing the run does, deliberately, and the ordering is the acceptance
+ * criterion rather than a preference. Everything below — the `what:` count, the anchor pass, the
+ * snapshot, the mutations — happens only if every case module parsed and validated. A file that
+ * does not parse therefore has no path to a check that counts things and calls the count a pass,
+ * which is exactly the path taken on 2026-08-31: `grep -c "what:"` answered 298, the expected
+ * arithmetic agreed, and `node` answered `SyntaxError: Unexpected token ':'`.
+ *
+ * The load is fail-closed in every direction (empty directory, unreadable module, duplicate id,
+ * a module carrying two rows, a `killedBy` naming a file that is not there) because a loader that
+ * skips what it cannot read is worse than the single array it replaces: the array at least died
+ * loudly, while a skipped module subtracts a row and leaves the survivors reporting a full sweep.
+ */
+let CASES;
+try {
+  CASES = await loadFalsifiabilityCases(ROOT);
+} catch (error) {
+  process.stdout.write(`verify-guards-are-falsifiable: ${error.message}\n`);
+  process.stdout.write(`\nRESULT: FAIL — ${CASES_DIR} was refused, so nothing was run.\n`);
+  process.exit(1);
+}
+
+/** The array and the directory are one table from here down. */
+const ALL_ROWS = [...GUARDS, ...CASES];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
 
@@ -3425,8 +3429,8 @@ const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".
  */
 const anchorsOnly = process.argv.includes("--anchors-only");
 
-const rows = GUARDS.filter((g) => !g.skip).filter(
-  (g) => !only || g.what.includes(only) || g.file.includes(only),
+const rows = ALL_ROWS.filter((g) => !g.skip).filter(
+  (g) => !only || g.what.includes(only) || g.file.includes(only) || (g.id ?? "").includes(only),
 );
 
 const out = (line) => process.stdout.write(line + "\n");
@@ -3454,9 +3458,13 @@ if (tableSource === null) {
   process.exit(2);
 }
 const declaredWhats = [...tableSource[1].matchAll(/^\s*what: "/gm)].length;
+// Its subject is the inline array only, and it has to stay that way: the case modules under
+// `scripts/falsifiability-cases/` cannot lose a row to a missing `},{` because there is no
+// enclosing literal to merge into. Their analogue is the loader's one-export/one-object check,
+// which has already run above.
 if (declaredWhats !== GUARDS.length) {
   out(
-    `verify-guards-are-falsifiable: the table has ${declaredWhats} \`what:\` line(s) and ` +
+    `verify-guards-are-falsifiable: the inline table has ${declaredWhats} \`what:\` line(s) and ` +
       `${GUARDS.length} row(s).`,
   );
   out("  A missing `},{` merges two rows into one object; the earlier one is discarded in silence.");
@@ -3756,7 +3764,7 @@ if (!lociBlock) {
   process.exit(1);
 }
 const loci = [...lociBlock[1].matchAll(/^\s*(\w+):/gm)].map((m) => m[1]);
-const claimed = new Set(GUARDS.flatMap((g) => g.symbols ?? []));
+const claimed = new Set(ALL_ROWS.flatMap((g) => g.symbols ?? []));
 const unclaimed = loci.filter((s) => !claimed.has(s));
 
 // ---------------------------------------------------------------------------
