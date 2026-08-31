@@ -16,7 +16,7 @@
     "postinstall": "node scripts/build-native-peercred.mjs",
     "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "node scripts/verify-v1-experiment-isolation-declaration.mjs && vitest run",
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",
     "test:e2e": "vitest run tests/e2e --testTimeout=600000",
