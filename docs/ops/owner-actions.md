@@ -246,7 +246,12 @@ git commit produces new bytes, not the ones that were actually running:
     BYTES_BACKUP="$HOME/.agent-control-plane/deploy-backups/dist-pre-512-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$BYTES_BACKUP" && chmod 700 "$BYTES_BACKUP"
     cp -a /Users/isaac/projects/agent-control-plane/dist "$BYTES_BACKUP/dist"
-    shasum -a 256 /Users/isaac/projects/agent-control-plane/dist/daemon/agentcpd.js | tee "$BYTES_BACKUP/agentcpd.js.sha256"
+    # Hash the copy, not the source. A hash of the source proves what was on the live tree, which
+    # is not the thing item 6 will restore from — a truncated or partial copy would carry a
+    # perfectly correct receipt describing bytes that are no longer anywhere.
+    shasum -a 256 "$BYTES_BACKUP/dist/daemon/agentcpd.js" | tee "$BYTES_BACKUP/agentcpd.js.sha256"
+    shasum -a 256 /Users/isaac/projects/agent-control-plane/dist/daemon/agentcpd.js
+    # The two lines above must print the same digest. If they differ, the copy is not the tree.
     cp "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
     cp "$HOME/.agent-control-plane/agentcpd-launch.sh" "$BYTES_BACKUP/agentcpd-launch.sh"
     chmod 600 "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
@@ -257,8 +262,24 @@ git commit produces new bytes, not the ones that were actually running:
     echo "$BYTES_BACKUP"
 
 The plist and the launcher go into **this execution's** `$BYTES_BACKUP` directory, beside the
-`dist` copy and named by the same timestamp as `$BACKUP_PATH`, and `set -e` plus the three
-`test` lines make a partial backup abort rather than look complete.
+`dist` copy, and `set -e` plus the `test` lines make a partial backup abort rather than look
+complete.
+
+`$BACKUP_PATH` and `$BYTES_BACKUP` are produced by two independent commands — `state-admin.js`
+names the database backup, and the shell names the bytes directory — so **their timestamps are
+not the same value and must not be treated as a shared identity**. An earlier revision of this
+section claimed they were. Seal the pairing explicitly instead, and let item 6 read it back:
+
+    cat > "$BYTES_BACKUP/rollback-receipt.json" <<JSON
+    { "databaseBackup": "$BACKUP_PATH",
+      "bytesBackup": "$BYTES_BACKUP",
+      "agentcpdSha256": "$(cut -d' ' -f1 "$BYTES_BACKUP/agentcpd.js.sha256")" }
+    JSON
+    cat "$BYTES_BACKUP/rollback-receipt.json"
+
+The receipt is what makes the two halves one operation. Without it the pairing lives only in a
+shell variable that dies with the session, and a later rollback would be picking two backups
+that merely look contemporaneous.
 
 That co-location is not tidiness. `install-launchd.sh` does snapshot the plist and launcher —
 `snapshot_current_deployment` (`deploy/install-launchd.sh:143-155`) — but it runs from exactly
@@ -378,9 +399,19 @@ construction.**
       echo "agentcpd lock remains after stop; refusing to replace deployment bytes" >&2
       exit 1
     fi
+    # Everything this rollback will read, checked before anything is destroyed. The list is
+    # derived from the commands below, not from what seems likely to be missing: each `cp`
+    # source and each file passed to `node` appears here, in the form it is used in.
     test -f "$BYTES_BACKUP/dist/daemon/agentcpd.js"
+    test -f "$BYTES_BACKUP/dist/db/state-admin.js"
+    test -r "$BYTES_BACKUP/dist/db/state-admin.js"
     test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
+    test -s "$BYTES_BACKUP/agentcpd-launch.sh"
     test -s "$BACKUP_PATH"
+    test -s "$BACKUP_PATH.manifest.json"
+    sqlite3 "$BACKUP_PATH" "PRAGMA integrity_check;" | grep -qx ok
+    shasum -a 256 "$BYTES_BACKUP/dist/daemon/agentcpd.js" | \
+      cut -d' ' -f1 | grep -qxf <(cut -d' ' -f1 "$BYTES_BACKUP/agentcpd.js.sha256")
     rm -rf /Users/isaac/projects/agent-control-plane/dist
     cp -a "$BYTES_BACKUP/dist" /Users/isaac/projects/agent-control-plane/dist
     cp "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist" "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist"
@@ -391,9 +422,21 @@ construction.**
       --database "$HOME/.agent-control-plane/state.sqlite" --confirm-restore
     bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
 
-The three `test` lines run **before** the first destructive command, so a missing or truncated
-backup half stops the rollback while everything is still in place, rather than after `dist` is
-already gone.
+Those checks run **before** the first destructive command, and the list is complete rather than
+representative: every `cp` source and every path handed to `node` below appears above, checked
+in the form it is used in — `-r` on `state-admin.js` because `node` reads it, `-s` on the
+launcher and plist because they are copied and must not be empty.
+
+An earlier revision checked only three of them and then consumed `agentcpd-launch.sh` and
+`dist/db/state-admin.js` without ever having looked at either. If one of those were missing or
+truncated, `rm -rf dist` and part of the restore would already have run before the failure —
+`set -e` would stop the daemon from starting, but the rollback itself would be stranded
+half-applied. **A preflight that names some of what follows is not a preflight**; it is a
+sample, and the ones it omits are exactly the ones nobody thought about.
+
+The hash comparison closes the other half: it re-hashes the bytes **in the backup**, not the
+source they came from, so a copy that silently truncated is caught here rather than after the
+live `dist` is gone.
 
 `install-launchd.sh rollback` is deliberately **not** used here, and the reason is worth
 stating because reusing it looks obviously right. That path does stop the job, wait for the
