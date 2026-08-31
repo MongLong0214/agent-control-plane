@@ -72,72 +72,28 @@ jobs:
       # addons, prebuilt here rather than compiled on load. macos-15 is the only runner this job
       # uses, so this is also where #539's Darwin-only peercred addon gets its one build.
       - run: pnpm native:peercred:build
-      - run: pnpm lint
-      - run: pnpm terminology
-      # #705 — this check is correct and was reachable from neither package.json nor here, so
-      # a real defect it found (a `_STALE` code absent from STALENESS_REASON_CODES) reported
-      # into a room nobody was in. Dependency-free by the same PRD §17.4 contract as
-      # `terminology` and `release:version` above and below it.
-      - run: pnpm reason-codes
-      # Reports, never fails: stale evidence is a fact to see, and a check that fails on a
-      # true statement gets switched off. --strict exists for when a release wants a gate.
-      - run: pnpm evidence:freshness
-      - run: pnpm invariants
-      - run: pnpm typecheck
-      # #705's static half: every direct script has a plausible invocation site. The command
-      # prints that this cannot establish execution and that dynamic measurement remains #705.
-      - run: pnpm scripts:plausible-callers
-      # Mutable repository structure is named by symbols or derived at the point of use. This
-      # catches four copied coordinate forms that already went stale in tests and documentation.
-      - run: pnpm coordinates:stale
-      # Seconds, and it answers the question that actually goes stale: does every mutation row
-      # still name a line that exists. Editing a guarded line renames its anchor and the row
-      # silently stops checking anything — three times on one branch, each found only when the
-      # full sweep reached it forty minutes in. This fails first instead.
-      - run: pnpm guards:anchors
-      # The question that found three of the four findings in this branch's final review: which
-      # operand of a refusal does no falsifiability row name. The harness answers "is this guard
-      # tested" for the lines someone wrote a row for; it cannot answer which lines nobody did.
-      - run: pnpm guards:operands
-      # #539 lands src/core/peercred.ts unreachable from every live surface on purpose — a new
-      # call site (or a ControlPlane export) is a RED mutant here, not a deliverable.
-      - run: pnpm guards:peercred-unreachable
-      # Two defect classes this branch hit twice each, turned into checks so the third time
-      # is a failing step rather than a review finding.
+      # One step, one manifest, one executor. Every gate this job runs is in
+      # `scripts/lib/prepush-gates.mjs`, and `pnpm gates` is what a developer runs before pushing
+      # — the same command, the same order, the same fail-fast stop. It replaced twenty listed
+      # steps here because a list CI owns is a list nobody can execute: #736 was verified locally
+      # against a hand-made set of four checks and failed here in 35 seconds on `pnpm lint`, which
+      # was not on it, and the same wrong set went into four subagent briefs.
       #
-      # `migrations:check` freezes what each migration does. v24's DDL was edited in place
-      # across two correction rounds; a database created at the earlier one then sat at that
-      # version with bodies nobody's code expected and could not settle a turn.
+      # The job log stays per-gate. The runner prints a banner and an exit code for every gate, an
+      # `::error::` annotation naming the one that failed, and a table of all of them to the run's
+      # step summary — which is also the readback that this job ran the runner rather than a step
+      # list of its own.
       #
-      # `schema:census` refuses a table guarded on UPDATE or DELETE and open on INSERT.
-      # `INSERT OR REPLACE` skips the implicit delete's triggers on a connection with
-      # recursive_triggers off, which is any connection ACP did not open. Adding it found two
-      # more tables in that shape within a minute of first running.
-      - run: pnpm migrations:check
-      - run: pnpm schema:census
-      # #676: Every inline-SQL direct call whose TypeScript property symbol is exactly Db.run and
-      # that names a turn-fence table is in that table's declared application owner.
-      - run: pnpm schema:writers
-      # A trigger sentinel with no entry in TRIGGER_CODES reaches its caller as a raw Error
-      # instead of a Decision, so a refusal is indistinguishable from a bug. The whole
-      # canonical-turn ledger was in that state, and a census found five more that predate it.
-      - run: pnpm schema:denials
-      # A trigger declared and named by no required registry is created on a fresh install and
-      # never checked again — drop it from a live database and nothing notices. The registries are
-      # hand-written lists, and four defects on this branch were a hand-written list that stopped
-      # matching what it enumerates.
-      - run: pnpm schema:registry
-      # A wrapped CommitLore trailer is not a trailer: git ends the block at the continuation
-      # line and the record is stored by nobody. It happened six times on 2026-08-22, and
-      # every one was *detected* — `commitlore validate` printed a warning and exited 0, after
-      # the commit it described already existed. The local commit-msg hook refuses it up
-      # front; this is the half that holds for a clone that never installed the hooks.
-      - run: pnpm trailers ${{ github.event.pull_request.base.sha && format('{0}..HEAD', github.event.pull_request.base.sha) || 'HEAD~1..HEAD' }}
-      - run: pnpm build
-      # One suite run in each matrix leg. Its JSON belongs to the gate that judged this exact run,
-      # and traceability consumes that JSON rather than running the suite a second time: a second
-      # run is a different execution, so anything it reports is a claim about a run no gate judged.
-      - run: pnpm test
+      # `pnpm gates:ci-parity` (a gate inside the manifest) refuses any step added to this job that
+      # verifies something the manifest does not hold, in either direction. Adding `- run: pnpm
+      # <check>` below is a red build, not a quiet divergence.
+      #
+      # ACP_TRAILERS_RANGE is the one workflow-specific value the runner takes: which commits to
+      # read is a property of the event GitHub is handling, not of the gate. Unset locally, where
+      # the check uses its own default of `origin/main..HEAD`.
+      - run: pnpm gates
+        env:
+          ACP_TRAILERS_RANGE: ${{ github.event.pull_request.base.sha && format('{0}..HEAD', github.event.pull_request.base.sha) || 'HEAD~1..HEAD' }}
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         if: always()
         with:
