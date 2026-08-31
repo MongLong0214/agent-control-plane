@@ -242,10 +242,34 @@ use (the app root and node path are not changing — only the tree's contents ar
 step, "roll back the bytes" in item 6 would have nothing to restore to, since rebuilding from any
 git commit produces new bytes, not the ones that were actually running:
 
+    set -e
     BYTES_BACKUP="$HOME/.agent-control-plane/deploy-backups/dist-pre-512-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$BYTES_BACKUP" && chmod 700 "$BYTES_BACKUP"
     cp -a /Users/isaac/projects/agent-control-plane/dist "$BYTES_BACKUP/dist"
     shasum -a 256 /Users/isaac/projects/agent-control-plane/dist/daemon/agentcpd.js | tee "$BYTES_BACKUP/agentcpd.js.sha256"
+    cp "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist" "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
+    cp "$HOME/.agent-control-plane/agentcpd-launch.sh" "$BYTES_BACKUP/agentcpd-launch.sh"
+    chmod 600 "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
+    chmod 700 "$BYTES_BACKUP/agentcpd-launch.sh"
+    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
+    test -s "$BYTES_BACKUP/agentcpd-launch.sh"
+    test -f "$BYTES_BACKUP/dist/daemon/agentcpd.js"
+    echo "$BYTES_BACKUP"
+
+The plist and the launcher go into **this execution's** `$BYTES_BACKUP` directory, beside the
+`dist` copy and named by the same timestamp as `$BACKUP_PATH`, and `set -e` plus the three
+`test` lines make a partial backup abort rather than look complete.
+
+That co-location is not tidiness. `install-launchd.sh` does snapshot the plist and launcher —
+`snapshot_current_deployment` (`deploy/install-launchd.sh:143-155`) — but it runs from exactly
+one call site, inside `install|upgrade` (`:338`), and this procedure calls neither. So no
+snapshot is created by this run. And `rollback` selects one with
+`find "$deploy_backups_dir" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1` (`:373`) — the
+newest directory *by name*, which would be some earlier install's artifacts, or nothing at all
+(`fail "no prior deployment snapshot is available"`).
+
+**A rollback that restores a plist from a past install is not a rollback of this operation.**
+Both halves of item 6 therefore name `$BYTES_BACKUP` explicitly and never let a tool pick.
 
 **3. Stop the job, then rebuild the candidate, then validate on a throwaway copy — never the
 live file.**
@@ -354,23 +378,41 @@ construction.**
       echo "agentcpd lock remains after stop; refusing to replace deployment bytes" >&2
       exit 1
     fi
+    test -f "$BYTES_BACKUP/dist/daemon/agentcpd.js"
+    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"
+    test -s "$BACKUP_PATH"
     rm -rf /Users/isaac/projects/agent-control-plane/dist
     cp -a "$BYTES_BACKUP/dist" /Users/isaac/projects/agent-control-plane/dist
-    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh rollback \
-      --database-backup "$BACKUP_PATH"
+    cp "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist" "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist"
+    cp "$BYTES_BACKUP/agentcpd-launch.sh" "$HOME/.agent-control-plane/agentcpd-launch.sh"
+    chmod 600 "$HOME/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist"
+    chmod 700 "$HOME/.agent-control-plane/agentcpd-launch.sh"
+    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \
+      --database "$HOME/.agent-control-plane/state.sqlite" --confirm-restore
+    bash /Users/isaac/projects/agent-control-plane/deploy/install-launchd.sh start
 
-The database half is delegated to `install-launchd.sh rollback` rather than driven by hand,
-because that path already stops the job, waits for the lock **fail-closed**, restores the
-database through `state-admin.js`, restores the saved plist and launcher, and starts the job
-(`deploy/install-launchd.sh:367-386`). Reproducing those steps here would reproduce them
-without the `fail`.
+The three `test` lines run **before** the first destructive command, so a missing or truncated
+backup half stops the rollback while everything is still in place, rather than after `dist` is
+already gone.
 
-Only the `dist` restore is written out, because `rollback` snapshots the launchd artifacts and
-the database — not the build output. That is exactly why the guard above it is not optional:
-`rm -rf dist` against a still-running daemon replaces the bytes of a live process, and the
-database restore is then refused by the lock a moment later, leaving a **partial rollback** —
-old bytes, new schema — which is the one combination `applySchema` refuses outright and
-`KeepAlive` then retries forever.
+`install-launchd.sh rollback` is deliberately **not** used here, and the reason is worth
+stating because reusing it looks obviously right. That path does stop the job, wait for the
+lock fail-closed, restore the database and restore a plist and launcher — but it selects them
+with `find … | sort | tail -n 1` (`deploy/install-launchd.sh:373`), the newest directory in
+`deploy-backups/` **by name**. This procedure never calls `install`/`upgrade`, which is the
+only caller of `snapshot_current_deployment` (`:143-155`, called at `:338`), so it creates no
+snapshot of its own. `rollback` would therefore either abort with `no prior deployment
+snapshot is available`, or restore the plist and launcher of some earlier install — **a
+rollback to an identity that is not the one this operation replaced.**
+
+So the restore names `$BYTES_BACKUP` explicitly at every step and lets nothing pick for it.
+`state-admin.js` is invoked from the **backup's** `dist`, not the live tree's, because the live
+tree's `dist` is what is being replaced two lines above.
+
+The guard above all of this is not optional: `rm -rf dist` against a still-running daemon
+replaces the bytes of a live process, and the database restore is then refused by the lock a
+moment later, leaving a **partial rollback** — old bytes, new schema — the one combination
+`applySchema` refuses outright and `KeepAlive` then retries forever.
 
 Restoring only the database and leaving 34-declaring bytes in place is nearly harmless — a build
 opening a database *older* than itself just migrates forward again, reproducing the state being
