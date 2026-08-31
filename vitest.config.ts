@@ -1,6 +1,10 @@
 import { defineConfig } from "vitest/config";
 import { fileURLToPath } from "node:url";
 
+import { prepareVitestRpcTrace, VITEST_RPC_TRACE_ENV } from "./tests/helpers/vitest-rpc-trace.ts";
+
+const rpcTrace = prepareVitestRpcTrace(process.env[VITEST_RPC_TRACE_ENV], process.cwd());
+
 export default defineConfig({
   resolve: {
     alias: {
@@ -19,7 +23,13 @@ export default defineConfig({
     pool: "forks",
     // The JSON reporter is declared here rather than passed on the command line: `pnpm test --`
     // forwards `--` to vitest, which then has to guess whether the rest are flags or filters.
-    reporters: process.env.CI ? ["default", "junit", "json"] : ["default"],
+    reporters: [
+      ...(process.env.CI ? (["default", "junit", "json"] as const) : (["default"] as const)),
+      ...(rpcTrace ? [rpcTrace.reporter] : []),
+    ],
+    setupFiles: rpcTrace
+      ? [fileURLToPath(new URL("./tests/helpers/vitest-rpc-trace-worker.ts", import.meta.url))]
+      : [],
     outputFile: {
       junit: "evidence/junit.xml",
       json: "evidence/local/ci-vitest-results.json",
