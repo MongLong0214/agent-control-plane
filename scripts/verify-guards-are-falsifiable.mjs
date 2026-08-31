@@ -3260,6 +3260,41 @@ const GUARDS = [
       "tests/unit/github-app-credential-store.test.ts::names every approved shape in the refusal message rather than only saying the match failed",
     ],
   },
+  {
+    // #734 criterion 3, the row that kills the shape the brief names explicitly: a re-evaluation
+    // that fails must yield STALE right away, never the previous healthy value with a checked_at
+    // that quietly stopped advancing. Forcing the condition to `false` makes a failed attempt
+    // fall straight through to the freshness-window check, which still passes (the last success
+    // is recent), so the previous — now wrong — status is returned as if nothing had failed.
+    what: "#734: a doctor re-evaluation that fails is reported STALE immediately, not the retained previous healthy value",
+    file: "src/doctor/doctor.ts",
+    find: "  if (lastAttempt && !lastAttempt.ok && Date.parse(lastAttempt.at) >= Date.parse(checkedAt)) {\n",
+    replace: "  if (false) {\n",
+    killedBy: ["tests/unit/doctor-health-freshness.test.ts"],
+  },
+  {
+    // The other half of #734 criterion 1: an evaluation old enough to have exceeded the bounded
+    // freshness window must not be handed back as its own (possibly long-stale) status. Forcing
+    // this condition to `false` makes every report current forever, regardless of age — the
+    // exact defect the whole freshness bound exists to remove.
+    what: "#734: a doctor report older than the freshness window is reported STALE rather than reused as current",
+    file: "src/doctor/doctor.ts",
+    find: "  if (ageMs > freshnessMs) {\n",
+    replace: "  if (false) {\n",
+    killedBy: ["tests/unit/doctor-health-freshness.test.ts"],
+  },
+  {
+    // #734 criterion 2: a continuity reconciliation is the daemon's own hook for "capacity or
+    // continuity state changed", reached both by the periodic capacity-sensor tick and by the
+    // reactive provider-failure callback. Removing the doctor refresh from it silently regresses
+    // to the pre-#734 shape — a report re-evaluated only at startup — while every other part of
+    // `reconcileContinuity` keeps working, so nothing else here would notice.
+    what: "#734: a continuity reconciliation re-evaluates the persisted system doctor snapshot",
+    file: "src/daemon/daemon.ts",
+    find: '      await this.runPeriodic("doctor_refresh", () => this.runSystemDoctorCheck().then(() => undefined));\n',
+    replace: "",
+    killedBy: ["tests/unit/daemon-doctor-freshness.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

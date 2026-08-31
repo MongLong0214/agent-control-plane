@@ -62,6 +62,112 @@ export interface DoctorReport {
   ranAt: string;
 }
 
+/**
+ * #734 — a `DoctorReport` is a fact about the instant its `ranAt` names, not a running verdict.
+ * `DoctorStatus` never gains a fifth member for this: those four values still mean exactly what
+ * the deterministic §25.5 aggregation says. `STALE` and `UNKNOWN` exist only at the layer that
+ * compares a report against the clock and against whether a fresh one could be produced at all —
+ * the same separation #448 draws between a wrong answer and a comparison whose two sides came
+ * from different generations.
+ */
+export type DoctorHealthStatus = DoctorStatus | "STALE" | "UNKNOWN";
+
+/** The outcome of one attempt to produce a fresh system report, independent of whether it landed. */
+export interface DoctorHealthAttempt {
+  at: string;
+  ok: boolean;
+  error?: string;
+}
+
+export interface DoctorHealthSnapshot {
+  status: DoctorHealthStatus;
+  reasonCode: ReasonCode;
+  /** `ranAt` of the last evaluation that actually finished, or `null` if none ever has. */
+  checkedAt: string | null;
+  ageMs: number | null;
+  freshnessMs: number;
+  /** Present only when the status is not the report's own value verbatim. */
+  reason?: string;
+}
+
+const doctorHealthReasonCode = (status: DoctorHealthStatus): ReasonCode =>
+  status === "STALE"
+    ? ReasonCode.DOCTOR_HEALTH_STALE
+    : status === "UNKNOWN"
+      ? ReasonCode.DOCTOR_HEALTH_UNKNOWN
+      : statusReason(status);
+
+/**
+ * #734 — the one place "is this doctor verdict still good?" is answered.
+ *
+ * Two facts come in, from two different code paths that do not otherwise talk to each other:
+ * the last report that actually finished (`lastSuccess`), and what happened on the most recent
+ * *attempt* to produce a new one (`lastAttempt`), which may have failed. Comparing timestamps
+ * rather than trusting call order, because both are written independently and only the
+ * timestamp says which is the newer fact.
+ *
+ * Criterion 3 is why `lastAttempt` exists as its own input rather than folding into
+ * `lastSuccess` alone: a re-evaluation that throws must not leave a reader looking at the old
+ * healthy value with a `checked_at` that quietly stopped advancing. A failed attempt at or after
+ * the last success's timestamp reports `STALE` immediately — it does not wait for
+ * `freshnessMs` to elapse, because the failure is itself evidence, right now, that nothing
+ * fresher could be established.
+ */
+export const resolveDoctorHealth = (
+  lastSuccess: { report: DoctorReport } | null,
+  lastAttempt: DoctorHealthAttempt | null,
+  nowIso: string,
+  freshnessMs: number,
+): DoctorHealthSnapshot => {
+  const build = (
+    status: DoctorHealthStatus,
+    checkedAt: string | null,
+    ageMs: number | null,
+    reason?: string,
+  ): DoctorHealthSnapshot => ({
+    status,
+    reasonCode: doctorHealthReasonCode(status),
+    checkedAt,
+    ageMs,
+    freshnessMs,
+    ...(reason ? { reason } : {}),
+  });
+
+  if (!lastSuccess) {
+    return build(
+      "UNKNOWN",
+      null,
+      null,
+      lastAttempt && !lastAttempt.ok
+        ? `no doctor evaluation has ever succeeded; the last attempt failed: ${lastAttempt.error ?? "unknown error"}`
+        : "no doctor evaluation has run yet",
+    );
+  }
+
+  const checkedAt = lastSuccess.report.ranAt;
+  const ageMs = Date.parse(nowIso) - Date.parse(checkedAt);
+
+  if (lastAttempt && !lastAttempt.ok && Date.parse(lastAttempt.at) >= Date.parse(checkedAt)) {
+    return build(
+      "STALE",
+      checkedAt,
+      ageMs,
+      `a re-evaluation attempted at ${lastAttempt.at} failed: ${lastAttempt.error ?? "unknown error"}`,
+    );
+  }
+
+  if (ageMs > freshnessMs) {
+    return build(
+      "STALE",
+      checkedAt,
+      ageMs,
+      `last evaluation is ${ageMs}ms old, past the ${freshnessMs}ms freshness window`,
+    );
+  }
+
+  return build(lastSuccess.report.status, checkedAt, ageMs);
+};
+
 export type DoctorScope =
   | "system"
   | "project"

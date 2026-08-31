@@ -11,7 +11,14 @@ import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
-import type { DoctorScope, Finding } from "../doctor/doctor.ts";
+import {
+  resolveDoctorHealth,
+  type DoctorHealthAttempt,
+  type DoctorHealthSnapshot,
+  type DoctorReport,
+  type DoctorScope,
+  type Finding,
+} from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
@@ -77,6 +84,27 @@ export const sweepBudgetMs = (providerCount: number): number =>
 const DEFAULT_CAPACITY_REFRESH_MS = 4 * 60_000;
 
 /**
+ * #734 — how old a system doctor evaluation may be before a reader is told `STALE` instead of
+ * its last value. Bound against the capacity-sensor cadence rather than picked independently:
+ * that tick is what re-evaluates the doctor outside startup (both periodically and reactively
+ * on a provider failure, via `reconcileContinuity`), so a window shorter than its interval
+ * would report every report as expired the instant it landed. `assertDoctorFreshnessOrdering`
+ * refuses that configuration at start, the same way `assertContinuityFreshnessOrdering` already
+ * refuses one for the continuity verdict it bounds.
+ */
+const DEFAULT_DOCTOR_FRESHNESS_MS = 3 * DEFAULT_CAPACITY_REFRESH_MS;
+
+const assertDoctorFreshnessOrdering = (capacityRefreshMs: number, doctorFreshnessMs: number): void => {
+  if (capacityRefreshMs >= doctorFreshnessMs) {
+    throw acpError(
+      ReasonCode.INVALID_ARGUMENT,
+      "the doctor freshness window must be longer than the capacity refresh interval that renews it",
+      { capacityRefreshMs, doctorFreshnessMs },
+    );
+  }
+};
+
+/**
  * Refuses a configuration where the tick cannot keep the verdict fresh.
  *
  * Called at start rather than trusted: the two values live in different files, and the failure
@@ -139,6 +167,12 @@ export interface DaemonOptions {
    * already gives the capacity sweep.
    */
   turnReconcileBudgetMs?: number;
+  /**
+   * #734 — how old a persisted system doctor evaluation may be before it is reported `STALE`
+   * rather than reused as current. Must be strictly greater than the effective capacity
+   * refresh interval; see `assertDoctorFreshnessOrdering`.
+   */
+  doctorFreshnessMs?: number;
 }
 
 /**
@@ -396,6 +430,12 @@ export class Daemon {
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
+  // #734 — the last system evaluation that actually finished, and the outcome of the most
+  // recent *attempt*, kept apart on purpose: a failed attempt must be visible even while the
+  // last success is still inside its freshness window (criterion 3). `resolveDoctorHealth`
+  // is the only place these two are compared.
+  #lastDoctorSuccess: { report: DoctorReport } | null = null;
+  #lastDoctorAttempt: DoctorHealthAttempt | null = null;
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
   readonly #operatorResults = new Map<string, { fingerprint: string; result: Decision<unknown> }>();
   readonly #finalizer: ApprovedRunFinalizer;
@@ -517,6 +557,14 @@ export class Daemon {
           if (!isDoctorScope(scope)) return invalidOperatorParam("scope", scope);
           if (target !== undefined && target !== null && typeof target !== "string") {
             return invalidOperatorParam("target", target);
+          }
+          // #734 criterion 4 — an untargeted system check is the same evaluation the periodic
+          // and reactive triggers produce, so it also updates the persisted freshness snapshot.
+          // A caller need not wait for the next tick, or restart the daemon, to force one: this
+          // is the on-demand escape hatch. A targeted or non-system call is diagnostic only,
+          // exactly as before, and does not touch the persisted snapshot.
+          if (scope === "system" && target === undefined) {
+            return allow(ReasonCode.OK, await this.runSystemDoctorCheck(this.telegramIngressFindings()));
           }
           return allow(ReasonCode.OK, await this.cp.doctor.run(
             scope,
@@ -1066,6 +1114,47 @@ export class Daemon {
     }
   }
 
+  /**
+   * #734 — the one place a system-scope `DoctorReport` is produced and recorded as either a
+   * success or a failure, so `resolveDoctorHealth` always has both facts current.
+   *
+   * A thrown probe is recorded as a failed attempt *before* it propagates — the catch here does
+   * not swallow the error, it only makes sure the failure is visible to freshness before the
+   * caller's own error handling runs. Every caller that needs the result awaited (`reconcile()`,
+   * the on-demand operator door) still gets the rejection; callers that only need freshness kept
+   * current (the periodic and reactive triggers) go through `runPeriodic`, which already catches
+   * and backs off.
+   */
+  private async runSystemDoctorCheck(supplementalFindings: readonly Finding[] = []): Promise<DoctorReport> {
+    const at = this.cp.clock.nowIso();
+    try {
+      const report = await this.cp.doctor.run("system", undefined, supplementalFindings);
+      this.#lastDoctorSuccess = { report };
+      this.#lastDoctorAttempt = { at, ok: true };
+      this.writeHealth(null);
+      return report;
+    } catch (err) {
+      this.#lastDoctorAttempt = { at, ok: false, error: safeErrorMessage(err) };
+      throw err;
+    }
+  }
+
+  /**
+   * #734 — what a reader gets *right now*: the last system evaluation that finished, bounded by
+   * `doctorFreshnessMs` and by whether the most recent attempt to refresh it actually landed.
+   * `writeHealth` calls this on every write, so `health.json`'s `doctor` field is never older
+   * than the gap between two writes — bounded, by construction, by the capacity-sensor tick that
+   * drives `reconcileContinuity` on its own asserted-shorter interval.
+   */
+  currentDoctorHealth(): DoctorHealthSnapshot {
+    return resolveDoctorHealth(
+      this.#lastDoctorSuccess,
+      this.#lastDoctorAttempt,
+      this.cp.clock.nowIso(),
+      this.options.doctorFreshnessMs ?? DEFAULT_DOCTOR_FRESHNESS_MS,
+    );
+  }
+
   /** §34.5 — the documented restart sequence, in order. */
   async reconcile(): Promise<ReconcileReport> {
     const expiredClaims = this.cp.claims.expireOverdue();
@@ -1099,7 +1188,7 @@ export class Daemon {
       `SELECT COUNT(*) AS n FROM assignments WHERE status = 'ACTIVE'`,
     );
 
-    const report = await this.cp.doctor.run("system");
+    const report = await this.runSystemDoctorCheck();
 
     return {
       activeBindings: activeBindings?.n ?? 0,
@@ -1247,6 +1336,14 @@ export class Daemon {
           restoration,
         },
       });
+
+      // #734 criterion 2 — capacity and continuity state changing is exactly what this method
+      // is called to react to (both the periodic capacity-sensor tick and the reactive
+      // provider-failure callback route through here), so it is the natural place to keep the
+      // persisted doctor snapshot current between restarts. `runPeriodic` already catches and
+      // backs off, so this can be awaited without changing what this method returns or throws.
+      await this.runPeriodic("doctor_refresh", () => this.runSystemDoctorCheck().then(() => undefined));
+
       return {
         plan,
         reassigned,
@@ -1370,6 +1467,7 @@ export class Daemon {
       this.options.capacityRefreshBudgetMs ?? sweepBudgetMs(providerCount),
       providerCount,
     );
+    assertDoctorFreshnessOrdering(capacityRefreshMs, this.options.doctorFreshnessMs ?? DEFAULT_DOCTOR_FRESHNESS_MS);
 
     const watchdog = setInterval(() => {
       void this.runPeriodic("watchdog", async () => {
@@ -1588,6 +1686,10 @@ export class Daemon {
         blockedPostMerge: this.cp.runs.list({ state: RunState.BLOCKED_POST_MERGE }).length,
       },
       lastReconcile: reconcile,
+      // #734 — freshness-bounded, recomputed against the live clock on every write rather than
+      // read back from whatever was last persisted. A caller that never advances the doctor
+      // still gets a correct answer here: age is derived from `checkedAt`, not cached.
+      doctor: this.currentDoctorHealth(),
       timerHealth: {
         status: this.#timerFailures.size === 0 ? "HEALTHY" : "DEGRADED",
         failures: Object.fromEntries(this.#timerFailures),
