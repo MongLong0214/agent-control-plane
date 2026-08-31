@@ -10,6 +10,7 @@ import { cleanupTempDirs, commitAll, makeRepo, writeFiles } from "../helpers/fix
 import {
   TEST_OWNER,
   type Harness,
+  bindCeo,
   finalizeNoRepositoryRun,
   fixtureManifest,
   makeHarness,
@@ -226,6 +227,48 @@ describe("round-2 CTO lifecycle regressions", () => {
     await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
     expect(harness.cp.runs.require(run.runId).state).toBe(RunState.BLOCKED);
     expect(harness.cp.runs.require(run.runId).ownerBindingGeneration).toBe(1);
+  });
+
+  it("reblocks an escalation resolved while suspension stops its owner", async () => {
+    const harness = makeHarness();
+    const { projectId, repositoryId } = await registerFixtureProject(harness);
+    const run = await createActiveRun(harness, projectId, repositoryId);
+    const cto = harness.cp.bindings.activePrimaryCto(projectId);
+    if (!cto) throw new Error("run dispatch did not bind a primary CTO");
+    const ceoSessionId = bindCeo(harness);
+
+    // `suspendProject` does not yield between the STOPPED write and revocation. Schedule the
+    // real CEO path from immediately after the real lifecycle transition instead of fabricating
+    // revoke's denial or changing the run row ourselves.
+    const originalTransition = harness.cp.sessions.transition.bind(harness.cp.sessions);
+    let resolveAttempted = false;
+    let resolveAllowed = false;
+    harness.cp.sessions.transition = (sessionId, to, transitionReason) => {
+      const transitioned = originalTransition(sessionId, to, transitionReason);
+      if (sessionId === cto.sessionId && to === SessionLifecycle.STOPPED) {
+        resolveAttempted = true;
+        resolveAllowed = harness.cp.ceo.resolveEscalation(
+          run.runId,
+          "continue after review",
+          ceoSessionId,
+        ).allowed;
+      }
+      return transitioned;
+    };
+
+    let suspended: Awaited<ReturnType<typeof harness.cp.cto.suspendProject>>;
+    try {
+      suspended = await harness.cp.cto.suspendProject(projectId, true, "capacity crisis", TEST_OWNER);
+    } finally {
+      harness.cp.sessions.transition = originalTransition;
+    }
+
+    expect(resolveAttempted).toBe(true);
+    expect(resolveAllowed).toBe(true);
+    expect(harness.cp.sessions.require(cto.sessionId).lifecycle).toBe(SessionLifecycle.STOPPED);
+    expect(suspended).toMatchObject({ allowed: true });
+    expect(harness.cp.runs.require(run.runId).state).toBe(RunState.BLOCKED);
+    expect(harness.cp.bindings.activePrimaryCto(projectId)).toBeNull();
   });
 
   it("accepts a delivered, session-authenticated handoff envelope", async () => {
