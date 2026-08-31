@@ -165,10 +165,10 @@ const NAMED_ENTRIES: Array<{ label: string; file: string; marker: string; expect
     expectStdout: "stale exemption",
   },
   {
-    label: "suspendProject's completed tx (DEFERRED, #692)",
+    label: "suspendProject's completed tx (EXEMPT, #692)",
     file: "cto/cto-lifecycle.ts",
-    marker: "the CTO binding changed while runtime shutdown was in progress",
-    expectStdout: "stale deferral",
+    marker: "owner session stopped during project suspension",
+    expectStdout: "stale exemption",
   },
   {
     label: "RunEngine.dispatch's applyRunStateTransition callback (EXEMPT)",
@@ -224,7 +224,6 @@ describe("the tx-denial census sees a plain tx() body that writes and can deny",
       `${CONVERTED_SITES.length} using txDecision, ${exemptCount} documented exemption(s), ` +
         `${deferredCount} deferred known defect(s), 0 undocumented trap(s)`,
     );
-    expect(done.stdout).toContain("cto/cto-lifecycle.ts:732 (#692)");
   });
 
   it("fails on a new, undocumented write-then-deny tx() body (block form)", () => {
