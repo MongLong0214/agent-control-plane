@@ -148,7 +148,7 @@ describe("a reply moving through its lifecycle does not take the turn's with it"
       reply: "답",
       sent: true,
       deliveryStatus: "APPLIED",
-    });
+    }, "ANSWERED");
 
     expect(done.allowed).toBe(true);
     expect(
@@ -180,7 +180,7 @@ describe("a reply moving through its lifecycle does not take the turn's with it"
         reply: "답",
         sent: true,
         deliveryStatus: "APPLIED",
-      }),
+      }, "ANSWERED"),
     ).toThrow();
 
     // The reply is still reserved, not applied: the whole transaction went back.
@@ -206,7 +206,7 @@ describe("a reply moving through its lifecycle does not take the turn's with it"
       reply: "답",
       sent: true,
       deliveryStatus: "APPLIED",
-    });
+    }, "ANSWERED");
 
     expect(refused.allowed).toBe(false);
     expect(

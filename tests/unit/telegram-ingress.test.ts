@@ -2692,6 +2692,7 @@ describe("Telegram production ingress", () => {
       updateId: firstUpdate.update_id,
       nonce: "update:402",
       correlationId: "telegram-replay-no-reply-guard",
+      turnAnswered: false,
       admitted: true,
       replayed: true,
       classification: null,

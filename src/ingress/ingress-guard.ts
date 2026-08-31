@@ -758,11 +758,34 @@ export class IngressGuard {
    *
    * One transaction is the fix, not a second call placed more carefully: any ordering of two
    * commits has a window, and this is the commit that says the owner has the reply.
+   *
+   * `turnOutcome` is required and has no default (#639). The reply's completion is unconditional
+   * — Telegram accepted a message and the row must say so — but the turn's resolution is not.
+   * `repliedAt` is a narrow claim: *the CEO's answer* was accepted by the transport. A sentence
+   * the daemon composed because `answerAsCeo` got a deny is delivered by the identical code path
+   * and is not that, so writing `repliedAt` for it tells every later reader — a person, doctor,
+   * #638's receipt comparison — that a turn was answered when nobody answered it.
+   *
+   * `UNANSWERED` therefore commits the reply and leaves the claim carrying none of its three
+   * terminal facts, which is precisely `OUTCOME_UNKNOWN`: `unresolvedTurns` still lists it,
+   * doctor still raises `TURN_OUTCOME_UNKNOWN`, and the owner's next message in that
+   * conversation is parked with the `/again` escape rather than run twice. The issue asks for
+   * exactly that — an unmatched or absent outcome must stay visible rather than resolve to
+   * either verdict.
+   *
+   * The default that used to be implicit here is the one #748 warned about in the other file:
+   * a field that decides a turn's fate must not be one a caller can leave unstated.
    */
-  completeReplyAndResolveTurn(channel: string, nonce: string, result: unknown): Decision<void> {
+  completeReplyAndResolveTurn(
+    channel: string,
+    nonce: string,
+    result: unknown,
+    turnOutcome: "ANSWERED" | "UNANSWERED",
+  ): Decision<void> {
     return this.db.tx(() => {
       const completed = this.#recordResultHere(channel, nonce, result, "PENDING");
       if (!completed.allowed) return completed;
+      if (turnOutcome === "UNANSWERED") return allow(ReasonCode.OK, undefined);
       return this.#resolveTurnHere(channel, nonce);
     });
   }
@@ -771,17 +794,26 @@ export class IngressGuard {
    * Atomically terminalize a failed reply and settle the handler turn that produced it.
    * `settledAt` is separate from `repliedAt`: Telegram did not accept this reply, so the row must
    * not claim that it did, but the stored handler result is no longer an unknown turn outcome.
+   *
+   * `turnOutcome` for the same reason `completeReplyAndResolveTurn` takes one (#639), pointed the
+   * other way. `settledAt` closes the turn — it says the handler's result is terminal and the
+   * outcome is no longer unknown. That is true of a CEO answer whose delivery failed. It is not
+   * true of an apology whose delivery failed: the CEO's turn was never answered, so the reply
+   * being terminal settles nothing about it. `UNANSWERED` terminalizes the reply and leaves the
+   * claim unresolved, where doctor and the next owner message can still see it.
    */
   settleReplyAndTurn(
     channel: string,
     nonce: string,
     result: unknown,
     settlement: "UNANSWERABLE" | "UNRESOLVED",
+    turnOutcome: "ANSWERED" | "UNANSWERED",
     expected: "PENDING" | "UNKNOWN_RETRYABLE" = "PENDING",
   ): Decision<void> {
     return this.db.txDecision(() => {
       const completed = this.#recordResultHere(channel, nonce, result, expected);
       if (!completed.allowed) return completed;
+      if (turnOutcome === "UNANSWERED") return allow(ReasonCode.OK, undefined);
       return this.#settleTurnHere(channel, nonce, settlement);
     });
   }
