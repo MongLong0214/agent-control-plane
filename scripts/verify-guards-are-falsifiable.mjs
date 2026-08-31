@@ -2117,6 +2117,17 @@ const GUARDS = [
     ],
   },
   {
+    // #692 — the provider stop cannot be rolled back, so a CEO resolution that lands after
+    // STOPPED must be checkpointed again before the binding revocation reads its live runs.
+    what: "suspension reblocks a run that a CEO resolution revived after its owner stopped",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "          if (run.state !== RunState.ACTIVE) continue;",
+    replace: "          if (true) continue;",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::reblocks an escalation resolved while suspension stops its owner",
+    ],
+  },
+  {
     // A takeover that cannot repoint every live execution to the new generation must not
     // leave the old generation revoked and a new one minted — the guard that keeps a
     // run from being pinned to a revoked generation.
@@ -2292,6 +2303,249 @@ const GUARDS = [
     killedBy: [
       "tests/unit/doctor-daemon-r2.test.ts::#639: a receipt port that fails every lookup is audited and degrades the health file, not read as an empty ledger",
     ],
+  },
+  {
+    // The scheduled entrypoint imports TypeScript before it can inspect an issue. Removing the
+    // install restores the clean-checkout ERR_MODULE_NOT_FOUND that blocked #689.
+    what: "the scheduled tracker-loci workflow installs dependencies before starting its scanner",
+    file: ".github/workflows/tracker-loci.yml",
+    find: "      - run: pnpm install --frozen-lockfile --ignore-scripts",
+    replace: "      - run: true",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::scheduled workflow installs dependencies before the tracker command can load TypeScript",
+    ],
+  },
+  {
+    // The clean scheduled-checkout probe exposes only packages declared in package.json. Replacing
+    // the parser with a nonexistent bare import must fail before the fake GitHub client is reached.
+    what: "every package imported by the scheduled tracker-loci entrypoint is resolvable after its declared install",
+    file: "scripts/lib/tracker-loci-strip.mjs",
+    find: 'import ts from "typescript";',
+    replace: 'import ts from "tracker-loci-deliberately-missing";',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::scheduled entrypoint resolves every import from the dependencies the workflow installs",
+    ],
+  },
+  {
+    // The top-level table covers both markers and variable-length runs without claiming every
+    // container spelling. Removing tilde from the executable grammar reopens the false green.
+    what: "supported top level fence marker length indentation and info string forms make vanished code stale",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '    markers: Object.freeze(["`", "~"]),',
+    replace: '    markers: Object.freeze(["`"]),',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::supported top level fence marker length indentation and info string forms make vanished code stale",
+    ],
+  },
+  {
+    what: "blockquote prefixes are removed before fence indentation is judged",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  const blockquote = blockquoteLineForOpening(rawLine);",
+    replace: "  const blockquote = { logical: rawLine, depth: 0 };",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::blockquote and list container relative fences make vanished code stale",
+    ],
+  },
+  {
+    what: "list markers and continuation indentation are removed before fence indentation is judged",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  const directList = listItemLine(blockquote.logical);",
+    replace: "  const directList = null;",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::blockquote and list container relative fences make vanished code stale",
+    ],
+  },
+  {
+    what: "an inline backtick span closes only on a run equal to its opener",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "      if (runEnd - cursor === openerLength) {",
+    replace: "      if (runEnd - cursor > 0) {",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a backtick run closes only at an equal length run",
+    ],
+  },
+  {
+    what: "a backtick wrapped citation consumes its whole equal length closing run",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find:
+      "    if (closingRun?.length === backtickOpener.length) {\n" +
+      "      return { matched: true, tail: after.slice(closingRun.length), unsupportedReason: null };\n" +
+      "    }",
+    replace:
+      "    if (closingRun !== null) {\n" +
+      "      return { matched: true, tail: after.slice(1), unsupportedReason: null };\n" +
+      "    }",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a backtick run closes only at an equal length run",
+    ],
+  },
+  {
+    what: "signed line numbers reach stale classification instead of disappearing at extraction",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '    integerSource: "-?\\\\d+",',
+    replace: '    integerSource: "\\\\d+",',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::negative line numbers in every supported coordinate form are stale instead of invisible",
+    ],
+  },
+  {
+    what: "symbol extraction accepts Unicode identifier starts from the shared grammar",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '  identifierStartSource: "[\\\\p{ID_Start}$_]",',
+    replace: '  identifierStartSource: "[A-Za-z$_]",',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::Unicode identifiers resolve when present and are stale when absent",
+    ],
+  },
+  {
+    what: "symbol search boundaries use identifier continuation instead of ASCII word boundaries",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find:
+      "  return new RegExp(\n" +
+      "    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource}|${escapeRegex(SYMBOL_GRAMMAR_RULES.privatePrefix)})` +\n" +
+      "      `${escaped}` +\n" +
+      "      `(?!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})`,\n" +
+      '    "u",\n' +
+      "  );",
+    replace: '  return new RegExp(`\\\\b${escaped}\\\\b`, "u");',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::dollar prefixed identifiers resolve when present and are stale when absent",
+    ],
+  },
+  {
+    what: "a private identifier prefix is part of the symbol search boundary",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find:
+      "    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource}|${escapeRegex(SYMBOL_GRAMMAR_RULES.privatePrefix)})` +",
+    replace: "    `(?<!${SYMBOL_GRAMMAR_RULES.identifierContinueSource})` +",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::an unprefixed private identifier citation does not match the prefixed symbol",
+    ],
+  },
+  {
+    what: "a symbol citation is unresolved when its explicit path matches only an unrelated basename",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '    if (resolved.matchKind === "basename") {\n      unresolved.push({',
+    replace: "    if (false) {\n      unresolved.push({",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a parent relative symbol path is unresolved instead of matching only its basename",
+    ],
+  },
+  {
+    what: "a local slash branch does not register its final segment as a separate known ref",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '        refs.add(refname.slice("refs/heads/".length));',
+    replace:
+      '        const localRef = refname.slice("refs/heads/".length);\n' +
+      "        refs.add(localRef);\n" +
+      '        const slash = localRef.indexOf("/");\n' +
+      "        if (slash !== -1) refs.add(localRef.slice(slash + 1));",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a local slash branch does not manufacture a known short ref",
+    ],
+  },
+  {
+    what: "quoted non identifiers in a symbol citation report unsupported instead of disappearing",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find:
+      "    if (symbol === null) {\n" +
+      "      noteUnsupported(\n" +
+      "        m[0],\n" +
+      "        `quoted symbol \\`${m[1]}\\` is ${SYMBOL_GRAMMAR_RULES.invalidQuotedToken}; ` +\n" +
+      "          `use ${SYMBOL_GRAMMAR_RULES.support} ` +\n" +
+      '          "JavaScript/TypeScript identifier or dotted member-reference syntax, or rewrite the citation",\n' +
+      "      );\n" +
+      "      continue;\n" +
+      "    }",
+    replace: "    if (symbol === null) continue;",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::quoted non identifiers are unsupported instead of disappearing",
+    ],
+  },
+  {
+    what: "explicit citation shapes outside the grammar fail instead of reporting success",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  unsupported.length > 0 ||\n  nonDurableFindings.length > 0 ||",
+    replace: "  false ||\n  nonDurableFindings.length > 0 ||",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::explicit citation shapes outside the grammar fail as unsupported instead of disappearing",
+    ],
+  },
+  {
+    // A Markdown link's closing parenthesis sits just after the lexical path or URL match. Leaving
+    // it in front of the following backtick makes the quoted content invisible and downgrades a
+    // genuinely vanished line from STALE to ADVISORY.
+    what: "a Markdown link closing delimiter is removed before its quoted content is read",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "    return { matched: true, tail: after.slice(close.length), unsupportedReason: null };",
+    replace: "    return { matched: true, tail: after, unsupportedReason: null };",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::bare and Markdown linked loci give vanished quoted content the same STALE verdict",
+    ],
+  },
+  {
+    // Whitespace means the citation already ended. Crossing it consumes the opening backtick of
+    // the quoted content and turns a real stale-content finding back into a line-number advisory.
+    what: "a separator cannot consume the opening backtick of quoted citation content",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: '  t = t.replace(/^[\\s:—–-]+/, ""); // the separator between a citation and what follows',
+    replace: '  t = t.replace(/^[\\s`—–:-]+/, ""); // the separator between a citation and what follows',
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::a separator cannot consume the opening backtick of quoted citation content",
+    ],
+  },
+  {
+    // Dropping pages after the first one is the old 500-item blind spot in another spelling.
+    what: "every open GitHub issue page is checked instead of silently truncating after five hundred",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "    return pages.flat().filter((issue) => !issue.pull_request);",
+    replace: "    return pages.slice(0, 1).flat().filter((issue) => !issue.pull_request);",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::the GitHub API pagination includes a stale issue after the five hundredth",
+    ],
+  },
+  {
+    // URL.search is not part of URL.pathname. Folding it back into the pathname recreates the
+    // exact false STALE from #689 for both query strings GitHub emits on blob links.
+    what: "a GitHub blob URL query string is not part of its tracked path",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "    segments = parsed.pathname.split(\"/\").map((segment) => decodeURIComponent(segment));",
+    replace:
+      "    segments = `${parsed.pathname}${parsed.search}`.split(\"/\").map((segment) => decodeURIComponent(segment));",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::GitHub blob URL query strings do not become part of the tracked path",
+    ],
+  },
+  {
+    // With neither a known ref nor a tracked-file tail, a multi-segment span has more than one
+    // possible boundary. Treating it like the unambiguous two-segment form manufactures a path.
+    what: "an unknown multi segment blob ref is reported unresolved instead of absent",
+    file: "scripts/verify-tracker-loci-resolve.mjs",
+    find: "  if (segments.length === 2) {",
+    replace: "  if (segments.length >= 2) {",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::an unknown multi segment blob ref is reported unresolved instead of absent",
+    ],
+  },
+  {
+    // Without the regex branch, the quote inside cli-adapters.ts's /(["\\])/g character class
+    // opens a fake string and erases all three real declarations the production CLI checks.
+    what: "a JavaScript regex literal is one atomic span before quotes and comments are dispatched",
+    file: "scripts/lib/tracker-loci-strip.mjs",
+    find: '      if (ch === "/" && regexStarts.has(i)) {',
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/verify-tracker-loci-resolve.test.ts::ManagedWriteScope remains visible after a regex literal",
+    ],
+  },
+  {
+    // Treating every slash as a regex opener consumes the rest of a division line when no closing
+    // slash exists, recreating the opposite half of the lexical ambiguity this fix must resolve.
+    what: "a slash after an expression ending token remains division rather than opening a regex literal",
+    file: "scripts/lib/tracker-loci-strip.mjs",
+    find: '      if (ch === "/" && regexStarts.has(i)) {',
+    replace: '      if (ch === "/") {',
+    killedBy: ["tests/unit/tracker-loci-strip-invariants.test.ts::division does not open a regex literal"],
   },
   {
     // Without the envelope boundary, an HTML/plain-text proxy rejection falls through to the
@@ -2793,6 +3047,58 @@ const GUARDS = [
       "    });",
     killedBy: [
       "tests/process/every-script-has-a-plausible-caller.test.ts::uses any plausibly CI routed package alias for a multiply aliased script",
+    ],
+  },
+  {
+    what: "a reported failed test is a product failure",
+    file: "scripts/run-vitest-gate.mjs",
+    find: "  if (statusCounts.failed > 0) {",
+    replace: "  if (statusCounts.failed < 0) {",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::fails when the result contains a failed test",
+    ],
+  },
+  {
+    what: "a reporter-pending assertion is incomplete rather than a completed skip",
+    file: "scripts/run-vitest-gate.mjs",
+    find:
+      "  const pendingAssertions = assertions.filter(\n" +
+      '    (assertion) => assertion?.status === "pending",\n' +
+      "  ).length;\n" +
+      "  const skippedAssertions = statusCounts.skipped;",
+    replace:
+      "  const pendingAssertions = 0;\n" +
+      "  const skippedAssertions = report.numPendingTests;",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::classifies a reporter pending assertion as incomplete",
+    ],
+  },
+  {
+    what: "a nonzero exit after complete passing results is an unexplained run failure",
+    file: "scripts/run-vitest-gate.mjs",
+    find: "  if (exitCode !== 0) {",
+    replace: "  if (exitCode === 0) {",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::fails closed when a nonzero exit follows complete passing results",
+    ],
+  },
+  {
+    what: "an unexplained run failure is not retried into a pass",
+    file: "scripts/run-vitest-gate.mjs",
+    find:
+      "  const result = runAttempt(1);\n" +
+      "  printClassification(result.classification, out);\n" +
+      '  return result.classification.kind === "pass" ? 0 : 1;',
+    replace:
+      "  let result = runAttempt(1);\n" +
+      "  printClassification(result.classification, out);\n" +
+      '  if (result.classification.kind === "run-failure") {\n' +
+      "    result = runAttempt(2);\n" +
+      "    printClassification(result.classification, out);\n" +
+      "  }\n" +
+      '  return result.classification.kind === "pass" ? 0 : 1;',
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::does not retry an unexplained run failure",
     ],
   },
 ];
