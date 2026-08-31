@@ -94,9 +94,23 @@ commands beyond the inspection examples above.
 
 ## Deployment prerequisites that are not satisfied here
 
-The checked-in launchd plist is a template, not a deployable artifact. It contains values a
-deployment owner must supply, and no live installation has been accepted. Do not copy it into
-`~/Library/LaunchAgents` as though it were ready; follow [the deployment work](https://github.com/MongLong0214/agent-control-plane/issues/400).
+The file checked in at `deploy/com.agentcontrolplane.agentcpd.plist.template` is a template, not
+a deployable artifact by itself: it contains placeholder values (`__ACP_WORKING_DIRECTORY__` and
+similar) that `deploy/render-launchd-plist.mjs` fills in per host, driven by
+`deploy/install-launchd.sh`. Do not copy the template file directly into
+`~/Library/LaunchAgents`; render it through that script.
+
+This is no longer a statement that no live installation exists. As of this writing, a launchd
+job *is* registered at `~/Library/LaunchAgents/com.agentcontrolplane.agentcpd.plist` and a daemon
+has been running from it for several days, started from a checkout of this repository that is not
+current `main`. Verify the actual state of any given host directly —
+`launchctl print gui/$(id -u)/com.agentcontrolplane.agentcpd`, or
+`deploy/install-launchd.sh status` — rather than assuming, from this document alone, that no
+reconciliation is needed. Reconciling a running deployment with a newer `main` is a distinct,
+higher-stakes operation from a first install: see [Owner actions §4](ops/owner-actions.md) for
+the prepared-up-to-the-line packet, including why the running daemon's database and binary
+identity cannot currently be read back from anything the daemon itself exposes. The original
+first-install tracker is [issue #400](https://github.com/MongLong0214/agent-control-plane/issues/400).
 
 The daemon also refuses to fabricate the following configuration:
 

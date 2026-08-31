@@ -1188,6 +1188,36 @@ const GUARDS = [
     killedBy: ["tests/unit/grok-billing-probe.test.ts"],
   },
   {
+    what: "grok is excluded from the unattended capacity probe by default (#735)",
+    symbols: ["isAutoProbeEnabled"],
+    file: "src/capacity/capacity-monitor.ts",
+    find: 'export const UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT: ReadonlySet<string> = new Set(["grok"]);',
+    replace: "export const UNATTENDED_PROBE_EXCLUDED_BY_DEFAULT: ReadonlySet<string> = new Set();",
+    killedBy: [
+      "tests/unit/grok-probe-retirement.test.ts::a default configuration does not probe grok during an unattended refresh",
+    ],
+  },
+  {
+    what: "naming grok in unattendedProbeOptIns actually restores it to the unattended probe",
+    symbols: ["isAutoProbeEnabled"],
+    file: "src/capacity/capacity-monitor.ts",
+    find: "    return (this.#options.unattendedProbeOptIns ?? []).includes(provider);",
+    replace: "    return false;",
+    killedBy: [
+      "tests/unit/grok-probe-retirement.test.ts::an explicit opt in probes grok during an unattended refresh",
+    ],
+  },
+  {
+    what: "a provider retired from the unattended probe is not also faulted for a sensor file the sweep will never refresh again",
+    symbols: ["isAutoProbeEnabled"],
+    file: "src/doctor/doctor.ts",
+    find: "      if (!this.capacity.isAutoProbeEnabled(provider)) continue;\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/grok-probe-retirement.test.ts::a stale grok sensor file does not resurface as a doctor finding after retirement",
+    ],
+  },
+  {
     what: "the handshake deadline stops governing once the peer has authenticated",
     file: "src/daemon/agentcpd.ts",
     find: "    beginRequest(method ?? \"<none>\");\n",
@@ -3219,6 +3249,371 @@ const GUARDS = [
     ],
   },
   {
+    // #737: the rollback preflight in docs/ops/owner-actions.md item 6 checks every file the
+    // rollback will read before its first destructive command (`rm -rf .../dist`). This row
+    // deletes the launcher check specifically, leaving the other checks around it intact, so a
+    // test that only asserted "some check exists somewhere" could not be fooled by this — the
+    // named test extracts the whole block and runs it against a fixture backup that is otherwise
+    // fully valid and is missing only the launcher file, so with this line gone the extracted
+    // script sails through every remaining check and actually runs `rm -rf` against the fixture's
+    // live dist directory.
+    what: "the rollback preflight refuses a missing launcher backup file before rm -rf runs",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
+      '    test -s "$BYTES_BACKUP/agentcpd-launch.sh"\n' +
+      '    test -s "$BACKUP_PATH"\n',
+    replace:
+      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
+      '    test -s "$BACKUP_PATH"\n',
+    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+  },
+  {
+    // #737, CEO's second-round finding: the launcher row above did not cover the *other* named
+    // counterexample — nothing mutated the state-admin.js existence/readability guard, so that
+    // half of the fixture had a test but no proof the test could fail. This row deletes both
+    // lines (existence and readability are one guard for this file; deleting only one would still
+    // leave the other blocking `rm -rf`, so it would not be about the file going missing at all).
+    // Reproduced by hand before this row existed: with these two lines removed and the
+    // state-admin-only-missing fixture otherwise fully valid, the extracted script ran `rm -rf`
+    // for real and the named test failed on that — proving the guard was untested, not merely
+    // unwritten.
+    what: "the rollback preflight refuses a missing backup state-admin.js before rm -rf runs",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    test -f "$BYTES_BACKUP/dist/db/state-admin.js"\n' +
+      '    test -r "$BYTES_BACKUP/dist/db/state-admin.js"\n',
+    replace: "",
+    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+  },
+  {
+    // #745 round 4, measured. Every `sqlite3` call in the database-backup block passes
+    // `-readonly`, and a read-only connection to a WAL database must create the `-shm` file it is
+    // not permitted to create: it fails `SQLITE_CANTOPEN (14)` and says nothing about why. The
+    // document declares the live database is `delete` — measured, true — but `Db`'s constructor
+    // sets `journal_mode = WAL` on a database it creates, so a state file made by this code rather
+    // than inherited from an older one is WAL, and the declaration is a fact with an expiry date.
+    //
+    // Deleting this guard does not make the block succeed on a WAL source; it makes it fail with
+    // an errno instead of a sentence. That is why the named test asserts the message and not the
+    // exit status — the guard's whole content is that the refusal is legible.
+    what: "the database backup step refuses a WAL source by name instead of failing with a bare errno",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    SOURCE_JOURNAL_FORMAT="$(od -An -tu1 -j18 -N1 "$SOURCE_DB" | tr -d \' \')"\n' +
+      '    if [ "$SOURCE_JOURNAL_FORMAT" != "1" ]; then\n' +
+      '      echo "refusing: $SOURCE_DB has SQLite write-format $SOURCE_JOURNAL_FORMAT, not 1; a read-only connection cannot open a WAL database and this procedure is not verified for one" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses a WAL source by name rather than letting a read-only connection fail with an errno",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2. `readManifest` runs `assertPrivatePath` on the backup *and* its
+    // manifest, and that requires mode exactly 0600. `.backup` writes with the ambient umask —
+    // 0644 on this host — so without this line the restore refuses the artifact on permissions
+    // before it ever reaches the manifest's contents. The named test runs the whole documented
+    // procedure and hands the result to the real `restoreDatabase`, which is where this surfaces.
+    what: "the database backup step makes the backup file private enough for the restore validator to read",
+    file: "docs/ops/owner-actions.md",
+    find: '    chmod 600 "$BACKUP_TMP"\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2, the same for the manifest — a separate line, a separate way to
+    // fail, and `assertPrivatePath` is called on both paths independently.
+    what: "the database backup step makes the manifest private enough for the restore validator to read",
+    file: "docs/ops/owner-actions.md",
+    find: '    chmod 600 "${BACKUP_TMP}.manifest.json"\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2, the defect itself. The document had invented a second manifest
+    // schema (`agent-control-plane.sqlite-backup/online-v1`, `backupSha256`, `backupUserVersion`)
+    // that `readManifest` in src/db/backup.ts refuses outright, so `state-admin.js restore`
+    // rejected every backup this procedure produced — the procedure whose only purpose is to make
+    // that restore possible.
+    //
+    // This row restores the old `format` string and nothing else. One field is enough: it is an
+    // equality check in `readManifest`, and it proves the named test is coupled to what the
+    // validator actually accepts rather than to a shape written down twice.
+    what: "the database backup step writes the manifest schema the restore validator accepts, not one of its own",
+    file: "docs/ops/owner-actions.md",
+    find: '    { "format": "agent-control-plane.sqlite-backup/v1",\n',
+    replace: '    { "format": "agent-control-plane.sqlite-backup/online-v1",\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::produces a backup that item 6's real restore validator accepts, end to end",
+    ],
+  },
+  {
+    // #745 round 4. `schemaVersion` is the one manifest field emitted unquoted, so a reading that
+    // is empty or non-numeric does not produce a manifest that is merely wrong — it produces one
+    // that is not JSON, and the failure then surfaces at restore time as a parse error rather
+    // than here as a refusal. Deleting the guard lets the block publish that manifest and exit 0.
+    what: "the database backup step refuses a non-integer user_version before it can emit a manifest that is not JSON",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    case "$BACKUP_USER_VERSION" in\n' +
+      "      ''|*[!0-9]*) echo \"refusing: user_version of $BACKUP_TMP is '$BACKUP_USER_VERSION', not an integer\" >&2; exit 1 ;;\n" +
+      "    esac\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses when the backup's user_version does not read as an integer, before publishing a manifest",
+    ],
+  },
+  {
+    // #745 round 4, blocker 2's ordering half — the part that made the schema mismatch dangerous
+    // rather than merely wrong. Item 6's preflight checked that a manifest *existed*; it never
+    // checked that `restoreDatabase` would accept it, and those are different claims. So an
+    // unreadable manifest failed *after* `rm -rf .../dist`, in the procedure you reach for when
+    // things are already broken.
+    //
+    // Deleting the validating restore returns the preflight to existence-checking. The named test
+    // supplies a backup whose file is real, private and integral and whose manifest is exactly
+    // what this document wrote before this round: every remaining check passes, and `rm -rf` runs.
+    what: "the rollback preflight validates the backup through the real restore before rm -rf, not merely that a manifest exists",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    node "$BYTES_BACKUP/dist/db/state-admin.js" restore "$BACKUP_PATH" \\\n' +
+      '      --database "$ROLLBACK_PREFLIGHT_DIR/state.sqlite" --confirm-restore\n',
+    replace: "",
+    killedBy: [
+      "tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts::refuses to run rm -rf when the backup's manifest is one the real restore validator rejects",
+    ],
+  },
+  {
+    // #512: the database-backup step in item 4 step 2 replaced `state-admin.js backup` (which
+    // needs a `better-sqlite3` binding a fresh `node` process cannot load) with SQLite's own
+    // online backup API. Executing the old text against the real host produced an empty
+    // `BACKUP_PATH` and `sqlite3 "" "PRAGMA integrity_check;"` printed `ok` — a real command, a
+    // real success exit, and no backup at all. This row deletes the destination guard that makes
+    // that shape unreachable (empty / already-exists / symlink), leaving the `mv` at the end free
+    // to silently overwrite whatever already sits at the deterministic destination name — exactly
+    // the "destination already exists" counterexample the named test drives.
+    what: "the database backup step refuses an already-existing destination before writing anything",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if [ -z "$BACKUP_PATH" ] || [ -e "$BACKUP_PATH" ] || [ -L "$BACKUP_PATH" ]; then\n' +
+      '      echo "refusing: $BACKUP_PATH is empty or already exists" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+  },
+  {
+    // #512, second guard on the same block: exit code alone does not prove the backup is good —
+    // the reported defect was exactly a command that exited 0 while proving nothing. Deleting the
+    // content comparison (keeping only a nonzero-exit check would still be satisfied by a stub
+    // that prints the wrong text and exits 0) reproduces that shape for the destination file
+    // instead of the empty path, and the named test's "bad integrity" fixture — a `sqlite3` stub
+    // that answers every `integrity_check` with `malformed` at exit 0 — catches it.
+    what: "the database backup step requires integrity_check stdout to be exactly ok, not just exit 0",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if [ "$INTEGRITY" != "ok" ]; then\n' +
+      '      echo "refusing: integrity_check on $BACKUP_TMP returned \'$INTEGRITY\', not ok" >&2; exit 1\n' +
+      "    fi\n",
+    replace: "",
+    killedBy: ["tests/process/the-database-backup-step-fails-closed.test.ts"],
+  },
+  {
+    // #745, CEO round 2: the destination check runs once, before the backup, and does not close
+    // the window between that check and publication. Two runs sharing a timestamp both pass it
+    // independently and both reach the publish step; without an exclusive claim on the final
+    // name, the second silently overwrites the first run's already-verified backup.
+    //
+    // Round 3 replaced a `mkdir` reservation with the final name itself, so this row now mutates
+    // the claim that survived: `ln -f` unlinks an existing destination before linking, which
+    // means it never fails `EEXIST` and grants no exclusivity at all — the exact property the
+    // reservation was there for. The named test forces two runs onto one final name with a
+    // pinned timestamp and a barrier, and sees the second one publish instead of refuse.
+    what: "the database backup step claims the final name atomically so only one of two racing runs ever publishes",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if ! ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n",
+    replace: '    ln -f "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses a delayed claim: a run that passed the destination check before another run published cannot overwrite it",
+    ],
+  },
+  {
+    // #745, CEO round 3, counterexample 1: `trap … EXIT` does not run on `SIGKILL` or a host
+    // power loss, so which name is written last — not the trap — is what decides what an
+    // untrappable death can leave behind. The manifest is linked first and the database last, so
+    // `$BACKUP_PATH` is the commit marker and the worst survivable state is a manifest with no
+    // database (which item 6's `test -s "$BACKUP_PATH"` refuses).
+    //
+    // This row swaps the two links. The result is still atomic and still exclusive — the claim
+    // is simply on the wrong name — which is why nothing about racing dies here: the mutation is
+    // about ordering alone. The named test kills the run immediately after its first publish
+    // call and finds a database sitting at the final path with no manifest beside it.
+    what: "the database backup step links the database last so an untrappable death cannot leave one without a manifest",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    if ! ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n" +
+      "    MANIFEST_LINKED=1\n" +
+      '    ln "$BACKUP_TMP" "$BACKUP_PATH"\n',
+    replace:
+      '    if ! ln "$BACKUP_TMP" "$BACKUP_PATH" 2>/dev/null; then\n' +
+      '      echo "refusing: another run already owns the final name $BACKUP_PATH" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n" +
+      "    MANIFEST_LINKED=1\n" +
+      '    ln "${BACKUP_TMP}.manifest.json" "${BACKUP_PATH}.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::leaves no database at the final path when the run dies untrappably mid-publish, and the next run refuses rather than resuming",
+    ],
+  },
+  {
+    // #745, CEO round 2, second counterexample: publication writes two names, so an ordinary
+    // failure between them can leave one of them alone at the final path. Deleting the unwind
+    // reproduces that half-published shape — the named test fails the second publish call after
+    // the first has succeeded, and without this line the manifest survives alone at
+    // `$BACKUP_PATH.manifest.json` instead of the partial publish being unwound.
+    what: "the database backup step unwinds a partial publish so no database-without-manifest survives at the final path",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then\n' +
+      '        rm -f "$BACKUP_PATH.manifest.json"\n' +
+      "      fi\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::leaves zero consumable backups at the final path when the second publish step fails after the first succeeded",
+    ],
+  },
+  {
+    // #745, CEO round 3, the derivative of counterexample 2 and its own property. The unwind
+    // above must remove only names *this run* created, and only while the commit marker is
+    // absent. The previous revision released its reservation on success, so the name no longer
+    // recorded who owned it, and a later run that failed after claiming ran
+    // `rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json"` over a stranger's verified backup.
+    //
+    // This row restores exactly that unconditional form — same anchor as the row above, opposite
+    // mutation, because "unwinds its own partial publish" and "does not unwind anyone else's" are
+    // two properties of one block and a single mutation cannot ask both. The named test lets one
+    // run publish and a second, older run fail afterwards, then reads the published bytes back.
+    what: "the database backup cleanup unlinks only what this run created, never a publication it merely collided with",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '      if [ "$MANIFEST_LINKED" = "1" ] && [ ! -e "$BACKUP_PATH" ]; then\n' +
+      '        rm -f "$BACKUP_PATH.manifest.json"\n' +
+      "      fi\n",
+    replace: '      rm -f "$BACKUP_PATH" "$BACKUP_PATH.manifest.json"\n',
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::a failed run does not delete another run's published backup",
+    ],
+  },
+  {
+    // #745, CEO round 3: `ln` claims the final name only because both names are on one
+    // filesystem — across a mount boundary it fails outright, and the reflex fix for that failure
+    // is a `mv`, which clobbers. The siblings-in-one-directory argument is true today and is
+    // asserted rather than assumed, because an assumption nothing checks survives until the day
+    // it stops holding. Deleting the assertion lets the run proceed on a temp file its own `stat`
+    // reports on a different device, which the named test injects.
+    what: "the database backup step proves the temp file and the destination share a filesystem before claiming with ln",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    BACKUP_TMP_DEVICE="$(stat -f \'%d\' "$BACKUP_TMP")"\n' +
+      '    BACKUP_DIR_DEVICE="$(stat -f \'%d\' "$BACKUP_DIR")"\n' +
+      '    if [ -z "$BACKUP_TMP_DEVICE" ] || [ "$BACKUP_TMP_DEVICE" != "$BACKUP_DIR_DEVICE" ]; then\n' +
+      '      echo "refusing: $BACKUP_TMP is not on the same filesystem as $BACKUP_DIR; ln cannot claim the final name atomically" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-database-backup-step-fails-closed.test.ts::refuses when the temp file is not on the same filesystem as the destination directory",
+    ],
+  },
+  {
+    // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an
+    // empty database compute accepted anomalies (all zero) and report OBSERVED_NO_ANOMALIES
+    // instead of N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony
+    // it replaces.
+    what: "an acceptance report with zero lifecycles reports NA rather than a zero anomaly count",
+    file: "src/export/acceptance-report.ts",
+    find: "  const observed = lifecycles.total > 0;",
+    replace: "  const observed = true;",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::reports NA for the verdict and every accepted anomaly when the database has no lifecycles",
+    ],
+  },
+  {
+    what: "a prevented forged-gate attempt is actually counted from its enforcement's writer",
+    file: "src/export/acceptance-report.ts",
+    find: "  forgedGates: [\n    { kind: \"GATE_REJECTED\", reasonCode: ReasonCode.GATE_CREATOR_UNTRUSTED },\n    { kind: \"GATE_REJECTED\", reasonCode: ReasonCode.GATE_PAYLOAD_PROVENANCE_INVALID },\n  ],",
+    replace: "  forgedGates: [],",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::a prevented attempt from a guard refusing a forged gate does not produce ANOMALIES_PRESENT",
+    ],
+  },
+  {
+    // #736 third correction: kind and reason_code, keyed alone, are not enough — a
+    // MERGE_AUTHORITY_DENIED row exists under FINALIZATION_ATTEMPT_FAILED too (the daemon's own
+    // finalizer lacking authority mid-finalization), and that is not a blocked unauthorised-merge
+    // attempt. Widening the writer's kind to admit it reintroduces exactly that inversion.
+    what: "unauthorizedMerges counts only the write-guard writer, not the unrelated finalization-failure writer of the same reason code",
+    file: "src/export/acceptance-report.ts",
+    find: "  unauthorizedMerges: [{ kind: \"MANAGED_WRITE_GUARD\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED }],",
+    replace:
+      "  unauthorizedMerges: [\n" +
+      "    { kind: \"MANAGED_WRITE_GUARD\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED },\n" +
+      "    { kind: \"FINALIZATION_ATTEMPT_FAILED\", reasonCode: ReasonCode.MERGE_AUTHORITY_DENIED },\n" +
+      "  ],",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::a MERGE_AUTHORITY_DENIED row written under FINALIZATION_ATTEMPT_FAILED not an unauthorized-merge event does not increment unauthorizedMerges",
+    ],
+  },
+  {
+    // Same correction, the other collapsed reason code: seven unrelated SQLite trigger sentinels
+    // also translate to COMPLETION_AUTHORITY_DENIED (src/db/database.ts TRIGGER_CODES). Removing
+    // the evidence.sqlite discriminator would count any of those seven as a false completion.
+    what: "falseCompletions excludes a COMPLETION_AUTHORITY_DENIED row stamped with an unrelated SQLite trigger sentinel",
+    file: "src/export/acceptance-report.ts",
+    find: '      isGenuine: (evidence) => evidence["sqlite"] === undefined,',
+    replace: "      isGenuine: () => true,",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::a COMPLETION_AUTHORITY_DENIED row stamped with a non-completion SQLite sentinel does not increment falseCompletions",
+    ],
+  },
+  {
+    what: "the acceptance window is read from the data rather than a hardcoded constant",
+    file: "src/export/acceptance-report.ts",
+    find:
+      "  const firstActivityAt = row?.first ?? null;\n" +
+      "  const lastActivityAt = row?.last ?? null;",
+    replace:
+      '  const firstActivityAt = "2026-01-01T00:00:00.000Z";\n' +
+      '  const lastActivityAt = "2026-01-01T00:00:00.000Z";',
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::derives the window from the data's own first and last activity rather than a constant",
+    ],
+  },
+  {
+    // The second correction from the CEO's review of #736 (efe7552): the first cut let a
+    // prevented attempt (a guard denial) read as an accepted anomaly. This row reintroduces
+    // exactly that bug — computing "is anything present" from `preventedAttempts` instead of
+    // `acceptedAnomalies` — so a guard doing its job would flip the verdict to ANOMALIES_PRESENT.
+    what: "ANOMALIES_PRESENT is decided from accepted anomalies, never from prevented attempts alone",
+    file: "src/export/acceptance-report.ts",
+    find: "  const entries = Object.entries(acceptedAnomalies) as [keyof AcceptedAnomalies, AcceptedAnomalyCount][];",
+    replace: "  const entries = Object.entries(preventedAttempts) as [keyof AcceptedAnomalies, AcceptedAnomalyCount][];",
+    killedBy: [
+      "tests/unit/acceptance-report.test.ts::is ANOMALIES_PRESENT only when an accepted anomaly is an actual positive count, never from prevented attempts alone",
+    ],
+  },
+  {
     // #575: the App permission check moved from a single exact shape to an append-only list
     // of exact shapes, precisely so the App's grant and this code no longer have to narrow in
     // the same instant. Removing the key-count check turns every shape's match into "contains
@@ -3477,6 +3872,134 @@ const GUARDS = [
     find: "  return judgeAndCleanupIfJustCreated(localRepoPath, justCreated, statEntry);\n",
     replace: "  void justCreated;\n  return allow(ReasonCode.OK, undefined);\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // #734 criterion 3, the row that kills the shape the brief names explicitly: a re-evaluation
+    // that fails must yield STALE right away, never the previous healthy value with a checked_at
+    // that quietly stopped advancing. Forcing the condition to `false` makes a failed attempt
+    // fall straight through to the freshness-window check, which still passes (the last success
+    // is recent), so the previous — now wrong — status is returned as if nothing had failed.
+    what: "#734: a doctor re-evaluation that fails is reported STALE immediately, not the retained previous healthy value",
+    file: "src/doctor/doctor.ts",
+    find: "  if (lastAttempt && !lastAttempt.ok && lastAttempt.generation > lastSuccess.generation) {\n",
+    replace: "  if (false) {\n",
+    killedBy: ["tests/unit/doctor-health-freshness.test.ts"],
+  },
+  {
+    // The other direction of the same operand, and the one that says this is an *ordering* rather
+    // than a latch. Dropping the generation comparison makes any failure ever recorded outrank
+    // every success forever: a daemon that saw one transient probe failure would answer STALE
+    // from then on, no matter how many healthy evaluations completed after it. A rule that can
+    // only escalate is the same outage in the other direction, so both halves need a row.
+    what: "#734: a failed doctor attempt that completed BEFORE the retained success does not mark it stale",
+    file: "src/doctor/doctor.ts",
+    find: "  if (lastAttempt && !lastAttempt.ok && lastAttempt.generation > lastSuccess.generation) {\n",
+    replace: "  if (lastAttempt && !lastAttempt.ok) {\n",
+    killedBy: [
+      "tests/unit/doctor-health-freshness.test.ts::a failed attempt older than the current success does not retroactively mark it stale",
+    ],
+  },
+  {
+    // The other half of #734 criterion 1: an evaluation old enough to have exceeded the bounded
+    // freshness window must not be handed back as its own (possibly long-stale) status. Forcing
+    // this condition to `false` makes every report current forever, regardless of age — the
+    // exact defect the whole freshness bound exists to remove.
+    what: "#734: a doctor report older than the freshness window is reported STALE rather than reused as current",
+    file: "src/doctor/doctor.ts",
+    find: "  if (ageMs > freshnessMs) {\n",
+    replace: "  if (false) {\n",
+    killedBy: ["tests/unit/doctor-health-freshness.test.ts"],
+  },
+  {
+    // #734 criterion 2: a continuity reconciliation is the daemon's own hook for "capacity or
+    // continuity state changed", reached both by the periodic capacity-sensor tick and by the
+    // reactive provider-failure callback. Removing the doctor refresh from it silently regresses
+    // to the pre-#734 shape — a report re-evaluated only at startup — while every other part of
+    // `reconcileContinuity` keeps working, so nothing else here would notice.
+    what: "#734: a continuity reconciliation re-evaluates the persisted system doctor snapshot",
+    file: "src/daemon/daemon.ts",
+    find: '      await this.runPeriodic("doctor_refresh", () => this.runSystemDoctorCheck().then(() => undefined));\n',
+    replace: "",
+    killedBy: ["tests/unit/daemon-doctor-freshness.test.ts"],
+  },
+  {
+    // The CEO's counterexample, made a guard: `runSystemDoctorCheck()`'s failure branch used to
+    // update `#lastDoctorAttempt` in memory only and rethrow, leaving *the caller* responsible
+    // for persisting it. `reconcileContinuity()`'s failure path read as covered only because
+    // `runPeriodic`'s own catch calls `writeHealth` — but `OPERATOR_METHOD.DOCTOR_RUN`'s failure
+    // is caught by `executeOperatorRequest`'s outer catch, which returns `INTERNAL_ERROR` and
+    // never calls `writeHealth`, and `DAEMON_STATUS` serves `health.json` from disk. Removing
+    // the persist from the failure branch itself reproduces exactly that: a failed re-evaluation
+    // that stays in memory while `health.json` keeps answering the previous healthy value.
+    what: "#734: a failed system-doctor re-evaluation persists STALE to disk inside its own failure branch, not only when a caller happens to writeHealth afterward",
+    file: "src/daemon/daemon.ts",
+    find: "      this.persistDoctorHealth();\n      throw err;\n",
+    replace: "      throw err;\n",
+    killedBy: ["tests/unit/daemon-doctor-freshness.test.ts"],
+  },
+  {
+    // A persistence failure is not the caller's answer, on either branch. Rethrowing instead of
+    // auditing puts a storage error where the doctor's outcome belongs: on the success path the
+    // operator is told the run failed when it succeeded, and on the failure path the storage
+    // error replaces the doctor rejection the method exists to surface. This is the guard that
+    // makes "persistence is not evaluation" enforceable rather than merely arranged — the `try`
+    // scope alone cannot be mutated into the defect, but the swallow can.
+    what: "#734: a failed health persist is audited and dropped, never raised as the doctor evaluation's outcome",
+    file: "src/daemon/daemon.ts",
+    find: "      this.writeHealth(null);\n    } catch (writeErr) {\n",
+    replace: "      this.writeHealth(null);\n    } catch (writeErr) {\n      throw writeErr;\n",
+    killedBy: [
+      "tests/unit/daemon-doctor-freshness.test.ts::a health-write failure after a doctor SUCCESS is not reclassified",
+    ],
+  },
+  {
+    // The audit sink is a sink, and an unprotected report of a failure is a second way for the
+    // reporting to become the failure. Removing the inner `try` restores exactly the shape the
+    // CEO blocked: an audit that throws escapes the write handler and replaces the doctor error
+    // on its way to the operator, so the one fact the whole method exists to surface is the one
+    // fact the caller does not receive.
+    what: "#734: an audit failure while reporting a failed health persist does not replace the doctor error",
+    file: "src/daemon/daemon.ts",
+    find:
+      "      try {\n        this.cp.audit.record({\n          kind: \"DAEMON_TIMER_FAILED\",\n" +
+      "          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,\n" +
+      "          evidence: { timer: \"health\", error: safeErrorMessage(writeErr) },\n        });\n      } catch {\n",
+    replace:
+      "      {\n        this.cp.audit.record({\n          kind: \"DAEMON_TIMER_FAILED\",\n" +
+      "          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,\n" +
+      "          evidence: { timer: \"health\", error: safeErrorMessage(writeErr) },\n        });\n      }\n      if (false) {\n",
+    killedBy: [
+      "tests/unit/daemon-doctor-freshness.test.ts::a doctor failure whose health write AND whose audit both fail",
+    ],
+  },
+  {
+    // The failed attempt's ticket must be a *fresh* completion position, because that is the only
+    // thing that lets it outrank the success it supersedes. Handing it the retained success's own
+    // number instead makes `lastAttempt.generation > lastSuccess.generation` false for every
+    // failure that ever happens: the comparison stays in `resolveDoctorHealth`, reads as present,
+    // and no failure can ever reach it. This is the operand, not the condition — a guard is only
+    // as real as the value it is given.
+    what: "#734: a failed system-doctor evaluation takes a fresh completion ticket, so it outranks the success it supersedes",
+    file: "src/daemon/daemon.ts",
+    find: "    } catch (err) {\n      const generation = ++this.#doctorCompletions;\n",
+    replace: "    } catch (err) {\n      const generation = this.#lastDoctorSuccess?.generation ?? 0;\n",
+    killedBy: [
+      "tests/unit/daemon-doctor-freshness.test.ts::a slow re-evaluation that FAILS after a fast one succeeded",
+    ],
+  },
+  {
+    // The same operand on the success side. A success that records a number ahead of its own
+    // completion position permanently outranks the next failure, so the daemon would answer with
+    // a healthy verdict after a probe that just threw — #734's original defect, reintroduced
+    // through the ordering rather than through the write. Off by one in the direction that fails
+    // open, which is why it gets its own row rather than being read off the row above.
+    what: "#734: a successful system-doctor evaluation records its own completion position, not one ahead of it",
+    file: "src/daemon/daemon.ts",
+    find: "    this.#lastDoctorSuccess = { report, generation };\n",
+    replace: "    this.#lastDoctorSuccess = { report, generation: generation + 1 };\n",
+    killedBy: [
+      "tests/unit/daemon-doctor-freshness.test.ts::a re-evaluation that fails yields STALE immediately",
+    ],
   },
 ];
 

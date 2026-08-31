@@ -11,9 +11,17 @@ import { digestOf } from "../core/digest.ts";
 import { acpError, type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode, type ReasonCode as ReasonCodeValue } from "../core/reason-codes.ts";
 import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
-import type { DoctorScope, Finding } from "../doctor/doctor.ts";
+import {
+  resolveDoctorHealth,
+  type DoctorHealthAttempt,
+  type DoctorHealthSnapshot,
+  type DoctorReport,
+  type DoctorScope,
+  type Finding,
+} from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
+import { buildAcceptanceReport } from "../export/acceptance-report.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
 import {
   acknowledgeTerminalTelegramReply,
@@ -75,6 +83,27 @@ export const sweepBudgetMs = (providerCount: number): number =>
   providerCount * COLLECTOR_TIMEOUT_MS + STARTUP_CAPACITY_REFRESH_BUDGET_MS;
 
 const DEFAULT_CAPACITY_REFRESH_MS = 4 * 60_000;
+
+/**
+ * #734 — how old a system doctor evaluation may be before a reader is told `STALE` instead of
+ * its last value. Bound against the capacity-sensor cadence rather than picked independently:
+ * that tick is what re-evaluates the doctor outside startup (both periodically and reactively
+ * on a provider failure, via `reconcileContinuity`), so a window shorter than its interval
+ * would report every report as expired the instant it landed. `assertDoctorFreshnessOrdering`
+ * refuses that configuration at start, the same way `assertContinuityFreshnessOrdering` already
+ * refuses one for the continuity verdict it bounds.
+ */
+const DEFAULT_DOCTOR_FRESHNESS_MS = 3 * DEFAULT_CAPACITY_REFRESH_MS;
+
+const assertDoctorFreshnessOrdering = (capacityRefreshMs: number, doctorFreshnessMs: number): void => {
+  if (capacityRefreshMs >= doctorFreshnessMs) {
+    throw acpError(
+      ReasonCode.INVALID_ARGUMENT,
+      "the doctor freshness window must be longer than the capacity refresh interval that renews it",
+      { capacityRefreshMs, doctorFreshnessMs },
+    );
+  }
+};
 
 /**
  * Refuses a configuration where the tick cannot keep the verdict fresh.
@@ -139,6 +168,12 @@ export interface DaemonOptions {
    * already gives the capacity sweep.
    */
   turnReconcileBudgetMs?: number;
+  /**
+   * #734 — how old a persisted system doctor evaluation may be before it is reported `STALE`
+   * rather than reused as current. Must be strictly greater than the effective capacity
+   * refresh interval; see `assertDoctorFreshnessOrdering`.
+   */
+  doctorFreshnessMs?: number;
 }
 
 /**
@@ -194,6 +229,7 @@ export const OPERATOR_METHOD = {
   CONVERSATION_RESOLVE: "conversation.resolve",
   TELEGRAM_REPLY_ACKNOWLEDGE: "telegram.reply.acknowledge",
   DAEMON_STATUS: "daemon.status",
+  ACCEPTANCE_REPORT: "acceptance.report",
 } as const;
 
 export type OperatorMethod = (typeof OPERATOR_METHOD)[keyof typeof OPERATOR_METHOD];
@@ -396,6 +432,31 @@ export class Daemon {
   #telegramIngressController: TelegramIngressController | null = null;
   #continuityCoordinatorInstalled = false;
   #continuityReconciling = false;
+  // #734 — the last system evaluation that actually finished, and the outcome of the most
+  // recent *attempt*, kept apart on purpose: a failed attempt must be visible even while the
+  // last success is still inside its freshness window (criterion 3). `resolveDoctorHealth`
+  // is the only place these two are compared.
+  #lastDoctorSuccess: { report: DoctorReport; generation: number } | null = null;
+  #lastDoctorAttempt: DoctorHealthAttempt | null = null;
+  /**
+   * #734 — completion order for system doctor evaluations, and the only thing
+   * `resolveDoctorHealth` is allowed to order the two fields above by.
+   *
+   * `runSystemDoctorCheck` has three callers sharing no fence — `reconcile()`, the
+   * `doctor_refresh` periodic/reactive tick, and the on-demand `OPERATOR_METHOD.DOCTOR_RUN`
+   * door — so two evaluations can be in flight at once and finish in either order. The ticket is
+   * taken *at completion*, in the same synchronous stretch as the writes it labels, so the
+   * number a field carries is the position in which that run finished. "Whose knowledge stands"
+   * is then a comparison of two integers rather than of two timestamps that were never taken at
+   * the same lifecycle point.
+   *
+   * A counter and not a clock reading, for two reasons that both bite here. `cp.clock.nowIso()`
+   * is millisecond-resolution, so two runs finishing inside one millisecond tie — and a tie is
+   * where a last-writer-wins bug lives. And this repository's tests run on `ManualClock`, where
+   * every reading inside one un-advanced stretch is *identical*: a timestamp-ordered rule would
+   * degrade to guesswork in exactly the test written to kill it.
+   */
+  #doctorCompletions = 0;
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
   readonly #operatorResults = new Map<string, { fingerprint: string; result: Decision<unknown> }>();
   readonly #finalizer: ApprovedRunFinalizer;
@@ -517,6 +578,14 @@ export class Daemon {
           if (!isDoctorScope(scope)) return invalidOperatorParam("scope", scope);
           if (target !== undefined && target !== null && typeof target !== "string") {
             return invalidOperatorParam("target", target);
+          }
+          // #734 criterion 4 — an untargeted system check is the same evaluation the periodic
+          // and reactive triggers produce, so it also updates the persisted freshness snapshot.
+          // A caller need not wait for the next tick, or restart the daemon, to force one: this
+          // is the on-demand escape hatch. A targeted or non-system call is diagnostic only,
+          // exactly as before, and does not touch the persisted snapshot.
+          if (scope === "system" && target === undefined) {
+            return allow(ReasonCode.OK, await this.runSystemDoctorCheck(this.telegramIngressFindings()));
           }
           return allow(ReasonCode.OK, await this.cp.doctor.run(
             scope,
@@ -751,14 +820,15 @@ export class Daemon {
         }
 
         case OPERATOR_METHOD.DAEMON_STATUS:
+          return allow(ReasonCode.OK, this.daemonHealthSnapshot());
+
+        case OPERATOR_METHOD.ACCEPTANCE_REPORT:
+          // #241 — the acceptance readout. Its own reads (window, lifecycle outcomes, anomaly
+          // counts) come from `buildAcceptanceReport`; daemon health is reused rather than
+          // reimplemented, exactly as `daemon status` reports it.
           return allow(ReasonCode.OK, {
-            lock: this.lock.read(),
-            databasePath: this.cp.config.databasePath,
-            health: readJson(join(this.options.stateDir, "health.json")),
-            mode: this.#mode,
-            admittedMethods:
-              this.#mode === "BOOTSTRAP" ? [...BOOTSTRAP_OPERATOR_METHODS].sort() : null,
-            blockingFindings: this.#mode === "BOOTSTRAP" ? this.#bootstrapBlocking : [],
+            ...buildAcceptanceReport(this.cp.db, this.cp.clock),
+            daemonHealth: this.daemonHealthSnapshot(),
           });
       }
     } catch (error) {
@@ -767,6 +837,28 @@ export class Daemon {
         error: safeErrorMessage(error),
       });
     }
+  }
+
+  /**
+   * The object `daemon.status` reports, extracted so `acceptance.report` (#241) can embed the
+   * same daemon health rather than reimplementing it.
+   */
+  private daemonHealthSnapshot(): {
+    lock: unknown;
+    databasePath: string;
+    health: unknown;
+    mode: DaemonMode;
+    admittedMethods: string[] | null;
+    blockingFindings: BlockingFinding[];
+  } {
+    return {
+      lock: this.lock.read(),
+      databasePath: this.cp.config.databasePath,
+      health: readJson(join(this.options.stateDir, "health.json")),
+      mode: this.#mode,
+      admittedMethods: this.#mode === "BOOTSTRAP" ? [...BOOTSTRAP_OPERATOR_METHODS].sort() : null,
+      blockingFindings: this.#mode === "BOOTSTRAP" ? this.#bootstrapBlocking : [],
+    };
   }
 
   private executeOwnerApproval(
@@ -1066,6 +1158,127 @@ export class Daemon {
     }
   }
 
+  /**
+   * #734 — the one place a system-scope `DoctorReport` is produced and recorded as either a
+   * success or a failure, so `resolveDoctorHealth` always has both facts current.
+   *
+   * A thrown probe is recorded as a failed attempt *and persisted to disk right here* — not
+   * left for whichever caller happens to call `writeHealth` next. That distinction is the whole
+   * fix for the counterexample the CEO found: `reconcileContinuity()`'s failure path used to
+   * read as covered only because `runPeriodic`'s own catch calls `writeHealth`, which the
+   * on-demand operator path (`OPERATOR_METHOD.DOCTOR_RUN`) never goes through — its outer catch
+   * in `executeOperatorRequest` turns the rejection into `INTERNAL_ERROR` and returns, and
+   * `DAEMON_STATUS` serves `health.json` from disk regardless. A caller-dependent persist is not
+   * a persist; this method must not depend on what calls it. Every caller (`reconcile()`, the
+   * periodic/reactive triggers, the on-demand operator door) now gets the same guarantee for
+   * free, and none of them needs to remember to call `writeHealth` themselves on failure.
+   *
+   * A write failure on top of the doctor's own failure must not replace the error the caller
+   * is asking about with an unrelated one — the doctor's rejection is the fact this method
+   * exists to surface, so it always wins and is always what propagates. A failed persist is
+   * audited (the same `DAEMON_TIMER_FAILED`/`"health"` shape `runPeriodic` already uses for an
+   * unrelated write failure) rather than silently dropped, but it is secondary: it never
+   * replaces or suppresses the doctor error being thrown.
+   *
+   * The two stamps are different lifecycle points and are named as such. `startedAt` is taken
+   * before the probes; `completedAt` after them, alongside the completion ticket. They used to be
+   * one field called `at`, which was a *start* time — and `resolveDoctorHealth` compared it
+   * against `DoctorReport.ranAt`, which `Doctor.run` stamps *after* its probes. Comparing a start
+   * against a completion is wrong by one probe duration whatever the concurrency, and it becomes
+   * observable when two evaluations overlap: a slow failure that began before a fast success
+   * finished has `startedAt < ranAt`, so the old comparison ruled it older and the failure hid
+   * behind the healthy verdict it should have invalidated.
+   *
+   * There is deliberately no "am I superseded, skip the write" refusal here. The ticket and the
+   * writes it labels sit in one synchronous stretch with no `await` between them, so writes
+   * already land in completion order and the newest completion is always the one on disk. A
+   * refusal would be a condition that can never fire — a guard that reads as coverage and
+   * enforces nothing. What was missing was never a fence; it was an ordering the reader could
+   * compare. That ordering is `generation`, and it is enforced where the comparison happens.
+   */
+  private async runSystemDoctorCheck(supplementalFindings: readonly Finding[] = []): Promise<DoctorReport> {
+    const startedAt = this.cp.clock.nowIso();
+    let report: DoctorReport;
+    // The `try` covers the evaluation and nothing else. It used to wrap the success path's
+    // persist as well, which made a *storage* error arrive at a `catch` whose only vocabulary is
+    // "the doctor failed": the write threw, the catch recorded a failed attempt naming the
+    // storage error, the retry inside it succeeded, and disk ended up holding STALE and
+    // `"re-evaluation failed: <storage error>"` for an evaluation that had actually succeeded.
+    // The ordering was corrupted with it — `++this.#doctorCompletions` ran a second time, so one
+    // evaluation consumed two completion tickets and the fabricated failure outranked its own
+    // success. The generation mechanism was doing exactly what it should with a fact that was
+    // not true. Persistence is not evaluation, and only the evaluation belongs in here.
+    try {
+      report = await this.cp.doctor.run("system", undefined, supplementalFindings);
+    } catch (err) {
+      const generation = ++this.#doctorCompletions;
+      this.#lastDoctorAttempt = {
+        startedAt,
+        completedAt: this.cp.clock.nowIso(),
+        generation,
+        ok: false,
+        error: safeErrorMessage(err),
+      };
+      this.persistDoctorHealth();
+      throw err;
+    }
+    const generation = ++this.#doctorCompletions;
+    this.#lastDoctorSuccess = { report, generation };
+    this.#lastDoctorAttempt = { startedAt, completedAt: this.cp.clock.nowIso(), generation, ok: true };
+    this.persistDoctorHealth();
+    return report;
+  }
+
+  /**
+   * #734 — write the doctor snapshot, and never let the writing become the answer.
+   *
+   * Both branches of `runSystemDoctorCheck` end here, and the guarantee is the same for both: a
+   * persistence failure is audited and dropped, never raised. On the failure path that is what
+   * keeps the doctor's own rejection — the fact the method exists to surface — from being
+   * replaced by an unrelated storage error. On the success path it is what keeps a failed write
+   * from being reclassified as a failed evaluation.
+   *
+   * The audit is itself inside a `try`. That is not defensive decoration: an audit sink that
+   * throws is a sink, and without this the exception it raises escapes and replaces the doctor
+   * error on its way out — precisely the masking the outer contract promises cannot happen,
+   * reintroduced one layer down. There is nowhere left to report a failure of the reporting
+   * channel that is more reliable than the channel that just failed, so it is swallowed. That is
+   * the whole point: what the caller receives is the doctor's outcome, always.
+   */
+  private persistDoctorHealth(): void {
+    try {
+      this.writeHealth(null);
+    } catch (writeErr) {
+      try {
+        this.cp.audit.record({
+          kind: "DAEMON_TIMER_FAILED",
+          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
+          evidence: { timer: "health", error: safeErrorMessage(writeErr) },
+        });
+      } catch {
+        // The reporting channel is the thing that failed. Anything further would be another
+        // call to something already known to be throwing, and it would escape into the caller's
+        // answer — the exact defect this method exists to prevent.
+      }
+    }
+  }
+
+  /**
+   * #734 — what a reader gets *right now*: the last system evaluation that finished, bounded by
+   * `doctorFreshnessMs` and by whether the most recent attempt to refresh it actually landed.
+   * `writeHealth` calls this on every write, so `health.json`'s `doctor` field is never older
+   * than the gap between two writes — bounded, by construction, by the capacity-sensor tick that
+   * drives `reconcileContinuity` on its own asserted-shorter interval.
+   */
+  currentDoctorHealth(): DoctorHealthSnapshot {
+    return resolveDoctorHealth(
+      this.#lastDoctorSuccess,
+      this.#lastDoctorAttempt,
+      this.cp.clock.nowIso(),
+      this.options.doctorFreshnessMs ?? DEFAULT_DOCTOR_FRESHNESS_MS,
+    );
+  }
+
   /** §34.5 — the documented restart sequence, in order. */
   async reconcile(): Promise<ReconcileReport> {
     const expiredClaims = this.cp.claims.expireOverdue();
@@ -1099,7 +1312,7 @@ export class Daemon {
       `SELECT COUNT(*) AS n FROM assignments WHERE status = 'ACTIVE'`,
     );
 
-    const report = await this.cp.doctor.run("system");
+    const report = await this.runSystemDoctorCheck();
 
     return {
       activeBindings: activeBindings?.n ?? 0,
@@ -1247,6 +1460,14 @@ export class Daemon {
           restoration,
         },
       });
+
+      // #734 criterion 2 — capacity and continuity state changing is exactly what this method
+      // is called to react to (both the periodic capacity-sensor tick and the reactive
+      // provider-failure callback route through here), so it is the natural place to keep the
+      // persisted doctor snapshot current between restarts. `runPeriodic` already catches and
+      // backs off, so this can be awaited without changing what this method returns or throws.
+      await this.runPeriodic("doctor_refresh", () => this.runSystemDoctorCheck().then(() => undefined));
+
       return {
         plan,
         reassigned,
@@ -1370,6 +1591,7 @@ export class Daemon {
       this.options.capacityRefreshBudgetMs ?? sweepBudgetMs(providerCount),
       providerCount,
     );
+    assertDoctorFreshnessOrdering(capacityRefreshMs, this.options.doctorFreshnessMs ?? DEFAULT_DOCTOR_FRESHNESS_MS);
 
     const watchdog = setInterval(() => {
       void this.runPeriodic("watchdog", async () => {
@@ -1588,6 +1810,10 @@ export class Daemon {
         blockedPostMerge: this.cp.runs.list({ state: RunState.BLOCKED_POST_MERGE }).length,
       },
       lastReconcile: reconcile,
+      // #734 — freshness-bounded, recomputed against the live clock on every write rather than
+      // read back from whatever was last persisted. A caller that never advances the doctor
+      // still gets a correct answer here: age is derived from `checkedAt`, not cached.
+      doctor: this.currentDoctorHealth(),
       timerHealth: {
         status: this.#timerFailures.size === 0 ? "HEALTHY" : "DEGRADED",
         failures: Object.fromEntries(this.#timerFailures),

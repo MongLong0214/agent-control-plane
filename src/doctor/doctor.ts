@@ -62,6 +62,145 @@ export interface DoctorReport {
   ranAt: string;
 }
 
+/**
+ * #734 — a `DoctorReport` is a fact about the instant its `ranAt` names, not a running verdict.
+ * `DoctorStatus` never gains a fifth member for this: those four values still mean exactly what
+ * the deterministic §25.5 aggregation says. `STALE` and `UNKNOWN` exist only at the layer that
+ * compares a report against the clock and against whether a fresh one could be produced at all —
+ * the same separation #448 draws between a wrong answer and a comparison whose two sides came
+ * from different generations.
+ */
+export type DoctorHealthStatus = DoctorStatus | "STALE" | "UNKNOWN";
+
+/**
+ * The outcome of one attempt to produce a fresh system report, independent of whether it landed.
+ *
+ * `startedAt` and `completedAt` are separate fields because they are separate lifecycle points,
+ * and collapsing them into one called `at` is what produced #734's second defect. That single
+ * field held a *start* time, and `resolveDoctorHealth` compared it against `DoctorReport.ranAt`,
+ * which `Doctor.run` stamps *after* its probes. The two sides of that comparison were a start and
+ * a completion — different points on the same clock, off by one probe duration — so a failed
+ * re-evaluation that began before the last success finished was ruled older than it and silently
+ * dropped. The failure hid behind the healthy verdict it was evidence against.
+ *
+ * `generation` is the authority for "which of these two facts is newer", and neither timestamp
+ * is. It counts *completions* of `runSystemDoctorCheck`, so comparing it against the generation
+ * carried by the retained success compares like with like. It is an integer rather than a clock
+ * reading because millisecond-resolution stamps tie, and a tie is where a last-writer-wins bug
+ * lives; under this repository's `ManualClock` every reading in an un-advanced stretch ties, so a
+ * timestamp rule could not even be exercised by the test written to kill it.
+ */
+export interface DoctorHealthAttempt {
+  /** Before the probes — what `runSystemDoctorCheck` stamps on entry. */
+  startedAt: string;
+  /** After the probes — the same lifecycle point `DoctorReport.ranAt` is stamped at. */
+  completedAt: string;
+  /** Position in completion order. The only field an ordering decision may read. */
+  generation: number;
+  ok: boolean;
+  error?: string;
+}
+
+export interface DoctorHealthSnapshot {
+  status: DoctorHealthStatus;
+  reasonCode: ReasonCode;
+  /** `ranAt` of the last evaluation that actually finished, or `null` if none ever has. */
+  checkedAt: string | null;
+  ageMs: number | null;
+  freshnessMs: number;
+  /** Present only when the status is not the report's own value verbatim. */
+  reason?: string;
+}
+
+const doctorHealthReasonCode = (status: DoctorHealthStatus): ReasonCode =>
+  status === "STALE"
+    ? ReasonCode.DOCTOR_HEALTH_STALE
+    : status === "UNKNOWN"
+      ? ReasonCode.DOCTOR_HEALTH_UNKNOWN
+      : statusReason(status);
+
+/**
+ * #734 — the one place "is this doctor verdict still good?" is answered.
+ *
+ * Two facts come in, from two different code paths that do not otherwise talk to each other:
+ * the last report that actually finished (`lastSuccess`), and what happened on the most recent
+ * *attempt* to produce a new one (`lastAttempt`), which may have failed. Comparing timestamps
+ * rather than trusting call order, because both are written independently and only the
+ * timestamp says which is the newer fact.
+ *
+ * Criterion 3 is why `lastAttempt` exists as its own input rather than folding into
+ * `lastSuccess` alone: a re-evaluation that throws must not leave a reader looking at the old
+ * healthy value with a `checked_at` that quietly stopped advancing. A failed attempt at or after
+ * the last success's timestamp reports `STALE` immediately — it does not wait for
+ * `freshnessMs` to elapse, because the failure is itself evidence, right now, that nothing
+ * fresher could be established.
+ */
+export const resolveDoctorHealth = (
+  lastSuccess: { report: DoctorReport; generation: number } | null,
+  lastAttempt: DoctorHealthAttempt | null,
+  nowIso: string,
+  freshnessMs: number,
+): DoctorHealthSnapshot => {
+  const build = (
+    status: DoctorHealthStatus,
+    checkedAt: string | null,
+    ageMs: number | null,
+    reason?: string,
+  ): DoctorHealthSnapshot => ({
+    status,
+    reasonCode: doctorHealthReasonCode(status),
+    checkedAt,
+    ageMs,
+    freshnessMs,
+    ...(reason ? { reason } : {}),
+  });
+
+  if (!lastSuccess) {
+    return build(
+      "UNKNOWN",
+      null,
+      null,
+      lastAttempt && !lastAttempt.ok
+        ? `no doctor evaluation has ever succeeded; the last attempt failed: ${lastAttempt.error ?? "unknown error"}`
+        : "no doctor evaluation has run yet",
+    );
+  }
+
+  // A completion stamp: `Doctor.run` writes `ranAt` after its probes, not before them. Age is
+  // therefore measured from when the observation *finished*. Judging freshness from when it began
+  // would be the more conservative reading, and `DoctorReport` carries no start stamp to do it
+  // with — a deliberate boundary, noted here rather than approximated with the attempt's
+  // `startedAt`, which belongs to a different run whenever evaluations overlap.
+  const checkedAt = lastSuccess.report.ranAt;
+  const ageMs = Date.parse(nowIso) - Date.parse(checkedAt);
+
+  // Completion order, not clock arithmetic. The previous form compared `lastAttempt.at` — a start
+  // stamp — against `checkedAt`, a completion stamp, and a failure that began before the retained
+  // success finished was therefore ruled older than it and dropped. Generations are taken at
+  // completion for both facts, so this asks the question it means to ask: did the run that
+  // finished most recently fail?
+  if (lastAttempt && !lastAttempt.ok && lastAttempt.generation > lastSuccess.generation) {
+    return build(
+      "STALE",
+      checkedAt,
+      ageMs,
+      `a re-evaluation that started at ${lastAttempt.startedAt} failed at ${lastAttempt.completedAt}: ` +
+        `${lastAttempt.error ?? "unknown error"}`,
+    );
+  }
+
+  if (ageMs > freshnessMs) {
+    return build(
+      "STALE",
+      checkedAt,
+      ageMs,
+      `last evaluation is ${ageMs}ms old, past the ${freshnessMs}ms freshness window`,
+    );
+  }
+
+  return build(lastSuccess.report.status, checkedAt, ageMs);
+};
+
 export type DoctorScope =
   | "system"
   | "project"
@@ -520,6 +659,11 @@ export class Doctor {
 
     for (const adapter of this.providers.production()) {
       const provider = adapter.provider;
+      // A provider excluded from the unattended probe (#735) never gets this file refreshed
+      // again by that sweep. Checking its age would resurrect exactly the always-on warning
+      // retirement removes — a registered-but-unprobed provider is expected to have no
+      // fresh file, not a stale one, and a missing file is not evidence of anything here.
+      if (!this.capacity.isAutoProbeEnabled(provider)) continue;
       const file = capacitySensorFile(this.capacitySensorFiles.directory, provider);
       if (!existsSync(file)) {
         findings.push({
