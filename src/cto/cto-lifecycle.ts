@@ -720,15 +720,14 @@ export class CtoLifecycle {
         });
       }
 
-      // #692 (deferred out of #664/#679) — `stopped` below writes and commits, and
-      // `bindings.revoke()` can then deny (e.g. a concurrent `resolveEscalation` flips a
-      // BLOCKED run back to ACTIVE between the two calls). This is deliberately left as
-      // plain `tx()`, not converted to `txDecision()`: by this point the external
-      // provider has already been told to stop and that is not reversible, so rolling
-      // the STOPPED write back would leave the session record disagreeing with reality.
-      // The real fix needs an explicit compensation policy and an interleaving test; see
-      // #692. `scripts/verify-tx-denial-sites.mjs` records this as a deferred, not an
-      // exempt, site — it is a known open defect, not a decision that the write is safe.
+      // #692 chooses compensation (b), not a new "stop succeeded, revoke pending" state.
+      // STOPPED is already the durable fact after the irreversible provider call. Re-derive
+      // the revocation precondition from that fact: a CEO resolution that reactivated a
+      // checkpointed run after the stop no longer has a runnable owner, so checkpoint it
+      // again before revoke. A new terminal state would need its own retry, clearing and
+      // crash-recovery lifecycle while saying no more about the runtime than STOPPED does.
+      // This stays plain `tx()`: rolling STOPPED back on an unexpected cleanup refusal would
+      // make the durable session claim that a process exists after the provider stopped it.
       const completed = this.db.tx(() => {
         const fresh = this.bindings.active(roleKey);
         if (
@@ -748,9 +747,18 @@ export class CtoLifecycle {
         }
         const stopped = this.sessions.transition(current.sessionId, SessionLifecycle.STOPPED, "project suspended");
         if (!stopped.allowed) return stopped as Decision<void>;
+        for (const run of this.runs.activeRunsOwnedBy(current.sessionId)) {
+          if (run.state !== RunState.ACTIVE) continue;
+          const reblocked = this.runs.transition(
+            run.runId,
+            RunState.BLOCKED,
+            "owner session stopped during project suspension",
+          );
+          if (!reblocked.allowed) return reblocked as Decision<void>;
+        }
         // Suspension is the one deliberate exception to a normal revocation: every
-        // owned run was checkpointed to BLOCKED above and cannot regain authority from
-        // this revoked binding. Any runnable state still refuses the revocation.
+        // owned run is BLOCKED now that its session is STOPPED and cannot regain authority
+        // from this revoked binding. Any runnable state still refuses the revocation.
         return this.bindings.revoke(roleKey, `project suspended: ${reason}`, {
           allowBlockedRuns: true,
         });

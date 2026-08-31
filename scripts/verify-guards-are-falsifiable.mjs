@@ -2164,6 +2164,17 @@ const GUARDS = [
     ],
   },
   {
+    // #692 — the provider stop cannot be rolled back, so a CEO resolution that lands after
+    // STOPPED must be checkpointed again before the binding revocation reads its live runs.
+    what: "suspension reblocks a run that a CEO resolution revived after its owner stopped",
+    file: "src/cto/cto-lifecycle.ts",
+    find: "          if (run.state !== RunState.ACTIVE) continue;",
+    replace: "          if (true) continue;",
+    killedBy: [
+      "tests/unit/cto-registry-r2.test.ts::reblocks an escalation resolved while suspension stops its owner",
+    ],
+  },
+  {
     // A takeover that cannot repoint every live execution to the new generation must not
     // leave the old generation revoked and a new one minted — the guard that keeps a
     // run from being pinned to a revoked generation.
