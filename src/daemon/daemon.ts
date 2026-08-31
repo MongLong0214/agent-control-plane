@@ -1118,12 +1118,23 @@ export class Daemon {
    * #734 — the one place a system-scope `DoctorReport` is produced and recorded as either a
    * success or a failure, so `resolveDoctorHealth` always has both facts current.
    *
-   * A thrown probe is recorded as a failed attempt *before* it propagates — the catch here does
-   * not swallow the error, it only makes sure the failure is visible to freshness before the
-   * caller's own error handling runs. Every caller that needs the result awaited (`reconcile()`,
-   * the on-demand operator door) still gets the rejection; callers that only need freshness kept
-   * current (the periodic and reactive triggers) go through `runPeriodic`, which already catches
-   * and backs off.
+   * A thrown probe is recorded as a failed attempt *and persisted to disk right here* — not
+   * left for whichever caller happens to call `writeHealth` next. That distinction is the whole
+   * fix for the counterexample the CEO found: `reconcileContinuity()`'s failure path used to
+   * read as covered only because `runPeriodic`'s own catch calls `writeHealth`, which the
+   * on-demand operator path (`OPERATOR_METHOD.DOCTOR_RUN`) never goes through — its outer catch
+   * in `executeOperatorRequest` turns the rejection into `INTERNAL_ERROR` and returns, and
+   * `DAEMON_STATUS` serves `health.json` from disk regardless. A caller-dependent persist is not
+   * a persist; this method must not depend on what calls it. Every caller (`reconcile()`, the
+   * periodic/reactive triggers, the on-demand operator door) now gets the same guarantee for
+   * free, and none of them needs to remember to call `writeHealth` themselves on failure.
+   *
+   * A write failure on top of the doctor's own failure must not replace the error the caller
+   * is asking about with an unrelated one — the doctor's rejection is the fact this method
+   * exists to surface, so it always wins and is always what propagates. A failed persist is
+   * audited (the same `DAEMON_TIMER_FAILED`/`"health"` shape `runPeriodic` already uses for an
+   * unrelated write failure) rather than silently dropped, but it is secondary: it never
+   * replaces or suppresses the doctor error being thrown.
    */
   private async runSystemDoctorCheck(supplementalFindings: readonly Finding[] = []): Promise<DoctorReport> {
     const at = this.cp.clock.nowIso();
@@ -1135,6 +1146,15 @@ export class Daemon {
       return report;
     } catch (err) {
       this.#lastDoctorAttempt = { at, ok: false, error: safeErrorMessage(err) };
+      try {
+        this.writeHealth(null);
+      } catch (writeErr) {
+        this.cp.audit.record({
+          kind: "DAEMON_TIMER_FAILED",
+          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,
+          evidence: { timer: "health", error: safeErrorMessage(writeErr) },
+        });
+      }
       throw err;
     }
   }

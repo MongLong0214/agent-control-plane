@@ -3295,6 +3295,21 @@ const GUARDS = [
     replace: "",
     killedBy: ["tests/unit/daemon-doctor-freshness.test.ts"],
   },
+  {
+    // The CEO's counterexample, made a guard: `runSystemDoctorCheck()`'s failure branch used to
+    // update `#lastDoctorAttempt` in memory only and rethrow, leaving *the caller* responsible
+    // for persisting it. `reconcileContinuity()`'s failure path read as covered only because
+    // `runPeriodic`'s own catch calls `writeHealth` — but `OPERATOR_METHOD.DOCTOR_RUN`'s failure
+    // is caught by `executeOperatorRequest`'s outer catch, which returns `INTERNAL_ERROR` and
+    // never calls `writeHealth`, and `DAEMON_STATUS` serves `health.json` from disk. Removing
+    // the persist from the failure branch itself reproduces exactly that: a failed re-evaluation
+    // that stays in memory while `health.json` keeps answering the previous healthy value.
+    what: "#734: a failed system-doctor re-evaluation persists STALE to disk inside its own failure branch, not only when a caller happens to writeHealth afterward",
+    file: "src/daemon/daemon.ts",
+    find: '      this.#lastDoctorAttempt = { at, ok: false, error: safeErrorMessage(err) };\n      try {\n        this.writeHealth(null);\n      } catch (writeErr) {\n        this.cp.audit.record({\n          kind: "DAEMON_TIMER_FAILED",\n          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,\n          evidence: { timer: "health", error: safeErrorMessage(writeErr) },\n        });\n      }\n',
+    replace: '      this.#lastDoctorAttempt = { at, ok: false, error: safeErrorMessage(err) };\n',
+    killedBy: ["tests/unit/daemon-doctor-freshness.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

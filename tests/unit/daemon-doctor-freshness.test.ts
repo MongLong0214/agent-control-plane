@@ -163,6 +163,80 @@ describe("#734 daemon doctor freshness", () => {
     await daemon.stop();
   });
 
+  it("criterion 3 (operator path): a failed on-demand DOCTOR_RUN persists STALE to disk immediately, not only when a later caller happens to writeHealth", async () => {
+    // The CEO's counterexample: `runSystemDoctorCheck()`'s failure branch used to update memory
+    // only and rethrow, relying on the *caller* to persist. `reconcileContinuity()`'s failure
+    // path looked covered only because `runPeriodic`'s own catch calls `writeHealth` — but
+    // `OPERATOR_METHOD.DOCTOR_RUN`'s failure is caught by `executeOperatorRequest`'s outer catch,
+    // which returns `INTERNAL_ERROR` and never calls `writeHealth`. Without a persist inside the
+    // failure branch itself, `DAEMON_STATUS` — which reads `health.json` from disk — would keep
+    // answering the previous healthy value until some unrelated write happened to land.
+    const harness = makeHarness();
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const stateDir = tempDir("acp-doctor-freshness-");
+    const daemon = new Daemon(harness.cp, { stateDir, doctorFreshnessMs: 5 * 60_000 });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    const healthyBefore = readHealth(stateDir).doctor!;
+    expect(healthyBefore.status).not.toBe("STALE");
+
+    vi.spyOn(harness.cp.doctor, "run").mockRejectedValueOnce(new Error("#734 test: operator-triggered probe exploded"));
+    harness.clock.advance(10_000);
+    const response = await daemon.handleOperatorRequest(
+      { requestId: "req-doctor-run-fail", method: OPERATOR_METHOD.DOCTOR_RUN, params: { scope: "system" } },
+      PEER,
+    );
+    expect(response.allowed).toBe(false);
+    expect(response.reasonCode).toBe(ReasonCode.INTERNAL_ERROR);
+
+    // Immediately after the failed response — no later write, no additional tick.
+    const onDisk = readHealth(stateDir).doctor!;
+    expect(onDisk.status).toBe("STALE");
+    expect(onDisk.status).not.toBe(healthyBefore.status);
+    expect(onDisk.reason).toContain("#734 test: operator-triggered probe exploded");
+
+    const status = await daemon.handleOperatorRequest(
+      { requestId: "req-daemon-status", method: OPERATOR_METHOD.DAEMON_STATUS, params: {} },
+      PEER,
+    );
+    expect(status.allowed).toBe(true);
+    if (status.allowed) {
+      const daemonStatus = status.value as { health: { doctor: { status: string; reason?: string } } };
+      expect(daemonStatus.health.doctor.status).toBe("STALE");
+      expect(daemonStatus.health.doctor.reason).toContain("#734 test: operator-triggered probe exploded");
+    }
+    await daemon.stop();
+  });
+
+  it("criterion 3 (startup path): a doctor that throws during startup does not leave a previous run's healthy health.json as if current", async () => {
+    const harness = makeHarness();
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const stateDir = tempDir("acp-doctor-freshness-");
+
+    const first = new Daemon(harness.cp, { stateDir, doctorFreshnessMs: 5 * 60_000 });
+    const firstStarted = await first.start();
+    expect(firstStarted.allowed).toBe(true);
+    const healthyBefore = readHealth(stateDir).doctor!;
+    expect(healthyBefore.status).not.toBe("STALE");
+    await first.stop();
+
+    // A fresh process (a fresh `Daemon` instance, same on-disk state) whose startup doctor pass
+    // throws — the crash a restart is meant to recover from, not the ordinary BLOCKED/ERROR
+    // verdict path.
+    vi.spyOn(harness.cp.doctor, "run").mockRejectedValueOnce(new Error("#734 test: startup probe exploded"));
+    harness.clock.advance(10_000);
+    const second = new Daemon(harness.cp, { stateDir, doctorFreshnessMs: 5 * 60_000 });
+    const secondStarted = await second.start();
+    expect(secondStarted.allowed).toBe(false);
+    expect(secondStarted.reasonCode).toBe(ReasonCode.DAEMON_STARTUP_FAILED);
+
+    const onDisk = readHealth(stateDir).doctor!;
+    expect(onDisk.status).not.toBe(healthyBefore.status);
+    expect(onDisk.status).not.toBe("HEALTHY");
+    expect(onDisk.status).not.toBe("DEGRADED");
+    expect(onDisk.reason).toContain("#734 test: startup probe exploded");
+  });
+
   it("regression: DEGRADED still does not block startup dispatch", async () => {
     // A fresh harness with no CEO bound and no capacity sensor file yet written produces
     // CEO_ROLE_UNBOUND (WARN, non-blocking) and CAPACITY_SENSOR_FILE_MISSING (ERROR,
