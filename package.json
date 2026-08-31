@@ -15,7 +15,8 @@
   "scripts": {
     "postinstall": "node scripts/build-native-peercred.mjs",
     "build": "tsc -p tsconfig.build.json && cp src/db/schema.sql dist/db/schema.sql",
-    "typecheck": "tsc --noEmit",
+    "declarations:tracker-loci-strip": "tsc --allowJs --checkJs --declaration --emitDeclarationOnly --skipLibCheck --module ESNext --target ES2023 --moduleResolution bundler --outDir scripts/lib scripts/lib/tracker-loci-strip.mjs",
+    "typecheck": "pnpm declarations:tracker-loci-strip && git diff --exit-code -- scripts/lib/tracker-loci-strip.d.mts && tsc --noEmit",
     "test": "node scripts/verify-v1-experiment-isolation-declaration.mjs && node scripts/run-vitest-gate.mjs",
     "test:unit": "vitest run tests/unit",
     "test:scenarios": "vitest run tests/scenarios",
@@ -32,6 +33,7 @@
     "buzz:contract": "tsx scripts/verify-buzz-cli-contract.ts",
     "release:version": "node scripts/verify-release-version.mjs",
     "symbols": "node scripts/verify-enforcement-symbols.mjs",
+    "tracker:loci": "node scripts/verify-tracker-loci-resolve.mjs",
     "adapter:source": "node scripts/verify-acceptance-adapter-source.mjs",
     "guards:falsifiable": "node scripts/verify-guards-are-falsifiable.mjs",
     "guards:anchors": "node scripts/verify-guards-are-falsifiable.mjs --anchors-only",

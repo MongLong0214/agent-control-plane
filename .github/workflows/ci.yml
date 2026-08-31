@@ -210,6 +210,15 @@ jobs:
       - run: node scripts/ssot-report.mjs
         env:
           GH_TOKEN: ${{ github.token }}
+      # `verify-tracker-loci-resolve.mjs` (#597's citation-staleness check) does NOT run here.
+      # It was here once and was wrong to be: it is a fact about the *tracker*, not about this
+      # PR's diff, and — unlike `ssot-report.mjs` above, whose reconciliation only turns red when
+      # someone actively mis-records a marker — it is red *today*, on an unedited `main`, because
+      # an open issue (#649) already cites a moved line. Requiring it here would block every PR's
+      # merge on an issue-thread fact nothing in the diff touched, for however long that issue
+      # stays open — which is the coupling that gets a check silenced rather than fixed. It runs
+      # instead in `.github/workflows/tracker-loci.yml` on a schedule, where it can fail loudly
+      # without failing anyone's merge.
 
   # Branch protection requires the check named exactly `verify` (app_id 15368, GitHub Actions) —
   # confirmed against this repository's live protection settings, not assumed. `verify-matrix`
