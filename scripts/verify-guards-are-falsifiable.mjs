@@ -3097,6 +3097,66 @@ const GUARDS = [
     ],
   },
   {
+    what: "the scan enters both tests and documents",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find:
+      'const testFiles = filesBelow("tests", (path) => sourceExtensions.has(extensionOf(path)));\n' +
+      'const documentFiles = filesBelow("docs", (path) => path.endsWith(".md"));',
+    replace: "const testFiles = [];\nconst documentFiles = [];",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::the scan enters both tests and documents",
+    ],
+  },
+  {
+    what: "an existing production line copied into a test is rejected",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find: "      if (!existsSync(join(repoRoot, productionPath))) continue;",
+    replace: "      if (true) continue;",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::an existing production line copied into a test is rejected",
+    ],
+  },
+  {
+    what: "a missing production path remains a stable negative control",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find: "      if (!existsSync(join(repoRoot, productionPath))) continue;",
+    replace: "      if (false) continue;",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::a missing production path remains a stable negative control",
+    ],
+  },
+  {
+    what: "a discovered file count pinned to a literal is rejected",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find:
+      "          if (readsDiscoveredMembers) pins.push({ index: node.getStart(sourceFile), count: node.arguments[0].text });",
+    replace:
+      "          if (false) pins.push({ index: node.getStart(sourceFile), count: node.arguments[0].text });",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::a discovered file count pinned to a literal is rejected",
+    ],
+  },
+  {
+    what: "a measured SHA is consumed by its reproduction command",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find:
+      "        const consumesMeasuredRef = new RegExp(`--ref(?:=|\\\\s+)${sha}(?:\\\\s|$)`).test(command[1]);",
+    replace: "        const consumesMeasuredRef = true;",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::a measured SHA is consumed by its reproduction command",
+    ],
+  },
+  {
+    what: "a workflow job total copied into documentation is rejected",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find:
+      "  const jobTotalPattern = /\\b(?:the\\s+)?workflow\\s+(?:now|currently)\\s+has\\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\\d+)\\s+jobs?\\b/gi;",
+    replace: "  const jobTotalPattern = /$^/g;",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::a workflow job total copied into documentation is rejected",
+    ],
+  },
+  {
     // #416 keeps V1's stated absence of enforcement honest; ACP 2.0 still needs its runtime guard.
     what: "the V1 experiment isolation census scans every production source file",
     file: "scripts/verify-v1-experiment-isolation-declaration.mjs",

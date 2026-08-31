@@ -10,7 +10,7 @@ that the repository protect itself before any later wave's "green" means anythin
 
 The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **the bare `verify` check is the
 required status check context** — that is a job check name GitHub reports, not the workflow name.
-The workflow now has five jobs:
+Its jobs, and what each contributes to that check:
 
 - `verify-matrix`, displayed as `verify`, runs the main build and test steps on Node 22.18.0 and
   the current Node 22 release, producing `verify (22.18.0)` and `verify (22)` checks;
