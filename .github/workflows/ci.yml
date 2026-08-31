@@ -254,8 +254,12 @@ jobs:
       - name: require the test matrix to have actually succeeded
         run: |
           verify_matrix="${{ needs.verify-matrix.result }}"
+          # Print the value before deciding on it. A gate that only prints its verdict cannot be
+          # told apart from a gate that read the wrong input, which is the position this check was
+          # in when it failed while both matrix legs were green.
+          echo "needs.verify-matrix.result=${verify_matrix}"
           if [ "$verify_matrix" != "success" ]; then
-            echo "verify-matrix=$verify_matrix — failing the required verify check"
+            echo "the test matrix did not succeed — failing the required verify check"
             exit 1
           fi
           echo "the test matrix succeeded""
