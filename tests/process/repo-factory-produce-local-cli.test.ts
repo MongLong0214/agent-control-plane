@@ -125,4 +125,37 @@ describe("repo-factory:produce-local CLI (#246)", () => {
     expect(existsSync(join(outsideTarget, ".git"))).toBe(false);
     expect(readdirSync(outsideTarget)).toEqual([]);
   });
+
+  it("CEO review round 5, defect 2 — two real concurrent processes creating the same checkout: exactly one succeeds, decided by the kernel, not a check either process could race between", async () => {
+    // Real, separate OS processes — genuine concurrency a single Node event loop cannot
+    // reproduce. Reproduced directly against commit 7d6b580 (the previous, recursive-mkdir
+    // shape) before this fix: two such processes racing the same path did not deterministically
+    // split 1-1 — one run crashed outright (`ENOTEMPTY` during a concurrent `rmSync` cleanup
+    // colliding with the other process's still-open writes into the same directory), because
+    // recursive `mkdirSync` treats an already-existing directory as success for *both*
+    // callers, giving no collision signal at all. Against the fix below, five consecutive real
+    // concurrent runs each split exactly 1 success / 1 collision, in either order, with no
+    // crash — the invariant this test pins.
+    const sandbox = makeSandbox();
+    const workDir = join(sandbox, "workdir");
+    const planAPath = writePlan(sandbox, basePlan());
+    const planBPath = join(sandbox, "plan-b.json");
+    writeFileSync(planBPath, JSON.stringify({ ...basePlan(), bootstrapOperationId: "bootstrap_246_cli_concurrent_b" }));
+
+    const spawn = (planPath: string) =>
+      execFileAsync(process.execPath, [TSX_ENTRY, CLI_ENTRY, `--plan=${planPath}`, `--work-dir=${workDir}`], {
+        cwd: process.cwd(),
+      });
+
+    const [a, b] = await Promise.allSettled([spawn(planAPath), spawn(planBPath)]);
+    const outcomes = [a, b];
+    const succeeded = outcomes.filter((o) => o.status === "fulfilled");
+    const failed = outcomes.filter((o) => o.status === "rejected");
+    // The invariant is the split, not which process wins — genuine OS scheduling decides
+    // that, and the kernel's atomic `mkdir` decides the split regardless of the order.
+    expect(succeeded).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    const loser = failed[0] as PromiseRejectedResult;
+    expect((loser.reason as { code?: number }).code).toBe(1);
+  });
 });

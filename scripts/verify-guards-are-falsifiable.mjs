@@ -3407,6 +3407,36 @@ const GUARDS = [
     replace: "  if (false && (stat.mode & 0o022) !== 0) {\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
+  {
+    // CEO review round 5, defect 1 — round 4's chain walk stopped at `workDir` itself,
+    // leaving `dirname(workDir)` unchecked. Renaming or replacing the `workDir` *entry* does
+    // not need write access inside `workDir` — only on its own parent — so an
+    // attacker-writable grandparent holding an owner-only `workDir` passed round 4's check
+    // while still being able to swap the `workDir` entry out from under it. Neutering the
+    // one-level extension here reproduces exactly that gap: reachedBoundary is computed but
+    // never used to add the boundary's own parent to the chain.
+    what: "the producer refuses when the directory governing workDir's own rename permission is unsafe, not only workDir and below",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "    if (parentOfWorkDir !== boundary) chain.push(parentOfWorkDir);\n",
+    replace: "    if (false && parentOfWorkDir !== boundary) chain.push(parentOfWorkDir);\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 5, defect 2 — CEO's correction: same-UID concurrent producers are
+    // this system's normal operating mode, not an attacker model, and an `existsSync`
+    // check-then-act cannot decide a collision between two such producers racing the same
+    // path. Reverting the atomic, non-recursive leaf creation back to `recursive: true`
+    // reproduces exactly the shape CEO found: reproduced directly against commit 7d6b580,
+    // two real concurrent OS processes racing the same checkout path did not deterministically
+    // split 1 success / 1 collision — one run crashed with `ENOTEMPTY` when one process's
+    // cleanup collided with the other's still-open writes into the same directory, because
+    // recursive `mkdirSync` treats an already-existing directory as success for both callers.
+    what: "the filesystem's own atomic mkdir, not existsSync, decides a same-path creation collision",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "    mkdirSync(localRepoPath);\n",
+    replace: "    mkdirSync(localRepoPath, { recursive: true });\n",
+    killedBy: ["tests/process/repo-factory-produce-local-cli.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

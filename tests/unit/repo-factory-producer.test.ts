@@ -19,6 +19,7 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import {
+  ensureDirectoryLevel,
   judgeDirectoryOwnership,
   produceRepoFactoryResult,
   repositoryCheckoutPath,
@@ -254,6 +255,108 @@ describe("repo factory producer (#246)", () => {
       // Refusing before ever creating the checkout — the unsafe directory is left exactly as
       // found, not silently written into anyway.
       expect(existsSync(join(repositoriesDir, "primary"))).toBe(false);
+    });
+  });
+
+  /**
+   * CEO review round 5 — round 4's ownership-chain check stopped at `workDir` itself,
+   * never checking `dirname(workDir)`. But renaming or replacing the `workDir` *entry* does
+   * not need write access *inside* `workDir` — it needs write access on `workDir`'s own
+   * parent. Reproduced directly against commit 7d6b580 (before this fix), copied temporarily
+   * alongside the real module so its relative imports still resolved, then deleted — never
+   * committed:
+   *
+   *   unsafeParent = 0o777, owned by this process; workDir = join(unsafeParent, "workdir")
+   *   (workDir does not exist yet)
+   *   produced.allowed: true
+   *   workDir now exists (was it created despite the unsafe parent?): true
+   *   workDir contents: [ 'repositories', 'repositories/primary', '.../.git', ... ]  (full run)
+   *
+   * The old check found nothing to examine (`workDir` and `repositories` did not exist yet,
+   * so the chain walk skipped both), and `mkdirSync(localRepoPath, { recursive: true })`
+   * then created every missing level — including `workDir` itself — in one call, with no
+   * check in between. Against the fixed code below, the same input refuses before creating
+   * anything:
+   *
+   *   produced.allowed: false
+   *   reasonCode: WRITE_TARGET_OUTSIDE_RUN_SCOPE
+   *   workDir now exists (should be false — no pre-write side effect): false
+   *   unsafeParent contents (should be unchanged, no 'workdir' entry): []
+   */
+  describe("CEO review round 5, defect 1 — the boundary parent that governs workDir's own rename permission", () => {
+    it("refuses when workDir's own parent is writable by another user or group, producing no pre-write side effect at all", async () => {
+      const { sandbox } = makeSandbox();
+      const unsafeParent = join(sandbox, "unsafe-parent");
+      mkdirSync(unsafeParent, { recursive: true });
+      chmodSync(unsafeParent, 0o777);
+      const workDir = join(unsafeParent, "workdir"); // does not exist yet
+
+      const produced = await produceRepoFactoryResult({ plan: basePlan(), workDir });
+      expect(produced.allowed).toBe(false);
+      if (produced.allowed) return;
+      expect(produced.reasonCode).toBe(ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE);
+      // Not merely refused afterward — nothing was ever created, including workDir itself.
+      expect(existsSync(workDir)).toBe(false);
+      expect(readdirSync(unsafeParent)).toEqual([]);
+    });
+
+    it("still refuses (via the existing repositories-level check) when workDir itself pre-exists safely but its parent does not, even once workDir is created ahead of time", async () => {
+      // A variant of the same gap with workDir already materialized: confirms the fix does
+      // not merely special-case "workDir missing" but genuinely walks past workDir.
+      const { sandbox } = makeSandbox();
+      const unsafeParent = join(sandbox, "unsafe-parent-2");
+      mkdirSync(unsafeParent, { recursive: true });
+      const workDir = join(unsafeParent, "workdir");
+      mkdirSync(workDir, { recursive: true }); // workDir itself is fine (owned by us, 0o755)
+      chmodSync(unsafeParent, 0o777); // ...but its own parent is not
+
+      const produced = await produceRepoFactoryResult({ plan: basePlan(), workDir });
+      expect(produced.allowed).toBe(false);
+      expect(existsSync(join(workDir, "repositories"))).toBe(false);
+    });
+  });
+
+  /**
+   * CEO review round 5, defect 2 — CEO's correction: a same-UID actor is not this system's
+   * attacker model, it is its normal concurrency model (multiple agents run as one user all
+   * day). Two producers can legitimately race past a check-then-act `existsSync`, both
+   * proceed, and both write into the same path — a real collision in ordinary operation, not
+   * only a hypothetical exploit. `mkdirSync` without `recursive` is the standard primitive
+   * for "create it or lose the race, never both": it is a single atomic syscall that either
+   * creates a genuinely new directory or fails `EEXIST`, decided by the kernel.
+   */
+  describe("CEO review round 5, defect 2 — same-UID concurrency must be decided by the filesystem", () => {
+    it("recursive mkdirSync gives no collision signal on an already-existing directory — the exact primitive gap that let two concurrent creators both succeed", () => {
+      const { workDir } = makeSandbox();
+      const existing = join(workDir, "already-here");
+      mkdirSync(existing, { recursive: true });
+
+      // This is Node's own documented behaviour, not a bug in this file: a second caller
+      // "creating" an already-existing directory recursively is treated as success, not a
+      // collision — which is exactly why it cannot be the authority for "did I just win a
+      // race to create this directory".
+      expect(() => mkdirSync(existing, { recursive: true })).not.toThrow();
+
+      // The primitive this producer uses instead, on the same already-existing path: a real,
+      // deterministic collision signal, not a hopeful `existsSync` read beforehand.
+      expect(() => mkdirSync(existing)).toThrow(
+        expect.objectContaining({ code: "EEXIST" }),
+      );
+    });
+
+    it("ensureDirectoryLevel accepts a real pre-existing directory but refuses a symlink occupying the same name", () => {
+      const { sandbox } = makeSandbox();
+      const real = join(sandbox, "real-dir");
+      mkdirSync(real, { recursive: true });
+      const reused = ensureDirectoryLevel(real);
+      expect(reused.allowed).toBe(true);
+
+      const elsewhere = join(sandbox, "elsewhere");
+      mkdirSync(elsewhere, { recursive: true });
+      const symlinked = join(sandbox, "symlinked-name");
+      symlinkSync(elsewhere, symlinked);
+      const refused = ensureDirectoryLevel(symlinked);
+      expect(refused.allowed).toBe(false);
     });
   });
 

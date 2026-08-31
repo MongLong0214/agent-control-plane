@@ -1,5 +1,6 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   rmSync,
@@ -186,29 +187,34 @@ export const judgeDirectoryOwnership = (
  * real close is removing the actor who could ever win that race.
  *
  * This does that by converting the race into a precondition: every existing directory
- * between the checkout's own parent and `workDir` (inclusive) must be owned by this
- * process's effective user and must not be writable by any other user or group
- * (`mode & 0o022 === 0`, i.e. neither the group-write nor other-write bit is set). If that
- * holds, no *other* account can create, delete, or rename anything inside those directories
+ * between the checkout's own parent and `dirname(workDir)` — **not stopping at `workDir`
+ * itself** — must be owned by this process's effective user and must not be writable by any
+ * other user or group (`mode & 0o022 === 0`). Stopping the walk at `workDir` (round 4's
+ * first attempt) answered "can someone tamper with what's *inside* workDir", which is a
+ * different question from "can someone rename or replace the `workDir` *entry* itself" —
+ * that second question is answered by `workDir`'s own parent's permissions, and only its
+ * own parent's: renaming or deleting a directory entry needs write access on the directory
+ * that *contains* the entry, not on the entry itself. An attacker-writable grandparent
+ * holding an owner-only `workDir` swaps the `workDir` entry with no need to write inside it
+ * at all, which stopping at `workDir` could not see.
+ *
+ * If the whole chain holds, no *other* account can create, delete, or rename anything in it
  * — not "probably won't in the brief window before the next syscall", but categorically
  * cannot, because doing so requires write access to the parent directory and, by
  * construction, nothing but this process has it. Once verified, the invariant holds for the
  * rest of this run without needing to be re-checked before every operation: changing it
  * would itself require the very write access this check just proved nobody but this process
- * holds. It is checked twice regardless — once before `mkdirSync`, once immediately after —
- * the same belt-and-braces shape as `assertContained`, to cover the (now merely lexical, not
- * racy) gap between the two calls and to validate the directories this run itself just
- * created.
+ * holds.
  *
  * What this does *not* do, stated rather than left as a documented hole: it does not defend
- * against a same-account attacker. Another process already running as this user holds
- * exactly the same access this run does and could tamper with these same directories
- * regardless of what this check finds. No single producer function can meaningfully defend
- * against its own account being compromised — that is a strictly larger compromise than a
- * swapped git checkout. The guarantee here is narrower, and that narrowing is the honest
- * answer: this producer refuses to operate in a namespace a *different* user or group could
- * tamper with, which is the realistic shared-host/shared-temp-directory threat model it
- * actually faces, not a claim to have closed every race a co-resident attacker could run.
+ * against a same-account actor. In this system same-UID *concurrent* producers are the
+ * normal operating mode, not an attacker — that case is real and is closed separately, by
+ * making leaf creation atomic (see `produceRepoFactoryResult`'s `mkdirSync(localRepoPath)`
+ * with no `recursive`), not by an ownership check, because two same-UID processes legitimately
+ * share exactly the access this check verifies. A same-UID actor deliberately racing this
+ * producer maliciously is a compromised-account scenario no single producer function can
+ * meaningfully defend against; the guarantee here is narrower on purpose: it refuses to
+ * operate in a namespace a *different* user or group could tamper with.
  */
 const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: string): Decision<void> => {
   if (typeof process.getuid !== "function") {
@@ -222,17 +228,83 @@ const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: st
   const boundary = resolve(workDir);
   const chain: string[] = [];
   let current = dirname(resolve(localRepoPath));
+  let reachedBoundary = false;
   for (;;) {
     chain.push(current);
-    if (current === boundary) break;
+    if (current === boundary) {
+      reachedBoundary = true;
+      break;
+    }
     const parent = dirname(current);
     if (parent === current) break; // reached the filesystem root without meeting workDir
     current = parent;
+  }
+  if (reachedBoundary) {
+    // The one directory that governs whether `workDir` *itself* can be renamed, deleted, or
+    // replaced. Deliberately exactly one level further, not a walk to the filesystem root:
+    // going further would need to special-case shared, sticky-bit-protected roots like the
+    // OS temp directory (world-writable but safe, because the sticky bit already restricts
+    // deletion/rename to an entry's own owner) to avoid refusing every ordinary temp-rooted
+    // workDir, and this producer's contract is "given a workDir", not "given everything
+    // above it". A caller wanting one more level of protection nests workDir one directory
+    // deeper under something it already owns — which is what every test and the CLI already do.
+    const parentOfWorkDir = dirname(boundary);
+    if (parentOfWorkDir !== boundary) chain.push(parentOfWorkDir);
   }
   for (const dir of chain) {
     if (!existsSync(dir)) continue; // not created yet — nothing to own or misconfigure
     const judged = judgeDirectoryOwnership(dir, statSync(dir), myUid);
     if (!judged.allowed) return judged;
+  }
+  return allow(ReasonCode.OK, undefined);
+};
+
+/**
+ * Creates `dir` if it does not already exist — one level, never `recursive: true`. A single
+ * recursive `mkdirSync` call can silently create *several* missing path components in one
+ * shot, including ones that did not exist at precheck time; if a symlink was raced into
+ * place anywhere along that path in the meantime, recursive creation tunnels straight
+ * through it and writes real directories inside whatever it points to, *before* any
+ * post-creation check gets a chance to refuse (CEO review round 4, defect 3b). A plain
+ * `mkdirSync(dir)` either creates a fresh, genuine directory atomically, or fails `EEXIST`
+ * if anything — including a symlink raced into place — already occupies that exact path; the
+ * `lstatSync` fallback below (never `statSync`, which would follow a symlink and inspect its
+ * *target* instead of the entry itself) tells the two cases apart and refuses the second.
+ *
+ * `workDir` and the shared `repositories` directory are created this way; the checkout leaf
+ * itself uses the same primitive directly in `produceRepoFactoryResult` as the collision
+ * authority (see the comment there for why that matters for same-UID concurrency).
+ */
+export const ensureDirectoryLevel = (dir: string): Decision<void> => {
+  try {
+    mkdirSync(dir);
+    return allow(ReasonCode.OK, undefined);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST") {
+      return deny(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "could not create a directory this run needs",
+        { dir, message: (err as Error).message },
+      );
+    }
+  }
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(dir);
+  } catch (statErr) {
+    return deny(
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      "a directory this run needs disappeared between creation and inspection",
+      { dir, message: (statErr as Error).message },
+    );
+  }
+  if (!stat.isDirectory()) {
+    return deny(
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      "a path this run needs to be a real directory is something else (possibly a symlink raced into place)",
+      { dir },
+    );
   }
   return allow(ReasonCode.OK, undefined);
 };
@@ -328,6 +400,14 @@ export const produceRepoFactoryResult = async (
 
   const workDir = resolve(input.workDir);
   const localRepoPath = repositoryCheckoutPath(workDir, plan.repositoryRole);
+  const repositoriesDir = dirname(localRepoPath);
+
+  // Fast-path only — refusing early avoids the containment/ownership/creation work below for
+  // the common, non-concurrent case. It is NOT the collision authority: see the atomic
+  // `mkdirSync(localRepoPath)` further down, which is (CEO review round 4, defect 3b — this
+  // system runs multiple same-UID producers concurrently as normal operation, and an
+  // `existsSync` check has a gap another process's own creation can land in before this one
+  // reads it).
   if (existsSync(localRepoPath)) {
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
@@ -341,14 +421,40 @@ export const produceRepoFactoryResult = async (
   const ownershipPrecheck = assertParentChainNotAttackerWritable(workDir, localRepoPath);
   if (!ownershipPrecheck.allowed) return ownershipPrecheck as Decision<RepoFactoryResult>;
 
-  mkdirSync(localRepoPath, { recursive: true });
+  // `workDir` and `repositories` are created one level at a time, never `recursive: true` —
+  // a single recursive call can tunnel through several path components (including one raced
+  // into place after the precheck above) before anything checks again. Each step below
+  // either creates a fresh, genuine directory or discovers a real, already-existing one;
+  // anything else — a symlink raced into place in that exact window — is refused immediately,
+  // producing no write inside it, not merely a refusal after the fact.
+  for (const dir of [workDir, repositoriesDir]) {
+    const ensured = ensureDirectoryLevel(dir);
+    if (!ensured.allowed) return ensured as Decision<RepoFactoryResult>;
+  }
 
-  // Closes the (now purely lexical, not racy) gap between the checks above and this write,
-  // and validates the directories this call itself just created.
-  const postCreate = assertContained(workDir, localRepoPath);
-  if (!postCreate.allowed) return postCreate as Decision<RepoFactoryResult>;
-  const ownershipPostCreate = assertParentChainNotAttackerWritable(workDir, localRepoPath);
-  if (!ownershipPostCreate.allowed) return ownershipPostCreate as Decision<RepoFactoryResult>;
+  // THE collision authority (CEO review round 4, defect 3b): the filesystem's own atomic
+  // `mkdir`. Exactly one concurrent caller for this exact path succeeds; every other one —
+  // including another of this project's own producers racing the same operation, the normal
+  // concurrent case this system actually runs, not only a hypothetical attacker — gets
+  // `EEXIST` here, decided by the kernel in one syscall, never by a check-then-act
+  // `existsSync` another process can run between.
+  try {
+    mkdirSync(localRepoPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") {
+      return deny(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "local repository checkout path already exists; a same-named resource with unknown provenance is a collision, not a resume (Integration §13.3)",
+        { localRepoPath },
+      );
+    }
+    return deny(
+      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+      "could not create the local repository checkout directory",
+      { localRepoPath, message: (err as Error).message },
+    );
+  }
 
   writeFileSync(
     join(localRepoPath, OPERATION_MARKER_NAME),
