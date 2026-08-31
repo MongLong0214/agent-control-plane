@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { buildAcceptanceReport } from "../../src/export/acceptance-report.ts";
-import { Db } from "../../src/db/database.ts";
+import type { Db } from "../../src/db/database.ts";
 import { makeHarness } from "../helpers/harness.ts";
 import { cleanupTempDirs } from "../helpers/fixtures.ts";
 
