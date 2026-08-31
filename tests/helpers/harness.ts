@@ -12,6 +12,7 @@ import { BuzzAdapter, InMemoryBuzzTransport, type BuzzTransport } from "../../sr
 import { TestProductionAdapter } from "./production-adapter.ts";
 import type { GitHubClient, GitHubKernelOptions } from "../../src/github/github-kernel.ts";
 import type { OwnerIdentity } from "../../src/ceo/owner-authority.ts";
+import type { BaselineHarnessInput } from "../../src/export/baseline-contract.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
 import { IngressGuard, ownerApprovalPayload } from "../../src/ingress/ingress-guard.ts";
 import { digestOf } from "../../src/core/digest.ts";
@@ -620,6 +621,8 @@ export const finalizeNoRepositoryRun = async (
   harness: Harness,
   projectId: string,
   contract: TaskContract,
+  /** Baseline exports only count a run whose harness identity attests production evidence. */
+  options: { baselineHarness?: BaselineHarnessInput } = {},
 ): Promise<{ runId: string; candidateSnapshotDigest: string }> => {
   bindCeo(harness);
   harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acp-trusted-app" });
@@ -631,6 +634,7 @@ export const finalizeNoRepositoryRun = async (
     // omit their required owner item.
     executionMode: ExecutionMode.STANDARD,
     contract,
+    ...(options.baselineHarness ? { baselineHarness: options.baselineHarness } : {}),
   });
   if (!created.allowed) throw new Error(created.message);
   const dispatched = await harness.cp.runs.dispatch(created.value.runId);

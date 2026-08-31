@@ -859,8 +859,15 @@ const projectQuality = (
     );
   const latestObservation = (fact: "rollbackOrCompensation" | "defectEscape"): Record<string, unknown> | null =>
     [...qualityObservations].reverse().find((observation) => observation["fact"] === fact) ?? null;
-  const observationCoversFact = (observation: Record<string, unknown> | null): boolean =>
-    observation?.["status"] === "OBSERVED" || observation?.["status"] === "NOT_OBSERVED";
+  // A status is an assertion; the digest is what makes it an observation. The ledger is
+  // append-only, so a record written before the recorder required evidence — or inserted
+  // around it — is still read here forever. Coverage is decided at this end.
+  const observationCoversFact = (observation: Record<string, unknown> | null): boolean => {
+    if (observation === null) return false;
+    const status = observation["status"];
+    if (status !== "OBSERVED" && status !== "NOT_OBSERVED") return false;
+    return typeof observation["evidenceDigest"] === "string";
+  };
   const rollbackObservation = latestObservation("rollbackOrCompensation");
   const defectEscapeObservation = latestObservation("defectEscape");
   const facts = [
