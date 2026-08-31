@@ -184,9 +184,31 @@ const install = (): InstalledWorkerTrace | undefined => {
     },
   });
 
+  // This instrument reads one internal path. When a Vitest version stops routing task updates
+  // through it, every measurement silently becomes zero — and zero measurements read the same as
+  // "nothing went wrong". Say which one it was, so a version that moves the path is a visible
+  // absence rather than a quiet pass. Measured on 4.1.11: `onTaskUpdate` is never called.
+  const reportPathIfNeverEntered = (): void => {
+    if (sequence > 0) return;
+    record({
+      version: 1,
+      runId: trace.runId,
+      pid: process.pid,
+      atMs: performance.timeOrigin + performance.now(),
+      type: "path-not-exercised",
+      rpcMethod: "onTaskUpdate",
+      detail:
+        "the worker RPC never called onTaskUpdate, so no update segment could be measured; " +
+        "this is the absence of the measured path, not the absence of delay",
+    });
+  };
+
   const installed: InstalledWorkerTrace = {
     writer,
-    flush: () => writer.flush(),
+    flush: () => {
+      reportPathIfNeverEntered();
+      return writer.flush();
+    },
   };
   workerGlobal.__acp_vitest_rpc_trace__ = installed;
   state.onCleanup(async () => {

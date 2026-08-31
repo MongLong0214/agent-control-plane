@@ -89,6 +89,17 @@ export interface MainUpdateUnattributedRecord extends TraceBase {
   mainOnTaskUpdateMs: number;
 }
 
+/**
+ * The instrument wraps one internal Vitest path. A version that stops using that path yields zero
+ * measurements, which is indistinguishable from a run with nothing to report unless the absence is
+ * stated. This record states it.
+ */
+export interface PathNotExercisedRecord extends TraceBase {
+  type: "path-not-exercised";
+  rpcMethod: string;
+  detail: string;
+}
+
 export type VitestRpcClassification =
   | "a-main-onTaskUpdate"
   | "b-ipc-or-process-scheduling"
@@ -142,6 +153,7 @@ export type VitestRpcTraceRecord =
   | MainUpdateStartRecord
   | MainUpdateEndRecord
   | MainUpdateUnattributedRecord
+  | PathNotExercisedRecord
   | VitestRpcMeasurement
   | VitestRpcSummaryRecord;
 
@@ -584,6 +596,7 @@ export const currentVitestRpcTrace = (): { file: string; runId: string } | undef
 
 export class VitestRpcTraceReporter implements Reporter {
   private readonly writer: VitestRpcTraceWriter;
+  private summarized = false;
 
   constructor(
     readonly file: string,
@@ -632,7 +645,17 @@ export class VitestRpcTraceReporter implements Reporter {
     };
   }
 
+  // Vitest 3.x ends a run through `onFinished`; 4.x renamed that hook to `onTestRunEnd` and stopped
+  // calling the old name. A reporter that only implements the retired one is never asked to write
+  // its summary, and the trace then holds raw segments with no measurement — which reads exactly
+  // like a run where nothing was slow. Implement both and let the first one to fire do the work.
+  async onTestRunEnd(): Promise<void> {
+    await this.onFinished();
+  }
+
   async onFinished(): Promise<void> {
+    if (this.summarized) return;
+    this.summarized = true;
     await this.writer.flush();
     const { measurements, summary } = summarizeVitestRpcTrace(
       readVitestRpcTrace(this.file),
