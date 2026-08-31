@@ -27,6 +27,7 @@
     "reason-codes": "node scripts/verify-reason-codes.mjs",
     "reason-codes:usage": "node scripts/verify-reason-code-usage.mjs",
     "scripts:plausible-callers": "node scripts/verify-every-script-has-a-plausible-caller.mjs",
+    "coordinates:stale": "node scripts/verify-stale-coordinate-literals.mjs",
     "evidence:freshness": "node scripts/verify-evidence-freshness.mjs",
     "invariants": "node scripts/verify-invariant-coverage.mjs",
     "buzz:contract": "tsx scripts/verify-buzz-cli-contract.ts",

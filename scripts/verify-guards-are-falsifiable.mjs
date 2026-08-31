@@ -2795,6 +2795,64 @@ const GUARDS = [
       "tests/process/every-script-has-a-plausible-caller.test.ts::uses any plausibly CI routed package alias for a multiply aliased script",
     ],
   },
+  {
+    what: "the scan enters both tests and documents",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find:
+      'const testFiles = filesBelow("tests", (path) => sourceExtensions.has(extensionOf(path)));\n' +
+      'const documentFiles = filesBelow("docs", (path) => path.endsWith(".md"));',
+    replace: "const testFiles = [];\nconst documentFiles = [];",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::the scan enters both tests and documents",
+    ],
+  },
+  {
+    what: "an existing production line copied into a test is rejected",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find: "      if (!existsSync(join(repoRoot, productionPath))) continue;",
+    replace: "      if (true) continue;",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::an existing production line copied into a test is rejected",
+    ],
+  },
+  {
+    what: "a missing production path remains a stable negative control",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find: "      if (!existsSync(join(repoRoot, productionPath))) continue;",
+    replace: "      if (false) continue;",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::a missing production path remains a stable negative control",
+    ],
+  },
+  {
+    what: "a discovered file count pinned to a literal is rejected",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find: "    if (readsDiscoveredMembers) pins.push({ index: start, count: match[2] });",
+    replace: "    if (false) pins.push({ index: start, count: match[2] });",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::a discovered file count pinned to a literal is rejected",
+    ],
+  },
+  {
+    what: "a measured SHA is consumed by its reproduction command",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find:
+      "        const consumesMeasuredRef = new RegExp(`--ref(?:=|\\\\s+)${sha}(?:\\\\s|$)`).test(command[1]);",
+    replace: "        const consumesMeasuredRef = true;",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::a measured SHA is consumed by its reproduction command",
+    ],
+  },
+  {
+    what: "a workflow job total copied into documentation is rejected",
+    file: "scripts/verify-stale-coordinate-literals.mjs",
+    find:
+      "  const jobTotalPattern = /\\b(?:the\\s+)?workflow\\s+(?:now\\s+)?has\\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\\d+)\\s+jobs?\\b/gi;",
+    replace: "  const jobTotalPattern = /$^/g;",
+    killedBy: [
+      "tests/unit/verify-stale-coordinate-literals.test.ts::a workflow job total copied into documentation is rejected",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
