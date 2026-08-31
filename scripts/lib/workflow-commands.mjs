@@ -62,6 +62,125 @@ export const jobByLine = (lines) => {
   return jobs;
 };
 
+/**
+ * A plain YAML scalar with its trailing comment removed.
+ *
+ * `uses: actions/checkout@<sha> # v4.2.2` is the repository's pinning convention, and the ` # `
+ * is a YAML comment, not part of the value. Reading it as part of the value made every pinned
+ * action look unpinned — a check failing on the truth, which is how a check gets deleted.
+ */
+export const plainScalar = (inline) => inline.replace(/(^|\s)#.*$/, "$1").trim();
+
+/** Top-level workflow keys, so a reach-in like `defaults:` or `env:` can be seen from above. */
+export const topLevelKeys = (lines) => {
+  const keys = [];
+  for (const [index, line] of lines.entries()) {
+    if (line.trim() === "" || line.startsWith("#")) continue;
+    const match = /^([A-Za-z0-9_.-]+):(.*)$/.exec(line);
+    if (match) keys.push({ name: match[1], inline: match[2].trim(), line: index + 1 });
+  }
+  return keys;
+};
+
+/**
+ * One job, taken apart into the things GitHub reads: its own keys, its steps, and each step's
+ * keys — plus every line the walk could not place.
+ *
+ * That last list is the point. The first version of the gate-parity check read `run:` text and was
+ * silent about everything around it, so `if: false`, a `working-directory:`, and a whole `uses:`
+ * step all passed unseen. A check that classifies some shapes and says nothing about the rest
+ * reports a coverage it does not have, which is the defect this repository keeps paying for. So
+ * this returns what it could not place, and the caller refuses on it rather than ignoring it.
+ *
+ * The subset of YAML understood here is block mappings, block sequences, and block scalars, at any
+ * indentation. Flow style (`- {run: x}`), anchors, aliases, and multi-document files are not
+ * understood — and land in `unplaced`, which fails, rather than disappearing.
+ */
+export const parseJob = (lines, jobs, jobName) => {
+  const owned = [...lines.keys()].filter((index) => jobs[index] === jobName);
+  if (owned.length === 0) return null;
+  const first = owned[0];
+  const last = owned[owned.length - 1];
+  const unplaced = [];
+  const skippable = (index) => lines[index].trim() === "" || lines[index].trim().startsWith("#");
+
+  /** The last line of the block belonging to a key or item that starts at `from`. */
+  const blockEnd = (from, ownerIndent) => {
+    let at = from;
+    while (at <= last && (skippable(at) || indentationOf(lines[at]) > ownerIndent)) at++;
+    return at - 1;
+  };
+
+  /** `key: value` pairs directly under `ownerIndent`, with the block each one owns. */
+  const mappingAt = (from, to, ownerIndent) => {
+    const entries = [];
+    let at = from;
+    while (at <= to) {
+      if (skippable(at)) {
+        at++;
+        continue;
+      }
+      const indent = indentationOf(lines[at]);
+      const match = /^\s*([A-Za-z0-9_.-]+):(.*)$/.exec(lines[at]);
+      if (!match || indent !== ownerIndent) {
+        unplaced.push({ line: at + 1, text: lines[at] });
+        at++;
+        continue;
+      }
+      const end = blockEnd(at + 1, indent);
+      entries.push({ name: match[1], inline: match[2].trim(), line: at + 1, body: [at + 1, end] });
+      at = end + 1;
+    }
+    return entries;
+  };
+
+  const jobKeyIndent = indentationOf(lines[first]) + 2;
+  const jobKeys = mappingAt(first + 1, last, jobKeyIndent);
+
+  const stepsKey = jobKeys.find((key) => key.name === "steps");
+  const steps = [];
+  if (stepsKey) {
+    const [from, to] = stepsKey.body;
+    let itemIndent = null;
+    let at = from;
+    while (at <= to) {
+      if (skippable(at)) {
+        at++;
+        continue;
+      }
+      const match = /^(\s*)-\s+(.*)$/.exec(lines[at]);
+      const indent = match ? match[1].length : indentationOf(lines[at]);
+      if (!match || (itemIndent !== null && indent !== itemIndent)) {
+        unplaced.push({ line: at + 1, text: lines[at] });
+        at++;
+        continue;
+      }
+      itemIndent = indent;
+      const end = blockEnd(at + 1, itemIndent);
+      // The text after `- ` is the step's first key, at the indentation the rest of them use.
+      const inlineKey = /^([A-Za-z0-9_.-]+):(.*)$/.exec(match[2]);
+      const keys = [];
+      if (inlineKey) {
+        const owns = blockEnd(at + 1, itemIndent + 2);
+        keys.push({
+          name: inlineKey[1],
+          inline: inlineKey[2].trim(),
+          line: at + 1,
+          body: [at + 1, owns],
+        });
+        keys.push(...mappingAt(owns + 1, end, itemIndent + 2));
+      } else {
+        unplaced.push({ line: at + 1, text: lines[at] });
+        keys.push(...mappingAt(at + 1, end, itemIndent + 2));
+      }
+      steps.push({ line: at + 1, keys });
+      at = end + 1;
+    }
+  }
+
+  return { first: first + 1, last: last + 1, jobKeys, steps, unplaced, mappingAt };
+};
+
 /** Reads the command text GitHub gives the shell, not arbitrary mentions of `run:` in comments. */
 export const extractRunCommands = (yamlText, source) => {
   const lines = yamlText.split(/\r?\n/);

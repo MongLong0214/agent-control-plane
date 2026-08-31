@@ -129,6 +129,87 @@ export const CI_SETUP_COMMANDS = new Map([
 ]);
 
 /**
+ * The gate job's own shape, declared rather than assumed.
+ *
+ * The first version of the parity check read `run:` text and nothing else, and an independent
+ * review defeated it four ways in minutes: `if: false` on the runner step, a `working-directory:`
+ * pointing at another tree, a `uses:` action doing the verification, and a package script that
+ * kept the runner's path in a string while running `echo`. None of those touch a `run:` command,
+ * and all four left CI running something other than the manifest while the check said the two
+ * sides agreed.
+ *
+ * So the job is enumerated instead of sampled. Every key of the job, every step, every key of
+ * every step, and every `with:` input is either named here or refuses the build — and a line the
+ * parser cannot place at all refuses it too. The list below will be incomplete again; what has to
+ * hold is that being incomplete is red, not green.
+ */
+export const CI_GATE_JOB_KEYS = new Map([
+  ["name", "the check-run name branch protection requires (#694)"],
+  ["runs-on", "which runner image; the same image runs every gate"],
+  ["strategy", "the Node matrix, constrained by CI_GATE_JOB_STRATEGY below"],
+  ["permissions", "narrows the job's token; cannot add verification or move it"],
+  ["needs", "ordering between jobs; cannot change what this one runs"],
+  ["timeout-minutes", "a ceiling that fails the job — it cannot turn a failure green"],
+  ["steps", "the steps themselves, enumerated below"],
+]);
+
+/**
+ * Keys deliberately absent from the map above, and what each one would do. Named so the refusal
+ * can say why rather than only that: `if` decides whether the job runs at all, `env` changes what
+ * every command in it means, `defaults` moves every step's working directory, `container` and
+ * `services` replace the tree and toolchain being verified, and `continue-on-error` makes a failed
+ * gate report success.
+ */
+export const CI_GATE_JOB_KEYS_REFUSED = new Map([
+  ["if", "would let the whole gate job be skipped"],
+  ["env", "would change what every gate in the job means"],
+  ["defaults", "would move every step's working directory off the tree under test"],
+  ["container", "would verify a different toolchain than the one declared"],
+  ["services", "would add a runtime the local runner does not have"],
+  ["continue-on-error", "would let a failed gate report success"],
+]);
+
+/** `strategy` may hold the Node matrix and nothing that changes which legs exist. */
+export const CI_GATE_JOB_STRATEGY = {
+  keys: new Set(["fail-fast", "matrix"]),
+  matrixKeys: new Set(["node-version"]),
+};
+
+/**
+ * Actions the gate job may use, by name, with the inputs each may take.
+ *
+ * The ref is required to be a 40-character commit SHA rather than pinned here, so a version bump
+ * is not a manifest edit — but an action this list does not name is refused, which is what stops a
+ * verification action from being added as a step nothing classifies.
+ *
+ * The `with:` allow-lists are not decoration. `actions/checkout` takes `repository`, `ref`, and
+ * `path`, and any of the three makes CI verify a tree that is not the one this commit is: the same
+ * "different tree" defect as `working-directory`, arriving through an action's inputs.
+ */
+export const CI_GATE_JOB_ACTIONS = new Map([
+  ["actions/checkout", { with: new Set(["fetch-depth"]), why: "the tree under test, at full depth for the trailer range" }],
+  ["pnpm/action-setup", { with: new Set(["version"]), why: "installs the package manager every gate is invoked through" }],
+  ["actions/setup-node", { with: new Set(["node-version", "cache"]), why: "the matrix leg's Node, and the dependency cache" }],
+  [
+    "actions/upload-artifact",
+    {
+      with: new Set(["name", "path", "if-no-files-found"]),
+      if: true,
+      why: "publishes the Vitest JSON the traceability job consumes; runs after the gates and verifies nothing",
+    },
+  ],
+]);
+
+/** Step keys the runner's own step may carry. Anything else changes whether or where it runs. */
+export const RUNNER_STEP_KEYS = new Set(["run", "env"]);
+
+/** Environment the workflow may set on the runner step — the commit range, and nothing else. */
+export const RUNNER_STEP_ENV = new Set(["ACP_TRAILERS_RANGE"]);
+
+/** The exact argv the `gates` package script must be. See the parity check for why it is exact. */
+export const RUNNER_SCRIPT_WORDS = ["node", "scripts/run-prepush-gates.mjs"];
+
+/**
  * Verification a workflow runs outside the runner on purpose, with the reason it is not a pre-push
  * gate. Every entry must match something a workflow actually runs — a stale exemption is a hole
  * that reads as a decision, so the parity check fails on one that names nothing.

@@ -132,6 +132,130 @@ const GUARDS = [
     killedBy: ["tests/process/ci-preflight.test.ts::accepts every repository workflow command"],
   },
   // sol-simplify: #739's rows. They exist only while the gate manifest and its runner do;
+  {
+    what: "the gate-parity check requires the gates script to be exactly the runner's argv",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "  if (!isExactly) {\n",
+    replace: "  if (false) {\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a gates script that mentions the runner's path while running something else",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a key on the runner step that is not run or env",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "        for (const name of keyNames) {\n" +
+      "          if (RUNNER_STEP_KEYS.has(name)) continue;\n",
+    replace: "        for (const name of []) {\n          if (RUNNER_STEP_KEYS.has(name)) continue;\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses an if: on the runner step, which would skip every gate",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses environment on the runner step it did not declare",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "            if (RUNNER_STEP_ENV.has(variable.name)) continue;\n",
+    replace: "            continue;\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses environment on the runner step other than the commit range",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses an action the gate job does not declare",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "        if (declared === undefined) {\n",
+    replace: "        if (false) {\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses an action in the gate job that no declaration names",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses an action that is not pinned to a commit SHA",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "        if (!/^[0-9a-f]{40}$/.test(ref ?? \"\")) {\n" +
+      "          fail(`${at}: ${JSON.stringify(uses)} is not pinned to a 40-character commit SHA`);\n" +
+      "        }\n",
+    replace: "",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a declared action that is not pinned to a commit SHA",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses an action input that moves the tree",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "            if (declared.with.has(input.name)) continue;\n",
+    replace: "            continue;\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses an action input that moves the tree CI checks out",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a key on a setup step of the gate job",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "      for (const name of keyNames) {\n" +
+      "        if (name === \"run\") continue;\n",
+    replace: "      for (const name of []) {\n        if (name === \"run\") continue;\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a key on a setup step, so no setup step can skip or move what follows",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a job key the gate job may not carry",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "      if (CI_GATE_JOB_KEYS.has(key.name)) continue;\n",
+    replace: "      continue;\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a job-level key that would move or skip the whole gate job",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a top-level defaults or env in the gate workflow",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "      if (key.name !== \"defaults\" && key.name !== \"env\") continue;\n",
+    replace: "      continue;\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a top-level defaults, which reaches into the gate job from above it",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a matrix dimension that changes which legs exist",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "          if (CI_GATE_JOB_STRATEGY.matrixKeys.has(dimension.name)) continue;\n",
+    replace: "          continue;\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a matrix dimension that changes which legs exist",
+    ],
+  },
+  {
+    what: "the gate-parity check refuses a line inside the gate job it could not place",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "    for (const stray of job.unplaced) {\n",
+    replace: "    for (const stray of []) {\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a step shape it cannot place, even when the step runs no command",
+    ],
+  },
+  {
+    what: "the gate-parity check requires exactly one runner step in the gate job",
+    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
+    find:
+      "    if (runnerSteps !== 1) {\n",
+    replace: "    if (false) {\n",
+    killedBy: [
+      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a second step running the runner",
+    ],
+  },
   // remove them with that contract, not before it.
   {
     what: "the gate-parity check refuses a gate the CI job runs outside the runner",
@@ -188,19 +312,6 @@ const GUARDS = [
     ],
   },
   {
-    what: "the gate-parity check refuses a gates script that does not invoke the runner",
-    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
-    find:
-      "  fail(\n" +
-      "    `the ${JSON.stringify(RUNNER_SCRIPT)} script does not invoke ${RUNNER_PATH} ` +\n" +
-      "      `(it is ${JSON.stringify(runnerScriptBody)})`,\n" +
-      "  );\n",
-    replace: "",
-    killedBy: [
-      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses a gates script that no longer invokes the runner",
-    ],
-  },
-  {
     what: "the gate-parity check refuses a manifest gate that names no package script",
     file: "scripts/verify-ci-runs-the-gate-runner.mjs",
     find:
@@ -223,16 +334,6 @@ const GUARDS = [
     replace: "",
     killedBy: [
       "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses verification in another job that no declaration explains",
-    ],
-  },
-  {
-    what: "the gate-parity check refuses continue-on-error on the gate job",
-    file: "scripts/verify-ci-runs-the-gate-runner.mjs",
-    find:
-      "      fail(`${source}:${index + 1}: ${CI_GATE_JOB} sets continue-on-error, so its gates cannot fail the job`);\n",
-    replace: "",
-    killedBy: [
-      "tests/process/the-gate-set-cannot-drift-from-ci.test.ts::refuses continue-on-error on the gate job, which would let every gate fail green",
     ],
   },
   {

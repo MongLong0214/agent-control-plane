@@ -33,21 +33,32 @@ import { fileURLToPath } from "node:url";
 
 import {
   CI_GATE_JOB,
+  CI_GATE_JOB_ACTIONS,
+  CI_GATE_JOB_KEYS,
+  CI_GATE_JOB_KEYS_REFUSED,
+  CI_GATE_JOB_STRATEGY,
   CI_SETUP_COMMANDS,
   GATES,
-  RUNNER_PATH,
   RUNNER_SCRIPT,
+  RUNNER_SCRIPT_WORDS,
+  RUNNER_STEP_ENV,
+  RUNNER_STEP_KEYS,
   VERIFICATION_OUTSIDE_THE_RUNNER,
 } from "./lib/prepush-gates.mjs";
 import {
   extractRunCommands,
   jobByLine,
+  parseJob,
   pnpmCommandFrom,
   PNPM_NON_SCRIPT_COMMANDS,
   replaceGitHubExpressions,
   shellSegments,
+  plainScalar,
   shellWords,
+  topLevelKeys,
 } from "./lib/workflow-commands.mjs";
+
+const indentOf = (line) => (/^(\s*)/.exec(line) ?? ["", ""])[1].length;
 
 const defaultRoot = fileURLToPath(new URL("..", import.meta.url));
 const rootArgument = process.argv.find((argument) => argument.startsWith("--repo-root="));
@@ -81,16 +92,44 @@ for (const gate of GATES) {
   }
 }
 
+/**
+ * The `gates` script has to *be* the runner's invocation, not mention it.
+ *
+ * This check used to ask whether the script text contained the runner's path. An independent
+ * review broke it in one move: `"gates": "echo scripts/run-prepush-gates.mjs"` contains the path,
+ * runs nothing, and the check passed. A substring test is defeated by including the substring, and
+ * that is the first thing someone routing around a guard reaches for, not the last.
+ *
+ * "Exact" here means: the script is one shell command, and its words are exactly the runner's
+ * argv — `node scripts/run-prepush-gates.mjs`. That definition cannot be satisfied by a script
+ * that does not run the runner, because there is nowhere for anything else to go. A second command
+ * needs an operator (`&&`, `;`, `|`, a newline), which makes a second segment. A different program
+ * changes word 0. A wrapper, a redirect, a leading `VAR=` assignment, an extra flag, or a path that
+ * only resembles the runner's changes the word list. Word-for-word equality leaves no room that a
+ * substring match leaves open.
+ *
+ * The limit, stated rather than implied: this is a claim about the argv, not about the file it
+ * names. It does not prove `node` on PATH is Node, and it does not prove
+ * `scripts/run-prepush-gates.mjs` still runs the manifest — that is what the runner's own
+ * falsifiability rows are for.
+ */
 const runnerScriptBody = packageScripts[RUNNER_SCRIPT];
 if (runnerScriptBody === undefined) {
   fail(`package.json has no ${JSON.stringify(RUNNER_SCRIPT)} script, so \`pnpm ${RUNNER_SCRIPT}\` runs nothing`);
-} else if (!runnerScriptBody.includes(RUNNER_PATH)) {
-  // Without this, the whole contract is defeated by pointing the script somewhere else: CI would
-  // still say `pnpm gates` and would run whatever that name had come to mean.
-  fail(
-    `the ${JSON.stringify(RUNNER_SCRIPT)} script does not invoke ${RUNNER_PATH} ` +
-      `(it is ${JSON.stringify(runnerScriptBody)})`,
-  );
+} else {
+  const segments = shellSegments(runnerScriptBody);
+  const words = segments.length === 1 ? shellWords(segments[0]) : [];
+  const isExactly =
+    segments.length === 1 &&
+    words.length === RUNNER_SCRIPT_WORDS.length &&
+    words.every((word, at) => word.replace(/^\.\//, "") === RUNNER_SCRIPT_WORDS[at]);
+  if (!isExactly) {
+    fail(
+      `the ${JSON.stringify(RUNNER_SCRIPT)} script is ${JSON.stringify(runnerScriptBody)}, which is not ` +
+        `exactly \`${RUNNER_SCRIPT_WORDS.join(" ")}\`. It must be that one command and nothing else — ` +
+        "a script that merely mentions the runner's path passes a substring test while running `echo`.",
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -247,13 +286,175 @@ for (const workflowName of workflowNames) {
     }
   }
 
-  // A step allowed to fail is not a gate. `continue-on-error` anywhere in the gate job would let
-  // the whole manifest report green after failing.
-  for (const [index, line] of lines.entries()) {
-    if (jobs[index] !== CI_GATE_JOB) continue;
-    if (line.trim().startsWith("#")) continue;
-    if (/^\s*continue-on-error:/.test(line)) {
-      fail(`${source}:${index + 1}: ${CI_GATE_JOB} sets continue-on-error, so its gates cannot fail the job`);
+  // ---------------------------------------------------------------------------------------------
+  // Reach-in from above the job.
+  //
+  // A top-level `defaults:` sets `working-directory` for every step of every job, and a top-level
+  // `env:` changes what every command in the file means. Neither appears inside the gate job, so a
+  // job-scoped check cannot see either — the same blind spot as `working-directory`, one level up.
+  // ---------------------------------------------------------------------------------------------
+  if (jobs.includes(CI_GATE_JOB)) {
+    for (const key of topLevelKeys(lines)) {
+      if (key.name !== "defaults" && key.name !== "env") continue;
+      fail(
+        `${source}:${key.line}: the workflow that holds ${CI_GATE_JOB} sets a top-level ` +
+          `${JSON.stringify(key.name)}, which reaches into every step of the gate job — ` +
+          `${key.name === "defaults" ? "moving the directory it verifies" : "changing what its commands mean"}. ` +
+          "The gate job must run on the tree and the environment `pnpm gates` runs on locally.",
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The gate job, enumerated rather than sampled.
+  //
+  // Reading `run:` text and nothing else is what let four separate mutations through: `if: false`,
+  // a `working-directory:`, a `uses:` action doing the verification, and — in another file — a
+  // package script that only mentioned the runner. None of them is a command. So every key of the
+  // job, every step, every key of every step, and every `with:` input is either named in the
+  // manifest or fails here, and a line the parser could not place fails too.
+  // ---------------------------------------------------------------------------------------------
+  const job = parseJob(lines, jobs, CI_GATE_JOB);
+  if (job !== null) {
+    for (const stray of job.unplaced) {
+      fail(
+        `${source}:${stray.line}: a line inside ${CI_GATE_JOB} this check could not place: ` +
+          `${JSON.stringify(stray.text.trim())}. It refuses rather than pass over a shape it does ` +
+          "not understand — an unread line is how `if:`, `uses:` and `working-directory:` got in.",
+      );
+    }
+
+    for (const key of job.jobKeys) {
+      if (CI_GATE_JOB_KEYS.has(key.name)) continue;
+      const refused = CI_GATE_JOB_KEYS_REFUSED.get(key.name);
+      fail(
+        `${source}:${key.line}: ${CI_GATE_JOB} sets ${JSON.stringify(key.name)}, which is not one of ` +
+          `the job keys the gate job may carry${refused ? ` — it ${refused}` : ""}. Declare it in ` +
+          "CI_GATE_JOB_KEYS with the reason it cannot change what CI verifies, or remove it.",
+      );
+    }
+
+    const strategy = job.jobKeys.find((key) => key.name === "strategy");
+    if (strategy) {
+      for (const entry of job.mappingAt(strategy.body[0], strategy.body[1], indentOf(lines[strategy.line - 1]) + 2)) {
+        if (!CI_GATE_JOB_STRATEGY.keys.has(entry.name)) {
+          fail(`${source}:${entry.line}: ${CI_GATE_JOB}'s strategy sets ${JSON.stringify(entry.name)}`);
+          continue;
+        }
+        if (entry.name !== "matrix") continue;
+        const matrixIndent = indentOf(lines[entry.line - 1]) + 2;
+        const dimensions = job.mappingAt(entry.body[0], entry.body[1], matrixIndent);
+        for (const dimension of dimensions) {
+          if (CI_GATE_JOB_STRATEGY.matrixKeys.has(dimension.name)) continue;
+          // `include:` and `exclude:` decide which legs exist at all. A matrix that excludes every
+          // leg produces a job that runs no gates and reports `skipped`, not `failure`.
+          fail(
+            `${source}:${dimension.line}: ${CI_GATE_JOB}'s matrix declares ${JSON.stringify(dimension.name)}, ` +
+              "which changes which legs exist. Only the declared dimensions may vary; the gate set may not.",
+          );
+        }
+      }
+    }
+
+    let runnerSteps = 0;
+    for (const step of job.steps) {
+      const keyNames = step.keys.map((key) => key.name);
+      const runKey = step.keys.find((key) => key.name === "run");
+      const usesKey = step.keys.find((key) => key.name === "uses");
+      const at = `${source}:${step.line}`;
+
+      if (usesKey) {
+        const uses = plainScalar(usesKey.inline);
+        const [action, ref] = uses.split("@");
+        const declared = CI_GATE_JOB_ACTIONS.get(action);
+        if (declared === undefined) {
+          fail(
+            `${at}: ${CI_GATE_JOB} uses the action ${JSON.stringify(uses)}, which is not ` +
+              "declared in CI_GATE_JOB_ACTIONS. An action can verify anything a gate can, and no " +
+              "`run:` line says so — so an undeclared one is a gate CI holds and `pnpm gates` does not.",
+          );
+          continue;
+        }
+        if (!/^[0-9a-f]{40}$/.test(ref ?? "")) {
+          fail(`${at}: ${JSON.stringify(uses)} is not pinned to a 40-character commit SHA`);
+        }
+        const allowedKeys = new Set(["uses", "with", ...(declared.if ? ["if"] : [])]);
+        for (const name of keyNames) {
+          if (!allowedKeys.has(name)) {
+            fail(`${at}: the ${JSON.stringify(action)} step carries ${JSON.stringify(name)}, which it may not`);
+          }
+        }
+        const withKey = step.keys.find((key) => key.name === "with");
+        if (withKey) {
+          const withIndent = indentOf(lines[withKey.line - 1]) + 2;
+          for (const input of job.mappingAt(withKey.body[0], withKey.body[1], withIndent)) {
+            if (declared.with.has(input.name)) continue;
+            // `repository`, `ref` and `path` on a checkout each make CI verify a tree that is not
+            // this commit — the `working-directory` defect arriving through an action's inputs.
+            fail(
+              `${at}: ${JSON.stringify(action)} is given ${JSON.stringify(input.name)} at ` +
+                `${source}:${input.line}, which is not one of the inputs it may take here. ` +
+                "An input that moves or replaces the tree makes CI verify something else.",
+            );
+          }
+        }
+        continue;
+      }
+
+      if (!runKey) {
+        fail(`${at}: a step in ${CI_GATE_JOB} that is neither a \`run:\` nor a \`uses:\``);
+        continue;
+      }
+
+      const isRunner = shellSegments(replaceGitHubExpressions(runKey.inline)).some((segment) => {
+        const command = commandKeyFor(segment);
+        return command !== null && command.key === `pnpm ${RUNNER_SCRIPT}`;
+      });
+
+      if (isRunner) {
+        runnerSteps++;
+        for (const name of keyNames) {
+          if (RUNNER_STEP_KEYS.has(name)) continue;
+          // This is the whole class the review found: `if:` decides whether the runner runs,
+          // `working-directory:` decides which tree it runs on, `shell:` decides how its exit
+          // status is read, `continue-on-error:` decides whether its failure counts. None of them
+          // is a command, and all four leave CI running something other than the manifest.
+          fail(
+            `${at}: the \`pnpm ${RUNNER_SCRIPT}\` step carries ${JSON.stringify(name)}. The runner ` +
+              "step may carry only `run` and `env`: anything else decides whether it runs, which " +
+              "tree it runs on, or whether its failure counts — while the command still reads " +
+              "`pnpm gates`.",
+          );
+        }
+        const envKey = step.keys.find((key) => key.name === "env");
+        if (envKey) {
+          const envIndent = indentOf(lines[envKey.line - 1]) + 2;
+          for (const variable of job.mappingAt(envKey.body[0], envKey.body[1], envIndent)) {
+            if (RUNNER_STEP_ENV.has(variable.name)) continue;
+            fail(
+              `${source}:${variable.line}: the gate step sets ${JSON.stringify(variable.name)}; only ` +
+                `${[...RUNNER_STEP_ENV].join(", ")} may be supplied by the workflow, because a gate's ` +
+                "behaviour must not depend on which side invoked it.",
+            );
+          }
+        }
+        continue;
+      }
+
+      for (const name of keyNames) {
+        if (name === "run") continue;
+        fail(
+          `${at}: a setup step in ${CI_GATE_JOB} carries ${JSON.stringify(name)}; setup steps may ` +
+            "carry only `run`, so none of them can move, skip, or reinterpret what follows.",
+        );
+      }
+    }
+
+    if (runnerSteps !== 1) {
+      fail(
+        `${source}: ${CI_GATE_JOB} has ${runnerSteps} step(s) running \`pnpm ${RUNNER_SCRIPT}\`; ` +
+          "it must have exactly one.",
+      );
     }
   }
 }

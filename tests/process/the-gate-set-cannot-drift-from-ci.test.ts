@@ -8,13 +8,29 @@
  * the gate set, free to stop resembling the two it is meant to hold together.
  */
 import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { cleanupTempDirs, tempDir } from "../helpers/fixtures.ts";
+/**
+ * Temporary directories, kept local on purpose.
+ *
+ * The shared fixture helper reaches the whole core harness — SQLite, the migration ledger, the
+ * session registry — none of which this file touches: it spawns two scripts and reads their
+ * output. Importing it made a process test fail to collect because an unrelated edit in `src/db`
+ * was mid-flight, and a suite that cannot collect proves nothing about the guard it names.
+ */
+const temporaryDirectories: string[] = [];
+const tempDir = (prefix: string): string => {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  temporaryDirectories.push(directory);
+  return directory;
+};
 
-afterAll(cleanupTempDirs);
+afterAll(() => {
+  for (const directory of temporaryDirectories) rmSync(directory, { recursive: true, force: true });
+});
 
 const REPO_ROOT = process.cwd();
 const PARITY = join(REPO_ROOT, "scripts", "verify-ci-runs-the-gate-runner.mjs");
@@ -116,7 +132,7 @@ describe("the CI gate set and the pre-push gate set", () => {
     const result = parity(repoRoot);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('the "gates" script does not invoke scripts/run-prepush-gates.mjs');
+    expect(result.stderr).toContain('the "gates" script is "echo ok", which is not exactly');
   });
 
   it("refuses a manifest gate whose package script a merge deleted", () => {
@@ -154,7 +170,7 @@ describe("the CI gate set and the pre-push gate set", () => {
     const result = parity(repoRoot);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("verify-matrix sets continue-on-error");
+    expect(result.stderr).toContain('carries "continue-on-error"');
   });
 
   it("refuses a declaration that no longer names anything a workflow runs", () => {
@@ -178,6 +194,207 @@ describe("the CI gate set and the pre-push gate set", () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("a command-shaped line outside every parsed run block");
+  });
+});
+
+/**
+ * Everything above reads commands. An independent review defeated the first version of this check
+ * four times without touching one: `if: false` on the runner step, a `working-directory:` pointing
+ * somewhere else, a `uses:` action doing the verification, and a package script that kept the
+ * runner's path in a string while running `echo`. All four left CI executing something other than
+ * the manifest while the check reported that both sides held the same gates.
+ *
+ * The lesson is not "add four cases". It is that a check which classifies some shapes and is
+ * silent about the rest reports a coverage it does not have — the same defect it exists to catch,
+ * occurring inside it. So the gate job is enumerated: every job key, every step, every step key,
+ * every action input. These tests are the four, the ones found by asking what else decides whether,
+ * where, or how a command runs, and the general net that has to catch the ones nobody has thought
+ * of yet.
+ */
+const RUNS_ON = "    runs-on: macos-15\n";
+const CHECKOUT_INPUT = "          fetch-depth: 0\n";
+const MATRIX_LEGS = '        node-version: ["22.18.0", "22"]\n';
+
+describe("the gate job's shape, not only its commands", () => {
+  it("refuses a gates script that mentions the runner's path while running something else", () => {
+    const repoRoot = copyOfThisRepository();
+    // The exact mutation an independent review used. `"echo ok"` — the shape the first round of
+    // testing chose — removes the substring, so a substring check catches it. Keeping the substring
+    // is what someone routing around the guard reaches for first.
+    editPackage(repoRoot, (scripts) => {
+      scripts.gates = "echo scripts/run-prepush-gates.mjs";
+    });
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("which is not exactly `node scripts/run-prepush-gates.mjs`");
+  });
+
+  it("refuses a gates script that runs the runner and then something else", () => {
+    const repoRoot = copyOfThisRepository();
+    editPackage(repoRoot, (scripts) => {
+      scripts.gates = "node scripts/run-prepush-gates.mjs || true";
+    });
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("It must be that one command and nothing else");
+  });
+
+  it("refuses an if: on the runner step, which would skip every gate", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) => text.replace(GATE_STEP, `${GATE_STEP}        if: false\n`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('the `pnpm gates` step carries "if"');
+  });
+
+  it("refuses a working-directory on the runner step, which would verify another tree", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) => text.replace(GATE_STEP, `${GATE_STEP}        working-directory: elsewhere\n`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('the `pnpm gates` step carries "working-directory"');
+  });
+
+  it("refuses a shell: on the runner step, which decides how its exit status is read", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) => text.replace(GATE_STEP, `${GATE_STEP}        shell: sh -e {0}\n`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('the `pnpm gates` step carries "shell"');
+  });
+
+  it("refuses environment on the runner step other than the commit range", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) =>
+      text.replace("          ACP_TRAILERS_RANGE:", '          NODE_OPTIONS: "--max-old-space-size=64"\n          ACP_TRAILERS_RANGE:'),
+    );
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('the gate step sets "NODE_OPTIONS"');
+  });
+
+  it("refuses an action in the gate job that no declaration names", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) => text.replace(GATE_STEP, `      - uses: some/verifier-action@v1\n${GATE_STEP}`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("An action can verify anything a gate can");
+  });
+
+  it("refuses a declared action that is not pinned to a commit SHA", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) =>
+      text.replace(/uses: actions\/checkout@[0-9a-f]{40}/, "uses: actions/checkout@main"),
+    );
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("is not pinned to a 40-character commit SHA");
+  });
+
+  it("refuses an action input that moves the tree CI checks out", () => {
+    const repoRoot = copyOfThisRepository();
+    // `working-directory` arriving through an action's inputs. `repository`, `ref` and `path` each
+    // make the job verify something that is not this commit, and none of them is a command.
+    editWorkflow(repoRoot, (text) => text.replace(CHECKOUT_INPUT, `${CHECKOUT_INPUT}          repository: someone/else\n`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("An input that moves or replaces the tree makes CI verify something else");
+  });
+
+  it("refuses a key on a setup step, so no setup step can skip or move what follows", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) =>
+      text.replace("      - run: pnpm install --frozen-lockfile\n", "      - run: pnpm install --frozen-lockfile\n        continue-on-error: true\n"),
+    );
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("a setup step in verify-matrix carries");
+  });
+
+  it("refuses a job-level key that would move or skip the whole gate job", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) => text.replace(RUNS_ON, `${RUNS_ON}    defaults:\n      run:\n        working-directory: elsewhere\n`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('verify-matrix sets "defaults"');
+    expect(result.stderr).toContain("would move every step's working directory off the tree under test");
+  });
+
+  it("refuses job-level environment, which changes what every gate in the job means", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) => text.replace(RUNS_ON, `${RUNS_ON}    env:\n      SKIP_SLOW: "1"\n`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('verify-matrix sets "env"');
+  });
+
+  it("refuses a top-level defaults, which reaches into the gate job from above it", () => {
+    const repoRoot = copyOfThisRepository();
+    // Nothing inside the job changes, so a job-scoped check sees a clean gate job and passes.
+    editWorkflow(repoRoot, (text) => text.replace("jobs:\n", "defaults:\n  run:\n    working-directory: elsewhere\njobs:\n"));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("sets a top-level \"defaults\"");
+  });
+
+  it("refuses a matrix dimension that changes which legs exist", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) => text.replace(MATRIX_LEGS, `${MATRIX_LEGS}        include:\n          - node-version: "22"\n`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('matrix declares "include"');
+  });
+
+  it("refuses a step shape it cannot place, even when the step runs no command", () => {
+    const repoRoot = copyOfThisRepository();
+    // The general net, and the only one of these that catches what nobody has thought of. A
+    // flow-style `uses:` step is not command-shaped, so the command-level passes are blind to it.
+    editWorkflow(repoRoot, (text) =>
+      text.replace(GATE_STEP, `${GATE_STEP}      - {uses: some/verifier-action@${"0".repeat(40)}}\n`),
+    );
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("a line inside verify-matrix this check could not place");
+  });
+
+  it("refuses a second step running the runner", () => {
+    const repoRoot = copyOfThisRepository();
+    editWorkflow(repoRoot, (text) => text.replace(GATE_STEP, `${GATE_STEP}${GATE_STEP}`));
+
+    const result = parity(repoRoot);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("step(s) running `pnpm gates`; it must have exactly one");
   });
 });
 
