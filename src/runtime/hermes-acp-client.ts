@@ -408,6 +408,7 @@ export const runHermesAcp = async (
     let resolved = false;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let shutdownTimer: NodeJS.Timeout | undefined;
+    let orphanErrorDrainActive = false;
     const seenResponseIds = new Set<number>();
 
     const clearTimers = (): void => {
@@ -432,11 +433,34 @@ export const runHermesAcp = async (
       if (input.signal) input.signal.removeEventListener("abort", onAbort);
     };
 
+    const onOrphanError = (): void => { /* drain errors after caller settlement until child close */ };
+
+    const releaseOrphanErrorDrain = (): void => {
+      if (!orphanErrorDrainActive) return;
+      orphanErrorDrainActive = false;
+      child.stdin.off("error", onOrphanError);
+      child.stdout.off("error", onOrphanError);
+      child.stderr.off("error", onOrphanError);
+      child.off("error", onOrphanError);
+      child.off("close", releaseOrphanErrorDrain);
+    };
+
+    const retainOrphanErrorDrain = (): void => {
+      if (orphanErrorDrainActive || closeSeen) return;
+      orphanErrorDrainActive = true;
+      child.stdin.on("error", onOrphanError);
+      child.stdout.on("error", onOrphanError);
+      child.stderr.on("error", onOrphanError);
+      child.on("error", onOrphanError);
+      child.on("close", releaseOrphanErrorDrain);
+    };
+
     const resolveOnce = (result: HermesAcpResult): void => {
       if (resolved) return;
       resolved = true;
       clearTimers();
       removeListeners();
+      if (failure && !closeSeen) retainOrphanErrorDrain();
       resolve(result);
     };
 

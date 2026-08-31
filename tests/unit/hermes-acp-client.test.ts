@@ -41,13 +41,14 @@ class FakeChild extends EventEmitter {
   killCalls = 0;
   closeCalls = 0;
   autoCloseOnKill = true;
+  killReturns = true;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
 
   kill(): boolean {
     this.killCalls += 1;
     if (this.autoCloseOnKill) queueMicrotask(() => this.close(0));
-    return this.exitCode === null && this.signalCode === null;
+    return this.killReturns;
   }
 
   close(code: number | null, signal: NodeJS.Signals | null = null): void {
@@ -202,6 +203,22 @@ const expectFailureShutdown = (child: FakeChild): void => {
   expectNoResidue(child);
 };
 
+const expectOrphanErrorDrain = (child: FakeChild): void => {
+  expect(child.stdin.endCalls).toBe(1);
+  expect(child.killCalls).toBe(1);
+  expect(child.stdout.listenerCount("data")).toBe(0);
+  expect(child.stdout.listenerCount("end")).toBe(0);
+  expect(child.stderr.listenerCount("data")).toBe(0);
+  expect(child.stderr.listenerCount("end")).toBe(0);
+  expect(child.stdin.listenerCount("drain")).toBe(0);
+  expect(child.listenerCount("exit")).toBe(0);
+  expect(child.listenerCount("close")).toBe(1);
+  expect(child.listenerCount("error")).toBe(1);
+  expect(child.stdin.listenerCount("error")).toBe(1);
+  expect(child.stdout.listenerCount("error")).toBe(1);
+  expect(child.stderr.listenerCount("error")).toBe(1);
+};
+
 describe("bounded Hermes ACP client", () => {
   it("launches only with the explicit dark ACP environment", async () => {
     const child = new FakeChild();
@@ -294,7 +311,7 @@ describe("bounded Hermes ACP client", () => {
       await vi.advanceTimersByTimeAsync(100);
       await expect(pending).resolves.toEqual({ status: "FAILED", reason: "NONZERO_EXIT" });
       expect(child.stdin.writes).toEqual([]);
-      expectFailureShutdown(child);
+      expectOrphanErrorDrain(child);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -362,7 +379,46 @@ describe("bounded Hermes ACP client", () => {
       const pending = runHermesAcp(request(), { spawn: () => child });
       await vi.advanceTimersByTimeAsync(100);
       await expect(pending).resolves.toEqual({ status: "FAILED", reason: "MALFORMED_FRAME" });
-      expectFailureShutdown(child);
+      expectOrphanErrorDrain(child);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["child", (child: FakeChild) => child.emit("error", new Error("child failed"))],
+    ["stdout", (child: FakeChild) => child.stdout.emit("error", new Error("stdout failed"))],
+    ["stderr", (child: FakeChild) => child.stderr.emit("error", new Error("stderr failed"))],
+  ] as const)("drains delayed orphaned %s errors until the late close", async (_kind, emitError) => {
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChild();
+      child.autoCloseOnKill = false;
+      child.killReturns = false;
+      connect(child, () => child.stdout.emitText("not-json\n"));
+
+      const pending = runHermesAcp(request(), { spawn: () => child });
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(pending).resolves.toEqual({ status: "FAILED", reason: "MALFORMED_FRAME" });
+
+      expect(child.stdin.endCalls).toBe(1);
+      expect(child.killCalls).toBe(1);
+      expect(child.closeCalls).toBe(0);
+      expect(child.listenerCount("close")).toBe(1);
+      expect(child.listenerCount("error")).toBe(1);
+      expect(child.stdin.listenerCount("error")).toBe(1);
+      expect(child.stdout.listenerCount("error")).toBe(1);
+      expect(child.stderr.listenerCount("error")).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+
+      expect(() => emitError(child)).not.toThrow();
+      expect(child.stdin.endCalls).toBe(1);
+      expect(child.killCalls).toBe(1);
+      child.close(0);
+      child.emit("close", 0, null);
+      expect(child.closeCalls).toBe(1);
+      expectNoResidue(child);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
