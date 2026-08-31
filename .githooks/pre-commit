@@ -23,10 +23,12 @@ if [ -e "$SENTINEL" ]; then
   exit 1
 fi
 
-# `pnpm ci:preflight` triggers pnpm's dependency check, which aborts without a TTY when the
-# module directory needs purging — the hook then fails on an unrelated condition and gets
-# disabled. The check reads workflow YAML and package.json only, so call node directly.
-if ! node scripts/verify-ci-preflight.mjs; then
+# Through `pnpm`, so a repository that stubs the script — as the hook's own test does — is
+# running what it declared rather than a path this file guessed. `CI=true` is what pnpm's
+# dependency check needs to proceed without a TTY; without it the hook fails on module-purge
+# confirmation, which is a condition unrelated to anything it is checking, and a hook that
+# fails for unrelated reasons gets switched off.
+if ! CI=true pnpm ci:preflight; then
   echo "pre-commit: the workflow commands do not match the working tree." >&2
   exit 1
 fi
