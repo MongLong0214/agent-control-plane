@@ -72,9 +72,31 @@ export interface DoctorReport {
  */
 export type DoctorHealthStatus = DoctorStatus | "STALE" | "UNKNOWN";
 
-/** The outcome of one attempt to produce a fresh system report, independent of whether it landed. */
+/**
+ * The outcome of one attempt to produce a fresh system report, independent of whether it landed.
+ *
+ * `startedAt` and `completedAt` are separate fields because they are separate lifecycle points,
+ * and collapsing them into one called `at` is what produced #734's second defect. That single
+ * field held a *start* time, and `resolveDoctorHealth` compared it against `DoctorReport.ranAt`,
+ * which `Doctor.run` stamps *after* its probes. The two sides of that comparison were a start and
+ * a completion — different points on the same clock, off by one probe duration — so a failed
+ * re-evaluation that began before the last success finished was ruled older than it and silently
+ * dropped. The failure hid behind the healthy verdict it was evidence against.
+ *
+ * `generation` is the authority for "which of these two facts is newer", and neither timestamp
+ * is. It counts *completions* of `runSystemDoctorCheck`, so comparing it against the generation
+ * carried by the retained success compares like with like. It is an integer rather than a clock
+ * reading because millisecond-resolution stamps tie, and a tie is where a last-writer-wins bug
+ * lives; under this repository's `ManualClock` every reading in an un-advanced stretch ties, so a
+ * timestamp rule could not even be exercised by the test written to kill it.
+ */
 export interface DoctorHealthAttempt {
-  at: string;
+  /** Before the probes — what `runSystemDoctorCheck` stamps on entry. */
+  startedAt: string;
+  /** After the probes — the same lifecycle point `DoctorReport.ranAt` is stamped at. */
+  completedAt: string;
+  /** Position in completion order. The only field an ordering decision may read. */
+  generation: number;
   ok: boolean;
   error?: string;
 }
@@ -114,7 +136,7 @@ const doctorHealthReasonCode = (status: DoctorHealthStatus): ReasonCode =>
  * fresher could be established.
  */
 export const resolveDoctorHealth = (
-  lastSuccess: { report: DoctorReport } | null,
+  lastSuccess: { report: DoctorReport; generation: number } | null,
   lastAttempt: DoctorHealthAttempt | null,
   nowIso: string,
   freshnessMs: number,
@@ -144,15 +166,26 @@ export const resolveDoctorHealth = (
     );
   }
 
+  // A completion stamp: `Doctor.run` writes `ranAt` after its probes, not before them. Age is
+  // therefore measured from when the observation *finished*. Judging freshness from when it began
+  // would be the more conservative reading, and `DoctorReport` carries no start stamp to do it
+  // with — a deliberate boundary, noted here rather than approximated with the attempt's
+  // `startedAt`, which belongs to a different run whenever evaluations overlap.
   const checkedAt = lastSuccess.report.ranAt;
   const ageMs = Date.parse(nowIso) - Date.parse(checkedAt);
 
-  if (lastAttempt && !lastAttempt.ok && Date.parse(lastAttempt.at) >= Date.parse(checkedAt)) {
+  // Completion order, not clock arithmetic. The previous form compared `lastAttempt.at` — a start
+  // stamp — against `checkedAt`, a completion stamp, and a failure that began before the retained
+  // success finished was therefore ruled older than it and dropped. Generations are taken at
+  // completion for both facts, so this asks the question it means to ask: did the run that
+  // finished most recently fail?
+  if (lastAttempt && !lastAttempt.ok && lastAttempt.generation > lastSuccess.generation) {
     return build(
       "STALE",
       checkedAt,
       ageMs,
-      `a re-evaluation attempted at ${lastAttempt.at} failed: ${lastAttempt.error ?? "unknown error"}`,
+      `a re-evaluation that started at ${lastAttempt.startedAt} failed at ${lastAttempt.completedAt}: ` +
+        `${lastAttempt.error ?? "unknown error"}`,
     );
   }
 

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
 import { ReasonCode } from "../../src/core/reason-codes.ts";
+import type { DoctorReport } from "../../src/doctor/doctor.ts";
 import { ExecutionMode } from "../../src/domain/types.ts";
 import { Daemon, OPERATOR_METHOD, type AuthenticatedOperatorPeer } from "../../src/daemon/daemon.ts";
 import type { TaskContract } from "../../src/run/run-engine.ts";
@@ -33,6 +34,25 @@ const CONTRACT: TaskContract = {
 const readHealth = (stateDir: string): {
   doctor?: { status: string; checkedAt: string | null; ageMs: number | null; reason?: string };
 } => JSON.parse(readFileSync(join(stateDir, "health.json"), "utf8"));
+
+/**
+ * Real promise control rather than `setTimeout` racing: the overlap tests below assert an
+ * ordering, and an ordering asserted against a timer is a flake waiting for a loaded runner.
+ * Each stubbed `doctor.run` announces that it has been entered and then blocks on a gate the
+ * test releases by hand, so "B finished before A" is a fact of the test, not a hope about it.
+ */
+interface Deferred {
+  readonly promise: Promise<void>;
+  readonly release: () => void;
+}
+
+const deferred = (): Deferred => {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = () => resolve();
+  });
+  return { promise, release };
+};
 
 const PEER: AuthenticatedOperatorPeer = {
   channel: "cli",
@@ -235,6 +255,157 @@ describe("#734 daemon doctor freshness", () => {
     expect(onDisk.status).not.toBe("HEALTHY");
     expect(onDisk.status).not.toBe("DEGRADED");
     expect(onDisk.reason).toContain("#734 test: startup probe exploded");
+  });
+
+  it("criterion 5: a slow re-evaluation that FAILS after a fast one succeeded is STALE immediately, with the failure's own provenance", async () => {
+    // The CEO's counterexample, and the defect it exposes is a malformed comparison rather than a
+    // missing fence. `runSystemDoctorCheck` stamps its attempt *before* the probes; `Doctor.run`
+    // stamps `DoctorReport.ranAt` *after* them (`doctor.ts` — the report literal is built once
+    // every check has returned). `resolveDoctorHealth` then compared the two as if they were the
+    // same lifecycle point. They differ by one probe duration, and when two evaluations overlap
+    // the difference is a wrong answer: a failure that began before a fast success finished has
+    // the earlier start stamp, so it was ruled older and dropped — the failure hiding behind the
+    // healthy verdict it was evidence against.
+    const harness = makeHarness();
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const stateDir = tempDir("acp-doctor-freshness-");
+    const daemon = new Daemon(harness.cp, { stateDir, doctorFreshnessMs: 5 * 60_000 });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+    expect(readHealth(stateDir).doctor!.status).not.toBe("STALE");
+
+    const enteredFailing = deferred();
+    const enteredSucceeding = deferred();
+    const releaseFailing = deferred();
+    const releaseSucceeding = deferred();
+    let calls = 0;
+    // Faithful to production: `ranAt` is read from the clock *after* the gate, because that is
+    // where the real `Doctor.run` reads it — after its probes, not on entry. Stamping it on entry
+    // would make the stub model a doctor this repository does not have, and the ordering under
+    // test is exactly the one those two stamps disagree about.
+    vi.spyOn(harness.cp.doctor, "run").mockImplementation(async (): Promise<DoctorReport> => {
+      const first = calls++ === 0;
+      if (first) {
+        enteredFailing.release();
+        await releaseFailing.promise;
+        throw new Error("#734 test: the slow overlapping probe exploded");
+      }
+      enteredSucceeding.release();
+      await releaseSucceeding.promise;
+      return { scope: "system", target: null, status: "HEALTHY", findings: [], ranAt: harness.clock.nowIso() };
+    });
+
+    // A — the operator door. Starts first, fails last.
+    harness.clock.advance(10_000);
+    const startedAtFailing = harness.clock.nowIso();
+    const slowFailingRun = daemon.handleOperatorRequest(
+      { requestId: "req-doctor-run-slow-failure", method: OPERATOR_METHOD.DOCTOR_RUN, params: { scope: "system" } },
+      PEER,
+    );
+    await enteredFailing.promise;
+
+    // B — the reactive continuity trigger. Starts second, succeeds first.
+    const reactiveRefresh = daemon.reconcileContinuity("#734 test: a fast success inside a slow failure");
+    await enteredSucceeding.promise;
+    harness.clock.advance(10_000);
+    const ranAtSucceeding = harness.clock.nowIso();
+    releaseSucceeding.release();
+    await reactiveRefresh;
+
+    const afterSuccess = readHealth(stateDir).doctor!;
+    expect(afterSuccess.status).toBe("HEALTHY");
+    expect(afterSuccess.checkedAt).toBe(ranAtSucceeding);
+    // A's start stamp is genuinely earlier than the success's completion stamp. That is the input
+    // the old comparison got wrong, and it is not an artefact of a tie.
+    expect(Date.parse(startedAtFailing)).toBeLessThan(Date.parse(ranAtSucceeding));
+
+    // A now fails, completing after B. It is the newest thing the daemon knows.
+    harness.clock.advance(10_000);
+    releaseFailing.release();
+    const response = await slowFailingRun;
+    expect(response.allowed).toBe(false);
+    expect(response.reasonCode).toBe(ReasonCode.INTERNAL_ERROR);
+
+    // Immediately — no later write, no additional tick.
+    const onDisk = readHealth(stateDir).doctor!;
+    expect(onDisk.status).toBe("STALE");
+    expect(onDisk.status).not.toBe("HEALTHY");
+    expect(onDisk.reason).toContain("#734 test: the slow overlapping probe exploded");
+
+    const status = await daemon.handleOperatorRequest(
+      { requestId: "req-daemon-status-overlap", method: OPERATOR_METHOD.DAEMON_STATUS, params: {} },
+      PEER,
+    );
+    expect(status.allowed).toBe(true);
+    if (status.allowed) {
+      const daemonStatus = status.value as { health: { doctor: { status: string; reason?: string } } };
+      expect(daemonStatus.health.doctor.status).toBe("STALE");
+      expect(daemonStatus.health.doctor.reason).toContain("#734 test: the slow overlapping probe exploded");
+    }
+    await daemon.stop();
+  });
+
+  it("criterion 5 (reverse completion order): a failure that completed FIRST does not overwrite the success that completed after it", async () => {
+    // The other direction. Once the ordering authority is "which run finished last", the rule has
+    // to be able to say *not stale* as well as *stale* — a rule that only ever escalates is not an
+    // ordering, it is a latch, and a daemon whose doctor never recovers from one transient probe
+    // failure is the same outage in the other direction. Same two overlapping runs as above, with
+    // the completions swapped.
+    const harness = makeHarness();
+    harness.cp.credentials.install({ token: "test-token", creatorIdentity: "acme-bot" });
+    const stateDir = tempDir("acp-doctor-freshness-");
+    const daemon = new Daemon(harness.cp, { stateDir, doctorFreshnessMs: 5 * 60_000 });
+    const started = await daemon.start();
+    expect(started.allowed).toBe(true);
+
+    const enteredFailing = deferred();
+    const enteredSucceeding = deferred();
+    const releaseFailing = deferred();
+    const releaseSucceeding = deferred();
+    let calls = 0;
+    vi.spyOn(harness.cp.doctor, "run").mockImplementation(async (): Promise<DoctorReport> => {
+      const first = calls++ === 0;
+      if (first) {
+        enteredFailing.release();
+        await releaseFailing.promise;
+        throw new Error("#734 test: the early overlapping probe exploded");
+      }
+      enteredSucceeding.release();
+      await releaseSucceeding.promise;
+      return { scope: "system", target: null, status: "HEALTHY", findings: [], ranAt: harness.clock.nowIso() };
+    });
+
+    harness.clock.advance(10_000);
+    const failingRun = daemon.handleOperatorRequest(
+      { requestId: "req-doctor-run-early-failure", method: OPERATOR_METHOD.DOCTOR_RUN, params: { scope: "system" } },
+      PEER,
+    );
+    await enteredFailing.promise;
+    const slowSucceedingRefresh = daemon.reconcileContinuity("#734 test: a slow success outliving a fast failure");
+    await enteredSucceeding.promise;
+
+    // The failure completes first, and while it stands it is correctly the newest fact.
+    harness.clock.advance(10_000);
+    releaseFailing.release();
+    const response = await failingRun;
+    expect(response.allowed).toBe(false);
+    expect(response.reasonCode).toBe(ReasonCode.INTERNAL_ERROR);
+    const whileFailingStands = readHealth(stateDir).doctor!;
+    expect(whileFailingStands.status).toBe("STALE");
+    expect(whileFailingStands.reason).toContain("#734 test: the early overlapping probe exploded");
+
+    // The success completes after it and supersedes it.
+    harness.clock.advance(10_000);
+    const ranAtSucceeding = harness.clock.nowIso();
+    releaseSucceeding.release();
+    await slowSucceedingRefresh;
+
+    const afterSuccess = readHealth(stateDir).doctor!;
+    expect(afterSuccess.status).toBe("HEALTHY");
+    expect(afterSuccess.status).not.toBe("STALE");
+    expect(afterSuccess.checkedAt).toBe(ranAtSucceeding);
+    expect(afterSuccess.reason).toBeUndefined();
+    await daemon.stop();
   });
 
   it("regression: DEGRADED still does not block startup dispatch", async () => {

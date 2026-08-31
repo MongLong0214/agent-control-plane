@@ -434,8 +434,27 @@ export class Daemon {
   // recent *attempt*, kept apart on purpose: a failed attempt must be visible even while the
   // last success is still inside its freshness window (criterion 3). `resolveDoctorHealth`
   // is the only place these two are compared.
-  #lastDoctorSuccess: { report: DoctorReport } | null = null;
+  #lastDoctorSuccess: { report: DoctorReport; generation: number } | null = null;
   #lastDoctorAttempt: DoctorHealthAttempt | null = null;
+  /**
+   * #734 — completion order for system doctor evaluations, and the only thing
+   * `resolveDoctorHealth` is allowed to order the two fields above by.
+   *
+   * `runSystemDoctorCheck` has three callers sharing no fence — `reconcile()`, the
+   * `doctor_refresh` periodic/reactive tick, and the on-demand `OPERATOR_METHOD.DOCTOR_RUN`
+   * door — so two evaluations can be in flight at once and finish in either order. The ticket is
+   * taken *at completion*, in the same synchronous stretch as the writes it labels, so the
+   * number a field carries is the position in which that run finished. "Whose knowledge stands"
+   * is then a comparison of two integers rather than of two timestamps that were never taken at
+   * the same lifecycle point.
+   *
+   * A counter and not a clock reading, for two reasons that both bite here. `cp.clock.nowIso()`
+   * is millisecond-resolution, so two runs finishing inside one millisecond tie — and a tie is
+   * where a last-writer-wins bug lives. And this repository's tests run on `ManualClock`, where
+   * every reading inside one un-advanced stretch is *identical*: a timestamp-ordered rule would
+   * degrade to guesswork in exactly the test written to kill it.
+   */
+  #doctorCompletions = 0;
   readonly #operatorInFlight = new Map<string, Promise<Decision<unknown>>>();
   readonly #operatorResults = new Map<string, { fingerprint: string; result: Decision<unknown> }>();
   readonly #finalizer: ApprovedRunFinalizer;
@@ -1135,17 +1154,41 @@ export class Daemon {
    * audited (the same `DAEMON_TIMER_FAILED`/`"health"` shape `runPeriodic` already uses for an
    * unrelated write failure) rather than silently dropped, but it is secondary: it never
    * replaces or suppresses the doctor error being thrown.
+   *
+   * The two stamps are different lifecycle points and are named as such. `startedAt` is taken
+   * before the probes; `completedAt` after them, alongside the completion ticket. They used to be
+   * one field called `at`, which was a *start* time — and `resolveDoctorHealth` compared it
+   * against `DoctorReport.ranAt`, which `Doctor.run` stamps *after* its probes. Comparing a start
+   * against a completion is wrong by one probe duration whatever the concurrency, and it becomes
+   * observable when two evaluations overlap: a slow failure that began before a fast success
+   * finished has `startedAt < ranAt`, so the old comparison ruled it older and the failure hid
+   * behind the healthy verdict it should have invalidated.
+   *
+   * There is deliberately no "am I superseded, skip the write" refusal here. The ticket and the
+   * writes it labels sit in one synchronous stretch with no `await` between them, so writes
+   * already land in completion order and the newest completion is always the one on disk. A
+   * refusal would be a condition that can never fire — a guard that reads as coverage and
+   * enforces nothing. What was missing was never a fence; it was an ordering the reader could
+   * compare. That ordering is `generation`, and it is enforced where the comparison happens.
    */
   private async runSystemDoctorCheck(supplementalFindings: readonly Finding[] = []): Promise<DoctorReport> {
-    const at = this.cp.clock.nowIso();
+    const startedAt = this.cp.clock.nowIso();
     try {
       const report = await this.cp.doctor.run("system", undefined, supplementalFindings);
-      this.#lastDoctorSuccess = { report };
-      this.#lastDoctorAttempt = { at, ok: true };
+      const generation = ++this.#doctorCompletions;
+      this.#lastDoctorSuccess = { report, generation };
+      this.#lastDoctorAttempt = { startedAt, completedAt: this.cp.clock.nowIso(), generation, ok: true };
       this.writeHealth(null);
       return report;
     } catch (err) {
-      this.#lastDoctorAttempt = { at, ok: false, error: safeErrorMessage(err) };
+      const generation = ++this.#doctorCompletions;
+      this.#lastDoctorAttempt = {
+        startedAt,
+        completedAt: this.cp.clock.nowIso(),
+        generation,
+        ok: false,
+        error: safeErrorMessage(err),
+      };
       try {
         this.writeHealth(null);
       } catch (writeErr) {

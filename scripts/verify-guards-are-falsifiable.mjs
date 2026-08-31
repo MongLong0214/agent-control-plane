@@ -3268,9 +3268,23 @@ const GUARDS = [
     // is recent), so the previous — now wrong — status is returned as if nothing had failed.
     what: "#734: a doctor re-evaluation that fails is reported STALE immediately, not the retained previous healthy value",
     file: "src/doctor/doctor.ts",
-    find: "  if (lastAttempt && !lastAttempt.ok && Date.parse(lastAttempt.at) >= Date.parse(checkedAt)) {\n",
+    find: "  if (lastAttempt && !lastAttempt.ok && lastAttempt.generation > lastSuccess.generation) {\n",
     replace: "  if (false) {\n",
     killedBy: ["tests/unit/doctor-health-freshness.test.ts"],
+  },
+  {
+    // The other direction of the same operand, and the one that says this is an *ordering* rather
+    // than a latch. Dropping the generation comparison makes any failure ever recorded outrank
+    // every success forever: a daemon that saw one transient probe failure would answer STALE
+    // from then on, no matter how many healthy evaluations completed after it. A rule that can
+    // only escalate is the same outage in the other direction, so both halves need a row.
+    what: "#734: a failed doctor attempt that completed BEFORE the retained success does not mark it stale",
+    file: "src/doctor/doctor.ts",
+    find: "  if (lastAttempt && !lastAttempt.ok && lastAttempt.generation > lastSuccess.generation) {\n",
+    replace: "  if (lastAttempt && !lastAttempt.ok) {\n",
+    killedBy: [
+      "tests/unit/doctor-health-freshness.test.ts::a failed attempt older than the current success does not retroactively mark it stale",
+    ],
   },
   {
     // The other half of #734 criterion 1: an evaluation old enough to have exceeded the bounded
@@ -3306,9 +3320,38 @@ const GUARDS = [
     // that stays in memory while `health.json` keeps answering the previous healthy value.
     what: "#734: a failed system-doctor re-evaluation persists STALE to disk inside its own failure branch, not only when a caller happens to writeHealth afterward",
     file: "src/daemon/daemon.ts",
-    find: '      this.#lastDoctorAttempt = { at, ok: false, error: safeErrorMessage(err) };\n      try {\n        this.writeHealth(null);\n      } catch (writeErr) {\n        this.cp.audit.record({\n          kind: "DAEMON_TIMER_FAILED",\n          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,\n          evidence: { timer: "health", error: safeErrorMessage(writeErr) },\n        });\n      }\n',
-    replace: '      this.#lastDoctorAttempt = { at, ok: false, error: safeErrorMessage(err) };\n',
+    find: '      try {\n        this.writeHealth(null);\n      } catch (writeErr) {\n        this.cp.audit.record({\n          kind: "DAEMON_TIMER_FAILED",\n          reasonCode: ReasonCode.DAEMON_TIMER_FAILED,\n          evidence: { timer: "health", error: safeErrorMessage(writeErr) },\n        });\n      }\n',
+    replace: "",
     killedBy: ["tests/unit/daemon-doctor-freshness.test.ts"],
+  },
+  {
+    // The failed attempt's ticket must be a *fresh* completion position, because that is the only
+    // thing that lets it outrank the success it supersedes. Handing it the retained success's own
+    // number instead makes `lastAttempt.generation > lastSuccess.generation` false for every
+    // failure that ever happens: the comparison stays in `resolveDoctorHealth`, reads as present,
+    // and no failure can ever reach it. This is the operand, not the condition — a guard is only
+    // as real as the value it is given.
+    what: "#734: a failed system-doctor evaluation takes a fresh completion ticket, so it outranks the success it supersedes",
+    file: "src/daemon/daemon.ts",
+    find: "    } catch (err) {\n      const generation = ++this.#doctorCompletions;\n",
+    replace: "    } catch (err) {\n      const generation = this.#lastDoctorSuccess?.generation ?? 0;\n",
+    killedBy: [
+      "tests/unit/daemon-doctor-freshness.test.ts::a slow re-evaluation that FAILS after a fast one succeeded",
+    ],
+  },
+  {
+    // The same operand on the success side. A success that records a number ahead of its own
+    // completion position permanently outranks the next failure, so the daemon would answer with
+    // a healthy verdict after a probe that just threw — #734's original defect, reintroduced
+    // through the ordering rather than through the write. Off by one in the direction that fails
+    // open, which is why it gets its own row rather than being read off the row above.
+    what: "#734: a successful system-doctor evaluation records its own completion position, not one ahead of it",
+    file: "src/daemon/daemon.ts",
+    find: "      this.#lastDoctorSuccess = { report, generation };\n",
+    replace: "      this.#lastDoctorSuccess = { report, generation: generation + 1 };\n",
+    killedBy: [
+      "tests/unit/daemon-doctor-freshness.test.ts::a re-evaluation that fails yields STALE immediately",
+    ],
   },
 ];
 
