@@ -3442,6 +3442,23 @@ const GUARDS = [
     ],
   },
   {
+    // Taking the lock and re-reading state under it are two different properties, and the row
+    // above only observes the first. Without this one, a second process that read version 11
+    // before the holder committed applies a chain that has already been applied — measured, it
+    // dies inside migration v12 and rolls back, so the harm is a failed start on a database
+    // that was already correct, not a silent corruption. Either way it is not the refusal the
+    // code claims to make.
+    what: "a migration re-reads the schema version under the lock before applying its chain",
+    file: "src/db/database.ts",
+    find:
+      "      const current = Number(this.#raw.pragma(\"user_version\", { simple: true }));\n" +
+      "      if (current !== version) {",
+    replace: "      const current = version;\n      if (false) {",
+    killedBy: [
+      "tests/unit/an-approval-is-a-capability-over-one-database.test.ts::refuses under the lock rather than re-running it, and the ledger records one run",
+    ],
+  },
+  {
     // Filing the spent approval away is bookkeeping about a migration that already committed.
     // Throwing from it reports a committed migration as a failed start, which is the state
     // nothing could recognise.

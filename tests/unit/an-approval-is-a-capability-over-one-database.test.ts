@@ -1,6 +1,5 @@
 import Database from "better-sqlite3";
-import { execFileSync } from "node:child_process";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -16,7 +15,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { isAcpError } from "../../src/core/errors.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
-import { SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
+import { Db, SCHEMA_VERSION, openDb } from "../../src/db/database.ts";
 import { approveMigration, migrationApprovalPath } from "../../src/db/migration-approval.ts";
 
 /**
@@ -37,6 +36,8 @@ import { approveMigration, migrationApprovalPath } from "../../src/db/migration-
  *      failure was thrown — producing an upgraded database reported as a failed start, a state
  *      nothing could recognise and nothing would resolve.
  */
+const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url)).replace(/\/$/u, "");
+const MIGRATE_ONE = join(repositoryRoot, "tests/helpers/migrate-one-database.ts");
 const V11_SCHEMA = readFileSync(
   fileURLToPath(new URL("../fixtures/schema-v11.sql", import.meta.url)),
   "utf8",
@@ -205,6 +206,57 @@ describe("a migration that would run while another process holds the state", () 
     openDb(databasePath).close();
     expect(schemaVersionOf(databasePath)).toBe(SCHEMA_VERSION);
   }, 60_000);
+});
+
+describe("a migration whose chain another process already ran", () => {
+  it("refuses under the lock rather than re-running it, and the ledger records one run", () => {
+    const root = stateRoot();
+    const databasePath = databaseAtV11(root, "state.sqlite", "sentinel");
+    approveMigration(databasePath, "isaac");
+
+    // Taking the lock and re-reading state under it are two different properties. This is the
+    // second one: both processes pass the pre-lock version check at 11, the other one acquires
+    // first and runs the whole chain, and this one acquires afterwards still believing the
+    // database is at 11. Without the re-read it would apply a chain that has already been
+    // applied. `acquire` denies instead of blocking, so this ordering is only reachable for a
+    // process that arrives *after* the holder released — which is exactly the window the seam
+    // below opens.
+    let raced = false;
+    let migrator: ReturnType<typeof spawnSync> | null = null;
+    expect(
+      () =>
+        new Db(databasePath, {
+          beforeMigrationExclusivity: () => {
+            if (raced) return;
+            raced = true;
+            migrator = spawnSync(
+              process.execPath,
+              ["--import", "tsx", MIGRATE_ONE, databasePath],
+              { cwd: repositoryRoot, encoding: "utf8", timeout: 60_000 },
+            );
+          },
+        }),
+    ).toThrowError(/schema changed while this process was acquiring migration exclusivity/);
+
+    expect(raced).toBe(true);
+    expect(migrator!.status, `stderr:\n${migrator!.stderr}`).toBe(0);
+    expect(schemaVersionOf(databasePath)).toBe(SCHEMA_VERSION);
+
+    // Migrated exactly once. The version alone cannot say that — a chain re-applied over
+    // itself would land on the same number — so this reads the ledger the migrations write.
+    const raw = new Database(databasePath, { readonly: true, fileMustExist: true });
+    try {
+      const duplicated = raw
+        .prepare("SELECT version FROM schema_migrations GROUP BY version HAVING COUNT(*) > 1")
+        .all();
+      expect(duplicated).toEqual([]);
+      expect(
+        raw.prepare("SELECT MAX(version) AS max FROM schema_migrations").get(),
+      ).toEqual({ max: SCHEMA_VERSION });
+    } finally {
+      raw.close();
+    }
+  }, 120_000);
 });
 
 describe("a spent approval that could not be filed away", () => {

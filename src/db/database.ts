@@ -81,6 +81,18 @@ export interface DbOpenOptions {
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
   afterMigration?: (migration: SchemaMigration) => void;
   /**
+   * Test-only scheduling seam at the one point a migration race is decidable: after this open
+   * has read the on-disk version and validated its approval, and before it acquires
+   * exclusivity (#747).
+   *
+   * `SingleInstanceLock.acquire` denies rather than blocking, so the interleaving that the
+   * re-read below exists for cannot be produced by starting two processes and hoping — the
+   * second one has to arrive *after* the first released, still holding a version it read
+   * before the first committed. This seam schedules that window; it does not simulate it. What
+   * runs inside it is a real second process taking the real lock and running the real chain.
+   */
+  beforeMigrationExclusivity?: () => void;
+  /**
    * An approval delivered in-process rather than through the state directory's approval file
    * (#738). Held to the identical checks, so this is a second way to hand over an approval and
    * not a way past one. Omitting it does not permit a migration: it means the only approval
@@ -426,6 +438,7 @@ export class Db {
     // is an exclusive operation whoever performs it, so the CLI and the verification scripts
     // that reach this same line take it too, on their own state directory, where it is
     // uncontended. An open that does not migrate never touches the lock.
+    this.options.beforeMigrationExclusivity?.();
     this.withMigrationExclusivity(() => {
       // Re-read under the lock. Everything above was decided without exclusivity, so a
       // concurrent migration could have completed in between; a check whose result is used
