@@ -269,7 +269,23 @@ non-empty, absolute, and a real file.
     if [ "$SOURCE_JOURNAL_FORMAT" != "1" ]; then
       echo "refusing: $SOURCE_DB has SQLite write-format $SOURCE_JOURNAL_FORMAT, not 1; a read-only connection cannot open a WAL database and this procedure is not verified for one" >&2; exit 1
     fi
-    SOURCE_USER_VERSION="$(sqlite3 -readonly "$SOURCE_DB" 'PRAGMA user_version;')"
+    # `.timeout 30000` for the same reason step 3's `.backup` carries one, and it was missing here
+    # only from this line. This is a read of the *live* database, and under `journal_mode=delete` a
+    # committing writer holds `EXCLUSIVE` for a short window in which a plain read is not queued —
+    # it is refused instantly with `SQLITE_BUSY`. An owner running this against a working daemon is
+    # reading a database that is being committed to continuously, so that window is not rare.
+    #
+    # Measured: with the daemon-shaped writer of
+    # `tests/process/the-database-backup-step-fails-closed.test.ts` on the source, this line — and
+    # only this line — could hand the owner a bare `5`. `sqlite3` prints `Error: stepping, database
+    # is locked (5)`, `set -e` carries the substitution's exit status, and the procedure died here,
+    # *before* `.backup` ever ran, with nothing on the way out naming the backup, the daemon, or
+    # what to do next. The dot command is what queues instead of refusing; the sentence below is
+    # what a reader gets if 30 seconds of queueing is still not enough.
+    if ! SOURCE_USER_VERSION="$(sqlite3 -readonly "$SOURCE_DB" '.timeout 30000' 'PRAGMA user_version;')"; then
+      echo "refusing: could not read user_version from $SOURCE_DB — it stayed locked for the 30s this read waits, which means a concurrent writer (normally the daemon) is committing to it without a gap. No backup was taken and nothing was written. Retry when the daemon is quieter, or stop it first." >&2
+      exit 1
+    fi
     echo "source: size=$SOURCE_SIZE inode=$SOURCE_INODE mtime=$SOURCE_MTIME user_version=$SOURCE_USER_VERSION"
 
     # 2. An explicit new destination inside the owner-only backup directory. Refused here, before
@@ -318,6 +334,18 @@ non-empty, absolute, and a real file.
     # 3. The backup itself: one `sqlite3` invocation, the online backup API, against the live
     #    database exactly as it stands. Busy, error, or any nonzero exit stops here — there is no
     #    raw-copy fallback for this command to fall back to.
+    #
+    #    What `.timeout` covers here, stated exactly, because #753 was filed reading it as covering
+    #    more: it queues behind *lock contention*. Measured against a source held under
+    #    `BEGIN EXCLUSIVE`, this command waits for the holder and exits `0`; without the dot
+    #    command it exits `1` with `Error: database is locked`. It cannot exit `5` — the shell maps
+    #    every backup failure to `1` — so a bare `5` out of this block was never this line.
+    #
+    #    It does not cover *starvation*. `.backup` is the online backup API, which restarts its
+    #    copy whenever the source is written mid-pass, and the CLI's copy loop has no iteration cap
+    #    and no deadline. A source written without a gap would therefore show up as a run that does
+    #    not finish, not as a nonzero exit. That has not been observed here and nothing below
+    #    bounds it; if this procedure ever hangs at this line, that is the shape to suspect.
     sqlite3 -readonly "$SOURCE_DB" ".timeout 30000" ".backup '$BACKUP_TMP'"
     # `readManifest` in `src/db/backup.ts` runs `assertPrivatePath` on both the backup and its
     # manifest, and that requires mode exactly 0600. `.backup` writes with the ambient umask, so

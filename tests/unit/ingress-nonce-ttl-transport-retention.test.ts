@@ -106,7 +106,7 @@ describe("#673 the nonce window must not close before the transport's own retent
         reply: "answered",
         sent: true,
         deliveryStatus: "APPLIED",
-      }).allowed,
+      }, "ANSWERED").allowed,
     ).toBe(true);
     // Resolved: an ordinary replay right now is correctly ignored, not treated as unknown, and
     // there is nothing left in `unresolvedTurns` for a person to chase.

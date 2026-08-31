@@ -495,10 +495,16 @@ const GUARDS = [
     // one specific guard. `if (!completed.allowed) return completed;` exists only in this method's
     // reply-completion transaction, so pairing it with the mutated line is what makes this row
     // about the reply path and not the no-reply one below.
+    //
+    // #639 put a line between those two, so the anchor moved to the pair that now brackets the
+    // resolution: the `UNANSWERED` early return and the resolution itself. It still names only
+    // this method — `settleReplyAndTurn` ends in `#settleTurnHere` — and the property is
+    // unchanged. A turn the CEO *did* answer must still stop being outstanding; that half is
+    // what this row keeps honest, and the new row beside it covers the other half.
     what: "a turn whose reply the transport accepted stops being outstanding",
     file: "src/ingress/ingress-guard.ts",
-    find: "      if (!completed.allowed) return completed;\n      return this.#resolveTurnHere(channel, nonce);",
-    replace: "      if (!completed.allowed) return completed;\n      return completed;",
+    find: "      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n      return this.#resolveTurnHere(channel, nonce);",
+    replace: "      if (turnOutcome === \"UNANSWERED\") return allow(ReasonCode.OK, undefined);\n      return completed;",
     killedBy: [
       "tests/unit/a-turn-and-a-reply-are-two-lifecycles.test.ts::resolves the turn in the same transaction that records the reply",
     ],
