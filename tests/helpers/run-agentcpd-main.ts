@@ -8,9 +8,73 @@ import { ExecutionMode, Role, RunKind, RunState, SessionLifecycle, roleKeyFor } 
 import { ScriptedAdapter } from "../../src/runtime/scripted-adapter.ts";
 import type { TelegramBotTransport } from "../../src/ingress/telegram-polling.ts";
 import type { TelegramUpdate } from "../../src/ingress/telegram.ts";
+import { allow } from "../../src/core/errors.ts";
+import { ReasonCode } from "../../src/core/reason-codes.ts";
+import { ingressSignature } from "../../src/ingress/ingress-guard.ts";
+import { buzzMessageSigningRequest } from "../../src/ingress/buzz-message.ts";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { generateKeyPairSync } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { join } from "node:path";
+
+/**
+ * Every live child of this process, read from the OS rather than from anything the daemon says
+ * about itself.
+ *
+ * `ps -A -o pid=,ppid=` is the form both BSD and GNU `ps` accept. The whole point of #627 is
+ * that the deployed Buzz path answers by starting `hermes acp` as a session child, so "no fork"
+ * has to be measured as processes, not inferred from a delivery that succeeded.
+ */
+const childPids = (): string[] => {
+  const listed = spawnSync("ps", ["-A", "-o", "pid=,ppid=,command="], { encoding: "utf8" });
+  if (listed.status !== 0) throw new Error(`could not list processes: ${listed.stderr}`);
+  const children: string[] = [];
+  for (const line of listed.stdout.split("\n")) {
+    const parts = line.trim().split(/\s+/u);
+    if (parts.length < 3 || Number(parts[1]) !== process.pid) continue;
+    const command = parts.slice(2).join(" ");
+    // `ps` lists itself, and it is this reading's own child. Counting it would put a transient
+    // in both numbers and make a real spawn harder to see rather than easier.
+    if (/(^|\/)ps$/u.test(parts[2] ?? "")) continue;
+    children.push(command.slice(0, 80));
+  }
+  return children;
+};
+
+/** Reads one newline-delimited response from a local ingress socket. */
+const exchangeSocketLine = (socketPath: string, line: unknown): Promise<string> =>
+  new Promise((resolveExchange, rejectExchange) => {
+    const socket = createConnection(socketPath);
+    let received = "";
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (error) rejectExchange(error);
+      else resolveExchange(received);
+    };
+    const timer = setTimeout(() => {
+      socket.destroy();
+      finish(new Error("Buzz message socket response timed out"));
+    }, 20_000);
+    timer.unref();
+    socket.setEncoding("utf8");
+    socket.once("connect", () => socket.write(`${JSON.stringify(line)}\n`));
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      if (received.includes("\n")) socket.end();
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timer);
+      finish(error);
+    });
+    socket.once("close", () => {
+      clearTimeout(timer);
+      finish();
+    });
+  });
 
 class StartupAdapter extends ScriptedAdapter {
   override readonly isProduction = true;
@@ -149,6 +213,7 @@ const expectPromptFlow = process.env["ACP_STARTUP_TEST_EXPECT_PROMPT_FLOW"] === 
 // so `ACP_TELEGRAM_API_BASE_URL` actually reaches it and its `redeliveryRetentionMs` is computed
 // from the real class rather than this fixture's own declared value.
 const useRealTelegramTransport = process.env["ACP_STARTUP_TEST_REAL_TELEGRAM_TRANSPORT"] === "1";
+const expectBuzzMessage = process.env["ACP_STARTUP_TEST_EXPECT_BUZZ_MESSAGE"] === "1";
 const startupTransport = new StartupTelegramTransport(expectPromptFlow);
 
 try {
@@ -286,6 +351,114 @@ try {
         process.stdout.write("startup test Telegram poll observed\n");
         process.stdout.write("startup test Telegram inbound routed\n");
         process.stdout.write("startup test DIRECT answered by the CEO route\n");
+      }
+      if (expectBuzzMessage) {
+        // #627: an owner Buzz message reaches the CEO through the daemon's own socket, and no
+        // session child is started to answer it. Everything here goes through the composition
+        // `main` built — the socket it opened, the port it wired — because a test that called
+        // the ingress class directly would not prove the socket path reaches it.
+        if (!context.ceoConversation) throw new Error("Buzz startup test found no CEO conversation port");
+
+        const ceoSession = context.cp.sessions.create({ provider: "claude", model: "startup-test-ceo" });
+        const ceoReady = context.cp.sessions.transition(
+          ceoSession.sessionId,
+          SessionLifecycle.READY,
+          "startup buzz-message test",
+        );
+        if (!ceoReady.allowed) throw new Error(ceoReady.message);
+        const ceoBinding = context.cp.bindings.bind({
+          roleKey: roleKeyFor(Role.CEO),
+          role: Role.CEO,
+          sessionId: ceoSession.sessionId,
+        });
+        if (!ceoBinding.allowed) throw new Error(ceoBinding.message);
+
+        // The peer the CEO socket would attach: it answers sampling requests and is never
+        // started by this path — it is already there, which is the entire mechanism.
+        const asked: string[] = [];
+        const peer = {
+          server: {
+            getClientCapabilities: () => ({ sampling: {} }),
+            createMessage: async (params: { messages: { content: { text?: string } }[] }) => {
+              asked.push(params.messages[0]?.content.text ?? "");
+              return { model: "startup-test", role: "assistant", content: { type: "text", text: "CEO 응답" } };
+            },
+          },
+        } as unknown as McpServer;
+        context.ceoConversation.attach(peer, () =>
+          allow(ReasonCode.OK, {
+            sessionId: ceoSession.sessionId,
+            sessionIncarnation: ceoSession.incarnation,
+            sessionSecret: ceoSession.sessionSecret,
+          } as never),
+        );
+
+        const sessionsBefore = context.cp.db
+          .all<{ session_id: string }>(`SELECT session_id FROM sessions ORDER BY session_id`, [])
+          .map((row) => row.session_id);
+        const childrenBefore = childPids();
+
+        const message = {
+          actor: "npub-startup-owner",
+          conversation: "buzz-startup-room",
+          eventId: "startup-buzz-1",
+          addressedTo: "CEO",
+          text: "어떻게 돼가?",
+        };
+        const response = await exchangeSocketLine(
+          join(root, ".agent-control-plane", "buzz-message.ingress.sock"),
+          {
+            ...message,
+            signature: ingressSignature(
+              process.env["ACP_BUZZ_INGRESS_SECRET"] ?? "",
+              buzzMessageSigningRequest(message),
+            ),
+          },
+        );
+        const answered = JSON.parse(response.trim()) as {
+          ok: boolean;
+          reasonCode: string;
+          answer: string | null;
+          answeredByCeo: boolean;
+        };
+        if (!answered.ok || answered.reasonCode !== ReasonCode.OK || answered.answer !== "CEO 응답") {
+          throw new Error(`Buzz startup test did not get the CEO's answer back: ${response.trim()}`);
+        }
+        if (!answered.answeredByCeo || asked.length !== 1 || asked[0] !== message.text) {
+          throw new Error(`Buzz startup test did not reach the CEO peer: ${JSON.stringify(asked)}`);
+        }
+
+        const childrenAfter = childPids();
+        const sessionsAfter = context.cp.db
+          .all<{ session_id: string }>(`SELECT session_id FROM sessions ORDER BY session_id`, [])
+          .map((row) => row.session_id);
+        // Both halves of "no fork", and neither is inferred from the delivery having worked:
+        // the OS's own child list, and the session registry the deployed path fills with
+        // one-answer sessions titled "Configure Buzz platform sess".
+        if (childrenAfter.length !== childrenBefore.length) {
+          throw new Error(
+            `Buzz startup test spawned a child process: before=${JSON.stringify(childrenBefore)} ` +
+              `after=${JSON.stringify(childrenAfter)}`,
+          );
+        }
+        if (sessionsAfter.join(",") !== sessionsBefore.join(",")) {
+          throw new Error(
+            `Buzz startup test created a session: before=${sessionsBefore.length} after=${sessionsAfter.length}`,
+          );
+        }
+        const stillBound = context.cp.bindings.active(roleKeyFor(Role.CEO))?.boundSessionId;
+        if (stillBound !== ceoSession.sessionId) {
+          throw new Error(`Buzz startup test moved the CEO binding to ${String(stillBound)}`);
+        }
+        process.stdout.write("startup test Buzz message answered by the CEO route\n");
+        // The counts are printed with the child commands behind them: "0 -> 0" and "1 -> 1" are
+        // both passes, and only naming what the 1 is lets a reader see that it is the test
+        // toolchain's own and not something the turn started.
+        process.stdout.write(
+          `startup test Buzz message spawned no session child (children ${childrenBefore.length} -> ` +
+            `${childrenAfter.length} ${JSON.stringify(childrenAfter)}, sessions ` +
+            `${sessionsBefore.length} -> ${sessionsAfter.length})\n`,
+        );
       }
       await shutdown("STARTUP_TEST");
     },

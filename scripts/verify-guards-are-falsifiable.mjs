@@ -1392,6 +1392,83 @@ const GUARDS = [
     killedBy: ["tests/unit/configured-ingress-policy.test.ts"],
   },
   {
+    // #627: the deployed Buzz path answers the owner by starting `hermes acp` as a session
+    // child. These rows guard the receiving half that replaces it — every one of them, mutated,
+    // puts a turn somewhere it was not supposed to go or loses the record that it went there.
+    what: "#627: a Buzz event the relay did not address to the CEO does not become a CEO turn",
+    file: "src/ingress/buzz-message.ts",
+    find: "    if (input.addressedTo !== BUZZ_MESSAGE_RECIPIENT_CEO) {\n",
+    replace: "    if (false) {\n",
+    killedBy: [
+      "tests/unit/buzz-message-ingress.test.ts::refuses a forged signature, a channel identity that is not allowlisted, and a message not addressed to the CEO",
+    ],
+  },
+  {
+    what: "#627: a Buzz message is not delivered at all on an unsigned ingress policy",
+    file: "src/ingress/buzz-message.ts",
+    find: "    if (!this.guard.requiresSignature(\"buzz\")) {\n",
+    replace: "    if (false) {\n",
+    killedBy: [
+      "tests/unit/buzz-message-ingress.test.ts::refuses to deliver at all on an unsigned Buzz policy",
+    ],
+  },
+  {
+    what: "#627: the Buzz message listener refuses to open on a policy with no signing secret",
+    file: "src/daemon/agentcpd.ts",
+    find: "    throw new Error(\"Buzz message ingress requires a non-empty signing secret\");\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/buzz-message-ingress.test.ts::refuses to open a message socket on a policy with no signing secret",
+    ],
+  },
+  {
+    what: "#627: a Buzz message takes its turn claim before the CEO is asked anything",
+    file: "src/ingress/buzz-message.ts",
+    find:
+      "  const claimed = ingress.claimTurn(admitted.value.nonce, identity);\n" +
+      "  if (!claimed.allowed) return claimed as Decision<BuzzMessageAnswer>;\n",
+    replace: "",
+    killedBy: [
+      "tests/unit/buzz-message-ingress.test.ts::claims the turn under the CEO generation it was answered by, and refuses the same event twice",
+    ],
+  },
+  {
+    what: "#627: a Buzz turn's claim records the CEO generation it actually ran under",
+    file: "src/daemon/agentcpd.ts",
+    find: "    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,\n",
+    replace: "    bindingGeneration: () => null,\n",
+    killedBy: [
+      "tests/unit/buzz-message-ingress.test.ts::claims the turn under the CEO generation it was answered by, and refuses the same event twice",
+    ],
+  },
+  {
+    what: "#627: a Buzz turn that reached the CEO without an answer is left unresolved, not marked replied",
+    file: "src/ingress/buzz-message.ts",
+    find: "  const closes = delivered.reachedCeo ? answered : !answered;\n",
+    replace: "  const closes = true;\n",
+    killedBy: [
+      "tests/unit/buzz-message-ingress.test.ts::leaves the claim outstanding when the turn reached the CEO and no answer came back",
+    ],
+  },
+  {
+    what: "#627: a Buzz turn nothing was asked of is closed rather than left outstanding forever",
+    file: "src/ingress/buzz-message.ts",
+    find: "  const closes = delivered.reachedCeo ? answered : !answered;\n",
+    replace: "  const closes = false;\n",
+    killedBy: [
+      "tests/unit/buzz-message-ingress.test.ts::tells the owner when no CEO peer is connected instead of starting one",
+    ],
+  },
+  {
+    what: "#627: a Buzz message nonce cannot consume an actor binding's nonce on the shared channel",
+    file: "src/ingress/buzz-message.ts",
+    find: "export const BUZZ_MESSAGE_NONCE_PREFIX = \"buzz-message:\";\n",
+    replace: "export const BUZZ_MESSAGE_NONCE_PREFIX = \"\";\n",
+    killedBy: [
+      "tests/unit/buzz-message-ingress.test.ts::keeps a message event id from consuming an actor binding's nonce",
+    ],
+  },
+  {
     what: "the Buzz CLI transport sends on the channel it was given",
     symbols: ["BuzzTransport", "messagesSend", "channelsGet"],
     file: "src/buzz/buzz-adapter.ts",
