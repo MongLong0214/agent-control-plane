@@ -8,19 +8,27 @@ that the repository protect itself before any later wave's "green" means anythin
 - force-push and branch deletion are refused
 - there are **no bypass actors** — the review is explicit that this count is zero
 
-The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **`verify` is the required
-status check context** — that is the name GitHub reports, not `project-ci`. It used to be true
-because the workflow's one job had that id; it is no longer, and stating it that way would be
-exactly the kind of stale claim this repository keeps finding elsewhere. As of #539's CI-matrix
-fix, the workflow has two jobs: `verify-matrix` (`node-version: ["22.18.0", "22"]`, running
-`pnpm lint`, `pnpm typecheck`, `pnpm build`, `pnpm test`, `pnpm trace`, `node scripts/ssot-report.mjs`
-and the rest of the step list) and `verify-gate`, which needs it and runs unconditionally
-(`if: always()`) to fail closed on anything but a fully successful matrix. Both jobs carry
-`name: verify`; GitHub appends the matrix value to a matrixed job's check name regardless of that
-field, so `verify-matrix`'s checks read `verify (22.18.0)` / `verify (22)`, and `verify-gate` —
-unmatrixed — is what produces the bare `verify` check this section's required-status-check
-configuration actually matches. The required context string itself did not change, so nothing in
-this document's `gh api` commands or `app_id`/`integration_id` pins needs updating for this.
+The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **the bare `verify` check is the
+required status check context** — that is a job check name GitHub reports, not the workflow name.
+The workflow now has five jobs:
+
+- `verify-matrix`, displayed as `verify`, runs the main build and test steps on Node 22.18.0 and
+  the current Node 22 release, producing `verify (22.18.0)` and `verify (22)` checks;
+- `guard-falsifiability`, displayed as `guard falsifiability`, runs the mutation sweep in its own
+  clean checkout after the matrix;
+- `traceability`, displayed as `traceability`, runs its own independent test suite and generates
+  the complete report it consumes in its own clean checkout;
+- `ssot`, displayed as `SSOT reconciliation`, runs the reconciliation check in its own checkout;
+  and
+- `verify-gate`, displayed as bare `verify`, needs all four preceding jobs and runs under
+  `if: always()` so only four explicit `success` results pass it.
+
+The first four jobs are therefore transitively required by the bare `verify` gate; they are not
+separate branch-protection contexts. The required context remains `verify` with GitHub Actions App
+id `15368`. Existing protection that already requires that pinned context needs no settings change
+for this workflow split, and the commands below remain current. Registering the four component
+checks separately would be a repository-owner policy change and is not part of this document or
+the workflow change.
 
 Applying this is an owner action: it changes repository settings.
 

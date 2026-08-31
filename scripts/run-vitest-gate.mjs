@@ -11,6 +11,12 @@ const vitestPath = join(repoRoot, "node_modules", ".bin", "vitest");
 
 const nonnegativeInteger = (value) => Number.isInteger(value) && value >= 0;
 
+const outputPathFor = (vitestArgs, reporter, fallback) => {
+  const prefix = `--outputFile.${reporter}=`;
+  const override = vitestArgs.find((argument) => argument.startsWith(prefix));
+  return override ? resolve(repoRoot, override.slice(prefix.length)) : fallback;
+};
+
 const invalid = (reason) => ({
   kind: "invalid",
   reason,
@@ -29,6 +35,10 @@ export const classifyVitestRun = (exitCode, report) => {
   }
 
   const countNames = [
+    "numTotalTestSuites",
+    "numPassedTestSuites",
+    "numFailedTestSuites",
+    "numPendingTestSuites",
     "numTotalTests",
     "numPassedTests",
     "numFailedTests",
@@ -37,6 +47,16 @@ export const classifyVitestRun = (exitCode, report) => {
   ];
   for (const name of countNames) {
     if (!nonnegativeInteger(report[name])) return invalid(`${name} is missing or is not a nonnegative integer`);
+  }
+  const accountedSuites =
+    report.numPassedTestSuites + report.numFailedTestSuites + report.numPendingTestSuites;
+  if (accountedSuites !== report.numTotalTestSuites) {
+    return invalid(
+      `suite counters account for ${accountedSuites} of ${report.numTotalTestSuites} collected suites`,
+    );
+  }
+  if (typeof report.success !== "boolean") {
+    return invalid("success is missing or is not a boolean");
   }
   if (!Array.isArray(report.testResults) || report.testResults.length === 0) {
     return invalid("the result file names no collected test files");
@@ -52,12 +72,54 @@ export const classifyVitestRun = (exitCode, report) => {
 
   const files = report.testResults.length;
   const tests = report.numTotalTests;
-  const failedAssertions = assertions.filter((assertion) => assertion?.status === "failed").length;
-  const failedTests = Math.max(report.numFailedTests, failedAssertions);
-  if (failedTests > 0) {
+  if (assertions.length !== tests) {
+    return invalid(
+      `assertion results enumerate ${assertions.length} of ${tests} collected tests`,
+    );
+  }
+
+  const statusCounts = {
+    passed: 0,
+    failed: 0,
+    pending: 0,
+    skipped: 0,
+    todo: 0,
+  };
+  for (const assertion of assertions) {
+    if (
+      !assertion ||
+      typeof assertion !== "object" ||
+      !Object.hasOwn(statusCounts, assertion.status)
+    ) {
+      return invalid("an assertion result has an unrecognized status");
+    }
+    statusCounts[assertion.status] += 1;
+  }
+
+  const expectedCounts = [
+    ["numPassedTests", statusCounts.passed, "passed"],
+    ["numFailedTests", statusCounts.failed, "failed"],
+    ["numPendingTests", statusCounts.pending + statusCounts.skipped, "pending or skipped"],
+    ["numTodoTests", statusCounts.todo, "todo"],
+  ];
+  for (const [name, assertionCount, status] of expectedCounts) {
+    if (report[name] !== assertionCount) {
+      return invalid(
+        `${name} reports ${report[name]}, but assertion results enumerate ${assertionCount} ${status} tests`,
+      );
+    }
+  }
+
+  const accountedTests =
+    report.numPassedTests + report.numFailedTests + report.numPendingTests + report.numTodoTests;
+  if (accountedTests !== tests) {
+    return invalid(`test counters account for ${accountedTests} of ${tests} collected tests`);
+  }
+
+  if (statusCounts.failed > 0) {
     return {
       kind: "product-failure",
-      reason: `${failedTests} test${failedTests === 1 ? "" : "s"} failed`,
+      reason: `${statusCounts.failed} test${statusCounts.failed === 1 ? "" : "s"} failed`,
       files,
       tests,
     };
@@ -72,9 +134,7 @@ export const classifyVitestRun = (exitCode, report) => {
   const pendingAssertions = assertions.filter(
     (assertion) => assertion?.status === "pending",
   ).length;
-  const skippedAssertions = assertions.filter(
-    (assertion) => assertion?.status === "skipped",
-  ).length;
+  const skippedAssertions = statusCounts.skipped;
   if (incompleteFiles.length > 0 || pendingAssertions > 0) {
     const reasons = [];
     if (incompleteFiles.length > 0) {
@@ -95,19 +155,6 @@ export const classifyVitestRun = (exitCode, report) => {
     };
   }
 
-  if (report.numPendingTests !== skippedAssertions) {
-    return invalid(
-      `Vitest's pending counter reports ${report.numPendingTests}, but ${skippedAssertions} completed assertions were skipped`,
-    );
-  }
-
-  const accountedTests =
-    report.numPassedTests + report.numFailedTests + skippedAssertions + report.numTodoTests;
-  if (accountedTests !== report.numTotalTests) {
-    return invalid(
-      `test counters account for ${accountedTests} of ${report.numTotalTests} collected tests`,
-    );
-  }
   if (report.success !== true) {
     return {
       kind: "run-failure",
@@ -119,8 +166,8 @@ export const classifyVitestRun = (exitCode, report) => {
 
   if (exitCode !== 0) {
     return {
-      kind: "infrastructure",
-      reason: `all ${files} collected files completed; ${report.numPassedTests} passed, ${skippedAssertions} skipped, ${report.numTodoTests} todo, but Vitest exited ${exitCode}`,
+      kind: "run-failure",
+      reason: `Vitest exited ${exitCode} after reporting a complete passing result; the JSON and JUnit reports do not identify the cause`,
       files,
       tests,
     };
@@ -133,19 +180,21 @@ export const classifyVitestRun = (exitCode, report) => {
   };
 };
 
-const readReport = () => {
-  if (!existsSync(resultPath)) return null;
+const readReport = (path) => {
+  if (!existsSync(path)) return null;
   try {
-    return JSON.parse(readFileSync(resultPath, "utf8"));
+    return JSON.parse(readFileSync(path, "utf8"));
   } catch {
     return null;
   }
 };
 
 export const runVitestAttempt = (vitestArgs = []) => {
-  mkdirSync(dirname(resultPath), { recursive: true });
-  rmSync(resultPath, { force: true });
-  rmSync(junitPath, { force: true });
+  const attemptResultPath = outputPathFor(vitestArgs, "json", resultPath);
+  const attemptJunitPath = outputPathFor(vitestArgs, "junit", junitPath);
+  mkdirSync(dirname(attemptResultPath), { recursive: true });
+  rmSync(attemptResultPath, { force: true });
+  rmSync(attemptJunitPath, { force: true });
   const child = spawnSync(vitestPath, ["run", ...vitestArgs], {
     cwd: repoRoot,
     env: { ...process.env, ACP_VITEST_GATE: "1" },
@@ -154,42 +203,28 @@ export const runVitestAttempt = (vitestArgs = []) => {
   const exitCode = child.status ?? 1;
   return {
     exitCode,
-    classification: classifyVitestRun(exitCode, readReport()),
+    classification: classifyVitestRun(exitCode, readReport(attemptResultPath)),
   };
 };
 
-const printClassification = (classification, attempt, out) => {
+const printClassification = (classification, out) => {
   if (classification.kind === "pass") {
     out(`VITEST GATE: PASS — ${classification.reason}`);
-    return;
-  }
-  if (classification.kind === "infrastructure") {
-    out(`VITEST GATE: INFRASTRUCTURE, NOT PRODUCT TEST FAILURE — ${classification.reason}`);
-    if (attempt === 1) out("VITEST GATE: retrying once in this job");
     return;
   }
   const label = classification.kind === "product-failure" ? "PRODUCT TEST FAILURE" : "FAIL";
   out(`VITEST GATE: ${label} — ${classification.reason}`);
 };
 
-/** Runs once normally, and exactly once more only for an infrastructure-classified result. */
+/** Runs once and fails closed on every classification other than a complete pass. */
 export const runGate = (runAttempt, out = console.log) => {
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const result = runAttempt(attempt);
-    printClassification(result.classification, attempt, out);
-    if (result.classification.kind === "pass") return 0;
-    if (result.classification.kind !== "infrastructure") return 1;
-    if (attempt === 2) {
-      out(
-        "VITEST GATE: FAIL — two consecutive infrastructure-classified runs; neither run had a product test failure, but infrastructure stayed nonzero",
-      );
-      return 1;
-    }
-  }
-  return 1;
+  const result = runAttempt(1);
+  printClassification(result.classification, out);
+  return result.classification.kind === "pass" ? 0 : 1;
 };
 
-export const main = (args = process.argv.slice(2)) => runGate(() => runVitestAttempt(args));
+export const main = (args = process.argv.slice(2), out = console.log) =>
+  runGate(() => runVitestAttempt(args), out);
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
 if (invokedPath === fileURLToPath(import.meta.url)) process.exit(main());

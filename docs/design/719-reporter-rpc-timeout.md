@@ -251,9 +251,8 @@ that `trace` defines what it should report when the test-result artifact is miss
 
 Follow-up work on 2026-08-31 upgraded the pinned version to Vitest 4.1.11 and added an
 exit-code-independent result gate. These are two separate protections: the version removes the
-specific 60-second worker RPC timer, while the gate distinguishes product failures, incomplete
-result sets, and post-test infrastructure failures even if a later version changes that transport
-again.
+specific 60-second worker RPC timer, while the gate distinguishes product failures and incomplete
+result sets and fails closed when a nonzero process exit has no cause in its report artifacts.
 
 ### Vitest 4 source result
 
@@ -274,8 +273,24 @@ The 4.1.11 JSON reporter's `StatusMap` keeps the evidence needed by the gate: ta
 and `queued` become assertion status `pending`, while mode/state `skip` becomes `skipped` and
 `todo` remains `todo`. Its top-level `numPendingTests` counter is less precise: it combines
 `run`/`queued` tests with skipped tests. The gate therefore reads assertion status to distinguish
-unfinished work from intentional non-execution and does not add `numPendingTests` to its count of
-completed outcomes.
+unfinished work from intentional non-execution, and checks `numPendingTests` against the combined
+pending-plus-skipped assertion count.
+
+The same source also establishes what those report files cannot prove. `JsonReporter.onTestRunEnd`
+does not consume the `unhandledErrors` argument, and computes `success` only from collected files,
+failed suites, and failed tests. `JUnitReporter.onTestRunEnd` likewise consumes only test modules.
+The blob reporter would serialize unhandled errors, and the default reporter prints their type and
+message, but neither JSON nor JUnit preserves them. The run writes both files; the classifier reads
+JSON and inherits the default reporter's output instead of capturing it. A complete passing JSON
+report plus exit 1 therefore does not identify whether the process saw a product-code rejection, a
+reporter failure, or an RPC failure.
+
+The old RPC timeout text and an ordinary unhandled rejection are visually distinguishable in the
+default reporter output, but there is no remaining retry case to justify adding a text classifier:
+the pinned 4.1.11 transport disables the specific `onTaskUpdate` timeout this change addressed.
+No other error signature has been established as safely retryable. The gate therefore treats every
+nonzero exit after a complete passing report as an unexplained run failure and fails the first run.
+It does not retry.
 
 The npm artifact does not bundle a changelog. External release-note review was unavailable in the
 networkless sandbox and is **unmeasured**. The locally available package and source did expose the
@@ -295,21 +310,24 @@ contained a completed interval for the one collected file and consistent 6/6 cou
 
 ### Result gate
 
-`pnpm test` now enters `scripts/run-vitest-gate.mjs`. Before each attempt it deletes both old
-report files, runs the normal Vitest production entry point, and classifies the new JSON result:
+`pnpm test` now enters `scripts/run-vitest-gate.mjs`. Before the run it deletes both old report
+files, runs the normal Vitest production entry point, and classifies the new JSON result:
 
-- any failed assertion or failed-test counter is a product failure;
+- every assertion must have a recognized status, and the enumerated assertion total must equal
+  `numTotalTests`;
+- the enumerated passed, failed, pending-or-skipped, and todo distributions must equal
+  `numPassedTests`, `numFailedTests`, `numPendingTests`, and `numTodoTests`, while the four counters
+  must account for `numTotalTests`;
+- suite counters must likewise account for `numTotalTestSuites`;
+- a consistently reported failed assertion is a product failure;
 - a collected file without a finite, ordered start/end interval, or with any `pending` assertion,
   is incomplete and fails;
 - missing, malformed, empty, inconsistent, or unsuccessful result data fails closed;
 - a complete result with no product failure plus exit zero passes; and
-- a complete result with no product failure plus a nonzero exit is explicitly infrastructure,
-  not a product failure.
+- a complete result with no product failure plus a nonzero exit is an unexplained run failure.
 
-Only that last classification is retried, exactly once. A second infrastructure classification
-fails the gate and prints both that neither run had a product test failure and that infrastructure
-remained nonzero. Product, incomplete, and invalid results are never retried or converted to
-success.
+No failed classification is retried or converted to success. In particular, a later passing run
+cannot erase an intermittent unhandled error whose first JSON report looked completely green.
 
 The incomplete fixture is an actual 4.1.11 JSON report. A forked test first waited 100 ms so its
 `run` update reached the main process, then sent `SIGTERM` to its own worker. Vitest exited 1 and
@@ -318,19 +336,23 @@ assertion, and equal finite file start/end times. That saved output drives both 
 test and the no-retry test; the latter supplies a successful second attempt and proves it is never
 called.
 
-Four classification counterexamples are permanent tests and mutation rows. Each mutation was applied
-individually, its named test was run as a regular-expression-safe selector, the test failed, and
-the source was restored:
+Six report counterexamples cover a shorter assertion enumeration, a longer enumeration, and each
+of the four mismatched status counters. A separate integration test calls the production `main()`
+path, which spawns Vitest 4.1.11 against a one-test fixture with an opt-in unhandled rejection,
+writes JSON and JUnit to isolated temporary paths, reads the real JSON through the gate, and fails
+that run once. In the measured focused run the child reported one passing test, `success: true`,
+one unhandled rejection, and exit 1; the gate returned 1 without retrying. The outer focused file
+passed 12/12 tests.
 
-| mutation | named test result |
+Four classification counterexamples remain permanent mutation rows. Each row has a
+regular-expression-safe test selector:
+
+| mutation | named test |
 |---|---|
-| ignore a failed-test count | failed: expected `product-failure`, received `run-failure` |
-| conflate a pending assertion with a completed skip | failed: expected `incomplete`, received `infrastructure` |
-| treat nonzero after complete pass as zero | failed: expected `infrastructure`, received `pass` |
-| let a second infrastructure result pass | failed: expected exit 1, received exit 0 |
-
-The restored test file passed 8/8 under the exact installed 4.1.11 runner. The actual gate entry
-point wrote JSON and JUnit and printed `PASS` for one completed file and eight passing tests.
+| ignore a failed assertion | `fails when the result contains a failed test` |
+| conflate a pending assertion with a completed skip | `classifies a reporter pending assertion as incomplete` |
+| treat a nonzero exit after complete pass as zero | `fails closed when a nonzero exit follows complete passing results` |
+| retry an unexplained run failure into a pass | `does not retry an unexplained run failure` |
 
 ### Independent downstream jobs and cost
 

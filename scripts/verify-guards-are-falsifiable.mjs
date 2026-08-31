@@ -2798,8 +2798,8 @@ const GUARDS = [
   {
     what: "a reported failed test is a product failure",
     file: "scripts/run-vitest-gate.mjs",
-    find: "  if (failedTests > 0) {",
-    replace: "  if (failedTests < 0) {",
+    find: "  if (statusCounts.failed > 0) {",
+    replace: "  if (statusCounts.failed < 0) {",
     killedBy: [
       "tests/process/vitest-result-gate.test.ts::fails when the result contains a failed test",
     ],
@@ -2811,9 +2811,7 @@ const GUARDS = [
       "  const pendingAssertions = assertions.filter(\n" +
       '    (assertion) => assertion?.status === "pending",\n' +
       "  ).length;\n" +
-      "  const skippedAssertions = assertions.filter(\n" +
-      '    (assertion) => assertion?.status === "skipped",\n' +
-      "  ).length;",
+      "  const skippedAssertions = statusCounts.skipped;",
     replace:
       "  const pendingAssertions = 0;\n" +
       "  const skippedAssertions = report.numPendingTests;",
@@ -2822,29 +2820,31 @@ const GUARDS = [
     ],
   },
   {
-    what: "a nonzero exit after complete passing results is infrastructure",
+    what: "a nonzero exit after complete passing results is an unexplained run failure",
     file: "scripts/run-vitest-gate.mjs",
     find: "  if (exitCode !== 0) {",
     replace: "  if (exitCode === 0) {",
     killedBy: [
-      "tests/process/vitest-result-gate.test.ts::classifies a nonzero exit after complete passing results as infrastructure",
+      "tests/process/vitest-result-gate.test.ts::fails closed when a nonzero exit follows complete passing results",
     ],
   },
   {
-    what: "two consecutive infrastructure classifications fail the gate",
+    what: "an unexplained run failure is not retried into a pass",
     file: "scripts/run-vitest-gate.mjs",
     find:
-      '      out(\n' +
-      '        "VITEST GATE: FAIL — two consecutive infrastructure-classified runs; neither run had a product test failure, but infrastructure stayed nonzero",\n' +
-      "      );\n" +
-      "      return 1;",
+      "  const result = runAttempt(1);\n" +
+      "  printClassification(result.classification, out);\n" +
+      '  return result.classification.kind === "pass" ? 0 : 1;',
     replace:
-      '      out(\n' +
-      '        "VITEST GATE: PASS — two consecutive infrastructure-classified runs",\n' +
-      "      );\n" +
-      "      return 0;",
+      "  let result = runAttempt(1);\n" +
+      "  printClassification(result.classification, out);\n" +
+      '  if (result.classification.kind === "run-failure") {\n' +
+      "    result = runAttempt(2);\n" +
+      "    printClassification(result.classification, out);\n" +
+      "  }\n" +
+      '  return result.classification.kind === "pass" ? 0 : 1;',
     killedBy: [
-      "tests/process/vitest-result-gate.test.ts::fails after two consecutive infrastructure classifications",
+      "tests/process/vitest-result-gate.test.ts::does not retry an unexplained run failure",
     ],
   },
 ];
