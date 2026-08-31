@@ -19,6 +19,7 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import {
+  createCheckoutLeafOrDeny,
   ensureDirectoryLevel,
   judgeDirectoryOwnership,
   produceRepoFactoryResult,
@@ -342,6 +343,25 @@ describe("repo factory producer (#246)", () => {
       expect(() => mkdirSync(existing)).toThrow(
         expect.objectContaining({ code: "EEXIST" }),
       );
+    });
+
+    it("createCheckoutLeafOrDeny refuses EEXIST rather than silently reusing an already-existing directory — deterministic, no race required", () => {
+      // Directly exercises the exact function `produceRepoFactoryResult` calls as the
+      // collision authority. The pre-existing directory here stands in for what a
+      // same-UID concurrent producer would have left behind a moment earlier — the point
+      // is not to race one, but to prove this function does not silently treat that as a
+      // successful reuse the way `mkdirSync(path, { recursive: true })` would.
+      const { workDir } = makeSandbox();
+      const alreadyThere = repositoryCheckoutPath(workDir, "primary");
+      mkdirSync(alreadyThere, { recursive: true });
+
+      const collided = createCheckoutLeafOrDeny(alreadyThere);
+      expect(collided.allowed).toBe(false);
+
+      const fresh = repositoryCheckoutPath(workDir, "secondary");
+      const created = createCheckoutLeafOrDeny(fresh);
+      expect(created.allowed).toBe(true);
+      expect(existsSync(fresh)).toBe(true);
     });
 
     it("ensureDirectoryLevel accepts a real pre-existing directory but refuses a symlink occupying the same name", () => {

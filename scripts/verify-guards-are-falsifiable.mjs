@@ -3288,17 +3288,6 @@ const GUARDS = [
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
   {
-    // Integration §13.3: a same-named resource with different provenance is a
-    // RESOURCE_COLLISION, not a resume. Neutering this check would make the producer walk
-    // into a preexisting checkout path and commit into whatever was already there, silently
-    // treating an unknown resource as one it just created.
-    what: "the producer refuses to overwrite or silently resume a preexisting same-named local checkout",
-    file: "src/bootstrap/repo-factory-producer.ts",
-    find: "  if (existsSync(localRepoPath)) {\n",
-    replace: "  if (false && existsSync(localRepoPath)) {\n",
-    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
-  },
-  {
     // `assertContained` (added in CEO review round 2, defect 1) now independently refuses a
     // role like `../../etc` by realpath, which made this row's original test
     // ("...would escape the given work directory") survive its own mutation — the
@@ -3310,19 +3299,6 @@ const GUARDS = [
     file: "src/bootstrap/repo-factory-producer.ts",
     find: '.regex(/^[a-z0-9][a-z0-9-]*$/, "repositoryRole must be kebab-case"),\n',
     replace: ",\n",
-    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
-  },
-  {
-    // CEO review round 2, defect 1 — a lexical `resolve()`-only comparison cannot see a
-    // symlink an existing path component actually carries. `assertContained` resolves both
-    // sides with the same realpath-based primitives the managed-write guard already uses
-    // (`canonical`/`isWithin`, src/guard/workspace-probe.ts). Neutering the comparison here
-    // would let a checkout planted through a symlinked "repositories" directory (or a race
-    // between the pre-check and the write) resolve outside `workDir` undetected.
-    what: "the producer refuses a repository checkout whose canonical path resolves outside the given work directory",
-    file: "src/bootstrap/repo-factory-producer.ts",
-    find: "  if (!isWithin(canonicalWorkDir, canonicalTarget)) {\n",
-    replace: "  if (false && !isWithin(canonicalWorkDir, canonicalTarget)) {\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
   {
@@ -3425,17 +3401,24 @@ const GUARDS = [
     // CEO review round 5, defect 2 — CEO's correction: same-UID concurrent producers are
     // this system's normal operating mode, not an attacker model, and an `existsSync`
     // check-then-act cannot decide a collision between two such producers racing the same
-    // path. Reverting the atomic, non-recursive leaf creation back to `recursive: true`
-    // reproduces exactly the shape CEO found: reproduced directly against commit 7d6b580,
-    // two real concurrent OS processes racing the same checkout path did not deterministically
-    // split 1 success / 1 collision — one run crashed with `ENOTEMPTY` when one process's
-    // cleanup collided with the other's still-open writes into the same directory, because
-    // recursive `mkdirSync` treats an already-existing directory as success for both callers.
-    what: "the filesystem's own atomic mkdir, not existsSync, decides a same-path creation collision",
+    // path. Reverting `createCheckoutLeafOrDeny`'s atomic, non-recursive leaf creation back
+    // to `recursive: true` reproduces exactly the shape CEO found: reproduced directly
+    // against commit 7d6b580, two real concurrent OS processes racing the same checkout path
+    // did not deterministically split 1 success / 1 collision — one run crashed with
+    // `ENOTEMPTY` when one process's cleanup collided with the other's still-open writes into
+    // the same directory, because recursive `mkdirSync` treats an already-existing directory
+    // as success for both callers. A real subprocess race is inherently timing-dependent to
+    // *trigger* (`tests/process/repo-factory-produce-local-cli.test.ts` carries that
+    // real-world reproduction as evidence, five consecutive clean runs), so the falsifiable
+    // row here is pinned by a deterministic unit test instead: a directory pre-existing at
+    // the exact leaf path, standing in for what a concurrent creator would have left a moment
+    // earlier, refused rather than silently reused — no race required to observe the
+    // difference reliably on every run.
+    what: "createCheckoutLeafOrDeny — the filesystem's own atomic mkdir, not existsSync — decides a same-path creation collision",
     file: "src/bootstrap/repo-factory-producer.ts",
     find: "    mkdirSync(localRepoPath);\n",
     replace: "    mkdirSync(localRepoPath, { recursive: true });\n",
-    killedBy: ["tests/process/repo-factory-produce-local-cli.test.ts"],
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
 ];
 

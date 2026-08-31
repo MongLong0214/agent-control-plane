@@ -275,6 +275,43 @@ const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: st
  * itself uses the same primitive directly in `produceRepoFactoryResult` as the collision
  * authority (see the comment there for why that matters for same-UID concurrency).
  */
+/**
+ * THE collision authority for the checkout leaf itself (CEO review round 5, defect 2). Unlike
+ * `ensureDirectoryLevel` above — which treats an already-existing real directory as fine to
+ * reuse, because `repositories` is legitimately shared across roles and calls — the leaf must
+ * be *freshly created by this exact call*. `mkdirSync` with no `recursive` is a single atomic
+ * syscall: it either creates a genuinely new directory or fails `EEXIST`, decided by the
+ * kernel. Exactly one concurrent caller for this exact path succeeds; every other one —
+ * including another of this project's own producers racing the same operation, the normal
+ * concurrent case this system actually runs as one user all day, not only a hypothetical
+ * attacker — gets `EEXIST` here, never a check-then-act `existsSync` another process can run
+ * between (proof: `mkdirSync(existingRealDir, { recursive: true })` does not throw at all —
+ * that is Node's own documented idempotent behaviour, and it is exactly why the previous
+ * shape gave two concurrent creators no collision signal whatsoever; a plain, non-recursive
+ * `mkdirSync` on the same already-existing directory does throw `EEXIST`, tested directly
+ * below without needing a real race).
+ */
+export const createCheckoutLeafOrDeny = (localRepoPath: string): Decision<void> => {
+  try {
+    mkdirSync(localRepoPath);
+    return allow(ReasonCode.OK, undefined);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") {
+      return deny(
+        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+        "local repository checkout path already exists; a same-named resource with unknown provenance is a collision, not a resume (Integration §13.3)",
+        { localRepoPath },
+      );
+    }
+    return deny(
+      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+      "could not create the local repository checkout directory",
+      { localRepoPath, message: (err as Error).message },
+    );
+  }
+};
+
 export const ensureDirectoryLevel = (dir: string): Decision<void> => {
   try {
     mkdirSync(dir);
@@ -432,29 +469,8 @@ export const produceRepoFactoryResult = async (
     if (!ensured.allowed) return ensured as Decision<RepoFactoryResult>;
   }
 
-  // THE collision authority (CEO review round 4, defect 3b): the filesystem's own atomic
-  // `mkdir`. Exactly one concurrent caller for this exact path succeeds; every other one —
-  // including another of this project's own producers racing the same operation, the normal
-  // concurrent case this system actually runs, not only a hypothetical attacker — gets
-  // `EEXIST` here, decided by the kernel in one syscall, never by a check-then-act
-  // `existsSync` another process can run between.
-  try {
-    mkdirSync(localRepoPath);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "EEXIST") {
-      return deny(
-        ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-        "local repository checkout path already exists; a same-named resource with unknown provenance is a collision, not a resume (Integration §13.3)",
-        { localRepoPath },
-      );
-    }
-    return deny(
-      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
-      "could not create the local repository checkout directory",
-      { localRepoPath, message: (err as Error).message },
-    );
-  }
+  const leafCreated = createCheckoutLeafOrDeny(localRepoPath);
+  if (!leafCreated.allowed) return leafCreated as Decision<RepoFactoryResult>;
 
   writeFileSync(
     join(localRepoPath, OPERATION_MARKER_NAME),
