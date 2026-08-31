@@ -3310,6 +3310,46 @@ const GUARDS = [
     replace: ",\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
+  {
+    // CEO review round 2, defect 1 — a lexical `resolve()`-only comparison cannot see a
+    // symlink an existing path component actually carries. `assertContained` resolves both
+    // sides with the same realpath-based primitives the managed-write guard already uses
+    // (`canonical`/`isWithin`, src/guard/workspace-probe.ts). Neutering the comparison here
+    // would let a checkout planted through a symlinked "repositories" directory (or a race
+    // between the pre-check and the write) resolve outside `workDir` undetected.
+    what: "the producer refuses a repository checkout whose canonical path resolves outside the given work directory",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (!isWithin(canonicalWorkDir, canonicalTarget)) {\n",
+    replace: "  if (false && !isWithin(canonicalWorkDir, canonicalTarget)) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 2, defect 2 — without this, a failure after `mkdirSync` (a genuinely
+    // failing verification command, a failed commit, …) leaves the checkout directory
+    // behind. The next attempt at the exact same bootstrap operation is then refused forever
+    // by the `existsSync` collision check above, which is correct in isolation but a
+    // permanent trap combined with a mid-flight failure. Neutering the removal here
+    // reproduces exactly that: cleanup is attempted, ownership is proven, and nothing is
+    // actually deleted.
+    what: "a failed run removes only the checkout it just created, so the same bootstrap operation can retry",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  rmSync(localRepoPath, { recursive: true, force: true });\n",
+    replace: "  // rmSync(localRepoPath, { recursive: true, force: true });\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 2, defect 4 — `git ls-tree` ran with `allowFailure: true` and its
+    // exit code was never checked before this function built `verified: true` on top of its
+    // output: a failed listing produced a receipt claiming verification anyway, the same
+    // "field filled because the shape wanted it" defect the rest of this producer exists to
+    // refuse. Neutering the check here reproduces that: `trackedFilesOrDeny` records success
+    // regardless of what `git ls-tree` actually reported.
+    what: "the producer refuses to build a verified receipt on top of a tracked-file listing that genuinely failed",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (tracked.exitCode !== 0) {\n",
+    replace: "  if (false && tracked.exitCode !== 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

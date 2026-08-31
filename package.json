@@ -54,6 +54,7 @@
     "guards:operands": "node scripts/verify-refusal-operands-are-watched.mjs",
     "verify:fresh-database": "tsx scripts/verify-fresh-database.ts",
     "probe:daemon-startup": "tsx scripts/probe-daemon-startup.ts",
+    "repo-factory:produce-local": "tsx scripts/repo-factory-produce-local.ts",
     "ssot:report": "node scripts/ssot-report.mjs",
     "review:grok": "node scripts/grok-review.mjs",
     "review:production": "node scripts/production-review.mjs",

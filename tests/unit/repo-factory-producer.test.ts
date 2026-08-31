@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { rm } from "node:fs/promises";
@@ -11,6 +11,7 @@ import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.
 import {
   produceRepoFactoryResult,
   repositoryCheckoutPath,
+  trackedFilesOrDeny,
   type RepoFactoryPlanFixture,
 } from "../../src/bootstrap/repo-factory-producer.ts";
 
@@ -131,6 +132,56 @@ describe("repo factory producer (#246)", () => {
     const plan: RepoFactoryPlanFixture = { ...basePlan(), repositoryRole: "../../etc" };
     const produced = await produceRepoFactoryResult({ plan, workDir });
     expect(produced.allowed).toBe(false);
+  });
+
+  it("refuses when an existing path component between the work directory and the checkout escapes it via a symlink", async () => {
+    const { sandbox, workDir } = makeSandbox();
+    mkdirSync(workDir, { recursive: true });
+    const outsideTarget = join(sandbox, "outside-target");
+    mkdirSync(outsideTarget, { recursive: true });
+    // The leaf ("primary") does not exist yet — only "repositories" is planted, and it is a
+    // symlink to a directory outside workDir. A lexical-only check that only compares
+    // `resolve()`d strings cannot see this; the escape is real only once symlinks resolve.
+    symlinkSync(outsideTarget, join(workDir, "repositories"));
+
+    const plan = basePlan();
+    const produced = await produceRepoFactoryResult({ plan, workDir });
+    expect(produced.allowed).toBe(false);
+    // Nothing was ever written through the symlink into the real outside directory.
+    expect(readdirSync(outsideTarget)).toEqual([]);
+  });
+
+  it("cleans up its own newly-created checkout on failure so the exact same operation can retry", async () => {
+    const { workDir } = makeSandbox();
+    const failingPlan: RepoFactoryPlanFixture = {
+      ...basePlan(),
+      // A real, deterministically-failing git command.
+      verificationArgs: ["rev-parse", "--verify", "refs/heads/does-not-exist"],
+    };
+    const firstAttempt = await produceRepoFactoryResult({ plan: failingPlan, workDir });
+    expect(firstAttempt.allowed).toBe(false);
+    // The failed attempt must not leave permanent collision residue behind — otherwise the
+    // existsSync collision check refuses every future retry of this exact same operation.
+    expect(existsSync(repositoryCheckoutPath(workDir, failingPlan.repositoryRole))).toBe(false);
+
+    const retryPlan: RepoFactoryPlanFixture = { ...failingPlan, verificationArgs: ["status", "--porcelain"] };
+    const retried = await produceRepoFactoryResult({ plan: retryPlan, workDir });
+    expect(retried.allowed).toBe(true);
+  });
+
+  it("does not build a verified receipt on top of a tracked-file listing that genuinely failed", () => {
+    // Forcing `git ls-tree` itself to fail at exactly that point in a real repository is not
+    // reliably reproducible without corrupting the process's own working tree mid-run, so
+    // this exercises the exact exported decision function `produceRepoFactoryResult` calls
+    // with the exact shape `git()` returns — the same entry point production uses, not a
+    // different layer standing in for it.
+    const failed = trackedFilesOrDeny({ stdout: "", stderr: "fatal: not a tree object", exitCode: 128 });
+    expect(failed.allowed).toBe(false);
+
+    const passed = trackedFilesOrDeny({ stdout: "a.txt\nb.txt\n", stderr: "", exitCode: 0 });
+    expect(passed.allowed).toBe(true);
+    if (!passed.allowed) return;
+    expect(passed.value).toEqual(["a.txt", "b.txt"]);
   });
 
   it("writes only inside the given work directory and nothing outside it", async () => {
