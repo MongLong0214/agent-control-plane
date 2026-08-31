@@ -23,8 +23,12 @@ export default defineConfig({
     pool: "forks",
     // The JSON reporter is declared here rather than passed on the command line: `pnpm test --`
     // forwards `--` to vitest, which then has to guess whether the rest are flags or filters.
+    // The gate reads the JSON report rather than the exit status, so it needs that report even
+    // when CI is unset — a local `pnpm test` judged from a stale or absent file is not judged.
     reporters: [
-      ...(process.env.CI ? (["default", "junit", "json"] as const) : (["default"] as const)),
+      ...(process.env.CI || process.env.ACP_VITEST_GATE
+        ? (["default", "junit", "json"] as const)
+        : (["default"] as const)),
       ...(rpcTrace ? [rpcTrace.reporter] : []),
     ],
     setupFiles: rpcTrace

@@ -150,3 +150,31 @@ floor moved from `22.0.0` to `22.18.0`. This is not a cost of the native addon o
 that was already false for its own scripts. The floor entry in the matrix is what checked it, on
 the first edge it ever ran. It stays in the matrix going forward: it is the only thing that tests
 the declared floor, and it has already found one real defect there.
+
+## Amendment 2026-08-31 — `engines.node` narrowed to `^22.18.0 || >=24`
+
+The rejection above stands for its own case and is superseded for this one. Both are about a tool's
+support range reaching `engines.node`; the difference is what the range costs and what it buys.
+
+`node-gyp@13` wanted `^22.22.2 || ^24.15.0 || >=26.0.0` — a discontinuous range that would have
+dropped most of the declared `22.x` line, for a reason unrelated to what was being fixed. Pinning
+`node-gyp` was cheaper than that.
+
+Vitest 4.1.11 declares `^20 || ^22 || >=24`. It keeps `22.x` whole and excludes only `23.x`. It is
+also the only version without the birpc 60-second `onTaskUpdate` timeout that made CI fail after
+every test passed — measured eight times across `main` and four PRs, each with zero failing tests,
+and unfixable in `3.2.7`, which exposes no key for that timeout (#719, #724).
+
+`23.x` was measured before this was decided, not assumed:
+
+```
+CI matrix            ["22.18.0", "22"]      no 23.x leg
+the three added jobs  "22.18.0"             no 23.x
+deploy/               no node version pin at all
+docs                  the only mention of 23.x was the rejection above
+```
+
+So the support this narrows was declared and never exercised, and no lane verified it. The remaining
+work this creates is the honest half: a declared range with no leg that runs its edges is the same
+shape this repository keeps finding elsewhere — a name that exceeds its enforcement. `>=24` is now
+declared and untested, exactly as `23.x` was.
