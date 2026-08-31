@@ -16,7 +16,6 @@ import { digestOf } from "../core/digest.ts";
 import { type Decision, allow, deny } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { git, tryRevParse, type GitResult } from "../git/git.ts";
-import { canonical, isWithin } from "../guard/workspace-probe.ts";
 import {
   REPO_FACTORY_RESULT_SCHEMA_ID,
   type ExternalWriteReceipt,
@@ -126,30 +125,25 @@ const localRepositoryIdentity = (repositoryRole: string): string => `local:${rep
 const OPERATION_MARKER_NAME = ".repo-factory-operation.json";
 
 /**
- * A repository role is checked against `workDir` twice on purpose: once before anything is
- * created, and once again immediately after `mkdirSync`, right before the first byte is
- * written into it. `canonical()`/`isWithin()` are the same realpath-based containment
- * primitives the managed-write guard already uses (`src/guard/workspace-probe.ts`) — they
- * resolve every symlink a path component *actually has*, including one planted after the
- * role passed its kebab-case check but before this call reached it, which a lexical
- * `resolve()`-only comparison cannot see at all.
- *
- * This answers "is the path lexically/structurally where it claims to be", which is a
- * different question from "can someone else change that answer out from under this run" —
- * `assertParentChainNotAttackerWritable` below answers that one.
+ * CEO review round 8 — this producer used to also run a realpath-based containment check
+ * (`canonical()`/`isWithin()`, the same primitives `src/guard/workspace-probe.ts` uses) ahead
+ * of every operation below. It was removed rather than kept as belt-and-braces: CEO neutered
+ * it on a scratch copy of this exact head (`if (!isWithin(...))` → `if (false && ...)`) and
+ * every test still passed. Measured why, rather than assumed: `repositoryCheckoutPath` joins
+ * `role` — which the schema restricts to `^[a-z0-9][a-z0-9-]*$`, so it can carry no `/` or
+ * `..` — straight onto `resolve(workDir)`, so for every input the schema admits, the only way
+ * the resulting path can differ from a plain subdirectory of `workDir` is a *real* symlink
+ * sitting at `workDir`, `repositories`, `dirname(workDir)`, or the leaf itself. Every one of
+ * those is already refused by an `lstatSync`-based check elsewhere: the first three by
+ * `assertParentChainNotAttackerWritable`'s chain walk below (which denies outright on
+ * `isSymbolicLink()`, not merely on where it resolves to), and the leaf by the pre-creation
+ * `existsSync` fast path or `createCheckoutLeafOrDeny`'s own `EEXIST` — both of which already
+ * fire before any write, regardless of whether the pre-existing entry is a symlink or
+ * anything else. No input reaches the removed check that is not already refused by one of
+ * these — that is what "no test noticed" was reporting. A dead guard that reads as live
+ * defense is worse than none, because it is counted; removing it removes a claim nothing
+ * behind it could actually back.
  */
-const assertContained = (workDir: string, target: string): Decision<void> => {
-  const canonicalWorkDir = canonical(workDir);
-  const canonicalTarget = canonical(target);
-  if (!isWithin(canonicalWorkDir, canonicalTarget)) {
-    return deny(
-      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
-      "repository checkout path escapes the given work directory",
-      { workDir, target, canonicalWorkDir, canonicalTarget },
-    );
-  }
-  return allow(ReasonCode.OK, undefined);
-};
 
 /**
  * The ownership/permission decision, factored out so it can be exercised directly with a
@@ -295,6 +289,25 @@ const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: st
 const SAFE_DIRECTORY_MODE = 0o700;
 
 /**
+ * How `judgeAndCleanupIfJustCreated` reads back what is actually at a path. Always
+ * `lstatSync` in production — every real call site below passes it explicitly, not as an
+ * implicit default a caller happens to rely on — so this is the one seam a test can supply a
+ * different value through, following the same shape `judgeDirectoryOwnership` above already
+ * uses for its crafted `{ uid, mode }`.
+ *
+ * CEO review round 7 named exactly why this seam has to exist rather than a umask trick:
+ * `mkdirSync(dir, { mode })` applies `mode & ~umask`, which can only *clear* bits — a
+ * directory freshly created at `SAFE_DIRECTORY_MODE` can never come back group- or
+ * world-writable from the umask alone, so no umask value can make the judgement below
+ * observably fire for a freshly created directory. What it exists to catch is a real race —
+ * another process replacing or chmod'ing the entry between `mkdirSync` and this call — and a
+ * real race is not a deterministic thing to trigger in a test. Supplying a `statEntry` that
+ * reports what a winning racer would have left is how that race is exercised without needing
+ * to win one.
+ */
+type DirectoryStatReader = (path: string) => Stats;
+
+/**
  * Judges whatever now sits at `dir` — freshly created by this same call, or discovered
  * already there — and, if this call is the one that just created it, removes it again on a
  * denial. CEO review round 6, defect 2: an explicit `mode` on `mkdirSync` is still subject to
@@ -303,8 +316,9 @@ const SAFE_DIRECTORY_MODE = 0o700;
  * under `umask(0)`, a bare `mkdirSync(dir)` with no mode argument created `workDir`,
  * `repositories`, and the checkout leaf all at `0777` — world-writable — and the run
  * completed successfully anyway. `SAFE_DIRECTORY_MODE` narrows what is *requested*; this
- * function is what actually verifies what was *granted*, via `lstatSync` (never `statSync`,
- * for the same reason `judgeRealDirectoryEntry` above does not use it).
+ * function is what actually verifies what was *granted*, via `statEntry` (`lstatSync` in
+ * production — never `statSync`, for the same reason `judgeRealDirectoryEntry` above does
+ * not use it).
  *
  * Self-cleanup is safe exactly because there is no gap to race here: `mkdirSync` above and
  * this judgement are the same synchronous call, so whatever this call just created is
@@ -312,7 +326,11 @@ const SAFE_DIRECTORY_MODE = 0o700;
  * dance because real async work happens between creating the checkout and a possible later
  * failure.
  */
-const judgeAndCleanupIfJustCreated = (dir: string, justCreated: boolean): Decision<void> => {
+const judgeAndCleanupIfJustCreated = (
+  dir: string,
+  justCreated: boolean,
+  statEntry: DirectoryStatReader,
+): Decision<void> => {
   if (typeof process.getuid !== "function") {
     if (justCreated) rmSync(dir, { recursive: true, force: true });
     return deny(
@@ -323,7 +341,7 @@ const judgeAndCleanupIfJustCreated = (dir: string, justCreated: boolean): Decisi
   }
   let stat: Stats;
   try {
-    stat = lstatSync(dir);
+    stat = statEntry(dir);
   } catch (err) {
     return deny(
       ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
@@ -354,7 +372,7 @@ const judgeAndCleanupIfJustCreated = (dir: string, justCreated: boolean): Decisi
  * itself uses `createCheckoutLeafOrDeny` in `produceRepoFactoryResult` (same shape, except an
  * already-existing directory there is a collision, never something to reuse).
  */
-export const ensureDirectoryLevel = (dir: string): Decision<void> => {
+export const ensureDirectoryLevel = (dir: string, statEntry: DirectoryStatReader = lstatSync): Decision<void> => {
   let justCreated = false;
   try {
     mkdirSync(dir, { mode: SAFE_DIRECTORY_MODE });
@@ -369,7 +387,7 @@ export const ensureDirectoryLevel = (dir: string): Decision<void> => {
       );
     }
   }
-  return judgeAndCleanupIfJustCreated(dir, justCreated);
+  return judgeAndCleanupIfJustCreated(dir, justCreated, statEntry);
 };
 
 /**
@@ -390,7 +408,10 @@ export const ensureDirectoryLevel = (dir: string): Decision<void> => {
  * still judged afterward — see `judgeAndCleanupIfJustCreated` for why (CEO review round 6,
  * defect 2).
  */
-export const createCheckoutLeafOrDeny = (localRepoPath: string): Decision<void> => {
+export const createCheckoutLeafOrDeny = (
+  localRepoPath: string,
+  statEntry: DirectoryStatReader = lstatSync,
+): Decision<void> => {
   let justCreated = false;
   try {
     mkdirSync(localRepoPath, { mode: SAFE_DIRECTORY_MODE });
@@ -410,20 +431,17 @@ export const createCheckoutLeafOrDeny = (localRepoPath: string): Decision<void> 
       { localRepoPath, message: (err as Error).message },
     );
   }
-  return judgeAndCleanupIfJustCreated(localRepoPath, justCreated);
+  return judgeAndCleanupIfJustCreated(localRepoPath, justCreated, statEntry);
 };
 
 /**
- * Removes the checkout this call created — and only if containment and the ownership
- * precondition both still hold for it *and* the ownership marker inside it still names this
- * exact operation. Any of those failing means either this call's own write never completed
- * or something else may now be involved with that path; either way this refuses to delete it
- * (Integration §13.3's RESOURCE_COLLISION is the right outcome for an unproven resource, not
- * a guess).
+ * Removes the checkout this call created — and only if the ownership precondition still
+ * holds for it *and* the ownership marker inside it still names this exact operation. Either
+ * failing means either this call's own write never completed or something else may now be
+ * involved with that path; either way this refuses to delete it (Integration §13.3's
+ * RESOURCE_COLLISION is the right outcome for an unproven resource, not a guess).
  */
 const cleanupOwnedCheckout = (workDir: string, localRepoPath: string, bootstrapOperationId: string): void => {
-  const containment = assertContained(workDir, localRepoPath);
-  if (!containment.allowed) return;
   const ownership = assertParentChainNotAttackerWritable(workDir, localRepoPath);
   if (!ownership.allowed) return;
   let marker: unknown;
@@ -473,10 +491,11 @@ export const trackedFilesOrDeny = (tracked: GitResult): Decision<string[]> => {
  *  - a `bootstrapVerification` PASS when the real local verification command's exit code or
  *    stdout says otherwise, or the tracked-file listing behind the receipt fails — recording
  *    PASS anyway would be a schema-complete lie;
- *  - a checkout path outside `workDir`, even one reached only through a symlink planted
- *    after the plan's own path-shaped fields were validated (`assertContained`), or one a
- *    different-account actor could plant later because it shares write access to a
- *    directory in the chain (`assertParentChainNotAttackerWritable`).
+ *  - a checkout path outside `workDir`, reached through a symlink anywhere in the chain
+ *    between `workDir`'s own parent and the checkout leaf — refused outright by
+ *    `assertParentChainNotAttackerWritable` and the `lstatSync` checks in
+ *    `ensureDirectoryLevel`/`createCheckoutLeafOrDeny`, not by resolving where the symlink
+ *    points and judging that instead.
  *
  * A failure after the checkout directory exists cleans up only the exact thing this call
  * created (see `cleanupOwnedCheckout`), so the same operation can be retried rather than
@@ -520,8 +539,6 @@ export const produceRepoFactoryResult = async (
     );
   }
 
-  const precheck = assertContained(workDir, localRepoPath);
-  if (!precheck.allowed) return precheck as Decision<RepoFactoryResult>;
   const ownershipPrecheck = assertParentChainNotAttackerWritable(workDir, localRepoPath);
   if (!ownershipPrecheck.allowed) return ownershipPrecheck as Decision<RepoFactoryResult>;
 

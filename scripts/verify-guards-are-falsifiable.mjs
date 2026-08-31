@@ -3451,6 +3451,33 @@ const GUARDS = [
     replace: "    mkdirSync(dir);\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
+  {
+    // CEO review round 7, M1 — CEO mutated this exact condition on the committed code and
+    // reported the count: 25 passed, survives. The judgement (`judgeRealDirectoryEntry`)
+    // still correctly denies with this line neutered; only the *cleanup* stops happening, so
+    // a test that only checks `judged.allowed` cannot see it. Removing the whole condition
+    // reproduces exactly that: the directory this call just created is left behind after a
+    // denial rather than removed.
+    what: "a directory judged unsafe immediately after this call created it is actually removed, not merely denied",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (!judged.allowed && justCreated) {\n",
+    replace: "  if (false) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // CEO review round 7, M2 — CEO mutated this exact call site on the committed code and
+    // reported the count: 25 passed, survives. Every other test's route to a denial for a
+    // freshly created directory went through `ensureDirectoryLevel`'s reuse branch, a path
+    // `createCheckoutLeafOrDeny` never takes (an already-existing leaf is always a collision
+    // there, never something to judge-and-reuse) — so nothing exercised the leaf's own call
+    // site at all. Bypassing the judgement here reproduces exactly that: the repository is
+    // written into a checkout directory this function never verified.
+    what: "createCheckoutLeafOrDeny judges the leaf directory through its own call site, not only via ensureDirectoryLevel's shared path",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  return judgeAndCleanupIfJustCreated(localRepoPath, justCreated, statEntry);\n",
+    replace: "  void justCreated;\n  return allow(ReasonCode.OK, undefined);\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);

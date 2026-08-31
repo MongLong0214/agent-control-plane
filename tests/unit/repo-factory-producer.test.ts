@@ -8,6 +8,7 @@ import {
   statSync,
   symlinkSync,
   writeFileSync,
+  type Stats,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -458,6 +459,74 @@ describe("repo factory producer (#246)", () => {
     });
   });
 
+  /**
+   * CEO review round 7 — CEO mutated the committed code directly and reported the counts:
+   *
+   *   M1  judgeAndCleanupIfJustCreated: `if (!judged.allowed && justCreated)` -> `if (false && ...)`
+   *       25 passed  SURVIVES
+   *   M2  createCheckoutLeafOrDeny: its call to judgeAndCleanupIfJustCreated replaced with
+   *       `void justCreated; return allow(ReasonCode.OK, undefined);`
+   *       25 passed  SURVIVES
+   *   M3  the same removal at ensureDirectoryLevel's call site
+   *       2 failed | 23 passed  killed
+   *
+   * M3's kill came entirely through `ensureDirectoryLevel`'s reuse branch (the
+   * "already-unsafe" test above) — a path `createCheckoutLeafOrDeny` never takes, since an
+   * already-existing leaf is always a collision there, never something to judge-and-reuse.
+   * So no existing test's *call site* ever reached a denial for a directory this producer
+   * had just created moments ago — the only way that denial can fire for a freshly created,
+   * explicitly-`SAFE_DIRECTORY_MODE`-requested directory is a real race (another process
+   * replacing or chmod'ing the entry between `mkdirSync` and the `lstat` right after), which
+   * a umask trick cannot manufacture: `mode & ~umask` only clears bits, so a freshly created
+   * `0700` directory can never come back group- or world-writable from umask alone.
+   *
+   * `statEntry` is the seam this needs, in the same shape `judgeDirectoryOwnership` already
+   * uses for its crafted `{ uid, mode }`: every real call site below passes it explicitly
+   * (production's default argument *is* `lstatSync` — not a test-only branch alongside it),
+   * so a test supplying a different `statEntry` is exercising the exact same code the real
+   * call traverses, with a stand-in for what a winning racer would have left behind.
+   */
+  describe("CEO review round 7 — M1 (cleanup wiring) and M2 (the leaf's own call site) each need their own test", () => {
+    it("removes the directory it just created when the entry is judged unsafe — the cleanup itself, not merely the decision (kills M1)", () => {
+      const { workDir } = makeSandbox();
+      mkdirSync(workDir, { recursive: true });
+      const dir = join(workDir, "fresh-unsafe");
+      const notMyUid = (process.getuid ? process.getuid() : 0) + 999_999;
+      const fakeUnsafeStat = {
+        uid: notMyUid,
+        mode: 0o700,
+        isSymbolicLink: () => false,
+        isDirectory: () => true,
+      } as unknown as Stats;
+
+      const judged = ensureDirectoryLevel(dir, () => fakeUnsafeStat);
+      expect(judged.allowed).toBe(false);
+      // Not merely the decision: the real directory this call actually created (via a real
+      // mkdirSync, above) must be gone. M1 breaks exactly this without touching the decision.
+      expect(existsSync(dir)).toBe(false);
+    });
+
+    it("judges the checkout leaf itself after creating it, through createCheckoutLeafOrDeny's own real call site (kills M2)", () => {
+      const { workDir } = makeSandbox();
+      mkdirSync(join(workDir, "repositories"), { recursive: true });
+      const leaf = repositoryCheckoutPath(workDir, "primary");
+      const notMyUid = (process.getuid ? process.getuid() : 0) + 999_999;
+      const fakeUnsafeStat = {
+        uid: notMyUid,
+        mode: 0o700,
+        isSymbolicLink: () => false,
+        isDirectory: () => true,
+      } as unknown as Stats;
+
+      // Through createCheckoutLeafOrDeny specifically — not ensureDirectoryLevel, and not
+      // judgeAndCleanupIfJustCreated directly — because M2 mutates only this function's own
+      // return statement, leaving the shared function itself untouched.
+      const judged = createCheckoutLeafOrDeny(leaf, () => fakeUnsafeStat);
+      expect(judged.allowed).toBe(false);
+      expect(existsSync(leaf)).toBe(false);
+    });
+  });
+
   it("refuses to overwrite or silently resume a preexisting same-named local checkout", async () => {
     const { workDir } = makeSandbox();
     const plan = basePlan();
@@ -491,8 +560,9 @@ describe("repo factory producer (#246)", () => {
     const outsideTarget = join(sandbox, "outside-target");
     mkdirSync(outsideTarget, { recursive: true });
     // The leaf ("primary") does not exist yet — only "repositories" is planted, and it is a
-    // symlink to a directory outside workDir. A lexical-only check that only compares
-    // `resolve()`d strings cannot see this; the escape is real only once symlinks resolve.
+    // symlink to a directory outside workDir. Caught by `assertParentChainNotAttackerWritable`'s
+    // `lstatSync`-based chain walk, which refuses a symlink outright rather than resolving it
+    // and judging wherever it points.
     symlinkSync(outsideTarget, join(workDir, "repositories"));
 
     const plan = basePlan();
