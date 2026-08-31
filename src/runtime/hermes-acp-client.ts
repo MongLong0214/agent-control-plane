@@ -169,6 +169,9 @@ const isDigest = (value: unknown): value is string =>
 const safeNonnegativeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
+const safePositiveInteger = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+
 const finiteNumber = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value);
 
@@ -193,7 +196,7 @@ const asTargetBindWire = (value: unknown): HermesTargetBindWireReceipt | null =>
   if (!isRecord(value) || !hasExactKeys(value, TARGET_BIND_KEYS)) return null;
   if (
     value.domain !== "hermes.target-bind" || value.version !== 1 ||
-    !nonEmpty(value.actor_id) || !safeNonnegativeInteger(value.binding_generation) ||
+    !nonEmpty(value.actor_id) || !safePositiveInteger(value.binding_generation) ||
     !nonEmpty(value.executor_runtime_identity) || !nonEmpty(value.requested_session_id) ||
     !isDigest(value.lineage_root_digest) || !isDigest(value.receipt_digest)
   ) return null;
@@ -215,7 +218,7 @@ const asReceiptIdentity = (value: unknown): HermesAcpReceiptIdentity | null => {
   if (
     value.schema !== "hermes.acp-terminal-receipt-identity" || value.version !== 1 ||
     !nonEmpty(value.turnRequestId) || !nonEmpty(value.targetActorId) || !isDigest(value.promptDigest) ||
-    !safeNonnegativeInteger(value.bindingGeneration) ||
+    !safePositiveInteger(value.bindingGeneration) ||
     !nonEmpty(value.targetBindingId) || !nonEmpty(value.targetAttestationId) ||
     !nonEmpty(value.executorSessionId) || !nonEmpty(value.executorSessionIncarnation)
   ) return null;

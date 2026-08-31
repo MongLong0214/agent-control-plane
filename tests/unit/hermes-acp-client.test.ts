@@ -223,6 +223,8 @@ const expectOrphanErrorDrain = (child: FakeChild): void => {
 describe("bounded Hermes ACP client", () => {
   it("launches only with the explicit dark ACP environment", async () => {
     const child = new FakeChild();
+    let spawnCommand: unknown;
+    let spawnArgs: unknown;
     let spawnOptions: unknown;
     connect(child, () => {
       child.stdout.emitText(frame(2, terminalResult(completed())));
@@ -230,7 +232,9 @@ describe("bounded Hermes ACP client", () => {
     });
 
     await expect(runHermesAcp(request(), {
-      spawn: (_command, _args, options) => {
+      spawn: (command, args, options) => {
+        spawnCommand = command;
+        spawnArgs = args;
         spawnOptions = options;
         return child;
       },
@@ -251,6 +255,29 @@ describe("bounded Hermes ACP client", () => {
         HERMES_ACP_SKIP_CONFIGURED_MCP: "1",
       },
       stdio: ["pipe", "pipe", "pipe"],
+    });
+    expect(spawnCommand).toBe("/trusted/hermes");
+    expect(spawnArgs).toEqual(["acp"]);
+    const [initializeFrame, promptFrame] = child.stdin.writes.map((written) => JSON.parse(written));
+    expect(initializeFrame).toEqual({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: "agent-control-plane", version: "1" } },
+    });
+    expect(promptFrame).toEqual({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "session/prompt",
+      params: {
+        sessionId: targetBindReceipt.requested_session_id,
+        prompt: [{ type: "text", text: "exact prompt bytes" }],
+        _meta: { hermes: { acpTerminalReceipt: {
+          operation: "execute",
+          receiptIdentity,
+          targetBindReceipt,
+        } } },
+      },
     });
     expect(child.stdin.endCalls).toBe(1);
     expect(child.killCalls).toBe(0);
@@ -300,6 +327,62 @@ describe("bounded Hermes ACP client", () => {
 
     await expect(runHermesAcp(request({ signal: controller.signal }), { spawn })).resolves.toEqual({ status: "FAILED", reason: "ABORTED" });
     expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a self-consistent zero target binding generation before spawn", async () => {
+    const zeroTargetBindPublic = { ...targetBindPublic, binding_generation: 0 } as const;
+    const zeroTargetBindReceipt = {
+      ...zeroTargetBindPublic,
+      receipt_digest: canonicalDigest(zeroTargetBindPublic),
+    } as const;
+    const zeroReceiptIdentity = { ...receiptIdentity, bindingGeneration: 0 } as const;
+    const spawn = vi.fn((): FakeChild => { throw new Error("must not spawn invalid input"); });
+
+    await expect(runHermesAcp(request({
+      receiptIdentity: zeroReceiptIdentity,
+      targetBindReceipt: zeroTargetBindReceipt,
+    }), { spawn })).resolves.toEqual({ status: "FAILED", reason: "INVALID_INPUT" });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("sends a bound empty status prompt and rejects status text before spawn", async () => {
+    const child = new FakeChild();
+    const spawn = vi.fn(() => child);
+    const statusInput = { ...request(), operation: "status" as const, text: undefined };
+    connect(child, () => {
+      child.stdout.emitText(frame(2, terminalResult({ status: "NEVER_FOUND", turnRequestId: receiptIdentity.turnRequestId })));
+      cleanClose(child);
+    });
+
+    await expect(runHermesAcp(statusInput, { spawn })).resolves.toEqual({ status: "NEVER_FOUND" });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const [initializeFrame, promptFrame] = child.stdin.writes.map((written) => JSON.parse(written));
+    expect(initializeFrame).toEqual({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: "agent-control-plane", version: "1" } },
+    });
+    expect(promptFrame).toEqual({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "session/prompt",
+      params: {
+        sessionId: targetBindReceipt.requested_session_id,
+        prompt: [],
+        _meta: { hermes: { acpTerminalReceipt: {
+          operation: "status",
+          receiptIdentity,
+          targetBindReceipt,
+        } } },
+      },
+    });
+    expectNoResidue(child);
+
+    const statusTextSpawn = vi.fn(() => new FakeChild());
+    await expect(runHermesAcp({ ...statusInput, text: "status must not carry text" }, { spawn: statusTextSpawn }))
+      .resolves.toEqual({ status: "FAILED", reason: "INVALID_INPUT" });
+    expect(statusTextSpawn).not.toHaveBeenCalled();
   });
 
   it("reconciles an exit that happened synchronously during spawn", async () => {
@@ -572,6 +655,7 @@ describe("bounded Hermes ACP client", () => {
 
   it.each([
     ["malformed", aborted({ assistantContent: "must not exist" }), "MALFORMED_TERMINAL_RECEIPT"],
+    ["noncanonical reason code", aborted({ reasonCode: ReasonCode.INTERNAL_ERROR }), "MALFORMED_TERMINAL_RECEIPT"],
     ["mismatched", aborted({
       receiptIdentity: { ...receiptIdentity, targetActorId: "actor:other" },
       receiptIdentityDigest: canonicalDigest({ ...receiptIdentity, targetActorId: "actor:other" }),
