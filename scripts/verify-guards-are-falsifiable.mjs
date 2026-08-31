@@ -3260,6 +3260,56 @@ const GUARDS = [
       "tests/unit/github-app-credential-store.test.ts::names every approved shape in the refusal message rather than only saying the match failed",
     ],
   },
+  {
+    // Issue #246 — a producer forbidden from writing to GitHub still has to answer a plan
+    // that calls for one. Honestly receipting a GitHub operation requires performing it,
+    // which this producer never does, so it refuses the whole plan instead. Neutering the
+    // condition would make the producer fabricate a result — repositories, receipts,
+    // verification — for a GitHub write that never happened.
+    //
+    // Bare-file `killedBy`: the describing `describe` block is `repo factory producer
+    // (#246)`, and `vitest -t` treats `#`/`(`/`)` as regex metacharacters (see this file's
+    // own guidance at the top).
+    what: "the producer refuses a plan that requires a GitHub write rather than fabricating a receipt for one",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (plan.githubOperations.length > 0) {\n",
+    replace: "  if (false && plan.githubOperations.length > 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // The other honesty refusal this producer builds in: `bootstrapVerification` must carry
+    // a real PASS. Neutering this check would let a genuinely-failing local `git` command
+    // (a real, non-zero exit) still get recorded as PASS with a real exactHead attached — a
+    // schema-complete lie about something that was actually observed to fail.
+    what: "the producer refuses to record a fabricated PASS when the local verification command genuinely fails",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (verification.exitCode !== 0) {\n",
+    replace: "  if (false && verification.exitCode !== 0) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // Integration §13.3: a same-named resource with different provenance is a
+    // RESOURCE_COLLISION, not a resume. Neutering this check would make the producer walk
+    // into a preexisting checkout path and commit into whatever was already there, silently
+    // treating an unknown resource as one it just created.
+    what: "the producer refuses to overwrite or silently resume a preexisting same-named local checkout",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if (existsSync(localRepoPath)) {\n",
+    replace: "  if (false && existsSync(localRepoPath)) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // `repositoryRole` is also the local directory name (`repositoryCheckoutPath` joins it
+    // straight onto `workDir`), so this regex is the only thing standing between a plan and
+    // a path that escapes the directory the producer was given to write in. Removing it
+    // would let a role like `../../etc` parse and be joined into a real filesystem path
+    // outside `workDir`.
+    what: "the plan schema refuses a repository role that would escape the given work directory",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: '.regex(/^[a-z0-9][a-z0-9-]*$/, "repositoryRole must be kebab-case"),\n',
+    replace: ",\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
