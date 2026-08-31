@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { isAcpError } from "../core/errors.ts";
 import { SingleInstanceLock } from "../daemon/single-instance.ts";
 import { backupDatabase, pruneAutomaticBackups, restoreDatabase } from "./backup.ts";
+import { PRODUCTION_DATABASE_PATH } from "./production-paths.ts";
 import { assertPrivatePath, ensurePrivateDirectory } from "./state-preflight.ts";
 
-const defaultDatabasePath = (): string => join(homedir(), ".agent-control-plane", "state.sqlite");
+const defaultDatabasePath = (): string => PRODUCTION_DATABASE_PATH;
 
 const USAGE = `agentcpd-state — database backup and restore maintenance
 

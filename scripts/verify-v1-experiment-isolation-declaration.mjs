@@ -1,5 +1,19 @@
 #!/usr/bin/env node
-/** #416 keeps V1's stated absence of enforcement honest but does not add ACP 2.0 runtime enforcement. */
+/**
+ * #416 originally shipped only `validateExperimentIsolation` plus a declaration that V1 had
+ * nothing to consume it: this script's job was to catch a *second*, undeclared consumer
+ * appearing anywhere in `src` while that claim stood — a caller that opened experiment state or
+ * threaded the validation's fields through code the declaration said did not exist.
+ *
+ * That premise is gone. `Db`'s constructor (`src/db/database.ts`) now consumes this validation
+ * as a real write-denial gate before it opens a handle for a declared experiment context, and the
+ * isolation module's own `runtimeEnforcement` field says so (`"ENFORCED_AT_DB_OPEN"`). So the
+ * question this script answers changed with it: it no longer asks "does anything touch these
+ * tokens" (the honest answer is now yes, on purpose, at exactly one place) — it asks "does
+ * anything touch them *outside* the one place the isolation module claims does". `AUTHORIZED_CONSUMERS`
+ * is that allowlist. A hit inside it is the sanctioned wiring; a hit anywhere else is exactly the
+ * silent-second-consumer drift this script was built to catch, and still fails the build.
+ */
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +24,14 @@ const repoRoot = rootArg
   : fileURLToPath(new URL("..", import.meta.url));
 const asJson = process.argv.includes("--json");
 const ISOLATION_MODULE = "src/export/experiment-isolation.ts";
+
+/**
+ * The only file(s) permitted to consume `validateExperimentIsolation`'s fields outside the
+ * isolation module itself. `Db`'s constructor is the enforcement point the isolation module's
+ * own `enforcementPoint` field names (#416) — keep the two in sync by hand; a rename on either
+ * side that does not move the other is exactly the drift this script exists to catch.
+ */
+const AUTHORIZED_CONSUMERS = new Set(["src/db/database.ts"]);
 
 const walk = (directory, files = []) => {
   for (const entry of readdirSync(join(repoRoot, directory)).sort()) {
@@ -89,11 +111,17 @@ const candidates = {
   experimentArtifactRoot: [],
   validatorConsumer: [],
 };
+const authorizedConsumers = {
+  experimentDatabasePath: [],
+  experimentArtifactRoot: [],
+  validatorConsumer: [],
+};
 for (const file of sourceFiles) {
   const source = executableSource(readFileSync(join(repoRoot, file), "utf8"));
-  candidates.experimentDatabasePath.push(...locations(file, source, /\bexperimentDatabasePath\b/g));
-  candidates.experimentArtifactRoot.push(...locations(file, source, /\bexperimentArtifactRoot\b/g));
-  candidates.validatorConsumer.push(
+  const bucket = AUTHORIZED_CONSUMERS.has(file) ? authorizedConsumers : candidates;
+  bucket.experimentDatabasePath.push(...locations(file, source, /\bexperimentDatabasePath\b/g));
+  bucket.experimentArtifactRoot.push(...locations(file, source, /\bexperimentArtifactRoot\b/g));
+  bucket.validatorConsumer.push(
     ...locations(file, source, /\bExperimentIsolationValidation\b/g),
     ...locations(file, source, /\bvalidateExperimentIsolation\s*\(/g),
   );
@@ -103,7 +131,7 @@ const isolationSource = readFileSync(join(repoRoot, ISOLATION_MODULE), "utf8");
 const runtimeEnforcementDeclarations = locations(
   ISOLATION_MODULE,
   isolationSource,
-  /\bruntimeEnforcement\s*:\s*"NOT_AVAILABLE_IN_V1"/g,
+  /\bruntimeEnforcement\s*:\s*"ENFORCED_AT_DB_OPEN"/g,
 );
 const candidateCount = Object.values(candidates).reduce((count, locations) => count + locations.length, 0);
 const active = runtimeEnforcementDeclarations.length > 0;
@@ -112,16 +140,17 @@ const report = {
   scannedFileCount: sourceFiles.length,
   runtimeEnforcementDeclarations,
   candidates,
+  authorizedConsumers,
 };
 
 if (asJson) {
   process.stdout.write(`${JSON.stringify(report)}\n`);
 } else if (active) {
   process.stdout.write(
-    `V1 experiment isolation scanned ${sourceFiles.length} source file(s): database paths ${candidates.experimentDatabasePath.length}, artifact roots ${candidates.experimentArtifactRoot.length}, validator consumers ${candidates.validatorConsumer.length}.\n`,
+    `V1 experiment isolation scanned ${sourceFiles.length} source file(s): unauthorized database paths ${candidates.experimentDatabasePath.length}, unauthorized artifact roots ${candidates.experimentArtifactRoot.length}, unauthorized validator consumers ${candidates.validatorConsumer.length}.\n`,
   );
 } else {
-  process.stdout.write("No NOT_AVAILABLE_IN_V1 declaration is present, so the V1 absence census is inactive.\n");
+  process.stdout.write("No ENFORCED_AT_DB_OPEN declaration is present, so the V1 enforcement census is inactive.\n");
 }
 
 if (active && candidateCount > 0) {
@@ -129,7 +158,7 @@ if (active && candidateCount > 0) {
     for (const hit of hits) process.stderr.write(`${kind}: ${hit}\n`);
   }
   process.stderr.write(
-    "NOT_AVAILABLE_IN_V1 declares no runtime enforcement, but V1 source contains experiment-state candidates.\n",
+    `ENFORCED_AT_DB_OPEN names ${[...AUTHORIZED_CONSUMERS].join(", ")} as the only authorized consumer(s), but another source file references experiment-state tokens.\n`,
   );
   process.exit(1);
 }

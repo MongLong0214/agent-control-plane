@@ -1,6 +1,5 @@
 import { dirname, join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 
 import { type Clock, systemClock } from "../core/clock.ts";
 import { digestOf } from "../core/digest.ts";
@@ -16,6 +15,7 @@ import { allow, deny, fail } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
 import { ArtifactStore, type EvidenceWriterSet } from "../db/artifacts.ts";
 import { Db } from "../db/database.ts";
+import { PRODUCTION_STATE_ROOT } from "../db/production-paths.ts";
 import { databaseSidecarPaths, ensurePrivateDirectory } from "../db/state-preflight.ts";
 import { Role, SessionLifecycle, roleKeyFor } from "../domain/types.ts";
 import {
@@ -137,7 +137,7 @@ export interface ControlPlaneConfig {
   githubClient?: GitHubClient;
 }
 
-export const defaultConfig = (root = join(homedir(), ".agent-control-plane")): ControlPlaneConfig => ({
+export const defaultConfig = (root = PRODUCTION_STATE_ROOT): ControlPlaneConfig => ({
   databasePath: join(root, "state.sqlite"),
   worktreeRoot: join(root, "worktrees"),
   capacityDir: join(root, "capacity"),

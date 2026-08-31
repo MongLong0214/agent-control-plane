@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 
 import { acpError, fail, isAcpError, type Decision } from "../core/errors.ts";
 import { ReasonCode } from "../core/reason-codes.ts";
+import { validateExperimentIsolation } from "../export/experiment-isolation.ts";
 import {
   DEFAULT_BACKUP_RETENTION,
   assertIntegrity,
@@ -24,6 +25,7 @@ import {
   schemaDdl,
   type SchemaMigration,
 } from "./migrations.ts";
+import { PRODUCTION_DATABASE_PATH, PRODUCTION_STATE_ROOT } from "./production-paths.ts";
 import {
   assertPrivateDatabaseFiles,
   ensurePrivateDirectory,
@@ -63,6 +65,27 @@ const assertReadQuery = (sql: string): void => {
 /** Version of the shape in schema.sql plus its ordered migration registry. */
 export const SCHEMA_VERSION = CURRENT_SCHEMA_VERSION;
 
+/**
+ * Declares that a `Db` is being opened inside an experiment, not production (#416, V1-BR-08).
+ *
+ * Deliberately carries no production coordinates: the constructor resolves those itself from
+ * `PRODUCTION_DATABASE_PATH`/`PRODUCTION_STATE_ROOT` rather than accepting them here. A field
+ * here for "what production is" is a field a caller could omit, misstate, or point at a stub —
+ * and `validateExperimentIsolation` would then compare the experiment against whatever the
+ * caller said, not against the real thing, and silently allow. There is nothing to omit when
+ * there is nothing to supply.
+ */
+export interface DbExperimentContext {
+  /** Path-safe identifier for the experiment; validated by `validateExperimentIsolation`. */
+  experimentId: string;
+  /**
+   * Directory this experiment may write artifacts into. Required, not optional: an experiment
+   * context declared without one is refused at open time rather than treated as having nothing
+   * to check.
+   */
+  experimentArtifactRoot: string;
+}
+
 export interface DbOpenOptions {
   /** Number of generated manual/pre-migration backups retained beside the database. */
   backupRetention?: number;
@@ -70,6 +93,15 @@ export interface DbOpenOptions {
   temporaryStorage?: "MEMORY";
   /** Test-only fault injection that proves a committed migration is restored from its backup. */
   afterMigration?: (migration: SchemaMigration) => void;
+  /**
+   * Marks this handle as opened inside a declared offline experiment (#416, V1-BR-08).
+   *
+   * When present, the file this constructor is about to open must be proven isolated from
+   * production *before* `new Database(filename)` runs. A denial here throws out of the
+   * constructor, so no handle — and, for a persistent file that did not already exist, no file —
+   * is ever created for a path or artifact root that aliases production.
+   */
+  experimentContext?: DbExperimentContext;
 }
 const EVIDENCE_WRITE_MINT: unique symbol = Symbol("evidence-write-mint");
 const TURN_MATERIALIZATION_MINT: unique symbol = Symbol("turn-materialization-mint");
@@ -234,6 +266,47 @@ export class Db {
   readonly temporaryStorage: "DEFAULT" | "FILE" | "MEMORY";
 
   constructor(filename: string, private readonly options: DbOpenOptions = {}) {
+    // Runs first, before any of this constructor's other work — `ensurePrivateDirectory` and
+    // `new Database(filename)` included. A check that ran after either has already created or
+    // touched the file it was meant to refuse to open (#416, V1-BR-08).
+    if (options.experimentContext) {
+      const { experimentId, experimentArtifactRoot } = options.experimentContext;
+      // The omission this refuses: a caller that declares an experiment context but forgets its
+      // artifact root. Without this, `validateExperimentIsolation` would receive `undefined`,
+      // `resolve()` would throw a bare TypeError, and a caller reaching this constructor without
+      // the compiler in the loop (a JS caller, a loosely typed config) would get an ugly crash
+      // instead of a named denial — or, worse, a falsy-but-stringy value that happens to resolve
+      // outside production and silently passes. Refused explicitly, before either can happen.
+      if (!experimentArtifactRoot) {
+        fail(
+          ReasonCode.INVALID_ARGUMENT,
+          "an experiment context must declare its own artifact root explicitly",
+          { experimentId },
+        );
+      }
+      // `:memory:` is permitted under an experiment context, deliberately, without a special
+      // case: SQLite never touches disk for it, so it cannot alias `PRODUCTION_DATABASE_PATH`
+      // regardless of what `resolve()` does with the literal string (it resolves relative to
+      // `cwd`, which is never inside the production state root). The artifact-root half of the
+      // check below still runs unconditionally — an in-memory database does not stop the same
+      // experiment from writing real files elsewhere, and that half has nothing to do with
+      // whether the SQLite file itself is on disk.
+      const isolation = validateExperimentIsolation({
+        experimentId,
+        experimentDatabasePath: filename,
+        experimentArtifactRoot,
+        // Resolved here, not accepted as a field on `DbExperimentContext`: a caller that could
+        // supply its own idea of "production" could omit it, or point it at a stub, and the
+        // comparison above would then run against nothing and pass. These are the same
+        // coordinates `defaultConfig()` (`src/app/control-plane.ts`) and `agentcpd-state`
+        // (`src/db/state-admin.ts`) themselves fall back to.
+        productionDatabasePath: PRODUCTION_DATABASE_PATH,
+        productionArtifactRoot: PRODUCTION_STATE_ROOT,
+      });
+      if (!isolation.allowed) {
+        fail(isolation.reasonCode, isolation.message, isolation.evidence);
+      }
+    }
     const persistent = filename !== ":memory:";
     const databaseExisted = persistent && existsSync(filename);
     if (persistent) {

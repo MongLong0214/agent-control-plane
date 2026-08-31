@@ -3157,13 +3157,14 @@ const GUARDS = [
     ],
   },
   {
-    // #416 keeps V1's stated absence of enforcement honest; ACP 2.0 still needs its runtime guard.
+    // #416 wired real enforcement at Db's constructor; this census now watches for a *second*,
+    // unauthorized consumer of the same tokens appearing anywhere else in src.
     what: "the V1 experiment isolation census scans every production source file",
     file: "scripts/verify-v1-experiment-isolation-declaration.mjs",
     find: 'const sourceFiles = walk("src").filter((file) => file !== ISOLATION_MODULE);',
     replace: "const sourceFiles = [];",
     killedBy: [
-      "tests/process/v1-experiment-isolation-declaration.test.ts::detects synthetic experiment state opening and validator consumption",
+      "tests/process/v1-experiment-isolation-declaration.test.ts::detects synthetic experiment state opening and validator consumption outside the authorized consumer",
     ],
   },
   {
@@ -3216,6 +3217,52 @@ const GUARDS = [
       '  return result.classification.kind === "pass" ? 0 : 1;',
     killedBy: [
       "tests/process/vitest-result-gate.test.ts::does not retry an unexplained run failure",
+    ],
+  },
+  {
+    // #416: without this, a declared experiment context is computed and silently discarded, and
+    // `new Database(filename)` runs regardless of what the isolation decision said.
+    what: "a declared experiment context is checked before Db opens a handle for it",
+    file: "src/db/database.ts",
+    find: "    if (options.experimentContext) {",
+    replace: "    if (false && options.experimentContext) {",
+    killedBy: [
+      "tests/unit/an-experiment-context-cannot-open-production.test.ts::denies opening the literal production database path",
+    ],
+  },
+  {
+    // The omission this refuses: a caller declares an experiment context but forgets its
+    // artifact root, so the isolation check would otherwise compare against nothing and pass.
+    what: "an experiment context omitting its artifact root is refused, not compared against nothing",
+    file: "src/db/database.ts",
+    find: "      if (!experimentArtifactRoot) {",
+    replace: "      if (false) {",
+    killedBy: [
+      "tests/unit/an-experiment-context-cannot-open-production.test.ts::denies an experiment context that omits its artifact root, rather than comparing against nothing",
+    ],
+  },
+  {
+    // Production's database path for this comparison must be the fixed coordinate this module
+    // resolves on its own, not a value derived from the file the caller asked to open — the
+    // premise `PRODUCTION_DATABASE_PATH` exists to guarantee (#416, constraint 3).
+    what: "the production database path compared against is the fixed production coordinate",
+    file: "src/db/database.ts",
+    find: "        productionDatabasePath: PRODUCTION_DATABASE_PATH,",
+    replace: "        productionDatabasePath: filename,",
+    killedBy: [
+      "tests/unit/an-experiment-context-cannot-open-production.test.ts::opens normally when the experiment's database and artifact root are properly separated",
+    ],
+  },
+  {
+    // Same guarantee as above, for the artifact-root half of the comparison: production's
+    // artifact root must be the fixed state root, not a value taken from the experiment's own
+    // declared root.
+    what: "the production artifact root compared against is the fixed production coordinate",
+    file: "src/db/database.ts",
+    find: "        productionArtifactRoot: PRODUCTION_STATE_ROOT,",
+    replace: "        productionArtifactRoot: experimentArtifactRoot,",
+    killedBy: [
+      "tests/unit/an-experiment-context-cannot-open-production.test.ts::opens normally when the experiment's database and artifact root are properly separated",
     ],
   },
 ];

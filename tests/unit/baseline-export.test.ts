@@ -782,7 +782,10 @@ describe("baseline boundary contracts", () => {
     });
     expect(prepared.allowed).toBe(true);
     if (!prepared.allowed) return;
-    expect(prepared.value.runtimeEnforcement).toBe("NOT_AVAILABLE_IN_V1");
+    expect(prepared.value.runtimeEnforcement).toBe("ENFORCED_AT_DB_OPEN");
+    expect(prepared.value.enforcementPoint).toBe(
+      "src/db/database.ts Db constructor (DbOpenOptions.experimentContext)",
+    );
   });
 
   it("keeps the Repo Factory result boundary strict and the baseline migration ordered", () => {
