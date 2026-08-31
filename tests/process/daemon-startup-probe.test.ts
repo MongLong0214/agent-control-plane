@@ -104,10 +104,14 @@ const stableOutcome = (report: StartupReport) => report.stages.map((stage, index
   retryAfterBackoff: index === 3 ? stableStartup(startup(stage, "retryAfterBackoff")) : undefined,
 }));
 
+// grok is deliberately absent: #735 retired it from the unattended capacity probe, so a
+// default-configuration startup (this probe never opts it back in) never reads it at all —
+// `cp.capacity.all()` only reports providers a refresh actually persisted a row for. Do not
+// add it back here; that would be re-introducing the always-failing unattended probe this
+// retirement removed.
 const isolatedSources = {
   claude: "daemon-startup-probe-isolated:claude",
   gpt: "daemon-startup-probe-isolated:gpt",
-  grok: "daemon-startup-probe-isolated:grok",
 };
 
 describe("the daemon startup probe", () => {
@@ -126,6 +130,9 @@ describe("the daemon startup probe", () => {
     for (const stage of withoutLoginPaths.stages) {
       expect(stage).not.toHaveProperty("error");
       expect(stage["capacitySources"]).toEqual(isolatedSources);
+      // Named explicitly, not left as a silent omission: a provider quietly dropping out of
+      // a startup probe is exactly the kind of change that should be visible in a test.
+      expect(stage["capacitySources"]).not.toHaveProperty("grok");
     }
 
     expect(withoutLoginPaths.stages[0]).toMatchObject({
