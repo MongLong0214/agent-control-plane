@@ -8,15 +8,29 @@ that the repository protect itself before any later wave's "green" means anythin
 - force-push and branch deletion are refused
 - there are **no bypass actors** — the review is explicit that this count is zero
 
-The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **`verify` is the required
-status check context** — that is the name GitHub reports, not `project-ci`. It used to be true
-because the workflow's one job had that id; it is no longer, and stating it that way would be
-exactly the kind of stale claim this repository keeps finding elsewhere. `verify-matrix` carries
-the moving Node matrix, so GitHub appends each matrix value to its `name: verify` check. The
-unmatrixed `verify-gate` runs unconditionally (`if: always()`) after its declared dependencies and
-is what produces the bare `verify` check this section's required-status-check configuration
-actually matches. The required context string itself did not change, so nothing in this document's
-`gh api` commands or `app_id`/`integration_id` pins needs updating for this.
+The CI workflow is `project-ci` (`.github/workflows/ci.yml`), and **the bare `verify` check is the
+required status check context** — that is a job check name GitHub reports, not the workflow name.
+The workflow now has five jobs:
+
+- `verify-matrix`, displayed as `verify`, runs the main build and test steps on Node 22.18.0 and
+  the current Node 22 release, producing `verify (22.18.0)` and `verify (22)` checks;
+- `guard-falsifiability`, displayed as `guard falsifiability`, runs the mutation sweep in its own
+  clean checkout after the matrix;
+- `traceability`, displayed as `traceability`, checks out clean and consumes the Vitest JSON the
+  gate judged, downloaded from the `22.18.0` matrix leg of the same run. It does not run the suite
+  again: a second execution is a different run, so a report built from it describes something no
+  gate examined. A missing or empty artifact fails the job rather than falling back to a fresh run;
+- `ssot`, displayed as `SSOT reconciliation`, runs the reconciliation check in its own checkout;
+  and
+- `verify-gate`, displayed as bare `verify`, needs all four preceding jobs and runs under
+  `if: always()` so only four explicit `success` results pass it.
+
+The first four jobs are therefore transitively required by the bare `verify` gate; they are not
+separate branch-protection contexts. The required context remains `verify` with GitHub Actions App
+id `15368`. Existing protection that already requires that pinned context needs no settings change
+for this workflow split, and the commands below remain current. Registering the four component
+checks separately would be a repository-owner policy change and is not part of this document or
+the workflow change.
 
 Applying this is an owner action: it changes repository settings.
 
@@ -51,7 +65,7 @@ cat > /tmp/acp-ruleset.json <<'JSON'
     {
       "type": "required_status_checks",
       "parameters": {
-        "strict_required_status_checks_policy": true,
+        "strict_required_status_checks_policy": false,
         "required_status_checks": [
           { "context": "verify", "integration_id": 15368 }
         ]
@@ -64,8 +78,16 @@ JSON
 gh api -X POST repos/MongLong0214/agent-control-plane/rulesets --input /tmp/acp-ruleset.json
 ```
 
-`strict_required_status_checks_policy: true` is "branch must be up to date before merging", which is
-what makes the base a proven base rather than a stale one.
+`strict_required_status_checks_policy` is "branch must be up to date before merging". It is now
+**false**, and the live setting is `"strict": false`. It was true, and the cost was measured: with a
+required check that takes 13-25 minutes, every merge invalidated every other open PR, so a day of
+ordinary work spent most of its wall-clock re-running a suite that had already passed on the same
+code. What it bought was a base proven current at merge time; what it cost was that no two PRs could
+land without serialising through a full re-run each. The tradeoff was resolved toward throughput.
+
+A PR can therefore merge on a base that is behind main. `merge-tree` conflict detection still runs,
+but a semantic conflict — one where both sides merge cleanly and the combination is wrong — is no
+longer caught before the merge. It shows up on main's own CI run instead.
 
 `required_approving_review_count` is `0` because this repository currently has one human. Raise it to
 `1` the moment there is a second, and the review's intent is satisfied either way — the gate that
@@ -106,7 +128,7 @@ ruleset path next to it was pinned to an app.
 cat > /tmp/acp-protection.json <<'JSON'
 {
   "required_status_checks": {
-    "strict": true,
+    "strict": false,
     "checks": [{ "context": "verify", "app_id": 15368 }]
   },
   "enforce_admins": true,

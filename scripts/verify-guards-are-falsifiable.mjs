@@ -2855,6 +2855,58 @@ const GUARDS = [
       "tests/unit/verify-stale-coordinate-literals.test.ts::a workflow job total copied into documentation is rejected",
     ],
   },
+  {
+    what: "a reported failed test is a product failure",
+    file: "scripts/run-vitest-gate.mjs",
+    find: "  if (statusCounts.failed > 0) {",
+    replace: "  if (statusCounts.failed < 0) {",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::fails when the result contains a failed test",
+    ],
+  },
+  {
+    what: "a reporter-pending assertion is incomplete rather than a completed skip",
+    file: "scripts/run-vitest-gate.mjs",
+    find:
+      "  const pendingAssertions = assertions.filter(\n" +
+      '    (assertion) => assertion?.status === "pending",\n' +
+      "  ).length;\n" +
+      "  const skippedAssertions = statusCounts.skipped;",
+    replace:
+      "  const pendingAssertions = 0;\n" +
+      "  const skippedAssertions = report.numPendingTests;",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::classifies a reporter pending assertion as incomplete",
+    ],
+  },
+  {
+    what: "a nonzero exit after complete passing results is an unexplained run failure",
+    file: "scripts/run-vitest-gate.mjs",
+    find: "  if (exitCode !== 0) {",
+    replace: "  if (exitCode === 0) {",
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::fails closed when a nonzero exit follows complete passing results",
+    ],
+  },
+  {
+    what: "an unexplained run failure is not retried into a pass",
+    file: "scripts/run-vitest-gate.mjs",
+    find:
+      "  const result = runAttempt(1);\n" +
+      "  printClassification(result.classification, out);\n" +
+      '  return result.classification.kind === "pass" ? 0 : 1;',
+    replace:
+      "  let result = runAttempt(1);\n" +
+      "  printClassification(result.classification, out);\n" +
+      '  if (result.classification.kind === "run-failure") {\n' +
+      "    result = runAttempt(2);\n" +
+      "    printClassification(result.classification, out);\n" +
+      "  }\n" +
+      '  return result.classification.kind === "pass" ? 0 : 1;',
+    killedBy: [
+      "tests/process/vitest-result-gate.test.ts::does not retry an unexplained run failure",
+    ],
+  },
 ];
 
 const only = process.argv.find((a) => a.startsWith("--only="))?.slice("--only=".length);
