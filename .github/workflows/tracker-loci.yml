@@ -1,0 +1,51 @@
+name: tracker-loci
+on:
+  # This is the *only* place `verify-tracker-loci-resolve.mjs` runs, deliberately.
+  #
+  # It was briefly also a `project-ci` step, on the theory that it should also catch drift a PR's
+  # own commit introduces. An independent review found the coupling that creates: the check is a
+  # fact about the open issue tracker, not about any one PR's diff, and on an unedited `main` it
+  # is *already* red — #649 cites a line #657 moved, with no fix required of this repo's code. A
+  # required `project-ci` step in that state blocks every PR's merge on an issue-thread fact
+  # nothing in the diff touched, for as long as the issue stays open — which is exactly the
+  # coupling that gets a check disabled rather than fixed (an unrelated PR turning red because
+  # someone edited an issue is the same shape `ssot-report.mjs` accepts, but that check only reds
+  # on an *active mistake* — a marker added without an issue — not on an ordinary day with an
+  # ordinary open issue).
+  #
+  # A scheduled run has no such cost: it can fail loudly — visible in the Actions tab, same as any
+  # other failed scheduled workflow — without failing anyone's merge. That is the trade this
+  # script's own header already argues for staleness that "can go stale without any commit at
+  # all"; the fix is to act on that argument here rather than also blocking PRs on it.
+  #
+  # Not tied to the full lint/typecheck/test/`guards:falsifiable` job either: that suite is a
+  # deliberate hour-plus mutation sweep. The scanner does need the TypeScript compiler for the
+  # JavaScript lexical goal that distinguishes regex literals from division, so this job pays for
+  # Node/pnpm setup and one frozen dependency install each day. Lifecycle scripts stay disabled:
+  # the scanner needs TypeScript, not either native addon build or the rest of the verification
+  # suite.
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch: {}
+jobs:
+  loci:
+    runs-on: macos-15
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+        with:
+          version: 10
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22.18.0
+          cache: pnpm
+      # sol-simplify: this install is the scheduled entrypoint's runtime dependency boundary;
+      # remove it when that entrypoint has no bare package imports.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: node scripts/verify-tracker-loci-resolve.mjs
+        env:
+          GH_TOKEN: ${{ github.token }}
