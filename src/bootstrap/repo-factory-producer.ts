@@ -1,16 +1,12 @@
 import {
-  closeSync,
-  constants as fsConstants,
   existsSync,
-  fstatSync,
-  lstatSync,
   mkdirSync,
-  openSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -136,6 +132,10 @@ const OPERATION_MARKER_NAME = ".repo-factory-operation.json";
  * resolve every symlink a path component *actually has*, including one planted after the
  * role passed its kebab-case check but before this call reached it, which a lexical
  * `resolve()`-only comparison cannot see at all.
+ *
+ * This answers "is the path lexically/structurally where it claims to be", which is a
+ * different question from "can someone else change that answer out from under this run" —
+ * `assertParentChainNotAttackerWritable` below answers that one.
  */
 const assertContained = (workDir: string, target: string): Decision<void> => {
   const canonicalWorkDir = canonical(workDir);
@@ -150,136 +150,114 @@ const assertContained = (workDir: string, target: string): Decision<void> => {
   return allow(ReasonCode.OK, undefined);
 };
 
-export interface AnchoredDirectory {
-  readonly path: string;
-  readonly identity: { readonly dev: number; readonly ino: number };
-}
-
 /**
- * CEO review round 3, defect 3 — `assertContained` above closes the window between the
- * containment check and `mkdirSync`, but every operation *after* that (`git init`, the
- * marker write, `commit`, verification, `ls-tree`, …) used to pass the same bare pathname
- * straight through with no re-verification at all. A pathname swapped out from under it at
- * any point after the one check at the top was silently followed — proven directly: a bare
- * `git -C <path>` call given a path that was deleted and replaced with a symlink to
- * elsewhere operates on the symlink's target without complaint.
- *
- * `anchorDirectory` opens `path` once — refusing outright via `O_NOFOLLOW` if it is itself
- * a symlink — and records its device+inode identity. `assertStillAnchored` re-verifies that
- * identity immediately before every subsequent operation, via `lstatSync` (never
- * `statSync`, so a pathname that became a symlink is seen as the symlink, not silently
- * followed). A mismatch means the pathname no longer refers to the exact directory this run
- * created, at any point after it was opened, and every write below refuses rather than
- * operate on whatever now sits there.
- *
- * This is not a full elimination of the race: Node has no binding for the `openat`-family
- * syscalls that would let every later operation go through the already-open fd directly
- * instead of re-resolving the pathname, and this project ships to macOS CI, where `/dev/fd/N`
- * cannot be reopened as a directory or accept an appended subpath (verified directly: both
- * `git -C /dev/fd/N` and a child path under it fail with EBADF/ENOTDIR on Darwin — Linux's
- * `/proc/self/fd/N` supports exactly this, but this project cannot depend on a Linux-only
- * mechanism). Re-verifying immediately before every syscall is the closest real close
- * available in portable Node; it shrinks the window from "the rest of this async function"
- * to the gap between one `lstat` and the operation right after it, and it reliably refuses
- * the attack shape this defect was found with — a swap that happens once and then sits
- * there, which is what a test (and an attacker who is not actively racing this exact
- * process at that instant) produces.
+ * The ownership/permission decision, factored out so it can be exercised directly with a
+ * crafted `{ uid, mode }` — the exact fields `fs.Stats` carries — without needing a real
+ * directory owned by a different account, which a test sandbox cannot create without root.
  */
-export const anchorDirectory = (path: string): Decision<AnchoredDirectory> => {
-  let fd: number;
-  try {
-    fd = openSync(path, fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-  } catch (err) {
-    return deny(
-      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
-      "could not open the repository checkout as a real directory (it may be a symlink)",
-      { path, message: (err as Error).message },
-    );
-  }
-  try {
-    const stat = fstatSync(fd);
-    return allow(ReasonCode.OK, { path, identity: { dev: stat.dev, ino: stat.ino } });
-  } finally {
-    closeSync(fd);
-  }
-};
-
-export const assertStillAnchored = (anchor: AnchoredDirectory): Decision<void> => {
-  let stat: ReturnType<typeof lstatSync>;
-  try {
-    stat = lstatSync(anchor.path);
-  } catch (err) {
-    return deny(
-      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
-      "repository checkout path disappeared during the run",
-      { path: anchor.path, message: (err as Error).message },
-    );
-  }
-  if (stat.dev !== anchor.identity.dev || stat.ino !== anchor.identity.ino) {
-    return deny(
-      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
-      "repository checkout path no longer refers to the directory this run created — possible symlink swap",
-      { path: anchor.path },
-    );
-  }
-  return allow(ReasonCode.OK, undefined);
-};
-
-/** Every `git` call after the anchor is taken goes through this, never a bare pathname. */
-const gitAnchored = async (
-  anchor: AnchoredDirectory,
-  args: readonly string[],
-  options: { allowFailure?: boolean } = {},
-): Promise<Decision<GitResult>> => {
-  const stillThere = assertStillAnchored(anchor);
-  if (!stillThere.allowed) return stillThere as Decision<GitResult>;
-  return allow(ReasonCode.OK, await git(anchor.path, args, options));
-};
-
-/** Every file write after the anchor is taken goes through this, never a bare pathname. */
-const writeFileAnchored = (
-  anchor: AnchoredDirectory,
-  relativePath: string,
-  content: string,
-  flag?: "a",
+export const judgeDirectoryOwnership = (
+  dir: string,
+  stat: { uid: number; mode: number },
+  myUid: number,
 ): Decision<void> => {
-  const stillThere = assertStillAnchored(anchor);
-  if (!stillThere.allowed) return stillThere;
-  writeFileSync(join(anchor.path, relativePath), content, flag ? { flag } : undefined);
+  if (stat.uid !== myUid) {
+    return deny(
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      "a directory between the work directory and the repository checkout is not owned by this process; refusing rather than risk a symlink swap by another account",
+      { dir, ownerUid: stat.uid, myUid },
+    );
+  }
+  if ((stat.mode & 0o022) !== 0) {
+    return deny(
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      "a directory between the work directory and the repository checkout is writable by another user or group; refusing rather than risk a symlink swap",
+      { dir, mode: (stat.mode & 0o777).toString(8) },
+    );
+  }
   return allow(ReasonCode.OK, undefined);
-};
-
-const revParseAnchored = async (anchor: AnchoredDirectory, ref: string): Promise<Decision<string>> => {
-  const stillThere = assertStillAnchored(anchor);
-  if (!stillThere.allowed) return stillThere as Decision<string>;
-  const head = await tryRevParse(anchor.path, ref);
-  return head
-    ? allow(ReasonCode.OK, head)
-    : deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "no exact ref could be resolved", {
-        path: anchor.path,
-        ref,
-      });
 };
 
 /**
- * Removes the checkout this call created — and only if it is still the exact directory the
- * anchor opened (never a swapped-in replacement) *and* the ownership marker inside it still
- * names this exact operation. Either check failing means either this call's own write never
- * completed or something else now owns that path; either way this refuses to delete it
+ * CEO review round 4, defect 3 — round 3's fix re-verified the checkout path's device+inode
+ * identity immediately before every subsequent operation. CEO's verdict was explicit and
+ * demonstrated directly: a swap injected strictly between a successful re-check and the git
+ * call right after it was followed exactly as before — shrinking a check-then-act window is
+ * not closing it, no matter how tight the shrink. Re-checking faster does not help; the only
+ * real close is removing the actor who could ever win that race.
+ *
+ * This does that by converting the race into a precondition: every existing directory
+ * between the checkout's own parent and `workDir` (inclusive) must be owned by this
+ * process's effective user and must not be writable by any other user or group
+ * (`mode & 0o022 === 0`, i.e. neither the group-write nor other-write bit is set). If that
+ * holds, no *other* account can create, delete, or rename anything inside those directories
+ * — not "probably won't in the brief window before the next syscall", but categorically
+ * cannot, because doing so requires write access to the parent directory and, by
+ * construction, nothing but this process has it. Once verified, the invariant holds for the
+ * rest of this run without needing to be re-checked before every operation: changing it
+ * would itself require the very write access this check just proved nobody but this process
+ * holds. It is checked twice regardless — once before `mkdirSync`, once immediately after —
+ * the same belt-and-braces shape as `assertContained`, to cover the (now merely lexical, not
+ * racy) gap between the two calls and to validate the directories this run itself just
+ * created.
+ *
+ * What this does *not* do, stated rather than left as a documented hole: it does not defend
+ * against a same-account attacker. Another process already running as this user holds
+ * exactly the same access this run does and could tamper with these same directories
+ * regardless of what this check finds. No single producer function can meaningfully defend
+ * against its own account being compromised — that is a strictly larger compromise than a
+ * swapped git checkout. The guarantee here is narrower, and that narrowing is the honest
+ * answer: this producer refuses to operate in a namespace a *different* user or group could
+ * tamper with, which is the realistic shared-host/shared-temp-directory threat model it
+ * actually faces, not a claim to have closed every race a co-resident attacker could run.
+ */
+const assertParentChainNotAttackerWritable = (workDir: string, localRepoPath: string): Decision<void> => {
+  if (typeof process.getuid !== "function") {
+    return deny(
+      ReasonCode.WRITE_TARGET_OUTSIDE_RUN_SCOPE,
+      "ownership verification is not supported on this platform; refusing rather than silently skipping it",
+      { workDir, localRepoPath },
+    );
+  }
+  const myUid = process.getuid();
+  const boundary = resolve(workDir);
+  const chain: string[] = [];
+  let current = dirname(resolve(localRepoPath));
+  for (;;) {
+    chain.push(current);
+    if (current === boundary) break;
+    const parent = dirname(current);
+    if (parent === current) break; // reached the filesystem root without meeting workDir
+    current = parent;
+  }
+  for (const dir of chain) {
+    if (!existsSync(dir)) continue; // not created yet — nothing to own or misconfigure
+    const judged = judgeDirectoryOwnership(dir, statSync(dir), myUid);
+    if (!judged.allowed) return judged;
+  }
+  return allow(ReasonCode.OK, undefined);
+};
+
+/**
+ * Removes the checkout this call created — and only if containment and the ownership
+ * precondition both still hold for it *and* the ownership marker inside it still names this
+ * exact operation. Any of those failing means either this call's own write never completed
+ * or something else may now be involved with that path; either way this refuses to delete it
  * (Integration §13.3's RESOURCE_COLLISION is the right outcome for an unproven resource, not
  * a guess).
  */
-const cleanupOwnedCheckout = (anchor: AnchoredDirectory, bootstrapOperationId: string): void => {
-  const stillThere = assertStillAnchored(anchor);
-  if (!stillThere.allowed) return;
+const cleanupOwnedCheckout = (workDir: string, localRepoPath: string, bootstrapOperationId: string): void => {
+  const containment = assertContained(workDir, localRepoPath);
+  if (!containment.allowed) return;
+  const ownership = assertParentChainNotAttackerWritable(workDir, localRepoPath);
+  if (!ownership.allowed) return;
   let marker: unknown;
   try {
-    marker = JSON.parse(readFileSync(join(anchor.path, OPERATION_MARKER_NAME), "utf8"));
+    marker = JSON.parse(readFileSync(join(localRepoPath, OPERATION_MARKER_NAME), "utf8"));
   } catch {
     return;
   }
   if ((marker as { bootstrapOperationId?: unknown }).bootstrapOperationId !== bootstrapOperationId) return;
-  rmSync(anchor.path, { recursive: true, force: true });
+  rmSync(localRepoPath, { recursive: true, force: true });
 };
 
 /**
@@ -320,8 +298,9 @@ export const trackedFilesOrDeny = (tracked: GitResult): Decision<string[]> => {
  *    stdout says otherwise, or the tracked-file listing behind the receipt fails — recording
  *    PASS anyway would be a schema-complete lie;
  *  - a checkout path outside `workDir`, even one reached only through a symlink planted
- *    after the plan's own path-shaped fields were validated, or one swapped in after the
- *    checkout directory was created (see `assertContained` / `anchorDirectory`).
+ *    after the plan's own path-shaped fields were validated (`assertContained`), or one a
+ *    different-account actor could plant later because it shares write access to a
+ *    directory in the chain (`assertParentChainNotAttackerWritable`).
  *
  * A failure after the checkout directory exists cleans up only the exact thing this call
  * created (see `cleanupOwnedCheckout`), so the same operation can be retried rather than
@@ -359,37 +338,31 @@ export const produceRepoFactoryResult = async (
 
   const precheck = assertContained(workDir, localRepoPath);
   if (!precheck.allowed) return precheck as Decision<RepoFactoryResult>;
+  const ownershipPrecheck = assertParentChainNotAttackerWritable(workDir, localRepoPath);
+  if (!ownershipPrecheck.allowed) return ownershipPrecheck as Decision<RepoFactoryResult>;
 
   mkdirSync(localRepoPath, { recursive: true });
 
-  // Closes the TOCTOU window between the check above and this write: re-verify the boundary
-  // against what was actually created before anything is written into it.
+  // Closes the (now purely lexical, not racy) gap between the checks above and this write,
+  // and validates the directories this call itself just created.
   const postCreate = assertContained(workDir, localRepoPath);
   if (!postCreate.allowed) return postCreate as Decision<RepoFactoryResult>;
+  const ownershipPostCreate = assertParentChainNotAttackerWritable(workDir, localRepoPath);
+  if (!ownershipPostCreate.allowed) return ownershipPostCreate as Decision<RepoFactoryResult>;
 
-  const anchored = anchorDirectory(localRepoPath);
-  if (!anchored.allowed) return anchored as Decision<RepoFactoryResult>;
-  const anchor = anchored.value;
-
-  const markerWrite = writeFileAnchored(
-    anchor,
-    OPERATION_MARKER_NAME,
+  writeFileSync(
+    join(localRepoPath, OPERATION_MARKER_NAME),
     `${JSON.stringify({ bootstrapOperationId: plan.bootstrapOperationId })}\n`,
   );
-  if (!markerWrite.allowed) return markerWrite as Decision<RepoFactoryResult>;
-  const cleanup = (): void => cleanupOwnedCheckout(anchor, plan.bootstrapOperationId);
+  const cleanup = (): void => cleanupOwnedCheckout(workDir, localRepoPath, plan.bootstrapOperationId);
 
   const createdAt = clock.nowIso();
 
-  const init = await gitAnchored(anchor, ["init", "-b", plan.defaultBranch], { allowFailure: true });
-  if (!init.allowed) {
-    cleanup();
-    return init as Decision<RepoFactoryResult>;
-  }
-  if (init.value.exitCode !== 0) {
+  const init = await git(localRepoPath, ["init", "-b", plan.defaultBranch], { allowFailure: true });
+  if (init.exitCode !== 0) {
     cleanup();
     return deny(ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT, "local git init failed", {
-      stderr: init.value.stderr,
+      stderr: init.stderr,
     });
   }
 
@@ -400,31 +373,18 @@ export const produceRepoFactoryResult = async (
   // bookkeeping, not part of the repository's real content. Tested directly in
   // `tests/unit/repo-factory-producer.test.ts` by running real `git status --porcelain`
   // against a produced repository and asserting its output is empty.
-  const excludeWrite = writeFileAnchored(anchor, join(".git", "info", "exclude"), `${OPERATION_MARKER_NAME}\n`, "a");
-  if (!excludeWrite.allowed) {
-    cleanup();
-    return excludeWrite as Decision<RepoFactoryResult>;
-  }
+  writeFileSync(join(localRepoPath, ".git", "info", "exclude"), `${OPERATION_MARKER_NAME}\n`, { flag: "a" });
 
-  const bootstrapFileWrite = writeFileAnchored(
-    anchor,
-    ".repo-factory-bootstrap.json",
+  writeFileSync(
+    join(localRepoPath, ".repo-factory-bootstrap.json"),
     `${JSON.stringify({ runId: plan.runId, repositoryRole: plan.repositoryRole }, null, 2)}\n`,
   );
-  if (!bootstrapFileWrite.allowed) {
-    cleanup();
-    return bootstrapFileWrite as Decision<RepoFactoryResult>;
-  }
 
   // Only the bootstrap content file is tracked — the ownership marker above is bookkeeping
   // for this function's own retry/cleanup logic, not part of the repository's real content.
-  const added = await gitAnchored(anchor, ["add", ".repo-factory-bootstrap.json"]);
-  if (!added.allowed) {
-    cleanup();
-    return added as Decision<RepoFactoryResult>;
-  }
-  const commit = await gitAnchored(
-    anchor,
+  await git(localRepoPath, ["add", ".repo-factory-bootstrap.json"]);
+  const commit = await git(
+    localRepoPath,
     [
       "-c", "user.email=repo-factory@local",
       "-c", "user.name=Repo Factory",
@@ -432,62 +392,49 @@ export const produceRepoFactoryResult = async (
     ],
     { allowFailure: true },
   );
-  if (!commit.allowed) {
-    cleanup();
-    return commit as Decision<RepoFactoryResult>;
-  }
-  if (commit.value.exitCode !== 0) {
+  if (commit.exitCode !== 0) {
     cleanup();
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
       "local bootstrap commit failed; refusing to fabricate a result without a real commit",
-      { stderr: commit.value.stderr },
+      { stderr: commit.stderr },
     );
   }
 
-  const headResult = await revParseAnchored(anchor, "HEAD");
-  if (!headResult.allowed) {
+  const head = await tryRevParse(localRepoPath, "HEAD");
+  if (!head) {
     cleanup();
-    return headResult as Decision<RepoFactoryResult>;
+    return deny(
+      ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
+      "local repository has no exact HEAD after commit",
+      { localRepoPath },
+    );
   }
-  const head = headResult.value;
 
   // The real verification kind this run promises `bootstrapVerification` about. A judge
   // that denies is a genuine observation, not a fabricated one, and it must refuse rather
   // than record PASS regardless.
   const verificationSpec = VERIFICATION_KINDS[plan.verificationKind];
-  const verificationRun = await gitAnchored(anchor, verificationSpec.argv, { allowFailure: true });
-  if (!verificationRun.allowed) {
-    cleanup();
-    return verificationRun as Decision<RepoFactoryResult>;
-  }
-  const verificationJudged = verificationSpec.judge(verificationRun.value);
+  const verificationRun = await git(localRepoPath, verificationSpec.argv, { allowFailure: true });
+  const verificationJudged = verificationSpec.judge(verificationRun);
   if (!verificationJudged.allowed) {
     cleanup();
     return verificationJudged as Decision<RepoFactoryResult>;
   }
 
   const rereadAt = clock.nowIso();
-  const rereadResult = await revParseAnchored(anchor, "HEAD");
-  if (!rereadResult.allowed) {
-    cleanup();
-    return rereadResult as Decision<RepoFactoryResult>;
-  }
-  if (rereadResult.value !== head) {
+  const rereadHead = await tryRevParse(localRepoPath, "HEAD");
+  if (rereadHead !== head) {
     cleanup();
     return deny(
       ReasonCode.BOOTSTRAP_FACTORY_RESULT_INSUFFICIENT,
       "local repository HEAD changed between write and post-write re-read",
-      { localRepoPath: anchor.path, head, rereadHead: rereadResult.value },
+      { localRepoPath, head, rereadHead },
     );
   }
 
-  const trackedRun = await gitAnchored(anchor, ["ls-tree", "-r", "--name-only", "HEAD"], { allowFailure: true });
-  if (!trackedRun.allowed) {
-    cleanup();
-    return trackedRun as Decision<RepoFactoryResult>;
-  }
-  const tracked = trackedFilesOrDeny(trackedRun.value);
+  const trackedRun = await git(localRepoPath, ["ls-tree", "-r", "--name-only", "HEAD"], { allowFailure: true });
+  const tracked = trackedFilesOrDeny(trackedRun);
   if (!tracked.allowed) {
     cleanup();
     return tracked as Decision<RepoFactoryResult>;
@@ -521,7 +468,7 @@ export const produceRepoFactoryResult = async (
         // Integration §13's own comment: Repo Factory may *propose* a local binding, it
         // never commits one. This is the honest form of that — a real path this run
         // created, offered as a proposal only.
-        proposedCheckoutPath: anchor.path,
+        proposedCheckoutPath: localRepoPath,
         defaultBranch: plan.defaultBranch,
         createdBranches: [],
       },

@@ -1,10 +1,10 @@
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
-  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -19,8 +19,7 @@ import { ManualClock } from "../../src/core/clock.ts";
 import { ReasonCode } from "../../src/core/reason-codes.ts";
 import { parseRepoFactoryResult } from "../../src/bootstrap/repo-factory-result.ts";
 import {
-  anchorDirectory,
-  assertStillAnchored,
+  judgeDirectoryOwnership,
   produceRepoFactoryResult,
   repositoryCheckoutPath,
   trackedFilesOrDeny,
@@ -197,48 +196,64 @@ describe("repo factory producer (#246)", () => {
     });
   });
 
-  describe("CEO review round 3, defect 3 — TOCTOU between the containment check and later use", () => {
-    it("assertStillAnchored refuses once the path has been swapped after anchorDirectory opened it — not one planted in advance", () => {
-      const { sandbox } = makeSandbox();
-      const real = join(sandbox, "real");
-      const elsewhere = join(sandbox, "elsewhere");
-      mkdirSync(real, { recursive: true });
-      mkdirSync(elsewhere, { recursive: true });
+  /**
+   * CEO review round 3's fix re-verified the checkout path's device+inode identity
+   * immediately before every subsequent operation (`anchorDirectory` + `assertStillAnchored`,
+   * wired through `gitAnchored`/`writeFileAnchored`). CEO's round 4 verdict was that this
+   * shrinks a check-then-act window rather than closing it, and demonstrated it directly by
+   * composing the exact same exported primitives `gitAnchored` used internally, with a real
+   * symlink swap injected in the reproduction's own code strictly between them:
+   *
+   *   anchorDirectory(real)                                   // "the check" — passes
+   *   assertStillAnchored(anchored.value)                     // passes: allowed === true
+   *   rmSync(real, ...); symlinkSync(elsewhere, real);         // "the swap", injected here,
+   *                                                             //   strictly after the check
+   *   await git(anchored.value.path, ["init", "-b", "pwn"])    // "the use" — followed it
+   *
+   * Observed against commit 94dc8f2: `git init exitCode: 0`, and `.git` created inside
+   * `elsewhere` — the swapped-to directory, not `real`. That reproduction is the RED this
+   * defect was reopened for.
+   *
+   * `anchorDirectory`/`assertStillAnchored`/`gitAnchored`/`writeFileAnchored` were removed
+   * entirely rather than patched — no amount of re-checking closes a check-then-act race,
+   * only removing the actor who could win it does. `assertParentChainNotAttackerWritable`
+   * below is that removal: a directory-ownership/permission precondition, verified once
+   * (not race-prone — see the function's own doc comment for why), tested here.
+   */
+  describe("CEO review round 4, defect 3 — a real close, not a smaller race window", () => {
+    it("judgeDirectoryOwnership refuses a directory writable by another user or group, even one this process owns", () => {
+      const myUid = process.getuid ? process.getuid() : 0;
+      const worldWritable = judgeDirectoryOwnership("/some/dir", { uid: myUid, mode: 0o40777 }, myUid);
+      expect(worldWritable.allowed).toBe(false);
 
-      // "The check": anchor the directory while it is still genuinely what it claims to be.
-      const anchored = anchorDirectory(real);
-      expect(anchored.allowed).toBe(true);
-      if (!anchored.allowed) return;
+      const groupWritable = judgeDirectoryOwnership("/some/dir", { uid: myUid, mode: 0o40775 }, myUid);
+      expect(groupWritable.allowed).toBe(false);
 
-      // Positive control: nothing has changed yet, so the anchor still holds.
-      expect(assertStillAnchored(anchored.value).allowed).toBe(true);
-
-      // The swap happens strictly *between* the check above and "the use" below.
-      rmSync(real, { recursive: true, force: true });
-      symlinkSync(elsewhere, real);
-
-      // "The use": every subsequent operation re-verifies before acting, and refuses here.
-      expect(assertStillAnchored(anchored.value).allowed).toBe(false);
+      const safe = judgeDirectoryOwnership("/some/dir", { uid: myUid, mode: 0o40755 }, myUid);
+      expect(safe.allowed).toBe(true);
     });
 
-    it("refuses a real git call once the anchored path has been swapped, rather than silently operating on the replacement", async () => {
-      const { sandbox } = makeSandbox();
-      const real = join(sandbox, "real");
-      const elsewhere = join(sandbox, "elsewhere");
-      mkdirSync(real, { recursive: true });
-      mkdirSync(elsewhere, { recursive: true });
+    it("judgeDirectoryOwnership refuses a directory owned by a different account regardless of its permission bits", () => {
+      // A real directory owned by a different uid cannot be created in a test sandbox
+      // without root, so this exercises the exact decision function
+      // `assertParentChainNotAttackerWritable` calls, with the exact `{ uid, mode }` shape
+      // `fs.Stats` carries.
+      const notMine = judgeDirectoryOwnership("/some/dir", { uid: 0, mode: 0o40700 }, 501);
+      expect(notMine.allowed).toBe(false);
+    });
 
-      const anchored = anchorDirectory(real);
-      expect(anchored.allowed).toBe(true);
-      if (!anchored.allowed) return;
+    it("refuses to operate when a directory between workDir and the checkout is writable by another user or group — real and deterministic, no race required", async () => {
+      const { workDir } = makeSandbox();
+      mkdirSync(workDir, { recursive: true });
+      const repositoriesDir = join(workDir, "repositories");
+      mkdirSync(repositoriesDir, { recursive: true });
+      chmodSync(repositoriesDir, 0o777);
 
-      rmSync(real, { recursive: true, force: true });
-      symlinkSync(elsewhere, real);
-
-      const stillOk = assertStillAnchored(anchored.value);
-      expect(stillOk.allowed).toBe(false);
-      // And critically: nothing was written into the swapped-in replacement either.
-      expect(readdirSync(elsewhere)).toEqual([]);
+      const produced = await produceRepoFactoryResult({ plan: basePlan(), workDir });
+      expect(produced.allowed).toBe(false);
+      // Refusing before ever creating the checkout — the unsafe directory is left exactly as
+      // found, not silently written into anyway.
+      expect(existsSync(join(repositoriesDir, "primary"))).toBe(false);
     });
   });
 

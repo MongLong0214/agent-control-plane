@@ -3335,8 +3335,8 @@ const GUARDS = [
     // actually deleted.
     what: "a failed run removes only the checkout it just created, so the same bootstrap operation can retry",
     file: "src/bootstrap/repo-factory-producer.ts",
-    find: "  rmSync(anchor.path, { recursive: true, force: true });\n",
-    replace: "  // rmSync(anchor.path, { recursive: true, force: true });\n",
+    find: "  rmSync(localRepoPath, { recursive: true, force: true });\n",
+    replace: "  // rmSync(localRepoPath, { recursive: true, force: true });\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
   {
@@ -3379,16 +3379,32 @@ const GUARDS = [
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
   {
-    // CEO review round 3, defect 3 — every operation after the one containment check at the
-    // top passed a bare pathname straight through, so a symlink swapped in afterward (proven
-    // directly: a bare `git -C <path>` call follows such a swap without complaint) was
-    // silently followed. Neutering the identity comparison here reproduces exactly that:
-    // `assertStillAnchored` reports "still anchored" regardless of whether the pathname still
-    // refers to the directory `anchorDirectory` opened.
-    what: "assertStillAnchored refuses once the anchored path no longer matches the directory's original device+inode identity",
+    // CEO review round 4, defect 3 — round 3's fix re-verified device+inode identity
+    // immediately before every operation, and CEO demonstrated directly that a swap injected
+    // strictly between a successful re-check and the git call right after it was followed
+    // exactly as before: shrinking a check-then-act window is not closing it. The real close
+    // is this: an ancestor directory owned by someone else can be tampered with by that other
+    // account regardless of any check this process performs, so it is refused outright.
+    // Neutering the ownership half of the check would let a directory owned by another
+    // account (who could swap its contents at any time, on their own schedule, not raced) be
+    // treated as safe.
+    what: "the producer refuses a checkout whose parent chain includes a directory not owned by this process",
     file: "src/bootstrap/repo-factory-producer.ts",
-    find: "  if (stat.dev !== anchor.identity.dev || stat.ino !== anchor.identity.ino) {\n",
-    replace: "  if (false && (stat.dev !== anchor.identity.dev || stat.ino !== anchor.identity.ino)) {\n",
+    find: "  if (stat.uid !== myUid) {\n",
+    replace: "  if (false && stat.uid !== myUid) {\n",
+    killedBy: ["tests/unit/repo-factory-producer.test.ts"],
+  },
+  {
+    // The other half of the same precondition: even a directory this process owns is unsafe
+    // if another user or group can also write to it — group/other write access is exactly
+    // what would let a different account create, delete, or rename entries inside it,
+    // including replacing this run's own checkout with a symlink, at any time, not only in
+    // some narrow window this process might fail to re-check. Neutering the mode check here
+    // reproduces exactly that: a world-writable "repositories" directory is treated as safe.
+    what: "the producer refuses a checkout whose parent chain includes a directory writable by another user or group",
+    file: "src/bootstrap/repo-factory-producer.ts",
+    find: "  if ((stat.mode & 0o022) !== 0) {\n",
+    replace: "  if (false && (stat.mode & 0o022) !== 0) {\n",
     killedBy: ["tests/unit/repo-factory-producer.test.ts"],
   },
 ];
