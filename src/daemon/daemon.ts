@@ -14,6 +14,7 @@ import { CONTINUITY_MODE_MAX_AGE_MS } from "../run/run-engine.ts";
 import type { DoctorScope, Finding } from "../doctor/doctor.ts";
 import { REPAIR_OWNER_APPROVAL_OPERATION } from "../doctor/repair.ts";
 import { RunState, SessionLifecycle } from "../domain/types.ts";
+import { buildAcceptanceReport } from "../export/acceptance-report.ts";
 import { RunEvidenceExporter } from "../export/run-evidence.ts";
 import {
   acknowledgeTerminalTelegramReply,
@@ -194,6 +195,7 @@ export const OPERATOR_METHOD = {
   CONVERSATION_RESOLVE: "conversation.resolve",
   TELEGRAM_REPLY_ACKNOWLEDGE: "telegram.reply.acknowledge",
   DAEMON_STATUS: "daemon.status",
+  ACCEPTANCE_REPORT: "acceptance.report",
 } as const;
 
 export type OperatorMethod = (typeof OPERATOR_METHOD)[keyof typeof OPERATOR_METHOD];
@@ -751,14 +753,15 @@ export class Daemon {
         }
 
         case OPERATOR_METHOD.DAEMON_STATUS:
+          return allow(ReasonCode.OK, this.daemonHealthSnapshot());
+
+        case OPERATOR_METHOD.ACCEPTANCE_REPORT:
+          // #241 — the acceptance readout. Its own reads (window, lifecycle outcomes, anomaly
+          // counts) come from `buildAcceptanceReport`; daemon health is reused rather than
+          // reimplemented, exactly as `daemon status` reports it.
           return allow(ReasonCode.OK, {
-            lock: this.lock.read(),
-            databasePath: this.cp.config.databasePath,
-            health: readJson(join(this.options.stateDir, "health.json")),
-            mode: this.#mode,
-            admittedMethods:
-              this.#mode === "BOOTSTRAP" ? [...BOOTSTRAP_OPERATOR_METHODS].sort() : null,
-            blockingFindings: this.#mode === "BOOTSTRAP" ? this.#bootstrapBlocking : [],
+            ...buildAcceptanceReport(this.cp.db, this.cp.clock),
+            daemonHealth: this.daemonHealthSnapshot(),
           });
       }
     } catch (error) {
@@ -767,6 +770,28 @@ export class Daemon {
         error: safeErrorMessage(error),
       });
     }
+  }
+
+  /**
+   * The object `daemon.status` reports, extracted so `acceptance.report` (#241) can embed the
+   * same daemon health rather than reimplementing it.
+   */
+  private daemonHealthSnapshot(): {
+    lock: unknown;
+    databasePath: string;
+    health: unknown;
+    mode: DaemonMode;
+    admittedMethods: string[] | null;
+    blockingFindings: BlockingFinding[];
+  } {
+    return {
+      lock: this.lock.read(),
+      databasePath: this.cp.config.databasePath,
+      health: readJson(join(this.options.stateDir, "health.json")),
+      mode: this.#mode,
+      admittedMethods: this.#mode === "BOOTSTRAP" ? [...BOOTSTRAP_OPERATOR_METHODS].sort() : null,
+      blockingFindings: this.#mode === "BOOTSTRAP" ? this.#bootstrapBlocking : [],
+    };
   }
 
   private executeOwnerApproval(

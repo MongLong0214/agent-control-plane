@@ -25,6 +25,9 @@ const USAGE = `agentctl — Agent Control Plane operator CLI
   agentctl run cancel <runId> <reason>    cancel a run and its task graph
   agentctl baseline export --from <ISO> --to <ISO>
   agentctl continuity status              continuity mode and role coverage plan
+  agentctl acceptance report               observation window, lifecycle outcomes, the five
+                                           anomaly counts and daemon health; N/A when no
+                                           lifecycle has reached a terminal state
   agentctl outbox retry                   reset delivery attempts on pending messages
   agentctl owner approve <runId> <item>   record an owner decision for a human gate
   agentctl github merge ...             refused: agentcpd owns CEO-approved finalization
@@ -245,6 +248,11 @@ export const dispatch = async (
   if (command === "continuity") {
     if (args[0] !== "status") return fail(`unknown continuity subcommand: ${args[0] ?? ""}`);
     return call("continuity.status");
+  }
+
+  if (command === "acceptance") {
+    if (args[0] !== "report") return fail(`unknown acceptance subcommand: ${args[0] ?? ""}`);
+    return call("acceptance.report");
   }
 
   if (command === "outbox") {

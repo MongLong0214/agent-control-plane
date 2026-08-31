@@ -89,8 +89,8 @@ these 12 failures arrived with them.
 | 4 | One multi-repository run with an explicit merge order | **Met in part** | Multi-repository freezing and staleness are proven with two real repositories (CP-S25), `run_repositories.merge_order` and per-repository merge state are implemented, and merge order is enforced with a regression test. A real two-repository run merging in declared order, with the first repository's post-merge verification gating the second, has not been executed — #240. |
 | 5 | Zero role/session independence violations under GPT-down and Claude-down continuity | **Met** | CP-S19–CP-S22, CP-S24, CP-S34, all in `tests/scenarios/graph-capacity-continuity.test.ts`, all passing. Distinct sessions are asserted, and a failover the coverage plan cannot staff is refused rather than downgraded. |
 | 6 | Repo Factory bootstrap → primary CTO activation → doctor | **Met on the control-plane side** | Activation runs from a fixture `repo-factory.result.v2` through registration, binding, handoff ACK and doctor (CP-S52, passing). The producing side is a separate deliverable and does not exist yet — #246. |
-| 7 | Scenario suite + ≥3 dogfood projects + ≥30 observed run/bootstrap lifecycles with zero false completions, duplicate dispatches, accepted stale-generation results, forged gates or unauthorised merges | **Not met — requires an observation period** | The mechanisms each have a negative test proving the zero is enforced rather than hoped for. The *count* needs real operating time across three projects. Three lifecycles exist so far, the three runs of item 3. Tracked as #241. |
-| 8 | Recorded observation window and duration for the zero counts | **Not met** | Follows item 7. #241. |
+| 7 | Zero false completions, duplicate dispatches, accepted stale-generation results, forged gates or unauthorised merges | **Superseded by tooling — run `agentctl acceptance report`** | The CEO ruling on #241 discarded the `30 lifecycles × 3 projects` quota and the hand-transcribed ceremony this row used to describe. `agentctl acceptance report` reads `runs`, `audit_events` and `telemetry_metrics` directly and prints the five counts itself; **its output is the evidence**, not a number copied into this file. Zero lifecycles renders every count `N/A`, never a passing zero — see `src/export/acceptance-report.ts`. |
+| 8 | Recorded observation window and duration for the zero counts | **Superseded by tooling — run `agentctl acceptance report`** | The same command derives the window from the data's own first and last recorded activity and prints it alongside the counts. Follows item 7. |
 | 9 | Zero owner interrupts for routine technical revision during dogfood | **Not met** | Follows item 7. #241. CP-S33 and CP-S53 prove routine revision and churn do not notify upward, and both pass. |
 | 10 | Every P0 requirement linked to a scenario and evidence | **Met** | The generated report links P0 requirements to scenario declarations from the PRD tables. This is declaration traceability, not behavioural proof that a requirement is met. |
 
@@ -413,11 +413,34 @@ path works against a real project in all three execution modes — but an advers
 with full source access still finds authority and evidence gaps faster than the fix waves
 close them, and the current suite is red.
 
-## What would close items 7–9
+## Items 7–8: `agentctl acceptance report`
 
-Run three real projects through the control plane for as long as it takes to accumulate 30
-run or bootstrap lifecycles, then record the window, the duration and the five counts. The
-telemetry needed for that is already collected (`telemetry_metrics`, scoped run / task /
-quality / capacity / graph / continuity), and `agentctl` can read it back. The three runs in
-item 3 are the first three lifecycles and each one wrote its own telemetry rows, visible in
-the `telemetry` block of each evidence file.
+There is no quota here and nothing in this section is transcribed by hand — a number typed
+into a document with no reconciliation is exactly the defect `#448` item 4 removed elsewhere,
+and copying `agentctl`'s output into prose would reintroduce it for this file alone. Run:
+
+```
+agentctl acceptance report
+```
+
+against the deployment's own database. It reads `runs`, `audit_events` and `telemetry_metrics`
+and prints, as its own output:
+
+- **the observation window** — the first and last recorded activity the data actually spans,
+  and the duration between them (never a configured or constant window);
+- **lifecycle outcomes** — completed / failed / abandoned counts, drawn from `runs.state`;
+- **the five anomaly counts** — false completions, duplicate dispatches, accepted
+  stale-generation results, forged gates and unauthorised merges, each counted from the
+  `audit_events` rows the mechanism that already enforces it records (see
+  `ANOMALY_REASON_CODES` in `src/export/acceptance-report.ts` for exactly which reason codes
+  back each count, and the negative test each mechanism carries);
+- **daemon health**, reused from `agentctl daemon status` rather than reimplemented.
+
+**The load-bearing property, proved by `tests/unit/acceptance-report.test.ts`:** zero lifecycles
+renders every anomaly count `N/A` and the overall verdict `N/A` — never a passing zero. A
+database can hold tens of thousands of `audit_events` / `telemetry_metrics` rows from the daemon
+monitoring itself (capacity probes, continuity reconciliation) while `runs` stays empty; the
+verdict gates on lifecycles reaching a terminal state, not on that self-monitoring activity, so
+that case still reads `N/A` rather than a clean pass. When at least one lifecycle has completed,
+the verdict is either `OBSERVED_NO_ANOMALIES` (carrying the exact lifecycle count, and explicitly
+not a long-term reliability claim) or `ANOMALIES_PRESENT` (naming which counts are non-zero).
