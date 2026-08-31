@@ -3249,6 +3249,44 @@ const GUARDS = [
     ],
   },
   {
+    // #737: the rollback preflight in docs/ops/owner-actions.md item 6 checks every file the
+    // rollback will read before its first destructive command (`rm -rf .../dist`). This row
+    // deletes the launcher check specifically, leaving the other checks around it intact, so a
+    // test that only asserted "some check exists somewhere" could not be fooled by this — the
+    // named test extracts the whole block and runs it against a fixture backup that is otherwise
+    // fully valid and is missing only the launcher file, so with this line gone the extracted
+    // script sails through every remaining check and actually runs `rm -rf` against the fixture's
+    // live dist directory.
+    what: "the rollback preflight refuses a missing launcher backup file before rm -rf runs",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
+      '    test -s "$BYTES_BACKUP/agentcpd-launch.sh"\n' +
+      '    test -s "$BACKUP_PATH"\n',
+    replace:
+      '    test -s "$BYTES_BACKUP/com.agentcontrolplane.agentcpd.plist"\n' +
+      '    test -s "$BACKUP_PATH"\n',
+    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+  },
+  {
+    // #737, CEO's second-round finding: the launcher row above did not cover the *other* named
+    // counterexample — nothing mutated the state-admin.js existence/readability guard, so that
+    // half of the fixture had a test but no proof the test could fail. This row deletes both
+    // lines (existence and readability are one guard for this file; deleting only one would still
+    // leave the other blocking `rm -rf`, so it would not be about the file going missing at all).
+    // Reproduced by hand before this row existed: with these two lines removed and the
+    // state-admin-only-missing fixture otherwise fully valid, the extracted script ran `rm -rf`
+    // for real and the named test failed on that — proving the guard was untested, not merely
+    // unwritten.
+    what: "the rollback preflight refuses a missing backup state-admin.js before rm -rf runs",
+    file: "docs/ops/owner-actions.md",
+    find:
+      '    test -f "$BYTES_BACKUP/dist/db/state-admin.js"\n' +
+      '    test -r "$BYTES_BACKUP/dist/db/state-admin.js"\n',
+    replace: "",
+    killedBy: ["tests/process/the-rollback-preflight-refuses-a-missing-backup-file.test.ts"],
+  },
+  {
     // #241 — the whole point of the acceptance readout. Forcing `observed` to true makes an
     // empty database compute accepted anomalies (all zero) and report OBSERVED_NO_ANOMALIES
     // instead of N/A: exactly the "0/PASS" shape the CEO ruling named as worse than the ceremony
