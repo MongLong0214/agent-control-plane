@@ -282,6 +282,46 @@ const waitForFile = async (path: string, timeoutMs = 20_000): Promise<void> => {
   }
 };
 
+/**
+ * Holds `BEGIN EXCLUSIVE` on `dbPath` for `holdSeconds`, and resolves only once the lock is
+ * genuinely held: the marker it waits on is touched by `sqlite3` itself, from inside the open
+ * transaction, so there is no window in which the caller believes the source is locked and it is
+ * not. The transaction is never committed — stdin closing ends it — so the source is byte-unchanged
+ * afterwards and the case can still assert it is writable.
+ *
+ * This is what makes #753's property deterministic instead of sampled. The concurrent-writer case
+ * above inserts in a loop and hopes the backup lands inside one of the short `EXCLUSIVE` windows
+ * that committing opens; whether it does is a property of the host's load, which is why the same
+ * merge SHA passed on one CI leg and failed on the other. Handing the script a lock that is
+ * *already held* when it starts removes the sampling: the contention is certain, so a run that
+ * survives it has demonstrated the property rather than been lucky.
+ */
+const holdExclusiveLockOnSource = async (
+  root: string,
+  dbPath: string,
+  holdSeconds: number,
+): Promise<{ released: Promise<number | null> }> => {
+  const held = join(root, "source-lock-held");
+  const holder = spawn(
+    BASH,
+    [
+      "-c",
+      '{ printf "begin exclusive;\\ninsert into t values (555);\\n.shell /usr/bin/touch %s\\n" "$2"; ' +
+        '/bin/sleep "$3"; } | /usr/bin/sqlite3 "$1"',
+      "source-lock-holder",
+      dbPath,
+      held,
+      String(holdSeconds),
+    ],
+    { stdio: ["ignore", "ignore", "ignore"] },
+  );
+  const released = new Promise<number | null>((resolve) => {
+    holder.on("close", (code) => resolve(code));
+  });
+  await waitForFile(held, 20_000);
+  return { released };
+};
+
 describe("the database-backup step in docs/ops/owner-actions.md, extracted and run against fixtures", () => {
   it("never calls sqlite3 against an empty path when the backup command itself fails, and exits nonzero", () => {
     const root = tempDir("acp-database-backup-cmd-fails-");
@@ -475,6 +515,90 @@ describe("the database-backup step in docs/ops/owner-actions.md, extracted and r
     );
     expect(rowCountAfter).toBeGreaterThan(3);
   }, 20_000);
+
+  it("completes against a source that is already locked when it starts, rather than exiting SQLITE_BUSY before the backup runs", async () => {
+    const root = tempDir("acp-database-backup-locked-source-");
+    const { fixtureHome, dbPath } = setUpFixtureHome(root);
+
+    const { released } = await holdExclusiveLockOnSource(root, dbPath, 3);
+    const result = runExtractedBackup(fixtureHome, minimalPath());
+    await released;
+
+    expect(result.spawnError).toBeUndefined();
+    expect(result.signal).toBeNull();
+    // `5` is `SQLITE_BUSY`, and it is what #753 measured on CI. It never came from `.backup`: the
+    // `sqlite3` shell maps every backup failure to `1`. It came from step 1's `PRAGMA
+    // user_version` — a plain read of the live database carrying no busy timeout, which is refused
+    // outright rather than queued while a commit holds `EXCLUSIVE`. `set -e` carries the
+    // substitution's status, so the run died there, before `.backup` was ever reached.
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("backup verified:");
+    expect(result.stdout).toContain("user_version=25");
+
+    // Past the read and all the way through: a real artifact, not merely a run that did not exit 5.
+    const published = listing(join(fixtureHome, ".agent-control-plane", "backups")).filter((p) =>
+      p.endsWith(".sqlite"),
+    );
+    expect(published.length).toBe(1);
+    const backupFile = published[0];
+    if (backupFile === undefined) {
+      throw new Error("expected exactly one published backup after the lock was waited out");
+    }
+    expect(
+      execFileSync("sqlite3", [backupFile, "PRAGMA integrity_check;"], { encoding: "utf8" }).trim(),
+    ).toBe("ok");
+    expect(existsSync(`${backupFile}.manifest.json`)).toBe(true);
+
+    // The source outlives the wait: the holder's transaction rolled back, and it is still writable.
+    expect(
+      Number(
+        execFileSync("sqlite3", [dbPath, "insert into t values (999); select count(*) from t;"], {
+          encoding: "utf8",
+        }).trim(),
+      ),
+    ).toBe(4);
+  }, 60_000);
+
+  it("names the concurrent writer when the source stays locked past that read's timeout, instead of handing back a bare SQLITE_BUSY", () => {
+    const root = tempDir("acp-database-backup-locked-out-");
+    const { fixtureHome } = setUpFixtureHome(root);
+
+    // Contention that genuinely outlasts the 30s wait would spend 30s of wall clock to measure one
+    // sentence. That the wait *works* is measured by the case above, against a real lock; what is
+    // measured here is what a reader is handed once the wait is exhausted, so the busy failure is
+    // injected the same way this file's first case injects a failing `.backup`. The stub fails only
+    // the source read — the `user_version` calls against `$BACKUP_TMP` inside `backups/` are the
+    // block's other two, and they are passed through.
+    const stubDir = join(root, "stub-bin");
+    const reachedBackup = join(root, "reached-backup");
+    writeStub(stubDir, "sqlite3", [
+      "#!/bin/bash",
+      'case " $* " in',
+      `  *".backup"*) /usr/bin/touch "${reachedBackup}" ;;`,
+      "esac",
+      'case " $* " in',
+      '  *"/backups/"*) ;;',
+      '  *"PRAGMA user_version;"*)',
+      '    echo "Error: stepping, database is locked (5)" >&2; exit 5 ;;',
+      "esac",
+      'exec /usr/bin/sqlite3 "$@"',
+    ]);
+
+    const result = runExtractedBackup(fixtureHome, minimalPath(stubDir));
+
+    expect(result.spawnError).toBeUndefined();
+    // A refusal the block itself wrote, not the raw SQLite result code an owner would have to go
+    // look up. `5` reaching the caller unexplained is the whole of #753.
+    expect(result.code).toBe(1);
+    expect(result.code).not.toBe(5);
+    expect(result.stderr).toContain("refusing: could not read user_version");
+    expect(result.stderr).toContain("a concurrent writer (normally the daemon) is committing to it");
+    expect(result.stderr).toContain("No backup was taken and nothing was written");
+
+    // It stops at step 1. The backup is never attempted and nothing is left behind to clean up.
+    expect(existsSync(reachedBackup)).toBe(false);
+    expect(listing(join(fixtureHome, ".agent-control-plane", "backups"))).toEqual([]);
+  });
 
   it("publishes atomically: two overlapping runs targeting the same final name — exactly one wins, and its artifact is byte-unchanged afterward", async () => {
     const root = tempDir("acp-database-backup-collision-");
