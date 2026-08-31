@@ -172,6 +172,24 @@ const GUARDS = [
     ],
   },
   {
+    // #639 contract 1's fourth field was a constant. `TelegramRouterOptions.bindingGeneration`
+    // was optional with a `() => null` default, and no composition root — not this one, not the
+    // disposable-realm driver, not a test — ever supplied it. So every claim ACP has written
+    // stored `digestOf({ bindingGeneration: null })`, and a turn claimed while a CEO was bound at
+    // generation 1 was indistinguishable from one claimed with no CEO bound at all: the fence
+    // against reconciling one CEO's turn under the next generation could not move.
+    //
+    // The mutation is exactly the old behaviour, not a nonsense value, because the old behaviour
+    // is what was wrong — and it produced a digest that looked entirely plausible in every row.
+    what: "the claim's binding digest names the CEO generation that asked the turn",
+    file: "src/ingress/telegram-polling.ts",
+    find: "    bindingGeneration: () => cp.bindings.active(roleKeyFor(Role.CEO))?.bindingGeneration ?? null,",
+    replace: "    bindingGeneration: () => null,",
+    killedBy: [
+      "tests/process/a-turn-claim-outlives-the-process-that-made-it.test.ts::carries the same four values to a reader that opens the file after the writer is gone",
+    ],
+  },
+  {
     // Two lifecycles in one field: the reply reservation writes `result_json` whole, and an
     // ordinary timeout produces a reply, so the claim and the turn identity went with it.
     what: "the turn claim is stored apart from the reply it will produce",
